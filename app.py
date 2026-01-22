@@ -4,6 +4,7 @@ import uuid
 from datetime import datetime, timezone
 
 from flask import Flask, request, jsonify
+from pydantic import ValidationError
 
 from ap.config import Config
 from ap.db import init_db
@@ -13,7 +14,7 @@ from ap.queue import enqueue_signal, worker_loop
 from ap.state import load_state, update_state
 from ap.broker import SimBroker
 
-# NEW: scanner parser + Tradier broker
+# Scanner + Tradier
 from ap.parsers import parse_scanner_text
 from ap.brokers.tradier import TradierBroker, TradierConfig
 
@@ -22,13 +23,15 @@ log = get_logger("app")
 
 app = Flask(__name__)
 
-# Choose broker based on BOT_MODE
+# Choose broker
 if cfg.BOT_MODE in ("PAPER", "LIVE"):
-    BROKER = TradierBroker(TradierConfig(
-        base_url=os.getenv("TRADIER_BASE_URL", "https://sandbox.tradier.com"),
-        access_token=os.getenv("TRADIER_ACCESS_TOKEN", "").strip(),
-        account_id=os.getenv("TRADIER_ACCOUNT_ID", "").strip(),
-    ))
+    BROKER = TradierBroker(
+        TradierConfig(
+            base_url=os.getenv("TRADIER_BASE_URL", "https://sandbox.tradier.com"),
+            access_token=os.getenv("TRADIER_ACCESS_TOKEN", "").strip(),
+            account_id=os.getenv("TRADIER_ACCOUNT_ID", "").strip(),
+        )
+    )
 else:
     BROKER = SimBroker(starting_equity=10000.0)
 
@@ -63,7 +66,7 @@ def kill_off():
 
 @app.post("/mode")
 def set_mode():
-    body = request.get_json(force=True)
+    body = request.get_json(force=True) or {}
     mode = str(body.get("mode", "")).upper()
     if mode not in ("SIM", "PAPER", "LIVE", "READ_ONLY"):
         return jsonify({"ok": False, "error": "Invalid mode"}), 400
@@ -74,11 +77,27 @@ def set_mode():
 @app.post("/signal")
 def signal():
     """
-    Existing JSON signal intake (manual/structured)
-    Body must match ap.models.Signal schema.
+    Structured JSON signal intake.
+    Returns 400 on bad payload instead of crashing.
     """
-    body = request.get_json(force=True)
-    sig = Signal(**body)
+    body = request.get_json(force=True) or {}
+
+    try:
+        sig = Signal(**body)
+    except ValidationError as e:
+        return jsonify({
+            "ok": False,
+            "error": "Invalid signal payload",
+            "details": e.errors(),
+            "example": {
+                "signal_id": "uuid-string",
+                "symbol": "SPY",
+                "direction": "CALL",
+                "pattern_id": "MANUAL_TEST",
+                "timestamp_iso": "2026-01-22T00:00:00Z"
+            }
+        }), 400
+
     enqueue_signal(sig)
     return jsonify({"ok": True, "queued": True, "signal_id": sig.signal_id})
 
@@ -86,17 +105,16 @@ def signal():
 @app.post("/scanner/discord")
 def scanner_discord():
     """
-    New endpoint: takes raw scanner discord text:
-      { "content": "<discord message text>" }
-    Parses one or more setups, and queues one Signal per CALL leg and PUT leg.
+    Raw Discord scanner text intake.
     """
-    body = request.get_json(force=True)
+    body = request.get_json(force=True) or {}
     text = body.get("content") or ""
     parsed = parse_scanner_text(text)
     queued = 0
 
     for msg in parsed:
-        # Queue CALL leg
+        now_iso = datetime.now(timezone.utc).isoformat()
+
         if msg.calls and msg.calls.strike:
             sig = Signal(
                 signal_id=str(uuid.uuid4()),
@@ -104,7 +122,7 @@ def scanner_discord():
                 direction="CALL",
                 pattern_id="SCANNER_V1",
                 confidence_tag="standard_pool",
-                timestamp_iso=datetime.now(timezone.utc).isoformat(),
+                timestamp_iso=now_iso,
                 trigger={
                     "source": "discord",
                     "scanned_at": msg.scanned_at,
@@ -122,7 +140,6 @@ def scanner_discord():
             enqueue_signal(sig)
             queued += 1
 
-        # Queue PUT leg
         if msg.puts and msg.puts.strike:
             sig = Signal(
                 signal_id=str(uuid.uuid4()),
@@ -130,7 +147,7 @@ def scanner_discord():
                 direction="PUT",
                 pattern_id="SCANNER_V1",
                 confidence_tag="standard_pool",
-                timestamp_iso=datetime.now(timezone.utc).isoformat(),
+                timestamp_iso=now_iso,
                 trigger={
                     "source": "discord",
                     "scanned_at": msg.scanned_at,
@@ -153,10 +170,6 @@ def scanner_discord():
 
 @app.get("/tradier/test")
 def tradier_test():
-    """
-    Optional: quick sanity check that Tradier credentials work.
-    Only meaningful when BOT_MODE=PAPER or LIVE.
-    """
     try:
         equity = BROKER.get_account_equity()
         return jsonify({"ok": True, "equity": equity})
@@ -171,10 +184,6 @@ def start_worker():
 
 if __name__ == "__main__":
     init_db()
-
-    # bootstrap mode from env into state
     update_state({"mode": cfg.BOT_MODE})
-
     start_worker()
     app.run(host="0.0.0.0", port=5000, debug=False)
-
