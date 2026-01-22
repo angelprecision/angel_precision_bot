@@ -1,4 +1,8 @@
+import os
 import threading
+import uuid
+from datetime import datetime, timezone
+
 from flask import Flask, request, jsonify
 
 from ap.config import Config
@@ -9,32 +13,53 @@ from ap.queue import enqueue_signal, worker_loop
 from ap.state import load_state, update_state
 from ap.broker import SimBroker
 
+# NEW: scanner parser + Tradier broker
+from ap.parsers import parse_scanner_text
+from ap.brokers.tradier import TradierBroker, TradierConfig
+
 cfg = Config()
 log = get_logger("app")
 
 app = Flask(__name__)
 
-BROKER = SimBroker(starting_equity=10000.0)
+# Choose broker based on BOT_MODE
+if cfg.BOT_MODE in ("PAPER", "LIVE"):
+    BROKER = TradierBroker(TradierConfig(
+        base_url=os.getenv("TRADIER_BASE_URL", "https://sandbox.tradier.com"),
+        access_token=os.getenv("TRADIER_ACCESS_TOKEN", "").strip(),
+        account_id=os.getenv("TRADIER_ACCOUNT_ID", "").strip(),
+    ))
+else:
+    BROKER = SimBroker(starting_equity=10000.0)
+
 
 @app.get("/health")
 def health():
     st = load_state()
-    return jsonify({"ok": True, "mode": st["mode"], "kill_switch": st["kill_switch"], "heartbeat": st["last_heartbeat_ts"]})
+    return jsonify({
+        "ok": True,
+        "mode": st["mode"],
+        "kill_switch": st["kill_switch"],
+        "heartbeat": st["last_heartbeat_ts"]
+    })
+
 
 @app.get("/state")
 def state():
     return jsonify(load_state())
+
 
 @app.post("/kill_switch/on")
 def kill_on():
     update_state({"kill_switch": True, "mode": "READ_ONLY"})
     return jsonify({"ok": True, "kill_switch": True, "mode": "READ_ONLY"})
 
+
 @app.post("/kill_switch/off")
 def kill_off():
-    # Only re-enable if you intend to resume
     update_state({"kill_switch": False})
     return jsonify({"ok": True, "kill_switch": False})
+
 
 @app.post("/mode")
 def set_mode():
@@ -45,37 +70,33 @@ def set_mode():
     update_state({"mode": mode})
     return jsonify({"ok": True, "mode": mode})
 
+
 @app.post("/signal")
 def signal():
+    """
+    Existing JSON signal intake (manual/structured)
+    Body must match ap.models.Signal schema.
+    """
     body = request.get_json(force=True)
     sig = Signal(**body)
     enqueue_signal(sig)
     return jsonify({"ok": True, "queued": True, "signal_id": sig.signal_id})
 
-def start_worker():
-    t = threading.Thread(target=worker_loop, args=(BROKER,), daemon=True)
-    t.start()
-
-if __name__ == "__main__":
-    init_db()
-    # bootstrap mode from env into state
-    update_state({"mode": cfg.BOT_MODE})
-    start_worker()
-    app.run(host="0.0.0.0", port=5000, debug=False)
-from ap.parsers import parse_scanner_text
-import uuid
-from datetime import datetime, timezone
 
 @app.post("/scanner/discord")
 def scanner_discord():
+    """
+    New endpoint: takes raw scanner discord text:
+      { "content": "<discord message text>" }
+    Parses one or more setups, and queues one Signal per CALL leg and PUT leg.
+    """
     body = request.get_json(force=True)
-    # expected: {"content": "...discord message text..."}
     text = body.get("content") or ""
     parsed = parse_scanner_text(text)
     queued = 0
 
     for msg in parsed:
-        # pick CALLS leg by default for now; later add logic (or send both as separate signals)
+        # Queue CALL leg
         if msg.calls and msg.calls.strike:
             sig = Signal(
                 signal_id=str(uuid.uuid4()),
@@ -101,6 +122,7 @@ def scanner_discord():
             enqueue_signal(sig)
             queued += 1
 
+        # Queue PUT leg
         if msg.puts and msg.puts.strike:
             sig = Signal(
                 signal_id=str(uuid.uuid4()),
@@ -127,4 +149,32 @@ def scanner_discord():
             queued += 1
 
     return jsonify({"ok": True, "parsed": len(parsed), "queued": queued})
+
+
+@app.get("/tradier/test")
+def tradier_test():
+    """
+    Optional: quick sanity check that Tradier credentials work.
+    Only meaningful when BOT_MODE=PAPER or LIVE.
+    """
+    try:
+        equity = BROKER.get_account_equity()
+        return jsonify({"ok": True, "equity": equity})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+def start_worker():
+    t = threading.Thread(target=worker_loop, args=(BROKER,), daemon=True)
+    t.start()
+
+
+if __name__ == "__main__":
+    init_db()
+
+    # bootstrap mode from env into state
+    update_state({"mode": cfg.BOT_MODE})
+
+    start_worker()
+    app.run(host="0.0.0.0", port=5000, debug=False)
 
