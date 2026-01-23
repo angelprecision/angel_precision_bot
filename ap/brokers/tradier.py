@@ -23,19 +23,17 @@ class TradierBroker(BrokerAdapter):
         url = f"{self.cfg.base_url}{path}"
         r = self.session.get(url, params=params, timeout=20)
         r.raise_for_status()
-        return r.json{}
+        return r.json() if r.content else {}
 
     def _post(self, path: str, data: dict) -> dict:
         url = f"{self.cfg.base_url}{path}"
         r = self.session.post(url, data=data, timeout=20)
         r.raise_for_status()
-        return r.json{}
+        return r.json() if r.content else {}
 
     def get_account_equity(self) -> float:
         j = self._get(f"/v1/accounts/{self.cfg.account_id}/balances")
-        # Tradier: balances -> balances -> total_equity / equity
         bal = j.get("balances") or {}
-        # try a few likely fields
         for k in ("total_equity", "equity", "total_cash", "cash"):
             v = bal.get(k)
             if v is not None:
@@ -52,19 +50,26 @@ class TradierBroker(BrokerAdapter):
         return q
 
     def get_option_chain(self, symbol: str, expiration: str) -> List[Dict[str, Any]]:
-        j = self._get("/v1/markets/options/chains", params={"symbol": symbol, "expiration": expiration, "greeks": "false"})
+        j = self._get("/v1/markets/options/chains", params={
+            "symbol": symbol,
+            "expiration": expiration,
+            "greeks": "false"
+        })
         opts = (j.get("options") or {}).get("option")
         if not opts:
             return []
         return opts if isinstance(opts, list) else [opts]
 
     def get_option_expirations(self, symbol: str) -> List[str]:
-        j = self._get("/v1/markets/options/expirations", params={"symbol": symbol, "includeAllRoots": "true", "strikes": "false"})
+        j = self._get("/v1/markets/options/expirations", params={
+            "symbol": symbol,
+            "includeAllRoots": "true",
+            "strikes": "false"
+        })
         dates = (j.get("expirations") or {}).get("date") or []
-        return dates
+        return dates if isinstance(dates, list) else [dates]
 
     def place_order(self, symbol: str, contract: str, qty: int, limit_price: Optional[float]) -> BrokerOrderResponse:
-        # Tradier expects 'option_symbol' for options orders
         data = {
             "class": "option",
             "symbol": symbol,
@@ -79,10 +84,10 @@ class TradierBroker(BrokerAdapter):
 
         j = self._post(f"/v1/accounts/{self.cfg.account_id}/orders", data=data)
 
-        # Typical: {"order":{"id":12345,"status":"ok"}}
         order = j.get("order") or {}
         oid = str(order.get("id") or "")
         status = "ACK" if oid else "REJECTED"
+
         return BrokerOrderResponse(
             broker_order_id=oid or "N/A",
             status=status,
@@ -96,8 +101,6 @@ class TradierBroker(BrokerAdapter):
         return j.get("order") or j
 
     def close_position(self, position_id: str) -> BrokerOrderResponse:
-        # For now: you will close by submitting sell_to_close on contract
-        # Exit manager will handle this properly; keeping stub.
         return BrokerOrderResponse(
             broker_order_id="N/A",
             status="REJECTED",
@@ -106,3 +109,4 @@ class TradierBroker(BrokerAdapter):
             error="close_position not implemented (use exit orders)"
         )
 
+        
