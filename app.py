@@ -182,8 +182,11 @@ def start_worker():
     t.start()
 
 
+# Initialize on import (runs when gunicorn loads the module)
+init_db()
+update_state({"mode": cfg.BOT_MODE})
+start_worker()
+
+# This runs when you do "python app.py" locally for testing
 if __name__ == "__main__":
-    init_db()
-    update_state({"mode": cfg.BOT_MODE})
-    start_worker()
-    app.run(host="0.0.0.0", port=5000, debug=False)
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")), debug=False)
