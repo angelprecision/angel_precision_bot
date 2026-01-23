@@ -3,7 +3,7 @@ import uuid
 from ap.config import Config
 from ap.logger import get_logger
 from ap.models import Signal, OrderPlan
-from ap.db import conn
+from ap.db import conn, run_with_retry
 from ap.utils import now_utc_iso, json_dumps
 from ap.state import load_state, update_state, reserve_equity, release_equity
 from ap.risk import run_gates, effective_limits
