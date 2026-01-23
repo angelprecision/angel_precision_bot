@@ -1,8 +1,38 @@
+# ap/db.py
+import time
 import sqlite3
 from contextlib import contextmanager
 from ap.config import Config
 
 cfg = Config()
+
+def run_with_retry(fn, retries: int = 12, base_sleep: float = 0.05, max_sleep: float = 1.0):
+    """
+    Retry SQLite operations that fail with 'database is locked/busy'.
+    Exponential backoff.
+    """
+    delay = base_sleep
+    last_err = None
+
+    for _ in range(retries):
+        try:
+            return fn()
+        except sqlite3.OperationalError as e:
+            last_err = e
+            msg = str(e).lower()
+            if ("database is locked" in msg) or ("database is busy" in msg) or ("locked" in msg):
+                time.sleep(delay)
+                delay = min(delay * 2, max_sleep)
+                continue
+            raise
+
+    # final attempt (or re-raise last locked error)
+    try:
+        return fn()
+    except Exception:
+        if last_err:
+            raise last_err
+        raise
 
 @contextmanager
 def conn():
