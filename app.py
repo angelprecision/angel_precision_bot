@@ -184,8 +184,17 @@ def scanner_discord():
     Raw Discord scanner text intake.
     Primary signal ingestion endpoint.
     """
-    body = request.get_json(force=True) or {}
+    body = request.get_json(silent=True) or {}
+
+    if not body:
+        return jsonify({
+            "ok": False,
+            "error": "Expected JSON body",
+            "example": {"content": "paste scanner text here"}
+        }), 400
+
     text = body.get("content") or ""
+
     
     if not text:
         return jsonify({"ok": False, "error": "No content provided"}), 400
