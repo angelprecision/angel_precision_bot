@@ -23,13 +23,13 @@ class TradierBroker(BrokerAdapter):
         url = f"{self.cfg.base_url}{path}"
         r = self.session.get(url, params=params, timeout=20)
         r.raise_for_status()
-        return r.json()
+        return r.json{}
 
     def _post(self, path: str, data: dict) -> dict:
         url = f"{self.cfg.base_url}{path}"
         r = self.session.post(url, data=data, timeout=20)
         r.raise_for_status()
-        return r.json()
+        return r.json{}
 
     def get_account_equity(self) -> float:
         j = self._get(f"/v1/accounts/{self.cfg.account_id}/balances")
