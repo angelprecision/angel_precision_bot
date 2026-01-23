@@ -5,13 +5,14 @@ from ap.config import Config
 cfg = Config()
 
 @contextmanager
+@contextmanager
 def conn():
-    c = sqlite3.connect(cfg.DB_FILE, timeout=30, isolation_level=None, check_same_thread=False)
+    c = sqlite3.connect(cfg.DB_FILE, timeout=30, isolation_level=None, check_same_thread=False)  # ✅ Added parameter
     c.row_factory = sqlite3.Row
     
-    # Enable WAL mode and busy timeout for every connection
+    # ✅ Enable WAL mode and busy timeout
     c.execute("PRAGMA journal_mode=WAL;")
-    c.execute("PRAGMA busy_timeout=30000;")  # 30 seconds in milliseconds
+    c.execute("PRAGMA busy_timeout=30000;")
     
     try:
         yield c
