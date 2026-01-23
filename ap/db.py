@@ -6,8 +6,13 @@ cfg = Config()
 
 @contextmanager
 def conn():
-    c = sqlite3.connect(cfg.DB_FILE, timeout=30, isolation_level=None)  # autocommit
+    c = sqlite3.connect(cfg.DB_FILE, timeout=30, isolation_level=None, check_same_thread=False)
     c.row_factory = sqlite3.Row
+    
+    # Enable WAL mode and busy timeout for every connection
+    c.execute("PRAGMA journal_mode=WAL;")
+    c.execute("PRAGMA busy_timeout=30000;")  # 30 seconds in milliseconds
+    
     try:
         yield c
     finally:
