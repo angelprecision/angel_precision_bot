@@ -34,12 +34,13 @@ def run_with_retry(fn, retries: int = 12, base_sleep: float = 0.05, max_sleep: f
             raise last_err
         raise
 
+
 @contextmanager
 def conn():
     c = sqlite3.connect(
         cfg.DB_FILE,
         timeout=30,
-        isolation_level=None,
+        isolation_level=None,          # autocommit
         check_same_thread=False
     )
     c.row_factory = sqlite3.Row
@@ -54,8 +55,12 @@ def conn():
     finally:
         c.close()
 
+
 def init_db():
     with conn() as c:
+        # -------------------------
+        # Core KV store
+        # -------------------------
         c.execute("""
         CREATE TABLE IF NOT EXISTS kv (
             k TEXT PRIMARY KEY,
@@ -64,6 +69,9 @@ def init_db():
         );
         """)
 
+        # -------------------------
+        # Audit log
+        # -------------------------
         c.execute("""
         CREATE TABLE IF NOT EXISTS audit_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -74,26 +82,45 @@ def init_db():
         );
         """)
 
+        # -------------------------
+        # Trade queue (NOW includes details)
+        # -------------------------
         c.execute("""
         CREATE TABLE IF NOT EXISTS trade_queue (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             signal_id TEXT NOT NULL,
             created_ts TEXT NOT NULL,
-            status TEXT NOT NULL,
+            status TEXT NOT NULL,    -- NEW | PROCESSING | DONE | REJECTED
             payload TEXT NOT NULL,
             decision TEXT,
-            reason TEXT
+            reason TEXT,
+            details TEXT
         );
         """)
 
+        # Migration: add details column if table already existed before
+        try:
+            c.execute("ALTER TABLE trade_queue ADD COLUMN details TEXT;")
+        except Exception:
+            pass
+
+        # Helpful indexes
+        try:
+            c.execute("CREATE INDEX IF NOT EXISTS idx_trade_queue_status_id ON trade_queue(status, id);")
+        except Exception:
+            pass
+
+        # -------------------------
+        # Orders
+        # -------------------------
         c.execute("""
         CREATE TABLE IF NOT EXISTS orders (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             local_order_id TEXT NOT NULL,
             broker_order_id TEXT,
             position_id TEXT,
-            kind TEXT NOT NULL,
-            status TEXT NOT NULL,
+            kind TEXT NOT NULL,      -- ENTRY | EXIT | FLATTEN
+            status TEXT NOT NULL,    -- NEW | ACK | PARTIAL | FILLED | REJECTED | CANCELED
             symbol TEXT NOT NULL,
             contract TEXT NOT NULL,
             qty INTEGER NOT NULL,
@@ -106,20 +133,34 @@ def init_db():
         );
         """)
 
+        try:
+            c.execute("CREATE INDEX IF NOT EXISTS idx_orders_local_order_id ON orders(local_order_id);")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);")
+        except Exception:
+            pass
+
+        # -------------------------
+        # Positions
+        # -------------------------
         c.execute("""
         CREATE TABLE IF NOT EXISTS positions (
             id TEXT PRIMARY KEY,
             underlying TEXT NOT NULL,
             contract TEXT NOT NULL,
-            direction TEXT NOT NULL,
+            direction TEXT NOT NULL, -- CALL | PUT
             qty INTEGER NOT NULL,
             avg_fill REAL NOT NULL,
             entry_ts TEXT NOT NULL,
             tp_pct REAL NOT NULL,
             sl_pct REAL NOT NULL,
-            status TEXT NOT NULL,
+            status TEXT NOT NULL,    -- OPEN | CLOSING | CLOSED
             exit_ts TEXT,
             exit_reason TEXT,
             realized_pnl REAL
         );
         """)
+
+        try:
+            c.execute("CREATE INDEX IF NOT EXISTS idx_positions_status ON positions(status);")
+        except Exception:
+            pass
