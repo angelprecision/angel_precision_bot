@@ -1,3 +1,4 @@
+# ap/queue.py
 import time
 from ap.db import conn, run_with_retry
 from ap.utils import now_utc_iso, json_dumps, json_loads
@@ -8,12 +9,14 @@ from ap.state import update_state
 
 log = get_logger("ap.queue")
 
+
 def enqueue_signal(signal: Signal):
     with conn() as c:
         run_with_retry(lambda: c.execute(
             "INSERT INTO trade_queue (signal_id, created_ts, status, payload) VALUES (?,?,?,?)",
             (signal.signal_id, now_utc_iso(), "NEW", json_dumps(signal.model_dump())),
         ))
+
 
 def fetch_next_job():
     """
@@ -42,13 +45,25 @@ def fetch_next_job():
 
         return dict(row)
 
+
 def complete_job(job_id: int, ok: bool, decision: str, reason: str = "", details=None):
+    """
+    Marks a job DONE/REJECTED and persists details JSON into trade_queue.details.
+    NOTE: You must add 'details TEXT' column to trade_queue in init_db().
+    """
     with conn() as c:
         run_with_retry(lambda: c.execute("""
             UPDATE trade_queue
-            SET status=?, decision=?, reason=?
+            SET status=?, decision=?, reason=?, details=?
             WHERE id=?
-        """, ("DONE" if ok else "REJECTED", decision, reason, job_id)))
+        """, (
+            "DONE" if ok else "REJECTED",
+            decision,
+            reason,
+            json_dumps(details) if details is not None else None,
+            job_id
+        )))
+
 
 def worker_loop(broker, poll_seconds: float = 0.5):
     log.info("Worker started")
@@ -57,7 +72,7 @@ def worker_loop(broker, poll_seconds: float = 0.5):
 
     while True:
         now = time.time()
-        if now - last_hb >= 10.0:  # ✅ write heartbeat every 10s (not every 0.5s)
+        if now - last_hb >= 10.0:  # write heartbeat every 10s (not every 0.5s)
             try:
                 update_state({"last_heartbeat_ts": now_utc_iso()})
             except Exception:
@@ -84,6 +99,6 @@ def worker_loop(broker, poll_seconds: float = 0.5):
             )
             log.info(f"Processed signal={signal.signal_id} ok={res.get('ok')} reason={res.get('reason')}")
         except Exception as e:
-            complete_job(job["id"], False, decision="ERROR", reason=str(e))
+            complete_job(job["id"], False, decision="ERROR", reason=str(e), details={"error": str(e)})
             log.exception("Job failed")
 
