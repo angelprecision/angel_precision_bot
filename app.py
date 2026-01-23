@@ -1,4 +1,3 @@
-
 # app.py - Angel Precision Bot
 # Fixed for Render deployment with gunicorn
 
@@ -61,7 +60,8 @@ def root():
             "health": "/health",
             "state": "/state",
             "signal": "/scanner/discord",
-            "dashboard": "/dashboard"
+            "dashboard": "/dashboard",
+            "reset_equity": "/reset_equity"
         }
     })
 
@@ -312,6 +312,26 @@ def dashboard():
     except Exception as e:
         log.error(f"Dashboard error: {e}")
         return jsonify({"error": str(e)}), 500
+
+
+@app.post("/reset_equity")
+def reset_equity():
+    """Reset equity to match broker balance - fixes profit cap issues"""
+    try:
+        equity = BROKER.get_account_equity()
+        update_state({
+            "initial_equity_run": equity,
+            "starting_equity_today": equity,
+            "current_equity_last": equity,
+            "realized_pnl_today": 0.0,
+            "trades_taken_today": 0,
+            "daily_stop_hit": False
+        })
+        log.info(f"🔄 Equity reset to ${equity}")
+        return jsonify({"ok": True, "equity": equity, "message": "Equity reset successful"})
+    except Exception as e:
+        log.error(f"Equity reset failed: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
 # =========================
