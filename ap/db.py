@@ -268,4 +268,142 @@ def update_order(
         params.append(local_order_id)
         
         sql = f"UPDATE orders SET {', '.join(updates)} WHERE local_order_id=?"
-        run_with_retry(lambda: c.execute(sql, params))
+        run_with_retry(lambda: c.execute(sql, params))# =========================================================================
+# CLIENT MANAGEMENT - Multi-client support
+# =========================================================================
+
+def get_client(client_id: str) -> dict:
+    """Get client configuration"""
+    with conn() as c:
+        row = run_with_retry(lambda: c.execute(
+            "SELECT * FROM clients WHERE client_id=?",
+            (client_id,)
+        ).fetchone())
+        
+        if not row:
+            raise ValueError(f"Client not found: {client_id}")
+        
+        return dict(row)
+
+
+def get_all_clients(status: str = None) -> list:
+    """Get all clients, optionally filtered by status"""
+    with conn() as c:
+        if status:
+            rows = run_with_retry(lambda: c.execute(
+                "SELECT * FROM clients WHERE status=? ORDER BY created_at DESC",
+                (status,)
+            ).fetchall())
+        else:
+            rows = run_with_retry(lambda: c.execute(
+                "SELECT * FROM clients ORDER BY created_at DESC"
+            ).fetchall())
+        
+        return [dict(r) for r in rows]
+
+
+def create_client(
+    client_id: str,
+    name: str,
+    broker_type: str,
+    broker_account_id: str,
+    broker_token: str,
+    broker_base_url: str,
+    initial_equity: float,
+    **kwargs
+) -> dict:
+    """Create new client"""
+    with conn() as c:
+        run_with_retry(lambda: c.execute(
+            """
+            INSERT INTO clients (
+                client_id, name, broker_type, broker_account_id, broker_token,
+                broker_base_url, initial_equity, status, created_at,
+                max_trades_per_day, max_concurrent_positions,
+                daily_max_loss_pct, base_position_pct
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'ACTIVE', ?, ?, ?, ?, ?)
+            """,
+            (
+                client_id,
+                name,
+                broker_type,
+                broker_account_id,
+                broker_token,
+                broker_base_url,
+                initial_equity,
+                now_utc_iso(),
+                kwargs.get("max_trades_per_day", 5),
+                kwargs.get("max_concurrent_positions", 3),
+                kwargs.get("daily_max_loss_pct", 0.05),
+                kwargs.get("base_position_pct", 0.10),
+            ),
+        ))
+        
+        # Create initial state
+        run_with_retry(lambda: c.execute(
+            """
+            INSERT INTO client_state (
+                client_id, current_equity, starting_equity_today,
+                realized_pnl_today, trades_taken_today, mode
+            )
+            VALUES (?, ?, ?, 0.0, 0, 'PAPER')
+            """,
+            (client_id, initial_equity, initial_equity),
+        ))
+    
+    return get_client(client_id)
+
+
+def update_client(client_id: str, **updates) -> dict:
+    """Update client fields"""
+    allowed = {
+        "name", "broker_account_id", "broker_token", "broker_base_url",
+        "status", "max_trades_per_day", "max_concurrent_positions",
+        "daily_max_loss_pct", "base_position_pct"
+    }
+    
+    updates = {k: v for k, v in updates.items() if k in allowed}
+    
+    if not updates:
+        return get_client(client_id)
+    
+    with conn() as c:
+        set_clause = ", ".join(f"{k}=?" for k in updates.keys())
+        values = list(updates.values()) + [client_id]
+        
+        run_with_retry(lambda: c.execute(
+            f"UPDATE clients SET {set_clause} WHERE client_id=?",
+            values
+        ))
+    
+    return get_client(client_id)
+
+
+def get_client_state(client_id: str) -> dict:
+    """Get client state"""
+    with conn() as c:
+        row = run_with_retry(lambda: c.execute(
+            "SELECT * FROM client_state WHERE client_id=?",
+            (client_id,)
+        ).fetchone())
+        
+        if not row:
+            raise ValueError(f"Client state not found: {client_id}")
+        
+        return dict(row)
+
+
+def update_client_state(client_id: str, updates: dict):
+    """Update client state"""
+    if not updates:
+        return
+    
+    with conn() as c:
+        set_clause = ", ".join(f"{k}=?" for k in updates.keys())
+        values = list(updates.values()) + [client_id]
+        
+        run_with_retry(lambda: c.execute(
+            f"UPDATE client_state SET {set_clause} WHERE client_id=?",
+            values
+        ))
