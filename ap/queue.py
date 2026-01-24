@@ -1,6 +1,11 @@
 # ap/queue.py
 import time
-from ap.db import conn, run_with_retry
+from ap.db import (
+    conn,
+    run_with_retry,
+    already_processed_signal,
+    mark_signal_processed,
+)
 from ap.utils import now_utc_iso, json_dumps, json_loads
 from ap.logger import get_logger
 from ap.models import Signal
@@ -49,7 +54,6 @@ def fetch_next_job():
 def complete_job(job_id: int, ok: bool, decision: str, reason: str = "", details=None):
     """
     Marks a job DONE/REJECTED and persists details JSON into trade_queue.details.
-    NOTE: You must add 'details TEXT' column to trade_queue in init_db().
     """
     with conn() as c:
         run_with_retry(lambda: c.execute("""
@@ -72,11 +76,10 @@ def worker_loop(broker, poll_seconds: float = 0.5):
 
     while True:
         now = time.time()
-        if now - last_hb >= 10.0:  # write heartbeat every 10s (not every 0.5s)
+        if now - last_hb >= 10.0:  # write heartbeat every 10s
             try:
                 update_state({"last_heartbeat_ts": now_utc_iso()})
             except Exception:
-                # don't kill worker if heartbeat write fails
                 log.exception("Heartbeat update failed")
             last_hb = now
 
@@ -88,6 +91,17 @@ def worker_loop(broker, poll_seconds: float = 0.5):
         try:
             payload = json_loads(job["payload"])
             signal = Signal(**payload)
+
+            # ✅ DEDUPE: if we already processed this signal_id, do nothing.
+            if already_processed_signal(signal.signal_id):
+                res = {"ok": True, "reason": "DEDUPED", "signal_id": signal.signal_id}
+                complete_job(job["id"], True, decision="DEDUPED", reason="DEDUPED", details=res)
+                log.info(f"Processed signal={signal.signal_id} ok=True reason=DEDUPED")
+                continue
+
+            # Mark processed BEFORE execution to prevent double-fire on repeats
+            mark_signal_processed(signal.signal_id)
+
             res = process_signal(signal, broker)
 
             complete_job(
@@ -102,3 +116,4 @@ def worker_loop(broker, poll_seconds: float = 0.5):
             complete_job(job["id"], False, decision="ERROR", reason=str(e), details={"error": str(e)})
             log.exception("Job failed")
 
+            
