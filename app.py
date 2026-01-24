@@ -82,6 +82,12 @@ def root():
             "signal_discord": "/scanner/discord",
             "dashboard": "/dashboard",
             "reset_equity": "/reset_equity",
+            "reports": {
+                "orders": "/report/orders",
+                "positions": "/report/positions",
+                "audit": "/report/audit",
+                "summary": "/report/summary"
+            }
         }
     })
 
@@ -347,6 +353,205 @@ def list_clients():
     except Exception as e:
         log.error(f"Failed to list clients: {e}")
         return jsonify({"ok": False, "error": str(e)}), 500
+
+@app.get("/admin/clients")
+def list_clients():
+    """List all clients (for testing)"""
+    try:
+        from ap.db import get_all_clients
+        clients = get_all_clients()
+        return jsonify({"ok": True, "clients": clients})
+    except Exception as e:
+        log.error(f"Failed to list clients: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+# =========================
+# REPORTING ENDPOINTS      ← ADD THIS ENTIRE SECTION HERE
+# =========================
+
+@app.get("/report/orders")
+def report_orders():
+    """Get all orders with full details"""
+    try:
+        from ap.db import conn
+        
+        limit = request.args.get("limit", 50, type=int)
+        status_filter = request.args.get("status")
+        
+        with conn() as c:
+            if status_filter:
+                rows = c.execute("""
+                    SELECT * FROM orders 
+                    WHERE status=?
+                    ORDER BY created_ts DESC 
+                    LIMIT ?
+                """, (status_filter, limit)).fetchall()
+            else:
+                rows = c.execute("""
+                    SELECT * FROM orders 
+                    ORDER BY created_ts DESC 
+                    LIMIT ?
+                """, (limit,)).fetchall()
+        
+        orders = [dict(r) for r in rows]
+        
+        with conn() as c:
+            stats = c.execute("""
+                SELECT 
+                    status,
+                    COUNT(*) as count
+                FROM orders
+                GROUP BY status
+            """).fetchall()
+        
+        summary = {row["status"]: row["count"] for row in stats}
+        
+        return jsonify({
+            "ok": True,
+            "count": len(orders),
+            "summary": summary,
+            "orders": orders
+        })
+    except Exception as e:
+        log.error(f"Report orders failed: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.get("/report/positions")
+def report_positions():
+    """Get all positions with full details"""
+    try:
+        from ap.db import conn
+        
+        status_filter = request.args.get("status", "OPEN")
+        
+        with conn() as c:
+            if status_filter == "ALL":
+                rows = c.execute("""
+                    SELECT * FROM positions 
+                    ORDER BY entry_ts DESC
+                """).fetchall()
+            else:
+                rows = c.execute("""
+                    SELECT * FROM positions 
+                    WHERE status=?
+                    ORDER BY entry_ts DESC
+                """, (status_filter,)).fetchall()
+        
+        positions = [dict(r) for r in rows]
+        
+        total_pnl = sum(float(p.get("realized_pnl") or 0) for p in positions if p.get("status") == "CLOSED")
+        
+        return jsonify({
+            "ok": True,
+            "count": len(positions),
+            "total_realized_pnl": total_pnl,
+            "positions": positions
+        })
+    except Exception as e:
+        log.error(f"Report positions failed: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.get("/report/audit")
+def report_audit():
+    """Get recent audit log events"""
+    try:
+        from ap.db import conn
+        import json as json_lib
+        
+        limit = request.args.get("limit", 100, type=int)
+        event_filter = request.args.get("event")
+        level_filter = request.args.get("level")
+        
+        with conn() as c:
+            sql = "SELECT * FROM audit_log WHERE 1=1"
+            params = []
+            
+            if event_filter:
+                sql += " AND event=?"
+                params.append(event_filter)
+            
+            if level_filter:
+                sql += " AND level=?"
+                params.append(level_filter)
+            
+            sql += " ORDER BY id DESC LIMIT ?"
+            params.append(limit)
+            
+            rows = c.execute(sql, params).fetchall()
+        
+        events = []
+        for r in rows:
+            event = dict(r)
+            try:
+                event["payload"] = json_lib.loads(event["payload"])
+            except:
+                pass
+            events.append(event)
+        
+        return jsonify({
+            "ok": True,
+            "count": len(events),
+            "events": events
+        })
+    except Exception as e:
+        log.error(f"Report audit failed: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.get("/report/summary")
+def report_summary():
+    """Get overall bot health summary"""
+    try:
+        from ap.db import conn
+        
+        with conn() as c:
+            order_stats = c.execute("""
+                SELECT status, COUNT(*) as count
+                FROM orders
+                GROUP BY status
+            """).fetchall()
+            
+            pos_stats = c.execute("""
+                SELECT status, COUNT(*) as count
+                FROM positions
+                GROUP BY status
+            """).fetchall()
+            
+            queue_stats = c.execute("""
+                SELECT status, COUNT(*) as count
+                FROM trade_queue
+                GROUP BY status
+            """).fetchall()
+            
+            errors = c.execute("""
+                SELECT event, COUNT(*) as count
+                FROM audit_log
+                WHERE level='ERROR'
+                AND ts > datetime('now', '-1 day')
+                GROUP BY event
+            """).fetchall()
+        
+        state = load_state()
+        
+        return jsonify({
+            "ok": True,
+            "state": state,
+            "orders": {row["status"]: row["count"] for row in order_stats},
+            "positions": {row["status"]: row["count"] for row in pos_stats},
+            "queue": {row["status"]: row["count"] for row in queue_stats},
+            "recent_errors": {row["event"]: row["count"] for row in errors}
+        })
+    except Exception as e:
+        log.error(f"Report summary failed: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+# =========================
+# WORKER THREADS          ← This section stays as is
+# =========================
 # =========================
 # WORKER THREADS
 # =========================
