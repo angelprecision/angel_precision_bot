@@ -255,7 +255,7 @@ def scanner_discord():
                         "pt2": msg.puts.pt2,
                         "pt3": msg.puts.pt3,
                         "strike": msg.puts.strike,
-                        "expiry_hint": m sg.puts.expiry_hint,
+                        "expiry_hint": msg.puts.expiry_hint,
                         "raw_strike": msg.puts.raw_strike_line
                     }
                 )
