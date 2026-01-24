@@ -1,5 +1,6 @@
 # ap/queue.py
 import time
+
 from ap.db import (
     conn,
     run_with_retry,
@@ -11,6 +12,7 @@ from ap.logger import get_logger
 from ap.models import Signal
 from ap.execution import process_signal
 from ap.state import update_state
+from ap.reconcile import reconcile_once
 
 log = get_logger("ap.queue")
 
@@ -72,15 +74,24 @@ def complete_job(job_id: int, ok: bool, decision: str, reason: str = "", details
 def worker_loop(broker, poll_seconds: float = 0.5):
     log.info("Worker started")
 
-    last_hb = 0.0  # throttle heartbeat writes
+    last_hb = 0.0  # throttle heartbeat + reconcile (every 10s)
 
     while True:
         now = time.time()
-        if now - last_hb >= 10.0:  # write heartbeat every 10s
+
+        # Heartbeat + reconciliation every 10 seconds
+        if now - last_hb >= 10.0:
             try:
                 update_state({"last_heartbeat_ts": now_utc_iso()})
             except Exception:
                 log.exception("Heartbeat update failed")
+
+            # ✅ Reconcile broker orders -> update local DB truth
+            try:
+                reconcile_once(broker, limit=50)
+            except Exception:
+                log.exception("Reconcile loop error")
+
             last_hb = now
 
         job = fetch_next_job()
@@ -92,7 +103,7 @@ def worker_loop(broker, poll_seconds: float = 0.5):
             payload = json_loads(job["payload"])
             signal = Signal(**payload)
 
-            # ✅ DEDUPE: if we already processed this signal_id, do nothing.
+            # ✅ DEDUPE: if signal_id already processed, do nothing
             if already_processed_signal(signal.signal_id):
                 res = {"ok": True, "reason": "DEDUPED", "signal_id": signal.signal_id}
                 complete_job(job["id"], True, decision="DEDUPED", reason="DEDUPED", details=res)
@@ -115,5 +126,3 @@ def worker_loop(broker, poll_seconds: float = 0.5):
         except Exception as e:
             complete_job(job["id"], False, decision="ERROR", reason=str(e), details={"error": str(e)})
             log.exception("Job failed")
-
-            
