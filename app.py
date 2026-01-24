@@ -1,6 +1,4 @@
-# app.py - Angel Precision Bot
-# Fixed for Render deployment with gunicorn
-
+# app.py - Angel Precision Bot (Render + gunicorn safe)
 import os
 import threading
 import uuid
@@ -24,29 +22,45 @@ from ap.brokers.tradier import TradierBroker, TradierConfig
 # Exit Manager
 from ap.exit_manager import exit_manager_loop
 
-# =========================
-# CONFIGURATION
-# =========================
 cfg = Config()
 log = get_logger("app")
 
 app = Flask(__name__)
 
-# Choose broker based on mode
-if cfg.BOT_MODE in ("PAPER", "LIVE"):
-    log.info(f"Initializing Tradier broker in {cfg.BOT_MODE} mode")
-    BROKER = TradierBroker(
-        TradierConfig(
-            base_url=os.getenv("TRADIER_BASE_URL", "https://sandbox.tradier.com"),
-            access_token=os.getenv("TRADIER_ACCESS_TOKEN", "").strip(),
-            account_id=os.getenv("TRADIER_ACCOUNT_ID", "").strip(),
-        )
-    )
-    log.info("Tradier broker initialized")
-else:
+# -------------------------
+# Thread safety: start once
+# -------------------------
+THREADS_STARTED = False
+THREAD_LOCK = threading.Lock()
+
+# -------------------------
+# Broker init
+# -------------------------
+def build_broker():
+    if cfg.BOT_MODE in ("PAPER", "LIVE"):
+        base_url = os.getenv("TRADIER_BASE_URL", "https://sandbox.tradier.com")
+        access_token = os.getenv("TRADIER_ACCESS_TOKEN", "").strip()
+        account_id = os.getenv("TRADIER_ACCOUNT_ID", "").strip()
+
+        if not access_token or not account_id:
+            raise RuntimeError("Missing TRADIER_ACCESS_TOKEN or TRADIER_ACCOUNT_ID")
+
+        log.info(f"Initializing Tradier broker in {cfg.BOT_MODE} mode")
+        b = TradierBroker(TradierConfig(
+            base_url=base_url,
+            access_token=access_token,
+            account_id=account_id,
+        ))
+        log.info("Tradier broker initialized")
+        return b
+
     log.info(f"Initializing Simulator broker in {cfg.BOT_MODE} mode")
-    BROKER = SimBroker(starting_equity=10000.0)
+    b = SimBroker(starting_equity=10000.0)
     log.info("Simulator broker initialized")
+    return b
+
+
+BROKER = build_broker()
 
 
 # =========================
@@ -55,40 +69,37 @@ else:
 
 @app.get("/")
 def root():
-    """Root endpoint - redirect to health"""
     return jsonify({
         "service": "Angel Precision Bot",
         "status": "online",
         "endpoints": {
             "health": "/health",
             "state": "/state",
-            "signal": "/scanner/discord",
+            "signal_json": "/signal",
+            "signal_discord": "/scanner/discord",
             "dashboard": "/dashboard",
-            "reset_equity": "/reset_equity"
+            "reset_equity": "/reset_equity",
         }
     })
 
 
 @app.get("/health")
 def health():
-    """Comprehensive health check"""
     try:
         st = load_state()
-        
-        # Check worker heartbeat
+
         heartbeat_ok = False
         heartbeat_age = None
         if st.get("last_heartbeat_ts"):
             try:
-                from datetime import datetime, timezone
                 hb_time = datetime.fromisoformat(st["last_heartbeat_ts"])
                 heartbeat_age = (datetime.now(timezone.utc) - hb_time).total_seconds()
-                heartbeat_ok = heartbeat_age < 120  # Within 2 minutes
-            except:
+                heartbeat_ok = heartbeat_age < 120
+            except Exception:
                 pass
-        
-        all_ok = heartbeat_ok or heartbeat_age is None  # OK if no heartbeat yet (just started)
-        
+
+        all_ok = heartbeat_ok or heartbeat_age is None
+
         return jsonify({
             "ok": all_ok,
             "status": "healthy" if all_ok else "degraded",
@@ -98,18 +109,14 @@ def health():
             "heartbeat_age_seconds": heartbeat_age,
             "worker_alive": heartbeat_ok
         }), 200 if all_ok else 503
+
     except Exception as e:
         log.error(f"Health check failed: {e}")
-        return jsonify({
-            "ok": False,
-            "status": "error",
-            "error": str(e)
-        }), 503
+        return jsonify({"ok": False, "status": "error", "error": str(e)}), 503
 
 
 @app.get("/state")
 def state():
-    """Get current bot state"""
     try:
         return jsonify(load_state())
     except Exception as e:
@@ -119,7 +126,6 @@ def state():
 
 @app.post("/kill_switch/on")
 def kill_on():
-    """Enable kill switch - stops all trading"""
     log.warning("🔴 KILL SWITCH ENABLED")
     update_state({"kill_switch": True, "mode": "READ_ONLY"})
     return jsonify({"ok": True, "kill_switch": True, "mode": "READ_ONLY"})
@@ -127,7 +133,6 @@ def kill_on():
 
 @app.post("/kill_switch/off")
 def kill_off():
-    """Disable kill switch"""
     log.info("🟢 KILL SWITCH DISABLED")
     update_state({"kill_switch": False})
     return jsonify({"ok": True, "kill_switch": False})
@@ -135,12 +140,11 @@ def kill_off():
 
 @app.post("/mode")
 def set_mode():
-    """Change bot mode"""
     body = request.get_json(force=True) or {}
     mode = str(body.get("mode", "")).upper()
     if mode not in ("SIM", "PAPER", "LIVE", "READ_ONLY"):
         return jsonify({"ok": False, "error": "Invalid mode"}), 400
-    
+
     log.info(f"Mode changed to: {mode}")
     update_state({"mode": mode})
     return jsonify({"ok": True, "mode": mode})
@@ -152,12 +156,7 @@ def set_mode():
 
 @app.post("/signal")
 def signal():
-    """
-    Structured JSON signal intake.
-    Returns 400 on bad payload instead of crashing.
-    """
     body = request.get_json(force=True) or {}
-
     try:
         sig = Signal(**body)
     except ValidationError as e:
@@ -183,25 +182,18 @@ def signal():
 
 @app.post("/scanner/discord")
 def scanner_discord():
-    """
-    Raw Discord scanner text intake.
-    Primary signal ingestion endpoint.
-    """
     body = request.get_json(silent=True) or {}
-
     if not body:
-        return jsonify({
-            "ok": False,
-            "error": "Expected JSON body",
-            "example": {"content": "paste scanner text here"}
-        }), 400
+        return jsonify({"ok": False, "error": "Expected JSON body", "example": {"content": "paste scanner text here"}}), 400
 
     text = body.get("content") or ""
-
-    
     if not text:
         return jsonify({"ok": False, "error": "No content provided"}), 400
-    
+
+    # prevent huge payloads (memory spikes)
+    if len(text) > 20000:
+        return jsonify({"ok": False, "error": "content too large"}), 413
+
     try:
         parsed = parse_scanner_text(text)
         queued = 0
@@ -209,7 +201,6 @@ def scanner_discord():
         for msg in parsed:
             now_iso = datetime.now(timezone.utc).isoformat()
 
-            # Queue CALL leg
             if msg.calls and msg.calls.strike:
                 sig = Signal(
                     signal_id=str(uuid.uuid4()),
@@ -236,7 +227,6 @@ def scanner_discord():
                 queued += 1
                 log.info(f"Queued CALL: {msg.symbol} strike={msg.calls.strike}")
 
-            # Queue PUT leg
             if msg.puts and msg.puts.strike:
                 sig = Signal(
                     signal_id=str(uuid.uuid4()),
@@ -265,7 +255,7 @@ def scanner_discord():
 
         log.info(f"Parsed {len(parsed)} setups, queued {queued} signals")
         return jsonify({"ok": True, "parsed": len(parsed), "queued": queued})
-        
+
     except Exception as e:
         log.error(f"Failed to parse scanner message: {e}")
         return jsonify({"ok": False, "error": str(e)}), 500
@@ -273,10 +263,9 @@ def scanner_discord():
 
 @app.get("/tradier/test")
 def tradier_test():
-    """Test Tradier connection"""
     if cfg.BOT_MODE not in ("PAPER", "LIVE"):
         return jsonify({"ok": False, "error": "Only available in PAPER/LIVE mode"}), 400
-    
+
     try:
         equity = BROKER.get_account_equity()
         log.info(f"Tradier test successful: equity=${equity}")
@@ -288,19 +277,17 @@ def tradier_test():
 
 @app.get("/dashboard")
 def dashboard():
-    """Simple performance dashboard"""
     try:
         st = load_state()
-        
-        # Get position count from database
         from ap.db import conn
+
         with conn() as c:
             pos_row = c.execute("SELECT COUNT(*) as n FROM positions WHERE status='OPEN'").fetchone()
             open_positions = pos_row["n"] if pos_row else 0
-            
+
             queue_row = c.execute("SELECT COUNT(*) as n FROM trade_queue WHERE status='NEW'").fetchone()
             pending_signals = queue_row["n"] if queue_row else 0
-        
+
         return jsonify({
             "status": "healthy" if not st.get("kill_switch") else "stopped",
             "mode": st.get("mode"),
@@ -319,7 +306,6 @@ def dashboard():
 
 @app.post("/reset_equity")
 def reset_equity():
-    """Reset equity to match broker balance - fixes profit cap issues"""
     try:
         equity = BROKER.get_account_equity()
         update_state({
@@ -342,7 +328,6 @@ def reset_equity():
 # =========================
 
 def start_worker():
-    """Start background worker thread"""
     log.info("Starting worker thread...")
     t = threading.Thread(target=worker_loop, args=(BROKER,), daemon=True, name="WorkerThread")
     t.start()
@@ -350,68 +335,51 @@ def start_worker():
 
 
 def start_exit_manager():
-    """Start exit management thread"""
+    # IMPORTANT: only safe if Tradier supports side and exit_manager uses sell_to_close
     log.info("Starting exit manager thread...")
     t = threading.Thread(target=exit_manager_loop, args=(BROKER,), daemon=True, name="ExitManagerThread")
     t.start()
     log.info("✅ Exit manager thread started")
 
 
+def start_background_threads_once():
+    global THREADS_STARTED
+    with THREAD_LOCK:
+        if THREADS_STARTED:
+            log.info("Background threads already started; skipping.")
+            return
+        start_worker()
+        start_exit_manager()
+        THREADS_STARTED = True
+
+
 # =========================
-# INITIALIZATION
+# INITIALIZATION (runs on gunicorn import)
 # =========================
-# This runs when gunicorn imports the module (critical for Render!)
 
 log.info("=" * 60)
 log.info("ANGEL PRECISION BOT - STARTING")
 log.info("=" * 60)
 log.info(f"Mode: {cfg.BOT_MODE}")
 log.info(f"Database: {cfg.DB_FILE}")
-log.info(f"Broker: {'Tradier' if cfg.BOT_MODE in ('PAPER', 'LIVE') else 'Simulator'}")
 log.info("=" * 60)
 
-# Initialize database
 log.info("Initializing database...")
-try:
-    init_db()
-    log.info("✅ Database initialized")
-except Exception as e:
-    log.error(f"❌ Database initialization failed: {e}")
-    raise
+init_db()
+log.info("✅ Database initialized")
 
-# Set initial state
 log.info(f"Setting mode to: {cfg.BOT_MODE}")
-try:
-    update_state({"mode": cfg.BOT_MODE})
-    log.info("✅ State initialized")
-except Exception as e:
-    log.error(f"❌ State initialization failed: {e}")
-    raise
+update_state({"mode": cfg.BOT_MODE})
+log.info("✅ State initialized")
 
-# Start worker thread
-try:
-    start_worker()
-except Exception as e:
-    log.error(f"❌ Worker thread failed to start: {e}")
-    raise
-
-# Start exit manager thread
-try:
-    start_exit_manager()
-except Exception as e:
-    log.error(f"❌ Exit manager failed to start: {e}")
-    raise
+start_background_threads_once()
 
 log.info("=" * 60)
 log.info("✅ INITIALIZATION COMPLETE")
 log.info("=" * 60)
 
 
-# =========================
-# STARTUP (local testing only)
-# =========================
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "5000"))
     log.info(f"Starting Flask development server on port {port}")
-    log.info("Note: Use gunicorn for production")
     app.run(host="0.0.0.0", port=port, debug=False)
