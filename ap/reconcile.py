@@ -1,4 +1,6 @@
 # ap/reconcile.py
+from typing import Optional, Any, Dict
+
 from ap.logger import get_logger
 from ap.utils import now_utc_iso, json_dumps
 from ap.db import conn, run_with_retry, update_order
@@ -34,12 +36,31 @@ def _tradier_status_to_local(remote: dict) -> str:
     return "ACK"
 
 
-def _extract_error(remote: dict) -> str | None:
+def _extract_error(remote: dict) -> Optional[str]:
     # Tradier sometimes returns reason/message/error
     for k in ("reason", "message", "error"):
         v = remote.get(k)
         if v:
             return str(v)
+    return None
+
+
+def _to_int(x: Any) -> Optional[int]:
+    try:
+        return int(float(x))
+    except Exception:
+        return None
+
+
+def _extract_filled_qty(remote: Dict[str, Any]) -> Optional[int]:
+    """
+    Try common Tradier keys for filled quantity.
+    """
+    for k in ("exec_quantity", "filled_quantity", "filled", "quantity_executed"):
+        if k in remote and remote.get(k) is not None:
+            v = _to_int(remote.get(k))
+            if v is not None:
+                return v
     return None
 
 
@@ -82,14 +103,16 @@ def reconcile_once(broker, limit: int = 50) -> int:
         try:
             remote = broker.get_order(broker_id)  # TradierBroker implements this
             local_status = _tradier_status_to_local(remote)
-
             err = _extract_error(remote) if local_status == "REJECTED" else None
+            filled_qty = _extract_filled_qty(remote)
 
+            # Update local order record
             update_order(
                 o["local_order_id"],
                 status=local_status,
                 broker_order_id=broker_id,
                 last_error=err,
+                filled_qty=filled_qty,
             )
 
             audit("INFO", "RECONCILE_ORDER_UPDATE", {
@@ -97,12 +120,12 @@ def reconcile_once(broker, limit: int = 50) -> int:
                 "broker_order_id": broker_id,
                 "prev_status": o.get("status"),
                 "new_status": local_status,
+                "filled_qty": filled_qty,
             })
 
             processed += 1
 
         except Exception as e:
             log.exception(f"Reconcile failed for broker_order_id={broker_id}: {e}")
-            # don’t crash the loop
 
     return processed
