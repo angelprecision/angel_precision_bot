@@ -117,6 +117,34 @@ def persist_order(
         ))
 
 
+def update_order_row(local_order_id: str, **fields):
+    """
+    Update orders row by local_order_id.
+    fields can include: broker_order_id, status, filled_qty, last_error
+    """
+    if not fields:
+        return
+
+    allowed = {"broker_order_id", "status", "filled_qty", "last_error"}
+    sets = []
+    vals = []
+    for k, v in fields.items():
+        if k in allowed:
+            sets.append(f"{k}=?")
+            vals.append(v)
+
+    sets.append("updated_ts=?")
+    vals.append(now_utc_iso())
+
+    vals.append(local_order_id)
+
+    with conn() as c:
+        run_with_retry(lambda: c.execute(
+            f"UPDATE orders SET {', '.join(sets)} WHERE local_order_id=?",
+            tuple(vals),
+        ))
+
+
 def open_position_from_fill(plan: OrderPlan, avg_fill: float) -> str:
     pos_id = str(uuid.uuid4())
     with conn() as c:
@@ -196,37 +224,79 @@ def process_signal(signal: Signal, broker: BrokerAdapter) -> dict:
 
     # Execute
     try:
-        resp = broker.place_order(plan.symbol, plan.contract, plan.qty, plan.limit_price)
+        # ✅ Tradier needs a side. Default buy_to_open, explicit is safer.
+        # Your TradierBroker.place_order must accept "side" (we patched that).
+        resp = broker.place_order(
+            plan.symbol,
+            plan.contract,
+            plan.qty,
+            plan.limit_price,
+            side="buy_to_open"
+        )
+
         audit("INFO", "ORDER_RESPONSE", {"local_order_id": local_order_id, "resp": getattr(resp, "__dict__", str(resp))})
 
+        # Always store broker order id + status if present
+        update_order_row(
+            local_order_id,
+            broker_order_id=getattr(resp, "broker_order_id", None),
+            status=getattr(resp, "status", None),
+            filled_qty=getattr(resp, "filled_qty", 0) or 0,
+        )
+
         if resp.status == "REJECTED":
+            # release reserve on failure
             release_equity(reserve_amt)
+            update_order_row(local_order_id, last_error=str(resp.error))
             audit("ERROR", "ORDER_REJECTED", {"local_order_id": local_order_id, "error": resp.error})
             return {"ok": False, "reason": "ORDER_REJECTED", "error": resp.error}
 
         # Tradier returns ACK (not FILLED immediately). Treat ACK as successful submission.
         if resp.status == "ACK":
+            # We should count the trade attempt; otherwise gates may allow too many.
+            update_state({"trades_taken_today": int(state.get("trades_taken_today", 0)) + 1})
+
+            # Reserve is only used to prevent over-allocation; once order is out, release it.
             release_equity(reserve_amt)
-            audit("INFO", "ORDER_ACKNOWLEDGED", {"local_order_id": local_order_id, "broker_order_id": resp.broker_order_id})
-            return {"ok": True, "reason": "ORDER_ACK", "broker_order_id": resp.broker_order_id, "plan": plan.model_dump()}
+
+            audit("INFO", "ORDER_ACKNOWLEDGED", {
+                "local_order_id": local_order_id,
+                "broker_order_id": resp.broker_order_id
+            })
+            return {
+                "ok": True,
+                "reason": "ORDER_ACK",
+                "local_order_id": local_order_id,
+                "broker_order_id": resp.broker_order_id,
+                "plan": plan.model_dump()
+            }
 
         # SIM broker can return FILLED/PARTIAL
         if resp.status in ("FILLED", "PARTIAL"):
             pos_id = open_position_from_fill(plan, resp.avg_fill_price)
             update_state({"trades_taken_today": int(state.get("trades_taken_today", 0)) + 1})
             release_equity(reserve_amt)
+
+            # optional: link position id on order row (requires update_order_row extension if you want)
             audit("INFO", "POSITION_OPENED", {"position_id": pos_id, "plan": plan.model_dump()})
-            return {"ok": True, "position_id": pos_id, "plan": plan.model_dump()}
+            return {
+                "ok": True,
+                "position_id": pos_id,
+                "local_order_id": local_order_id,
+                "broker_order_id": getattr(resp, "broker_order_id", None),
+                "plan": plan.model_dump()
+            }
 
         # Unknown status - fail safe
         update_state({"mode": "READ_ONLY"})
         release_equity(reserve_amt)
+        update_order_row(local_order_id, last_error=f"UNKNOWN_STATUS:{resp.status}")
         return {"ok": False, "reason": "UNKNOWN_ORDER_STATUS", "status": resp.status}
 
     except Exception as e:
+        # Always release reserve on exception
         release_equity(reserve_amt)
+        update_order_row(local_order_id, status="REJECTED", last_error=str(e))
         audit("ERROR", "EXECUTION_EXCEPTION", {"err": str(e)})
         update_state({"mode": "READ_ONLY"})
         return {"ok": False, "reason": "EXECUTION_EXCEPTION", "error": str(e)}
-
-
