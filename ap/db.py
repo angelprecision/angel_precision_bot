@@ -6,6 +6,7 @@ from ap.config import Config
 
 cfg = Config()
 
+
 def run_with_retry(fn, retries: int = 12, base_sleep: float = 0.05, max_sleep: float = 1.0):
     """
     Retry SQLite operations that fail with 'database is locked/busy'.
@@ -40,12 +41,12 @@ def conn():
     c = sqlite3.connect(
         cfg.DB_FILE,
         timeout=30,
-        isolation_level=None,          # autocommit
+        isolation_level=None,  # autocommit
         check_same_thread=False
     )
     c.row_factory = sqlite3.Row
 
-    # DB pragmas
+    # DB pragmas for concurrency + correctness
     c.execute("PRAGMA journal_mode=WAL;")
     c.execute("PRAGMA busy_timeout=30000;")
     c.execute("PRAGMA foreign_keys=ON;")
@@ -57,9 +58,18 @@ def conn():
 
 
 def init_db():
+    """
+    Initializes the full schema required for beta execution bot:
+      - kv: simple key/value store
+      - audit_log: immutable event log
+      - processed_signals: idempotency/dedupe
+      - trade_queue: worker jobs
+      - orders: execution truth (submit/ack/reject/etc.)
+      - positions: open/closed position tracking
+    """
     with conn() as c:
         # -------------------------
-        # Core KV store
+        # KV
         # -------------------------
         c.execute("""
         CREATE TABLE IF NOT EXISTS kv (
@@ -83,14 +93,24 @@ def init_db():
         """)
 
         # -------------------------
-        # Trade queue (NOW includes details)
+        # Dedupe / idempotency
+        # -------------------------
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS processed_signals (
+            signal_id TEXT PRIMARY KEY,
+            first_seen_ts TEXT NOT NULL
+        );
+        """)
+
+        # -------------------------
+        # Trade queue
         # -------------------------
         c.execute("""
         CREATE TABLE IF NOT EXISTS trade_queue (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             signal_id TEXT NOT NULL,
             created_ts TEXT NOT NULL,
-            status TEXT NOT NULL,    -- NEW | PROCESSING | DONE | REJECTED
+            status TEXT NOT NULL,     -- NEW | PROCESSING | DONE | REJECTED
             payload TEXT NOT NULL,
             decision TEXT,
             reason TEXT,
@@ -98,15 +118,9 @@ def init_db():
         );
         """)
 
-        # Migration: add details column if table already existed before
+        # Safe migration if old DB existed without details
         try:
             c.execute("ALTER TABLE trade_queue ADD COLUMN details TEXT;")
-        except Exception:
-            pass
-
-        # Helpful indexes
-        try:
-            c.execute("CREATE INDEX IF NOT EXISTS idx_trade_queue_status_id ON trade_queue(status, id);")
         except Exception:
             pass
 
@@ -119,8 +133,8 @@ def init_db():
             local_order_id TEXT NOT NULL,
             broker_order_id TEXT,
             position_id TEXT,
-            kind TEXT NOT NULL,      -- ENTRY | EXIT | FLATTEN
-            status TEXT NOT NULL,    -- NEW | ACK | PARTIAL | FILLED | REJECTED | CANCELED
+            kind TEXT NOT NULL,       -- ENTRY | EXIT | FLATTEN
+            status TEXT NOT NULL,     -- NEW | ACK | PARTIAL | FILLED | REJECTED | CANCELED
             symbol TEXT NOT NULL,
             contract TEXT NOT NULL,
             qty INTEGER NOT NULL,
@@ -133,12 +147,6 @@ def init_db():
         );
         """)
 
-        try:
-            c.execute("CREATE INDEX IF NOT EXISTS idx_orders_local_order_id ON orders(local_order_id);")
-            c.execute("CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);")
-        except Exception:
-            pass
-
         # -------------------------
         # Positions
         # -------------------------
@@ -147,20 +155,12 @@ def init_db():
             id TEXT PRIMARY KEY,
             underlying TEXT NOT NULL,
             contract TEXT NOT NULL,
-            direction TEXT NOT NULL, -- CALL | PUT
+            direction TEXT NOT NULL,  -- CALL | PUT
             qty INTEGER NOT NULL,
             avg_fill REAL NOT NULL,
             entry_ts TEXT NOT NULL,
             tp_pct REAL NOT NULL,
             sl_pct REAL NOT NULL,
-            status TEXT NOT NULL,    -- OPEN | CLOSING | CLOSED
+            status TEXT NOT NULL,     -- OPEN | CLOSING | CLOSED
             exit_ts TEXT,
-            exit_reason TEXT,
-            realized_pnl REAL
-        );
-        """)
-
-        try:
-            c.execute("CREATE INDEX IF NOT EXISTS idx_positions_status ON positions(status);")
-        except Exception:
-            pass
+            exit_reason T_
