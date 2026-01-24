@@ -26,10 +26,6 @@ def enqueue_signal(signal: Signal):
 
 
 def fetch_next_job():
-    """
-    Claim ONE NEW job without BEGIN IMMEDIATE (avoids grabbing a write lock early).
-    Safe because only the worker calls this, and we also guard with status='NEW' in UPDATE.
-    """
     with conn() as c:
         row = run_with_retry(lambda: c.execute("""
             SELECT * FROM trade_queue
@@ -41,7 +37,6 @@ def fetch_next_job():
         if not row:
             return None
 
-        # Claim it (only if still NEW)
         cur = run_with_retry(lambda: c.execute(
             "UPDATE trade_queue SET status='PROCESSING' WHERE id=? AND status='NEW'",
             (row["id"],)
@@ -54,9 +49,6 @@ def fetch_next_job():
 
 
 def complete_job(job_id: int, ok: bool, decision: str, reason: str = "", details=None):
-    """
-    Marks a job DONE/REJECTED and persists details JSON into trade_queue.details.
-    """
     with conn() as c:
         run_with_retry(lambda: c.execute("""
             UPDATE trade_queue
@@ -73,26 +65,24 @@ def complete_job(job_id: int, ok: bool, decision: str, reason: str = "", details
 
 def worker_loop(broker, poll_seconds: float = 0.5):
     log.info("Worker started")
-
-    last_hb = 0.0  # throttle heartbeat + reconcile (every 10s)
+    last_tick = 0.0  # heartbeat + reconcile timer
 
     while True:
         now = time.time()
 
-        # Heartbeat + reconciliation every 10 seconds
-        if now - last_hb >= 10.0:
+        # Every 10 seconds: heartbeat + reconcile
+        if now - last_tick >= 10.0:
             try:
                 update_state({"last_heartbeat_ts": now_utc_iso()})
             except Exception:
                 log.exception("Heartbeat update failed")
 
-            # ✅ Reconcile broker orders -> update local DB truth
             try:
                 reconcile_once(broker, limit=50)
             except Exception:
                 log.exception("Reconcile loop error")
 
-            last_hb = now
+            last_tick = now
 
         job = fetch_next_job()
         if not job:
@@ -103,14 +93,13 @@ def worker_loop(broker, poll_seconds: float = 0.5):
             payload = json_loads(job["payload"])
             signal = Signal(**payload)
 
-            # ✅ DEDUPE: if signal_id already processed, do nothing
+            # Dedupe
             if already_processed_signal(signal.signal_id):
                 res = {"ok": True, "reason": "DEDUPED", "signal_id": signal.signal_id}
                 complete_job(job["id"], True, decision="DEDUPED", reason="DEDUPED", details=res)
                 log.info(f"Processed signal={signal.signal_id} ok=True reason=DEDUPED")
                 continue
 
-            # Mark processed BEFORE execution to prevent double-fire on repeats
             mark_signal_processed(signal.signal_id)
 
             res = process_signal(signal, broker)
@@ -123,6 +112,7 @@ def worker_loop(broker, poll_seconds: float = 0.5):
                 details=res,
             )
             log.info(f"Processed signal={signal.signal_id} ok={res.get('ok')} reason={res.get('reason')}")
+
         except Exception as e:
             complete_job(job["id"], False, decision="ERROR", reason=str(e), details={"error": str(e)})
             log.exception("Job failed")
