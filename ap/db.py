@@ -27,7 +27,6 @@ def run_with_retry(fn, retries: int = 12, base_sleep: float = 0.05, max_sleep: f
                 continue
             raise
 
-    # final attempt (or re-raise last locked error)
     try:
         return fn()
     except Exception:
@@ -46,7 +45,7 @@ def conn():
     )
     c.row_factory = sqlite3.Row
 
-    # DB pragmas for concurrency + correctness
+    # DB pragmas
     c.execute("PRAGMA journal_mode=WAL;")
     c.execute("PRAGMA busy_timeout=30000;")
     c.execute("PRAGMA foreign_keys=ON;")
@@ -59,18 +58,11 @@ def conn():
 
 def init_db():
     """
-    Initializes the full schema required for beta execution bot:
-      - kv: simple key/value store
-      - audit_log: immutable event log
-      - processed_signals: idempotency/dedupe
-      - trade_queue: worker jobs
-      - orders: execution truth (submit/ack/reject/etc.)
-      - positions: open/closed position tracking
+    Single source of truth schema for beta.
+    Safe to run repeatedly.
     """
     with conn() as c:
-        # -------------------------
         # KV
-        # -------------------------
         c.execute("""
         CREATE TABLE IF NOT EXISTS kv (
             k TEXT PRIMARY KEY,
@@ -79,9 +71,7 @@ def init_db():
         );
         """)
 
-        # -------------------------
         # Audit log
-        # -------------------------
         c.execute("""
         CREATE TABLE IF NOT EXISTS audit_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -92,9 +82,7 @@ def init_db():
         );
         """)
 
-        # -------------------------
-        # Dedupe / idempotency
-        # -------------------------
+        # Dedupe table (idempotency)
         c.execute("""
         CREATE TABLE IF NOT EXISTS processed_signals (
             signal_id TEXT PRIMARY KEY,
@@ -102,9 +90,7 @@ def init_db():
         );
         """)
 
-        # -------------------------
         # Trade queue
-        # -------------------------
         c.execute("""
         CREATE TABLE IF NOT EXISTS trade_queue (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -117,16 +103,13 @@ def init_db():
             details TEXT
         );
         """)
-
-        # Safe migration if old DB existed without details
+        # migration
         try:
             c.execute("ALTER TABLE trade_queue ADD COLUMN details TEXT;")
         except Exception:
             pass
 
-        # -------------------------
-        # Orders
-        # -------------------------
+        # Orders (execution truth)
         c.execute("""
         CREATE TABLE IF NOT EXISTS orders (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -147,9 +130,7 @@ def init_db():
         );
         """)
 
-        # -------------------------
         # Positions
-        # -------------------------
         c.execute("""
         CREATE TABLE IF NOT EXISTS positions (
             id TEXT PRIMARY KEY,
@@ -163,4 +144,45 @@ def init_db():
             sl_pct REAL NOT NULL,
             status TEXT NOT NULL,     -- OPEN | CLOSING | CLOSED
             exit_ts TEXT,
-            exit_reason T_
+            exit_reason TEXT,
+            realized_pnl REAL
+        );
+        """)
+
+        # Indexes
+        try:
+            c.execute("CREATE INDEX IF NOT EXISTS idx_processed_signals_ts ON processed_signals(first_seen_ts);")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_trade_queue_status_id ON trade_queue(status, id);")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_trade_queue_created_ts ON trade_queue(created_ts);")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_trade_queue_signal_id ON trade_queue(signal_id);")
+
+            c.execute("CREATE INDEX IF NOT EXISTS idx_orders_local_order_id ON orders(local_order_id);")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_orders_created_ts ON orders(created_ts);")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_orders_broker_order_id ON orders(broker_order_id);")
+
+            c.execute("CREATE INDEX IF NOT EXISTS idx_positions_status ON positions(status);")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_positions_entry_ts ON positions(entry_ts);")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_positions_contract ON positions(contract);")
+        except Exception:
+            pass
+
+
+# --- helpers used by ap/queue.py ---
+def already_processed_signal(signal_id: str) -> bool:
+    def _fn():
+        with conn() as c:
+            row = c.execute("SELECT 1 FROM processed_signals WHERE signal_id=?", (signal_id,)).fetchone()
+            return row is not None
+    return run_with_retry(_fn)
+
+
+def mark_signal_processed(signal_id: str):
+    from ap.utils import now_utc_iso
+    def _fn():
+        with conn() as c:
+            c.execute(
+                "INSERT OR IGNORE INTO processed_signals(signal_id, first_seen_ts) VALUES (?,?)",
+                (signal_id, now_utc_iso())
+            )
+    return run_with_retry(_fn)
