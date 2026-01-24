@@ -21,6 +21,9 @@ from ap.broker import SimBroker
 from ap.parsers import parse_scanner_text
 from ap.brokers.tradier import TradierBroker, TradierConfig
 
+# Exit Manager
+from ap.exit_manager import exit_manager_loop
+
 # =========================
 # CONFIGURATION
 # =========================
@@ -252,7 +255,7 @@ def scanner_discord():
                         "pt2": msg.puts.pt2,
                         "pt3": msg.puts.pt3,
                         "strike": msg.puts.strike,
-                        "expiry_hint": msg.puts.expiry_hint,
+                        "expiry_hint": m sg.puts.expiry_hint,
                         "raw_strike": msg.puts.raw_strike_line
                     }
                 )
@@ -335,7 +338,7 @@ def reset_equity():
 
 
 # =========================
-# WORKER THREAD
+# WORKER THREADS
 # =========================
 
 def start_worker():
@@ -344,6 +347,14 @@ def start_worker():
     t = threading.Thread(target=worker_loop, args=(BROKER,), daemon=True, name="WorkerThread")
     t.start()
     log.info("✅ Worker thread started")
+
+
+def start_exit_manager():
+    """Start exit management thread"""
+    log.info("Starting exit manager thread...")
+    t = threading.Thread(target=exit_manager_loop, args=(BROKER,), daemon=True, name="ExitManagerThread")
+    t.start()
+    log.info("✅ Exit manager thread started")
 
 
 # =========================
@@ -382,6 +393,13 @@ try:
     start_worker()
 except Exception as e:
     log.error(f"❌ Worker thread failed to start: {e}")
+    raise
+
+# Start exit manager thread
+try:
+    start_exit_manager()
+except Exception as e:
+    log.error(f"❌ Exit manager failed to start: {e}")
     raise
 
 log.info("=" * 60)
