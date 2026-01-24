@@ -322,7 +322,28 @@ def reset_equity():
         log.error(f"Equity reset failed: {e}")
         return jsonify({"ok": False, "error": str(e)}), 500
 
+@app.post("/admin/migrate")
+def run_migration():
+    """Run database migration for multi-client support"""
+    try:
+        from ap.migrations.add_clients import migrate
+        migrate()
+        return jsonify({"ok": True, "message": "Multi-client migration complete"})
+    except Exception as e:
+        log.error(f"Migration failed: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
 
+
+@app.get("/admin/clients")
+def list_clients():
+    """List all clients (for testing)"""
+    try:
+        from ap.db import get_all_clients
+        clients = get_all_clients()
+        return jsonify({"ok": True, "clients": clients})
+    except Exception as e:
+        log.error(f"Failed to list clients: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
 # =========================
 # WORKER THREADS
 # =========================
