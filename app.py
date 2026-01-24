@@ -3,10 +3,8 @@ import os
 import threading
 import uuid
 from datetime import datetime, timezone
-
 from flask import Flask, request, jsonify
 from pydantic import ValidationError
-
 from ap.config import Config
 from ap.db import init_db
 from ap.logger import get_logger
@@ -21,9 +19,6 @@ from ap.brokers.tradier import TradierBroker, TradierConfig
 
 # Exit Manager
 from ap.exit_manager import exit_manager_loop
-
-from ap.reconcile import reconcile_once
-
 
 cfg = Config()
 log = get_logger("app")
@@ -199,7 +194,6 @@ def scanner_discord():
     if not text:
         return jsonify({"ok": False, "error": "No content provided"}), 400
 
-    # prevent huge payloads (memory spikes)
     if len(text) > 20000:
         return jsonify({"ok": False, "error": "content too large"}), 413
 
@@ -331,43 +325,9 @@ def reset_equity():
         log.error(f"Equity reset failed: {e}")
         return jsonify({"ok": False, "error": str(e)}), 500
 
-@app.post("/admin/migrate")
-def run_migration():
-    """Run database migration for multi-client support"""
-    try:
-        from ap.migrations.add_clients import migrate
-        migrate()
-        return jsonify({"ok": True, "message": "Multi-client migration complete"})
-    except Exception as e:
-        log.error(f"Migration failed: {e}")
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-
-@app.get("/admin/clients")
-def list_clients():
-    """List all clients (for testing)"""
-    try:
-        from ap.db import get_all_clients
-        clients = get_all_clients()
-        return jsonify({"ok": True, "clients": clients})
-    except Exception as e:
-        log.error(f"Failed to list clients: {e}")
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-@app.get("/admin/clients")
-def list_clients():
-    """List all clients (for testing)"""
-    try:
-        from ap.db import get_all_clients
-        clients = get_all_clients()
-        return jsonify({"ok": True, "clients": clients})
-    except Exception as e:
-        log.error(f"Failed to list clients: {e}")
-        return jsonify({"ok": False, "error": str(e)}), 500
-
 
 # =========================
-# REPORTING ENDPOINTS      ← ADD THIS ENTIRE SECTION HERE
+# REPORTING ENDPOINTS
 # =========================
 
 @app.get("/report/orders")
@@ -550,9 +510,6 @@ def report_summary():
 
 
 # =========================
-# WORKER THREADS          ← This section stays as is
-# =========================
-# =========================
 # WORKER THREADS
 # =========================
 
@@ -564,7 +521,6 @@ def start_worker():
 
 
 def start_exit_manager():
-    # IMPORTANT: only safe if Tradier supports side and exit_manager uses sell_to_close
     log.info("Starting exit manager thread...")
     t = threading.Thread(target=exit_manager_loop, args=(BROKER,), daemon=True, name="ExitManagerThread")
     t.start()
@@ -583,7 +539,7 @@ def start_background_threads_once():
 
 
 # =========================
-# INITIALIZATION (runs on gunicorn import)
+# INITIALIZATION
 # =========================
 
 log.info("=" * 60)
