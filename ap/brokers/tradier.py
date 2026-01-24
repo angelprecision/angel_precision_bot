@@ -21,13 +21,14 @@ class TradierBroker(BrokerAdapter):
 
     def _get(self, path: str, params: Optional[dict] = None) -> dict:
         url = f"{self.cfg.base_url}{path}"
-        r = self.session.get(url, params=params, timeout=20)
+        # connect timeout, read timeout
+        r = self.session.get(url, params=params, timeout=(3.05, 15))
         r.raise_for_status()
         return r.json() if r.content else {}
 
     def _post(self, path: str, data: dict) -> dict:
         url = f"{self.cfg.base_url}{path}"
-        r = self.session.post(url, data=data, timeout=20)
+        r = self.session.post(url, data=data, timeout=(3.05, 15))
         r.raise_for_status()
         return r.json() if r.content else {}
 
@@ -69,12 +70,25 @@ class TradierBroker(BrokerAdapter):
         dates = (j.get("expirations") or {}).get("date") or []
         return dates if isinstance(dates, list) else [dates]
 
-    def place_order(self, symbol: str, contract: str, qty: int, limit_price: Optional[float]) -> BrokerOrderResponse:
+    def place_order(
+        self,
+        symbol: str,
+        contract: str,
+        qty: int,
+        limit_price: Optional[float],
+        side: str = "buy_to_open",   # ✅ NEW: default keeps old behavior
+    ) -> BrokerOrderResponse:
+        """
+        side values Tradier accepts for options:
+          buy_to_open, buy_to_close, sell_to_open, sell_to_close
+        """
+        side = (side or "buy_to_open").lower().strip()
+
         data = {
             "class": "option",
             "symbol": symbol,
             "option_symbol": contract,
-            "side": "buy_to_open",
+            "side": side,
             "quantity": str(qty),
             "type": "limit" if limit_price is not None else "market",
             "duration": "day",
@@ -109,4 +123,3 @@ class TradierBroker(BrokerAdapter):
             error="close_position not implemented (use exit orders)"
         )
 
-        
