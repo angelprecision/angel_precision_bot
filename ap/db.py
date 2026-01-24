@@ -1,8 +1,10 @@
 # ap/db.py
 import time
+import uuid
 import sqlite3
 from contextlib import contextmanager
 from ap.config import Config
+from ap.utils import now_utc_iso
 
 cfg = Config()
 
@@ -103,7 +105,8 @@ def init_db():
             details TEXT
         );
         """)
-        # migration
+        
+        # Migration for old DBs
         try:
             c.execute("ALTER TABLE trade_queue ADD COLUMN details TEXT;")
         except Exception:
@@ -149,18 +152,16 @@ def init_db():
         );
         """)
 
-        # Indexes
+        # Indexes for performance
         try:
             c.execute("CREATE INDEX IF NOT EXISTS idx_processed_signals_ts ON processed_signals(first_seen_ts);")
             c.execute("CREATE INDEX IF NOT EXISTS idx_trade_queue_status_id ON trade_queue(status, id);")
             c.execute("CREATE INDEX IF NOT EXISTS idx_trade_queue_created_ts ON trade_queue(created_ts);")
             c.execute("CREATE INDEX IF NOT EXISTS idx_trade_queue_signal_id ON trade_queue(signal_id);")
-
             c.execute("CREATE INDEX IF NOT EXISTS idx_orders_local_order_id ON orders(local_order_id);")
             c.execute("CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);")
             c.execute("CREATE INDEX IF NOT EXISTS idx_orders_created_ts ON orders(created_ts);")
             c.execute("CREATE INDEX IF NOT EXISTS idx_orders_broker_order_id ON orders(broker_order_id);")
-
             c.execute("CREATE INDEX IF NOT EXISTS idx_positions_status ON positions(status);")
             c.execute("CREATE INDEX IF NOT EXISTS idx_positions_entry_ts ON positions(entry_ts);")
             c.execute("CREATE INDEX IF NOT EXISTS idx_positions_contract ON positions(contract);")
@@ -168,21 +169,103 @@ def init_db():
             pass
 
 
-# --- helpers used by ap/queue.py ---
+# =========================================================================
+# HELPER FUNCTIONS - Used by ap/queue.py and ap/exit_manager.py
+# =========================================================================
+
 def already_processed_signal(signal_id: str) -> bool:
-    def _fn():
-        with conn() as c:
-            row = c.execute("SELECT 1 FROM processed_signals WHERE signal_id=?", (signal_id,)).fetchone()
-            return row is not None
-    return run_with_retry(_fn)
+    """Check if signal was already processed (deduplication)"""
+    with conn() as c:
+        row = run_with_retry(lambda: c.execute(
+            "SELECT 1 FROM processed_signals WHERE signal_id=?",
+            (signal_id,)
+        ).fetchone())
+        return row is not None
 
 
 def mark_signal_processed(signal_id: str):
-    from ap.utils import now_utc_iso
-    def _fn():
-        with conn() as c:
-            c.execute(
-                "INSERT OR IGNORE INTO processed_signals(signal_id, first_seen_ts) VALUES (?,?)",
-                (signal_id, now_utc_iso())
+    """Mark signal as processed"""
+    with conn() as c:
+        run_with_retry(lambda: c.execute(
+            "INSERT OR IGNORE INTO processed_signals (signal_id, first_seen_ts) VALUES (?,?)",
+            (signal_id, now_utc_iso())
+        ))
+
+
+def new_local_order_id() -> str:
+    """Generate new local order ID"""
+    return str(uuid.uuid4())
+
+
+def insert_order(
+    local_order_id: str,
+    position_id: str,
+    kind: str,
+    status: str,
+    symbol: str,
+    contract: str,
+    qty: int,
+    limit_price: float = None,
+    broker_order_id: str = None
+):
+    """Insert new order record"""
+    with conn() as c:
+        ts = now_utc_iso()
+        run_with_retry(lambda: c.execute(
+            """
+            INSERT INTO orders (
+                local_order_id, broker_order_id, position_id, kind, status,
+                symbol, contract, qty, limit_price, filled_qty, retries, last_error,
+                created_ts, updated_ts
             )
-    return run_with_retry(_fn)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                local_order_id,
+                broker_order_id,
+                position_id,
+                kind,
+                status,
+                symbol,
+                contract,
+                qty,
+                limit_price,
+                0,  # filled_qty
+                0,  # retries
+                None,  # last_error
+                ts,
+                ts,
+            ),
+        ))
+
+
+def update_order(
+    local_order_id: str,
+    status: str = None,
+    broker_order_id: str = None,
+    last_error: str = None
+):
+    """Update order record"""
+    with conn() as c:
+        updates = []
+        params = []
+        
+        if status is not None:
+            updates.append("status=?")
+            params.append(status)
+        
+        if broker_order_id is not None:
+            updates.append("broker_order_id=?")
+            params.append(broker_order_id)
+        
+        if last_error is not None:
+            updates.append("last_error=?")
+            params.append(last_error)
+        
+        updates.append("updated_ts=?")
+        params.append(now_utc_iso())
+        
+        params.append(local_order_id)
+        
+        sql = f"UPDATE orders SET {', '.join(updates)} WHERE local_order_id=?"
+        run_with_retry(lambda: c.execute(sql, params))
