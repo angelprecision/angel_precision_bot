@@ -304,7 +304,11 @@ def create_app() -> Flask:
                 "kill_switch": st.get("kill_switch", False),
                 "heartbeat": st.get("last_heartbeat_ts"),
                 "heartbeat_age_seconds": heartbeat_age,
-                "worker_alive": heartbeat_ok
+                "worker_alive": heartbeat_ok "app_env": APP_ENV,
+             
+                "signing_secret_loaded": bool(SIGNING_SECRET),
+                "signing_secret_len": len(SIGNING_SECRET) if SIGNING_SECRET else 0,
+
             }), 200 if all_ok else 503
 
         except Exception as e:
