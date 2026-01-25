@@ -19,7 +19,7 @@ from flask import Flask, request, jsonify
 from pydantic import ValidationError
 
 from ap.config import Config
-from ap.db import init_db, conn
+from ap.db import init_db, conn, get_client
 from ap.logger import get_logger
 from ap.models import Signal
 from ap.queue import enqueue_signal, worker_loop
@@ -135,6 +135,28 @@ def require_hmac(fn):
             return jsonify({"ok": False, "error": "unauthorized"}), 401
         return fn(*args, **kwargs)
     return wrapper
+def _require_client_id_header() -> str | None:
+    """
+    Option A routing:
+      - prod: requires X-Client-Id
+      - dev: falls back to 'default'
+    """
+    cid = (request.headers.get("X-Client-Id", "") or "").strip()
+    if cid:
+        return cid
+    if APP_ENV != "prod":
+        return "default"
+    return None
+
+
+def _validate_active_client(client_id: str):
+    """
+    Raises ValueError if unknown or inactive.
+    """
+    client = get_client(client_id)  # raises if not found
+    if (client.get("status") or "").upper() != "ACTIVE":
+        raise ValueError(f"client_not_active:{client.get('status')}")
+    return client
 
 
 # ============================================================
@@ -357,65 +379,152 @@ def create_app() -> Flask:
     # SIGNAL INGESTION (PROTECTED IN PROD)
     # =========================
 
-    @app.post("/signal")
-    @require_hmac
-    def signal():
-        ip = _client_ip()
+ @app.post("/signal")
+@require_hmac
+def signal():
+    ip = _client_ip()
 
-        # Rate limit first
-        if _rate_limited(f"signal:{ip}"):
-            return jsonify({"ok": False, "error": "rate_limited"}), 429
+    # Rate limit first
+    if _rate_limited(f"signal:{ip}"):
+        return jsonify({"ok": False, "error": "rate_limited"}), 429
 
-        body = request.get_json(force=True) or {}
+    # Option A client routing
+    client_id = _require_client_id_header()
+    if not client_id:
+        return jsonify({"ok": False, "error": "missing_client_id", "message": "X-Client-Id required"}), 400
 
-        # Idempotency (prefer signal_id)
-        idem_key = (
-            str(body.get("signal_id") or "").strip()
-            or request.headers.get("Idempotency-Key", "").strip()
-            or str(body.get("idempotency_key") or "").strip()
-        )
+    try:
+        _validate_active_client(client_id)
+    except Exception as e:
+        msg = str(e)
+        if msg.startswith("client_not_active:"):
+            return jsonify({"ok": False, "error": "client_not_active", "detail": msg}), 403
+        return jsonify({"ok": False, "error": "unknown_client"}), 404
 
-        cached = _idem_get(idem_key)
-        if cached:
-            return jsonify(cached), 200
+    body = request.get_json(force=True) or {}
 
-        try:
-            sig = Signal(**body)
-        except ValidationError as e:
-            log.warning(f"Invalid signal payload: {e.errors()}")
-            payload = {
-                "ok": False,
-                "error": "Invalid signal payload",
-                "details": e.errors(),
-                "example": {
-                    "signal_id": "uuid-string",
-                    "symbol": "SPY",
-                    "direction": "CALL",
-                    "pattern_id": "MANUAL_TEST",
-                    "timestamp_iso": "2026-01-22T00:00:00Z",
-                    "trigger": {"strike": 475.0, "expiry_hint": "Weekly"}
-                }
+    # Idempotency (prefer signal_id)
+    idem_key = (
+        str(body.get("signal_id") or "").strip()
+        or request.headers.get("Idempotency-Key", "").strip()
+        or str(body.get("idempotency_key") or "").strip()
+    )
+
+    cached = _idem_get(idem_key)
+    if cached:
+        return jsonify(cached), 200
+
+    try:
+        sig = Signal(**body)
+    except ValidationError as e:
+        log.warning(f"Invalid signal payload: {e.errors()}")
+        payload = {
+            "ok": False,
+            "error": "Invalid signal payload",
+            "details": e.errors(),
+            "example": {
+                "signal_id": "uuid-string",
+                "symbol": "SPY",
+                "direction": "CALL",
+                "pattern_id": "MANUAL_TEST",
+                "timestamp_iso": "2026-01-22T00:00:00Z",
+                "trigger": {"strike": 475.0, "expiry_hint": "Weekly"}
             }
-            _idem_set(idem_key, payload)
-            return jsonify(payload), 400
-
-        st = load_state()
-        if st.get("kill_switch") or st.get("mode") == "READ_ONLY":
-            payload = {
-                "ok": False,
-                "error": "bot_in_read_only",
-                "mode": st.get("mode"),
-                "kill_switch": st.get("kill_switch", False)
-            }
-            _idem_set(idem_key, payload)
-            return jsonify(payload), 403
-
-        enqueue_signal(sig)
-        log.info(f"Signal queued: {sig.symbol} {sig.direction} (ip={ip})")
-
-        payload = {"ok": True, "queued": True, "signal_id": sig.signal_id}
+        }
         _idem_set(idem_key, payload)
-        return jsonify(payload), 202
+        return jsonify(payload), 400
+
+    st = load_state()
+    if st.get("kill_switch") or st.get("mode") == "READ_ONLY":
+        payload = {
+            "ok": False,
+            "error": "bot_in_read_only",
+            "mode": st.get("mode"),
+            "kill_switch": st.get("kill_switch", False)
+        }
+        _idem_set(idem_key, payload)
+        return jsonify(payload), 403
+
+    enqueue_signal(sig, client_id=client_id)
+    log.info(f"Signal queued: client_id={client_id} {sig.symbol} {sig.direction} (ip={ip})")
+
+    payload = {"ok": True, "queued": True, "signal_id": sig.signal_id, "client_id": client_id}
+    _idem_set(idem_key, payload)
+    return jsonify(payload), 202
+
+@app.post("/signal")
+@require_hmac
+def signal():
+    ip = _client_ip()
+
+    # Rate limit first
+    if _rate_limited(f"signal:{ip}"):
+        return jsonify({"ok": False, "error": "rate_limited"}), 429
+
+    # Option A client routing
+    client_id = _require_client_id_header()
+    if not client_id:
+        return jsonify({"ok": False, "error": "missing_client_id", "message": "X-Client-Id required"}), 400
+
+    try:
+        _validate_active_client(client_id)
+    except Exception as e:
+        msg = str(e)
+        if msg.startswith("client_not_active:"):
+            return jsonify({"ok": False, "error": "client_not_active", "detail": msg}), 403
+        return jsonify({"ok": False, "error": "unknown_client"}), 404
+
+    body = request.get_json(force=True) or {}
+
+    # Idempotency (prefer signal_id)
+    idem_key = (
+        str(body.get("signal_id") or "").strip()
+        or request.headers.get("Idempotency-Key", "").strip()
+        or str(body.get("idempotency_key") or "").strip()
+    )
+
+    cached = _idem_get(idem_key)
+    if cached:
+        return jsonify(cached), 200
+
+    try:
+        sig = Signal(**body)
+    except ValidationError as e:
+        log.warning(f"Invalid signal payload: {e.errors()}")
+        payload = {
+            "ok": False,
+            "error": "Invalid signal payload",
+            "details": e.errors(),
+            "example": {
+                "signal_id": "uuid-string",
+                "symbol": "SPY",
+                "direction": "CALL",
+                "pattern_id": "MANUAL_TEST",
+                "timestamp_iso": "2026-01-22T00:00:00Z",
+                "trigger": {"strike": 475.0, "expiry_hint": "Weekly"}
+            }
+        }
+        _idem_set(idem_key, payload)
+        return jsonify(payload), 400
+
+    st = load_state()
+    if st.get("kill_switch") or st.get("mode") == "READ_ONLY":
+        payload = {
+            "ok": False,
+            "error": "bot_in_read_only",
+            "mode": st.get("mode"),
+            "kill_switch": st.get("kill_switch", False)
+        }
+        _idem_set(idem_key, payload)
+        return jsonify(payload), 403
+
+    enqueue_signal(sig, client_id=client_id)
+    log.info(f"Signal queued: client_id={client_id} {sig.symbol} {sig.direction} (ip={ip})")
+
+    payload = {"ok": True, "queued": True, "signal_id": sig.signal_id, "client_id": client_id}
+    _idem_set(idem_key, payload)
+    return jsonify(payload), 202
+     
 
     @app.post("/scanner/discord")
     @require_hmac
