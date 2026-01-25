@@ -182,8 +182,18 @@ def start_exit_manager(broker):
 def start_fill_monitor(broker):
     """Start fill monitoring thread - THE ACCURACY LAYER!"""
     log.info("Starting fill monitor thread...")
-    from ap.fill_monitor import fill_monitor_loop
-    t = threading.Thread(target=fill_monitor_loop, args=(broker,), daemon=True, name="FillMonitorThread")
+    try:
+        from ap.fill_monitor import fill_monitor_loop
+    except Exception as e:
+        log.warning(f"⚠️ Fill monitor not started (import failed): {e}")
+        return
+
+    t = threading.Thread(
+        target=fill_monitor_loop,
+        args=(broker,),
+        daemon=True,
+        name="FillMonitorThread"
+    )
     t.start()
     log.info("✅ Fill monitor thread started")
 
