@@ -1,9 +1,10 @@
 # app.py - Angel Precision Bot (Render + gunicorn safe)
 # ✅ Gunicorn-safe: no threads started at import time (starts on first request per worker)
 # ✅ Production-safe auth: HMAC for /signal + control endpoints (in prod)
+# ✅ Multi-client routing: X-Client-Id header routes to correct client
 # ✅ Rate limiting + idempotency (in-memory per worker)
 # ✅ Debug endpoints hidden in prod (404)
-# ✅ Health includes safe diagnostics (env + whether signing secret is loaded)
+# ✅ CORS + Security headers enabled
 
 import os
 import time
@@ -16,6 +17,7 @@ from datetime import datetime, timezone
 from functools import wraps
 
 from flask import Flask, request, jsonify
+from flask_cors import CORS
 from pydantic import ValidationError
 
 from ap.config import Config
@@ -135,11 +137,13 @@ def require_hmac(fn):
             return jsonify({"ok": False, "error": "unauthorized"}), 401
         return fn(*args, **kwargs)
     return wrapper
+
+
 def _require_client_id_header() -> str | None:
     """
-    Option A routing:
-      - prod: requires X-Client-Id
-      - dev: falls back to 'default'
+    Multi-client routing:
+      - prod: requires X-Client-Id header
+      - dev: falls back to 'default' for backward compatibility
     """
     cid = (request.headers.get("X-Client-Id", "") or "").strip()
     if cid:
@@ -151,7 +155,7 @@ def _require_client_id_header() -> str | None:
 
 def _validate_active_client(client_id: str):
     """
-    Raises ValueError if unknown or inactive.
+    Raises ValueError if client unknown or inactive.
     """
     client = get_client(client_id)  # raises if not found
     if (client.get("status") or "").upper() != "ACTIVE":
@@ -265,6 +269,30 @@ def create_app() -> Flask:
     app.register_blueprint(client_bp)
     app.register_blueprint(admin_bp)
 
+    # CORS Protection
+    CORS(app, resources={
+        r"/client/*": {
+            "origins": ["*"],  # TODO: Change to your dashboard domain before production
+            "methods": ["GET", "POST", "PATCH"],
+            "allow_headers": ["Content-Type", "Authorization", "X-API-Key"]
+        },
+        r"/admin/*": {
+            "origins": ["*"],  # TODO: Change to your admin domain before production
+            "methods": ["GET", "POST", "PATCH"],
+            "allow_headers": ["Content-Type", "X-Admin-Key"]
+        }
+    })
+
+    # Security Headers
+    @app.after_request
+    def add_security_headers(response):
+        response.headers['X-Content-Type-Options'] = 'nosniff'
+        response.headers['X-Frame-Options'] = 'DENY'
+        response.headers['X-XSS-Protection'] = '1; mode=block'
+        response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
+        response.headers['Content-Security-Policy'] = "default-src 'self'"
+        return response
+
     # =========================
     # ROOT / HEALTH / STATE
     # =========================
@@ -376,155 +404,81 @@ def create_app() -> Flask:
         return jsonify({"ok": True, "mode": mode})
 
     # =========================
-    # SIGNAL INGESTION (PROTECTED IN PROD)
+    # SIGNAL INGESTION (PROTECTED IN PROD + MULTI-CLIENT)
     # =========================
 
- @app.post("/signal")
-@require_hmac
-def signal():
-    ip = _client_ip()
+    @app.post("/signal")
+    @require_hmac
+    def signal():
+        ip = _client_ip()
 
-    # Rate limit first
-    if _rate_limited(f"signal:{ip}"):
-        return jsonify({"ok": False, "error": "rate_limited"}), 429
+        # Rate limit first
+        if _rate_limited(f"signal:{ip}"):
+            return jsonify({"ok": False, "error": "rate_limited"}), 429
 
-    # Option A client routing
-    client_id = _require_client_id_header()
-    if not client_id:
-        return jsonify({"ok": False, "error": "missing_client_id", "message": "X-Client-Id required"}), 400
+        # Multi-client routing
+        client_id = _require_client_id_header()
+        if not client_id:
+            return jsonify({"ok": False, "error": "missing_client_id", "message": "X-Client-Id required"}), 400
 
-    try:
-        _validate_active_client(client_id)
-    except Exception as e:
-        msg = str(e)
-        if msg.startswith("client_not_active:"):
-            return jsonify({"ok": False, "error": "client_not_active", "detail": msg}), 403
-        return jsonify({"ok": False, "error": "unknown_client"}), 404
+        try:
+            _validate_active_client(client_id)
+        except Exception as e:
+            msg = str(e)
+            if msg.startswith("client_not_active:"):
+                return jsonify({"ok": False, "error": "client_not_active", "detail": msg}), 403
+            return jsonify({"ok": False, "error": "unknown_client"}), 404
 
-    body = request.get_json(force=True) or {}
+        body = request.get_json(force=True) or {}
 
-    # Idempotency (prefer signal_id)
-    idem_key = (
-        str(body.get("signal_id") or "").strip()
-        or request.headers.get("Idempotency-Key", "").strip()
-        or str(body.get("idempotency_key") or "").strip()
-    )
+        # Idempotency (prefer signal_id)
+        idem_key = (
+            str(body.get("signal_id") or "").strip()
+            or request.headers.get("Idempotency-Key", "").strip()
+            or str(body.get("idempotency_key") or "").strip()
+        )
 
-    cached = _idem_get(idem_key)
-    if cached:
-        return jsonify(cached), 200
+        cached = _idem_get(idem_key)
+        if cached:
+            return jsonify(cached), 200
 
-    try:
-        sig = Signal(**body)
-    except ValidationError as e:
-        log.warning(f"Invalid signal payload: {e.errors()}")
-        payload = {
-            "ok": False,
-            "error": "Invalid signal payload",
-            "details": e.errors(),
-            "example": {
-                "signal_id": "uuid-string",
-                "symbol": "SPY",
-                "direction": "CALL",
-                "pattern_id": "MANUAL_TEST",
-                "timestamp_iso": "2026-01-22T00:00:00Z",
-                "trigger": {"strike": 475.0, "expiry_hint": "Weekly"}
+        try:
+            sig = Signal(**body)
+        except ValidationError as e:
+            log.warning(f"Invalid signal payload: {e.errors()}")
+            payload = {
+                "ok": False,
+                "error": "Invalid signal payload",
+                "details": e.errors(),
+                "example": {
+                    "signal_id": "uuid-string",
+                    "symbol": "SPY",
+                    "direction": "CALL",
+                    "pattern_id": "MANUAL_TEST",
+                    "timestamp_iso": "2026-01-22T00:00:00Z",
+                    "trigger": {"strike": 475.0, "expiry_hint": "Weekly"}
+                }
             }
-        }
-        _idem_set(idem_key, payload)
-        return jsonify(payload), 400
+            _idem_set(idem_key, payload)
+            return jsonify(payload), 400
 
-    st = load_state()
-    if st.get("kill_switch") or st.get("mode") == "READ_ONLY":
-        payload = {
-            "ok": False,
-            "error": "bot_in_read_only",
-            "mode": st.get("mode"),
-            "kill_switch": st.get("kill_switch", False)
-        }
-        _idem_set(idem_key, payload)
-        return jsonify(payload), 403
-
-    enqueue_signal(sig, client_id=client_id)
-    log.info(f"Signal queued: client_id={client_id} {sig.symbol} {sig.direction} (ip={ip})")
-
-    payload = {"ok": True, "queued": True, "signal_id": sig.signal_id, "client_id": client_id}
-    _idem_set(idem_key, payload)
-    return jsonify(payload), 202
-
-@app.post("/signal")
-@require_hmac
-def signal():
-    ip = _client_ip()
-
-    # Rate limit first
-    if _rate_limited(f"signal:{ip}"):
-        return jsonify({"ok": False, "error": "rate_limited"}), 429
-
-    # Option A client routing
-    client_id = _require_client_id_header()
-    if not client_id:
-        return jsonify({"ok": False, "error": "missing_client_id", "message": "X-Client-Id required"}), 400
-
-    try:
-        _validate_active_client(client_id)
-    except Exception as e:
-        msg = str(e)
-        if msg.startswith("client_not_active:"):
-            return jsonify({"ok": False, "error": "client_not_active", "detail": msg}), 403
-        return jsonify({"ok": False, "error": "unknown_client"}), 404
-
-    body = request.get_json(force=True) or {}
-
-    # Idempotency (prefer signal_id)
-    idem_key = (
-        str(body.get("signal_id") or "").strip()
-        or request.headers.get("Idempotency-Key", "").strip()
-        or str(body.get("idempotency_key") or "").strip()
-    )
-
-    cached = _idem_get(idem_key)
-    if cached:
-        return jsonify(cached), 200
-
-    try:
-        sig = Signal(**body)
-    except ValidationError as e:
-        log.warning(f"Invalid signal payload: {e.errors()}")
-        payload = {
-            "ok": False,
-            "error": "Invalid signal payload",
-            "details": e.errors(),
-            "example": {
-                "signal_id": "uuid-string",
-                "symbol": "SPY",
-                "direction": "CALL",
-                "pattern_id": "MANUAL_TEST",
-                "timestamp_iso": "2026-01-22T00:00:00Z",
-                "trigger": {"strike": 475.0, "expiry_hint": "Weekly"}
+        st = load_state()
+        if st.get("kill_switch") or st.get("mode") == "READ_ONLY":
+            payload = {
+                "ok": False,
+                "error": "bot_in_read_only",
+                "mode": st.get("mode"),
+                "kill_switch": st.get("kill_switch", False)
             }
-        }
+            _idem_set(idem_key, payload)
+            return jsonify(payload), 403
+
+        enqueue_signal(sig, client_id=client_id)
+        log.info(f"Signal queued: client_id={client_id} {sig.symbol} {sig.direction} (ip={ip})")
+
+        payload = {"ok": True, "queued": True, "signal_id": sig.signal_id, "client_id": client_id}
         _idem_set(idem_key, payload)
-        return jsonify(payload), 400
-
-    st = load_state()
-    if st.get("kill_switch") or st.get("mode") == "READ_ONLY":
-        payload = {
-            "ok": False,
-            "error": "bot_in_read_only",
-            "mode": st.get("mode"),
-            "kill_switch": st.get("kill_switch", False)
-        }
-        _idem_set(idem_key, payload)
-        return jsonify(payload), 403
-
-    enqueue_signal(sig, client_id=client_id)
-    log.info(f"Signal queued: client_id={client_id} {sig.symbol} {sig.direction} (ip={ip})")
-
-    payload = {"ok": True, "queued": True, "signal_id": sig.signal_id, "client_id": client_id}
-    _idem_set(idem_key, payload)
-    return jsonify(payload), 202
-     
+        return jsonify(payload), 202
 
     @app.post("/scanner/discord")
     @require_hmac
@@ -532,6 +486,19 @@ def signal():
         ip = _client_ip()
         if _rate_limited(f"scanner:{ip}"):
             return jsonify({"ok": False, "error": "rate_limited"}), 429
+
+        # Multi-client routing
+        client_id = _require_client_id_header()
+        if not client_id:
+            return jsonify({"ok": False, "error": "missing_client_id", "message": "X-Client-Id required"}), 400
+
+        try:
+            _validate_active_client(client_id)
+        except Exception as e:
+            msg = str(e)
+            if msg.startswith("client_not_active:"):
+                return jsonify({"ok": False, "error": "client_not_active", "detail": msg}), 403
+            return jsonify({"ok": False, "error": "unknown_client"}), 404
 
         body = request.get_json(silent=True) or {}
         if not body:
@@ -573,9 +540,9 @@ def signal():
                             "raw_strike": msg.calls.raw_strike_line
                         }
                     )
-                    enqueue_signal(sig)
+                    enqueue_signal(sig, client_id=client_id)
                     queued += 1
-                    log.info(f"Queued CALL: {msg.symbol} strike={msg.calls.strike}")
+                    log.info(f"Queued CALL: client_id={client_id} {msg.symbol} strike={msg.calls.strike}")
 
                 if msg.puts and msg.puts.strike:
                     sig = Signal(
@@ -599,12 +566,12 @@ def signal():
                             "raw_strike": msg.puts.raw_strike_line
                         }
                     )
-                    enqueue_signal(sig)
+                    enqueue_signal(sig, client_id=client_id)
                     queued += 1
-                    log.info(f"Queued PUT: {msg.symbol} strike={msg.puts.strike}")
+                    log.info(f"Queued PUT: client_id={client_id} {msg.symbol} strike={msg.puts.strike}")
 
-            log.info(f"Parsed {len(parsed)} setups, queued {queued} signals")
-            return jsonify({"ok": True, "parsed": len(parsed), "queued": queued})
+            log.info(f"Parsed {len(parsed)} setups, queued {queued} signals for client_id={client_id}")
+            return jsonify({"ok": True, "parsed": len(parsed), "queued": queued, "client_id": client_id})
 
         except Exception as e:
             log.error(f"Failed to parse scanner message: {e}")
@@ -836,7 +803,7 @@ def signal():
                     "pt3": 0
                 }
             )
-            enqueue_signal(sig)
+            enqueue_signal(sig, client_id="default")
             return jsonify({"ok": True, "queued": True, "signal_id": sig.signal_id})
         except Exception as e:
             log.error(f"Test signal failed: {e}")
@@ -915,18 +882,24 @@ def signal():
             return jsonify({"ok": False, "error": str(e)}), 500
 
     # =========================
-    # CONTROL (TRADING ACTIONS) - PROTECTED
+    # CONTROL (TRADING ACTIONS) - PROTECTED + CLIENT-SCOPED
     # =========================
 
     @app.post("/control/force_exit/<position_id>")
     @require_hmac
     def force_exit_position(position_id: str):
         broker = app.config["BROKER"]
+        
+        # Multi-client routing
+        client_id = _require_client_id_header()
+        if not client_id:
+            return jsonify({"ok": False, "error": "missing_client_id"}), 400
+        
         try:
             with conn() as c:
                 pos_row = c.execute(
-                    "SELECT * FROM positions WHERE id=? AND status IN ('OPEN', 'CLOSING')",
-                    (position_id,)
+                    "SELECT * FROM positions WHERE id=? AND client_id=? AND status IN ('OPEN', 'CLOSING')",
+                    (position_id, client_id)
                 ).fetchone()
 
             if not pos_row:
@@ -964,7 +937,7 @@ def signal():
 
             update_order(local_order_id, status=status, broker_order_id=broker_order_id)
 
-            log.warning(f"🚨 MANUAL EXIT: {pos['contract']} by user request")
+            log.warning(f"🚨 MANUAL EXIT: client_id={client_id} {pos['contract']} by user request")
 
             return jsonify({
                 "ok": True,
@@ -984,9 +957,18 @@ def signal():
     @require_hmac
     def flatten_all_positions():
         broker = app.config["BROKER"]
+        
+        # Multi-client routing
+        client_id = _require_client_id_header()
+        if not client_id:
+            return jsonify({"ok": False, "error": "missing_client_id"}), 400
+        
         try:
             with conn() as c:
-                rows = c.execute("SELECT * FROM positions WHERE status='OPEN'").fetchall()
+                rows = c.execute(
+                    "SELECT * FROM positions WHERE status='OPEN' AND client_id=?",
+                    (client_id,)
+                ).fetchall()
 
             positions = [dict(r) for r in rows]
             if not positions:
@@ -1032,7 +1014,7 @@ def signal():
                 except Exception as e:
                     failed.append({"position_id": pos.get("id"), "contract": pos.get("contract"), "error": str(e)})
 
-            log.warning(f"🚨 FLATTEN ALL: {len(closed)} positions, {len(failed)} failed")
+            log.warning(f"🚨 FLATTEN ALL: client_id={client_id} {len(closed)} positions, {len(failed)} failed")
 
             return jsonify({
                 "ok": True,
