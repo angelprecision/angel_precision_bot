@@ -30,6 +30,9 @@ from ap.parsers import parse_scanner_text
 from ap.brokers.tradier import TradierBroker, TradierConfig
 from ap.exit_manager import exit_manager_loop
 
+from ap.client_api import client_bp
+from ap.admin_api import admin_bp
+
 
 # ============================================================
 # GLOBALS (safe for gunicorn import)
@@ -235,6 +238,10 @@ def create_app() -> Flask:
     @app.before_request
     def _ensure_threads_started():
         start_background_threads_once(app.config["BROKER"])
+
+    # Register multi-client blueprints
+      app.register_blueprint(client_bp)
+      app.register_blueprint(admin_bp)
 
     # =========================
     # ROOT / HEALTH / STATE
@@ -543,7 +550,17 @@ def create_app() -> Flask:
         except Exception as e:
             log.error(f"Equity reset failed: {e}")
             return jsonify({"ok": False, "error": str(e)}), 500
-
+    @app.post("/admin/migrate")
+@require_hmac
+def run_migration():
+    """Run multi-client database migration"""
+    try:
+        from ap.migrations.add_client_id import migrate
+        migrate()
+        return jsonify({"ok": True, "message": "Migration completed successfully"})
+    except Exception as e:
+        log.error(f"Migration failed: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
     @app.get("/tradier/test")
     @require_hmac
     def tradier_test():
