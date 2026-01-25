@@ -4,9 +4,8 @@ import uuid
 from ap.config import Config
 from ap.logger import get_logger
 from ap.models import Signal, OrderPlan
-from ap.db import conn, run_with_retry
+from ap.db import conn, run_with_retry, get_client_state, update_client_state
 from ap.utils import now_utc_iso, json_dumps
-from ap.state import load_state, update_state, reserve_equity, release_equity
 from ap.risk import run_gates, effective_limits
 from ap.broker import BrokerAdapter
 
@@ -16,21 +15,36 @@ from ap.contract_selection import pick_expiration, resolve_contract_symbol
 cfg = Config()
 log = get_logger("ap.execution")
 
+DEFAULT_CLIENT_ID = "default"
 
-def count_open_positions() -> int:
+
+def count_open_positions(client_id: str) -> int:
     with conn() as c:
         row = run_with_retry(lambda: c.execute(
-            "SELECT COUNT(*) as n FROM positions WHERE status='OPEN'"
+            "SELECT COUNT(*) as n FROM positions WHERE status='OPEN' AND client_id=?",
+            (client_id,)
         ).fetchone())
         return int(row["n"]) if row else 0
 
 
-def audit(level: str, event: str, payload: dict):
+def audit(client_id: str, level: str, event: str, payload: dict):
+    """
+    Writes audit log. Migration adds client_id column; if not present it will still work
+    if your table is older (but you already migrated).
+    """
     with conn() as c:
-        run_with_retry(lambda: c.execute(
-            "INSERT INTO audit_log (ts, level, event, payload) VALUES (?,?,?,?)",
-            (now_utc_iso(), level, event, json_dumps(payload)),
-        ))
+        # Prefer including client_id
+        try:
+            run_with_retry(lambda: c.execute(
+                "INSERT INTO audit_log (client_id, ts, level, event, payload) VALUES (?,?,?,?,?)",
+                (client_id, now_utc_iso(), level, event, json_dumps(payload)),
+            ))
+        except Exception:
+            # Fallback for older audit_log schema
+            run_with_retry(lambda: c.execute(
+                "INSERT INTO audit_log (ts, level, event, payload) VALUES (?,?,?,?)",
+                (now_utc_iso(), level, event, json_dumps(payload)),
+            ))
 
 
 def create_order_plan(signal: Signal, state: dict, broker: BrokerAdapter) -> OrderPlan:
@@ -79,6 +93,7 @@ def create_order_plan(signal: Signal, state: dict, broker: BrokerAdapter) -> Ord
 
 
 def persist_order(
+    client_id: str,
     local_order_id: str,
     kind: str,
     status: str,
@@ -89,16 +104,19 @@ def persist_order(
 ):
     with conn() as c:
         ts = now_utc_iso()
+        # Include client_id in insert
         run_with_retry(lambda: c.execute(
             """
             INSERT INTO orders (
+                client_id,
                 local_order_id, broker_order_id, position_id, kind, status,
                 symbol, contract, qty, limit_price, filled_qty, retries, last_error,
                 created_ts, updated_ts
             )
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
+                client_id,
                 local_order_id,
                 broker_order_id,
                 None,
@@ -125,7 +143,7 @@ def update_order_row(local_order_id: str, **fields):
     if not fields:
         return
 
-    allowed = {"broker_order_id", "status", "filled_qty", "last_error"}
+    allowed = {"broker_order_id", "status", "filled_qty", "last_error", "position_id"}
     sets = []
     vals = []
     for k, v in fields.items():
@@ -145,19 +163,21 @@ def update_order_row(local_order_id: str, **fields):
         ))
 
 
-def open_position_from_fill(plan: OrderPlan, avg_fill: float) -> str:
+def open_position_from_fill(client_id: str, plan: OrderPlan, avg_fill: float) -> str:
     pos_id = str(uuid.uuid4())
     with conn() as c:
         run_with_retry(lambda: c.execute(
             """
             INSERT INTO positions (
-                id, underlying, contract, direction, qty, avg_fill,
+                id, client_id,
+                underlying, contract, direction, qty, avg_fill,
                 entry_ts, tp_pct, sl_pct, status
             )
-            VALUES (?,?,?,?,?,?,?,?,?,?)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 pos_id,
+                client_id,
                 plan.symbol,
                 plan.contract,
                 plan.direction,
@@ -172,60 +192,71 @@ def open_position_from_fill(plan: OrderPlan, avg_fill: float) -> str:
     return pos_id
 
 
-def process_signal(signal: Signal, broker: BrokerAdapter) -> dict:
-    # Load once
-    state = load_state()
+def process_signal(signal: Signal, broker: BrokerAdapter, client_id: str = DEFAULT_CLIENT_ID) -> dict:
+    """
+    Client-scoped execution.
+    Uses client_state for mode/kill/equity counters.
+    """
+    # Load per-client state
+    state = get_client_state(client_id)
+
+    # Safety: respect client kill switch / read-only mode
+    if int(state.get("kill_switch", 0)) == 1 or (state.get("mode") or "").upper() == "READ_ONLY":
+        return {"ok": False, "reason": "CLIENT_READ_ONLY", "client_id": client_id}
 
     # Refresh equity from broker
-    current_equity = float(state.get("current_equity_last", 10000.0))
     try:
         current_equity = float(broker.get_account_equity())
     except Exception as e:
-        audit("ERROR", "BROKER_EQUITY_FAIL", {"err": str(e)})
-        update_state({"mode": "READ_ONLY"})
-        return {"ok": False, "reason": "BROKER_EQUITY_FAIL", "error": str(e)}
+        audit(client_id, "ERROR", "BROKER_EQUITY_FAIL", {"err": str(e)})
+        # Put this client into READ_ONLY
+        update_client_state(client_id, {"mode": "READ_ONLY"})
+        return {"ok": False, "reason": "BROKER_EQUITY_FAIL", "error": str(e), "client_id": client_id}
 
-    # Update snapshot + persist once
-    state["current_equity_last"] = current_equity
-    update_state({"current_equity_last": current_equity})
+    # Persist equity snapshot to client_state
+    update_client_state(client_id, {"current_equity": current_equity})
 
-    open_positions = count_open_positions()
+    # Build a state dict compatible with your risk module
+    # (risk.py expects keys like current_equity_last / trades_taken_today / daily_stop_hit / kill_switch / mode, etc.)
+    risk_state = {
+        "current_equity_last": current_equity,
+        "trades_taken_today": int(state.get("trades_taken_today", 0)),
+        "daily_stop_hit": bool(int(state.get("daily_stop_hit", 0))),
+        "kill_switch": bool(int(state.get("kill_switch", 0))),
+        "mode": state.get("mode", "PAPER"),
+    }
 
-    # Run gates off the in-memory snapshot (no extra DB load)
-    gates = run_gates(state, open_positions)
+    open_positions = count_open_positions(client_id)
 
-    audit("INFO", "GATES_RESULT", {
+    # Run gates
+    gates = run_gates(risk_state, open_positions)
+
+    audit(client_id, "INFO", "GATES_RESULT", {
         "signal_id": signal.signal_id,
         "ok": gates.ok,
         "reason": gates.reason,
         "details": gates.details,
+        "open_positions": open_positions,
     })
 
     if not gates.ok:
         if gates.reason == "DRAWDOWN_KILL":
-            update_state({"kill_switch": True, "mode": "READ_ONLY"})
-        return {"ok": False, "reason": gates.reason, "details": gates.details}
+            update_client_state(client_id, {"kill_switch": 1, "mode": "READ_ONLY"})
+        return {"ok": False, "reason": gates.reason, "details": gates.details, "client_id": client_id}
 
     # Create order plan (resolve contract)
     try:
-        plan = create_order_plan(signal, state, broker)
-        audit("INFO", "ORDER_PLAN_CREATED", {"signal_id": signal.signal_id, "plan": plan.model_dump()})
+        plan = create_order_plan(signal, risk_state, broker)
+        audit(client_id, "INFO", "ORDER_PLAN_CREATED", {"signal_id": signal.signal_id, "plan": plan.model_dump()})
     except Exception as e:
-        audit("ERROR", "ORDER_PLAN_FAIL", {"signal_id": signal.signal_id, "err": str(e), "trigger": signal.trigger})
-        return {"ok": False, "reason": "ORDER_PLAN_FAIL", "error": str(e)}
-
-    # Reserve equity (position_pct of equity)
-    reserve_amt = plan.position_pct * float(state["current_equity_last"])
-    reserve_equity(reserve_amt)
-    audit("INFO", "EQUITY_RESERVED", {"signal_id": signal.signal_id, "amount": reserve_amt})
+        audit(client_id, "ERROR", "ORDER_PLAN_FAIL", {"signal_id": signal.signal_id, "err": str(e), "trigger": signal.trigger})
+        return {"ok": False, "reason": "ORDER_PLAN_FAIL", "error": str(e), "client_id": client_id}
 
     local_order_id = str(uuid.uuid4())
-    persist_order(local_order_id, "ENTRY", "NEW", plan)
+    persist_order(client_id, local_order_id, "ENTRY", "NEW", plan)
 
     # Execute
     try:
-        # ✅ Tradier needs a side. Default buy_to_open, explicit is safer.
-        # Your TradierBroker.place_order must accept "side" (we patched that).
         resp = broker.place_order(
             plan.symbol,
             plan.contract,
@@ -234,9 +265,8 @@ def process_signal(signal: Signal, broker: BrokerAdapter) -> dict:
             side="buy_to_open"
         )
 
-        audit("INFO", "ORDER_RESPONSE", {"local_order_id": local_order_id, "resp": getattr(resp, "__dict__", str(resp))})
+        audit(client_id, "INFO", "ORDER_RESPONSE", {"local_order_id": local_order_id, "resp": getattr(resp, "__dict__", str(resp))})
 
-        # Always store broker order id + status if present
         update_order_row(
             local_order_id,
             broker_order_id=getattr(resp, "broker_order_id", None),
@@ -245,58 +275,45 @@ def process_signal(signal: Signal, broker: BrokerAdapter) -> dict:
         )
 
         if resp.status == "REJECTED":
-            # release reserve on failure
-            release_equity(reserve_amt)
-            update_order_row(local_order_id, last_error=str(resp.error))
-            audit("ERROR", "ORDER_REJECTED", {"local_order_id": local_order_id, "error": resp.error})
-            return {"ok": False, "reason": "ORDER_REJECTED", "error": resp.error}
+            update_order_row(local_order_id, last_error=str(getattr(resp, "error", "")))
+            audit(client_id, "ERROR", "ORDER_REJECTED", {"local_order_id": local_order_id, "error": getattr(resp, "error", "")})
+            return {"ok": False, "reason": "ORDER_REJECTED", "error": getattr(resp, "error", ""), "client_id": client_id}
 
-        # Tradier returns ACK (not FILLED immediately). Treat ACK as successful submission.
+        # Tradier: ACK is successful submission
         if resp.status == "ACK":
-            # We should count the trade attempt; otherwise gates may allow too many.
-            update_state({"trades_taken_today": int(state.get("trades_taken_today", 0)) + 1})
-
-            # Reserve is only used to prevent over-allocation; once order is out, release it.
-            release_equity(reserve_amt)
-
-            audit("INFO", "ORDER_ACKNOWLEDGED", {
-                "local_order_id": local_order_id,
-                "broker_order_id": resp.broker_order_id
-            })
+            update_client_state(client_id, {"trades_taken_today": int(state.get("trades_taken_today", 0)) + 1})
+            audit(client_id, "INFO", "ORDER_ACKNOWLEDGED", {"local_order_id": local_order_id, "broker_order_id": getattr(resp, "broker_order_id", None)})
             return {
                 "ok": True,
                 "reason": "ORDER_ACK",
                 "local_order_id": local_order_id,
-                "broker_order_id": resp.broker_order_id,
-                "plan": plan.model_dump()
+                "broker_order_id": getattr(resp, "broker_order_id", None),
+                "plan": plan.model_dump(),
+                "client_id": client_id,
             }
 
         # SIM broker can return FILLED/PARTIAL
         if resp.status in ("FILLED", "PARTIAL"):
-            pos_id = open_position_from_fill(plan, resp.avg_fill_price)
-            update_state({"trades_taken_today": int(state.get("trades_taken_today", 0)) + 1})
-            release_equity(reserve_amt)
-
-            # optional: link position id on order row (requires update_order_row extension if you want)
-            audit("INFO", "POSITION_OPENED", {"position_id": pos_id, "plan": plan.model_dump()})
+            pos_id = open_position_from_fill(client_id, plan, resp.avg_fill_price)
+            update_order_row(local_order_id, position_id=pos_id)
+            update_client_state(client_id, {"trades_taken_today": int(state.get("trades_taken_today", 0)) + 1})
+            audit(client_id, "INFO", "POSITION_OPENED", {"position_id": pos_id, "plan": plan.model_dump()})
             return {
                 "ok": True,
                 "position_id": pos_id,
                 "local_order_id": local_order_id,
                 "broker_order_id": getattr(resp, "broker_order_id", None),
-                "plan": plan.model_dump()
+                "plan": plan.model_dump(),
+                "client_id": client_id,
             }
 
         # Unknown status - fail safe
-        update_state({"mode": "READ_ONLY"})
-        release_equity(reserve_amt)
-        update_order_row(local_order_id, last_error=f"UNKNOWN_STATUS:{resp.status}")
-        return {"ok": False, "reason": "UNKNOWN_ORDER_STATUS", "status": resp.status}
+        update_client_state(client_id, {"mode": "READ_ONLY"})
+        update_order_row(local_order_id, last_error=f"UNKNOWN_STATUS:{getattr(resp, 'status', None)}")
+        return {"ok": False, "reason": "UNKNOWN_ORDER_STATUS", "status": getattr(resp, "status", None), "client_id": client_id}
 
     except Exception as e:
-        # Always release reserve on exception
-        release_equity(reserve_amt)
         update_order_row(local_order_id, status="REJECTED", last_error=str(e))
-        audit("ERROR", "EXECUTION_EXCEPTION", {"err": str(e)})
-        update_state({"mode": "READ_ONLY"})
-        return {"ok": False, "reason": "EXECUTION_EXCEPTION", "error": str(e)}
+        audit(client_id, "ERROR", "EXECUTION_EXCEPTION", {"err": str(e)})
+        update_client_state(client_id, {"mode": "READ_ONLY"})
+        return {"ok": False, "reason": "EXECUTION_EXCEPTION", "error": str(e), "client_id": client_id}
