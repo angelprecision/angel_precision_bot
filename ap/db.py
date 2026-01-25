@@ -169,6 +169,8 @@ def init_db():
         c.execute("""
         CREATE TABLE IF NOT EXISTS clients (
             client_id TEXT PRIMARY KEY,
+            api_key TEXT UNIQUE,
+            
             name TEXT NOT NULL,
             broker_type TEXT NOT NULL,           -- 'tradier' or 'ibkr'
             broker_account_id TEXT NOT NULL,
@@ -221,6 +223,7 @@ def init_db():
             c.execute("CREATE INDEX IF NOT EXISTS idx_positions_contract ON positions(contract);")
 
             c.execute("CREATE INDEX IF NOT EXISTS idx_clients_status ON clients(status);")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_clients_api_key ON clients(api_key);")
         except Exception:
             pass
 
