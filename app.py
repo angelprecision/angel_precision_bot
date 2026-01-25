@@ -1,17 +1,19 @@
 # app.py - Angel Precision Bot (Render + gunicorn safe)
-# ✅ Production-safe /signal (HMAC auth + idempotency + rate limit)
-# ✅ Debug endpoints hidden in prod
-# ✅ Gunicorn-safe: no background threads started at import time (starts on first request per worker)
+# ✅ Gunicorn-safe: no threads started at import time (starts on first request per worker)
+# ✅ Production-safe auth: HMAC for /signal + control endpoints (in prod)
+# ✅ Rate limiting + idempotency (in-memory per worker)
+# ✅ Debug endpoints hidden in prod (404)
+# ✅ Health includes safe diagnostics (env + whether signing secret is loaded)
 
 import os
 import time
-import json
 import hmac
 import hashlib
 import threading
 import uuid
 from collections import defaultdict, deque
 from datetime import datetime, timezone
+from functools import wraps
 
 from flask import Flask, request, jsonify
 from pydantic import ValidationError
@@ -24,11 +26,8 @@ from ap.queue import enqueue_signal, worker_loop
 from ap.state import load_state, update_state
 from ap.broker import SimBroker
 
-# Scanner + Tradier
 from ap.parsers import parse_scanner_text
 from ap.brokers.tradier import TradierBroker, TradierConfig
-
-# Exit Manager
 from ap.exit_manager import exit_manager_loop
 
 
@@ -39,18 +38,16 @@ from ap.exit_manager import exit_manager_loop
 cfg = Config()
 log = get_logger("app")
 
-APP_ENV = os.getenv("APP_ENV", "dev").lower()
+APP_ENV = os.getenv("APP_ENV", "dev").lower().strip()  # dev|prod
+SIGNING_SECRET = os.getenv("SIGNING_SECRET", "").encode()  # required in prod for signed endpoints
 
-# HMAC signing secret (required for production /signal)
-SIGNING_SECRET = os.getenv("SIGNING_SECRET", "").encode()
-
-# Rate limiting (in-memory per process). Upgrade to Redis later.
+# Rate limiting (per process / per worker). Upgrade to Redis later.
 _RATE = defaultdict(lambda: deque())
 RATE_LIMIT_PER_MIN = int(os.getenv("RATE_LIMIT_PER_MIN", "60"))
 
-# Idempotency (in-memory per process). Upgrade to DB/Redis later.
+# Idempotency cache (per process / per worker). Upgrade to DB/Redis later.
 _IDEMP = {}
-IDEMP_TTL_SECONDS = int(os.getenv("IDEMP_TTL_SECONDS", "300"))
+IDEMP_TTL_SECONDS = int(os.getenv("IDEMP_TTL_SECONDS", "300"))  # 5 minutes
 
 # Threads
 THREADS_STARTED = False
@@ -58,7 +55,7 @@ THREAD_LOCK = threading.Lock()
 
 
 # ============================================================
-# SECURITY HELPERS
+# SECURITY + UTIL HELPERS
 # ============================================================
 
 def _client_ip() -> str:
@@ -84,7 +81,7 @@ def _idem_cleanup():
         _IDEMP.pop(k, None)
 
 
-def _idem_seen(key: str):
+def _idem_get(key: str):
     if not key:
         return None
     _idem_cleanup()
@@ -92,7 +89,7 @@ def _idem_seen(key: str):
     return hit[1] if hit else None
 
 
-def _idem_store(key: str, payload: dict):
+def _idem_set(key: str, payload: dict):
     if key:
         _IDEMP[key] = (time.time(), payload)
 
@@ -100,9 +97,10 @@ def _idem_store(key: str, payload: dict):
 def _verify_hmac(req) -> bool:
     """
     Client sends:
-      X-AP-Timestamp: unix seconds
+      X-AP-Timestamp: unix seconds (string)
       X-AP-Signature: hex(hmac_sha256(secret, f"{ts}.{raw_body}"))
-    Replay window: ±60s
+
+    Replay window: ±60 seconds
     """
     if not SIGNING_SECRET:
         return False
@@ -126,11 +124,14 @@ def _verify_hmac(req) -> bool:
     return hmac.compare_digest(expected, sig)
 
 
-def _require_prod_auth() -> bool:
-    """Return True if request is authorized (or auth not required)."""
-    if APP_ENV != "prod":
-        return True
-    return _verify_hmac(request)
+def require_hmac(fn):
+    """Require HMAC auth in prod; no-op in dev."""
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        if APP_ENV == "prod" and not _verify_hmac(request):
+            return jsonify({"ok": False, "error": "unauthorized"}), 401
+        return fn(*args, **kwargs)
+    return wrapper
 
 
 # ============================================================
@@ -180,20 +181,15 @@ def start_exit_manager(broker):
 
 
 def start_fill_monitor(broker):
-    """Start fill monitoring thread - THE ACCURACY LAYER!"""
+    """Start fill monitoring thread - THE ACCURACY LAYER! (optional, never fatal)"""
     log.info("Starting fill monitor thread...")
     try:
         from ap.fill_monitor import fill_monitor_loop
     except Exception as e:
-        log.warning(f"⚠️ Fill monitor not started (import failed): {e}")
+        log.warning(f"⚠️ Fill monitor not started: {e}")
         return
 
-    t = threading.Thread(
-        target=fill_monitor_loop,
-        args=(broker,),
-        daemon=True,
-        name="FillMonitorThread"
-    )
+    t = threading.Thread(target=fill_monitor_loop, args=(broker,), daemon=True, name="FillMonitorThread")
     t.start()
     log.info("✅ Fill monitor thread started")
 
@@ -217,7 +213,6 @@ def start_background_threads_once(broker):
 def create_app() -> Flask:
     app = Flask(__name__)
 
-    # --- init (safe on import; executed when gunicorn creates worker and imports)
     log.info("=" * 60)
     log.info("ANGEL PRECISION BOT - STARTING")
     log.info("=" * 60)
@@ -234,18 +229,16 @@ def create_app() -> Flask:
     update_state({"mode": cfg.BOT_MODE})
     log.info("✅ State initialized")
 
-    # Broker per worker
     broker = build_broker()
     app.config["BROKER"] = broker
 
-    # Start background threads on first request (per worker)
     @app.before_request
     def _ensure_threads_started():
         start_background_threads_once(app.config["BROKER"])
 
-    # ============================================================
+    # =========================
     # ROOT / HEALTH / STATE
-    # ============================================================
+    # =========================
 
     @app.get("/")
     def root():
@@ -304,11 +297,12 @@ def create_app() -> Flask:
                 "kill_switch": st.get("kill_switch", False),
                 "heartbeat": st.get("last_heartbeat_ts"),
                 "heartbeat_age_seconds": heartbeat_age,
-                "worker_alive": heartbeat_ok "app_env": APP_ENV,
-             
+                "worker_alive": heartbeat_ok,
+
+                # Safe auth diagnostics (does NOT reveal secret)
+                "app_env": APP_ENV,
                 "signing_secret_loaded": bool(SIGNING_SECRET),
                 "signing_secret_len": len(SIGNING_SECRET) if SIGNING_SECRET else 0,
-
             }), 200 if all_ok else 503
 
         except Exception as e:
@@ -323,19 +317,26 @@ def create_app() -> Flask:
             log.error(f"State retrieval failed: {e}")
             return jsonify({"error": str(e)}), 500
 
+    # =========================
+    # CONTROL (PROTECTED)
+    # =========================
+
     @app.post("/kill_switch/on")
+    @require_hmac
     def kill_on():
         log.warning("🔴 KILL SWITCH ENABLED")
         update_state({"kill_switch": True, "mode": "READ_ONLY"})
         return jsonify({"ok": True, "kill_switch": True, "mode": "READ_ONLY"})
 
     @app.post("/kill_switch/off")
+    @require_hmac
     def kill_off():
         log.info("🟢 KILL SWITCH DISABLED")
         update_state({"kill_switch": False})
         return jsonify({"ok": True, "kill_switch": False})
 
     @app.post("/mode")
+    @require_hmac
     def set_mode():
         body = request.get_json(force=True) or {}
         mode = str(body.get("mode", "")).upper()
@@ -345,35 +346,29 @@ def create_app() -> Flask:
         update_state({"mode": mode})
         return jsonify({"ok": True, "mode": mode})
 
-    # ============================================================
-    # SIGNAL INGESTION (HARDENED)
-    # ============================================================
+    # =========================
+    # SIGNAL INGESTION (PROTECTED IN PROD)
+    # =========================
 
     @app.post("/signal")
+    @require_hmac
     def signal():
         ip = _client_ip()
 
-        # Rate limit BEFORE doing any heavy work
+        # Rate limit first
         if _rate_limited(f"signal:{ip}"):
             return jsonify({"ok": False, "error": "rate_limited"}), 429
 
-        # Require auth in prod
-        if not _require_prod_auth():
-            return jsonify({"ok": False, "error": "unauthorized"}), 401
-
         body = request.get_json(force=True) or {}
 
-        # Idempotency key preference:
-        # 1) signal_id (if present)
-        # 2) Idempotency-Key header
-        # 3) idempotency_key in body
+        # Idempotency (prefer signal_id)
         idem_key = (
             str(body.get("signal_id") or "").strip()
             or request.headers.get("Idempotency-Key", "").strip()
             or str(body.get("idempotency_key") or "").strip()
         )
 
-        cached = _idem_seen(idem_key)
+        cached = _idem_get(idem_key)
         if cached:
             return jsonify(cached), 200
 
@@ -394,7 +389,7 @@ def create_app() -> Flask:
                     "trigger": {"strike": 475.0, "expiry_hint": "Weekly"}
                 }
             }
-            _idem_store(idem_key, payload)
+            _idem_set(idem_key, payload)
             return jsonify(payload), 400
 
         st = load_state()
@@ -405,21 +400,22 @@ def create_app() -> Flask:
                 "mode": st.get("mode"),
                 "kill_switch": st.get("kill_switch", False)
             }
-            _idem_store(idem_key, payload)
+            _idem_set(idem_key, payload)
             return jsonify(payload), 403
 
         enqueue_signal(sig)
         log.info(f"Signal queued: {sig.symbol} {sig.direction} (ip={ip})")
 
         payload = {"ok": True, "queued": True, "signal_id": sig.signal_id}
-        _idem_store(idem_key, payload)
+        _idem_set(idem_key, payload)
         return jsonify(payload), 202
 
     @app.post("/scanner/discord")
+    @require_hmac
     def scanner_discord():
-        # Optional: require auth in prod (recommended)
-        if APP_ENV == "prod" and not _require_prod_auth():
-            return jsonify({"ok": False, "error": "unauthorized"}), 401
+        ip = _client_ip()
+        if _rate_limited(f"scanner:{ip}"):
+            return jsonify({"ok": False, "error": "rate_limited"}), 429
 
         body = request.get_json(silent=True) or {}
         if not body:
@@ -498,22 +494,9 @@ def create_app() -> Flask:
             log.error(f"Failed to parse scanner message: {e}")
             return jsonify({"ok": False, "error": str(e)}), 500
 
-    # ============================================================
+    # =========================
     # UTIL
-    # ============================================================
-
-    @app.get("/tradier/test")
-    def tradier_test():
-        broker = app.config["BROKER"]
-        if cfg.BOT_MODE not in ("PAPER", "LIVE"):
-            return jsonify({"ok": False, "error": "Only available in PAPER/LIVE mode"}), 400
-        try:
-            equity = broker.get_account_equity()
-            log.info(f"Tradier test successful: equity=${equity}")
-            return jsonify({"ok": True, "equity": equity})
-        except Exception as e:
-            log.error(f"Tradier test failed: {e}")
-            return jsonify({"ok": False, "error": str(e)}), 500
+    # =========================
 
     @app.get("/dashboard")
     def dashboard():
@@ -542,6 +525,7 @@ def create_app() -> Flask:
             return jsonify({"error": str(e)}), 500
 
     @app.post("/reset_equity")
+    @require_hmac
     def reset_equity():
         broker = app.config["BROKER"]
         try:
@@ -560,11 +544,26 @@ def create_app() -> Flask:
             log.error(f"Equity reset failed: {e}")
             return jsonify({"ok": False, "error": str(e)}), 500
 
-    # ============================================================
+    @app.get("/tradier/test")
+    @require_hmac
+    def tradier_test():
+        broker = app.config["BROKER"]
+        if cfg.BOT_MODE not in ("PAPER", "LIVE"):
+            return jsonify({"ok": False, "error": "Only available in PAPER/LIVE mode"}), 400
+        try:
+            equity = broker.get_account_equity()
+            log.info(f"Tradier test successful: equity=${equity}")
+            return jsonify({"ok": True, "equity": equity})
+        except Exception as e:
+            log.error(f"Tradier test failed: {e}")
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    # =========================
     # REPORTING
-    # ============================================================
+    # =========================
 
     @app.get("/report/orders")
+    @require_hmac
     def report_orders():
         limit = int(request.args.get("limit", "200"))
         status = request.args.get("status")
@@ -582,6 +581,7 @@ def create_app() -> Flask:
         return jsonify({"ok": True, "count": len(rows), "orders": [dict(r) for r in rows]})
 
     @app.get("/report/positions")
+    @require_hmac
     def report_positions():
         status = str(request.args.get("status", "OPEN")).upper()
         limit = int(request.args.get("limit", "200"))
@@ -603,6 +603,7 @@ def create_app() -> Flask:
         return jsonify({"ok": True, "count": len(rows), "positions": [dict(r) for r in rows]})
 
     @app.get("/report/audit")
+    @require_hmac
     def report_audit():
         limit = int(request.args.get("limit", "200"))
         level = request.args.get("level")
@@ -627,6 +628,7 @@ def create_app() -> Flask:
         return jsonify({"ok": True, "count": len(rows), "events": [dict(r) for r in rows]})
 
     @app.get("/report/summary")
+    @require_hmac
     def report_summary():
         try:
             with conn() as c:
@@ -655,9 +657,9 @@ def create_app() -> Flask:
         except Exception as e:
             return jsonify({"ok": False, "error": str(e)}), 500
 
-    # ============================================================
-    # DEBUG & CONTROL
-    # ============================================================
+    # =========================
+    # DEBUG (HIDDEN IN PROD)
+    # =========================
 
     @app.get("/debug/order/<order_id>")
     def debug_order(order_id):
@@ -675,7 +677,6 @@ def create_app() -> Flask:
             return jsonify({"ok": False, "error": "not_found"}), 404
 
         body = request.get_json(force=True) or {}
-
         symbol = (body.get("symbol", "SPY") or "SPY").upper().strip()
         direction = (body.get("direction", "CALL") or "CALL").upper().strip()
         strike = body.get("strike")
@@ -685,12 +686,7 @@ def create_app() -> Flask:
             return jsonify({
                 "ok": False,
                 "error": "Missing strike price",
-                "example": {
-                    "symbol": "AAPL",
-                    "direction": "CALL",
-                    "strike": 240,
-                    "expiry_hint": "Weekly"
-                }
+                "example": {"symbol": "AAPL", "direction": "CALL", "strike": 240, "expiry_hint": "Weekly"}
             }), 400
 
         try:
@@ -712,23 +708,18 @@ def create_app() -> Flask:
                     "pt3": 0
                 }
             )
-
             enqueue_signal(sig)
-            log.info(f"Manual test signal queued: {symbol} {direction} {strike}")
-
-            return jsonify({
-                "ok": True,
-                "message": "Test signal queued",
-                "signal_id": sig.signal_id,
-                "symbol": symbol,
-                "direction": direction,
-                "strike": strike
-            })
+            return jsonify({"ok": True, "queued": True, "signal_id": sig.signal_id})
         except Exception as e:
             log.error(f"Test signal failed: {e}")
             return jsonify({"ok": False, "error": str(e)}), 500
 
+    # =========================
+    # MONITOR
+    # =========================
+
     @app.get("/monitor/positions")
+    @require_hmac
     def monitor_positions():
         broker = app.config["BROKER"]
         try:
@@ -742,7 +733,6 @@ def create_app() -> Flask:
                 """).fetchall()
 
             positions = []
-
             for row in rows:
                 pos = dict(row)
                 try:
@@ -773,31 +763,35 @@ def create_app() -> Flask:
                         "exit_reason": pos.get("exit_reason")
                     })
                 except Exception as e:
-                    log.error(f"Failed to get price for {pos['contract']}: {e}")
+                    log.error(f"Failed to get price for {pos.get('contract')}: {e}")
                     positions.append({
-                        "position_id": pos["id"],
-                        "contract": pos["contract"],
-                        "status": pos["status"],
+                        "position_id": pos.get("id"),
+                        "contract": pos.get("contract"),
+                        "status": pos.get("status"),
                         "error": "Price unavailable"
                     })
 
-            state = load_state()
-
+            state_now = load_state()
             return jsonify({
                 "ok": True,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
-                "mode": state.get("mode"),
-                "kill_switch": state.get("kill_switch"),
+                "mode": state_now.get("mode"),
+                "kill_switch": state_now.get("kill_switch"),
                 "positions": positions,
                 "total_unrealized_pnl": sum(p.get("unrealized_pnl", 0) for p in positions),
-                "realized_pnl_today": state.get("realized_pnl_today", 0)
+                "realized_pnl_today": state_now.get("realized_pnl_today", 0)
             })
 
         except Exception as e:
             log.error(f"Position monitor failed: {e}")
             return jsonify({"ok": False, "error": str(e)}), 500
 
+    # =========================
+    # CONTROL (TRADING ACTIONS) - PROTECTED
+    # =========================
+
     @app.post("/control/force_exit/<position_id>")
+    @require_hmac
     def force_exit_position(position_id: str):
         broker = app.config["BROKER"]
         try:
@@ -808,18 +802,12 @@ def create_app() -> Flask:
                 ).fetchone()
 
             if not pos_row:
-                return jsonify({
-                    "ok": False,
-                    "error": f"Position {position_id} not found or already closed"
-                }), 404
+                return jsonify({"ok": False, "error": f"Position {position_id} not found or already closed"}), 404
 
             pos = dict(pos_row)
 
             with conn() as c:
-                c.execute(
-                    "UPDATE positions SET status='CLOSING', exit_reason='MANUAL_EXIT' WHERE id=?",
-                    (position_id,)
-                )
+                c.execute("UPDATE positions SET status='CLOSING', exit_reason='MANUAL_EXIT' WHERE id=?", (position_id,))
 
             from ap.db import insert_order, update_order, new_local_order_id
             local_order_id = new_local_order_id()
@@ -865,6 +853,7 @@ def create_app() -> Flask:
             return jsonify({"ok": False, "error": str(e)}), 500
 
     @app.post("/control/flatten_all")
+    @require_hmac
     def flatten_all_positions():
         broker = app.config["BROKER"]
         try:
@@ -881,10 +870,7 @@ def create_app() -> Flask:
             for pos in positions:
                 try:
                     with conn() as c:
-                        c.execute(
-                            "UPDATE positions SET status='CLOSING', exit_reason='FLATTEN_ALL' WHERE id=?",
-                            (pos["id"],)
-                        )
+                        c.execute("UPDATE positions SET status='CLOSING', exit_reason='FLATTEN_ALL' WHERE id=?", (pos["id"],))
 
                     from ap.db import insert_order, update_order, new_local_order_id
                     local_order_id = new_local_order_id()
@@ -913,18 +899,10 @@ def create_app() -> Flask:
 
                     update_order(local_order_id, status=status, broker_order_id=broker_order_id)
 
-                    closed.append({
-                        "position_id": pos["id"],
-                        "contract": pos["contract"],
-                        "order_id": broker_order_id
-                    })
+                    closed.append({"position_id": pos["id"], "contract": pos["contract"], "order_id": broker_order_id})
 
                 except Exception as e:
-                    failed.append({
-                        "position_id": pos["id"],
-                        "contract": pos["contract"],
-                        "error": str(e)
-                    })
+                    failed.append({"position_id": pos.get("id"), "contract": pos.get("contract"), "error": str(e)})
 
             log.warning(f"🚨 FLATTEN ALL: {len(closed)} positions, {len(failed)} failed")
 
@@ -945,7 +923,7 @@ def create_app() -> Flask:
     return app
 
 
-# gunicorn entrypoint
+# Gunicorn entrypoint
 app = create_app()
 
 
@@ -953,3 +931,5 @@ if __name__ == "__main__":
     port = int(os.getenv("PORT", "5000"))
     log.info(f"Starting Flask dev server on port {port}")
     app.run(host="0.0.0.0", port=port, debug=False)
+
+    
