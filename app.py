@@ -527,6 +527,15 @@ def start_exit_manager():
     log.info("✅ Exit manager thread started")
 
 
+def start_fill_monitor():
+    """Start fill monitoring thread - THE ACCURACY LAYER!"""
+    log.info("Starting fill monitor thread...")
+    from ap.fill_monitor import fill_monitor_loop
+    t = threading.Thread(target=fill_monitor_loop, args=(BROKER,), daemon=True, name="FillMonitorThread")
+    t.start()
+    log.info("✅ Fill monitor thread started")
+
+
 def start_background_threads_once():
     global THREADS_STARTED
     with THREAD_LOCK:
@@ -535,6 +544,7 @@ def start_background_threads_once():
             return
         start_worker()
         start_exit_manager()
+        start_fill_monitor()  # ← THE CRITICAL ADDITION!
         THREADS_STARTED = True
 
 
