@@ -1,12 +1,15 @@
 # app.py - Angel Precision Bot (Render + gunicorn safe)
+
 import os
 import threading
 import uuid
 from datetime import datetime, timezone
+
 from flask import Flask, request, jsonify
 from pydantic import ValidationError
+
 from ap.config import Config
-from ap.db import init_db
+from ap.db import init_db, conn
 from ap.logger import get_logger
 from ap.models import Signal
 from ap.queue import enqueue_signal, worker_loop
@@ -62,7 +65,7 @@ BROKER = build_broker()
 
 
 # =========================
-# HEALTH & STATE ENDPOINTS
+# ROOT / HEALTH / STATE
 # =========================
 
 @app.get("/")
@@ -82,6 +85,9 @@ def root():
                 "positions": "/report/positions",
                 "audit": "/report/audit",
                 "summary": "/report/summary"
+            },
+            "debug": {
+                "order": "/debug/order/<order_id>"
             }
         }
     })
@@ -148,10 +154,25 @@ def set_mode():
     mode = str(body.get("mode", "")).upper()
     if mode not in ("SIM", "PAPER", "LIVE", "READ_ONLY"):
         return jsonify({"ok": False, "error": "Invalid mode"}), 400
-
     log.info(f"Mode changed to: {mode}")
     update_state({"mode": mode})
     return jsonify({"ok": True, "mode": mode})
+
+
+# =========================
+# DEBUG (TEMP FOR BETA)
+# =========================
+
+@app.get("/debug/order/<order_id>")
+def debug_order(order_id):
+    """
+    Helps us see Tradier raw order payload for reconciliation.
+    Keep during beta. Remove later.
+    """
+    try:
+        return jsonify({"ok": True, "order": BROKER.get_order(order_id)})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
 # =========================
@@ -264,11 +285,14 @@ def scanner_discord():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
+# =========================
+# UTIL
+# =========================
+
 @app.get("/tradier/test")
 def tradier_test():
     if cfg.BOT_MODE not in ("PAPER", "LIVE"):
         return jsonify({"ok": False, "error": "Only available in PAPER/LIVE mode"}), 400
-
     try:
         equity = BROKER.get_account_equity()
         log.info(f"Tradier test successful: equity=${equity}")
@@ -282,14 +306,12 @@ def tradier_test():
 def dashboard():
     try:
         st = load_state()
-        from ap.db import conn
-
         with conn() as c:
             pos_row = c.execute("SELECT COUNT(*) as n FROM positions WHERE status='OPEN'").fetchone()
-            open_positions = pos_row["n"] if pos_row else 0
+            open_positions = int(pos_row["n"]) if pos_row else 0
 
             queue_row = c.execute("SELECT COUNT(*) as n FROM trade_queue WHERE status='NEW'").fetchone()
-            pending_signals = queue_row["n"] if queue_row else 0
+            pending_signals = int(queue_row["n"]) if queue_row else 0
 
         return jsonify({
             "status": "healthy" if not st.get("kill_switch") else "stopped",
@@ -327,175 +349,92 @@ def reset_equity():
 
 
 # =========================
-# REPORTING ENDPOINTS
+# REPORTING
 # =========================
 
 @app.get("/report/orders")
 def report_orders():
-    """Get all orders with full details"""
-    try:
-        from ap.db import conn
-        
-        limit = request.args.get("limit", 50, type=int)
-        status_filter = request.args.get("status")
-        
-        with conn() as c:
-            if status_filter:
-                rows = c.execute("""
-                    SELECT * FROM orders 
-                    WHERE status=?
-                    ORDER BY created_ts DESC 
-                    LIMIT ?
-                """, (status_filter, limit)).fetchall()
-            else:
-                rows = c.execute("""
-                    SELECT * FROM orders 
-                    ORDER BY created_ts DESC 
-                    LIMIT ?
-                """, (limit,)).fetchall()
-        
-        orders = [dict(r) for r in rows]
-        
-        with conn() as c:
-            stats = c.execute("""
-                SELECT 
-                    status,
-                    COUNT(*) as count
-                FROM orders
-                GROUP BY status
-            """).fetchall()
-        
-        summary = {row["status"]: row["count"] for row in stats}
-        
-        return jsonify({
-            "ok": True,
-            "count": len(orders),
-            "summary": summary,
-            "orders": orders
-        })
-    except Exception as e:
-        log.error(f"Report orders failed: {e}")
-        return jsonify({"ok": False, "error": str(e)}), 500
+    limit = int(request.args.get("limit", "200"))
+    status = request.args.get("status")  # optional
+    with conn() as c:
+        if status:
+            rows = c.execute(
+                "SELECT * FROM orders WHERE status=? ORDER BY created_ts DESC LIMIT ?",
+                (status, limit)
+            ).fetchall()
+        else:
+            rows = c.execute(
+                "SELECT * FROM orders ORDER BY created_ts DESC LIMIT ?",
+                (limit,)
+            ).fetchall()
+    return jsonify({"ok": True, "count": len(rows), "orders": [dict(r) for r in rows]})
 
 
 @app.get("/report/positions")
 def report_positions():
-    """Get all positions with full details"""
-    try:
-        from ap.db import conn
-        
-        status_filter = request.args.get("status", "OPEN")
-        
-        with conn() as c:
-            if status_filter == "ALL":
-                rows = c.execute("""
-                    SELECT * FROM positions 
-                    ORDER BY entry_ts DESC
-                """).fetchall()
-            else:
-                rows = c.execute("""
-                    SELECT * FROM positions 
-                    WHERE status=?
-                    ORDER BY entry_ts DESC
-                """, (status_filter,)).fetchall()
-        
-        positions = [dict(r) for r in rows]
-        
-        total_pnl = sum(float(p.get("realized_pnl") or 0) for p in positions if p.get("status") == "CLOSED")
-        
-        return jsonify({
-            "ok": True,
-            "count": len(positions),
-            "total_realized_pnl": total_pnl,
-            "positions": positions
-        })
-    except Exception as e:
-        log.error(f"Report positions failed: {e}")
-        return jsonify({"ok": False, "error": str(e)}), 500
+    status = str(request.args.get("status", "OPEN")).upper()
+    limit = int(request.args.get("limit", "200"))
+    if status not in ("ALL", "OPEN", "CLOSING", "CLOSED"):
+        return jsonify({"ok": False, "error": "status must be ALL|OPEN|CLOSING|CLOSED"}), 400
+
+    with conn() as c:
+        if status == "ALL":
+            rows = c.execute(
+                "SELECT * FROM positions ORDER BY entry_ts DESC LIMIT ?",
+                (limit,)
+            ).fetchall()
+        else:
+            rows = c.execute(
+                "SELECT * FROM positions WHERE status=? ORDER BY entry_ts DESC LIMIT ?",
+                (status, limit)
+            ).fetchall()
+
+    return jsonify({"ok": True, "count": len(rows), "positions": [dict(r) for r in rows]})
 
 
 @app.get("/report/audit")
 def report_audit():
-    """Get recent audit log events"""
-    try:
-        from ap.db import conn
-        import json as json_lib
-        
-        limit = request.args.get("limit", 100, type=int)
-        event_filter = request.args.get("event")
-        level_filter = request.args.get("level")
-        
-        with conn() as c:
-            sql = "SELECT * FROM audit_log WHERE 1=1"
-            params = []
-            
-            if event_filter:
-                sql += " AND event=?"
-                params.append(event_filter)
-            
-            if level_filter:
-                sql += " AND level=?"
-                params.append(level_filter)
-            
-            sql += " ORDER BY id DESC LIMIT ?"
-            params.append(limit)
-            
-            rows = c.execute(sql, params).fetchall()
-        
-        events = []
-        for r in rows:
-            event = dict(r)
-            try:
-                event["payload"] = json_lib.loads(event["payload"])
-            except:
-                pass
-            events.append(event)
-        
-        return jsonify({
-            "ok": True,
-            "count": len(events),
-            "events": events
-        })
-    except Exception as e:
-        log.error(f"Report audit failed: {e}")
-        return jsonify({"ok": False, "error": str(e)}), 500
+    limit = int(request.args.get("limit", "200"))
+    level = request.args.get("level")
+    event = request.args.get("event")
+
+    sql = "SELECT * FROM audit_log WHERE 1=1"
+    params = []
+
+    if level:
+        sql += " AND level=?"
+        params.append(level)
+    if event:
+        sql += " AND event=?"
+        params.append(event)
+
+    sql += " ORDER BY id DESC LIMIT ?"
+    params.append(limit)
+
+    with conn() as c:
+        rows = c.execute(sql, params).fetchall()
+
+    return jsonify({"ok": True, "count": len(rows), "events": [dict(r) for r in rows]})
 
 
 @app.get("/report/summary")
 def report_summary():
-    """Get overall bot health summary"""
     try:
-        from ap.db import conn
-        
         with conn() as c:
-            order_stats = c.execute("""
-                SELECT status, COUNT(*) as count
-                FROM orders
-                GROUP BY status
-            """).fetchall()
-            
-            pos_stats = c.execute("""
-                SELECT status, COUNT(*) as count
-                FROM positions
-                GROUP BY status
-            """).fetchall()
-            
-            queue_stats = c.execute("""
-                SELECT status, COUNT(*) as count
-                FROM trade_queue
-                GROUP BY status
-            """).fetchall()
-            
+            order_stats = c.execute("SELECT status, COUNT(*) as count FROM orders GROUP BY status").fetchall()
+            pos_stats = c.execute("SELECT status, COUNT(*) as count FROM positions GROUP BY status").fetchall()
+            queue_stats = c.execute("SELECT status, COUNT(*) as count FROM trade_queue GROUP BY status").fetchall()
+
             errors = c.execute("""
                 SELECT event, COUNT(*) as count
                 FROM audit_log
                 WHERE level='ERROR'
-                AND ts > datetime('now', '-1 day')
+                  AND ts > datetime('now', '-1 day')
                 GROUP BY event
             """).fetchall()
-        
+
         state = load_state()
-        
+
         return jsonify({
             "ok": True,
             "state": state,
@@ -505,7 +444,6 @@ def report_summary():
             "recent_errors": {row["event"]: row["count"] for row in errors}
         })
     except Exception as e:
-        log.error(f"Report summary failed: {e}")
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
@@ -527,15 +465,6 @@ def start_exit_manager():
     log.info("✅ Exit manager thread started")
 
 
-def start_fill_monitor():
-    """Start fill monitoring thread - THE ACCURACY LAYER!"""
-    log.info("Starting fill monitor thread...")
-    from ap.fill_monitor import fill_monitor_loop
-    t = threading.Thread(target=fill_monitor_loop, args=(BROKER,), daemon=True, name="FillMonitorThread")
-    t.start()
-    log.info("✅ Fill monitor thread started")
-
-
 def start_background_threads_once():
     global THREADS_STARTED
     with THREAD_LOCK:
@@ -544,7 +473,6 @@ def start_background_threads_once():
             return
         start_worker()
         start_exit_manager()
-        start_fill_monitor()  # ← THE CRITICAL ADDITION!
         THREADS_STARTED = True
 
 
