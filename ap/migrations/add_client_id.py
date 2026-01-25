@@ -7,6 +7,8 @@ import sqlite3
 import json
 from ap.config import Config
 from ap.utils import now_utc_iso
+from ap.auth import generate_api_key
+from ap.crypto import encrypt_token
 
 cfg = Config()
 
@@ -110,6 +112,12 @@ def migrate():
             else:
                 current_equity = 100000.0
 
+            # Generate API key for default client
+            default_api_key = generate_api_key("ak")
+            
+            # Encrypt the Tradier token
+            encrypted_token = encrypt_token(cfg.TRADIER_ACCESS_TOKEN)
+
             conn.execute("""
             INSERT INTO clients (
                 client_id, api_key, name, broker_type, broker_account_id, broker_token,
@@ -117,12 +125,12 @@ def migrate():
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 "default",
-                None,  # default client has no api_key; you can set one later
+                default_api_key,  # Generated API key
                 "Default Account",
                 "tradier",
-                "REPLACE_ME",
-                "REPLACE_ME",
-                "https://sandbox.tradier.com",
+                cfg.TRADIER_ACCOUNT_ID,  # Real account ID from env
+                encrypted_token,  # Encrypted token
+                cfg.TRADIER_BASE_URL or "https://sandbox.tradier.com",
                 current_equity,
                 "ACTIVE",
                 now_utc_iso()
@@ -141,7 +149,8 @@ def migrate():
                 "PAPER"
             ))
 
-            print("  ✅ Default client created")
+            print(f"  ✅ Default client created with API key: {default_api_key}")
+            print(f"  ⚠️  SAVE THIS API KEY - you won't see it again!")
         else:
             print("  ↳ Default client already exists")
 
@@ -158,4 +167,3 @@ def migrate():
 
 if __name__ == "__main__":
     migrate()
-
