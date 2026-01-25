@@ -87,7 +87,15 @@ def root():
                 "summary": "/report/summary"
             },
             "debug": {
-                "order": "/debug/order/<order_id>"
+                "order": "/debug/order/<order_id>",
+                "test_signal": "POST /debug/test_signal"
+            },
+            "monitor": {
+                "positions": "/monitor/positions"
+            },
+            "control": {
+                "force_exit": "POST /control/force_exit/<position_id>",
+                "flatten_all": "POST /control/flatten_all"
             }
         }
     })
@@ -157,22 +165,6 @@ def set_mode():
     log.info(f"Mode changed to: {mode}")
     update_state({"mode": mode})
     return jsonify({"ok": True, "mode": mode})
-
-
-# =========================
-# DEBUG (TEMP FOR BETA)
-# =========================
-
-@app.get("/debug/order/<order_id>")
-def debug_order(order_id):
-    """
-    Helps us see Tradier raw order payload for reconciliation.
-    Keep during beta. Remove later.
-    """
-    try:
-        return jsonify({"ok": True, "order": BROKER.get_order(order_id)})
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
 
 
 # =========================
@@ -355,7 +347,7 @@ def reset_equity():
 @app.get("/report/orders")
 def report_orders():
     limit = int(request.args.get("limit", "200"))
-    status = request.args.get("status")  # optional
+    status = request.args.get("status")
     with conn() as c:
         if status:
             rows = c.execute(
@@ -448,6 +440,316 @@ def report_summary():
 
 
 # =========================
+# DEBUG & CONTROL
+# =========================
+
+@app.get("/debug/order/<order_id>")
+def debug_order(order_id):
+    """Raw Tradier order data for debugging"""
+    try:
+        return jsonify({"ok": True, "order": BROKER.get_order(order_id)})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.post("/debug/test_signal")
+def debug_test_signal():
+    """Submit manual test signal for testing"""
+    body = request.get_json(force=True) or {}
+    
+    symbol = body.get("symbol", "SPY")
+    direction = body.get("direction", "CALL")
+    strike = body.get("strike")
+    expiry_hint = body.get("expiry_hint", "Weekly")
+    
+    if not strike:
+        return jsonify({
+            "ok": False,
+            "error": "Missing strike price",
+            "example": {
+                "symbol": "AAPL",
+                "direction": "CALL",
+                "strike": 240,
+                "expiry_hint": "Weekly"
+            }
+        }), 400
+    
+    try:
+        sig = Signal(
+            signal_id=str(uuid.uuid4()),
+            symbol=symbol,
+            direction=direction.upper(),
+            pattern_id="MANUAL_TEST",
+            confidence_tag="test",
+            timestamp_iso=datetime.now(timezone.utc).isoformat(),
+            trigger={
+                "source": "manual_test",
+                "strike": float(strike),
+                "expiry_hint": expiry_hint,
+                "entry": 0,
+                "stop": 0,
+                "pt1": 0,
+                "pt2": 0,
+                "pt3": 0
+            }
+        )
+        
+        enqueue_signal(sig)
+        log.info(f"Manual test signal queued: {symbol} {direction} {strike}")
+        
+        return jsonify({
+            "ok": True,
+            "message": "Test signal queued",
+            "signal_id": sig.signal_id,
+            "symbol": symbol,
+            "direction": direction,
+            "strike": strike
+        })
+        
+    except Exception as e:
+        log.error(f"Test signal failed: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.get("/monitor/positions")
+def monitor_positions():
+    """Real-time position monitoring with current prices and P&L"""
+    try:
+        from ap.contract_pricing import get_contract_price
+        
+        # Get all open/closing positions
+        with conn() as c:
+            rows = c.execute("""
+                SELECT * FROM positions 
+                WHERE status IN ('OPEN', 'CLOSING')
+                ORDER BY entry_ts DESC
+            """).fetchall()
+        
+        positions = []
+        
+        for row in rows:
+            pos = dict(row)
+            
+            try:
+                # Get current market price
+                current_price = get_contract_price(BROKER, pos["contract"], side="SELL")
+                
+                # Calculate unrealized P&L
+                entry_price = float(pos["avg_fill"])
+                qty = int(pos["qty"])
+                unrealized_pnl = (current_price - entry_price) * qty * 100
+                
+                # Calculate TP/SL levels
+                tp_price = entry_price * (1.0 + float(pos["tp_pct"]))
+                sl_price = entry_price * (1.0 - float(pos["sl_pct"]))
+                
+                # Distance to targets
+                to_tp_pct = ((tp_price - current_price) / current_price) * 100 if current_price > 0 else 0
+                to_sl_pct = ((current_price - sl_price) / current_price) * 100 if current_price > 0 else 0
+                
+                positions.append({
+                    "position_id": pos["id"],
+                    "contract": pos["contract"],
+                    "status": pos["status"],
+                    "qty": qty,
+                    "entry_price": entry_price,
+                    "current_price": current_price,
+                    "unrealized_pnl": unrealized_pnl,
+                    "tp_price": tp_price,
+                    "sl_price": sl_price,
+                    "to_tp_pct": to_tp_pct,
+                    "to_sl_pct": to_sl_pct,
+                    "entry_ts": pos["entry_ts"],
+                    "exit_reason": pos.get("exit_reason")
+                })
+                
+            except Exception as e:
+                log.error(f"Failed to get price for {pos['contract']}: {e}")
+                positions.append({
+                    "position_id": pos["id"],
+                    "contract": pos["contract"],
+                    "status": pos["status"],
+                    "error": "Price unavailable"
+                })
+        
+        # Get state
+        state = load_state()
+        
+        return jsonify({
+            "ok": True,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "mode": state.get("mode"),
+            "kill_switch": state.get("kill_switch"),
+            "positions": positions,
+            "total_unrealized_pnl": sum(p.get("unrealized_pnl", 0) for p in positions),
+            "realized_pnl_today": state.get("realized_pnl_today", 0)
+        })
+        
+    except Exception as e:
+        log.error(f"Position monitor failed: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.post("/control/force_exit/<position_id>")
+def force_exit_position(position_id: str):
+    """Manually force exit a position"""
+    try:
+        # Get position
+        with conn() as c:
+            pos_row = c.execute(
+                "SELECT * FROM positions WHERE id=? AND status IN ('OPEN', 'CLOSING')",
+                (position_id,)
+            ).fetchone()
+        
+        if not pos_row:
+            return jsonify({
+                "ok": False,
+                "error": f"Position {position_id} not found or already closed"
+            }), 404
+        
+        pos = dict(pos_row)
+        
+        # Mark as CLOSING
+        with conn() as c:
+            c.execute(
+                "UPDATE positions SET status='CLOSING', exit_reason='MANUAL_EXIT' WHERE id=?",
+                (position_id,)
+            )
+        
+        # Create exit order
+        from ap.db import insert_order, update_order, new_local_order_id
+        local_order_id = new_local_order_id()
+        
+        insert_order(
+            local_order_id=local_order_id,
+            position_id=position_id,
+            kind="EXIT",
+            status="NEW",
+            symbol=pos["underlying"],
+            contract=pos["contract"],
+            qty=int(pos["qty"]),
+            limit_price=None
+        )
+        
+        # Submit exit order
+        resp = BROKER.place_order(
+            symbol=pos["underlying"],
+            contract=pos["contract"],
+            qty=int(pos["qty"]),
+            limit_price=None,
+            side="sell_to_close"
+        )
+        
+        broker_order_id = getattr(resp, "broker_order_id", None)
+        status = getattr(resp, "status", None)
+        
+        # Update order
+        update_order(local_order_id, status=status, broker_order_id=broker_order_id)
+        
+        log.warning(f"🚨 MANUAL EXIT: {pos['contract']} by user request")
+        
+        return jsonify({
+            "ok": True,
+            "message": "Manual exit order submitted",
+            "position_id": position_id,
+            "contract": pos["contract"],
+            "local_order_id": local_order_id,
+            "broker_order_id": broker_order_id,
+            "status": status
+        })
+        
+    except Exception as e:
+        log.error(f"Force exit failed: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.post("/control/flatten_all")
+def flatten_all_positions():
+    """EMERGENCY: Close all positions immediately"""
+    try:
+        # Get all open positions
+        with conn() as c:
+            rows = c.execute(
+                "SELECT * FROM positions WHERE status='OPEN'"
+            ).fetchall()
+        
+        positions = [dict(r) for r in rows]
+        
+        if not positions:
+            return jsonify({
+                "ok": True,
+                "message": "No open positions to close",
+                "closed": 0
+            })
+        
+        closed = []
+        failed = []
+        
+        for pos in positions:
+            try:
+                # Mark CLOSING
+                with conn() as c:
+                    c.execute(
+                        "UPDATE positions SET status='CLOSING', exit_reason='FLATTEN_ALL' WHERE id=?",
+                        (pos["id"],)
+                    )
+                
+                # Create and submit exit order
+                from ap.db import insert_order, update_order, new_local_order_id
+                local_order_id = new_local_order_id()
+                
+                insert_order(
+                    local_order_id=local_order_id,
+                    position_id=pos["id"],
+                    kind="EXIT",
+                    status="NEW",
+                    symbol=pos["underlying"],
+                    contract=pos["contract"],
+                    qty=int(pos["qty"]),
+                    limit_price=None
+                )
+                
+                resp = BROKER.place_order(
+                    symbol=pos["underlying"],
+                    contract=pos["contract"],
+                    qty=int(pos["qty"]),
+                    limit_price=None,
+                    side="sell_to_close"
+                )
+                
+                broker_order_id = getattr(resp, "broker_order_id", None)
+                status = getattr(resp, "status", None)
+                
+                update_order(local_order_id, status=status, broker_order_id=broker_order_id)
+                
+                closed.append({
+                    "position_id": pos["id"],
+                    "contract": pos["contract"],
+                    "order_id": broker_order_id
+                })
+                
+            except Exception as e:
+                failed.append({
+                    "position_id": pos["id"],
+                    "contract": pos["contract"],
+                    "error": str(e)
+                })
+        
+        log.warning(f"🚨 FLATTEN ALL: {len(closed)} positions, {len(failed)} failed")
+        
+        return jsonify({
+            "ok": True,
+            "message": f"Submitted exit orders for {len(closed)} positions",
+            "closed": closed,
+            "failed": failed
+        })
+        
+    except Exception as e:
+        log.error(f"Flatten all failed: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+# =========================
 # WORKER THREADS
 # =========================
 
@@ -465,6 +767,15 @@ def start_exit_manager():
     log.info("✅ Exit manager thread started")
 
 
+def start_fill_monitor():
+    """Start fill monitoring thread - THE ACCURACY LAYER!"""
+    log.info("Starting fill monitor thread...")
+    from ap.fill_monitor import fill_monitor_loop
+    t = threading.Thread(target=fill_monitor_loop, args=(BROKER,), daemon=True, name="FillMonitorThread")
+    t.start()
+    log.info("✅ Fill monitor thread started")
+
+
 def start_background_threads_once():
     global THREADS_STARTED
     with THREAD_LOCK:
@@ -473,6 +784,7 @@ def start_background_threads_once():
             return
         start_worker()
         start_exit_manager()
+        start_fill_monitor()  # ← CRITICAL FIX!
         THREADS_STARTED = True
 
 
