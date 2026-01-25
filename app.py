@@ -239,7 +239,7 @@ def create_app() -> Flask:
     def _ensure_threads_started():
         start_background_threads_once(app.config["BROKER"])
 
-     # Register multi-client blueprints
+    # Register multi-client blueprints
     app.register_blueprint(client_bp)
     app.register_blueprint(admin_bp)
 
@@ -550,17 +550,19 @@ def create_app() -> Flask:
         except Exception as e:
             log.error(f"Equity reset failed: {e}")
             return jsonify({"ok": False, "error": str(e)}), 500
+
     @app.post("/admin/migrate")
-@require_hmac
-def run_migration():
-    """Run multi-client database migration"""
-    try:
-        from ap.migrations.add_client_id import migrate
-        migrate()
-        return jsonify({"ok": True, "message": "Migration completed successfully"})
-    except Exception as e:
-        log.error(f"Migration failed: {e}")
-        return jsonify({"ok": False, "error": str(e)}), 500
+    @require_hmac
+    def run_migration():
+        """Run multi-client database migration"""
+        try:
+            from ap.migrations.add_clients import migrate
+            migrate()
+            return jsonify({"ok": True, "message": "Migration completed successfully"})
+        except Exception as e:
+            log.error(f"Migration failed: {e}")
+            return jsonify({"ok": False, "error": str(e)}), 500
+
     @app.get("/tradier/test")
     @require_hmac
     def tradier_test():
@@ -948,5 +950,3 @@ if __name__ == "__main__":
     port = int(os.getenv("PORT", "5000"))
     log.info(f"Starting Flask dev server on port {port}")
     app.run(host="0.0.0.0", port=port, debug=False)
-
-    
