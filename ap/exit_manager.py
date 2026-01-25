@@ -13,7 +13,7 @@ from ap.broker import BrokerAdapter
 log = get_logger("ap.exit")
 
 NY = ZoneInfo("America/New_York")
-OPT_MULTIPLIER = 100
+
 
 def audit(level: str, event: str, payload: dict):
     with conn() as c:
@@ -21,6 +21,7 @@ def audit(level: str, event: str, payload: dict):
             "INSERT INTO audit_log (ts, level, event, payload) VALUES (?,?,?,?)",
             (now_utc_iso(), level, event, json_dumps(payload)),
         ))
+
 
 def get_open_positions():
     with conn() as c:
@@ -33,6 +34,7 @@ def get_open_positions():
         """).fetchall())
         return [dict(r) for r in rows]
 
+
 def mark_position_closing(position_id: str, reason: str):
     with conn() as c:
         run_with_retry(lambda: c.execute("""
@@ -40,6 +42,35 @@ def mark_position_closing(position_id: str, reason: str):
             SET status='CLOSING', exit_reason=?
             WHERE id=? AND status='OPEN'
         """, (reason, position_id)))
+
+
+def revert_position_open(position_id: str):
+    with conn() as c:
+        run_with_retry(lambda: c.execute(
+            "UPDATE positions SET status='OPEN', exit_reason=NULL WHERE id=?",
+            (position_id,)
+        ))
+
+
+def has_pending_exit_order(position_id: str) -> bool:
+    """
+    Prevent double-submitting EXIT orders.
+    If an EXIT order exists for this position and isn't final, skip.
+    """
+    with conn() as c:
+        row = run_with_retry(lambda: c.execute(
+            """
+            SELECT 1
+            FROM orders
+            WHERE position_id=?
+              AND kind='EXIT'
+              AND status IN ('NEW','ACK','PARTIAL')
+            LIMIT 1
+            """,
+            (position_id,)
+        ).fetchone())
+        return row is not None
+
 
 def market_is_open_now() -> bool:
     """
@@ -56,6 +87,7 @@ def market_is_open_now() -> bool:
         return False
     return True
 
+
 def market_closing_soon(minutes: int = 15) -> bool:
     now_ny = datetime.now(timezone.utc).astimezone(NY)
     if now_ny.weekday() >= 5:
@@ -63,6 +95,7 @@ def market_closing_soon(minutes: int = 15) -> bool:
     close_min = 16 * 60
     now_min = now_ny.hour * 60 + now_ny.minute
     return (close_min - now_min) <= minutes
+
 
 def check_exit_conditions(position: dict, current_price: float) -> tuple[bool, str]:
     avg_fill = float(position["avg_fill"])
@@ -83,9 +116,10 @@ def check_exit_conditions(position: dict, current_price: float) -> tuple[bool, s
 
     return False, ""
 
+
 def submit_exit_order(broker: BrokerAdapter, position: dict, reason: str) -> tuple[bool, str | None, str | None]:
     """
-    Submit exit order.
+    Submit exit order (SELL_TO_CLOSE).
     Returns: (ok, broker_order_id, error)
     """
     contract = position["contract"]
@@ -97,21 +131,12 @@ def submit_exit_order(broker: BrokerAdapter, position: dict, reason: str) -> tup
             contract=contract,
             qty=qty,
             limit_price=None,
-            side="sell_to_close"  # Explicit exit side
+            side="sell_to_close"
         )
 
-        broker_order_id = None
-        status = None
-        error = None
-
-        if isinstance(resp, dict):
-            broker_order_id = resp.get("order_id") or resp.get("id") or resp.get("broker_order_id")
-            status = resp.get("status") or resp.get("state")
-            error = resp.get("error")
-        else:
-            broker_order_id = getattr(resp, "broker_order_id", None)
-            status = getattr(resp, "status", None)
-            error = getattr(resp, "error", None)
+        broker_order_id = getattr(resp, "broker_order_id", None)
+        status = getattr(resp, "status", None)
+        error = getattr(resp, "error", None)
 
         if (status or "").upper() in ("ACK", "ACKED", "FILLED", "SUBMITTED"):
             audit("INFO", "EXIT_ORDER_SUBMITTED", {
@@ -143,9 +168,24 @@ def submit_exit_order(broker: BrokerAdapter, position: dict, reason: str) -> tup
         })
         return False, None, str(e)
 
+
+def get_exit_price_safe(broker: BrokerAdapter, contract: str) -> float:
+    """
+    Compatibility helper: if get_contract_price() doesn't accept side=, fallback.
+    """
+    try:
+        return float(get_contract_price(broker, contract, side="SELL"))
+    except TypeError:
+        return float(get_contract_price(broker, contract))
+
+
 def exit_manager_loop(broker: BrokerAdapter, poll_seconds: float = 30.0):
     """
-    Monitor open positions and exit when conditions met.
+    Monitor OPEN positions and submit EXIT orders when conditions hit.
+
+    IMPORTANT:
+    - This file does NOT close positions.
+    - Reconcile closes positions when the EXIT order is FILLED.
     """
     log.info("Exit manager started")
 
@@ -162,14 +202,18 @@ def exit_manager_loop(broker: BrokerAdapter, poll_seconds: float = 30.0):
                 continue
 
             for pos in positions:
-                # Skip if already closing
+                # Skip if already closing (reconcile will finish it)
                 if pos.get("status") == "CLOSING":
+                    continue
+
+                # Extra guard: avoid duplicate exits
+                if has_pending_exit_order(pos["id"]):
                     continue
 
                 contract = pos["contract"]
 
                 # SELL side pricing for exits
-                current_price = get_contract_price(broker, contract, side="SELL")
+                current_price = get_exit_price_safe(broker, contract)
                 if current_price <= 0:
                     log.warning(f"Invalid price for {contract}, skipping")
                     continue
@@ -203,10 +247,12 @@ def exit_manager_loop(broker: BrokerAdapter, poll_seconds: float = 30.0):
 
                 if ok:
                     update_order(local_order_id, status="ACK", broker_order_id=broker_order_id)
-                    
-                    # Position stays CLOSING - fill monitor will close it when confirmed
-                    log.info(f"⏳ Exit order submitted: {contract} - waiting for fill confirmation")
-                    
+
+                    log.info(
+                        f"⏳ Exit order submitted: {contract} "
+                        f"(waiting for fill) broker_order_id={broker_order_id}"
+                    )
+
                     audit("INFO", "EXIT_ORDER_PENDING", {
                         "position_id": pos["id"],
                         "contract": contract,
@@ -216,15 +262,11 @@ def exit_manager_loop(broker: BrokerAdapter, poll_seconds: float = 30.0):
                     })
                 else:
                     # Exit failed - revert to OPEN
-                    with conn() as c:
-                        run_with_retry(lambda: c.execute(
-                            "UPDATE positions SET status='OPEN', exit_reason=NULL WHERE id=?",
-                            (pos["id"],)
-                        ))
-                    
+                    revert_position_open(pos["id"])
+
                     update_order(local_order_id, status="REJECTED", broker_order_id=broker_order_id, last_error=err)
                     log.error(f"❌ Exit order failed for {contract}: {err}")
-                    
+
                     audit("ERROR", "EXIT_ORDER_FAILED", {
                         "position_id": pos["id"],
                         "contract": contract,
