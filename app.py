@@ -239,9 +239,9 @@ def create_app() -> Flask:
     def _ensure_threads_started():
         start_background_threads_once(app.config["BROKER"])
 
-    # Register multi-client blueprints
-      app.register_blueprint(client_bp)
-      app.register_blueprint(admin_bp)
+     # Register multi-client blueprints
+    app.register_blueprint(client_bp)
+    app.register_blueprint(admin_bp)
 
     # =========================
     # ROOT / HEALTH / STATE
