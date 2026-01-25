@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from ap.db import conn, run_with_retry
 from ap.utils import now_utc_iso, json_dumps
 from ap.logger import get_logger
-from ap.state import load_state
+from ap.state import load_state, update_state
 from ap.broker import BrokerAdapter
 
 log = get_logger("ap.fill_monitor")
@@ -31,6 +31,8 @@ def get_pending_orders():
             SELECT 
                 local_order_id,
                 broker_order_id,
+                position_id,
+                kind,
                 symbol,
                 contract,
                 qty,
@@ -39,13 +41,13 @@ def get_pending_orders():
                 created_ts
             FROM orders
             WHERE status IN ('NEW', 'ACK', 'PARTIAL')
-            AND kind = 'ENTRY'
+            AND kind IN ('ENTRY', 'EXIT')
             ORDER BY created_ts ASC
         """).fetchall())
         return [dict(r) for r in rows]
 
 
-def update_order_status(local_order_id: str, status: str, filled_qty: int = None, avg_fill: float = None, error: str = None):
+def update_order_status(local_order_id: str, status: str, filled_qty: int = None, error: str = None):
     """Update order in database"""
     with conn() as c:
         updates = ["status=?", "updated_ts=?"]
@@ -63,11 +65,6 @@ def update_order_status(local_order_id: str, status: str, filled_qty: int = None
         
         sql = f"UPDATE orders SET {', '.join(updates)} WHERE local_order_id=?"
         run_with_retry(lambda: c.execute(sql, params))
-        
-        # Store avg_fill in metadata if needed
-        if avg_fill is not None:
-            # We'll use position table for this
-            pass
 
 
 def create_position_from_fill(order: dict, avg_fill_price: float, filled_qty: int):
@@ -76,11 +73,9 @@ def create_position_from_fill(order: dict, avg_fill_price: float, filled_qty: in
     This is the ONLY place positions should be created for Tradier orders!
     """
     import uuid
-    
-    # Get TP/SL from config
     from ap.config import Config
-    cfg = Config()
     
+    cfg = Config()
     pos_id = str(uuid.uuid4())
     
     with conn() as c:
@@ -96,7 +91,7 @@ def create_position_from_fill(order: dict, avg_fill_price: float, filled_qty: in
                 pos_id,
                 order["symbol"],
                 order["contract"],
-                "CALL",  # TODO: Need to store direction in orders table
+                "CALL",  # TODO: Store direction in orders table
                 filled_qty,
                 avg_fill_price,
                 now_utc_iso(),
@@ -127,6 +122,61 @@ def create_position_from_fill(order: dict, avg_fill_price: float, filled_qty: in
     return pos_id
 
 
+def close_position_from_exit_fill(order: dict, avg_fill_price: float):
+    """Close position after confirmed exit fill"""
+    position_id = order.get("position_id")
+    
+    if not position_id:
+        log.error(f"Exit order {order['local_order_id']} has no position_id!")
+        return
+    
+    # Get position details for P&L calculation
+    with conn() as c:
+        pos_row = run_with_retry(lambda: c.execute(
+            "SELECT * FROM positions WHERE id=?",
+            (position_id,)
+        ).fetchone())
+    
+    if not pos_row:
+        log.error(f"Position {position_id} not found!")
+        return
+    
+    pos = dict(pos_row)
+    
+    # Calculate realized P&L
+    entry_price = float(pos["avg_fill"])
+    qty = int(pos["qty"])
+    realized_pnl = (avg_fill_price - entry_price) * qty * 100  # Options multiplier
+    
+    # Close position
+    with conn() as c:
+        run_with_retry(lambda: c.execute(
+            """
+            UPDATE positions 
+            SET status='CLOSED', exit_ts=?, realized_pnl=?
+            WHERE id=?
+            """,
+            (now_utc_iso(), realized_pnl, position_id)
+        ))
+    
+    # Update daily P&L
+    state = load_state()
+    new_realized = float(state.get("realized_pnl_today", 0.0)) + realized_pnl
+    update_state({"realized_pnl_today": new_realized})
+    
+    log.info(f"✅ Position CLOSED: {pos['contract']} realized=${realized_pnl:.2f}")
+    
+    audit("INFO", "POSITION_CLOSED_FROM_EXIT", {
+        "position_id": position_id,
+        "contract": pos["contract"],
+        "entry_price": entry_price,
+        "exit_price": avg_fill_price,
+        "qty": qty,
+        "realized_pnl": realized_pnl,
+        "exit_reason": pos.get("exit_reason")
+    })
+
+
 def check_order_with_broker(broker: BrokerAdapter, order: dict) -> dict:
     """
     Query Tradier for actual order status
@@ -148,7 +198,7 @@ def check_order_with_broker(broker: BrokerAdapter, order: dict) -> dict:
         # Map Tradier statuses to our statuses
         status_map = {
             "FILLED": "FILLED",
-            "OPEN": "ACK",  # Still pending
+            "OPEN": "ACK",
             "PENDING": "ACK",
             "PARTIALLY_FILLED": "PARTIAL",
             "CANCELED": "CANCELED",
@@ -159,7 +209,7 @@ def check_order_with_broker(broker: BrokerAdapter, order: dict) -> dict:
         our_status = status_map.get(status, "UNKNOWN")
         
         # Get fill details
-        filled_qty = int(broker_order.get("exec_quantity") or broker_order.get("quantity_filled") or 0)
+        filled_qty = int(broker_order.get("exec_quantity") or broker_order.get("quantity") or 0)
         avg_fill_price = float(broker_order.get("avg_fill_price") or broker_order.get("price") or 0.0)
         
         return {
@@ -171,7 +221,7 @@ def check_order_with_broker(broker: BrokerAdapter, order: dict) -> dict:
         }
         
     except Exception as e:
-        log.error(f"Failed to check order {broker_order_id} with broker: {e}")
+        log.error(f"Failed to check order {broker_order_id}: {e}")
         audit("ERROR", "FILL_CHECK_FAILED", {
             "local_order_id": order["local_order_id"],
             "broker_order_id": broker_order_id,
@@ -183,30 +233,31 @@ def check_order_with_broker(broker: BrokerAdapter, order: dict) -> dict:
 def process_pending_order(broker: BrokerAdapter, order: dict):
     """Check one pending order and update accordingly"""
     
-    # Check with broker
     result = check_order_with_broker(broker, order)
     
     local_id = order["local_order_id"]
     broker_id = order.get("broker_order_id")
+    order_kind = order.get("kind", "ENTRY")
     
     # Handle different statuses
     if result["status"] == "FILLED":
         log.info(f"🎯 Order FILLED: {broker_id} - {order['contract']} x{result['filled_qty']} @ ${result['avg_fill']:.2f}")
         
         # Update order
-        update_order_status(local_id, "FILLED", result["filled_qty"], result["avg_fill"])
+        update_order_status(local_id, "FILLED", result["filled_qty"])
         
-        # Create position
-        pos_id = create_position_from_fill(order, result["avg_fill"], result["filled_qty"])
-        
-        # Update state
-        state = load_state()
-        update_state({"trades_taken_today": int(state.get("trades_taken_today", 0)) + 1})
+        # Handle based on order type
+        if order_kind == "ENTRY":
+            # Create position
+            create_position_from_fill(order, result["avg_fill"], result["filled_qty"])
+        elif order_kind == "EXIT":
+            # Close position
+            close_position_from_exit_fill(order, result["avg_fill"])
         
         audit("INFO", "ORDER_FILLED", {
             "local_order_id": local_id,
             "broker_order_id": broker_id,
-            "position_id": pos_id,
+            "kind": order_kind,
             "filled_qty": result["filled_qty"],
             "avg_fill": result["avg_fill"]
         })
@@ -219,6 +270,7 @@ def process_pending_order(broker: BrokerAdapter, order: dict):
         audit("INFO", "ORDER_PARTIAL", {
             "local_order_id": local_id,
             "broker_order_id": broker_id,
+            "kind": order_kind,
             "filled_qty": result["filled_qty"],
             "total_qty": order["qty"]
         })
@@ -228,15 +280,24 @@ def process_pending_order(broker: BrokerAdapter, order: dict):
         
         update_order_status(local_id, result["status"], error=result.get("reason"))
         
+        # If EXIT order failed, revert position to OPEN
+        if order_kind == "EXIT" and order.get("position_id"):
+            with conn() as c:
+                run_with_retry(lambda: c.execute(
+                    "UPDATE positions SET status='OPEN', exit_reason=NULL WHERE id=?",
+                    (order["position_id"],)
+                ))
+            log.info(f"Reverted position {order['position_id']} to OPEN (exit {result['status']})")
+        
         audit("WARNING", f"ORDER_{result['status']}", {
             "local_order_id": local_id,
             "broker_order_id": broker_id,
+            "kind": order_kind,
             "reason": result.get("reason")
         })
         
     elif result["status"] == "ACK":
         # Still pending, check age
-        from datetime import datetime
         created = datetime.fromisoformat(order["created_ts"])
         age_seconds = (datetime.now(timezone.utc) - created).total_seconds()
         
@@ -246,12 +307,12 @@ def process_pending_order(broker: BrokerAdapter, order: dict):
             audit("WARNING", "ORDER_PENDING_LONG", {
                 "local_order_id": local_id,
                 "broker_order_id": broker_id,
+                "kind": order_kind,
                 "age_seconds": age_seconds
             })
     
     elif result["status"] == "ERROR":
         log.error(f"💥 Error checking order: {broker_id} - {result['reason']}")
-        # Don't update status on transient errors, will retry next loop
 
 
 def fill_monitor_loop(broker: BrokerAdapter, poll_seconds: float = 10.0):
@@ -287,4 +348,4 @@ def fill_monitor_loop(broker: BrokerAdapter, poll_seconds: float = 10.0):
             
         except Exception as e:
             log.exception(f"Fill monitor error: {e}")
-            time.sleep(poll_seconds * 2)  # Back off on errors
+            time.sleep(poll_seconds * 2)
