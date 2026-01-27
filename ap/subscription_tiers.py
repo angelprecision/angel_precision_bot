@@ -1,18 +1,12 @@
- cat > ap/subscription_tiers.py << 'EOF'
-# ap/subscription_tiers.py - CORRECTED VERSION
-# Properly initializes client_state when subscription is created
-# Ready to deploy - no manual edits needed
-
+cat > ap/subscription_tiers.py << 'EOF'
+# ap/subscription_tiers.py - SIMPLE FIX VERSION
 from datetime import datetime, timedelta, timezone
-from ap.db import conn, run_with_retry, get_client_state, update_client_state
+from ap.db import get_client_state, update_client_state
 from ap.logger import get_logger
 
 log = get_logger("ap.subscription_tiers")
 
-
 class CorrectRentalTiers:
-    """Define the 3 rental tiers"""
-    
     TIERS = {
         "rental_5k": {
             "name": "Angel Precision - $5K Tier",
@@ -49,73 +43,32 @@ class CorrectRentalTiers:
         },
     }
 
-
 def create_rental_subscription(client_id: str, tier: str, start_date: str = None) -> dict:
-    """
-    Create a rental subscription for a client.
-    
-    This INITIALIZES client_state with all growth tracking fields.
-    
-    Args:
-        client_id: Client identifier
-        tier: One of: rental_5k, rental_10k, rental_25k
-        start_date: ISO format start date (optional, defaults to now)
-    
-    Returns:
-        Dict with subscription details
-    """
     try:
-        # Validate tier
         if tier not in CorrectRentalTiers.TIERS:
-            return {
-                "ok": False,
-                "error": "invalid_tier",
-                "available_tiers": list(CorrectRentalTiers.TIERS.keys())
-            }
+            return {"ok": False, "error": "invalid_tier"}
         
         tier_def = CorrectRentalTiers.TIERS[tier]
         
-        # Parse dates
         if start_date:
-            try:
-                start_dt = datetime.fromisoformat(start_date.replace('Z', '+00:00'))
-            except Exception as e:
-                return {"ok": False, "error": f"invalid_start_date: {str(e)}"}
+            start_dt = datetime.fromisoformat(start_date.replace('Z', '+00:00'))
         else:
             start_dt = datetime.now(timezone.utc)
         
         end_dt = start_dt + timedelta(days=30)
         
-        # CRITICAL: Initialize client_state with growth tracking
-        # This is what was missing before
-        try:
-            from ap.account_growth import init_fee_rental_account
-            
-            init_result = init_fee_rental_account(
-                client_id=client_id,
-                rental_fee=tier_def["rental_fee"],
-                client_capital=tier_def["client_capital"],
-                working_capital=tier_def["working_capital"],
-                profit_target_min=tier_def["profit_target_min"],
-                profit_target_max=tier_def["profit_target_max"]
-            )
-            
-            if not init_result.get("ok"):
-                return {"ok": False, "error": "failed_to_init_growth_tracking"}
-        except Exception as e:
-            log.error(f"Failed to initialize growth tracking: {e}")
-            return {"ok": False, "error": f"growth_init_error: {str(e)}"}
-        
-        # Also update client_state with subscription dates
-        try:
-            update_client_state(client_id, {
-                "subscription_start_date": start_dt.isoformat(),
-                "subscription_end_date": end_dt.isoformat(),
-                "rental_tier": tier,
-            })
-        except Exception as e:
-            log.error(f"Failed to update subscription dates: {e}")
-            return {"ok": False, "error": f"subscription_date_error: {str(e)}"}
+        # Initialize client_state directly with all growth fields
+        update_client_state(client_id, {
+            "rental_fee": tier_def["rental_fee"],
+            "client_capital": tier_def["client_capital"],
+            "working_capital": tier_def["working_capital"],
+            "current_equity": tier_def["working_capital"],
+            "profit_target_min": tier_def["profit_target_min"],
+            "profit_target_max": tier_def["profit_target_max"],
+            "subscription_start_date": start_dt.isoformat(),
+            "subscription_end_date": end_dt.isoformat(),
+            "rental_tier": tier,
+        })
         
         log.info(f"✅ Subscription created: {client_id} {tier}")
         
@@ -129,130 +82,33 @@ def create_rental_subscription(client_id: str, tier: str, start_date: str = None
             "working_capital": tier_def["working_capital"],
             "profit_target_min": tier_def["profit_target_min"],
             "profit_target_max": tier_def["profit_target_max"],
-            "end_balance_if_min": tier_def["end_balance_min"],
-            "end_balance_if_max": tier_def["end_balance_max"],
             "subscription_start": start_dt.isoformat(),
             "subscription_end": end_dt.isoformat(),
             "subscription_days": 30,
-            "description": tier_def["description"],
         }
-    
     except Exception as e:
         log.error(f"Create subscription failed: {e}")
         return {"ok": False, "error": str(e)}
 
-
 def get_rental_status(client_id: str) -> dict:
-    """
-    Get current rental subscription status for a client.
-    Shows progress toward profit targets.
-    
-    Returns:
-        Dict with current balance, profit, targets, time remaining
-    """
     try:
-        from ap.account_growth import get_growth_metrics, check_growth_status
-        
         state = get_client_state(client_id)
         if not state:
             return {"ok": False, "error": "client_not_found"}
         
-        metrics = get_growth_metrics(client_id)
-        status = check_growth_status(client_id)
+        current = state.get("current_equity", state.get("working_capital", 0))
+        working = state.get("working_capital", 0)
+        profit = current - working if working > 0 else 0
         
         return {
             "ok": True,
             "client_id": client_id,
-            "tier": state.get("rental_tier"),
-            "current_balance": metrics.get("current_balance", 0),
-            "starting_balance": metrics.get("starting_balance", 0),
-            "profit": metrics.get("profit", 0),
-            "profit_pct": metrics.get("profit_pct", 0),
+            "current_balance": current,
+            "profit": profit,
             "profit_target_min": state.get("profit_target_min", 0),
             "profit_target_max": state.get("profit_target_max", 0),
-            "should_stop": status.get("should_stop", False),
-            "days_remaining": status.get("days_remaining", 0),
-            "subscription_end": state.get("subscription_end_date"),
         }
-    
     except Exception as e:
         log.error(f"Get rental status failed: {e}")
         return {"ok": False, "error": str(e)}
-
-
-def calculate_settlement(client_id: str) -> dict:
-    """
-    Calculate final settlement when subscription ends or targets hit.
-    
-    Returns how much profit went to Angel (fee already paid)
-    and how much client earned/lost.
-    """
-    try:
-        from ap.account_growth import get_growth_metrics
-        
-        state = get_client_state(client_id)
-        if not state:
-            return {"ok": False, "error": "client_not_found"}
-        
-        metrics = get_growth_metrics(client_id)
-        
-        rental_fee = state.get("rental_fee", 0)
-        working_capital = state.get("working_capital", 0)
-        current_balance = metrics.get("current_balance", working_capital)
-        profit = current_balance - working_capital
-        
-        return {
-            "ok": True,
-            "client_id": client_id,
-            "rental_fee_paid": rental_fee,
-            "working_capital": working_capital,
-            "final_balance": current_balance,
-            "total_profit": profit,
-            "profit_pct": round(100.0 * profit / working_capital, 2) if working_capital > 0 else 0,
-            "angel_keeps": rental_fee,  # Fee was upfront
-            "client_receives": current_balance - rental_fee,  # Their original capital +/- profit
-        }
-    
-    except Exception as e:
-        log.error(f"Calculate settlement failed: {e}")
-        return {"ok": False, "error": str(e)}
-
-
-def project_subscription_revenue(num_subscriptions: int, tiers: list = None) -> dict:
-    """
-    Project monthly revenue based on subscription tiers.
-    
-    Args:
-        num_subscriptions: Number of clients
-        tiers: List of tier names (default: all 3)
-    
-    Returns:
-        Monthly and annual revenue projections
-    """
-    if not tiers:
-        tiers = ["rental_5k", "rental_10k", "rental_25k"]
-    
-    total_monthly = 0
-    breakdown = {}
-    
-    for tier in tiers:
-        if tier not in CorrectRentalTiers.TIERS:
-            continue
-        
-        fee = CorrectRentalTiers.TIERS[tier]["rental_fee"]
-        monthly = fee  # Each client pays fee once per month
-        breakdown[tier] = {
-            "fee_per_client": fee,
-            "clients": num_subscriptions,
-            "monthly_revenue": fee * num_subscriptions,
-        }
-        total_monthly += fee * num_subscriptions
-    
-    return {
-        "ok": True,
-        "total_clients": num_subscriptions,
-        "monthly_revenue": total_monthly,
-        "annual_revenue": total_monthly * 12,
-        "by_tier": breakdown,
-    }
 EOF
