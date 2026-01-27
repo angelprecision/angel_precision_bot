@@ -1,80 +1,126 @@
-# ap/account_growth.py (CORRECTED - Fee + Capital Model)
+# ap/account_growth.py (SAFE VERSION - won't block unless initialized)
 """
 Account growth tracker for fee-based bot rental.
 
-CORRECT MODEL:
-- Client pays Angel: $10K (rental fee upfront)
-- Client puts in: $10K (their own capital)
-- Total working capital: $20K
-- Minimum profit needed: $10K (to recover rental fee)
-- Ideal profit target: $17-25K additional (fee + bonus)
+SAFE BEHAVIOR (important for live/paper testing):
+- If growth tracking is NOT initialized, we DO NOT block trades.
+- If growth_tracking_enabled is falsey, we DO NOT block trades.
+- No defaulting to $10k/$10k that can create bogus working_capital.
 
-Usage:
-    from ap.account_growth import init_fee_rental_account
-    
-    init_fee_rental_account(
-        client_id="user123",
-        client_capital=10000.0,      # What they invest
-        rental_fee=10000.0,          # What they pay Angel
-        profit_target_min=10000.0,   # Cover fee minimum
-        profit_target_max=25000.0,   # Fee + profit ideal
-        subscription_end_date="2026-02-26"
-    )
+How to enable:
+- Call init_fee_rental_account(...) for a client_id, which sets:
+  growth_tracking_enabled=1, client_capital, rental_fee, targets, etc.
+
+Your execution engine can call:
+    from ap.account_growth import check_growth_status
+    growth = check_growth_status(client_id)
+    if growth["should_stop"]: stop trading
 """
 
+from __future__ import annotations
+
 from datetime import datetime, timezone
+from typing import Optional, Dict, Any
+
 from ap.logger import get_logger
-from ap.db import conn, run_with_retry, get_client_state, update_client_state
+from ap.db import conn, run_with_retry, update_client_state
 
 log = get_logger("ap.account_growth")
 
 
-def get_growth_metrics(client_id: str = "default") -> dict:
-    """
-    Get current growth metrics for a fee-rental account.
-    
-    Working capital = client_capital + rental_fee (both in account)
-    Profit = current_balance - working_capital
-    
-    Returns:
-        {
-            "client_capital": 10000.0,
-            "rental_fee": 10000.0,
-            "working_capital": 20000.0,
-            "current_balance": 25500.0,
-            "profit": 5500.0,
-            "profit_pct": 27.5,
-            "profit_target_min": 10000.0,
-            "profit_target_max": 25000.0,
-            "min_hit": True,
-            "max_hit": False,
-            ...
-        }
-    """
+def _row_client_state(client_id: str) -> Optional[dict]:
     with conn() as c:
-        state = run_with_retry(lambda: c.execute(
+        row = run_with_retry(lambda: c.execute(
             "SELECT * FROM client_state WHERE client_id=?",
             (client_id,)
         ).fetchone())
-    
+    return dict(row) if row else None
+
+
+def _parse_iso_dt_maybe(s: str) -> Optional[datetime]:
+    if not s:
+        return None
+    try:
+        # Allow "Z"
+        if s.endswith("Z"):
+            return datetime.fromisoformat(s.replace("Z", "+00:00"))
+        # If it already has time, parse directly
+        if "T" in s:
+            dt = datetime.fromisoformat(s)
+            # Ensure tz-aware
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt
+        # Date-only -> assume end of day UTC
+        dt = datetime.fromisoformat(s + "T23:59:59")
+        return dt.replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+
+def get_growth_metrics(client_id: str) -> dict:
+    """
+    Returns a metrics dict.
+
+    SAFE RULE:
+    - If not initialized, returns {"ok": False, "error": "growth_not_initialized", ...}
+      (no exceptions)
+    """
+    state = _row_client_state(client_id)
     if not state:
-        return {"error": "Client not found", "client_id": client_id}
-    
-    state = dict(state)
-    
-    client_capital = float(state.get("client_capital", 0.0)) or 10000.0
-    rental_fee = float(state.get("rental_fee", 0.0)) or 10000.0
-    working_capital = client_capital + rental_fee  # Total in account
-    
-    current_balance = float(state.get("current_equity", 0.0)) or working_capital
-    
-    profit_target_min = float(state.get("profit_target_min", 0.0)) or rental_fee  # Default: cover fee
-    profit_target_max = float(state.get("profit_target_max", 0.0)) or (rental_fee + 15000.0)  # Default: fee + $15K
-    
+        return {"ok": False, "error": "client_not_found", "client_id": client_id}
+
+    enabled = int(state.get("growth_tracking_enabled") or 0)
+    if not enabled:
+        return {
+            "ok": False,
+            "error": "growth_tracking_disabled",
+            "client_id": client_id,
+        }
+
+    client_capital = float(state.get("client_capital") or 0.0)
+    rental_fee = float(state.get("rental_fee") or 0.0)
+    working_capital = float(state.get("working_capital") or 0.0)
+
+    # working_capital can be derived if missing
+    if working_capital <= 0:
+        working_capital = client_capital + rental_fee
+
+    # Must be explicitly set
+    if client_capital <= 0 or rental_fee <= 0 or working_capital <= 0:
+        return {
+            "ok": False,
+            "error": "growth_not_initialized",
+            "client_id": client_id,
+            "hint": "Run init_fee_rental_account() to set client_capital, rental_fee, working_capital, and targets.",
+        }
+
+    current_balance = float(state.get("current_equity") or 0.0)
+    if current_balance <= 0:
+        # If equity not yet set, assume at least working_capital (neutral)
+        current_balance = working_capital
+
+    profit_target_min = float(state.get("profit_target_min") or 0.0)
+    profit_target_max = float(state.get("profit_target_max") or 0.0)
+
+    # Targets should be explicitly set; if missing, set conservative defaults ONCE (non-breaking)
+    if profit_target_min <= 0:
+        profit_target_min = rental_fee
+    if profit_target_max <= 0:
+        profit_target_max = rental_fee + 15000.0
+
     profit = current_balance - working_capital
-    profit_pct = ((profit / working_capital) * 100) if working_capital > 0 else 0
-    
+    profit_pct = (profit / working_capital * 100.0) if working_capital > 0 else 0.0
+
+    remaining_to_min = max(0.0, profit_target_min - profit)
+    remaining_to_max = max(0.0, profit_target_max - profit)
+
+    progress_to_max_pct = 0.0
+    if profit_target_max > 0:
+        progress_to_max_pct = min((profit / profit_target_max) * 100.0, 100.0)
+
     return {
+        "ok": True,
         "client_id": client_id,
         "client_capital": client_capital,
         "rental_fee": rental_fee,
@@ -86,181 +132,157 @@ def get_growth_metrics(client_id: str = "default") -> dict:
         "profit_target_max": profit_target_max,
         "min_hit": profit >= profit_target_min,
         "max_hit": profit >= profit_target_max,
-        "remaining_to_min": max(0, profit_target_min - profit),
-        "remaining_to_max": max(0, profit_target_max - profit),
+        "remaining_to_min": remaining_to_min,
+        "remaining_to_max": remaining_to_max,
         "end_balance_if_min": working_capital + profit_target_min,
         "end_balance_if_max": working_capital + profit_target_max,
-        "progress_to_max_pct": min((profit / profit_target_max * 100) if profit_target_max > 0 else 0, 100)
+        "progress_to_max_pct": progress_to_max_pct,
+        "subscription_end_date": state.get("subscription_end_date"),
+        "account_type": state.get("account_type"),
     }
 
 
 def check_growth_status(
-    client_id: str = "default",
-    subscription_end_date: str = None,
+    client_id: str,
+    subscription_end_date: Optional[str] = None,
     stop_at_min: bool = False,
 ) -> dict:
     """
-    Check if rental account should stop trading.
-    
-    Stops when:
-    1. Minimum profit target hit (covers rental fee), OR
-    2. Maximum profit target hit (fee + bonus), OR
-    3. Subscription period ends
-    
-    Args:
-        client_id: Client identifier
-        subscription_end_date: When rental ends (ISO format)
-        stop_at_min: If True, stop at minimum. If False, stop at maximum.
-    
-    Returns:
-        {"should_stop": bool, "reason": str, "message": str, "metrics": dict}
+    SAFE RULE:
+    - If not initialized or disabled -> should_stop=False (do not block trades)
     """
     metrics = get_growth_metrics(client_id)
-    
-    if "error" in metrics:
+
+    # Not blocking unless ok=True
+    if not metrics.get("ok"):
         return {
             "should_stop": False,
-            "reason": "account_not_found",
-            "error": metrics.get("error")
+            "reason": metrics.get("error") or "growth_not_ready",
+            "message": "Growth tracking not initialized/disabled — allowing trades.",
+            "metrics": metrics,
         }
-    
-    # Check minimum profit (fee coverage)
+
+    # Check min profit
     if stop_at_min and metrics["min_hit"]:
         return {
             "should_stop": True,
             "reason": "min_profit_hit",
-            "message": f"Minimum profit hit (rental fee covered): ${metrics['profit']:,.2f} / ${metrics['profit_target_min']:,.2f}",
-            "metrics": metrics
+            "message": f"Minimum profit hit: ${metrics['profit']:,.2f} / ${metrics['profit_target_min']:,.2f}",
+            "metrics": metrics,
         }
-    
-    # Check maximum profit
+
+    # Check max profit
     if metrics["max_hit"]:
         return {
             "should_stop": True,
             "reason": "max_profit_hit",
-            "message": f"Maximum profit target hit: ${metrics['profit']:,.2f} / ${metrics['profit_target_max']:,.2f}",
-            "metrics": metrics
+            "message": f"Maximum profit hit: ${metrics['profit']:,.2f} / ${metrics['profit_target_max']:,.2f}",
+            "metrics": metrics,
         }
-    
-    # Check subscription end
-    if subscription_end_date:
-        try:
-            if subscription_end_date.endswith('Z') or 'T' in subscription_end_date:
-                end_dt = datetime.fromisoformat(subscription_end_date.replace('Z', '+00:00'))
-            else:
-                end_dt = datetime.fromisoformat(subscription_end_date + "T23:59:59Z").replace(tzinfo=timezone.utc)
-            
+
+    # Subscription end date: prefer explicit arg, else state value
+    end_str = subscription_end_date or (metrics.get("subscription_end_date") or "")
+    if end_str:
+        end_dt = _parse_iso_dt_maybe(end_str)
+        if end_dt:
             now = datetime.now(timezone.utc)
-            
             if now >= end_dt:
                 return {
                     "should_stop": True,
                     "reason": "subscription_ended",
-                    "message": f"Subscription period ended on {subscription_end_date}",
-                    "metrics": metrics
+                    "message": f"Subscription ended on {end_str}",
+                    "metrics": metrics,
                 }
-        except Exception as e:
-            log.warning(f"Failed to parse subscription end date: {e}")
-    
+        else:
+            log.warning(f"Could not parse subscription_end_date: {end_str}")
+
     # Still growing
-    remaining = metrics["remaining_to_max"]
     return {
         "should_stop": False,
         "reason": "still_growing",
-        "message": f"Growing: ${metrics['current_balance']:,.2f} → Target: ${metrics['end_balance_if_max']:,.2f} (${remaining:,.2f} remaining)",
-        "metrics": metrics
+        "message": f"Growing: ${metrics['current_balance']:,.2f} → Target: ${metrics['end_balance_if_max']:,.2f} "
+                   f"(${metrics['remaining_to_max']:,.2f} remaining)",
+        "metrics": metrics,
     }
 
 
 def init_fee_rental_account(
-    client_id: str = "default",
+    client_id: str,
     client_capital: float = 10000.0,
     rental_fee: float = 10000.0,
-    profit_target_min: float = None,
-    profit_target_max: float = None,
-    subscription_end_date: str = None,
+    profit_target_min: Optional[float] = None,
+    profit_target_max: Optional[float] = None,
+    subscription_end_date: Optional[str] = None,
 ) -> bool:
     """
-    Initialize a fee-based rental account.
-    
-    Args:
-        client_id: Client identifier
-        client_capital: Client's own investment ($10K, $25K, etc.)
-        rental_fee: What client paid Angel upfront ($10K, $25K, etc.)
-        profit_target_min: Minimum profit (default: equal to rental_fee)
-        profit_target_max: Ideal profit (default: rental_fee + $15K)
-        subscription_end_date: When rental ends
-    
-    Returns:
-        True if successful
-    
-    Example:
-        init_fee_rental_account(
-            client_id="john@email.com",
-            client_capital=10000.0,
-            rental_fee=10000.0,
-            profit_target_min=10000.0,  # Need $10K profit
-            profit_target_max=25000.0,  # Want $25K profit
-            subscription_end_date="2026-02-26"
-        )
+    Enables growth tracking for a client by writing required fields to client_state.
     """
     try:
-        # Default targets
+        client_capital = float(client_capital)
+        rental_fee = float(rental_fee)
+
         if profit_target_min is None:
-            profit_target_min = rental_fee  # Minimum = cover the fee
+            profit_target_min = rental_fee
         if profit_target_max is None:
-            profit_target_max = rental_fee + 15000.0  # Ideal = fee + $15K bonus
-        
-        working_capital = client_capital + rental_fee
-        
-        state = {
-            "client_capital": client_capital,
-            "rental_fee": rental_fee,
-            "working_capital": working_capital,
-            "profit_target_min": profit_target_min,
-            "profit_target_max": profit_target_max,
+            profit_target_max = rental_fee + 15000.0
+
+        working_capital = float(client_capital + rental_fee)
+
+        patch = {
+            "client_capital": float(client_capital),
+            "rental_fee": float(rental_fee),
+            "working_capital": float(working_capital),
+            "profit_target_min": float(profit_target_min),
+            "profit_target_max": float(profit_target_max),
             "subscription_end_date": subscription_end_date,
-            "current_equity": working_capital,
             "growth_tracking_enabled": 1,
-            "account_type": "fee_rental"
+            "account_type": "fee_rental",
+            # initialize equity baseline if missing
+            "current_equity": float(working_capital),
         }
-        
-        update_client_state(client_id, state)
+
+        update_client_state(client_id, patch)
         log.info(
-            f"Fee-rental account initialized: {client_id} "
-            f"capital=${client_capital:,.2f} fee=${rental_fee:,.2f} "
-            f"total=${working_capital:,.2f} "
-            f"profit_target=${profit_target_max:,.2f}"
+            f"Growth initialized: {client_id} "
+            f"capital=${client_capital:,.2f} fee=${rental_fee:,.2f} working=${working_capital:,.2f} "
+            f"target_max=${float(profit_target_max):,.2f}"
         )
         return True
     except Exception as e:
-        log.error(f"Failed to initialize fee-rental account: {e}")
+        log.error(f"init_fee_rental_account failed: {e}")
         return False
 
 
-def get_progress_bar(client_id: str = "default", width: int = 20) -> str:
-    """Get ASCII progress bar for Discord."""
+def disable_growth_tracking(client_id: str) -> bool:
+    """
+    Hard disable growth tracking (safe for paper/testing).
+    """
+    try:
+        update_client_state(client_id, {"growth_tracking_enabled": 0})
+        return True
+    except Exception as e:
+        log.error(f"disable_growth_tracking failed: {e}")
+        return False
+
+
+def get_progress_bar(client_id: str, width: int = 20) -> str:
     metrics = get_growth_metrics(client_id)
-    
-    if "error" in metrics:
-        return "Account not initialized"
-    
-    progress = metrics.get("progress_to_max_pct", 0) / 100.0
+    if not metrics.get("ok"):
+        return "Growth not initialized"
+
+    progress = float(metrics.get("progress_to_max_pct") or 0.0) / 100.0
     filled = int(progress * width)
     bar = "█" * filled + "░" * (width - filled)
-    
     return f"[{bar}] ${metrics['profit']:,.2f} / ${metrics['profit_target_max']:,.2f} ({metrics['progress_to_max_pct']:.1f}%)"
 
 
-def format_growth_summary(client_id: str = "default") -> str:
-    """Format metrics for Discord display."""
+def format_growth_summary(client_id: str) -> str:
     metrics = get_growth_metrics(client_id)
-    
-    if "error" in metrics:
-        return "Account not initialized"
-    
+    if not metrics.get("ok"):
+        return "Growth tracking not initialized."
+
     status = check_growth_status(client_id)
-    
+
     summary = f"""
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 💰 FEE-RENTAL ACCOUNT PROGRESS
@@ -276,27 +298,23 @@ Current Balance:    ${metrics['current_balance']:>12,.2f}
    Min (cover fee): ${metrics['profit_target_min']:>12,.2f} {'✓' if metrics['min_hit'] else ''}
    Max (+ bonus):   ${metrics['profit_target_max']:>12,.2f} {'✓' if metrics['max_hit'] else ''}
 
-🔄 End Balances:
-   If Min Hit:      ${metrics['end_balance_if_min']:>12,.2f}
-   If Max Hit:      ${metrics['end_balance_if_max']:>12,.2f}
-
 📊 Progress:        {get_progress_bar(client_id)}
 
 Status:             {status['message']}
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-"""
-    return summary.strip()
+""".strip()
+    return summary
 
 
-def get_rental_summary(client_id: str = "default") -> dict:
-    """Get complete rental summary for reporting/billing."""
+def get_rental_summary(client_id: str) -> dict:
     metrics = get_growth_metrics(client_id)
     status = check_growth_status(client_id)
-    
-    if "error" in metrics:
-        return {"error": metrics.get("error")}
-    
+
+    if not metrics.get("ok"):
+        return {"ok": False, "error": metrics.get("error"), "metrics": metrics}
+
     return {
+        "ok": True,
         "client_id": client_id,
         "client_capital": metrics["client_capital"],
         "rental_fee": metrics["rental_fee"],
@@ -313,4 +331,6 @@ def get_rental_summary(client_id: str = "default") -> dict:
         "progress_pct": metrics["progress_to_max_pct"],
         "should_stop": status.get("should_stop"),
         "stop_reason": status.get("reason"),
+        "message": status.get("message"),
     }
+
