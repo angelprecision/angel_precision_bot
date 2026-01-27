@@ -1,4 +1,8 @@
-# ap/db.py
+# ap/db.py - COMPLETE MULTI-CLIENT VERSION
+# Multi-client ready with client_id in all core tables
+# Safe migrations for existing single-client DBs
+# Drop-in replacement - ready to deploy
+
 import time
 import uuid
 import sqlite3
@@ -60,13 +64,13 @@ def conn():
 
 def init_db():
     """
-    Single source of truth schema for beta (single-client) + safe multi-client tables.
-    Safe to run repeatedly.
+    Initialize database with multi-client support.
+    Safe to run repeatedly - handles migrations.
     """
     with conn() as c:
-        # -------------------------
-        # KV
-        # -------------------------
+        # ========================
+        # KV STORE
+        # ========================
         c.execute("""
         CREATE TABLE IF NOT EXISTS kv (
             k TEXT PRIMARY KEY,
@@ -75,22 +79,34 @@ def init_db():
         );
         """)
 
-        # -------------------------
-        # Audit log
-        # -------------------------
+        # ========================
+        # AUDIT LOG (with client_id)
+        # ========================
         c.execute("""
         CREATE TABLE IF NOT EXISTS audit_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             ts TEXT NOT NULL,
             level TEXT NOT NULL,
             event TEXT NOT NULL,
-            payload TEXT NOT NULL
+            payload TEXT NOT NULL,
+            client_id TEXT
         );
         """)
+        
+        # Safe migration
+        try:
+            c.execute("ALTER TABLE audit_log ADD COLUMN client_id TEXT;")
+        except Exception:
+            pass
+        
+        try:
+            c.execute("CREATE INDEX IF NOT EXISTS idx_audit_log_client_id ON audit_log(client_id);")
+        except Exception:
+            pass
 
-        # -------------------------
-        # Dedupe (idempotency)
-        # -------------------------
+        # ========================
+        # PROCESSED SIGNALS (dedupe/idempotency)
+        # ========================
         c.execute("""
         CREATE TABLE IF NOT EXISTS processed_signals (
             signal_id TEXT PRIMARY KEY,
@@ -98,33 +114,71 @@ def init_db():
         );
         """)
 
-        # -------------------------
-        # Trade queue
-        # -------------------------
+        # ========================
+        # TRADE QUEUE (with client_id)
+        # ========================
         c.execute("""
         CREATE TABLE IF NOT EXISTS trade_queue (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            client_id TEXT NOT NULL DEFAULT 'default',
             signal_id TEXT NOT NULL,
             created_ts TEXT NOT NULL,
-            status TEXT NOT NULL,     -- NEW | PROCESSING | DONE | REJECTED
+            status TEXT NOT NULL,     -- NEW | PROCESSING | DONE | REJECTED | ERROR
             payload TEXT NOT NULL,
-            decision TEXT,
-            reason TEXT,
-            details TEXT
+            started_ts TEXT,
+            finished_ts TEXT,
+            result_json TEXT,
+            last_error TEXT,
+            idempotency_key TEXT
         );
         """)
-        # Migration for older DBs
+        
+        # Safe migrations
         try:
-            c.execute("ALTER TABLE trade_queue ADD COLUMN details TEXT;")
+            c.execute("ALTER TABLE trade_queue ADD COLUMN client_id TEXT NOT NULL DEFAULT 'default';")
+        except Exception:
+            pass
+        
+        try:
+            c.execute("ALTER TABLE trade_queue ADD COLUMN started_ts TEXT;")
+        except Exception:
+            pass
+        
+        try:
+            c.execute("ALTER TABLE trade_queue ADD COLUMN finished_ts TEXT;")
+        except Exception:
+            pass
+        
+        try:
+            c.execute("ALTER TABLE trade_queue ADD COLUMN result_json TEXT;")
+        except Exception:
+            pass
+        
+        try:
+            c.execute("ALTER TABLE trade_queue ADD COLUMN last_error TEXT;")
+        except Exception:
+            pass
+        
+        try:
+            c.execute("ALTER TABLE trade_queue ADD COLUMN idempotency_key TEXT;")
+        except Exception:
+            pass
+        
+        try:
+            c.execute("CREATE INDEX IF NOT EXISTS idx_trade_queue_client_status ON trade_queue(client_id, status);")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_trade_queue_status_id ON trade_queue(status, id);")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_trade_queue_created_ts ON trade_queue(created_ts);")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_trade_queue_signal_id ON trade_queue(signal_id);")
         except Exception:
             pass
 
-        # -------------------------
-        # Orders
-        # -------------------------
+        # ========================
+        # ORDERS (with client_id)
+        # ========================
         c.execute("""
         CREATE TABLE IF NOT EXISTS orders (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            client_id TEXT NOT NULL DEFAULT 'default',
             local_order_id TEXT NOT NULL,
             broker_order_id TEXT,
             position_id TEXT,
@@ -141,13 +195,31 @@ def init_db():
             updated_ts TEXT NOT NULL
         );
         """)
+        
+        # Safe migrations
+        try:
+            c.execute("ALTER TABLE orders ADD COLUMN client_id TEXT NOT NULL DEFAULT 'default';")
+        except Exception:
+            pass
+        
+        try:
+            c.execute("CREATE INDEX IF NOT EXISTS idx_orders_client_local_order_id ON orders(client_id, local_order_id);")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_orders_client_status ON orders(client_id, status);")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_orders_local_order_id ON orders(local_order_id);")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_orders_created_ts ON orders(created_ts);")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_orders_broker_order_id ON orders(broker_order_id);")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_orders_position_id ON orders(position_id);")
+        except Exception:
+            pass
 
-        # -------------------------
-        # Positions
-        # -------------------------
+        # ========================
+        # POSITIONS (with client_id)
+        # ========================
         c.execute("""
         CREATE TABLE IF NOT EXISTS positions (
             id TEXT PRIMARY KEY,
+            client_id TEXT NOT NULL DEFAULT 'default',
             underlying TEXT NOT NULL,
             contract TEXT NOT NULL,
             direction TEXT NOT NULL,  -- CALL | PUT
@@ -162,10 +234,24 @@ def init_db():
             realized_pnl REAL
         );
         """)
+        
+        # Safe migrations
+        try:
+            c.execute("ALTER TABLE positions ADD COLUMN client_id TEXT NOT NULL DEFAULT 'default';")
+        except Exception:
+            pass
+        
+        try:
+            c.execute("CREATE INDEX IF NOT EXISTS idx_positions_client_status ON positions(client_id, status);")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_positions_status ON positions(status);")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_positions_entry_ts ON positions(entry_ts);")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_positions_contract ON positions(contract);")
+        except Exception:
+            pass
 
-        # -------------------------
-        # Multi-client tables (safe to exist even if unused)
-        # -------------------------
+        # ========================
+        # CLIENTS (multi-tenant)
+        # ========================
         c.execute("""
         CREATE TABLE IF NOT EXISTS clients (
             client_id TEXT PRIMARY KEY,
@@ -186,7 +272,16 @@ def init_db():
             base_position_pct REAL NOT NULL DEFAULT 0.10
         );
         """)
+        
+        try:
+            c.execute("CREATE INDEX IF NOT EXISTS idx_clients_status ON clients(status);")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_clients_api_key ON clients(api_key);")
+        except Exception:
+            pass
 
+        # ========================
+        # CLIENT STATE (per-client tracking)
+        # ========================
         c.execute("""
         CREATE TABLE IF NOT EXISTS client_state (
             client_id TEXT PRIMARY KEY,
@@ -198,38 +293,65 @@ def init_db():
             kill_switch INTEGER NOT NULL DEFAULT 0,
             mode TEXT NOT NULL DEFAULT 'PAPER',
             last_heartbeat_ts TEXT,
+            
+            -- Fee-rental fields (from account_growth_CORRECTED.py)
+            client_capital REAL,
+            rental_fee REAL,
+            working_capital REAL,
+            profit_target_min REAL,
+            profit_target_max REAL,
+            subscription_end_date TEXT,
+            growth_tracking_enabled INTEGER DEFAULT 0,
+            account_type TEXT,
+            
             FOREIGN KEY (client_id) REFERENCES clients(client_id)
         );
         """)
-
-        # -------------------------
-        # Indexes
-        # -------------------------
+        
+        # Safe migrations for rental fields
         try:
-            c.execute("CREATE INDEX IF NOT EXISTS idx_processed_signals_ts ON processed_signals(first_seen_ts);")
-
-            c.execute("CREATE INDEX IF NOT EXISTS idx_trade_queue_status_id ON trade_queue(status, id);")
-            c.execute("CREATE INDEX IF NOT EXISTS idx_trade_queue_created_ts ON trade_queue(created_ts);")
-            c.execute("CREATE INDEX IF NOT EXISTS idx_trade_queue_signal_id ON trade_queue(signal_id);")
-
-            c.execute("CREATE INDEX IF NOT EXISTS idx_orders_local_order_id ON orders(local_order_id);")
-            c.execute("CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);")
-            c.execute("CREATE INDEX IF NOT EXISTS idx_orders_created_ts ON orders(created_ts);")
-            c.execute("CREATE INDEX IF NOT EXISTS idx_orders_broker_order_id ON orders(broker_order_id);")
-            c.execute("CREATE INDEX IF NOT EXISTS idx_orders_position_id ON orders(position_id);")
-
-            c.execute("CREATE INDEX IF NOT EXISTS idx_positions_status ON positions(status);")
-            c.execute("CREATE INDEX IF NOT EXISTS idx_positions_entry_ts ON positions(entry_ts);")
-            c.execute("CREATE INDEX IF NOT EXISTS idx_positions_contract ON positions(contract);")
-
-            c.execute("CREATE INDEX IF NOT EXISTS idx_clients_status ON clients(status);")
-            c.execute("CREATE INDEX IF NOT EXISTS idx_clients_api_key ON clients(api_key);")
+            c.execute("ALTER TABLE client_state ADD COLUMN client_capital REAL;")
+        except Exception:
+            pass
+        
+        try:
+            c.execute("ALTER TABLE client_state ADD COLUMN rental_fee REAL;")
+        except Exception:
+            pass
+        
+        try:
+            c.execute("ALTER TABLE client_state ADD COLUMN working_capital REAL;")
+        except Exception:
+            pass
+        
+        try:
+            c.execute("ALTER TABLE client_state ADD COLUMN profit_target_min REAL;")
+        except Exception:
+            pass
+        
+        try:
+            c.execute("ALTER TABLE client_state ADD COLUMN profit_target_max REAL;")
+        except Exception:
+            pass
+        
+        try:
+            c.execute("ALTER TABLE client_state ADD COLUMN subscription_end_date TEXT;")
+        except Exception:
+            pass
+        
+        try:
+            c.execute("ALTER TABLE client_state ADD COLUMN growth_tracking_enabled INTEGER DEFAULT 0;")
+        except Exception:
+            pass
+        
+        try:
+            c.execute("ALTER TABLE client_state ADD COLUMN account_type TEXT;")
         except Exception:
             pass
 
 
 # =========================================================================
-# DEDUPE HELPERS (used by ap/queue.py)
+# DEDUPE HELPERS (idempotency)
 # =========================================================================
 
 def already_processed_signal(signal_id: str) -> bool:
@@ -251,7 +373,7 @@ def mark_signal_processed(signal_id: str):
 
 
 # =========================================================================
-# ORDER HELPERS (used by exit_manager + reconciliation)
+# ORDER HELPERS (with client_id)
 # =========================================================================
 
 def new_local_order_id() -> str:
@@ -260,6 +382,7 @@ def new_local_order_id() -> str:
 
 def insert_order(
     *,
+    client_id: str = "default",
     local_order_id: str,
     position_id: str | None,
     kind: str,
@@ -277,13 +400,14 @@ def insert_order(
             c.execute(
                 """
                 INSERT INTO orders (
-                    local_order_id, broker_order_id, position_id, kind, status,
+                    client_id, local_order_id, broker_order_id, position_id, kind, status,
                     symbol, contract, qty, limit_price, filled_qty, retries, last_error,
                     created_ts, updated_ts
                 )
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
+                    client_id,
                     local_order_id,
                     broker_order_id,
                     position_id,
@@ -344,67 +468,96 @@ def update_order(
 
 
 # =========================================================================
-# REPORTING + RECONCILIATION READS
+# REPORTING + RECONCILIATION READS (with client_id filtering)
 # =========================================================================
 
-def list_orders(limit: int = 200):
+def list_orders(client_id: str = "default", limit: int = 200, status: str | None = None):
     def _fn():
         with conn() as c:
-            rows = c.execute("SELECT * FROM orders ORDER BY created_ts DESC LIMIT ?", (limit,)).fetchall()
+            if status:
+                rows = c.execute(
+                    "SELECT * FROM orders WHERE client_id=? AND status=? ORDER BY created_ts DESC LIMIT ?",
+                    (client_id, status, limit),
+                ).fetchall()
+            else:
+                rows = c.execute(
+                    "SELECT * FROM orders WHERE client_id=? ORDER BY created_ts DESC LIMIT ?",
+                    (client_id, limit),
+                ).fetchall()
             return [dict(r) for r in rows]
     return run_with_retry(_fn)
 
 
-def list_positions(limit: int = 200, status: str = "ALL"):
+def list_positions(client_id: str = "default", limit: int = 200, status: str = "ALL"):
     status = (status or "ALL").upper()
 
     def _fn():
         with conn() as c:
             if status != "ALL":
                 rows = c.execute(
-                    "SELECT * FROM positions WHERE status=? ORDER BY entry_ts DESC LIMIT ?",
-                    (status, limit),
+                    "SELECT * FROM positions WHERE client_id=? AND status=? ORDER BY entry_ts DESC LIMIT ?",
+                    (client_id, status, limit),
                 ).fetchall()
             else:
                 rows = c.execute(
-                    "SELECT * FROM positions ORDER BY entry_ts DESC LIMIT ?",
+                    "SELECT * FROM positions WHERE client_id=? ORDER BY entry_ts DESC LIMIT ?",
+                    (client_id, limit),
+                ).fetchall()
+            return [dict(r) for r in rows]
+    return run_with_retry(_fn)
+
+
+def list_audit(client_id: str | None = None, limit: int = 200):
+    def _fn():
+        with conn() as c:
+            if client_id:
+                rows = c.execute(
+                    "SELECT ts, level, event, payload FROM audit_log WHERE client_id=? ORDER BY id DESC LIMIT ?",
+                    (client_id, limit),
+                ).fetchall()
+            else:
+                rows = c.execute(
+                    "SELECT ts, level, event, payload FROM audit_log ORDER BY id DESC LIMIT ?",
                     (limit,),
                 ).fetchall()
             return [dict(r) for r in rows]
     return run_with_retry(_fn)
 
 
-def list_audit(limit: int = 200):
+def get_open_orders_for_reconcile(client_id: str | None = None, limit: int = 200):
     def _fn():
         with conn() as c:
-            rows = c.execute(
-                "SELECT ts, level, event, payload FROM audit_log ORDER BY id DESC LIMIT ?",
-                (limit,),
-            ).fetchall()
-            return [dict(r) for r in rows]
-    return run_with_retry(_fn)
-
-
-def get_open_orders_for_reconcile(limit: int = 200):
-    def _fn():
-        with conn() as c:
-            rows = c.execute(
-                """
-                SELECT * FROM orders
-                WHERE broker_order_id IS NOT NULL
-                  AND broker_order_id != 'N/A'
-                  AND status IN ('NEW','ACK','PARTIAL')
-                ORDER BY updated_ts ASC
-                LIMIT ?
-                """,
-                (limit,),
-            ).fetchall()
+            if client_id:
+                rows = c.execute(
+                    """
+                    SELECT * FROM orders
+                    WHERE client_id=?
+                      AND broker_order_id IS NOT NULL
+                      AND broker_order_id != 'N/A'
+                      AND status IN ('NEW','ACK','PARTIAL')
+                    ORDER BY updated_ts ASC
+                    LIMIT ?
+                    """,
+                    (client_id, limit),
+                ).fetchall()
+            else:
+                rows = c.execute(
+                    """
+                    SELECT * FROM orders
+                    WHERE broker_order_id IS NOT NULL
+                      AND broker_order_id != 'N/A'
+                      AND status IN ('NEW','ACK','PARTIAL')
+                    ORDER BY updated_ts ASC
+                    LIMIT ?
+                    """,
+                    (limit,),
+                ).fetchall()
             return [dict(r) for r in rows]
     return run_with_retry(_fn)
 
 
 # =========================================================================
-# CLIENT MANAGEMENT (ONLY for admin endpoints; safe because schema exists)
+# CLIENT MANAGEMENT
 # =========================================================================
 
 def get_client(client_id: str) -> dict:
@@ -504,21 +657,52 @@ def update_client(client_id: str, **updates) -> dict:
     return get_client(client_id)
 
 
-def get_client_state(client_id: str) -> dict:
+def get_client_state(client_id: str = "default") -> dict:
     with conn() as c:
         row = run_with_retry(lambda: c.execute(
             "SELECT * FROM client_state WHERE client_id=?",
             (client_id,),
         ).fetchone())
         if not row:
-            raise ValueError(f"Client state not found: {client_id}")
+            # Return defaults if state doesn't exist
+            return {
+                "client_id": client_id,
+                "current_equity": 0,
+                "starting_equity_today": 0,
+                "realized_pnl_today": 0.0,
+                "trades_taken_today": 0,
+                "daily_stop_hit": 0,
+                "kill_switch": 0,
+                "mode": "PAPER",
+            }
         return dict(row)
 
 
-def update_client_state(client_id: str, updates: dict):
+def update_client_state(client_id: str = "default", updates: dict | None = None):
     if not updates:
         return
 
+    # First, ensure the row exists
+    with conn() as c:
+        existing = run_with_retry(lambda: c.execute(
+            "SELECT 1 FROM client_state WHERE client_id=?",
+            (client_id,),
+        ).fetchone())
+        
+        if not existing:
+            # Create default state
+            run_with_retry(lambda: c.execute(
+                """
+                INSERT INTO client_state (
+                    client_id, current_equity, starting_equity_today,
+                    realized_pnl_today, trades_taken_today, mode
+                )
+                VALUES (?, 0, 0, 0.0, 0, 'PAPER')
+                """,
+                (client_id,),
+            ))
+
+    # Now update
     set_clause = ", ".join(f"{k}=?" for k in updates.keys())
     values = list(updates.values()) + [client_id]
 
