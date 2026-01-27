@@ -1,6 +1,6 @@
-# ap/queue.py - COMPLETE MULTI-CLIENT VERSION
+# ap/queue.py - FIXED VERSION
 # Multi-client signal queue processing
-# Ready to deploy - no manual edits needed
+# FIXED: uses 'payload' column (not payload_json)
 
 import time
 import json
@@ -41,7 +41,7 @@ def enqueue_signal(sig, client_id: str, idempotency_key: str | None = None):
         def _ins():
             c.execute("""
                 INSERT INTO trade_queue (
-                    client_id, signal_id, payload_json, status, created_ts, idempotency_key
+                    client_id, signal_id, payload, status, created_ts, idempotency_key
                 )
                 VALUES (?, ?, ?, 'NEW', ?, ?)
             """, (client_id, payload.get("signal_id"), _json_dumps(payload), _now_iso(), idempotency_key))
@@ -92,7 +92,7 @@ def worker_loop(broker):
             # GET NEXT JOB FROM QUEUE
             with conn() as c:
                 job = run_with_retry(lambda: c.execute("""
-                    SELECT id, client_id, signal_id, payload_json
+                    SELECT id, client_id, signal_id, payload
                     FROM trade_queue
                     WHERE status='NEW'
                     ORDER BY id ASC
@@ -132,7 +132,7 @@ def worker_loop(broker):
 
             # PARSE PAYLOAD
             try:
-                payload = json.loads(job["payload_json"] or "{}")
+                payload = json.loads(job["payload"] or "{}")
             except Exception as e:
                 log.error(f"Failed to parse payload: {e}")
                 with conn() as c:
