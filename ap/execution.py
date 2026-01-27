@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from ap.logger import get_logger
 from ap.db import conn, run_with_retry, get_client, get_client_state, update_client_state, insert_order, new_local_order_id
 from ap.utils import json_dumps, now_utc_iso
+from zoneinfo import ZoneInfo
 
 log = get_logger("ap.execution")
 
@@ -78,6 +79,45 @@ def _calculate_qty(dollar_amount: float, contract_price: float) -> int:
     qty = int(dollar_amount / contract_price)
     return max(1, qty)
 
+NY = ZoneInfo("America/New_York")
+
+def _ny_day_key() -> str:
+    return datetime.now(NY).strftime("%Y-%m-%d")
+
+def _maybe_reset_client_daily_state(broker, client_id: str, client_cfg: dict, st: dict) -> dict:
+    """
+    Resets per-client daily counters when NY day changes.
+    Also syncs starting_equity_today to current equity (important for PAPER).
+    """
+    today = _ny_day_key()
+    prev = (st.get("day_key") or "").strip()
+
+    # Always try to compute equity once (used for baseline)
+    equity = _get_equity_for_client(broker, client_id, client_cfg, st)
+
+    # If day changed OR day_key missing, reset daily counters
+    if prev != today:
+        patch = {
+            "day_key": today,
+            "last_day_reset_ts": now_utc_iso(),
+            "trades_taken_today": 0,
+            "realized_pnl_today": 0.0,
+            "daily_stop_hit": 0,
+            "profit_cap_state": "normal",
+            "starting_equity_today": float(equity),
+            "current_equity": float(equity),
+        }
+        update_client_state(client_id, patch)
+        st.update(patch)
+    else:
+        # Same day: just keep equity fresh
+        try:
+            update_client_state(client_id, {"current_equity": float(equity)})
+        except Exception:
+            pass
+        st["current_equity"] = float(equity)
+
+    return st
 
 def process_signal(broker, client_id: str, signal_payload: dict) -> dict:
     """
@@ -103,6 +143,10 @@ def process_signal(broker, client_id: str, signal_payload: dict) -> dict:
         mode = (st.get("mode") or "").upper()
         if bool(st.get("kill_switch")) or mode == "READ_ONLY":
             return {"ok": False, "reason": "READ_ONLY", "error": "bot_in_read_only", "client_id": client_id}
+       
+        # NEW: daily reset + baseline sync (prevents PAPER growth check crashes)
+        st = _maybe_reset_client_daily_state(broker, client_id, client, st)
+    
 
         # 2) GROWTH/TARGET CHECK FIRST (before any trade)
         try:
@@ -113,8 +157,14 @@ def process_signal(broker, client_id: str, signal_payload: dict) -> dict:
                 audit(client_id, "INFO", "GROWTH_STOP", growth)
                 return {"ok": False, "reason": "GROWTH_STOP", "error": "profit_target_hit", "client_id": client_id}
         except Exception as e:
-            audit(client_id, "ERROR", "GROWTH_CHECK_FAILED", {"error": str(e)})
-            return {"ok": False, "error": "growth_check_failed", "client_id": client_id}
+                audit(client_id, "ERROR", "GROWTH_CHECK_FAILED", {"error": str(e), "mode": mode})
+
+    # Fail-open in PAPER/SIM so you can keep testing.
+    # Fail-closed in LIVE for safety.
+    if mode in ("PAPER", "SIM"):
+        log.warning(f"Growth check failed in {mode}; allowing PAPER trade for testing. err={e}")
+    else:
+        return {"ok": False, "error": "growth_check_failed", "client_id": client_id}
 
         # 3) DAILY TRADE CAP
         max_trades_per_day = int(client.get("max_trades_per_day") or 0) or 25
