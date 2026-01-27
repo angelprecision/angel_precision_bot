@@ -1,4 +1,4 @@
-# app.py - ANGEL PRECISION BOT (FROZEN VERSION)
+# app.py - ANGEL PRECISION BOT (FROZEN VERSION - CORRECTED)
 # =====================================================================
 # THIS FILE IS NOW STABLE. DO NOT EDIT.
 # All business logic lives in blueprints (client_api, admin_api, etc).
@@ -534,7 +534,8 @@ def create_app() -> Flask:
             return jsonify({"ok": True, "equity": equity})
         except Exception as e:
             return jsonify({"ok": False, "error": str(e)}), 500
-# =============================================
+
+    # =============================================
     # RENTAL SUBSCRIPTIONS (fee-based tiers)
     # =============================================
 
@@ -582,6 +583,7 @@ def create_app() -> Flask:
             }
         
         return jsonify({"ok": True, "tiers": tiers})
+
     log.info("=" * 70)
     log.info("✅ APP READY")
     log.info("=" * 70)
