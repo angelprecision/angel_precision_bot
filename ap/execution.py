@@ -102,8 +102,8 @@ def _resolve_option_contract(broker, symbol: str, strike: float, direction: str)
 
 
 def _validate_premium(premium: float) -> bool:
-    """Accept $75–$250 contracts => premium 0.75–2.50 per share"""
-    return 0.75 <= float(premium) <= 2.50
+    """Accept $50–$250 contracts => premium 0.50–2.50 per share"""
+    return 0.50 <= float(premium) <= 2.50
 
 
 def _calc_qty(dollars: float, premium: float) -> int:
