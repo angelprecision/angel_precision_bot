@@ -534,7 +534,54 @@ def create_app() -> Flask:
             return jsonify({"ok": True, "equity": equity})
         except Exception as e:
             return jsonify({"ok": False, "error": str(e)}), 500
+# =============================================
+    # RENTAL SUBSCRIPTIONS (fee-based tiers)
+    # =============================================
 
+    @app.post("/rental/subscribe")
+    @require_hmac
+    def create_rental():
+        from ap.subscription_tiers import create_rental_subscription
+        
+        body = request.get_json(force=True) or {}
+        result = create_rental_subscription(
+            client_id=body.get("client_id"),
+            tier=body.get("tier"),
+            start_date=body.get("start_date")
+        )
+        return jsonify(result), 201 if result.get("ok") else 400
+
+    @app.get("/rental/<client_id>/status")
+    @require_hmac
+    def rental_status(client_id: str):
+        from ap.subscription_tiers import get_rental_status
+        
+        result = get_rental_status(client_id)
+        return jsonify(result), 200 if result.get("ok") else 404
+
+    @app.get("/rental/tiers")
+    def list_tiers():
+        from ap.subscription_tiers import CorrectRentalTiers
+        
+        tiers = {}
+        for tier_key, tier_def in CorrectRentalTiers.TIERS.items():
+            tiers[tier_key] = {
+                "name": tier_def["name"],
+                "description": tier_def["description"],
+                "client_capital": tier_def["client_capital"],
+                "rental_fee": tier_def["rental_fee"],
+                "working_capital": tier_def["working_capital"],
+                "profit_targets": {
+                    "min": tier_def["profit_target_min"],
+                    "max": tier_def["profit_target_max"]
+                },
+                "end_balance": {
+                    "min": tier_def["end_balance_min"],
+                    "max": tier_def["end_balance_max"]
+                }
+            }
+        
+        return jsonify({"ok": True, "tiers": tiers})
     log.info("=" * 70)
     log.info("✅ APP READY")
     log.info("=" * 70)
