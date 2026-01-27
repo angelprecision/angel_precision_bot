@@ -148,14 +148,53 @@ def process_signal(broker, client_id: str, signal_payload: dict) -> dict:
         st = _maybe_reset_client_daily_state(broker, client_id, client, st)
     
 
-        # 2) GROWTH/TARGET CHECK FIRST (before any trade)
+        # 2) GROWTH / TARGET CHECK (SAFE)
+    try:
+      from ap.account_growth import check_growth_status
+
+        # LIVE accounts: enforce growth stops
+        if mode not in ("PAPER", "SIM"):
+        growth = check_growth_status(
+            client_id,
+            subscription_end_date=client.get("subscription_end_date")
+        )
+
+        if growth.get("should_stop"):
+            update_client_state(client_id, {
+                "kill_switch": 1,
+                "mode": "READ_ONLY"
+            })
+            audit(client_id, "INFO", "GROWTH_STOP", growth)
+            return {
+                "ok": False,
+                "reason": "GROWTH_STOP",
+                "error": "profit_target_hit",
+                "client_id": client_id
+            }
+
+    # PAPER / SIM: never block execution
+    else:
         try:
-            from ap.account_growth import check_growth_status
             growth = check_growth_status(client_id)
-            if growth.get("should_stop"):
-                update_client_state(client_id, {"kill_switch": 1, "mode": "READ_ONLY"})
-                audit(client_id, "INFO", "GROWTH_STOP", growth)
-                return {"ok": False, "reason": "GROWTH_STOP", "error": "profit_target_hit", "client_id": client_id}
+            audit(client_id, "INFO", "GROWTH_STATUS_PAPER", {
+                "message": growth.get("message"),
+                "reason": growth.get("reason")
+            })
+        except Exception:
+            pass
+
+except Exception as e:
+    audit(client_id, "ERROR", "GROWTH_CHECK_FAILED", {
+        "error": str(e),
+        "mode": mode
+    })
+
+    # Fail-open in PAPER / SIM
+    if mode in ("PAPER", "SIM"):
+        log.warning(f"[SAFE] Growth check failed in {mode}, allowing trade: {e}")
+    else:
+        return {"ok": False, "error": "growth_check_failed", "client_id": client_id}
+H_STOP", "error": "profit_target_hit", "client_id": client_id}
         except Exception as e:
                 audit(client_id, "ERROR", "GROWTH_CHECK_FAILED", {"error": str(e), "mode": mode})
 
