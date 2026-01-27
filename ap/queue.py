@@ -1,4 +1,10 @@
 # ap/queue.py
+# ✅ DB-backed queue (trade_queue)
+# ✅ Per-client broker cache
+# ✅ Idempotency: already_processed_signal / mark_signal_processed
+# ✅ Best-effort reconcile tick
+# ✅ Throttle handling (requeues job cleanly)
+
 import time
 from typing import Dict
 
@@ -14,23 +20,22 @@ from ap.models import Signal
 from ap.execution import process_signal
 from ap.state import update_state  # global heartbeat only
 from ap.reconcile import reconcile_once
-from ap.client_manager import get_client_broker
 
 log = get_logger("ap.queue")
 
 DEFAULT_CLIENT_ID = "default"
-
-# Per-worker broker cache (good enough for now)
-_BROKERS: Dict[str, object] = {}
+_BROKERS: Dict[str, object] = {}  # populated lazily by _broker_for()
 
 
-def _broker_for(client_id: str):
-    b = _BROKERS.get(client_id)
-    if b is not None:
-        return b
-    b = get_client_broker(client_id)
-    _BROKERS[client_id] = b
-    return b
+def _broker_for(client_id: str, default_broker):
+    """
+    MVP: one broker instance shared per worker.
+    If you later support client-specific broker creds, build them here.
+    """
+    if client_id in _BROKERS:
+        return _BROKERS[client_id]
+    _BROKERS[client_id] = default_broker
+    return default_broker
 
 
 def enqueue_signal(signal: Signal, client_id: str = DEFAULT_CLIENT_ID):
@@ -85,26 +90,37 @@ def complete_job(job_id: int, ok: bool, decision: str, reason: str = "", details
         )))
 
 
+def requeue_job(job_id: int, reason: str, details=None):
+    """
+    Put a job back to NEW (simple MVP throttle/retry).
+    """
+    with conn() as c:
+        run_with_retry(lambda: c.execute("""
+            UPDATE trade_queue
+            SET status='NEW', decision=?, reason=?, details=?
+            WHERE id=?
+        """, (
+            "REQUEUED",
+            reason,
+            json_dumps(details) if details is not None else None,
+            job_id
+        )))
+
+
 def worker_loop(_unused_broker=None, poll_seconds: float = 0.5):
     """
     Gunicorn worker loop. Uses per-client brokers based on job.client_id.
-    NOTE: signature kept compatible with your current app.py thread start.
     """
-    log.info("Worker started (multi-client)")
+    log.info("Worker loop running")
     last_tick = 0.0
 
     while True:
         now = time.time()
 
-        # Every 10 seconds: global heartbeat + reconcile best-effort
-        if now - last_tick >= 10.0:
-            try:
-                # Global heartbeat for /health
-                update_state({"last_heartbeat_ts": now_utc_iso()})
-            except Exception:
-                log.exception("Heartbeat update failed")
+        # heartbeat + reconcile tick
+        if now - last_tick > 5.0:
+            update_state({"last_heartbeat_ts": now_utc_iso()})
 
-            # Reconcile each cached broker (best-effort)
             for cid, b in list(_BROKERS.items()):
                 try:
                     reconcile_once(b, limit=50)
@@ -118,34 +134,39 @@ def worker_loop(_unused_broker=None, poll_seconds: float = 0.5):
             time.sleep(poll_seconds)
             continue
 
-        client_id = (job.get("client_id") or DEFAULT_CLIENT_ID)
+        job_id = int(job["id"])
+        client_id = (job.get("client_id") or DEFAULT_CLIENT_ID).strip()
+        signal_id = (job.get("signal_id") or "").strip()
 
         try:
-            payload = json_loads(job["payload"])
-            signal = Signal(**payload)
-
-            # Dedupe
-            if already_processed_signal(signal.signal_id):
-                res = {"ok": True, "reason": "DEDUPED", "signal_id": signal.signal_id, "client_id": client_id}
-                complete_job(job["id"], True, decision="DEDUPED", reason="DEDUPED", details=res)
-                log.info(f"Processed signal={signal.signal_id} client_id={client_id} ok=True reason=DEDUPED")
+            # Idempotency (DB-backed)
+            if signal_id and already_processed_signal(signal_id, client_id=client_id):
+                complete_job(job_id, ok=True, decision="SKIP_DUP", reason="already_processed")
                 continue
 
-            mark_signal_processed(signal.signal_id)
+            payload = json_loads(job.get("payload") or "{}")
+            sig = Signal(**payload)
 
-            broker = _broker_for(client_id)
+            broker = _broker_for(client_id, _unused_broker)
 
-            res = process_signal(signal, broker, client_id=client_id)
+            result = process_signal(sig, broker, client_id=client_id)
 
-            complete_job(
-                job["id"],
-                bool(res.get("ok")),
-                decision="EXECUTED" if res.get("ok") else "REJECTED",
-                reason=res.get("reason", ""),
-                details=res,
-            )
-            log.info(f"Processed signal={signal.signal_id} client_id={client_id} ok={res.get('ok')} reason={res.get('reason')}")
+            if result.get("ok"):
+                if signal_id:
+                    mark_signal_processed(signal_id, client_id=client_id, decision="EXECUTED")
+                complete_job(job_id, ok=True, decision="EXECUTED", reason="", details=result)
+            else:
+                reason = result.get("reason", "REJECTED")
+                # If throttled, requeue instead of rejecting permanently
+                if reason == "THROTTLED":
+                    requeue_job(job_id, reason="THROTTLED", details=result)
+                    time.sleep(2.0)
+                else:
+                    if signal_id:
+                        mark_signal_processed(signal_id, client_id=client_id, decision="REJECTED", reason=reason)
+                    complete_job(job_id, ok=False, decision="REJECTED", reason=reason, details=result)
 
         except Exception as e:
-            complete_job(job["id"], False, decision="ERROR", reason=str(e), details={"error": str(e), "client_id": client_id})
-            log.exception("Job failed")
+            log.exception(f"Job failed (id={job_id}, client_id={client_id}): {e}")
+            complete_job(job_id, ok=False, decision="ERROR", reason="exception", details={"err": str(e)})
+            time.sleep(0.25)
