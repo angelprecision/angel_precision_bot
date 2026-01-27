@@ -1,10 +1,9 @@
-# app.py - Angel Precision Bot (Render + gunicorn safe)
-# ✅ Gunicorn-safe: no threads started at import time (starts on first request per worker)
-# ✅ Production-safe auth: HMAC for /signal + control endpoints (in prod)
-# ✅ Multi-client routing: X-Client-Id header routes to correct client
-# ✅ Rate limiting + idempotency (in-memory per worker)
-# ✅ Debug endpoints hidden in prod (404)
-# ✅ CORS + Security headers enabled
+# app.py - ANGEL PRECISION BOT (FROZEN VERSION)
+# =====================================================================
+# THIS FILE IS NOW STABLE. DO NOT EDIT.
+# All business logic lives in blueprints (client_api, admin_api, etc).
+# Deploy once. Maintain blueprints only.
+# =====================================================================
 
 import os
 import time
@@ -15,6 +14,7 @@ import uuid
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 from functools import wraps
+from typing import Optional
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -35,32 +35,32 @@ from ap.exit_manager import exit_manager_loop
 from ap.client_api import client_bp
 from ap.admin_api import admin_bp
 
-
 # ============================================================
-# GLOBALS (safe for gunicorn import)
+# GLOBALS (gunicorn safe - no threads at import time)
 # ============================================================
 
 cfg = Config()
 log = get_logger("app")
 
-APP_ENV = os.getenv("APP_ENV", "dev").lower().strip()  # dev|prod
-SIGNING_SECRET = os.getenv("SIGNING_SECRET", "").encode()  # required in prod for signed endpoints
+APP_ENV = os.getenv("APP_ENV", "dev").lower().strip()
+SIGNING_SECRET = os.getenv("SIGNING_SECRET", "").encode()
 
-# Rate limiting (per process / per worker). Upgrade to Redis later.
+# Rate limiting (per worker - upgrade to Redis later)
 _RATE = defaultdict(lambda: deque())
 RATE_LIMIT_PER_MIN = int(os.getenv("RATE_LIMIT_PER_MIN", "60"))
 
-# Idempotency cache (per process / per worker). Upgrade to DB/Redis later.
+# Idempotency cache (per worker - upgrade to Redis later)
 _IDEMP = {}
-IDEMP_TTL_SECONDS = int(os.getenv("IDEMP_TTL_SECONDS", "300"))  # 5 minutes
+IDEMP_TTL_SECONDS = int(os.getenv("IDEMP_TTL_SECONDS", "300"))
 
 # Threads
 THREADS_STARTED = False
 THREAD_LOCK = threading.Lock()
 
+MAX_CONTENT_LENGTH = int(os.getenv("MAX_CONTENT_LENGTH_BYTES", str(256 * 1024)))
 
 # ============================================================
-# SECURITY + UTIL HELPERS
+# SECURITY HELPERS
 # ============================================================
 
 def _client_ip() -> str:
@@ -100,13 +100,7 @@ def _idem_set(key: str, payload: dict):
 
 
 def _verify_hmac(req) -> bool:
-    """
-    Client sends:
-      X-AP-Timestamp: unix seconds (string)
-      X-AP-Signature: hex(hmac_sha256(secret, f"{ts}.{raw_body}"))
-
-    Replay window: ±60 seconds
-    """
+    """HMAC-SHA256 signature verification (required in prod)"""
     if not SIGNING_SECRET:
         return False
 
@@ -123,14 +117,15 @@ def _verify_hmac(req) -> bool:
     if abs(int(time.time()) - ts_i) > 60:
         return False
 
-    raw = req.get_data(cache=False, as_text=False) or b""
+    # CRITICAL: cache=True allows Flask to parse JSON later
+    raw = req.get_data(cache=True, as_text=False) or b""
     msg = str(ts_i).encode() + b"." + raw
     expected = hmac.new(SIGNING_SECRET, msg, hashlib.sha256).hexdigest()
     return hmac.compare_digest(expected, sig)
 
 
 def require_hmac(fn):
-    """Require HMAC auth in prod; no-op in dev."""
+    """Require HMAC in prod; no-op in dev"""
     @wraps(fn)
     def wrapper(*args, **kwargs):
         if APP_ENV == "prod" and not _verify_hmac(request):
@@ -139,12 +134,8 @@ def require_hmac(fn):
     return wrapper
 
 
-def _require_client_id_header() -> str | None:
-    """
-    Multi-client routing:
-      - prod: requires X-Client-Id header
-      - dev: falls back to 'default' for backward compatibility
-    """
+def _require_client_id_header() -> Optional[str]:
+    """Multi-client routing via X-Client-Id header"""
     cid = (request.headers.get("X-Client-Id", "") or "").strip()
     if cid:
         return cid
@@ -154,17 +145,15 @@ def _require_client_id_header() -> str | None:
 
 
 def _validate_active_client(client_id: str):
-    """
-    Raises ValueError if client unknown or inactive.
-    """
-    client = get_client(client_id)  # raises if not found
+    """Validate client is active"""
+    client = get_client(client_id)
     if (client.get("status") or "").upper() != "ACTIVE":
         raise ValueError(f"client_not_active:{client.get('status')}")
     return client
 
 
 # ============================================================
-# BROKER INIT
+# BROKER INITIALIZATION
 # ============================================================
 
 def build_broker():
@@ -176,51 +165,43 @@ def build_broker():
         if not access_token or not account_id:
             raise RuntimeError("Missing TRADIER_ACCESS_TOKEN or TRADIER_ACCOUNT_ID")
 
-        log.info(f"Initializing Tradier broker in {cfg.BOT_MODE} mode")
+        log.info(f"Initializing Tradier broker ({cfg.BOT_MODE})")
         b = TradierBroker(TradierConfig(
             base_url=base_url,
             access_token=access_token,
             account_id=account_id,
         ))
-        log.info("Tradier broker initialized")
         return b
 
-    log.info(f"Initializing Simulator broker in {cfg.BOT_MODE} mode")
-    b = SimBroker(starting_equity=10000.0)
-    log.info("Simulator broker initialized")
-    return b
+    log.info(f"Initializing Simulator broker ({cfg.BOT_MODE})")
+    return SimBroker(starting_equity=10000.0)
 
 
 # ============================================================
-# BACKGROUND THREADS (per gunicorn worker)
+# BACKGROUND THREADS (start once per worker)
 # ============================================================
 
 def start_worker(broker):
     log.info("Starting worker thread...")
     t = threading.Thread(target=worker_loop, args=(broker,), daemon=True, name="WorkerThread")
     t.start()
-    log.info("✅ Worker thread started")
 
 
 def start_exit_manager(broker):
     log.info("Starting exit manager thread...")
     t = threading.Thread(target=exit_manager_loop, args=(broker,), daemon=True, name="ExitManagerThread")
     t.start()
-    log.info("✅ Exit manager thread started")
 
 
 def start_fill_monitor(broker):
-    """Start fill monitoring thread - THE ACCURACY LAYER! (optional, never fatal)"""
-    log.info("Starting fill monitor thread...")
+    """Optional: fill monitor thread"""
     try:
         from ap.fill_monitor import fill_monitor_loop
+        log.info("Starting fill monitor thread...")
+        t = threading.Thread(target=fill_monitor_loop, args=(broker,), daemon=True, name="FillMonitorThread")
+        t.start()
     except Exception as e:
-        log.warning(f"⚠️ Fill monitor not started: {e}")
-        return
-
-    t = threading.Thread(target=fill_monitor_loop, args=(broker,), daemon=True, name="FillMonitorThread")
-    t.start()
-    log.info("✅ Fill monitor thread started")
+        log.warning(f"Fill monitor not available: {e}")
 
 
 def start_background_threads_once(broker):
@@ -232,7 +213,7 @@ def start_background_threads_once(broker):
         start_exit_manager(broker)
         start_fill_monitor(broker)
         THREADS_STARTED = True
-        log.info("✅ Background threads started (once per worker)")
+        log.info("✅ All background threads started")
 
 
 # ============================================================
@@ -241,61 +222,61 @@ def start_background_threads_once(broker):
 
 def create_app() -> Flask:
     app = Flask(__name__)
+    app.config["MAX_CONTENT_LENGTH"] = MAX_CONTENT_LENGTH
 
-    log.info("=" * 60)
-    log.info("ANGEL PRECISION BOT - STARTING")
-    log.info("=" * 60)
-    log.info(f"APP_ENV: {APP_ENV}")
-    log.info(f"Mode: {cfg.BOT_MODE}")
-    log.info(f"Database: {cfg.DB_FILE}")
-    log.info("=" * 60)
+    log.info("=" * 70)
+    log.info("ANGEL PRECISION BOT - INITIALIZING")
+    log.info("=" * 70)
+    log.info(f"ENV: {APP_ENV} | MODE: {cfg.BOT_MODE} | DB: {cfg.DB_FILE}")
+    log.info("=" * 70)
 
-    log.info("Initializing database...")
     init_db()
     log.info("✅ Database initialized")
 
-    log.info(f"Setting mode to: {cfg.BOT_MODE}")
     update_state({"mode": cfg.BOT_MODE})
     log.info("✅ State initialized")
 
     broker = build_broker()
     app.config["BROKER"] = broker
+    log.info("✅ Broker initialized")
 
     @app.before_request
     def _ensure_threads_started():
         start_background_threads_once(app.config["BROKER"])
 
-    # Register multi-client blueprints
+    # Register blueprints
     app.register_blueprint(client_bp)
     app.register_blueprint(admin_bp)
 
-    # CORS Protection
+    # CORS
+    allow_headers = [
+        "Content-Type", "Authorization", "X-Client-Id", "X-AP-Timestamp",
+        "X-AP-Signature", "Idempotency-Key", "X-API-Key", "X-Admin-Key",
+    ]
     CORS(app, resources={
-        r"/client/*": {
-            "origins": ["*"],  # TODO: Change to your dashboard domain before production
-            "methods": ["GET", "POST", "PATCH"],
-            "allow_headers": ["Content-Type", "Authorization", "X-API-Key"]
-        },
-        r"/admin/*": {
-            "origins": ["*"],  # TODO: Change to your admin domain before production
-            "methods": ["GET", "POST", "PATCH"],
-            "allow_headers": ["Content-Type", "X-Admin-Key"]
-        }
+        r"/client/*": {"origins": ["*"], "methods": ["GET", "POST", "PATCH"], "allow_headers": allow_headers},
+        r"/admin/*": {"origins": ["*"], "methods": ["GET", "POST", "PATCH"], "allow_headers": allow_headers},
+        r"/signal": {"origins": ["*"], "methods": ["POST"], "allow_headers": allow_headers},
+        r"/scanner/*": {"origins": ["*"], "methods": ["POST"], "allow_headers": allow_headers},
+        r"/control/*": {"origins": ["*"], "methods": ["POST"], "allow_headers": allow_headers},
+        r"/rental/*": {"origins": ["*"], "methods": ["GET", "POST"], "allow_headers": allow_headers},
     })
 
-    # Security Headers
+    # Security headers
     @app.after_request
     def add_security_headers(response):
-        response.headers['X-Content-Type-Options'] = 'nosniff'
-        response.headers['X-Frame-Options'] = 'DENY'
-        response.headers['X-XSS-Protection'] = '1; mode=block'
-        response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
-        response.headers['Content-Security-Policy'] = "default-src 'self'"
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        response.headers["Permissions-Policy"] = "geolocation=(), microphone=(), camera=()"
+        if APP_ENV == "prod":
+            response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+            response.headers["Content-Security-Policy"] = "default-src 'self'"
         return response
 
-    # =========================
-    # ROOT / HEALTH / STATE
-    # =========================
+    # =============================================
+    # ROOT / HEALTH / STATE (core infrastructure)
+    # =============================================
 
     @app.get("/")
     def root():
@@ -303,30 +284,15 @@ def create_app() -> Flask:
             "service": "Angel Precision Bot",
             "status": "online",
             "env": APP_ENV,
-            "endpoints": {
-                "health": "/health",
-                "state": "/state",
-                "signal_json": "/signal",
-                "signal_discord": "/scanner/discord",
-                "dashboard": "/dashboard",
-                "reset_equity": "/reset_equity",
-                "reports": {
-                    "orders": "/report/orders",
-                    "positions": "/report/positions",
-                    "audit": "/report/audit",
-                    "summary": "/report/summary"
-                },
-                "debug": {
-                    "order": "/debug/order/<order_id>",
-                    "test_signal": "POST /debug/test_signal"
-                },
-                "monitor": {
-                    "positions": "/monitor/positions"
-                },
-                "control": {
-                    "force_exit": "POST /control/force_exit/<position_id>",
-                    "flatten_all": "POST /control/flatten_all"
-                }
+            "mode": cfg.BOT_MODE,
+            "docs": {
+                "health": "GET /health",
+                "state": "GET /state",
+                "ingest": ["POST /signal", "POST /scanner/discord"],
+                "client_api": "GET /client/*",
+                "admin_api": "GET /admin/*",
+                "control": "POST /control/*, POST /kill_switch/*, POST /mode",
+                "rental": "POST /rental/subscribe, GET /rental/<client_id>/status",
             }
         })
 
@@ -334,7 +300,6 @@ def create_app() -> Flask:
     def health():
         try:
             st = load_state()
-
             heartbeat_ok = False
             heartbeat_age = None
             if st.get("last_heartbeat_ts"):
@@ -346,44 +311,60 @@ def create_app() -> Flask:
                     pass
 
             all_ok = heartbeat_ok or heartbeat_age is None
-
-            return jsonify({
+            resp = {
                 "ok": all_ok,
                 "status": "healthy" if all_ok else "degraded",
                 "mode": st.get("mode", "UNKNOWN"),
                 "kill_switch": st.get("kill_switch", False),
-                "heartbeat": st.get("last_heartbeat_ts"),
                 "heartbeat_age_seconds": heartbeat_age,
-                "worker_alive": heartbeat_ok,
+            }
 
-                # Safe auth diagnostics (does NOT reveal secret)
-                "app_env": APP_ENV,
-                "signing_secret_loaded": bool(SIGNING_SECRET),
-                "signing_secret_len": len(SIGNING_SECRET) if SIGNING_SECRET else 0,
-            }), 200 if all_ok else 503
+            if APP_ENV != "prod":
+                resp["signing_secret_loaded"] = bool(SIGNING_SECRET)
 
+            return jsonify(resp), 200 if all_ok else 503
         except Exception as e:
             log.error(f"Health check failed: {e}")
-            return jsonify({"ok": False, "status": "error", "error": str(e)}), 503
+            return jsonify({"ok": False, "status": "error"}), 503
 
     @app.get("/state")
     def state():
         try:
             return jsonify(load_state())
         except Exception as e:
-            log.error(f"State retrieval failed: {e}")
+            log.error(f"State failed: {e}")
             return jsonify({"error": str(e)}), 500
 
-    # =========================
-    # CONTROL (PROTECTED)
-    # =========================
+    @app.get("/dashboard")
+    def dashboard():
+        try:
+            st = load_state()
+            with conn() as c:
+                pos_row = c.execute("SELECT COUNT(*) as n FROM positions WHERE status='OPEN'").fetchone()
+                queue_row = c.execute("SELECT COUNT(*) as n FROM trade_queue WHERE status='NEW'").fetchone()
+            
+            return jsonify({
+                "status": "healthy" if not st.get("kill_switch") else "stopped",
+                "mode": st.get("mode"),
+                "open_positions": int(pos_row["n"]) if pos_row else 0,
+                "pending_signals": int(queue_row["n"]) if queue_row else 0,
+                "trades_today": st.get("trades_taken_today", 0),
+                "current_equity": st.get("current_equity_last", 0),
+            })
+        except Exception as e:
+            log.error(f"Dashboard failed: {e}")
+            return jsonify({"error": str(e)}), 500
+
+    # =============================================
+    # GLOBAL CONTROL (kill switch, mode)
+    # =============================================
 
     @app.post("/kill_switch/on")
     @require_hmac
     def kill_on():
         log.warning("🔴 KILL SWITCH ENABLED")
         update_state({"kill_switch": True, "mode": "READ_ONLY"})
-        return jsonify({"ok": True, "kill_switch": True, "mode": "READ_ONLY"})
+        return jsonify({"ok": True, "kill_switch": True})
 
     @app.post("/kill_switch/off")
     @require_hmac
@@ -398,44 +379,38 @@ def create_app() -> Flask:
         body = request.get_json(force=True) or {}
         mode = str(body.get("mode", "")).upper()
         if mode not in ("SIM", "PAPER", "LIVE", "READ_ONLY"):
-            return jsonify({"ok": False, "error": "Invalid mode"}), 400
-        log.info(f"Mode changed to: {mode}")
+            return jsonify({"ok": False, "error": "invalid_mode"}), 400
+        log.info(f"Mode changed: {mode}")
         update_state({"mode": mode})
         return jsonify({"ok": True, "mode": mode})
 
-    # =========================
-    # SIGNAL INGESTION (PROTECTED IN PROD + MULTI-CLIENT)
-    # =========================
+    # =============================================
+    # SIGNAL INGESTION (multi-client, HMAC protected)
+    # =============================================
 
     @app.post("/signal")
     @require_hmac
     def signal():
         ip = _client_ip()
-
-        # Rate limit first
-        if _rate_limited(f"signal:{ip}"):
-            return jsonify({"ok": False, "error": "rate_limited"}), 429
-
-        # Multi-client routing
         client_id = _require_client_id_header()
         if not client_id:
-            return jsonify({"ok": False, "error": "missing_client_id", "message": "X-Client-Id required"}), 400
+            return jsonify({"ok": False, "error": "missing_client_id"}), 400
+
+        if _rate_limited(f"signal:{client_id}:{ip}"):
+            return jsonify({"ok": False, "error": "rate_limited"}), 429
 
         try:
             _validate_active_client(client_id)
         except Exception as e:
             msg = str(e)
             if msg.startswith("client_not_active:"):
-                return jsonify({"ok": False, "error": "client_not_active", "detail": msg}), 403
+                return jsonify({"ok": False, "error": "client_not_active"}), 403
             return jsonify({"ok": False, "error": "unknown_client"}), 404
 
         body = request.get_json(force=True) or {}
-
-        # Idempotency (prefer signal_id)
         idem_key = (
             str(body.get("signal_id") or "").strip()
             or request.headers.get("Idempotency-Key", "").strip()
-            or str(body.get("idempotency_key") or "").strip()
         )
 
         cached = _idem_get(idem_key)
@@ -445,38 +420,20 @@ def create_app() -> Flask:
         try:
             sig = Signal(**body)
         except ValidationError as e:
-            log.warning(f"Invalid signal payload: {e.errors()}")
-            payload = {
-                "ok": False,
-                "error": "Invalid signal payload",
-                "details": e.errors(),
-                "example": {
-                    "signal_id": "uuid-string",
-                    "symbol": "SPY",
-                    "direction": "CALL",
-                    "pattern_id": "MANUAL_TEST",
-                    "timestamp_iso": "2026-01-22T00:00:00Z",
-                    "trigger": {"strike": 475.0, "expiry_hint": "Weekly"}
-                }
-            }
+            payload = {"ok": False, "error": "invalid_signal", "details": e.errors()}
             _idem_set(idem_key, payload)
             return jsonify(payload), 400
 
         st = load_state()
         if st.get("kill_switch") or st.get("mode") == "READ_ONLY":
-            payload = {
-                "ok": False,
-                "error": "bot_in_read_only",
-                "mode": st.get("mode"),
-                "kill_switch": st.get("kill_switch", False)
-            }
+            payload = {"ok": False, "error": "bot_in_read_only"}
             _idem_set(idem_key, payload)
             return jsonify(payload), 403
 
         enqueue_signal(sig, client_id=client_id)
-        log.info(f"Signal queued: client_id={client_id} {sig.symbol} {sig.direction} (ip={ip})")
+        log.info(f"Signal queued: {client_id} {sig.symbol} {sig.direction}")
 
-        payload = {"ok": True, "queued": True, "signal_id": sig.signal_id, "client_id": client_id}
+        payload = {"ok": True, "queued": True, "signal_id": sig.signal_id}
         _idem_set(idem_key, payload)
         return jsonify(payload), 202
 
@@ -484,40 +441,34 @@ def create_app() -> Flask:
     @require_hmac
     def scanner_discord():
         ip = _client_ip()
-        if _rate_limited(f"scanner:{ip}"):
-            return jsonify({"ok": False, "error": "rate_limited"}), 429
-
-        # Multi-client routing
         client_id = _require_client_id_header()
         if not client_id:
-            return jsonify({"ok": False, "error": "missing_client_id", "message": "X-Client-Id required"}), 400
+            return jsonify({"ok": False, "error": "missing_client_id"}), 400
+
+        if _rate_limited(f"scanner:{client_id}:{ip}"):
+            return jsonify({"ok": False, "error": "rate_limited"}), 429
 
         try:
             _validate_active_client(client_id)
         except Exception as e:
             msg = str(e)
             if msg.startswith("client_not_active:"):
-                return jsonify({"ok": False, "error": "client_not_active", "detail": msg}), 403
+                return jsonify({"ok": False, "error": "client_not_active"}), 403
             return jsonify({"ok": False, "error": "unknown_client"}), 404
 
         body = request.get_json(silent=True) or {}
-        if not body:
-            return jsonify({"ok": False, "error": "Expected JSON body", "example": {"content": "paste scanner text here"}}), 400
-
         text = body.get("content") or ""
         if not text:
-            return jsonify({"ok": False, "error": "No content provided"}), 400
-
+            return jsonify({"ok": False, "error": "no_content"}), 400
         if len(text) > 20000:
-            return jsonify({"ok": False, "error": "content too large"}), 413
+            return jsonify({"ok": False, "error": "content_too_large"}), 413
 
         try:
             parsed = parse_scanner_text(text)
             queued = 0
+            now_iso = datetime.now(timezone.utc).isoformat()
 
             for msg in parsed:
-                now_iso = datetime.now(timezone.utc).isoformat()
-
                 if msg.calls and msg.calls.strike:
                     sig = Signal(
                         signal_id=str(uuid.uuid4()),
@@ -528,21 +479,17 @@ def create_app() -> Flask:
                         timestamp_iso=now_iso,
                         trigger={
                             "source": "discord",
-                            "scanned_at": msg.scanned_at,
-                            "current": msg.current,
+                            "strike": msg.calls.strike,
                             "entry": msg.calls.entry,
                             "stop": msg.calls.stop,
                             "pt1": msg.calls.pt1,
                             "pt2": msg.calls.pt2,
                             "pt3": msg.calls.pt3,
-                            "strike": msg.calls.strike,
                             "expiry_hint": msg.calls.expiry_hint,
-                            "raw_strike": msg.calls.raw_strike_line
-                        }
+                        },
                     )
                     enqueue_signal(sig, client_id=client_id)
                     queued += 1
-                    log.info(f"Queued CALL: client_id={client_id} {msg.symbol} strike={msg.calls.strike}")
 
                 if msg.puts and msg.puts.strike:
                     sig = Signal(
@@ -554,490 +501,50 @@ def create_app() -> Flask:
                         timestamp_iso=now_iso,
                         trigger={
                             "source": "discord",
-                            "scanned_at": msg.scanned_at,
-                            "current": msg.current,
+                            "strike": msg.puts.strike,
                             "entry": msg.puts.entry,
                             "stop": msg.puts.stop,
                             "pt1": msg.puts.pt1,
                             "pt2": msg.puts.pt2,
                             "pt3": msg.puts.pt3,
-                            "strike": msg.puts.strike,
                             "expiry_hint": msg.puts.expiry_hint,
-                            "raw_strike": msg.puts.raw_strike_line
-                        }
+                        },
                     )
                     enqueue_signal(sig, client_id=client_id)
                     queued += 1
-                    log.info(f"Queued PUT: client_id={client_id} {msg.symbol} strike={msg.puts.strike}")
 
-            log.info(f"Parsed {len(parsed)} setups, queued {queued} signals for client_id={client_id}")
-            return jsonify({"ok": True, "parsed": len(parsed), "queued": queued, "client_id": client_id})
+            return jsonify({"ok": True, "parsed": len(parsed), "queued": queued})
 
         except Exception as e:
-            log.error(f"Failed to parse scanner message: {e}")
+            log.error(f"Scanner parse failed: {e}")
             return jsonify({"ok": False, "error": str(e)}), 500
 
-    # =========================
-    # UTIL
-    # =========================
-
-    @app.get("/dashboard")
-    def dashboard():
-        try:
-            st = load_state()
-            with conn() as c:
-                pos_row = c.execute("SELECT COUNT(*) as n FROM positions WHERE status='OPEN'").fetchone()
-                open_positions = int(pos_row["n"]) if pos_row else 0
-
-                queue_row = c.execute("SELECT COUNT(*) as n FROM trade_queue WHERE status='NEW'").fetchone()
-                pending_signals = int(queue_row["n"]) if queue_row else 0
-
-            return jsonify({
-                "status": "healthy" if not st.get("kill_switch") else "stopped",
-                "mode": st.get("mode"),
-                "kill_switch": st.get("kill_switch"),
-                "stats": {
-                    "open_positions": open_positions,
-                    "pending_signals": pending_signals,
-                    "trades_today": st.get("trades_taken_today", 0),
-                    "current_equity": st.get("current_equity_last", 0)
-                }
-            })
-        except Exception as e:
-            log.error(f"Dashboard error: {e}")
-            return jsonify({"error": str(e)}), 500
-
-    @app.post("/reset_equity")
-    @require_hmac
-    def reset_equity():
-        broker = app.config["BROKER"]
-        try:
-            equity = broker.get_account_equity()
-            update_state({
-                "initial_equity_run": equity,
-                "starting_equity_today": equity,
-                "current_equity_last": equity,
-                "realized_pnl_today": 0.0,
-                "trades_taken_today": 0,
-                "daily_stop_hit": False
-            })
-            log.info(f"🔄 Equity reset to ${equity}")
-            return jsonify({"ok": True, "equity": equity, "message": "Equity reset successful"})
-        except Exception as e:
-            log.error(f"Equity reset failed: {e}")
-            return jsonify({"ok": False, "error": str(e)}), 500
-
-    @app.post("/admin/migrate")
-    @require_hmac
-    def run_migration():
-        """Run multi-client database migration"""
-        try:
-            from ap.migrations.add_clients import migrate
-            migrate()
-            return jsonify({"ok": True, "message": "Migration completed successfully"})
-        except Exception as e:
-            log.error(f"Migration failed: {e}")
-            return jsonify({"ok": False, "error": str(e)}), 500
+    # =============================================
+    # BROKER TEST
+    # =============================================
 
     @app.get("/tradier/test")
     @require_hmac
     def tradier_test():
         broker = app.config["BROKER"]
         if cfg.BOT_MODE not in ("PAPER", "LIVE"):
-            return jsonify({"ok": False, "error": "Only available in PAPER/LIVE mode"}), 400
+            return jsonify({"ok": False, "error": "only_paper_live"}), 400
         try:
             equity = broker.get_account_equity()
-            log.info(f"Tradier test successful: equity=${equity}")
             return jsonify({"ok": True, "equity": equity})
         except Exception as e:
-            log.error(f"Tradier test failed: {e}")
             return jsonify({"ok": False, "error": str(e)}), 500
 
-    # =========================
-    # REPORTING
-    # =========================
-
-    @app.get("/report/orders")
-    @require_hmac
-    def report_orders():
-        limit = int(request.args.get("limit", "200"))
-        status = request.args.get("status")
-        with conn() as c:
-            if status:
-                rows = c.execute(
-                    "SELECT * FROM orders WHERE status=? ORDER BY created_ts DESC LIMIT ?",
-                    (status, limit)
-                ).fetchall()
-            else:
-                rows = c.execute(
-                    "SELECT * FROM orders ORDER BY created_ts DESC LIMIT ?",
-                    (limit,)
-                ).fetchall()
-        return jsonify({"ok": True, "count": len(rows), "orders": [dict(r) for r in rows]})
-
-    @app.get("/report/positions")
-    @require_hmac
-    def report_positions():
-        status = str(request.args.get("status", "OPEN")).upper()
-        limit = int(request.args.get("limit", "200"))
-        if status not in ("ALL", "OPEN", "CLOSING", "CLOSED"):
-            return jsonify({"ok": False, "error": "status must be ALL|OPEN|CLOSING|CLOSED"}), 400
-
-        with conn() as c:
-            if status == "ALL":
-                rows = c.execute(
-                    "SELECT * FROM positions ORDER BY entry_ts DESC LIMIT ?",
-                    (limit,)
-                ).fetchall()
-            else:
-                rows = c.execute(
-                    "SELECT * FROM positions WHERE status=? ORDER BY entry_ts DESC LIMIT ?",
-                    (status, limit)
-                ).fetchall()
-
-        return jsonify({"ok": True, "count": len(rows), "positions": [dict(r) for r in rows]})
-
-    @app.get("/report/audit")
-    @require_hmac
-    def report_audit():
-        limit = int(request.args.get("limit", "200"))
-        level = request.args.get("level")
-        event = request.args.get("event")
-
-        sql = "SELECT * FROM audit_log WHERE 1=1"
-        params = []
-
-        if level:
-            sql += " AND level=?"
-            params.append(level)
-        if event:
-            sql += " AND event=?"
-            params.append(event)
-
-        sql += " ORDER BY id DESC LIMIT ?"
-        params.append(limit)
-
-        with conn() as c:
-            rows = c.execute(sql, params).fetchall()
-
-        return jsonify({"ok": True, "count": len(rows), "events": [dict(r) for r in rows]})
-
-    @app.get("/report/summary")
-    @require_hmac
-    def report_summary():
-        try:
-            with conn() as c:
-                order_stats = c.execute("SELECT status, COUNT(*) as count FROM orders GROUP BY status").fetchall()
-                pos_stats = c.execute("SELECT status, COUNT(*) as count FROM positions GROUP BY status").fetchall()
-                queue_stats = c.execute("SELECT status, COUNT(*) as count FROM trade_queue GROUP BY status").fetchall()
-
-                errors = c.execute("""
-                    SELECT event, COUNT(*) as count
-                    FROM audit_log
-                    WHERE level='ERROR'
-                      AND ts > datetime('now', '-1 day')
-                    GROUP BY event
-                """).fetchall()
-
-            state = load_state()
-
-            return jsonify({
-                "ok": True,
-                "state": state,
-                "orders": {row["status"]: row["count"] for row in order_stats},
-                "positions": {row["status"]: row["count"] for row in pos_stats},
-                "queue": {row["status"]: row["count"] for row in queue_stats},
-                "recent_errors": {row["event"]: row["count"] for row in errors}
-            })
-        except Exception as e:
-            return jsonify({"ok": False, "error": str(e)}), 500
-
-    # =========================
-    # DEBUG (HIDDEN IN PROD)
-    # =========================
-
-    @app.get("/debug/order/<order_id>")
-    def debug_order(order_id):
-        broker = app.config["BROKER"]
-        if APP_ENV == "prod":
-            return jsonify({"ok": False, "error": "not_found"}), 404
-        try:
-            return jsonify({"ok": True, "order": broker.get_order(order_id)})
-        except Exception as e:
-            return jsonify({"ok": False, "error": str(e)}), 500
-
-    @app.post("/debug/test_signal")
-    def debug_test_signal():
-        if APP_ENV == "prod":
-            return jsonify({"ok": False, "error": "not_found"}), 404
-
-        body = request.get_json(force=True) or {}
-        symbol = (body.get("symbol", "SPY") or "SPY").upper().strip()
-        direction = (body.get("direction", "CALL") or "CALL").upper().strip()
-        strike = body.get("strike")
-        expiry_hint = body.get("expiry_hint", "Weekly")
-
-        if strike is None:
-            return jsonify({
-                "ok": False,
-                "error": "Missing strike price",
-                "example": {"symbol": "AAPL", "direction": "CALL", "strike": 240, "expiry_hint": "Weekly"}
-            }), 400
-
-        try:
-            sig = Signal(
-                signal_id=str(uuid.uuid4()),
-                symbol=symbol,
-                direction=direction,
-                pattern_id="MANUAL_TEST",
-                confidence_tag="test",
-                timestamp_iso=datetime.now(timezone.utc).isoformat(),
-                trigger={
-                    "source": "manual_test",
-                    "strike": float(strike),
-                    "expiry_hint": expiry_hint,
-                    "entry": 0,
-                    "stop": 0,
-                    "pt1": 0,
-                    "pt2": 0,
-                    "pt3": 0
-                }
-            )
-            enqueue_signal(sig, client_id="default")
-            return jsonify({"ok": True, "queued": True, "signal_id": sig.signal_id})
-        except Exception as e:
-            log.error(f"Test signal failed: {e}")
-            return jsonify({"ok": False, "error": str(e)}), 500
-
-    # =========================
-    # MONITOR
-    # =========================
-
-    @app.get("/monitor/positions")
-    @require_hmac
-    def monitor_positions():
-        broker = app.config["BROKER"]
-        try:
-            from ap.contract_pricing import get_contract_price
-
-            with conn() as c:
-                rows = c.execute("""
-                    SELECT * FROM positions
-                    WHERE status IN ('OPEN', 'CLOSING')
-                    ORDER BY entry_ts DESC
-                """).fetchall()
-
-            positions = []
-            for row in rows:
-                pos = dict(row)
-                try:
-                    current_price = get_contract_price(broker, pos["contract"], side="SELL")
-                    entry_price = float(pos["avg_fill"])
-                    qty = int(pos["qty"])
-                    unrealized_pnl = (current_price - entry_price) * qty * 100
-
-                    tp_price = entry_price * (1.0 + float(pos["tp_pct"]))
-                    sl_price = entry_price * (1.0 - float(pos["sl_pct"]))
-
-                    to_tp_pct = ((tp_price - current_price) / current_price) * 100 if current_price > 0 else 0
-                    to_sl_pct = ((current_price - sl_price) / current_price) * 100 if current_price > 0 else 0
-
-                    positions.append({
-                        "position_id": pos["id"],
-                        "contract": pos["contract"],
-                        "status": pos["status"],
-                        "qty": qty,
-                        "entry_price": entry_price,
-                        "current_price": current_price,
-                        "unrealized_pnl": unrealized_pnl,
-                        "tp_price": tp_price,
-                        "sl_price": sl_price,
-                        "to_tp_pct": to_tp_pct,
-                        "to_sl_pct": to_sl_pct,
-                        "entry_ts": pos["entry_ts"],
-                        "exit_reason": pos.get("exit_reason")
-                    })
-                except Exception as e:
-                    log.error(f"Failed to get price for {pos.get('contract')}: {e}")
-                    positions.append({
-                        "position_id": pos.get("id"),
-                        "contract": pos.get("contract"),
-                        "status": pos.get("status"),
-                        "error": "Price unavailable"
-                    })
-
-            state_now = load_state()
-            return jsonify({
-                "ok": True,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "mode": state_now.get("mode"),
-                "kill_switch": state_now.get("kill_switch"),
-                "positions": positions,
-                "total_unrealized_pnl": sum(p.get("unrealized_pnl", 0) for p in positions),
-                "realized_pnl_today": state_now.get("realized_pnl_today", 0)
-            })
-
-        except Exception as e:
-            log.error(f"Position monitor failed: {e}")
-            return jsonify({"ok": False, "error": str(e)}), 500
-
-    # =========================
-    # CONTROL (TRADING ACTIONS) - PROTECTED + CLIENT-SCOPED
-    # =========================
-
-    @app.post("/control/force_exit/<position_id>")
-    @require_hmac
-    def force_exit_position(position_id: str):
-        broker = app.config["BROKER"]
-        
-        # Multi-client routing
-        client_id = _require_client_id_header()
-        if not client_id:
-            return jsonify({"ok": False, "error": "missing_client_id"}), 400
-        
-        try:
-            with conn() as c:
-                pos_row = c.execute(
-                    "SELECT * FROM positions WHERE id=? AND client_id=? AND status IN ('OPEN', 'CLOSING')",
-                    (position_id, client_id)
-                ).fetchone()
-
-            if not pos_row:
-                return jsonify({"ok": False, "error": f"Position {position_id} not found or already closed"}), 404
-
-            pos = dict(pos_row)
-
-            with conn() as c:
-                c.execute("UPDATE positions SET status='CLOSING', exit_reason='MANUAL_EXIT' WHERE id=?", (position_id,))
-
-            from ap.db import insert_order, update_order, new_local_order_id
-            local_order_id = new_local_order_id()
-
-            insert_order(
-                local_order_id=local_order_id,
-                position_id=position_id,
-                kind="EXIT",
-                status="NEW",
-                symbol=pos["underlying"],
-                contract=pos["contract"],
-                qty=int(pos["qty"]),
-                limit_price=None
-            )
-
-            resp = broker.place_order(
-                symbol=pos["underlying"],
-                contract=pos["contract"],
-                qty=int(pos["qty"]),
-                limit_price=None,
-                side="sell_to_close"
-            )
-
-            broker_order_id = getattr(resp, "broker_order_id", None)
-            status = getattr(resp, "status", None)
-
-            update_order(local_order_id, status=status, broker_order_id=broker_order_id)
-
-            log.warning(f"🚨 MANUAL EXIT: client_id={client_id} {pos['contract']} by user request")
-
-            return jsonify({
-                "ok": True,
-                "message": "Manual exit order submitted",
-                "position_id": position_id,
-                "contract": pos["contract"],
-                "local_order_id": local_order_id,
-                "broker_order_id": broker_order_id,
-                "status": status
-            })
-
-        except Exception as e:
-            log.error(f"Force exit failed: {e}")
-            return jsonify({"ok": False, "error": str(e)}), 500
-
-    @app.post("/control/flatten_all")
-    @require_hmac
-    def flatten_all_positions():
-        broker = app.config["BROKER"]
-        
-        # Multi-client routing
-        client_id = _require_client_id_header()
-        if not client_id:
-            return jsonify({"ok": False, "error": "missing_client_id"}), 400
-        
-        try:
-            with conn() as c:
-                rows = c.execute(
-                    "SELECT * FROM positions WHERE status='OPEN' AND client_id=?",
-                    (client_id,)
-                ).fetchall()
-
-            positions = [dict(r) for r in rows]
-            if not positions:
-                return jsonify({"ok": True, "message": "No open positions to close", "closed": 0})
-
-            closed = []
-            failed = []
-
-            for pos in positions:
-                try:
-                    with conn() as c:
-                        c.execute("UPDATE positions SET status='CLOSING', exit_reason='FLATTEN_ALL' WHERE id=?", (pos["id"],))
-
-                    from ap.db import insert_order, update_order, new_local_order_id
-                    local_order_id = new_local_order_id()
-
-                    insert_order(
-                        local_order_id=local_order_id,
-                        position_id=pos["id"],
-                        kind="EXIT",
-                        status="NEW",
-                        symbol=pos["underlying"],
-                        contract=pos["contract"],
-                        qty=int(pos["qty"]),
-                        limit_price=None
-                    )
-
-                    resp = broker.place_order(
-                        symbol=pos["underlying"],
-                        contract=pos["contract"],
-                        qty=int(pos["qty"]),
-                        limit_price=None,
-                        side="sell_to_close"
-                    )
-
-                    broker_order_id = getattr(resp, "broker_order_id", None)
-                    status = getattr(resp, "status", None)
-
-                    update_order(local_order_id, status=status, broker_order_id=broker_order_id)
-
-                    closed.append({"position_id": pos["id"], "contract": pos["contract"], "order_id": broker_order_id})
-
-                except Exception as e:
-                    failed.append({"position_id": pos.get("id"), "contract": pos.get("contract"), "error": str(e)})
-
-            log.warning(f"🚨 FLATTEN ALL: client_id={client_id} {len(closed)} positions, {len(failed)} failed")
-
-            return jsonify({
-                "ok": True,
-                "message": f"Submitted exit orders for {len(closed)} positions",
-                "closed": closed,
-                "failed": failed
-            })
-
-        except Exception as e:
-            log.error(f"Flatten all failed: {e}")
-            return jsonify({"ok": False, "error": str(e)}), 500
-
-    log.info("=" * 60)
-    log.info("✅ APP FACTORY READY")
-    log.info("=" * 60)
+    log.info("=" * 70)
+    log.info("✅ APP READY")
+    log.info("=" * 70)
     return app
 
 
 # Gunicorn entrypoint
 app = create_app()
 
-
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "5000"))
-    log.info(f"Starting Flask dev server on port {port}")
+    log.info(f"Starting on port {port}")
     app.run(host="0.0.0.0", port=port, debug=False)
