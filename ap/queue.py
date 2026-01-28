@@ -294,5 +294,4 @@ def worker_loop(broker, poll_seconds: float = POLL_INTERVAL):
                 except:
                     pass
             time.sleep(poll_seconds)
-EOF
 
