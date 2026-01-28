@@ -1,5 +1,7 @@
+cd /Users/azmareyawilson/Desktop/latest_bot
+
 cat > ap/queue.py << 'EOF'
-# ap/queue.py - PRODUCTION READY (no processed_ts, fixed idempotency)
+# ap/queue.py - PRODUCTION READY (anti-starvation, correct entry=0 handling)
 import time
 import json
 import os
@@ -12,7 +14,6 @@ from ap.execution import process_signal
 
 log = get_logger("ap.queue")
 
-# Configuration
 MAX_TRADES_PER_HOUR = int(os.getenv("MAX_TRADES_PER_HOUR", "12"))
 POLL_INTERVAL = float(os.getenv("QUEUE_POLL_INTERVAL", "1.0"))
 PRICE_CHECK_INTERVAL = float(os.getenv("PRICE_CHECK_INTERVAL", "0.5"))
@@ -82,18 +83,27 @@ def _get_stock_price(broker, symbol: str) -> Optional[float]:
 
 
 def _extract_entry_price(payload: Dict[str, Any]) -> Optional[float]:
+    """FIX 1: Correctly handle entry=0.0"""
     # Check trigger.entry first
     if "trigger" in payload and isinstance(payload["trigger"], dict):
         entry = payload["trigger"].get("entry")
-        if entry:
+        if entry is not None:  # Changed from 'if entry'
             try:
                 return float(entry)
             except:
                 pass
     
-    # Check top-level
-    entry = payload.get("entry_price") or payload.get("entry")
-    if entry:
+    # Check top-level entry_price
+    entry = payload.get("entry_price")
+    if entry is not None:  # Changed from 'if entry'
+        try:
+            return float(entry)
+        except:
+            pass
+    
+    # Check top-level entry
+    entry = payload.get("entry")
+    if entry is not None:  # Changed from 'if entry'
         try:
             return float(entry)
         except:
@@ -120,7 +130,6 @@ def _check_rate_limit(client_id: str) -> bool:
 
 def enqueue_signal(signal: Dict[str, Any], client_id: str = "default", 
                    idempotency_key: Optional[str] = None) -> bool:
-    # Handle model objects
     if hasattr(signal, "model_dump"):
         payload = signal.model_dump()
     elif hasattr(signal, "dict"):
@@ -130,7 +139,6 @@ def enqueue_signal(signal: Dict[str, Any], client_id: str = "default",
     
     signal_id = payload.get("signal_id", f"signal_{_now_iso()}")
     
-    # FIX: Auto-generate idempotency_key if not provided
     if not idempotency_key:
         idempotency_key = f"{client_id}:{signal_id}"
     
@@ -138,21 +146,10 @@ def enqueue_signal(signal: Dict[str, Any], client_id: str = "default",
         with conn() as c:
             run_with_retry(lambda: c.execute("""
                 INSERT INTO trade_queue (
-                    client_id,
-                    signal_id,
-                    payload,
-                    status,
-                    created_ts,
-                    idempotency_key
+                    client_id, signal_id, payload, status, created_ts, idempotency_key
                 )
                 VALUES (?, ?, ?, 'NEW', ?, ?)
-            """, (
-                client_id,
-                signal_id,
-                _json_dumps(payload),
-                _now_iso(),
-                idempotency_key
-            )))
+            """, (client_id, signal_id, _json_dumps(payload), _now_iso(), idempotency_key)))
         
         log.info(f"✅ Enqueued: {signal_id}")
         return True
@@ -174,7 +171,6 @@ def worker_loop(broker, poll_seconds: float = POLL_INTERVAL):
         job_id = None
         
         try:
-            # GET NEXT JOB
             with conn() as c:
                 job = run_with_retry(lambda: c.execute("""
                     SELECT id, client_id, signal_id, payload
@@ -192,7 +188,6 @@ def worker_loop(broker, poll_seconds: float = POLL_INTERVAL):
             client_id = job["client_id"]
             signal_id = job["signal_id"]
             
-            # MARK PROCESSING
             with conn() as c:
                 run_with_retry(lambda: c.execute("""
                     UPDATE trade_queue
@@ -200,7 +195,6 @@ def worker_loop(broker, poll_seconds: float = POLL_INTERVAL):
                     WHERE id = ?
                 """, (_now_iso(), job_id)))
             
-            # PARSE PAYLOAD
             try:
                 payload = json.loads(job["payload"])
             except Exception as e:
@@ -208,89 +202,74 @@ def worker_loop(broker, poll_seconds: float = POLL_INTERVAL):
                 with conn() as c:
                     run_with_retry(lambda: c.execute("""
                         UPDATE trade_queue
-                        SET status = 'REJECTED', 
-                            finished_ts = ?,
-                            last_error = ?
+                        SET status = 'REJECTED', finished_ts = ?, last_error = ?
                         WHERE id = ?
                     """, (_now_iso(), f"parse_error: {str(e)}", job_id)))
                 continue
             
-            # RATE LIMIT
+            # FIX 2: Anti-starvation for rate limit
             if _check_rate_limit(client_id):
                 with conn() as c:
                     run_with_retry(lambda: c.execute("""
                         UPDATE trade_queue
-                        SET status = 'NEW',
-                            started_ts = NULL,
-                            last_error = ?
+                        SET status = 'NEW', started_ts = NULL, last_error = ?, created_ts = ?
                         WHERE id = ?
-                    """, (f"rate_limited: {MAX_TRADES_PER_HOUR}/hour", job_id)))
+                    """, (f"rate_limited: {MAX_TRADES_PER_HOUR}/hour", _now_iso(), job_id)))
                 time.sleep(poll_seconds)
                 continue
             
-            # EXTRACT DATA
             symbol = payload.get("symbol") or payload.get("underlying")
             direction = payload.get("direction") or payload.get("side")
             entry_price = _extract_entry_price(payload)
             
-            # PRICE TRIGGER CHECK
-            if entry_price and symbol and direction:
+            if entry_price is not None and symbol and direction:
                 current_price = _get_stock_price(broker, symbol)
                 
+                # FIX 2: Anti-starvation for price unavailable
                 if current_price is None:
                     with conn() as c:
                         run_with_retry(lambda: c.execute("""
                             UPDATE trade_queue
-                            SET status = 'NEW',
-                                started_ts = NULL,
-                                last_error = ?
+                            SET status = 'NEW', started_ts = NULL, last_error = ?, created_ts = ?
                             WHERE id = ?
-                        """, ("price_unavailable", job_id)))
+                        """, ("price_unavailable", _now_iso(), job_id)))
                     time.sleep(PRICE_CHECK_INTERVAL)
                     continue
                 
                 triggered = _is_triggered(direction, entry_price, current_price)
                 
+                # FIX 2: Anti-starvation for waiting trigger
                 if not triggered:
                     log.debug(f"⏳ {symbol}: ${current_price:.2f} waiting ${entry_price}")
                     with conn() as c:
                         run_with_retry(lambda: c.execute("""
                             UPDATE trade_queue
-                            SET status = 'NEW',
-                                started_ts = NULL,
-                                last_error = ?
+                            SET status = 'NEW', started_ts = NULL, last_error = ?, created_ts = ?
                             WHERE id = ?
-                        """, (f"waiting: current=${current_price:.2f}", job_id)))
+                        """, (f"waiting: current=${current_price:.2f}", _now_iso(), job_id)))
                     time.sleep(PRICE_CHECK_INTERVAL)
                     continue
                 
                 log.info(f"🎯 {symbol} TRIGGERED: ${current_price:.2f} → ${entry_price}")
             
-            # EXECUTE
+            # FIX 3: Call with keyword args
             log.info(f"Executing: {signal_id}")
-            result = process_signal(broker, client_id, payload)
+            result = process_signal(
+                broker=broker,
+                client_id=client_id,
+                signal_payload=payload
+            )
             
-            # UPDATE RESULT (NO processed_ts - only finished_ts)
             status = "DONE" if result.get("ok") else "REJECTED"
             error = None if result.get("ok") else (result.get("error") or result.get("reason"))
             
             with conn() as c:
                 run_with_retry(lambda: c.execute("""
                     UPDATE trade_queue
-                    SET status = ?,
-                        finished_ts = ?,
-                        result_json = ?,
-                        last_error = ?
+                    SET status = ?, finished_ts = ?, result_json = ?, last_error = ?
                     WHERE id = ?
-                """, (
-                    status,
-                    _now_iso(),
-                    _json_dumps(result),
-                    error,
-                    job_id
-                )))
+                """, (status, _now_iso(), _json_dumps(result), error, job_id)))
             
-            # LOG
             if result.get("ok"):
                 log.info(f"✅ {signal_id}: {result.get('contract')}")
             else:
@@ -303,9 +282,7 @@ def worker_loop(broker, poll_seconds: float = POLL_INTERVAL):
                     with conn() as c:
                         run_with_retry(lambda: c.execute("""
                             UPDATE trade_queue
-                            SET status = 'ERROR',
-                                finished_ts = ?,
-                                last_error = ?
+                            SET status = 'ERROR', finished_ts = ?, last_error = ?
                             WHERE id = ?
                         """, (_now_iso(), str(e), job_id)))
                 except:
@@ -313,4 +290,4 @@ def worker_loop(broker, poll_seconds: float = POLL_INTERVAL):
             time.sleep(poll_seconds)
 EOF
 
-echo "✅ Production queue installed"
+echo "✅ FINAL production queue installed"
