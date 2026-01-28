@@ -128,39 +128,48 @@ def _check_rate_limit(client_id: str) -> bool:
         return False
 
 
-def enqueue_signal(signal: Dict[str, Any], client_id: str = "default", 
-                   idempotency_key: Optional[str] = None) -> bool:
-    if hasattr(signal, "model_dump"):
-        payload = signal.model_dump()
-    elif hasattr(signal, "dict"):
-        payload = signal.dict()
+def enqueue_signal(sig, client_id: str = "default", idempotency_key: str | None = None):
+    """
+    Insert signal into trade_queue for async processing.
+    Accepts dict OR pydantic model.
+    """
+
+    # ✅ FIX: handle dict safely
+    if isinstance(sig, dict):
+        payload = sig
+    elif hasattr(sig, "model_dump"):
+        payload = sig.model_dump()
+    elif hasattr(sig, "dict"):
+        payload = sig.dict()
     else:
-        payload = signal
-    
-    signal_id = payload.get("signal_id", f"signal_{_now_iso()}")
-    
+        raise TypeError(f"Unsupported signal type: {type(sig)}")
+
+    # Always have a signal_id
+    signal_id = payload.get("signal_id") or f"signal_{_now_iso()}"
+
+    # ✅ FIX: default idempotency key if missing
     if not idempotency_key:
         idempotency_key = f"{client_id}:{signal_id}"
-    
-    try:
-        with conn() as c:
-            run_with_retry(lambda: c.execute("""
+
+    with conn() as c:
+        def _ins():
+            c.execute("""
                 INSERT INTO trade_queue (
                     client_id, signal_id, payload, status, created_ts, idempotency_key
                 )
                 VALUES (?, ?, ?, 'NEW', ?, ?)
-            """, (client_id, signal_id, _json_dumps(payload), _now_iso(), idempotency_key)))
-        
-        log.info(f"✅ Enqueued: {signal_id}")
-        return True
-        
-    except Exception as e:
-        error_msg = str(e).lower()
-        if "unique" in error_msg or "constraint" in error_msg:
-            log.debug(f"Duplicate ignored: {signal_id}")
-            return False
-        log.error(f"Enqueue failed: {e}")
-        raise
+            """, (client_id, signal_id, _json_dumps(payload), _now_iso(), idempotency_key))
+
+        try:
+            run_with_retry(_ins)
+            log.info(f"✅ Enqueued: {signal_id}")
+            return True
+        except Exception as e:
+            msg = str(e).lower()
+            if "unique" in msg or "constraint" in msg:
+                log.debug(f"Duplicate ignored: {signal_id}")
+                return False
+            raise
 
 
 def worker_loop(broker, poll_seconds: float = POLL_INTERVAL):
