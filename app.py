@@ -240,9 +240,9 @@ def create_app() -> Flask:
     app.config["BROKER"] = broker
     log.info("✅ Broker initialized")
 
-    @app.before_request
-    def _ensure_threads_started():
-        start_background_threads_once(app.config["BROKER"])
+   # @app.before_request
+    #def _ensure_threads_started():
+       # start_background_threads_once(app.config["BROKER"])
 
     # Register blueprints
     app.register_blueprint(client_bp)
