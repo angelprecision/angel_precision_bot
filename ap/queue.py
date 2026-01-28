@@ -1,6 +1,3 @@
-
-
-cat > ap/queue.py << 'EOF'
 # ap/queue.py - PRODUCTION READY (anti-starvation, correct entry=0 handling)
 import time
 import json
