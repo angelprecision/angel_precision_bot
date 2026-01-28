@@ -1,4 +1,4 @@
-cd /Users/azmareyawilson/Desktop/latest_bot
+
 
 cat > ap/queue.py << 'EOF'
 # ap/queue.py - PRODUCTION READY (anti-starvation, correct entry=0 handling)
