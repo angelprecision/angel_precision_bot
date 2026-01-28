@@ -65,7 +65,8 @@ def _get_equity_for_client(broker, st: dict, client_cfg: dict) -> float:
         )
 
 
-def _resolve_option_contract(broker, symbol: str, strike: float, direction: str) -> tuple[str, float]:
+def _resolve_option_contract(broker, symbol: str, strike: float, direction: str, mode: str = "PAPER") -> tuple[str, float]:
+
     """
     Get the actual option contract symbol from broker's option chain.
     Returns: (contract_symbol, premium_per_share)
@@ -81,11 +82,17 @@ def _resolve_option_contract(broker, symbol: str, strike: float, direction: str)
         
         # Get option chain for that expiration
         chain = broker.get_option_chain(symbol, expiration)
-        if not chain:
+if not chain:
+    # ✅ PAPER/SIM fallback: allow E2E testing without live option chains
+        if (mode or "").upper() in ("PAPER", "SIM"):
+        contract_symbol = f"{symbol}_{expiration}_{int(strike)}_{direction}"
+        premium = 1.00  # $100/contract synthetic premium
+        log.warning(f"[{mode}] No options in chain for {symbol} {expiration}. Using synthetic {contract_symbol} @ {premium}")
+        return contract_symbol, premium
             raise ValueError(f"No options in chain for {symbol} {expiration}")
-        
+
         # Resolve actual contract symbol
-        contract_symbol = resolve_contract_symbol(chain, strike, direction)
+        contract_symbol, premium = _resolve_option_contract(broker, symbol, strike, direction, mode=mode)
         
         # Get current premium
         from ap.contract_pricing import get_contract_price
