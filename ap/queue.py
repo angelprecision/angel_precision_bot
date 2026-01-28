@@ -290,4 +290,3 @@ def worker_loop(broker, poll_seconds: float = POLL_INTERVAL):
             time.sleep(poll_seconds)
 EOF
 
-echo "✅ FINAL production queue installed"
