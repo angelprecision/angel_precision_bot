@@ -44,6 +44,8 @@ log = get_logger("app")
 
 APP_ENV = os.getenv("APP_ENV", "dev").lower().strip()
 SIGNING_SECRET = os.getenv("SIGNING_SECRET", "").encode()
+import hashlib
+log.info("SIGNING_SECRET_SHA256_8=" + hashlib.sha256(SIGNING_SECRET).hexdigest()[:8])
 
 # Rate limiting (per worker - upgrade to Redis later)
 _RATE = defaultdict(lambda: deque())
