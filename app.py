@@ -242,9 +242,16 @@ def create_app() -> Flask:
     app.config["BROKER"] = broker
     log.info("✅ Broker initialized")
 
-   # @app.before_request
-    #def _ensure_threads_started():
-       # start_background_threads_once(app.config["BROKER"])
+    broker = build_broker()
+    app.config["BROKER"] = broker
+    log.info("✅ Broker initialized")
+
+    # ✅ IMPORTANT: start background loops inside the web service
+    # so they share the same SQLite DB file on this Render instance.
+    start_background_threads_once(broker)
+ 
+    log.info("✅ Background threads started (worker + exit manager)")
+
 
     # Register blueprints
     app.register_blueprint(client_bp)
