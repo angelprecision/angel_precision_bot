@@ -2,6 +2,7 @@
 # Client management + reporting + monitoring + control
 # Multi-client ready, drop-in replacement
 
+from ap.crypto import encrypt_token
 from flask import Blueprint, jsonify, request
 from ap.logger import get_logger
 from ap.db import (
@@ -78,7 +79,7 @@ def create_client_endpoint():
         client = create_client(
             client_id=body["client_id"],
             name=body["name"],
-            broker_type=body["broker_type"],
+            broker_token=encrypt_token(body["broker_token"]),
             broker_account_id=body["broker_account_id"],
             broker_token=body["broker_token"],
             broker_base_url=body["broker_base_url"],
