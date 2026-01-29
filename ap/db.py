@@ -303,7 +303,19 @@ def init_db():
             FOREIGN KEY (client_id) REFERENCES clients(client_id)
         );
         """)
+        # ========================
+        # MIGRATION: day_key (daily reset tracking)
+        # ========================
+        try:
+             ex("ALTER TABLE client_state ADD COLUMN day_key TEXT;")
+        except Exception:
+             pass  # column already exists
 
+        try:
+             ex("CREATE INDEX IF NOT EXISTS idx_client_state_day_key ON client_state(day_key);")
+        except Exception:
+             pass
+ 
         for sql in [
             "ALTER TABLE client_state ADD COLUMN client_capital REAL;",
             "ALTER TABLE client_state ADD COLUMN rental_fee REAL;",
