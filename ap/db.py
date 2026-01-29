@@ -647,9 +647,17 @@ def get_client_state(client_id: str = "default") -> dict:
 
 
 def update_client_state(client_id: str = "default", updates: dict | None = None):
+    """
+    Update per-client state safely.
+
+    - Ensures the client_state row exists.
+    - Filters out keys that are not actual columns in the client_state table
+      (prevents crashes like: sqlite3.OperationalError: no such column: day_key).
+    """
     if not updates:
         return
 
+    # Ensure row exists
     with conn() as c:
         existing = run_with_retry(lambda: c.execute(
             "SELECT 1 FROM client_state WHERE client_id=?",
@@ -660,19 +668,54 @@ def update_client_state(client_id: str = "default", updates: dict | None = None)
             run_with_retry(lambda: c.execute(
                 """
                 INSERT INTO client_state (
-                    client_id, current_equity, starting_equity_today,
-                    realized_pnl_today, trades_taken_today, mode
+                    client_id,
+                    current_equity,
+                    starting_equity_today,
+                    realized_pnl_today,
+                    trades_taken_today,
+                    daily_stop_hit,
+                    kill_switch,
+                    mode,
+                    last_heartbeat_ts
                 )
-                VALUES (?, 0, 0, 0.0, 0, 'PAPER')
+                VALUES (?, 0, 0, 0.0, 0, 0, 0, 'PAPER', NULL)
                 """,
                 (client_id,),
             ))
 
-    set_clause = ", ".join(f"{k}=?" for k in updates.keys())
-    values = list(updates.values()) + [client_id]
+    # Filter updates to only real columns
+    with conn() as c:
+        cols = run_with_retry(lambda: c.execute("PRAGMA table_info(client_state);").fetchall())
+        allowed = {row["name"] for row in cols}
+
+    safe_updates = {k: v for k, v in updates.items() if k in allowed}
+
+    # If nothing valid remains, do nothing (but don’t crash)
+    if not safe_updates:
+        try:
+            from ap.logger import get_logger
+            log = get_logger("ap.db")
+            skipped = [k for k in updates.keys() if k not in allowed]
+            log.warning(f"update_client_state: skipped unknown columns for {client_id}: {skipped}")
+        except Exception:
+            pass
+        return
+
+    set_clause = ", ".join(f"{k}=?" for k in safe_updates.keys())
+    values = list(safe_updates.values()) + [client_id]
 
     with conn() as c:
         run_with_retry(lambda: c.execute(
             f"UPDATE client_state SET {set_clause} WHERE client_id=?",
             values,
         ))
+
+    # Log skipped keys (helps debugging migrations)
+    skipped = [k for k in updates.keys() if k not in allowed]
+    if skipped:
+        try:
+            from ap.logger import get_logger
+            log = get_logger("ap.db")
+            log.warning(f"update_client_state: skipped unknown columns for {client_id}: {skipped}")
+        except Exception:
+            pass
