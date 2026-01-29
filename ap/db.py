@@ -1,4 +1,4 @@
-# ap/db.py - COMPLETE MULTI-CLIENT VERSION
+# ap/db.py - COMPLETE MULTI-CLIENT VERSION (hardened)
 # Multi-client ready with client_id in all core tables
 # Safe migrations for existing single-client DBs
 # Drop-in replacement - ready to deploy
@@ -52,6 +52,7 @@ def conn():
     )
     c.row_factory = sqlite3.Row
 
+    # WAL helps concurrency for web+worker
     c.execute("PRAGMA journal_mode=WAL;")
     c.execute("PRAGMA busy_timeout=30000;")
     c.execute("PRAGMA foreign_keys=ON;")
@@ -68,10 +69,13 @@ def init_db():
     Safe to run repeatedly - handles migrations.
     """
     with conn() as c:
+        def ex(sql: str, params: tuple = ()):
+            return run_with_retry(lambda: c.execute(sql, params))
+
         # ========================
         # KV STORE
         # ========================
-        c.execute("""
+        ex("""
         CREATE TABLE IF NOT EXISTS kv (
             k TEXT PRIMARY KEY,
             v TEXT NOT NULL,
@@ -82,7 +86,7 @@ def init_db():
         # ========================
         # AUDIT LOG (with client_id)
         # ========================
-        c.execute("""
+        ex("""
         CREATE TABLE IF NOT EXISTS audit_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             ts TEXT NOT NULL,
@@ -92,22 +96,22 @@ def init_db():
             client_id TEXT
         );
         """)
-        
+
         # Safe migration
         try:
-            c.execute("ALTER TABLE audit_log ADD COLUMN client_id TEXT;")
+            ex("ALTER TABLE audit_log ADD COLUMN client_id TEXT;")
         except Exception:
             pass
-        
+
         try:
-            c.execute("CREATE INDEX IF NOT EXISTS idx_audit_log_client_id ON audit_log(client_id);")
+            ex("CREATE INDEX IF NOT EXISTS idx_audit_log_client_id ON audit_log(client_id);")
         except Exception:
             pass
 
         # ========================
         # PROCESSED SIGNALS (dedupe/idempotency)
         # ========================
-        c.execute("""
+        ex("""
         CREATE TABLE IF NOT EXISTS processed_signals (
             signal_id TEXT PRIMARY KEY,
             first_seen_ts TEXT NOT NULL
@@ -117,7 +121,7 @@ def init_db():
         # ========================
         # TRADE QUEUE (with client_id)
         # ========================
-        c.execute("""
+        ex("""
         CREATE TABLE IF NOT EXISTS trade_queue (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             client_id TEXT NOT NULL DEFAULT 'default',
@@ -132,50 +136,40 @@ def init_db():
             idempotency_key TEXT
         );
         """)
-        
-        # Safe migrations
+
+        # Safe migrations (ignore if exists)
+        for sql in [
+            "ALTER TABLE trade_queue ADD COLUMN client_id TEXT NOT NULL DEFAULT 'default';",
+            "ALTER TABLE trade_queue ADD COLUMN started_ts TEXT;",
+            "ALTER TABLE trade_queue ADD COLUMN finished_ts TEXT;",
+            "ALTER TABLE trade_queue ADD COLUMN result_json TEXT;",
+            "ALTER TABLE trade_queue ADD COLUMN last_error TEXT;",
+            "ALTER TABLE trade_queue ADD COLUMN idempotency_key TEXT;",
+        ]:
+            try:
+                ex(sql)
+            except Exception:
+                pass
+
+        # Indexes + idempotency unique key
         try:
-            c.execute("ALTER TABLE trade_queue ADD COLUMN client_id TEXT NOT NULL DEFAULT 'default';")
+            ex("CREATE INDEX IF NOT EXISTS idx_trade_queue_client_status ON trade_queue(client_id, status);")
+            ex("CREATE INDEX IF NOT EXISTS idx_trade_queue_status_id ON trade_queue(status, id);")
+            ex("CREATE INDEX IF NOT EXISTS idx_trade_queue_created_ts ON trade_queue(created_ts);")
+            ex("CREATE INDEX IF NOT EXISTS idx_trade_queue_signal_id ON trade_queue(signal_id);")
         except Exception:
             pass
-        
+
+        # Unique idempotency per client
         try:
-            c.execute("ALTER TABLE trade_queue ADD COLUMN started_ts TEXT;")
-        except Exception:
-            pass
-        
-        try:
-            c.execute("ALTER TABLE trade_queue ADD COLUMN finished_ts TEXT;")
-        except Exception:
-            pass
-        
-        try:
-            c.execute("ALTER TABLE trade_queue ADD COLUMN result_json TEXT;")
-        except Exception:
-            pass
-        
-        try:
-            c.execute("ALTER TABLE trade_queue ADD COLUMN last_error TEXT;")
-        except Exception:
-            pass
-        
-        try:
-            c.execute("ALTER TABLE trade_queue ADD COLUMN idempotency_key TEXT;")
-        except Exception:
-            pass
-        
-        try:
-            c.execute("CREATE INDEX IF NOT EXISTS idx_trade_queue_client_status ON trade_queue(client_id, status);")
-            c.execute("CREATE INDEX IF NOT EXISTS idx_trade_queue_status_id ON trade_queue(status, id);")
-            c.execute("CREATE INDEX IF NOT EXISTS idx_trade_queue_created_ts ON trade_queue(created_ts);")
-            c.execute("CREATE INDEX IF NOT EXISTS idx_trade_queue_signal_id ON trade_queue(signal_id);")
+            ex("CREATE UNIQUE INDEX IF NOT EXISTS idx_trade_queue_idempotency ON trade_queue(client_id, idempotency_key);")
         except Exception:
             pass
 
         # ========================
         # ORDERS (with client_id)
         # ========================
-        c.execute("""
+        ex("""
         CREATE TABLE IF NOT EXISTS orders (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             client_id TEXT NOT NULL DEFAULT 'default',
@@ -195,28 +189,27 @@ def init_db():
             updated_ts TEXT NOT NULL
         );
         """)
-        
-        # Safe migrations
+
         try:
-            c.execute("ALTER TABLE orders ADD COLUMN client_id TEXT NOT NULL DEFAULT 'default';")
+            ex("ALTER TABLE orders ADD COLUMN client_id TEXT NOT NULL DEFAULT 'default';")
         except Exception:
             pass
-        
+
         try:
-            c.execute("CREATE INDEX IF NOT EXISTS idx_orders_client_local_order_id ON orders(client_id, local_order_id);")
-            c.execute("CREATE INDEX IF NOT EXISTS idx_orders_client_status ON orders(client_id, status);")
-            c.execute("CREATE INDEX IF NOT EXISTS idx_orders_local_order_id ON orders(local_order_id);")
-            c.execute("CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);")
-            c.execute("CREATE INDEX IF NOT EXISTS idx_orders_created_ts ON orders(created_ts);")
-            c.execute("CREATE INDEX IF NOT EXISTS idx_orders_broker_order_id ON orders(broker_order_id);")
-            c.execute("CREATE INDEX IF NOT EXISTS idx_orders_position_id ON orders(position_id);")
+            ex("CREATE INDEX IF NOT EXISTS idx_orders_client_local_order_id ON orders(client_id, local_order_id);")
+            ex("CREATE INDEX IF NOT EXISTS idx_orders_client_status ON orders(client_id, status);")
+            ex("CREATE INDEX IF NOT EXISTS idx_orders_local_order_id ON orders(local_order_id);")
+            ex("CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);")
+            ex("CREATE INDEX IF NOT EXISTS idx_orders_created_ts ON orders(created_ts);")
+            ex("CREATE INDEX IF NOT EXISTS idx_orders_broker_order_id ON orders(broker_order_id);")
+            ex("CREATE INDEX IF NOT EXISTS idx_orders_position_id ON orders(position_id);")
         except Exception:
             pass
 
         # ========================
         # POSITIONS (with client_id)
         # ========================
-        c.execute("""
+        ex("""
         CREATE TABLE IF NOT EXISTS positions (
             id TEXT PRIMARY KEY,
             client_id TEXT NOT NULL DEFAULT 'default',
@@ -234,29 +227,28 @@ def init_db():
             realized_pnl REAL
         );
         """)
-        
-        # Safe migrations
+
         try:
-            c.execute("ALTER TABLE positions ADD COLUMN client_id TEXT NOT NULL DEFAULT 'default';")
+            ex("ALTER TABLE positions ADD COLUMN client_id TEXT NOT NULL DEFAULT 'default';")
         except Exception:
             pass
-        
+
         try:
-            c.execute("CREATE INDEX IF NOT EXISTS idx_positions_client_status ON positions(client_id, status);")
-            c.execute("CREATE INDEX IF NOT EXISTS idx_positions_status ON positions(status);")
-            c.execute("CREATE INDEX IF NOT EXISTS idx_positions_entry_ts ON positions(entry_ts);")
-            c.execute("CREATE INDEX IF NOT EXISTS idx_positions_contract ON positions(contract);")
+            ex("CREATE INDEX IF NOT EXISTS idx_positions_client_status ON positions(client_id, status);")
+            ex("CREATE INDEX IF NOT EXISTS idx_positions_status ON positions(status);")
+            ex("CREATE INDEX IF NOT EXISTS idx_positions_entry_ts ON positions(entry_ts);")
+            ex("CREATE INDEX IF NOT EXISTS idx_positions_contract ON positions(contract);")
         except Exception:
             pass
 
         # ========================
         # CLIENTS (multi-tenant)
         # ========================
-        c.execute("""
+        ex("""
         CREATE TABLE IF NOT EXISTS clients (
             client_id TEXT PRIMARY KEY,
             api_key TEXT UNIQUE,
-            
+
             name TEXT NOT NULL,
             broker_type TEXT NOT NULL,           -- 'tradier' or 'ibkr'
             broker_account_id TEXT NOT NULL,
@@ -272,17 +264,17 @@ def init_db():
             base_position_pct REAL NOT NULL DEFAULT 0.10
         );
         """)
-        
+
         try:
-            c.execute("CREATE INDEX IF NOT EXISTS idx_clients_status ON clients(status);")
-            c.execute("CREATE INDEX IF NOT EXISTS idx_clients_api_key ON clients(api_key);")
+            ex("CREATE INDEX IF NOT EXISTS idx_clients_status ON clients(status);")
+            ex("CREATE INDEX IF NOT EXISTS idx_clients_api_key ON clients(api_key);")
         except Exception:
             pass
 
         # ========================
-        # CLIENT STATE (per-client tracking)
+        # CLIENT STATE
         # ========================
-        c.execute("""
+        ex("""
         CREATE TABLE IF NOT EXISTS client_state (
             client_id TEXT PRIMARY KEY,
             current_equity REAL NOT NULL,
@@ -293,8 +285,7 @@ def init_db():
             kill_switch INTEGER NOT NULL DEFAULT 0,
             mode TEXT NOT NULL DEFAULT 'PAPER',
             last_heartbeat_ts TEXT,
-            
-            -- Fee-rental fields (from account_growth_CORRECTED.py)
+
             client_capital REAL,
             rental_fee REAL,
             working_capital REAL,
@@ -303,55 +294,29 @@ def init_db():
             subscription_end_date TEXT,
             growth_tracking_enabled INTEGER DEFAULT 0,
             account_type TEXT,
-            
+
             FOREIGN KEY (client_id) REFERENCES clients(client_id)
         );
         """)
-        
-        # Safe migrations for rental fields
-        try:
-            c.execute("ALTER TABLE client_state ADD COLUMN client_capital REAL;")
-        except Exception:
-            pass
-        
-        try:
-            c.execute("ALTER TABLE client_state ADD COLUMN rental_fee REAL;")
-        except Exception:
-            pass
-        
-        try:
-            c.execute("ALTER TABLE client_state ADD COLUMN working_capital REAL;")
-        except Exception:
-            pass
-        
-        try:
-            c.execute("ALTER TABLE client_state ADD COLUMN profit_target_min REAL;")
-        except Exception:
-            pass
-        
-        try:
-            c.execute("ALTER TABLE client_state ADD COLUMN profit_target_max REAL;")
-        except Exception:
-            pass
-        
-        try:
-            c.execute("ALTER TABLE client_state ADD COLUMN subscription_end_date TEXT;")
-        except Exception:
-            pass
-        
-        try:
-            c.execute("ALTER TABLE client_state ADD COLUMN growth_tracking_enabled INTEGER DEFAULT 0;")
-        except Exception:
-            pass
-        
-        try:
-            c.execute("ALTER TABLE client_state ADD COLUMN account_type TEXT;")
-        except Exception:
-            pass
+
+        for sql in [
+            "ALTER TABLE client_state ADD COLUMN client_capital REAL;",
+            "ALTER TABLE client_state ADD COLUMN rental_fee REAL;",
+            "ALTER TABLE client_state ADD COLUMN working_capital REAL;",
+            "ALTER TABLE client_state ADD COLUMN profit_target_min REAL;",
+            "ALTER TABLE client_state ADD COLUMN profit_target_max REAL;",
+            "ALTER TABLE client_state ADD COLUMN subscription_end_date TEXT;",
+            "ALTER TABLE client_state ADD COLUMN growth_tracking_enabled INTEGER DEFAULT 0;",
+            "ALTER TABLE client_state ADD COLUMN account_type TEXT;",
+        ]:
+            try:
+                ex(sql)
+            except Exception:
+                pass
 
 
 # =========================================================================
-# DEDUPE HELPERS (idempotency)
+# DEDUPE HELPERS
 # =========================================================================
 
 def already_processed_signal(signal_id: str) -> bool:
@@ -373,7 +338,7 @@ def mark_signal_processed(signal_id: str):
 
 
 # =========================================================================
-# ORDER HELPERS (with client_id)
+# ORDER HELPERS
 # =========================================================================
 
 def new_local_order_id() -> str:
@@ -456,7 +421,6 @@ def update_order(
 
     updates.append("updated_ts=?")
     params.append(now_utc_iso())
-
     params.append(local_order_id)
 
     sql = f"UPDATE orders SET {', '.join(updates)} WHERE local_order_id=?"
@@ -468,7 +432,7 @@ def update_order(
 
 
 # =========================================================================
-# REPORTING + RECONCILIATION READS (with client_id filtering)
+# REPORTING READS
 # =========================================================================
 
 def list_orders(client_id: str = "default", limit: int = 200, status: str | None = None):
@@ -664,7 +628,6 @@ def get_client_state(client_id: str = "default") -> dict:
             (client_id,),
         ).fetchone())
         if not row:
-            # Return defaults if state doesn't exist
             return {
                 "client_id": client_id,
                 "current_equity": 0,
@@ -682,15 +645,13 @@ def update_client_state(client_id: str = "default", updates: dict | None = None)
     if not updates:
         return
 
-    # First, ensure the row exists
     with conn() as c:
         existing = run_with_retry(lambda: c.execute(
             "SELECT 1 FROM client_state WHERE client_id=?",
             (client_id,),
         ).fetchone())
-        
+
         if not existing:
-            # Create default state
             run_with_retry(lambda: c.execute(
                 """
                 INSERT INTO client_state (
@@ -702,7 +663,6 @@ def update_client_state(client_id: str = "default", updates: dict | None = None)
                 (client_id,),
             ))
 
-    # Now update
     set_clause = ", ".join(f"{k}=?" for k in updates.keys())
     values = list(updates.values()) + [client_id]
 
