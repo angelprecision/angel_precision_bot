@@ -1,4 +1,5 @@
-# worker.py - Background worker that processes queue (production-safe)
+# worker.py - Background worker that processes queue (AUTO-BOOTSTRAP)
+
 import os
 import sys
 
@@ -9,30 +10,25 @@ from ap.db import init_db, get_client, create_client
 
 log = get_logger("worker")
 
-
-def ensure_default_client():
-    """
-    Ensure a 'default' client exists so the worker can create a broker.
-    Uses env vars if it needs to create the client.
-    """
+def ensure_client_exists(client_id: str):
     try:
-        get_client("default")
+        get_client(client_id)
         return
     except Exception:
         pass
 
-    # These MUST be set in Render env for the Worker (and usually Web too)
+    # Pull broker credentials from env (set these in Render Worker env)
     broker_type = os.getenv("BROKER_TYPE", "tradier")
     broker_account_id = os.getenv("BROKER_ACCOUNT_ID", "demo")
     broker_token = os.getenv("BROKER_TOKEN", "demo")
     broker_base_url = os.getenv("BROKER_BASE_URL", "https://sandbox.tradier.com")
     initial_equity = float(os.getenv("INITIAL_EQUITY", "5000"))
 
-    log.warning("⚠️ default client missing — creating it from env vars")
+    log.warning(f"⚠️ Client '{client_id}' missing — creating from env vars")
 
     create_client(
-        client_id="default",
-        name="Default Client",
+        client_id=client_id,
+        name=f"{client_id} Client",
         broker_type=broker_type,
         broker_account_id=broker_account_id,
         broker_token=broker_token,
@@ -40,23 +36,26 @@ def ensure_default_client():
         initial_equity=initial_equity,
     )
 
-    log.info("✅ default client created")
+    log.info(f"✅ Client '{client_id}' created")
 
 
 if __name__ == "__main__":
     log.info("🤖 Worker starting...")
 
+    # Use env var; default to "default"
+    client_id = os.getenv("BOT_CLIENT_ID", "default").strip() or "default"
+
     try:
-        # ✅ Critical: create tables before any DB reads (clients, trade_queue, etc.)
+        # ✅ Always create tables first
         init_db()
 
-        # ✅ Ensure default client exists (otherwise get_client_broker crashes)
-        ensure_default_client()
+        # ✅ Ensure the client exists
+        ensure_client_exists(client_id)
 
-        broker = get_client_broker("default")
-        log.info("✅ Broker initialized")
+        # ✅ Now broker can load
+        broker = get_client_broker(client_id)
+        log.info(f"✅ Broker initialized for client_id={client_id}")
 
-        # Run worker loop forever
         worker_loop(broker, poll_seconds=1)
 
     except KeyboardInterrupt:
