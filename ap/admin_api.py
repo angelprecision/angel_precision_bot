@@ -81,7 +81,6 @@ def create_client_endpoint():
             name=body["name"],
             broker_token=encrypt_token(body["broker_token"]),
             broker_account_id=body["broker_account_id"],
-            broker_token=body["broker_token"],
             broker_base_url=body["broker_base_url"],
             initial_equity=float(body.get("initial_equity", 100000.0)),
             max_trades_per_day=int(body.get("max_trades_per_day", 5)),
