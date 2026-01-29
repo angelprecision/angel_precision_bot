@@ -638,24 +638,6 @@ def update_client(client_id: str, **updates) -> dict:
     return get_client(client_id)
 
 
-def get_client_state(client_id: str = "default") -> dict:
-    with conn() as c:
-        row = run_with_retry(lambda: c.execute(
-            "SELECT * FROM client_state WHERE client_id=?",
-            (client_id,),
-        ).fetchone())
-        if not row:
-            return {
-                "client_id": client_id,
-                "current_equity": 0,
-                "starting_equity_today": 0,
-                "realized_pnl_today": 0.0,
-                "trades_taken_today": 0,
-                "daily_stop_hit": 0,
-                "kill_switch": 0,
-                "mode": "PAPER",
-            }
-        return dict(row)
 
 
 def update_client_state(client_id: str = "default", updates: dict | None = None):
