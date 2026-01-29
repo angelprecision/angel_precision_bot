@@ -2,7 +2,7 @@
 # Multi-client ready with client_id in all core tables
 # Safe migrations for existing single-client DBs
 # Drop-in replacement - ready to deploy
-
+import os
 import time
 import uuid
 import sqlite3
@@ -10,6 +10,7 @@ from contextlib import contextmanager
 
 from ap.config import Config
 from ap.utils import now_utc_iso
+
 
 cfg = Config()
 
@@ -44,6 +45,10 @@ def run_with_retry(fn, retries: int = 12, base_sleep: float = 0.05, max_sleep: f
 
 @contextmanager
 def conn():
+    # 🔒 Ensure DB directory exists (prevents "unable to open database file")
+    db_dir = os.path.dirname(cfg.DB_FILE)
+    if db_dir and not os.path.exists(db_dir):
+        os.makedirs(db_dir, exist_ok=True)
     c = sqlite3.connect(
         cfg.DB_FILE,
         timeout=30,
