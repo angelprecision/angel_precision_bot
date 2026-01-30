@@ -1,4 +1,13 @@
-# ap/exit_manager.py
+# ap/exit_manager.py - FIXED VERSION with Circuit Breaker
+"""
+Exit Manager with Circuit Breaker
+
+KEY FIXES:
+1. Circuit breaker - stops after 3 failed exit attempts
+2. Checks if entry order actually filled before allowing exit
+3. Rate limiting on exit attempts
+4. Better error handling
+"""
 import time
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
@@ -14,6 +23,10 @@ log = get_logger("ap.exit")
 
 NY = ZoneInfo("America/New_York")
 
+# Circuit breaker settings
+MAX_EXIT_ATTEMPTS = 3
+MIN_EXIT_RETRY_SECONDS = 60  # Don't retry exit more than once per minute
+
 
 def audit(level: str, event: str, payload: dict):
     with conn() as c:
@@ -27,7 +40,7 @@ def get_open_positions():
     with conn() as c:
         rows = run_with_retry(lambda: c.execute("""
             SELECT id, underlying, contract, direction, qty, avg_fill,
-                   tp_pct, sl_pct, entry_ts, status
+                   tp_pct, sl_pct, entry_ts, status, client_id
             FROM positions
             WHERE status IN ('OPEN','CLOSING')
             ORDER BY entry_ts ASC
@@ -44,12 +57,65 @@ def mark_position_closing(position_id: str, reason: str):
         """, (reason, position_id)))
 
 
+def mark_position_stuck(position_id: str, reason: str):
+    """Mark a position as STUCK after multiple failed exit attempts"""
+    with conn() as c:
+        run_with_retry(lambda: c.execute("""
+            UPDATE positions
+            SET status='STUCK', exit_reason=?
+            WHERE id=?
+        """, (f"STUCK:{reason}", position_id)))
+    
+    audit("ERROR", "POSITION_STUCK", {
+        "position_id": position_id,
+        "reason": reason
+    })
+    
+    log.error(f"🚨 Position {position_id} marked as STUCK: {reason}")
+
+
 def revert_position_open(position_id: str):
     with conn() as c:
         run_with_retry(lambda: c.execute(
             "UPDATE positions SET status='OPEN', exit_reason=NULL WHERE id=?",
             (position_id,)
         ))
+
+
+def get_failed_exit_count(position_id: str) -> int:
+    """
+    Count how many times we've tried (and failed) to exit this position
+    Circuit breaker: stop trying after MAX_EXIT_ATTEMPTS failures
+    """
+    with conn() as c:
+        row = run_with_retry(lambda: c.execute("""
+            SELECT COUNT(*) as cnt
+            FROM orders
+            WHERE position_id=? 
+              AND kind='EXIT' 
+              AND status='REJECTED'
+        """, (position_id,)).fetchone())
+        
+        return row["cnt"] if row else 0
+
+
+def get_last_exit_attempt_time(position_id: str) -> datetime | None:
+    """Get timestamp of last exit attempt to prevent spam"""
+    with conn() as c:
+        row = run_with_retry(lambda: c.execute("""
+            SELECT MAX(created_ts) as last_attempt
+            FROM orders
+            WHERE position_id=? 
+              AND kind='EXIT'
+        """, (position_id,)).fetchone())
+        
+        if row and row["last_attempt"]:
+            try:
+                return datetime.fromisoformat(row["last_attempt"])
+            except:
+                return None
+        
+        return None
 
 
 def has_pending_exit_order(position_id: str) -> bool:
@@ -69,6 +135,24 @@ def has_pending_exit_order(position_id: str) -> bool:
             """,
             (position_id,)
         ).fetchone())
+        return row is not None
+
+
+def position_actually_exists_at_broker(position_id: str) -> bool:
+    """
+    CRITICAL CHECK: Verify the entry order actually filled.
+    Don't try to exit positions that were never opened!
+    """
+    with conn() as c:
+        row = run_with_retry(lambda: c.execute("""
+            SELECT 1
+            FROM orders
+            WHERE position_id=?
+              AND kind='ENTRY'
+              AND status='FILLED'
+            LIMIT 1
+        """, (position_id,)).fetchone())
+        
         return row is not None
 
 
@@ -186,8 +270,13 @@ def exit_manager_loop(broker: BrokerAdapter, poll_seconds: float = 30.0):
     IMPORTANT:
     - This file does NOT close positions.
     - Reconcile closes positions when the EXIT order is FILLED.
+    
+    NEW FEATURES:
+    - Circuit breaker: stops after MAX_EXIT_ATTEMPTS failed exits
+    - Rate limiting: won't retry exit within MIN_EXIT_RETRY_SECONDS
+    - Validation: only exits positions that actually filled
     """
-    log.info("Exit manager started")
+    log.info("Exit manager started (with circuit breaker)")
 
     while True:
         try:
@@ -206,8 +295,40 @@ def exit_manager_loop(broker: BrokerAdapter, poll_seconds: float = 30.0):
                 if pos.get("status") == "CLOSING":
                     continue
 
+                position_id = pos["id"]
+                
+                # CRITICAL CHECK: Does this position actually exist at broker?
+                if not position_actually_exists_at_broker(position_id):
+                    log.warning(
+                        f"⚠️ Position {position_id} has no FILLED entry order, "
+                        f"cannot exit (position was never opened at broker)"
+                    )
+                    # Don't mark as STUCK - fill monitor will handle this
+                    continue
+
+                # Circuit breaker: check failed attempt count
+                failed_count = get_failed_exit_count(position_id)
+                if failed_count >= MAX_EXIT_ATTEMPTS:
+                    log.error(
+                        f"🛑 Position {position_id} hit circuit breaker "
+                        f"({failed_count} failed exits), marking as STUCK"
+                    )
+                    mark_position_stuck(position_id, f"EXIT_FAILED_{failed_count}x")
+                    continue
+
+                # Rate limiting: check last attempt time
+                last_attempt = get_last_exit_attempt_time(position_id)
+                if last_attempt:
+                    elapsed = (datetime.now(timezone.utc) - last_attempt).total_seconds()
+                    if elapsed < MIN_EXIT_RETRY_SECONDS:
+                        log.debug(
+                            f"Rate limiting: waiting {MIN_EXIT_RETRY_SECONDS - elapsed:.0f}s "
+                            f"before next exit attempt for {position_id}"
+                        )
+                        continue
+
                 # Extra guard: avoid duplicate exits
-                if has_pending_exit_order(pos["id"]):
+                if has_pending_exit_order(position_id):
                     continue
 
                 contract = pos["contract"]
@@ -228,13 +349,13 @@ def exit_manager_loop(broker: BrokerAdapter, poll_seconds: float = 30.0):
                 )
 
                 # Mark CLOSING immediately
-                mark_position_closing(pos["id"], reason)
+                mark_position_closing(position_id, reason)
 
                 # Persist EXIT order row
                 local_order_id = new_local_order_id()
                 insert_order(
                     local_order_id=local_order_id,
-                    position_id=pos["id"],
+                    position_id=position_id,
                     kind="EXIT",
                     status="NEW",
                     symbol=pos["underlying"],
@@ -254,7 +375,7 @@ def exit_manager_loop(broker: BrokerAdapter, poll_seconds: float = 30.0):
                     )
 
                     audit("INFO", "EXIT_ORDER_PENDING", {
-                        "position_id": pos["id"],
+                        "position_id": position_id,
                         "contract": contract,
                         "local_order_id": local_order_id,
                         "broker_order_id": broker_order_id,
@@ -262,15 +383,22 @@ def exit_manager_loop(broker: BrokerAdapter, poll_seconds: float = 30.0):
                     })
                 else:
                     # Exit failed - revert to OPEN
-                    revert_position_open(pos["id"])
+                    revert_position_open(position_id)
 
                     update_order(local_order_id, status="REJECTED", broker_order_id=broker_order_id, last_error=err)
-                    log.error(f"❌ Exit order failed for {contract}: {err}")
+                    
+                    # Log with attempt count
+                    new_failed_count = failed_count + 1
+                    log.error(
+                        f"❌ Exit order failed for {contract}: {err} "
+                        f"(attempt {new_failed_count}/{MAX_EXIT_ATTEMPTS})"
+                    )
 
                     audit("ERROR", "EXIT_ORDER_FAILED", {
-                        "position_id": pos["id"],
+                        "position_id": position_id,
                         "contract": contract,
-                        "error": err
+                        "error": err,
+                        "failed_attempt_count": new_failed_count
                     })
 
         except Exception as e:
