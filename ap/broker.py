@@ -1,33 +1,110 @@
-# ap/broker.py
+# ap/broker.py - BROKER ADAPTERS (PRODUCTION SAFE)
+from __future__ import annotations
+
 import random
 from dataclasses import dataclass
 from typing import Optional, Dict, Any, List
 
+
+# ============================================================
+# Unified response model
+# ============================================================
 @dataclass
 class BrokerOrderResponse:
     broker_order_id: str
-    status: str  # NEW | ACK | FILLED | REJECTED | PARTIAL | CANCELED
-    filled_qty: int
-    avg_fill_price: float
+    status: str  # NEW | ACK | FILLED | REJECTED | PARTIAL | CANCELED | EXPIRED | UNKNOWN
+    filled_qty: int = 0
+    avg_fill_price: float = 0.0
     error: Optional[str] = None
-    raw: Optional[Dict[str, Any]] = None  # keep raw broker payload (debug)
+    raw: Optional[Dict[str, Any]] = None
 
 
+# ============================================================
+# Normalization helpers (make debugging consistent)
+# ============================================================
+def normalize_status(s: Any) -> str:
+    s = str(s or "").strip().upper()
+
+    mapping = {
+        "FILLED": "FILLED",
+        "FILL": "FILLED",
+
+        "PARTIALLY_FILLED": "PARTIAL",
+        "PARTIAL": "PARTIAL",
+
+        "ACK": "ACK",
+        "ACKED": "ACK",
+        "OPEN": "ACK",
+        "PENDING": "ACK",
+        "SUBMITTED": "ACK",
+        "ACCEPTED": "ACK",
+        "OK": "ACK",
+        "NEW": "NEW",
+
+        "REJECTED": "REJECTED",
+        "CANCELED": "CANCELED",
+        "CANCELLED": "CANCELED",
+
+        "EXPIRED": "EXPIRED",
+    }
+
+    # common lowercase payloads
+    if s == "FILLED".lower().upper():  # no-op, just clarity
+        pass
+
+    return mapping.get(s, "UNKNOWN")
+
+
+def _to_float(x: Any) -> Optional[float]:
+    try:
+        if x is None:
+            return None
+        v = float(x)
+        return v
+    except Exception:
+        return None
+
+
+def normalize_quote(q: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Normalize quote dict to {bid, ask, last} floats when possible.
+    """
+    if not isinstance(q, dict):
+        return {"bid": None, "ask": None, "last": None}
+
+    bid = _to_float(q.get("bid"))
+    ask = _to_float(q.get("ask"))
+    last = _to_float(q.get("last") or q.get("lastPrice") or q.get("mark"))
+
+    return {
+        "bid": bid if (bid is not None and bid > 0) else None,
+        "ask": ask if (ask is not None and ask > 0) else None,
+        "last": last if (last is not None and last > 0) else None,
+        "raw": q,
+    }
+
+
+# ============================================================
+# Broker adapter interface
+# ============================================================
 class BrokerAdapter:
     def get_account_equity(self) -> float:
         raise NotImplementedError
 
     def get_order(self, order_id: str) -> Dict[str, Any]:
         """
-        Return the broker's raw order payload as dict.
-        Required for reconciliation.
+        Return broker order payload as dict.
+        REQUIRED KEYS (normalized preferred):
+          - status (any form, fill_monitor normalizes)
+          - exec_quantity or filled_quantity or quantity
+          - avg_fill_price or price
         """
         raise NotImplementedError
 
     def get_quote(self, symbol: str) -> Dict[str, Any]:
         """
-        Quote dict with bid/ask/last where possible.
-        Needed for contract pricing.
+        Return quote dict; pricing will normalize.
+        Prefer keys: bid, ask, last.
         """
         raise NotImplementedError
 
@@ -45,23 +122,27 @@ class BrokerAdapter:
         limit_price: Optional[float],
         side: str = "buy_to_open",
     ) -> BrokerOrderResponse:
-        """
-        side: buy_to_open | buy_to_close | sell_to_open | sell_to_close
-        SIM ignores side; Tradier uses it.
-        """
         raise NotImplementedError
 
     def close_position(self, position_id: str) -> BrokerOrderResponse:
         raise NotImplementedError
 
 
+# ============================================================
+# SIM BROKER (for pipeline testing)
+# ============================================================
 class SimBroker(BrokerAdapter):
     """
     MVP sim broker: fills immediately around limit_price or random mid.
+
+    Note:
+      - option chain defaults empty -> forces synthetic contract branch
+      - set synthetic_chain=True to test resolve_contract_symbol path
     """
 
-    def __init__(self, starting_equity: float = 10000.0):
+    def __init__(self, starting_equity: float = 10000.0, synthetic_chain: bool = False):
         self.equity = float(starting_equity)
+        self.synthetic_chain = bool(synthetic_chain)
         self._orders: Dict[str, Dict[str, Any]] = {}
 
     def get_account_equity(self) -> float:
@@ -71,7 +152,11 @@ class SimBroker(BrokerAdapter):
         o = self._orders.get(order_id)
         if not o:
             raise RuntimeError(f"SIM: order not found: {order_id}")
-        return o
+
+        # normalize status for downstream
+        o2 = dict(o)
+        o2["status"] = normalize_status(o2.get("status"))
+        return o2
 
     def get_quote(self, symbol: str) -> Dict[str, Any]:
         bid = round(random.uniform(0.8, 1.1), 2)
@@ -80,10 +165,28 @@ class SimBroker(BrokerAdapter):
         return {"symbol": symbol, "bid": bid, "ask": ask, "last": last}
 
     def get_option_expirations(self, symbol: str) -> List[str]:
+        # include "today" occasionally? you can replace with real date logic in tests
         return ["2026-01-30", "2026-02-06"]
 
     def get_option_chain(self, symbol: str, expiration: str) -> List[Dict[str, Any]]:
-        return []
+        if not self.synthetic_chain:
+            return []
+
+        # minimal synthetic chain (CALL/PUT) at a few strikes
+        strikes = [100, 105, 110, 115, 120]
+        chain: List[Dict[str, Any]] = []
+        for k in strikes:
+            chain.append({
+                "symbol": f"{symbol}{expiration.replace('-','')[2:]}C{int(k):08d}",
+                "option_type": "call",
+                "strike": float(k),
+            })
+            chain.append({
+                "symbol": f"{symbol}{expiration.replace('-','')[2:]}P{int(k):08d}",
+                "option_type": "put",
+                "strike": float(k),
+            })
+        return chain
 
     def place_order(
         self,
@@ -98,28 +201,28 @@ class SimBroker(BrokerAdapter):
 
         raw = {
             "id": broker_order_id,
-            "status": "filled",
+            "status": "FILLED",
             "symbol": symbol,
             "option_symbol": contract,
             "side": side,
-            "quantity": qty,
-            "avg_fill_price": fill_price,
-            "exec_quantity": qty,
+            "quantity": int(qty),
+            "avg_fill_price": float(fill_price),
+            "exec_quantity": int(qty),
         }
         self._orders[broker_order_id] = raw
 
         return BrokerOrderResponse(
             broker_order_id=broker_order_id,
             status="FILLED",
-            filled_qty=qty,
-            avg_fill_price=fill_price,
+            filled_qty=int(qty),
+            avg_fill_price=float(fill_price),
             error=None,
             raw=raw,
         )
 
     def close_position(self, position_id: str) -> BrokerOrderResponse:
         broker_order_id = f"SIM-CLOSE-{random.randint(100000,999999)}"
-        raw = {"id": broker_order_id, "status": "filled", "position_id": position_id}
+        raw = {"id": broker_order_id, "status": "FILLED", "position_id": position_id}
         self._orders[broker_order_id] = raw
         return BrokerOrderResponse(
             broker_order_id=broker_order_id,
@@ -129,3 +232,4 @@ class SimBroker(BrokerAdapter):
             error=None,
             raw=raw,
         )
+
