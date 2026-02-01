@@ -1,201 +1,189 @@
-# ap/fill_monitor.py
-""" 
-Fill Monitor - Polls Tradier to confirm order fills
-THE ACCURACY LAYER - Don't trust ACK, verify fills!
-"""
+# ap/fill_monitor.py - PRODUCTION SAFE (FIXED)
+
+from __future__ import annotations
+
 import time
 from datetime import datetime, timezone
 
-from ap.db import conn, run_with_retry
+from ap.db import conn, run_with_retry, update_client_state
 from ap.utils import now_utc_iso, json_dumps
 from ap.logger import get_logger
-from ap.state import load_state, update_state
+from ap.config import Config
+from ap.state import release_equity, release_symbol_lock
 from ap.broker import BrokerAdapter
 
 log = get_logger("ap.fill_monitor")
+cfg = Config()
+
+OPT_MULTIPLIER = 100
 
 
-def audit(level: str, event: str, payload: dict):
-    """Log to audit table"""
+def audit(client_id: str, level: str, event: str, payload: dict):
     with conn() as c:
         run_with_retry(lambda: c.execute(
-            "INSERT INTO audit_log (ts, level, event, payload) VALUES (?,?,?,?)",
-            (now_utc_iso(), level, event, json_dumps(payload)),
+            "INSERT INTO audit_log (ts, level, event, payload, client_id) VALUES (?,?,?,?,?)",
+            (now_utc_iso(), level, event, json_dumps(payload), client_id),
         ))
 
 
 def get_pending_orders():
-    """Get all orders that need fill confirmation"""
     with conn() as c:
         rows = run_with_retry(lambda: c.execute("""
-            SELECT 
+            SELECT
+                client_id,
                 local_order_id,
                 broker_order_id,
                 position_id,
                 kind,
                 symbol,
                 contract,
+                direction,
                 qty,
                 limit_price,
+                reserved_cost,
                 status,
                 created_ts
             FROM orders
-            WHERE status IN ('NEW', 'ACK', 'PARTIAL')
-            AND kind IN ('ENTRY', 'EXIT')
+            WHERE kind IN ('ENTRY','EXIT')
+              AND status IN ('NEW','ACK','PARTIAL')
+              AND broker_order_id IS NOT NULL
+              AND broker_order_id != 'N/A'
             ORDER BY created_ts ASC
         """).fetchall())
         return [dict(r) for r in rows]
 
 
-def update_order_status(local_order_id: str, status: str, filled_qty: int = None, error: str = None):
-    """Update order in database"""
+def update_order_status(local_order_id: str, status: str, filled_qty: int | None = None, error: str | None = None):
     with conn() as c:
         updates = ["status=?", "updated_ts=?"]
         params = [status, now_utc_iso()]
-        
+
         if filled_qty is not None:
             updates.append("filled_qty=?")
-            params.append(filled_qty)
-        
+            params.append(int(filled_qty))
+
         if error is not None:
             updates.append("last_error=?")
             params.append(error)
-        
+
         params.append(local_order_id)
-        
         sql = f"UPDATE orders SET {', '.join(updates)} WHERE local_order_id=?"
         run_with_retry(lambda: c.execute(sql, params))
 
 
 def create_position_from_fill(order: dict, avg_fill_price: float, filled_qty: int):
-    """
-    Create position after confirmed fill
-    This is the ONLY place positions should be created for Tradier orders!
-    """
     import uuid
-    from ap.config import Config
-    
-    cfg = Config()
+
     pos_id = str(uuid.uuid4())
-    
+    client_id = order["client_id"]
+    direction = (order.get("direction") or "CALL").upper()
+
     with conn() as c:
         run_with_retry(lambda: c.execute(
             """
             INSERT INTO positions (
-                id, underlying, contract, direction, qty, avg_fill,
+                id, client_id, underlying, contract, direction, qty, avg_fill,
                 entry_ts, tp_pct, sl_pct, status
             )
-            VALUES (?,?,?,?,?,?,?,?,?,?)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 pos_id,
+                client_id,
                 order["symbol"],
                 order["contract"],
-                "CALL",  # TODO: Store direction in orders table
-                filled_qty,
-                avg_fill_price,
+                direction,
+                int(filled_qty),
+                float(avg_fill_price),
                 now_utc_iso(),
-                cfg.TAKE_PROFIT_PCT,
-                cfg.STOP_LOSS_PCT,
+                float(cfg.TAKE_PROFIT_PCT),
+                float(cfg.STOP_LOSS_PCT),
                 "OPEN",
             ),
         ))
-    
-    # Link position to order
+
     with conn() as c:
         run_with_retry(lambda: c.execute(
             "UPDATE orders SET position_id=? WHERE local_order_id=?",
-            (pos_id, order["local_order_id"])
+            (pos_id, order["local_order_id"]),
         ))
-    
-    log.info(f"✅ Position created: {pos_id} for {order['contract']} @ ${avg_fill_price:.2f}")
-    
-    audit("INFO", "POSITION_CREATED_FROM_FILL", {
+
+    audit(client_id, "INFO", "POSITION_CREATED_FROM_FILL", {
         "position_id": pos_id,
         "local_order_id": order["local_order_id"],
         "broker_order_id": order.get("broker_order_id"),
         "contract": order["contract"],
-        "qty": filled_qty,
-        "avg_fill": avg_fill_price
+        "qty": int(filled_qty),
+        "avg_fill": float(avg_fill_price),
+        "direction": direction,
     })
-    
+
     return pos_id
 
 
 def close_position_from_exit_fill(order: dict, avg_fill_price: float):
-    """Close position after confirmed exit fill"""
+    client_id = order["client_id"]
     position_id = order.get("position_id")
-    
     if not position_id:
-        log.error(f"Exit order {order['local_order_id']} has no position_id!")
+        log.error(f"Exit order has no position_id: {order.get('local_order_id')}")
         return
-    
-    # Get position details for P&L calculation
+
     with conn() as c:
         pos_row = run_with_retry(lambda: c.execute(
-            "SELECT * FROM positions WHERE id=?",
-            (position_id,)
+            "SELECT * FROM positions WHERE id=? AND client_id=?",
+            (position_id, client_id),
         ).fetchone())
-    
+
     if not pos_row:
-        log.error(f"Position {position_id} not found!")
+        log.error(f"Position not found: {position_id}")
         return
-    
+
     pos = dict(pos_row)
-    
-    # Calculate realized P&L
     entry_price = float(pos["avg_fill"])
     qty = int(pos["qty"])
-    realized_pnl = (avg_fill_price - entry_price) * qty * 100  # Options multiplier
-    
-    # Close position
+    realized_pnl = (float(avg_fill_price) - entry_price) * qty * OPT_MULTIPLIER
+
     with conn() as c:
         run_with_retry(lambda: c.execute(
             """
-            UPDATE positions 
+            UPDATE positions
             SET status='CLOSED', exit_ts=?, realized_pnl=?
-            WHERE id=?
+            WHERE id=? AND client_id=?
             """,
-            (now_utc_iso(), realized_pnl, position_id)
+            (now_utc_iso(), float(realized_pnl), position_id, client_id),
         ))
-    
-    # Update daily P&L
-    state = load_state()
-    new_realized = float(state.get("realized_pnl_today", 0.0)) + realized_pnl
-    update_state({"realized_pnl_today": new_realized})
-    
-    log.info(f"✅ Position CLOSED: {pos['contract']} realized=${realized_pnl:.2f}")
-    
-    audit("INFO", "POSITION_CLOSED_FROM_EXIT", {
+
+    # Update client_state realized_pnl_today (single source of truth)
+    # Add on top of existing value using SQL to avoid races.
+    with conn() as c:
+        run_with_retry(lambda: c.execute(
+            """
+            UPDATE client_state
+            SET realized_pnl_today = COALESCE(realized_pnl_today, 0.0) + ?
+            WHERE client_id=?
+            """,
+            (float(realized_pnl), client_id),
+        ))
+
+    audit(client_id, "INFO", "POSITION_CLOSED_FROM_EXIT", {
         "position_id": position_id,
         "contract": pos["contract"],
         "entry_price": entry_price,
-        "exit_price": avg_fill_price,
+        "exit_price": float(avg_fill_price),
         "qty": qty,
-        "realized_pnl": realized_pnl,
-        "exit_reason": pos.get("exit_reason")
+        "realized_pnl": float(realized_pnl),
     })
 
 
 def check_order_with_broker(broker: BrokerAdapter, order: dict) -> dict:
-    """
-    Query Tradier for actual order status
-    Returns: {"status": str, "filled_qty": int, "avg_fill": float, "reason": str}
-    """
     broker_order_id = order.get("broker_order_id")
-    
     if not broker_order_id or broker_order_id == "N/A":
-        log.warning(f"Order {order['local_order_id']} has no broker_order_id")
         return {"status": "UNKNOWN", "reason": "NO_BROKER_ID"}
-    
+
     try:
-        # Query Tradier
-        broker_order = broker.get_order(broker_order_id)
-        
-        # Parse Tradier response
-        status = (broker_order.get("status") or "").upper()
-        
-        # Map Tradier statuses to our statuses
+        raw = broker.get_order(broker_order_id)
+        status = (raw.get("status") or "").upper()
+
         status_map = {
             "FILLED": "FILLED",
             "OPEN": "ACK",
@@ -203,149 +191,124 @@ def check_order_with_broker(broker: BrokerAdapter, order: dict) -> dict:
             "PARTIALLY_FILLED": "PARTIAL",
             "CANCELED": "CANCELED",
             "REJECTED": "REJECTED",
-            "EXPIRED": "EXPIRED"
+            "EXPIRED": "EXPIRED",
         }
-        
-        our_status = status_map.get(status, "UNKNOWN")
-        
-        # Get fill details
-        filled_qty = int(broker_order.get("exec_quantity") or broker_order.get("quantity") or 0)
-        avg_fill_price = float(broker_order.get("avg_fill_price") or broker_order.get("price") or 0.0)
-        
-        return {
-            "status": our_status,
-            "filled_qty": filled_qty,
-            "avg_fill": avg_fill_price if filled_qty > 0 else 0.0,
-            "reason": broker_order.get("reason") or broker_order.get("status"),
-            "raw": broker_order
-        }
-        
+        our = status_map.get(status, "UNKNOWN")
+
+        filled_qty = int(raw.get("exec_quantity") or raw.get("filled_quantity") or raw.get("quantity") or 0)
+        avg_fill = float(raw.get("avg_fill_price") or raw.get("price") or 0.0)
+
+        return {"status": our, "filled_qty": filled_qty, "avg_fill": avg_fill, "reason": raw.get("reason") or status, "raw": raw}
+
     except Exception as e:
-        log.error(f"Failed to check order {broker_order_id}: {e}")
-        audit("ERROR", "FILL_CHECK_FAILED", {
-            "local_order_id": order["local_order_id"],
-            "broker_order_id": broker_order_id,
-            "error": str(e)
-        })
+        audit(order["client_id"], "ERROR", "FILL_CHECK_FAILED", {"error": str(e), "broker_order_id": broker_order_id})
         return {"status": "ERROR", "reason": str(e)}
 
 
+def _release_entry_guards(order: dict, used_cost: float | None = None):
+    """
+    Releases reserved equity and symbol lock for ENTRY orders.
+    used_cost defaults to orders.reserved_cost, else computed from limit_price*qty*100
+    """
+    client_id = order["client_id"]
+    symbol = order["symbol"]
+
+    cost = used_cost
+    if cost is None:
+        if order.get("reserved_cost") is not None:
+            cost = float(order["reserved_cost"])
+        else:
+            cost = float(order.get("limit_price") or 0.0) * int(order.get("qty") or 0) * OPT_MULTIPLIER
+
+    if cost and cost > 0:
+        release_equity(client_id, float(cost))
+    release_symbol_lock(client_id, symbol)
+
+
 def process_pending_order(broker: BrokerAdapter, order: dict):
-    """Check one pending order and update accordingly"""
-    
-    result = check_order_with_broker(broker, order)
-    
+    client_id = order["client_id"]
     local_id = order["local_order_id"]
     broker_id = order.get("broker_order_id")
-    order_kind = order.get("kind", "ENTRY")
-    
-    # Handle different statuses
+    kind = (order.get("kind") or "ENTRY").upper()
+
+    result = check_order_with_broker(broker, order)
+
     if result["status"] == "FILLED":
-        log.info(f"🎯 Order FILLED: {broker_id} - {order['contract']} x{result['filled_qty']} @ ${result['avg_fill']:.2f}")
-        
-        # Update order
-        update_order_status(local_id, "FILLED", result["filled_qty"])
-        
-        # Handle based on order type
-        if order_kind == "ENTRY":
-            # Create position
+        update_order_status(local_id, "FILLED", filled_qty=result["filled_qty"])
+
+        if kind == "ENTRY":
             create_position_from_fill(order, result["avg_fill"], result["filled_qty"])
-        elif order_kind == "EXIT":
-            # Close position
+            # release based on reserved_cost (or limit*qty fallback)
+            _release_entry_guards(order, used_cost=float(order.get("reserved_cost") or 0.0) or None)
+
+        elif kind == "EXIT":
             close_position_from_exit_fill(order, result["avg_fill"])
-        
-        audit("INFO", "ORDER_FILLED", {
+
+        audit(client_id, "INFO", "ORDER_FILLED", {
             "local_order_id": local_id,
             "broker_order_id": broker_id,
-            "kind": order_kind,
+            "kind": kind,
             "filled_qty": result["filled_qty"],
-            "avg_fill": result["avg_fill"]
+            "avg_fill": result["avg_fill"],
         })
-        
-    elif result["status"] == "PARTIAL":
-        log.info(f"⏳ Order PARTIAL: {broker_id} - {result['filled_qty']}/{order['qty']}")
-        
-        update_order_status(local_id, "PARTIAL", result["filled_qty"])
-        
-        audit("INFO", "ORDER_PARTIAL", {
-            "local_order_id": local_id,
-            "broker_order_id": broker_id,
-            "kind": order_kind,
-            "filled_qty": result["filled_qty"],
-            "total_qty": order["qty"]
+        return
+
+    if result["status"] == "PARTIAL":
+        update_order_status(local_id, "PARTIAL", filled_qty=result["filled_qty"])
+        audit(client_id, "INFO", "ORDER_PARTIAL", {
+            "local_order_id": local_id, "broker_order_id": broker_id,
+            "kind": kind, "filled_qty": result["filled_qty"], "total_qty": int(order["qty"]),
         })
-        
-    elif result["status"] in ("REJECTED", "CANCELED", "EXPIRED"):
-        log.warning(f"❌ Order {result['status']}: {broker_id} - {result.get('reason')}")
-        
+        return
+
+    if result["status"] in ("REJECTED", "CANCELED", "EXPIRED"):
         update_order_status(local_id, result["status"], error=result.get("reason"))
-        
-        # If EXIT order failed, revert position to OPEN
-        if order_kind == "EXIT" and order.get("position_id"):
+
+        if kind == "ENTRY":
+            _release_entry_guards(order)
+
+        if kind == "EXIT" and order.get("position_id"):
             with conn() as c:
                 run_with_retry(lambda: c.execute(
-                    "UPDATE positions SET status='OPEN', exit_reason=NULL WHERE id=?",
-                    (order["position_id"],)
+                    "UPDATE positions SET status='OPEN', exit_reason=NULL WHERE id=? AND client_id=?",
+                    (order["position_id"], client_id),
                 ))
-            log.info(f"Reverted position {order['position_id']} to OPEN (exit {result['status']})")
-        
-        audit("WARNING", f"ORDER_{result['status']}", {
-            "local_order_id": local_id,
-            "broker_order_id": broker_id,
-            "kind": order_kind,
-            "reason": result.get("reason")
+
+        audit(client_id, "WARNING", f"ORDER_{result['status']}", {
+            "local_order_id": local_id, "broker_order_id": broker_id, "kind": kind, "reason": result.get("reason"),
         })
-        
-    elif result["status"] == "ACK":
-        # Still pending, check age
+        return
+
+    if result["status"] == "ACK":
         created = datetime.fromisoformat(order["created_ts"])
-        age_seconds = (datetime.now(timezone.utc) - created).total_seconds()
-        
-        if age_seconds > 300:  # 5 minutes
-            log.warning(f"⚠️ Order pending for {age_seconds:.0f}s: {broker_id}")
-            
-            audit("WARNING", "ORDER_PENDING_LONG", {
-                "local_order_id": local_id,
-                "broker_order_id": broker_id,
-                "kind": order_kind,
-                "age_seconds": age_seconds
-            })
-    
-    elif result["status"] == "ERROR":
-        log.error(f"💥 Error checking order: {broker_id} - {result['reason']}")
+        age = (datetime.now(timezone.utc) - created).total_seconds()
+        if age > 300:
+            audit(client_id, "WARNING", "ORDER_PENDING_LONG", {"local_order_id": local_id, "broker_order_id": broker_id, "age_seconds": age})
+        return
+
+    if result["status"] == "ERROR":
+        audit(client_id, "ERROR", "ORDER_CHECK_ERROR", {"local_order_id": local_id, "broker_order_id": broker_id, "reason": result.get("reason")})
 
 
 def fill_monitor_loop(broker: BrokerAdapter, poll_seconds: float = 10.0):
     """
-    Main fill monitoring loop
-    Runs continuously, checking pending orders
+    Fill monitor must NEVER pause on kill switch.
+    It’s the reconciliation layer.
     """
     log.info("🔍 Fill monitor started")
-    
+
     while True:
         try:
-            # Check kill switch
-            state = load_state()
-            if state.get("kill_switch"):
-                log.warning("Kill switch enabled, fill monitor paused")
-                time.sleep(poll_seconds)
-                continue
-            
-            # Get all pending orders
             pending = get_pending_orders()
-            
-            if pending:
-                log.info(f"Checking {len(pending)} pending order(s)...")
-                
-                for order in pending:
-                    try:
-                        process_pending_order(broker, order)
-                    except Exception as e:
-                        log.exception(f"Failed to process order {order.get('local_order_id')}: {e}")
-            
-            # Sleep before next check
+            for order in pending:
+                try:
+                    process_pending_order(broker, order)
+                except Exception as e:
+                    log.exception(f"Failed to process order {order.get('local_order_id')}: {e}")
+
             time.sleep(poll_seconds)
-            
+
         except Exception as e:
-            log.exception(f"Fill monitor error: {e}")
+            log.exception(f"Fill monitor loop error: {e}")
             time.sleep(poll_seconds * 2)
+
