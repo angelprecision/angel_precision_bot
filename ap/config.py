@@ -23,28 +23,24 @@ class Config:
     # =====================================================================
     
     # Position sizing: 15% of equity BUT hard capped at $5K
-    # Examples:
-    #   $10K account: 15% = $1,500 per trade ✅
-    #   $50K account: 15% = $7,500 → CAPPED at $5,000 ✅
-    #   $100K account: 15% = $15,000 → CAPPED at $5,000 ✅
     BASE_POSITION_PCT: float = min(
         float(os.getenv("BASE_POSITION_PCT", "0.15")),
-        0.15  # Never exceed 15%
+        0.15
     )
     
     # Maximum cost per trade (hard safety cap)
     MAX_POSITION_COST: float = 5000.0
     
-    # Maximum concurrent positions (prevents duplicates + overexposure)
+    # Maximum concurrent positions
     MAX_CONCURRENT_POSITIONS: int = min(
         int(os.getenv("MAX_CONCURRENT_POSITIONS", "1")),
-        1  # Only 1 position at a time
+        1
     )
     
-    # Maximum trades per day (prevents overtrading)
+    # Maximum trades per day
     MAX_TRADES_PER_DAY: int = min(
         int(os.getenv("MAX_TRADES_PER_DAY", "2")),
-        2  # Max 2 trades per day
+        2
     )
     
     # Daily loss stop (kill switch at 17% loss)
