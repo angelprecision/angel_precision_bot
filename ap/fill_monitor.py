@@ -1,11 +1,19 @@
 # ap/fill_monitor.py - PRODUCTION SAFE (FIXED)
+"""
+Fill Monitor - Polls broker to confirm order fills
+THE ACCURACY LAYER - Don't trust ACK, verify fills!
+
+CRITICAL RULE:
+- Fill monitor MUST NEVER pause on kill switch. It reconciles reality.
+- Releases symbol locks + reserved equity for ENTRY when FILLED/REJECTED/CANCELED/EXPIRED.
+"""
 
 from __future__ import annotations
 
 import time
 from datetime import datetime, timezone
 
-from ap.db import conn, run_with_retry, update_client_state
+from ap.db import conn, run_with_retry
 from ap.utils import now_utc_iso, json_dumps
 from ap.logger import get_logger
 from ap.config import Config
@@ -72,6 +80,9 @@ def update_order_status(local_order_id: str, status: str, filled_qty: int | None
 
 
 def create_position_from_fill(order: dict, avg_fill_price: float, filled_qty: int):
+    """
+    Create position after confirmed ENTRY fill
+    """
     import uuid
 
     pos_id = str(uuid.uuid4())
@@ -122,8 +133,12 @@ def create_position_from_fill(order: dict, avg_fill_price: float, filled_qty: in
 
 
 def close_position_from_exit_fill(order: dict, avg_fill_price: float):
+    """
+    Close position after confirmed EXIT fill
+    """
     client_id = order["client_id"]
     position_id = order.get("position_id")
+
     if not position_id:
         log.error(f"Exit order has no position_id: {order.get('local_order_id')}")
         return
@@ -153,8 +168,7 @@ def close_position_from_exit_fill(order: dict, avg_fill_price: float):
             (now_utc_iso(), float(realized_pnl), position_id, client_id),
         ))
 
-    # Update client_state realized_pnl_today (single source of truth)
-    # Add on top of existing value using SQL to avoid races.
+    # Update client_state realized_pnl_today atomically (no races)
     with conn() as c:
         run_with_retry(lambda: c.execute(
             """
@@ -176,6 +190,10 @@ def close_position_from_exit_fill(order: dict, avg_fill_price: float):
 
 
 def check_order_with_broker(broker: BrokerAdapter, order: dict) -> dict:
+    """
+    Query broker for actual order status
+    Returns: {"status": str, "filled_qty": int, "avg_fill": float, "reason": str, "raw": dict}
+    """
     broker_order_id = order.get("broker_order_id")
     if not broker_order_id or broker_order_id == "N/A":
         return {"status": "UNKNOWN", "reason": "NO_BROKER_ID"}
@@ -198,30 +216,44 @@ def check_order_with_broker(broker: BrokerAdapter, order: dict) -> dict:
         filled_qty = int(raw.get("exec_quantity") or raw.get("filled_quantity") or raw.get("quantity") or 0)
         avg_fill = float(raw.get("avg_fill_price") or raw.get("price") or 0.0)
 
-        return {"status": our, "filled_qty": filled_qty, "avg_fill": avg_fill, "reason": raw.get("reason") or status, "raw": raw}
+        return {
+            "status": our,
+            "filled_qty": filled_qty,
+            "avg_fill": avg_fill,
+            "reason": raw.get("reason") or status,
+            "raw": raw,
+        }
 
     except Exception as e:
-        audit(order["client_id"], "ERROR", "FILL_CHECK_FAILED", {"error": str(e), "broker_order_id": broker_order_id})
+        audit(order["client_id"], "ERROR", "FILL_CHECK_FAILED", {
+            "error": str(e),
+            "broker_order_id": broker_order_id,
+            "local_order_id": order.get("local_order_id"),
+        })
         return {"status": "ERROR", "reason": str(e)}
 
 
-def _release_entry_guards(order: dict, used_cost: float | None = None):
+def _release_entry_guards(order: dict):
     """
     Releases reserved equity and symbol lock for ENTRY orders.
-    used_cost defaults to orders.reserved_cost, else computed from limit_price*qty*100
+    Uses orders.reserved_cost if present, else falls back to limit_price*qty*100.
     """
     client_id = order["client_id"]
     symbol = order["symbol"]
 
-    cost = used_cost
-    if cost is None:
-        if order.get("reserved_cost") is not None:
+    cost = None
+    if order.get("reserved_cost") is not None:
+        try:
             cost = float(order["reserved_cost"])
-        else:
-            cost = float(order.get("limit_price") or 0.0) * int(order.get("qty") or 0) * OPT_MULTIPLIER
+        except Exception:
+            cost = None
+
+    if cost is None:
+        cost = float(order.get("limit_price") or 0.0) * int(order.get("qty") or 0) * OPT_MULTIPLIER
 
     if cost and cost > 0:
-        release_equity(client_id, float(cost))
+        release_equity(client_id, cost)
+
     release_symbol_lock(client_id, symbol)
 
 
@@ -238,8 +270,7 @@ def process_pending_order(broker: BrokerAdapter, order: dict):
 
         if kind == "ENTRY":
             create_position_from_fill(order, result["avg_fill"], result["filled_qty"])
-            # release based on reserved_cost (or limit*qty fallback)
-            _release_entry_guards(order, used_cost=float(order.get("reserved_cost") or 0.0) or None)
+            _release_entry_guards(order)
 
         elif kind == "EXIT":
             close_position_from_exit_fill(order, result["avg_fill"])
@@ -256,8 +287,11 @@ def process_pending_order(broker: BrokerAdapter, order: dict):
     if result["status"] == "PARTIAL":
         update_order_status(local_id, "PARTIAL", filled_qty=result["filled_qty"])
         audit(client_id, "INFO", "ORDER_PARTIAL", {
-            "local_order_id": local_id, "broker_order_id": broker_id,
-            "kind": kind, "filled_qty": result["filled_qty"], "total_qty": int(order["qty"]),
+            "local_order_id": local_id,
+            "broker_order_id": broker_id,
+            "kind": kind,
+            "filled_qty": result["filled_qty"],
+            "total_qty": int(order["qty"]),
         })
         return
 
@@ -275,19 +309,35 @@ def process_pending_order(broker: BrokerAdapter, order: dict):
                 ))
 
         audit(client_id, "WARNING", f"ORDER_{result['status']}", {
-            "local_order_id": local_id, "broker_order_id": broker_id, "kind": kind, "reason": result.get("reason"),
+            "local_order_id": local_id,
+            "broker_order_id": broker_id,
+            "kind": kind,
+            "reason": result.get("reason"),
         })
         return
 
     if result["status"] == "ACK":
-        created = datetime.fromisoformat(order["created_ts"])
-        age = (datetime.now(timezone.utc) - created).total_seconds()
-        if age > 300:
-            audit(client_id, "WARNING", "ORDER_PENDING_LONG", {"local_order_id": local_id, "broker_order_id": broker_id, "age_seconds": age})
+        # still pending
+        try:
+            created = datetime.fromisoformat(order["created_ts"])
+            age = (datetime.now(timezone.utc) - created).total_seconds()
+            if age > 300:
+                audit(client_id, "WARNING", "ORDER_PENDING_LONG", {
+                    "local_order_id": local_id,
+                    "broker_order_id": broker_id,
+                    "kind": kind,
+                    "age_seconds": age,
+                })
+        except Exception:
+            pass
         return
 
     if result["status"] == "ERROR":
-        audit(client_id, "ERROR", "ORDER_CHECK_ERROR", {"local_order_id": local_id, "broker_order_id": broker_id, "reason": result.get("reason")})
+        audit(client_id, "ERROR", "ORDER_CHECK_ERROR", {
+            "local_order_id": local_id,
+            "broker_order_id": broker_id,
+            "reason": result.get("reason"),
+        })
 
 
 def fill_monitor_loop(broker: BrokerAdapter, poll_seconds: float = 10.0):
