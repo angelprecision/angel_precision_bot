@@ -2,7 +2,9 @@
 # - Uses /data disk when BOT_DB_FILE is set to /data/ap_state.db
 # - Safe to run repeatedly (migrations included)
 # - Multi-client tables: clients, client_state, trade_queue, orders, positions, audit_log
-# - Fixes your crash: adds client_state.day_key + hardens update_client_state() to never die on missing columns
+# - Adds orders.direction + orders.reserved_cost to support safe release logic
+
+from __future__ import annotations
 
 import os
 import time
@@ -18,13 +20,9 @@ cfg = Config()
 
 
 # ============================================================
-# SQLite retry wrapper (WAL + busy_timeout still can lock briefly)
+# SQLite retry wrapper
 # ============================================================
 def run_with_retry(fn: Callable[[], Any], retries: int = 12, base_sleep: float = 0.05, max_sleep: float = 1.0):
-    """
-    Retry SQLite operations that fail with 'database is locked/busy'.
-    Exponential backoff.
-    """
     delay = base_sleep
     last_err = None
 
@@ -40,7 +38,6 @@ def run_with_retry(fn: Callable[[], Any], retries: int = 12, base_sleep: float =
                 continue
             raise
 
-    # last attempt
     try:
         return fn()
     except Exception:
@@ -54,7 +51,6 @@ def run_with_retry(fn: Callable[[], Any], retries: int = 12, base_sleep: float =
 # ============================================================
 @contextmanager
 def conn():
-    # Prevent: sqlite3.OperationalError: unable to open database file
     db_dir = os.path.dirname(cfg.DB_FILE)
     if db_dir and not os.path.exists(db_dir):
         os.makedirs(db_dir, exist_ok=True)
@@ -67,7 +63,6 @@ def conn():
     )
     c.row_factory = sqlite3.Row
 
-    # concurrency helpers (web + worker)
     c.execute("PRAGMA journal_mode=WAL;")
     c.execute("PRAGMA busy_timeout=30000;")
     c.execute("PRAGMA foreign_keys=ON;")
@@ -82,10 +77,6 @@ def conn():
 # Schema init + migrations
 # ============================================================
 def init_db():
-    """
-    Initialize database with multi-client support.
-    Safe to run repeatedly - handles migrations.
-    """
     with conn() as c:
 
         def ex(sql: str, params: tuple = ()):
@@ -160,7 +151,6 @@ def init_db():
             );
             """
         )
-        # migrations (safe)
         for sql in [
             "ALTER TABLE trade_queue ADD COLUMN client_id TEXT NOT NULL DEFAULT 'default';",
             "ALTER TABLE trade_queue ADD COLUMN started_ts TEXT;",
@@ -182,7 +172,6 @@ def init_db():
         except Exception:
             pass
 
-        # idempotency (unique per client)
         try:
             ex("CREATE UNIQUE INDEX IF NOT EXISTS idx_trade_queue_idempotency ON trade_queue(client_id, idempotency_key);")
         except Exception:
@@ -203,6 +192,11 @@ def init_db():
                 status TEXT NOT NULL,     -- NEW | ACK | PARTIAL | FILLED | REJECTED | CANCELED
                 symbol TEXT NOT NULL,
                 contract TEXT NOT NULL,
+
+                -- NEW: direction + reserved_cost (migrations below)
+                direction TEXT,
+                reserved_cost REAL,
+
                 qty INTEGER NOT NULL,
                 limit_price REAL,
                 filled_qty INTEGER NOT NULL DEFAULT 0,
@@ -213,10 +207,17 @@ def init_db():
             );
             """
         )
-        try:
-            ex("ALTER TABLE orders ADD COLUMN client_id TEXT NOT NULL DEFAULT 'default';")
-        except Exception:
-            pass
+
+        # migrations for older DBs that created orders without these columns
+        for sql in [
+            "ALTER TABLE orders ADD COLUMN client_id TEXT NOT NULL DEFAULT 'default';",
+            "ALTER TABLE orders ADD COLUMN direction TEXT;",
+            "ALTER TABLE orders ADD COLUMN reserved_cost REAL;",
+        ]:
+            try:
+                ex(sql)
+            except Exception:
+                pass
 
         try:
             ex("CREATE INDEX IF NOT EXISTS idx_orders_client_local_order_id ON orders(client_id, local_order_id);")
@@ -266,7 +267,7 @@ def init_db():
             pass
 
         # ------------------------
-        # CLIENTS (multi-tenant)
+        # CLIENTS
         # ------------------------
         ex(
             """
@@ -297,7 +298,7 @@ def init_db():
             pass
 
         # ------------------------
-        # CLIENT STATE (per-client tracking)
+        # CLIENT STATE
         # ------------------------
         ex(
             """
@@ -311,11 +312,8 @@ def init_db():
                 kill_switch INTEGER NOT NULL DEFAULT 0,
                 mode TEXT NOT NULL DEFAULT 'PAPER',
                 last_heartbeat_ts TEXT,
-
-                -- used by daily reset logic / growth systems
                 day_key TEXT,
 
-                -- Fee/rental optional fields
                 client_capital REAL,
                 rental_fee REAL,
                 working_capital REAL,
@@ -330,7 +328,6 @@ def init_db():
             """
         )
 
-        # ✅ migrations for existing DBs
         for sql in [
             "ALTER TABLE client_state ADD COLUMN day_key TEXT;",
             "ALTER TABLE client_state ADD COLUMN client_capital REAL;",
@@ -354,14 +351,13 @@ def init_db():
 
 
 # =========================================================================
-# DEDUPE HELPERS (idempotency)
+# DEDUPE HELPERS
 # =========================================================================
 def already_processed_signal(signal_id: str) -> bool:
     def _fn():
         with conn() as c:
             row = c.execute("SELECT 1 FROM processed_signals WHERE signal_id=?", (signal_id,)).fetchone()
             return row is not None
-
     return run_with_retry(_fn)
 
 
@@ -372,7 +368,6 @@ def mark_signal_processed(signal_id: str):
                 "INSERT OR IGNORE INTO processed_signals(signal_id, first_seen_ts) VALUES (?,?)",
                 (signal_id, now_utc_iso()),
             )
-
     return run_with_retry(_fn)
 
 
@@ -395,6 +390,8 @@ def insert_order(
     qty: int,
     limit_price: float | None = None,
     broker_order_id: str | None = None,
+    direction: str | None = None,
+    reserved_cost: float | None = None,
 ):
     ts = now_utc_iso()
 
@@ -404,10 +401,11 @@ def insert_order(
                 """
                 INSERT INTO orders (
                     client_id, local_order_id, broker_order_id, position_id, kind, status,
-                    symbol, contract, qty, limit_price, filled_qty, retries, last_error,
+                    symbol, contract, direction, reserved_cost,
+                    qty, limit_price, filled_qty, retries, last_error,
                     created_ts, updated_ts
                 )
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     client_id,
@@ -418,6 +416,8 @@ def insert_order(
                     status,
                     symbol,
                     contract,
+                    direction,
+                    reserved_cost,
                     int(qty),
                     limit_price,
                     0,
@@ -440,7 +440,7 @@ def update_order(
     filled_qty: int | None = None,
 ):
     updates = []
-    params = []
+    params: list[Any] = []
 
     if status is not None:
         updates.append("status=?")
@@ -472,129 +472,6 @@ def update_order(
 
 
 # =========================================================================
-# REPORTING + RECONCILIATION READS
-# =========================================================================
-def list_orders(client_id: str | None = "default", limit: int = 200, status: str | None = None):
-    """
-    If client_id is None -> return across all clients (admin view).
-    """
-    def _fn():
-        with conn() as c:
-            if client_id is None:
-                if status:
-                    rows = c.execute(
-                        "SELECT * FROM orders WHERE status=? ORDER BY created_ts DESC LIMIT ?",
-                        (status, limit),
-                    ).fetchall()
-                else:
-                    rows = c.execute(
-                        "SELECT * FROM orders ORDER BY created_ts DESC LIMIT ?",
-                        (limit,),
-                    ).fetchall()
-            else:
-                if status:
-                    rows = c.execute(
-                        "SELECT * FROM orders WHERE client_id=? AND status=? ORDER BY created_ts DESC LIMIT ?",
-                        (client_id, status, limit),
-                    ).fetchall()
-                else:
-                    rows = c.execute(
-                        "SELECT * FROM orders WHERE client_id=? ORDER BY created_ts DESC LIMIT ?",
-                        (client_id, limit),
-                    ).fetchall()
-            return [dict(r) for r in rows]
-
-    return run_with_retry(_fn)
-
-
-def list_positions(client_id: str | None = "default", limit: int = 200, status: str = "ALL"):
-    """
-    If client_id is None -> return across all clients (admin view).
-    status: ALL | OPEN | CLOSING | CLOSED
-    """
-    status = (status or "ALL").upper()
-
-    def _fn():
-        with conn() as c:
-            if client_id is None:
-                if status != "ALL":
-                    rows = c.execute(
-                        "SELECT * FROM positions WHERE status=? ORDER BY entry_ts DESC LIMIT ?",
-                        (status, limit),
-                    ).fetchall()
-                else:
-                    rows = c.execute(
-                        "SELECT * FROM positions ORDER BY entry_ts DESC LIMIT ?",
-                        (limit,),
-                    ).fetchall()
-            else:
-                if status != "ALL":
-                    rows = c.execute(
-                        "SELECT * FROM positions WHERE client_id=? AND status=? ORDER BY entry_ts DESC LIMIT ?",
-                        (client_id, status, limit),
-                    ).fetchall()
-                else:
-                    rows = c.execute(
-                        "SELECT * FROM positions WHERE client_id=? ORDER BY entry_ts DESC LIMIT ?",
-                        (client_id, limit),
-                    ).fetchall()
-            return [dict(r) for r in rows]
-
-    return run_with_retry(_fn)
-
-
-def list_audit(client_id: str | None = None, limit: int = 200):
-    def _fn():
-        with conn() as c:
-            if client_id:
-                rows = c.execute(
-                    "SELECT ts, level, event, payload, client_id FROM audit_log WHERE client_id=? ORDER BY id DESC LIMIT ?",
-                    (client_id, limit),
-                ).fetchall()
-            else:
-                rows = c.execute(
-                    "SELECT ts, level, event, payload, client_id FROM audit_log ORDER BY id DESC LIMIT ?",
-                    (limit,),
-                ).fetchall()
-            return [dict(r) for r in rows]
-
-    return run_with_retry(_fn)
-
-
-def get_open_orders_for_reconcile(client_id: str | None = None, limit: int = 200):
-    def _fn():
-        with conn() as c:
-            if client_id:
-                rows = c.execute(
-                    """
-                    SELECT * FROM orders
-                    WHERE client_id=?
-                      AND broker_order_id IS NOT NULL
-                      AND broker_order_id != 'N/A'
-                      AND status IN ('NEW','ACK','PARTIAL')
-                    ORDER BY updated_ts ASC
-                    LIMIT ?
-                    """,
-                    (client_id, limit),
-                ).fetchall()
-            else:
-                rows = c.execute(
-                    """
-                    SELECT * FROM orders
-                    WHERE broker_order_id IS NOT NULL
-                      AND broker_order_id != 'N/A'
-                      AND status IN ('NEW','ACK','PARTIAL')
-                    ORDER BY updated_ts ASC
-                    LIMIT ?
-                    """,
-                    (limit,),
-                ).fetchall()
-            return [dict(r) for r in rows]
-
-    return run_with_retry(_fn)
-
-
-# =========================================================================
 # CLIENT MANAGEMENT
 # =========================================================================
 def get_client(client_id: str) -> dict:
@@ -605,99 +482,10 @@ def get_client(client_id: str) -> dict:
         return dict(row)
 
 
-def get_all_clients(status: str | None = None) -> list:
-    with conn() as c:
-        if status:
-            rows = run_with_retry(lambda: c.execute(
-                "SELECT * FROM clients WHERE status=? ORDER BY created_at DESC",
-                (status,),
-            ).fetchall())
-        else:
-            rows = run_with_retry(lambda: c.execute(
-                "SELECT * FROM clients ORDER BY created_at DESC",
-            ).fetchall())
-        return [dict(r) for r in rows]
-
-
-def create_client(
-    client_id: str,
-    name: str,
-    broker_type: str,
-    broker_account_id: str,
-    broker_token: str,
-    broker_base_url: str,
-    initial_equity: float,
-    **kwargs,
-) -> dict:
-    """
-    NOTE: broker_token should be already encrypted if you're using ap.crypto/encrypt_token.
-    """
-    with conn() as c:
-        run_with_retry(lambda: c.execute(
-            """
-            INSERT INTO clients (
-                client_id, name, broker_type, broker_account_id, broker_token,
-                broker_base_url, initial_equity, status, created_at,
-                max_trades_per_day, max_concurrent_positions,
-                daily_max_loss_pct, base_position_pct
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, 'ACTIVE', ?, ?, ?, ?, ?)
-            """,
-            (
-                client_id,
-                name,
-                broker_type,
-                broker_account_id,
-                broker_token,
-                broker_base_url,
-                float(initial_equity),
-                now_utc_iso(),
-                int(kwargs.get("max_trades_per_day", 5)),
-                int(kwargs.get("max_concurrent_positions", 3)),
-                float(kwargs.get("daily_max_loss_pct", 0.05)),
-                float(kwargs.get("base_position_pct", 0.10)),
-            ),
-        ))
-
-        # create state row
-        run_with_retry(lambda: c.execute(
-            """
-            INSERT INTO client_state (
-                client_id, current_equity, starting_equity_today,
-                realized_pnl_today, trades_taken_today, daily_stop_hit, kill_switch, mode, last_heartbeat_ts, day_key
-            )
-            VALUES (?, ?, ?, 0.0, 0, 0, 0, 'PAPER', NULL, NULL)
-            """,
-            (client_id, float(initial_equity), float(initial_equity)),
-        ))
-
-    return get_client(client_id)
-
-
-def update_client(client_id: str, **updates) -> dict:
-    allowed = {
-        "name", "broker_account_id", "broker_token", "broker_base_url",
-        "status", "max_trades_per_day", "max_concurrent_positions",
-        "daily_max_loss_pct", "base_position_pct", "api_key",
-    }
-    updates = {k: v for k, v in updates.items() if k in allowed}
-    if not updates:
-        return get_client(client_id)
-
-    set_clause = ", ".join(f"{k}=?" for k in updates.keys())
-    values = list(updates.values()) + [client_id]
-
-    with conn() as c:
-        run_with_retry(lambda: c.execute(f"UPDATE clients SET {set_clause} WHERE client_id=?", values))
-
-    return get_client(client_id)
-
-
 def get_client_state(client_id: str = "default") -> dict:
     with conn() as c:
         row = run_with_retry(lambda: c.execute("SELECT * FROM client_state WHERE client_id=?", (client_id,)).fetchone())
         if not row:
-            # return defaults if missing
             return {
                 "client_id": client_id,
                 "current_equity": 0.0,
@@ -713,12 +501,6 @@ def get_client_state(client_id: str = "default") -> dict:
 
 
 def update_client_state(client_id: str = "default", updates: dict | None = None):
-    """
-    Update per-client state safely.
-
-    - Ensures the client_state row exists.
-    - Filters updates to only real columns (prevents crashes like "no such column: day_key").
-    """
     if not updates:
         return
 
@@ -749,7 +531,7 @@ def update_client_state(client_id: str = "default", updates: dict | None = None)
                 (client_id,),
             ))
 
-    # Discover actual columns (robust)
+    # Discover real columns
     with conn() as c:
         cols = run_with_retry(lambda: c.execute("PRAGMA table_info(client_state);").fetchall())
 
@@ -758,7 +540,7 @@ def update_client_state(client_id: str = "default", updates: dict | None = None)
         try:
             allowed.add(r["name"])
         except Exception:
-            allowed.add(r[1])  # fallback: (cid, name, type, ...)
+            allowed.add(r[1])
 
     safe_updates = {k: v for k, v in updates.items() if k in allowed}
     if not safe_updates:
@@ -772,3 +554,4 @@ def update_client_state(client_id: str = "default", updates: dict | None = None)
             f"UPDATE client_state SET {set_clause} WHERE client_id=?",
             values,
         ))
+
