@@ -6,6 +6,8 @@
 # This file creates ORDERS. fill_monitor.py creates POSITIONS.
 #
 # Safety Features:
+# - Duplicate symbol prevention (no FAST x2, EXC x2)
+# - Position size cap ($5K max per trade)
 # - Pre-trade validation (equity, risk limits, growth targets)
 # - Contract resolution with PAPER/SIM fallback
 # - Premium validation (prevents bad fills)
@@ -23,6 +25,7 @@ from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 from ap.logger import get_logger
+from ap.config import Config
 from ap.db import (
     conn,
     run_with_retry,
@@ -37,6 +40,7 @@ from ap.utils import json_dumps, now_utc_iso
 from ap.contract_selection import pick_expiration, resolve_contract_symbol
 
 log = get_logger("ap.execution")
+cfg = Config()
 
 # =====================================================================
 # CONSTANTS
@@ -428,7 +432,7 @@ def _validate_premium(premium: float, mode: str = "PAPER") -> tuple[bool, str]:
 
 
 # =====================================================================
-# POSITION SIZING
+# POSITION SIZING (15% with $5K cap)
 # =====================================================================
 
 def _calc_qty(dollars: float, premium: float) -> int:
@@ -539,15 +543,17 @@ def process_signal(broker, client_id: str, signal_payload: dict) -> dict:
     4. Check growth limits
     5. Validate daily trade cap
     6. Validate max open positions
-    7. Calculate position size
-    8. Resolve option contract
-    9. Validate premium
-    10. Calculate quantity
-    11. Create ORDER record (status="NEW")
-    12. Submit to broker
-    13. Update order with broker response
-    14. Update daily counters
-    15. Log to audit trail
+    7. CHECK FOR DUPLICATE SYMBOL ⚡ NEW!
+    8. Calculate position size
+    9. Resolve option contract
+    10. Validate premium
+    11. Calculate quantity
+    12. CAP POSITION AT $5K ⚡ NEW!
+    13. Create ORDER record (status="NEW")
+    14. Submit to broker
+    15. Update order with broker response
+    16. Update daily counters
+    17. Log to audit trail
     
     CRITICAL: This function creates ORDERS, not POSITIONS.
     Positions are created by fill_monitor.py when order fills.
@@ -645,7 +651,7 @@ def process_signal(broker, client_id: str, signal_payload: dict) -> dict:
         
         log.info("Step 5: Checking daily trade cap...")
         
-        max_trades = int(client.get("max_trades_per_day") or 25)
+        max_trades = int(client.get("max_trades_per_day") or cfg.MAX_TRADES_PER_DAY)
         trades_today = _today_trade_count(st)
         
         if trades_today >= max_trades:
@@ -665,7 +671,7 @@ def process_signal(broker, client_id: str, signal_payload: dict) -> dict:
         
         log.info("Step 6: Checking max open positions...")
         
-        max_open = int(client.get("max_concurrent_positions") or 2)
+        max_open = int(client.get("max_concurrent_positions") or cfg.MAX_CONCURRENT_POSITIONS)
         open_positions = _count_open_positions(client_id)
         
         if open_positions >= max_open:
@@ -705,74 +711,43 @@ def process_signal(broker, client_id: str, signal_payload: dict) -> dict:
         strike = float(strike)
         
         log.info(f"✅ Signal parsed: {symbol} {direction} ${strike}")
+        
         # ============================================================
-        # STEP 7B: CHECK FOR DUPLICATE SYMBOL (HARDENED)
-        # - Blocks if any OPEN-ish position exists for same underlying
-        # - Also blocks if a same-symbol order is already "in flight" in trade_queue
+        # STEP 7B: CHECK FOR DUPLICATE SYMBOL ⚡ NEW!
         # ============================================================
-
+        
         log.info("Step 7B: Checking for duplicate symbol...")
- 
-        # Normalize symbol to avoid SPY vs spy vs "SPY "
-        symbol_norm = (symbol or "").strip().upper()
-
-        OPEN_STATES = ("OPEN", "OPENING", "CLOSING")  # keep aligned with your system
-
+        
         with conn() as c:
-        # 1) Block if a position is already open (or closing) for this underlying
-        existing_pos = run_with_retry(lambda: c.execute("""
-            SELECT id, contract, status
-            FROM positions
-            WHERE client_id=?
-            AND UPPER(TRIM(underlying))=?
-            AND status IN ('OPEN','OPENING','CLOSING')
-            ORDER BY entry_ts DESC
-            LIMIT 1
-        """, (client_id, symbol_norm)).fetchone())
-
-        if existing_pos:
-        log.warning(f"❌ Already have position in {symbol_norm}: {existing_pos['contract']} ({existing_pos['status']})")
-        audit(client_id, "WARNING", "DUPLICATE_SYMBOL_BLOCKED", {
-            "symbol": symbol_norm,
-            "existing_position": existing_pos["id"],
-            "existing_contract": existing_pos["contract"],
-            "existing_status": existing_pos["status"],
-        })
-        return {
-            "ok": False,
-            "error": "duplicate_symbol",
-            "symbol": symbol_norm,
-            "existing_position": existing_pos["id"],
-        }
-
-        # 2) Block if there is an in-flight queued signal for the same underlying
-        # (prevents multiple NEW/PROCESSING items piling up for same symbol)
-        inflight = run_with_retry(lambda: c.execute("""
-        SELECT id, status, created_ts
-        FROM trade_queue
-        WHERE client_id=?
-           AND UPPER(TRIM(symbol))=?
-           AND status IN ('NEW','PROCESSING')
-        ORDER BY created_ts DESC
-        LIMIT 1
-        """, (client_id, symbol_norm)).fetchone())
-
-        if inflight:
-        log.warning(f"❌ In-flight queue item exists for {symbol_norm}: id={inflight['id']} status={inflight['status']}")
-        audit(client_id, "WARNING", "DUPLICATE_QUEUE_SYMBOL_BLOCKED", {
-            "symbol": symbol_norm,
-            "queue_id": inflight["id"],
-            "queue_status": inflight["status"],
-        })
-        return {
-            "ok": False,
-            "error": "duplicate_symbol_inflight",
-            "symbol": symbol_norm,
-            "existing_queue_id": inflight["id"],
-        }
-
-        log.info(f"✅ No duplicate: {symbol_norm} is clear")
- 
+            existing = run_with_retry(lambda: c.execute("""
+                SELECT id, contract, status 
+                FROM positions 
+                WHERE client_id=? 
+                  AND underlying=? 
+                  AND status IN ('OPEN','CLOSING')
+            """, (client_id, symbol)).fetchone())
+            
+            if existing:
+                log.warning(f"❌ Already have position in {symbol}: {existing['contract']} ({existing['status']})")
+                
+                audit(client_id, "WARNING", "DUPLICATE_SYMBOL_BLOCKED", {
+                    "symbol": symbol,
+                    "direction": direction,
+                    "existing_position": existing['id'],
+                    "existing_contract": existing['contract'],
+                    "existing_status": existing['status']
+                })
+                
+                return {
+                    "ok": False,
+                    "error": "duplicate_symbol",
+                    "symbol": symbol,
+                    "existing_position": existing['id'],
+                    "existing_contract": existing['contract']
+                }
+        
+        log.info(f"✅ No duplicate: {symbol} is clear")
+        
         # ============================================================
         # STEP 8: POSITION SIZING
         # ============================================================
@@ -780,7 +755,7 @@ def process_signal(broker, client_id: str, signal_payload: dict) -> dict:
         log.info("Step 8: Calculating position size...")
         
         equity = _get_equity_for_client(broker, st, client)
-        position_pct = float(client.get("base_position_pct") or 0.15)
+        position_pct = float(client.get("base_position_pct") or cfg.BASE_POSITION_PCT)
         dollars = equity * position_pct
         
         log.info(f"💰 Equity: ${equity:,.2f}")
@@ -850,35 +825,36 @@ def process_signal(broker, client_id: str, signal_payload: dict) -> dict:
         
         log.info(f"📦 Quantity: {qty} contracts")
         log.info(f"💰 Total cost: ${total_cost:,.2f}")
-
-            # ap/execution.py - Add after line 532 (after "📦 Quantity: {qty} contracts")
-
-           # ============================================================
-           # STEP 11B: CAP POSITION SIZE (Safety Check)
-           # ============================================================
-
+        
+        # ============================================================
+        # STEP 11B: CAP POSITION AT $5K ⚡ NEW!
+        # ============================================================
+        
         log.info("Step 11B: Checking position size cap...")
-
-        MAX_POSITION_COST = 5000.0  # Never spend more than $5K per trade
-
+        
+        MAX_POSITION_COST = cfg.MAX_POSITION_COST
+        
         if total_cost > MAX_POSITION_COST:
-        log.warning(f"⚠️ Position too large: ${total_cost:,.2f} > ${MAX_POSITION_COST:,.2f}")
-    
-         # Recalculate qty to fit within cap
-        qty = int(MAX_POSITION_COST // (premium * OPT_MULTIPLIER))
-        qty = max(1, qty)
-        total_cost = qty * premium * OPT_MULTIPLIER
-    
-        log.info(f"✅ Reduced to {qty} contracts = ${total_cost:,.2f}")
-    
-        audit(client_id, "WARNING", "POSITION_SIZE_CAPPED", {
-            "symbol": symbol,
-            "original_qty": int(dollars // (premium * OPT_MULTIPLIER)),
-            "capped_qty": qty,
-            "cap": MAX_POSITION_COST
-        })
-
-        log.info(f"✅ Position size OK: ${total_cost:,.2f}")
+            log.warning(f"⚠️  Position too large: ${total_cost:,.2f} > ${MAX_POSITION_COST:,.2f}")
+            
+            # Recalculate qty to fit cap
+            qty = int(MAX_POSITION_COST // (premium * OPT_MULTIPLIER))
+            qty = max(1, qty)
+            total_cost = qty * premium * OPT_MULTIPLIER
+            
+            log.info(f"✅ Reduced to {qty} contracts = ${total_cost:,.2f}")
+            
+            audit(client_id, "WARNING", "POSITION_SIZE_CAPPED", {
+                "symbol": symbol,
+                "requested_cost": dollars,
+                "requested_qty": int(dollars // (premium * OPT_MULTIPLIER)),
+                "capped_qty": qty,
+                "capped_cost": total_cost,
+                "max_cost": MAX_POSITION_COST
+            })
+        
+        log.info(f"✅ Position size validated: ${total_cost:,.2f}")
+        
         # ============================================================
         # STEP 12: CREATE ORDER RECORD
         # ============================================================
