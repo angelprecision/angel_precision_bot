@@ -1,290 +1,285 @@
-# ap/state.py
+# ap/state.py - ATOMIC STATE MANAGEMENT
 """
-Angel Precision Bot - state management (SQLite kv store)
-
-Goals:
-- Stable defaults + bootstrap
-- Daily reset of counters (NY day)
-- Safe, retryable SQLite writes
-- Atomic reserve/release of reserved_equity (BEGIN IMMEDIATE)
+Equity reservation & symbol locking for safe concurrency.
+Prevents over-allocation when multiple signals arrive simultaneously.
 """
 
-from __future__ import annotations
-
-from datetime import datetime
-from zoneinfo import ZoneInfo
-from typing import Any, Dict, Optional
+import json
+from datetime import datetime, timezone
 
 from ap.db import conn, run_with_retry
 from ap.utils import now_utc_iso, json_dumps, json_loads
+from ap.logger import get_logger
 
-NY = ZoneInfo("America/New_York")
-
-# ---------------------------
-# State schema (kv table)
-# ---------------------------
-DEFAULT_STATE: Dict[str, Any] = {
-    # Mode should match the rest of your bot: "PAPER" | "LIVE"
-    # (If you still use "SIM" elsewhere, treat it as PAPER in your checks.)
-    "mode": "PAPER",
-
-    # Global safety controls
-    "kill_switch": False,
-
-    # Equity snapshots / daily baselines
-    "initial_equity_run": 10000.0,     # initial equity for this run (can be overridden at runtime)
-    "starting_equity_today": 10000.0,  # equity baseline used for "growth" checks
-    "current_equity_last": 10000.0,    # last seen equity
-
-    # Daily counters / gates
-    "realized_pnl_today": 0.0,
-    "trades_taken_today": 0,
-    "daily_stop_hit": False,
-    "profit_cap_state": "normal",  # normal | throttled | hard_stop
-
-    # Reserved funds (approved-but-not-filled entries)
-    "reserved_equity": 0.0,
-
-    # Heartbeats
-    "last_heartbeat_ts": None,
-    "last_exit_ts_iso": None,
-
-    # Daily reset tracking (NY day)
-    "day_key": None,              # e.g. "2026-01-27" (New York day)
-    "last_day_reset_ts": None,    # ISO timestamp when reset occurred
-}
+log = get_logger("ap.state")
 
 
-# ---------------------------
-# Internal helpers
-# ---------------------------
-def _day_key_now_ny() -> str:
-    return datetime.now(NY).strftime("%Y-%m-%d")
+# =====================================================================
+# EQUITY RESERVATION (Prevents over-allocation)
+# =====================================================================
 
-
-def _read_all_kv() -> Dict[str, Any]:
-    with conn() as c:
-        rows = run_with_retry(lambda: c.execute("SELECT k, v FROM kv").fetchall())
-        data: Dict[str, Any] = {}
-        for r in rows:
-            data[r["k"]] = json_loads(r["v"])
-        return data
-
-
-def _exists_any_kv() -> bool:
-    with conn() as c:
-        row = run_with_retry(lambda: c.execute("SELECT 1 AS one FROM kv LIMIT 1").fetchone())
-        return bool(row)
-
-
-# ---------------------------
-# Public API
-# ---------------------------
-def bootstrap_state(state: Dict[str, Any]) -> None:
+def reserve_equity_if_available(
+    client_id: str,
+    amount: float,
+    current_equity: float
+) -> bool:
     """
-    Writes all keys in 'state' into kv.
-    Safe to call multiple times; overwrites existing keys.
-    """
-    ts = now_utc_iso()
-    with conn() as c:
-        for k, v in state.items():
-            run_with_retry(lambda k=k, v=v: c.execute(
-                "INSERT OR REPLACE INTO kv (k,v,updated_at) VALUES (?,?,?)",
-                (k, json_dumps(v), ts),
-            ))
-
-
-def load_state() -> Dict[str, Any]:
-    """
-    Loads kv into a full state dict merged onto DEFAULT_STATE.
-    Bootstraps DEFAULT_STATE if kv is empty.
-    """
-    if not _exists_any_kv():
-        bootstrap_state(DEFAULT_STATE)
-        return dict(DEFAULT_STATE)
-
-    st = dict(DEFAULT_STATE)
-    kv = _read_all_kv()
-    st.update(kv)
-    return st
-
-
-def get_kv(key: str, default: Any = None) -> Any:
-    with conn() as c:
-        row = run_with_retry(lambda: c.execute("SELECT v FROM kv WHERE k=?", (key,)).fetchone())
-        if not row:
-            return default
-        return json_loads(row["v"])
-
-
-def set_kv(key: str, value: Any) -> None:
-    with conn() as c:
-        run_with_retry(lambda: c.execute(
-            "INSERT OR REPLACE INTO kv (k,v,updated_at) VALUES (?,?,?)",
-            (key, json_dumps(value), now_utc_iso()),
-        ))
-
-
-def update_state(patch: Dict[str, Any]) -> None:
-    """
-    Bulk update multiple keys with the same updated_at.
-    """
-    ts = now_utc_iso()
-    with conn() as c:
-        for k, v in patch.items():
-            run_with_retry(lambda k=k, v=v: c.execute(
-                "INSERT OR REPLACE INTO kv (k,v,updated_at) VALUES (?,?,?)",
-                (k, json_dumps(v), ts),
-            ))
-
-
-# ---------------------------
-# Daily reset (NY)
-# ---------------------------
-def reset_daily_state(current_equity: Optional[float] = None) -> Dict[str, Any]:
-    """
-    Hard reset daily counters and gates.
-    If current_equity is provided, we also reset daily baseline to it.
-    Returns the updated state dict.
-    """
-    patch: Dict[str, Any] = {
-        "day_key": _day_key_now_ny(),
-        "last_day_reset_ts": now_utc_iso(),
-        "realized_pnl_today": 0.0,
-        "trades_taken_today": 0,
-        "daily_stop_hit": False,
-        "profit_cap_state": "normal",
-        "reserved_equity": 0.0,  # clear stale reservations at day reset
-    }
-    if current_equity is not None:
-        eq = float(current_equity)
-        patch["starting_equity_today"] = eq
-        patch["current_equity_last"] = eq
-
-    update_state(patch)
-    st = load_state()
-    st.update(patch)
-    return st
-
-
-def maybe_reset_daily_state(current_equity: Optional[float] = None) -> Dict[str, Any]:
-    """
-    If NY day changed since last reset, resets daily counters.
-    Call this before growth/risk checks (ideally right after you fetch equity).
-    Returns the current (possibly updated) state dict.
-    """
-    st = load_state()
-    today = _day_key_now_ny()
-    prev = st.get("day_key")
-
-    # If missing day_key, treat it as needing initialization
-    if prev != today:
-        return reset_daily_state(current_equity=current_equity)
-
-    # If same day, just optionally refresh current_equity_last snapshot
-    if current_equity is not None:
-        update_state({"current_equity_last": float(current_equity)})
-        st["current_equity_last"] = float(current_equity)
-
-    return st
-
-
-# ---------------------------
-# Equity reservation (atomic)
-# ---------------------------
-def reserve_equity(amount: float) -> bool:
-    """
-    Atomically reserve equity by incrementing kv.reserved_equity.
-
-    Uses BEGIN IMMEDIATE so two concurrent requests can't clobber the value.
+    Atomically reserve equity only if available.
+    
+    CRITICAL: This prevents 88 signals from each allocating $5K when
+    you only have $100K total. First 20 get reserved, rest fail gracefully.
+    
+    Args:
+        client_id: Client identifier
+        amount: Amount to reserve (e.g., $5000)
+        current_equity: Current account equity
+        
+    Returns:
+        True if reservation succeeded, False if insufficient available
     """
     amount = float(amount)
+    current_equity = float(current_equity)
+    
     if amount <= 0:
         return True
-
+    
+    key = f"reserved_equity:{client_id}"
+    ok = False
+    
     def _txn():
+        nonlocal ok
         with conn() as c:
             c.execute("BEGIN IMMEDIATE")
-            row = c.execute("SELECT v FROM kv WHERE k='reserved_equity'").fetchone()
-            reserved = json_loads(row["v"]) if row else 0.0
-            reserved_new = float(reserved) + amount
+            
+            # Get current reserved amount
+            row = c.execute(
+                "SELECT v FROM kv WHERE k=?",
+                (key,)
+            ).fetchone()
+            
+            reserved = float(json_loads(row["v"])) if row else 0.0
+            
+            # Calculate available
+            available = max(0.0, current_equity - reserved)
+            
+            if amount > available:
+                log.warning(
+                    f"❌ Insufficient equity: need ${amount:,.2f}, "
+                    f"available ${available:,.2f} "
+                    f"(equity=${current_equity:,.2f}, reserved=${reserved:,.2f})"
+                )
+                c.execute("ROLLBACK")
+                ok = False
+                return
+            
+            # Reserve it
+            reserved_new = reserved + amount
             c.execute(
-                "INSERT OR REPLACE INTO kv (k,v,updated_at) VALUES (?,?,?)",
-                ("reserved_equity", json_dumps(reserved_new), now_utc_iso()),
+                "INSERT OR REPLACE INTO kv (k, v, updated_at) VALUES (?, ?, ?)",
+                (key, json_dumps(reserved_new), now_utc_iso())
             )
             c.execute("COMMIT")
-
+            
+            log.info(
+                f"✅ Reserved ${amount:,.2f} for {client_id} "
+                f"(total reserved: ${reserved_new:,.2f})"
+            )
+            ok = True
+    
     run_with_retry(_txn)
-    return True
+    return ok
 
 
-def release_equity(amount: float) -> None:
+def release_equity(client_id: str, amount: float) -> None:
     """
-    Atomically release reserved equity by decrementing kv.reserved_equity.
-    Floors at 0.
+    Release previously reserved equity.
+    
+    Call this when:
+    - Order gets rejected by broker
+    - Order fills (position now exists, no longer reserved)
+    - Position closes (realized P&L applied)
+    
+    Args:
+        client_id: Client identifier
+        amount: Amount to release
     """
     amount = float(amount)
     if amount <= 0:
         return
-
+    
+    key = f"reserved_equity:{client_id}"
+    
     def _txn():
         with conn() as c:
             c.execute("BEGIN IMMEDIATE")
-            row = c.execute("SELECT v FROM kv WHERE k='reserved_equity'").fetchone()
-            reserved = json_loads(row["v"]) if row else 0.0
-            reserved_new = max(0.0, float(reserved) - amount)
+            
+            row = c.execute("SELECT v FROM kv WHERE k=?", (key,)).fetchone()
+            reserved = float(json_loads(row["v"])) if row else 0.0
+            
+            reserved_new = max(0.0, reserved - amount)
+            
             c.execute(
-                "INSERT OR REPLACE INTO kv (k,v,updated_at) VALUES (?,?,?)",
-                ("reserved_equity", json_dumps(reserved_new), now_utc_iso()),
+                "INSERT OR REPLACE INTO kv (k, v, updated_at) VALUES (?, ?, ?)",
+                (key, json_dumps(reserved_new), now_utc_iso())
             )
             c.execute("COMMIT")
-
+            
+            log.info(
+                f"✅ Released ${amount:,.2f} for {client_id} "
+                f"(remaining reserved: ${reserved_new:,.2f})"
+            )
+    
     run_with_retry(_txn)
 
 
-# ---------------------------
-# Convenience helpers
-# ---------------------------
-def set_mode(mode: str) -> None:
+def get_reserved_equity(client_id: str) -> float:
+    """Get currently reserved equity for client"""
+    key = f"reserved_equity:{client_id}"
+    
+    with conn() as c:
+        row = run_with_retry(
+            lambda: c.execute("SELECT v FROM kv WHERE k=?", (key,)).fetchone()
+        )
+        
+        if row:
+            return float(json_loads(row["v"]))
+        return 0.0
+
+
+# =====================================================================
+# SYMBOL LOCKS (Prevents duplicate trades)
+# =====================================================================
+
+def acquire_symbol_lock(
+    client_id: str,
+    symbol: str,
+    ttl_seconds: int = 60
+) -> bool:
     """
-    mode: "PAPER" or "LIVE" (or "SIM" if you still use it)
+    Atomically acquire lock on a symbol.
+    
+    CRITICAL: This prevents FAST trading twice simultaneously.
+    Uses BEGIN IMMEDIATE for true atomicity.
+    
+    Args:
+        client_id: Client identifier
+        symbol: Stock symbol (e.g., "AAPL")
+        ttl_seconds: Lock expires after this time (default 60s)
+        
+    Returns:
+        True if lock acquired, False if already locked
     """
-    set_kv("mode", str(mode).upper().strip())
+    client_id = (client_id or "default").strip()
+    symbol = (symbol or "").strip().upper()
+    
+    if not symbol:
+        return False
+    
+    key = f"lock:{client_id}:{symbol}"
+    now = datetime.now(timezone.utc).timestamp()
+    
+    ok = False
+    
+    def _txn():
+        nonlocal ok
+        with conn() as c:
+            c.execute("BEGIN IMMEDIATE")
+            
+            # Check if lock exists and is still valid
+            row = c.execute("SELECT v FROM kv WHERE k=?", (key,)).fetchone()
+            
+            if row:
+                payload = json_loads(row["v"])
+                lock_ts = float(payload.get("ts", 0))
+                
+                # Lock still valid?
+                if (now - lock_ts) < ttl_seconds:
+                    log.warning(f"❌ Symbol locked: {symbol} (locked {now - lock_ts:.0f}s ago)")
+                    c.execute("ROLLBACK")
+                    ok = False
+                    return
+            
+            # Acquire lock
+            c.execute(
+                "INSERT OR REPLACE INTO kv (k, v, updated_at) VALUES (?, ?, ?)",
+                (key, json_dumps({"ts": now}), now_utc_iso())
+            )
+            c.execute("COMMIT")
+            
+            log.info(f"🔒 Acquired symbol lock: {symbol}")
+            ok = True
+    
+    run_with_retry(_txn)
+    return ok
 
 
-def bump_heartbeat() -> None:
-    update_state({"last_heartbeat_ts": now_utc_iso()})
-
-
-def set_last_exit_ts(ts_iso: Optional[str]) -> None:
-    update_state({"last_exit_ts_iso": ts_iso})
-
-
-def add_realized_pnl(pnl: float) -> None:
+def release_symbol_lock(client_id: str, symbol: str) -> None:
     """
-    Adds to realized PnL for today.
+    Release symbol lock.
+    
+    Call this when:
+    - Order fills (position created, lock no longer needed)
+    - Order rejected (allow retry on different signal)
+    
+    Args:
+        client_id: Client identifier
+        symbol: Stock symbol
     """
-    st = load_state()
-    cur = float(st.get("realized_pnl_today") or 0.0)
-    update_state({"realized_pnl_today": cur + float(pnl)})
+    client_id = (client_id or "default").strip()
+    symbol = (symbol or "").strip().upper()
+    
+    if not symbol:
+        return
+    
+    key = f"lock:{client_id}:{symbol}"
+    
+    with conn() as c:
+        run_with_retry(
+            lambda: c.execute("DELETE FROM kv WHERE k=?", (key,))
+        )
+    
+    log.info(f"🔓 Released symbol lock: {symbol}")
 
 
-def inc_trades_taken(n: int = 1) -> None:
-    st = load_state()
-    cur = int(st.get("trades_taken_today") or 0)
-    update_state({"trades_taken_today": cur + int(n)})
-
-
-def set_profit_cap_state(state: str) -> None:
-    update_state({"profit_cap_state": str(state)})
-
-
-def set_daily_stop(hit: bool = True) -> None:
-    update_state({"daily_stop_hit": bool(hit)})
-
-
-def snapshot_equity(equity: float) -> None:
+def is_symbol_locked(client_id: str, symbol: str, ttl_seconds: int = 60) -> bool:
     """
-    Updates current_equity_last (does not change starting_equity_today).
+    Check if symbol is currently locked (without acquiring).
+    
+    Useful for read-only checks without blocking.
     """
-    update_state({"current_equity_last": float(equity)})
+    client_id = (client_id or "default").strip()
+    symbol = (symbol or "").strip().upper()
+    
+    if not symbol:
+        return False
+    
+    key = f"lock:{client_id}:{symbol}"
+    now = datetime.now(timezone.utc).timestamp()
+    
+    with conn() as c:
+        row = run_with_retry(
+            lambda: c.execute("SELECT v FROM kv WHERE k=?", (key,)).fetchone()
+        )
+        
+        if row:
+            payload = json_loads(row["v"])
+            lock_ts = float(payload.get("ts", 0))
+            return (now - lock_ts) < ttl_seconds
+        
+        return False
+
+
+# =====================================================================
+# STATE HELPERS (Legacy compatibility)
+# =====================================================================
+
+def load_state(client_id: str = "default") -> dict:
+    """Load client state from database"""
+    from ap.db import get_client_state
+    return get_client_state(client_id)
+
+
+def update_state(updates: dict, client_id: str = "default") -> None:
+    """Update client state"""
+    from ap.db import update_client_state
+    update_client_state(client_id, updates)
