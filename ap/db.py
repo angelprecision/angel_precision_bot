@@ -558,6 +558,10 @@ def update_client_state(client_id: str = "default", updates: dict | None = None)
 # ADMIN & QUERY HELPERS (for admin_api.py)
 # =========================================================================
 
+ # =========================================================================
+# ADMIN & QUERY HELPERS (for admin_api.py)
+# =========================================================================
+
 def get_all_clients() -> list[dict]:
     """Get all clients"""
     with conn() as c:
@@ -565,6 +569,73 @@ def get_all_clients() -> list[dict]:
             lambda: c.execute("SELECT * FROM clients ORDER BY created_at DESC").fetchall()
         )
         return [dict(r) for r in rows]
+
+
+def create_client(
+    client_id: str,
+    name: str,
+    broker_type: str,
+    broker_account_id: str,
+    broker_token: str,
+    broker_base_url: str,
+    initial_equity: float,
+    max_trades_per_day: int = 5,
+    max_concurrent_positions: int = 3,
+    daily_max_loss_pct: float = 0.05,
+    base_position_pct: float = 0.10,
+    api_key: str | None = None,
+) -> str:
+    """Create a new client"""
+    now = now_utc_iso()
+    
+    with conn() as c:
+        run_with_retry(
+            lambda: c.execute(
+                """
+                INSERT INTO clients (
+                    client_id, api_key, name, broker_type, broker_account_id,
+                    broker_token, broker_base_url, initial_equity, status,
+                    created_at, max_trades_per_day, max_concurrent_positions,
+                    daily_max_loss_pct, base_position_pct
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    client_id,
+                    api_key,
+                    name,
+                    broker_type,
+                    broker_account_id,
+                    broker_token,
+                    broker_base_url,
+                    float(initial_equity),
+                    "ACTIVE",
+                    now,
+                    int(max_trades_per_day),
+                    int(max_concurrent_positions),
+                    float(daily_max_loss_pct),
+                    float(base_position_pct),
+                ),
+            )
+        )
+    
+    # Create initial client_state
+    with conn() as c:
+        run_with_retry(
+            lambda: c.execute(
+                """
+                INSERT INTO client_state (
+                    client_id, current_equity, starting_equity_today,
+                    realized_pnl_today, trades_taken_today, daily_stop_hit,
+                    kill_switch, mode, day_key
+                )
+                VALUES (?, ?, ?, 0.0, 0, 0, 0, 'PAPER', NULL)
+                """,
+                (client_id, float(initial_equity), float(initial_equity)),
+            )
+        )
+    
+    return client_id
 
 
 def upsert_client(client_id: str, **kwargs):
