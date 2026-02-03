@@ -554,4 +554,141 @@ def update_client_state(client_id: str = "default", updates: dict | None = None)
             f"UPDATE client_state SET {set_clause} WHERE client_id=?",
             values,
         ))
+# =========================================================================
+# ADMIN & QUERY HELPERS (for admin_api.py)
+# =========================================================================
 
+def get_all_clients() -> list[dict]:
+    """Get all clients"""
+    with conn() as c:
+        rows = run_with_retry(
+            lambda: c.execute("SELECT * FROM clients ORDER BY created_at DESC").fetchall()
+        )
+        return [dict(r) for r in rows]
+
+
+def upsert_client(client_id: str, **kwargs):
+    """Insert or update client"""
+    with conn() as c:
+        existing = c.execute(
+            "SELECT client_id FROM clients WHERE client_id=?",
+            (client_id,)
+        ).fetchone()
+
+        now = now_utc_iso()
+
+        if existing:
+            # Update
+            updates = []
+            params = []
+            for k, v in kwargs.items():
+                updates.append(f"{k}=?")
+                params.append(v)
+            params.append(client_id)
+
+            sql = f"UPDATE clients SET {', '.join(updates)} WHERE client_id=?"
+            run_with_retry(lambda: c.execute(sql, params))
+        else:
+            # Insert
+            kwargs.setdefault("status", "ACTIVE")
+            kwargs.setdefault("created_at", now)
+            kwargs["client_id"] = client_id
+
+            cols = ", ".join(kwargs.keys())
+            placeholders = ", ".join(["?"] * len(kwargs))
+            sql = f"INSERT INTO clients ({cols}) VALUES ({placeholders})"
+            run_with_retry(lambda: c.execute(sql, list(kwargs.values())))
+
+
+def get_all_positions(client_id: str | None = None) -> list[dict]:
+    """Get all positions, optionally filtered by client"""
+    with conn() as c:
+        if client_id:
+            rows = run_with_retry(
+                lambda: c.execute(
+                    "SELECT * FROM positions WHERE client_id=? ORDER BY entry_ts DESC",
+                    (client_id,)
+                ).fetchall()
+            )
+        else:
+            rows = run_with_retry(
+                lambda: c.execute("SELECT * FROM positions ORDER BY entry_ts DESC").fetchall()
+            )
+        return [dict(r) for r in rows]
+
+
+def get_orders_for_client(client_id: str) -> list[dict]:
+    """Get all orders for a client"""
+    with conn() as c:
+        rows = run_with_retry(
+            lambda: c.execute(
+                "SELECT * FROM orders WHERE client_id=? ORDER BY created_ts DESC",
+                (client_id,)
+            ).fetchall()
+        )
+        return [dict(r) for r in rows]
+
+
+def get_all_orders() -> list[dict]:
+    """Get all orders"""
+    with conn() as c:
+        rows = run_with_retry(
+            lambda: c.execute("SELECT * FROM orders ORDER BY created_ts DESC").fetchall()
+        )
+        return [dict(r) for r in rows]
+
+
+def get_audit_logs(client_id: str | None = None, limit: int = 100) -> list[dict]:
+    """Get audit logs, optionally filtered by client"""
+    with conn() as c:
+        if client_id:
+            rows = run_with_retry(
+                lambda: c.execute(
+                    "SELECT * FROM audit_log WHERE client_id=? ORDER BY ts DESC LIMIT ?",
+                    (client_id, limit)
+                ).fetchall()
+            )
+        else:
+            rows = run_with_retry(
+                lambda: c.execute(
+                    "SELECT * FROM audit_log ORDER BY ts DESC LIMIT ?",
+                    (limit,)
+                ).fetchall()
+            )
+        return [dict(r) for r in rows]
+
+
+def get_position_by_id(position_id: str) -> dict | None:
+    """Get position by ID"""
+    with conn() as c:
+        row = run_with_retry(
+            lambda: c.execute(
+                "SELECT * FROM positions WHERE id=?",
+                (position_id,)
+            ).fetchone()
+        )
+        return dict(row) if row else None
+
+
+def get_order_by_id(local_order_id: str) -> dict | None:
+    """Get order by local order ID"""
+    with conn() as c:
+        row = run_with_retry(
+            lambda: c.execute(
+                "SELECT * FROM orders WHERE local_order_id=?",
+                (local_order_id,)
+            ).fetchone()
+        )
+        return dict(row) if row else None
+
+
+def delete_client(client_id: str):
+    """Delete client and all related data"""
+    with conn() as c:
+        # Delete in reverse order of foreign keys
+        run_with_retry(lambda: c.execute("DELETE FROM audit_log WHERE client_id=?", (client_id,)))
+        run_with_retry(lambda: c.execute("DELETE FROM trade_queue WHERE client_id=?", (client_id,)))
+        run_with_retry(lambda: c.execute("DELETE FROM orders WHERE client_id=?", (client_id,)))
+        run_with_retry(lambda: c.execute("DELETE FROM positions WHERE client_id=?", (client_id,)))
+        run_with_retry(lambda: c.execute("DELETE FROM client_state WHERE client_id=?", (client_id,)))
+        run_with_retry(lambda: c.execute("DELETE FROM clients WHERE client_id=?", (client_id,)))
