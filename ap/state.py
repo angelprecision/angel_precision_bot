@@ -178,3 +178,19 @@ def is_symbol_locked(client_id: str, symbol: str, ttl_seconds: int = 90) -> bool
         lock_ts = float(payload.get("ts") or 0.0)
         return (now - lock_ts) < ttl_seconds
 
+
+# =====================================================================
+# LEGACY COMPATIBILITY (for app.py and other files)
+# =====================================================================
+
+def load_state(client_id: str = "default") -> dict:
+    """Load client state from database (legacy compatibility)"""
+    from ap.db import get_client_state
+    return get_client_state(client_id)
+
+
+def update_state(updates: dict, client_id: str = "default") -> None:
+    """Update client state (legacy compatibility)"""
+    from ap.db import update_client_state
+    update_client_state(client_id, updates)
+
