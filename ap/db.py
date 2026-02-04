@@ -771,151 +771,12 @@ def delete_client(client_id: str):
         run_with_retry(lambda: c.execute("DELETE FROM positions WHERE client_id=?", (client_id,)))
         run_with_retry(lambda: c.execute("DELETE FROM client_state WHERE client_id=?", (client_id,)))
         run_with_retry(lambda: c.execute("DELETE FROM clients WHERE client_id=?", (client_id,)))
-def update_client(client_id: str, **kwargs) -> dict:
-    """Update client fields and return updated client"""
-    if not kwargs:
-        raise ValueError("No fields to update")
-    
-    with conn() as c:
-        # Build UPDATE query
-        updates = []
-        params = []
-        for k, v in kwargs.items():
-            updates.append(f"{k}=?")
-            params.append(v)
-        params.append(client_id)
-        
-        sql = f"UPDATE clients SET {', '.join(updates)} WHERE client_id=?"
-        run_with_retry(lambda: c.execute(sql, params))
-        
-        # Return updated client
-        return get_client(client_id)
-
-
-def list_orders(client_id: str | None = None, limit: int = 200, status: str | None = None) -> list[dict]:
-    """List orders with optional filters"""
-    with conn() as c:
-        if client_id and status:
-            rows = run_with_retry(
-                lambda: c.execute(
-                    "SELECT * FROM orders WHERE client_id=? AND status=? ORDER BY created_ts DESC LIMIT ?",
-                    (client_id, status, limit)
-                ).fetchall()
-            )
-        elif client_id:
-            rows = run_with_retry(
-                lambda: c.execute(
-                    "SELECT * FROM orders WHERE client_id=? ORDER BY created_ts DESC LIMIT ?",
-                    (client_id, limit)
-                ).fetchall()
-            )
-        elif status:
-            rows = run_with_retry(
-                lambda: c.execute(
-                    "SELECT * FROM orders WHERE status=? ORDER BY created_ts DESC LIMIT ?",
-                    (status, limit)
-                ).fetchall()
-            )
-        else:
-            rows = run_with_retry(
-                lambda: c.execute(
-                    "SELECT * FROM orders ORDER BY created_ts DESC LIMIT ?",
-                    (limit,)
-                ).fetchall()
-            )
-        return [dict(r) for r in rows]
-
-
-def list_positions(client_id: str | None = None, limit: int = 200, status: str | None = None) -> list[dict]:
-    """List positions with optional filters"""
-    with conn() as c:
-        if client_id and status:
-            rows = run_with_retry(
-                lambda: c.execute(
-                    "SELECT * FROM positions WHERE client_id=? AND status=? ORDER BY entry_ts DESC LIMIT ?",
-                    (client_id, status, limit)
-                ).fetchall()
-            )
-        elif client_id:
-            rows = run_with_retry(
-                lambda: c.execute(
-                    "SELECT * FROM positions WHERE client_id=? ORDER BY entry_ts DESC LIMIT ?",
-                    (client_id, limit)
-                ).fetchall()
-            )
-        elif status:
-            rows = run_with_retry(
-                lambda: c.execute(
-                    "SELECT * FROM positions WHERE status=? ORDER BY entry_ts DESC LIMIT ?",
-                    (status, limit)
-                ).fetchall()
-            )
-        else:
-            rows = run_with_retry(
-                lambda: c.execute(
-                    "SELECT * FROM positions ORDER BY entry_ts DESC LIMIT ?",
-                    (limit,)
-                ).fetchall()
-            )
-        return [dict(r) for r in rows]
-
-
-def list_audit(client_id: str | None = None, limit: int = 200) -> list[dict]:
-    """List audit log events"""
-    with conn() as c:
-        if client_id:
-            rows = run_with_retry(
-                lambda: c.execute(
-                    "SELECT * FROM audit_log WHERE client_id=? ORDER BY ts DESC LIMIT ?",
-                    (client_id, limit)
-                ).fetchall()
-            )
-        else:
-            rows = run_with_retry(
-                lambda: c.execute(
-                    "SELECT * FROM audit_log ORDER BY ts DESC LIMIT ?",
-                    (limit,)
-                ).fetchall()
-            )
-        return [dict(r) for r in rows]
-
-
-def get_open_orders_for_reconcile(client_id: str | None = None, limit: int = 200) -> list[dict]:
-    """Get open/pending orders for reconciliation"""
-    with conn() as c:
-        if client_id:
-            rows = run_with_retry(
-                lambda: c.execute(
-                    """
-                    SELECT * FROM orders 
-                    WHERE client_id=? 
-                      AND status IN ('NEW', 'ACK', 'PARTIAL')
-                    ORDER BY created_ts DESC 
-                    LIMIT ?
-                    """,
-                    (client_id, limit)
-                ).fetchall()
-            )
-        else:
-            rows = run_with_retry(
-                lambda: c.execute(
-                    """
-                    SELECT * FROM orders 
-                    WHERE status IN ('NEW', 'ACK', 'PARTIAL')
-                    ORDER BY created_ts DESC 
-                    LIMIT ?
-                    """,
-                    (limit,)
-                ).fetchall()
-            )
-        return [dict(r) for r in rows]
         def update_client(client_id: str, **kwargs) -> dict:
     """Update client fields and return updated client"""
     if not kwargs:
         raise ValueError("No fields to update")
     
     with conn() as c:
-        # Build UPDATE query
         updates = []
         params = []
         for k, v in kwargs.items():
@@ -926,7 +787,6 @@ def get_open_orders_for_reconcile(client_id: str | None = None, limit: int = 200
         sql = f"UPDATE clients SET {', '.join(updates)} WHERE client_id=?"
         run_with_retry(lambda: c.execute(sql, params))
         
-        # Return updated client
         return get_client(client_id)
 
 
