@@ -554,11 +554,9 @@ def update_client_state(client_id: str = "default", updates: dict | None = None)
             f"UPDATE client_state SET {set_clause} WHERE client_id=?",
             values,
         ))
-# =========================================================================
-# ADMIN & QUERY HELPERS (for admin_api.py)
-# =========================================================================
 
- # =========================================================================
+
+# =========================================================================
 # ADMIN & QUERY HELPERS (for admin_api.py)
 # =========================================================================
 
@@ -771,12 +769,15 @@ def delete_client(client_id: str):
         run_with_retry(lambda: c.execute("DELETE FROM positions WHERE client_id=?", (client_id,)))
         run_with_retry(lambda: c.execute("DELETE FROM client_state WHERE client_id=?", (client_id,)))
         run_with_retry(lambda: c.execute("DELETE FROM clients WHERE client_id=?", (client_id,)))
-        def update_client(client_id: str, **kwargs) -> dict:
+
+
+def update_client(client_id: str, **kwargs) -> dict:
     """Update client fields and return updated client"""
     if not kwargs:
         raise ValueError("No fields to update")
     
     with conn() as c:
+        # Build UPDATE query
         updates = []
         params = []
         for k, v in kwargs.items():
@@ -787,6 +788,7 @@ def delete_client(client_id: str):
         sql = f"UPDATE clients SET {', '.join(updates)} WHERE client_id=?"
         run_with_retry(lambda: c.execute(sql, params))
         
+        # Return updated client
         return get_client(client_id)
 
 
