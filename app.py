@@ -1,4 +1,4 @@
-# app.py - ANGEL PRECISION BOT (PRODUCTION VERSION)
+# app.py - ANGEL PRECISION BOT (PRODUCTION VERSION - IMPROVED)
 # =====================================================================
 # THIS FILE IS NOW STABLE. DO NOT EDIT.
 # All business logic lives in blueprints (client_api, admin_api, etc).
@@ -46,6 +46,15 @@ log.info(f"CONFIG LOADED FROM: {__import__('ap.config').config.__file__}")
 APP_ENV = os.getenv("APP_ENV", "dev").lower().strip()
 SIGNING_SECRET = os.getenv("SIGNING_SECRET", "").encode()
 log.info("SIGNING_SECRET_SHA256_8=" + hashlib.sha256(SIGNING_SECRET).hexdigest()[:8])
+
+# ✅ CRITICAL: Validate SIGNING_SECRET in prod
+if APP_ENV == "prod" and not SIGNING_SECRET:
+    log.error("=" * 70)
+    log.error("🚨 CRITICAL: SIGNING_SECRET not set in production!")
+    log.error("All signal ingestion will fail with 401 unauthorized")
+    log.error("Set SIGNING_SECRET env var on Render")
+    log.error("=" * 70)
+    raise RuntimeError("SIGNING_SECRET required in production")
 
 # Rate limiting (per worker - upgrade to Redis later)
 _RATE = defaultdict(lambda: deque())
@@ -131,7 +140,12 @@ def require_hmac(fn):
     @wraps(fn)
     def wrapper(*args, **kwargs):
         if APP_ENV == "prod" and not _verify_hmac(request):
-            return jsonify({"ok": False, "error": "unauthorized"}), 401
+            log.warning(f"HMAC verification failed for {request.path} from {_client_ip()}")
+            return jsonify({
+                "ok": False,
+                "error": "unauthorized",
+                "hint": "Missing or invalid X-AP-Timestamp / X-AP-Signature headers"
+            }), 401
         return fn(*args, **kwargs)
     return wrapper
 
@@ -304,11 +318,14 @@ def create_app() -> Flask:
 
     @app.get("/")
     def root():
+        # ✅ FIX: Report actual runtime mode from state, not config default
+        st = load_state("default")
         return jsonify({
             "service": "Angel Precision Bot",
             "status": "online",
             "env": APP_ENV,
-            "mode": cfg.BOT_MODE,
+            "mode": st.get("mode", cfg.BOT_MODE),
+            "kill_switch": st.get("kill_switch", False),
             "docs": {
                 "health": "GET /health",
                 "state": "GET /state",
@@ -323,7 +340,7 @@ def create_app() -> Flask:
     @app.get("/health")
     def health():
         try:
-            st = load_state()
+            st = load_state("default")
             heartbeat_ok = False
             heartbeat_age = None
             if st.get("last_heartbeat_ts"):
@@ -354,7 +371,7 @@ def create_app() -> Flask:
     @app.get("/state")
     def state():
         try:
-            return jsonify(load_state())
+            return jsonify(load_state("default"))
         except Exception as e:
             log.error(f"State failed: {e}")
             return jsonify({"error": str(e)}), 500
@@ -362,11 +379,11 @@ def create_app() -> Flask:
     @app.get("/dashboard")
     def dashboard():
         try:
-            st = load_state()
+            st = load_state("default")
             with conn() as c:
                 pos_row = c.execute("SELECT COUNT(*) as n FROM positions WHERE status='OPEN'").fetchone()
                 queue_row = c.execute("SELECT COUNT(*) as n FROM trade_queue WHERE status='NEW'").fetchone()
-            
+
             return jsonify({
                 "status": "healthy" if not st.get("kill_switch") else "stopped",
                 "mode": st.get("mode"),
@@ -418,7 +435,8 @@ def create_app() -> Flask:
         ip = _client_ip()
         client_id = _require_client_id_header()
         if not client_id:
-            return jsonify({"ok": False, "error": "missing_client_id"}), 400
+            hint = "Set X-Client-Id: default header" if APP_ENV == "prod" else ""
+            return jsonify({"ok": False, "error": "missing_client_id", "hint": hint}), 400
 
         if _rate_limited(f"signal:{client_id}:{ip}"):
             return jsonify({"ok": False, "error": "rate_limited"}), 429
@@ -432,10 +450,7 @@ def create_app() -> Flask:
             return jsonify({"ok": False, "error": "unknown_client"}), 404
 
         body = request.get_json(force=True) or {}
-        idem_key = (
-            str(body.get("signal_id") or "").strip()
-            or request.headers.get("Idempotency-Key", "").strip()
-        )
+        idem_key = (str(body.get("signal_id") or "").strip() or request.headers.get("Idempotency-Key", "").strip())
 
         cached = _idem_get(idem_key)
         if cached:
@@ -448,7 +463,7 @@ def create_app() -> Flask:
             _idem_set(idem_key, payload)
             return jsonify(payload), 400
 
-        st = load_state()
+        st = load_state("default")
         if st.get("kill_switch") or st.get("mode") == "READ_ONLY":
             payload = {"ok": False, "error": "bot_in_read_only"}
             _idem_set(idem_key, payload)
@@ -467,7 +482,8 @@ def create_app() -> Flask:
         ip = _client_ip()
         client_id = _require_client_id_header()
         if not client_id:
-            return jsonify({"ok": False, "error": "missing_client_id"}), 400
+            hint = "Set X-Client-Id: default header" if APP_ENV == "prod" else ""
+            return jsonify({"ok": False, "error": "missing_client_id", "hint": hint}), 400
 
         if _rate_limited(f"scanner:{client_id}:{ip}"):
             return jsonify({"ok": False, "error": "rate_limited"}), 429
@@ -567,7 +583,7 @@ def create_app() -> Flask:
     @require_hmac
     def create_rental():
         from ap.subscription_tiers import create_rental_subscription
-        
+
         body = request.get_json(force=True) or {}
         result = create_rental_subscription(
             client_id=body.get("client_id"),
@@ -580,14 +596,14 @@ def create_app() -> Flask:
     @require_hmac
     def rental_status(client_id: str):
         from ap.subscription_tiers import get_rental_status
-        
+
         result = get_rental_status(client_id)
         return jsonify(result), 200 if result.get("ok") else 404
 
     @app.get("/rental/tiers")
     def list_tiers():
         from ap.subscription_tiers import CorrectRentalTiers
-        
+
         tiers = {}
         for tier_key, tier_def in CorrectRentalTiers.TIERS.items():
             tiers[tier_key] = {
@@ -596,16 +612,10 @@ def create_app() -> Flask:
                 "client_capital": tier_def["client_capital"],
                 "rental_fee": tier_def["rental_fee"],
                 "working_capital": tier_def["working_capital"],
-                "profit_targets": {
-                    "min": tier_def["profit_target_min"],
-                    "max": tier_def["profit_target_max"]
-                },
-                "end_balance": {
-                    "min": tier_def["end_balance_min"],
-                    "max": tier_def["end_balance_max"]
-                }
+                "profit_targets": {"min": tier_def["profit_target_min"], "max": tier_def["profit_target_max"]},
+                "end_balance": {"min": tier_def["end_balance_min"], "max": tier_def["end_balance_max"]},
             }
-        
+
         return jsonify({"ok": True, "tiers": tiers})
 
     log.info("=" * 70)
@@ -621,3 +631,4 @@ if __name__ == "__main__":
     port = int(os.getenv("PORT", "5000"))
     log.info(f"Starting on port {port}")
     app.run(host="0.0.0.0", port=port, debug=False)
+
