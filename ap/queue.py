@@ -16,6 +16,9 @@ from typing import Optional, Dict, Any
 from ap.db import conn, run_with_retry, init_db
 from ap.logger import get_logger
 from ap.execution import process_signal
+from ap.state import update_state
+from ap.utils import now_utc_iso
+
 
 log = get_logger("ap.queue")
 
@@ -273,6 +276,12 @@ def _claim_one_job() -> Optional[sqlite3.Row]:
 
 
 def worker_loop(broker, poll_seconds: float = POLL_INTERVAL):
+    # Heartbeat (proves worker is alive)
+    try:
+    update_state({"last_heartbeat_ts": now_utc_iso()}, client_id="default")
+        except Exception:
+            pass
+    
     # ✅ Critical: ensures trade_queue exists in the DB file the worker is using
     init_db()
 
