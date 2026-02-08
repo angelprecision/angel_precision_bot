@@ -272,6 +272,33 @@ def create_app() -> Flask:
         log.info("✅ Default client created")
     else:
         log.info("✅ Default client exists")
+        # =============================================
+    # DEBUG (TEMP) - REMOVE LATER
+    # =============================================
+
+    @app.get("/debug/threads")
+    def debug_threads():
+        import threading
+        threads = []
+        for t in threading.enumerate():
+            threads.append({
+                "name": t.name,
+                "daemon": bool(getattr(t, "daemon", False)),
+                "alive": bool(t.is_alive()),
+            })
+        return jsonify({"ok": True, "threads": threads})
+
+    @app.get("/debug/queue_counts")
+    def debug_queue_counts():
+        try:
+            with conn() as c:
+                new_cnt = c.execute("SELECT COUNT(*) AS n FROM trade_queue WHERE status='NEW'").fetchone()["n"]
+                proc_cnt = c.execute("SELECT COUNT(*) AS n FROM trade_queue WHERE status='PROCESSING'").fetchone()["n"]
+                done_cnt = c.execute("SELECT COUNT(*) AS n FROM trade_queue WHERE status='DONE'").fetchone()["n"]
+                err_cnt = c.execute("SELECT COUNT(*) AS n FROM trade_queue WHERE status='ERROR'").fetchone()["n"]
+            return jsonify({"ok": True, "NEW": int(new_cnt), "PROCESSING": int(proc_cnt), "DONE": int(done_cnt), "ERROR": int(err_cnt)})
+        except Exception as e:
+            return jsonify({"ok": False, "error": str(e)}), 500
 
     # ✅ Explicit default client state update (prevents FK issues & ambiguity)
     update_state({"mode": mode}, client_id=DEFAULT_CLIENT_ID)
