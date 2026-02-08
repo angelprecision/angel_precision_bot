@@ -1,10 +1,12 @@
-# ap/queue.py - PRODUCTION READY
+# ap/queue.py - PRODUCTION READY (FIXED)
 # Fixes:
 # ✅ init_db() at startup (prevents "no such table: trade_queue")
 # ✅ Safe job claiming (avoids double-processing with multiple workers)
 # ✅ Anti-starvation: requeue with updated created_ts when waiting/price/rate-limited
 # ✅ Correct entry=0 handling (_extract_entry_price uses is not None)
-# ✅ Uses your existing trade_queue schema/columns from ap/db.py
+# ✅ Heartbeat written every loop (proves worker is alive)
+# ✅ IMPORTANT: discord scanner signals skip stock-price trigger waiting
+#    (because scanner entry=option premium, not underlying stock price)
 
 import time
 import json
@@ -18,7 +20,6 @@ from ap.logger import get_logger
 from ap.execution import process_signal
 from ap.state import update_state
 from ap.utils import now_utc_iso
-
 
 log = get_logger("ap.queue")
 
@@ -115,6 +116,13 @@ def _extract_entry_price(payload: Dict[str, Any]) -> Optional[float]:
             pass
 
     return None
+
+
+def _trigger_source(payload: Dict[str, Any]) -> str:
+    trg = payload.get("trigger")
+    if isinstance(trg, dict):
+        return str(trg.get("source") or "").lower().strip()
+    return ""
 
 
 def _check_rate_limit(client_id: str) -> bool:
@@ -250,7 +258,7 @@ def _claim_one_job() -> Optional[sqlite3.Row]:
 
         job_id = int(job["id"])
 
-        # 3) Claim it (atomic-ish): only claim if still NEW
+        # 3) Claim it: only claim if still NEW
         def _claim():
             cur = c.execute(
                 """
@@ -268,7 +276,7 @@ def _claim_one_job() -> Optional[sqlite3.Row]:
         if claimed != 1:
             return None
 
-        # Re-read claimed row (payload etc)
+        # Re-read claimed row
         return run_with_retry(lambda: c.execute(
             "SELECT id, client_id, signal_id, payload FROM trade_queue WHERE id=?",
             (job_id,),
@@ -276,18 +284,17 @@ def _claim_one_job() -> Optional[sqlite3.Row]:
 
 
 def worker_loop(broker, poll_seconds: float = POLL_INTERVAL):
-    # Heartbeat (proves worker is alive)
-    try:
-    update_state({"last_heartbeat_ts": now_utc_iso()}, client_id="default")
-        except Exception:
-            pass
-    
     # ✅ Critical: ensures trade_queue exists in the DB file the worker is using
     init_db()
-
     log.info(f"🤖 Worker started (poll={poll_seconds}s)")
 
     while True:
+        # ✅ Heartbeat every loop
+        try:
+            update_state({"last_heartbeat_ts": now_utc_iso()}, client_id="default")
+        except Exception:
+            pass
+
         job = None
         job_id = None
 
@@ -318,26 +325,31 @@ def worker_loop(broker, poll_seconds: float = POLL_INTERVAL):
             direction = payload.get("direction") or payload.get("side")
             entry_price = _extract_entry_price(payload)
 
-            # If entry price is supplied, wait for trigger
-            if entry_price is not None and symbol and direction:
-                current_price = _get_stock_price(broker, symbol)
+            # ✅ IMPORTANT: scanner/discord signals use OPTION premium entry
+            # Do NOT compare that to the STOCK price (it will never trigger).
+            source = _trigger_source(payload)
+            if source == "discord":
+                log.info(f"🔔 Scanner signal (discord) - skipping stock-price trigger wait: {symbol} {direction}")
+            else:
+                # If entry price is supplied, wait for trigger (non-discord flows only)
+                if entry_price is not None and symbol and direction:
+                    current_price = _get_stock_price(broker, symbol)
 
-                if current_price is None:
-                    _requeue(job_id, "price_unavailable")
-                    time.sleep(PRICE_CHECK_INTERVAL)
-                    continue
+                    if current_price is None:
+                        _requeue(job_id, "price_unavailable")
+                        time.sleep(PRICE_CHECK_INTERVAL)
+                        continue
 
-                if not _is_triggered(direction, entry_price, current_price):
-                    log.debug(f"⏳ {symbol}: ${current_price:.2f} waiting entry=${entry_price}")
-                    _requeue(job_id, f"waiting: current=${current_price:.2f} entry={entry_price}")
-                    time.sleep(PRICE_CHECK_INTERVAL)
-                    continue
+                    if not _is_triggered(direction, entry_price, current_price):
+                        log.debug(f"⏳ {symbol}: ${current_price:.2f} waiting entry={entry_price}")
+                        _requeue(job_id, f"waiting: current={current_price:.2f} entry={entry_price}")
+                        time.sleep(PRICE_CHECK_INTERVAL)
+                        continue
 
-                log.info(f"🎯 {symbol} TRIGGERED: ${current_price:.2f} → entry={entry_price}")
+                    log.info(f"🎯 {symbol} TRIGGERED: ${current_price:.2f} → entry={entry_price}")
 
             log.info(f"Executing: {signal_id}")
 
-            # ✅ Call execution with keyword args (matches your execution.py)
             result = process_signal(
                 broker=broker,
                 client_id=client_id,
@@ -363,4 +375,5 @@ def worker_loop(broker, poll_seconds: float = POLL_INTERVAL):
                 except Exception:
                     pass
             time.sleep(poll_seconds)
+
 
