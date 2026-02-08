@@ -1,4 +1,4 @@
-# app.py - ANGEL PRECISION BOT (PRODUCTION VERSION - IMPROVED)
+# app.py - ANGEL PRECISION BOT (PRODUCTION VERSION - STABLE)
 # =====================================================================
 # THIS FILE IS NOW STABLE. DO NOT EDIT.
 # All business logic lives in blueprints (client_api, admin_api, etc).
@@ -70,6 +70,8 @@ THREAD_LOCK = threading.Lock()
 
 MAX_CONTENT_LENGTH = int(os.getenv("MAX_CONTENT_LENGTH_BYTES", str(256 * 1024)))
 
+DEFAULT_CLIENT_ID = os.getenv("DEFAULT_CLIENT_ID", "default").strip() or "default"
+
 # ============================================================
 # SECURITY HELPERS
 # ============================================================
@@ -125,6 +127,7 @@ def _verify_hmac(req) -> bool:
     except ValueError:
         return False
 
+    # Reject replay / time drift
     if abs(int(time.time()) - ts_i) > 60:
         return False
 
@@ -156,7 +159,7 @@ def _require_client_id_header() -> Optional[str]:
     if cid:
         return cid
     if APP_ENV != "prod":
-        return "default"
+        return DEFAULT_CLIENT_ID
     return None
 
 
@@ -182,12 +185,11 @@ def build_broker():
             raise RuntimeError("Missing TRADIER_ACCESS_TOKEN or TRADIER_ACCOUNT_ID")
 
         log.info(f"Initializing Tradier broker ({cfg.BOT_MODE})")
-        b = TradierBroker(TradierConfig(
+        return TradierBroker(TradierConfig(
             base_url=base_url,
             access_token=access_token,
             account_id=account_id,
         ))
-        return b
 
     log.info(f"Initializing Simulator broker ({cfg.BOT_MODE})")
     return SimBroker(starting_equity=10000.0)
@@ -252,14 +254,14 @@ def create_app() -> Flask:
     init_db()
     log.info("✅ Database initialized")
 
-    # ✅ CRITICAL: Ensure default client exists BEFORE any state write
+    # ✅ Ensure default client exists BEFORE any state write
     with conn() as c:
-        row = c.execute("SELECT 1 FROM clients WHERE client_id=?", ("default",)).fetchone()
+        row = c.execute("SELECT 1 FROM clients WHERE client_id=?", (DEFAULT_CLIENT_ID,)).fetchone()
 
     if not row:
-        log.info("Creating default client (not found in DB)...")
+        log.info(f"Creating default client (not found in DB): {DEFAULT_CLIENT_ID}")
         create_client(
-            client_id="default",
+            client_id=DEFAULT_CLIENT_ID,
             name="Default Client",
             broker_type=os.getenv("BROKER_TYPE", "tradier"),
             broker_account_id=os.getenv("TRADIER_ACCOUNT_ID", ""),
@@ -271,8 +273,8 @@ def create_app() -> Flask:
     else:
         log.info("✅ Default client exists")
 
-    # ✅ CRITICAL: Explicit default client state update
-    update_state({"mode": mode}, client_id="default")
+    # ✅ Explicit default client state update (prevents FK issues & ambiguity)
+    update_state({"mode": mode}, client_id=DEFAULT_CLIENT_ID)
     log.info("✅ State initialized")
 
     broker = build_broker()
@@ -285,6 +287,7 @@ def create_app() -> Flask:
     # Register blueprints
     app.register_blueprint(client_bp)
     app.register_blueprint(admin_bp)
+    log.info("✅ Blueprints registered")
 
     # CORS
     allow_headers = [
@@ -318,8 +321,7 @@ def create_app() -> Flask:
 
     @app.get("/")
     def root():
-        # ✅ FIX: Report actual runtime mode from state, not config default
-        st = load_state("default")
+        st = load_state(client_id=DEFAULT_CLIENT_ID)
         return jsonify({
             "service": "Angel Precision Bot",
             "status": "online",
@@ -329,18 +331,15 @@ def create_app() -> Flask:
             "docs": {
                 "health": "GET /health",
                 "state": "GET /state",
+                "dashboard": "GET /dashboard",
                 "ingest": ["POST /signal", "POST /scanner/discord"],
-                "client_api": "GET /client/*",
-                "admin_api": "GET /admin/*",
-                "control": "POST /control/*, POST /kill_switch/*, POST /mode",
-                "rental": "POST /rental/subscribe, GET /rental/<client_id>/status",
             }
         })
 
     @app.get("/health")
     def health():
         try:
-            st = load_state("default")
+            st = load_state(client_id=DEFAULT_CLIENT_ID)
             heartbeat_ok = False
             heartbeat_age = None
             if st.get("last_heartbeat_ts"):
@@ -371,7 +370,7 @@ def create_app() -> Flask:
     @app.get("/state")
     def state():
         try:
-            return jsonify(load_state("default"))
+            return jsonify(load_state(client_id=DEFAULT_CLIENT_ID))
         except Exception as e:
             log.error(f"State failed: {e}")
             return jsonify({"error": str(e)}), 500
@@ -379,7 +378,7 @@ def create_app() -> Flask:
     @app.get("/dashboard")
     def dashboard():
         try:
-            st = load_state("default")
+            st = load_state(client_id=DEFAULT_CLIENT_ID)
             with conn() as c:
                 pos_row = c.execute("SELECT COUNT(*) as n FROM positions WHERE status='OPEN'").fetchone()
                 queue_row = c.execute("SELECT COUNT(*) as n FROM trade_queue WHERE status='NEW'").fetchone()
@@ -404,26 +403,26 @@ def create_app() -> Flask:
     @require_hmac
     def kill_on():
         log.warning("🔴 KILL SWITCH ENABLED")
-        update_state({"kill_switch": True, "mode": "READ_ONLY"}, client_id="default")
+        update_state({"kill_switch": True, "mode": "READ_ONLY"}, client_id=DEFAULT_CLIENT_ID)
         return jsonify({"ok": True, "kill_switch": True})
 
     @app.post("/kill_switch/off")
     @require_hmac
     def kill_off():
         log.info("🟢 KILL SWITCH DISABLED")
-        update_state({"kill_switch": False}, client_id="default")
+        update_state({"kill_switch": False}, client_id=DEFAULT_CLIENT_ID)
         return jsonify({"ok": True, "kill_switch": False})
 
     @app.post("/mode")
     @require_hmac
     def set_mode():
         body = request.get_json(force=True) or {}
-        mode = str(body.get("mode", "")).upper()
-        if mode not in ("SIM", "PAPER", "LIVE", "READ_ONLY"):
+        new_mode = str(body.get("mode", "")).upper()
+        if new_mode not in ("SIM", "PAPER", "LIVE", "READ_ONLY"):
             return jsonify({"ok": False, "error": "invalid_mode"}), 400
-        log.info(f"Mode changed: {mode}")
-        update_state({"mode": mode}, client_id="default")
-        return jsonify({"ok": True, "mode": mode})
+        log.info(f"Mode changed: {new_mode}")
+        update_state({"mode": new_mode}, client_id=DEFAULT_CLIENT_ID)
+        return jsonify({"ok": True, "mode": new_mode})
 
     # =============================================
     # SIGNAL INGESTION (multi-client, HMAC protected)
@@ -450,7 +449,8 @@ def create_app() -> Flask:
             return jsonify({"ok": False, "error": "unknown_client"}), 404
 
         body = request.get_json(force=True) or {}
-        idem_key = (str(body.get("signal_id") or "").strip() or request.headers.get("Idempotency-Key", "").strip())
+        idem_key = (str(body.get("signal_id") or "").strip()
+                    or request.headers.get("Idempotency-Key", "").strip())
 
         cached = _idem_get(idem_key)
         if cached:
@@ -463,7 +463,7 @@ def create_app() -> Flask:
             _idem_set(idem_key, payload)
             return jsonify(payload), 400
 
-        st = load_state("default")
+        st = load_state(client_id=DEFAULT_CLIENT_ID)
         if st.get("kill_switch") or st.get("mode") == "READ_ONLY":
             payload = {"ok": False, "error": "bot_in_read_only"}
             _idem_set(idem_key, payload)
@@ -574,49 +574,6 @@ def create_app() -> Flask:
             return jsonify({"ok": True, "equity": equity})
         except Exception as e:
             return jsonify({"ok": False, "error": str(e)}), 500
-
-    # =============================================
-    # RENTAL SUBSCRIPTIONS (fee-based tiers)
-    # =============================================
-
-    @app.post("/rental/subscribe")
-    @require_hmac
-    def create_rental():
-        from ap.subscription_tiers import create_rental_subscription
-
-        body = request.get_json(force=True) or {}
-        result = create_rental_subscription(
-            client_id=body.get("client_id"),
-            tier=body.get("tier"),
-            start_date=body.get("start_date")
-        )
-        return jsonify(result), 201 if result.get("ok") else 400
-
-    @app.get("/rental/<client_id>/status")
-    @require_hmac
-    def rental_status(client_id: str):
-        from ap.subscription_tiers import get_rental_status
-
-        result = get_rental_status(client_id)
-        return jsonify(result), 200 if result.get("ok") else 404
-
-    @app.get("/rental/tiers")
-    def list_tiers():
-        from ap.subscription_tiers import CorrectRentalTiers
-
-        tiers = {}
-        for tier_key, tier_def in CorrectRentalTiers.TIERS.items():
-            tiers[tier_key] = {
-                "name": tier_def["name"],
-                "description": tier_def["description"],
-                "client_capital": tier_def["client_capital"],
-                "rental_fee": tier_def["rental_fee"],
-                "working_capital": tier_def["working_capital"],
-                "profit_targets": {"min": tier_def["profit_target_min"], "max": tier_def["profit_target_max"]},
-                "end_balance": {"min": tier_def["end_balance_min"], "max": tier_def["end_balance_max"]},
-            }
-
-        return jsonify({"ok": True, "tiers": tiers})
 
     log.info("=" * 70)
     log.info("✅ APP READY")
