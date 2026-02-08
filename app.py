@@ -229,7 +229,7 @@ def create_app() -> Flask:
 
     log.info("=" * 70)
     log.info("ANGEL PRECISION BOT - INITIALIZING")
-    log.info("=" * 70
+    log.info("=" * 70)
             
     mode = getattr(cfg, "BOT_MODE", os.getenv("BOT_MODE", os.getenv("MODE", "PAPER"))).upper()
     db_file = getattr(cfg, "DB_FILE", os.getenv("BOT_DB_FILE", "ap_state.db"))
@@ -240,7 +240,7 @@ def create_app() -> Flask:
     init_db()
     log.info("✅ Database initialized")
 
-    update_state({"mode": cfg.BOT_MODE})
+    update_state({"mode": mode})
     log.info("✅ State initialized")
 
     broker = build_broker()
