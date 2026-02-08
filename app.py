@@ -41,6 +41,7 @@ from ap.admin_api import admin_bp
 
 cfg = Config()
 log = get_logger("app")
+log.info(f"CONFIG LOADED FROM: {__import__('ap.config').config.__file__}")
 
 APP_ENV = os.getenv("APP_ENV", "dev").lower().strip()
 SIGNING_SECRET = os.getenv("SIGNING_SECRET", "").encode()
@@ -228,8 +229,12 @@ def create_app() -> Flask:
 
     log.info("=" * 70)
     log.info("ANGEL PRECISION BOT - INITIALIZING")
-    log.info("=" * 70)
-    log.info(f"ENV: {APP_ENV} | MODE: {cfg.BOT_MODE} | DB: {cfg.DB_FILE}")
+    log.info("=" * 70
+            
+    mode = getattr(cfg, "BOT_MODE", os.getenv("BOT_MODE", os.getenv("MODE", "PAPER"))).upper()
+    db_file = getattr(cfg, "DB_FILE", os.getenv("BOT_DB_FILE", "ap_state.db"))
+    log.info(f"ENV: {APP_ENV} | MODE: {mode} | DB: {db_file}")
+
     log.info("=" * 70)
 
     init_db()
@@ -242,10 +247,7 @@ def create_app() -> Flask:
     app.config["BROKER"] = broker
     log.info("✅ Broker initialized")
 
-    broker = build_broker()
-    app.config["BROKER"] = broker
-    log.info("✅ Broker initialized")
-
+    return app
     # ✅ IMPORTANT: start background loops inside the web service
     # so they share the same SQLite DB file on this Render instance.
     start_background_threads_once(broker)
