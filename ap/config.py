@@ -76,3 +76,9 @@ class Config:
     TRADIER_ACCOUNT_ID: str = os.getenv("TRADIER_ACCOUNT_ID", "")
     TRADIER_ACCESS_TOKEN: str = os.getenv("TRADIER_ACCESS_TOKEN", "")
     TRADIER_BASE_URL: str = os.getenv("TRADIER_BASE_URL", "https://sandbox.tradier.com")
+
+        # Backward compatibility: older code expects cfg.BOT_MODE
+    @property
+    def BOT_MODE(self) -> str:
+        return self.DEFAULT_CLIENT_MODE
+
