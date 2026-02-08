@@ -1,4 +1,4 @@
-# app.py - ANGEL PRECISION BOT (FROZEN VERSION - CORRECTED)
+# app.py - ANGEL PRECISION BOT (PRODUCTION VERSION)
 # =====================================================================
 # THIS FILE IS NOW STABLE. DO NOT EDIT.
 # All business logic lives in blueprints (client_api, admin_api, etc).
@@ -21,7 +21,7 @@ from flask_cors import CORS
 from pydantic import ValidationError
 
 from ap.config import Config
-from ap.db import init_db, conn, get_client
+from ap.db import init_db, conn, get_client, create_client
 from ap.logger import get_logger
 from ap.models import Signal
 from ap.queue import enqueue_signal, worker_loop
@@ -45,7 +45,6 @@ log.info(f"CONFIG LOADED FROM: {__import__('ap.config').config.__file__}")
 
 APP_ENV = os.getenv("APP_ENV", "dev").lower().strip()
 SIGNING_SECRET = os.getenv("SIGNING_SECRET", "").encode()
-import hashlib
 log.info("SIGNING_SECRET_SHA256_8=" + hashlib.sha256(SIGNING_SECRET).hexdigest()[:8])
 
 # Rate limiting (per worker - upgrade to Redis later)
@@ -230,30 +229,44 @@ def create_app() -> Flask:
     log.info("=" * 70)
     log.info("ANGEL PRECISION BOT - INITIALIZING")
     log.info("=" * 70)
-            
+
     mode = getattr(cfg, "BOT_MODE", os.getenv("BOT_MODE", os.getenv("MODE", "PAPER"))).upper()
     db_file = getattr(cfg, "DB_FILE", os.getenv("BOT_DB_FILE", "ap_state.db"))
     log.info(f"ENV: {APP_ENV} | MODE: {mode} | DB: {db_file}")
-
     log.info("=" * 70)
 
     init_db()
     log.info("✅ Database initialized")
 
-    update_state({"mode": mode})
+    # ✅ CRITICAL: Ensure default client exists BEFORE any state write
+    with conn() as c:
+        row = c.execute("SELECT 1 FROM clients WHERE client_id=?", ("default",)).fetchone()
+
+    if not row:
+        log.info("Creating default client (not found in DB)...")
+        create_client(
+            client_id="default",
+            name="Default Client",
+            broker_type=os.getenv("BROKER_TYPE", "tradier"),
+            broker_account_id=os.getenv("TRADIER_ACCOUNT_ID", ""),
+            broker_token=os.getenv("TRADIER_ACCESS_TOKEN", ""),
+            broker_base_url=os.getenv("TRADIER_BASE_URL", "https://sandbox.tradier.com"),
+            initial_equity=100000.0,
+        )
+        log.info("✅ Default client created")
+    else:
+        log.info("✅ Default client exists")
+
+    # ✅ CRITICAL: Explicit default client state update
+    update_state({"mode": mode}, client_id="default")
     log.info("✅ State initialized")
 
     broker = build_broker()
     app.config["BROKER"] = broker
     log.info("✅ Broker initialized")
 
-    return app
-    # ✅ IMPORTANT: start background loops inside the web service
-    # so they share the same SQLite DB file on this Render instance.
     start_background_threads_once(broker)
- 
-    log.info("✅ Background threads started (worker + exit manager)")
-
+    log.info("✅ Background threads started")
 
     # Register blueprints
     app.register_blueprint(client_bp)
@@ -374,14 +387,14 @@ def create_app() -> Flask:
     @require_hmac
     def kill_on():
         log.warning("🔴 KILL SWITCH ENABLED")
-        update_state({"kill_switch": True, "mode": "READ_ONLY"})
+        update_state({"kill_switch": True, "mode": "READ_ONLY"}, client_id="default")
         return jsonify({"ok": True, "kill_switch": True})
 
     @app.post("/kill_switch/off")
     @require_hmac
     def kill_off():
         log.info("🟢 KILL SWITCH DISABLED")
-        update_state({"kill_switch": False})
+        update_state({"kill_switch": False}, client_id="default")
         return jsonify({"ok": True, "kill_switch": False})
 
     @app.post("/mode")
@@ -392,7 +405,7 @@ def create_app() -> Flask:
         if mode not in ("SIM", "PAPER", "LIVE", "READ_ONLY"):
             return jsonify({"ok": False, "error": "invalid_mode"}), 400
         log.info(f"Mode changed: {mode}")
-        update_state({"mode": mode})
+        update_state({"mode": mode}, client_id="default")
         return jsonify({"ok": True, "mode": mode})
 
     # =============================================
