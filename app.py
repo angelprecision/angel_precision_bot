@@ -585,11 +585,7 @@ def create_app() -> Flask:
         except Exception as e:
             log.error(f"Scanner parse failed: {e}")
             return jsonify({"ok": False, "error": str(e)}), 500
-    # Alias for legacy scanners still posting to /signal
-    @app.post("/signal")
-    @require_hmac
-    def signal_alias():
-        return scanner_discord()
+   
 
     # =============================================
     # BROKER TEST
