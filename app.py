@@ -64,6 +64,9 @@ RATE_LIMIT_PER_MIN = int(os.getenv("RATE_LIMIT_PER_MIN", "60"))
 _IDEMP = {}
 IDEMP_TTL_SECONDS = int(os.getenv("IDEMP_TTL_SECONDS", "300"))
 
+# HMAC time drift (seconds)
+HMAC_MAX_SKEW_SECONDS = int(os.getenv("HMAC_MAX_SKEW_SECONDS", "300"))  # ✅ 5 min default
+
 # Threads
 THREADS_STARTED = False
 THREAD_LOCK = threading.Lock()
@@ -73,7 +76,7 @@ MAX_CONTENT_LENGTH = int(os.getenv("MAX_CONTENT_LENGTH_BYTES", str(256 * 1024)))
 DEFAULT_CLIENT_ID = os.getenv("DEFAULT_CLIENT_ID", "default").strip() or "default"
 
 # ============================================================
-# SECURITY HELPERS
+# SECURITY HELPERS (HMAC + Rate Limit + Idempotency)
 # ============================================================
 
 def _client_ip() -> str:
@@ -112,30 +115,75 @@ def _idem_set(key: str, payload: dict):
         _IDEMP[key] = (time.time(), payload)
 
 
+def _hmac_hex(key: bytes, msg: bytes) -> str:
+    """Helper: compute HMAC-SHA256 hex digest"""
+    return hmac.new(key, msg, hashlib.sha256).hexdigest()
+
+
 def _verify_hmac(req) -> bool:
-    """HMAC-SHA256 signature verification (required in prod)"""
+    """
+    HMAC verification supporting 2 schemes:
+    
+    Scheme A (preferred): X-AP-Timestamp + X-AP-Signature
+        signature = HMAC_SHA256(secret, f"{timestamp}.{raw_body_bytes}")
+    
+    Scheme B (fallback): X-Signature
+        signature = HMAC_SHA256(secret, raw_body_bytes)
+    
+    Returns True if either scheme validates successfully.
+    """
+    # In dev/test, allow unsigned requests
+    if APP_ENV != "prod":
+        return True
+
+    # In prod, require secret + valid signature
     if not SIGNING_SECRET:
+        log.warning("SIGNING_SECRET not set - rejecting request")
         return False
 
-    ts = req.headers.get("X-AP-Timestamp", "")
-    sig = req.headers.get("X-AP-Signature", "")
-    if not ts or not sig:
-        return False
-
-    try:
-        ts_i = int(ts)
-    except ValueError:
-        return False
-
-    # Reject replay / time drift
-    if abs(int(time.time()) - ts_i) > 60:
-        return False
-
-    # CRITICAL: cache=True allows Flask to parse JSON later
     raw = req.get_data(cache=True, as_text=False) or b""
-    msg = str(ts_i).encode() + b"." + raw
-    expected = hmac.new(SIGNING_SECRET, msg, hashlib.sha256).hexdigest()
-    return hmac.compare_digest(expected, sig)
+
+    # -----------------------------
+    # Scheme A: Timestamped HMAC
+    # -----------------------------
+    ts = (req.headers.get("X-AP-Timestamp", "") or "").strip()
+    sig = (req.headers.get("X-AP-Signature", "") or "").strip()
+
+    if ts and sig:
+        try:
+            ts_i = int(ts)
+        except Exception:
+            log.warning(f"Invalid X-AP-Timestamp: {ts}")
+            ts_i = None
+
+        if ts_i is not None:
+            # Anti-replay / drift window
+            if abs(int(time.time()) - ts_i) > HMAC_MAX_SKEW_SECONDS:
+                log.warning(f"Timestamp out of range: {ts_i}")
+            else:
+                msg = str(ts_i).encode("utf-8") + b"." + raw
+                expected = _hmac_hex(SIGNING_SECRET, msg)
+                if hmac.compare_digest(expected, sig):
+                    log.debug("✅ HMAC verified (timestamped scheme)")
+                    return True
+                else:
+                    log.warning("HMAC timestamped scheme failed (signature mismatch)")
+
+    # -----------------------------
+    # Scheme B: Simple body-only HMAC
+    # -----------------------------
+    simple_sig = (req.headers.get("X-Signature", "") or "").strip()
+    if simple_sig:
+        expected_simple = _hmac_hex(SIGNING_SECRET, raw)
+        if hmac.compare_digest(expected_simple, simple_sig):
+            log.debug("✅ HMAC verified (simple scheme)")
+            return True
+        else:
+            log.warning("HMAC simple scheme failed (signature mismatch)")
+
+    # Both schemes failed
+    log.warning(f"HMAC verification failed for {req.path} from {_client_ip()}")
+    return False
 
 
 def require_hmac(fn):
@@ -147,7 +195,7 @@ def require_hmac(fn):
             return jsonify({
                 "ok": False,
                 "error": "unauthorized",
-                "hint": "Missing or invalid X-AP-Timestamp / X-AP-Signature headers"
+                "hint": "Provide X-AP-Timestamp + X-AP-Signature (preferred) OR X-Signature"
             }), 401
         return fn(*args, **kwargs)
     return wrapper
@@ -320,6 +368,7 @@ def create_app() -> Flask:
     allow_headers = [
         "Content-Type", "Authorization", "X-Client-Id", "X-AP-Timestamp",
         "X-AP-Signature", "Idempotency-Key", "X-API-Key", "X-Admin-Key",
+        "X-Signature",  # ✅ Added for simple HMAC scheme
     ]
     CORS(app, resources={
         r"/client/*": {"origins": ["*"], "methods": ["GET", "POST", "PATCH"], "allow_headers": allow_headers},
