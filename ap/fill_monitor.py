@@ -191,7 +191,7 @@ def close_position_from_exit_fill(order: dict, avg_fill_price: float):
 
 def check_order_with_broker(broker: BrokerAdapter, order: dict) -> dict:
     """
-    Query broker for actual order status
+    Query broker for actual order status.
     Returns: {"status": str, "filled_qty": int, "avg_fill": float, "reason": str, "raw": dict}
     """
     broker_order_id = order.get("broker_order_id")
@@ -317,7 +317,7 @@ def process_pending_order(broker: BrokerAdapter, order: dict):
         return
 
     if result["status"] == "ACK":
-        # still pending
+        # Still pending - log a warning if it's been pending too long
         try:
             created = datetime.fromisoformat(order["created_ts"])
             age = (datetime.now(timezone.utc) - created).total_seconds()
@@ -343,7 +343,7 @@ def process_pending_order(broker: BrokerAdapter, order: dict):
 def fill_monitor_loop(broker: BrokerAdapter, poll_seconds: float = 10.0):
     """
     Fill monitor must NEVER pause on kill switch.
-    It’s the reconciliation layer.
+    It's the reconciliation layer.
     """
     log.info("🔍 Fill monitor started")
 
