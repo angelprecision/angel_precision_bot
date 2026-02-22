@@ -42,6 +42,7 @@ def get_contract_price(broker: BrokerAdapter, contract_symbol: str, side: str = 
     side = (side or "SELL").upper().strip()
     if side not in ("BUY", "SELL"):
         side = "SELL"
+
     try:
         quote = broker.get_quote(contract_symbol) or {}
         bid = _to_float(quote.get("bid"))
@@ -75,3 +76,17 @@ def get_contract_price(broker: BrokerAdapter, contract_symbol: str, side: str = 
                 return _round_tick((bid + ask) / 2.0)
         else:
             if ask is not None and ask > 0:
+                return _round_tick(ask)
+            if last is not None and last > 0:
+                return _round_tick(last)
+            if bid is not None and ask is not None and bid > 0 and ask > 0:
+                return _round_tick((bid + ask) / 2.0)
+
+        log.warning(
+            f"No valid price {contract_symbol} side={side} bid={bid} ask={ask} last={last} raw={quote}"
+        )
+        return 0.0
+
+    except Exception as e:
+        log.error(f"Failed to get price for {contract_symbol} side={side}: {e}")
+        return 0.0
