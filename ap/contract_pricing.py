@@ -5,7 +5,8 @@ from __future__ import annotations
 from ap.logger import get_logger
 from ap.broker import BrokerAdapter
 from ap.config import Config
-
+from datetime import datetime
+import re
 log = get_logger("ap.pricing")
 cfg = Config()
 
@@ -28,6 +29,15 @@ def _round_tick(price: float, tick: float = 0.01) -> float:
     except Exception:
         return float(price)
 
+def is_contract_expired(symbol: str) -> bool:
+    match = re.search(r'(\d{6})[CP]\d+$', symbol)
+    if not match:
+        return False
+    try:
+        expiry = datetime.strptime(match.group(1), "%y%m%d").date()
+        return expiry < datetime.today().date()
+    except:
+        return False
 
 def get_contract_price(broker: BrokerAdapter, contract_symbol: str, side: str = "SELL") -> float:
     """
@@ -41,6 +51,13 @@ def get_contract_price(broker: BrokerAdapter, contract_symbol: str, side: str = 
       - If bid/ask are present but spread is extreme, reject (return 0.0)
       - If best side is missing, fall back to last or mid if sane
     """
+    def get_contract_price(broker: BrokerAdapter, contract_symbol: str, side: str = "SELL") -> float:
+    # NEW: skip expired contracts immediately
+    if is_contract_expired(contract_symbol):
+        log.warning(f"Contract {contract_symbol} is expired, skipping")
+        return 0.0
+    
+    # ... rest of your existing code unchanged
     side = (side or "SELL").upper().strip()
     if side not in ("BUY", "SELL"):
         side = "SELL"
