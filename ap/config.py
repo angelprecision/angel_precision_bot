@@ -31,11 +31,11 @@ class Config:
     # Hard maximum cost per trade (absolute cap)
     MAX_POSITION_COST: float = float(os.getenv("MAX_POSITION_COST", "5000"))
 
-    # Hard maximum concurrent positions (absolute cap)
-    MAX_CONCURRENT_POSITIONS: int = min(int(os.getenv("MAX_CONCURRENT_POSITIONS", "1")), 1)
+    # Hard maximum concurrent positions
+    MAX_CONCURRENT_POSITIONS: int = int(os.getenv("MAX_CONCURRENT_POSITIONS", "3"))
 
-    # Hard maximum trades per day (absolute cap)
-    MAX_TRADES_PER_DAY: int = min(int(os.getenv("MAX_TRADES_PER_DAY", "2")), 2)
+    # Hard maximum trades per day
+    MAX_TRADES_PER_DAY: int = int(os.getenv("MAX_TRADES_PER_DAY", "10"))
 
     # Daily loss stop (kill switch at 17% realized loss on the day)
     MAX_DAILY_LOSS_PCT: float = float(os.getenv("MAX_DAILY_LOSS_PCT", "0.17"))
@@ -77,8 +77,7 @@ class Config:
     TRADIER_ACCESS_TOKEN: str = os.getenv("TRADIER_ACCESS_TOKEN", "")
     TRADIER_BASE_URL: str = os.getenv("TRADIER_BASE_URL", "https://sandbox.tradier.com")
 
-        # Backward compatibility: older code expects cfg.BOT_MODE
+    # Backward compatibility: older code expects cfg.BOT_MODE
     @property
     def BOT_MODE(self) -> str:
         return self.DEFAULT_CLIENT_MODE
-
