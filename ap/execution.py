@@ -310,7 +310,12 @@ def process_signal(broker, client_id: str, signal_payload: dict) -> dict:
         budget = min(equity * position_pct, float(cfg.MAX_POSITION_COST))
 
         # --- contract ---
-        exp_hint = str(signal_payload.get("exp_hint") or signal_payload.get("dte") or "0DTE").upper()
+        exp_hint = (
+            trigger.get("expiry_hint")
+            or signal_payload.get("exp_hint")
+            or signal_payload.get("dte")
+            or "DAILY"
+        ).strip().upper()
         contract, premium = _resolve_option_contract(broker, client_id, symbol, strike, direction, mode=mode, exp_hint=exp_hint)
 
         ok_p, prem_err = _validate_premium(premium, mode)
