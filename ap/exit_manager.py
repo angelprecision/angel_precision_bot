@@ -7,6 +7,8 @@ KEY FIXES:
 2. Checks if entry order actually filled before allowing exit
 3. Rate limiting on exit attempts
 4. Better error handling
+5. FIX: insert_order now includes client_id
+6. FIX: load_state now includes client_id
 """
 import time
 from datetime import datetime, timezone
@@ -65,12 +67,12 @@ def mark_position_stuck(position_id: str, reason: str):
             SET status='STUCK', exit_reason=?
             WHERE id=?
         """, (f"STUCK:{reason}", position_id)))
-    
+
     audit("ERROR", "POSITION_STUCK", {
         "position_id": position_id,
         "reason": reason
     })
-    
+
     log.error(f"🚨 Position {position_id} marked as STUCK: {reason}")
 
 
@@ -84,18 +86,18 @@ def revert_position_open(position_id: str):
 
 def get_failed_exit_count(position_id: str) -> int:
     """
-    Count how many times we've tried (and failed) to exit this position
-    Circuit breaker: stop trying after MAX_EXIT_ATTEMPTS failures
+    Count how many times we've tried (and failed) to exit this position.
+    Circuit breaker: stop trying after MAX_EXIT_ATTEMPTS failures.
     """
     with conn() as c:
         row = run_with_retry(lambda: c.execute("""
             SELECT COUNT(*) as cnt
             FROM orders
-            WHERE position_id=? 
-              AND kind='EXIT' 
+            WHERE position_id=?
+              AND kind='EXIT'
               AND status='REJECTED'
         """, (position_id,)).fetchone())
-        
+
         return row["cnt"] if row else 0
 
 
@@ -105,16 +107,16 @@ def get_last_exit_attempt_time(position_id: str) -> datetime | None:
         row = run_with_retry(lambda: c.execute("""
             SELECT MAX(created_ts) as last_attempt
             FROM orders
-            WHERE position_id=? 
+            WHERE position_id=?
               AND kind='EXIT'
         """, (position_id,)).fetchone())
-        
+
         if row and row["last_attempt"]:
             try:
                 return datetime.fromisoformat(row["last_attempt"])
-            except:
+            except Exception:
                 return None
-        
+
         return None
 
 
@@ -152,14 +154,13 @@ def position_actually_exists_at_broker(position_id: str) -> bool:
               AND status='FILLED'
             LIMIT 1
         """, (position_id,)).fetchone())
-        
+
         return row is not None
 
 
 def market_is_open_now() -> bool:
     """
-    US equities: 9:30–16:00 America/New_York, Mon–Fri.
-    (No holiday calendar here yet — beta OK.)
+    US equities: 9:30-16:00 America/New_York, Mon-Fri.
     """
     now_ny = datetime.now(timezone.utc).astimezone(NY)
     if now_ny.weekday() >= 5:
@@ -269,41 +270,44 @@ def exit_manager_loop(broker: BrokerAdapter, poll_seconds: float = 30.0):
 
     IMPORTANT:
     - This file does NOT close positions.
-    - Reconcile closes positions when the EXIT order is FILLED.
-    
-    NEW FEATURES:
+    - fill_monitor closes positions when the EXIT order is FILLED.
+
+    FEATURES:
     - Circuit breaker: stops after MAX_EXIT_ATTEMPTS failed exits
     - Rate limiting: won't retry exit within MIN_EXIT_RETRY_SECONDS
-    - Validation: only exits positions that actually filled
+    - Validation: only exits positions that actually filled at broker
+    - FIX: load_state uses client_id from position
+    - FIX: insert_order includes client_id
     """
     log.info("Exit manager started (with circuit breaker)")
 
     while True:
         try:
-            state = load_state()
-            if state.get("kill_switch") or state.get("mode") == "READ_ONLY":
-                time.sleep(poll_seconds)
-                continue
-
             positions = get_open_positions()
             if not positions:
                 time.sleep(poll_seconds)
                 continue
 
             for pos in positions:
-                # Skip if already closing (reconcile will finish it)
+                client_id = pos.get("client_id") or "default"
+
+                # FIX: load_state with correct client_id
+                state = load_state(client_id=client_id)
+                if state.get("kill_switch") or state.get("mode") == "READ_ONLY":
+                    continue
+
+                # Skip if already closing (fill_monitor will finish it)
                 if pos.get("status") == "CLOSING":
                     continue
 
                 position_id = pos["id"]
-                
+
                 # CRITICAL CHECK: Does this position actually exist at broker?
                 if not position_actually_exists_at_broker(position_id):
                     log.warning(
                         f"⚠️ Position {position_id} has no FILLED entry order, "
                         f"cannot exit (position was never opened at broker)"
                     )
-                    # Don't mark as STUCK - fill monitor will handle this
                     continue
 
                 # Circuit breaker: check failed attempt count
@@ -351,9 +355,10 @@ def exit_manager_loop(broker: BrokerAdapter, poll_seconds: float = 30.0):
                 # Mark CLOSING immediately
                 mark_position_closing(position_id, reason)
 
-                # Persist EXIT order row
+                # FIX: Persist EXIT order row with client_id
                 local_order_id = new_local_order_id()
                 insert_order(
+                    client_id=client_id,
                     local_order_id=local_order_id,
                     position_id=position_id,
                     kind="EXIT",
@@ -386,7 +391,7 @@ def exit_manager_loop(broker: BrokerAdapter, poll_seconds: float = 30.0):
                     revert_position_open(position_id)
 
                     update_order(local_order_id, status="REJECTED", broker_order_id=broker_order_id, last_error=err)
-                    
+
                     # Log with attempt count
                     new_failed_count = failed_count + 1
                     log.error(
