@@ -1,5 +1,7 @@
 # ap/contract_pricing.py - PRODUCTION SAFE PRICING
+
 from __future__ import annotations
+
 from ap.logger import get_logger
 from ap.broker import BrokerAdapter
 from ap.config import Config
@@ -8,7 +10,9 @@ import re
 
 log = get_logger("ap.pricing")
 cfg = Config()
+
 MIN_BID_ASK = 0.01
+
 
 def _to_float(x):
     try:
@@ -18,11 +22,13 @@ def _to_float(x):
     except Exception:
         return None
 
+
 def _round_tick(price: float, tick: float = 0.01) -> float:
     try:
         return round(float(price) / tick) * tick
     except Exception:
         return float(price)
+
 
 def is_contract_expired(symbol: str) -> bool:
     match = re.search(r'(\d{6})[CP]\d+$', symbol)
@@ -31,8 +37,9 @@ def is_contract_expired(symbol: str) -> bool:
     try:
         expiry = datetime.strptime(match.group(1), "%y%m%d").date()
         return expiry < datetime.today().date()
-    except:
+    except Exception:
         return False
+
 
 def get_contract_price(broker: BrokerAdapter, contract_symbol: str, side: str = "SELL") -> float:
     if is_contract_expired(contract_symbol):
@@ -56,17 +63,28 @@ def get_contract_price(broker: BrokerAdapter, contract_symbol: str, side: str = 
         if last is not None and last < MIN_BID_ASK:
             last = None
 
-        if bid is not None and ask is not None and bid > 0 and ask > 0:
-            mid = (bid + ask) / 2.0
-            spread = ask - bid
-            spread_pct = (spread / mid) if mid > 0 else 1.0
-            if spread_pct > float(cfg.MAX_SPREAD_PCT):
-                log.warning(
-                    f"Reject price (spread too wide) {contract_symbol} "
-                    f"side={side} bid={bid} ask={ask} last={last} spread_pct={spread_pct:.2f}"
-                )
-                return 0.0
+        # =============================================
+        # SPREAD CHECK: BUY side only.
+        # On SELL (exit) we MUST get out regardless of spread.
+        # Never block an exit due to wide spread.
+        # =============================================
+        if side == "BUY":
+            if bid is not None and ask is not None and bid > 0 and ask > 0:
+                mid = (bid + ask) / 2.0
+                spread = ask - bid
+                spread_pct = (spread / mid) if mid > 0 else 1.0
+                if spread_pct > float(cfg.MAX_SPREAD_PCT):
+                    log.warning(
+                        f"Reject price (spread too wide) {contract_symbol} "
+                        f"side={side} bid={bid} ask={ask} last={last} spread_pct={spread_pct:.2f}"
+                    )
+                    return 0.0
 
+        # =============================================
+        # PRICE SELECTION
+        # SELL (exit): use bid — that's what you get filled at
+        # BUY (entry): use ask — that's what you pay
+        # =============================================
         if side == "SELL":
             if bid is not None and bid > 0:
                 return _round_tick(bid)
