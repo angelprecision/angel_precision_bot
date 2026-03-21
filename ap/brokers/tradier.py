@@ -159,8 +159,23 @@ class TradierBroker(BrokerAdapter):
         if limit_price is not None:
             data["price"] = f"{float(limit_price):.2f}"
 
+        # -------------------------------------------------------
+        # DEBUG: Log exact payload hitting Tradier API
+        # Remove once Short bug is confirmed fixed
+        # -------------------------------------------------------
+        log.info(
+            f"TRADIER_ORDER_PAYLOAD | symbol={symbol} contract={contract} "
+            f"side={side} qty={qty} price={data.get('price', 'market')} "
+            f"full_payload={data}"
+        )
+
         try:
             j = self._post(f"/v1/accounts/{self.cfg.account_id}/orders", data=data)
+
+            # -------------------------------------------------------
+            # DEBUG: Log raw Tradier response
+            # -------------------------------------------------------
+            log.info(f"TRADIER_ORDER_RESPONSE | {j}")
 
             # Tradier returns {"order":{"id": "...", "status":"ok"}} or similar
             order = j.get("order") or {}
@@ -170,13 +185,13 @@ class TradierBroker(BrokerAdapter):
             status = normalize_status(raw_status)
             # When Tradier returns OK/ACCEPTED/PENDING, treat as ACK
             if status in ("NEW", "UNKNOWN"):
-                # Tradier sometimes uses "ok"/"accepted"/"pending"
                 s = str(raw_status).upper()
                 if s in ("OK", "ACCEPTED", "PENDING"):
                     status = "ACK"
 
             # If no id, treat as rejected
             if oid == "N/A":
+                log.error(f"TRADIER_ORDER_REJECTED | no order id in response: {j}")
                 return BrokerOrderResponse(
                     broker_order_id="N/A",
                     status="REJECTED",
@@ -188,6 +203,11 @@ class TradierBroker(BrokerAdapter):
             if status == "FILLED":
                 status = "ACK"
 
+            log.info(
+                f"TRADIER_ORDER_ACK | symbol={symbol} contract={contract} "
+                f"side={side} broker_order_id={oid} status={status}"
+            )
+
             return BrokerOrderResponse(
                 broker_order_id=oid,
                 status=status if status != "UNKNOWN" else "ACK",
@@ -198,7 +218,7 @@ class TradierBroker(BrokerAdapter):
             )
 
         except Exception as e:
-            log.error(f"place_order failed: {e}")
+            log.error(f"place_order EXCEPTION | symbol={symbol} contract={contract} side={side} error={e}")
             return BrokerOrderResponse(
                 broker_order_id="N/A",
                 status="REJECTED",
