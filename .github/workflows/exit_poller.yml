@@ -1,0 +1,38 @@
+name: Exit Poller
+
+on:
+  schedule:
+    # Every 5 minutes, 9am–4pm ET (14:00–21:00 UTC), Mon–Fri
+    # GitHub Actions minimum is 5 min; this fires at :00 :05 :10 ... :55
+    - cron: '*/5 14-21 * * 1-5'
+  workflow_dispatch:  # Allow manual trigger from GitHub UI
+
+jobs:
+  poll:
+    name: Check Open Positions & Fire Exits
+    runs-on: ubuntu-latest
+    timeout-minutes: 4  # Hard kill before next 5-min trigger
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests yfinance --quiet
+
+      - name: Run exit poller
+        run: python scripts/exit_poller.py
+        env:
+          BOT_URL:              ${{ secrets.BOT_URL }}
+          BOT_CLIENT_ID:        ${{ secrets.BOT_CLIENT_ID }}
+          SIGNING_SECRET:       ${{ secrets.SIGNING_SECRET }}
+          DISCORD_WEBHOOK_URL:  ${{ secrets.DISCORD_WEBHOOK_URL }}
+          TRADIER_ACCESS_TOKEN: ${{ secrets.TRADIER_ACCESS_TOKEN }}
+          TRADIER_ACCOUNT_ID:   ${{ secrets.TRADIER_ACCOUNT_ID }}
+          STOP_LOSS_PCT:        "0.25"
+          TAKE_PROFIT_PCT:      "0.50"
