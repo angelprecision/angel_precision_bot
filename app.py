@@ -34,7 +34,9 @@ from ap.exit_manager import exit_manager_loop
 
 from ap.client_api import client_bp
 from ap.admin_api import admin_bp
-
+from client_runner import 
+start_multi_client_supervisor
+start_multi_client_supervisor()
 # ============================================================
 # GLOBALS (gunicorn safe - no threads at import time)
 # ============================================================
