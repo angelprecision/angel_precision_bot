@@ -69,11 +69,11 @@ class ClientRunner(threading.Thread):
     def _import_bot(self):
         """
         Lazy-import the bot modules to avoid circular imports at module load.
-        Returns (TradierBroker, TradierConfig, ExitManager) tuple or raises.
+        Returns (TradierBroker, TradierConfig, exit_manager_loop) tuple or raises.
         """
-        from ap.brokers.tradier import TradierBroker, TradierConfig
-        from ap.exit_manager    import ExitManager
-        return TradierBroker, TradierConfig, ExitManager
+        from ap.brokers.tradier  import TradierBroker, TradierConfig
+        from ap.exit_manager     import exit_manager_loop
+        return TradierBroker, TradierConfig, exit_manager_loop
 
     def run(self):
         logger.info(f"[{self.email}] ClientRunner starting — account {self.account_id} @ {self.base_url}")
@@ -83,7 +83,7 @@ class ClientRunner(threading.Thread):
             return
 
         try:
-            TradierBroker, TradierConfig, ExitManager = self._import_bot()
+            TradierBroker, TradierConfig, exit_manager_loop = self._import_bot()
         except Exception as e:
             logger.error(f"[{self.email}] Failed to import bot modules: {e}")
             return
@@ -95,17 +95,12 @@ class ClientRunner(threading.Thread):
                 access_token=token,
                 account_id=self.account_id,
             )
-            broker   = TradierBroker(broker_cfg)
-            exit_mgr = ExitManager(broker, broker_cfg)
-
+            broker = TradierBroker(broker_cfg)
             logger.info(f"[{self.email}] Broker initialized. Starting exit poll loop.")
 
-            while not self.stopped.is_set():
-                try:
-                    exit_mgr.poll_exits()
-                except Exception as e:
-                    logger.warning(f"[{self.email}] poll_exits error: {e}")
-                self.stopped.wait(timeout=30)   # poll every 30s
+            # exit_manager_loop runs its own internal loop — blocking call
+            # It will run until the thread is stopped
+            exit_manager_loop(broker)
 
         except Exception as e:
             logger.error(f"[{self.email}] Runner crashed: {e}", exc_info=True)
