@@ -69,12 +69,11 @@ class ClientRunner(threading.Thread):
     def _import_bot(self):
         """
         Lazy-import the bot modules to avoid circular imports at module load.
-        Returns (broker, exit_manager, config) tuple or raises.
+        Returns (TradierBroker, TradierConfig, ExitManager) tuple or raises.
         """
-        from ap.broker       import TradierBroker
-        from ap.exit_manager import ExitManager
-        from ap.config       import Config
-        return TradierBroker, ExitManager, Config
+        from ap.brokers.tradier import TradierBroker, TradierConfig
+        from ap.exit_manager    import ExitManager
+        return TradierBroker, TradierConfig, ExitManager
 
     def run(self):
         logger.info(f"[{self.email}] ClientRunner starting — account {self.account_id} @ {self.base_url}")
@@ -84,21 +83,20 @@ class ClientRunner(threading.Thread):
             return
 
         try:
-            TradierBroker, ExitManager, Config = self._import_bot()
+            TradierBroker, TradierConfig, ExitManager = self._import_bot()
         except Exception as e:
             logger.error(f"[{self.email}] Failed to import bot modules: {e}")
             return
 
-        # Override env vars for this thread's broker instance
-        # (Each broker reads these at instantiation — set before creating)
-        os.environ["TRADIER_ACCOUNT_ID"]   = self.account_id
-        os.environ["TRADIER_ACCESS_TOKEN"] = token
-        os.environ["TRADIER_BASE_URL"]     = self.base_url
-
         try:
-            config  = Config()
-            broker  = TradierBroker(config)
-            exit_mgr = ExitManager(broker, config)
+            # Pass credentials directly — never mutate os.environ (not thread-safe)
+            broker_cfg = TradierConfig(
+                base_url=self.base_url,
+                access_token=token,
+                account_id=self.account_id,
+            )
+            broker   = TradierBroker(broker_cfg)
+            exit_mgr = ExitManager(broker, broker_cfg)
 
             logger.info(f"[{self.email}] Broker initialized. Starting exit poll loop.")
 
