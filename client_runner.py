@@ -4,10 +4,9 @@
 # How it works:
 #   1. On startup, fetch all approved + subscription_active members from Supabase
 #   2. For each member with tradier_account_id + tradier_access_token → spawn a ClientRunner thread
-#   3. Each thread runs its own exit poller and trade loop independently
+#   3. Each thread runs its own APExecutionCore (entry watcher, options gate, exit engine, feedback)
 #   4. Every 5 minutes, re-check Supabase for new clients or disconnected ones
-#
-# The bot's existing single-client logic stays intact — ClientRunner wraps it per client.
+#   5. app.py routes /signal calls to each active runner's core via runner.core.receive_signal()
 
 import os
 import time
@@ -43,8 +42,8 @@ _registry_lock  = threading.Lock()
 
 class ClientRunner(threading.Thread):
     """
-    One thread per client. Owns its own broker connection and trading loop.
-    Mirrors the single-client logic but isolated per account.
+    One thread per client. Owns its own broker connection and APExecutionCore.
+    The core handles: entry watching, options intelligence, exit engine, feedback loop.
     """
     def __init__(self, member: dict):
         super().__init__(daemon=True, name=f"runner-{member['email']}")
@@ -53,7 +52,7 @@ class ClientRunner(threading.Thread):
         self.account_id   = member["tradier_account_id"]
         self.base_url     = member.get("tradier_base_url", "https://sandbox.tradier.com")
         self.stopped      = threading.Event()
-        self._access_token: str | None = None
+        self.core         = None   # APExecutionCore — set in run(), used by app.py /signal route
 
     def _get_token(self) -> str | None:
         """Decrypt the stored token."""
@@ -66,15 +65,6 @@ class ClientRunner(threading.Thread):
             logger.error(f"[{self.email}] Token decrypt failed: {e}")
             return None
 
-    def _import_bot(self):
-        """
-        Lazy-import the bot modules to avoid circular imports at module load.
-        Returns (TradierBroker, TradierConfig, exit_manager_loop) tuple or raises.
-        """
-        from ap.brokers.tradier  import TradierBroker, TradierConfig
-        from ap.exit_manager     import exit_manager_loop
-        return TradierBroker, TradierConfig, exit_manager_loop
-
     def run(self):
         logger.info(f"[{self.email}] ClientRunner starting — account {self.account_id} @ {self.base_url}")
         token = self._get_token()
@@ -83,28 +73,44 @@ class ClientRunner(threading.Thread):
             return
 
         try:
-            TradierBroker, TradierConfig, exit_manager_loop = self._import_bot()
+            from ap.brokers.tradier import TradierBroker, TradierConfig
+            from ap_execution_core  import APExecutionCore
         except Exception as e:
             logger.error(f"[{self.email}] Failed to import bot modules: {e}")
             return
 
         try:
-            # Pass credentials directly — never mutate os.environ (not thread-safe)
+            # Build broker — pass credentials directly, never mutate os.environ
             broker_cfg = TradierConfig(
                 base_url=self.base_url,
                 access_token=token,
                 account_id=self.account_id,
             )
             broker = TradierBroker(broker_cfg)
-            logger.info(f"[{self.email}] Broker initialized. Starting exit poll loop.")
+            logger.info(f"[{self.email}] Broker initialized. Starting execution core.")
 
-            # exit_manager_loop runs its own internal loop — blocking call
-            # It will run until the thread is stopped
-            exit_manager_loop(broker)
+            # Supabase client for this runner (feedback loop + shadow tracker)
+            sb = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY) if SUPABASE_URL else None
+
+            # Start the full execution core
+            # This spins up: entry watcher, exit engine, feedback loop — all as background threads
+            self.core = APExecutionCore(
+                broker=broker,
+                supabase_client=sb,
+                email=self.email,
+            )
+            self.core.start()
+
+            # Keep this thread alive — core runs its own background threads
+            # Checks stopped flag every 60 seconds so stop() works cleanly
+            while not self.stopped.wait(60):
+                pass
 
         except Exception as e:
             logger.error(f"[{self.email}] Runner crashed: {e}", exc_info=True)
         finally:
+            if self.core:
+                self.core.stop()
             logger.info(f"[{self.email}] ClientRunner stopped.")
 
     def stop(self):
@@ -189,6 +195,28 @@ def get_runner_status() -> list[dict]:
                 "account_id": r.account_id,
                 "base_url":   r.base_url,
                 "alive":      r.is_alive(),
+                "core_active": r.core is not None,
             }
             for email, r in _active_runners.items()
         ]
+
+
+def route_signal_to_all_clients(signal: dict):
+    """
+    Called by app.py /signal endpoint.
+    Routes an incoming scanner signal to every active client's execution core.
+    Each core independently decides whether to trade it based on its own tier/score gates.
+    """
+    with _registry_lock:
+        runners = list(_active_runners.values())
+
+    if not runners:
+        logger.warning("Signal received but no active runners — nobody to route to")
+        return
+
+    for runner in runners:
+        if runner.core and runner.is_alive():
+            try:
+                runner.core.receive_signal(signal)
+            except Exception as e:
+                logger.error(f"[{runner.email}] Signal routing failed: {e}")
