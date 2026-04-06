@@ -9,6 +9,11 @@
 # - hard per-trade $ cap
 # - pre-submit kill-switch recheck
 #
+# Signal Quality Gates (added):
+# - Trend alignment: CALL blocked in BEAR, PUT blocked in BULL
+# - Time gate: individual stocks blocked before 10:00 AM ET
+#   (indices SPY/QQQ/IWM execute immediately — quick TP handled in exit)
+#
 # Debuggability:
 # - minimal branching
 # - consistent audit events
@@ -20,6 +25,8 @@ from __future__ import annotations
 import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
+
+import yfinance as yf
 
 from ap.logger import get_logger
 from ap.config import Config
@@ -54,6 +61,9 @@ MAX_PREMIUM_PER_SHARE = 2.50
 MAX_BROKER_RETRIES = 3
 BROKER_RETRY_DELAY = 1.0
 
+# Indices that execute immediately with no time gate
+_INDICES = {"SPY", "QQQ", "IWM"}
+
 
 def audit(client_id: str, level: str, event: str, payload: dict):
     try:
@@ -69,6 +79,78 @@ def audit(client_id: str, level: str, event: str, payload: dict):
 def _ny_day_key() -> str:
     return datetime.now(NY).strftime("%Y-%m-%d")
 
+
+# ── SIGNAL QUALITY GATES ──────────────────────────────────────────────────────
+
+def _get_spy_trend_live() -> str:
+    """
+    Fetch SPY trend at execution time — not from the EOD scan.
+    Returns 'BULL', 'BEAR', or 'UNKNOWN'.
+    """
+    try:
+        df = yf.download("SPY", period="30d", interval="1d", progress=False, auto_adjust=True)
+        if df is None or df.empty or len(df) < 20:
+            return "UNKNOWN"
+        # Flatten MultiIndex columns if present (newer yfinance)
+        if hasattr(df.columns, "get_level_values"):
+            try:
+                df.columns = df.columns.get_level_values(0)
+            except Exception:
+                pass
+        closes = df["Close"].dropna().values.astype(float)
+        if len(closes) < 20 or closes[-1] == 0:
+            return "UNKNOWN"
+        ma20 = float(closes[-20:].mean())
+        return "BULL" if closes[-1] > ma20 else "BEAR"
+    except Exception as e:
+        log.warning(f"SPY trend fetch failed at execution: {e}")
+        return "UNKNOWN"
+
+
+def _trend_allows_execution(symbol: str, direction: str, spy_trend: str) -> tuple[bool, str]:
+    """
+    At execution time, block counter-trend trades.
+    - CALL in BEAR market → blocked (except indices which you want both sides)
+    - PUT in BULL market → blocked (except indices)
+    - UNKNOWN trend → allow (don't block on data failures)
+    - Indices always allowed — they're the hedge and you take quick TP
+    """
+    if symbol.upper() in _INDICES:
+        return True, ""
+    if spy_trend == "UNKNOWN":
+        return True, ""
+    if spy_trend == "BEAR" and direction == "CALL":
+        return False, f"trend_blocked:BEAR_market_no_CALL:{symbol}"
+    if spy_trend == "BULL" and direction == "PUT":
+        return False, f"trend_blocked:BULL_market_no_PUT:{symbol}"
+    return True, ""
+
+
+def _time_gate_allows_execution(symbol: str) -> tuple[bool, str]:
+    """
+    Individual stocks: block execution before 10:00 AM ET.
+    First 30 minutes (9:30-10:00) is noise — fake breakouts, wide spreads.
+    Indices bypass this gate entirely — you want immediate fills on SPY/QQQ/IWM.
+    """
+    if symbol.upper() in _INDICES:
+        return True, ""
+
+    now_et = datetime.now(NY)
+    # Allow if it's 10:00 AM ET or later
+    if now_et.hour > 10 or (now_et.hour == 10 and now_et.minute >= 0):
+        return True, ""
+
+    # Also allow after-hours signals that will queue for next session
+    # (scanner runs EOD — signals are pre-loaded for next morning)
+    # Block only during the first 30 min window: 9:30-9:59 ET
+    if now_et.hour == 9 and now_et.minute >= 30:
+        return False, f"time_gate_blocked:first_30min:{symbol}:{now_et.strftime('%H:%M')}ET"
+
+    # Outside market hours — allow (pre-market queuing)
+    return True, ""
+
+
+# ── EXISTING HELPERS (unchanged) ──────────────────────────────────────────────
 
 def _get_equity_for_client(broker, st: dict, client_cfg: dict) -> float:
     try:
@@ -128,7 +210,7 @@ def _check_daily_loss_stop(client_id: str, st: dict) -> dict:
     starting = float(st.get("starting_equity_today") or 0.0) or 100000.0
     realized = float(st.get("realized_pnl_today") or 0.0)
 
-    loss = -min(0.0, realized)  # ONLY losses count
+    loss = -min(0.0, realized)
     loss_pct = loss / starting if starting > 0 else 0.0
 
     if loss_pct >= float(cfg.MAX_DAILY_LOSS_PCT):
@@ -160,7 +242,7 @@ def _calc_qty(max_cost: float, premium: float) -> int:
     cost_per_contract = float(premium) * OPT_MULTIPLIER
     if cost_per_contract <= 0:
         return 0
-    return int(float(max_cost) // cost_per_contract)  # allow 0
+    return int(float(max_cost) // cost_per_contract)
 
 
 def _resolve_option_contract(broker, client_id: str, symbol: str, strike: float, direction: str, mode: str, exp_hint: str) -> tuple[str, float]:
@@ -245,6 +327,8 @@ def _submit_order_with_retry(broker, symbol: str, contract: str, qty: int, premi
     return False, None, last_error
 
 
+# ── MAIN ENTRY POINT ──────────────────────────────────────────────────────────
+
 def process_signal(broker, client_id: str, signal_payload: dict) -> dict:
     t0 = time.time()
 
@@ -297,6 +381,35 @@ def process_signal(broker, client_id: str, signal_payload: dict) -> dict:
             return {"ok": False, "error": "missing_strike"}
 
         strike = float(strike)
+
+        # ── SIGNAL QUALITY GATE 1: Time gate ─────────────────────────────────
+        # Individual stocks blocked in first 30 min (9:30-10:00 ET)
+        # Indices (SPY/QQQ/IWM) bypass — execute immediately
+        time_ok, time_reason = _time_gate_allows_execution(symbol)
+        if not time_ok:
+            audit(client_id, "INFO", "TIME_GATE_BLOCKED", {
+                "symbol": symbol,
+                "direction": direction,
+                "reason": time_reason,
+            })
+            log.info(f"⏳ Time gate blocked {symbol} {direction}: {time_reason}")
+            return {"ok": False, "error": "time_gate", "details": time_reason}
+
+        # ── SIGNAL QUALITY GATE 2: Trend alignment ────────────────────────────
+        # Fetch live SPY trend at execution time — not from EOD scan
+        # This is the key: price triggers the entry level (pure Strat),
+        # but we only execute in the direction the market supports.
+        spy_trend = _get_spy_trend_live()
+        trend_ok, trend_reason = _trend_allows_execution(symbol, direction, spy_trend)
+        if not trend_ok:
+            audit(client_id, "INFO", "TREND_GATE_BLOCKED", {
+                "symbol": symbol,
+                "direction": direction,
+                "spy_trend": spy_trend,
+                "reason": trend_reason,
+            })
+            log.info(f"⛔ Trend gate blocked {symbol} {direction}: {trend_reason} (SPY={spy_trend})")
+            return {"ok": False, "error": "trend_gate", "details": trend_reason, "spy_trend": spy_trend}
 
         # --- lock ---
         if not acquire_symbol_lock(client_id, symbol, ttl_seconds=90):
@@ -391,6 +504,7 @@ def process_signal(broker, client_id: str, signal_payload: dict) -> dict:
             "reserved_cost": float(reserved_cost),
             "local_order_id": local_order_id,
             "broker_order_id": broker_order_id,
+            "spy_trend": spy_trend,
             "ms": int((time.time() - t0) * 1000),
         })
 
@@ -406,12 +520,12 @@ def process_signal(broker, client_id: str, signal_payload: dict) -> dict:
             "local_order_id": local_order_id,
             "broker_order_id": broker_order_id,
             "status": "PENDING_FILL",
+            "spy_trend": spy_trend,
         }
 
     except Exception as e:
         log.exception(f"EXECUTION_EXCEPTION: {e}")
 
-        # best-effort cleanup
         try:
             if reserved:
                 release_equity(client_id, reserved_cost)
@@ -425,5 +539,3 @@ def process_signal(broker, client_id: str, signal_payload: dict) -> dict:
 
         audit(client_id, "ERROR", "EXECUTION_FAILED", {"error": str(e), "symbol": symbol, "signal": signal_payload})
         return {"ok": False, "error": "execution_exception", "details": str(e)}
-
-
