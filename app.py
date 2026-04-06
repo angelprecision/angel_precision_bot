@@ -34,7 +34,7 @@ from ap.exit_manager import exit_manager_loop
 
 from ap.client_api import client_bp
 from ap.admin_api import admin_bp
-from client_runner import start_multi_client_supervisor
+from client_runner import start_multi_client_supervisor, route_signal_to_all_clients
 start_multi_client_supervisor()
 # ============================================================
 # GLOBALS (gunicorn safe - no threads at import time)
@@ -124,13 +124,13 @@ def _hmac_hex(key: bytes, msg: bytes) -> str:
 def _verify_hmac(req) -> bool:
     """
     HMAC verification supporting 2 schemes:
-    
+
     Scheme A (preferred): X-AP-Timestamp + X-AP-Signature
         signature = HMAC_SHA256(secret, f"{timestamp}.{raw_body_bytes}")
-    
+
     Scheme B (fallback): X-Signature
         signature = HMAC_SHA256(secret, raw_body_bytes)
-    
+
     Returns True if either scheme validates successfully.
     """
     # In dev/test, allow unsigned requests
@@ -533,6 +533,17 @@ def create_app() -> Flask:
         if cached:
             return jsonify(cached), 200
 
+        # ── Route to execution cores (entry watcher + tier engine) ──────────
+        # This sends the signal to every active client's APExecutionCore.
+        # Each core independently scores, tiers, and decides whether to trade.
+        try:
+            route_signal_to_all_clients(body)
+            log.info(f"Signal routed to execution cores: {body.get('ticker')} {body.get('side')} score={body.get('score')}")
+        except Exception as e:
+            log.warning(f"Execution core routing failed (non-fatal): {e}")
+        # ────────────────────────────────────────────────────────────────────
+
+        # Legacy queue path — keeps existing worker/queue system intact
         try:
             sig = Signal(**body)
         except ValidationError as e:
@@ -635,7 +646,6 @@ def create_app() -> Flask:
         except Exception as e:
             log.error(f"Scanner parse failed: {e}")
             return jsonify({"ok": False, "error": str(e)}), 500
-   
 
     # =============================================
     # BROKER TEST
@@ -666,4 +676,3 @@ if __name__ == "__main__":
     port = int(os.getenv("PORT", "5000"))
     log.info(f"Starting on port {port}")
     app.run(host="0.0.0.0", port=port, debug=False)
-
