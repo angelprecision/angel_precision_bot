@@ -32,6 +32,7 @@ from ap_options_intelligence import evaluate_contract, chain_health_report
 from ap_exit_engine          import APExitEngine, ManagedPosition
 from ap_feedback_loop        import APFeedbackLoop
 from ap_tier_engine          import APTierEngine, APShadowTracker, Tier
+from ap_proof_logger         import APProofLogger, funnel
 
 log = logging.getLogger("ap.execution_core")
 ET  = ZoneInfo("America/New_York")
@@ -97,6 +98,11 @@ class RankingQueue:
             expired = len(self._queue) - len(fresh)
             if expired > 0:
                 log.info(f"RankingQueue: {expired} signal(s) expired (>{self.MAX_WAIT_SECONDS}s)")
+                try:
+                    from ap_proof_logger import funnel as _f
+                    _f.inc("queue_expired", expired)
+                except Exception:
+                    pass
             self._queue = fresh
             to_execute   = self._queue[:available_slots]
             self._queue  = self._queue[available_slots:]
@@ -134,6 +140,13 @@ class APExecutionCore:
         self.tier_engine  = APTierEngine()
         self.shadow       = APShadowTracker(supabase_client, DISCORD_WEBHOOK_URL)
         self.rank_queue   = RankingQueue()
+        self._sector_counts: dict[str, int] = {}   # Fix 4: sector correlation cap
+        self._sector_lock   = threading.Lock()
+        self.proof          = APProofLogger(
+            supabase_client=supabase_client,
+            client_email=email,
+            mode="paper" if BOT_MODE != "LIVE" else "live",
+        )
 
         # Wire watcher callbacks
         self.watcher.on_trigger    = self._on_entry_trigger
@@ -175,18 +188,22 @@ class APExecutionCore:
         )
 
         # ── Gate 1: Score floor ───────────────────────────────────────────────
+        funnel.inc("signals_received")
         if score < 85:
             log.info(f"[{ticker}] REJECTED — score {score:.1f} below 85 floor")
             return
+        funnel.inc("passed_score")
 
         # ── Gate 2: Context hard block ────────────────────────────────────────
-        context_score = float(signal.get("score_breakdown", {}).get("real_time_ctx", 20) or 20)
+        context_score = float(signal.get("score_breakdown", {}).get("real_time_ctx", 0) or 0)  # Fix 3: default=0, never assume good context
         if context_score < 12.0:
             log.info(
                 f"[{ticker}] CONTEXT BLOCKED — context={context_score:.1f}/20 "
                 f"(score={score:.1f} but tape is wrong)"
             )
+            funnel.inc("context_blocked")
             return
+        funnel.inc("passed_context")
 
         # ── Tier classify ─────────────────────────────────────────────────────
         tier = Tier.from_score(score)
@@ -196,6 +213,7 @@ class APExecutionCore:
             if score_result:
                 td = self.tier_engine.classify(score_result)
                 self.shadow.log_shadow(signal, td)
+            funnel.inc("shadow_tracked")
             log.info(f"[{ticker}] B-TIER — shadow tracked (score={score:.1f}), no live capital")
             return
 
@@ -225,15 +243,51 @@ class APExecutionCore:
                             tkr   = sig.get("ticker", "")
                             side  = sig.get("side", "")
                             score = float(sig.get("score", 0))
+
+                            # FIX 2: Decrement slots inside loop so we never over-dispatch
+                            if slots <= 0:
+                                log.info(f"[{tkr}] No slots left — re-queuing remaining signals")
+                                self.rank_queue.add(sig)
+                                continue
+                            slots -= 1
+
+                            # FIX 4: Sector correlation cap — max 2 per sector
+                            sector = sig.get("correlation_bucket", "OTHER")
+                            with self._sector_lock:
+                                sector_count = self._sector_counts.get(sector, 0)
+                            SECTOR_MAX = {"SEMI": 2, "MEGACAP": 2, "INDEX": 2,
+                                          "FINANCIAL": 2, "BIO": 1, "CLOUD": 2}.get(sector, 2)
+                            if sector_count >= SECTOR_MAX:
+                                log.info(
+                                    f"[{tkr}] SECTOR CAP — {sector} already has "
+                                    f"{sector_count}/{SECTOR_MAX} active. Skipping."
+                                )
+                                continue
+
+                            # FIX 5: Re-check context before dispatching to watcher
+                            # Signal may have sat in queue for up to 120s — conditions may have changed
+                            stale_ctx = float(sig.get("score_breakdown", {}).get("real_time_ctx", 0) or 0)
+                            if stale_ctx < 12.0 and stale_ctx > 0:
+                                log.info(
+                                    f"[{tkr}] Context re-check failed after queue wait "
+                                    f"(ctx={stale_ctx:.1f}) — skipping"
+                                )
+                                continue
+
                             added = self.watcher.add_signal(sig)
                             if added:
+                                # Track sector exposure
+                                with self._sector_lock:
+                                    self._sector_counts[sector] = self._sector_counts.get(sector, 0) + 1
                                 log.info(
                                     f"[{tkr}] Dispatched from ranking queue → watcher | "
                                     f"score={score:.1f} [{sig.get('grade')}] | "
-                                    f"slots remaining: {slots-1}"
+                                    f"sector={sector} ({sector_count+1}/{SECTOR_MAX}) | "
+                                    f"slots left: {slots}"
                                 )
                             else:
-                                log.info(f"[{tkr}] Watcher rejected (EOD or duplicate)")
+                                slots += 1  # watcher rejected it — give slot back
+                                log.info(f"[{tkr}] Watcher rejected (EOD or duplicate) — slot returned")
                 except Exception as e:
                     log.error(f"Ranking queue processor error: {e}")
                 time.sleep(5)
@@ -251,6 +305,17 @@ class APExecutionCore:
         side   = watched.side
 
         log.info(f"[{ticker}] Breach confirmed @ ${watched.trigger_price:.2f} — evaluating chain")
+
+        # FIX 1: Re-check position count at breach time
+        # Another signal may have triggered between queue dispatch and breach confirmation.
+        # If no slots available, this trade must wait — do not force it through.
+        if self._position_count >= MAX_POSITIONS:
+            log.info(
+                f"[{ticker}] No slot at breach time — positions full ({self._position_count}/{MAX_POSITIONS}). "
+                f"Re-queuing signal."
+            )
+            self.rank_queue.add(sig)   # put it back — it will compete again when a slot opens
+            return
 
         # Fetch 0DTE chain
         try:
@@ -283,6 +348,7 @@ class APExecutionCore:
 
         if not decision.approved:
             log.warning(f"[{ticker}] Options gate REJECTED: {decision.rejection_reason}")
+            funnel.inc("options_rejected")
             return
 
         # Feedback size modifier (live performance adjustment)
@@ -351,6 +417,15 @@ class APExecutionCore:
         with self._pos_lock:
             self._position_count += 1
 
+        # Proof: log position opened (FIX 2 — increment executed at OPEN, not close)
+        self.proof.log_position_opened(
+            ticker    = ticker,
+            side      = side,
+            tier      = sig.get("tier", "A"),
+            score     = watched.score,
+            contracts = contracts,
+        )
+
         log.info(
             f"[{ticker}] {'PAPER' if self.paper else 'LIVE'} OPEN | "
             f"{contracts}x {decision.symbol} @ ${fill_price:.2f} | "
@@ -364,6 +439,11 @@ class APExecutionCore:
         with self._pos_lock:
             self._position_count = max(0, self._position_count - 1)
 
+        # Release sector slot so that sector can trade again
+        sector = getattr(pos, "signal", {}).get("correlation_bucket", "OTHER")
+        with self._sector_lock:
+            self._sector_counts[sector] = max(0, self._sector_counts.get(sector, 0) - 1)
+
         if self.paper:
             exit_price = pos.current_option_price
             log.info(f"[{pos.ticker}] PAPER CLOSE | P&L={pos.option_pnl_pct*100:+.1f}% | {decision.reason}")
@@ -375,7 +455,40 @@ class APExecutionCore:
                 limit_price=pos.current_option_price,
             ) or pos.current_option_price
 
-        sig = getattr(pos, "signal", {})
+        sig     = getattr(pos, "signal", {})
+        opt_pnl = (exit_price - pos.entry_price) / pos.entry_price * 100 if pos.entry_price else 0
+        win     = opt_pnl > 0
+        tier    = sig.get("tier", Tier.A_PLUS)
+
+        # ── Proof logger: write trade record to Supabase ──────────────────────
+        self.proof.log_trade(
+            ticker              = pos.ticker,
+            pattern             = sig.get("pattern", ""),
+            side                = pos.side,
+            timeframe           = sig.get("timeframe", "1d"),
+            score               = float(sig.get("score", 0) or 0),
+            tier                = tier,
+            context_score       = float(sig.get("score_breakdown", {}).get("real_time_ctx", 0) or 0),
+            setup_status        = self.feedback.get_setup_status(
+                                      pos.ticker, sig.get("pattern",""),
+                                      sig.get("timeframe","1d"), pos.side),
+            entry_trigger       = pos.underlying_entry,
+            entry_option_price  = pos.entry_price,
+            exit_option_price   = exit_price,
+            underlying_entry    = pos.underlying_entry,
+            underlying_exit     = pos.current_underlying,
+            contracts           = pos.quantity,
+            exit_reason         = decision.reason,
+            option_pnl_pct      = opt_pnl,
+            underlying_pnl_pct  = (pos.current_underlying - pos.underlying_entry) / pos.underlying_entry * 100
+                                   if pos.underlying_entry else 0,
+            win                 = win,
+            spread_pct          = float(sig.get("spread_pct", 0) or 0),
+            chain_grade         = sig.get("chain_grade", ""),
+            opened_at           = pos.opened_at if hasattr(pos, "opened_at") else None,
+        )
+        # ──────────────────────────────────────────────────────────────────────
+
         self.feedback.record_outcome(
             signal=sig,
             entry_option_price=pos.entry_price,
@@ -387,8 +500,6 @@ class APExecutionCore:
             context_notes=f"mode={'paper' if self.paper else 'live'}",
         )
 
-        tier    = sig.get("tier", Tier.A_PLUS)
-        opt_pnl = (exit_price - pos.entry_price) / pos.entry_price * 100 if pos.entry_price else 0
         self.shadow.record_live_outcome(tier, opt_pnl)
 
     def _on_position_scale(self, pos: ManagedPosition, decision):
