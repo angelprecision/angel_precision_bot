@@ -189,6 +189,43 @@ class APExecutionCore:
 
         # ── Gate 1: Score floor ───────────────────────────────────────────────
         funnel.inc("signals_received")
+
+        # LEGACY FALLBACK: signals from old scanners (scanner.py, scanner_failed_directional.py
+        # etc) arrive with symbol/direction/signal_id/pattern_id fields but NO score field.
+        # Route them directly to the existing legacy queue so they trade exactly as before.
+        # Detection: has signal_id OR symbol (not ticker) OR pattern_id but no score/ev_score.
+        is_legacy = (
+            score == 0 and (
+                signal.get("signal_id")     # old scanner always sets signal_id
+                or signal.get("symbol")     # old scanner uses symbol not ticker
+                or signal.get("pattern_id") # old scanner always sets pattern_id
+            ) and not signal.get("ev_score")  # new scanner always sets ev_score
+        )
+        if is_legacy:
+            # Normalize ticker field for logging
+            legacy_ticker = signal.get("symbol") or signal.get("ticker", "?")
+            log.info(f"[{legacy_ticker}] LEGACY SIGNAL — routing to legacy queue (no score)")
+            try:
+                from ap.queue import enqueue_signal
+                from ap.models import Signal
+                from datetime import datetime, timezone
+                # Old scanner already builds a properly shaped Signal dict
+                # Just pass it straight through to enqueue
+                legacy_sig = Signal(
+                    signal_id      = signal.get("signal_id", str(__import__('uuid').uuid4())),
+                    symbol         = signal.get("symbol", signal.get("ticker", "")),
+                    direction      = signal.get("direction", signal.get("side", "CALL")),
+                    pattern_id     = signal.get("pattern_id", "SCANNER_V1"),
+                    confidence_tag = signal.get("confidence_tag", "standard_pool"),
+                    timestamp_iso  = signal.get("timestamp_iso", datetime.now(timezone.utc).isoformat()),
+                    trigger        = signal.get("trigger", signal),
+                )
+                enqueue_signal(legacy_sig, client_id="default")
+                log.info(f"[{legacy_ticker}] Legacy signal queued successfully")
+            except Exception as e:
+                log.warning(f"[{legacy_ticker}] Legacy queue failed: {e} — signal dropped")
+            return
+
         if score < 85:
             log.info(f"[{ticker}] REJECTED — score {score:.1f} below 85 floor")
             return
