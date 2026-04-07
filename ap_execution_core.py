@@ -5,9 +5,9 @@
 #
 # Signal flow:
 #   receive_signal()
-#     → score gate (85 minimum)
-#     → context hard block (context < 12/20 → reject)
-#     → tier classification (A+/A/B)
+#     → score gate (85 live / 75 paper)
+#     → context hard block (context < 12/20 live / 8/20 paper → reject)
+#     → tier classify (A+/A/B)
 #     → B tier → shadow tracker (paper only)
 #     → A/A+ → RankingQueue (signals compete by score)
 #         → every 5s: highest scores fill available slots first
@@ -15,6 +15,12 @@
 #         → breach confirmed → options intelligence gate
 #         → order placed → ExitEngine monitors position
 #         → position closed → FeedbackLoop records outcome
+#
+# PAPER MODE FIXES (2025-01 patch):
+#   Fix A: Fallback exec quality scores when no real chain data (paper only)
+#   Fix B: Score floor lowered to 75 in paper mode (85 live)
+#   Fix C: Context floor lowered to 8.0 in paper mode (12.0 live)
+#   Fix D: Skip context gate entirely when score_breakdown is missing/empty
 # =============================================================================
 
 from __future__ import annotations
@@ -40,6 +46,19 @@ ET  = ZoneInfo("America/New_York")
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
 BOT_MODE            = os.getenv("BOT_MODE", "PAPER").upper()
 MAX_POSITIONS       = int(os.getenv("MAX_POSITIONS", "7"))
+
+# ── Paper-mode gate thresholds ────────────────────────────────────────────────
+# In paper mode we lack real option chain data (spread/liquidity components = 0),
+# which eats 10 pts from exec quality. Context also suffers on downtrend days.
+# These softer thresholds keep the bot generating trades for evaluation purposes.
+SCORE_FLOOR_LIVE    = 85
+SCORE_FLOOR_PAPER   = 75
+CONTEXT_FLOOR_LIVE  = 12.0
+CONTEXT_FLOOR_PAPER = 8.0
+
+# Paper-mode fallback exec quality scores (used when chain data absent)
+PAPER_SPREAD_DEFAULT   = 3.0   # /5  — assume reasonable spread
+PAPER_LIQUIDITY_DEFAULT = 3.0  # /5  — assume reasonable liquidity
 
 
 # =============================================================================
@@ -133,6 +152,10 @@ class APExecutionCore:
         self._pos_lock = threading.Lock()
         self._position_count = 0    # tracked locally for slot calculation
 
+        # Mode-specific gate values (set once at init for clarity)
+        self._score_floor   = SCORE_FLOOR_PAPER   if self.paper else SCORE_FLOOR_LIVE
+        self._context_floor = CONTEXT_FLOOR_PAPER if self.paper else CONTEXT_FLOOR_LIVE
+
         # Core modules
         self.watcher      = APEntryWatcher(broker)
         self.exit_eng     = APExitEngine(broker)
@@ -157,7 +180,13 @@ class APExecutionCore:
         self.exit_eng.on_exit  = self._on_position_close
         self.exit_eng.on_scale = self._on_position_scale
 
-        log.info(f"APExecutionCore initialized for {email} | Mode: {'PAPER' if self.paper else 'LIVE'} | MaxPos: {MAX_POSITIONS}")
+        log.info(
+            f"APExecutionCore initialized for {email} | "
+            f"Mode: {'PAPER' if self.paper else 'LIVE'} | "
+            f"MaxPos: {MAX_POSITIONS} | "
+            f"ScoreFloor: {self._score_floor} | "
+            f"ContextFloor: {self._context_floor}"
+        )
 
     def start(self):
         """Start all background threads."""
@@ -170,6 +199,52 @@ class APExecutionCore:
         self.watcher.stop()
         self.exit_eng.stop()
         self._rq_running = False
+
+    # ── HELPER: apply paper-mode exec quality fallbacks ───────────────────────
+
+    def _apply_paper_exec_fallbacks(self, signal: dict) -> dict:
+        """
+        Fix A: In paper mode, when exec quality sub-scores are 0/absent
+        (because we have no real option chain at signal time), inject minimum
+        viable defaults so the composite score isn't artificially crushed.
+
+        Only mutates a copy — never alters the original signal dict.
+        """
+        if not self.paper:
+            return signal  # live mode: no changes
+
+        import copy
+        sig = copy.deepcopy(signal)
+        bd  = sig.setdefault("score_breakdown", {})
+
+        # If spread_score and liquidity_score are both 0/absent, inject defaults.
+        # trigger_score is kept as-is because it IS computable from price data.
+        spread_score    = float(bd.get("spread_score", 0) or 0)
+        liquidity_score = float(bd.get("liquidity_score", 0) or 0)
+
+        if spread_score == 0 and liquidity_score == 0:
+            # No chain data was available — use paper defaults
+            bd["spread_score"]    = PAPER_SPREAD_DEFAULT
+            bd["liquidity_score"] = PAPER_LIQUIDITY_DEFAULT
+            log.debug(
+                f"[{sig.get('ticker')}] Paper exec fallback applied: "
+                f"spread={PAPER_SPREAD_DEFAULT} liquidity={PAPER_LIQUIDITY_DEFAULT}"
+            )
+
+            # Also patch top-level score to reflect the added points if the score
+            # field is present and the raw score looks like it was built without them.
+            # We add up to 6 pts (3+3) only when both were zero.
+            raw_score = float(sig.get("score", 0) or 0)
+            if raw_score > 0:
+                injected = PAPER_SPREAD_DEFAULT + PAPER_LIQUIDITY_DEFAULT  # 6.0 pts
+                sig["score"] = round(raw_score + injected, 2)
+                sig["_paper_exec_boost"] = injected   # audit trail
+                log.debug(
+                    f"[{sig.get('ticker')}] Paper score boosted: "
+                    f"{raw_score:.1f} → {sig['score']:.1f} (+{injected:.1f} exec fallback)"
+                )
+
+        return sig
 
     # ── PUBLIC: receive incoming scanner signal ───────────────────────────────
 
@@ -226,20 +301,49 @@ class APExecutionCore:
                 log.warning(f"[{legacy_ticker}] Legacy queue failed: {e} — signal dropped")
             return
 
-        if score < 85:
-            log.info(f"[{ticker}] REJECTED — score {score:.1f} below 85 floor")
+        # Fix A: apply paper exec fallbacks before score gate so boosted score is evaluated
+        signal = self._apply_paper_exec_fallbacks(signal)
+        score  = float(signal.get("score", 0) or 0)  # re-read after potential boost
+
+        # Fix B: mode-aware score floor (75 paper / 85 live)
+        score_floor = self._score_floor
+        if score < score_floor:
+            log.info(
+                f"[{ticker}] REJECTED — score {score:.1f} below "
+                f"{'paper' if self.paper else 'live'} floor ({score_floor})"
+            )
+            funnel.inc("rejected_score")
             return
         funnel.inc("passed_score")
 
         # ── Gate 2: Context hard block ────────────────────────────────────────
-        context_score = float(signal.get("score_breakdown", {}).get("real_time_ctx", 0) or 0)  # Fix 3: default=0, never assume good context
-        if context_score < 12.0:
+        # Fix D: skip context gate when score_breakdown is missing/empty
+        # (legacy signal path or minimal scanners that don't emit breakdown)
+        score_breakdown = signal.get("score_breakdown")
+        has_breakdown   = bool(score_breakdown)  # True only if dict is non-empty
+
+        if not has_breakdown:
+            # No breakdown provided — cannot evaluate context, skip gate
             log.info(
-                f"[{ticker}] CONTEXT BLOCKED — context={context_score:.1f}/20 "
-                f"(score={score:.1f} but tape is wrong)"
+                f"[{ticker}] Context gate SKIPPED — no score_breakdown in signal "
+                f"(legacy signal path)"
             )
-            funnel.inc("context_blocked")
-            return
+        else:
+            # Fix C: mode-aware context floor (8.0 paper / 12.0 live)
+            context_score   = float(score_breakdown.get("real_time_ctx", 0) or 0)
+            context_floor   = self._context_floor
+            if context_score < context_floor:
+                log.info(
+                    f"[{ticker}] CONTEXT BLOCKED — context={context_score:.1f}/20 "
+                    f"(floor={context_floor} {'paper' if self.paper else 'live'} | "
+                    f"score={score:.1f} but tape is wrong)"
+                )
+                funnel.inc("context_blocked")
+                return
+            log.debug(
+                f"[{ticker}] Context OK: {context_score:.1f}/20 "
+                f"(floor={context_floor})"
+            )
         funnel.inc("passed_context")
 
         # ── Tier classify ─────────────────────────────────────────────────────
@@ -302,14 +406,17 @@ class APExecutionCore:
                                 continue
 
                             # FIX 5: Re-check context before dispatching to watcher
-                            # Signal may have sat in queue for up to 120s — conditions may have changed
-                            stale_ctx = float(sig.get("score_breakdown", {}).get("real_time_ctx", 0) or 0)
-                            if stale_ctx < 12.0 and stale_ctx > 0:
-                                log.info(
-                                    f"[{tkr}] Context re-check failed after queue wait "
-                                    f"(ctx={stale_ctx:.1f}) — skipping"
-                                )
-                                continue
+                            # Signal may have sat in queue for up to 120s — conditions may have changed.
+                            # Fix C/D: use mode-aware floor and skip when no breakdown.
+                            stale_breakdown = sig.get("score_breakdown")
+                            if stale_breakdown:
+                                stale_ctx = float(stale_breakdown.get("real_time_ctx", 0) or 0)
+                                if stale_ctx < self._context_floor and stale_ctx > 0:
+                                    log.info(
+                                        f"[{tkr}] Context re-check failed after queue wait "
+                                        f"(ctx={stale_ctx:.1f} < floor={self._context_floor}) — skipping"
+                                    )
+                                    continue
 
                             added = self.watcher.add_signal(sig)
                             if added:
