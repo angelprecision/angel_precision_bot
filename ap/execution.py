@@ -258,7 +258,24 @@ def _resolve_option_contract(broker, client_id: str, symbol: str, strike: float,
             return contract, premium
         raise ValueError(f"no_chain:{symbol}:{expiration}")
 
-    contract = resolve_contract_symbol(chain, strike, direction)
+    # FIX: fetch current underlying price so contract_selection picks ATM strike
+    # not the entry trigger (breach level) which caused deep OTM selection ($653 for SPY)
+    underlying_price = None
+    try:
+        if hasattr(broker, "get_quote"):
+            q = broker.get_quote(symbol)
+            if isinstance(q, dict):
+                last = q.get("last") or q.get("lastPrice") or q.get("mark")
+                if last and float(last) > 0:
+                    underlying_price = float(last)
+        if underlying_price is None and hasattr(broker, "get_last_price"):
+            p = broker.get_last_price(symbol)
+            if p and float(p) > 0:
+                underlying_price = float(p)
+    except Exception as e:
+        log.warning(f"[{symbol}] Could not fetch underlying price for ATM selection: {e}")
+
+    contract = resolve_contract_symbol(chain, strike, direction, underlying_price=underlying_price)
 
     from ap.contract_pricing import get_contract_price
     premium = float(get_contract_price(broker, contract, side="BUY"))
