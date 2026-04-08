@@ -40,36 +40,36 @@ log = logging.getLogger("ap.options_intel")
 ET  = ZoneInfo("America/New_York")
 
 # ── GATES ─────────────────────────────────────────────────────────────────────
-MAX_SPREAD_PCT      = 0.12   # 12% max spread — any wider, reject
-IDEAL_SPREAD_PCT    = 0.06   # 6% ideal
-MAX_IV              = 3.00   # 300% max IV (above = earnings/binary event)
-MIN_IV              = 0.20   # 20% min IV (below = dead chain)
-HIGH_IVR_THRESHOLD  = 0.85   # IV rank above this = premium inflated
-MIN_VOLUME          = 50     # minimum option volume
-MIN_OI              = 25     # minimum open interest
-MIN_CONTRACT_PRICE  = 0.25   # avoid lottery tickets
-MAX_CONTRACT_PRICE  = 8.00   # avoid over-expensive contracts
-IDEAL_DELTA_MIN     = 0.35   # preferred delta range low
-IDEAL_DELTA_MAX     = 0.70   # preferred delta range high
+MAX_SPREAD_PCT     = 0.12   # 12% max spread — any wider, reject
+IDEAL_SPREAD_PCT   = 0.06   # 6% ideal
+MAX_IV             = 3.00   # 300% max IV (above = earnings/binary event)
+MIN_IV             = 0.20   # 20% min IV (below = dead chain)
+HIGH_IVR_THRESHOLD = 0.85   # IV rank above this = premium inflated
+MIN_VOLUME         = 50     # minimum option volume
+MIN_OI             = 25     # minimum open interest
+MIN_CONTRACT_PRICE = 0.25   # avoid lottery tickets
+MAX_CONTRACT_PRICE = 8.00   # avoid over-expensive contracts
+IDEAL_DELTA_MIN    = 0.35   # preferred delta range low
+IDEAL_DELTA_MAX    = 0.70   # preferred delta range high
 
 
 # ── DECISION DATACLASS ────────────────────────────────────────────────────────
 
 @dataclass
 class ContractDecision:
-    approved:        bool
-    symbol:          Optional[str]  = None
-    strike:          Optional[float] = None
-    expiration:      Optional[str]  = None
-    mid_price:       Optional[float] = None
-    spread_pct:      Optional[float] = None
-    volume:          Optional[int]  = None
-    open_interest:   Optional[int]  = None
-    iv:              Optional[float] = None
-    delta:           Optional[float] = None
-    grade:           str = "REJECT"
-    rejection_reason: Optional[str] = None
-    size_modifier:   float = 1.0    # 1.0 = full size, 0.5 = half, 0.25 = quarter
+    approved:         bool
+    symbol:           Optional[str]   = None
+    strike:           Optional[float] = None
+    expiration:       Optional[str]   = None
+    mid_price:        Optional[float] = None
+    spread_pct:       Optional[float] = None
+    volume:           Optional[int]   = None
+    open_interest:    Optional[int]   = None
+    iv:               Optional[float] = None
+    delta:            Optional[float] = None
+    grade:            str   = "REJECT"
+    rejection_reason: Optional[str]   = None
+    size_modifier:    float = 1.0    # 1.0 = full size, 0.5 = half, 0.25 = quarter
 
     def log_summary(self):
         if self.approved:
@@ -87,11 +87,13 @@ class ContractDecision:
 # ── MAIN INTELLIGENCE FUNCTION ────────────────────────────────────────────────
 
 def evaluate_contract(
-    chain: list[dict],
-    direction: str,           # "CALL" or "PUT"
+    chain:            list[dict],
+    direction:        str,            # "CALL" or "PUT"
     underlying_price: float,
-    expiration: str,          # "YYYY-MM-DD"
-    signal_score: float = 0,  # from scoring engine — affects size_modifier
+    expiration:       str,            # "YYYY-MM-DD"
+    signal_score:     float = 0,      # from scoring engine — affects size_modifier
+    signal_store      = None,         # APSignalStore — for writing option outcomes
+    signal_id:        Optional[str] = None,
 ) -> ContractDecision:
     """
     Run the 3-gate options intelligence check and select the best contract.
@@ -102,11 +104,13 @@ def evaluate_contract(
         underlying_price: Current underlying price
         expiration:       Target expiration date
         signal_score:     Score from APScorer (0–100) — affects sizing
+        signal_store:     APSignalStore instance (optional) — writes option outcomes
+        signal_id:        Signal UUID (optional) — used for option outcome writes
 
     Returns:
         ContractDecision
     """
-    side = direction.upper()
+    side      = direction.upper()
     want_type = "call" if side == "CALL" else "put"
 
     # Filter to correct option type
@@ -117,6 +121,9 @@ def evaluate_contract(
     ]
 
     if not candidates:
+        if signal_store and signal_id:
+            signal_store.insert_option_outcome(signal_id, {"chain_grade": "REJECT",
+                "rejection_reason": f"No {side} options found for {expiration}"})
         return ContractDecision(
             approved=False,
             rejection_reason=f"No {side} options found for {expiration}"
@@ -140,13 +147,14 @@ def evaluate_contract(
 
     if not spreadable:
         worst_spread = min(get_spread_pct(c) for c in candidates)
-        return ContractDecision(
-            approved=False,
-            rejection_reason=(
-                f"Spread gate failed: tightest spread is "
-                f"{worst_spread*100:.1f}% (max {MAX_SPREAD_PCT*100:.0f}%)"
-            )
+        reason = (
+            f"Spread gate failed: tightest spread is "
+            f"{worst_spread*100:.1f}% (max {MAX_SPREAD_PCT*100:.0f}%)"
         )
+        if signal_store and signal_id:
+            signal_store.insert_option_outcome(signal_id, {"chain_grade": "REJECT",
+                "rejection_reason": reason})
+        return ContractDecision(approved=False, rejection_reason=reason)
 
     # ── GATE 2: IV Reality Check ───────────────────────────────────────────────
     def get_iv(c: dict) -> float:
@@ -175,10 +183,11 @@ def evaluate_contract(
         iv_ok.append(c)
 
     if not iv_ok:
-        return ContractDecision(
-            approved=False,
-            rejection_reason=f"IV gate failed: all contracts have extreme IV (>{MAX_IV*100:.0f}% or <{MIN_IV*100:.0f}%)"
-        )
+        reason = f"IV gate failed: all contracts have extreme IV (>{MAX_IV*100:.0f}% or <{MIN_IV*100:.0f}%)"
+        if signal_store and signal_id:
+            signal_store.insert_option_outcome(signal_id, {"chain_grade": "REJECT",
+                "rejection_reason": reason})
+        return ContractDecision(approved=False, rejection_reason=reason)
 
     # ── GATE 3: Liquidity Gate ─────────────────────────────────────────────────
     def is_liquid(c: dict) -> bool:
@@ -194,7 +203,7 @@ def evaluate_contract(
             f"Liquidity gate soft fail: no contracts meet vol≥{MIN_VOLUME} "
             f"and OI≥{MIN_OI}. Using best available with reduced size."
         )
-        liquid = iv_ok
+        liquid            = iv_ok
         liquidity_penalty = True
     else:
         liquidity_penalty = False
@@ -225,11 +234,10 @@ def evaluate_contract(
 
     def quality_score(c: dict) -> tuple:
         """Multi-factor sort: delta → spread → volume → OI."""
-        sp    = get_spread_pct(c)
-        vol   = int(c.get("volume", 0) or 0)
-        oi    = int(c.get("open_interest", 0) or 0)
-        mid   = get_mid(c)
-        # Price tier bonus
+        sp        = get_spread_pct(c)
+        vol       = int(c.get("volume", 0) or 0)
+        oi        = int(c.get("open_interest", 0) or 0)
+        mid       = get_mid(c)
         price_pen = 0 if MIN_CONTRACT_PRICE <= mid <= MAX_CONTRACT_PRICE else 1
         return (delta_score(c), sp, -vol, -oi, price_pen)
 
@@ -287,19 +295,39 @@ def evaluate_contract(
     size = round(max(0.10, min(1.0, size)), 2)
 
     decision = ContractDecision(
-        approved=True,
-        symbol=symbol,
-        strike=strike,
-        expiration=expiration,
-        mid_price=round(mid, 2),
-        spread_pct=round(spread, 4),
-        volume=vol,
-        open_interest=oi,
-        iv=round(iv, 4),
-        delta=round(delta, 3),
-        grade=grade,
-        size_modifier=size,
+        approved      = True,
+        symbol        = symbol,
+        strike        = strike,
+        expiration    = expiration,
+        mid_price     = round(mid, 2),
+        spread_pct    = round(spread, 4),
+        volume        = vol,
+        open_interest = oi,
+        iv            = round(iv, 4),
+        delta         = round(delta, 3),
+        grade         = grade,
+        size_modifier = size,
     )
+
+    # Write option outcome snapshot to Supabase
+    if signal_store and signal_id:
+        signal_store.insert_option_outcome(
+            signal_id,
+            {
+                "contract_symbol":     symbol,
+                "expiration":          expiration,
+                "strike":              strike,
+                "option_type":         side.lower(),
+                "spread_pct_at_signal": round(spread, 4),
+                "iv_at_signal":        round(iv, 4),
+                "delta_at_signal":     round(delta, 3),
+                "volume_at_signal":    vol,
+                "oi_at_signal":        oi,
+                "chain_grade":         grade,
+                "mark_at_signal":      round(mid, 4),
+            },
+        )
+
     decision.log_summary()
     return decision
 
@@ -311,8 +339,8 @@ def chain_health_report(chain: list[dict], direction: str, underlying: float) ->
     Fast diagnostic: is this chain worth trading right now?
     Returns a dict with health metrics for logging/Discord output.
     """
-    side = direction.upper()
-    want = "call" if side == "CALL" else "put"
+    side      = direction.upper()
+    want      = "call" if side == "CALL" else "put"
     contracts = [
         c for c in chain
         if str(c.get("option_type", "")).lower() in (want, want[0])
