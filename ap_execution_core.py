@@ -5,28 +5,38 @@
 #
 # Signal flow:
 #   receive_signal()
-#     → score gate (85 live / 75 paper)
-#     → context hard block (context < 12/20 live / 8/20 paper → reject)
-#     → tier classify (A+/A/B)
-#     → B tier → shadow tracker (paper only)
-#     → A/A+ → RankingQueue (signals compete by score)
-#         → every 5s: highest scores fill available slots first
-#         → EntryWatcher parks signal → waits for breach (2 polls)
-#         → breach confirmed → options intelligence gate
-#         → order placed → ExitEngine monitors position
-#         → position closed → FeedbackLoop records outcome
+#     -> score gate (85 live / 75 paper)
+#     -> context hard block (context < 12/20 live / 8/20 paper -> reject)
+#     -> tier classify (A+/A/B)
+#     -> B tier -> shadow tracker (paper only)
+#     -> A/A+ -> RankingQueue (signals compete by score)
+#         -> every 5s: highest scores fill available slots first
+#         -> EntryWatcher parks signal -> waits for breach (2 polls)
+#         -> breach confirmed -> options intelligence gate
+#         -> order placed -> ExitEngine monitors position
+#         -> position closed -> FeedbackLoop records outcome
 #
-# PAPER MODE FIXES (2025-01 patch):
+# PAPER MODE FIXES:
 #   Fix A: Fallback exec quality scores when no real chain data (paper only)
 #   Fix B: Score floor lowered to 75 in paper mode (85 live)
 #   Fix C: Context floor lowered to 8.0 in paper mode (12.0 live)
-#   Fix D: Skip context gate entirely when score_breakdown is missing/empty
+#   Fix D: Skip context gate when score_breakdown missing OR real_time_ctx absent
+#           _apply_paper_exec_fallbacks injects spread/liquidity into score_breakdown,
+#           making it non-empty. Checking only bool(score_breakdown) would then trigger
+#           the context gate with ctx=0.0 and block every signal. The fix requires
+#           real_time_ctx to actually be present before gating on it.
 #
-# SIGNAL INTELLIGENCE (2025-01 patch):
-#   Every signal is now a first-class persistent object in ap_signals.
-#   Full lifecycle tracked: received → queued → watching → triggered → executed → closed
+# SIGNAL INTELLIGENCE:
+#   Every signal is a first-class persistent object in ap_signals.
+#   Full lifecycle: received -> queued -> watching -> triggered -> executed -> closed
 #   Dropped signals record WHY: rejected / context_blocked / shadow /
 #   sector_cap / context_recheck_fail / requeued_after_trigger / legacy_routed
+#
+# FUNNEL COUNTER:
+#   All funnel.inc() calls wired: signals_received, rejected_score, passed_score,
+#   context_blocked, passed_context, shadow_tracked, sector_capped, queue_expired,
+#   watcher_sent, watcher_triggered, watcher_expired, watcher_invalidated,
+#   options_rejected, order_failed, trades_executed
 # =============================================================================
 
 from __future__ import annotations
@@ -94,7 +104,7 @@ class RankingQueue:
                     self._queue.remove(existing)
                     log.info(
                         f"[{signal.get('ticker')}] Replaced queued signal "
-                        f"(score {existing.get('score',0):.0f} → {signal.get('score',0):.0f})"
+                        f"(score {existing.get('score',0):.0f} -> {signal.get('score',0):.0f})"
                     )
                 else:
                     log.debug(f"[{signal.get('ticker')}] Kept existing higher-score signal in queue")
@@ -103,7 +113,7 @@ class RankingQueue:
             self._queue.sort(key=lambda s: float(s.get("score", 0)), reverse=True)
         log.info(
             f"[{signal.get('ticker')}] Added to ranking queue "
-            f"score={signal.get('score', 0):.1f} [{signal.get('grade')}] — "
+            f"score={signal.get('score', 0):.1f} [{signal.get('grade')}] -- "
             f"{len(self._queue)} total queued"
         )
 
@@ -141,7 +151,7 @@ class RankingQueue:
 class APExecutionCore:
     """
     One instance per client (per ClientRunner thread).
-    Manages full lifecycle: signal → rank → watch → enter → manage → exit → record.
+    Manages full lifecycle: signal -> rank -> watch -> enter -> manage -> exit -> record.
     """
 
     def __init__(self, broker, supabase_client=None, email: str = ""):
@@ -156,6 +166,7 @@ class APExecutionCore:
         self._context_floor = CONTEXT_FLOOR_PAPER if self.paper else CONTEXT_FLOOR_LIVE
 
         # Signal intelligence store + tracker
+        # Tracker deduplicates strictly by signal_id so one per client is safe.
         self.store   = APSignalStore(supabase_client, client_email=email)
         self.tracker = APSignalTracker(supabase_client, store=self.store)
 
@@ -205,13 +216,17 @@ class APExecutionCore:
         self.tracker.stop()
         self._rq_running = False
 
-    # ── HELPER: apply paper-mode exec quality fallbacks ───────────────────────
+    # ── HELPER: paper-mode exec quality fallbacks ─────────────────────────────
 
     def _apply_paper_exec_fallbacks(self, signal: dict) -> dict:
         """
         Fix A: In paper mode, when exec quality sub-scores are 0/absent,
-        inject minimum viable defaults so composite score isn't crushed.
-        Only mutates a copy — never alters the original signal dict.
+        inject minimum viable defaults so composite score is not crushed.
+        Only mutates a copy -- never alters the original signal dict.
+
+        NOTE: This injects spread_score/liquidity_score into score_breakdown,
+        making it non-empty. The context gate must therefore check for the
+        presence of real_time_ctx specifically, not just bool(score_breakdown).
         """
         if not self.paper:
             return signal
@@ -232,12 +247,12 @@ class APExecutionCore:
             )
             raw_score = float(sig.get("score", 0) or 0)
             if raw_score > 0:
-                injected = PAPER_SPREAD_DEFAULT + PAPER_LIQUIDITY_DEFAULT
-                sig["score"] = round(raw_score + injected, 2)
+                injected                 = PAPER_SPREAD_DEFAULT + PAPER_LIQUIDITY_DEFAULT
+                sig["score"]             = round(raw_score + injected, 2)
                 sig["_paper_exec_boost"] = injected
                 log.debug(
                     f"[{sig.get('ticker')}] Paper score boosted: "
-                    f"{raw_score:.1f} → {sig['score']:.1f} (+{injected:.1f} exec fallback)"
+                    f"{raw_score:.1f} -> {sig['score']:.1f} (+{injected:.1f} exec fallback)"
                 )
 
         return sig
@@ -247,13 +262,13 @@ class APExecutionCore:
     def receive_signal(self, signal: dict, score_result=None):
         """
         Entry point for all scanner signals.
-        Gates → tier classify → shadow or rank queue.
-        Every signal — regardless of outcome — gets a row in ap_signals.
+        Gates -> tier classify -> shadow or rank queue.
+        Every signal gets a row in ap_signals regardless of outcome.
         """
         ticker = signal.get("ticker", "")
         score  = float(signal.get("score", 0) or 0)
 
-        # Assign signal_id immediately — flows through the entire lifecycle
+        # Assign signal_id immediately -- flows through the entire lifecycle
         signal_id = str(signal.get("signal_id") or uuid.uuid4())
         signal["signal_id"] = signal_id
 
@@ -266,6 +281,8 @@ class APExecutionCore:
         funnel.inc("signals_received")
 
         # ── LEGACY FALLBACK ───────────────────────────────────────────────────
+        # Old scanners send symbol/direction/pattern_id but no score or ev_score.
+        # Route to legacy queue. Insert ap_signals row so traffic is visible.
         is_legacy = (
             score == 0 and (
                 signal.get("signal_id")
@@ -275,7 +292,7 @@ class APExecutionCore:
         )
         if is_legacy:
             legacy_ticker = signal.get("symbol") or signal.get("ticker", "?")
-            log.info(f"[{legacy_ticker}] LEGACY SIGNAL — routing to legacy queue (no score)")
+            log.info(f"[{legacy_ticker}] LEGACY SIGNAL -- routing to legacy queue (no score)")
             self.store.insert_signal(signal_id, signal, decision_status="legacy_routed")
             try:
                 from ap.queue import enqueue_signal
@@ -292,13 +309,13 @@ class APExecutionCore:
                 enqueue_signal(legacy_sig, client_id="default")
                 log.info(f"[{legacy_ticker}] Legacy signal queued successfully")
             except Exception as e:
-                log.warning(f"[{legacy_ticker}] Legacy queue failed: {e} — signal dropped")
+                log.warning(f"[{legacy_ticker}] Legacy queue failed: {e} -- signal dropped")
             return
 
-        # Apply paper exec fallbacks before score gate
+        # Apply paper exec fallbacks before score gate so boosted score is evaluated
         signal    = self._apply_paper_exec_fallbacks(signal)
         score     = float(signal.get("score", 0) or 0)
-        signal_id = str(signal.get("signal_id", signal_id))
+        signal_id = str(signal.get("signal_id", signal_id))  # preserve after deepcopy
 
         # Insert into ap_signals with the final post-boost score
         self.store.insert_signal(signal_id, signal, decision_status="received")
@@ -307,7 +324,7 @@ class APExecutionCore:
         score_floor = self._score_floor
         if score < score_floor:
             log.info(
-                f"[{ticker}] REJECTED — score {score:.1f} below "
+                f"[{ticker}] REJECTED -- score {score:.1f} below "
                 f"{'paper' if self.paper else 'live'} floor ({score_floor})"
             )
             funnel.inc("rejected_score")
@@ -317,20 +334,29 @@ class APExecutionCore:
         funnel.inc("passed_score")
 
         # ── Gate 2: Context hard block ────────────────────────────────────────
+        # Fix D (corrected): check that real_time_ctx is actually present in
+        # score_breakdown before attempting to gate on it.
+        #
+        # Why this check is required:
+        #   _apply_paper_exec_fallbacks injects spread_score + liquidity_score
+        #   into score_breakdown, making it non-empty even when the scanner did
+        #   not send real_time_ctx. Checking only bool(score_breakdown) would
+        #   enter the gate with ctx=0.0 and block every signal from a scanner
+        #   that does not emit a context score. This check ensures the gate only
+        #   fires when the scanner explicitly computed and sent real_time_ctx.
         score_breakdown = signal.get("score_breakdown")
-        has_breakdown   = bool(score_breakdown)
+        has_breakdown   = bool(score_breakdown and "real_time_ctx" in score_breakdown)
 
         if not has_breakdown:
             log.info(
-                f"[{ticker}] Context gate SKIPPED — no score_breakdown in signal "
-                f"(legacy signal path)"
+                f"[{ticker}] Context gate SKIPPED -- real_time_ctx not in score_breakdown"
             )
         else:
             context_score = float(score_breakdown.get("real_time_ctx", 0) or 0)
             context_floor = self._context_floor
             if context_score < context_floor:
                 log.info(
-                    f"[{ticker}] CONTEXT BLOCKED — context={context_score:.1f}/20 "
+                    f"[{ticker}] CONTEXT BLOCKED -- context={context_score:.1f}/20 "
                     f"(floor={context_floor} {'paper' if self.paper else 'live'} | "
                     f"score={score:.1f} but tape is wrong)"
                 )
@@ -351,12 +377,12 @@ class APExecutionCore:
                 self.shadow.log_shadow(signal, td)
             funnel.inc("shadow_tracked")
             self.store.update_status(signal_id, "shadow")
-            log.info(f"[{ticker}] B-TIER — shadow tracked (score={score:.1f}), no live capital")
+            log.info(f"[{ticker}] B-TIER -- shadow tracked (score={score:.1f}), no live capital")
             return
 
         # ── Hard reject ───────────────────────────────────────────────────────
         if tier == Tier.REJECT:
-            log.info(f"[{ticker}] REJECTED — score {score:.1f}")
+            log.info(f"[{ticker}] REJECTED -- score {score:.1f}")
             self.store.update_status(signal_id, "rejected",
                 context_notes=f"tier=REJECT score={score:.1f}")
             return
@@ -385,7 +411,7 @@ class APExecutionCore:
                             signal_id = str(sig.get("signal_id", ""))
 
                             if slots <= 0:
-                                log.info(f"[{tkr}] No slots left — re-queuing remaining signals")
+                                log.info(f"[{tkr}] No slots left -- re-queuing remaining signals")
                                 self.rank_queue.add(sig)
                                 continue
                             slots -= 1
@@ -398,7 +424,7 @@ class APExecutionCore:
                                           "FINANCIAL": 2, "BIO": 1, "CLOUD": 2}.get(sector, 2)
                             if sector_count >= SECTOR_MAX:
                                 log.info(
-                                    f"[{tkr}] SECTOR CAP — {sector} already has "
+                                    f"[{tkr}] SECTOR CAP -- {sector} already has "
                                     f"{sector_count}/{SECTOR_MAX} active. Skipping."
                                 )
                                 funnel.inc("sector_capped")
@@ -409,14 +435,16 @@ class APExecutionCore:
                                     })
                                 continue
 
-                            # Re-check context before dispatching to watcher
+                            # Re-check context before dispatching to watcher.
+                            # Signal may have sat in queue for up to 120s.
+                            # Only re-check if real_time_ctx is actually present.
                             stale_breakdown = sig.get("score_breakdown")
-                            if stale_breakdown:
+                            if stale_breakdown and "real_time_ctx" in stale_breakdown:
                                 stale_ctx = float(stale_breakdown.get("real_time_ctx", 0) or 0)
                                 if stale_ctx < self._context_floor and stale_ctx > 0:
                                     log.info(
                                         f"[{tkr}] Context re-check failed after queue wait "
-                                        f"(ctx={stale_ctx:.1f} < floor={self._context_floor}) — skipping"
+                                        f"(ctx={stale_ctx:.1f} < floor={self._context_floor}) -- skipping"
                                     )
                                     if signal_id:
                                         self.store.update_signal_fields(signal_id, {
@@ -427,7 +455,7 @@ class APExecutionCore:
 
                             added = self.watcher.add_signal(sig)
                             if added:
-                                funnel.inc("watcher_sent")                          # ← ADDED
+                                funnel.inc("watcher_sent")
                                 self.store.update_status(
                                     signal_id, "watching",
                                     timestamp_flag="watcher_started_at",
@@ -435,14 +463,14 @@ class APExecutionCore:
                                 with self._sector_lock:
                                     self._sector_counts[sector] = self._sector_counts.get(sector, 0) + 1
                                 log.info(
-                                    f"[{tkr}] Dispatched from ranking queue → watcher | "
+                                    f"[{tkr}] Dispatched from ranking queue -> watcher | "
                                     f"score={score:.1f} [{sig.get('grade')}] | "
                                     f"sector={sector} ({sector_count+1}/{SECTOR_MAX}) | "
                                     f"slots left: {slots}"
                                 )
                             else:
                                 slots += 1
-                                log.info(f"[{tkr}] Watcher rejected (EOD or duplicate) — slot returned")
+                                log.info(f"[{tkr}] Watcher rejected (EOD or duplicate) -- slot returned")
                 except Exception as e:
                     log.error(f"Ranking queue processor error: {e}")
                 time.sleep(5)
@@ -451,7 +479,7 @@ class APExecutionCore:
         t.start()
         log.info(f"[{self.email}] RankingQueueProcessor started (5s interval)")
 
-    # ── CALLBACK: Breach Confirmed → Execute ──────────────────────────────────
+    # ── CALLBACK: Breach Confirmed -> Execute ─────────────────────────────────
 
     def _on_entry_trigger(self, watched: WatchedSignal):
         """Called by watcher when price holds above/below trigger for 2 polls."""
@@ -460,16 +488,16 @@ class APExecutionCore:
         side      = watched.side
         signal_id = str(sig.get("signal_id", ""))
 
-        log.info(f"[{ticker}] Breach confirmed @ ${watched.trigger_price:.2f} — evaluating chain")
+        log.info(f"[{ticker}] Breach confirmed @ ${watched.trigger_price:.2f} -- evaluating chain")
 
         if signal_id:
             self.store.update_status(signal_id, "triggered", timestamp_flag="triggered_at")
-        funnel.inc("watcher_triggered")                                             # ← ADDED
+        funnel.inc("watcher_triggered")
 
         # Re-check position count at breach time
         if self._position_count >= MAX_POSITIONS:
             log.info(
-                f"[{ticker}] No slot at breach time — positions full "
+                f"[{ticker}] No slot at breach time -- positions full "
                 f"({self._position_count}/{MAX_POSITIONS}). Re-queuing signal."
             )
             if signal_id:
@@ -488,14 +516,14 @@ class APExecutionCore:
             return
 
         if not chain:
-            log.warning(f"[{ticker}] Empty chain — cannot enter")
+            log.warning(f"[{ticker}] Empty chain -- cannot enter")
             return
 
         # Chain health check
         health = chain_health_report(chain, side, watched.trigger_price)
         if not health["tradeable"]:
             log.warning(
-                f"[{ticker}] Chain health FAILED — "
+                f"[{ticker}] Chain health FAILED -- "
                 f"spread={health['avg_spread']}% vol={health['total_volume']}"
             )
             return
@@ -529,24 +557,24 @@ class APExecutionCore:
 
         # Hard block DOWNGRADED setups in live mode
         if setup_status == "DOWNGRADED" and not self.paper:
-            log.warning(f"[{ticker}] BLOCKED — setup DOWNGRADED (live WR diverged >25% from backtest)")
+            log.warning(f"[{ticker}] BLOCKED -- setup DOWNGRADED (live WR diverged >25% from backtest)")
             return
 
-        # Size: base × spread modifier × feedback modifier × tier multiplier
+        # Size: base x spread modifier x feedback modifier x tier multiplier
         tier      = sig.get("tier", Tier.A)
         tier_mult = 1.0 if tier == Tier.A_PLUS else 0.6
         base      = self._get_base_contracts(watched.score)
         contracts = max(1, round(base * decision.size_modifier * feedback_mod * tier_mult))
 
         log.info(
-            f"[{ticker}] Sizing: base={base} × spread={decision.size_modifier:.2f} "
-            f"× feedback={feedback_mod:.2f} × tier={tier_mult:.1f} → {contracts}x "
+            f"[{ticker}] Sizing: base={base} x spread={decision.size_modifier:.2f} "
+            f"x feedback={feedback_mod:.2f} x tier={tier_mult:.1f} -> {contracts}x "
             f"[{decision.grade}] [{setup_status}]"
         )
 
         # Place order
         if self.paper:
-            log.info(f"[{ticker}] PAPER — simulating fill @ ${decision.mid_price:.2f}")
+            log.info(f"[{ticker}] PAPER -- simulating fill @ ${decision.mid_price:.2f}")
             fill_price = decision.mid_price
         else:
             fill_price = self._place_option_order(
@@ -557,8 +585,8 @@ class APExecutionCore:
             )
 
         if not fill_price:
-            log.error(f"[{ticker}] Order failed — no fill price returned")
-            funnel.inc("order_failed")                                              # ← ADDED
+            log.error(f"[{ticker}] Order failed -- no fill price returned")
+            funnel.inc("order_failed")
             return
 
         # Register with exit engine
@@ -634,7 +662,7 @@ class APExecutionCore:
             timeframe          = sig.get("timeframe", "1d"),
             score              = float(sig.get("score", 0) or 0),
             tier               = tier,
-            context_score      = float(sig.get("score_breakdown", {}).get("real_time_ctx", 0) or 0),
+            context_score      = float((sig.get("score_breakdown") or {}).get("real_time_ctx", 0) or 0),
             setup_status       = self.feedback.get_setup_status(
                                      pos.ticker, sig.get("pattern", ""),
                                      sig.get("timeframe", "1d"), pos.side),
@@ -665,6 +693,7 @@ class APExecutionCore:
             context_notes      = f"mode={'paper' if self.paper else 'live'}",
         )
 
+        # Belt-and-suspenders: mark closed here in addition to feedback loop
         signal_id = str(sig.get("signal_id", ""))
         if signal_id:
             self.store.update_status(signal_id, "closed", timestamp_flag="closed_at")
@@ -677,15 +706,15 @@ class APExecutionCore:
         signal_id = str(watched.signal.get("signal_id", ""))
         if signal_id:
             self.store.update_status(signal_id, "expired", timestamp_flag="expired_at")
-        funnel.inc("watcher_expired")                                               # ← ADDED
-        log.info(f"[{watched.ticker}] Signal expired — no breach")
+        funnel.inc("watcher_expired")
+        log.info(f"[{watched.ticker}] Signal expired -- no breach")
 
     def _on_signal_invalidate(self, watched: WatchedSignal):
         signal_id = str(watched.signal.get("signal_id", ""))
         if signal_id:
             self.store.update_status(signal_id, "invalidated", timestamp_flag="invalidated_at")
-        funnel.inc("watcher_invalidated")                                           # ← ADDED
-        log.info(f"[{watched.ticker}] Signal invalidated — wrong direction")
+        funnel.inc("watcher_invalidated")
+        log.info(f"[{watched.ticker}] Signal invalidated -- wrong direction")
 
     def _on_position_scale(self, pos: ManagedPosition, decision):
         log.info(f"[{pos.ticker}] SCALE OUT {decision.quantity}x | P&L={pos.option_pnl_pct*100:+.1f}% | {decision.reason}")
