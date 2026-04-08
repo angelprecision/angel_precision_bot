@@ -156,10 +156,6 @@ class APExecutionCore:
         self._context_floor = CONTEXT_FLOOR_PAPER if self.paper else CONTEXT_FLOOR_LIVE
 
         # Signal intelligence store + tracker
-        # FIX (tracker duplication): APSignalTracker deduplicates strictly by signal_id
-        # via its internal _states dict so running one per client is safe — each tracker
-        # only picks up signals belonging to its own client_email filter.
-        # If you later want a single global tracker, move it to client_runner.py instead.
         self.store   = APSignalStore(supabase_client, client_email=email)
         self.tracker = APSignalTracker(supabase_client, store=self.store)
 
@@ -270,10 +266,6 @@ class APExecutionCore:
         funnel.inc("signals_received")
 
         # ── LEGACY FALLBACK ───────────────────────────────────────────────────
-        # Old scanners send symbol/direction/pattern_id but no score/ev_score.
-        # Route them to the legacy queue unchanged.
-        # FIX (legacy visibility): insert a lightweight ap_signals row so legacy
-        # traffic is visible in the intelligence layer.
         is_legacy = (
             score == 0 and (
                 signal.get("signal_id")
@@ -284,10 +276,7 @@ class APExecutionCore:
         if is_legacy:
             legacy_ticker = signal.get("symbol") or signal.get("ticker", "?")
             log.info(f"[{legacy_ticker}] LEGACY SIGNAL — routing to legacy queue (no score)")
-
-            # Insert into ap_signals so legacy traffic appears in analytics
             self.store.insert_signal(signal_id, signal, decision_status="legacy_routed")
-
             try:
                 from ap.queue import enqueue_signal
                 from ap.models import Signal
@@ -306,10 +295,10 @@ class APExecutionCore:
                 log.warning(f"[{legacy_ticker}] Legacy queue failed: {e} — signal dropped")
             return
 
-        # Apply paper exec fallbacks before score gate so boosted score is evaluated
+        # Apply paper exec fallbacks before score gate
         signal    = self._apply_paper_exec_fallbacks(signal)
         score     = float(signal.get("score", 0) or 0)
-        signal_id = str(signal.get("signal_id", signal_id))  # preserve after deepcopy
+        signal_id = str(signal.get("signal_id", signal_id))
 
         # Insert into ap_signals with the final post-boost score
         self.store.insert_signal(signal_id, signal, decision_status="received")
@@ -328,7 +317,6 @@ class APExecutionCore:
         funnel.inc("passed_score")
 
         # ── Gate 2: Context hard block ────────────────────────────────────────
-        # Skip gate when score_breakdown is missing/empty (legacy path or minimal scanners)
         score_breakdown = signal.get("score_breakdown")
         has_breakdown   = bool(score_breakdown)
 
@@ -347,8 +335,6 @@ class APExecutionCore:
                     f"score={score:.1f} but tape is wrong)"
                 )
                 funnel.inc("context_blocked")
-                # FIX: use consistent 'context_blocked' status — ensure your
-                # migration and analytics account for this status value
                 self.store.update_status(signal_id, "context_blocked",
                     context_notes=f"ctx={context_score:.1f} below floor {context_floor}")
                 return
@@ -398,14 +384,13 @@ class APExecutionCore:
                             score     = float(sig.get("score", 0))
                             signal_id = str(sig.get("signal_id", ""))
 
-                            # Decrement slots inside loop so we never over-dispatch
                             if slots <= 0:
                                 log.info(f"[{tkr}] No slots left — re-queuing remaining signals")
                                 self.rank_queue.add(sig)
                                 continue
                             slots -= 1
 
-                            # Sector correlation cap — max N per sector
+                            # Sector correlation cap
                             sector = sig.get("correlation_bucket", "OTHER")
                             with self._sector_lock:
                                 sector_count = self._sector_counts.get(sector, 0)
@@ -416,7 +401,7 @@ class APExecutionCore:
                                     f"[{tkr}] SECTOR CAP — {sector} already has "
                                     f"{sector_count}/{SECTOR_MAX} active. Skipping."
                                 )
-                                # FIX (sector-cap persistence): record why this signal was dropped
+                                funnel.inc("sector_capped")
                                 if signal_id:
                                     self.store.update_signal_fields(signal_id, {
                                         "decision_status": "dropped",
@@ -425,7 +410,6 @@ class APExecutionCore:
                                 continue
 
                             # Re-check context before dispatching to watcher
-                            # Signal may have sat in queue for up to 120s — conditions may have changed
                             stale_breakdown = sig.get("score_breakdown")
                             if stale_breakdown:
                                 stale_ctx = float(stale_breakdown.get("real_time_ctx", 0) or 0)
@@ -434,7 +418,6 @@ class APExecutionCore:
                                         f"[{tkr}] Context re-check failed after queue wait "
                                         f"(ctx={stale_ctx:.1f} < floor={self._context_floor}) — skipping"
                                     )
-                                    # FIX (context-recheck persistence): record why this was dropped
                                     if signal_id:
                                         self.store.update_signal_fields(signal_id, {
                                             "decision_status": "dropped",
@@ -444,6 +427,7 @@ class APExecutionCore:
 
                             added = self.watcher.add_signal(sig)
                             if added:
+                                funnel.inc("watcher_sent")                          # ← ADDED
                                 self.store.update_status(
                                     signal_id, "watching",
                                     timestamp_flag="watcher_started_at",
@@ -457,7 +441,7 @@ class APExecutionCore:
                                     f"slots left: {slots}"
                                 )
                             else:
-                                slots += 1  # watcher rejected it — give slot back
+                                slots += 1
                                 log.info(f"[{tkr}] Watcher rejected (EOD or duplicate) — slot returned")
                 except Exception as e:
                     log.error(f"Ranking queue processor error: {e}")
@@ -480,15 +464,14 @@ class APExecutionCore:
 
         if signal_id:
             self.store.update_status(signal_id, "triggered", timestamp_flag="triggered_at")
+        funnel.inc("watcher_triggered")                                             # ← ADDED
 
-        # Re-check position count at breach time — another signal may have
-        # triggered between queue dispatch and breach confirmation
+        # Re-check position count at breach time
         if self._position_count >= MAX_POSITIONS:
             log.info(
                 f"[{ticker}] No slot at breach time — positions full "
                 f"({self._position_count}/{MAX_POSITIONS}). Re-queuing signal."
             )
-            # FIX (requeue persistence): mark state so analytics know what happened
             if signal_id:
                 self.store.update_signal_fields(signal_id, {
                     "decision_status": "requeued_after_trigger",
@@ -533,7 +516,7 @@ class APExecutionCore:
             funnel.inc("options_rejected")
             return
 
-        # Feedback size modifier (live performance adjustment)
+        # Feedback size modifier
         feedback_mod = self.feedback.get_size_modifier(
             ticker    = ticker,
             pattern   = sig.get("pattern", ""),
@@ -575,6 +558,7 @@ class APExecutionCore:
 
         if not fill_price:
             log.error(f"[{ticker}] Order failed — no fill price returned")
+            funnel.inc("order_failed")                                              # ← ADDED
             return
 
         # Register with exit engine
@@ -681,7 +665,6 @@ class APExecutionCore:
             context_notes      = f"mode={'paper' if self.paper else 'live'}",
         )
 
-        # Belt-and-suspenders: mark closed here too in case feedback loop misses it
         signal_id = str(sig.get("signal_id", ""))
         if signal_id:
             self.store.update_status(signal_id, "closed", timestamp_flag="closed_at")
@@ -694,12 +677,14 @@ class APExecutionCore:
         signal_id = str(watched.signal.get("signal_id", ""))
         if signal_id:
             self.store.update_status(signal_id, "expired", timestamp_flag="expired_at")
+        funnel.inc("watcher_expired")                                               # ← ADDED
         log.info(f"[{watched.ticker}] Signal expired — no breach")
 
     def _on_signal_invalidate(self, watched: WatchedSignal):
         signal_id = str(watched.signal.get("signal_id", ""))
         if signal_id:
             self.store.update_status(signal_id, "invalidated", timestamp_flag="invalidated_at")
+        funnel.inc("watcher_invalidated")                                           # ← ADDED
         log.info(f"[{watched.ticker}] Signal invalidated — wrong direction")
 
     def _on_position_scale(self, pos: ManagedPosition, decision):
