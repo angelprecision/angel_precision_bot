@@ -18,6 +18,8 @@
 # - minimal branching
 # - consistent audit events
 # - order row stores: direction + reserved_cost
+#
+# FIX: MAX_DAILY_LOSS_PCT → DAILY_MAX_LOSS_PCT (matches config.py)
 # =====================================================================
 
 from __future__ import annotations
@@ -83,15 +85,10 @@ def _ny_day_key() -> str:
 # ── SIGNAL QUALITY GATES ──────────────────────────────────────────────────────
 
 def _get_spy_trend_live() -> str:
-    """
-    Fetch SPY trend at execution time — not from the EOD scan.
-    Returns 'BULL', 'BEAR', or 'UNKNOWN'.
-    """
     try:
         df = yf.download("SPY", period="30d", interval="1d", progress=False, auto_adjust=True)
         if df is None or df.empty or len(df) < 20:
             return "UNKNOWN"
-        # Flatten MultiIndex columns if present (newer yfinance)
         if hasattr(df.columns, "get_level_values"):
             try:
                 df.columns = df.columns.get_level_values(0)
@@ -108,13 +105,6 @@ def _get_spy_trend_live() -> str:
 
 
 def _trend_allows_execution(symbol: str, direction: str, spy_trend: str) -> tuple[bool, str]:
-    """
-    At execution time, block counter-trend trades.
-    - CALL in BEAR market → blocked (except indices which you want both sides)
-    - PUT in BULL market → blocked (except indices)
-    - UNKNOWN trend → allow (don't block on data failures)
-    - Indices always allowed — they're the hedge and you take quick TP
-    """
     if symbol.upper() in _INDICES:
         return True, ""
     if spy_trend == "UNKNOWN":
@@ -127,30 +117,20 @@ def _trend_allows_execution(symbol: str, direction: str, spy_trend: str) -> tupl
 
 
 def _time_gate_allows_execution(symbol: str) -> tuple[bool, str]:
-    """
-    Individual stocks: block execution before 10:00 AM ET.
-    First 30 minutes (9:30-10:00) is noise — fake breakouts, wide spreads.
-    Indices bypass this gate entirely — you want immediate fills on SPY/QQQ/IWM.
-    """
     if symbol.upper() in _INDICES:
         return True, ""
 
     now_et = datetime.now(NY)
-    # Allow if it's 10:00 AM ET or later
     if now_et.hour > 10 or (now_et.hour == 10 and now_et.minute >= 0):
         return True, ""
 
-    # Also allow after-hours signals that will queue for next session
-    # (scanner runs EOD — signals are pre-loaded for next morning)
-    # Block only during the first 30 min window: 9:30-9:59 ET
     if now_et.hour == 9 and now_et.minute >= 30:
         return False, f"time_gate_blocked:first_30min:{symbol}:{now_et.strftime('%H:%M')}ET"
 
-    # Outside market hours — allow (pre-market queuing)
     return True, ""
 
 
-# ── EXISTING HELPERS (unchanged) ──────────────────────────────────────────────
+# ── EXISTING HELPERS ──────────────────────────────────────────────────────────
 
 def _get_equity_for_client(broker, st: dict, client_cfg: dict) -> float:
     try:
@@ -213,14 +193,15 @@ def _check_daily_loss_stop(client_id: str, st: dict) -> dict:
     loss = -min(0.0, realized)
     loss_pct = loss / starting if starting > 0 else 0.0
 
-    if loss_pct >= float(cfg.MAX_DAILY_LOSS_PCT):
+    # FIX: was cfg.MAX_DAILY_LOSS_PCT — renamed to DAILY_MAX_LOSS_PCT in config.py
+    if loss_pct >= float(cfg.DAILY_MAX_LOSS_PCT):
         update_client_state(client_id, {"kill_switch": 1, "mode": "READ_ONLY", "daily_stop_hit": 1})
         audit(client_id, "CRITICAL", "DAILY_LOSS_STOP_HIT", {
             "loss_pct": loss_pct,
             "loss": loss,
             "realized_pnl_today": realized,
             "starting_equity_today": starting,
-            "threshold": float(cfg.MAX_DAILY_LOSS_PCT),
+            "threshold": float(cfg.DAILY_MAX_LOSS_PCT),  # FIX: was MAX_DAILY_LOSS_PCT
         })
         return {"ok": False, "error": "daily_loss_stop", "loss_pct": loss_pct, "loss": loss}
 
@@ -338,7 +319,6 @@ def process_signal(broker, client_id: str, signal_payload: dict) -> dict:
     reserved_cost = 0.0
 
     try:
-        # --- client + state ---
         client = get_client(client_id)
         if (client.get("status") or "").upper() != "ACTIVE":
             return {"ok": False, "error": "client_inactive"}
@@ -356,7 +336,6 @@ def process_signal(broker, client_id: str, signal_payload: dict) -> dict:
         if not loss_check.get("ok"):
             return loss_check
 
-        # --- caps ---
         max_trades = int(client.get("max_trades_per_day") or cfg.MAX_TRADES_PER_DAY)
         trades_today = int(st.get("trades_taken_today") or 0)
         if trades_today >= max_trades:
@@ -367,7 +346,6 @@ def process_signal(broker, client_id: str, signal_payload: dict) -> dict:
         if open_positions >= max_open:
             return {"ok": False, "error": "max_open_positions", "open_positions": open_positions, "max_open": max_open}
 
-        # --- parse signal ---
         symbol = (signal_payload.get("symbol") or "").strip().upper()
         direction = (signal_payload.get("direction") or "").strip().upper()
         trigger = signal_payload.get("trigger") or {}
@@ -382,54 +360,42 @@ def process_signal(broker, client_id: str, signal_payload: dict) -> dict:
 
         strike = float(strike)
 
-        # ── SIGNAL QUALITY GATE 1: Time gate ─────────────────────────────────
-        # Individual stocks blocked in first 30 min (9:30-10:00 ET)
-        # Indices (SPY/QQQ/IWM) bypass — execute immediately
         time_ok, time_reason = _time_gate_allows_execution(symbol)
         if not time_ok:
             audit(client_id, "INFO", "TIME_GATE_BLOCKED", {
-                "symbol": symbol,
-                "direction": direction,
-                "reason": time_reason,
+                "symbol": symbol, "direction": direction, "reason": time_reason,
             })
             log.info(f"⏳ Time gate blocked {symbol} {direction}: {time_reason}")
             return {"ok": False, "error": "time_gate", "details": time_reason}
 
-        # ── SIGNAL QUALITY GATE 2: Trend alignment ────────────────────────────
-        # Fetch live SPY trend at execution time — not from EOD scan
-        # This is the key: price triggers the entry level (pure Strat),
-        # but we only execute in the direction the market supports.
         spy_trend = _get_spy_trend_live()
         trend_ok, trend_reason = _trend_allows_execution(symbol, direction, spy_trend)
         if not trend_ok:
             audit(client_id, "INFO", "TREND_GATE_BLOCKED", {
-                "symbol": symbol,
-                "direction": direction,
-                "spy_trend": spy_trend,
-                "reason": trend_reason,
+                "symbol": symbol, "direction": direction,
+                "spy_trend": spy_trend, "reason": trend_reason,
             })
             log.info(f"⛔ Trend gate blocked {symbol} {direction}: {trend_reason} (SPY={spy_trend})")
             return {"ok": False, "error": "trend_gate", "details": trend_reason, "spy_trend": spy_trend}
 
-        # --- lock ---
         if not acquire_symbol_lock(client_id, symbol, ttl_seconds=90):
             audit(client_id, "WARNING", "SYMBOL_LOCKED", {"symbol": symbol})
             return {"ok": False, "error": "symbol_locked", "symbol": symbol}
         locked = True
 
-        # --- sizing (budget) ---
         equity = _get_equity_for_client(broker, st, client)
         position_pct = float(client.get("base_position_pct") or cfg.BASE_POSITION_PCT)
         budget = min(equity * position_pct, float(cfg.MAX_POSITION_COST))
 
-        # --- contract ---
         exp_hint = (
             trigger.get("expiry_hint")
             or signal_payload.get("exp_hint")
             or signal_payload.get("dte")
             or "DAILY"
         ).strip().upper()
-        contract, premium = _resolve_option_contract(broker, client_id, symbol, strike, direction, mode=mode, exp_hint=exp_hint)
+        contract, premium = _resolve_option_contract(
+            broker, client_id, symbol, strike, direction, mode=mode, exp_hint=exp_hint
+        )
 
         ok_p, prem_err = _validate_premium(premium, mode)
         if not ok_p:
@@ -449,17 +415,18 @@ def process_signal(broker, client_id: str, signal_payload: dict) -> dict:
             qty = max(1, qty)
             total_cost = float(qty) * float(premium) * OPT_MULTIPLIER
 
-        # --- reserve exact cost ---
         if not reserve_equity_if_available(client_id, total_cost, equity):
             release_symbol_lock(client_id, symbol)
             locked = False
-            audit(client_id, "WARNING", "RESERVE_EQUITY_FAILED", {"symbol": symbol, "cost": float(total_cost), "equity": float(equity)})
-            return {"ok": False, "error": "insufficient_available_equity", "cost": float(total_cost), "equity": float(equity)}
+            audit(client_id, "WARNING", "RESERVE_EQUITY_FAILED", {
+                "symbol": symbol, "cost": float(total_cost), "equity": float(equity)
+            })
+            return {"ok": False, "error": "insufficient_available_equity",
+                    "cost": float(total_cost), "equity": float(equity)}
 
         reserved = True
         reserved_cost = float(total_cost)
 
-        # --- create order row ---
         local_order_id = new_local_order_id()
         insert_order(
             client_id=client_id,
@@ -475,7 +442,6 @@ def process_signal(broker, client_id: str, signal_payload: dict) -> dict:
             reserved_cost=float(reserved_cost),
         )
 
-        # --- pre-submit kill recheck ---
         st2 = get_client_state(client_id)
         if st2.get("kill_switch") or (st2.get("mode") or "").upper() == "READ_ONLY":
             update_order(local_order_id, status="CANCELED", last_error="killed_before_submit")
@@ -483,24 +449,27 @@ def process_signal(broker, client_id: str, signal_payload: dict) -> dict:
             release_symbol_lock(client_id, symbol)
             return {"ok": False, "error": "killed_before_submit"}
 
-        # --- submit ---
         ok, broker_order_id, err = _submit_order_with_retry(broker, symbol, contract, qty, float(premium))
         if not ok:
             update_order(local_order_id, status="REJECTED", broker_order_id=broker_order_id, last_error=err)
             release_equity(client_id, reserved_cost)
             release_symbol_lock(client_id, symbol)
-            audit(client_id, "ERROR", "ORDER_REJECTED", {"symbol": symbol, "contract": contract, "error": err, "local_order_id": local_order_id})
-            return {"ok": False, "error": "broker_rejected", "details": err, "local_order_id": local_order_id}
+            audit(client_id, "ERROR", "ORDER_REJECTED", {
+                "symbol": symbol, "contract": contract,
+                "error": err, "local_order_id": local_order_id
+            })
+            return {"ok": False, "error": "broker_rejected", "details": err,
+                    "local_order_id": local_order_id}
 
         update_order(local_order_id, status="ACK", broker_order_id=broker_order_id)
-        update_client_state(client_id, {"trades_taken_today": trades_today + 1, "current_equity": float(equity)})
+        update_client_state(client_id, {
+            "trades_taken_today": trades_today + 1,
+            "current_equity": float(equity)
+        })
 
         audit(client_id, "INFO", "TRADE_EXECUTED", {
-            "symbol": symbol,
-            "direction": direction,
-            "contract": contract,
-            "qty": int(qty),
-            "premium": float(premium),
+            "symbol": symbol, "direction": direction, "contract": contract,
+            "qty": int(qty), "premium": float(premium),
             "reserved_cost": float(reserved_cost),
             "local_order_id": local_order_id,
             "broker_order_id": broker_order_id,
@@ -508,7 +477,6 @@ def process_signal(broker, client_id: str, signal_payload: dict) -> dict:
             "ms": int((time.time() - t0) * 1000),
         })
 
-        # keep reserve+lock until fill_monitor releases
         return {
             "ok": True,
             "symbol": symbol,
@@ -525,7 +493,6 @@ def process_signal(broker, client_id: str, signal_payload: dict) -> dict:
 
     except Exception as e:
         log.exception(f"EXECUTION_EXCEPTION: {e}")
-
         try:
             if reserved:
                 release_equity(client_id, reserved_cost)
@@ -536,6 +503,7 @@ def process_signal(broker, client_id: str, signal_payload: dict) -> dict:
                 release_symbol_lock(client_id, symbol)
         except Exception:
             pass
-
-        audit(client_id, "ERROR", "EXECUTION_FAILED", {"error": str(e), "symbol": symbol, "signal": signal_payload})
+        audit(client_id, "ERROR", "EXECUTION_FAILED", {
+            "error": str(e), "symbol": symbol, "signal": signal_payload
+        })
         return {"ok": False, "error": "execution_exception", "details": str(e)}
