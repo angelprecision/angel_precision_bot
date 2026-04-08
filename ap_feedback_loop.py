@@ -63,10 +63,11 @@ class APFeedbackLoop:
         )
     """
 
-    def __init__(self, supabase_client=None, discord_webhook_url: str = ""):
-        self.sb          = supabase_client
-        self.webhook_url = discord_webhook_url
-        self._lock       = threading.Lock()
+    def __init__(self, supabase_client=None, discord_webhook_url: str = "", signal_store=None):
+        self.sb           = supabase_client
+        self.webhook_url  = discord_webhook_url
+        self.signal_store = signal_store
+        self._lock        = threading.Lock()
         self._live_stats: dict[str, dict] = {}   # key = "TICKER:PATTERN:TF:SIDE"
 
     # ── RECORD A CLOSED TRADE ─────────────────────────────────────────────────
@@ -83,11 +84,11 @@ class APFeedbackLoop:
         context_notes:        str = "",
     ):
         """Call this every time a position closes."""
-        ticker    = signal.get("ticker", "")
-        pattern   = signal.get("pattern", "")
-        side      = signal.get("side", "CALL")
-        timeframe = signal.get("timeframe", "1d")
-        score     = float(signal.get("score", 0) or 0)
+        ticker      = signal.get("ticker", "")
+        pattern     = signal.get("pattern", "")
+        side        = signal.get("side", "CALL")
+        timeframe   = signal.get("timeframe", "1d")
+        score       = float(signal.get("score", 0) or 0)
         backtest_wr = float(signal.get("win_rate", 0) or 0)
 
         # P&L
@@ -103,10 +104,10 @@ class APFeedbackLoop:
         else:
             underlying_pnl_pct = 0.0
 
-        win            = option_pnl_pct > 0
-        hit_target     = "TARGET" in exit_reason.upper()
-        hit_stop       = "STOP" in exit_reason.upper()
-        time_exit      = any(x in exit_reason.upper() for x in ["EOD", "THETA", "PROTECT"])
+        win        = option_pnl_pct > 0
+        hit_target = "TARGET" in exit_reason.upper()
+        hit_stop   = "STOP" in exit_reason.upper()
+        time_exit  = any(x in exit_reason.upper() for x in ["EOD", "THETA", "PROTECT"])
 
         outcome = {
             "ticker":             ticker,
@@ -144,6 +145,11 @@ class APFeedbackLoop:
 
         # 3. Send Discord notification
         self._notify_discord(outcome)
+
+        # 4. Signal intelligence: mark signal as closed
+        signal_id = signal.get("signal_id")
+        if self.signal_store and signal_id:
+            self.signal_store.update_status(str(signal_id), "closed", timestamp_flag="closed_at")
 
     # ── SUPABASE WRITE ────────────────────────────────────────────────────────
 
@@ -212,7 +218,7 @@ class APFeedbackLoop:
             return
         try:
             import requests
-            emoji = "🔴" if level == "DOWNGRADED" else "🟡"
+            emoji  = "🔴" if level == "DOWNGRADED" else "🟡"
             action = "STOP TRADING THIS SETUP" if level == "DOWNGRADED" else "MONITOR CLOSELY"
             msg = (
                 f"{emoji} **LIVE vs BACKTEST DIVERGENCE**\n"
@@ -234,9 +240,10 @@ class APFeedbackLoop:
             return
         try:
             import requests
-            win_emoji = "✅" if outcome["win"] else "❌"
+            win_emoji  = "✅" if outcome["win"] else "❌"
             exit_emoji = {"TARGET": "🎯", "STOP": "🛑", "THETA": "⏰", "EOD": "⏰", "PROTECT": "🔒"}.get(
-                next((k for k in ["TARGET","STOP","THETA","EOD","PROTECT"] if k in outcome["exit_reason"].upper()), ""), "📊"
+                next((k for k in ["TARGET", "STOP", "THETA", "EOD", "PROTECT"]
+                      if k in outcome["exit_reason"].upper()), ""), "📊"
             )
             pnl = outcome["option_pnl_pct"]
             msg = (
@@ -253,7 +260,7 @@ class APFeedbackLoop:
     # ── REPORTS ───────────────────────────────────────────────────────────────
 
     def get_live_stats(self) -> list[dict]:
-        """Return all live performance stats, sorted by divergence."""
+        """Return all live performance stats, sorted by trade count."""
         with self._lock:
             stats = list(self._live_stats.values())
         return sorted(stats, key=lambda x: x["trades"], reverse=True)
@@ -283,3 +290,34 @@ class APFeedbackLoop:
         if downgraded:
             lines.append(f"> ⚠️ Downgraded setups: {len(downgraded)} — review needed")
         return "\n".join(lines)
+
+    # ── SIZE MODIFIER + STATUS (used by execution core) ───────────────────────
+
+    def get_size_modifier(self, ticker: str, pattern: str, timeframe: str, side: str) -> float:
+        """
+        Returns live-performance size modifier for a setup.
+        1.0 = no adjustment (default / learning phase)
+        < 1.0 = downgraded (live WR diverged from backtest)
+        """
+        key = f"{ticker}:{pattern}:{timeframe}:{side}"
+        with self._lock:
+            stats = self._live_stats.get(key)
+        if not stats or stats["trades"] < MIN_LIVE_TRADES_TO_OVERRIDE:
+            return 1.0
+        status = stats.get("status")
+        if status == "DOWNGRADED":
+            return 0.5
+        if status == "WATCH":
+            return 0.8
+        if status == "OUTPERFORMING":
+            return 1.1
+        return 1.0
+
+    def get_setup_status(self, ticker: str, pattern: str, timeframe: str, side: str) -> str:
+        """Returns current live-performance status for a setup."""
+        key = f"{ticker}:{pattern}:{timeframe}:{side}"
+        with self._lock:
+            stats = self._live_stats.get(key)
+        if not stats:
+            return "LEARNING"
+        return str(stats.get("status") or "LEARNING")
