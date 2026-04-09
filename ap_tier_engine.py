@@ -1,3 +1,4 @@
+
 # ap_tier_engine.py — Angel Precision A+ Factory Tier Engine
 # =============================================================================
 # FIX: B-tier (78-84) now EXECUTES at reduced size in paper mode.
@@ -35,10 +36,10 @@ class Tier:
     REJECT   = "REJECT"
 
     THRESHOLDS = {
-        A_PLUS: 90,
-        A:      85,
-        B:      78,
-        SHADOW: 75,
+        A_PLUS: 85,   # lowered from 90 — achievable with real signals
+        A:      75,   # lowered from 85
+        B:      65,   # lowered from 78 — executes at 1 contract
+        SHADOW: 55,   # lowered from 75 — shadow track only
     }
 
     # Size multipliers per tier
