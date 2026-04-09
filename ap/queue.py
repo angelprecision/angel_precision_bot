@@ -7,6 +7,7 @@
 # ✅ Heartbeat written every loop (proves worker is alive)
 # ✅ IMPORTANT: discord scanner signals skip stock-price trigger waiting
 #    (because scanner entry=option premium, not underlying stock price)
+# ✅ FIX: Legacy worker skips signals with ev_score — those route to APExecutionCore
 
 import time
 import json
@@ -222,12 +223,12 @@ def _mark_job(job_id: int, status: str, *, result: dict | None = None, error: st
 
 def _claim_one_job() -> Optional[sqlite3.Row]:
     """
-    Claim exactly one job safely.
-    - Prefer NEW jobs.
-    - Also reclaim stale PROCESSING jobs (worker crash) older than PROCESSING_STALE_SECS.
+    Claim exactly one LEGACY job safely.
+    FIX: Skips signals with ev_score — those are scanner signals routed to APExecutionCore.
+    Legacy worker only processes signals without ev_score (discord/manual signals).
     """
     with conn() as c:
-        # 1) Reclaim stale PROCESSING jobs
+        # 1) Reclaim stale PROCESSING jobs (excluding execution-core signals)
         run_with_retry(lambda: c.execute(
             """
             UPDATE trade_queue
@@ -238,16 +239,18 @@ def _claim_one_job() -> Optional[sqlite3.Row]:
             WHERE status='PROCESSING'
               AND started_ts IS NOT NULL
               AND started_ts < datetime('now', ?)
+              AND json_extract(payload, '$.ev_score') IS NULL
             """,
             (_now_iso(), f"-{PROCESSING_STALE_SECS} seconds"),
         ))
 
-        # 2) Find next NEW job
+        # 2) Find next NEW legacy job (no ev_score = legacy signal)
         job = run_with_retry(lambda: c.execute(
             """
             SELECT id, client_id, signal_id, payload
             FROM trade_queue
             WHERE status='NEW'
+              AND json_extract(payload, '$.ev_score') IS NULL
             ORDER BY created_ts ASC
             LIMIT 1
             """
@@ -375,5 +378,3 @@ def worker_loop(broker, poll_seconds: float = POLL_INTERVAL):
                 except Exception:
                     pass
             time.sleep(poll_seconds)
-
-
