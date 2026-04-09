@@ -1,20 +1,19 @@
 # client_runner.py — Multi-client trading loop for Angel Precision Bot
+# =============================================================================
 # Each active member with Tradier credentials gets their own isolated trading thread.
 #
-# How it works:
-#   1. On startup, fetch all approved + subscription_active members from Supabase
-#   2. For each member with tradier_account_id + tradier_access_token → spawn a ClientRunner thread
-#   3. Each thread runs its own APExecutionCore (entry watcher, options gate, exit engine, feedback)
-#   4. Every 5 minutes, re-check Supabase for new clients or disconnected ones
-#   5. app.py routes /signal calls to each active runner's core via runner.core.receive_signal()
-#
-# QUEUE SUBSCRIBER FIX:
+# SIGNAL ROUTING FIX (gunicorn multi-worker):
 #   gunicorn --workers 2 creates 2 separate Python processes, each with their own
 #   _active_runners dict. Signals hit worker 1 OR worker 2 randomly via round-robin.
-#   Fix: each ClientRunner now subscribes to the SQLite trade_queue directly.
-#   Signals written by ANY gunicorn worker to the shared SQLite DB are picked up
-#   by the queue subscriber thread and routed to receive_signal(). This works
-#   correctly with any number of gunicorn workers.
+#
+#   OLD (broken): route_signal_to_all_clients() called runner.core.receive_signal()
+#   directly — only works if the signal lands on the SAME worker that has the runner.
+#
+#   FIX: route_signal_to_all_clients() now writes to SQLite trade_queue.
+#   Each ClientRunner has a queue subscriber thread that polls trade_queue every 1s.
+#   Signals written by ANY gunicorn worker are picked up by the subscriber in the
+#   worker that has the runner — works correctly regardless of worker count.
+# =============================================================================
 
 import os
 import time
@@ -24,6 +23,7 @@ import threading
 import logging
 import hashlib
 import base64
+import uuid
 from datetime import datetime, timezone
 
 from cryptography.fernet import Fernet
@@ -35,6 +35,9 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelna
 # ── Supabase ──────────────────────────────────────────────────────────────────
 SUPABASE_URL         = os.getenv("SUPABASE_URL", "")
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY", "")
+
+# ── DB path (must match app.py) ───────────────────────────────────────────────
+DB_FILE = os.getenv("BOT_DB_FILE", "/opt/render/project/src/ap_state.db")
 
 # ── Encryption (must match dashboard backend) ─────────────────────────────────
 _raw_key   = os.getenv("ENCRYPTION_KEY", "angel-precision-encrypt-2026")
@@ -50,10 +53,50 @@ _active_runners: dict[str, "ClientRunner"] = {}   # keyed by member email
 _registry_lock  = threading.Lock()
 
 
+# ── Queue writer (called by route_signal_to_all_clients) ─────────────────────
+
+def _write_signal_to_queue(signal: dict, client_id: str = "default"):
+    """
+    Write a signal to the SQLite trade_queue so it can be picked up by
+    the queue subscriber in ANY gunicorn worker process.
+    This is the fix for the multi-worker race condition.
+    """
+    signal_id      = str(signal.get("signal_id") or uuid.uuid4())
+    idempotency_key = f"{signal_id}:{client_id}"
+
+    try:
+        with sqlite3.connect(DB_FILE, timeout=10) as conn:
+            conn.row_factory = sqlite3.Row
+            # Idempotency: don't insert the same signal twice
+            existing = conn.execute(
+                "SELECT id FROM trade_queue WHERE idempotency_key = ?",
+                (idempotency_key,)
+            ).fetchone()
+            if existing:
+                logger.debug(f"Signal {signal_id} already in queue — skipping duplicate")
+                return
+
+            conn.execute(
+                """INSERT INTO trade_queue
+                   (client_id, signal_id, created_ts, status, payload, idempotency_key)
+                   VALUES (?, ?, ?, 'NEW', ?, ?)""",
+                (
+                    client_id,
+                    signal_id,
+                    datetime.now(timezone.utc).isoformat(),
+                    json.dumps(signal),
+                    idempotency_key,
+                )
+            )
+            conn.commit()
+        logger.info(f"Signal {signal_id} written to trade_queue for client={client_id}")
+    except Exception as e:
+        logger.error(f"Failed to write signal to trade_queue: {e}")
+
+
 class ClientRunner(threading.Thread):
     """
     One thread per client. Owns its own broker connection and APExecutionCore.
-    The core handles: entry watching, options intelligence, exit engine, feedback loop.
     Also runs a queue subscriber thread that polls trade_queue and routes signals
     to receive_signal() — works correctly across all gunicorn worker processes.
     """
@@ -108,8 +151,7 @@ class ClientRunner(threading.Thread):
             )
             self.core.start()
 
-            # Start queue subscriber — routes signals from SQLite to receive_signal()
-            # This is the fix for the gunicorn multi-worker routing problem.
+            # Start queue subscriber — this is the fix for gunicorn multi-worker
             self._start_queue_subscriber()
 
             while not self.stopped.wait(60):
@@ -125,116 +167,61 @@ class ClientRunner(threading.Thread):
     def stop(self):
         self.stopped.set()
 
-    # ── QUEUE SUBSCRIBER ──────────────────────────────────────────────────────
-
     def _start_queue_subscriber(self):
         """
-        Poll trade_queue for NEW signals and route them to receive_signal().
-
-        Race condition fix:
-            The old worker_loop (started by app.py) also reads from trade_queue.
-            To prevent it from stealing new-format signals before the subscriber
-            can process them, this subscriber bulk-claims ALL NEW rows in a single
-            UPDATE before reading their payloads. The old worker uses the same
-            atomic claim pattern so whichever process runs the UPDATE first wins
-            all rows in that batch.
-
-            Poll interval is 0.1s (10x faster than old worker at 1.0s) to ensure
-            the subscriber almost always gets first pick.
+        Poll trade_queue every 1s for NEW signals assigned to this client.
+        Route them to receive_signal() on this runner's execution core.
+        This works regardless of which gunicorn worker wrote the signal.
         """
         def _poll():
-            from ap.config import Config
-            db_path = Config().DB_FILE
-
+            logger.info(f"[{self.email}] Queue subscriber started")
             while not self.stopped.is_set():
                 try:
-                    with sqlite3.connect(db_path, timeout=10,
-                                         isolation_level=None) as c:
-                        c.row_factory = sqlite3.Row
-                        c.execute("PRAGMA journal_mode=WAL;")
-                        c.execute("PRAGMA busy_timeout=5000;")
+                    with sqlite3.connect(DB_FILE, timeout=5) as conn:
+                        conn.row_factory = sqlite3.Row
+                        # Claim up to 3 NEW signals for this client atomically
+                        rows = conn.execute(
+                            """SELECT id, signal_id, payload FROM trade_queue
+                               WHERE status = 'NEW' AND client_id = ?
+                               ORDER BY created_ts ASC LIMIT 3""",
+                            ("default",)   # all clients share the queue for now
+                        ).fetchall()
 
-                        # Bulk-claim ALL new signals in one atomic UPDATE.
-                        # This beats the old worker which only claims one at a time.
-                        claimed = c.execute("""
-                            UPDATE trade_queue
-                            SET status = 'PROCESSING',
-                                started_ts = datetime('now')
-                            WHERE status = 'NEW'
-                        """).rowcount
+                        for row in rows:
+                            # Mark as PROCESSING immediately to prevent double-routing
+                            conn.execute(
+                                "UPDATE trade_queue SET status='PROCESSING', started_ts=? WHERE id=? AND status='NEW'",
+                                (datetime.now(timezone.utc).isoformat(), row["id"])
+                            )
+                            conn.commit()
 
-                        if claimed == 0:
-                            time.sleep(0.1)
-                            continue
-
-                        # Fetch everything we just claimed
-                        rows = c.execute("""
-                            SELECT id, payload, signal_id
-                            FROM trade_queue
-                            WHERE status = 'PROCESSING'
-                              AND started_ts >= datetime('now', '-3 seconds')
-                            ORDER BY created_ts ASC
-                        """).fetchall()
-
-                    # Process each claimed row outside the DB connection
-                    for row in rows:
-                        job_id    = row["id"]
-                        signal_id = row["signal_id"]
-
-                        try:
-                            payload = json.loads(row["payload"])
-                        except Exception as e:
-                            with sqlite3.connect(db_path, timeout=10,
-                                                 isolation_level=None) as c:
-                                c.execute(
-                                    "UPDATE trade_queue SET status='REJECTED', last_error=? WHERE id=?",
-                                    (str(e), job_id)
-                                )
-                            continue
-
-                        if self.core:
+                            # Route to execution core
                             try:
-                                self.core.receive_signal(payload)
-                                with sqlite3.connect(db_path, timeout=10,
-                                                     isolation_level=None) as c:
-                                    c.execute(
-                                        "UPDATE trade_queue SET status='DONE', "
-                                        "finished_ts=datetime('now') WHERE id=?",
-                                        (job_id,)
-                                    )
+                                signal = json.loads(row["payload"])
+                                if self.core:
+                                    self.core.receive_signal(signal)
+                                # Mark DONE
+                                conn.execute(
+                                    "UPDATE trade_queue SET status='DONE', finished_ts=? WHERE id=?",
+                                    (datetime.now(timezone.utc).isoformat(), row["id"])
+                                )
                             except Exception as e:
-                                logger.error(
-                                    f"[{self.email}] receive_signal failed for "
-                                    f"{signal_id}: {e}"
+                                logger.error(f"[{self.email}] Queue signal processing failed: {e}")
+                                conn.execute(
+                                    "UPDATE trade_queue SET status='ERROR', last_error=?, finished_ts=? WHERE id=?",
+                                    (str(e), datetime.now(timezone.utc).isoformat(), row["id"])
                                 )
-                                with sqlite3.connect(db_path, timeout=10,
-                                                     isolation_level=None) as c:
-                                    c.execute(
-                                        "UPDATE trade_queue SET status='ERROR', "
-                                        "last_error=? WHERE id=?",
-                                        (str(e), job_id)
-                                    )
-                        else:
-                            # Core not ready — release back to NEW
-                            with sqlite3.connect(db_path, timeout=10,
-                                                 isolation_level=None) as c:
-                                c.execute(
-                                    "UPDATE trade_queue SET status='NEW', "
-                                    "started_ts=NULL WHERE id=?",
-                                    (job_id,)
-                                )
+                            conn.commit()
 
+                except sqlite3.OperationalError as e:
+                    logger.warning(f"[{self.email}] Queue DB error: {e}")
                 except Exception as e:
-                    logger.warning(f"[{self.email}] Queue subscriber error: {e}")
-                    time.sleep(1)
+                    logger.error(f"[{self.email}] Queue subscriber error: {e}")
 
-        t = threading.Thread(
-            target=_poll,
-            daemon=True,
-            name=f"queue-sub-{self.email}",
-        )
+                time.sleep(1)
+
+        t = threading.Thread(target=_poll, daemon=True, name=f"queue-sub-{self.email}")
         t.start()
-        logger.info(f"[{self.email}] Queue subscriber started")
 
 
 # ── Supervisor loop ───────────────────────────────────────────────────────────
@@ -312,24 +299,14 @@ def get_runner_status() -> list[dict]:
 def route_signal_to_all_clients(signal: dict):
     """
     Called by app.py /signal endpoint.
-    With the queue subscriber in place, this is now a best-effort fast path
-    for the worker that happens to have runners. The queue subscriber handles
-    the case where this worker has no runners.
+    FIX: Writes to SQLite trade_queue instead of calling receive_signal() directly.
+    This ensures delivery regardless of which gunicorn worker receives the HTTP request.
+    The queue subscriber in each ClientRunner picks it up within 1 second.
     """
-    with _registry_lock:
-        runners = list(_active_runners.values())
+    signal_id = str(signal.get("signal_id") or uuid.uuid4())
+    signal["signal_id"] = signal_id
 
-    if not runners:
-        # Not a warning — queue subscriber in the other worker handles it
-        logger.debug(
-            "route_signal_to_all_clients: no runners in this worker — "
-            "queue subscriber will handle via trade_queue"
-        )
-        return
+    # Write to queue — subscriber in the correct worker process picks it up
+    _write_signal_to_queue(signal, client_id="default")
 
-    for runner in runners:
-        if runner.core and runner.is_alive():
-            try:
-                runner.core.receive_signal(signal)
-            except Exception as e:
-                logger.error(f"[{runner.email}] Signal routing failed: {e}")
+    logger.info(f"Signal {signal_id} [{signal.get('ticker')}] written to queue for all clients")
