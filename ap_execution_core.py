@@ -67,10 +67,10 @@ BOT_MODE            = os.getenv("BOT_MODE", "PAPER").upper()
 MAX_POSITIONS       = int(os.getenv("MAX_POSITIONS", "7"))
 
 # ── Paper-mode gate thresholds ────────────────────────────────────────────────
-SCORE_FLOOR_LIVE    = 85
-SCORE_FLOOR_PAPER   = 75
-CONTEXT_FLOOR_LIVE  = 12.0
-CONTEXT_FLOOR_PAPER = 8.0
+SCORE_FLOOR_LIVE    = 75   # live: only trade validated setups
+SCORE_FLOOR_PAPER   = 60   # paper: collect data on all qualifying signals
+CONTEXT_FLOOR_LIVE  = 10.0
+CONTEXT_FLOOR_PAPER = 6.0  # paper: don't block on context — collect the data
 
 # Paper-mode fallback exec quality scores (used when chain data absent)
 PAPER_SPREAD_DEFAULT    = 3.0   # /5
@@ -370,14 +370,16 @@ class APExecutionCore:
         # ── Tier classify ─────────────────────────────────────────────────────
         tier = Tier.from_score(score)
 
-        # ── B Tier: shadow track only, never live ─────────────────────────────
-        if tier == Tier.B:
+        # ── SHADOW tier: paper track only, no capital ────────────────────────
+        # FIX: B-tier (78-84) now EXECUTES at 1 contract in paper mode.
+        #      Only SHADOW tier (75-77) is parked without live capital.
+        if tier == Tier.SHADOW:
             if score_result:
                 td = self.tier_engine.classify(score_result)
                 self.shadow.log_shadow(signal, td)
             funnel.inc("shadow_tracked")
             self.store.update_status(signal_id, "shadow")
-            log.info(f"[{ticker}] B-TIER -- shadow tracked (score={score:.1f}), no live capital")
+            log.info(f"[{ticker}] SHADOW-TIER -- paper tracked only (score={score:.1f})")
             return
 
         # ── Hard reject ───────────────────────────────────────────────────────
@@ -387,11 +389,13 @@ class APExecutionCore:
                 context_notes=f"tier=REJECT score={score:.1f}")
             return
 
-        # ── A / A+: add to ranking queue ──────────────────────────────────────
+        # ── A+ / A / B: add to ranking queue ─────────────────────────────────
+        # B-tier executes at 1 contract (30% size) — probation tier
         signal["tier"]         = tier
         signal["auto_execute"] = (tier == Tier.A_PLUS)
         self.rank_queue.add(signal)
         self.store.update_status(signal_id, "queued", timestamp_flag="queued_at")
+        log.info(f"[{ticker}] {tier}-TIER queued (score={score:.1f}) -- {'1 contract probation' if tier == Tier.B else 'full execution'}")
 
     # ── RANKING QUEUE PROCESSOR ───────────────────────────────────────────────
 
@@ -561,10 +565,14 @@ class APExecutionCore:
             return
 
         # Size: base x spread modifier x feedback modifier x tier multiplier
+        # FIX: B-tier always executes as 1 contract regardless of other multipliers
         tier      = sig.get("tier", Tier.A)
-        tier_mult = 1.0 if tier == Tier.A_PLUS else 0.6
-        base      = self._get_base_contracts(watched.score)
-        contracts = max(1, round(base * decision.size_modifier * feedback_mod * tier_mult))
+        if tier == Tier.B:
+            contracts = 1   # B-tier: always 1 contract, no scaling
+        else:
+            tier_mult = 1.0 if tier == Tier.A_PLUS else 0.6
+            base      = self._get_base_contracts(watched.score)
+            contracts = max(1, round(base * decision.size_modifier * feedback_mod * tier_mult))
 
         log.info(
             f"[{ticker}] Sizing: base={base} x spread={decision.size_modifier:.2f} "
