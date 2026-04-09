@@ -1,4 +1,3 @@
-
 # app.py - ANGEL PRECISION BOT (PRODUCTION VERSION - STABLE)
 # =====================================================================
 # THIS FILE IS NOW STABLE. DO NOT EDIT.
@@ -534,17 +533,29 @@ def create_app() -> Flask:
         if cached:
             return jsonify(cached), 200
 
-        # ── Route to execution cores (entry watcher + tier engine) ──────────
-        # This sends the signal to every active client's APExecutionCore.
-        # Each core independently scores, tiers, and decides whether to trade.
+        # Check kill switch before routing
+        st = load_state(client_id=DEFAULT_CLIENT_ID)
+        if st.get("kill_switch") or st.get("mode") == "READ_ONLY":
+            payload = {"ok": False, "error": "bot_in_read_only"}
+            _idem_set(idem_key, payload)
+            return jsonify(payload), 403
+
+        # ── PRIMARY: Route to execution cores (tier engine + entry watcher) ──
+        # Each APExecutionCore scores, tiers, and decides whether to trade.
+        # Returns immediately — legacy queue is fallback only.
         try:
             route_signal_to_all_clients(body)
-            log.info(f"Signal routed to execution cores: {body.get('ticker')} {body.get('side')} score={body.get('score')}")
+            log.info(
+                f"Signal routed to execution cores: "
+                f"{body.get('ticker')} {body.get('side')} score={body.get('score')}"
+            )
+            payload = {"ok": True, "queued": True, "signal_id": str(body.get("signal_id", ""))}
+            _idem_set(idem_key, payload)
+            return jsonify(payload), 202
         except Exception as e:
-            log.warning(f"Execution core routing failed (non-fatal): {e}")
-        # ────────────────────────────────────────────────────────────────────
+            log.warning(f"Execution core routing failed — falling back to legacy queue: {e}")
 
-        # Legacy queue path — keeps existing worker/queue system intact
+        # ── FALLBACK: Legacy queue (only if execution core throws) ────────────
         try:
             sig = Signal(**body)
         except ValidationError as e:
@@ -552,14 +563,8 @@ def create_app() -> Flask:
             _idem_set(idem_key, payload)
             return jsonify(payload), 400
 
-        st = load_state(client_id=DEFAULT_CLIENT_ID)
-        if st.get("kill_switch") or st.get("mode") == "READ_ONLY":
-            payload = {"ok": False, "error": "bot_in_read_only"}
-            _idem_set(idem_key, payload)
-            return jsonify(payload), 403
-
         enqueue_signal(sig, client_id=client_id)
-        log.info(f"Signal queued: {client_id} {sig.symbol} {sig.direction}")
+        log.info(f"Signal queued (legacy fallback): {client_id} {sig.symbol} {sig.direction}")
 
         payload = {"ok": True, "queued": True, "signal_id": sig.signal_id}
         _idem_set(idem_key, payload)
