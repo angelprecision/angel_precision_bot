@@ -18,7 +18,6 @@
 import os
 import time
 import json
-import sqlite3
 import threading
 import logging
 import hashlib
@@ -28,6 +27,8 @@ from datetime import datetime, timezone
 
 from cryptography.fernet import Fernet
 from supabase import create_client, Client
+from ap.db import conn as ap_conn, run_with_retry
+from ap.utils import now_utc_iso
 
 logger = logging.getLogger("client_runner")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
@@ -35,9 +36,6 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelna
 # ── Supabase ──────────────────────────────────────────────────────────────────
 SUPABASE_URL         = os.getenv("SUPABASE_URL", "")
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY", "")
-
-# ── DB path (must match app.py) ───────────────────────────────────────────────
-DB_FILE = os.getenv("BOT_DB_FILE", "/opt/render/project/src/ap_state.db")
 
 # ── Encryption (must match dashboard backend) ─────────────────────────────────
 _raw_key   = os.getenv("ENCRYPTION_KEY", "angel-precision-encrypt-2026")
@@ -57,38 +55,36 @@ _registry_lock  = threading.Lock()
 
 def _write_signal_to_queue(signal: dict, client_id: str = "default"):
     """
-    Write a signal to the SQLite trade_queue so it can be picked up by
-    the queue subscriber in ANY gunicorn worker process.
-    This is the fix for the multi-worker race condition.
+    Write a signal to the SQLite trade_queue using ap/db.py's connection pool.
+    Uses run_with_retry to handle Render's disk contention gracefully.
     """
-    signal_id      = str(signal.get("signal_id") or uuid.uuid4())
+    signal_id       = str(signal.get("signal_id") or uuid.uuid4())
     idempotency_key = f"{signal_id}:{client_id}"
 
-    try:
-        with sqlite3.connect(DB_FILE, timeout=10) as conn:
-            conn.row_factory = sqlite3.Row
-            # Idempotency: don't insert the same signal twice
-            existing = conn.execute(
+    def _do_write():
+        with ap_conn() as c:
+            existing = c.execute(
                 "SELECT id FROM trade_queue WHERE idempotency_key = ?",
                 (idempotency_key,)
             ).fetchone()
             if existing:
                 logger.debug(f"Signal {signal_id} already in queue — skipping duplicate")
                 return
-
-            conn.execute(
+            c.execute(
                 """INSERT INTO trade_queue
                    (client_id, signal_id, created_ts, status, payload, idempotency_key)
                    VALUES (?, ?, ?, 'NEW', ?, ?)""",
                 (
                     client_id,
                     signal_id,
-                    datetime.now(timezone.utc).isoformat(),
+                    now_utc_iso(),
                     json.dumps(signal),
                     idempotency_key,
                 )
             )
-            conn.commit()
+
+    try:
+        run_with_retry(_do_write)
         logger.info(f"Signal {signal_id} written to trade_queue for client={client_id}")
     except Exception as e:
         logger.error(f"Failed to write signal to trade_queue: {e}")
@@ -169,52 +165,61 @@ class ClientRunner(threading.Thread):
 
     def _start_queue_subscriber(self):
         """
-        Poll trade_queue every 1s for NEW signals assigned to this client.
-        Route them to receive_signal() on this runner's execution core.
-        This works regardless of which gunicorn worker wrote the signal.
+        Poll trade_queue every 1s for NEW signals.
+        Uses ap/db.py conn pool + run_with_retry — no raw sqlite3, no lock errors.
         """
         def _poll():
             logger.info(f"[{self.email}] Queue subscriber started")
             while not self.stopped.is_set():
                 try:
-                    with sqlite3.connect(DB_FILE, timeout=5) as conn:
-                        conn.row_factory = sqlite3.Row
-                        # Claim up to 3 NEW signals for this client atomically
-                        rows = conn.execute(
-                            """SELECT id, signal_id, payload FROM trade_queue
-                               WHERE status = 'NEW' AND client_id = ?
-                               ORDER BY created_ts ASC LIMIT 3""",
-                            ("default",)   # all clients share the queue for now
-                        ).fetchall()
+                    def _fetch():
+                        with ap_conn() as c:
+                            return c.execute(
+                                """SELECT id, signal_id, payload FROM trade_queue
+                                   WHERE status = 'NEW'
+                                   ORDER BY created_ts ASC LIMIT 3"""
+                            ).fetchall()
 
-                        for row in rows:
-                            # Mark as PROCESSING immediately to prevent double-routing
-                            conn.execute(
-                                "UPDATE trade_queue SET status='PROCESSING', started_ts=? WHERE id=? AND status='NEW'",
-                                (datetime.now(timezone.utc).isoformat(), row["id"])
-                            )
-                            conn.commit()
+                    rows = run_with_retry(_fetch)
 
-                            # Route to execution core
-                            try:
-                                signal = json.loads(row["payload"])
-                                if self.core:
-                                    self.core.receive_signal(signal)
-                                # Mark DONE
-                                conn.execute(
-                                    "UPDATE trade_queue SET status='DONE', finished_ts=? WHERE id=?",
-                                    (datetime.now(timezone.utc).isoformat(), row["id"])
+                    for row in rows:
+                        row_id    = row["id"]
+                        signal_id = row["signal_id"]
+
+                        # Claim atomically
+                        def _claim(rid=row_id):
+                            with ap_conn() as c:
+                                c.execute(
+                                    "UPDATE trade_queue SET status='PROCESSING', started_ts=? "
+                                    "WHERE id=? AND status='NEW'",
+                                    (now_utc_iso(), rid)
                                 )
-                            except Exception as e:
-                                logger.error(f"[{self.email}] Queue signal processing failed: {e}")
-                                conn.execute(
-                                    "UPDATE trade_queue SET status='ERROR', last_error=?, finished_ts=? WHERE id=?",
-                                    (str(e), datetime.now(timezone.utc).isoformat(), row["id"])
-                                )
-                            conn.commit()
+                        run_with_retry(_claim)
 
-                except sqlite3.OperationalError as e:
-                    logger.warning(f"[{self.email}] Queue DB error: {e}")
+                        # Route to execution core
+                        try:
+                            signal = json.loads(row["payload"])
+                            if self.core:
+                                self.core.receive_signal(signal)
+
+                            def _done(rid=row_id):
+                                with ap_conn() as c:
+                                    c.execute(
+                                        "UPDATE trade_queue SET status='DONE', finished_ts=? WHERE id=?",
+                                        (now_utc_iso(), rid)
+                                    )
+                            run_with_retry(_done)
+
+                        except Exception as e:
+                            logger.error(f"[{self.email}] Queue signal failed {signal_id}: {e}")
+                            def _err(rid=row_id, err=str(e)):
+                                with ap_conn() as c:
+                                    c.execute(
+                                        "UPDATE trade_queue SET status='ERROR', last_error=?, finished_ts=? WHERE id=?",
+                                        (err, now_utc_iso(), rid)
+                                    )
+                            run_with_retry(_err)
+
                 except Exception as e:
                     logger.error(f"[{self.email}] Queue subscriber error: {e}")
 
