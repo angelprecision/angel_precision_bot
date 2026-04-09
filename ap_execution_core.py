@@ -569,6 +569,8 @@ class APExecutionCore:
         tier      = sig.get("tier", Tier.A)
         if tier == Tier.B:
             contracts = 1   # B-tier: always 1 contract, no scaling
+            base      = 1
+            tier_mult = 0.30
         else:
             tier_mult = 1.0 if tier == Tier.A_PLUS else 0.6
             base      = self._get_base_contracts(watched.score)
