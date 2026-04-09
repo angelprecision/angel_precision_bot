@@ -131,18 +131,16 @@ class ClientRunner(threading.Thread):
         """
         Poll trade_queue for NEW signals and route them to receive_signal().
 
-        Why this exists:
-            gunicorn --workers 2 = 2 separate Python processes.
-            _active_runners only exists in the process that called _sync_runners.
-            Signals can land in either process via HTTP round-robin.
-            SQLite trade_queue is on disk — visible to all processes.
-            This subscriber runs in the process that HAS the execution core,
-            so receive_signal() always works regardless of which HTTP worker
-            received the original request.
+        Race condition fix:
+            The old worker_loop (started by app.py) also reads from trade_queue.
+            To prevent it from stealing new-format signals before the subscriber
+            can process them, this subscriber bulk-claims ALL NEW rows in a single
+            UPDATE before reading their payloads. The old worker uses the same
+            atomic claim pattern so whichever process runs the UPDATE first wins
+            all rows in that batch.
 
-        Atomicity:
-            Uses UPDATE ... WHERE status='NEW' and checks rowcount=1 to claim
-            jobs. If two workers race, only one claims the row. The other skips.
+            Poll interval is 0.1s (10x faster than old worker at 1.0s) to ensure
+            the subscriber almost always gets first pick.
         """
         def _poll():
             from ap.config import Config
@@ -156,78 +154,79 @@ class ClientRunner(threading.Thread):
                         c.execute("PRAGMA journal_mode=WAL;")
                         c.execute("PRAGMA busy_timeout=5000;")
 
-                        row = c.execute("""
-                            SELECT id, payload, signal_id
-                            FROM trade_queue
-                            WHERE status = 'NEW'
-                            ORDER BY created_ts ASC
-                            LIMIT 1
-                        """).fetchone()
-
-                        if not row:
-                            time.sleep(0.5)
-                            continue
-
-                        job_id = row["id"]
-
-                        # Atomic claim — only one worker wins
-                        affected = c.execute("""
+                        # Bulk-claim ALL new signals in one atomic UPDATE.
+                        # This beats the old worker which only claims one at a time.
+                        claimed = c.execute("""
                             UPDATE trade_queue
                             SET status = 'PROCESSING',
                                 started_ts = datetime('now')
-                            WHERE id = ? AND status = 'NEW'
-                        """, (job_id,)).rowcount
+                            WHERE status = 'NEW'
+                        """).rowcount
 
-                        if affected != 1:
+                        if claimed == 0:
                             time.sleep(0.1)
                             continue
+
+                        # Fetch everything we just claimed
+                        rows = c.execute("""
+                            SELECT id, payload, signal_id
+                            FROM trade_queue
+                            WHERE status = 'PROCESSING'
+                              AND started_ts >= datetime('now', '-3 seconds')
+                            ORDER BY created_ts ASC
+                        """).fetchall()
+
+                    # Process each claimed row outside the DB connection
+                    for row in rows:
+                        job_id    = row["id"]
+                        signal_id = row["signal_id"]
 
                         try:
                             payload = json.loads(row["payload"])
                         except Exception as e:
-                            c.execute(
-                                "UPDATE trade_queue SET status='REJECTED', last_error=? WHERE id=?",
-                                (str(e), job_id)
-                            )
-                            continue
-
-                    # Route to execution core (outside the DB connection)
-                    if self.core:
-                        try:
-                            self.core.receive_signal(payload)
                             with sqlite3.connect(db_path, timeout=10,
                                                  isolation_level=None) as c:
                                 c.execute(
-                                    "UPDATE trade_queue SET status='DONE', "
-                                    "finished_ts=datetime('now') WHERE id=?",
-                                    (job_id,)
-                                )
-                        except Exception as e:
-                            logger.error(
-                                f"[{self.email}] receive_signal failed for "
-                                f"{row['signal_id']}: {e}"
-                            )
-                            with sqlite3.connect(db_path, timeout=10,
-                                                 isolation_level=None) as c:
-                                c.execute(
-                                    "UPDATE trade_queue SET status='ERROR', "
-                                    "last_error=? WHERE id=?",
+                                    "UPDATE trade_queue SET status='REJECTED', last_error=? WHERE id=?",
                                     (str(e), job_id)
                                 )
-                    else:
-                        # Core not ready — put it back
-                        with sqlite3.connect(db_path, timeout=10,
-                                             isolation_level=None) as c:
-                            c.execute(
-                                "UPDATE trade_queue SET status='NEW', "
-                                "started_ts=NULL WHERE id=?",
-                                (job_id,)
-                            )
-                        time.sleep(1)
+                            continue
+
+                        if self.core:
+                            try:
+                                self.core.receive_signal(payload)
+                                with sqlite3.connect(db_path, timeout=10,
+                                                     isolation_level=None) as c:
+                                    c.execute(
+                                        "UPDATE trade_queue SET status='DONE', "
+                                        "finished_ts=datetime('now') WHERE id=?",
+                                        (job_id,)
+                                    )
+                            except Exception as e:
+                                logger.error(
+                                    f"[{self.email}] receive_signal failed for "
+                                    f"{signal_id}: {e}"
+                                )
+                                with sqlite3.connect(db_path, timeout=10,
+                                                     isolation_level=None) as c:
+                                    c.execute(
+                                        "UPDATE trade_queue SET status='ERROR', "
+                                        "last_error=? WHERE id=?",
+                                        (str(e), job_id)
+                                    )
+                        else:
+                            # Core not ready — release back to NEW
+                            with sqlite3.connect(db_path, timeout=10,
+                                                 isolation_level=None) as c:
+                                c.execute(
+                                    "UPDATE trade_queue SET status='NEW', "
+                                    "started_ts=NULL WHERE id=?",
+                                    (job_id,)
+                                )
 
                 except Exception as e:
                     logger.warning(f"[{self.email}] Queue subscriber error: {e}")
-                    time.sleep(2)
+                    time.sleep(1)
 
         t = threading.Thread(
             target=_poll,
