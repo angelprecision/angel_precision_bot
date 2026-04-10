@@ -369,8 +369,14 @@ class APEntryWatcher:
         """
         symbols = ",".join(tickers)
         try:
+            # FIX: broker stores URL as broker.cfg.base_url not broker.base_url
+            _base = (
+                getattr(self.broker, "base_url", None)
+                or getattr(getattr(self.broker, "cfg", None), "base_url", None)
+                or "https://sandbox.tradier.com"
+            )
             resp = self.broker.session.get(
-                f"{self.broker.base_url}/v1/markets/quotes",
+                f"{_base}/v1/markets/quotes",
                 params={"symbols": symbols, "greeks": "false"},
                 headers={"Accept": "application/json"},
                 timeout=5,
