@@ -1,370 +1,581 @@
-# ap/queue.py - POSTGRES PRODUCTION VERSION
-# ✅ All SQLite datetime() replaced with Postgres NOW() / INTERVAL
-# ✅ Removed unused sqlite3 import
-# ✅ JSONB payload handled correctly (Postgres returns dict, not string)
-# ✅ ? placeholders throughout (wrapper converts to %s)
-# ✅ INTERVAL parameterized safely via f-string (avoids Postgres version issues)
-# ✅ Legacy worker skips signals with ev_score — those route to APExecutionCore
+# ap/db.py — PRODUCTION POSTGRES VERSION
+# =============================================================================
+# Replaces SQLite with Supabase Postgres via psycopg2.
+# ThreadedConnectionPool handles concurrent gunicorn workers + threads safely.
+# Interface is identical to the SQLite version — nothing else needs to change.
+#
+# Required env vars:
+#   DATABASE_URL  — Supabase Postgres connection string
+#                   Format: postgresql://postgres:[password]@db.[ref].supabase.co:5432/postgres
+#                   Found in: Supabase → Settings → Database → Connection String → URI
+# =============================================================================
 
-import time
-import json
+from __future__ import annotations
+
 import os
-from datetime import datetime, timezone
-from typing import Optional, Dict, Any
+import time
+import uuid
+import logging
+from contextlib import contextmanager
+from typing import Any, Callable
 
-from ap.db import conn, run_with_retry, init_db
-from ap.logger import get_logger
-from ap.execution import process_signal
-from ap.state import update_state
+import psycopg2
+import psycopg2.extras
+import psycopg2.pool
+from psycopg2 import errors as pg_errors
+
 from ap.utils import now_utc_iso
 
-log = get_logger("ap.queue")
+log = logging.getLogger("ap.db")
 
-MAX_TRADES_PER_HOUR    = int(os.getenv("MAX_TRADES_PER_HOUR", "12"))
-POLL_INTERVAL          = float(os.getenv("QUEUE_POLL_INTERVAL", "1.0"))
-PRICE_CHECK_INTERVAL   = float(os.getenv("PRICE_CHECK_INTERVAL", "0.5"))
-ENTRY_TOLERANCE        = float(os.getenv("ENTRY_TOLERANCE", "0.05"))
-PROCESSING_STALE_SECS  = int(os.getenv("PROCESSING_STALE_SECS", "900"))
+# ── Connection pool ───────────────────────────────────────────────────────────
+DATABASE_URL = os.getenv("DATABASE_URL", "")
 
+if not DATABASE_URL:
+    raise RuntimeError(
+        "DATABASE_URL env var is required. "
+        "Get it from Supabase → Settings → Database → Connection String → URI"
+    )
 
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def _json_dumps(data: Any) -> str:
-    return json.dumps(data, separators=(",", ":"), ensure_ascii=False)
+_pool: psycopg2.pool.ThreadedConnectionPool | None = None
 
 
-def _normalize_direction(direction: str) -> str:
-    if not direction:
-        return ""
-    d = direction.upper().strip()
-    if d in ("BUY", "LONG", "CALLS", "CALL"):
-        return "CALL"
-    if d in ("SELL", "SHORT", "PUTS", "PUT"):
-        return "PUT"
-    return d
-
-
-def _is_triggered(direction: str, entry_price: float, current_price: float,
-                  tolerance: float = ENTRY_TOLERANCE) -> bool:
-    d = _normalize_direction(direction)
-    if d == "CALL":
-        return current_price + tolerance >= entry_price
-    if d == "PUT":
-        return current_price - tolerance <= entry_price
-    return False
-
-
-def _get_stock_price(broker, symbol: str) -> Optional[float]:
-    if not symbol:
-        return None
-    try:
-        if hasattr(broker, "get_quote"):
-            q = broker.get_quote(symbol)
-            if isinstance(q, dict):
-                last = q.get("last") or q.get("lastPrice") or q.get("mark")
-                if last is not None and float(last) > 0:
-                    return float(last)
-        if hasattr(broker, "get_last_price"):
-            p = broker.get_last_price(symbol)
-            if p is not None and float(p) > 0:
-                return float(p)
-        if hasattr(broker, "quote"):
-            q = broker.quote(symbol)
-            if isinstance(q, dict):
-                last = q.get("last") or q.get("lastPrice") or q.get("mark")
-                if last is not None and float(last) > 0:
-                    return float(last)
-        return None
-    except Exception as e:
-        log.warning(f"Price fetch error for {symbol}: {e}")
-        return None
-
-
-def _extract_entry_price(payload: Dict[str, Any]) -> Optional[float]:
-    if isinstance(payload.get("trigger"), dict):
-        entry = payload["trigger"].get("entry")
-        if entry is not None:
-            try:
-                return float(entry)
-            except Exception:
-                pass
-    for key in ("entry_price", "entry"):
-        entry = payload.get(key)
-        if entry is not None:
-            try:
-                return float(entry)
-            except Exception:
-                pass
-    return None
-
-
-def _trigger_source(payload: Dict[str, Any]) -> str:
-    trg = payload.get("trigger")
-    if isinstance(trg, dict):
-        return str(trg.get("source") or "").lower().strip()
-    return ""
-
-
-def _parse_payload(raw) -> dict:
-    """Postgres JSONB returns dict. SQLite returned string. Handle both."""
-    if isinstance(raw, dict):
-        return raw
-    if isinstance(raw, str):
-        return json.loads(raw)
-    return {}
-
-
-def _check_rate_limit(client_id: str) -> bool:
-    def _fn():
-        with conn() as c:
-            c.execute(
-                """
-                SELECT COUNT(*) AS n
-                FROM positions
-                WHERE client_id = ?
-                  AND entry_ts >= NOW() - INTERVAL '1 hour'
-                """,
-                (client_id,),
-            )
-            row = c.fetchone()
-            return int((row or {}).get("n") or 0)
-    count = run_with_retry(_fn)
-    if count >= MAX_TRADES_PER_HOUR:
-        log.warning(f"Rate limit: {client_id} has {count}/{MAX_TRADES_PER_HOUR} trades")
-        return True
-    return False
-
-
-def enqueue_signal(sig, client_id: str = "default",
-                   idempotency_key: str | None = None) -> bool:
-    if isinstance(sig, dict):
-        payload = sig
-    elif hasattr(sig, "model_dump"):
-        payload = sig.model_dump()
-    elif hasattr(sig, "dict"):
-        payload = sig.dict()
-    else:
-        raise TypeError(f"Unsupported signal type: {type(sig)}")
-
-    signal_id = payload.get("signal_id") or f"signal_{_now_iso()}"
-    if not idempotency_key:
-        idempotency_key = f"{client_id}:{signal_id}"
-
-    def _ins():
-        with conn() as c:
-            c.execute(
-                """
-                INSERT INTO trade_queue (
-                    client_id, signal_id, created_ts, status, payload, idempotency_key
-                )
-                VALUES (?, ?, ?, 'NEW', ?, ?)
-                ON CONFLICT (idempotency_key) DO NOTHING
-                """,
-                (client_id, signal_id, _now_iso(),
-                 json.dumps(payload), idempotency_key),
-            )
-    try:
-        run_with_retry(_ins)
-        log.info(f"✅ Enqueued: {signal_id}")
-        return True
-    except Exception as e:
-        msg = str(e).lower()
-        if "unique" in msg or "constraint" in msg:
-            log.debug(f"Duplicate ignored: {signal_id}")
-            return False
-        raise
-
-
-def _requeue(job_id: int, reason: str):
-    def _fn():
-        with conn() as c:
-            c.execute(
-                """
-                UPDATE trade_queue
-                SET status='NEW',
-                    started_ts=NULL,
-                    last_error=?,
-                    created_ts=NOW()
-                WHERE id=?
-                """,
-                (reason, job_id),
-            )
-    run_with_retry(_fn)
-
-
-def _mark_job(job_id: int, status: str, *,
-              result: dict | None = None, error: str | None = None):
-    def _fn():
-        with conn() as c:
-            c.execute(
-                """
-                UPDATE trade_queue
-                SET status=?,
-                    finished_ts=NOW(),
-                    result_json=?,
-                    last_error=?
-                WHERE id=?
-                """,
-                (status,
-                 json.dumps(result) if result is not None else None,
-                 error, job_id),
-            )
-    run_with_retry(_fn)
-
-
-def _claim_one_job() -> Optional[dict]:
-    """
-    Claim exactly one LEGACY job safely.
-    Skips signals with ev_score — those route to APExecutionCore.
-    Uses f-string for INTERVAL to avoid Postgres parameterized INTERVAL issues.
-    """
-    # 1) Reclaim stale PROCESSING jobs — f-string INTERVAL is safe here (integer constant)
-    def _reclaim():
-        with conn() as c:
-            c.execute(
-                f"""
-                UPDATE trade_queue
-                SET status='NEW',
-                    started_ts=NULL,
-                    last_error=COALESCE(last_error,'') || ' | reclaimed_stale',
-                    created_ts=NOW()
-                WHERE status='PROCESSING'
-                  AND started_ts IS NOT NULL
-                  AND started_ts < NOW() - INTERVAL '{PROCESSING_STALE_SECS} seconds'
-                  AND (payload->>'ev_score') IS NULL
-                """,
-            )
-    run_with_retry(_reclaim)
-
-    # 2) Find next NEW legacy job
-    def _find():
-        with conn() as c:
-            c.execute(
-                """
-                SELECT id, client_id, signal_id, payload
-                FROM trade_queue
-                WHERE status='NEW'
-                  AND (payload->>'ev_score') IS NULL
-                ORDER BY created_ts ASC
-                LIMIT 1
-                """
-            )
-            return c.fetchone()
-    job = run_with_retry(_find)
-    if not job:
-        return None
-
-    job_id = int(job["id"])
-
-    # 3) Claim atomically
-    def _claim():
-        with conn() as c:
-            c.execute(
-                """
-                UPDATE trade_queue
-                SET status='PROCESSING',
-                    started_ts=NOW()
-                WHERE id=?
-                  AND status='NEW'
-                """,
-                (job_id,),
-            )
-            return c.rowcount
-    claimed = run_with_retry(_claim)
-    if claimed != 1:
-        return None
-
-    # 4) Re-read claimed row
-    def _reread():
-        with conn() as c:
-            c.execute(
-                "SELECT id, client_id, signal_id, payload FROM trade_queue WHERE id=?",
-                (job_id,),
-            )
-            return c.fetchone()
-    return run_with_retry(_reread)
-
-
-def worker_loop(broker, poll_seconds: float = POLL_INTERVAL):
-    init_db()
-    log.info(f"🤖 Worker started (poll={poll_seconds}s)")
-
-    while True:
+def _get_pool() -> psycopg2.pool.ThreadedConnectionPool:
+    global _pool
+    if _pool is None or _pool.closed:
         try:
-            update_state({"last_heartbeat_ts": now_utc_iso()}, client_id="default")
+            # Append sslmode=require if not already in URL
+            dsn = DATABASE_URL
+            if "sslmode" not in dsn:
+                dsn += "?sslmode=require" if "?" not in dsn else "&sslmode=require"
+            _pool = psycopg2.pool.ThreadedConnectionPool(
+                minconn=1,
+                maxconn=20,
+                dsn=dsn,
+                connect_timeout=10,
+                keepalives=1,
+                keepalives_idle=30,
+                keepalives_interval=10,
+                keepalives_count=5,
+            )
+            log.info("Postgres connection pool initialized (min=1 max=20)")
+        except Exception as e:
+            log.error(f"Pool creation failed: {e}")
+            raise
+    return _pool
+
+
+# ── Retry wrapper ─────────────────────────────────────────────────────────────
+
+def run_with_retry(fn: Callable[[], Any], retries: int = 10,
+                   base_sleep: float = 0.1, max_sleep: float = 2.0):
+    delay = base_sleep
+    last_err = None
+    for attempt in range(retries + 1):
+        try:
+            return fn()
+        except (psycopg2.OperationalError,
+                psycopg2.InterfaceError,
+                pg_errors.DeadlockDetected,
+                pg_errors.SerializationFailure) as e:
+            last_err = e
+            if attempt < retries:
+                log.warning(f"DB transient error (attempt {attempt+1}/{retries}): {e}")
+                time.sleep(delay)
+                delay = min(delay * 2, max_sleep)
+            else:
+                log.error(f"DB error after {retries} retries: {e}")
+                raise
+
+
+# ── Connection context manager ────────────────────────────────────────────────
+
+@contextmanager
+def conn():
+    """
+    Yields a _ConnWrapper from the pool.
+    Auto-commits on success, rolls back on exception.
+    Validates connection health before use — discards and reopens stale
+    connections (handles SSL drop / transient TCP errors).
+    Callers use: `with conn() as c: c.execute(sql, params)`
+    """
+    pool = _get_pool()
+    db_conn = pool.getconn()
+
+    # Validate the connection is still alive; replace it if not
+    try:
+        if db_conn.closed or db_conn.status != psycopg2.extensions.STATUS_READY:
+            raise psycopg2.OperationalError("stale connection")
+        db_conn.reset()  # rollback any dangling txn, does NOT close
+    except Exception:
+        try:
+            pool.putconn(db_conn, close=True)
+        except Exception:
+            pass
+        # Re-initialise pool if it went bad, then grab a fresh conn
+        global _pool
+        _pool = None
+        pool = _get_pool()
+        db_conn = pool.getconn()
+
+    try:
+        db_conn.autocommit = False
+        cursor = db_conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        wrapper = _ConnWrapper(db_conn, cursor)
+        yield wrapper
+        db_conn.commit()
+    except Exception:
+        try:
+            db_conn.rollback()
+        except Exception:
+            pass
+        raise
+    finally:
+        try:
+            cursor.close()
+        except Exception:
+            pass
+        try:
+            pool.putconn(db_conn)
         except Exception:
             pass
 
-        job = None
-        job_id = None
 
-        try:
-            job = _claim_one_job()
-            if not job:
-                time.sleep(poll_seconds)
-                continue
+class _ConnWrapper:
+    """
+    Drop-in replacement for sqlite3 connection.
+    Converts ? → %s placeholders automatically.
+    Converts RealDictRow results to plain dicts.
+    Also supports .rowcount for UPDATE/DELETE checks.
+    """
+    def __init__(self, connection, cursor):
+        self._conn = connection
+        self._cur  = cursor
 
-            job_id    = int(job["id"])
-            client_id = job["client_id"]
-            signal_id = job["signal_id"]
+    def execute(self, sql: str, params: tuple | list = ()):
+        pg_sql = sql.replace("?", "%s")
+        self._cur.execute(pg_sql, params)
+        return self
 
-            try:
-                payload = _parse_payload(job["payload"])
-            except Exception as e:
-                log.error(f"Parse error: {e}")
-                _mark_job(job_id, "REJECTED", error=f"parse_error: {e}")
-                continue
+    def fetchone(self):
+        row = self._cur.fetchone()
+        return dict(row) if row else None
 
-            if _check_rate_limit(client_id):
-                _requeue(job_id, f"rate_limited: {MAX_TRADES_PER_HOUR}/hour")
-                time.sleep(poll_seconds)
-                continue
+    def fetchall(self):
+        return [dict(r) for r in (self._cur.fetchall() or [])]
 
-            symbol      = payload.get("symbol") or payload.get("underlying")
-            direction   = payload.get("direction") or payload.get("side")
-            entry_price = _extract_entry_price(payload)
-            source      = _trigger_source(payload)
+    @property
+    def rowcount(self):
+        return self._cur.rowcount
 
-            if source == "discord":
-                log.info(f"🔔 Discord signal — skipping stock-price wait: {symbol} {direction}")
-            else:
-                if entry_price is not None and symbol and direction:
-                    current_price = _get_stock_price(broker, symbol)
-                    if current_price is None:
-                        _requeue(job_id, "price_unavailable")
-                        time.sleep(PRICE_CHECK_INTERVAL)
-                        continue
-                    if not _is_triggered(direction, entry_price, current_price):
-                        log.debug(f"⏳ {symbol}: ${current_price:.2f} waiting entry={entry_price}")
-                        _requeue(job_id, f"waiting: current={current_price:.2f} entry={entry_price}")
-                        time.sleep(PRICE_CHECK_INTERVAL)
-                        continue
-                    log.info(f"🎯 {symbol} TRIGGERED: ${current_price:.2f} → entry={entry_price}")
+    @property
+    def lastrowid(self):
+        # Postgres uses RETURNING — fallback to None if not used
+        return None
 
-            log.info(f"Executing: {signal_id}")
-            result = process_signal(
-                broker=broker,
-                client_id=client_id,
-                signal_payload=payload,
+    def __getattr__(self, name):
+        return getattr(self._cur, name)
+
+
+# ── Schema init ───────────────────────────────────────────────────────────────
+
+def init_db():
+    """
+    No-op for Postgres — schema managed via Supabase SQL editor.
+    Verifies connection is healthy on startup.
+    Non-fatal: logs error but does not crash the bot if DB is temporarily unreachable.
+    """
+    try:
+        with conn() as c:
+            c.execute("SELECT 1")
+        log.info("✅ Postgres connection verified")
+    except Exception as e:
+        log.error(f"❌ Postgres connection failed: {e}")
+        log.error("Bot will continue — DB writes will fail until connection is restored.")
+        # Do NOT raise — let the bot start so UptimeRobot keeps it awake
+        # and retries will reconnect on next write
+
+
+# =========================================================================
+# DEDUPE HELPERS
+# =========================================================================
+
+def already_processed_signal(signal_id: str) -> bool:
+    def _fn():
+        with conn() as c:
+            c.execute("SELECT 1 FROM processed_signals WHERE signal_id = %s", (signal_id,))
+            return c.fetchone() is not None
+    return run_with_retry(_fn)
+
+
+def mark_signal_processed(signal_id: str):
+    def _fn():
+        with conn() as c:
+            c.execute(
+                "INSERT INTO processed_signals(signal_id, first_seen_ts) "
+                "VALUES (%s, %s) ON CONFLICT DO NOTHING",
+                (signal_id, now_utc_iso()),
             )
+    return run_with_retry(_fn)
 
-            ok     = bool(result.get("ok"))
-            status = "DONE" if ok else "REJECTED"
-            error  = None if ok else (result.get("error") or result.get("reason") or "unknown_error")
-            _mark_job(job_id, status, result=result, error=error)
 
-            if ok:
-                log.info(f"✅ {signal_id}: {result.get('contract')}")
+# =========================================================================
+# ORDER HELPERS
+# =========================================================================
+
+def new_local_order_id() -> str:
+    return str(uuid.uuid4())
+
+
+def insert_order(
+    *,
+    client_id: str = "default",
+    local_order_id: str,
+    position_id: str | None,
+    kind: str,
+    status: str,
+    symbol: str,
+    contract: str,
+    qty: int,
+    limit_price: float | None = None,
+    broker_order_id: str | None = None,
+    direction: str | None = None,
+    reserved_cost: float | None = None,
+):
+    ts = now_utc_iso()
+    def _fn():
+        with conn() as c:
+            c.execute(
+                """
+                INSERT INTO orders (
+                    client_id, local_order_id, broker_order_id, position_id,
+                    kind, status, symbol, contract, direction, reserved_cost,
+                    qty, limit_price, filled_qty, retries, last_error,
+                    created_ts, updated_ts
+                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                ON CONFLICT (local_order_id) DO NOTHING
+                """,
+                (client_id, local_order_id, broker_order_id, position_id,
+                 kind, status, symbol, contract, direction, reserved_cost,
+                 int(qty), limit_price, 0, 0, None, ts, ts),
+            )
+    return run_with_retry(_fn)
+
+
+def update_order(
+    local_order_id: str,
+    *,
+    status: str | None = None,
+    broker_order_id: str | None = None,
+    last_error: str | None = None,
+    filled_qty: int | None = None,
+):
+    updates = []; params: list[Any] = []
+    if status is not None:           updates.append("status=%s");           params.append(status)
+    if broker_order_id is not None:  updates.append("broker_order_id=%s");  params.append(broker_order_id)
+    if last_error is not None:       updates.append("last_error=%s");       params.append(last_error)
+    if filled_qty is not None:       updates.append("filled_qty=%s");       params.append(int(filled_qty))
+    updates.append("updated_ts=%s"); params.append(now_utc_iso())
+    params.append(local_order_id)
+    sql = f"UPDATE orders SET {', '.join(updates)} WHERE local_order_id=%s"
+    def _fn():
+        with conn() as c:
+            c.execute(sql, tuple(params))
+    return run_with_retry(_fn)
+
+
+# =========================================================================
+# CLIENT MANAGEMENT
+# =========================================================================
+
+def get_client(client_id: str) -> dict:
+    def _fn():
+        with conn() as c:
+            c.execute("SELECT * FROM clients WHERE client_id = %s", (client_id,))
+            row = c.fetchone()
+            if not row:
+                raise ValueError(f"Client not found: {client_id}")
+            return row
+    return run_with_retry(_fn)
+
+
+def get_client_state(client_id: str = "default") -> dict:
+    def _fn():
+        with conn() as c:
+            c.execute("SELECT * FROM client_state WHERE client_id = %s", (client_id,))
+            row = c.fetchone()
+            if not row:
+                return {
+                    "client_id": client_id, "current_equity": 0.0,
+                    "starting_equity_today": 0.0, "realized_pnl_today": 0.0,
+                    "trades_taken_today": 0, "daily_stop_hit": 0,
+                    "kill_switch": 0, "mode": "PAPER", "day_key": None,
+                }
+            return row
+    return run_with_retry(_fn)
+
+
+def update_client_state(client_id: str = "default", updates: dict | None = None):
+    if not updates:
+        return
+    ALLOWED = {
+        "current_equity", "starting_equity_today", "realized_pnl_today",
+        "trades_taken_today", "daily_stop_hit", "kill_switch", "mode",
+        "last_heartbeat_ts", "day_key", "client_capital", "rental_fee",
+        "working_capital", "profit_target_min", "profit_target_max",
+        "subscription_end_date", "growth_tracking_enabled", "account_type",
+        "updated_at",
+    }
+    safe = {k: v for k, v in updates.items() if k in ALLOWED}
+    if not safe:
+        return
+    safe["updated_at"] = now_utc_iso()
+    set_clause = ", ".join(f"{k}=%s" for k in safe.keys())
+    set_values = list(safe.values())
+    def _fn():
+        with conn() as c:
+            # Two-step: upsert the row, then update the fields
+            # Step 1: ensure row exists
+            c.execute(
+                """
+                INSERT INTO client_state (client_id, current_equity, starting_equity_today,
+                    realized_pnl_today, trades_taken_today, mode, updated_at)
+                VALUES (%s, 100000, 100000, 0, 0, 'PAPER', NOW())
+                ON CONFLICT (client_id) DO NOTHING
+                """,
+                (client_id,),
+            )
+            # Step 2: apply updates
+            c.execute(
+                f"UPDATE client_state SET {set_clause} WHERE client_id=%s",
+                set_values + [client_id],
+            )
+    return run_with_retry(_fn)
+
+
+def create_client(
+    client_id: str, name: str, broker_type: str,
+    broker_account_id: str, broker_token: str, broker_base_url: str,
+    initial_equity: float, max_trades_per_day: int = 5,
+    max_concurrent_positions: int = 7, daily_max_loss_pct: float = 0.05,
+    base_position_pct: float = 0.10, api_key: str | None = None,
+) -> str:
+    now = now_utc_iso()
+    def _fn():
+        with conn() as c:
+            c.execute(
+                """
+                INSERT INTO clients (
+                    client_id, api_key, name, broker_type, broker_account_id,
+                    broker_token, broker_base_url, initial_equity, status,
+                    created_at, max_trades_per_day, max_concurrent_positions,
+                    daily_max_loss_pct, base_position_pct
+                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                ON CONFLICT (client_id) DO NOTHING
+                """,
+                (client_id, api_key, name, broker_type, broker_account_id,
+                 broker_token, broker_base_url, float(initial_equity), "ACTIVE",
+                 now, int(max_trades_per_day), int(max_concurrent_positions),
+                 float(daily_max_loss_pct), float(base_position_pct)),
+            )
+            c.execute(
+                """
+                INSERT INTO client_state (
+                    client_id, current_equity, starting_equity_today,
+                    realized_pnl_today, trades_taken_today, daily_stop_hit,
+                    kill_switch, mode, day_key
+                ) VALUES (%s,%s,%s,0.0,0,0,0,'PAPER',NULL)
+                ON CONFLICT (client_id) DO NOTHING
+                """,
+                (client_id, float(initial_equity), float(initial_equity)),
+            )
+    run_with_retry(_fn)
+    return client_id
+
+
+def upsert_client(client_id: str, **kwargs):
+    def _fn():
+        with conn() as c:
+            c.execute("SELECT client_id FROM clients WHERE client_id=%s", (client_id,))
+            existing = c.fetchone()
+            now = now_utc_iso()
+            if existing:
+                updates = []; params = []
+                for k, v in kwargs.items():
+                    updates.append(f"{k}=%s"); params.append(v)
+                params.append(client_id)
+                c.execute(f"UPDATE clients SET {', '.join(updates)} WHERE client_id=%s", params)
             else:
-                log.warning(f"❌ {signal_id}: {error}")
+                kwargs.setdefault("status", "ACTIVE")
+                kwargs.setdefault("created_at", now)
+                kwargs["client_id"] = client_id
+                cols = ", ".join(kwargs.keys())
+                phs  = ", ".join(["%s"] * len(kwargs))
+                c.execute(f"INSERT INTO clients ({cols}) VALUES ({phs})", list(kwargs.values()))
+    return run_with_retry(_fn)
 
-        except Exception as e:
-            log.error(f"Worker error: {e}", exc_info=True)
-            if job_id is not None:
-                try:
-                    _mark_job(job_id, "ERROR", error=str(e))
-                except Exception:
-                    pass
-            time.sleep(poll_seconds)
+
+def get_all_clients(status: str | None = None) -> list[dict]:
+    def _fn():
+        with conn() as c:
+            if status:
+                c.execute("SELECT * FROM clients WHERE status=%s ORDER BY created_at DESC", (status,))
+            else:
+                c.execute("SELECT * FROM clients ORDER BY created_at DESC")
+            return c.fetchall()
+    return run_with_retry(_fn)
+
+
+def update_client(client_id: str, **kwargs) -> dict:
+    if not kwargs:
+        raise ValueError("No fields to update")
+    def _fn():
+        with conn() as c:
+            updates = []; params = []
+            for k, v in kwargs.items():
+                updates.append(f"{k}=%s"); params.append(v)
+            params.append(client_id)
+            c.execute(f"UPDATE clients SET {', '.join(updates)} WHERE client_id=%s", params)
+    run_with_retry(_fn)
+    return get_client(client_id)
+
+
+def delete_client(client_id: str):
+    def _fn():
+        with conn() as c:
+            for table in ["audit_log", "trade_queue", "orders", "positions", "client_state", "clients"]:
+                c.execute(f"DELETE FROM {table} WHERE client_id=%s", (client_id,))
+    return run_with_retry(_fn)
+
+
+# =========================================================================
+# POSITION HELPERS
+# =========================================================================
+
+def get_all_positions(client_id: str | None = None) -> list[dict]:
+    def _fn():
+        with conn() as c:
+            if client_id:
+                c.execute("SELECT * FROM positions WHERE client_id=%s ORDER BY entry_ts DESC", (client_id,))
+            else:
+                c.execute("SELECT * FROM positions ORDER BY entry_ts DESC")
+            return c.fetchall()
+    return run_with_retry(_fn)
+
+
+def get_position_by_id(position_id: str) -> dict | None:
+    def _fn():
+        with conn() as c:
+            c.execute("SELECT * FROM positions WHERE id=%s", (position_id,))
+            return c.fetchone()
+    return run_with_retry(_fn)
+
+
+def list_positions(client_id: str | None = None, limit: int = 200,
+                   status: str | None = None) -> list[dict]:
+    def _fn():
+        with conn() as c:
+            if client_id and status:
+                c.execute(
+                    "SELECT * FROM positions WHERE client_id=%s AND status=%s "
+                    "ORDER BY entry_ts DESC LIMIT %s", (client_id, status, limit))
+            elif client_id:
+                c.execute(
+                    "SELECT * FROM positions WHERE client_id=%s "
+                    "ORDER BY entry_ts DESC LIMIT %s", (client_id, limit))
+            elif status:
+                c.execute(
+                    "SELECT * FROM positions WHERE status=%s "
+                    "ORDER BY entry_ts DESC LIMIT %s", (status, limit))
+            else:
+                c.execute("SELECT * FROM positions ORDER BY entry_ts DESC LIMIT %s", (limit,))
+            return c.fetchall()
+    return run_with_retry(_fn)
+
+
+# =========================================================================
+# ORDER QUERY HELPERS
+# =========================================================================
+
+def get_orders_for_client(client_id: str) -> list[dict]:
+    def _fn():
+        with conn() as c:
+            c.execute("SELECT * FROM orders WHERE client_id=%s ORDER BY created_ts DESC", (client_id,))
+            return c.fetchall()
+    return run_with_retry(_fn)
+
+
+def get_all_orders() -> list[dict]:
+    def _fn():
+        with conn() as c:
+            c.execute("SELECT * FROM orders ORDER BY created_ts DESC")
+            return c.fetchall()
+    return run_with_retry(_fn)
+
+
+def get_order_by_id(local_order_id: str) -> dict | None:
+    def _fn():
+        with conn() as c:
+            c.execute("SELECT * FROM orders WHERE local_order_id=%s", (local_order_id,))
+            return c.fetchone()
+    return run_with_retry(_fn)
+
+
+def list_orders(client_id: str | None = None, limit: int = 200,
+                status: str | None = None) -> list[dict]:
+    def _fn():
+        with conn() as c:
+            if client_id and status:
+                c.execute(
+                    "SELECT * FROM orders WHERE client_id=%s AND status=%s "
+                    "ORDER BY created_ts DESC LIMIT %s", (client_id, status, limit))
+            elif client_id:
+                c.execute(
+                    "SELECT * FROM orders WHERE client_id=%s "
+                    "ORDER BY created_ts DESC LIMIT %s", (client_id, limit))
+            elif status:
+                c.execute(
+                    "SELECT * FROM orders WHERE status=%s "
+                    "ORDER BY created_ts DESC LIMIT %s", (status, limit))
+            else:
+                c.execute("SELECT * FROM orders ORDER BY created_ts DESC LIMIT %s", (limit,))
+            return c.fetchall()
+    return run_with_retry(_fn)
+
+
+def get_open_orders_for_reconcile(client_id: str | None = None,
+                                   limit: int = 200) -> list[dict]:
+    def _fn():
+        with conn() as c:
+            if client_id:
+                c.execute(
+                    "SELECT * FROM orders WHERE client_id=%s "
+                    "AND status IN ('NEW','ACK','PARTIAL') "
+                    "ORDER BY created_ts DESC LIMIT %s", (client_id, limit))
+            else:
+                c.execute(
+                    "SELECT * FROM orders WHERE status IN ('NEW','ACK','PARTIAL') "
+                    "ORDER BY created_ts DESC LIMIT %s", (limit,))
+            return c.fetchall()
+    return run_with_retry(_fn)
+
+
+# =========================================================================
+# AUDIT LOG HELPERS
+# =========================================================================
+
+def get_audit_logs(client_id: str | None = None, limit: int = 100) -> list[dict]:
+    def _fn():
+        with conn() as c:
+            if client_id:
+                c.execute(
+                    "SELECT * FROM audit_log WHERE client_id=%s ORDER BY ts DESC LIMIT %s",
+                    (client_id, limit))
+            else:
+                c.execute("SELECT * FROM audit_log ORDER BY ts DESC LIMIT %s", (limit,))
+            return c.fetchall()
+    return run_with_retry(_fn)
+
+
+def list_audit(client_id: str | None = None, limit: int = 200) -> list[dict]:
+    return get_audit_logs(client_id=client_id, limit=limit)
