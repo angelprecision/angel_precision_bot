@@ -340,12 +340,17 @@ def create_app() -> Flask:
     @app.get("/debug/queue_counts")
     def debug_queue_counts():
         try:
-            with conn() as c:
-                new_cnt = c.execute("SELECT COUNT(*) AS n FROM trade_queue WHERE status='NEW'").fetchone()["n"]
-                proc_cnt = c.execute("SELECT COUNT(*) AS n FROM trade_queue WHERE status='PROCESSING'").fetchone()["n"]
-                done_cnt = c.execute("SELECT COUNT(*) AS n FROM trade_queue WHERE status='DONE'").fetchone()["n"]
-                err_cnt = c.execute("SELECT COUNT(*) AS n FROM trade_queue WHERE status='ERROR'").fetchone()["n"]
-            return jsonify({"ok": True, "NEW": int(new_cnt), "PROCESSING": int(proc_cnt), "DONE": int(done_cnt), "ERROR": int(err_cnt)})
+            from ap.db import run_with_retry
+            def _q():
+                with conn() as c:
+                    return {
+                        "new":  c.execute("SELECT COUNT(*) AS n FROM trade_queue WHERE status='NEW'").fetchone()["n"],
+                        "proc": c.execute("SELECT COUNT(*) AS n FROM trade_queue WHERE status='PROCESSING'").fetchone()["n"],
+                        "done": c.execute("SELECT COUNT(*) AS n FROM trade_queue WHERE status='DONE'").fetchone()["n"],
+                        "err":  c.execute("SELECT COUNT(*) AS n FROM trade_queue WHERE status='ERROR'").fetchone()["n"],
+                    }
+            counts = run_with_retry(_q)
+            return jsonify({"ok": True, "NEW": int(counts["new"]), "PROCESSING": int(counts["proc"]), "DONE": int(counts["done"]), "ERROR": int(counts["err"])})
         except Exception as e:
             return jsonify({"ok": False, "error": str(e)}), 500
 
@@ -455,11 +460,14 @@ def create_app() -> Flask:
     @app.get("/dashboard")
     def dashboard():
         try:
+            from ap.db import run_with_retry
             st = load_state(client_id=DEFAULT_CLIENT_ID)
-            with conn() as c:
-                pos_row = c.execute("SELECT COUNT(*) as n FROM positions WHERE status='OPEN'").fetchone()
-                queue_row = c.execute("SELECT COUNT(*) as n FROM trade_queue WHERE status='NEW'").fetchone()
-
+            def _q():
+                with conn() as c:
+                    pos_row   = c.execute("SELECT COUNT(*) as n FROM positions WHERE status='OPEN'").fetchone()
+                    queue_row = c.execute("SELECT COUNT(*) as n FROM trade_queue WHERE status='NEW'").fetchone()
+                    return pos_row, queue_row
+            pos_row, queue_row = run_with_retry(_q)
             return jsonify({
                 "status": "healthy" if not st.get("kill_switch") else "stopped",
                 "mode": st.get("mode"),
