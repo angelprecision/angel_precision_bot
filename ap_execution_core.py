@@ -1,4 +1,4 @@
-# ap_execution_core.py — Angel Precision Execution Core
+ # ap_execution_core.py — Angel Precision Execution Core
 # =============================================================================
 # Ties all execution modules together into one clean interface.
 # One instance per client (per ClientRunner thread).
@@ -738,10 +738,26 @@ class APExecutionCore:
 
     # ── BROKER HELPERS ────────────────────────────────────────────────────────
 
+    def _broker_base_url(self) -> str:
+        """FIX: TradierBroker stores URL as broker.cfg.base_url not broker.base_url"""
+        return (
+            getattr(self.broker, "base_url", None)
+            or getattr(getattr(self.broker, "cfg", None), "base_url", None)
+            or "https://sandbox.tradier.com"
+        )
+
+    def _broker_account_id(self) -> str:
+        """FIX: TradierBroker stores account as broker.cfg.account_id not broker.account_id"""
+        return (
+            getattr(self.broker, "account_id", None)
+            or getattr(getattr(self.broker, "cfg", None), "account_id", None)
+            or ""
+        )
+
     def _fetch_0dte_chain(self, ticker: str) -> tuple[list, str]:
         today = date.today().strftime("%Y-%m-%d")
         resp  = self.broker.session.get(
-            f"{self.broker.base_url}/v1/markets/options/chains",
+            f"{self._broker_base_url()}/v1/markets/options/chains",
             params  = {"symbol": ticker, "expiration": today, "greeks": "true"},
             headers = {"Accept": "application/json"},
             timeout = 10,
@@ -762,7 +778,7 @@ class APExecutionCore:
     ) -> Optional[float]:
         try:
             resp = self.broker.session.post(
-                f"{self.broker.base_url}/v1/accounts/{self.broker.account_id}/orders",
+                f"{self._broker_base_url()}/v1/accounts/{self._broker_account_id()}/orders",
                 data={
                     "class":         "option",
                     "symbol":        symbol.split()[0] if " " in symbol else symbol[:6],
