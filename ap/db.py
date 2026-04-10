@@ -3,6 +3,7 @@
 #      When multiple signals arrive simultaneously, SQLite throws "disk I/O error" instead
 #      of "database is locked" — this fix retries on that error too.
 # FIX: retries increased 12 → 30, base_sleep 0.05 → 0.1 for Render's slower disk
+# FIX: PRAGMA journal_mode=WAL moved to init_db() only — was causing lock on every conn()
 
 from __future__ import annotations
 
@@ -78,7 +79,10 @@ def conn():
     )
     c.row_factory = sqlite3.Row
 
-    c.execute("PRAGMA journal_mode=WAL;")
+    # FIX: Only set busy_timeout and foreign_keys per connection.
+    # journal_mode=WAL is set ONCE in init_db() — running it on every
+    # conn() causes "database is locked" when multiple threads connect
+    # simultaneously (WAL mode switch requires an exclusive lock).
     c.execute("PRAGMA busy_timeout=30000;")
     c.execute("PRAGMA foreign_keys=ON;")
 
@@ -92,6 +96,15 @@ def conn():
 # Schema init + migrations
 # ============================================================
 def init_db():
+    # Set WAL mode ONCE here — not in every conn() call
+    db_dir = os.path.dirname(cfg.DB_FILE)
+    if db_dir and not os.path.exists(db_dir):
+        os.makedirs(db_dir, exist_ok=True)
+    _c = sqlite3.connect(cfg.DB_FILE, timeout=30, isolation_level=None, check_same_thread=False)
+    _c.execute("PRAGMA journal_mode=WAL;")
+    _c.execute("PRAGMA busy_timeout=30000;")
+    _c.close()
+
     with conn() as c:
 
         def ex(sql: str, params: tuple = ()):
