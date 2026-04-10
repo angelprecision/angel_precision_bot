@@ -43,13 +43,17 @@ _pool: psycopg2.pool.ThreadedConnectionPool | None = None
 def _get_pool() -> psycopg2.pool.ThreadedConnectionPool:
     global _pool
     if _pool is None or _pool.closed:
-        _pool = psycopg2.pool.ThreadedConnectionPool(
-            minconn=2,
-            maxconn=20,
-            dsn=DATABASE_URL,
-            connect_timeout=10,
-        )
-        log.info("Postgres connection pool initialized (min=2 max=20)")
+        try:
+            _pool = psycopg2.pool.ThreadedConnectionPool(
+                minconn=1,
+                maxconn=20,
+                dsn=DATABASE_URL,
+                connect_timeout=10,
+            )
+            log.info("Postgres connection pool initialized (min=1 max=20)")
+        except Exception as e:
+            log.error(f"Pool creation failed: {e}")
+            raise
     return _pool
 
 
@@ -144,6 +148,7 @@ def init_db():
     """
     No-op for Postgres — schema managed via Supabase SQL editor.
     Verifies connection is healthy on startup.
+    Non-fatal: logs error but does not crash the bot if DB is temporarily unreachable.
     """
     try:
         with conn() as c:
@@ -151,7 +156,9 @@ def init_db():
         log.info("✅ Postgres connection verified")
     except Exception as e:
         log.error(f"❌ Postgres connection failed: {e}")
-        raise
+        log.error("Bot will continue — DB writes will fail until connection is restored.")
+        # Do NOT raise — let the bot start so UptimeRobot keeps it awake
+        # and retries will reconnect on next write
 
 
 # =========================================================================
@@ -289,17 +296,24 @@ def update_client_state(client_id: str = "default", updates: dict | None = None)
         return
     safe["updated_at"] = now_utc_iso()
     set_clause = ", ".join(f"{k}=%s" for k in safe.keys())
-    values = list(safe.values()) + [client_id]
+    set_values = list(safe.values())
     def _fn():
         with conn() as c:
+            # Two-step: upsert the row, then update the fields
+            # Step 1: ensure row exists
             c.execute(
-                f"""
+                """
                 INSERT INTO client_state (client_id, current_equity, starting_equity_today,
                     realized_pnl_today, trades_taken_today, mode, updated_at)
                 VALUES (%s, 100000, 100000, 0, 0, 'PAPER', NOW())
-                ON CONFLICT (client_id) DO UPDATE SET {set_clause}
+                ON CONFLICT (client_id) DO NOTHING
                 """,
-                [client_id] + values,
+                (client_id,),
+            )
+            # Step 2: apply updates
+            c.execute(
+                f"UPDATE client_state SET {set_clause} WHERE client_id=%s",
+                set_values + [client_id],
             )
     return run_with_retry(_fn)
 
