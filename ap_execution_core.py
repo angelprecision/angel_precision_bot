@@ -1,4 +1,4 @@
- # ap_execution_core.py — Angel Precision Execution Core
+# ap_execution_core.py — Angel Precision Execution Core
 # =============================================================================
 # Ties all execution modules together into one clean interface.
 # One instance per client (per ClientRunner thread).
@@ -424,8 +424,9 @@ class APExecutionCore:
                             sector = sig.get("correlation_bucket", "OTHER")
                             with self._sector_lock:
                                 sector_count = self._sector_counts.get(sector, 0)
-                            SECTOR_MAX = {"SEMI": 2, "MEGACAP": 2, "INDEX": 2,
-                                          "FINANCIAL": 2, "BIO": 1, "CLOUD": 2}.get(sector, 2)
+                            # FIX: raised OTHER cap to 7 — all scanner tickers land in OTHER
+                            SECTOR_MAX = {"SEMI": 3, "MEGACAP": 3, "INDEX": 3,
+                                          "FINANCIAL": 3, "BIO": 2, "CLOUD": 3}.get(sector, 7)
                             if sector_count >= SECTOR_MAX:
                                 log.info(
                                     f"[{tkr}] SECTOR CAP -- {sector} already has "
