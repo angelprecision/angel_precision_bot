@@ -133,7 +133,7 @@ def _check_rate_limit(client_id: str) -> bool:
             SELECT COUNT(*) AS n
             FROM positions
             WHERE client_id = ?
-              AND entry_ts >= datetime('now', '-1 hour')
+              AND entry_ts >= NOW() - INTERVAL '1 hour'
             """,
             (client_id,),
         ).fetchone())
@@ -221,7 +221,7 @@ def _mark_job(job_id: int, status: str, *, result: dict | None = None, error: st
         ))
 
 
-def _claim_one_job() -> Optional[sqlite3.Row]:
+def _claim_one_job() -> Optional[dict]:
     """
     Claim exactly one LEGACY job safely.
     FIX: Skips signals with ev_score — those are scanner signals routed to APExecutionCore.
@@ -235,13 +235,13 @@ def _claim_one_job() -> Optional[sqlite3.Row]:
             SET status='NEW',
                 started_ts=NULL,
                 last_error=COALESCE(last_error,'') || ' | reclaimed_stale',
-                created_ts=?
+                created_ts=%s
             WHERE status='PROCESSING'
               AND started_ts IS NOT NULL
-              AND started_ts < datetime('now', ?)
-              AND json_extract(payload, '$.ev_score') IS NULL
+              AND started_ts < NOW() - INTERVAL '%s seconds'
+              AND payload->>'ev_score' IS NULL
             """,
-            (_now_iso(), f"-{PROCESSING_STALE_SECS} seconds"),
+            (_now_iso(), PROCESSING_STALE_SECS),
         ))
 
         # 2) Find next NEW legacy job (no ev_score = legacy signal)
@@ -250,7 +250,7 @@ def _claim_one_job() -> Optional[sqlite3.Row]:
             SELECT id, client_id, signal_id, payload
             FROM trade_queue
             WHERE status='NEW'
-              AND json_extract(payload, '$.ev_score') IS NULL
+              AND payload->>'ev_score' IS NULL
             ORDER BY created_ts ASC
             LIMIT 1
             """
