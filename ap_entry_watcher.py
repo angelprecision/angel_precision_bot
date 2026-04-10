@@ -1,4 +1,5 @@
-# ap_entry_watcher.py — Angel Precision Real-Time Entry Watcher
+
+      # ap_entry_watcher.py — Angel Precision Real-Time Entry Watcher
 # =============================================================================
 # Gap 1 fix: The bot does NOT enter on signal. It enters on BREACH.
 #
@@ -36,7 +37,7 @@ ET  = ZoneInfo("America/New_York")
 
 # ── CONFIG ─────────────────────────────────────────────────────────────────────
 POLL_INTERVAL_SEC    = 15     # check every 15 seconds
-MAX_WATCH_MINUTES    = 90     # expire signal if no breach in 90 min
+MAX_WATCH_MINUTES    = 480    # FIX: 8 hours — holds overnight into next day's open
 EOD_CUTOFF_HOUR      = 15     # 3:00 PM ET — stop adding new watches after this
 EOD_CUTOFF_MIN       = 30     # 3:30 PM ET hard cutoff
 WRONG_DIR_BUFFER_PCT = 0.001  # 0.1% buffer before declaring wrong-direction breach
@@ -217,12 +218,18 @@ class APEntryWatcher:
     def add_signal(self, signal: dict) -> bool:
         """
         Add a signal to the watch queue.
-        Returns False if EOD cutoff has passed (no new watches after 3:30 PM ET).
+        FIX: Only reject during the trading session (9:30 AM - 3:30 PM ET).
+        Signals queued overnight are accepted and held until breach or expiry.
+        EOD cutoff only applies during live market hours to prevent new entries
+        near close — overnight signals should queue freely for next open.
         """
         now_et = datetime.now(ET)
-        if now_et.hour > EOD_CUTOFF_MIN // 60 or (
-            now_et.hour == EOD_CUTOFF_HOUR and now_et.minute >= EOD_CUTOFF_MIN
-        ):
+        # Only apply EOD cutoff during market hours (9:30 AM - 3:30 PM ET)
+        market_open  = now_et.hour > 9 or (now_et.hour == 9 and now_et.minute >= 30)
+        market_close = now_et.hour > 15 or (now_et.hour == 15 and now_et.minute >= 30)
+        in_market_hours = market_open and not market_close
+
+        if in_market_hours and market_close:
             log.warning(
                 f"[{signal.get('ticker')}] Signal rejected — past EOD cutoff "
                 f"({EOD_CUTOFF_HOUR}:{EOD_CUTOFF_MIN:02d} ET)"
