@@ -20,3 +20,5 @@ httpx==0.27.2
 
 # Notifications
 sendgrid>=6.11.0
+
+psycopg2-binary==2.9.9
