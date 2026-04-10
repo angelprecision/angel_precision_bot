@@ -57,9 +57,18 @@ class WatchedSignal:
         self.signal        = signal
         self.ticker        = signal["ticker"]
         self.side          = signal["side"]           # CALL or PUT
-        self.entry_trigger = float(signal["entry_price"])   # breach this
-        self.stop_level    = float(signal["stop_price"])    # wrong-dir invalidation
-        self.target_price  = float(signal["target_price"])
+
+        # FIX: support both flat signal fields and nested trigger dict
+        # Scanner signals: trigger.entry / trigger.stop / trigger.pt1
+        # Legacy signals:  entry_price / stop_price / target_price
+        _trigger = signal.get("trigger") or {}
+        _entry   = signal.get("entry_price") or _trigger.get("entry")
+        _stop    = signal.get("stop_price")  or _trigger.get("stop")
+        _target  = signal.get("target_price") or _trigger.get("pt1") or _trigger.get("pt2")
+
+        self.entry_trigger = float(_entry)   # breach this
+        self.stop_level    = float(_stop)    # wrong-dir invalidation
+        self.target_price  = float(_target)
         self.score         = float(signal.get("score", 0))
         self.grade         = signal.get("grade", "B")
 
