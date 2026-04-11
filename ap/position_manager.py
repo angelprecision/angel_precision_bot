@@ -55,10 +55,10 @@ class PositionStatus:
         return status in cls.ACTIVE
 
 
-# Pending entry order statuses in the orders table
-_PENDING_ENTRY_STATUSES = ("CREATED", "SUBMITTED", "ACKNOWLEDGED",
-                            "PARTIAL_FILL", "NEW", "ACK", "PARTIAL")
-_PENDING_EXIT_STATUSES  = ("EXIT_SUBMITTED",)
+# Pending entry order statuses — must match OrderStatus in ap/order_state_machine.py exactly
+_PENDING_ENTRY_STATUSES = ("CREATED", "SUBMITTED", "ACKNOWLEDGED", "PARTIAL_FILL")
+_PENDING_EXIT_STATUSES  = ("EXIT_REQUESTED", "EXIT_SUBMITTED",
+                            "EXIT_ACKNOWLEDGED", "EXIT_PARTIAL_FILL")
 
 
 # =============================================================================
