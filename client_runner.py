@@ -28,6 +28,9 @@ from supabase import create_client, Client
 
 from ap.db import conn as ap_conn, run_with_retry
 from ap.queue import enqueue_signal, worker_loop
+from ap.order_monitor import APOrderMonitor
+from ap.worker_health import get_monitor, init_monitor
+from ap.self_healing import get_healer, init_self_healing
 from ap.utils import now_utc_iso
 
 logger = logging.getLogger("client_runner")
@@ -82,6 +85,7 @@ class ClientRunner(threading.Thread):
         self.position_manager  = None
         self.order_state_machine = None
         self.contract_selector = None
+        self.order_monitor     = None
 
     def _get_token(self) -> str | None:
         try:
@@ -136,6 +140,8 @@ class ClientRunner(threading.Thread):
                 context_floor=float(os.getenv("CONTEXT_FLOOR", "6.0")),
                 max_positions=int(os.getenv("MAX_POSITIONS", "7")),
                 max_capital_pct=float(os.getenv("MAX_CAPITAL_PCT", "0.40")),
+                max_sector_pct=float(os.getenv("MAX_SECTOR_PCT", "0.25")),
+                max_ticker_pct=float(os.getenv("MAX_TICKER_PCT", "0.10")),
                 max_calls=int(os.getenv("MAX_CALLS", "5")),
                 max_puts=int(os.getenv("MAX_PUTS", "5")),
                 max_trades_today=int(os.getenv("MAX_TRADES_TODAY", "10")),
@@ -155,7 +161,6 @@ class ClientRunner(threading.Thread):
                 min_oi=int(os.getenv("MIN_OI", "50")),
                 min_volume=int(os.getenv("MIN_VOLUME", "10")),
                 max_dte=int(os.getenv("MAX_DTE", "21")),
-                max_sector_pct=float(os.getenv("MAX_SECTOR_PCT", "0.25")),
             )
 
             # ── Execution core (watcher + exit engine + fill monitor) ─────────
@@ -173,6 +178,32 @@ class ClientRunner(threading.Thread):
                 kill_switch_fn=lambda: getattr(self.core, "_kill_switch", False),
                 mode_fn=lambda: getattr(self.core, "mode", "PAPER"),
             )
+
+            # Pull live account equity so all % caps are per-client accurate
+            self._sync_account_equity(broker)
+
+            # Register with health monitor (singleton — watches thread liveness)
+            health_mon = get_monitor()
+            if health_mon:
+                health_mon.register(self)
+                health_mon.clear_dashboard_alert(self.email)
+
+            # Register with self-healing system (auto-restart + fast reconcile)
+            healer = get_healer()
+            if healer:
+                healer.register(self)
+
+            # Stale order monitor — cancel/alert/escalate on timeout
+            self.order_monitor = APOrderMonitor(
+                client_id=self.email,
+                broker=broker,
+                order_state_machine=self.order_state_machine,
+                position_manager=self.position_manager,
+            )
+            self.order_monitor.start()
+
+            # Periodic equity refresh in background (every 15 min)
+            self._start_equity_refresh(broker)
 
             logger.info(
                 f"[{self.email}] Control stack initialized | "
@@ -192,12 +223,56 @@ class ClientRunner(threading.Thread):
         except Exception as e:
             logger.error(f"[{self.email}] Runner crashed: {e}", exc_info=True)
         finally:
+            if self.order_monitor:
+                self.order_monitor.stop()
             if self.core:
                 self.core.stop()
+            # Unregister from health monitor
+            health_mon = get_monitor()
+            if health_mon:
+                health_mon.unregister(self.email)
+            # Unregister from self-healing system
+            healer = get_healer()
+            if healer:
+                healer.unregister(self.email)
             logger.info(f"[{self.email}] ClientRunner stopped.")
 
     def stop(self):
         self.stopped.set()
+        # Worker loop checks stop_event each poll cycle — exits cleanly
+
+    def _sync_account_equity(self, broker):
+        """Pull live balance from broker and update master control."""
+        try:
+            balance = None
+            if hasattr(broker, "get_account_balance"):
+                balance = broker.get_account_balance()
+            elif hasattr(broker, "get_balances"):
+                b = broker.get_balances()
+                balance = (b.get("equity") or b.get("total_equity")
+                           or b.get("net_liquidation") or b.get("cash"))
+            if balance and float(balance) > 0:
+                self.master_control.set_account_equity(float(balance))
+                logger.info(f"[{self.email}] Live equity synced: ${float(balance):.2f}")
+            else:
+                logger.warning(
+                    f"[{self.email}] Could not pull live equity — "
+                    f"using env default ${self.master_control.account_equity:.2f}"
+                )
+        except Exception as e:
+            logger.warning(f"[{self.email}] Equity sync failed: {e} — using env default")
+
+    def _start_equity_refresh(self, broker):
+        """Refresh account equity every 15 minutes in background."""
+        def _refresh_loop():
+            while not self.stopped.wait(900):  # 15 min
+                self._sync_account_equity(broker)
+        t = threading.Thread(
+            target=_refresh_loop,
+            daemon=True,
+            name=f"equity-refresh-{self.email}",
+        )
+        t.start()
 
     def _start_worker_thread(self, broker):
         """
@@ -205,6 +280,8 @@ class ClientRunner(threading.Thread):
         Passes full control stack — master control is the sole decision authority.
         """
         entry_watcher = getattr(self.core, "entry_watcher", None)
+
+        is_live = os.getenv("AP_MODE", "paper").upper() == "LIVE"
 
         def _run_worker():
             try:
@@ -215,6 +292,8 @@ class ClientRunner(threading.Thread):
                     order_state_machine=self.order_state_machine,
                     entry_watcher=entry_watcher,
                     client_id=self.email,
+                    stop_event=self.stopped,    # clean shutdown when runner stops
+                    live_mode=is_live,           # disables legacy fallback in live
                 )
             except Exception as e:
                 logger.error(f"[{self.email}] worker_loop crashed: {e}", exc_info=True)
@@ -235,20 +314,54 @@ class ClientRunner(threading.Thread):
 def route_signal_to_all_clients(signal: dict):
     """
     Called by app.py /signal endpoint.
-    Writes to Postgres trade_queue via enqueue_signal().
-    worker_loop() in each ClientRunner picks it up within 1 poll cycle.
-    Works correctly regardless of which gunicorn worker receives the HTTP request.
+    Fan-out: enqueues one job per active client so each client's worker
+    can claim and process it independently.
+
+    Critical: client_id in trade_queue MUST match the client_id each
+    worker polls for — they are isolated per client.
     """
     signal_id = str(signal.get("signal_id") or uuid.uuid4())
     signal["signal_id"] = signal_id
+    ticker = signal.get("ticker", "?")
 
-    try:
-        enqueue_signal(signal, client_id="default")
-        logger.info(
-            f"Signal {signal_id} [{signal.get('ticker')}] written to queue"
+    with _registry_lock:
+        active_emails = list(_active_runners.keys())
+
+    if not active_emails:
+        # No runners yet — fallback to "default" so signal isn't lost
+        logger.warning(
+            f"Signal {signal_id} [{ticker}] — no active runners, "
+            f"enqueuing to default"
         )
-    except Exception as e:
-        logger.error(f"Failed to enqueue signal {signal_id}: {e}")
+        try:
+            enqueue_signal(signal, client_id="default")
+        except Exception as e:
+            logger.error(f"Failed to enqueue signal to default: {e}")
+        return
+
+    # Fan-out: one queue entry per active client
+    enqueued = 0
+    for email in active_emails:
+        try:
+            # Use signal_id:email as idempotency key — prevents double-enqueue
+            # if this function is called twice (e.g. two gunicorn workers)
+            ok = enqueue_signal(
+                signal,
+                client_id=email,
+                idempotency_key=f"{signal_id}:{email}",
+            )
+            if ok:
+                enqueued += 1
+                logger.info(f"Signal {signal_id} [{ticker}] → queued for {email}")
+            else:
+                logger.debug(f"Signal {signal_id} duplicate for {email} — skipped")
+        except Exception as e:
+            logger.error(f"Failed to enqueue signal for {email}: {e}")
+
+    logger.info(
+        f"Signal {signal_id} [{ticker}] fan-out complete — "
+        f"{enqueued}/{len(active_emails)} clients queued"
+    )
 
 
 # =============================================================================
@@ -307,6 +420,14 @@ def start_multi_client_supervisor():
 
     sb = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
+    # Start worker health monitor singleton
+    init_monitor(supabase_client=sb)
+    logger.info("Worker health monitor initialized")
+
+    # Start self-healing system (auto-restart + fast reconcile)
+    init_self_healing(supabase_client=sb)
+    logger.info("Self-healing system initialized")
+
     def _supervisor():
         logger.info("Multi-client supervisor started")
         while True:
@@ -338,6 +459,7 @@ def get_runner_status() -> list[dict]:
                 "position_mgr":   r.position_manager is not None,
                 "order_osm":      r.order_state_machine is not None,
                 "contract_sel":   r.contract_selector is not None,
+                "order_monitor":  r.order_monitor is not None,
             }
             for email, r in _active_runners.items()
         ]
