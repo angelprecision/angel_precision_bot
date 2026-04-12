@@ -129,24 +129,50 @@ class APMasterControl:
         feedback_loop    — optional feedback loop
     """
 
+    # Sector classification map — ticker → sector
+    # Extend this as you add more tickers to your scanner
+    SECTOR_MAP: dict[str, str] = {
+        # Tech
+        "AAPL":"tech",  "MSFT":"tech",  "NVDA":"tech",  "AMD":"tech",
+        "GOOGL":"tech", "META":"tech",  "CRM":"tech",   "ORCL":"tech",
+        "TSLA":"tech",  "AMZN":"tech",  "NFLX":"tech",  "SNOW":"tech",
+        # Financials
+        "JPM":"financials", "BAC":"financials", "GS":"financials",
+        "MS":"financials",  "C":"financials",   "WFC":"financials",
+        # Healthcare
+        "UNH":"healthcare", "JNJ":"healthcare", "PFE":"healthcare",
+        "ABBV":"healthcare","MRK":"healthcare",  "LLY":"healthcare",
+        # Consumer
+        "WMT":"consumer",   "COST":"consumer",  "TGT":"consumer",
+        "LOW":"consumer",   "HD":"consumer",    "NKE":"consumer",
+        # Energy
+        "XOM":"energy",     "CVX":"energy",     "SLB":"energy",
+        # Industrials
+        "CAT":"industrials","DE":"industrials",  "BA":"industrials",
+        # Telecom / Media
+        "CMCSA":"telecom",  "VZ":"telecom",     "T":"telecom",
+        "DIS":"media",
+    }
+
     def __init__(
         self,
         *,
-        mode:             str   = "paper",
-        score_floor:      float = 60.0,
-        context_floor:    float = 6.0,
-        max_positions:    int   = 7,
-        max_capital_pct:  float = 0.40,     # block if deployed > 40% of equity
-        max_calls:        int   = 5,         # max simultaneous CALL positions
-        max_puts:         int   = 5,         # max simultaneous PUT positions
-        max_trades_today: int   = 10,        # entries per day
-        max_daily_loss:   float = -500.0,    # stop trading if PnL < this
-        account_equity:   float = 25000.0,   # used for capital% math
-        position_manager  = None,
-        supabase_client   = None,
-        signal_store      = None,
-        tier_engine       = None,
-        feedback_loop     = None,
+        mode:                str   = "paper",
+        score_floor:         float = 60.0,
+        context_floor:       float = 6.0,
+        max_positions:       int   = 7,
+        max_capital_pct:     float = 0.40,   # block if deployed > 40% of equity
+        max_sector_pct:      float = 0.25,   # max 25% of equity in one sector
+        max_calls:           int   = 5,      # max simultaneous CALL positions
+        max_puts:            int   = 5,      # max simultaneous PUT positions
+        max_trades_today:    int   = 10,     # entries per day
+        max_daily_loss:      float = -500.0, # stop trading if PnL < this
+        account_equity:      float = 25000.0,# used for capital% math
+        position_manager     = None,
+        supabase_client      = None,
+        signal_store         = None,
+        tier_engine          = None,
+        feedback_loop        = None,
     ):
         self.mode             = mode.upper()
         self.paper            = (self.mode != "LIVE")
@@ -154,6 +180,7 @@ class APMasterControl:
         self.context_floor    = context_floor
         self.max_positions    = max_positions
         self.max_capital_pct  = max_capital_pct
+        self.max_sector_pct   = max_sector_pct
         self.max_calls        = max_calls
         self.max_puts         = max_puts
         self.max_trades_today = max_trades_today
@@ -177,6 +204,7 @@ class APMasterControl:
             f"APMasterControl initialized | mode={self.mode} | "
             f"score_floor={self.score_floor} | ctx_floor={self.context_floor} | "
             f"max_pos={self.max_positions} | max_cap={self.max_capital_pct*100:.0f}% | "
+            f"max_sector={self.max_sector_pct*100:.0f}% | "
             f"max_calls={self.max_calls} | max_puts={self.max_puts} | "
             f"max_trades_today={self.max_trades_today} | "
             f"max_daily_loss=${self.max_daily_loss}"
@@ -188,8 +216,54 @@ class APMasterControl:
         if mode_fn:        self._mode_fn        = mode_fn
 
     def set_account_equity(self, equity: float):
-        """Update account equity (call after broker balance fetch)."""
+        """
+        Update account equity — call after broker balance fetch.
+        Critical for small accounts ($500–$5k) where fixed default is wrong.
+        All capital % and sector caps scale to this value automatically.
+        """
+        old = self.account_equity
         self.account_equity = float(equity)
+        if abs(old - self.account_equity) > 1:
+            log.info(
+                f"Account equity updated: ${old:.0f} → ${self.account_equity:.0f} | "
+                f"max_capital=${self.account_equity * self.max_capital_pct:.0f} "
+                f"max_sector=${self.account_equity * self.max_sector_pct:.0f}"
+            )
+
+    def _sector_capital_deployed(self, positions: list, sector: str) -> float:
+        """
+        Sum of avg_fill * qty * 100 for all active positions in this sector.
+        Positions come from snapshot open_positions + closing_positions.
+        """
+        total = 0.0
+        for pos in positions:
+            ticker_in_pos = str(pos.get("underlying") or pos.get("ticker") or "")
+            pos_sector    = self.SECTOR_MAP.get(ticker_in_pos.upper(), "other")
+            if pos_sector == sector:
+                try:
+                    fill = float(pos.get("avg_fill") or 0)
+                    qty  = int(pos.get("qty") or 0)
+                    total += fill * qty * 100
+                except Exception:
+                    pass
+        return total
+
+    def get_sector_exposure(self, positions: list) -> dict[str, float]:
+        """
+        Returns {sector: capital_deployed} for all active positions.
+        Useful for dashboard and reporting.
+        """
+        exposure: dict[str, float] = {}
+        for pos in positions:
+            ticker_in_pos = str(pos.get("underlying") or pos.get("ticker") or "")
+            sector        = self.SECTOR_MAP.get(ticker_in_pos.upper(), "other")
+            try:
+                fill = float(pos.get("avg_fill") or 0)
+                qty  = int(pos.get("qty") or 0)
+                exposure[sector] = exposure.get(sector, 0.0) + fill * qty * 100
+            except Exception:
+                pass
+        return exposure
 
     # =========================================================================
     # PUBLIC ENTRY POINT
@@ -243,12 +317,41 @@ class APMasterControl:
             return self._block(signal_id, ticker, client_id, "blocked_risk",
                                f"max_positions_with_pending ({effective_count}/{self.max_positions})")
 
-        # Capital % limit
-        max_capital = self.account_equity * self.max_capital_pct
-        if snap["capital_deployed"] >= max_capital:
+        # Total capital % limit — checks projected (current + est. new trade)
+        estimated_contracts_pre = max(1, self._base_contracts(score))
+        estimated_new_cost_pre  = estimated_contracts_pre * 100 * 5.0
+        projected_total         = snap["capital_deployed"] + estimated_new_cost_pre
+        max_capital             = self.account_equity * self.max_capital_pct
+        if projected_total > max_capital:
             return self._block(signal_id, ticker, client_id, "blocked_risk",
-                               f"capital_limit (${snap['capital_deployed']:.0f} >= "
-                               f"${max_capital:.0f} = {self.max_capital_pct*100:.0f}% of ${self.account_equity:.0f})")
+                               f"capital_limit "
+                               f"(projected ${projected_total:.0f} > "
+                               f"${max_capital:.0f} = {self.max_capital_pct*100:.0f}% "
+                               f"of ${self.account_equity:.0f} | "
+                               f"current=${snap['capital_deployed']:.0f} + est=${estimated_new_cost_pre:.0f})")
+
+        # Sector exposure cap — blocks if THIS trade WOULD exceed cap
+        # Uses projected exposure: current + estimated new position size
+        sector = self.SECTOR_MAP.get(ticker.upper(), "other")
+        sector_deployed = self._sector_capital_deployed(
+            snap["open_positions"] + snap["closing_positions"], sector
+        )
+        # Estimate new position cost before contract selection
+        # contracts from plan sizing (base 1), $5 placeholder premium — corrected
+        # after contract selection updates plan.max_position_usd
+        estimated_contracts = max(1, self._base_contracts(score))
+        estimated_new_cost  = estimated_contracts * 100 * 5.0   # placeholder pre-selection
+        projected_sector    = sector_deployed + estimated_new_cost
+        # Use per-client equity (set via set_account_equity() or env default)
+        effective_equity    = self.account_equity
+        max_sector_capital  = effective_equity * self.max_sector_pct
+        if projected_sector > max_sector_capital:
+            return self._block(signal_id, ticker, client_id, "blocked_risk",
+                               f"sector_cap_{sector} "
+                               f"(projected ${projected_sector:.0f} > "
+                               f"${max_sector_capital:.0f} = "
+                               f"{self.max_sector_pct*100:.0f}% of ${effective_equity:.0f} | "
+                               f"current=${sector_deployed:.0f} + est_new=${estimated_new_cost:.0f})")
 
         # Directional bias limits
         side = signal.get("side", signal.get("direction", "CALL")).upper()
@@ -411,6 +514,7 @@ class APMasterControl:
                 "setup_status":    setup_status,
                 "feedback_mod":    feedback_mod,
                 "intel_result":    intel,
+                "sector":          self.SECTOR_MAP.get(ticker.upper(), "other"),
                 "snapshot_at_eval": {
                     "open_count":       snap["open_count"],
                     "capital_deployed": snap["capital_deployed"],
