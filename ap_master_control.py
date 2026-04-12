@@ -24,6 +24,11 @@ from typing import Optional, Any
 
 log = logging.getLogger("ap.master_control")
 
+# Pre-selection premium estimate — used ONLY before contract_selector returns real cost.
+# After contract_selector runs and revalidate_exposure() fires, real premium is used.
+# Change this if your typical contract premium shifts significantly.
+DEFAULT_PREMIUM_ESTIMATE: float = 5.0
+
 
 # =============================================================================
 # APPROVED EXECUTION PLAN
@@ -220,17 +225,21 @@ class APMasterControl:
         if kill_switch_fn: self._kill_switch_fn = kill_switch_fn
         if mode_fn:        self._mode_fn        = mode_fn
 
-    def set_account_equity(self, equity: float):
+    def set_account_equity(self, equity: float, client_id: str = ""):
         """
-        Update account equity — call after broker balance fetch.
-        Critical for small accounts ($500–$5k) where fixed default is wrong.
-        All capital % and sector caps scale to this value automatically.
+        Update account equity for this specific client.
+        APMasterControl is instantiated once per ClientRunner, so
+        self.account_equity is already client-scoped.
+
+        client_id is accepted for logging clarity only.
+        Critical: never share one APMasterControl instance across clients.
         """
         old = self.account_equity
         self.account_equity = float(equity)
+        label = f"[{client_id}] " if client_id else ""
         if abs(old - self.account_equity) > 1:
             log.info(
-                f"Account equity updated: ${old:.0f} → ${self.account_equity:.0f} | "
+                f"{label}Account equity updated: ${old:.0f} → ${self.account_equity:.0f} | "
                 f"max_capital=${self.account_equity * self.max_capital_pct:.0f} "
                 f"max_sector=${self.account_equity * self.max_sector_pct:.0f}"
             )
@@ -252,6 +261,48 @@ class APMasterControl:
                 except Exception:
                     pass
         return total
+
+    def _pending_orders_capital(self, client_id: str) -> float:
+        """
+        Sum of reserved_cost for all pending (not-yet-filled) entry orders.
+        Uses the real cost set by create_entry_order() from plan.max_position_usd,
+        which is updated to the actual premium after contract selection.
+
+        Falls back to 0 if DB unavailable — never crashes the gate.
+        """
+        try:
+            from ap.db import conn, run_with_retry
+            def _fn():
+                with conn() as c:
+                    c.execute(
+                        """
+                        SELECT COALESCE(SUM(
+                            CASE
+                                -- If reserved_cost is set, use it (real premium × qty)
+                                WHEN reserved_cost IS NOT NULL AND reserved_cost > 0
+                                THEN reserved_cost
+                                -- Fallback: limit_price × qty × 100 if available
+                                WHEN limit_price IS NOT NULL AND limit_price > 0
+                                THEN limit_price * qty * 100
+                                -- Last resort: $5 placeholder per contract
+                                ELSE qty * 100 * 5.0
+                            END
+                        ), 0) AS pending_capital
+                        FROM orders
+                        WHERE client_id = %s
+                          AND kind = 'ENTRY'
+                          AND status IN (
+                              'CREATED','SUBMITTED','ACKNOWLEDGED','PARTIAL_FILL'
+                          )
+                        """,
+                        (client_id,),
+                    )
+                    row = c.fetchone()
+                    return float((row or {}).get("pending_capital") or 0)
+            return run_with_retry(_fn)
+        except Exception as e:
+            log.debug(f"_pending_orders_capital failed (non-critical): {e}")
+            return 0.0
 
     def _ticker_capital_deployed(self, positions: list, ticker: str) -> float:
         """
@@ -302,7 +353,18 @@ class APMasterControl:
         signal_id = str(signal.get("signal_id") or uuid.uuid4())
         signal["signal_id"] = signal_id
 
-        log.info(f"[{ticker}] evaluate | score={score:.1f} | client={client_id}")
+        # Normalize side/direction once — used in dedup, gates, and plan construction
+        raw_side  = signal.get("side") or signal.get("direction") or "CALL"
+        norm_side = raw_side.upper().strip()
+        if norm_side in ("BUY", "LONG", "CALLS", "BULLISH"):
+            norm_side = "CALL"
+        elif norm_side in ("SELL", "SHORT", "PUTS", "BEARISH"):
+            norm_side = "PUT"
+        # Write normalized value back so downstream modules see clean data
+        signal["side"]      = norm_side
+        signal["direction"] = norm_side
+
+        log.info(f"[{ticker}] evaluate | score={score:.1f} | side={norm_side} | client={client_id}")
 
         # ── A. SYSTEM GATES ───────────────────────────────────────────────────
 
@@ -315,19 +377,22 @@ class APMasterControl:
             return self._block(signal_id, ticker, client_id,
                                "blocked_system", "mode_read_only")
 
-        # Live mode safety: reject if signal came through legacy fallback path
-        # (identified by absence of ev_score — live mode requires full pipeline)
+        # Live mode safety: require ev_score specifically (not just any score).
+        # ev_score is only present when the full scanner pipeline ran.
+        # A plain "score" alone can come from legacy or partial paths.
+        # This enforces that live mode ONLY executes fully-scored signals.
         if current_mode == "LIVE":
-            ev = signal.get("ev_score") or signal.get("score")
-            if not ev:
+            ev_score = signal.get("ev_score")
+            if not ev_score or float(ev_score or 0) <= 0:
                 return self._block(signal_id, ticker, client_id,
                                    "blocked_system",
-                                   "live_mode_requires_scored_signal")
+                                   "live_mode_requires_ev_score "
+                                   "(plain score alone is insufficient in LIVE mode)")
 
-        # Dedupe — two layers:
-        # Layer 1: signal_id (exact replay protection)
-        # Layer 2: ticker+direction+timeframe+client (setup dedup within session)
-        direction_raw = signal.get("side", signal.get("direction", "CALL")).upper()
+        # Dedupe — in-memory check only at gate A (no DB write yet).
+        # Signals rejected for score/context/tier do NOT poison dedup state.
+        # DB persistence happens only after the signal is fully approved (gate I).
+        direction_raw = norm_side  # already normalized above
         timeframe_raw = signal.get("timeframe", "1d")
         setup_key     = f"{client_id}:{ticker.upper()}:{direction_raw}:{timeframe_raw}"
         signal_key    = f"sig:{signal_id}:{client_id}"
@@ -340,12 +405,8 @@ class APMasterControl:
             return self._block(signal_id, ticker, client_id,
                                "blocked_system",
                                f"duplicate_setup ({ticker} {direction_raw} {timeframe_raw})")
-
-        self._seen_signals.add(signal_key)
-        self._seen_signals.add(setup_key)
-
-        # Also persist dedup to DB so restarts don't create gaps
-        self._persist_dedup(signal_id, ticker, direction_raw, timeframe_raw, client_id)
+        # Note: _seen_signals NOT yet updated and NOT yet persisted to DB.
+        # That happens only at gate I after full approval.
 
         # ── B. POSITION SNAPSHOT ──────────────────────────────────────────────
 
@@ -364,15 +425,15 @@ class APMasterControl:
             return self._block(signal_id, ticker, client_id, "blocked_risk",
                                f"max_positions_with_pending ({effective_count}/{self.max_positions})")
 
-        # Total capital % limit — projected: current + pending orders + new trade
-        estimated_contracts_pre  = max(1, self._base_contracts(score))
-        estimated_new_cost_pre   = estimated_contracts_pre * 100 * 5.0
-        # Count pending entry orders as capital pressure too
-        pending_capital_estimate = snap["pending_entries"] * 100 * 5.0
-        projected_total          = (snap["capital_deployed"]
-                                    + pending_capital_estimate
-                                    + estimated_new_cost_pre)
-        max_capital              = self.account_equity * self.max_capital_pct
+        # Total capital % limit — projected: current + real pending cost + new trade estimate
+        estimated_contracts_pre = max(1, self._base_contracts(score))
+        estimated_new_cost_pre  = estimated_contracts_pre * 100 * DEFAULT_PREMIUM_ESTIMATE
+        # Real pending capital from reserved_cost on pending entry orders
+        pending_capital_real    = self._pending_orders_capital(client_id)
+        projected_total         = (snap["capital_deployed"]
+                                   + pending_capital_real
+                                   + estimated_new_cost_pre)
+        max_capital             = self.account_equity * self.max_capital_pct
         if projected_total > max_capital:
             return self._block(signal_id, ticker, client_id, "blocked_risk",
                                f"capital_limit "
@@ -380,7 +441,7 @@ class APMasterControl:
                                f"${max_capital:.0f} = {self.max_capital_pct*100:.0f}% "
                                f"of ${self.account_equity:.0f} | "
                                f"deployed=${snap['capital_deployed']:.0f} "
-                               f"pending_orders=${pending_capital_estimate:.0f} "
+                               f"pending_real=${pending_capital_real:.0f} "
                                f"new_est=${estimated_new_cost_pre:.0f})")
 
         # Sector exposure cap — blocks if THIS trade WOULD exceed cap
@@ -393,7 +454,7 @@ class APMasterControl:
         # contracts from plan sizing (base 1), $5 placeholder premium — corrected
         # after contract selection updates plan.max_position_usd
         estimated_contracts = max(1, self._base_contracts(score))
-        estimated_new_cost  = estimated_contracts * 100 * 5.0   # placeholder pre-selection
+        estimated_new_cost  = estimated_contracts * 100 * DEFAULT_PREMIUM_ESTIMATE
         projected_sector    = sector_deployed + estimated_new_cost
         # Use per-client equity (set via set_account_equity() or env default)
         effective_equity    = self.account_equity
@@ -410,7 +471,7 @@ class APMasterControl:
         ticker_deployed     = self._ticker_capital_deployed(
             snap["open_positions"] + snap["closing_positions"], ticker
         )
-        estimated_new_cost_ticker = estimated_contracts * 100 * 5.0
+        estimated_new_cost_ticker = estimated_contracts * 100 * DEFAULT_PREMIUM_ESTIMATE
         projected_ticker          = ticker_deployed + estimated_new_cost_ticker
         max_ticker_capital        = effective_equity * self.max_ticker_pct
         if projected_ticker > max_ticker_capital:
@@ -421,8 +482,8 @@ class APMasterControl:
                                f"{self.max_ticker_pct*100:.0f}% of ${effective_equity:.0f} | "
                                f"current=${ticker_deployed:.0f} + est=${estimated_new_cost_ticker:.0f})")
 
-        # Directional bias limits
-        side = signal.get("side", signal.get("direction", "CALL")).upper()
+        # Directional bias limits — use normalized side from top of evaluate()
+        side = norm_side
         if side == "CALL" and snap["calls_open"] >= self.max_calls:
             return self._block(signal_id, ticker, client_id, "blocked_risk",
                                f"max_calls ({snap['calls_open']}/{self.max_calls})")
@@ -562,7 +623,7 @@ class APMasterControl:
             pattern           = signal.get("pattern", signal.get("pattern_id", "")),
             timeframe         = signal.get("timeframe", "1d"),
             contracts         = contracts,
-            max_position_usd  = contracts * 100 * 5.0,
+            max_position_usd  = contracts * 100 * DEFAULT_PREMIUM_ESTIMATE,
             tier              = str(tier),
             score             = score,
             intel_score       = intel_score,
@@ -593,6 +654,13 @@ class APMasterControl:
             },
         )
 
+        # ── DEDUP COMMIT — only after full approval ──────────────────────────────
+        # Signal has passed all gates. Now safe to mark as seen so it cannot
+        # re-enter in the same session even if upstream replays it.
+        self._seen_signals.add(signal_key)
+        self._seen_signals.add(setup_key)
+        self._persist_dedup(signal_id, ticker, direction_raw, timeframe_raw, client_id)
+
         self._store_update(signal_id, "queued", timestamp_flag="queued_at")
 
         log.info(
@@ -615,12 +683,23 @@ class APMasterControl:
     # =========================================================================
 
     def _get_snapshot(self, client_id: str) -> dict:
-        """Pull position snapshot. Falls back to zeros if pm unavailable."""
+        """
+        Pull position snapshot for THIS client.
+        APPositionManager is client-scoped (instantiated per ClientRunner),
+        so self.pm.snapshot() already returns only this client's data.
+        Passes client_id for logging clarity and future multi-tenant safety.
+        """
         if self.pm:
             try:
+                # pm is already scoped to self.pm.client_id — verify alignment
+                if hasattr(self.pm, "client_id") and self.pm.client_id != client_id:
+                    log.error(
+                        f"SNAPSHOT MISMATCH: master_control client_id={client_id} "
+                        f"but pm.client_id={self.pm.client_id} — using pm data"
+                    )
                 return self.pm.snapshot()
             except Exception as e:
-                log.warning(f"snapshot() failed: {e} — using zeros")
+                log.warning(f"[{client_id}] snapshot() failed: {e} — using zeros")
         return {
             "open_count": 0, "open_tickers": set(),
             "calls_open": 0, "puts_open": 0,
@@ -671,50 +750,85 @@ class APMasterControl:
         with the real option premium.
 
         Re-checks only the three capital-sensitive gates using actual cost:
-          - Total capital % (real premium vs equity)
-          - Sector cap      (real premium vs sector limit)
-          - Per-ticker cap  (real premium vs ticker limit)
+          - Total capital %  (real premium vs equity)
+          - Sector cap       (real premium vs sector limit)
+          - Per-ticker cap   (real premium vs ticker limit)
 
         All other gates (score, tier, dedup, direction) already passed in evaluate().
+
+        ALL derived variables are computed upfront before any gate runs —
+        eliminates NameError if capital gate fires before sector/ticker are set.
         """
-        ticker     = plan.ticker
-        real_cost  = float(plan.max_position_usd)   # set by contract_selector
-        equity     = self.account_equity
-        signal_id  = plan.signal_id
+        ticker    = plan.ticker
+        real_cost = float(plan.max_position_usd)   # set by contract_selector
+        equity    = self.account_equity
+        signal_id = plan.signal_id
 
         snap = self._get_snapshot(client_id)
 
-        # Total capital re-check with real cost
-        pending_cap  = snap["pending_entries"] * 100 * 5.0
-        proj_total   = snap["capital_deployed"] + pending_cap + real_cost
-        max_capital  = equity * self.max_capital_pct
-        if proj_total > max_capital:
-            return self._block(signal_id, ticker, client_id, "blocked_risk",
-                               f"revalidate_capital_limit "
-                               f"(${proj_total:.0f} > ${max_capital:.0f} | real_cost=${real_cost:.0f})")
+        # ── Compute ALL derived values BEFORE any gate ────────────────────────
+        # Pending capital from real reserved_cost on active entry orders
+        pending_cap = self._pending_orders_capital(client_id)
 
-        # Sector cap re-check with real cost
-        sector = self.SECTOR_MAP.get(ticker.upper(), "other")
+        # Total capital projection
+        proj_total  = snap["capital_deployed"] + pending_cap + real_cost
+        max_capital = equity * self.max_capital_pct
+        pct_used    = proj_total / equity * 100 if equity > 0 else 0
+
+        # Sector
+        sector          = self.SECTOR_MAP.get(ticker.upper(), "other")
         sector_deployed = self._sector_capital_deployed(
             snap["open_positions"] + snap["closing_positions"], sector
         )
-        proj_sector     = sector_deployed + real_cost
-        max_sector      = equity * self.max_sector_pct
-        if proj_sector > max_sector:
-            return self._block(signal_id, ticker, client_id, "blocked_risk",
-                               f"revalidate_sector_cap_{sector} "
-                               f"(${proj_sector:.0f} > ${max_sector:.0f} | real_cost=${real_cost:.0f})")
+        proj_sector = sector_deployed + real_cost
+        max_sector  = equity * self.max_sector_pct
 
-        # Ticker cap re-check with real cost
+        # Ticker
         ticker_deployed = self._ticker_capital_deployed(
             snap["open_positions"] + snap["closing_positions"], ticker
         )
-        proj_ticker     = ticker_deployed + real_cost
-        max_ticker      = equity * self.max_ticker_pct
+        proj_ticker = ticker_deployed + real_cost
+        max_ticker  = equity * self.max_ticker_pct
+
+        # ── Shared log helper ─────────────────────────────────────────────────
+        def _log(blocked: bool, block_reason: str = ""):
+            self._log_capital_utilization(
+                client_id=client_id, ticker=ticker, signal_id=signal_id,
+                deployed=snap["capital_deployed"], pending=pending_cap,
+                new_cost=real_cost, projected=proj_total, limit=max_capital,
+                pct_used=pct_used,
+                sector=sector, sector_deployed=sector_deployed,
+                sector_projected=proj_sector, sector_limit=max_sector,
+                ticker_deployed=ticker_deployed, ticker_projected=proj_ticker,
+                ticker_limit=max_ticker,
+                blocked=blocked, block_reason=block_reason,
+            )
+
+        # ── Gate 1: Total capital % ───────────────────────────────────────────
+        if proj_total > max_capital:
+            _log(True, f"capital_limit: ${proj_total:.0f} > ${max_capital:.0f}")
+            return self._block(signal_id, ticker, client_id, "blocked_risk",
+                               f"revalidate_capital_limit "
+                               f"(${proj_total:.0f} > ${max_capital:.0f} | "
+                               f"deployed=${snap['capital_deployed']:.0f} "
+                               f"pending=${pending_cap:.0f} "
+                               f"real_cost=${real_cost:.0f})")
+
+        # ── Gate 2: Sector cap ────────────────────────────────────────────────
+        if proj_sector > max_sector:
+            _log(True, f"sector_cap_{sector}: ${proj_sector:.0f} > ${max_sector:.0f}")
+            return self._block(signal_id, ticker, client_id, "blocked_risk",
+                               f"revalidate_sector_cap_{sector} "
+                               f"(${proj_sector:.0f} > ${max_sector:.0f} | "
+                               f"real_cost=${real_cost:.0f})")
+
+        # ── Gate 3: Ticker cap ────────────────────────────────────────────────
         if proj_ticker > max_ticker:
+            _log(True, f"ticker_cap_{ticker.upper()}: ${proj_ticker:.0f} > ${max_ticker:.0f}")
             return self._block(signal_id, ticker, client_id, "blocked_risk",
                                f"revalidate_ticker_cap_{ticker.upper()} "
-                               f"(${proj_ticker:.0f} > ${max_ticker:.0f} | real_cost=${real_cost:.0f})")
+                               f"(${proj_ticker:.0f} > ${max_ticker:.0f} | "
+                               f"real_cost=${real_cost:.0f})")
 
         log.info(
             f"[{ticker}] ✅ Re-validation passed | "
@@ -723,6 +837,29 @@ class APMasterControl:
             f"sector_{sector}=${proj_sector:.0f}/{max_sector:.0f} "
             f"ticker=${proj_ticker:.0f}/{max_ticker:.0f}"
         )
+
+        # Persist capital utilization audit record
+        self._log_capital_utilization(
+            client_id  = client_id,
+            ticker     = ticker,
+            signal_id  = signal_id,
+            deployed   = snap["capital_deployed"],
+            pending    = pending_cap,
+            new_cost   = real_cost,
+            projected  = proj_total,
+            limit      = max_capital,
+            pct_used   = proj_total / equity * 100 if equity > 0 else 0,
+            sector     = sector,
+            sector_deployed = sector_deployed,
+            sector_projected= proj_sector,
+            sector_limit    = max_sector,
+            ticker_deployed = ticker_deployed,
+            ticker_projected= proj_ticker,
+            ticker_limit    = max_ticker,
+            blocked    = False,
+            block_reason= "",
+        )
+
         return ControlDecision(
             ok=True, stage="revalidated",
             signal_id=signal_id, ticker=ticker, client_id=client_id,
@@ -749,20 +886,132 @@ class APMasterControl:
         except Exception as e:
             log.debug(f"store_update failed: {e}")
 
-    def reset_session(self):
-        """Call at start of each trading day to clear dedup cache and DB."""
+    def _log_capital_utilization(
+        self,
+        *,
+        client_id:        str,
+        ticker:           str,
+        signal_id:        str,
+        deployed:         float,
+        pending:          float,
+        new_cost:         float,
+        projected:        float,
+        limit:            float,
+        pct_used:         float,
+        sector:           str,
+        sector_deployed:  float,
+        sector_projected: float,
+        sector_limit:     float,
+        ticker_deployed:  float,
+        ticker_projected: float,
+        ticker_limit:     float,
+        blocked:          bool,
+        block_reason:     str,
+    ):
+        """
+        Persist a capital utilization record to the audit_log table.
+        Every revalidate_exposure() call writes one row — whether it passed or blocked.
+        Enables post-session audit: which gate blocked trades, how full was the account.
+        """
+        import json
+        record = {
+            "event":            "capital_utilization",
+            "ticker":           ticker,
+            "signal_id":        signal_id,
+            "deployed":         round(deployed, 2),
+            "pending":          round(pending, 2),
+            "new_cost":         round(new_cost, 2),
+            "projected":        round(projected, 2),
+            "limit":            round(limit, 2),
+            "pct_used":         round(pct_used, 1),
+            "headroom":         round(limit - projected, 2),
+            "sector":           sector,
+            "sector_deployed":  round(sector_deployed, 2),
+            "sector_projected": round(sector_projected, 2),
+            "sector_limit":     round(sector_limit, 2),
+            "ticker_deployed":  round(ticker_deployed, 2),
+            "ticker_projected": round(ticker_projected, 2),
+            "ticker_limit":     round(ticker_limit, 2),
+            "blocked":          blocked,
+            "block_reason":     block_reason,
+            "account_equity":   round(self.account_equity, 2),
+        }
+
+        # Structured log — always emitted regardless of DB availability
+        log.info(
+            f"[{client_id}] CAPITAL_UTIL | {ticker} | "
+            f"deployed=${deployed:.0f} pending=${pending:.0f} "
+            f"new=${new_cost:.0f} projected=${projected:.0f}/{limit:.0f} "
+            f"({pct_used:.1f}%) headroom=${limit-projected:.0f} | "
+            f"{'BLOCKED: ' + block_reason if blocked else 'APPROVED'}"
+        )
+
+        # Persist to audit_log table
+        try:
+            from ap.db import conn, run_with_retry
+            from ap.utils import now_utc_iso
+            def _insert():
+                with conn() as c:
+                    c.execute(
+                        """
+                        INSERT INTO audit_log (client_id, event_type, payload, created_at)
+                        VALUES (%s, 'capital_utilization', %s, NOW())
+                        """,
+                        (client_id, json.dumps(record)),
+                    )
+            run_with_retry(_insert)
+        except Exception as e:
+            log.debug(f"Capital utilization log failed (non-critical): {e}")
+
+    def reset_session(self, client_id: str = ""):
+        """
+        Clear dedup cache for THIS client only, scoped to today's date.
+        Safe to call in multi-client environments — only wipes keys for
+        this client. Never touches other clients' dedup state.
+        """
+        from datetime import date
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")  # UTC — consistent with DB
+        # Build key prefix for this client
+        # Keys are: dedup:sig:{signal_id}:{client_id}
+        #           dedup:setup:{client_id}:{ticker}:{direction}:{timeframe}
+        client_prefix = client_id or (
+            self.pm.client_id if hasattr(self.pm, "client_id") else ""
+        )
+
         self._seen_signals.clear()
+
         try:
             from ap.db import conn, run_with_retry
             def _clear():
                 with conn() as c:
-                    c.execute(
-                        "DELETE FROM kv WHERE key LIKE 'dedup:%'",
-                    )
+                    if client_prefix:
+                        # Scope delete to this client AND today's date
+                        c.execute(
+                            """
+                            DELETE FROM kv
+                            WHERE (key LIKE %s OR key LIKE %s)
+                              AND updated_at::date = %s::date
+                            """,
+                            (
+                                f"dedup:sig:%:{client_prefix}",
+                                f"dedup:setup:{client_prefix}:%",
+                                today,
+                            ),
+                        )
+                    else:
+                        # No client_id — log warning, do NOT wipe all clients
+                        log.warning(
+                            "reset_session called without client_id — "
+                            "skipping DB clear to protect other clients"
+                        )
             run_with_retry(_clear)
         except Exception as e:
-            log.debug(f"Dedup DB clear failed: {e}")
-        log.info("MasterControl session reset — dedup cache cleared")
+            log.debug(f"Dedup DB clear failed (non-critical): {e}")
+
+        log.info(
+            f"MasterControl session reset | client={client_prefix or 'all'} "
+            f"date={today} — dedup cache cleared"
+        )
 
     def _persist_dedup(self, signal_id: str, ticker: str,
                        direction: str, timeframe: str, client_id: str):
@@ -792,28 +1041,32 @@ class APMasterControl:
 
     def _seed_dedup_from_db(self, client_id: str = "default"):
         """
-        On startup, load today's dedup keys from kv table into memory.
-        Prevents re-entering the same setup after a process restart.
+        On startup, load TODAY's dedup keys for THIS client only.
+        Scoped by client_id prefix — never loads other clients' dedup keys.
         """
         try:
             from ap.db import conn, run_with_retry
-            from datetime import date
-            today = date.today().isoformat()
+            today        = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            sig_prefix   = f"dedup:sig:%:{client_id}"
+            setup_prefix = f"dedup:setup:{client_id}:%"
             def _load():
                 with conn() as c:
                     c.execute(
                         """
                         SELECT key FROM kv
-                        WHERE key LIKE 'dedup:%'
-                        AND updated_at::date = %s::date
+                        WHERE (key LIKE %s OR key LIKE %s)
+                          AND updated_at::date = %s::date
                         """,
-                        (today,),
+                        (sig_prefix, setup_prefix, today),
                     )
                     return c.fetchall()
             rows = run_with_retry(_load)
             for row in rows:
                 self._seen_signals.add(row["key"].replace("dedup:", "", 1))
             if rows:
-                log.info(f"Dedup cache seeded from DB: {len(rows)} entries")
+                log.info(
+                    f"[{client_id}] Dedup seeded: {len(rows)} entries "
+                    f"(today={today}, client-scoped)"
+                )
         except Exception as e:
             log.debug(f"Dedup seed failed (non-critical): {e}")
