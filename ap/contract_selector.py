@@ -1,15 +1,17 @@
-# ap/contract_selector.py — APContractSelectionEngine
+ ap/contract_selector.py — APContractSelectionEngine
 # =============================================================================
 # Unified contract selection. Takes an ApprovedExecutionPlan, returns the
 # single best tradable contract + real sizing based on actual premium.
 #
 # Selection algorithm:
-#   A. Choose expiration  (0DTE / weekly / nearest)
-#   B. Filter to direction (CALL / PUT)
-#   C. Hard quality filters (spread, OI, volume, DTE, delta)
-#   D. Rank survivors (delta fit, spread, OI, volume, premium fit)
-#   E. Price sanity (buy-side: prefer ask when spread is tight)
-#   F. Affordability → final contract count from real premium
+#   A. Earnings blackout gate (APEarningsGuard) — before chain fetch
+#   B. Choose expiration  (0DTE / weekly / nearest)
+#   C. Filter to direction (CALL / PUT)
+#   D. Hard quality filters (spread, OI, volume, DTE, delta)
+#   E. IV rank gate (APIVRankFilter) — after chain fetch
+#   F. Rank survivors (delta fit, spread, OI, volume, premium fit)
+#   G. Price sanity (buy-side: prefer ask when spread is tight)
+#   H. Affordability → final contract count from real premium
 #
 # Replaces the placeholder:
 #   max_position_usd = contracts * 100 * 5.0
@@ -95,6 +97,8 @@ class APContractSelectionEngine:
         max_dte        — maximum days to expiration (default 21)
         min_dte        — minimum DTE (default 0 for 0DTE support)
         prefer_weekly  — prefer weekly expirations (default True)
+        earnings_guard — APEarningsGuard instance (optional; skipped if None)
+        iv_filter      — APIVRankFilter instance (optional; skipped if None)
     """
 
     def __init__(
@@ -112,6 +116,8 @@ class APContractSelectionEngine:
         max_dte:        int   = 21,
         min_dte:        int   = 0,
         prefer_weekly:  bool  = True,
+        earnings_guard=None,
+        iv_filter=None,
     ):
         self.broker         = broker
         self.mode           = mode
@@ -125,13 +131,23 @@ class APContractSelectionEngine:
         self.max_dte        = max_dte
         self.min_dte        = min_dte
         self.prefer_weekly  = prefer_weekly
+        self.earnings_guard = earnings_guard
+        self.iv_filter      = iv_filter
 
         log.info(
-            f"APContractSelectionEngine | mode={mode} "
-            f"delta={target_delta}±{delta_band} "
-            f"max_spread={max_spread_pct*100:.0f}% "
-            f"dte=[{min_dte},{max_dte}] "
-            f"premium=[${min_premium:.0f},${max_premium:.0f}]"
+            "APContractSelectionEngine | mode=%s "
+            "delta=%.2f±%.2f "
+            "max_spread=%d%% "
+            "dte=[%d,%d] "
+            "premium=[$%.0f,$%.0f] "
+            "earnings_guard=%s iv_filter=%s",
+            mode,
+            target_delta, delta_band,
+            int(max_spread_pct * 100),
+            min_dte, max_dte,
+            min_premium, max_premium,
+            type(earnings_guard).__name__ if earnings_guard is not None else "None",
+            type(iv_filter).__name__ if iv_filter is not None else "None",
         )
 
     # =========================================================================
@@ -141,31 +157,79 @@ class APContractSelectionEngine:
     def select(self, plan) -> Optional[SelectedContract]:
         """
         Given an ApprovedExecutionPlan, return the best SelectedContract.
-        Returns None if no suitable contract found.
-        
-        Also updates plan.contract_symbol, plan.limit_price, and 
-        plan.contracts to reflect real-premium sizing.
+        Returns None if no suitable contract found or a gate blocks the trade.
+
+        Gate order:
+          1. APEarningsGuard.check(ticker)   — BEFORE chain fetch
+          2. Chain fetch
+          3. APIVRankFilter.check(...)       — AFTER chain fetch
+          4. Quality filter + ranking
+          5. Affordability gate
         """
         ticker    = plan.ticker
         direction = plan.side.upper()   # "CALL" | "PUT"
         budget    = plan.max_position_usd
 
         log.info(
-            f"[{ticker}] ContractSelector | direction={direction} "
-            f"budget=${budget:.0f} tier={plan.tier}"
+            "[%s] ContractSelector | direction=%s budget=$%.0f tier=%s",
+            ticker, direction, budget, plan.tier,
         )
+
+        # ── GATE 1: EARNINGS BLACKOUT ─────────────────────────────────────────
+        # Check BEFORE fetching the chain to avoid unnecessary API calls.
+
+        if self.earnings_guard is not None:
+            try:
+                eg_result = self.earnings_guard.check(ticker)
+                if eg_result.get("blocked"):
+                    reason = eg_result.get("reason", "earnings blackout")
+                    log.warning(
+                        "[%s] BLOCKED by EarningsGuard — %s",
+                        ticker, reason,
+                    )
+                    return None
+            except Exception as exc:
+                # Fail open: log warning, do not block
+                log.warning(
+                    "[%s] EarningsGuard raised unexpectedly (%s) — continuing (fail open)",
+                    ticker, exc,
+                )
 
         # ── A. FETCH CHAIN ────────────────────────────────────────────────────
 
         try:
-            chain = self._fetch_chain(ticker, direction)
+            chain, underlying_price = self._fetch_chain_with_price(ticker, direction)
         except Exception as e:
-            log.error(f"[{ticker}] chain fetch failed: {e}")
+            log.error("[%s] chain fetch failed: %s", ticker, e)
             return None
 
         if not chain:
-            log.warning(f"[{ticker}] empty chain for {direction}")
+            log.warning("[%s] empty chain for %s", ticker, direction)
             return None
+
+        # ── GATE 2: IV RANK FILTER ────────────────────────────────────────────
+        # Check AFTER fetching the chain (we need chain data for ATM IV).
+
+        if self.iv_filter is not None:
+            try:
+                iv_result = self.iv_filter.check(
+                    ticker,
+                    option_chain=chain,
+                    underlying_price=underlying_price or 0.0,
+                )
+                if iv_result.get("blocked"):
+                    reason = iv_result.get("reason", "IV rank too high")
+                    log.warning(
+                        "[%s] BLOCKED by IVRankFilter — %s",
+                        ticker, reason,
+                    )
+                    return None
+            except Exception as exc:
+                # Fail open: log warning, do not block
+                log.warning(
+                    "[%s] IVRankFilter raised unexpectedly (%s) — continuing (fail open)",
+                    ticker, exc,
+                )
 
         # ── B. HARD QUALITY FILTER ────────────────────────────────────────────
 
@@ -176,13 +240,16 @@ class APContractSelectionEngine:
             if result is None:
                 survivors.append(opt)
             else:
-                log.debug(f"[{ticker}] filtered: {opt.get('symbol','?')} — {result}")
+                log.debug(
+                    "[%s] filtered: %s — %s",
+                    ticker, opt.get("symbol", "?"), result,
+                )
 
         if not survivors:
-            log.warning(f"[{ticker}] no contracts passed quality filter")
+            log.warning("[%s] no contracts passed quality filter", ticker)
             return None
 
-        log.info(f"[{ticker}] {len(survivors)} contracts passed quality filter")
+        log.info("[%s] %d contracts passed quality filter", ticker, len(survivors))
 
         # ── C. RANK ───────────────────────────────────────────────────────────
 
@@ -204,9 +271,11 @@ class APContractSelectionEngine:
         # If budget cannot cover even 1 contract, block. Never force to 1.
         if selected.affordable_contracts < 1:
             log.warning(
-                f"[{ticker}] BLOCKED — budget ${budget:.0f} cannot afford "
-                f"{selected.contract_symbol} "
-                f"@ ${selected.premium_per_contract:.0f}/contract"
+                "[%s] BLOCKED — budget $%.0f cannot afford %s "
+                "@ $%.0f/contract",
+                ticker, budget,
+                selected.contract_symbol,
+                selected.premium_per_contract,
             )
             return None
 
@@ -219,14 +288,22 @@ class APContractSelectionEngine:
         plan.max_position_usd = plan.contracts * selected.premium_per_contract
 
         log.info(
-            f"[{ticker}] ✅ SELECTED | {selected.contract_symbol} "
-            f"bid={selected.bid} ask={selected.ask} mid={selected.mid:.2f} "
-            f"spread={selected.spread_pct*100:.1f}% "
-            f"delta={selected.delta} OI={selected.open_interest} "
-            f"vol={selected.volume} DTE={selected.dte} "
-            f"premium=${selected.premium_per_contract:.0f} "
-            f"contracts={selected.affordable_contracts} "
-            f"score={selected.selection_score:.2f}"
+            "[%s] SELECTED | %s "
+            "bid=%s ask=%s mid=%.2f "
+            "spread=%.1f%% "
+            "delta=%s OI=%d "
+            "vol=%d DTE=%d "
+            "premium=$%.0f "
+            "contracts=%d "
+            "score=%.2f",
+            ticker, selected.contract_symbol,
+            selected.bid, selected.ask, selected.mid,
+            selected.spread_pct * 100,
+            selected.delta, selected.open_interest,
+            selected.volume, selected.dte,
+            selected.premium_per_contract,
+            selected.affordable_contracts,
+            selected.selection_score,
         )
         return selected
 
@@ -234,30 +311,39 @@ class APContractSelectionEngine:
     # PRIVATE — CHAIN FETCH
     # =========================================================================
 
-    def _fetch_chain(self, ticker: str, direction: str) -> list[dict]:
+    def _fetch_chain_with_price(
+        self, ticker: str, direction: str
+    ) -> tuple[list[dict], Optional[float]]:
         """
-        Fetch option chain from broker.
-        Supports Tradier broker interface.
-        Returns list of option dicts with keys:
-          symbol, strike, expiration_date, bid, ask, last,
-          open_interest, volume, greeks (delta etc.)
+        Fetch option chain and underlying price from broker.
+        Returns (chain_list, underlying_price_or_None).
         """
         option_type = direction.lower()   # "call" | "put"
 
         # Try broker's option chain method
         if hasattr(self.broker, "get_option_chain"):
             chain = self.broker.get_option_chain(ticker, option_type=option_type)
-            return chain or []
+            return (chain or []), None
 
         if hasattr(self.broker, "option_chain"):
             chain = self.broker.option_chain(ticker, option_type=option_type)
-            return chain or []
+            return (chain or []), None
 
         # Tradier REST fallback via requests
         return self._fetch_tradier_chain(ticker, option_type)
 
-    def _fetch_tradier_chain(self, ticker: str, option_type: str) -> list[dict]:
-        """Direct Tradier API call for option chain."""
+    def _fetch_chain(self, ticker: str, direction: str) -> list[dict]:
+        """
+        Thin wrapper kept for backward compatibility.
+        Returns chain list only (discards underlying price).
+        """
+        chain, _ = self._fetch_chain_with_price(ticker, direction)
+        return chain
+
+    def _fetch_tradier_chain(
+        self, ticker: str, option_type: str
+    ) -> tuple[list[dict], Optional[float]]:
+        """Direct Tradier API call for option chain. Returns (chain, underlying_price)."""
         import requests
 
         cfg      = getattr(self.broker, "cfg", None)
@@ -295,12 +381,12 @@ class APContractSelectionEngine:
 
         dates = exp_resp.json().get("expirations", {}).get("date", []) or []
         if not dates:
-            return []
+            return [], underlying_price
 
         # 3. Pick best expiration
         target_exp = self._pick_expiration(dates)
         if not target_exp:
-            return []
+            return [], underlying_price
 
         # 4. Get chain with greeks
         chain_resp = requests.get(
@@ -318,8 +404,10 @@ class APContractSelectionEngine:
             for o in options:
                 o["_underlying_price"] = underlying_price
 
-        return [o for o in options
-                if o.get("option_type", "").lower() == option_type]
+        filtered = [o for o in options
+                    if o.get("option_type", "").lower() == option_type]
+
+        return filtered, underlying_price
 
     def _pick_expiration(self, dates: list[str]) -> Optional[str]:
         """Choose target expiration from available dates."""
@@ -385,20 +473,20 @@ class APContractSelectionEngine:
             return "zero_mid"
         spread_pct = (ask - bid) / mid
         if spread_pct > self.max_spread_pct:
-            return f"spread_too_wide_{spread_pct*100:.1f}%"
+            return "spread_too_wide_%.1f%%" % (spread_pct * 100)
 
         # OI / volume
         if oi < self.min_oi:
-            return f"low_oi_{oi}"
+            return "low_oi_%d" % oi
         if vol < self.min_volume:
-            return f"low_volume_{vol}"
+            return "low_volume_%d" % vol
 
         # Premium range
         premium = mid * 100
         if premium < self.min_premium:
-            return f"premium_too_low_${premium:.0f}"
+            return "premium_too_low_$%.0f" % premium
         if premium > self.max_premium:
-            return f"premium_too_high_${premium:.0f}"
+            return "premium_too_high_$%.0f" % premium
 
         # DTE
         exp_str = opt.get("expiration_date", "")
@@ -407,9 +495,9 @@ class APContractSelectionEngine:
                 exp = date.fromisoformat(exp_str)
                 dte = (exp - today).days
                 if dte < self.min_dte:
-                    return f"dte_too_low_{dte}"
+                    return "dte_too_low_%d" % dte
                 if dte > self.max_dte:
-                    return f"dte_too_high_{dte}"
+                    return "dte_too_high_%d" % dte
             except Exception:
                 return "invalid_expiration"
 
@@ -422,7 +510,7 @@ class APContractSelectionEngine:
                 min_d = max(0.05, self.target_delta - self.delta_band)
                 max_d = min(0.95, self.target_delta + self.delta_band)
                 if delta < min_d or delta > max_d:
-                    return f"delta_out_of_band_{delta:.2f}"
+                    return "delta_out_of_band_%.2f" % delta
             except Exception:
                 pass
         else:
@@ -435,9 +523,9 @@ class APContractSelectionEngine:
                 # CALLs: slightly OTM to slightly ITM (0.93x–1.12x spot)
                 # PUTs:  slightly OTM to slightly ITM (0.88x–1.07x spot)
                 if option_type == "call" and not (0.93 <= moneyness <= 1.12):
-                    return f"moneyness_out_of_range_{moneyness:.3f}"
+                    return "moneyness_out_of_range_%.3f" % moneyness
                 if option_type == "put" and not (0.88 <= moneyness <= 1.07):
-                    return f"moneyness_out_of_range_{moneyness:.3f}"
+                    return "moneyness_out_of_range_%.3f" % moneyness
 
         return None  # passed
 
@@ -537,16 +625,17 @@ class APContractSelectionEngine:
                 premium_per_contract = premium_per_contract,
                 affordable_contracts = affordable,
                 selection_reason     = (
-                    f"delta={delta:.2f} spread={spread_pct*100:.1f}% "
-                    f"OI={oi} vol={vol} DTE={dte} "
-                    f"premium=${premium_per_contract:.0f}"
+                    "delta=%.2f spread=%.1f%% OI=%d vol=%d DTE=%d premium=$%.0f" % (
+                        delta, spread_pct * 100, oi, vol, dte, premium_per_contract
+                    )
                     if delta else
-                    f"spread={spread_pct*100:.1f}% OI={oi} vol={vol} "
-                    f"DTE={dte} premium=${premium_per_contract:.0f}"
+                    "spread=%.1f%% OI=%d vol=%d DTE=%d premium=$%.0f" % (
+                        spread_pct * 100, oi, vol, dte, premium_per_contract
+                    )
                 ),
                 selection_score      = score,
                 dte                  = dte,
             )
         except Exception as e:
-            log.error(f"_build_selected failed: {e}")
+            log.error("_build_selected failed: %s", e)
             return None
