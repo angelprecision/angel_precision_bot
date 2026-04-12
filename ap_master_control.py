@@ -655,11 +655,23 @@ class APMasterControl:
         )
 
         # ── DEDUP COMMIT — only after full approval ──────────────────────────────
-        # Signal has passed all gates. Now safe to mark as seen so it cannot
-        # re-enter in the same session even if upstream replays it.
+        # Final kill switch check before committing dedup state.
+        # If kill fires here, we abort before writing anything.
+        if self._kill_switch_fn and self._kill_switch_fn():
+            return self._block(signal_id, ticker, client_id,
+                               "blocked_system", "kill_switch_active_pre_commit")
+
+        # Signal has passed all gates. Persist dedup FIRST (DB),
+        # then add to in-memory cache. If DB persist raises, in-memory stays clean.
+        try:
+            self._persist_dedup(signal_id, ticker, direction_raw, timeframe_raw, client_id)
+        except Exception as _dedup_err:
+            log.warning(f"[{ticker}] Dedup persist failed — not committing to memory: {_dedup_err}")
+            raise   # propagate so caller knows eval was aborted
+
+        # Only add to memory AFTER DB write succeeds
         self._seen_signals.add(signal_key)
         self._seen_signals.add(setup_key)
-        self._persist_dedup(signal_id, ticker, direction_raw, timeframe_raw, client_id)
 
         self._store_update(signal_id, "queued", timestamp_flag="queued_at")
 
@@ -765,6 +777,12 @@ class APMasterControl:
         signal_id = plan.signal_id
 
         snap = self._get_snapshot(client_id)
+
+        # Re-check kill switch after snapshot — snapshot() can be slow
+        # and kill switch may have been activated during the DB call
+        if self._kill_switch_fn and self._kill_switch_fn():
+            return self._block(signal_id, ticker, client_id,
+                               "blocked_system", "kill_switch_active_post_snapshot")
 
         # ── Compute ALL derived values BEFORE any gate ────────────────────────
         # Pending capital from real reserved_cost on active entry orders
