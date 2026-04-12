@@ -256,14 +256,15 @@ class APExitEngine:
         engine.add_position(ManagedPosition(...))
     """
 
-    def __init__(self, broker):
-        self.broker      = broker
+    def __init__(self, broker, kill_switch_fn=None):
+        self.broker           = broker
         self._positions: list[ManagedPosition] = []
-        self._lock       = threading.Lock()
-        self._running    = False
+        self._lock            = threading.Lock()
+        self._running         = False
         self._thread: Optional[threading.Thread] = None
-        self.on_exit: Optional[Callable] = None    # callback(pos, ExitDecision)
+        self.on_exit: Optional[Callable]  = None   # callback(pos, ExitDecision)
         self.on_scale: Optional[Callable] = None   # callback(pos, ExitDecision, qty)
+        self._kill_switch_fn  = kill_switch_fn     # callable() → bool | None
 
     def add_position(self, pos: ManagedPosition):
         with self._lock:
@@ -303,6 +304,10 @@ class APExitEngine:
             time.sleep(POLL_INTERVAL_SEC)
 
     def _check_all_positions(self):
+        # ── Gap 1: Kill check at poll start (pre-fetch) ─────────────────────
+        if self._kill_switch_fn and self._kill_switch_fn():
+            log.debug("Exit engine poll skipped — kill switch active")
+            return
         now_et = datetime.now(ET)
         active = self.active_positions()
         if not active:
@@ -343,6 +348,17 @@ class APExitEngine:
                     if decision.should_act:
                         actions_to_take.append((pos, decision))
 
+        # ── Gap 2: Kill check post-fetch, pre-execute ───────────────────────────
+        # Quote fetch takes 1–5s on live Tradier. Kill may have fired during
+        # that I/O window. This check catches it before any broker call.
+        if self._kill_switch_fn and self._kill_switch_fn():
+            log.warning(
+                f"Exit engine: kill switch fired during quote fetch — "
+                f"aborting {len(actions_to_take)} pending exit action(s) "
+                f"for positions: {[p.ticker for p, _ in actions_to_take]}"
+            )
+            return
+
         # Execute actions
         for pos, decision in actions_to_take:
             log.info(
@@ -354,6 +370,14 @@ class APExitEngine:
                 pos.scale_outs_done += 1
                 pos.quantity_remaining -= decision.quantity
                 if self.on_scale:
+                    if self._kill_switch_fn and self._kill_switch_fn():
+                        log.warning(
+                            f"[{pos.ticker}] KILL ACTIVE at on_scale — "
+                            f"reverting scale_out and skipping broker order"
+                        )
+                        pos.scale_outs_done   -= 1
+                        pos.quantity_remaining += decision.quantity
+                        continue
                     self.on_scale(pos, decision)
             else:
                 pos.closed = True
@@ -361,6 +385,16 @@ class APExitEngine:
                 with self._lock:
                     self._positions = [p for p in self._positions if p is not pos]
                 if self.on_exit:
+                    # ── Gap 3: Final per-position kill check before broker call ──
+                    # Catches kill that fires between execute loop iterations.
+                    if self._kill_switch_fn and self._kill_switch_fn():
+                        log.error(
+                            f"[{pos.ticker}] KILL ACTIVE at on_exit — "
+                            f"reverting pos.closed and skipping broker order"
+                        )
+                        pos.closed       = False   # revert — no order sent
+                        pos.close_reason = ""
+                        continue
                     self.on_exit(pos, decision)
 
     def _fetch_quotes(self, tickers: list[str]) -> dict:
