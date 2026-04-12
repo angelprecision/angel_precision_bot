@@ -269,12 +269,22 @@ class APSelfHealingSystem:
 
         # Component → (thread_name, auto_restart_ok, severity_if_dead)
         components = {
-            "runner":         (runner.name,                 False, HealthState.FATAL),
-            "worker":         (f"worker-{email}",           True,  HealthState.CRITICAL),
-            "order_monitor":  (f"order-monitor-{email}",    True,  HealthState.CRITICAL),
-            "equity_refresh": (f"equity-refresh-{email}",   True,  HealthState.WARNING),
-            "exit_engine":    (f"ap-exit-engine",           False, HealthState.CRITICAL),
+            "runner":         (runner.name,                        False, HealthState.FATAL),
+            "worker":         (f"worker-{email}",                  True,  HealthState.CRITICAL),
+            "order_monitor":  (f"order-monitor-{email}",           True,  HealthState.CRITICAL),
+            # equity_refresh: WARNING on first death, CRITICAL after first failed restart
+            # Stale equity means capital caps become unreliable over time
+            "equity_refresh": (f"equity-refresh-{email}",          True,  HealthState.WARNING),
+            # exit_engine is client-scoped — thread name uses email for isolation
+            "exit_engine":    (f"ap-exit-engine-{email}",          False, HealthState.CRITICAL),
         }
+
+        # Promote equity_refresh to CRITICAL if it has had any failed restart
+        eq_health = self._get_health(email, "equity_refresh")
+        if eq_health.restart_count > 0 and eq_health.state != HealthState.OK:
+            components["equity_refresh"] = (
+                f"equity-refresh-{email}", True, HealthState.CRITICAL
+            )
 
         for comp, (tname, auto_restart, dead_severity) in components.items():
             health = self._get_health(email, comp)
@@ -282,7 +292,26 @@ class APSelfHealingSystem:
             alive  = (t is not None and t.is_alive())
 
             if alive:
-                health.state     = HealthState.OK
+                # Check for stall: alive but not progressing
+                # Heartbeat is updated by worker_loop's update_state() call.
+                # If last_seen is stale beyond threshold → WARNING
+                age_secs = (_now() - health.last_seen).total_seconds()
+                if age_secs > STALL_THRESHOLD_SEC and health.state == HealthState.OK:
+                    health.state = HealthState.WARNING
+                    log.warning(
+                        f"[{email}] {comp} STALLED — alive but no heartbeat "
+                        f"for {age_secs:.0f}s > {STALL_THRESHOLD_SEC}s threshold"
+                    )
+                    if health.cooldown_ok():
+                        self._alert(
+                            email, comp, HealthState.WARNING,
+                            f"Thread alive but stalled for {age_secs:.0f}s "
+                            f"(threshold={STALL_THRESHOLD_SEC}s). "
+                            f"Consider manual investigation.",
+                            health
+                        )
+                elif age_secs <= STALL_THRESHOLD_SEC:
+                    health.state     = HealthState.OK
                 health.last_seen = _now()
             else:
                 self._handle_dead_component(
@@ -322,16 +351,29 @@ class APSelfHealingSystem:
                 success = fn()
 
                 if success:
-                    log.info(f"[{email}] {comp} restarted successfully")
-                    health.state = HealthState.OK
-                    if health.cooldown_ok():
-                        self._alert(
-                            email, comp, HealthState.OK,
-                            f"Component {comp} restarted successfully "
-                            f"(attempt {health.restart_count}/{MAX_RESTART_ATTEMPTS})",
-                            health
-                        )
-                else:
+                    # Verify the thread is actually alive — not just "restart ran"
+                    time.sleep(2)   # give thread 2s to start
+                    live_after = {t.name: t for t in threading.enumerate()}
+                    thread_name = components[comp][0]
+                    thread_alive = (thread_name in live_after and
+                                    live_after[thread_name].is_alive())
+                    if thread_alive:
+                        log.info(f"[{email}] {comp} restarted and VERIFIED alive")
+                        health.state     = HealthState.OK
+                        health.last_seen = _now()
+                        if health.cooldown_ok():
+                            self._alert(
+                                email, comp, HealthState.OK,
+                                f"Component {comp} restarted and verified alive "
+                                f"(attempt {health.restart_count}/{MAX_RESTART_ATTEMPTS})",
+                                health
+                            )
+                    else:
+                        log.error(f"[{email}] {comp} restart returned True but thread NOT alive")
+                        success = False   # treat as failure
+                        health.record_error("Restart returned True but thread not alive")
+
+                if not success:
                     if health.restart_count >= MAX_RESTART_ATTEMPTS:
                         health.state = HealthState.FATAL
                         self._alert(
@@ -344,7 +386,8 @@ class APSelfHealingSystem:
                         health.state = HealthState.CRITICAL
                         if health.cooldown_ok():
                             self._alert(email, comp, HealthState.CRITICAL,
-                                        f"Restart attempt {health.restart_count} failed — "
+                                        f"Restart attempt {health.restart_count} failed "
+                                        f"(or thread not alive after restart) — "
                                         f"will retry in {RESTART_COOLDOWN_SEC}s", health)
             return
 
@@ -418,15 +461,62 @@ class APSelfHealingSystem:
                     f"({pos['underlying']} {pos['status']}) "
                     f"age={age_secs:.0f}s"
                 )
-                # Clear unmanaged flag — next exit engine poll will manage it
-                def _clear(pid=pos["id"]):
+                # Clear unmanaged flag ONLY if position is still OPEN (not mid-close)
+                # and no active exit order is already in-flight.
+                # Blind clearing can mask genuine issues.
+                pos_status = pos.get("status", "")
+                pos_id     = pos["id"]
+
+                def _check_exit_order(pid=pos_id):
                     with conn() as c:
                         c.execute(
-                            "UPDATE positions SET unmanaged=FALSE, updated_at=NOW() "
-                            "WHERE id=%s AND client_id=%s",
-                            (pid, email),
+                            """
+                            SELECT 1 FROM orders
+                            WHERE client_id=%s AND position_id=%s
+                              AND kind='EXIT'
+                              AND status NOT IN (
+                                  'EXIT_FILLED','REJECTED','CANCELED','EXPIRED','ERROR'
+                              )
+                            LIMIT 1
+                            """,
+                            (email, pid),
                         )
-                run_with_retry(_clear)
+                        return c.fetchone() is not None
+
+                has_exit_order = False
+                try:
+                    has_exit_order = run_with_retry(_check_exit_order)
+                except Exception:
+                    pass
+
+                if pos_status == "OPEN" and not has_exit_order:
+                    # Safe to clear — no in-flight exit, position is OPEN
+                    def _clear(pid=pos_id):
+                        with conn() as c:
+                            c.execute(
+                                "UPDATE positions SET unmanaged=FALSE, updated_at=NOW() "
+                                "WHERE id=%s AND client_id=%s AND status='OPEN'",
+                                (pid, email),
+                            )
+                    run_with_retry(_clear)
+                    log.info(
+                        f"[{email}] RECONCILE: cleared unmanaged flag for {pos_id} "
+                        f"({pos['underlying']}) — no exit order in-flight"
+                    )
+                else:
+                    # CLOSING or exit order exists — escalate, do not auto-clear
+                    log.warning(
+                        f"[{email}] RECONCILE: unmanaged {pos_id} NOT auto-cleared "
+                        f"(status={pos_status} has_exit_order={has_exit_order}) — "
+                        f"manual review required"
+                    )
+                    self._alert(
+                        email, "reconcile", HealthState.WARNING,
+                        f"Unmanaged position {pos_id} ({pos['underlying']}) in status="
+                        f"{pos_status} has_exit_order={has_exit_order}. "
+                        f"Auto-clear skipped — manual review required.",
+                        None
+                    )
         except Exception as e:
             log.debug(f"[{email}] Unmanaged check failed: {e}")
 
@@ -534,21 +624,41 @@ class APSelfHealingSystem:
         self, email: str, component: str, state: str,
         message: str, health: Optional[ComponentHealth]
     ):
+        """
+        Upserts one row per (client_id, component) — not one per client.
+        Requires client_health table to have PK on (client_id, component).
+        See worker_health_schema.sql for the updated schema.
+        """
         if not self.sb:
             return
         try:
             self.sb.table("client_health").upsert({
-                "client_id":       email,
-                "status":          state,
-                "alert_type":      f"self_heal_{component}",
-                "dead_threads":    json.dumps([component]),
-                "open_positions":  0,
-                "last_signal_ticker": "",
-                "alerted_at":      _now_iso(),
-                "updated_at":      _now_iso(),
-            }, on_conflict="client_id").execute()
+                "client_id":      email,
+                "component":      component,
+                "status":         state,
+                "alert_type":     f"self_heal_{component}",
+                "restart_count":  health.restart_count if health else 0,
+                "message":        message[:500],
+                "alerted_at":     _now_iso(),
+                "updated_at":     _now_iso(),
+            }, on_conflict="client_id,component").execute()
         except Exception as e:
             log.debug(f"Dashboard write failed: {e}")
+
+    def heartbeat(self, email: str, component: str):
+        """
+        Call from long-running loops to advance last_seen timestamp.
+        Prevents false stall alerts for healthy but slow threads.
+
+        Example — call from worker_loop every poll cycle:
+            healer = get_healer()
+            if healer:
+                healer.heartbeat(email, "worker")
+        """
+        health = self._get_health(email, component)
+        health.last_seen = _now()
+        if health.state == HealthState.WARNING:
+            health.state = HealthState.OK   # clear stall if heartbeat resumed
 
     def get_health_summary(self) -> list[dict]:
         """Return current health state of all components."""
