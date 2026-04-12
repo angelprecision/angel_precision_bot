@@ -60,6 +60,17 @@ def _now() -> datetime:
 def _now_iso() -> str:
     return _now().isoformat()
 
+def _to_utc(dt) -> datetime:
+    """Safely convert DB timestamp to UTC-aware datetime.
+    Postgres returns timezone-aware datetimes — only localize if naive.
+    Calling .replace(tzinfo=...) on an already-aware datetime distorts time math.
+    """
+    if dt is None:
+        return _now()
+    if hasattr(dt, "tzinfo") and dt.tzinfo is not None:
+        return dt.astimezone(timezone.utc)   # already aware — convert cleanly
+    return dt.replace(tzinfo=timezone.utc)   # naive — safe to localize
+
 
 # =============================================================================
 # ESCALATION TIERS
@@ -454,7 +465,7 @@ class APSelfHealingSystem:
         try:
             unmanaged = run_with_retry(_get_unmanaged)
             for pos in unmanaged:
-                age_secs = (_now() - pos["updated_at"].replace(tzinfo=timezone.utc)).total_seconds() \
+                age_secs = (_now() - _to_utc(pos["updated_at"])).total_seconds() \
                            if pos.get("updated_at") else 9999
                 log.warning(
                     f"[{email}] RECONCILE: unmanaged position {pos['id']} "
@@ -544,7 +555,7 @@ class APSelfHealingSystem:
         try:
             stuck = run_with_retry(_get_stuck_closing)
             for row in stuck:
-                age = (_now() - row["updated_at"].replace(tzinfo=timezone.utc)).total_seconds() \
+                age = (_now() - _to_utc(row["updated_at"])).total_seconds() \
                       if row.get("updated_at") else 9999
                 log.error(
                     f"[{email}] RECONCILE: CLOSING stuck {age:.0f}s | "
