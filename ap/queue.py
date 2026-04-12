@@ -145,13 +145,13 @@ def _mark_job(
     run_with_retry(_fn)
 
 
-def _claim_one_job() -> Optional[dict]:
+def _claim_one_job(client_id: str = "default") -> Optional[dict]:
     """
-    Atomically claim one NEW job from trade_queue.
-    First reclaims any stale PROCESSING jobs (all signals, no ev_score filter).
-    Returns row dict or None.
+    Atomically claim one NEW job for this specific client_id.
+    Per-client isolation: a worker for client A never consumes client B jobs.
+    Also reclaims stale PROCESSING jobs for this client only.
     """
-    # Reclaim stale PROCESSING jobs
+    # Reclaim stale PROCESSING jobs for this client only
     def _reclaim():
         with conn() as c:
             c.execute(
@@ -162,13 +162,15 @@ def _claim_one_job() -> Optional[dict]:
                     last_error=COALESCE(last_error,'') || ' | reclaimed_stale',
                     created_ts=NOW()
                 WHERE status='PROCESSING'
+                  AND client_id=%s
                   AND started_ts IS NOT NULL
                   AND started_ts < NOW() - INTERVAL '{PROCESSING_STALE_SECS} seconds'
                 """,
+                (client_id,),
             )
     run_with_retry(_reclaim)
 
-    # Find next NEW job — ALL signals, master control decides what to do with them
+    # Find next NEW job for THIS client only — isolation guaranteed
     def _find():
         with conn() as c:
             c.execute(
@@ -176,9 +178,11 @@ def _claim_one_job() -> Optional[dict]:
                 SELECT id, client_id, signal_id, payload
                 FROM trade_queue
                 WHERE status='NEW'
+                  AND client_id=%s
                 ORDER BY created_ts ASC
                 LIMIT 1
-                """
+                """,
+                (client_id,),
             )
             return c.fetchone()
 
@@ -188,16 +192,16 @@ def _claim_one_job() -> Optional[dict]:
 
     job_id = int(job["id"])
 
-    # Atomic claim
+    # Atomic claim — also checks client_id to prevent race with another runner
     def _claim():
         with conn() as c:
             c.execute(
                 """
                 UPDATE trade_queue
                 SET status='PROCESSING', started_ts=NOW()
-                WHERE id=%s AND status='NEW'
+                WHERE id=%s AND status='NEW' AND client_id=%s
                 """,
-                (job_id,),
+                (job_id, client_id),
             )
             return c.rowcount
 
@@ -232,16 +236,16 @@ def _dispatch(
     entry_watcher,
 ):
     """
-    New unified control path:
-      1. master_control.evaluate()   → gate + build ApprovedExecutionPlan
-      2. contract_selector.select()  → pick best contract, update plan
-      3. order_state_machine.create_entry_order()
-      4. breach trigger → hand to entry_watcher
-         immediate     → submit execution directly
+    Unified control path:
+      1. master_control.evaluate()      → gate with placeholder estimate → ApprovedExecutionPlan
+      2. contract_selector.select()     → real premium, updates plan in-place
+      3. master_control.revalidate()    → re-check capital/sector/ticker with REAL premium
+      4. order_state_machine.create_entry_order()
+      5. breach → entry_watcher  |  immediate → SUBMITTED transition
     """
     ticker = payload.get("ticker") or payload.get("symbol", "?")
 
-    # ── 1. MASTER CONTROL ────────────────────────────────────────────────────
+    # ── 1. MASTER CONTROL (initial gate, placeholder estimate) ────────────────
     try:
         decision = master_control.evaluate(payload, client_id=client_id)
     except Exception as e:
@@ -250,43 +254,54 @@ def _dispatch(
         return
 
     if not decision.ok:
-        log.info(
-            f"[{ticker}] BLOCKED by master control | "
-            f"stage={decision.stage} reason={decision.reason}"
-        )
-        _mark_job(
-            job_id, "REJECTED",
-            result={"stage": decision.stage, "reason": decision.reason},
-        )
+        log.info(f"[{ticker}] BLOCKED | stage={decision.stage} reason={decision.reason}")
+        _mark_job(job_id, "REJECTED",
+                  result={"stage": decision.stage, "reason": decision.reason})
         return
 
     plan = decision.plan
 
-    # ── 2. CONTRACT SELECTION ─────────────────────────────────────────────────
+    # ── 2. CONTRACT SELECTION — replaces placeholder with real premium ─────────
     if contract_selector:
         try:
             selected = contract_selector.select(plan)
             if selected is None:
-                log.warning(
-                    f"[{ticker}] No suitable contract found — blocking trade"
-                )
-                _mark_job(
-                    job_id, "REJECTED",
-                    result={"stage": "contract_selection", "reason": "no_contract_found"},
-                )
+                # Fail loudly — no silent fallback, no improvised contract
+                log.warning(f"[{ticker}] Contract selection failed — no suitable contract")
+                _mark_job(job_id, "REJECTED",
+                          result={"stage": "contract_selection",
+                                  "reason": "no_contract_found",
+                                  "ticker": ticker})
                 return
+            # plan.contract_symbol, plan.limit_price, plan.contracts,
+            # plan.max_position_usd now reflect REAL premium (set by selector)
             log.info(
                 f"[{ticker}] Contract selected: {selected.contract_symbol} "
-                f"@ ${selected.mid:.2f} x{plan.contracts}"
+                f"@ ${selected.mid:.2f} x{plan.contracts} "
+                f"cost=${plan.max_position_usd:.0f}"
             )
         except Exception as e:
-            log.error(f"[{ticker}] contract_selector.select() failed: {e}")
+            log.error(f"[{ticker}] contract_selector.select() raised: {e}")
             _mark_job(job_id, "ERROR", error=f"contract_selector_error: {e}")
             return
     else:
-        log.debug(f"[{ticker}] No contract selector — using plan as-is")
+        log.debug(f"[{ticker}] No contract selector — plan uses placeholder sizing")
 
-    # ── 3. ORDER STATE MACHINE ────────────────────────────────────────────────
+    # ── 3. RE-VALIDATE with REAL premium ──────────────────────────────────────
+    # Now that plan.max_position_usd is the actual cost, re-check capital/sector/ticker caps.
+    # This replaces the placeholder-based gate from step 1.
+    revalidation = master_control.revalidate_exposure(plan, client_id=client_id)
+    if not revalidation.ok:
+        log.warning(
+            f"[{ticker}] BLOCKED at re-validation (real premium) | "
+            f"reason={revalidation.reason}"
+        )
+        _mark_job(job_id, "REJECTED",
+                  result={"stage": "revalidation", "reason": revalidation.reason,
+                          "real_cost": plan.max_position_usd})
+        return
+
+    # ── 4. ORDER STATE MACHINE ─────────────────────────────────────────────────
     try:
         local_order_id = order_state_machine.create_entry_order(plan)
         log.info(
@@ -298,47 +313,36 @@ def _dispatch(
         _mark_job(job_id, "ERROR", error=f"order_create_error: {e}")
         return
 
-    # ── 4. ROUTE — BREACH vs IMMEDIATE ────────────────────────────────────────
+    # ── 5. ROUTE — BREACH vs IMMEDIATE ────────────────────────────────────────
     trigger_type = getattr(plan, "trigger_type", "immediate")
 
     if trigger_type == "breach" and entry_watcher:
-        # Hand to entry watcher — it will poll price, submit when triggered
         try:
             entry_watcher.watch(plan=plan, local_order_id=local_order_id)
             log.info(
                 f"[{ticker}] Handed to entry watcher | "
                 f"trigger=${getattr(plan, 'trigger_price', '?')}"
             )
-            _mark_job(
-                job_id, "WATCHING",
-                result={
-                    "plan_id":        plan.plan_id,
-                    "local_order_id": local_order_id,
-                    "contract":       getattr(plan, "contract_symbol", ""),
-                    "trigger_type":   "breach",
-                },
-            )
+            _mark_job(job_id, "WATCHING",
+                      result={"plan_id": plan.plan_id,
+                              "local_order_id": local_order_id,
+                              "contract": getattr(plan, "contract_symbol", ""),
+                              "real_cost": plan.max_position_usd,
+                              "trigger_type": "breach"})
         except Exception as e:
             log.error(f"[{ticker}] entry_watcher.watch() failed: {e}")
             _mark_job(job_id, "ERROR", error=f"watcher_error: {e}")
     else:
-        # Immediate execution — submit order now via order state machine
         try:
-            order_state_machine.transition(
-                local_order_id,
-                "SUBMITTED",
-                submitted_ts=now_utc_iso(),
-            )
+            order_state_machine.transition(local_order_id, "SUBMITTED",
+                                           submitted_ts=now_utc_iso())
             log.info(f"[{ticker}] Order submitted immediately: {local_order_id}")
-            _mark_job(
-                job_id, "SUBMITTED",
-                result={
-                    "plan_id":        plan.plan_id,
-                    "local_order_id": local_order_id,
-                    "contract":       getattr(plan, "contract_symbol", ""),
-                    "trigger_type":   "immediate",
-                },
-            )
+            _mark_job(job_id, "SUBMITTED",
+                      result={"plan_id": plan.plan_id,
+                              "local_order_id": local_order_id,
+                              "contract": getattr(plan, "contract_symbol", ""),
+                              "real_cost": plan.max_position_usd,
+                              "trigger_type": "immediate"})
         except Exception as e:
             log.error(f"[{ticker}] immediate submit failed: {e}")
             _mark_job(job_id, "ERROR", error=f"submit_error: {e}")
@@ -357,6 +361,8 @@ def worker_loop(
     order_state_machine=None,
     entry_watcher=None,
     client_id: str = "default",
+    stop_event=None,           # threading.Event — worker exits when set
+    live_mode: bool = False,   # if True, legacy fallback is DISABLED
 ):
     """
     Main queue worker.
@@ -364,19 +370,32 @@ def worker_loop(
     Pass master_control, contract_selector, order_state_machine, entry_watcher
     from client_runner so the worker has the full control stack.
 
-    If master_control is None, falls back to legacy process_signal() path
-    so the bot stays live while you migrate.
+    stop_event: threading.Event — set by ClientRunner.stop() to cleanly exit.
+    live_mode:  if True, legacy process_signal() fallback is disabled entirely.
+                Paper mode can fall back; live mode requires full control stack.
     """
     init_db()
+    mode_label = "control" if master_control else ("LIVE-NO-FALLBACK" if live_mode else "legacy")
     log.info(
-        f"🤖 Worker started (poll={poll_seconds}s) | "
-        f"path={'control' if master_control else 'legacy'}"
+        f"🤖 Worker started | client={client_id} poll={poll_seconds}s path={mode_label}"
     )
 
     while True:
-        # Heartbeat
+        # Clean shutdown check
+        if stop_event and stop_event.is_set():
+            log.info(f"[{client_id}] Worker stop_event set — exiting cleanly")
+            return
+
+        # Heartbeat — advance bot_status AND self-healing stall detection
         try:
             update_state({"last_heartbeat_ts": now_utc_iso()}, client_id=client_id)
+        except Exception:
+            pass
+        try:
+            from ap.self_healing import get_healer
+            h = get_healer()
+            if h:
+                h.heartbeat(client_id, "worker")
         except Exception:
             pass
 
@@ -384,7 +403,7 @@ def worker_loop(
         job_id = None
 
         try:
-            job = _claim_one_job()
+            job = _claim_one_job(client_id=client_id)
             if not job:
                 time.sleep(poll_seconds)
                 continue
@@ -410,29 +429,38 @@ def worker_loop(
                     entry_watcher=entry_watcher,
                 )
 
-            # ── LEGACY FALLBACK (while migrating) ─────────────────────────────
+            # ── LEGACY FALLBACK (paper mode only) ────────────────────────────
             else:
-                log.debug(f"[legacy] processing {signal_id}")
-                try:
-                    from ap.execution import process_signal
-                    result = process_signal(
-                        broker=broker,
-                        client_id=job_cid,
-                        signal_payload=payload,
+                # LIVE MODE: fallback is NEVER allowed — block and alert
+                if live_mode:
+                    log.error(
+                        f"[{client_id}] LIVE MODE — master_control required. "
+                        f"Rejecting {signal_id} without fallback."
                     )
-                    ok     = bool(result.get("ok"))
-                    status = "DONE" if ok else "REJECTED"
-                    error  = None if ok else (
-                        result.get("error") or result.get("reason") or "unknown"
-                    )
-                    _mark_job(job_id, status, result=result, error=error)
-                    if ok:
-                        log.info(f"✅ [legacy] {signal_id}: {result.get('contract')}")
-                    else:
-                        log.warning(f"❌ [legacy] {signal_id}: {error}")
-                except Exception as e:
-                    log.error(f"[legacy] execution error: {e}", exc_info=True)
-                    _mark_job(job_id, "ERROR", error=str(e))
+                    _mark_job(job_id, "REJECTED",
+                              error="live_mode_no_fallback_no_master_control")
+                else:
+                    log.debug(f"[legacy/paper] processing {signal_id}")
+                    try:
+                        from ap.execution import process_signal
+                        result = process_signal(
+                            broker=broker,
+                            client_id=job_cid,
+                            signal_payload=payload,
+                        )
+                        ok     = bool(result.get("ok"))
+                        status = "DONE" if ok else "REJECTED"
+                        error  = None if ok else (
+                            result.get("error") or result.get("reason") or "unknown"
+                        )
+                        _mark_job(job_id, status, result=result, error=error)
+                        if ok:
+                            log.info(f"✅ [legacy/paper] {signal_id}: {result.get('contract')}")
+                        else:
+                            log.warning(f"❌ [legacy/paper] {signal_id}: {error}")
+                    except Exception as e:
+                        log.error(f"[legacy/paper] execution error: {e}", exc_info=True)
+                        _mark_job(job_id, "ERROR", error=str(e))
 
         except Exception as e:
             log.error(f"Worker loop error: {e}", exc_info=True)
