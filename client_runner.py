@@ -29,6 +29,7 @@ from supabase import create_client, Client
 from ap.db import conn as ap_conn, run_with_retry
 from ap.queue import enqueue_signal, worker_loop
 from ap.order_monitor import APOrderMonitor
+from ap.position_sizer import APPositionSizer
 from ap.worker_health import get_monitor, init_monitor
 from ap.self_healing import get_healer, init_self_healing
 from ap.utils import now_utc_iso
@@ -134,6 +135,13 @@ class ClientRunner(threading.Thread):
             # ── Control stack ─────────────────────────────────────────────────
             self.position_manager = APPositionManager(client_id=self.email)
 
+            position_sizer = APPositionSizer(
+                throttle_threshold = float(os.getenv("THROTTLE_THRESHOLD", "-200")),
+                stop_threshold     = float(os.getenv("STOP_THRESHOLD",     "-500")),
+                throttle_factor    = float(os.getenv("THROTTLE_FACTOR",    "0.5")),
+                min_history        = int(os.getenv("KELLY_MIN_HISTORY",    "20")),
+            )
+
             self.master_control = APMasterControl(
                 mode=os.getenv("AP_MODE", "paper"),
                 score_floor=float(os.getenv("SCORE_FLOOR", "60")),
@@ -148,6 +156,7 @@ class ClientRunner(threading.Thread):
                 max_daily_loss=float(os.getenv("MAX_DAILY_LOSS", "-500")),
                 account_equity=float(os.getenv("ACCOUNT_EQUITY", "25000")),
                 position_manager=self.position_manager,
+                position_sizer=position_sizer,
                 supabase_client=sb,
             )
 
