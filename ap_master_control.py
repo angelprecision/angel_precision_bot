@@ -175,6 +175,7 @@ class APMasterControl:
         max_daily_loss:      float = -500.0, # stop trading if PnL < this
         account_equity:      float = 25000.0,# used for capital% math
         position_manager     = None,
+        position_sizer       = None,   # APPositionSizer — Kelly + drawdown sizing
         supabase_client      = None,
         signal_store         = None,
         tier_engine          = None,
@@ -195,6 +196,7 @@ class APMasterControl:
         self.account_equity   = account_equity
 
         self.pm       = position_manager   # APPositionManager
+        self.sizer    = position_sizer     # APPositionSizer (Kelly + drawdown)
         self.sb       = supabase_client
         self.store    = signal_store
         self.tier_eng = tier_engine
@@ -593,16 +595,53 @@ class APMasterControl:
             except Exception as e:
                 log.warning(f"[{ticker}] Feedback modifier failed: {e}")
 
-        # ── I. SIZING ─────────────────────────────────────────────────────────
+        # ── I. SIZING — Kelly + drawdown-adjusted ────────────────────────────
+        # APPositionSizer uses actual win rate from trade history (Kelly).
+        # Falls back to tier-based sizing if < min_history trades.
+        # Always applies drawdown throttle regardless of method.
+        # premium_per_contract unknown pre-contract-selection — use placeholder;
+        # contract_selector.select() will revalidate with real premium.
+        _placeholder_premium = 1 * 100 * DEFAULT_PREMIUM_ESTIMATE  # $500 est.
+        _pnl_today           = snap.get("realized_pnl_today", 0.0)
 
-        if str(tier).upper() == "B":
-            contracts = 1
+        if self.sizer:
+            try:
+                sizing = self.sizer.compute(
+                    client_id        = client_id,
+                    tier             = str(tier),
+                    premium_per_contract = _placeholder_premium,
+                    account_equity   = self.account_equity,
+                    realized_pnl_today = _pnl_today,
+                    position_manager = self.pm,
+                )
+                contracts = sizing.contracts
+                log.info(
+                    f"[{ticker}] Sizing | method={sizing.method} "
+                    f"contracts={contracts} win_rate={sizing.win_rate:.2f} "
+                    f"kelly_raw={sizing.kelly_raw:.2f} "
+                    f"throttle={sizing.throttle_applied} "
+                    f"reason={sizing.reason}"
+                )
+                # Block if sizer says 0 (negative edge or hard stop)
+                if contracts <= 0:
+                    return self._block(signal_id, ticker, client_id, "blocked_risk",
+                                       f"sizer_blocked: {sizing.reason}")
+                # Intel cap still applies
+                if intel_avail and intel_contracts > 0:
+                    contracts = min(contracts, intel_contracts)
+            except Exception as e:
+                log.warning(f"[{ticker}] Sizer failed ({e}) — falling back to tier")
+                contracts = self._base_contracts(score)
         else:
-            tier_mult = 1.0 if str(tier).upper() == "A+" else 0.6
-            base      = self._base_contracts(score)
-            contracts = max(1, round(base * feedback_mod * tier_mult))
-            if intel_avail and intel_contracts > 0:
-                contracts = min(contracts, intel_contracts)
+            # No sizer injected — use tier-based fallback
+            if str(tier).upper() == "B":
+                contracts = 1
+            else:
+                tier_mult = 1.0 if str(tier).upper() == "A+" else 0.6
+                base      = self._base_contracts(score)
+                contracts = max(1, round(base * feedback_mod * tier_mult))
+                if intel_avail and intel_contracts > 0:
+                    contracts = min(contracts, intel_contracts)
 
         # ── J. BUILD APPROVED PLAN ────────────────────────────────────────────
 
@@ -642,6 +681,8 @@ class APMasterControl:
             metadata          = {
                 "setup_status":    setup_status,
                 "feedback_mod":    feedback_mod,
+                "sizing_method":   sizing.method if self.sizer and 'sizing' in dir() else "tier_fallback",
+                "sizing_reason":   sizing.reason if self.sizer and 'sizing' in dir() else "",
                 "intel_result":    intel,
                 "sector":          self.SECTOR_MAP.get(ticker.upper(), "other"),
                 "snapshot_at_eval": {
