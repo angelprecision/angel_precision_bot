@@ -1,4 +1,4 @@
-# ap/queue.py — UNIFIED CONTROL QUEUE (Postgres)
+# ap/queue.py -- UNIFIED CONTROL QUEUE (Postgres)
 # =============================================================================
 # Architecture:
 #   enqueue_signal() → trade_queue table
@@ -7,19 +7,19 @@
 #                      → APEntryWatcher (breach) OR immediate execution
 #
 # What was removed vs old queue:
-#   ❌ _check_rate_limit()     — owned by master_control (trades_today gate)
-#   ❌ _is_triggered()         — owned by APEntryWatcher
-#   ❌ _get_stock_price()      — owned by APEntryWatcher
-#   ❌ trigger requeue loop    — owned by APEntryWatcher
-#   ❌ process_signal() direct — replaced by control path
-#   ❌ ev_score legacy filter  — all signals go through master control now
-#   ❌ ? placeholders          — all %s (Postgres)
+#   ❌ _check_rate_limit()     -- owned by master_control (trades_today gate)
+#   ❌ _is_triggered()         -- owned by APEntryWatcher
+#   ❌ _get_stock_price()      -- owned by APEntryWatcher
+#   ❌ trigger requeue loop    -- owned by APEntryWatcher
+#   ❌ process_signal() direct -- replaced by control path
+#   ❌ ev_score legacy filter  -- all signals go through master control now
+#   ❌ ? placeholders          -- all %s (Postgres)
 #
 # What was kept:
-#   ✅ enqueue_signal()        — idempotent insert
-#   ✅ _claim_one_job()        — atomic claim + stale reclaim
-#   ✅ _mark_job()             — terminal status
-#   ✅ worker_loop()           — poll + dispatch
+#   ✅ enqueue_signal()        -- idempotent insert
+#   ✅ _claim_one_job()        -- atomic claim + stale reclaim
+#   ✅ _mark_job()             -- terminal status
+#   ✅ worker_loop()           -- poll + dispatch
 # =============================================================================
 
 from __future__ import annotations
@@ -38,7 +38,7 @@ from ap.utils import now_utc_iso
 log = logging.getLogger("ap.queue")
 
 POLL_INTERVAL         = float(os.getenv("QUEUE_POLL_INTERVAL", "1.0"))
-PROCESSING_STALE_SECS = int(os.getenv("PROCESSING_STALE_SECS", "900"))
+PROCESSING_STALE_SECS = int(os.getenv("PROCESSING_STALE_SECS", "120"))  # 2 min -- was 15min
 
 
 # =============================================================================
@@ -63,7 +63,7 @@ def _parse_payload(raw) -> dict:
 
 
 # =============================================================================
-# ENQUEUE — idempotent insert
+# ENQUEUE -- idempotent insert
 # =============================================================================
 
 def enqueue_signal(
@@ -148,80 +148,59 @@ def _mark_job(
 def _claim_one_job(client_id: str = "default") -> Optional[dict]:
     """
     Atomically claim one NEW job for this specific client_id.
-    Per-client isolation: a worker for client A never consumes client B jobs.
-    Also reclaims stale PROCESSING jobs for this client only.
+
+    Uses a single CTE with FOR UPDATE SKIP LOCKED -- eliminates the 3-query
+    SELECT / UPDATE / re-read race condition. Only one worker can ever claim
+    a given row because SKIP LOCKED skips rows held by another transaction.
+
+    Also reclaims stale PROCESSING jobs in the same transaction.
     """
-    # Reclaim stale PROCESSING jobs for this client only
-    def _reclaim():
+    def _atomic_claim():
         with conn() as c:
+            # Step 1: reclaim stale PROCESSING rows for this client
             c.execute(
                 f"""
                 UPDATE trade_queue
-                SET status='NEW',
-                    started_ts=NULL,
-                    last_error=COALESCE(last_error,'') || ' | reclaimed_stale',
-                    created_ts=NOW()
-                WHERE status='PROCESSING'
-                  AND client_id=%s
+                SET status      = 'NEW',
+                    started_ts  = NULL,
+                    last_error  = COALESCE(last_error,'') || ' | reclaimed_stale'
+                WHERE status    = 'PROCESSING'
+                  AND client_id = %s
                   AND started_ts IS NOT NULL
                   AND started_ts < NOW() - INTERVAL '{PROCESSING_STALE_SECS} seconds'
                 """,
                 (client_id,),
             )
-    run_with_retry(_reclaim)
 
-    # Find next NEW job for THIS client only — isolation guaranteed
-    def _find():
-        with conn() as c:
+            # Step 2: atomic claim via CTE -- FOR UPDATE SKIP LOCKED guarantees
+            # no two workers ever claim the same row, even across gunicorn workers.
             c.execute(
                 """
-                SELECT id, client_id, signal_id, payload
-                FROM trade_queue
-                WHERE status='NEW'
-                  AND client_id=%s
-                ORDER BY created_ts ASC
-                LIMIT 1
+                WITH next_job AS (
+                    SELECT id
+                    FROM   trade_queue
+                    WHERE  status    = 'NEW'
+                      AND  client_id = %s
+                    ORDER BY created_ts ASC
+                    LIMIT  1
+                    FOR UPDATE SKIP LOCKED
+                )
+                UPDATE trade_queue tq
+                SET    status     = 'PROCESSING',
+                       started_ts = NOW()
+                FROM   next_job
+                WHERE  tq.id = next_job.id
+                RETURNING tq.id, tq.client_id, tq.signal_id, tq.payload
                 """,
                 (client_id,),
             )
             return c.fetchone()
 
-    job = run_with_retry(_find)
-    if not job:
-        return None
-
-    job_id = int(job["id"])
-
-    # Atomic claim — also checks client_id to prevent race with another runner
-    def _claim():
-        with conn() as c:
-            c.execute(
-                """
-                UPDATE trade_queue
-                SET status='PROCESSING', started_ts=NOW()
-                WHERE id=%s AND status='NEW' AND client_id=%s
-                """,
-                (job_id, client_id),
-            )
-            return c.rowcount
-
-    if run_with_retry(_claim) != 1:
-        return None
-
-    # Re-read claimed row
-    def _reread():
-        with conn() as c:
-            c.execute(
-                "SELECT id, client_id, signal_id, payload FROM trade_queue WHERE id=%s",
-                (job_id,),
-            )
-            return c.fetchone()
-
-    return run_with_retry(_reread)
+    return run_with_retry(_atomic_claim)
 
 
 # =============================================================================
-# DISPATCH — master control path
+# DISPATCH -- master control path
 # =============================================================================
 
 def _dispatch(
@@ -261,13 +240,13 @@ def _dispatch(
 
     plan = decision.plan
 
-    # ── 2. CONTRACT SELECTION — replaces placeholder with real premium ─────────
+    # ── 2. CONTRACT SELECTION -- replaces placeholder with real premium ─────────
     if contract_selector:
         try:
             selected = contract_selector.select(plan)
             if selected is None:
-                # Fail loudly — no silent fallback, no improvised contract
-                log.warning(f"[{ticker}] Contract selection failed — no suitable contract")
+                # Fail loudly -- no silent fallback, no improvised contract
+                log.warning(f"[{ticker}] Contract selection failed -- no suitable contract")
                 _mark_job(job_id, "REJECTED",
                           result={"stage": "contract_selection",
                                   "reason": "no_contract_found",
@@ -285,7 +264,7 @@ def _dispatch(
             _mark_job(job_id, "ERROR", error=f"contract_selector_error: {e}")
             return
     else:
-        log.debug(f"[{ticker}] No contract selector — plan uses placeholder sizing")
+        log.debug(f"[{ticker}] No contract selector -- plan uses placeholder sizing")
 
     # ── 3. RE-VALIDATE with REAL premium ──────────────────────────────────────
     # Now that plan.max_position_usd is the actual cost, re-check capital/sector/ticker caps.
@@ -313,7 +292,7 @@ def _dispatch(
         _mark_job(job_id, "ERROR", error=f"order_create_error: {e}")
         return
 
-    # ── 5. ROUTE — BREACH vs IMMEDIATE ────────────────────────────────────────
+    # ── 5. ROUTE -- BREACH vs IMMEDIATE ────────────────────────────────────────
     trigger_type = getattr(plan, "trigger_type", "immediate")
 
     if trigger_type == "breach" and entry_watcher:
@@ -361,7 +340,7 @@ def worker_loop(
     order_state_machine=None,
     entry_watcher=None,
     client_id: str = "default",
-    stop_event=None,           # threading.Event — worker exits when set
+    stop_event=None,           # threading.Event -- worker exits when set
     live_mode: bool = False,   # if True, legacy fallback is DISABLED
 ):
     """
@@ -370,7 +349,7 @@ def worker_loop(
     Pass master_control, contract_selector, order_state_machine, entry_watcher
     from client_runner so the worker has the full control stack.
 
-    stop_event: threading.Event — set by ClientRunner.stop() to cleanly exit.
+    stop_event: threading.Event -- set by ClientRunner.stop() to cleanly exit.
     live_mode:  if True, legacy process_signal() fallback is disabled entirely.
                 Paper mode can fall back; live mode requires full control stack.
     """
@@ -383,10 +362,10 @@ def worker_loop(
     while True:
         # Clean shutdown check
         if stop_event and stop_event.is_set():
-            log.info(f"[{client_id}] Worker stop_event set — exiting cleanly")
+            log.info(f"[{client_id}] Worker stop_event set -- exiting cleanly")
             return
 
-        # Heartbeat — advance bot_status AND self-healing stall detection
+        # Heartbeat -- advance bot_status AND self-healing stall detection
         try:
             update_state({"last_heartbeat_ts": now_utc_iso()}, client_id=client_id)
         except Exception:
@@ -431,10 +410,10 @@ def worker_loop(
 
             # ── LEGACY FALLBACK (paper mode only) ────────────────────────────
             else:
-                # LIVE MODE: fallback is NEVER allowed — block and alert
+                # LIVE MODE: fallback is NEVER allowed -- block and alert
                 if live_mode:
                     log.error(
-                        f"[{client_id}] LIVE MODE — master_control required. "
+                        f"[{client_id}] LIVE MODE -- master_control required. "
                         f"Rejecting {signal_id} without fallback."
                     )
                     _mark_job(job_id, "REJECTED",
