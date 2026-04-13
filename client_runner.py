@@ -1,4 +1,4 @@
- client_runner.py -- Multi-client trading loop for Angel Precision Bot
+# client_runner.py -- Multi-client trading loop for Angel Precision Bot
 # =============================================================================
 # Each active member gets their own isolated trading thread with:
 #   - APMasterControl    -- sole decision authority
