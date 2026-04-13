@@ -1,11 +1,11 @@
-# ap/db.py — PRODUCTION POSTGRES VERSION
+# ap/db.py -- PRODUCTION POSTGRES VERSION
 # =============================================================================
 # Replaces SQLite with Supabase Postgres via psycopg2.
 # ThreadedConnectionPool handles concurrent gunicorn workers + threads safely.
-# Interface is identical to the SQLite version — nothing else needs to change.
+# Interface is identical to the SQLite version -- nothing else needs to change.
 #
 # Required env vars:
-#   DATABASE_URL  — Supabase Postgres connection string
+#   DATABASE_URL  -- Supabase Postgres connection string
 #                   Format: postgresql://postgres:[password]@db.[ref].supabase.co:5432/postgres
 #                   Found in: Supabase → Settings → Database → Connection String → URI
 # =============================================================================
@@ -44,11 +44,19 @@ def _get_pool() -> psycopg2.pool.ThreadedConnectionPool:
     global _pool
     if _pool is None or _pool.closed:
         try:
+            # Append sslmode=require if not already in URL
+            dsn = DATABASE_URL
+            if "sslmode" not in dsn:
+                dsn += "?sslmode=require" if "?" not in dsn else "&sslmode=require"
             _pool = psycopg2.pool.ThreadedConnectionPool(
                 minconn=1,
                 maxconn=20,
-                dsn=DATABASE_URL,
+                dsn=dsn,
                 connect_timeout=10,
+                keepalives=1,
+                keepalives_idle=30,
+                keepalives_interval=10,
+                keepalives_count=5,
             )
             log.info("Postgres connection pool initialized (min=1 max=20)")
         except Exception as e:
@@ -62,23 +70,29 @@ def _get_pool() -> psycopg2.pool.ThreadedConnectionPool:
 def run_with_retry(fn: Callable[[], Any], retries: int = 10,
                    base_sleep: float = 0.1, max_sleep: float = 2.0):
     delay = base_sleep
-    last_err = None
-    for _ in range(retries):
+    for attempt in range(retries + 1):
         try:
             return fn()
-        except (psycopg2.OperationalError,
-                pg_errors.DeadlockDetected,
-                pg_errors.SerializationFailure) as e:
-            last_err = e
-            log.warning(f"DB transient error (retrying): {e}")
-            time.sleep(delay)
-            delay = min(delay * 2, max_sleep)
-    try:
-        return fn()
-    except Exception:
-        if last_err:
-            raise last_err
-        raise
+        except (
+            psycopg2.OperationalError,
+            psycopg2.InterfaceError,
+            psycopg2.pool.PoolError,       # pool exhausted -- wait and retry
+            pg_errors.DeadlockDetected,
+            pg_errors.SerializationFailure,
+            pg_errors.LockNotAvailable,    # advisory lock contention
+        ) as e:
+            if attempt < retries:
+                log.warning(f"DB transient error (attempt {attempt+1}/{retries}): {e}")
+                time.sleep(delay)
+                delay = min(delay * 2, max_sleep)
+            else:
+                log.error(f"DB error after {retries} retries: {e}")
+                raise
+        except psycopg2.Error as e:
+            # Non-retryable Postgres errors (schema mismatch, constraint violation, etc.)
+            # Log with full context so we know exactly which query failed
+            log.error(f"Non-retryable DB error [{type(e).__name__}]: {e}")
+            raise  # always re-raise -- caller decides whether to mark job ERROR
 
 
 # ── Connection context manager ────────────────────────────────────────────────
@@ -88,10 +102,38 @@ def conn():
     """
     Yields a _ConnWrapper from the pool.
     Auto-commits on success, rolls back on exception.
+    Validates connection health before use -- discards and reopens stale
+    connections (handles SSL drop / transient TCP errors).
     Callers use: `with conn() as c: c.execute(sql, params)`
     """
     pool = _get_pool()
-    db_conn = pool.getconn()
+
+    # Ping-validate: get a connection and probe it with SELECT 1.
+    # SSL EOF from the server side is only detectable via an actual query --
+    # psycopg2's status flags won't catch it until after the error.
+    # If the probe fails, close the bad conn, nuke the pool, and open fresh.
+    for _attempt in range(2):
+        db_conn = pool.getconn()
+        try:
+            _probe_cur = db_conn.cursor()
+            _probe_cur.execute("SELECT 1")
+            _probe_cur.close()
+            db_conn.rollback()  # reset txn state after probe
+            break  # connection is alive
+        except Exception as _probe_err:
+            log.warning(f"Stale connection detected ({_probe_err}), discarding and rebuilding pool")
+            try:
+                pool.putconn(db_conn, close=True)
+            except Exception:
+                pass
+            global _pool
+            _pool = None
+            pool = _get_pool()
+            # loop back to get a fresh connection from the new pool
+    else:
+        # Both attempts failed -- raise so run_with_retry can handle it
+        raise psycopg2.OperationalError("Could not obtain a live DB connection after pool rebuild")
+
     try:
         db_conn.autocommit = False
         cursor = db_conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
@@ -99,11 +141,20 @@ def conn():
         yield wrapper
         db_conn.commit()
     except Exception:
-        db_conn.rollback()
+        try:
+            db_conn.rollback()
+        except Exception:
+            pass
         raise
     finally:
-        cursor.close()
-        pool.putconn(db_conn)
+        try:
+            cursor.close()
+        except Exception:
+            pass
+        try:
+            pool.putconn(db_conn)
+        except Exception:
+            pass
 
 
 class _ConnWrapper:
@@ -135,7 +186,7 @@ class _ConnWrapper:
 
     @property
     def lastrowid(self):
-        # Postgres uses RETURNING — fallback to None if not used
+        # Postgres uses RETURNING -- fallback to None if not used
         return None
 
     def __getattr__(self, name):
@@ -146,7 +197,7 @@ class _ConnWrapper:
 
 def init_db():
     """
-    No-op for Postgres — schema managed via Supabase SQL editor.
+    No-op for Postgres -- schema managed via Supabase SQL editor.
     Verifies connection is healthy on startup.
     Non-fatal: logs error but does not crash the bot if DB is temporarily unreachable.
     """
@@ -156,8 +207,8 @@ def init_db():
         log.info("✅ Postgres connection verified")
     except Exception as e:
         log.error(f"❌ Postgres connection failed: {e}")
-        log.error("Bot will continue — DB writes will fail until connection is restored.")
-        # Do NOT raise — let the bot start so UptimeRobot keeps it awake
+        log.error("Bot will continue -- DB writes will fail until connection is restored.")
+        # Do NOT raise -- let the bot start so UptimeRobot keeps it awake
         # and retries will reconnect on next write
 
 
@@ -515,11 +566,11 @@ def get_open_orders_for_reconcile(client_id: str | None = None,
             if client_id:
                 c.execute(
                     "SELECT * FROM orders WHERE client_id=%s "
-                    "AND status IN ('NEW','ACK','PARTIAL') "
+                    "AND status IN ('CREATED','SUBMITTED','ACKNOWLEDGED','PARTIAL_FILL') "
                     "ORDER BY created_ts DESC LIMIT %s", (client_id, limit))
             else:
                 c.execute(
-                    "SELECT * FROM orders WHERE status IN ('NEW','ACK','PARTIAL') "
+                    "SELECT * FROM orders WHERE status IN ('CREATED','SUBMITTED','ACKNOWLEDGED','PARTIAL_FILL') "
                     "ORDER BY created_ts DESC LIMIT %s", (limit,))
             return c.fetchall()
     return run_with_retry(_fn)
