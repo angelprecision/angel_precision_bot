@@ -1,3 +1,4 @@
+"""
 ap/position_sizer.py -- Kelly + Drawdown-Adjusted Position Sizing
 =================================================================
 Replaces fixed tier-based contract sizing with edge-responsive sizing.
