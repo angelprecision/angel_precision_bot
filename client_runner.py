@@ -269,7 +269,11 @@ class ClientRunner(threading.Thread):
         """Pull live balance from broker and update master control."""
         try:
             balance = None
-            if hasattr(broker, "get_account_balance"):
+            # TradierBroker (ap.brokers.tradier) exposes get_account_equity()
+            # Fall back to legacy method names for compatibility
+            if hasattr(broker, "get_account_equity"):
+                balance = broker.get_account_equity()
+            elif hasattr(broker, "get_account_balance"):
                 balance = broker.get_account_balance()
             elif hasattr(broker, "get_balances"):
                 b = broker.get_balances()
