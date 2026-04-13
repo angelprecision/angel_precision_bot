@@ -356,16 +356,25 @@ def route_signal_to_all_clients(signal: dict):
         active_emails = list(_active_runners.keys())
 
     if not active_emails:
-        # No runners yet -- fallback to "default" so signal isn't lost
+        # _active_runners is empty in this gunicorn worker -- the runner lives
+        # in the other worker process. Fall back to Supabase members table so
+        # the signal is enqueued with the correct client email, not "default".
         logger.warning(
-            f"Signal {signal_id} [{ticker}] -- no active runners, "
-            f"enqueuing to default"
+            f"Signal {signal_id} [{ticker}] -- no active runners in this worker, "
+            f"falling back to Supabase members lookup"
         )
         try:
-            enqueue_signal(signal, client_id="default")
+            sb = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+            members = _fetch_active_members(sb)
+            active_emails = [m["email"] for m in members if m.get("email")]
         except Exception as e:
-            logger.error(f"Failed to enqueue signal to default: {e}")
-        return
+            logger.error(f"Supabase members fallback failed: {e}")
+            active_emails = []
+
+        if not active_emails:
+            # Truly no members -- last resort fallback
+            logger.error(f"Signal {signal_id} [{ticker}] -- no members found, dropping")
+            return
 
     # Fan-out: one queue entry per active client
     enqueued = 0
