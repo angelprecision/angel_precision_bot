@@ -175,7 +175,7 @@ class APExecutionCore:
 
         # Core modules
         self.watcher     = APEntryWatcher(broker)
-        self.exit_eng    = APExitEngine(broker)
+        self.exit_eng    = APExitEngine(broker, email=email)
         self.feedback    = APFeedbackLoop(supabase_client, DISCORD_WEBHOOK_URL, signal_store=self.store)
         self.tier_engine = APTierEngine()
         self.shadow      = APShadowTracker(supabase_client, DISCORD_WEBHOOK_URL)
@@ -222,6 +222,11 @@ class APExecutionCore:
             f"ScoreFloor: {self._score_floor} | "
             f"ContextFloor: {self._context_floor}"
         )
+
+    @property
+    def _exit_thread(self) -> Optional[threading.Thread]:
+        """Expose exit engine thread so worker_health can check liveness."""
+        return self.exit_eng._thread
 
     def start(self):
         """Start all background threads."""
@@ -852,4 +857,3 @@ class APExecutionCore:
         except Exception as e:
             log.error(f"Order error: {e}")
             return None
-
