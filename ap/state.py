@@ -1,10 +1,14 @@
 # ap/state.py
 """
 Equity reservation & symbol locking for safe concurrency.
-Uses SQLite kv table with BEGIN IMMEDIATE for atomicity.
+Postgres-native -- no SQLite syntax anywhere.
 
-- reserved_equity:{client_id} tracks approved-but-not-filled exposure
-- lock:{client_id}:{SYMBOL} prevents duplicate symbol trades
+Locking strategy:
+  - pg_try_advisory_xact_lock(hashtext(key)) -- lightweight, no table needed,
+    releases automatically at transaction end. Best for trading signals.
+  - kv table stores reserved equity and symbol lock timestamps.
+  - All mutations use INSERT ... ON CONFLICT DO UPDATE (upsert) -- no manual COMMIT/ROLLBACK.
+  - All queries use %s placeholders (psycopg2, not sqlite3).
 """
 
 from __future__ import annotations
@@ -23,47 +27,68 @@ log = get_logger("ap.state")
 # EQUITY RESERVATION (per-client)
 # =====================================================================
 
-def reserve_equity_if_available(client_id: str, amount: float, current_equity: float) -> bool:
+def reserve_equity_if_available(
+    client_id: str, amount: float, current_equity: float
+) -> bool:
     """
     Atomically reserve 'amount' only if (current_equity - reserved_equity) >= amount.
+    Uses pg_try_advisory_xact_lock so only one process can mutate this key at a time.
     """
     client_id = (client_id or "default").strip()
-    amount = float(amount)
+    amount     = float(amount)
     current_equity = float(current_equity)
 
     if amount <= 0:
         return True
 
-    key = f"reserved_equity:{client_id}"
-    ok = False
+    key    = f"reserved_equity:{client_id}"
+    ok     = False
 
     def _txn():
         nonlocal ok
         with conn() as c:
-            c.execute("BEGIN IMMEDIATE")
-
-            row = c.execute("SELECT v FROM kv WHERE k=?", (key,)).fetchone()
-            reserved = float(json_loads(row["v"])) if row else 0.0
-
-            available = max(0.0, current_equity - reserved)
-            if amount > available:
-                c.execute("ROLLBACK")
+            # Acquire advisory lock for this key -- non-blocking
+            # hashtext() is a stable Postgres function: same string -> same int
+            c.execute(
+                "SELECT pg_try_advisory_xact_lock(hashtext(%s))",
+                (key,)
+            )
+            acquired = c.fetchone()[0]
+            if not acquired:
                 ok = False
                 return
 
+            # Read current reservation
+            c.execute("SELECT v FROM kv WHERE k = %s", (key,))
+            row = c.fetchone()
+            reserved = float(json_loads(row[0])) if row else 0.0
+
+            available = max(0.0, current_equity - reserved)
+            if amount > available:
+                ok = False
+                return
+
+            # Write new reservation
             reserved_new = reserved + amount
             c.execute(
-                "INSERT OR REPLACE INTO kv (k, v, updated_at) VALUES (?,?,?)",
+                """
+                INSERT INTO kv (k, v, updated_at)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (k) DO UPDATE
+                    SET v = EXCLUDED.v, updated_at = EXCLUDED.updated_at
+                """,
                 (key, json_dumps(reserved_new), now_utc_iso()),
             )
-            c.execute("COMMIT")
             ok = True
 
     run_with_retry(_txn)
     if ok:
-        log.info(f"✅ Reserved ${amount:,.2f} for {client_id}")
+        log.info(f"Reserved ${amount:,.2f} for {client_id}")
     else:
-        log.warning(f"❌ Reserve failed for {client_id}: ${amount:,.2f} (equity=${current_equity:,.2f})")
+        log.warning(
+            f"Reserve failed for {client_id}: ${amount:,.2f} "
+            f"(equity=${current_equity:,.2f})"
+        )
     return ok
 
 
@@ -72,7 +97,7 @@ def release_equity(client_id: str, amount: float) -> None:
     Atomically release reserved equity. Floors at 0.
     """
     client_id = (client_id or "default").strip()
-    amount = float(amount)
+    amount     = float(amount)
     if amount <= 0:
         return
 
@@ -80,117 +105,154 @@ def release_equity(client_id: str, amount: float) -> None:
 
     def _txn():
         with conn() as c:
-            c.execute("BEGIN IMMEDIATE")
-
-            row = c.execute("SELECT v FROM kv WHERE k=?", (key,)).fetchone()
-            reserved = float(json_loads(row["v"])) if row else 0.0
-
+            c.execute(
+                "SELECT pg_try_advisory_xact_lock(hashtext(%s))",
+                (key,)
+            )
+            c.execute("SELECT v FROM kv WHERE k = %s", (key,))
+            row = c.fetchone()
+            reserved     = float(json_loads(row[0])) if row else 0.0
             reserved_new = max(0.0, reserved - amount)
             c.execute(
-                "INSERT OR REPLACE INTO kv (k, v, updated_at) VALUES (?,?,?)",
+                """
+                INSERT INTO kv (k, v, updated_at)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (k) DO UPDATE
+                    SET v = EXCLUDED.v, updated_at = EXCLUDED.updated_at
+                """,
                 (key, json_dumps(reserved_new), now_utc_iso()),
             )
-            c.execute("COMMIT")
 
     run_with_retry(_txn)
-    log.info(f"✅ Released ${amount:,.2f} for {client_id}")
+    log.info(f"Released ${amount:,.2f} for {client_id}")
 
 
 def get_reserved_equity(client_id: str) -> float:
     client_id = (client_id or "default").strip()
     key = f"reserved_equity:{client_id}"
-    with conn() as c:
-        row = run_with_retry(lambda: c.execute("SELECT v FROM kv WHERE k=?", (key,)).fetchone())
-        return float(json_loads(row["v"])) if row else 0.0
+
+    def _read():
+        with conn() as c:
+            c.execute("SELECT v FROM kv WHERE k = %s", (key,))
+            row = c.fetchone()
+            return float(json_loads(row[0])) if row else 0.0
+
+    return run_with_retry(_read)
 
 
 # =====================================================================
 # SYMBOL LOCKS
 # =====================================================================
 
-def acquire_symbol_lock(client_id: str, symbol: str, ttl_seconds: int = 90) -> bool:
+def acquire_symbol_lock(
+    client_id: str, symbol: str, ttl_seconds: int = 90
+) -> bool:
     """
-    Atomically acquire lock for symbol. Lock auto-expires after ttl_seconds.
-    Stores epoch seconds in payload["ts"].
+    Atomically acquire a per-symbol lock with TTL.
+    Uses pg_try_advisory_xact_lock for mutual exclusion, kv for TTL tracking.
+    Returns True if lock acquired, False if already held by another process.
     """
     client_id = (client_id or "default").strip()
-    symbol = (symbol or "").strip().upper()
+    symbol    = (symbol or "").strip().upper()
     if not symbol:
         return False
 
     key = f"lock:{client_id}:{symbol}"
     now = datetime.now(timezone.utc).timestamp()
-
-    ok = False
+    ok  = False
 
     def _txn():
         nonlocal ok
         with conn() as c:
-            c.execute("BEGIN IMMEDIATE")
+            # Advisory lock ensures only one process enters this block at a time
+            c.execute(
+                "SELECT pg_try_advisory_xact_lock(hashtext(%s))",
+                (key,)
+            )
+            acquired = c.fetchone()[0]
+            if not acquired:
+                ok = False
+                return
 
-            row = c.execute("SELECT v FROM kv WHERE k=?", (key,)).fetchone()
+            # Check if existing lock is still within TTL
+            c.execute("SELECT v FROM kv WHERE k = %s", (key,))
+            row = c.fetchone()
             if row:
-                payload = json_loads(row["v"])
-                lock_ts = float(payload.get("ts") or 0.0)
+                payload  = json_loads(row[0])
+                lock_ts  = float(payload.get("ts") or 0.0)
                 if (now - lock_ts) < ttl_seconds:
-                    c.execute("ROLLBACK")
                     ok = False
                     return
 
+            # Write new lock timestamp
             c.execute(
-                "INSERT OR REPLACE INTO kv (k, v, updated_at) VALUES (?,?,?)",
+                """
+                INSERT INTO kv (k, v, updated_at)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (k) DO UPDATE
+                    SET v = EXCLUDED.v, updated_at = EXCLUDED.updated_at
+                """,
                 (key, json_dumps({"ts": now}), now_utc_iso()),
             )
-            c.execute("COMMIT")
             ok = True
 
     run_with_retry(_txn)
     if ok:
-        log.info(f"🔒 Acquired lock: {client_id}:{symbol}")
+        log.info(f"Acquired lock: {client_id}:{symbol}")
     else:
-        log.warning(f"❌ Lock busy: {client_id}:{symbol}")
+        log.warning(f"Lock busy: {client_id}:{symbol}")
     return ok
 
 
 def release_symbol_lock(client_id: str, symbol: str) -> None:
     client_id = (client_id or "default").strip()
-    symbol = (symbol or "").strip().upper()
+    symbol    = (symbol or "").strip().upper()
     if not symbol:
         return
     key = f"lock:{client_id}:{symbol}"
-    with conn() as c:
-        run_with_retry(lambda: c.execute("DELETE FROM kv WHERE k=?", (key,)))
-    log.info(f"🔓 Released lock: {client_id}:{symbol}")
+
+    def _delete():
+        with conn() as c:
+            c.execute("DELETE FROM kv WHERE k = %s", (key,))
+
+    run_with_retry(_delete)
+    log.info(f"Released lock: {client_id}:{symbol}")
 
 
-def is_symbol_locked(client_id: str, symbol: str, ttl_seconds: int = 90) -> bool:
+def is_symbol_locked(
+    client_id: str, symbol: str, ttl_seconds: int = 90
+) -> bool:
     client_id = (client_id or "default").strip()
-    symbol = (symbol or "").strip().upper()
+    symbol    = (symbol or "").strip().upper()
     if not symbol:
         return False
     key = f"lock:{client_id}:{symbol}"
     now = datetime.now(timezone.utc).timestamp()
-    with conn() as c:
-        row = run_with_retry(lambda: c.execute("SELECT v FROM kv WHERE k=?", (key,)).fetchone())
-        if not row:
-            return False
-        payload = json_loads(row["v"])
-        lock_ts = float(payload.get("ts") or 0.0)
-        return (now - lock_ts) < ttl_seconds
+
+    def _read():
+        with conn() as c:
+            c.execute("SELECT v FROM kv WHERE k = %s", (key,))
+            row = c.fetchone()
+            if not row:
+                return False
+            payload = json_loads(row[0])
+            lock_ts = float(payload.get("ts") or 0.0)
+            return (now - lock_ts) < ttl_seconds
+
+    return run_with_retry(_read)
 
 
 # =====================================================================
-# LEGACY COMPATIBILITY (for app.py and other files)
+# LEGACY COMPATIBILITY
 # =====================================================================
 
 def load_state(client_id: str = "default") -> dict:
-    """Load client state from database (legacy compatibility)"""
+    """Load client state from database (legacy compatibility)."""
     from ap.db import get_client_state
     return get_client_state(client_id)
 
 
 def update_state(updates: dict, client_id: str = "default") -> None:
-    """Update client state (legacy compatibility)"""
+    """Update client state (legacy compatibility)."""
     from ap.db import update_client_state
     update_client_state(client_id, updates)
-
