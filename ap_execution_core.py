@@ -1,4 +1,4 @@
-# ap_execution_core.py — Angel Precision Execution Core
+# ap_execution_core.py -- Angel Precision Execution Core
 # =============================================================================
 # Ties all execution modules together into one clean interface.
 # One instance per client (per ClientRunner thread).
@@ -58,6 +58,7 @@ from ap_tier_engine          import APTierEngine, APShadowTracker, Tier
 from ap_proof_logger         import APProofLogger, funnel
 from ap_signal_store         import APSignalStore
 from ap_signal_tracker       import APSignalTracker
+from ap_master_control       import APMasterControl, ApprovedExecutionPlan
 
 log = logging.getLogger("ap.execution_core")
 ET  = ZoneInfo("America/New_York")
@@ -70,7 +71,7 @@ MAX_POSITIONS       = int(os.getenv("MAX_POSITIONS", "7"))
 SCORE_FLOOR_LIVE    = 75   # live: only trade validated setups
 SCORE_FLOOR_PAPER   = 60   # paper: collect data on all qualifying signals
 CONTEXT_FLOOR_LIVE  = 10.0
-CONTEXT_FLOOR_PAPER = 6.0  # paper: don't block on context — collect the data
+CONTEXT_FLOOR_PAPER = 6.0  # paper: don't block on context -- collect the data
 
 # Paper-mode fallback exec quality scores (used when chain data absent)
 PAPER_SPREAD_DEFAULT    = 3.0   # /5
@@ -154,9 +155,11 @@ class APExecutionCore:
     Manages full lifecycle: signal -> rank -> watch -> enter -> manage -> exit -> record.
     """
 
-    def __init__(self, broker, supabase_client=None, email: str = ""):
+    def __init__(self, broker, supabase_client=None, email: str = "", position_manager=None, order_state_machine=None):
         self.broker    = broker
-        self.email     = email
+        self.email              = email
+        self.position_manager   = position_manager    # APPositionManager (optional for now)
+        self.order_state_machine = order_state_machine # APOrderStateMachine (optional for now)
         self.paper     = BOT_MODE != "LIVE"
         self._pos_lock = threading.Lock()
         self._position_count = 0
@@ -183,6 +186,24 @@ class APExecutionCore:
             supabase_client=supabase_client,
             client_email=email,
             mode="paper" if BOT_MODE != "LIVE" else "live",
+        )
+
+        # ── MASTER CONTROL -- single decision authority ────────────────────────
+        self.master_control = APMasterControl(
+            mode           = "live" if BOT_MODE == "LIVE" else "paper",
+            score_floor    = self._score_floor,
+            context_floor  = self._context_floor,
+            max_positions  = MAX_POSITIONS,
+            supabase_client= supabase_client,
+            signal_store   = self.store,
+            tier_engine    = self.tier_engine,
+            feedback_loop  = self.feedback,
+        )
+        # Wire runtime callbacks into master control
+        self.master_control.wire(
+            position_count_fn = lambda: self._position_count,
+            kill_switch_fn    = None,   # TODO: wire state kill switch
+            mode_fn           = None,   # TODO: wire dynamic mode
         )
 
         # Wire watcher callbacks
@@ -262,13 +283,14 @@ class APExecutionCore:
     def receive_signal(self, signal: dict, score_result=None):
         """
         Entry point for all scanner signals.
-        Gates -> tier classify -> shadow or rank queue.
-        Every signal gets a row in ap_signals regardless of outcome.
+        Routes through APMasterControl -- the single decision authority.
+        Master control handles: gates, intelligence, tier, sizing, plan creation.
+        Execution core only dispatches the approved plan.
         """
         ticker = signal.get("ticker", "")
         score  = float(signal.get("score", 0) or 0)
 
-        # Assign signal_id immediately -- flows through the entire lifecycle
+        # Assign signal_id immediately
         signal_id = str(signal.get("signal_id") or uuid.uuid4())
         signal["signal_id"] = signal_id
 
@@ -283,6 +305,7 @@ class APExecutionCore:
         # ── LEGACY FALLBACK ───────────────────────────────────────────────────
         # Old scanners send symbol/direction/pattern_id but no score or ev_score.
         # Route to legacy queue. Insert ap_signals row so traffic is visible.
+        # Master control does NOT run on legacy signals.
         is_legacy = (
             score == 0 and (
                 signal.get("signal_id")
@@ -312,15 +335,44 @@ class APExecutionCore:
                 log.warning(f"[{legacy_ticker}] Legacy queue failed: {e} -- signal dropped")
             return
 
-        # Apply paper exec fallbacks before score gate so boosted score is evaluated
+        # Apply paper exec fallbacks before master control evaluates
         signal    = self._apply_paper_exec_fallbacks(signal)
         score     = float(signal.get("score", 0) or 0)
         signal_id = str(signal.get("signal_id", signal_id))  # preserve after deepcopy
 
-        # Insert into ap_signals with the final post-boost score
+        # Insert into ap_signals immediately so every signal is visible
         self.store.insert_signal(signal_id, signal, decision_status="received")
 
-        # ── Gate 1: Score floor ───────────────────────────────────────────────
+        # ── MASTER CONTROL -- single decision authority ────────────────────────
+        decision = self.master_control.evaluate(signal, client_id=self.email or "default")
+
+        if not decision.ok:
+            if decision.stage == "shadow":
+                if score_result:
+                    td = self.tier_engine.classify(score_result)
+                    self.shadow.log_shadow(signal, td)
+                funnel.inc("shadow_tracked")
+                log.info(f"[{ticker}] SHADOW-TIER | score={score:.1f}")
+            else:
+                funnel.inc("rejected_score")
+            return
+
+        # Plan approved -- attach tier and dispatch to ranking queue
+        plan = decision.plan
+        signal["tier"]         = plan.tier
+        signal["auto_execute"] = (plan.tier == "A+")
+        funnel.inc("passed_score")
+        funnel.inc("passed_context")
+        self.rank_queue.add(signal)
+        self.store.update_status(signal_id, "queued", timestamp_flag="queued_at")
+        log.info(
+            f"[{ticker}] {plan.tier}-TIER queued | score={score:.1f} "
+            f"contracts={plan.contracts} | "
+            f"{'1 contract probation' if plan.tier == 'B' else 'full execution'}"
+        )
+        return
+
+        # ── LEGACY GATE CODE -- now owned by APMasterControl (kept for reference) ──
         score_floor = self._score_floor
         if score < score_floor:
             log.info(
@@ -390,7 +442,7 @@ class APExecutionCore:
             return
 
         # ── A+ / A / B: add to ranking queue ─────────────────────────────────
-        # B-tier executes at 1 contract (30% size) — probation tier
+        # B-tier executes at 1 contract (30% size) -- probation tier
         signal["tier"]         = tier
         signal["auto_execute"] = (tier == Tier.A_PLUS)
         self.rank_queue.add(signal)
@@ -424,7 +476,7 @@ class APExecutionCore:
                             sector = sig.get("correlation_bucket", "OTHER")
                             with self._sector_lock:
                                 sector_count = self._sector_counts.get(sector, 0)
-                            # FIX: raised OTHER cap to 7 — all scanner tickers land in OTHER
+                            # FIX: raised OTHER cap to 7 -- all scanner tickers land in OTHER
                             SECTOR_MAX = {"SEMI": 3, "MEGACAP": 3, "INDEX": 3,
                                           "FINANCIAL": 3, "BIO": 2, "CLOUD": 3}.get(sector, 7)
                             if sector_count >= SECTOR_MAX:
