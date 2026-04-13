@@ -1,12 +1,12 @@
-# client_runner.py — Multi-client trading loop for Angel Precision Bot
+ client_runner.py -- Multi-client trading loop for Angel Precision Bot
 # =============================================================================
 # Each active member gets their own isolated trading thread with:
-#   - APMasterControl    — sole decision authority
-#   - APPositionManager  — Postgres-backed position truth
-#   - APOrderStateMachine— enforced order lifecycle
-#   - APContractSelector — real premium-based contract selection
-#   - APExecutionCore    — entry watcher, exit engine, fill monitor
-#   - worker_loop()      — new control path queue dispatch
+#   - APMasterControl    -- sole decision authority
+#   - APPositionManager  -- Postgres-backed position truth
+#   - APOrderStateMachine-- enforced order lifecycle
+#   - APContractSelector -- real premium-based contract selection
+#   - APExecutionCore    -- entry watcher, exit engine, fill monitor
+#   - worker_loop()      -- new control path queue dispatch
 #
 # Signal routing (gunicorn multi-worker safe):
 #   route_signal_to_all_clients() → trade_queue (Postgres)
@@ -81,7 +81,7 @@ class ClientRunner(threading.Thread):
         self.base_url   = member.get("tradier_base_url", "https://sandbox.tradier.com")
         self.stopped    = threading.Event()
 
-        # Control stack — set during run()
+        # Control stack -- set during run()
         self.core              = None
         self.master_control    = None
         self.position_manager  = None
@@ -101,12 +101,12 @@ class ClientRunner(threading.Thread):
 
     def run(self):
         logger.info(
-            f"[{self.email}] ClientRunner starting — "
+            f"[{self.email}] ClientRunner starting -- "
             f"account {self.account_id} @ {self.base_url}"
         )
         token = self._get_token()
         if not token:
-            logger.error(f"[{self.email}] No token — aborting runner")
+            logger.error(f"[{self.email}] No token -- aborting runner")
             return
 
         # ── Imports ──────────────────────────────────────────────────────────
@@ -163,13 +163,13 @@ class ClientRunner(threading.Thread):
 
             self.order_state_machine = APOrderStateMachine(client_id=self.email)
 
-            # Earnings blackout gate — blocks trades within N days of earnings
+            # Earnings blackout gate -- blocks trades within N days of earnings
             earnings_guard = APEarningsGuard(
                 broker=broker,
                 blackout_days=int(os.getenv("EARNINGS_BLACKOUT_DAYS", "3")),
             )
 
-            # IV rank filter — blocks buying expensive premium (rank > threshold)
+            # IV rank filter -- blocks buying expensive premium (rank > threshold)
             iv_filter = APIVRankFilter(
                 broker=broker,
                 max_iv_rank=float(os.getenv("MAX_IV_RANK", "70")),
@@ -206,7 +206,7 @@ class ClientRunner(threading.Thread):
             # Pull live account equity so all % caps are per-client accurate
             self._sync_account_equity(broker)
 
-            # Register with health monitor (singleton — watches thread liveness)
+            # Register with health monitor (singleton -- watches thread liveness)
             health_mon = get_monitor()
             if health_mon:
                 health_mon.register(self)
@@ -217,7 +217,7 @@ class ClientRunner(threading.Thread):
             if healer:
                 healer.register(self)
 
-            # Stale order monitor — cancel/alert/escalate on timeout
+            # Stale order monitor -- cancel/alert/escalate on timeout
             self.order_monitor = APOrderMonitor(
                 client_id=self.email,
                 broker=broker,
@@ -236,7 +236,7 @@ class ClientRunner(threading.Thread):
                 f"max_pos={os.getenv('MAX_POSITIONS','7')}"
             )
 
-            # ── Queue worker — NEW control path ───────────────────────────────
+            # ── Queue worker -- NEW control path ───────────────────────────────
             # Runs in its own daemon thread, dispatches via full control stack
             self._start_worker_thread(broker)
 
@@ -263,7 +263,7 @@ class ClientRunner(threading.Thread):
 
     def stop(self):
         self.stopped.set()
-        # Worker loop checks stop_event each poll cycle — exits cleanly
+        # Worker loop checks stop_event each poll cycle -- exits cleanly
 
     def _sync_account_equity(self, broker):
         """Pull live balance from broker and update master control."""
@@ -280,11 +280,11 @@ class ClientRunner(threading.Thread):
                 logger.info(f"[{self.email}] Live equity synced: ${float(balance):.2f}")
             else:
                 logger.warning(
-                    f"[{self.email}] Could not pull live equity — "
+                    f"[{self.email}] Could not pull live equity -- "
                     f"using env default ${self.master_control.account_equity:.2f}"
                 )
         except Exception as e:
-            logger.warning(f"[{self.email}] Equity sync failed: {e} — using env default")
+            logger.warning(f"[{self.email}] Equity sync failed: {e} -- using env default")
 
     def _start_equity_refresh(self, broker):
         """Refresh account equity every 15 minutes in background."""
@@ -301,7 +301,7 @@ class ClientRunner(threading.Thread):
     def _start_worker_thread(self, broker):
         """
         Launch worker_loop in a daemon thread.
-        Passes full control stack — master control is the sole decision authority.
+        Passes full control stack -- master control is the sole decision authority.
         """
         entry_watcher = getattr(self.core, "entry_watcher", None)
 
@@ -332,7 +332,7 @@ class ClientRunner(threading.Thread):
 
 
 # =============================================================================
-# SIGNAL ROUTING — write to Postgres queue (gunicorn multi-worker safe)
+# SIGNAL ROUTING -- write to Postgres queue (gunicorn multi-worker safe)
 # =============================================================================
 
 def route_signal_to_all_clients(signal: dict):
@@ -342,7 +342,7 @@ def route_signal_to_all_clients(signal: dict):
     can claim and process it independently.
 
     Critical: client_id in trade_queue MUST match the client_id each
-    worker polls for — they are isolated per client.
+    worker polls for -- they are isolated per client.
     """
     signal_id = str(signal.get("signal_id") or uuid.uuid4())
     signal["signal_id"] = signal_id
@@ -352,9 +352,9 @@ def route_signal_to_all_clients(signal: dict):
         active_emails = list(_active_runners.keys())
 
     if not active_emails:
-        # No runners yet — fallback to "default" so signal isn't lost
+        # No runners yet -- fallback to "default" so signal isn't lost
         logger.warning(
-            f"Signal {signal_id} [{ticker}] — no active runners, "
+            f"Signal {signal_id} [{ticker}] -- no active runners, "
             f"enqueuing to default"
         )
         try:
@@ -367,7 +367,7 @@ def route_signal_to_all_clients(signal: dict):
     enqueued = 0
     for email in active_emails:
         try:
-            # Use signal_id:email as idempotency key — prevents double-enqueue
+            # Use signal_id:email as idempotency key -- prevents double-enqueue
             # if this function is called twice (e.g. two gunicorn workers)
             ok = enqueue_signal(
                 signal,
@@ -378,18 +378,18 @@ def route_signal_to_all_clients(signal: dict):
                 enqueued += 1
                 logger.info(f"Signal {signal_id} [{ticker}] → queued for {email}")
             else:
-                logger.debug(f"Signal {signal_id} duplicate for {email} — skipped")
+                logger.debug(f"Signal {signal_id} duplicate for {email} -- skipped")
         except Exception as e:
             logger.error(f"Failed to enqueue signal for {email}: {e}")
 
     logger.info(
-        f"Signal {signal_id} [{ticker}] fan-out complete — "
+        f"Signal {signal_id} [{ticker}] fan-out complete -- "
         f"{enqueued}/{len(active_emails)} clients queued"
     )
 
 
 # =============================================================================
-# SUPERVISOR — sync runners from Supabase members table
+# SUPERVISOR -- sync runners from Supabase members table
 # =============================================================================
 
 def _fetch_active_members(sb: Client) -> list[dict]:
@@ -421,7 +421,7 @@ def _sync_runners(sb: Client):
         # Stop runners for removed/inactive members
         to_stop = [e for e in _active_runners if e not in active_emails]
         for email in to_stop:
-            logger.info(f"Stopping runner for {email} — no longer active")
+            logger.info(f"Stopping runner for {email} -- no longer active")
             _active_runners[email].stop()
             del _active_runners[email]
 
@@ -438,7 +438,7 @@ def _sync_runners(sb: Client):
 def start_multi_client_supervisor():
     if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
         logger.warning(
-            "No Supabase credentials — multi-client supervisor not starting"
+            "No Supabase credentials -- multi-client supervisor not starting"
         )
         return
 
