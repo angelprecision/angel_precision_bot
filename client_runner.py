@@ -30,6 +30,7 @@ from ap.db import conn as ap_conn, run_with_retry
 from ap.queue import enqueue_signal, worker_loop
 from ap.order_monitor import APOrderMonitor
 from ap.position_sizer import APPositionSizer
+from ap.market_intelligence import APEarningsGuard, APIVRankFilter
 from ap.worker_health import get_monitor, init_monitor
 from ap.self_healing import get_healer, init_self_healing
 from ap.utils import now_utc_iso
@@ -162,6 +163,18 @@ class ClientRunner(threading.Thread):
 
             self.order_state_machine = APOrderStateMachine(client_id=self.email)
 
+            # Earnings blackout gate — blocks trades within N days of earnings
+            earnings_guard = APEarningsGuard(
+                broker=broker,
+                blackout_days=int(os.getenv("EARNINGS_BLACKOUT_DAYS", "3")),
+            )
+
+            # IV rank filter — blocks buying expensive premium (rank > threshold)
+            iv_filter = APIVRankFilter(
+                broker=broker,
+                max_iv_rank=float(os.getenv("MAX_IV_RANK", "70")),
+            )
+
             self.contract_selector = APContractSelectionEngine(
                 broker=broker,
                 mode=os.getenv("AP_MODE", "paper"),
@@ -170,6 +183,8 @@ class ClientRunner(threading.Thread):
                 min_oi=int(os.getenv("MIN_OI", "50")),
                 min_volume=int(os.getenv("MIN_VOLUME", "10")),
                 max_dte=int(os.getenv("MAX_DTE", "21")),
+                earnings_guard=earnings_guard,
+                iv_filter=iv_filter,
             )
 
             # ── Execution core (watcher + exit engine + fill monitor) ─────────
@@ -468,6 +483,8 @@ def get_runner_status() -> list[dict]:
                 "position_mgr":   r.position_manager is not None,
                 "order_osm":      r.order_state_machine is not None,
                 "contract_sel":   r.contract_selector is not None,
+                "earnings_guard": r.contract_selector is not None,   # bundled in selector
+                "iv_filter":      r.contract_selector is not None,   # bundled in selector
                 "order_monitor":  r.order_monitor is not None,
             }
             for email, r in _active_runners.items()
