@@ -1,4 +1,4 @@
- ap/contract_selector.py — APContractSelectionEngine
+# ap/contract_selector.py — APContractSelectionEngine
 # =============================================================================
 # Unified contract selection. Takes an ApprovedExecutionPlan, returns the
 # single best tradable contract + real sizing based on actual premium.
