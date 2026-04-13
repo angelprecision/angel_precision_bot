@@ -1,12 +1,12 @@
-# ap_exit_engine.py — Angel Precision Time-Aware Exit Engine
+# ap_exit_engine.py -- Angel Precision Time-Aware Exit Engine
 # =============================================================================
-# Gap 3 fix: 0DTE options have a hard enemy — time. This engine knows that.
+# Gap 3 fix: 0DTE options have a hard enemy -- time. This engine knows that.
 #
 # The 4 exit conditions (checked in order every 30 seconds):
 #
-#   1. TARGET HIT — underlying reaches the wick target price → EXIT full position
+#   1. TARGET HIT -- underlying reaches the wick target price → EXIT full position
 #
-#   2. STOP HIT   — underlying hits stop level → EXIT full position
+#   2. STOP HIT   -- underlying hits stop level → EXIT full position
 #
 #   3. PROFIT PROTECTION (time-aware)
 #      If you're sitting on a good gain AND time is running out, lock it in.
@@ -14,7 +14,7 @@
 #        After 1:30 PM ET: if option P&L ≥ +150%, take 50% off the table
 #        After 2:30 PM ET: if option P&L ≥ +80%, take 75% off
 #        After 3:00 PM ET: if option P&L ≥ +30%, exit EVERYTHING
-#        After 3:30 PM ET: EXIT EVERYTHING — no exceptions
+#        After 3:30 PM ET: EXIT EVERYTHING -- no exceptions
 #
 #   4. THETA STOP (decay kill switch)
 #      If option has lost >50% of its value AND it's past noon → EXIT
@@ -39,13 +39,13 @@ log = logging.getLogger("ap.exit_engine")
 ET  = ZoneInfo("America/New_York")
 
 # ── TIME THRESHOLDS (ET) ──────────────────────────────────────────────────────
-PROFIT_PROTECT_1_HOUR = 13   # 1:30 PM — take 50% if +150%
+PROFIT_PROTECT_1_HOUR = 13   # 1:30 PM -- take 50% if +150%
 PROFIT_PROTECT_1_MIN  = 30
-PROFIT_PROTECT_2_HOUR = 14   # 2:30 PM — take 75% if +80%
+PROFIT_PROTECT_2_HOUR = 14   # 2:30 PM -- take 75% if +80%
 PROFIT_PROTECT_2_MIN  = 30
-PROFIT_PROTECT_3_HOUR = 15   # 3:00 PM — exit all if +30%
+PROFIT_PROTECT_3_HOUR = 15   # 3:00 PM -- exit all if +30%
 PROFIT_PROTECT_3_MIN  = 0
-EOD_HARD_CLOSE_HOUR   = 15   # 3:30 PM — EXIT EVERYTHING
+EOD_HARD_CLOSE_HOUR   = 15   # 3:30 PM -- EXIT EVERYTHING
 EOD_HARD_CLOSE_MIN    = 30
 POLL_INTERVAL_SEC     = 30   # check every 30 seconds
 
@@ -74,7 +74,7 @@ class ManagedPosition:
 
     # Context flags (set from context engine at entry time)
     is_trend_day:         bool  = False   # relaxes exit thresholds
-    trend_direction:      str   = ""      # "uptrend" / "downtrend" — must match side
+    trend_direction:      str   = ""      # "uptrend" / "downtrend" -- must match side
 
     # State
     current_option_price: float = 0.0
@@ -154,7 +154,7 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
     if pos.is_at_target:
         return ExitDecision(
             action="CLOSE_ALL", quantity=qty_rem,
-            reason=f"TARGET HIT — underlying ${pos.current_underlying:.2f} reached ${pos.underlying_target:.2f}",
+            reason=f"TARGET HIT -- underlying ${pos.current_underlying:.2f} reached ${pos.underlying_target:.2f}",
             urgency="IMMEDIATE", pnl_pct=option_pnl
         )
 
@@ -162,7 +162,7 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
     if pos.is_at_stop:
         return ExitDecision(
             action="STOP", quantity=qty_rem,
-            reason=f"STOP HIT — underlying ${pos.current_underlying:.2f} at stop ${pos.underlying_stop:.2f}",
+            reason=f"STOP HIT -- underlying ${pos.current_underlying:.2f} at stop ${pos.underlying_stop:.2f}",
             urgency="IMMEDIATE", pnl_pct=option_pnl
         )
 
@@ -182,23 +182,23 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
     if past_eod:
         return ExitDecision(
             action="CLOSE_ALL", quantity=qty_rem,
-            reason=f"EOD FORCE CLOSE — {hour}:{minute:02d} ET past {EOD_HARD_CLOSE_HOUR}:{EOD_HARD_CLOSE_MIN:02d}",
+            reason=f"EOD FORCE CLOSE -- {hour}:{minute:02d} ET past {EOD_HARD_CLOSE_HOUR}:{EOD_HARD_CLOSE_MIN:02d}",
             urgency="IMMEDIATE", pnl_pct=option_pnl
         )
 
-    # ── 4. PROFIT PROTECTION — WINDOW 3 (3:00 PM+) ───────────────────────────
+    # ── 4. PROFIT PROTECTION -- WINDOW 3 (3:00 PM+) ───────────────────────────
     past_window3 = (hour > PROFIT_PROTECT_3_HOUR or
                     (hour == PROFIT_PROTECT_3_HOUR and minute >= PROFIT_PROTECT_3_MIN))
     protect3_thresh = 0.50 if direction_aligns else PROTECT_3_THRESHOLD
     if past_window3 and option_pnl >= protect3_thresh:
-        trend_note = " [trend day — raised to 50% threshold]" if direction_aligns else ""
+        trend_note = " [trend day -- raised to 50% threshold]" if direction_aligns else ""
         return ExitDecision(
             action="CLOSE_ALL", quantity=qty_rem,
-            reason=f"PROFIT PROTECT W3 — +{option_pnl*100:.0f}% at 3PM+{trend_note}",
+            reason=f"PROFIT PROTECT W3 -- +{option_pnl*100:.0f}% at 3PM+{trend_note}",
             urgency="HIGH", pnl_pct=option_pnl
         )
 
-    # ── 5. PROFIT PROTECTION — WINDOW 2 (2:30 PM+, or 3:00 PM on trend day) ─
+    # ── 5. PROFIT PROTECTION -- WINDOW 2 (2:30 PM+, or 3:00 PM on trend day) ─
     w2_hour = PROFIT_PROTECT_2_HOUR
     w2_min  = PROFIT_PROTECT_2_MIN + trend_bonus_window
     if w2_min >= 60: w2_hour += 1; w2_min -= 60
@@ -206,14 +206,14 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
     scale2_threshold = SCALE_OUT_2_THRESHOLD * trend_bonus_threshold
     if past_window2 and option_pnl >= scale2_threshold and pos.scale_outs_done < 2:
         qty_close = max(1, round(qty_rem * (0.50 if direction_aligns else 0.75)))
-        trend_note = " [TREND DAY — reduced scale]" if direction_aligns else ""
+        trend_note = " [TREND DAY -- reduced scale]" if direction_aligns else ""
         return ExitDecision(
             action="SCALE_OUT", quantity=qty_close,
-            reason=f"PROFIT PROTECT W2 — +{option_pnl*100:.0f}% at {w2_hour}:{w2_min:02d}PM+ scale{trend_note}",
+            reason=f"PROFIT PROTECT W2 -- +{option_pnl*100:.0f}% at {w2_hour}:{w2_min:02d}PM+ scale{trend_note}",
             urgency="HIGH", pnl_pct=option_pnl
         )
 
-    # ── 6. PROFIT PROTECTION — WINDOW 1 (1:30 PM+, or 2:00 PM on trend day) ─
+    # ── 6. PROFIT PROTECTION -- WINDOW 1 (1:30 PM+, or 2:00 PM on trend day) ─
     w1_hour = PROFIT_PROTECT_1_HOUR
     w1_min  = PROFIT_PROTECT_1_MIN + trend_bonus_window
     if w1_min >= 60: w1_hour += 1; w1_min -= 60
@@ -221,10 +221,10 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
     scale1_threshold = SCALE_OUT_1_THRESHOLD * trend_bonus_threshold
     if past_window1 and option_pnl >= scale1_threshold and pos.scale_outs_done < 1:
         qty_close = max(1, round(qty_rem * (0.35 if direction_aligns else 0.50)))
-        trend_note = " [TREND DAY — let runner breathe]" if direction_aligns else ""
+        trend_note = " [TREND DAY -- let runner breathe]" if direction_aligns else ""
         return ExitDecision(
             action="SCALE_OUT", quantity=qty_close,
-            reason=f"PROFIT PROTECT W1 — +{option_pnl*100:.0f}% at {w1_hour}:{w1_min:02d}PM+ scale{trend_note}",
+            reason=f"PROFIT PROTECT W1 -- +{option_pnl*100:.0f}% at {w1_hour}:{w1_min:02d}PM+ scale{trend_note}",
             urgency="NORMAL", pnl_pct=option_pnl
         )
 
@@ -233,7 +233,7 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
     if past_noon and option_pnl <= THETA_STOP_LOSS_PCT:
         return ExitDecision(
             action="CLOSE_ALL", quantity=qty_rem,
-            reason=f"THETA STOP — option down {option_pnl*100:.0f}% after noon, cutting losses",
+            reason=f"THETA STOP -- option down {option_pnl*100:.0f}% after noon, cutting losses",
             urgency="NORMAL", pnl_pct=option_pnl
         )
 
@@ -256,8 +256,9 @@ class APExitEngine:
         engine.add_position(ManagedPosition(...))
     """
 
-    def __init__(self, broker, kill_switch_fn=None):
+    def __init__(self, broker, kill_switch_fn=None, email: str = ""):
         self.broker           = broker
+        self._email           = email              # used to name thread per-client
         self._positions: list[ManagedPosition] = []
         self._lock            = threading.Lock()
         self._running         = False
@@ -280,13 +281,16 @@ class APExitEngine:
         if self._running:
             return
         self._running = True
+        # Thread name must match self_healing's components dict:
+        # "exit_engine": (f"ap-exit-engine-{email}", ...)
+        thread_name = f"ap-exit-engine-{self._email}" if self._email else "ap-exit-engine"
         self._thread  = threading.Thread(
             target=self._exit_loop,
             daemon=True,
-            name="ap-exit-engine"
+            name=thread_name
         )
         self._thread.start()
-        log.info("APExitEngine started")
+        log.info(f"APExitEngine started [{thread_name}]")
 
     def stop(self):
         self._running = False
@@ -306,7 +310,7 @@ class APExitEngine:
     def _check_all_positions(self):
         # ── Gap 1: Kill check at poll start (pre-fetch) ─────────────────────
         if self._kill_switch_fn and self._kill_switch_fn():
-            log.debug("Exit engine poll skipped — kill switch active")
+            log.debug("Exit engine poll skipped -- kill switch active")
             return
         now_et = datetime.now(ET)
         active = self.active_positions()
@@ -349,11 +353,11 @@ class APExitEngine:
                         actions_to_take.append((pos, decision))
 
         # ── Gap 2: Kill check post-fetch, pre-execute ───────────────────────────
-        # Quote fetch takes 1–5s on live Tradier. Kill may have fired during
+        # Quote fetch takes 1-5s on live Tradier. Kill may have fired during
         # that I/O window. This check catches it before any broker call.
         if self._kill_switch_fn and self._kill_switch_fn():
             log.warning(
-                f"Exit engine: kill switch fired during quote fetch — "
+                f"Exit engine: kill switch fired during quote fetch -- "
                 f"aborting {len(actions_to_take)} pending exit action(s) "
                 f"for positions: {[p.ticker for p, _ in actions_to_take]}"
             )
@@ -372,7 +376,7 @@ class APExitEngine:
                 if self.on_scale:
                     if self._kill_switch_fn and self._kill_switch_fn():
                         log.warning(
-                            f"[{pos.ticker}] KILL ACTIVE at on_scale — "
+                            f"[{pos.ticker}] KILL ACTIVE at on_scale -- "
                             f"reverting scale_out and skipping broker order"
                         )
                         pos.scale_outs_done   -= 1
@@ -389,10 +393,10 @@ class APExitEngine:
                     # Catches kill that fires between execute loop iterations.
                     if self._kill_switch_fn and self._kill_switch_fn():
                         log.error(
-                            f"[{pos.ticker}] KILL ACTIVE at on_exit — "
+                            f"[{pos.ticker}] KILL ACTIVE at on_exit -- "
                             f"reverting pos.closed and skipping broker order"
                         )
-                        pos.closed       = False   # revert — no order sent
+                        pos.closed       = False   # revert -- no order sent
                         pos.close_reason = ""
                         continue
                     self.on_exit(pos, decision)
