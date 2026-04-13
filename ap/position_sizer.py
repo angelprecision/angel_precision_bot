@@ -1,14 +1,12 @@
-"""
-ap/position_sizer.py -- Kelly + Drawdown-Adjusted Position Sizing
-=================================================================
-Replaces fixed tier-based contract sizing with edge-responsive sizing.
+#ap/position_sizer.py -- Kelly + Drawdown-Adjusted Position Sizing
+#=================================================================
+#Replaces fixed tier-based contract sizing with edge-responsive sizing.
 
-Two modes:
-  1. Kelly sizing  (requires >= min_history closed trades)
-  2. Tier fallback (fewer than min_history trades)
+#Two modes:
+ # 1. Kelly sizing  (requires >= min_history closed trades)
+ # 2. Tier fallback (fewer than min_history trades)
 
-Drawdown throttle is always active, independent of sizing mode.
-"""
+#Drawdown throttle is always active, independent of sizing mode.
 
 from __future__ import annotations
 
