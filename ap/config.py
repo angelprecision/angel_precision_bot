@@ -1,4 +1,4 @@
-# ap/config.py — FIXED
+# ap/config.py -- FIXED
 # CHANGES:
 #   1. Renamed MAX_DAILY_LOSS_PCT → DAILY_MAX_LOSS_PCT (matches execution.py fix)
 #   2. Added DRAWDOWN_KILL and DRAWDOWN_STOP_DAY
@@ -17,7 +17,7 @@ load_dotenv()
 @dataclass(frozen=True)
 class Config:
     # ─── DATABASE ───────────────────────────────────────────────────────────
-    # FIX: Render free tier has ephemeral disk — SQLite must live in /tmp
+    # FIX: Render free tier has ephemeral disk -- SQLite must live in /tmp
     # Without this, the DB is wiped on every redeploy → disk I/O errors
     DB_FILE: str = os.getenv("BOT_DB_FILE", "/tmp/ap_state.db")
 
@@ -30,7 +30,7 @@ class Config:
     MAX_POSITION_COST: float = float(os.getenv("MAX_POSITION_COST", "1000"))
 
     # ─── PREMIUM RANGE ───────────────────────────────────────────────────────
-    # FIX: SPY/QQQ ATM 0DTE options trade at $5-10/share — old cap was $2.50
+    # FIX: SPY/QQQ ATM 0DTE options trade at $5-10/share -- old cap was $2.50
     # Raised to $10.00 so we don't reject valid liquid contracts
     MIN_PREMIUM_PER_SHARE: float = float(os.getenv("MIN_PREMIUM_PER_SHARE", "0.50"))
     MAX_PREMIUM_PER_SHARE: float = float(os.getenv("MAX_PREMIUM_PER_SHARE", "10.00"))
@@ -40,7 +40,7 @@ class Config:
     MAX_TRADES_PER_DAY: int = int(os.getenv("MAX_TRADES_PER_DAY", "5"))
 
     # ─── DAILY LOSS KILL SWITCH ──────────────────────────────────────────────
-    # FIX: renamed from MAX_DAILY_LOSS_PCT — execution.py now uses this name
+    # FIX: renamed from MAX_DAILY_LOSS_PCT -- execution.py now uses this name
     DAILY_MAX_LOSS_PCT: float = float(os.getenv("DAILY_MAX_LOSS_PCT", "0.06"))
 
     # ─── DRAWDOWN KILL ───────────────────────────────────────────────────────
@@ -49,7 +49,7 @@ class Config:
 
     # ─── TAKE PROFIT / STOP LOSS ─────────────────────────────────────────────
     TAKE_PROFIT_PCT: float = float(os.getenv("TAKE_PROFIT_PCT", "0.20"))
-    STOP_LOSS_PCT:   float = float(os.getenv("STOP_LOSS_PCT",   "0.35"))
+    STOP_LOSS_PCT:   float = float(os.getenv("STOP_LOSS_PCT",   "0.25"))  # 25% -- was 0.35
 
     # ─── EOD FLATTEN ────────────────────────────────────────────────────────
     EOD_FLATTEN_MINUTES_BEFORE_CLOSE: int = int(os.getenv("EOD_FLATTEN_MINUTES", "15"))
