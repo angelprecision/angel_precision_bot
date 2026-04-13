@@ -1,4 +1,4 @@
-# ap_master_control.py — Angel Precision Master Control
+# ap_master_control.py -- Angel Precision Master Control
 # =============================================================================
 # THE SINGLE AUTHORITY for whether a signal may become a trade.
 #
@@ -24,7 +24,7 @@ from typing import Optional, Any
 
 log = logging.getLogger("ap.master_control")
 
-# Pre-selection premium estimate — used ONLY before contract_selector returns real cost.
+# Pre-selection premium estimate -- used ONLY before contract_selector returns real cost.
 # After contract_selector runs and revalidate_exposure() fires, real premium is used.
 # Change this if your typical contract premium shifts significantly.
 DEFAULT_PREMIUM_ESTIMATE: float = 5.0
@@ -117,24 +117,24 @@ class APMasterControl:
     Single decision authority for all trading decisions.
 
     Constructor args:
-        mode             — "PAPER" | "LIVE"
-        score_floor      — minimum signal score (default 60)
-        context_floor    — minimum real_time_ctx score (default 6.0)
-        max_positions    — max concurrent active positions (default 7)
-        max_capital_pct  — max capital% deployed before blocking (default 0.40)
-        max_calls        — max active CALL positions (default 5)
-        max_puts         — max active PUT positions (default 5)
-        max_trades_today — max entries per day (default 10)
-        max_daily_loss   — max realized loss today before kill (default -500)
-        account_equity   — account size for capital% calculation (default 25000)
-        position_manager — APPositionManager instance (required for gates)
-        supabase_client  — optional Supabase client
-        signal_store     — optional signal status store
-        tier_engine      — optional tier engine
-        feedback_loop    — optional feedback loop
+        mode             -- "PAPER" | "LIVE"
+        score_floor      -- minimum signal score (default 60)
+        context_floor    -- minimum real_time_ctx score (default 6.0)
+        max_positions    -- max concurrent active positions (default 7)
+        max_capital_pct  -- max capital% deployed before blocking (default 0.40)
+        max_calls        -- max active CALL positions (default 5)
+        max_puts         -- max active PUT positions (default 5)
+        max_trades_today -- max entries per day (default 10)
+        max_daily_loss   -- max realized loss today before kill (default -500)
+        account_equity   -- account size for capital% calculation (default 25000)
+        position_manager -- APPositionManager instance (required for gates)
+        supabase_client  -- optional Supabase client
+        signal_store     -- optional signal status store
+        tier_engine      -- optional tier engine
+        feedback_loop    -- optional feedback loop
     """
 
-    # Sector classification map — ticker → sector
+    # Sector classification map -- ticker → sector
     # Extend this as you add more tickers to your scanner
     SECTOR_MAP: dict[str, str] = {
         # Tech
@@ -175,7 +175,7 @@ class APMasterControl:
         max_daily_loss:      float = -500.0, # stop trading if PnL < this
         account_equity:      float = 25000.0,# used for capital% math
         position_manager     = None,
-        position_sizer       = None,   # APPositionSizer — Kelly + drawdown sizing
+        position_sizer       = None,   # APPositionSizer -- Kelly + drawdown sizing
         supabase_client      = None,
         signal_store         = None,
         tier_engine          = None,
@@ -206,7 +206,7 @@ class APMasterControl:
         self._kill_switch_fn = None
         self._mode_fn        = None
 
-        # Session dedup cache — in-memory + DB-backed
+        # Session dedup cache -- in-memory + DB-backed
         self._seen_signals: set = set()
         # Seed from DB on init so restarts don't lose dedup state
         self._seed_dedup_from_db(client_id="default")
@@ -222,7 +222,7 @@ class APMasterControl:
             f"max_daily_loss=${self.max_daily_loss}"
         )
 
-    def wire(self, *, kill_switch_fn=None, mode_fn=None):
+    def wire(self, *, kill_switch_fn=None, mode_fn=None, position_count_fn=None, **kwargs):
         """Wire runtime callbacks from execution core."""
         if kill_switch_fn: self._kill_switch_fn = kill_switch_fn
         if mode_fn:        self._mode_fn        = mode_fn
@@ -270,7 +270,7 @@ class APMasterControl:
         Uses the real cost set by create_entry_order() from plan.max_position_usd,
         which is updated to the actual premium after contract selection.
 
-        Falls back to 0 if DB unavailable — never crashes the gate.
+        Falls back to 0 if DB unavailable -- never crashes the gate.
         """
         try:
             from ap.db import conn, run_with_retry
@@ -355,7 +355,7 @@ class APMasterControl:
         signal_id = str(signal.get("signal_id") or uuid.uuid4())
         signal["signal_id"] = signal_id
 
-        # Normalize side/direction once — used in dedup, gates, and plan construction
+        # Normalize side/direction once -- used in dedup, gates, and plan construction
         raw_side  = signal.get("side") or signal.get("direction") or "CALL"
         norm_side = raw_side.upper().strip()
         if norm_side in ("BUY", "LONG", "CALLS", "BULLISH"):
@@ -391,7 +391,7 @@ class APMasterControl:
                                    "live_mode_requires_ev_score "
                                    "(plain score alone is insufficient in LIVE mode)")
 
-        # Dedupe — in-memory check only at gate A (no DB write yet).
+        # Dedupe -- in-memory check only at gate A (no DB write yet).
         # Signals rejected for score/context/tier do NOT poison dedup state.
         # DB persistence happens only after the signal is fully approved (gate I).
         direction_raw = norm_side  # already normalized above
@@ -403,7 +403,7 @@ class APMasterControl:
             return self._block(signal_id, ticker, client_id,
                                "blocked_system", "duplicate_signal_id")
         if setup_key in self._seen_signals:
-            log.info(f"[{ticker}] Setup dedup blocked — same setup already active this session")
+            log.info(f"[{ticker}] Setup dedup blocked -- same setup already active this session")
             return self._block(signal_id, ticker, client_id,
                                "blocked_system",
                                f"duplicate_setup ({ticker} {direction_raw} {timeframe_raw})")
@@ -427,7 +427,7 @@ class APMasterControl:
             return self._block(signal_id, ticker, client_id, "blocked_risk",
                                f"max_positions_with_pending ({effective_count}/{self.max_positions})")
 
-        # Total capital % limit — projected: current + real pending cost + new trade estimate
+        # Total capital % limit -- projected: current + real pending cost + new trade estimate
         estimated_contracts_pre = max(1, self._base_contracts(score))
         estimated_new_cost_pre  = estimated_contracts_pre * 100 * DEFAULT_PREMIUM_ESTIMATE
         # Real pending capital from reserved_cost on pending entry orders
@@ -446,14 +446,14 @@ class APMasterControl:
                                f"pending_real=${pending_capital_real:.0f} "
                                f"new_est=${estimated_new_cost_pre:.0f})")
 
-        # Sector exposure cap — blocks if THIS trade WOULD exceed cap
+        # Sector exposure cap -- blocks if THIS trade WOULD exceed cap
         # Uses projected exposure: current + estimated new position size
         sector = self.SECTOR_MAP.get(ticker.upper(), "other")
         sector_deployed = self._sector_capital_deployed(
             snap["open_positions"] + snap["closing_positions"], sector
         )
         # Estimate new position cost before contract selection
-        # contracts from plan sizing (base 1), $5 placeholder premium — corrected
+        # contracts from plan sizing (base 1), $5 placeholder premium -- corrected
         # after contract selection updates plan.max_position_usd
         estimated_contracts = max(1, self._base_contracts(score))
         estimated_new_cost  = estimated_contracts * 100 * DEFAULT_PREMIUM_ESTIMATE
@@ -469,7 +469,7 @@ class APMasterControl:
                                f"{self.max_sector_pct*100:.0f}% of ${effective_equity:.0f} | "
                                f"current=${sector_deployed:.0f} + est_new=${estimated_new_cost:.0f})")
 
-        # Per-ticker cap — no single symbol > max_ticker_pct of equity, projected
+        # Per-ticker cap -- no single symbol > max_ticker_pct of equity, projected
         ticker_deployed     = self._ticker_capital_deployed(
             snap["open_positions"] + snap["closing_positions"], ticker
         )
@@ -484,7 +484,7 @@ class APMasterControl:
                                f"{self.max_ticker_pct*100:.0f}% of ${effective_equity:.0f} | "
                                f"current=${ticker_deployed:.0f} + est=${estimated_new_cost_ticker:.0f})")
 
-        # Directional bias limits — use normalized side from top of evaluate()
+        # Directional bias limits -- use normalized side from top of evaluate()
         side = norm_side
         if side == "CALL" and snap["calls_open"] >= self.max_calls:
             return self._block(signal_id, ticker, client_id, "blocked_risk",
@@ -503,7 +503,7 @@ class APMasterControl:
             return self._block(signal_id, ticker, client_id, "blocked_risk",
                                f"daily_loss_limit (${snap['realized_pnl_today']:.2f} <= ${self.max_daily_loss:.2f})")
 
-        # Ticker dedupe — already holding or pending entry in this ticker
+        # Ticker dedupe -- already holding or pending entry in this ticker
         if snap["open_tickers"] and ticker.upper() in snap["open_tickers"]:
             return self._block(signal_id, ticker, client_id, "blocked_risk",
                                f"ticker_already_active ({ticker})")
@@ -595,11 +595,11 @@ class APMasterControl:
             except Exception as e:
                 log.warning(f"[{ticker}] Feedback modifier failed: {e}")
 
-        # ── I. SIZING — Kelly + drawdown-adjusted ────────────────────────────
+        # ── I. SIZING -- Kelly + drawdown-adjusted ────────────────────────────
         # APPositionSizer uses actual win rate from trade history (Kelly).
         # Falls back to tier-based sizing if < min_history trades.
         # Always applies drawdown throttle regardless of method.
-        # premium_per_contract unknown pre-contract-selection — use placeholder;
+        # premium_per_contract unknown pre-contract-selection -- use placeholder;
         # contract_selector.select() will revalidate with real premium.
         _placeholder_premium = 1 * 100 * DEFAULT_PREMIUM_ESTIMATE  # $500 est.
         _pnl_today           = snap.get("realized_pnl_today", 0.0)
@@ -630,10 +630,10 @@ class APMasterControl:
                 if intel_avail and intel_contracts > 0:
                     contracts = min(contracts, intel_contracts)
             except Exception as e:
-                log.warning(f"[{ticker}] Sizer failed ({e}) — falling back to tier")
+                log.warning(f"[{ticker}] Sizer failed ({e}) -- falling back to tier")
                 contracts = self._base_contracts(score)
         else:
-            # No sizer injected — use tier-based fallback
+            # No sizer injected -- use tier-based fallback
             if str(tier).upper() == "B":
                 contracts = 1
             else:
@@ -695,7 +695,7 @@ class APMasterControl:
             },
         )
 
-        # ── DEDUP COMMIT — only after full approval ──────────────────────────────
+        # ── DEDUP COMMIT -- only after full approval ──────────────────────────────
         # Final kill switch check before committing dedup state.
         # If kill fires here, we abort before writing anything.
         if self._kill_switch_fn and self._kill_switch_fn():
@@ -707,7 +707,7 @@ class APMasterControl:
         try:
             self._persist_dedup(signal_id, ticker, direction_raw, timeframe_raw, client_id)
         except Exception as _dedup_err:
-            log.warning(f"[{ticker}] Dedup persist failed — not committing to memory: {_dedup_err}")
+            log.warning(f"[{ticker}] Dedup persist failed -- not committing to memory: {_dedup_err}")
             raise   # propagate so caller knows eval was aborted
 
         # Only add to memory AFTER DB write succeeds
@@ -720,7 +720,7 @@ class APMasterControl:
             f"[{ticker}] ✅ APPROVED | tier={tier} score={score:.1f} "
             f"contracts={contracts} trigger={trigger_type} "
             f"entry={entry_price} stop={stop_price} target={target_price} | "
-            f"intel={'✓' if intel_avail else '—'} feedback={feedback_mod:.2f} | "
+            f"intel={'✓' if intel_avail else '--'} feedback={feedback_mod:.2f} | "
             f"open={snap['open_count']} cap=${snap['capital_deployed']:.0f} "
             f"pending={snap['pending_entries']}"
         )
@@ -744,15 +744,15 @@ class APMasterControl:
         """
         if self.pm:
             try:
-                # pm is already scoped to self.pm.client_id — verify alignment
+                # pm is already scoped to self.pm.client_id -- verify alignment
                 if hasattr(self.pm, "client_id") and self.pm.client_id != client_id:
                     log.error(
                         f"SNAPSHOT MISMATCH: master_control client_id={client_id} "
-                        f"but pm.client_id={self.pm.client_id} — using pm data"
+                        f"but pm.client_id={self.pm.client_id} -- using pm data"
                     )
                 return self.pm.snapshot()
             except Exception as e:
-                log.warning(f"[{client_id}] snapshot() failed: {e} — using zeros")
+                log.warning(f"[{client_id}] snapshot() failed: {e} -- using zeros")
         return {
             "open_count": 0, "open_tickers": set(),
             "calls_open": 0, "puts_open": 0,
@@ -809,7 +809,7 @@ class APMasterControl:
 
         All other gates (score, tier, dedup, direction) already passed in evaluate().
 
-        ALL derived variables are computed upfront before any gate runs —
+        ALL derived variables are computed upfront before any gate runs --
         eliminates NameError if capital gate fires before sector/ticker are set.
         """
         ticker    = plan.ticker
@@ -819,7 +819,7 @@ class APMasterControl:
 
         snap = self._get_snapshot(client_id)
 
-        # Re-check kill switch after snapshot — snapshot() can be slow
+        # Re-check kill switch after snapshot -- snapshot() can be slow
         # and kill switch may have been activated during the DB call
         if self._kill_switch_fn and self._kill_switch_fn():
             return self._block(signal_id, ticker, client_id,
@@ -969,7 +969,7 @@ class APMasterControl:
     ):
         """
         Persist a capital utilization record to the audit_log table.
-        Every revalidate_exposure() call writes one row — whether it passed or blocked.
+        Every revalidate_exposure() call writes one row -- whether it passed or blocked.
         Enables post-session audit: which gate blocked trades, how full was the account.
         """
         import json
@@ -996,7 +996,7 @@ class APMasterControl:
             "account_equity":   round(self.account_equity, 2),
         }
 
-        # Structured log — always emitted regardless of DB availability
+        # Structured log -- always emitted regardless of DB availability
         log.info(
             f"[{client_id}] CAPITAL_UTIL | {ticker} | "
             f"deployed=${deployed:.0f} pending=${pending:.0f} "
@@ -1025,11 +1025,11 @@ class APMasterControl:
     def reset_session(self, client_id: str = ""):
         """
         Clear dedup cache for THIS client only, scoped to today's date.
-        Safe to call in multi-client environments — only wipes keys for
+        Safe to call in multi-client environments -- only wipes keys for
         this client. Never touches other clients' dedup state.
         """
         from datetime import date
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")  # UTC — consistent with DB
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")  # UTC -- consistent with DB
         # Build key prefix for this client
         # Keys are: dedup:sig:{signal_id}:{client_id}
         #           dedup:setup:{client_id}:{ticker}:{direction}:{timeframe}
@@ -1058,9 +1058,9 @@ class APMasterControl:
                             ),
                         )
                     else:
-                        # No client_id — log warning, do NOT wipe all clients
+                        # No client_id -- log warning, do NOT wipe all clients
                         log.warning(
-                            "reset_session called without client_id — "
+                            "reset_session called without client_id -- "
                             "skipping DB clear to protect other clients"
                         )
             run_with_retry(_clear)
@@ -1069,7 +1069,7 @@ class APMasterControl:
 
         log.info(
             f"MasterControl session reset | client={client_prefix or 'all'} "
-            f"date={today} — dedup cache cleared"
+            f"date={today} -- dedup cache cleared"
         )
 
     def _persist_dedup(self, signal_id: str, ticker: str,
@@ -1101,7 +1101,7 @@ class APMasterControl:
     def _seed_dedup_from_db(self, client_id: str = "default"):
         """
         On startup, load TODAY's dedup keys for THIS client only.
-        Scoped by client_id prefix — never loads other clients' dedup keys.
+        Scoped by client_id prefix -- never loads other clients' dedup keys.
         """
         try:
             from ap.db import conn, run_with_retry
