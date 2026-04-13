@@ -305,7 +305,7 @@ def create_app() -> Flask:
 
     # ✅ Ensure default client exists BEFORE any state write
     with conn() as c:
-        row = c.execute("SELECT 1 FROM clients WHERE client_id=?", (DEFAULT_CLIENT_ID,)).fetchone()
+        row = c.execute("SELECT 1 FROM clients WHERE client_id=%s", (DEFAULT_CLIENT_ID,)).fetchone()
 
     if not row:
         log.info(f"Creating default client (not found in DB): {DEFAULT_CLIENT_ID}")
@@ -550,7 +550,7 @@ def create_app() -> Flask:
 
         # ── PRIMARY: Route to execution cores (tier engine + entry watcher) ──
         # Each APExecutionCore scores, tiers, and decides whether to trade.
-        # Returns immediately — legacy queue is fallback only.
+        # Returns immediately -- legacy queue is fallback only.
         try:
             route_signal_to_all_clients(body)
             log.info(
@@ -561,7 +561,7 @@ def create_app() -> Flask:
             _idem_set(idem_key, payload)
             return jsonify(payload), 202
         except Exception as e:
-            log.warning(f"Execution core routing failed — falling back to legacy queue: {e}")
+            log.warning(f"Execution core routing failed -- falling back to legacy queue: {e}")
 
         # ── FALLBACK: Legacy queue (only if execution core throws) ────────────
         try:
