@@ -188,23 +188,13 @@ class ClientRunner(threading.Thread):
             )
 
             # ── Execution core (watcher + exit engine + fill monitor) ─────────
-            try:
-                self.core = APExecutionCore(
-                    broker=broker,
-                    supabase_client=sb,
-                    email=self.email,
-                    position_manager=self.position_manager,
-                    order_state_machine=self.order_state_machine,
-                )
-            except TypeError:
-                logger.warning(
-                    f"[{self.email}] APExecutionCore legacy init (push ap_execution_core_deploy.py to upgrade)"
-                )
-                self.core = APExecutionCore(
-                    broker=broker,
-                    supabase_client=sb,
-                    email=self.email,
-                )
+            self.core = APExecutionCore(
+                broker=broker,
+                supabase_client=sb,
+                email=self.email,
+                position_manager=self.position_manager,
+                order_state_machine=self.order_state_machine,
+            )
             self.core.start()
 
             # Wire kill switch + mode into master control
