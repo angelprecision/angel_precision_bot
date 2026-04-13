@@ -1,4 +1,4 @@
-ap/position_sizer.py — Kelly + Drawdown-Adjusted Position Sizing
+ap/position_sizer.py -- Kelly + Drawdown-Adjusted Position Sizing
 =================================================================
 Replaces fixed tier-based contract sizing with edge-responsive sizing.
 
@@ -111,7 +111,7 @@ class APPositionSizer:
         # ── Hard stop: daily loss exceeded ───────────────────────────────────
         if drawdown <= self.stop_threshold:
             log.warning(
-                "Daily stop hit: drawdown=%.2f <= stop_threshold=%.2f — sizing 0",
+                "Daily stop hit: drawdown=%.2f <= stop_threshold=%.2f -- sizing 0",
                 drawdown, self.stop_threshold,
             )
             return SizingResult(
@@ -145,7 +145,7 @@ class APPositionSizer:
                 rows, premium_per_contract, account_equity
             )
             if kelly_raw is not None and kelly_raw <= 0:
-                log.info("Kelly edge <= 0 (raw=%.4f) — blocking trade", kelly_raw)
+                log.info("Kelly edge <= 0 (raw=%.4f) -- blocking trade", kelly_raw)
                 return SizingResult(
                     contracts=0,
                     method="blocked",
@@ -231,7 +231,7 @@ class APPositionSizer:
         kelly_raw is the raw half-Kelly fraction (before equity scaling).
         """
         if premium_per_contract <= 0:
-            log.warning("premium_per_contract=%.4f invalid — falling back to 0", premium_per_contract)
+            log.warning("premium_per_contract=%.4f invalid -- falling back to 0", premium_per_contract)
             return 0, "blocked", 0.0, 0.0
 
         wins   = [r for r in rows if r["realized_pnl"] > 0]
@@ -247,7 +247,7 @@ class APPositionSizer:
         avg_loss = (sum(abs(r["realized_pnl"]) for r in losses) / len(losses)) if losses else 0.0
 
         if avg_loss == 0:
-            log.info("avg_loss=0 (no losses recorded) — using tier fallback")
+            log.info("avg_loss=0 (no losses recorded) -- using tier fallback")
             return 0, "blocked", win_rate, 0.0
 
         # Normalise to per-dollar-of-premium terms
@@ -289,7 +289,7 @@ class APPositionSizer:
 
         try:
             raw = db.run_with_retry(_query)
-            # psycopg2 RealDictCursor or tuple rows — normalise to dicts
+            # psycopg2 RealDictCursor or tuple rows -- normalise to dicts
             for row in raw:
                 if isinstance(row, dict):
                     rows.append(row)
@@ -302,6 +302,6 @@ class APPositionSizer:
                     })
         except Exception as exc:
             log.error("_fetch_history failed for client=%s: %s", client_id, exc)
-            # Return empty list — will trigger tier fallback
+            # Return empty list -- will trigger tier fallback
 
         return rows
