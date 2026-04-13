@@ -1,4 +1,4 @@
-# ap/worker_health.py — APWorkerHealthMonitor
+# ap/worker_health.py -- APWorkerHealthMonitor
 # =============================================================================
 # Detects silent thread death in ClientRunner worker loops and alerts via:
 #   1. Discord webhook (immediate)
@@ -123,7 +123,7 @@ class APWorkerHealthMonitor:
             f"worker-{email}",
             f"order-monitor-{email}",
             f"equity-refresh-{email}",
-            f"queue-sub-{email}",
+            # NOTE: queue-sub-{email} removed -- thread is named worker-{email}
         ]
         for tname in watch_names:
             t = live_threads.get(tname)
@@ -155,7 +155,7 @@ class APWorkerHealthMonitor:
     # =========================================================================
 
     def _fire_alert(self, email: str, runner, dead_threads: list[tuple[str, str]]):
-        """Rate-limited alert — fires once per ALERT_COOLDOWN seconds per client."""
+        """Rate-limited alert -- fires once per ALERT_COOLDOWN seconds per client."""
         now = time.time()
         last = self._last_alert.get(email, 0)
         if now - last < ALERT_COOLDOWN:
@@ -209,7 +209,7 @@ class APWorkerHealthMonitor:
         sig_id     = last_signal.get("signal_id", "unknown")[:8]
 
         lines = [
-            "🚨 **ANGEL PRECISION — THREAD DEATH ALERT**",
+            "🚨 **ANGEL PRECISION -- THREAD DEATH ALERT**",
             f"**Client:** `{email}`",
             f"**Time:** `{timestamp}`",
             f"**Dead threads:** {', '.join(f'`{t}`' for t in dead_threads)}",
@@ -226,7 +226,7 @@ class APWorkerHealthMonitor:
 
     def _send_discord(self, message: str):
         if not DISCORD_WEBHOOK_URL:
-            log.warning("DISCORD_WEBHOOK_URL not set — Discord alert skipped")
+            log.warning("DISCORD_WEBHOOK_URL not set -- Discord alert skipped")
             return
         try:
             resp = requests.post(
@@ -242,7 +242,7 @@ class APWorkerHealthMonitor:
             log.error(f"Discord alert error: {e}")
 
     # =========================================================================
-    # DASHBOARD — write to bot_status table
+    # DASHBOARD -- write to bot_status table
     # =========================================================================
 
     def _write_dashboard_alert(
@@ -254,41 +254,50 @@ class APWorkerHealthMonitor:
         timestamp: str,
     ):
         """
-        Write alert to Supabase bot_status table so the dashboard can display it.
-        Uses upsert on client_id so there's always one current record per client.
+        Write one row per dead thread into client_health.
+        PK is (client_id, component) -- uses on_conflict=client_id,component.
+        Columns match worker_health_schema.sql exactly (no dead_threads, no open_positions).
         """
         if not self.sb:
             return
-        try:
-            self.sb.table("client_health").upsert({
-                "client_id":      email,
-                "status":         "THREAD_DEAD",
-                "alert_type":     "thread_death",
-                "dead_threads":   dead_threads,
-                "open_positions": open_positions,
-                "last_signal_ticker": last_signal.get("ticker", ""),
-                "last_signal_ts":     last_signal.get("created_ts", ""),
-                "last_signal_id":     last_signal.get("signal_id", ""),
-                "alerted_at":     timestamp,
-                "updated_at":     timestamp,
-            }, on_conflict="client_id").execute()
-            log.info(f"[{email}] Dashboard alert written to client_health")
-        except Exception as e:
-            log.warning(f"Dashboard alert write failed: {e}")
+        msg_suffix = (
+            f"open_pos={open_positions} "
+            f"last={last_signal.get('ticker','?')}@{last_signal.get('created_ts','?')}"
+        )
+        for thread_name in dead_threads:
+            try:
+                self.sb.table("client_health").upsert({
+                    "client_id":    email,
+                    "component":    thread_name,
+                    "status":       "CRITICAL",
+                    "alert_type":   "thread_death",
+                    "restart_count": 0,
+                    "message":      f"Thread dead | {msg_suffix}"[:500],
+                    "alerted_at":   timestamp,
+                    "updated_at":   timestamp,
+                }, on_conflict="client_id,component").execute()
+            except Exception as e:
+                log.warning(f"Dashboard alert write failed for {thread_name}: {e}")
+        if dead_threads:
+            log.info(f"[{email}] Dashboard alert written for {dead_threads}")
 
     def clear_dashboard_alert(self, email: str):
         """
-        Call this when runner is restarted to clear the alert from dashboard.
+        Clear all CRITICAL/WARNING rows for this client when runner restarts.
+        Upserts a runner row with status=RUNNING so the dashboard goes green.
         """
         if not self.sb:
             return
         try:
             self.sb.table("client_health").upsert({
-                "client_id":  email,
-                "status":     "RUNNING",
-                "alert_type": None,
-                "updated_at": _now_utc(),
-            }, on_conflict="client_id").execute()
+                "client_id":    email,
+                "component":    "runner",
+                "status":       "OK",
+                "alert_type":   None,
+                "restart_count": 0,
+                "message":      "Runner started",
+                "updated_at":   _now_utc(),
+            }, on_conflict="client_id,component").execute()
         except Exception as e:
             log.debug(f"Clear dashboard alert failed: {e}")
 
