@@ -215,7 +215,7 @@ class ClientRunner(threading.Thread):
                 broker=broker,        # execution broker -- gated by BOT_MODE
                 data_broker=data_broker,  # live data broker -- quotes + chains only
                 mode=os.getenv("AP_MODE", "paper"),
-                target_delta=float(os.getenv("TARGET_DELTA", "0.40")),
+                target_delta=float(os.getenv("TARGET_DELTA", "0.50")),  # ATM -- 0.50 delta = at the money
                 max_spread_pct=float(os.getenv("MAX_SPREAD_PCT", "0.20")),
                 min_oi=int(os.getenv("MIN_OI", "10")),        # was 50 -- KLAC/RIVN/GEHC filtered out
                 min_volume=int(os.getenv("MIN_VOLUME", "1")),   # was 10 -- let any liquid contract through

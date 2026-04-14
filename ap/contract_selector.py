@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import math
 import logging
+import os
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from typing import Optional
@@ -634,8 +635,13 @@ class APContractSelectionEngine:
 
             premium_per_share    = mid
             premium_per_contract = mid * 100
+            # Hard cap: max $500 per trade regardless of budget passed in.
+            # Budget caps contracts from above; hard cap prevents runaway qty.
+            # Kelly/tier sizer sets budget -- this is the final safety net.
+            MAX_TRADE_USD = float(os.getenv("MAX_TRADE_USD", "500"))
+            effective_budget = min(budget, MAX_TRADE_USD)
             # 0 = unaffordable -- select() will block the trade
-            affordable = int(budget / premium_per_contract) if premium_per_contract > 0 else 0
+            affordable = int(effective_budget / premium_per_contract) if premium_per_contract > 0 else 0
 
             return SelectedContract(
                 contract_symbol      = opt.get("symbol", ""),
