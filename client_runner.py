@@ -156,7 +156,7 @@ class ClientRunner(threading.Thread):
 
             self.master_control = APMasterControl(
                 mode=os.getenv("AP_MODE", "paper"),
-                score_floor=float(os.getenv("SCORE_FLOOR", "60")),
+                score_floor=float(os.getenv("SCORE_FLOOR", "55")),  # was 60 -- loosen to get more trades
                 context_floor=float(os.getenv("CONTEXT_FLOOR", "6.0")),
                 max_positions=int(os.getenv("MAX_POSITIONS", "7")),
                 max_capital_pct=float(os.getenv("MAX_CAPITAL_PCT", "0.40")),
@@ -208,7 +208,7 @@ class ClientRunner(threading.Thread):
             # IV rank filter -- blocks buying expensive premium (rank > threshold)
             iv_filter = APIVRankFilter(
                 broker=data_broker,   # use live data broker for IV data
-                max_iv_rank=float(os.getenv("MAX_IV_RANK", "70")),
+                max_iv_rank=float(os.getenv("MAX_IV_RANK", "85")),  # was 70 -- V/CDW were blocked
             )
 
             self.contract_selector = APContractSelectionEngine(
@@ -217,8 +217,8 @@ class ClientRunner(threading.Thread):
                 mode=os.getenv("AP_MODE", "paper"),
                 target_delta=float(os.getenv("TARGET_DELTA", "0.40")),
                 max_spread_pct=float(os.getenv("MAX_SPREAD_PCT", "0.20")),
-                min_oi=int(os.getenv("MIN_OI", "50")),
-                min_volume=int(os.getenv("MIN_VOLUME", "10")),
+                min_oi=int(os.getenv("MIN_OI", "10")),        # was 50 -- KLAC/RIVN/GEHC filtered out
+                min_volume=int(os.getenv("MIN_VOLUME", "1")),   # was 10 -- let any liquid contract through
                 max_dte=int(os.getenv("MAX_DTE", "21")),
                 earnings_guard=earnings_guard,
                 iv_filter=iv_filter,
