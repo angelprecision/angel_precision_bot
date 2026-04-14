@@ -31,8 +31,22 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from ap.db import conn, run_with_retry, init_db
+# Deferred imports to avoid circular: app.py loads ap.db then ap.queue,
+# but ap.queue importing ap.db at module level crashes while ap.db is mid-load.
 from ap.state import update_state
+
+def _conn():
+    from ap.db import conn
+    return conn
+
+def _run_with_retry(fn, *args, **kwargs):
+    from ap.db import run_with_retry
+    return run_with_retry(fn, *args, **kwargs)
+
+def _init_db():
+    from ap.db import init_db
+    return init_db
+
 from ap.utils import now_utc_iso
 
 log = logging.getLogger("ap.queue")
@@ -89,7 +103,7 @@ def enqueue_signal(
         idempotency_key = f"{client_id}:{signal_id}"
 
     def _ins():
-        with conn() as c:
+        with _conn()() as c:
             c.execute(
                 """
                 INSERT INTO trade_queue (
@@ -102,7 +116,7 @@ def enqueue_signal(
             )
 
     try:
-        run_with_retry(_ins)
+        _run_with_retry(_ins)
         log.info(f"✅ Enqueued: {signal_id} client={client_id}")
         return True
     except Exception as e:
@@ -125,7 +139,7 @@ def _mark_job(
     error: str | None = None,
 ):
     def _fn():
-        with conn() as c:
+        with _conn()() as c:
             c.execute(
                 """
                 UPDATE trade_queue
@@ -142,7 +156,7 @@ def _mark_job(
                     job_id,
                 ),
             )
-    run_with_retry(_fn)
+    _run_with_retry(_fn)
 
 
 def _claim_one_job(client_id: str = "default") -> Optional[dict]:
@@ -156,7 +170,7 @@ def _claim_one_job(client_id: str = "default") -> Optional[dict]:
     Also reclaims stale PROCESSING jobs in the same transaction.
     """
     def _atomic_claim():
-        with conn() as c:
+        with _conn()() as c:
             # Step 1: reclaim stale PROCESSING rows for this client
             c.execute(
                 f"""
@@ -196,7 +210,7 @@ def _claim_one_job(client_id: str = "default") -> Optional[dict]:
             )
             return c.fetchone()
 
-    return run_with_retry(_atomic_claim)
+    return _run_with_retry(_atomic_claim)
 
 
 # =============================================================================
@@ -316,6 +330,36 @@ def _dispatch(
             order_state_machine.transition(local_order_id, "SUBMITTED",
                                            submitted_ts=now_utc_iso())
             log.info(f"[{ticker}] Order submitted immediately: {local_order_id}")
+
+            # PAPER MODE: simulate immediate fill at limit price
+            # In paper mode there is no real broker to confirm the order --
+            # transition straight to FILLED so the position goes live.
+            import os as _os
+            if _os.getenv("BOT_MODE", "PAPER").upper() != "LIVE":
+                fill_price = getattr(plan, "limit_price", None)
+                if fill_price:
+                    try:
+                        order_state_machine.transition(
+                            local_order_id, "FILLED",
+                            fill_price=fill_price,
+                            filled_qty=getattr(plan, "contracts", 1),
+                            filled_ts=now_utc_iso(),
+                        )
+                        log.info(
+                            f"[{ticker}] PAPER FILL | {getattr(plan, 'contract_symbol', '?')} "
+                            f"@ ${fill_price:.2f} x{getattr(plan, 'contracts', 1)}"
+                        )
+                        _mark_job(job_id, "COMPLETED",
+                                  result={"plan_id": plan.plan_id,
+                                          "local_order_id": local_order_id,
+                                          "contract": getattr(plan, "contract_symbol", ""),
+                                          "fill_price": fill_price,
+                                          "real_cost": plan.max_position_usd,
+                                          "trigger_type": "immediate_paper_fill"})
+                        return
+                    except Exception as pe:
+                        log.warning(f"[{ticker}] Paper fill transition failed: {pe}")
+
             _mark_job(job_id, "SUBMITTED",
                       result={"plan_id": plan.plan_id,
                               "local_order_id": local_order_id,
@@ -353,7 +397,7 @@ def worker_loop(
     live_mode:  if True, legacy process_signal() fallback is disabled entirely.
                 Paper mode can fall back; live mode requires full control stack.
     """
-    init_db()
+    _init_db()()
     mode_label = "control" if master_control else ("LIVE-NO-FALLBACK" if live_mode else "legacy")
     log.info(
         f"🤖 Worker started | client={client_id} poll={poll_seconds}s path={mode_label}"
