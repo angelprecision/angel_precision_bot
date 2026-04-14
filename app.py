@@ -1,10 +1,6 @@
 # app.py - ANGEL PRECISION BOT (PRODUCTION VERSION - STABLE)
 # ── In-process caches (reduce DB round-trips on hot /signal path) ────────
 # Avoids blocking DB calls when scanner fires 20+ signals in a burst.
-_SIGNAL_CACHE_LOCK  = threading.Lock()
-_client_status_cache: dict = {}   # {client_id: (status, expires_ts)}
-_kill_switch_cache:   dict = {}   # {client_id: (kill_val, mode, expires_ts)}
-_CACHE_TTL = 30.0                 # refresh every 30 seconds
 # =====================================================================
 # THIS FILE IS NOW STABLE. DO NOT EDIT.
 # All business logic lives in blueprints (client_api, admin_api, etc).
@@ -42,6 +38,13 @@ from ap.exit_manager import exit_manager_loop
 # from ap.client_api import client_bp
 # from ap.admin_api import admin_bp
 from client_runner import start_multi_client_supervisor, route_signal_to_all_clients
+
+# ── In-process caches (reduce DB round-trips on hot /signal path) ──────────
+_SIGNAL_CACHE_LOCK   = threading.Lock()
+_client_status_cache: dict = {}   # {client_id: (status, expires_ts)}
+_kill_switch_cache:   dict = {}   # {client_id: (kill_val, mode, expires_ts)}
+_CACHE_TTL = 30.0                 # seconds -- refresh every 30s
+
 start_multi_client_supervisor()
 # ============================================================
 # GLOBALS (gunicorn safe - no threads at import time)
