@@ -351,11 +351,20 @@ class APContractSelectionEngine:
         import requests
 
         # Use data_broker for all market data -- live API if configured
+        # TradierConfig stores token as .access_token (not .token)
         cfg      = getattr(self.data_broker, "cfg", None)
-        base_url = (getattr(cfg, "base_url", None) or
-                    getattr(self.data_broker, "base_url", "https://sandbox.tradier.com"))
-        token    = (getattr(cfg, "token", None) or
-                    getattr(self.data_broker, "token", ""))
+        base_url = (
+            getattr(cfg, "base_url", None)
+            or getattr(self.data_broker, "base_url", "https://sandbox.tradier.com")
+        )
+        token = (
+            getattr(cfg, "access_token", None)      # TradierConfig field name
+            or getattr(cfg, "token", None)           # fallback alias
+            or getattr(self.data_broker, "access_token", None)
+            or getattr(self.data_broker, "token", "")
+        ) or ""
+        if not token:
+            log.error("[%s] No Tradier token found on data_broker -- chain fetch will 401", ticker)
         headers  = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
 
         # 1. Fetch underlying quote for moneyness fallback when delta unavailable
