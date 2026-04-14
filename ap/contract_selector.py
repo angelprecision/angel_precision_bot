@@ -111,7 +111,7 @@ class APContractSelectionEngine:
                                   # if set, used for ALL market data calls
                                   # broker is used ONLY for order placement
         target_delta:   float = 0.50,  # ATM
-        delta_band:     float = 0.20,  # ±0.20 around 0.50 = 0.30-0.70 delta range
+        delta_band:     float = 0.15,  # ±0.15 around 0.50 = 0.35-0.65 delta range
         max_spread_pct: float = 0.20,
         min_oi:         int   = 50,
         min_volume:     int   = 10,
@@ -582,15 +582,15 @@ class APContractSelectionEngine:
         """
         Ranking score -- higher is better.
 
-        Priority order:
-          1. Affordability + premium size (dominant -- $3.50 ideal target)
-          2. ATM delta proximity (0.50 target)
-          3. Spread tightness
-          4. Liquidity (OI + volume, log scale)
-          5. PT1 direction (weak hint only -- never override affordability)
+        Priority order (probability-first):
+          1. Delta proximity -- ATM (0.50) = fastest reaction, highest hit rate
+          2. Spread tightness -- clean fills, less slippage on entry/exit
+          3. Liquidity (OI + volume, log scale) -- real market, avoids dead contracts
+          4. Premium size -- still respected, no longer dominant
+          5. Expected move context (tiny otm_bias)
 
-        The goal is the BEST AFFORDABLE ATM CONTRACT, not the contract
-        with the strike closest to price target. PT1/PT2 are exits, not strikes.
+        The goal is the BEST PROBABILITY CONTRACT, then affordable.
+        PT1/PT2 are exits, not strikes.
         """
         bid = float(opt.get("bid") or 0)
         ask = float(opt.get("ask") or 0)
@@ -642,12 +642,12 @@ class APContractSelectionEngine:
                     otm_bias = 0.1   # large expected move + barely OTM: tiny bonus
 
         score = (
-            (premium_penalty   * -100) +   # 1st: cheap is king
-            (delta_distance    *  -80) +   # 2nd: ATM proximity (delta 0.50)
-            (spread_pct        *  -30) +   # 3rd: tighter spread
-            (math.log(oi + 1)  *   10) +   # 4th: liquidity
-            (math.log(vol + 1) *    5) +   # 5th: volume
-            (otm_bias          *    8)     # tiny: expected move context
+            (delta_distance    * -130) +   # 1st: probability -- ATM = fastest reaction
+            (spread_pct        *  -80) +   # 2nd: execution quality -- tight spread
+            (math.log(oi + 1)  *   12) +   # 3rd: liquidity -- real market
+            (math.log(vol + 1) *    6) +   # 4th: volume -- confirmation of liquidity
+            (premium_penalty   *  -35) +   # 5th: cost -- respected, not dominant
+            (otm_bias          *    6)     # tiny: expected move context
         )
         return score
 
