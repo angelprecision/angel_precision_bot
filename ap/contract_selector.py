@@ -284,6 +284,7 @@ class APContractSelectionEngine:
                 opt, budget,
                 expected_move_pct=_expected_move_pct,
                 underlying_price=underlying_price or 0.0,
+                tier=getattr(plan, "tier", "B") or "B",
             )
             scored.append((s, opt))
 
@@ -578,7 +579,8 @@ class APContractSelectionEngine:
 
     def _rank_score(self, opt: dict, budget: float,
                      expected_move_pct: float = 0.0,
-                     underlying_price: float = 0.0) -> float:
+                     underlying_price: float = 0.0,
+                     tier: str = "B") -> float:
         """
         Ranking score -- higher is better.
 
@@ -641,13 +643,30 @@ class APContractSelectionEngine:
                 if otm_dist <= 0.5:
                     otm_bias = 0.1   # large expected move + barely OTM: tiny bonus
 
+        # ── Tier-based weight adjustment ─────────────────────────────────
+        # A+/A: best signal quality -- prioritize best contract, relax cost
+        # B:    default balanced weights
+        # C:    weaker signal -- tighter cost control, still want ATM
+        if tier in ("A+", "A"):
+            delta_weight   = -140
+            spread_weight  =  -90
+            premium_weight =  -25
+        elif tier == "B":
+            delta_weight   = -130
+            spread_weight  =  -80
+            premium_weight =  -35
+        else:  # C or unknown
+            delta_weight   = -120
+            spread_weight  =  -70
+            premium_weight =  -50
+
         score = (
-            (delta_distance    * -130) +   # 1st: probability -- ATM = fastest reaction
-            (spread_pct        *  -80) +   # 2nd: execution quality -- tight spread
-            (math.log(oi + 1)  *   12) +   # 3rd: liquidity -- real market
-            (math.log(vol + 1) *    6) +   # 4th: volume -- confirmation of liquidity
-            (premium_penalty   *  -35) +   # 5th: cost -- respected, not dominant
-            (otm_bias          *    6)     # tiny: expected move context
+            (delta_distance    * delta_weight)   +   # 1st: probability -- ATM
+            (spread_pct        * spread_weight)  +   # 2nd: execution quality
+            (math.log(oi + 1)  *   12)           +   # 3rd: liquidity
+            (math.log(vol + 1) *    6)           +   # 4th: volume
+            (premium_penalty   * premium_weight) +   # 5th: cost (tier-scaled)
+            (otm_bias          *    6)               # tiny: expected move context
         )
         return score
 
