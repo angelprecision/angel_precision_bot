@@ -326,16 +326,10 @@ class APContractSelectionEngine:
         """
         option_type = direction.lower()   # "call" | "put"
 
-        # Try broker's option chain method
-        if hasattr(self.broker, "get_option_chain"):
-            chain = self.broker.get_option_chain(ticker, option_type=option_type)
-            return (chain or []), None
-
-        if hasattr(self.broker, "option_chain"):
-            chain = self.broker.option_chain(ticker, option_type=option_type)
-            return (chain or []), None
-
-        # Tradier REST fallback via requests
+        # Always use _fetch_tradier_chain for full chain + expiration selection.
+        # TradierBroker.get_option_chain(ticker, expiration) requires an expiration
+        # date we don't have yet -- that logic lives inside _fetch_tradier_chain.
+        # Calling it with option_type= causes: got an unexpected keyword argument 'option_type'
         return self._fetch_tradier_chain(ticker, option_type)
 
     def _fetch_chain(self, ticker: str, direction: str) -> list[dict]:
