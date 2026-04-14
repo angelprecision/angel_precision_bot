@@ -617,8 +617,9 @@ class APMasterControl:
                 contracts = sizing.contracts
                 log.info(
                     f"[{ticker}] Sizing | method={sizing.method} "
-                    f"contracts={contracts} win_rate={sizing.win_rate:.2f} "
-                    f"kelly_raw={sizing.kelly_raw:.2f} "
+                    f"contracts={contracts} "
+                    f"win_rate={sizing.win_rate:.2f if sizing.win_rate is not None else 'n/a'} "
+                    f"kelly_raw={sizing.kelly_raw:.2f if sizing.kelly_raw is not None else 'n/a'} "
                     f"throttle={sizing.throttle_applied} "
                     f"reason={sizing.reason}"
                 )
@@ -1048,7 +1049,7 @@ class APMasterControl:
                         c.execute(
                             """
                             DELETE FROM kv
-                            WHERE (key LIKE %s OR key LIKE %s)
+                            WHERE (k LIKE %s OR k LIKE %s)
                               AND updated_at::date = %s::date
                             """,
                             (
@@ -1088,9 +1089,9 @@ class APMasterControl:
                     for key in keys:
                         c.execute(
                             """
-                            INSERT INTO kv (key, value, updated_at)
+                            INSERT INTO kv (k, v, updated_at)
                             VALUES (%s, %s, NOW())
-                            ON CONFLICT (key) DO UPDATE SET value=%s, updated_at=NOW()
+                            ON CONFLICT (k) DO UPDATE SET v=%s, updated_at=NOW()
                             """,
                             (key, ts, ts),
                         )
@@ -1112,8 +1113,8 @@ class APMasterControl:
                 with conn() as c:
                     c.execute(
                         """
-                        SELECT key FROM kv
-                        WHERE (key LIKE %s OR key LIKE %s)
+                        SELECT k FROM kv
+                        WHERE (k LIKE %s OR k LIKE %s)
                           AND updated_at::date = %s::date
                         """,
                         (sig_prefix, setup_prefix, today),
@@ -1121,7 +1122,7 @@ class APMasterControl:
                     return c.fetchall()
             rows = run_with_retry(_load)
             for row in rows:
-                self._seen_signals.add(row["key"].replace("dedup:", "", 1))
+                self._seen_signals.add(row["k"].replace("dedup:", "", 1))
             if rows:
                 log.info(
                     f"[{client_id}] Dedup seeded: {len(rows)} entries "
