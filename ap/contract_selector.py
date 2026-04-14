@@ -112,7 +112,7 @@ class APContractSelectionEngine:
                                   # broker is used ONLY for order placement
         target_delta:   float = 0.50,  # ATM
         delta_band:     float = 0.15,  # ±0.15 around 0.50 = 0.35-0.65 delta range
-        max_spread_pct: float = 0.20,
+        max_spread_pct: float = 0.35,  # raised 0.20→0.35 -- wide spreads on vol days
         min_oi:         int   = 50,
         min_volume:     int   = 10,
         min_premium:    float = 10.0,    # $0.10/share -- allow cheap weeklies
@@ -130,7 +130,8 @@ class APContractSelectionEngine:
         self.mode           = mode
         self.target_delta   = target_delta
         self.delta_band     = delta_band
-        self.max_spread_pct = max_spread_pct
+        # Allow runtime override via env -- loosen on high-vol days
+        self.max_spread_pct = float(os.getenv('MAX_SPREAD_PCT', str(max_spread_pct)))
         self.min_oi         = min_oi
         self.min_volume     = min_volume
         self.min_premium    = min_premium
