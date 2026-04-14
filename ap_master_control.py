@@ -621,8 +621,8 @@ class APMasterControl:
                 log.info(
                     f"[{ticker}] Sizing | method={sizing.method} "
                     f"contracts={contracts} "
-                    f"win_rate={sizing.win_rate:.2f if sizing.win_rate is not None else 'n/a'} "
-                    f"kelly_raw={sizing.kelly_raw:.2f if sizing.kelly_raw is not None else 'n/a'} "
+                    f"win_rate={sizing.win_rate:.2f if sizing.win_rate is not None else 0.0} "
+                    f"kelly_raw={sizing.kelly_raw:.4f if sizing.kelly_raw is not None else 0.0} "
                     f"throttle={sizing.throttle_applied} "
                     f"reason={sizing.reason}"
                 )
