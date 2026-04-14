@@ -331,6 +331,47 @@ def get_client_state(client_id: str = "default") -> dict:
     return run_with_retry(_fn)
 
 
+def ensure_client_exists(client_id: str, equity: float = 25000.0) -> None:
+    """
+    Auto-provision a client row + client_state row if they don't exist yet.
+    Called automatically before any write that has a FK dependency on clients.
+    This means adding a new member never requires a manual DB insert.
+
+    Safe to call on every heartbeat -- ON CONFLICT DO NOTHING makes it a no-op
+    if the rows already exist.
+    """
+    now = now_utc_iso()
+    def _fn():
+        with conn() as c:
+            # 1. clients row -- required by FK on client_state, positions, orders, trade_queue
+            c.execute(
+                """
+                INSERT INTO clients (
+                    client_id, name, broker_type, broker_account_id,
+                    broker_token, broker_base_url, initial_equity, status,
+                    created_at, max_trades_per_day, max_concurrent_positions,
+                    daily_max_loss_pct, base_position_pct
+                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                ON CONFLICT (client_id) DO NOTHING
+                """,
+                (client_id, client_id, 'tradier', '', '', 'https://sandbox.tradier.com',
+                 float(equity), 'ACTIVE', now, 10, 7, 0.05, 0.10),
+            )
+            # 2. client_state row -- required by heartbeat / mode reads
+            c.execute(
+                """
+                INSERT INTO client_state (
+                    client_id, current_equity, starting_equity_today,
+                    realized_pnl_today, trades_taken_today, daily_stop_hit,
+                    kill_switch, mode, day_key, updated_at
+                ) VALUES (%s,%s,%s,0.0,0,0,0,'PAPER',NULL,%s)
+                ON CONFLICT (client_id) DO NOTHING
+                """,
+                (client_id, float(equity), float(equity), now),
+            )
+    run_with_retry(_fn)
+
+
 def update_client_state(client_id: str = "default", updates: dict | None = None):
     if not updates:
         return
@@ -350,18 +391,32 @@ def update_client_state(client_id: str = "default", updates: dict | None = None)
     set_values = list(safe.values())
     def _fn():
         with conn() as c:
-            # Two-step: upsert the row, then update the fields
-            # Step 1: ensure row exists
+            # Auto-provision client + state rows before writing
+            # Prevents ForeignKeyViolation when a new member email is added
+            c.execute(
+                """
+                INSERT INTO clients (
+                    client_id, name, broker_type, broker_account_id,
+                    broker_token, broker_base_url, initial_equity, status,
+                    created_at, max_trades_per_day, max_concurrent_positions,
+                    daily_max_loss_pct, base_position_pct
+                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                ON CONFLICT (client_id) DO NOTHING
+                """,
+                (client_id, client_id, 'tradier', '', '',
+                 'https://sandbox.tradier.com', 25000.0, 'ACTIVE',
+                 now_utc_iso(), 10, 7, 0.05, 0.10),
+            )
             c.execute(
                 """
                 INSERT INTO client_state (client_id, current_equity, starting_equity_today,
                     realized_pnl_today, trades_taken_today, mode, updated_at)
-                VALUES (%s, 100000, 100000, 0, 0, 'PAPER', NOW())
+                VALUES (%s, 25000, 25000, 0, 0, 'PAPER', NOW())
                 ON CONFLICT (client_id) DO NOTHING
                 """,
                 (client_id,),
             )
-            # Step 2: apply updates
+            # Apply the actual updates
             c.execute(
                 f"UPDATE client_state SET {set_clause} WHERE client_id=%s",
                 set_values + [client_id],
