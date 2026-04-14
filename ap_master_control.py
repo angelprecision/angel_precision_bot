@@ -519,11 +519,15 @@ class APMasterControl:
 
         # ── D. SCORE GATE ─────────────────────────────────────────────────────
 
-        if score < self.score_floor:
+        # Priority ETFs bypass score floor -- deepest chains, tightest spreads
+        _PRIORITY_TICKERS = {"SPY", "QQQ", "IWM", "SPX", "NDX"}
+        if score < self.score_floor and ticker.upper() not in _PRIORITY_TICKERS:
             self._store_update(signal_id, "rejected",
                                f"score {score:.1f} < floor {self.score_floor}")
             return self._block(signal_id, ticker, client_id, "blocked_score",
                                f"score_below_floor ({score:.1f}<{self.score_floor})")
+        if score < self.score_floor:
+            log.info(f"[{ticker}] Priority ticker -- score floor bypassed ({score:.1f}<{self.score_floor})")
 
         # ── E. CONTEXT GATE ───────────────────────────────────────────────────
 
@@ -1014,8 +1018,8 @@ class APMasterControl:
                 with conn() as c:
                     c.execute(
                         """
-                        INSERT INTO audit_log (client_id, event_type, payload, created_at)
-                        VALUES (%s, 'capital_utilization', %s, NOW())
+                        INSERT INTO audit_log (client_id, level, event, payload, ts)
+                        VALUES (%s, 'INFO', 'capital_utilization', %s, NOW())
                         """,
                         (client_id, json.dumps(record)),
                     )
