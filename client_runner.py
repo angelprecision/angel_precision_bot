@@ -356,6 +356,7 @@ class ClientRunner(threading.Thread):
                     contract_selector=self.contract_selector,
                     order_state_machine=self.order_state_machine,
                     entry_watcher=entry_watcher,
+                    position_manager=self.position_manager,
                     client_id=self.email,
                     stop_event=self.stopped,    # clean shutdown when runner stops
                     live_mode=is_live,           # disables legacy fallback in live
