@@ -122,6 +122,17 @@ class ClientRunner(threading.Thread):
             return
 
         try:
+            # ── Auto-provision DB rows for this client ────────────────────────
+            # Creates clients + client_state rows if missing.
+            # Prevents ForeignKeyViolation on first heartbeat for new members.
+            # ON CONFLICT DO NOTHING makes this a no-op for existing clients.
+            from ap.db import ensure_client_exists
+            ensure_client_exists(
+                self.email,
+                equity=float(os.getenv("ACCOUNT_EQUITY", "25000")),
+            )
+            logger.info(f"[{self.email}] DB rows provisioned")
+
             # ── Broker ───────────────────────────────────────────────────────
             broker_cfg = TradierConfig(
                 base_url=self.base_url,
