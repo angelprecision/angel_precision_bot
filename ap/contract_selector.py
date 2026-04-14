@@ -115,8 +115,8 @@ class APContractSelectionEngine:
         max_spread_pct: float = 0.20,
         min_oi:         int   = 50,
         min_volume:     int   = 10,
-        min_premium:    float = 25.0,    # $0.25/share -- allow cheaper contracts
-        max_premium:    float = 350.0,   # $3.50/share = $350/contract max budget
+        min_premium:    float = 10.0,    # $0.10/share -- allow cheap weeklies
+        max_premium:    float = 400.0,   # $4.00/share = $400/contract hard cap
         max_dte:        int   = 21,
         min_dte:        int   = 0,
         prefer_weekly:  bool  = True,
@@ -176,9 +176,20 @@ class APContractSelectionEngine:
         ticker    = plan.ticker
         direction = plan.side.upper()   # "CALL" | "PUT"
         budget    = plan.max_position_usd
-        # PT1 from the signal -- used to cap strike selection
-        # We never want a strike above PT1 (that's our target, not our strike)
+        # PT1 = first price target (wick cluster level) -- expected move destination.
+        # Used ONLY as expected move % to calibrate OTM bias. NOT a strike anchor.
         pt1 = getattr(plan, "target_underlying", None)
+        # wick_targets from signal enrichment: [{price, confidence, distance_pct, ...}]
+        wick_targets = getattr(plan, "wick_targets", None) or []
+        # expected_move_pct: how far price is expected to travel (sets OTM bias)
+        _expected_move_pct = 0.0
+        _wick_confidence   = 0.5  # default if no wick data
+        if wick_targets:
+            _expected_move_pct = float(wick_targets[0].get("distance_pct", 0) or 0)
+            _wick_confidence   = float(wick_targets[0].get("confidence", 0.5) or 0.5)
+        elif pt1 and pt1 > 0:
+            entry_approx = getattr(plan, "trigger_price", pt1) or pt1
+            _expected_move_pct = abs(pt1 - entry_approx) / entry_approx * 100 if entry_approx else 0
 
         log.info(
             "[%s] ContractSelector | direction=%s budget=$%.0f tier=%s pt1=%s",
@@ -252,17 +263,6 @@ class APContractSelectionEngine:
         for opt in chain:
             result = self._quality_filter(opt, today)
             if result is None:
-                # Strike cap: never select a contract with strike above PT1.
-                # A strike at or above our price target means we need the stock
-                # to go PAST our target just to break even -- bad risk/reward.
-                if pt1 and direction == "CALL":
-                    strike = float(opt.get("strike") or 0)
-                    if strike > pt1:
-                        log.debug(
-                            "[%s] filtered: %s -- strike %.2f > PT1 %.2f",
-                            ticker, opt.get("symbol", "?"), strike, pt1,
-                        )
-                        continue
                 survivors.append(opt)
             else:
                 log.debug(
@@ -279,10 +279,12 @@ class APContractSelectionEngine:
         # ── C. RANK ───────────────────────────────────────────────────────────
 
         scored = []
-        _pt1 = pt1 or 0.0
-        _underlying = underlying_price or 0.0
         for opt in survivors:
-            s = self._rank_score(opt, budget, pt1=_pt1, underlying_price=_underlying)
+            s = self._rank_score(
+                opt, budget,
+                expected_move_pct=_expected_move_pct,
+                underlying_price=underlying_price or 0.0,
+            )
             scored.append((s, opt))
 
         scored.sort(key=lambda x: x[0], reverse=True)
@@ -313,6 +315,12 @@ class APContractSelectionEngine:
         plan.contracts       = selected.affordable_contracts  # never forced to 1
         # Recalculate max_position_usd with real premium
         plan.max_position_usd = plan.contracts * selected.premium_per_contract
+        # Inject wick confidence so sizer can scale qty (high conf = more contracts)
+        if _wick_confidence and not getattr(plan, "wick_confidence", None):
+            try:
+                plan.wick_confidence = _wick_confidence
+            except Exception:
+                pass
 
         log.info(
             "[%s] SELECTED | %s "
@@ -569,7 +577,8 @@ class APContractSelectionEngine:
     # =========================================================================
 
     def _rank_score(self, opt: dict, budget: float,
-                     pt1: float = 0.0, underlying_price: float = 0.0) -> float:
+                     expected_move_pct: float = 0.0,
+                     underlying_price: float = 0.0) -> float:
         """
         Ranking score -- higher is better.
 
@@ -604,7 +613,7 @@ class APContractSelectionEngine:
         # Ideal premium: $3.50/share ($350/contract). Hard cap $5.00 ($500).
         # Penalize contracts above ideal heavily; reward contracts below it.
         MAX_IDEAL_PREMIUM = float(os.getenv("MAX_IDEAL_PREMIUM", "3.50"))
-        MAX_HARD_PREMIUM  = float(os.getenv("MAX_HARD_PREMIUM",  "5.00"))
+        MAX_HARD_PREMIUM  = float(os.getenv("MAX_HARD_PREMIUM",  "4.00"))  # $400/contract hard cap
         if mid > MAX_HARD_PREMIUM:
             return -9999.0  # reject immediately -- too expensive
         premium_penalty = max(0.0, mid - MAX_IDEAL_PREMIUM)  # 0 if at/below ideal
