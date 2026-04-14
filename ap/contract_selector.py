@@ -627,25 +627,27 @@ class APContractSelectionEngine:
         # ── 2. Delta proximity (ATM bias) ────────────────────────────────
         delta_distance = abs(delta - self.target_delta)
 
-        # ── 3. PT1 strike hint (weak -- 10% weight max) ──────────────────
-        # Prefer strike slightly below PT1 so there is room to profit.
-        # This is a SOFT bias -- never overrides affordability or ATM proximity.
-        strike_bias = 0.0
-        if pt1 > 0 and underlying_price > 0:
+        # ── 3. Expected move OTM bias (tiny weight) ──────────────────────
+        # Wick targets = expected move magnitude, NOT strike selection.
+        # Large expected move gets a tiny allowance for slight OTM.
+        # ATM + affordability always dominate (weights -100 and -80 above).
+        otm_bias = 0.0
+        if underlying_price > 0:
             strike = float(opt.get("strike") or 0)
-            # Ideal: strike between current price and PT1
-            if underlying_price < strike < pt1:
-                strike_bias = 0.5  # small bonus
-            elif strike <= underlying_price:
-                strike_bias = 0.2  # slight bonus for ATM/slightly ITM
+            if strike <= underlying_price:
+                otm_bias = 0.2   # ATM or ITM: small bonus
+            elif expected_move_pct >= 1.5:
+                otm_dist = (strike - underlying_price) / underlying_price * 100
+                if otm_dist <= 0.5:
+                    otm_bias = 0.1   # large move + barely OTM: tiny bonus
 
         score = (
-            (premium_penalty   * -100) +   # dominant: cheap is king
-            (delta_distance    * -80)  +   # ATM proximity
-            (spread_pct        * -30)  +   # tighter spread
-            (math.log(oi + 1)  *  10)  +   # liquidity
-            (math.log(vol + 1) *   5)  +   # volume
-            (strike_bias       *  15)      # weak PT1 hint
+            (premium_penalty   * -100) +   # 1st: cheap is king
+            (delta_distance    *  -80) +   # 2nd: ATM proximity
+            (spread_pct        *  -30) +   # 3rd: tighter spread
+            (math.log(oi + 1)  *   10) +   # 4th: liquidity
+            (math.log(vol + 1) *    5) +   # 5th: volume
+            (otm_bias          *    8)     # tiny: expected move hint
         )
         return score
 
