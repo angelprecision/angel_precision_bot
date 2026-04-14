@@ -227,6 +227,7 @@ def _dispatch(
     contract_selector,
     order_state_machine,
     entry_watcher,
+    position_manager=None,
 ):
     """
     Unified control path:
@@ -349,12 +350,45 @@ def _dispatch(
                             f"[{ticker}] PAPER FILL | {getattr(plan, 'contract_symbol', '?')} "
                             f"@ ${fill_price:.2f} x{getattr(plan, 'contracts', 1)}"
                         )
+                        # ── Open position so exit engine can monitor it ──────
+                        _pos_id = None
+                        if position_manager is not None:
+                            try:
+                                _pos_id = position_manager.open_position(
+                                    plan_id=plan.plan_id,
+                                    signal_id=signal_id,
+                                    ticker=ticker,
+                                    contract=getattr(plan, "contract_symbol", ""),
+                                    side=getattr(plan, "side", "CALL"),
+                                    qty=getattr(plan, "contracts", 1),
+                                    entry_price=fill_price,
+                                    tier=str(getattr(plan, "tier", "B")),
+                                    score=float(getattr(plan, "score", 0.0) or 0),
+                                    pattern=str(getattr(plan, "pattern", "") or ""),
+                                    tp_pct=float(getattr(plan, "tp_pct", 0.20) or 0.20),
+                                    sl_pct=float(getattr(plan, "sl_pct", 0.25) or 0.25),
+                                    stop_underlying=getattr(plan, "stop_price", None),
+                                    target_underlying=getattr(plan, "target_underlying", None),
+                                )
+                                # Link position_id back to the order
+                                order_state_machine.transition(
+                                    local_order_id, "FILLED",
+                                    position_id=_pos_id,
+                                )
+                                log.info(
+                                    f"[{ticker}] POSITION CREATED | id={_pos_id}"
+                                )
+                            except Exception as ope:
+                                log.warning(f"[{ticker}] open_position failed: {ope}")
+                        else:
+                            log.warning(f"[{ticker}] position_manager not injected -- position not tracked")
                         _mark_job(job_id, "COMPLETED",
                                   result={"plan_id": plan.plan_id,
                                           "local_order_id": local_order_id,
                                           "contract": getattr(plan, "contract_symbol", ""),
                                           "fill_price": fill_price,
                                           "real_cost": plan.max_position_usd,
+                                          "position_id": _pos_id,
                                           "trigger_type": "immediate_paper_fill"})
                         return
                     except Exception as pe:
@@ -383,6 +417,7 @@ def worker_loop(
     contract_selector=None,
     order_state_machine=None,
     entry_watcher=None,
+    position_manager=None,
     client_id: str = "default",
     stop_event=None,           # threading.Event -- worker exits when set
     live_mode: bool = False,   # if True, legacy fallback is DISABLED
@@ -450,6 +485,7 @@ def worker_loop(
                     contract_selector=contract_selector,
                     order_state_machine=order_state_machine,
                     entry_watcher=entry_watcher,
+                    position_manager=position_manager,
                 )
 
             # ── LEGACY FALLBACK (paper mode only) ────────────────────────────
