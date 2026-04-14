@@ -163,20 +163,46 @@ class ClientRunner(threading.Thread):
 
             self.order_state_machine = APOrderStateMachine(client_id=self.email)
 
+            # ── Live data broker (optional) ──────────────────────────────────
+            # TRADIER_DATA_TOKEN + TRADIER_DATA_BASE_URL point at api.tradier.com
+            # for real option chains. The execution broker (above) stays on
+            # sandbox / paper so NO real orders are placed.
+            _data_token   = os.getenv("TRADIER_DATA_TOKEN", "").strip()
+            _data_base_url = os.getenv("TRADIER_DATA_BASE_URL",
+                                        "https://api.tradier.com").strip()
+            if _data_token:
+                data_broker_cfg = TradierConfig(
+                    base_url=_data_base_url,
+                    access_token=_data_token,
+                    account_id=self.account_id,   # account id not used for data calls
+                )
+                data_broker = TradierBroker(data_broker_cfg)
+                logger.info(
+                    f"[{self.email}] Live data broker initialized | "
+                    f"{_data_base_url} (data-only, no orders)"
+                )
+            else:
+                data_broker = broker   # fallback: same as execution broker
+                logger.warning(
+                    f"[{self.email}] TRADIER_DATA_TOKEN not set -- "
+                    f"using execution broker for data (sandbox chains)"
+                )
+
             # Earnings blackout gate -- blocks trades within N days of earnings
             earnings_guard = APEarningsGuard(
-                broker=broker,
+                broker=data_broker,   # use live data broker for earnings calendar
                 blackout_days=int(os.getenv("EARNINGS_BLACKOUT_DAYS", "3")),
             )
 
             # IV rank filter -- blocks buying expensive premium (rank > threshold)
             iv_filter = APIVRankFilter(
-                broker=broker,
+                broker=data_broker,   # use live data broker for IV data
                 max_iv_rank=float(os.getenv("MAX_IV_RANK", "70")),
             )
 
             self.contract_selector = APContractSelectionEngine(
-                broker=broker,
+                broker=broker,        # execution broker -- gated by BOT_MODE
+                data_broker=data_broker,  # live data broker -- quotes + chains only
                 mode=os.getenv("AP_MODE", "paper"),
                 target_delta=float(os.getenv("TARGET_DELTA", "0.40")),
                 max_spread_pct=float(os.getenv("MAX_SPREAD_PCT", "0.20")),
