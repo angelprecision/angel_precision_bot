@@ -1,14 +1,14 @@
-# ap/contract_selector.py — APContractSelectionEngine
+# ap/contract_selector.py -- APContractSelectionEngine
 # =============================================================================
 # Unified contract selection. Takes an ApprovedExecutionPlan, returns the
 # single best tradable contract + real sizing based on actual premium.
 #
 # Selection algorithm:
-#   A. Earnings blackout gate (APEarningsGuard) — before chain fetch
+#   A. Earnings blackout gate (APEarningsGuard) -- before chain fetch
 #   B. Choose expiration  (0DTE / weekly / nearest)
 #   C. Filter to direction (CALL / PUT)
 #   D. Hard quality filters (spread, OI, volume, DTE, delta)
-#   E. IV rank gate (APIVRankFilter) — after chain fetch
+#   E. IV rank gate (APIVRankFilter) -- after chain fetch
 #   F. Rank survivors (delta fit, spread, OI, volume, premium fit)
 #   G. Price sanity (buy-side: prefer ask when spread is tight)
 #   H. Affordability → final contract count from real premium
@@ -85,20 +85,20 @@ class APContractSelectionEngine:
     Selects the best tradable option contract for an ApprovedExecutionPlan.
 
     Constructor args:
-        broker         — Tradier broker instance (has option_chain method)
-        mode           — "paper" | "live"
-        target_delta   — preferred delta band center (default 0.40)
-        delta_band     — +/- tolerance around target delta (default 0.15)
-        max_spread_pct — max bid-ask spread as % of mid (default 0.20 = 20%)
-        min_oi         — minimum open interest (default 50)
-        min_volume     — minimum daily volume (default 10)
-        min_premium    — min premium per contract in $ (default 50 = $0.50/share)
-        max_premium    — max premium per contract in $ (default 2000 = $20/share)
-        max_dte        — maximum days to expiration (default 21)
-        min_dte        — minimum DTE (default 0 for 0DTE support)
-        prefer_weekly  — prefer weekly expirations (default True)
-        earnings_guard — APEarningsGuard instance (optional; skipped if None)
-        iv_filter      — APIVRankFilter instance (optional; skipped if None)
+        broker         -- Tradier broker instance (has option_chain method)
+        mode           -- "paper" | "live"
+        target_delta   -- preferred delta band center (default 0.40)
+        delta_band     -- +/- tolerance around target delta (default 0.15)
+        max_spread_pct -- max bid-ask spread as % of mid (default 0.20 = 20%)
+        min_oi         -- minimum open interest (default 50)
+        min_volume     -- minimum daily volume (default 10)
+        min_premium    -- min premium per contract in $ (default 50 = $0.50/share)
+        max_premium    -- max premium per contract in $ (default 2000 = $20/share)
+        max_dte        -- maximum days to expiration (default 21)
+        min_dte        -- minimum DTE (default 0 for 0DTE support)
+        prefer_weekly  -- prefer weekly expirations (default True)
+        earnings_guard -- APEarningsGuard instance (optional; skipped if None)
+        iv_filter      -- APIVRankFilter instance (optional; skipped if None)
     """
 
     def __init__(
@@ -106,6 +106,9 @@ class APContractSelectionEngine:
         broker,
         *,
         mode:           str   = "paper",
+        data_broker     = None,   # separate live-data broker for quotes/chains
+                                  # if set, used for ALL market data calls
+                                  # broker is used ONLY for order placement
         target_delta:   float = 0.40,
         delta_band:     float = 0.15,
         max_spread_pct: float = 0.20,
@@ -120,6 +123,9 @@ class APContractSelectionEngine:
         iv_filter=None,
     ):
         self.broker         = broker
+        # data_broker: used only for market data (quotes, chains, expirations)
+        # Falls back to self.broker if not set
+        self.data_broker    = data_broker if data_broker is not None else broker
         self.mode           = mode
         self.target_delta   = target_delta
         self.delta_band     = delta_band
@@ -151,7 +157,7 @@ class APContractSelectionEngine:
         )
 
     # =========================================================================
-    # PUBLIC — select(plan) → SelectedContract | None
+    # PUBLIC -- select(plan) → SelectedContract | None
     # =========================================================================
 
     def select(self, plan) -> Optional[SelectedContract]:
@@ -160,9 +166,9 @@ class APContractSelectionEngine:
         Returns None if no suitable contract found or a gate blocks the trade.
 
         Gate order:
-          1. APEarningsGuard.check(ticker)   — BEFORE chain fetch
+          1. APEarningsGuard.check(ticker)   -- BEFORE chain fetch
           2. Chain fetch
-          3. APIVRankFilter.check(...)       — AFTER chain fetch
+          3. APIVRankFilter.check(...)       -- AFTER chain fetch
           4. Quality filter + ranking
           5. Affordability gate
         """
@@ -184,14 +190,14 @@ class APContractSelectionEngine:
                 if eg_result.get("blocked"):
                     reason = eg_result.get("reason", "earnings blackout")
                     log.warning(
-                        "[%s] BLOCKED by EarningsGuard — %s",
+                        "[%s] BLOCKED by EarningsGuard -- %s",
                         ticker, reason,
                     )
                     return None
             except Exception as exc:
                 # Fail open: log warning, do not block
                 log.warning(
-                    "[%s] EarningsGuard raised unexpectedly (%s) — continuing (fail open)",
+                    "[%s] EarningsGuard raised unexpectedly (%s) -- continuing (fail open)",
                     ticker, exc,
                 )
 
@@ -220,14 +226,14 @@ class APContractSelectionEngine:
                 if iv_result.get("blocked"):
                     reason = iv_result.get("reason", "IV rank too high")
                     log.warning(
-                        "[%s] BLOCKED by IVRankFilter — %s",
+                        "[%s] BLOCKED by IVRankFilter -- %s",
                         ticker, reason,
                     )
                     return None
             except Exception as exc:
                 # Fail open: log warning, do not block
                 log.warning(
-                    "[%s] IVRankFilter raised unexpectedly (%s) — continuing (fail open)",
+                    "[%s] IVRankFilter raised unexpectedly (%s) -- continuing (fail open)",
                     ticker, exc,
                 )
 
@@ -241,7 +247,7 @@ class APContractSelectionEngine:
                 survivors.append(opt)
             else:
                 log.debug(
-                    "[%s] filtered: %s — %s",
+                    "[%s] filtered: %s -- %s",
                     ticker, opt.get("symbol", "?"), result,
                 )
 
@@ -267,11 +273,11 @@ class APContractSelectionEngine:
         if selected is None:
             return None
 
-        # ── E. AFFORDABILITY GATE — LIVE SAFETY ─────────────────────────────
+        # ── E. AFFORDABILITY GATE -- LIVE SAFETY ─────────────────────────────
         # If budget cannot cover even 1 contract, block. Never force to 1.
         if selected.affordable_contracts < 1:
             log.warning(
-                "[%s] BLOCKED — budget $%.0f cannot afford %s "
+                "[%s] BLOCKED -- budget $%.0f cannot afford %s "
                 "@ $%.0f/contract",
                 ticker, budget,
                 selected.contract_symbol,
@@ -308,7 +314,7 @@ class APContractSelectionEngine:
         return selected
 
     # =========================================================================
-    # PRIVATE — CHAIN FETCH
+    # PRIVATE -- CHAIN FETCH
     # =========================================================================
 
     def _fetch_chain_with_price(
@@ -343,14 +349,19 @@ class APContractSelectionEngine:
     def _fetch_tradier_chain(
         self, ticker: str, option_type: str
     ) -> tuple[list[dict], Optional[float]]:
-        """Direct Tradier API call for option chain. Returns (chain, underlying_price)."""
+        """Direct Tradier API call for option chain. Returns (chain, underlying_price).
+
+        Always uses self.data_broker for ALL market data calls.
+        self.broker (execution broker) is NEVER used here -- stays gated by BOT_MODE.
+        """
         import requests
 
-        cfg      = getattr(self.broker, "cfg", None)
+        # Use data_broker for all market data -- live API if configured
+        cfg      = getattr(self.data_broker, "cfg", None)
         base_url = (getattr(cfg, "base_url", None) or
-                    getattr(self.broker, "base_url", "https://sandbox.tradier.com"))
+                    getattr(self.data_broker, "base_url", "https://sandbox.tradier.com"))
         token    = (getattr(cfg, "token", None) or
-                    getattr(self.broker, "token", ""))
+                    getattr(self.data_broker, "token", ""))
         headers  = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
 
         # 1. Fetch underlying quote for moneyness fallback when delta unavailable
@@ -424,7 +435,7 @@ class APContractSelectionEngine:
                 continue
 
         if not valid:
-            # Relax DTE if nothing fits — take nearest after min_dte
+            # Relax DTE if nothing fits -- take nearest after min_dte
             for d_str in dates:
                 try:
                     d = date.fromisoformat(d_str)
@@ -449,7 +460,7 @@ class APContractSelectionEngine:
         return valid[0][1]
 
     # =========================================================================
-    # PRIVATE — QUALITY FILTER
+    # PRIVATE -- QUALITY FILTER
     # =========================================================================
 
     def _quality_filter(self, opt: dict, today: date) -> Optional[str]:
@@ -501,7 +512,7 @@ class APContractSelectionEngine:
             except Exception:
                 return "invalid_expiration"
 
-        # Delta check — if greeks available use delta band; else use moneyness proxy
+        # Delta check -- if greeks available use delta band; else use moneyness proxy
         greeks = opt.get("greeks") or {}
         delta = greeks.get("delta")
         if delta is not None:
@@ -520,8 +531,8 @@ class APContractSelectionEngine:
             if underlying_price and strike:
                 moneyness = strike / float(underlying_price)
                 option_type = opt.get("option_type", "").lower()
-                # CALLs: slightly OTM to slightly ITM (0.93x–1.12x spot)
-                # PUTs:  slightly OTM to slightly ITM (0.88x–1.07x spot)
+                # CALLs: slightly OTM to slightly ITM (0.93x-1.12x spot)
+                # PUTs:  slightly OTM to slightly ITM (0.88x-1.07x spot)
                 if option_type == "call" and not (0.93 <= moneyness <= 1.12):
                     return "moneyness_out_of_range_%.3f" % moneyness
                 if option_type == "put" and not (0.88 <= moneyness <= 1.07):
@@ -530,12 +541,12 @@ class APContractSelectionEngine:
         return None  # passed
 
     # =========================================================================
-    # PRIVATE — RANKING
+    # PRIVATE -- RANKING
     # =========================================================================
 
     def _rank_score(self, opt: dict, budget: float) -> float:
         """
-        Ranking score — higher is better.
+        Ranking score -- higher is better.
         Weights:
           delta fit     -40   (distance from target delta)
           spread        -25   (tighter is better)
@@ -560,8 +571,8 @@ class APContractSelectionEngine:
         delta_distance = abs(delta - self.target_delta)
         premium = mid * 100
 
-        # Premium fit — score 0-1 based on how many contracts fit in budget
-        # 0 = unaffordable — do NOT force to 1 here, gate in select()
+        # Premium fit -- score 0-1 based on how many contracts fit in budget
+        # 0 = unaffordable -- do NOT force to 1 here, gate in select()
         affordable = int(budget / premium) if premium > 0 else 0
         premium_fit = min(1.0, affordable / 5.0)  # normalize against 5 contracts
 
@@ -575,7 +586,7 @@ class APContractSelectionEngine:
         return score
 
     # =========================================================================
-    # PRIVATE — BUILD SelectedContract
+    # PRIVATE -- BUILD SelectedContract
     # =========================================================================
 
     def _build_selected(
@@ -606,7 +617,7 @@ class APContractSelectionEngine:
 
             premium_per_share    = mid
             premium_per_contract = mid * 100
-            # 0 = unaffordable — select() will block the trade
+            # 0 = unaffordable -- select() will block the trade
             affordable = int(budget / premium_per_contract) if premium_per_contract > 0 else 0
 
             return SelectedContract(
