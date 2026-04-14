@@ -792,18 +792,28 @@ class APMasterControl:
                     "reasoning": f"intel_error: {e}", "_available": False}
 
     def _fallback_tier(self, score: float) -> str:
-        """Tier classification if ap_tier_engine not importable."""
+        """
+        Tier classification fallback.
+        A+: elite signal  >= 85  -- max size
+        A:  strong        >= 75  -- standard size
+        B:  valid         >= 60  -- smaller size
+        C:  marginal      >= 52  -- 1 contract, tight budget
+        REJECT:           <  52  -- no trade
+        SHADOW is reserved for data/intelligence conflicts only,
+        NOT for score-based gating.
+        """
         if score >= 85: return "A+"
         if score >= 75: return "A"
-        if score >= 65: return "B"
-        if score >= 50: return "B"   # was SHADOW -- let 50-64 trade
+        if score >= 60: return "B"
+        if score >= 52: return "C"
         return "REJECT"
 
     def _base_contracts(self, score: float) -> int:
         if score >= 95: return 4
         if score >= 90: return 3
         if score >= 85: return 2
-        return 1
+        if score >= 75: return 2
+        return 1  # B and C tier: 1 contract, let budget/Kelly scale up
 
     # =========================================================================
     # REAL-PREMIUM RE-VALIDATION

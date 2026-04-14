@@ -217,6 +217,10 @@ class APContractSelectionEngine:
             log.warning("[%s] empty chain for %s", ticker, direction)
             return None
 
+        # Use plan's trigger price as underlying fallback if chain didn't return it
+        if not underlying_price:
+            underlying_price = getattr(plan, "trigger_price", None)
+
         # ── GATE 2: IV RANK FILTER ────────────────────────────────────────────
         # Check AFTER fetching the chain (we need chain data for ATM IV).
 
@@ -275,8 +279,10 @@ class APContractSelectionEngine:
         # ── C. RANK ───────────────────────────────────────────────────────────
 
         scored = []
+        _pt1 = pt1 or 0.0
+        _underlying = underlying_price or 0.0
         for opt in survivors:
-            s = self._rank_score(opt, budget)
+            s = self._rank_score(opt, budget, pt1=_pt1, underlying_price=_underlying)
             scored.append((s, opt))
 
         scored.sort(key=lambda x: x[0], reverse=True)
@@ -562,23 +568,31 @@ class APContractSelectionEngine:
     # PRIVATE -- RANKING
     # =========================================================================
 
-    def _rank_score(self, opt: dict, budget: float) -> float:
+    def _rank_score(self, opt: dict, budget: float,
+                     pt1: float = 0.0, underlying_price: float = 0.0) -> float:
         """
         Ranking score -- higher is better.
-        Weights:
-          delta fit     -40   (distance from target delta)
-          spread        -25   (tighter is better)
-          OI            +15   (log scale)
-          volume        +10   (log scale)
-          premium fit   +10   (how well premium fits the budget)
+
+        Priority order:
+          1. Affordability + premium size (dominant -- $3.50 ideal target)
+          2. ATM delta proximity (0.50 target)
+          3. Spread tightness
+          4. Liquidity (OI + volume, log scale)
+          5. PT1 direction (weak hint only -- never override affordability)
+
+        The goal is the BEST AFFORDABLE ATM CONTRACT, not the contract
+        with the strike closest to price target. PT1/PT2 are exits, not strikes.
         """
         bid = float(opt.get("bid") or 0)
         ask = float(opt.get("ask") or 0)
         oi  = int(opt.get("open_interest") or 0)
         vol = int(opt.get("volume") or 0)
         mid = (bid + ask) / 2
+        if mid <= 0:
+            return -9999.0
 
-        spread_pct = (ask - bid) / mid if mid > 0 else 1.0
+        spread_pct = (ask - bid) / mid
+        premium    = mid * 100  # cost per contract
 
         greeks = opt.get("greeks") or {}
         try:
@@ -586,20 +600,43 @@ class APContractSelectionEngine:
         except Exception:
             delta = self.target_delta
 
-        delta_distance = abs(delta - self.target_delta)
-        premium = mid * 100
+        # ── 1. Premium penalty (dominant weight) ──────────────────────────
+        # Ideal premium: $3.50/share ($350/contract). Hard cap $5.00 ($500).
+        # Penalize contracts above ideal heavily; reward contracts below it.
+        MAX_IDEAL_PREMIUM = float(os.getenv("MAX_IDEAL_PREMIUM", "3.50"))
+        MAX_HARD_PREMIUM  = float(os.getenv("MAX_HARD_PREMIUM",  "5.00"))
+        if mid > MAX_HARD_PREMIUM:
+            return -9999.0  # reject immediately -- too expensive
+        premium_penalty = max(0.0, mid - MAX_IDEAL_PREMIUM)  # 0 if at/below ideal
 
-        # Premium fit -- score 0-1 based on how many contracts fit in budget
-        # 0 = unaffordable -- do NOT force to 1 here, gate in select()
-        affordable = int(budget / premium) if premium > 0 else 0
-        premium_fit = min(1.0, affordable / 5.0)  # normalize against 5 contracts
+        # Affordable? 0 if not (gate fires in select())
+        effective_budget = min(budget, float(os.getenv("MAX_TRADE_USD", "500")))
+        affordable = int(effective_budget / premium) if premium > 0 else 0
+        if affordable < 1:
+            return -9999.0  # can't buy even one contract
+
+        # ── 2. Delta proximity (ATM bias) ────────────────────────────────
+        delta_distance = abs(delta - self.target_delta)
+
+        # ── 3. PT1 strike hint (weak -- 10% weight max) ──────────────────
+        # Prefer strike slightly below PT1 so there is room to profit.
+        # This is a SOFT bias -- never overrides affordability or ATM proximity.
+        strike_bias = 0.0
+        if pt1 > 0 and underlying_price > 0:
+            strike = float(opt.get("strike") or 0)
+            # Ideal: strike between current price and PT1
+            if underlying_price < strike < pt1:
+                strike_bias = 0.5  # small bonus
+            elif strike <= underlying_price:
+                strike_bias = 0.2  # slight bonus for ATM/slightly ITM
 
         score = (
-            (delta_distance * -40) +
-            (spread_pct     * -25) +
-            (math.log(oi  + 1) * 15) +
-            (math.log(vol + 1) * 10) +
-            (premium_fit       * 10)
+            (premium_penalty   * -100) +   # dominant: cheap is king
+            (delta_distance    * -80)  +   # ATM proximity
+            (spread_pct        * -30)  +   # tighter spread
+            (math.log(oi + 1)  *  10)  +   # liquidity
+            (math.log(vol + 1) *   5)  +   # volume
+            (strike_bias       *  15)      # weak PT1 hint
         )
         return score
 

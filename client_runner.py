@@ -156,8 +156,8 @@ class ClientRunner(threading.Thread):
 
             self.master_control = APMasterControl(
                 mode=os.getenv("AP_MODE", "paper"),
-                score_floor=float(os.getenv("SCORE_FLOOR", "55")),  # was 60 -- loosen to get more trades
-                context_floor=float(os.getenv("CONTEXT_FLOOR", "6.0")),
+                score_floor=float(os.getenv("SCORE_FLOOR", "52")),  # was 55
+                context_floor=float(os.getenv("CONTEXT_FLOOR", "4.0")),  # was 6.0
                 max_positions=int(os.getenv("MAX_POSITIONS", "7")),
                 max_capital_pct=float(os.getenv("MAX_CAPITAL_PCT", "0.40")),
                 max_sector_pct=float(os.getenv("MAX_SECTOR_PCT", "0.25")),
@@ -216,10 +216,10 @@ class ClientRunner(threading.Thread):
                 data_broker=data_broker,  # live data broker -- quotes + chains only
                 mode=os.getenv("AP_MODE", "paper"),
                 target_delta=float(os.getenv("TARGET_DELTA", "0.50")),  # ATM -- 0.50 delta = at the money
-                max_spread_pct=float(os.getenv("MAX_SPREAD_PCT", "0.20")),
-                min_oi=int(os.getenv("MIN_OI", "10")),        # was 50 -- KLAC/RIVN/GEHC filtered out
-                min_volume=int(os.getenv("MIN_VOLUME", "1")),   # was 10 -- let any liquid contract through
-                max_dte=int(os.getenv("MAX_DTE", "21")),
+                max_spread_pct=float(os.getenv("MAX_SPREAD_PCT", "0.25")),  # was 0.20
+                min_oi=int(os.getenv("MIN_OI", "5")),         # was 10
+                min_volume=int(os.getenv("MIN_VOLUME", "0")),   # was 1 -- 0 = no volume floor
+                max_dte=int(os.getenv("MAX_DTE", "14")),  # was 21 -- tighter to move horizon
                 earnings_guard=earnings_guard,
                 iv_filter=iv_filter,
             )
