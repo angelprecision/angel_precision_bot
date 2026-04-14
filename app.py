@@ -1,4 +1,10 @@
 # app.py - ANGEL PRECISION BOT (PRODUCTION VERSION - STABLE)
+# ── In-process caches (reduce DB round-trips on hot /signal path) ────────
+# Avoids blocking DB calls when scanner fires 20+ signals in a burst.
+_SIGNAL_CACHE_LOCK  = threading.Lock()
+_client_status_cache: dict = {}   # {client_id: (status, expires_ts)}
+_kill_switch_cache:   dict = {}   # {client_id: (kill_val, mode, expires_ts)}
+_CACHE_TTL = 30.0                 # refresh every 30 seconds
 # =====================================================================
 # THIS FILE IS NOW STABLE. DO NOT EDIT.
 # All business logic lives in blueprints (client_api, admin_api, etc).
@@ -214,11 +220,20 @@ def _require_client_id_header() -> Optional[str]:
 
 
 def _validate_active_client(client_id: str):
-    """Validate client is active"""
-    client = get_client(client_id)
-    if (client.get("status") or "").upper() != "ACTIVE":
-        raise ValueError(f"client_not_active:{client.get('status')}")
-    return client
+    """Validate client is active -- in-process cache avoids blocking DB call
+    on every /signal POST during scanner signal bursts."""
+    now = time.monotonic()
+    with _SIGNAL_CACHE_LOCK:
+        cached = _client_status_cache.get(client_id)
+    if cached and cached[1] > now:
+        status = cached[0]
+    else:
+        client = get_client(client_id)
+        status = (client.get("status") or "").upper()
+        with _SIGNAL_CACHE_LOCK:
+            _client_status_cache[client_id] = (status, now + _CACHE_TTL)
+    if status != "ACTIVE":
+        raise ValueError(f"client_not_active:{status}")
 
 
 # ============================================================
@@ -541,9 +556,18 @@ def create_app() -> Flask:
         if cached:
             return jsonify(cached), 200
 
-        # Check kill switch before routing
-        st = load_state(client_id=DEFAULT_CLIENT_ID)
-        if st.get("kill_switch") or st.get("mode") == "READ_ONLY":
+        # Check kill switch -- cached to avoid blocking under scanner signal bursts
+        _now = time.monotonic()
+        with _SIGNAL_CACHE_LOCK:
+            _ks_cached = _kill_switch_cache.get(DEFAULT_CLIENT_ID)
+        if _ks_cached and _ks_cached[2] > _now:
+            _ks, _mode = _ks_cached[0], _ks_cached[1]
+        else:
+            _st = load_state(client_id=DEFAULT_CLIENT_ID)
+            _ks, _mode = _st.get("kill_switch"), _st.get("mode")
+            with _SIGNAL_CACHE_LOCK:
+                _kill_switch_cache[DEFAULT_CLIENT_ID] = (_ks, _mode, _now + _CACHE_TTL)
+        if _ks or _mode == "READ_ONLY":
             payload = {"ok": False, "error": "bot_in_read_only"}
             _idem_set(idem_key, payload)
             return jsonify(payload), 403
