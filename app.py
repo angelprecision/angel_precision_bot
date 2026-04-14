@@ -572,34 +572,32 @@ def create_app() -> Flask:
             _idem_set(idem_key, payload)
             return jsonify(payload), 403
 
-        # ── PRIMARY: Route to execution cores (tier engine + entry watcher) ──
-        # Each APExecutionCore scores, tiers, and decides whether to trade.
-        # Returns immediately -- legacy queue is fallback only.
-        try:
-            route_signal_to_all_clients(body)
-            log.info(
-                f"Signal routed to execution cores: "
-                f"{body.get('ticker')} {body.get('side')} score={body.get('score')}"
-            )
-            payload = {"ok": True, "queued": True, "signal_id": str(body.get("signal_id", ""))}
-            _idem_set(idem_key, payload)
-            return jsonify(payload), 202
-        except Exception as e:
-            log.warning(f"Execution core routing failed -- falling back to legacy queue: {e}")
-
-        # ── FALLBACK: Legacy queue (only if execution core throws) ────────────
-        try:
-            sig = Signal(**body)
-        except ValidationError as e:
-            payload = {"ok": False, "error": "invalid_signal", "details": e.errors()}
-            _idem_set(idem_key, payload)
-            return jsonify(payload), 400
-
-        enqueue_signal(sig, client_id=client_id)
-        log.info(f"Signal queued (legacy fallback): {client_id} {sig.symbol} {sig.direction}")
-
-        payload = {"ok": True, "queued": True, "signal_id": sig.signal_id}
+        # ── FIRE-AND-FORGET: return 202 immediately, route in background ──────
+        # This is critical -- scanner sends 20+ signals in a burst.
+        # Any synchronous DB call here blocks all gthreads and causes timeouts.
+        _sig_id = str(body.get("signal_id") or uuid.uuid4())
+        body["signal_id"] = _sig_id
+        payload = {"ok": True, "queued": True, "signal_id": _sig_id}
         _idem_set(idem_key, payload)
+
+        def _bg_route(_body=body, _cid=client_id):
+            try:
+                route_signal_to_all_clients(_body)
+                log.info(
+                    f"Signal routed: {_body.get('ticker')} {_body.get('side')} "
+                    f"score={_body.get('score')}"
+                )
+            except Exception as _e:
+                log.warning(f"route_signal_to_all_clients failed: {_e} -- falling back")
+                try:
+                    sig = Signal(**_body)
+                    enqueue_signal(sig, client_id=_cid)
+                    log.info(f"Signal queued (legacy fallback): {_cid} {sig.symbol}")
+                except Exception as _e2:
+                    log.error(f"Signal fallback also failed: {_e2}")
+
+        threading.Thread(target=_bg_route, daemon=True,
+                         name=f"sig-{_sig_id[:8]}").start()
         return jsonify(payload), 202
 
     @app.post("/scanner/discord")
