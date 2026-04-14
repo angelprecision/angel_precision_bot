@@ -176,6 +176,18 @@ class APContractSelectionEngine:
         ticker    = plan.ticker
         direction = plan.side.upper()   # "CALL" | "PUT"
         budget    = plan.max_position_usd
+
+        # Index tickers (^GSPC etc) cannot be quoted via Tradier options API.
+        # Remap to tradable ETFs, or skip entirely.
+        _INDEX_MAP = {"^GSPC": "SPY", "^NDX": "QQQ", "^RUT": "IWM", "^DJI": None}
+        if ticker.startswith("^"):
+            mapped = _INDEX_MAP.get(ticker.upper())
+            if mapped:
+                log.info("[%s] Index ticker remapped to %s for options chain", ticker, mapped)
+                ticker = mapped
+            else:
+                log.warning("[%s] Index ticker has no options mapping -- skipping", ticker)
+                return None
         # PT1 = first price target (wick cluster level) -- expected move destination.
         # Used ONLY as expected move % to calibrate OTM bias. NOT a strike anchor.
         pt1 = getattr(plan, "target_underlying", None)
@@ -260,18 +272,26 @@ class APContractSelectionEngine:
 
         today = date.today()
         survivors = []
+        _rejections: dict = {}
         for opt in chain:
             result = self._quality_filter(opt, today)
             if result is None:
                 survivors.append(opt)
             else:
+                _rejections[result] = _rejections.get(result, 0) + 1
                 log.debug(
                     "[%s] filtered: %s -- %s",
                     ticker, opt.get("symbol", "?"), result,
                 )
 
         if not survivors:
-            log.warning("[%s] no contracts passed quality filter", ticker)
+            log.warning(
+                "[%s] no contracts passed quality filter | chain=%d | rejections: %s",
+                ticker, len(chain),
+                ", ".join(f"{k}({v})" for k, v in
+                          sorted(_rejections.items(), key=lambda x: -x[1]))
+                if _rejections else "none",
+            )
             return None
 
         log.info("[%s] %d contracts passed quality filter", ticker, len(survivors))
