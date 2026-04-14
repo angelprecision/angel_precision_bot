@@ -613,16 +613,17 @@ class APContractSelectionEngine:
         # Ideal premium: $3.50/share ($350/contract). Hard cap $5.00 ($500).
         # Penalize contracts above ideal heavily; reward contracts below it.
         MAX_IDEAL_PREMIUM = float(os.getenv("MAX_IDEAL_PREMIUM", "3.50"))
-        MAX_HARD_PREMIUM  = float(os.getenv("MAX_HARD_PREMIUM",  "4.00"))  # $400/contract hard cap
-        if mid > MAX_HARD_PREMIUM:
-            return -9999.0  # reject immediately -- too expensive
+        MAX_HARD_PREMIUM  = float(os.getenv("MAX_HARD_PREMIUM",  "4.00"))
+        # No hard kill -- expensive contracts get a heavy penalty and rank last.
+        # The quality filter (max_premium) handles the true ceiling.
+        # Killing here meant "no contracts passed" even when expensive was the only option.
         premium_penalty = max(0.0, mid - MAX_IDEAL_PREMIUM)  # 0 if at/below ideal
 
         # Affordable? 0 if not (gate fires in select())
         effective_budget = min(budget, float(os.getenv("MAX_TRADE_USD", "500")))
         affordable = int(effective_budget / premium) if premium > 0 else 0
-        if affordable < 1:
-            return -9999.0  # can't buy even one contract
+        # Don't hard-kill here -- let select() handle affordability gate.
+        # Returning -9999 here caused valid contracts to be invisible to the ranker.
 
         # ── 2. Delta proximity (ATM bias) ────────────────────────────────
         delta_distance = abs(delta - self.target_delta)

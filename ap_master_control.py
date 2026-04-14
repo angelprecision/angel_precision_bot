@@ -554,19 +554,11 @@ class APMasterControl:
                                f"tier_reject (score={score:.1f})")
 
         if tier in ("SHADOW", "shadow"):
-            # Priority ETFs with 232 pattern always bypass shadow gate --
-            # highest liquidity instruments, 232 is our core setup
-            _pattern = (signal.get("pattern") or signal.get("pattern_id") or "").lower()
-            _is_232  = any(p in _pattern for p in ["232", "2_3_2", "strat_232", "322", "strat_322"])
-            if ticker.upper() in {"SPY", "QQQ", "IWM", "SPX", "NDX"} and _is_232:
-                log.info(f"[{ticker}] Priority ETF 232 pattern -- shadow gate bypassed")
-            else:
-                self._store_update(signal_id, "shadow", f"tier=SHADOW score={score:.1f}")
-                return ControlDecision(
-                    ok=False, stage="shadow",
-                    reason=f"shadow_track score={score:.1f}",
-                    signal_id=signal_id, ticker=ticker, client_id=client_id,
-                )
+            # SHADOW = small size trade, NOT a block.
+            # Shadow signals have lower confidence -- force 1 contract max.
+            # They still go through the full pipeline: contract selector, fills, exits.
+            log.info(f"[{ticker}] SHADOW tier -- trading with 1 contract (small size)")
+            tier = "C"  # treat as Tier C for sizing purposes
 
         # ── G. INTELLIGENCE PIPELINE ──────────────────────────────────────────
 
