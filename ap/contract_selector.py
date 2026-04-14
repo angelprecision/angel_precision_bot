@@ -114,8 +114,8 @@ class APContractSelectionEngine:
         max_spread_pct: float = 0.20,
         min_oi:         int   = 50,
         min_volume:     int   = 10,
-        min_premium:    float = 50.0,
-        max_premium:    float = 2000.0,
+        min_premium:    float = 25.0,    # $0.25/share -- allow cheaper contracts
+        max_premium:    float = 350.0,   # $3.50/share = $350/contract max budget
         max_dte:        int   = 21,
         min_dte:        int   = 0,
         prefer_weekly:  bool  = True,
@@ -175,10 +175,13 @@ class APContractSelectionEngine:
         ticker    = plan.ticker
         direction = plan.side.upper()   # "CALL" | "PUT"
         budget    = plan.max_position_usd
+        # PT1 from the signal -- used to cap strike selection
+        # We never want a strike above PT1 (that's our target, not our strike)
+        pt1 = getattr(plan, "target_underlying", None)
 
         log.info(
-            "[%s] ContractSelector | direction=%s budget=$%.0f tier=%s",
-            ticker, direction, budget, plan.tier,
+            "[%s] ContractSelector | direction=%s budget=$%.0f tier=%s pt1=%s",
+            ticker, direction, budget, plan.tier, pt1,
         )
 
         # ── GATE 1: EARNINGS BLACKOUT ─────────────────────────────────────────
@@ -244,6 +247,17 @@ class APContractSelectionEngine:
         for opt in chain:
             result = self._quality_filter(opt, today)
             if result is None:
+                # Strike cap: never select a contract with strike above PT1.
+                # A strike at or above our price target means we need the stock
+                # to go PAST our target just to break even -- bad risk/reward.
+                if pt1 and direction == "CALL":
+                    strike = float(opt.get("strike") or 0)
+                    if strike > pt1:
+                        log.debug(
+                            "[%s] filtered: %s -- strike %.2f > PT1 %.2f",
+                            ticker, opt.get("symbol", "?"), strike, pt1,
+                        )
+                        continue
                 survivors.append(opt)
             else:
                 log.debug(
