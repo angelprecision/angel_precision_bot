@@ -121,7 +121,7 @@ def get_prices_yfinance(ticker: str, start_date: str, end_date: str) -> pd.DataF
         # Remove duplicate columns (MultiIndex flatten can create them)
         df = df.loc[:, ~df.columns.duplicated()]
         df.index.name = "Date"
-        _cache_set(cache_key, df.reset_index().to_dict(orient="records"))
+        _cache_set(cache_key, df.reset_index().assign(**{"Date": lambda x: x["Date"].astype(str)}).to_dict(orient="records"))
         return df
     except Exception as e:
         log.warning("get_prices_yfinance(%s) failed: %s", ticker, e)  # MED-009
