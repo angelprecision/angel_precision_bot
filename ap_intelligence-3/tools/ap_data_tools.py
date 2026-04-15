@@ -107,7 +107,13 @@ def get_prices_yfinance(ticker: str, start_date: str, end_date: str) -> pd.DataF
         df = yf.download(ticker, start=start_date, end=end_date, auto_adjust=True, progress=False)
         if df.empty:
             return pd.DataFrame()
-        df.columns = [c.lower() for c in df.columns]
+        # yfinance ≥0.2.x returns MultiIndex columns like ("Close", "NVDA")
+        # Flatten to first element before lowercasing
+        if hasattr(df.columns, "levels"):
+            df.columns = [c[0].lower() if isinstance(c, tuple) else c.lower()
+                          for c in df.columns]
+        else:
+            df.columns = [c.lower() for c in df.columns]
         df.index.name = "Date"
         _cache_set(cache_key, df.reset_index().to_dict(orient="records"))
         return df
