@@ -196,6 +196,7 @@ class APMasterControl:
         self.account_equity   = account_equity
 
         self.pm       = position_manager   # APPositionManager
+        self._client_id = "default"        # overwritten by ClientRunner after init
         self.sizer    = position_sizer     # APPositionSizer (Kelly + drawdown)
         self.sb       = supabase_client
         self.store    = signal_store
@@ -209,7 +210,7 @@ class APMasterControl:
         # Session dedup cache -- in-memory + DB-backed
         self._seen_signals: set = set()
         # Seed from DB on init so restarts don't lose dedup state
-        self._seed_dedup_from_db(client_id="default")
+        self._seed_dedup_from_db(client_id=getattr(self, "_client_id", "default"))
 
         log.info(
             f"APMasterControl initialized | mode={self.mode} | "
@@ -618,11 +619,13 @@ class APMasterControl:
                     position_manager = self.pm,
                 )
                 contracts = sizing.contracts
+                _wr = f"{sizing.win_rate:.2f}"  if sizing.win_rate  is not None else "0.00"
+                _kr = f"{sizing.kelly_raw:.4f}" if sizing.kelly_raw is not None else "0.0000"
                 log.info(
                     f"[{ticker}] Sizing | method={sizing.method} "
                     f"contracts={contracts} "
-                    f"win_rate={sizing.win_rate:.2f if sizing.win_rate is not None else 0.0} "
-                    f"kelly_raw={sizing.kelly_raw:.4f if sizing.kelly_raw is not None else 0.0} "
+                    f"win_rate={_wr} "
+                    f"kelly_raw={_kr} "
                     f"throttle={sizing.throttle_applied} "
                     f"reason={sizing.reason}"
                 )
