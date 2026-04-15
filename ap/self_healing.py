@@ -303,9 +303,10 @@ class APSelfHealingSystem:
             alive  = (t is not None and t.is_alive())
 
             if alive:
-                # Check for stall: alive but not progressing
-                # Heartbeat is updated by worker_loop's update_state() call.
-                # If last_seen is stale beyond threshold → WARNING
+                # Check for stall: alive but not progressing.
+                # last_seen is ONLY updated by heartbeat() calls from the
+                # component itself — never by the health checker.  This
+                # ensures stalls are detected even when the thread is alive.
                 age_secs = (_now() - health.last_seen).total_seconds()
                 if age_secs > STALL_THRESHOLD_SEC and health.state == HealthState.OK:
                     health.state = HealthState.WARNING
@@ -322,8 +323,7 @@ class APSelfHealingSystem:
                             health
                         )
                 elif age_secs <= STALL_THRESHOLD_SEC:
-                    health.state     = HealthState.OK
-                health.last_seen = _now()
+                    health.state = HealthState.OK
             else:
                 self._handle_dead_component(
                     email, runner, comp, health,
