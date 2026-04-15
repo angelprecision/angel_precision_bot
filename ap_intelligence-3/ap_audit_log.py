@@ -279,7 +279,7 @@ class APAuditLog:
     def _write_supabase(self, entry: dict):
         """Write to Supabase ap_audit_log table if configured."""
         url = os.environ.get("SUPABASE_URL")
-        key = os.environ.get("SUPABASE_KEY")
+        key = os.environ.get("SUPABASE_SERVICE_KEY") or os.environ.get("SUPABASE_KEY")
         if not url or not key:
             return
         try:
