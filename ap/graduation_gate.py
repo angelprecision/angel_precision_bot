@@ -1,4 +1,4 @@
- ap/graduation_gate.py — Paper-to-Live Graduation Gate
+# ap/graduation_gate.py — Paper-to-Live Graduation Gate
 # =============================================================================
 # Enforces that a client must prove paper-trading performance before switching
 # to live mode.  All five criteria must pass for the client to be eligible.
@@ -27,6 +27,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 import ap.db as _db
+from ap.utils import now_utc_iso
 
 log = logging.getLogger("ap.graduation_gate")
 
@@ -68,8 +69,9 @@ class GraduationBlockedError(Exception):
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 
+# MED-011: removed duplicate, use now_utc_iso from ap.utils
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return now_utc_iso()
 
 
 def _compute_max_drawdown(pnl_list: list[float]) -> float:

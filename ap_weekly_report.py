@@ -132,7 +132,7 @@ def generate_weekly_report(
             elif h < 14: window = "Midday"
             elif h < 15: window = "Afternoon"
             else:        window = "Power hour"
-        except:
+        except Exception:  # MED-015: bare except -> Exception
             window = "Unknown"
         by_tod[window].append(o)
 

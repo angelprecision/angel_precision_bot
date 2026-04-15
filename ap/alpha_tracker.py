@@ -32,6 +32,7 @@ except ImportError:
     _YF_AVAILABLE = False
 
 from ap.db import conn, run_with_retry
+from ap.utils import now_utc_iso
 
 log = logging.getLogger("ap.alpha_tracker")
 
@@ -59,8 +60,9 @@ def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
 
+# MED-011: removed duplicate, use now_utc_iso from ap.utils
 def _now_iso() -> str:
-    return _now_utc().isoformat()
+    return now_utc_iso()
 
 
 def _today_str() -> str:

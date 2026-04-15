@@ -48,7 +48,7 @@ SUPABASE_URL         = os.getenv("SUPABASE_URL", "")
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY", "")
 
 # ── Encryption ────────────────────────────────────────────────────────────────
-_raw_key   = os.getenv("ENCRYPTION_KEY", "angel-precision-encrypt-2026")
+_raw_key   = os.environ["ENCRYPTION_KEY"]  # HIGH-003: fail loud if missing
 _key_bytes = hashlib.sha256(_raw_key.encode()).digest()
 _fernet    = Fernet(base64.urlsafe_b64encode(_key_bytes))
 
@@ -303,6 +303,29 @@ class ClientRunner(threading.Thread):
 
     def stop(self):
         self.stopped.set()
+        # HIGH-013: graceful shutdown — log open positions and send Discord alert
+        try:
+            if self.position_manager:
+                open_pos = self.position_manager.get_open_positions()
+                if open_pos:
+                    tickers = [p.get("underlying", "?") for p in open_pos]
+                    logger.warning(
+                        f"[{self.email}] SHUTDOWN with {len(open_pos)} open positions: {tickers}"
+                    )
+                    try:
+                        webhook = os.getenv("DISCORD_WEBHOOK_URL", "")
+                        if webhook:
+                            import requests as _req
+                            _req.post(webhook, json={
+                                "content": (
+                                    f"**SHUTDOWN** {self.email} — "
+                                    f"{len(open_pos)} open positions: {', '.join(tickers)}"
+                                )
+                            }, timeout=5)
+                    except Exception:
+                        pass
+        except Exception as e:
+            logger.warning(f"[{self.email}] Shutdown logging failed: {e}")
         # Worker loop checks stop_event each poll cycle -- exits cleanly
 
     def _sync_account_equity(self, broker):
@@ -522,7 +545,7 @@ def start_multi_client_supervisor():
                 _sync_runners(sb)
             except Exception as e:
                 logger.error(f"Supervisor sync error: {e}")
-            time.sleep(300)
+            time.sleep(60)  # HIGH-016: reduced from 300s to 60s
 
     t = threading.Thread(target=_supervisor, daemon=True, name="client-supervisor")
     t.start()

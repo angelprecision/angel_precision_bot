@@ -23,3 +23,7 @@ sendgrid>=6.11.0
 
 psycopg2-binary>=2.9.9
 pydantic>=2.0.0,<3.0.0
+
+# MED-020: previously missing dependencies
+reportlab>=4.0.0
+discord.py>=2.3.0

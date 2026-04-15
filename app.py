@@ -45,7 +45,10 @@ _client_status_cache: dict = {}   # {client_id: (status, expires_ts)}
 _kill_switch_cache:   dict = {}   # {client_id: (kill_val, mode, expires_ts)}
 _CACHE_TTL = 30.0                 # seconds -- refresh every 30s
 
-start_multi_client_supervisor()
+# HIGH-007: gate supervisor behind env var -- do not start at import time
+if os.getenv("RUN_SUPERVISOR") == "1":
+    start_multi_client_supervisor()
+
 # ============================================================
 # GLOBALS (gunicorn safe - no threads at import time)
 # ============================================================
@@ -559,17 +562,17 @@ def create_app() -> Flask:
         if cached:
             return jsonify(cached), 200
 
-        # Check kill switch -- cached to avoid blocking under scanner signal bursts
+        # HIGH-008: use per-client cache key instead of DEFAULT_CLIENT_ID
         _now = time.monotonic()
         with _SIGNAL_CACHE_LOCK:
-            _ks_cached = _kill_switch_cache.get(DEFAULT_CLIENT_ID)
+            _ks_cached = _kill_switch_cache.get(client_id)
         if _ks_cached and _ks_cached[2] > _now:
             _ks, _mode = _ks_cached[0], _ks_cached[1]
         else:
-            _st = load_state(client_id=DEFAULT_CLIENT_ID)
+            _st = load_state(client_id=client_id)
             _ks, _mode = _st.get("kill_switch"), _st.get("mode")
             with _SIGNAL_CACHE_LOCK:
-                _kill_switch_cache[DEFAULT_CLIENT_ID] = (_ks, _mode, _now + _CACHE_TTL)
+                _kill_switch_cache[client_id] = (_ks, _mode, _now + _CACHE_TTL)
         if _ks or _mode == "READ_ONLY":
             payload = {"ok": False, "error": "bot_in_read_only"}
             _idem_set(idem_key, payload)
