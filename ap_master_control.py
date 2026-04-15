@@ -630,10 +630,14 @@ class APMasterControl:
                     f"throttle={sizing.throttle_applied} "
                     f"reason={sizing.reason}"
                 )
-                # Block if sizer says 0 (negative edge or hard stop)
+                # Fix 2: force minimum 1 contract in paper mode instead of blocking
                 if contracts <= 0:
-                    return self._block(signal_id, ticker, client_id, "blocked_risk",
-                                       f"sizer_blocked: {sizing.reason}")
+                    if self.mode.upper() != "LIVE":
+                        log.warning(f"[{ticker}] Sizer returned 0 contracts -- forcing 1 (paper mode data collection)")
+                        contracts = 1
+                    else:
+                        return self._block(signal_id, ticker, client_id, "blocked_risk",
+                                           f"sizer_blocked: {sizing.reason}")
                 # Intel cap still applies
                 if intel_avail and intel_contracts > 0:
                     contracts = min(contracts, intel_contracts)
