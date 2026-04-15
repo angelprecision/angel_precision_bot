@@ -237,6 +237,50 @@ class ClientRunner(threading.Thread):
             )
             self.core.start()
 
+            # ── Wire intel outcome feedback into exit engine ──────────────────
+            # When a position closes, record_trade_outcome() ships the real P&L
+            # back to intelligence_bridge so the audit log builds (decision, outcome)
+            # pairs. This is what turns Gate G from advisory → learning system.
+            # Fails silent — never blocks execution.
+            try:
+                from intelligence_bridge import record_trade_outcome as _record_outcome
+
+                _original_on_exit = getattr(self.core.exit_engine, "on_exit", None)
+
+                def _on_exit_with_outcome(pos, decision):
+                    # 1. Run original exit handler first (broker close order)
+                    if _original_on_exit is not None:
+                        _original_on_exit(pos, decision)
+
+                    # 2. Feed real P&L back to intel audit log
+                    # pos.option_pnl_pct is a computed property on ManagedPosition:
+                    #   (current_option_price - entry_price) / entry_price
+                    # decision.pnl_pct is the engine's own P&L calculation.
+                    # We prefer pos.option_pnl_pct as the ground truth since it
+                    # uses actual fill prices from the position object.
+                    try:
+                        pnl = (pos.option_pnl_pct
+                               if pos.entry_price > 0 and pos.current_option_price > 0
+                               else decision.pnl_pct)
+                        _record_outcome(
+                            ticker=pos.ticker,
+                            signal_id="",          # ManagedPosition has no signal_id field
+                            pnl_pct=float(pnl),
+                        )
+                    except Exception as _oe:
+                        pass  # never block on feedback failure
+
+                if hasattr(self.core, "exit_engine") and self.core.exit_engine is not None:
+                    self.core.exit_engine.on_exit = _on_exit_with_outcome
+                    log.info(f"[{self.email}] Intel outcome feedback wired to exit engine")
+                else:
+                    log.debug(f"[{self.email}] exit_engine not on core -- outcome feedback skipped")
+
+            except ImportError:
+                log.debug(f"[{self.email}] intelligence_bridge not available -- outcome feedback skipped")
+            except Exception as _hook_err:
+                log.warning(f"[{self.email}] Exit hook setup failed ({_hook_err}) -- continuing without feedback")
+
             # Wire kill switch + mode into master control
             self.master_control.wire(
                 kill_switch_fn=lambda: getattr(self.core, "_kill_switch", False),
