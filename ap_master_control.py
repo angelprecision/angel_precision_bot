@@ -779,7 +779,8 @@ class APMasterControl:
             _trigger = signal.get("trigger") or {}
             price = (signal.get("entry_price") or _trigger.get("entry") or
                      signal.get("current_price") or 100.0)
-            result = run_intelligence_check(signal, underlying_price=float(price))
+            result = run_intelligence_check(signal, underlying_price=float(price),
+                                              client_id=self._client_id)
             result["_available"] = True
             return result
         except Exception as e:

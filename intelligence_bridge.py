@@ -15,6 +15,7 @@ import importlib.util
 import logging
 import os
 import sys
+import threading
 import time
 import concurrent.futures
 from typing import Optional
@@ -82,27 +83,33 @@ INTEL_TIMEOUT_SECONDS:   float = float(os.getenv("INTEL_TIMEOUT_SECONDS",  "8.0"
 INTEL_APPROVE_THRESHOLD: float = float(os.getenv("INTEL_APPROVE_THRESHOLD", "35.0"))
 
 # FIX 4: Retry logic — transient errors don't permanently disable intel
-_pipeline:               Optional[object] = None
-_pipeline_last_attempt:  float = 0.0
-_pipeline_fail_count:    int   = 0
+# HIGH-002: Per-client pipeline state — prevents one client's failures from
+# disabling intelligence for all clients sharing the process.
 _PIPELINE_RETRY_SECONDS: float = float(os.getenv("INTEL_RETRY_SECONDS", "120.0"))
 _PIPELINE_MAX_FAILS:     int   = int(os.getenv("INTEL_MAX_FAILS", "5"))
 
+_pipelines:              dict[str, object] = {}   # client_id → pipeline
+_pipeline_fail_counts:   dict[str, int]    = {}   # client_id → fail count
+_pipeline_last_attempts: dict[str, float]  = {}   # client_id → monotonic time
+_pipeline_lock = threading.Lock()
 
-def _get_pipeline():
-    global _pipeline, _pipeline_last_attempt, _pipeline_fail_count
 
-    if _pipeline is not None:
-        return _pipeline
-    if _pipeline_fail_count >= _PIPELINE_MAX_FAILS:
-        return None
+def _get_pipeline(client_id: str = "default"):
+    with _pipeline_lock:
+        pipeline = _pipelines.get(client_id)
+        if pipeline is not None:
+            return pipeline
+        if _pipeline_fail_counts.get(client_id, 0) >= _PIPELINE_MAX_FAILS:
+            return None
 
-    now = time.monotonic()
-    if _pipeline_last_attempt > 0 and (now - _pipeline_last_attempt) < _PIPELINE_RETRY_SECONDS:
-        return None
+        now = time.monotonic()
+        last = _pipeline_last_attempts.get(client_id, 0)
+        if last > 0 and (now - last) < _PIPELINE_RETRY_SECONDS:
+            return None
 
-    _pipeline_last_attempt = now
+        _pipeline_last_attempts[client_id] = now
 
+    # Build pipeline outside lock (may be slow)
     try:
         from ap_intelligence.ap_signal_pipeline import APSignalPipeline
         from ap_intelligence.ap_mode_config     import APModeConfig
@@ -128,19 +135,23 @@ def _get_pipeline():
                     mode = intel_mode
                 pipeline.mode_cfg = _Stub()
 
-        _pipeline = pipeline
-        _pipeline_fail_count = 0
+        with _pipeline_lock:
+            _pipelines[client_id] = pipeline
+            _pipeline_fail_counts[client_id] = 0
         log.info(
-            f"intelligence_bridge: pipeline ready | mode={intel_mode} "
+            f"intelligence_bridge: pipeline ready for {client_id} | mode={intel_mode} "
             f"equity=${equity:,.0f} llm={'yes' if openai_key else 'rule-based'}"
         )
-        return _pipeline
+        return pipeline
 
     except Exception as e:
-        _pipeline_fail_count += 1
-        remaining = _PIPELINE_MAX_FAILS - _pipeline_fail_count
+        with _pipeline_lock:
+            _pipeline_fail_counts[client_id] = _pipeline_fail_counts.get(client_id, 0) + 1
+            count = _pipeline_fail_counts[client_id]
+        remaining = _PIPELINE_MAX_FAILS - count
         log.warning(
-            f"intelligence_bridge: init failed (attempt {_pipeline_fail_count}/{_PIPELINE_MAX_FAILS}): {e} "
+            f"intelligence_bridge: init failed for {client_id} "
+            f"(attempt {count}/{_PIPELINE_MAX_FAILS}): {e} "
             f"— {'permanently disabled' if remaining <= 0 else f'retry in {_PIPELINE_RETRY_SECONDS:.0f}s ({remaining} left)'}"
         )
         return None
@@ -248,7 +259,8 @@ def record_trade_outcome(ticker: str, signal_id: str, pnl_pct: float) -> None:
         log.debug(f"intelligence_bridge: outcome record failed ({e})")
 
 
-def run_intelligence_check(signal: dict, underlying_price: float) -> dict:
+def run_intelligence_check(signal: dict, underlying_price: float,
+                           client_id: str = "default") -> dict:
     """Called by APMasterControl._run_intelligence(). Always fails open."""
     ticker    = signal.get("ticker") or signal.get("symbol", "UNKNOWN")
     direction = _signal_to_direction(signal)
@@ -260,7 +272,7 @@ def run_intelligence_check(signal: dict, underlying_price: float) -> dict:
         "intel_status": "UNAVAILABLE", "intel_score": None,
     }
 
-    pipeline = _get_pipeline()
+    pipeline = _get_pipeline(client_id=client_id)
     if pipeline is None:
         return _fail_open
 
