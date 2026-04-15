@@ -158,6 +158,7 @@ class ClientRunner(threading.Thread):
 
             self.master_control = APMasterControl(
                 mode=os.getenv("AP_MODE", "paper"),
+                client_id=self.email,
                 score_floor=float(os.getenv("SCORE_FLOOR", "65")),  # Tier B floor=65
                 context_floor=float(os.getenv("CONTEXT_FLOOR", "0.0")),  # disabled: 4.0→0.0
                 max_positions=int(os.getenv("MAX_POSITIONS", "10")),  # raised: 7→10
@@ -173,7 +174,6 @@ class ClientRunner(threading.Thread):
                 position_sizer=position_sizer,
                 supabase_client=sb,
             )
-            self.master_control._client_id = self.email  # scopes dedup to correct client
 
             self.order_state_machine = APOrderStateMachine(client_id=self.email)
 
