@@ -104,30 +104,11 @@ def enqueue_signal(
         payload["ticker"] = payload["symbol"]
     if not payload.get("symbol") and payload.get("ticker"):
         payload["symbol"] = payload["ticker"]
-
-    # Normalize score -- scanner may send score=None or omit the field entirely.
-    # Default to 65.0 (Tier B floor) so signals are not blocked at Gate D.
-    if not payload.get("score"):
+    # Normalize score -- scanner may not send it; default to 65.0 (Tier B floor)
+    if payload.get("score") is None:
         payload["score"] = 65.0
-
-    # Normalize side/direction -- some scanners embed direction in signal_id
-    # (e.g. "2026-04-15:1-1:DLTR:Daily:PUT") rather than a separate side field.
-    if not payload.get("side") and not payload.get("direction"):
-        sig_id = str(payload.get("signal_id", "")).upper()
-        if sig_id.endswith(":PUT") or ":PUT:" in sig_id:
-            payload["side"] = "PUT"
-            payload["direction"] = "PUT"
-        else:
-            payload["side"] = "CALL"
-            payload["direction"] = "CALL"
-    elif not payload.get("side"):
-        payload["side"] = payload["direction"]
-    elif not payload.get("direction"):
-        payload["direction"] = payload["side"]
-
-    # Normalize score -- scanner sends score=None; default to 65.0 (Tier B floor)
-    if not payload.get("score"):
-        payload["score"] = 65.0
+    if payload.get("ev_score") is None:
+        payload["ev_score"] = payload["score"]
 
     # Normalize side/direction -- scanner embeds direction in signal_id
     # e.g. "2026-04-15:1-1:DLTR:Daily:PUT" -> side=PUT
@@ -139,16 +120,10 @@ def enqueue_signal(
         else:
             payload["side"] = "CALL"
             payload["direction"] = "CALL"
-    elif not payload.get("side"):
-        payload["side"] = payload["direction"]
     elif not payload.get("direction"):
         payload["direction"] = payload["side"]
-
-    # Ensure ev_score mirrors score so live mode gate doesn't block scanner signals
-    # MED-001: use `is None` so ev_score=0 is preserved
-    if payload.get("ev_score") is None and payload.get("score") is not None:
-        payload["ev_score"] = payload["score"]
-
+    elif not payload.get("side"):
+        payload["side"] = payload["direction"]
     signal_id = payload.get("signal_id") or f"signal_{_now_iso()}"
     if not idempotency_key:
         idempotency_key = f"{client_id}:{signal_id}"
@@ -393,6 +368,28 @@ def _dispatch(
                 fill_price = getattr(plan, "limit_price", None)
                 if fill_price:
                     try:
+                        # ── Submit real order to Tradier sandbox ──────────────
+                        # This makes trades visible in the Tradier sandbox account
+                        # while keeping all local tracking/exit engine intact.
+                        _submitted_to_broker = False
+                        if broker is not None:
+                            try:
+                                _resp = broker.place_order(
+                                    symbol=ticker,
+                                    contract=getattr(plan, "contract_symbol", ""),
+                                    qty=getattr(plan, "contracts", 1),
+                                    limit_price=fill_price,
+                                    side="buy_to_open",
+                                )
+                                _submitted_to_broker = True
+                                log.info(
+                                    f"[{ticker}] SANDBOX ORDER SUBMITTED | "
+                                    f"broker_id={getattr(_resp, 'broker_order_id', '?')} "
+                                    f"status={getattr(_resp, 'status', '?')}"
+                                )
+                            except Exception as _be:
+                                log.warning(f"[{ticker}] Sandbox order failed ({_be}) -- continuing with local paper fill")
+
                         order_state_machine.transition(
                             local_order_id, "FILLED",
                             fill_price=fill_price,
