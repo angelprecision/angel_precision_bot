@@ -197,14 +197,18 @@ def _map_result(result: dict, fallback_score: float) -> dict:
                 "intel_status": "RISK_VETO", "intel_score": score, "risk_detail": risk}
 
     if action == "skip":
-        return {"approved": False, "score": score, "contracts": 0,
-                "reasoning": f"intel_skip: {reasoning[:120]}",
-                "intel_status": "SKIP", "intel_score": score, "risk_detail": risk}
+        # Fix 4: data collection mode — approve at min size instead of blocking
+        # Intel skip = uncertainty, not certainty of loss. Let it trade 1 contract.
+        return {"approved": True, "score": max(score, 50.0), "contracts": 1,
+                "reasoning": f"intel_skip_override: {reasoning[:100]} (1 contract data collection)",
+                "intel_status": "SKIP_OVERRIDE", "intel_score": score, "risk_detail": risk}
 
     if score < INTEL_APPROVE_THRESHOLD:
-        return {"approved": False, "score": score, "contracts": 0,
-                "reasoning": f"intel_low_conf: {score:.1f}<{INTEL_APPROVE_THRESHOLD}",
-                "intel_status": "LOW_CONFIDENCE", "intel_score": score, "risk_detail": risk}
+        # Fix 4: low confidence → approve at 1 contract instead of blocking
+        # Need data to calibrate the threshold — can't learn from zero trades
+        return {"approved": True, "score": max(score, 50.0), "contracts": 1,
+                "reasoning": f"intel_low_conf_override: {score:.1f} (1 contract data collection)",
+                "intel_status": "LOW_CONF_OVERRIDE", "intel_score": score, "risk_detail": risk}
 
     # FIX 3: intel contracts is a CAP — MC does min(kelly, intel_cap) at Gate I
     return {"approved": True, "score": round(score, 1), "contracts": max(1, contracts),
