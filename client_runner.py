@@ -156,9 +156,9 @@ class ClientRunner(threading.Thread):
 
             self.master_control = APMasterControl(
                 mode=os.getenv("AP_MODE", "paper"),
-                score_floor=float(os.getenv("SCORE_FLOOR", "52")),  # was 55
-                context_floor=float(os.getenv("CONTEXT_FLOOR", "4.0")),  # was 6.0
-                max_positions=int(os.getenv("MAX_POSITIONS", "7")),
+                score_floor=float(os.getenv("SCORE_FLOOR", "45")),  # lowered: 52→45
+                context_floor=float(os.getenv("CONTEXT_FLOOR", "0.0")),  # disabled: 4.0→0.0
+                max_positions=int(os.getenv("MAX_POSITIONS", "10")),  # raised: 7→10
                 max_capital_pct=float(os.getenv("MAX_CAPITAL_PCT", "0.40")),
                 max_sector_pct=float(os.getenv("MAX_SECTOR_PCT", "0.25")),
                 max_ticker_pct=float(os.getenv("MAX_TICKER_PCT", "0.10")),
@@ -208,18 +208,18 @@ class ClientRunner(threading.Thread):
             # IV rank filter -- blocks buying expensive premium (rank > threshold)
             iv_filter = APIVRankFilter(
                 broker=data_broker,   # use live data broker for IV data
-                max_iv_rank=float(os.getenv("MAX_IV_RANK", "85")),  # was 70 -- V/CDW were blocked
+                max_iv_rank=float(os.getenv("MAX_IV_RANK", "100")),  # disabled: 85→100 (only blocks rank>100 which is impossible)
             )
 
             self.contract_selector = APContractSelectionEngine(
                 broker=broker,        # execution broker -- gated by BOT_MODE
                 data_broker=data_broker,  # live data broker -- quotes + chains only
                 mode=os.getenv("AP_MODE", "paper"),
-                target_delta=float(os.getenv("TARGET_DELTA", "0.50")),  # ATM -- 0.50 delta = at the money
-                max_spread_pct=float(os.getenv("MAX_SPREAD_PCT", "0.25")),  # was 0.20
-                min_oi=int(os.getenv("MIN_OI", "5")),         # was 10
-                min_volume=int(os.getenv("MIN_VOLUME", "0")),   # was 1 -- 0 = no volume floor
-                max_dte=int(os.getenv("MAX_DTE", "14")),  # was 21 -- tighter to move horizon
+                target_delta=float(os.getenv("TARGET_DELTA", "0.50")),  # ATM
+                max_spread_pct=float(os.getenv("MAX_SPREAD_PCT", "0.50")),  # raised: 0.25→0.50 -- let wide spreads through
+                min_oi=int(os.getenv("MIN_OI", "1")),          # lowered: 5→1
+                min_volume=int(os.getenv("MIN_VOLUME", "0")),   # no floor
+                max_dte=int(os.getenv("MAX_DTE", "21")),  # raised: 14→21 -- more expirations available
                 earnings_guard=earnings_guard,
                 iv_filter=iv_filter,
             )
@@ -269,7 +269,7 @@ class ClientRunner(threading.Thread):
             logger.info(
                 f"[{self.email}] Control stack initialized | "
                 f"mode={os.getenv('AP_MODE','paper').upper()} "
-                f"score_floor={os.getenv('SCORE_FLOOR','60')} "
+                f"score_floor={os.getenv('SCORE_FLOOR','45')} "
                 f"max_pos={os.getenv('MAX_POSITIONS','7')}"
             )
 
