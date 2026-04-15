@@ -216,7 +216,7 @@ class APSignalPipeline:
             daily_volume_options  = daily_volume_options,
             dte                   = dte,
             atr_stop_multiple     = atr_stop_multiple,
-            allow_0dte            = allow_0dte,
+            # allow_0dte removed — APRiskManager stores it on self, not evaluate()
         )
 
         # ── Build signals dict for portfolio manager ───────────────────────
