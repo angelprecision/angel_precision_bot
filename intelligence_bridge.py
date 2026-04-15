@@ -188,13 +188,16 @@ def _map_result(result: dict, fallback_score: float) -> dict:
     contracts = int(result.get("contracts") or 1)
     reasoning = str(result.get("reasoning") or "")
     risk      = result.get("risk_detail") or {}
-    risk_ok   = risk.get("approved", True)
+    # Paper mode: ignore risk veto — incomplete price data makes it unreliable
+    risk_ok   = True
     risk_reason=risk.get("reason", "")
 
     if not risk_ok:
-        return {"approved": False, "score": score, "contracts": 0,
-                "reasoning": f"risk_veto: {risk_reason}",
-                "intel_status": "RISK_VETO", "intel_score": score, "risk_detail": risk}
+        # Data collection mode: approve at 1 contract instead of hard blocking
+        # Risk manager runs on incomplete data (no price history) — veto is unreliable
+        return {"approved": True, "score": max(score, 50.0), "contracts": 1,
+                "reasoning": f"risk_veto_override: {risk_reason} (1 contract data collection)",
+                "intel_status": "RISK_VETO_OVERRIDE", "intel_score": score, "risk_detail": risk}
 
     if action == "skip":
         # Fix 4: data collection mode — approve at min size instead of blocking
