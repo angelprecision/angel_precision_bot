@@ -64,7 +64,7 @@ log = logging.getLogger("ap.execution_core")
 ET  = ZoneInfo("America/New_York")
 
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
-BOT_MODE            = os.getenv("BOT_MODE", "PAPER").upper()
+BOT_MODE            = (os.getenv("AP_MODE") or os.getenv("BOT_MODE") or "PAPER").upper()
 MAX_POSITIONS       = int(os.getenv("MAX_POSITIONS", "7"))
 
 # ── Paper-mode gate thresholds ────────────────────────────────────────────────
@@ -149,6 +149,13 @@ class RankingQueue:
 # EXECUTION CORE
 # =============================================================================
 
+# ═══════════════════════════════════════════════════════════
+# PRODUCTION PATH (April 2026):
+#   /signal → trade_queue → worker_loop → APMasterControl →
+#   APContractSelector → APOrderStateMachine → APEntryWatcher.watch()
+#   → APPositionManager
+# receive_signal() is NOT in the production path.
+# ═══════════════════════════════════════════════════════════
 class APExecutionCore:
     """
     One instance per client (per ClientRunner thread).
@@ -174,7 +181,7 @@ class APExecutionCore:
         self.tracker = APSignalTracker(supabase_client, store=self.store)
 
         # Core modules
-        self.watcher     = APEntryWatcher(broker)
+        self.entry_watcher = APEntryWatcher(broker)
         self.exit_eng    = APExitEngine(broker, email=email)
         self.feedback    = APFeedbackLoop(supabase_client, DISCORD_WEBHOOK_URL, signal_store=self.store)
         self.tier_engine = APTierEngine()
@@ -207,9 +214,9 @@ class APExecutionCore:
         )
 
         # Wire watcher callbacks
-        self.watcher.on_trigger    = self._on_entry_trigger
-        self.watcher.on_expire     = self._on_signal_expire
-        self.watcher.on_invalidate = self._on_signal_invalidate
+        self.entry_watcher.on_trigger    = self._on_entry_trigger
+        self.entry_watcher.on_expire     = self._on_signal_expire
+        self.entry_watcher.on_invalidate = self._on_signal_invalidate
 
         # Wire exit callbacks
         self.exit_eng.on_exit  = self._on_position_close
@@ -230,14 +237,14 @@ class APExecutionCore:
 
     def start(self):
         """Start all background threads."""
-        self.watcher.start()
+        self.entry_watcher.start()
         self.exit_eng.start()
         self.tracker.start()
         self._start_ranking_processor()
         log.info(f"[{self.email}] Execution core started (watcher + exit engine + tracker + ranking queue)")
 
     def stop(self):
-        self.watcher.stop()
+        self.entry_watcher.stop()
         self.exit_eng.stop()
         self.tracker.stop()
         self._rq_running = False
@@ -515,7 +522,7 @@ class APExecutionCore:
                                         })
                                     continue
 
-                            added = self.watcher.add_signal(sig)
+                            added = self.entry_watcher.add_signal(sig)
                             if added:
                                 funnel.inc("watcher_sent")
                                 self.store.update_status(
