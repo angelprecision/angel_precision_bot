@@ -104,16 +104,22 @@ def get_prices_yfinance(ticker: str, start_date: str, end_date: str) -> pd.DataF
         if cached:
             return pd.DataFrame(cached)
 
-        df = yf.download(ticker, start=start_date, end=end_date, auto_adjust=True, progress=False)
+        df = yf.download(ticker, start=start_date, end=end_date, auto_adjust=True,
+                         progress=False, group_by="ticker")
         if df.empty:
             return pd.DataFrame()
         # yfinance ≥0.2.x returns MultiIndex columns like ("Close", "NVDA")
-        # Flatten to first element before lowercasing
+        # Flatten: take first level (price type) and lowercase
         if hasattr(df.columns, "levels"):
-            df.columns = [c[0].lower() if isinstance(c, tuple) else c.lower()
+            df.columns = [c[0].lower() if isinstance(c, tuple) else str(c).lower()
+                          for c in df.columns]
+        elif df.columns.dtype == object and any(isinstance(c, tuple) for c in df.columns):
+            df.columns = [c[0].lower() if isinstance(c, tuple) else str(c).lower()
                           for c in df.columns]
         else:
-            df.columns = [c.lower() for c in df.columns]
+            df.columns = [str(c).lower() for c in df.columns]
+        # Remove duplicate columns (MultiIndex flatten can create them)
+        df = df.loc[:, ~df.columns.duplicated()]
         df.index.name = "Date"
         _cache_set(cache_key, df.reset_index().to_dict(orient="records"))
         return df
@@ -122,12 +128,30 @@ def get_prices_yfinance(ticker: str, start_date: str, end_date: str) -> pd.DataF
         return pd.DataFrame()
 
 
+# Module-level price cache — survives across calls within same process
+_last_known_prices: dict = {}  # ticker -> DataFrame (last valid result)
+
+
 def get_prices(ticker: str, start_date: str, end_date: str) -> pd.DataFrame:
-    """Main entry: Tradier first, yfinance fallback."""
+    """Main entry: Tradier first, yfinance fallback, last-known cache last resort."""
     df = get_prices_tradier(ticker, start_date, end_date)
     if df.empty:
         df = get_prices_yfinance(ticker, start_date, end_date)
-    return df
+
+    if not df.empty:
+        # Cache the valid result for this ticker
+        _last_known_prices[ticker] = df
+        return df
+
+    # Both sources failed — use last known price if available
+    cached = _last_known_prices.get(ticker)
+    if cached is not None and not cached.empty:
+        log.warning("[%s] PRICE DATA FAILED — using last known cache (%d rows)", ticker, len(cached))
+        return cached
+
+    # No data at all — return stub so intel doesn't crash, just scores low
+    log.warning("[%s] PRICE DATA FAILED — returning stub, intel will use scanner score only", ticker)
+    return pd.DataFrame()
 
 
 # ─────────────────────────────────────────────
