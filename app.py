@@ -384,8 +384,11 @@ def create_app() -> Flask:
     app.config["BROKER"] = broker
     log.info("✅ Broker initialized")
 
-    start_background_threads_once(broker)
-    log.info("✅ Background threads started")
+    if os.getenv("RUN_SUPERVISOR") == "1":
+        log.info("Supervisor active — skipping legacy worker threads")
+    else:
+        start_background_threads_once(broker)
+        log.info("Background threads started (legacy path)")
 
     # Register blueprints
     # Blueprints not yet built -- routes registered inline above
