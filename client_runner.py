@@ -13,6 +13,8 @@
 #   worker_loop() in each ClientRunner polls + dispatches via control stack
 # =============================================================================
 
+import base64
+import hashlib
 import json
 import logging
 import os
@@ -20,7 +22,10 @@ import threading
 import time
 import uuid
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
+_ET = ZoneInfo("America/New_York")
 
+from cryptography.fernet import Fernet
 from supabase import create_client, Client
 
 from ap.db import conn as ap_conn, run_with_retry
@@ -45,7 +50,12 @@ SUPABASE_URL         = os.getenv("SUPABASE_URL", "")
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY", "")
 
 # ── Encryption ────────────────────────────────────────────────────────────────
-from ap.crypto import encrypt_token, decrypt_token
+_raw_key   = os.getenv("ENCRYPTION_KEY", "angel-precision-encrypt-2026")
+_key_bytes = hashlib.sha256(_raw_key.encode()).digest()
+_fernet    = Fernet(base64.urlsafe_b64encode(_key_bytes))
+
+def decrypt_token(ciphertext: str) -> str:
+    return _fernet.decrypt(ciphertext.encode()).decode()
 
 # ── Active runner registry ────────────────────────────────────────────────────
 _active_runners: dict[str, "ClientRunner"] = {}
@@ -295,29 +305,6 @@ class ClientRunner(threading.Thread):
 
     def stop(self):
         self.stopped.set()
-        # HIGH-013: graceful shutdown — log open positions and send Discord alert
-        try:
-            if self.position_manager:
-                open_pos = self.position_manager.get_open_positions()
-                if open_pos:
-                    tickers = [p.get("underlying", "?") for p in open_pos]
-                    logger.warning(
-                        f"[{self.email}] SHUTDOWN with {len(open_pos)} open positions: {tickers}"
-                    )
-                    try:
-                        webhook = os.getenv("DISCORD_WEBHOOK_URL", "")
-                        if webhook:
-                            import requests as _req
-                            _req.post(webhook, json={
-                                "content": (
-                                    f"**SHUTDOWN** {self.email} — "
-                                    f"{len(open_pos)} open positions: {', '.join(tickers)}"
-                                )
-                            }, timeout=5)
-                    except Exception:
-                        pass
-        except Exception as e:
-            logger.warning(f"[{self.email}] Shutdown logging failed: {e}")
         # Worker loop checks stop_event each poll cycle -- exits cleanly
 
     def _sync_account_equity(self, broker):
@@ -346,10 +333,34 @@ class ClientRunner(threading.Thread):
             logger.warning(f"[{self.email}] Equity sync failed: {e} -- using env default")
 
     def _start_equity_refresh(self, broker):
-        """Refresh account equity every 15 minutes in background."""
+        """Refresh account equity every 15 minutes.
+        Also resets session dedup at 9:30 AM ET daily — prevents the same
+        setup being silently blocked all day after a single earlier fill.
+        """
+        _reset_done_for_date: str = ""  # tracks which date we last reset on
+
         def _refresh_loop():
+            nonlocal _reset_done_for_date
             while not self.stopped.wait(900):  # 15 min
                 self._sync_account_equity(broker)
+
+                # Daily session reset at 9:30 AM ET
+                # Fires once per calendar date, within one 15-min cycle of open
+                try:
+                    now_et   = datetime.now(_ET)
+                    today_str = now_et.strftime("%Y-%m-%d")
+                    at_open   = (now_et.hour == 9 and now_et.minute >= 30) or now_et.hour == 10
+                    if at_open and _reset_done_for_date != today_str:
+                        if self.master_control and hasattr(self.master_control, "reset_session"):
+                            self.master_control.reset_session(client_id=self.email)
+                            logger.info(
+                                f"[{self.email}] Session dedup reset at market open "
+                                f"({now_et.strftime('%H:%M ET')})"
+                            )
+                        _reset_done_for_date = today_str
+                except Exception as _re:
+                    logger.debug(f"[{self.email}] Session reset check failed: {_re}")
+
         t = threading.Thread(
             target=_refresh_loop,
             daemon=True,
@@ -537,7 +548,7 @@ def start_multi_client_supervisor():
                 _sync_runners(sb)
             except Exception as e:
                 logger.error(f"Supervisor sync error: {e}")
-            time.sleep(60)  # HIGH-016: reduced from 300s to 60s
+            time.sleep(300)
 
     t = threading.Thread(target=_supervisor, daemon=True, name="client-supervisor")
     t.start()
