@@ -161,7 +161,7 @@ class ClientRunner(threading.Thread):
             self.master_control = APMasterControl(
                 mode=os.getenv("AP_MODE", "paper"),
                 client_id=self.email,
-                score_floor=float(os.getenv("SCORE_FLOOR", "65")),  # Tier B floor=65
+                score_floor=float(os.getenv("SCORE_FLOOR", "45")),  # lowered: 48→45 for data collection
                 context_floor=float(os.getenv("CONTEXT_FLOOR", "0.0")),  # disabled: 4.0→0.0
                 max_positions=int(os.getenv("MAX_POSITIONS", "10")),  # raised: 7→10
                 max_capital_pct=float(os.getenv("MAX_CAPITAL_PCT", "0.40")),
