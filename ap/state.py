@@ -66,7 +66,7 @@ def reserve_equity_if_available(
                 "SELECT pg_try_advisory_xact_lock(hashtext(%s))",
                 (key,)
             )
-            acquired = c.fetchone()[0]
+            acquired = c.fetchone()['pg_try_advisory_xact_lock']
             if not acquired:
                 ok = False
                 return
@@ -74,7 +74,7 @@ def reserve_equity_if_available(
             # Read current reservation
             c.execute("SELECT value FROM kv WHERE key = %s", (key,))
             row = c.fetchone()
-            reserved = float(json_loads(row[0])) if row else 0.0
+            reserved = float(json_loads(row['value'])) if row else 0.0
 
             available = max(0.0, current_equity - reserved)
             if amount > available:
@@ -124,7 +124,7 @@ def release_equity(client_id: str, amount: float) -> None:
             )
             c.execute("SELECT value FROM kv WHERE key = %s", (key,))
             row = c.fetchone()
-            reserved     = float(json_loads(row[0])) if row else 0.0
+            reserved     = float(json_loads(row['value'])) if row else 0.0
             reserved_new = max(0.0, reserved - amount)
             c.execute(
                 """
@@ -148,7 +148,7 @@ def get_reserved_equity(client_id: str) -> float:
         with _conn()() as c:
             c.execute("SELECT value FROM kv WHERE key = %s", (key,))
             row = c.fetchone()
-            return float(json_loads(row[0])) if row else 0.0
+            return float(json_loads(row['value'])) if row else 0.0
 
     return _run_with_retry(_read)
 
@@ -182,7 +182,7 @@ def acquire_symbol_lock(
                 "SELECT pg_try_advisory_xact_lock(hashtext(%s))",
                 (key,)
             )
-            acquired = c.fetchone()[0]
+            acquired = c.fetchone()['pg_try_advisory_xact_lock']
             if not acquired:
                 ok = False
                 return
@@ -191,7 +191,7 @@ def acquire_symbol_lock(
             c.execute("SELECT value FROM kv WHERE key = %s", (key,))
             row = c.fetchone()
             if row:
-                payload  = json_loads(row[0])
+                payload  = json_loads(row['value'])
                 lock_ts  = float(payload.get("ts") or 0.0)
                 if (now - lock_ts) < ttl_seconds:
                     ok = False
@@ -248,7 +248,7 @@ def is_symbol_locked(
             row = c.fetchone()
             if not row:
                 return False
-            payload = json_loads(row[0])
+            payload = json_loads(row['value'])
             lock_ts = float(payload.get("ts") or 0.0)
             return (now - lock_ts) < ttl_seconds
 

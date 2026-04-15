@@ -13,8 +13,6 @@
 #   worker_loop() in each ClientRunner polls + dispatches via control stack
 # =============================================================================
 
-import base64
-import hashlib
 import json
 import logging
 import os
@@ -23,7 +21,6 @@ import time
 import uuid
 from datetime import datetime, timezone
 
-from cryptography.fernet import Fernet
 from supabase import create_client, Client
 
 from ap.db import conn as ap_conn, run_with_retry
@@ -48,12 +45,7 @@ SUPABASE_URL         = os.getenv("SUPABASE_URL", "")
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY", "")
 
 # ── Encryption ────────────────────────────────────────────────────────────────
-_raw_key   = os.getenv("ENCRYPTION_KEY", "angel-precision-encrypt-2026")
-_key_bytes = hashlib.sha256(_raw_key.encode()).digest()
-_fernet    = Fernet(base64.urlsafe_b64encode(_key_bytes))
-
-def decrypt_token(ciphertext: str) -> str:
-    return _fernet.decrypt(ciphertext.encode()).decode()
+from ap.crypto import encrypt_token, decrypt_token
 
 # ── Active runner registry ────────────────────────────────────────────────────
 _active_runners: dict[str, "ClientRunner"] = {}

@@ -74,7 +74,7 @@ def audit(client_id: str, level: str, event: str, payload: dict):
     try:
         with conn() as c:
             run_with_retry(lambda: c.execute(
-                "INSERT INTO audit_log (ts, level, event, payload, client_id) VALUES (?,?,?,?,?)",
+                "INSERT INTO audit_log (ts, level, event, payload, client_id) VALUES (%s,%s,%s,%s,%s)",
                 (now_utc_iso(), level, event, json_dumps(payload), client_id),
             ))
     except Exception as e:
@@ -181,7 +181,7 @@ def _count_open_positions(client_id: str) -> int:
             """
             SELECT COUNT(*) AS n
             FROM positions
-            WHERE client_id=?
+            WHERE client_id=%s
               AND status IN ('OPEN','CLOSING')
             """,
             (client_id,),

@@ -29,7 +29,7 @@ OPT_MULTIPLIER = 100
 def audit(client_id: str, level: str, event: str, payload: dict):
     with conn() as c:
         run_with_retry(lambda: c.execute(
-            "INSERT INTO audit_log (ts, level, event, payload, client_id) VALUES (?,?,?,?,?)",
+            "INSERT INTO audit_log (ts, level, event, payload, client_id) VALUES (%s,%s,%s,%s,%s)",
             (now_utc_iso(), level, event, json_dumps(payload), client_id),
         ))
 
@@ -63,19 +63,19 @@ def get_pending_orders():
 
 def update_order_status(local_order_id: str, status: str, filled_qty: int | None = None, error: str | None = None):
     with conn() as c:
-        updates = ["status=?", "updated_ts=?"]
+        updates = ["status=%s", "updated_ts=%s"]
         params = [status, now_utc_iso()]
 
         if filled_qty is not None:
-            updates.append("filled_qty=?")
+            updates.append("filled_qty=%s")
             params.append(int(filled_qty))
 
         if error is not None:
-            updates.append("last_error=?")
+            updates.append("last_error=%s")
             params.append(error)
 
         params.append(local_order_id)
-        sql = f"UPDATE orders SET {', '.join(updates)} WHERE local_order_id=?"
+        sql = f"UPDATE orders SET {', '.join(updates)} WHERE local_order_id=%s"
         run_with_retry(lambda: c.execute(sql, params))
 
 
@@ -96,7 +96,7 @@ def create_position_from_fill(order: dict, avg_fill_price: float, filled_qty: in
                 id, client_id, underlying, contract, direction, qty, avg_fill,
                 entry_ts, tp_pct, sl_pct, status
             )
-            VALUES (?,?,?,?,?,?,?,?,?,?,?)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             """,
             (
                 pos_id,
@@ -115,7 +115,7 @@ def create_position_from_fill(order: dict, avg_fill_price: float, filled_qty: in
 
     with conn() as c:
         run_with_retry(lambda: c.execute(
-            "UPDATE orders SET position_id=? WHERE local_order_id=?",
+            "UPDATE orders SET position_id=%s WHERE local_order_id=%s",
             (pos_id, order["local_order_id"]),
         ))
 
@@ -145,7 +145,7 @@ def close_position_from_exit_fill(order: dict, avg_fill_price: float):
 
     with conn() as c:
         pos_row = run_with_retry(lambda: c.execute(
-            "SELECT * FROM positions WHERE id=? AND client_id=?",
+            "SELECT * FROM positions WHERE id=%s AND client_id=%s",
             (position_id, client_id),
         ).fetchone())
 
@@ -162,8 +162,8 @@ def close_position_from_exit_fill(order: dict, avg_fill_price: float):
         run_with_retry(lambda: c.execute(
             """
             UPDATE positions
-            SET status='CLOSED', exit_ts=?, realized_pnl=?
-            WHERE id=? AND client_id=?
+            SET status='CLOSED', exit_ts=%s, realized_pnl=%s
+            WHERE id=%s AND client_id=%s
             """,
             (now_utc_iso(), float(realized_pnl), position_id, client_id),
         ))
@@ -173,8 +173,8 @@ def close_position_from_exit_fill(order: dict, avg_fill_price: float):
         run_with_retry(lambda: c.execute(
             """
             UPDATE client_state
-            SET realized_pnl_today = COALESCE(realized_pnl_today, 0.0) + ?
-            WHERE client_id=?
+            SET realized_pnl_today = COALESCE(realized_pnl_today, 0.0) + %s
+            WHERE client_id=%s
             """,
             (float(realized_pnl), client_id),
         ))
@@ -304,7 +304,7 @@ def process_pending_order(broker: BrokerAdapter, order: dict):
         if kind == "EXIT" and order.get("position_id"):
             with conn() as c:
                 run_with_retry(lambda: c.execute(
-                    "UPDATE positions SET status='OPEN', exit_reason=NULL WHERE id=? AND client_id=?",
+                    "UPDATE positions SET status='OPEN', exit_reason=NULL WHERE id=%s AND client_id=%s",
                     (order["position_id"], client_id),
                 ))
 

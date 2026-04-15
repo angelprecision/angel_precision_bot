@@ -329,11 +329,13 @@ class APSelfHealingSystem:
                     email, runner, comp, health,
                     auto_restart=auto_restart,
                     dead_severity=dead_severity,
+                    components=components,
                 )
 
     def _handle_dead_component(
         self, email: str, runner, comp: str,
-        health: ComponentHealth, auto_restart: bool, dead_severity: str
+        health: ComponentHealth, auto_restart: bool, dead_severity: str,
+        components: dict = None,
     ):
         # Already FATAL — don't retry, just keep alerting
         if health.state == HealthState.FATAL:

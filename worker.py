@@ -1,7 +1,11 @@
-# worker.py - Background worker that processes queue (AUTO-BOOTSTRAP, Tradier env compatible)
+# worker.py - DEPRECATED: Use client_runner.py instead.
+# This legacy path bypasses all 9 risk management gates in APMasterControl.
+
+import sys
+print("ERROR: worker.py is DEPRECATED. Use client_runner.py instead.", file=sys.stderr)
+sys.exit(1)
 
 import os
-import sys
 
 from ap.queue import worker_loop
 from ap.client_manager import get_client_broker
