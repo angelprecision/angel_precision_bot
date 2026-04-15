@@ -180,6 +180,7 @@ class APMasterControl:
         signal_store         = None,
         tier_engine          = None,
         feedback_loop        = None,
+        client_id            = "default",  # WARN-003: pass email at construction
     ):
         self.mode             = mode.upper()
         self.paper            = (self.mode != "LIVE")
@@ -196,7 +197,7 @@ class APMasterControl:
         self.account_equity   = account_equity
 
         self.pm       = position_manager   # APPositionManager
-        self._client_id = "default"        # overwritten by ClientRunner after init
+        self._client_id = client_id          # scoped at construction — no post-init race
         self.sizer    = position_sizer     # APPositionSizer (Kelly + drawdown)
         self.sb       = supabase_client
         self.store    = signal_store
