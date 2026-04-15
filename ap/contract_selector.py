@@ -112,9 +112,9 @@ class APContractSelectionEngine:
                                   # broker is used ONLY for order placement
         target_delta:   float = 0.50,  # ATM
         delta_band:     float = 0.15,  # ±0.15 around 0.50 = 0.35-0.65 delta range
-        max_spread_pct: float = 0.35,  # raised 0.20→0.35 -- wide spreads on vol days
-        min_oi:         int   = 50,
-        min_volume:     int   = 10,
+        max_spread_pct: float = 0.50,  # raised 0.35→0.50 -- data collection, wider acceptance
+        min_oi:         int   = 1,    # lowered 50→1 -- any open interest passes in paper mode
+        min_volume:     int   = 0,    # lowered 10→0 -- volume check disabled for data collection
         min_premium:    float = 10.0,    # $0.10/share -- allow cheap weeklies
         max_premium:    float = 400.0,   # $4.00/share = $400/contract hard cap
         max_dte:        int   = 21,
@@ -235,10 +235,14 @@ class APContractSelectionEngine:
             chain, underlying_price = self._fetch_chain_with_price(ticker, direction)
         except Exception as e:
             log.error("[%s] chain fetch failed: %s", ticker, e)
+            if self.mode.upper() != "LIVE":
+                return self._synthetic_contract(ticker, direction, "CHAIN_FETCH_ERROR_FALLBACK")
             return None
 
         if not chain:
-            log.warning("[%s] empty chain for %s", ticker, direction)
+            log.warning("[%s] EMPTY CHAIN for %s -- Tradier returned no options (sandbox data gap?)", ticker, direction)
+            if self.mode.upper() != "LIVE":
+                return self._synthetic_contract(ticker, direction, "EMPTY_CHAIN_FALLBACK")
             return None
 
         # Use plan's trigger price as underlying fallback if chain didn't return it
@@ -293,7 +297,20 @@ class APContractSelectionEngine:
                           sorted(_rejections.items(), key=lambda x: -x[1]))
                 if _rejections else "none",
             )
-            return None
+            # Paper mode: use best available even if it failed quality checks
+            # Pick the one with highest OI as fallback — it's the most liquid
+            if self.mode.upper() != "LIVE" and chain:
+                best_fallback = max(chain, key=lambda o: int(o.get("open_interest") or 0))
+                bid_f = float(best_fallback.get("bid") or 0)
+                ask_f = float(best_fallback.get("ask") or 0)
+                if ask_f > 0:
+                    log.warning("[%s] QUALITY FILTER FALLBACK -- using best available contract", ticker)
+                    survivors = [best_fallback]
+                else:
+                    # Even the best has no ask — go synthetic
+                    return self._synthetic_contract(ticker, direction, "NO_SURVIVORS_NO_ASK_FALLBACK")
+            else:
+                return None
 
         log.info("[%s] %d contracts passed quality filter", ticker, len(survivors))
 
@@ -316,19 +333,53 @@ class APContractSelectionEngine:
 
         selected = self._build_selected(best, best_score, budget, today)
         if selected is None:
+            if self.mode.upper() != "LIVE":
+                return self._synthetic_contract(ticker, direction, "BUILD_FAILED_FALLBACK")
             return None
 
-        # ── E. AFFORDABILITY GATE -- LIVE SAFETY ─────────────────────────────
-        # If budget cannot cover even 1 contract, block. Never force to 1.
+        # ── E. AFFORDABILITY GATE ────────────────────────────────────────────
+        # Paper mode: force 1 contract if budget can't cover it (data collection)
+        # Live mode: hard block — never trade what you can't afford
         if selected.affordable_contracts < 1:
-            log.warning(
-                "[%s] BLOCKED -- budget $%.0f cannot afford %s "
-                "@ $%.0f/contract",
-                ticker, budget,
-                selected.contract_symbol,
-                selected.premium_per_contract,
-            )
-            return None
+            if self.mode.upper() != "LIVE":
+                log.warning(
+                    "[%s] budget $%.0f < premium $%.0f -- forcing 1 contract (paper data collection)",
+                    ticker, budget, selected.premium_per_contract,
+                )
+                selected = SelectedContract(
+                    contract_symbol=selected.contract_symbol,
+                    expiration=selected.expiration,
+                    strike=selected.strike,
+                    option_type=selected.option_type,
+                    bid=selected.bid,
+                    ask=selected.ask,
+                    mid=selected.mid,
+                    spread_pct=selected.spread_pct,
+                    delta=selected.delta,
+                    open_interest=selected.open_interest,
+                    volume=selected.volume,
+                    premium_per_share=selected.premium_per_share,
+                    premium_per_contract=selected.premium_per_contract,
+                    affordable_contracts=1,
+                    selection_reason=selected.selection_reason + " [forced_1]",
+                    selection_score=selected.selection_score,
+                    dte=selected.dte,
+                )
+            else:
+                log.warning(
+                    "[%s] BLOCKED -- budget $%.0f cannot afford %s @ $%.0f/contract",
+                    ticker, budget, selected.contract_symbol, selected.premium_per_contract,
+                )
+                return None
+
+        # ── FINAL SAFETY NET ─────────────────────────────────────────────────
+        # Should never reach here with selected=None after all the fallbacks above,
+        # but if something slips through in paper mode, catch it here.
+        if selected is None:
+            if self.mode.upper() != "LIVE":
+                selected = self._synthetic_contract(ticker, direction, "FINAL_SAFETY_NET")
+            else:
+                return None
 
         # ── F. UPDATE PLAN IN-PLACE ───────────────────────────────────────────
 
@@ -516,6 +567,30 @@ class APContractSelectionEngine:
     # =========================================================================
     # PRIVATE -- QUALITY FILTER
     # =========================================================================
+
+
+    def _synthetic_contract(self, ticker: str, direction: str, reason: str) -> "SelectedContract":
+        """Last-resort fallback for paper mode — guarantees a fill for data collection."""
+        log.warning("[%s] SYNTHETIC CONTRACT -- %s", ticker, reason)
+        return SelectedContract(
+            contract_symbol=f"{ticker}_SIM",
+            expiration="SIM",
+            strike=0,
+            option_type=direction.lower(),
+            bid=0.50,
+            ask=1.00,
+            mid=0.75,
+            spread_pct=0.20,
+            delta=0.50,
+            open_interest=1,
+            volume=1,
+            premium_per_share=0.75,
+            premium_per_contract=75.0,
+            affordable_contracts=1,
+            selection_reason=reason,
+            selection_score=0,
+            dte=0,
+        )
 
     def _quality_filter(self, opt: dict, today: date) -> Optional[str]:
         """
