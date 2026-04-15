@@ -39,7 +39,7 @@ class Tier:
         A_PLUS: 85,   # lowered from 90 — achievable with real signals
         A:      75,   # lowered from 85
         B:      65,   # lowered from 78 — executes at 1 contract
-        SHADOW: 55,   # lowered from 75 — shadow track only
+        SHADOW: 35,   # lowered: 55→35 — matches score_floor=45, no false REJECTs
     }
 
     # Size multipliers per tier
