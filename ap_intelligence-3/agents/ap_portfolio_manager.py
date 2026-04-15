@@ -66,6 +66,7 @@ class PortfolioDecision:
     reasoning: str
     score_breakdown: ScoreBreakdown
     signal_breakdown: dict
+    confidence: float = 0.0         # normalised 0.0–1.0 (score / 100) for bridge
     hard_block: str = ""           # If blocked, why
 
 
@@ -175,6 +176,7 @@ class APPortfolioManager:
             score=sb.total,
             size_tier=tier_label,
             confidence_bucket=bucket,
+            confidence=sb.total / 100.0,  # normalised for bridge
             reasoning=reasoning,
             score_breakdown=sb,
             signal_breakdown=signals,
@@ -280,6 +282,7 @@ class APPortfolioManager:
             ticker=ticker, action="skip", direction=direction,
             contracts=0, max_usd=0.0, score=score,
             size_tier="skip", confidence_bucket="skip",
+            confidence=0.0,
             reasoning=reason, score_breakdown=score_breakdown,
             signal_breakdown=signals, hard_block=reason,
         )
