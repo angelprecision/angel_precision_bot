@@ -28,6 +28,7 @@ from __future__ import annotations
 import time
 import threading
 import logging
+import uuid
 from datetime import datetime, timezone, timedelta
 from typing import Callable, Optional
 from zoneinfo import ZoneInfo
@@ -229,7 +230,7 @@ class APEntryWatcher:
         market_close = now_et.hour > 15 or (now_et.hour == 15 and now_et.minute >= 30)
         in_market_hours = market_open and not market_close
 
-        if in_market_hours and market_close:
+        if market_close:
             log.warning(
                 f"[{signal.get('ticker')}] Signal rejected — past EOD cutoff "
                 f"({EOD_CUTOFF_HOUR}:{EOD_CUTOFF_MIN:02d} ET)"
@@ -255,6 +256,40 @@ class APEntryWatcher:
 
         log.info(f"[{watched.ticker}] Added to watch queue — {len(self._pending)} total watching")
         return True
+
+    def watch(self, plan, local_order_id: str) -> bool:
+        """
+        Plan-aware entry called by ap/queue.py _dispatch().
+        Converts an ApprovedExecutionPlan to signal dict and delegates to add_signal().
+        """
+        if plan is None:
+            log.warning("watch() called with None plan -- skipping")
+            return False
+        signal_dict = {
+            "signal_id":      getattr(plan, "signal_id",         str(uuid.uuid4())),
+            "ticker":         getattr(plan, "ticker",            ""),
+            "side":           getattr(plan, "side",              "CALL"),
+            "score":          getattr(plan, "score",             65.0),
+            "grade":          getattr(plan, "tier",              "B"),
+            "entry_price":    getattr(plan, "trigger_price",     None),
+            "stop_price":     getattr(plan, "stop_underlying",   None),
+            "target_price":   getattr(plan, "target_underlying", None),
+            "plan_id":        getattr(plan, "plan_id",           ""),
+            "local_order_id": local_order_id,
+            "contract_symbol": getattr(plan, "contract_symbol",  ""),
+            "pattern":        getattr(plan, "pattern",           ""),
+            "trigger": {
+                "entry": getattr(plan, "trigger_price",     None),
+                "stop":  getattr(plan, "stop_underlying",   None),
+                "pt1":   getattr(plan, "target_underlying", None),
+            },
+        }
+        log.info(
+            f"[{signal_dict['ticker']}] watch() | plan={getattr(plan,'plan_id','')} "
+            f"order={local_order_id} trigger=${signal_dict['entry_price']} "
+            f"side={signal_dict['side']}"
+        )
+        return self.add_signal(signal_dict)
 
     def start(self):
         """Start the background polling thread."""
