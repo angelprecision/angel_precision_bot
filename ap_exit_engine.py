@@ -354,14 +354,19 @@ class APExitEngine:
 
         # ── Gap 2: Kill check post-fetch, pre-execute ───────────────────────────
         # Quote fetch takes 1-5s on live Tradier. Kill may have fired during
-        # that I/O window. This check catches it before any broker call.
+        # that I/O window. Filter out non-protective exits but allow EOD/stop-loss.
         if self._kill_switch_fn and self._kill_switch_fn():
-            log.warning(
-                f"Exit engine: kill switch fired during quote fetch -- "
-                f"aborting {len(actions_to_take)} pending exit action(s) "
-                f"for positions: {[p.ticker for p, _ in actions_to_take]}"
-            )
-            return
+            protective = [(p, d) for p, d in actions_to_take
+                          if (d.reason or "") in ("EOD_FORCE_CLOSE", "STOP_LOSS", "MAX_LOSS")]
+            blocked = len(actions_to_take) - len(protective)
+            if blocked:
+                log.warning(
+                    f"Exit engine: kill switch active -- blocking {blocked} non-protective exit(s), "
+                    f"allowing {len(protective)} protective exit(s)"
+                )
+            actions_to_take = protective
+            if not actions_to_take:
+                return
 
         # Execute actions
         for pos, decision in actions_to_take:
@@ -384,22 +389,31 @@ class APExitEngine:
                         continue
                     self.on_scale(pos, decision)
             else:
+                if self.on_exit:
+                    # ── Gap 3: Final per-position kill check before broker call ──
+                    # Catches kill that fires between execute loop iterations.
+                    exit_reason = decision.reason or ""
+                    if self._kill_switch_fn and self._kill_switch_fn():
+                        if exit_reason not in ("EOD_FORCE_CLOSE", "STOP_LOSS", "MAX_LOSS"):
+                            log.warning(
+                                f"[{pos.ticker}] Kill switch active — blocking non-protective exit: {exit_reason}"
+                            )
+                            continue
+                        else:
+                            log.info(
+                                f"[{pos.ticker}] Kill switch active but allowing protective exit: {exit_reason}"
+                            )
+                    # 1. Call broker first
+                    try:
+                        self.on_exit(pos, decision)
+                    except Exception as e:
+                        log.error("Exit order FAILED for %s — position remains tracked: %s", pos.symbol, e)
+                        continue  # don't remove, retry next cycle
+                # 2. Only mark closed after successful broker submission
                 pos.closed = True
                 pos.close_reason = decision.reason
                 with self._lock:
                     self._positions = [p for p in self._positions if p is not pos]
-                if self.on_exit:
-                    # ── Gap 3: Final per-position kill check before broker call ──
-                    # Catches kill that fires between execute loop iterations.
-                    if self._kill_switch_fn and self._kill_switch_fn():
-                        log.error(
-                            f"[{pos.ticker}] KILL ACTIVE at on_exit -- "
-                            f"reverting pos.closed and skipping broker order"
-                        )
-                        pos.closed       = False   # revert -- no order sent
-                        pos.close_reason = ""
-                        continue
-                    self.on_exit(pos, decision)
 
     def _fetch_quotes(self, tickers: list[str]) -> dict:
         try:
@@ -413,8 +427,9 @@ class APExitEngine:
             raw  = data.get("quotes", {}).get("quote", [])
             if isinstance(raw, dict): raw = [raw]
             return {q["symbol"]: q for q in raw if q.get("symbol")}
-        except:
-            return {}
+        except Exception as e:
+            log.error("Quote fetch failed: %s", e, exc_info=True)
+            return {}  # caller must handle empty dict as "no data available"
 
     def _fetch_option_quotes(self, symbols: list[str]) -> dict:
         try:
@@ -428,5 +443,6 @@ class APExitEngine:
             raw  = data.get("quotes", {}).get("quote", [])
             if isinstance(raw, dict): raw = [raw]
             return {q["symbol"]: q for q in raw if q.get("symbol")}
-        except:
-            return {}
+        except Exception as e:
+            log.error("Option quote fetch failed: %s", e, exc_info=True)
+            return {}  # caller must handle empty dict as "no data available"

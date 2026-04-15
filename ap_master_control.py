@@ -1139,7 +1139,13 @@ class APMasterControl:
                     return c.fetchall()
             rows = run_with_retry(_load)
             for row in rows:
-                self._seen_signals.add(row["k"].replace("dedup:", "", 1))
+                key = row["k"]
+                if key.startswith("dedup:setup:"):
+                    self._seen_signals.add(key[len("dedup:setup:"):])
+                elif key.startswith("dedup:sig:"):
+                    self._seen_signals.add(key[len("dedup:"):])
+                else:
+                    self._seen_signals.add(key.replace("dedup:", "", 1))
             if rows:
                 log.info(
                     f"[{client_id}] Dedup seeded: {len(rows)} entries "

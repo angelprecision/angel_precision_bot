@@ -1,4 +1,3 @@
-cat > ap/subscription_tiers.py << 'EOF'
 # ap/subscription_tiers.py - BRAND NEW SIMPLE VERSION
 # No complex dependencies, just works
 
@@ -112,4 +111,3 @@ def get_rental_status(client_id: str) -> dict:
     except Exception as e:
         log.error(f"Status failed: {e}")
         return {"ok": False, "error": str(e)}
-EOF

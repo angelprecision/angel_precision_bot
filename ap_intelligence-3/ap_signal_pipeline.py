@@ -257,23 +257,25 @@ class APSignalPipeline:
         decision = self.pm.decide(ticker=ticker, signals=signals)
 
         # ── 7. Audit Log ──────────────────────────────────────────────────
-        self.audit.log(
-            ticker          = ticker,
-            action          = decision.action,
-            direction       = decision.direction,
-            scanner_signal  = scanner_signal,
-            scanner_conf    = scanner_confidence,
-            scorecard       = decision.signal_breakdown,
-            risk_approved   = risk_result.approved,
-            risk_reason     = risk_result.reason,
-            contracts       = decision.contracts,
-            max_usd         = decision.max_usd,
-            reasoning       = decision.reasoning,
-            regime          = {
+        self.audit.record({
+            "ticker":          ticker,
+            "timestamp":       timestamp,
+            "action":          decision.action,
+            "direction":       decision.direction,
+            "scanner_signal":  scanner_signal,
+            "scanner_conf":    scanner_confidence,
+            "score_breakdown": decision.signal_breakdown,
+            "signal_breakdown": decision.signal_breakdown,
+            "risk_approved":   risk_result.approved,
+            "risk_reason":     risk_result.reason,
+            "contracts":       decision.contracts,
+            "max_usd":         decision.max_usd,
+            "reasoning":       decision.reasoning,
+            "regime": {
                 "spy_trend": risk_result.spy_trend,
                 "vix":       risk_result.vix,
             },
-            contract_data   = {
+            "contract_data": {
                 "dte":                dte,
                 "delta":              option_delta,
                 "spread_pct":         bid_ask_spread_pct,
@@ -283,8 +285,8 @@ class APSignalPipeline:
                 "atr_value":          atr_value,
                 "stop_price":         getattr(risk_result, "stop_price", None),
             },
-            mode            = self.mode_cfg.mode,
-        )
+            "mode":            self.mode_cfg.mode,
+        })
 
         return {
             "ticker":          ticker,
