@@ -104,10 +104,51 @@ def enqueue_signal(
         payload["ticker"] = payload["symbol"]
     if not payload.get("symbol") and payload.get("ticker"):
         payload["symbol"] = payload["ticker"]
+
+    # Normalize score -- scanner may send score=None or omit the field entirely.
+    # Default to 65.0 (Tier B floor) so signals are not blocked at Gate D.
+    if not payload.get("score"):
+        payload["score"] = 65.0
+
+    # Normalize side/direction -- some scanners embed direction in signal_id
+    # (e.g. "2026-04-15:1-1:DLTR:Daily:PUT") rather than a separate side field.
+    if not payload.get("side") and not payload.get("direction"):
+        sig_id = str(payload.get("signal_id", "")).upper()
+        if sig_id.endswith(":PUT") or ":PUT:" in sig_id:
+            payload["side"] = "PUT"
+            payload["direction"] = "PUT"
+        else:
+            payload["side"] = "CALL"
+            payload["direction"] = "CALL"
+    elif not payload.get("side"):
+        payload["side"] = payload["direction"]
+    elif not payload.get("direction"):
+        payload["direction"] = payload["side"]
+
+    # Normalize score -- scanner sends score=None; default to 65.0 (Tier B floor)
+    if not payload.get("score"):
+        payload["score"] = 65.0
+
+    # Normalize side/direction -- scanner embeds direction in signal_id
+    # e.g. "2026-04-15:1-1:DLTR:Daily:PUT" -> side=PUT
+    if not payload.get("side") and not payload.get("direction"):
+        sig_id = str(payload.get("signal_id", "")).upper()
+        if sig_id.endswith(":PUT") or ":PUT:" in sig_id:
+            payload["side"] = "PUT"
+            payload["direction"] = "PUT"
+        else:
+            payload["side"] = "CALL"
+            payload["direction"] = "CALL"
+    elif not payload.get("side"):
+        payload["side"] = payload["direction"]
+    elif not payload.get("direction"):
+        payload["direction"] = payload["side"]
+
     # Ensure ev_score mirrors score so live mode gate doesn't block scanner signals
     # MED-001: use `is None` so ev_score=0 is preserved
     if payload.get("ev_score") is None and payload.get("score") is not None:
         payload["ev_score"] = payload["score"]
+
     signal_id = payload.get("signal_id") or f"signal_{_now_iso()}"
     if not idempotency_key:
         idempotency_key = f"{client_id}:{signal_id}"
