@@ -6,11 +6,23 @@ Mode = Literal["SIM", "PAPER", "LIVE", "READ_ONLY"]
 class Signal(BaseModel):
     signal_id: str
     symbol: str
+    ticker: Optional[str] = None       # alias for symbol -- standardize at model level
+    score: float = 65.0                # signal confidence score -- default B tier (65)
+    ev_score: Optional[float] = None   # scanner ev_score -- passed through for live mode gate
+    tier: Optional[str] = None         # optional pre-classified tier from scanner
     direction: Literal["CALL", "PUT"]
     pattern_id: str
     confidence_tag: Literal["elite_pool", "standard_pool"] = "standard_pool"
     timestamp_iso: str
     trigger: Dict[str, Any] = Field(default_factory=dict)
+
+    def __init__(self, **data):
+        # Normalize: ensure ticker mirrors symbol when not explicitly set
+        if not data.get('ticker') and data.get('symbol'):
+            data['ticker'] = data['symbol']
+        if not data.get('ev_score') and data.get('score'):
+            data['ev_score'] = data['score']
+        super().__init__(**data)
 
 class Quote(BaseModel):
     bid: float
