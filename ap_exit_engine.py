@@ -110,12 +110,20 @@ class ManagedPosition:
 
     @property
     def is_at_target(self) -> bool:
+        # Guard: zero or negative target means "not set" — rely on P&L exits only.
+        # Prevents false TARGET HIT on first quote poll when scanner omits pt1.
+        if self.underlying_target <= 0:
+            return False
         if self.side == "CALL":
             return self.current_underlying >= self.underlying_target
         return self.current_underlying <= self.underlying_target
 
     @property
     def is_at_stop(self) -> bool:
+        # Guard: zero or negative stop means "not set" — rely on theta stop / P&L.
+        # Prevents false STOP HIT when scanner omits stop level.
+        if self.underlying_stop <= 0:
+            return False
         if self.side == "CALL":
             return self.current_underlying <= self.underlying_stop
         return self.current_underlying >= self.underlying_stop
