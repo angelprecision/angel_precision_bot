@@ -395,19 +395,28 @@ def route_signal_to_all_clients(signal: dict):
 
     if not active_emails:
         # _active_runners is empty in this gunicorn worker -- the runner lives
-        # in the other worker process. Fall back to Supabase members table so
-        # the signal is enqueued with the correct client email, not "default".
-        logger.warning(
-            f"Signal {signal_id} [{ticker}] -- no active runners in this worker, "
-            f"falling back to Supabase members lookup"
-        )
-        try:
-            sb = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
-            members = _fetch_active_members(sb)
-            active_emails = [m["email"] for m in members if m.get("email")]
-        except Exception as e:
-            logger.error(f"Supabase members fallback failed: {e}")
-            active_emails = []
+        # in the other worker process. Fall back to cached Supabase members.
+        # Cache for 60 seconds to avoid a DB hit on every signal during a burst.
+        _now = _time_module.monotonic()
+        with _registry_lock:
+            _cached = _members_cache.get("emails")
+        if _cached and _cached[1] > _now:
+            active_emails = _cached[0]
+            logger.debug(f"Signal {signal_id} [{ticker}] -- using cached member list ({len(active_emails)} clients)")
+        else:
+            logger.warning(
+                f"Signal {signal_id} [{ticker}] -- no active runners in this worker, "
+                f"falling back to Supabase members lookup"
+            )
+            try:
+                sb = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+                members = _fetch_active_members(sb)
+                active_emails = [m["email"] for m in members if m.get("email")]
+                with _registry_lock:
+                    _members_cache["emails"] = (active_emails, _now + 60.0)
+            except Exception as e:
+                logger.error(f"Supabase members fallback failed: {e}")
+                active_emails = []
 
         if not active_emails:
             # Truly no members -- last resort fallback
