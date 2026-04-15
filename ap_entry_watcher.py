@@ -219,21 +219,33 @@ class APEntryWatcher:
     def add_signal(self, signal: dict) -> bool:
         """
         Add a signal to the watch queue.
-        FIX: Only reject during the trading session (9:30 AM - 3:30 PM ET).
-        Signals queued overnight are accepted and held until breach or expiry.
-        EOD cutoff only applies during live market hours to prevent new entries
-        near close — overnight signals should queue freely for next open.
+
+        POLICY (explicit):
+          - During trading session (9:30 AM – 3:30 PM ET): reject after EOD cutoff
+            (3:30 PM). Prevents new entries near close when there is no time to fill
+            or manage the position.
+          - Pre-market (midnight – 9:29 AM ET): ACCEPT. Scanner fires at 9:05 AM and
+            10:15 AM. Pre-market signals queue and wait for the open. WatchedSignal
+            TTL (MAX_WATCH_MINUTES=480, 8 hrs) ensures stale signals expire cleanly.
+          - Post-session (3:30 PM – midnight): REJECT. Session is over. Any signal
+            arriving here is from a late retry or re-run; it should not be held
+            overnight into the following day's open.
+
+        This means: reject 15:30–23:59 ET, accept 00:00–09:29 ET and 09:30–15:29 ET.
         """
         now_et = datetime.now(ET)
-        # Only apply EOD cutoff during market hours (9:30 AM - 3:30 PM ET)
-        market_open  = now_et.hour > 9 or (now_et.hour == 9 and now_et.minute >= 30)
-        market_close = now_et.hour > 15 or (now_et.hour == 15 and now_et.minute >= 30)
-        in_market_hours = market_open and not market_close
+        hour, minute = now_et.hour, now_et.minute
 
-        if market_close:
+        # Post-session window: 3:30 PM to midnight — reject
+        # Pre-market (midnight to 9:29 AM) and session (9:30 AM to 3:29 PM) — accept
+        post_session = (hour > EOD_CUTOFF_HOUR or
+                        (hour == EOD_CUTOFF_HOUR and minute >= EOD_CUTOFF_MIN))
+
+        if post_session:
             log.warning(
-                f"[{signal.get('ticker')}] Signal rejected — past EOD cutoff "
-                f"({EOD_CUTOFF_HOUR}:{EOD_CUTOFF_MIN:02d} ET)"
+                f"[{signal.get('ticker')}] Signal rejected — post-session "
+                f"(after {EOD_CUTOFF_HOUR}:{EOD_CUTOFF_MIN:02d} ET). "
+                f"Re-queue at next scanner run (pre-market or session open)."
             )
             return False
 
