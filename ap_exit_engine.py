@@ -458,7 +458,7 @@ class APExitEngine:
     def _fetch_quotes(self, tickers: list[str]) -> dict:
         try:
             resp = self.broker.session.get(
-                f"{self.broker.base_url}/v1/markets/quotes",
+                f"{self.broker.cfg.base_url}/v1/markets/quotes",
                 params={"symbols": ",".join(tickers), "greeks": "false"},
                 headers={"Accept": "application/json"},
                 timeout=5,
@@ -474,7 +474,7 @@ class APExitEngine:
     def _fetch_option_quotes(self, symbols: list[str]) -> dict:
         try:
             resp = self.broker.session.get(
-                f"{self.broker.base_url}/v1/markets/quotes",
+                f"{self.broker.cfg.base_url}/v1/markets/quotes",
                 params={"symbols": ",".join(symbols), "greeks": "true"},
                 headers={"Accept": "application/json"},
                 timeout=5,
