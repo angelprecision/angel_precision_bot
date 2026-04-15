@@ -60,6 +60,12 @@ from ap_signal_store         import APSignalStore
 from ap_signal_tracker       import APSignalTracker
 from ap_master_control       import APMasterControl, ApprovedExecutionPlan
 
+# Intelligence outcome feedback — optional, fails silently if bridge not deployed
+try:
+    from intelligence_bridge import record_trade_outcome as _record_intel_outcome
+except ImportError:
+    _record_intel_outcome = None
+
 log = logging.getLogger("ap.execution_core")
 ET  = ZoneInfo("America/New_York")
 
@@ -774,6 +780,17 @@ class APExecutionCore:
             self.store.update_status(signal_id, "closed", timestamp_flag="closed_at")
 
         self.shadow.record_live_outcome(tier, opt_pnl)
+
+        # Feed outcome back to intelligence audit log (builds learning dataset)
+        if _record_intel_outcome:
+            try:
+                _record_intel_outcome(
+                    ticker    = pos.ticker,
+                    signal_id = str(sig.get("signal_id", "")),
+                    pnl_pct   = opt_pnl / 100.0,  # opt_pnl is %, convert to decimal
+                )
+            except Exception:
+                pass
 
     # ── CALLBACKS: Expire / Invalidate ────────────────────────────────────────
 
