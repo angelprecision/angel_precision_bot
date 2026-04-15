@@ -206,16 +206,21 @@ def _persist_audit(result: dict, gate: dict, signal: dict) -> None:
     if not audit:
         return
     try:
+        import datetime as _dt
         audit.record({
             "ticker":       signal.get("ticker") or signal.get("symbol", ""),
             "action":       "execute" if gate["approved"] else "skip",
             "direction":    _signal_to_direction(signal),
             "score":        gate.get("intel_score", 0),
+            "intel_score":  gate.get("intel_score"),              # DATA-001
             "intel_status": gate.get("intel_status", "UNKNOWN"),
             "reasoning":    gate.get("reasoning", ""),
             "contracts":    gate.get("contracts", 0),
             "signal_id":    signal.get("signal_id", ""),
             "scanner_score":float(signal.get("score") or signal.get("ev_score") or 0),
+            "pattern":      signal.get("pattern") or signal.get("pattern_id", ""),  # DATA-001
+            "timeframe":    signal.get("timeframe", ""),          # DATA-001
+            "timestamp":    _dt.datetime.now(_dt.timezone.utc).isoformat(),  # DATA-001
             "signal_breakdown": result.get("signal_breakdown", {}),
             "risk_detail":      result.get("risk_detail", {}),
         })
