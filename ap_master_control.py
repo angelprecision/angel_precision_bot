@@ -797,8 +797,8 @@ class APMasterControl:
         if score >= 85: return "A+"
         if score >= 75: return "A"
         if score >= 60: return "B"
-        if score >= 52: return "C"
-        return "REJECT"
+        if score >= 35: return "C"   # lowered: 52→35 -- matches score_floor=45
+        return "REJECT"              # only truly garbage signals rejected
 
     def _base_contracts(self, score: float) -> int:
         if score >= 95: return 4
