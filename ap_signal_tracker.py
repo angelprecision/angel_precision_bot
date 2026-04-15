@@ -303,8 +303,8 @@ class APSignalTracker:
                     close = col_df["Close"].dropna()
                     if not close.empty:
                         prices[t] = round(float(close.iloc[-1]), 4)
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.warning("Price parse failed for %s: %s", t, e)  # MED-014
             return prices
 
         except Exception as e:

@@ -59,8 +59,9 @@ PROCESSING_STALE_SECS = int(os.getenv("PROCESSING_STALE_SECS", "120"))  # 2 min 
 # HELPERS
 # =============================================================================
 
+# MED-011: removed duplicate _now_iso(), using now_utc_iso from ap.utils
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return now_utc_iso()
 
 
 def _json_dumps(data: Any) -> str:
@@ -104,7 +105,8 @@ def enqueue_signal(
     if not payload.get("symbol") and payload.get("ticker"):
         payload["symbol"] = payload["ticker"]
     # Ensure ev_score mirrors score so live mode gate doesn't block scanner signals
-    if not payload.get("ev_score") and payload.get("score"):
+    # MED-001: use `is None` so ev_score=0 is preserved
+    if payload.get("ev_score") is None and payload.get("score") is not None:
         payload["ev_score"] = payload["score"]
     signal_id = payload.get("signal_id") or f"signal_{_now_iso()}"
     if not idempotency_key:

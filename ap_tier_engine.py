@@ -314,7 +314,7 @@ class APShadowTracker:
                     "created_at":   datetime.now(timezone.utc).isoformat(),
                 }).execute()
             except Exception as e:
-                log.debug(f"Shadow Supabase write failed: {e}")
+                log.warning(f"Shadow Supabase write failed: {e}")  # MED-013: promoted from debug
 
     def record_live_outcome(self, tier: str, pnl_pct: float):
         if tier not in self._live_perf:

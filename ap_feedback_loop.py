@@ -90,6 +90,9 @@ class APFeedbackLoop:
         timeframe   = signal.get("timeframe", "1d")
         score       = float(signal.get("score", 0) or 0)
         backtest_wr = float(signal.get("win_rate", 0) or 0)
+        # MED-002: normalize win_rate to percentage (0-100) if provided as ratio (0-1)
+        if 0 < backtest_wr <= 1.0:
+            backtest_wr = backtest_wr * 100.0
 
         # P&L
         if entry_option_price > 0:

@@ -12,6 +12,7 @@ Provides:
 - Caching layer to avoid redundant API calls
 """
 
+import logging
 import os
 import json
 import time
@@ -20,6 +21,8 @@ import requests
 import pandas as pd
 import numpy as np
 from pathlib import Path
+
+log = logging.getLogger("ap.data_tools")
 
 # ─────────────────────────────────────────────
 # CACHE
@@ -108,7 +111,8 @@ def get_prices_yfinance(ticker: str, start_date: str, end_date: str) -> pd.DataF
         df.index.name = "Date"
         _cache_set(cache_key, df.reset_index().to_dict(orient="records"))
         return df
-    except Exception:
+    except Exception as e:
+        log.warning("get_prices_yfinance(%s) failed: %s", ticker, e)  # MED-009
         return pd.DataFrame()
 
 
@@ -159,7 +163,8 @@ def get_financial_metrics(ticker: str) -> dict:
         }
         _cache_set(cache_key, metrics)
         return metrics
-    except Exception:
+    except Exception as e:
+        log.warning("get_financial_metrics(%s) failed: %s", ticker, e)  # MED-009
         return {}
 
 
@@ -190,7 +195,8 @@ def get_company_news(ticker: str, limit: int = 20) -> list[dict]:
             })
         _cache_set(cache_key, results)
         return results[:limit]
-    except Exception:
+    except Exception as e:
+        log.warning("get_company_news(%s) failed: %s", ticker, e)  # MED-009
         return []
 
 
@@ -211,7 +217,8 @@ def get_insider_trades(ticker: str) -> pd.DataFrame:
             return pd.DataFrame()
         _cache_set(cache_key, df.to_dict(orient="records"))
         return df
-    except Exception:
+    except Exception as e:
+        log.warning("get_insider_trades(%s) failed: %s", ticker, e)  # MED-009
         return pd.DataFrame()
 
 
@@ -271,4 +278,5 @@ def get_vix() -> dict:
         _cache_set(cache_key, result)
         return result
     except Exception:
-        return {"vix": 20.0, "premium": True, "elevated": False, "extreme": False, "tradeable": True}
+        # HIGH-012: do not return fake safe data on error
+        return {"vix": None, "premium": False, "elevated": False, "extreme": False, "tradeable": False}
