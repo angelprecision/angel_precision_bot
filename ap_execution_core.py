@@ -786,7 +786,7 @@ class APExecutionCore:
             try:
                 _record_intel_outcome(
                     ticker    = pos.ticker,
-                    signal_id = str(sig.get("signal_id", "")),
+                    signal_id = signal_id,        # already resolved two lines above
                     pnl_pct   = opt_pnl / 100.0,  # opt_pnl is %, convert to decimal
                 )
             except Exception:
