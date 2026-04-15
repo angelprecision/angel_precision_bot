@@ -98,6 +98,14 @@ def enqueue_signal(
     else:
         raise TypeError(f"Unsupported signal type: {type(sig)}")
 
+    # Normalize ticker/symbol -- both fields must be present
+    if not payload.get("ticker") and payload.get("symbol"):
+        payload["ticker"] = payload["symbol"]
+    if not payload.get("symbol") and payload.get("ticker"):
+        payload["symbol"] = payload["ticker"]
+    # Ensure ev_score mirrors score so live mode gate doesn't block scanner signals
+    if not payload.get("ev_score") and payload.get("score"):
+        payload["ev_score"] = payload["score"]
     signal_id = payload.get("signal_id") or f"signal_{_now_iso()}"
     if not idempotency_key:
         idempotency_key = f"{client_id}:{signal_id}"
