@@ -239,6 +239,11 @@ class ClientRunner(threading.Thread):
             )
             self.core.start()
 
+            # Seed exit engine with open positions from DB so restarts
+            # don't leave existing positions without stop/target/EOD protection
+            if self.core.exit_eng and self.position_manager:
+                self.core.exit_eng.seed_from_db(self.position_manager)
+
             # Wire kill switch + mode into master control
             self.master_control.wire(
                 kill_switch_fn=lambda: getattr(self.core, "_kill_switch", False),
@@ -374,6 +379,7 @@ class ClientRunner(threading.Thread):
         Passes full control stack -- master control is the sole decision authority.
         """
         entry_watcher = getattr(self.core, "entry_watcher", None)
+        exit_eng = getattr(self.core, "exit_eng", None)
 
         is_live = os.getenv("AP_MODE", "paper").upper() == "LIVE"
 
@@ -386,6 +392,7 @@ class ClientRunner(threading.Thread):
                     order_state_machine=self.order_state_machine,
                     entry_watcher=entry_watcher,
                     position_manager=self.position_manager,
+                    exit_eng=exit_eng,
                     client_id=self.email,
                     stop_event=self.stopped,    # clean shutdown when runner stops
                     live_mode=is_live,           # disables legacy fallback in live

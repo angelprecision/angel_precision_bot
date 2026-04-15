@@ -299,6 +299,38 @@ class APExitEngine:
         with self._lock:
             return [p for p in self._positions if not p.closed]
 
+    def seed_from_db(self, position_manager):
+        """
+        Re-hydrate in-memory positions from DB on startup.
+        Prevents open positions from losing exit protection after a restart.
+        """
+        try:
+            rows = position_manager.get_active_positions()
+            if not rows:
+                log.info("seed_from_db: no active positions to seed")
+                return
+            seeded = 0
+            for row in rows:
+                try:
+                    mp = ManagedPosition(
+                        ticker=row.get("underlying", ""),
+                        option_symbol=row.get("contract", ""),
+                        side=row.get("direction", "CALL"),
+                        quantity=int(row.get("qty", 1)),
+                        entry_price=float(row.get("avg_fill", 0)),
+                        underlying_entry=0.0,
+                        underlying_target=float(row.get("target_underlying") or 0),
+                        underlying_stop=float(row.get("stop_underlying") or 0),
+                    )
+                    mp.current_option_price = float(row.get("avg_fill", 0))
+                    self.add_position(mp)
+                    seeded += 1
+                except Exception as e:
+                    log.warning("seed_from_db: skipping row %s: %s", row.get("id"), e)
+            log.info("seed_from_db: seeded %d position(s) into exit engine", seeded)
+        except Exception as e:
+            log.error("seed_from_db FAILED — open positions have NO exit protection: %s", e)
+
     def _exit_loop(self):
         while self._running:
             try:

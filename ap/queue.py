@@ -238,6 +238,7 @@ def _dispatch(
     order_state_machine,
     entry_watcher,
     position_manager=None,
+    exit_eng=None,
 ):
     """
     Unified control path:
@@ -389,6 +390,27 @@ def _dispatch(
                                 log.info(
                                     f"[{ticker}] POSITION CREATED | id={_pos_id}"
                                 )
+                                # ── Register with exit engine for stop/target/EOD monitoring ──
+                                if exit_eng is not None:
+                                    try:
+                                        from ap_exit_engine import ManagedPosition
+                                        mp = ManagedPosition(
+                                            ticker=ticker,
+                                            option_symbol=getattr(plan, "contract_symbol", ""),
+                                            side=getattr(plan, "side", "CALL"),
+                                            quantity=getattr(plan, "contracts", 1),
+                                            entry_price=fill_price,
+                                            underlying_entry=getattr(plan, "trigger_price", 0.0) or 0.0,
+                                            underlying_target=getattr(plan, "target_underlying", 0.0) or 0.0,
+                                            underlying_stop=getattr(plan, "stop_underlying", 0.0) or 0.0,
+                                        )
+                                        mp.current_option_price = fill_price
+                                        exit_eng.add_position(mp)
+                                        log.info("[%s] Registered with exit engine | %s", ticker, getattr(plan, 'contract_symbol', ''))
+                                    except Exception as e:
+                                        log.error("[%s] EXIT ENGINE REGISTRATION FAILED — position has NO stop loss: %s", ticker, e)
+                                else:
+                                    log.error("[%s] exit_eng not injected — position has NO stop loss protection", ticker)
                             except Exception as ope:
                                 log.warning(f"[{ticker}] open_position failed: {ope}")
                         else:
@@ -429,6 +451,7 @@ def worker_loop(
     order_state_machine=None,
     entry_watcher=None,
     position_manager=None,
+    exit_eng=None,
     client_id: str = "default",
     stop_event=None,           # threading.Event -- worker exits when set
     live_mode: bool = False,   # if True, legacy fallback is DISABLED
@@ -497,6 +520,7 @@ def worker_loop(
                     order_state_machine=order_state_machine,
                     entry_watcher=entry_watcher,
                     position_manager=position_manager,
+                    exit_eng=exit_eng,
                 )
 
             # ── LEGACY FALLBACK (paper mode only) ────────────────────────────
