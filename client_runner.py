@@ -36,6 +36,8 @@ from ap.self_healing import get_healer, init_self_healing
 from ap.utils import now_utc_iso
 
 logger = logging.getLogger("client_runner")
+_time_module: object = time   # alias for fan-out fallback cache
+_members_cache: dict = {}     # {"emails": ([...], expires_monotonic)}
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
@@ -156,7 +158,7 @@ class ClientRunner(threading.Thread):
 
             self.master_control = APMasterControl(
                 mode=os.getenv("AP_MODE", "paper"),
-                score_floor=float(os.getenv("SCORE_FLOOR", "45")),  # lowered: 52→45
+                score_floor=float(os.getenv("SCORE_FLOOR", "65")),  # Tier B floor=65
                 context_floor=float(os.getenv("CONTEXT_FLOOR", "0.0")),  # disabled: 4.0→0.0
                 max_positions=int(os.getenv("MAX_POSITIONS", "10")),  # raised: 7→10
                 max_capital_pct=float(os.getenv("MAX_CAPITAL_PCT", "0.40")),
@@ -171,6 +173,7 @@ class ClientRunner(threading.Thread):
                 position_sizer=position_sizer,
                 supabase_client=sb,
             )
+            self.master_control._client_id = self.email  # scopes dedup to correct client
 
             self.order_state_machine = APOrderStateMachine(client_id=self.email)
 
@@ -269,7 +272,7 @@ class ClientRunner(threading.Thread):
             logger.info(
                 f"[{self.email}] Control stack initialized | "
                 f"mode={os.getenv('AP_MODE','paper').upper()} "
-                f"score_floor={os.getenv('SCORE_FLOOR','45')} "
+                f"score_floor={os.getenv('SCORE_FLOOR','65')} "
                 f"max_pos={os.getenv('MAX_POSITIONS','7')}"
             )
 
