@@ -92,9 +92,10 @@ class APSignalStore:
             "score_breakdown":      signal.get("score_breakdown"),
             "context_notes":        signal.get("context_notes"),
         }
+        # HIGH-015: bind payload by default parameter to avoid lambda closure bug
         self._enqueue(
             signal_id, "insert_signal",
-            lambda: self.sb.table("ap_signals").upsert(payload).execute(),
+            lambda p=payload: self.sb.table("ap_signals").upsert(p).execute(),
         )
 
     def update_status(
@@ -116,9 +117,10 @@ class APSignalStore:
         # FIX: use `is not None` so an empty string explicitly clears the field
         if context_notes is not None:
             patch["context_notes"] = context_notes
+        # HIGH-015: bind by default parameter to avoid lambda closure bug
         self._enqueue(
             signal_id, f"status_{status}",
-            lambda: self.sb.table("ap_signals").update(patch).eq("signal_id", signal_id).execute(),
+            lambda p=patch, sid=signal_id: self.sb.table("ap_signals").update(p).eq("signal_id", sid).execute(),
         )
 
     def update_signal_fields(
@@ -139,23 +141,26 @@ class APSignalStore:
         patch = dict(updates)
         if timestamp_flag:
             patch[timestamp_flag] = datetime.now(timezone.utc).isoformat()
+        # HIGH-015: bind by default parameter to avoid lambda closure bug
         self._enqueue(
             signal_id, "update_signal_fields",
-            lambda: self.sb.table("ap_signals").update(patch).eq("signal_id", signal_id).execute(),
+            lambda p=patch, sid=signal_id: self.sb.table("ap_signals").update(p).eq("signal_id", sid).execute(),
         )
 
     def insert_option_outcome(self, signal_id: str, outcome: dict[str, Any]):
         """Upsert a row into ap_signal_option_outcomes."""
         row = {"signal_id": signal_id, **outcome}
+        # HIGH-015: bind by default parameter to avoid lambda closure bug
         self._enqueue(
             signal_id, "option_outcome",
-            lambda: self.sb.table("ap_signal_option_outcomes").upsert(row).execute(),
+            lambda r=row: self.sb.table("ap_signal_option_outcomes").upsert(r).execute(),
         )
 
     def upsert_underlying_outcome(self, signal_id: str, outcome: dict[str, Any]):
         """Upsert a row into ap_signal_underlying_outcomes."""
         row = {"signal_id": signal_id, **outcome}
+        # HIGH-015: bind by default parameter to avoid lambda closure bug
         self._enqueue(
             signal_id, "underlying_outcome",
-            lambda: self.sb.table("ap_signal_underlying_outcomes").upsert(row).execute(),
+            lambda r=row: self.sb.table("ap_signal_underlying_outcomes").upsert(r).execute(),
         )

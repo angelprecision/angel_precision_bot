@@ -20,8 +20,8 @@ class Signal(BaseModel):
         # Normalize: ensure ticker mirrors symbol when not explicitly set
         if not data.get('ticker') and data.get('symbol'):
             data['ticker'] = data['symbol']
-        if not data.get('ev_score'):
-            data['ev_score'] = data.get('score', 65.0)  # covers default value path in Pydantic v2
+        if data.get('ev_score') is None:  # MED-001: use `is None` so ev_score=0 is preserved
+            data['ev_score'] = data.get('score', 65.0)
         super().__init__(**data)
 
 class Quote(BaseModel):

@@ -1,3 +1,9 @@
+# ap/contract_selection.py - DEPRECATED (MED-019)
+# The canonical contract selection module is ap/contract_selector.py (APContractSelectionEngine).
+# This module is only used by the legacy ap/execution.py path.
+# Do not add new code here -- use ap/contract_selector.py instead.
+#
+# ORIGINAL HEADER:
 # ap/contract_selection.py - PRODUCTION-GRADE CONTRACT SELECTION
 # =====================================================================
 # FIX: resolve_contract_symbol now uses underlying_price (current price)

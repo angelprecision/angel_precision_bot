@@ -76,7 +76,7 @@ def _register_intel_package() -> bool:
 
 _package_ready = _register_intel_package()
 
-INTELLIGENCE_AVAILABLE: bool = True
+INTELLIGENCE_AVAILABLE: bool = _package_ready  # MED-008: derive from actual registration result
 
 INTEL_TIMEOUT_SECONDS:   float = float(os.getenv("INTEL_TIMEOUT_SECONDS",  "8.0"))
 INTEL_APPROVE_THRESHOLD: float = float(os.getenv("INTEL_APPROVE_THRESHOLD", "35.0"))

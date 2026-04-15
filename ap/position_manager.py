@@ -555,34 +555,24 @@ class APPositionManager:
           trades_today        — positions opened today
           realized_pnl_today  — settled PnL today
         """
-        try:
-            active          = self.get_active_positions()
-            opens           = [p for p in active if p["status"] == "OPEN"]
-            closing         = [p for p in active if p["status"] == "CLOSING"]
-            summary         = self.daily_summary()
-            pending_entries = self.pending_entry_count()
-            pending_exits   = self.pending_exit_count()
+        # HIGH-005: raise on error instead of returning fake zeros
+        active          = self.get_active_positions()
+        opens           = [p for p in active if p["status"] == "OPEN"]
+        closing         = [p for p in active if p["status"] == "CLOSING"]
+        summary         = self.daily_summary()
+        pending_entries = self.pending_entry_count()
+        pending_exits   = self.pending_exit_count()
 
-            return {
-                "open_positions":     opens,
-                "closing_positions":  closing,
-                "open_count":         len(active),
-                "open_tickers":       {p["underlying"] for p in active},
-                "calls_open":         sum(1 for p in active if p.get("direction") == "CALL"),
-                "puts_open":          sum(1 for p in active if p.get("direction") == "PUT"),
-                "capital_deployed":   summary["capital_deployed"],
-                "pending_entries":    pending_entries,
-                "pending_exits":      pending_exits,
-                "trades_today":       summary["trades_today"],
-                "realized_pnl_today": summary["realized_pnl_today"],
-            }
-        except Exception as e:
-            log.error(f"[{self.client_id}] snapshot() failed: {e}")
-            return {
-                "open_positions": [], "closing_positions": [],
-                "open_count": 0, "open_tickers": set(),
-                "calls_open": 0, "puts_open": 0,
-                "capital_deployed": 0.0,
-                "pending_entries": 0, "pending_exits": 0,
-                "trades_today": 0, "realized_pnl_today": 0.0,
-            }
+        return {
+            "open_positions":     opens,
+            "closing_positions":  closing,
+            "open_count":         len(active),
+            "open_tickers":       {p["underlying"] for p in active},
+            "calls_open":         sum(1 for p in active if p.get("direction") == "CALL"),
+            "puts_open":          sum(1 for p in active if p.get("direction") == "PUT"),
+            "capital_deployed":   summary["capital_deployed"],
+            "pending_entries":    pending_entries,
+            "pending_exits":      pending_exits,
+            "trades_today":       summary["trades_today"],
+            "realized_pnl_today": summary["realized_pnl_today"],
+        }

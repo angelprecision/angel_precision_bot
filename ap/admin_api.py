@@ -51,11 +51,12 @@ def _admin_key_value() -> str:
 def _check_admin_key(req) -> bool:
     """
     Check X-Admin-Key header.
-    If no admin key set, allow all (dev mode).
+    HIGH-004: If no admin key set, deny all and log warning.
     """
     admin_key = _admin_key_value()
     if not admin_key:
-        return True
+        log.warning("ADMIN_KEY / ADMIN_API_KEY not set -- denying all admin requests")
+        return False
 
     provided = (req.headers.get("X-Admin-Key", "") or "").strip()
     return provided == admin_key

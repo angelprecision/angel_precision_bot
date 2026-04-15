@@ -19,6 +19,8 @@ import logging
 from contextlib import contextmanager
 from typing import Any, Callable
 
+import threading
+
 import psycopg2
 import psycopg2.extras
 import psycopg2.pool
@@ -27,6 +29,9 @@ from psycopg2 import errors as pg_errors
 from ap.utils import now_utc_iso
 
 log = logging.getLogger("ap.db")
+
+# HIGH-010: thread-safe pool rebuild lock
+_pool_lock = threading.Lock()
 
 # ── Connection pool ───────────────────────────────────────────────────────────
 DATABASE_URL = os.getenv("DATABASE_URL", "")
@@ -42,15 +47,20 @@ _pool: psycopg2.pool.ThreadedConnectionPool | None = None
 
 def _get_pool() -> psycopg2.pool.ThreadedConnectionPool:
     global _pool
-    if _pool is None or _pool.closed:
+    if _pool is not None and not _pool.closed:
+        return _pool
+    with _pool_lock:  # HIGH-010: thread-safe pool rebuild
+        if _pool is not None and not _pool.closed:
+            return _pool
         try:
             # Append sslmode=require if not already in URL
             dsn = DATABASE_URL
             if "sslmode" not in dsn:
                 dsn += "?sslmode=require" if "?" not in dsn else "&sslmode=require"
+            _max_conn = int(os.getenv("DB_POOL_MAX", "20"))  # HIGH-009: configurable
             _pool = psycopg2.pool.ThreadedConnectionPool(
                 minconn=1,
-                maxconn=20,
+                maxconn=_max_conn,
                 dsn=dsn,
                 connect_timeout=10,
                 keepalives=1,
@@ -58,11 +68,11 @@ def _get_pool() -> psycopg2.pool.ThreadedConnectionPool:
                 keepalives_interval=10,
                 keepalives_count=5,
             )
-            log.info("Postgres connection pool initialized (min=1 max=20)")
+            log.info(f"Postgres connection pool initialized (min=1 max={_max_conn})")
         except Exception as e:
             log.error(f"Pool creation failed: {e}")
             raise
-    return _pool
+        return _pool
 
 
 # ── Retry wrapper ─────────────────────────────────────────────────────────────
@@ -127,7 +137,8 @@ def conn():
             except Exception:
                 pass
             global _pool
-            _pool = None
+            with _pool_lock:  # HIGH-010: thread-safe pool rebuild
+                _pool = None
             pool = _get_pool()
             # loop back to get a fresh connection from the new pool
     else:
@@ -464,7 +475,21 @@ def create_client(
     return client_id
 
 
+# HIGH-011: allowlist of valid column names to prevent SQL injection
+_UPSERT_ALLOWED_COLUMNS = {
+    "client_id", "api_key", "name", "broker_type", "broker_account_id",
+    "broker_token", "broker_base_url", "initial_equity", "status",
+    "created_at", "max_trades_per_day", "max_concurrent_positions",
+    "daily_max_loss_pct", "base_position_pct",
+}
+
+
 def upsert_client(client_id: str, **kwargs):
+    # HIGH-011: validate column names against allowlist before interpolating into SQL
+    bad_keys = set(kwargs.keys()) - _UPSERT_ALLOWED_COLUMNS
+    if bad_keys:
+        raise ValueError(f"upsert_client: invalid column names: {bad_keys}")
+
     def _fn():
         with conn() as c:
             c.execute("SELECT client_id FROM clients WHERE client_id=%s", (client_id,))

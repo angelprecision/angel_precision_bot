@@ -217,6 +217,22 @@ class TradierBroker(BrokerAdapter):
                 raw=order if isinstance(order, dict) else j,
             )
 
+        except (requests.exceptions.Timeout,
+                requests.exceptions.ConnectionError,
+                requests.exceptions.HTTPError) as e:
+            # HIGH-006: transient errors — re-raise so caller can retry
+            status_code = getattr(getattr(e, 'response', None), 'status_code', None)
+            if isinstance(e, requests.exceptions.HTTPError) and status_code and 400 <= status_code < 500 and status_code != 429:
+                # Permanent client error (400, 401, 403, etc.) — treat as REJECTED
+                log.error(f"place_order REJECTED (HTTP {status_code}) | symbol={symbol} contract={contract} side={side} error={e}")
+                return BrokerOrderResponse(
+                    broker_order_id="N/A",
+                    status="REJECTED",
+                    error=str(e),
+                    raw=None,
+                )
+            log.warning(f"place_order TRANSIENT error | symbol={symbol} contract={contract} side={side} error={e}")
+            raise
         except Exception as e:
             log.error(f"place_order EXCEPTION | symbol={symbol} contract={contract} side={side} error={e}")
             return BrokerOrderResponse(
