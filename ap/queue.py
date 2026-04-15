@@ -344,7 +344,8 @@ def _dispatch(
             # In paper mode there is no real broker to confirm the order --
             # transition straight to FILLED so the position goes live.
             import os as _os
-            if _os.getenv("BOT_MODE", "PAPER").upper() != "LIVE":
+            _bot_mode = (_os.getenv("AP_MODE") or _os.getenv("BOT_MODE") or "PAPER").upper()
+            if _bot_mode != "LIVE":
                 fill_price = getattr(plan, "limit_price", None)
                 if fill_price:
                     try:
