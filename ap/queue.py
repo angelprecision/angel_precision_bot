@@ -401,8 +401,17 @@ def _dispatch(
                                             quantity=getattr(plan, "contracts", 1),
                                             entry_price=fill_price,
                                             underlying_entry=getattr(plan, "trigger_price", 0.0) or 0.0,
-                                            underlying_target=getattr(plan, "target_underlying", 0.0) or 0.0,
-                                            underlying_stop=getattr(plan, "stop_underlying", 0.0) or 0.0,
+                                            # Use real levels when available.
+                                            # When absent: target=inf (CALL) or 0 (PUT) so TARGET HIT never
+                                            # fires on first poll. is_at_target guards 0 too, but inf is explicit.
+                                            underlying_target=float(
+                                                getattr(plan, "target_underlying", None)
+                                                or (float("inf") if getattr(plan, "side", "CALL") == "CALL"
+                                                    else 0.0)
+                                            ),
+                                            underlying_stop=float(
+                                                getattr(plan, "stop_underlying", None) or 0.0
+                                            ),
                                         )
                                         mp.current_option_price = fill_price
                                         exit_eng.add_position(mp)
