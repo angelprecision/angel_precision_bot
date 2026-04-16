@@ -1,26 +1,12 @@
 
       # ap_entry_watcher.py — Angel Precision Real-Time Entry Watcher
 # =============================================================================
-# Gap 1 fix: The bot does NOT enter on signal. It enters on BREACH.
-#
-# How it works:
-#   1. Signal arrives: "NVDA CALL, signal_bar_high=855.00, signal_bar_low=830.00"
-#   2. Watcher parks that signal in a pending queue
-#   3. Every N seconds, polls the live quote for each pending ticker
-#   4. When bid/ask crosses the signal bar high (CALL) or low (PUT) → ENTER
-#   5. If price never breaches within the watch window → EXPIRE, no trade
-#   6. If price breaches in the WRONG direction first → INVALIDATE, no trade
-#
-# Why this matters:
-#   Without this, the bot fires at the close of the signal bar.
-#   That means you're entering BEFORE confirmation — chasing, not trading.
-#   With this, you only enter when the market proves your direction.
-#
-# Integration:
-#   watcher = APEntryWatcher(broker)
-#   watcher.add_signal(signal_dict)       # from scanner
-#   watcher.start()                       # background thread
-#   watcher.on_trigger = execute_trade    # callback when breach confirmed
+# Overnight signal support:
+#   Scanners fire post-market (~6 PM ET) for next-day setups.
+#   Signals arriving after 3:30 PM ET are accepted and held overnight.
+#   They activate at the next session open (9:30 AM ET).
+#   TTL is 20 hours — covers any post-market send time through next day's close.
+#   Force-expire at 4 PM only applies to same-day signals, not overnight ones.
 # =============================================================================
 
 from __future__ import annotations
@@ -36,40 +22,37 @@ from zoneinfo import ZoneInfo
 log = logging.getLogger("ap.entry_watcher")
 ET  = ZoneInfo("America/New_York")
 
-# ── CONFIG ─────────────────────────────────────────────────────────────────────
-POLL_INTERVAL_SEC    = 15     # check every 15 seconds
-MAX_WATCH_MINUTES    = 480    # FIX: 8 hours — holds overnight into next day's open
-EOD_CUTOFF_HOUR      = 15     # 3:00 PM ET — stop adding new watches after this
-EOD_CUTOFF_MIN       = 30     # 3:30 PM ET hard cutoff
-WRONG_DIR_BUFFER_PCT = 0.001  # 0.1% buffer before declaring wrong-direction breach
+POLL_INTERVAL_SEC       = 15
+MAX_WATCH_MINUTES       = 1200   # 20 hours — holds overnight post-market → next session
+EOD_CUTOFF_HOUR         = 15
+EOD_CUTOFF_MIN          = 30
+WRONG_DIR_BUFFER_PCT    = 0.001
+OVERNIGHT_THRESHOLD_HOUR = 15
+OVERNIGHT_THRESHOLD_MIN  = 30
 
 
-# ── SIGNAL STATES ─────────────────────────────────────────────────────────────
 class WatchState:
-    PENDING     = "PENDING"      # watching, no breach yet
-    TRIGGERED   = "TRIGGERED"    # breach confirmed → execute
-    EXPIRED     = "EXPIRED"      # watch window closed, no breach
-    INVALIDATED = "INVALIDATED"  # wrong direction breached first
-    CANCELLED   = "CANCELLED"    # manually cancelled
+    PENDING     = "PENDING"
+    TRIGGERED   = "TRIGGERED"
+    EXPIRED     = "EXPIRED"
+    INVALIDATED = "INVALIDATED"
+    CANCELLED   = "CANCELLED"
 
 
-# ── WATCHED SIGNAL ─────────────────────────────────────────────────────────────
 class WatchedSignal:
-    def __init__(self, signal: dict):
+    def __init__(self, signal: dict, overnight: bool = False):
         self.signal        = signal
         self.ticker        = signal["ticker"]
-        self.side          = signal["side"]           # CALL or PUT
+        self.side          = signal["side"]
+        self.overnight     = overnight
 
-        # FIX: support both flat signal fields and nested trigger dict
-        # Scanner signals: trigger.entry / trigger.stop / trigger.pt1
-        # Legacy signals:  entry_price / stop_price / target_price
         _trigger = signal.get("trigger") or {}
         _entry   = signal.get("entry_price") or _trigger.get("entry")
         _stop    = signal.get("stop_price")  or _trigger.get("stop")
         _target  = signal.get("target_price") or _trigger.get("pt1") or _trigger.get("pt2")
 
-        self.entry_trigger = float(_entry)   # breach this
-        self.stop_level    = float(_stop)    # wrong-dir invalidation
+        self.entry_trigger = float(_entry)
+        self.stop_level    = float(_stop)
         self.target_price  = float(_target)
         self.score         = float(signal.get("score", 0))
         self.grade         = signal.get("grade", "B")
@@ -80,96 +63,87 @@ class WatchedSignal:
         self.trigger_price: Optional[float]   = None
         self.expire_at     = self.created_at + timedelta(minutes=MAX_WATCH_MINUTES)
 
-        # Momentum confirmation: price must hold above trigger for N consecutive polls
-        self.breach_count:    int   = 0      # consecutive polls above/below trigger
-        self.breach_price:    float = 0.0    # price that initially breached
+        self.breach_count:    int   = 0
+        self.breach_price:    float = 0.0
         self.last_quote_bid:  float = 0.0
         self.last_quote_ask:  float = 0.0
 
-        log.info(
-            f"[{self.ticker}] Watching {self.side} | "
-            f"trigger=${self.entry_trigger} | stop=${self.stop_level} | "
-            f"target=${self.target_price} | expires {self.expire_at.strftime('%H:%M UTC')}"
-        )
+        if overnight:
+            log.info(
+                f"[{self.ticker}] OVERNIGHT signal queued | "
+                f"{self.side} | trigger=${self.entry_trigger} | stop=${self.stop_level} | "
+                f"target=${self.target_price} | activates at next session open (9:30 AM ET)"
+            )
+        else:
+            log.info(
+                f"[{self.ticker}] Watching {self.side} | "
+                f"trigger=${self.entry_trigger} | stop=${self.stop_level} | "
+                f"target=${self.target_price} | expires {self.expire_at.strftime('%H:%M UTC')}"
+            )
 
-    # Consecutive polls required ABOVE/BELOW trigger before firing
-    MOMENTUM_POLLS_REQUIRED = 2   # hold for 2 polls (~30 sec) = no fake breakouts
+    MOMENTUM_POLLS_REQUIRED = 2
 
     def check(self, bid: float, ask: float) -> str:
-        """
-        Check current quote against trigger/stop levels.
-        Requires MOMENTUM_POLLS_REQUIRED consecutive polls confirming breach
-        before triggering — eliminates fake breakouts and weak taps.
-        Returns new state.
-        """
         now = datetime.now(timezone.utc)
         self.last_quote_bid = bid
         self.last_quote_ask = ask
 
-        # Expiry check
         if now >= self.expire_at:
             self.state = WatchState.EXPIRED
             log.info(f"[{self.ticker}] EXPIRED — no breach in {MAX_WATCH_MINUTES}min")
             return self.state
 
         if self.side == "CALL":
-            # Breach candidate: ask above trigger
             if ask >= self.entry_trigger:
                 if self.breach_count == 0:
                     self.breach_price = ask
                     log.debug(f"[{self.ticker}] CALL breach candidate — ask=${ask:.2f} > ${self.entry_trigger:.2f} (poll 1/{self.MOMENTUM_POLLS_REQUIRED})")
                 self.breach_count += 1
-
                 if self.breach_count >= self.MOMENTUM_POLLS_REQUIRED:
                     self.state         = WatchState.TRIGGERED
                     self.triggered_at  = now
                     self.trigger_price = ask
                     log.info(
-                        f"[{self.ticker}] 🟢 CALL CONFIRMED — ask=${ask:.2f} "
+                        f"[{self.ticker}] CALL CONFIRMED — ask=${ask:.2f} "
                         f"held above ${self.entry_trigger:.2f} for {self.breach_count} polls"
                     )
             else:
-                # Price pulled back — reset momentum counter
                 if self.breach_count > 0:
-                    log.debug(f"[{self.ticker}] CALL breach reset — ask=${ask:.2f} pulled back below ${self.entry_trigger:.2f}")
+                    log.debug(f"[{self.ticker}] CALL breach reset — ask=${ask:.2f} pulled back")
                 self.breach_count = 0
 
-            # Invalidation: bid breaks BELOW stop level
             if bid <= self.stop_level * (1 - WRONG_DIR_BUFFER_PCT):
                 self.state = WatchState.INVALIDATED
                 self.breach_count = 0
                 log.info(
-                    f"[{self.ticker}] ❌ INVALIDATED — bid=${bid:.2f} "
+                    f"[{self.ticker}] INVALIDATED — bid=${bid:.2f} "
                     f"broke stop=${self.stop_level:.2f} before trigger"
                 )
 
         else:  # PUT
-            # Breach candidate: bid below trigger
             if bid <= self.entry_trigger:
                 if self.breach_count == 0:
                     self.breach_price = bid
                     log.debug(f"[{self.ticker}] PUT breach candidate — bid=${bid:.2f} < ${self.entry_trigger:.2f} (poll 1/{self.MOMENTUM_POLLS_REQUIRED})")
                 self.breach_count += 1
-
                 if self.breach_count >= self.MOMENTUM_POLLS_REQUIRED:
                     self.state         = WatchState.TRIGGERED
                     self.triggered_at  = now
                     self.trigger_price = bid
                     log.info(
-                        f"[{self.ticker}] 🔴 PUT CONFIRMED — bid=${bid:.2f} "
+                        f"[{self.ticker}] PUT CONFIRMED — bid=${bid:.2f} "
                         f"held below ${self.entry_trigger:.2f} for {self.breach_count} polls"
                     )
             else:
                 if self.breach_count > 0:
-                    log.debug(f"[{self.ticker}] PUT breach reset — bid=${bid:.2f} pulled back above ${self.entry_trigger:.2f}")
+                    log.debug(f"[{self.ticker}] PUT breach reset — bid=${bid:.2f} pulled back")
                 self.breach_count = 0
 
-            # Invalidation: ask breaks ABOVE stop level
             if ask >= self.stop_level * (1 + WRONG_DIR_BUFFER_PCT):
                 self.state = WatchState.INVALIDATED
                 self.breach_count = 0
                 log.info(
-                    f"[{self.ticker}] ❌ INVALIDATED — ask=${ask:.2f} "
+                    f"[{self.ticker}] INVALIDATED — ask=${ask:.2f} "
                     f"broke stop=${self.stop_level:.2f} before trigger"
                 )
 
@@ -184,24 +158,13 @@ class WatchedSignal:
         return (datetime.now(timezone.utc) - self.created_at).total_seconds() / 60
 
 
-# ── MAIN WATCHER ──────────────────────────────────────────────────────────────
-
 class APEntryWatcher:
     """
     Watches pending signals for entry breach confirmation.
-    Runs as a background thread — non-blocking.
+    Runs as a background thread.
 
-    Usage:
-        def on_trigger(watched: WatchedSignal):
-            broker.execute_option_trade(watched.signal, watched.trigger_price)
-
-        watcher = APEntryWatcher(broker)
-        watcher.on_trigger  = on_trigger
-        watcher.on_expire   = lambda w: log.info(f"Expired: {w.ticker}")
-        watcher.start()
-
-        # When scanner fires a signal:
-        watcher.add_signal(signal_dict)
+    Supports overnight signals: post-market scanner setups are held
+    overnight and activated at the next session open (9:30 AM ET).
     """
 
     def __init__(self, broker):
@@ -211,7 +174,6 @@ class APEntryWatcher:
         self._running       = False
         self._thread: Optional[threading.Thread] = None
 
-        # Callbacks
         self.on_trigger:    Optional[Callable] = None
         self.on_expire:     Optional[Callable] = None
         self.on_invalidate: Optional[Callable] = None
@@ -220,38 +182,33 @@ class APEntryWatcher:
         """
         Add a signal to the watch queue.
 
-        POLICY (explicit):
-          - During trading session (9:30 AM – 3:30 PM ET): reject after EOD cutoff
-            (3:30 PM). Prevents new entries near close when there is no time to fill
-            or manage the position.
-          - Pre-market (midnight – 9:29 AM ET): ACCEPT. Scanner fires at 9:05 AM and
-            10:15 AM. Pre-market signals queue and wait for the open. WatchedSignal
-            TTL (MAX_WATCH_MINUTES=480, 8 hrs) ensures stale signals expire cleanly.
-          - Post-session (3:30 PM – midnight): REJECT. Session is over. Any signal
-            arriving here is from a late retry or re-run; it should not be held
-            overnight into the following day's open.
+        POLICY:
+          - Session hours (9:30 AM – 3:30 PM ET): accept, watch immediately.
+          - Post-session (3:30 PM – midnight ET): ACCEPT as overnight signal.
+            Scanner fires post-market for next-day setups. Signal held overnight,
+            activates at 9:30 AM next morning.
+          - Pre-market (midnight – 9:29 AM ET): accept, waits for open.
 
-        This means: reject 15:30–23:59 ET, accept 00:00–09:29 ET and 09:30–15:29 ET.
+        All signals use 20-hour TTL. Force-expire at 4 PM applies to same-day
+        signals only — overnight signals survive to next session.
         """
         now_et = datetime.now(ET)
         hour, minute = now_et.hour, now_et.minute
 
-        # Post-session window: 3:30 PM to midnight — reject
-        # Pre-market (midnight to 9:29 AM) and session (9:30 AM to 3:29 PM) — accept
-        post_session = (hour > EOD_CUTOFF_HOUR or
-                        (hour == EOD_CUTOFF_HOUR and minute >= EOD_CUTOFF_MIN))
+        post_session = (hour > OVERNIGHT_THRESHOLD_HOUR or
+                        (hour == OVERNIGHT_THRESHOLD_HOUR and minute >= OVERNIGHT_THRESHOLD_MIN))
 
-        if post_session:
-            log.warning(
-                f"[{signal.get('ticker')}] Signal rejected — post-session "
-                f"(after {EOD_CUTOFF_HOUR}:{EOD_CUTOFF_MIN:02d} ET). "
-                f"Re-queue at next scanner run (pre-market or session open)."
+        overnight = post_session
+
+        if overnight:
+            log.info(
+                f"[{signal.get('ticker')}] Post-session signal accepted — "
+                f"holding overnight for next session open (9:30 AM ET). "
+                f"trigger=${signal.get('entry_price') or (signal.get('trigger') or {}).get('entry', '?')}"
             )
-            return False
 
-        watched = WatchedSignal(signal)
+        watched = WatchedSignal(signal, overnight=overnight)
         with self._lock:
-            # Dedup: don't add same ticker + side twice
             existing = [w for w in self._pending
                         if w.ticker == watched.ticker and w.side == watched.side]
             if existing:
@@ -266,30 +223,34 @@ class APEntryWatcher:
 
             self._pending.append(watched)
 
-        log.info(f"[{watched.ticker}] Added to watch queue — {len(self._pending)} total watching")
+        overnight_count = sum(1 for w in self._pending if w.overnight)
+        same_day_count  = sum(1 for w in self._pending if not w.overnight)
+        log.info(
+            f"[{watched.ticker}] Added to watch queue — "
+            f"{same_day_count} same-day + {overnight_count} overnight = {len(self._pending)} total"
+        )
         return True
 
     def watch(self, plan, local_order_id: str) -> bool:
         """
         Plan-aware entry called by ap/queue.py _dispatch().
-        Converts an ApprovedExecutionPlan to signal dict and delegates to add_signal().
         """
         if plan is None:
             log.warning("watch() called with None plan -- skipping")
             return False
         signal_dict = {
-            "signal_id":      getattr(plan, "signal_id",         str(uuid.uuid4())),
-            "ticker":         getattr(plan, "ticker",            ""),
-            "side":           getattr(plan, "side",              "CALL"),
-            "score":          getattr(plan, "score",             65.0),
-            "grade":          getattr(plan, "tier",              "B"),
-            "entry_price":    getattr(plan, "trigger_price",     None),
-            "stop_price":     getattr(plan, "stop_underlying",   None),
-            "target_price":   getattr(plan, "target_underlying", None),
-            "plan_id":        getattr(plan, "plan_id",           ""),
-            "local_order_id": local_order_id,
+            "signal_id":       getattr(plan, "signal_id",         str(uuid.uuid4())),
+            "ticker":          getattr(plan, "ticker",            ""),
+            "side":            getattr(plan, "side",              "CALL"),
+            "score":           getattr(plan, "score",             65.0),
+            "grade":           getattr(plan, "tier",              "B"),
+            "entry_price":     getattr(plan, "trigger_price",     None),
+            "stop_price":      getattr(plan, "stop_underlying",   None),
+            "target_price":    getattr(plan, "target_underlying", None),
+            "plan_id":         getattr(plan, "plan_id",           ""),
+            "local_order_id":  local_order_id,
             "contract_symbol": getattr(plan, "contract_symbol",  ""),
-            "pattern":        getattr(plan, "pattern",           ""),
+            "pattern":         getattr(plan, "pattern",           ""),
             "trigger": {
                 "entry": getattr(plan, "trigger_price",     None),
                 "stop":  getattr(plan, "stop_underlying",   None),
@@ -304,7 +265,6 @@ class APEntryWatcher:
         return self.add_signal(signal_dict)
 
     def start(self):
-        """Start the background polling thread."""
         if self._running:
             return
         self._running = True
@@ -321,24 +281,23 @@ class APEntryWatcher:
         log.info("APEntryWatcher stopped")
 
     def status(self) -> list[dict]:
-        """Return status of all watched signals."""
         with self._lock:
             return [
                 {
-                    "ticker":    w.ticker,
-                    "side":      w.side,
-                    "trigger":   w.entry_trigger,
-                    "target":    w.target_price,
-                    "state":     w.state,
+                    "ticker":        w.ticker,
+                    "side":          w.side,
+                    "trigger":       w.entry_trigger,
+                    "target":        w.target_price,
+                    "state":         w.state,
                     "mins_watching": round(w.minutes_watching, 1),
-                    "score":     w.score,
-                    "grade":     w.grade,
+                    "score":         w.score,
+                    "grade":         w.grade,
+                    "overnight":     w.overnight,
                 }
                 for w in self._pending
             ]
 
     def _poll_loop(self):
-        """Background loop — polls quotes every POLL_INTERVAL_SEC seconds."""
         while self._running:
             try:
                 self._check_all()
@@ -349,14 +308,29 @@ class APEntryWatcher:
     def _check_all(self):
         now_et = datetime.now(ET)
 
-        # Hard EOD: force-expire all watches at market close
+        # At 4 PM ET: force-expire SAME-DAY signals only.
+        # Overnight signals (post-market scanner setups) survive to next session.
         if now_et.hour >= 16:
             with self._lock:
+                expired   = []
+                surviving = []
                 for w in self._pending:
-                    if w.is_active:
+                    if w.is_active and not w.overnight:
                         w.state = WatchState.EXPIRED
-                        log.info(f"[{w.ticker}] Force-expired at market close")
-                self._pending = []
+                        expired.append(w)
+                        log.info(f"[{w.ticker}] Force-expired at market close (same-day signal)")
+                    else:
+                        surviving.append(w)
+                self._pending = surviving
+                if expired:
+                    log.info(
+                        f"EOD force-expire: {len(expired)} same-day signals expired, "
+                        f"{len(surviving)} overnight signals held for next session"
+                    )
+            return
+
+        # Outside session hours (before 9:30 AM ET): hold, don't poll
+        if now_et.hour < 9 or (now_et.hour == 9 and now_et.minute < 30):
             return
 
         with self._lock:
@@ -365,7 +339,6 @@ class APEntryWatcher:
         if not active:
             return
 
-        # Batch quote fetch — one API call for all active tickers
         tickers = list({w.ticker for w in active})
         try:
             quotes = self._fetch_quotes(tickers)
@@ -383,7 +356,6 @@ class APEntryWatcher:
                 bid = float(quote.get("bid", 0) or 0)
                 ask = float(quote.get("ask", 0) or 0)
                 if bid == 0 and ask == 0:
-                    # Fall back to last price
                     last = float(quote.get("last", 0) or 0)
                     bid = ask = last
 
@@ -394,11 +366,9 @@ class APEntryWatcher:
                 elif new_state in (WatchState.EXPIRED, WatchState.INVALIDATED):
                     completed.append(("done", w))
 
-            # Remove completed from pending
             done_set = {id(w) for _, w in completed}
             self._pending = [w for w in self._pending if id(w) not in done_set]
 
-        # Fire callbacks outside the lock
         for action, w in completed:
             if action == "trigger" and self.on_trigger:
                 try:
@@ -417,13 +387,8 @@ class APEntryWatcher:
                     log.error(f"on_invalidate callback failed: {e}")
 
     def _fetch_quotes(self, tickers: list[str]) -> dict:
-        """
-        Fetch live quotes via Tradier for multiple tickers at once.
-        Returns {ticker: {bid, ask, last}} dict.
-        """
         symbols = ",".join(tickers)
         try:
-            # FIX: broker stores URL as broker.cfg.base_url not broker.base_url
             _base = (
                 getattr(self.broker, "base_url", None)
                 or getattr(getattr(self.broker, "cfg", None), "base_url", None)
@@ -435,7 +400,7 @@ class APEntryWatcher:
                 headers={"Accept": "application/json"},
                 timeout=5,
             )
-            data  = resp.json()
+            data       = resp.json()
             quotes_raw = data.get("quotes", {}).get("quote", [])
             if isinstance(quotes_raw, dict):
                 quotes_raw = [quotes_raw]
