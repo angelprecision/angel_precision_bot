@@ -344,6 +344,12 @@ def _dispatch(
                 f"[{ticker}] Handed to entry watcher | "
                 f"trigger=${getattr(plan, 'trigger_price', '?')}"
             )
+            # Transition order to SUBMITTED so order_monitor doesn't stale-cancel it.
+            # The order is legitimately alive — it's waiting for breach confirmation.
+            order_state_machine.transition(
+                local_order_id, "SUBMITTED",
+                submitted_ts=now_utc_iso(),
+            )
             _mark_job(job_id, "WATCHING",
                       result={"plan_id": plan.plan_id,
                               "local_order_id": local_order_id,
