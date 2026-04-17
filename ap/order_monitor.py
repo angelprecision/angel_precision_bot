@@ -143,19 +143,27 @@ class APOrderMonitor:
                 ref_ts   = submitted_ts or created_ts
                 age_secs = (now - ref_ts).total_seconds()
                 if age_secs > TIMEOUT_SUBMITTED:
-                    # Query broker first — may have filled or been rejected
-                    broker_status = self._query_broker_order(broker_oid)
-                    if broker_status:
-                        self._advance_from_broker_status(local_id, broker_status, contract)
-                    else:
-                        self._handle_stale_entry(
-                            local_id, status, contract, age_secs,
-                            action="cancel",
-                            reason=(
-                                f"SUBMITTED for {age_secs:.0f}s > {TIMEOUT_SUBMITTED}s "
-                                f"— no broker response"
-                            ),
+                    # If no broker_order_id, this order is held by the entry watcher
+                    # waiting for a price breach — do NOT cancel it, it's intentional.
+                    if not broker_oid:
+                        log.debug(
+                            f"[{self.client_id}] Watcher-held order {local_id} "
+                            f"({contract}) SUBMITTED for {age_secs:.0f}s — skipping stale cancel"
                         )
+                    else:
+                        # Query broker first — may have filled or been rejected
+                        broker_status = self._query_broker_order(broker_oid)
+                        if broker_status:
+                            self._advance_from_broker_status(local_id, broker_status, contract)
+                        else:
+                            self._handle_stale_entry(
+                                local_id, status, contract, age_secs,
+                                action="cancel",
+                                reason=(
+                                    f"SUBMITTED for {age_secs:.0f}s > {TIMEOUT_SUBMITTED}s "
+                                    f"— no broker response"
+                                ),
+                            )
 
             elif status == "ACKNOWLEDGED":
                 ref_ts   = submitted_ts or created_ts
