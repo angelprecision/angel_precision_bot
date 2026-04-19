@@ -50,7 +50,23 @@ SUPABASE_URL         = os.getenv("SUPABASE_URL", "")
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY", "")
 
 # ── Encryption ────────────────────────────────────────────────────────────────
-_raw_key   = os.getenv("ENCRYPTION_KEY", "angel-precision-encrypt-2026")
+# SECURITY: Fail hard if ENCRYPTION_KEY is missing — no silent fallback
+# A missing key must never silently use a known default with client credentials
+_raw_key = os.getenv("ENCRYPTION_KEY", "")
+if not _raw_key:
+    import sys
+    print("FATAL: ENCRYPTION_KEY env var is not set. "
+          "Set it in Render before deploying with client credentials.", file=sys.stderr)
+    # In paper mode, warn but continue. In live mode, halt.
+    _BOT_MODE_CHECK = (os.getenv("AP_MODE") or os.getenv("BOT_MODE") or "PAPER").upper()
+    if _BOT_MODE_CHECK == "LIVE":
+        raise RuntimeError("ENCRYPTION_KEY is required in LIVE mode.")
+    else:
+        # Paper mode — use a random key (tokens will fail to decrypt, but won't
+        # silently expose client credentials encrypted with a known fallback)
+        import secrets as _secrets
+        _raw_key = _secrets.token_hex(32)
+
 _key_bytes = hashlib.sha256(_raw_key.encode()).digest()
 _fernet    = Fernet(base64.urlsafe_b64encode(_key_bytes))
 
@@ -161,7 +177,7 @@ class ClientRunner(threading.Thread):
             self.master_control = APMasterControl(
                 mode=os.getenv("AP_MODE", "paper"),
                 client_id=self.email,
-                score_floor=float(os.getenv("SCORE_FLOOR", "65")),  # Tier B floor=65
+                score_floor=float(os.getenv("SCORE_FLOOR", "45")),  # lowered: 48→45 for data collection
                 context_floor=float(os.getenv("CONTEXT_FLOOR", "0.0")),  # disabled: 4.0→0.0
                 max_positions=int(os.getenv("MAX_POSITIONS", "10")),  # raised: 7→10
                 max_capital_pct=float(os.getenv("MAX_CAPITAL_PCT", "0.40")),
@@ -213,7 +229,7 @@ class ClientRunner(threading.Thread):
             # IV rank filter -- blocks buying expensive premium (rank > threshold)
             iv_filter = APIVRankFilter(
                 broker=data_broker,   # use live data broker for IV data
-                max_iv_rank=float(os.getenv("MAX_IV_RANK", "100")),  # disabled: 85→100 (only blocks rank>100 which is impossible)
+                max_iv_rank=float(os.getenv("MAX_IV_RANK", "95")),  # raised for data collection phase
             )
 
             self.contract_selector = APContractSelectionEngine(
@@ -236,9 +252,13 @@ class ClientRunner(threading.Thread):
                 email=self.email,
                 position_manager=self.position_manager,
                 order_state_machine=self.order_state_machine,
-                data_broker=data_broker,  # live api.tradier.com for exit engine quotes
             )
             self.core.start()
+
+            # Seed exit engine with open positions from DB so restarts
+            # don't leave existing positions without stop/target/EOD protection
+            if self.core.exit_eng and self.position_manager:
+                self.core.exit_eng.seed_from_db(self.position_manager)
 
             # Wire kill switch + mode into master control
             self.master_control.wire(
@@ -375,6 +395,7 @@ class ClientRunner(threading.Thread):
         Passes full control stack -- master control is the sole decision authority.
         """
         entry_watcher = getattr(self.core, "entry_watcher", None)
+        exit_eng = getattr(self.core, "exit_eng", None)
 
         is_live = os.getenv("AP_MODE", "paper").upper() == "LIVE"
 
@@ -387,6 +408,7 @@ class ClientRunner(threading.Thread):
                     order_state_machine=self.order_state_machine,
                     entry_watcher=entry_watcher,
                     position_manager=self.position_manager,
+                    exit_eng=exit_eng,
                     client_id=self.email,
                     stop_event=self.stopped,    # clean shutdown when runner stops
                     live_mode=is_live,           # disables legacy fallback in live
