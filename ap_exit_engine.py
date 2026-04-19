@@ -264,8 +264,12 @@ class APExitEngine:
         engine.add_position(ManagedPosition(...))
     """
 
-    def __init__(self, broker, kill_switch_fn=None, email: str = ""):
+    def __init__(self, broker, kill_switch_fn=None, email: str = "",
+                 data_broker=None):
         self.broker           = broker
+        # data_broker: live api.tradier.com broker for real-time quotes.
+        # Falls back to execution broker if not provided (sandbox = delayed).
+        self._quote_broker    = data_broker or broker
         self._email           = email              # used to name thread per-client
         self._positions: list[ManagedPosition] = []
         self._lock            = threading.Lock()
@@ -457,8 +461,8 @@ class APExitEngine:
 
     def _fetch_quotes(self, tickers: list[str]) -> dict:
         try:
-            resp = self.broker.session.get(
-                f"{self.broker.cfg.base_url}/v1/markets/quotes",
+            resp = self._quote_broker.session.get(
+                f"{self._quote_broker.cfg.base_url}/v1/markets/quotes",
                 params={"symbols": ",".join(tickers), "greeks": "false"},
                 headers={"Accept": "application/json"},
                 timeout=5,
@@ -473,8 +477,8 @@ class APExitEngine:
 
     def _fetch_option_quotes(self, symbols: list[str]) -> dict:
         try:
-            resp = self.broker.session.get(
-                f"{self.broker.cfg.base_url}/v1/markets/quotes",
+            resp = self._quote_broker.session.get(
+                f"{self._quote_broker.cfg.base_url}/v1/markets/quotes",
                 params={"symbols": ",".join(symbols), "greeks": "true"},
                 headers={"Accept": "application/json"},
                 timeout=5,
