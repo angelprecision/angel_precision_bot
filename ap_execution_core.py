@@ -168,21 +168,14 @@ class APExecutionCore:
     Manages full lifecycle: signal -> rank -> watch -> enter -> manage -> exit -> record.
     """
 
-    def __init__(self, broker, supabase_client=None, email: str = "", position_manager=None, order_state_machine=None):
+    def __init__(self, broker, supabase_client=None, email: str = "", position_manager=None, order_state_machine=None, data_broker=None):
         self.broker    = broker
         self.email              = email
         self.position_manager   = position_manager    # APPositionManager (optional for now)
         self.order_state_machine = order_state_machine # APOrderStateMachine (optional for now)
         self.paper     = BOT_MODE != "LIVE"
         self._pos_lock = threading.Lock()
-        # MED-003: seed position counter from DB on startup
         self._position_count = 0
-        if position_manager:
-            try:
-                self._position_count = position_manager.open_count()
-                log.info(f"[{email}] Position counter seeded from DB: {self._position_count}")
-            except Exception as _e:
-                log.warning(f"[{email}] Failed to seed position counter from DB: {_e}")
 
         # Mode-specific gate values
         self._score_floor   = SCORE_FLOOR_PAPER   if self.paper else SCORE_FLOOR_LIVE
@@ -195,7 +188,8 @@ class APExecutionCore:
 
         # Core modules
         self.entry_watcher = APEntryWatcher(broker)
-        self.exit_eng    = APExitEngine(broker, email=email)
+        self.exit_eng    = APExitEngine(broker, email=email,
+                                           data_broker=data_broker)
         self.feedback    = APFeedbackLoop(supabase_client, DISCORD_WEBHOOK_URL, signal_store=self.store)
         self.tier_engine = APTierEngine()
         self.shadow      = APShadowTracker(supabase_client, DISCORD_WEBHOOK_URL)
