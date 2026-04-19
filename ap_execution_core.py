@@ -168,14 +168,21 @@ class APExecutionCore:
     Manages full lifecycle: signal -> rank -> watch -> enter -> manage -> exit -> record.
     """
 
-    def __init__(self, broker, supabase_client=None, email: str = "", position_manager=None, order_state_machine=None, data_broker=None):
+    def __init__(self, broker, supabase_client=None, email: str = "", position_manager=None, order_state_machine=None):
         self.broker    = broker
         self.email              = email
         self.position_manager   = position_manager    # APPositionManager (optional for now)
         self.order_state_machine = order_state_machine # APOrderStateMachine (optional for now)
         self.paper     = BOT_MODE != "LIVE"
         self._pos_lock = threading.Lock()
+        # MED-003: seed position counter from DB on startup
         self._position_count = 0
+        if position_manager:
+            try:
+                self._position_count = position_manager.open_count()
+                log.info(f"[{email}] Position counter seeded from DB: {self._position_count}")
+            except Exception as _e:
+                log.warning(f"[{email}] Failed to seed position counter from DB: {_e}")
 
         # Mode-specific gate values
         self._score_floor   = SCORE_FLOOR_PAPER   if self.paper else SCORE_FLOOR_LIVE
@@ -188,8 +195,7 @@ class APExecutionCore:
 
         # Core modules
         self.entry_watcher = APEntryWatcher(broker)
-        self.exit_eng    = APExitEngine(broker, email=email,
-                                           data_broker=data_broker)
+        self.exit_eng    = APExitEngine(broker, email=email)
         self.feedback    = APFeedbackLoop(supabase_client, DISCORD_WEBHOOK_URL, signal_store=self.store)
         self.tier_engine = APTierEngine()
         self.shadow      = APShadowTracker(supabase_client, DISCORD_WEBHOOK_URL)
@@ -656,8 +662,26 @@ class APExecutionCore:
 
         # Place order
         if self.paper:
+            # In paper mode: submit to Tradier sandbox so the order is visible
+            # in the sandbox account, then simulate the local fill.
             log.info(f"[{ticker}] PAPER -- simulating fill @ ${decision.mid_price:.2f}")
             fill_price = decision.mid_price
+            try:
+                _sb_resp = self._place_option_order(
+                    symbol      = decision.symbol,
+                    contracts   = contracts,
+                    side        = "buy_to_open",
+                    limit_price = decision.mid_price,
+                )
+                if _sb_resp:
+                    log.info(
+                        f"[{ticker}] SANDBOX ORDER SUBMITTED | "
+                        f"{contracts}x {decision.symbol} @ ${decision.mid_price:.2f}"
+                    )
+                else:
+                    log.warning(f"[{ticker}] Sandbox order not confirmed -- continuing with local paper fill")
+            except Exception as _se:
+                log.warning(f"[{ticker}] Sandbox submit error ({_se}) -- continuing with local paper fill")
         else:
             fill_price = self._place_option_order(
                 symbol      = decision.symbol,
