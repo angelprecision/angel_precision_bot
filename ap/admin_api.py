@@ -554,3 +554,42 @@ def get_client_growth(client_id):
     except Exception as e:
         log.error(f"Get growth failed: {e}", exc_info=True)
         return _json_error("get_growth_failed", 500, details=str(e))
+
+@admin_bp.post("/reconcile/<client_id>")
+def reconcile_client(client_id):
+    """
+    Reconcile broker positions vs DB positions for a client.
+    Finds mismatches between what Tradier shows and what DB has.
+    Call this at EOD or after any suspected state drift.
+    """
+    try:
+        from ap.reconcile import run_reconciliation
+        result = run_reconciliation(client_id)
+        return jsonify({"ok": True, "client_id": client_id, "result": result}), 200
+    except Exception as e:
+        log.error(f"Reconcile error for {client_id}: {e}")
+        return _json_error(f"reconcile_failed: {e}", 500)
+
+
+@admin_bp.get("/health/clients")
+def client_health_check():
+    """
+    Returns health status of all active client runners.
+    Shows which clients are running, stalled, or dead.
+    """
+    try:
+        from ap.db import run_with_retry, conn
+        def _fn():
+            with conn() as c:
+                c.execute("""
+                    SELECT client_id, component, status, last_heartbeat_at,
+                           restarts, last_error
+                    FROM client_health
+                    ORDER BY client_id, component
+                """)
+                return c.fetchall()
+        rows = run_with_retry(_fn)
+        return jsonify({"ok": True, "clients": rows}), 200
+    except Exception as e:
+        return _json_error(f"health_check_failed: {e}", 500)
+
