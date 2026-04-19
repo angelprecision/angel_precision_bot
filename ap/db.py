@@ -525,6 +525,10 @@ def get_all_clients(status: str | None = None) -> list[dict]:
 def update_client(client_id: str, **kwargs) -> dict:
     if not kwargs:
         raise ValueError("No fields to update")
+    # HIGH-011: same allowlist as upsert_client — prevent SQL injection via admin API
+    bad_keys = set(kwargs.keys()) - _UPSERT_ALLOWED_COLUMNS
+    if bad_keys:
+        raise ValueError(f"update_client: invalid column names: {bad_keys}")
     def _fn():
         with conn() as c:
             updates = []; params = []
