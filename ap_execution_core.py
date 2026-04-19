@@ -156,11 +156,14 @@ class RankingQueue:
 # =============================================================================
 
 # ═══════════════════════════════════════════════════════════
-# PRODUCTION PATH (April 2026):
+# PRODUCTION PATH (authoritative):
 #   /signal → trade_queue → worker_loop → APMasterControl →
 #   APContractSelector → APOrderStateMachine → APEntryWatcher.watch()
-#   → APPositionManager
-# receive_signal() is NOT in the production path.
+#   → APPositionManager → APExitEngine
+#
+# receive_signal() handles LEGACY signals only (no score/ev_score).
+# All new scanner signals go through the queue worker path above.
+# Legacy path kept for backwards compatibility with old scanners.
 # ═══════════════════════════════════════════════════════════
 class APExecutionCore:
     """
