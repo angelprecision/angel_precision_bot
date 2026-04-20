@@ -156,14 +156,11 @@ class RankingQueue:
 # =============================================================================
 
 # ═══════════════════════════════════════════════════════════
-# PRODUCTION PATH (authoritative):
+# PRODUCTION PATH (April 2026):
 #   /signal → trade_queue → worker_loop → APMasterControl →
 #   APContractSelector → APOrderStateMachine → APEntryWatcher.watch()
-#   → APPositionManager → APExitEngine
-#
-# receive_signal() handles LEGACY signals only (no score/ev_score).
-# All new scanner signals go through the queue worker path above.
-# Legacy path kept for backwards compatibility with old scanners.
+#   → APPositionManager
+# receive_signal() is NOT in the production path.
 # ═══════════════════════════════════════════════════════════
 class APExecutionCore:
     """
@@ -178,14 +175,7 @@ class APExecutionCore:
         self.order_state_machine = order_state_machine # APOrderStateMachine (optional for now)
         self.paper     = BOT_MODE != "LIVE"
         self._pos_lock = threading.Lock()
-        # MED-003: seed position counter from DB on startup
         self._position_count = 0
-        if position_manager:
-            try:
-                self._position_count = position_manager.open_count()
-                log.info(f"[{email}] Position counter seeded from DB: {self._position_count}")
-            except Exception as _e:
-                log.warning(f"[{email}] Failed to seed position counter from DB: {_e}")
 
         # Mode-specific gate values
         self._score_floor   = SCORE_FLOOR_PAPER   if self.paper else SCORE_FLOOR_LIVE
@@ -198,7 +188,8 @@ class APExecutionCore:
 
         # Core modules
         self.entry_watcher = APEntryWatcher(broker)
-        self.exit_eng    = APExitEngine(broker, email=email, data_broker=data_broker)
+        self.exit_eng    = APExitEngine(broker, email=email,
+                                           data_broker=data_broker)
         self.feedback    = APFeedbackLoop(supabase_client, DISCORD_WEBHOOK_URL, signal_store=self.store)
         self.tier_engine = APTierEngine()
         self.shadow      = APShadowTracker(supabase_client, DISCORD_WEBHOOK_URL)
@@ -211,17 +202,18 @@ class APExecutionCore:
             mode="paper" if BOT_MODE != "LIVE" else "live",
         )
 
-        # ── MASTER CONTROL -- injected from ClientRunner (ONE MC per client) ─────
-        # ExecutionCore never builds its own in production.
-        # If master_control is not injected, log a warning and build a fallback
-        # (this path is for unit tests / standalone use only).
+        # ── MASTER CONTROL -- single decision authority ────────────────────────
+        # Fix: require injected master_control; internal construction only if
+        # ALLOW_INTERNAL_MASTER_CONTROL=1 (unit tests / local dev only).
+        import os as _os_ec
+        _allow_internal = _os_ec.getenv("ALLOW_INTERNAL_MASTER_CONTROL", "0") == "1"
         if master_control is not None:
             self.master_control = master_control
             log.info("[%s] APExecutionCore using injected master_control", email)
-        else:
+        elif _allow_internal:
             log.warning(
-                "[%s] master_control not injected — building internal MC. "
-                "Production must inject from ClientRunner.", email
+                "[%s] APExecutionCore building internal master_control "
+                "(ALLOW_INTERNAL_MASTER_CONTROL=1 — dev/test only)", email
             )
             self.master_control = APMasterControl(
                 mode           = "live" if BOT_MODE == "LIVE" else "paper",
@@ -237,6 +229,12 @@ class APExecutionCore:
                 position_count_fn = lambda: self._position_count,
                 kill_switch_fn    = None,
                 mode_fn           = None,
+            )
+        else:
+            raise RuntimeError(
+                f"[{email}] APExecutionCore requires injected master_control in production. "
+                "Pass master_control= from ClientRunner. "
+                "Set ALLOW_INTERNAL_MASTER_CONTROL=1 only for local tests."
             )
 
         # Wire watcher callbacks
@@ -675,26 +673,8 @@ class APExecutionCore:
 
         # Place order
         if self.paper:
-            # In paper mode: submit to Tradier sandbox so the order is visible
-            # in the sandbox account, then simulate the local fill.
             log.info(f"[{ticker}] PAPER -- simulating fill @ ${decision.mid_price:.2f}")
             fill_price = decision.mid_price
-            try:
-                _sb_resp = self._place_option_order(
-                    symbol      = decision.symbol,
-                    contracts   = contracts,
-                    side        = "buy_to_open",
-                    limit_price = decision.mid_price,
-                )
-                if _sb_resp:
-                    log.info(
-                        f"[{ticker}] SANDBOX ORDER SUBMITTED | "
-                        f"{contracts}x {decision.symbol} @ ${decision.mid_price:.2f}"
-                    )
-                else:
-                    log.warning(f"[{ticker}] Sandbox order not confirmed -- continuing with local paper fill")
-            except Exception as _se:
-                log.warning(f"[{ticker}] Sandbox submit error ({_se}) -- continuing with local paper fill")
         else:
             fill_price = self._place_option_order(
                 symbol      = decision.symbol,
