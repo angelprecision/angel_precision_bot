@@ -423,7 +423,11 @@ class APStartupRecovery:
             with conn() as c:
                 c.execute(
                     """
-                    SELECT signal_id, ticker, direction, timeframe, client_id, status
+                    SELECT signal_id,
+                           payload->>'ticker'    AS ticker,
+                           payload->>'direction' AS direction,
+                           payload->>'timeframe' AS timeframe,
+                           client_id, status
                     FROM trade_queue
                     WHERE client_id=%s
                       AND created_ts > NOW() - INTERVAL '%s hours'
