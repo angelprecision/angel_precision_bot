@@ -588,33 +588,23 @@ def create_app() -> Flask:
             _idem_set(idem_key, payload)
             return jsonify(payload), 403
 
-        # ── FIRE-AND-FORGET: return 202 immediately, route in background ──────
-        # This is critical -- scanner sends 20+ signals in a burst.
-        # Any synchronous DB call here blocks all gthreads and causes timeouts.
+        # Fix 4: synchronous durable enqueue — 202 only after queue write succeeds
         _sig_id = str(body.get("signal_id") or uuid.uuid4())
         body["signal_id"] = _sig_id
-        payload = {"ok": True, "queued": True, "signal_id": _sig_id}
-        _idem_set(idem_key, payload)
 
-        def _bg_route(_body=body, _cid=client_id):
-            try:
-                route_signal_to_all_clients(_body)
-                log.info(
-                    f"Signal routed: {_body.get('ticker')} {_body.get('side')} "
-                    f"score={_body.get('score')}"
-                )
-            except Exception as _e:
-                log.warning(f"route_signal_to_all_clients failed: {_e} -- falling back")
-                try:
-                    sig = Signal(**_body)
-                    enqueue_signal(sig, client_id=_cid)
-                    log.info(f"Signal queued (legacy fallback): {_cid} {sig.symbol}")
-                except Exception as _e2:
-                    log.error(f"Signal fallback also failed: {_e2}")
-
-        threading.Thread(target=_bg_route, daemon=True,
-                         name=f"sig-{_sig_id[:8]}").start()
-        return jsonify(payload), 202
+        try:
+            route_signal_to_all_clients(body)
+            log.info(
+                f"Signal routed: {body.get('ticker')} {body.get('side')} "
+                f"score={body.get('score')} sig={_sig_id}"
+            )
+            payload = {"ok": True, "queued": True, "signal_id": _sig_id}
+            _idem_set(idem_key, payload)
+            return jsonify(payload), 202
+        except Exception as _e:
+            log.error(f"/signal durable enqueue failed: {_e}")
+            payload = {"ok": False, "error": "enqueue_failed", "signal_id": _sig_id}
+            return jsonify(payload), 500
 
     @app.post("/scanner/discord")
     @require_hmac
