@@ -171,7 +171,7 @@ class APExecutionCore:
     Manages full lifecycle: signal -> rank -> watch -> enter -> manage -> exit -> record.
     """
 
-    def __init__(self, broker, supabase_client=None, email: str = "", position_manager=None, order_state_machine=None):
+    def __init__(self, broker, supabase_client=None, email: str = "", position_manager=None, order_state_machine=None, data_broker=None, master_control=None):
         self.broker    = broker
         self.email              = email
         self.position_manager   = position_manager    # APPositionManager (optional for now)
@@ -198,7 +198,7 @@ class APExecutionCore:
 
         # Core modules
         self.entry_watcher = APEntryWatcher(broker)
-        self.exit_eng    = APExitEngine(broker, email=email)
+        self.exit_eng    = APExitEngine(broker, email=email, data_broker=data_broker)
         self.feedback    = APFeedbackLoop(supabase_client, DISCORD_WEBHOOK_URL, signal_store=self.store)
         self.tier_engine = APTierEngine()
         self.shadow      = APShadowTracker(supabase_client, DISCORD_WEBHOOK_URL)
@@ -211,23 +211,33 @@ class APExecutionCore:
             mode="paper" if BOT_MODE != "LIVE" else "live",
         )
 
-        # ── MASTER CONTROL -- single decision authority ────────────────────────
-        self.master_control = APMasterControl(
-            mode           = "live" if BOT_MODE == "LIVE" else "paper",
-            score_floor    = self._score_floor,
-            context_floor  = self._context_floor,
-            max_positions  = MAX_POSITIONS,
-            supabase_client= supabase_client,
-            signal_store   = self.store,
-            tier_engine    = self.tier_engine,
-            feedback_loop  = self.feedback,
-        )
-        # Wire runtime callbacks into master control
-        self.master_control.wire(
-            position_count_fn = lambda: self._position_count,
-            kill_switch_fn    = None,   # TODO: wire state kill switch
-            mode_fn           = None,   # TODO: wire dynamic mode
-        )
+        # ── MASTER CONTROL -- injected from ClientRunner (ONE MC per client) ─────
+        # ExecutionCore never builds its own in production.
+        # If master_control is not injected, log a warning and build a fallback
+        # (this path is for unit tests / standalone use only).
+        if master_control is not None:
+            self.master_control = master_control
+            log.info("[%s] APExecutionCore using injected master_control", email)
+        else:
+            log.warning(
+                "[%s] master_control not injected — building internal MC. "
+                "Production must inject from ClientRunner.", email
+            )
+            self.master_control = APMasterControl(
+                mode           = "live" if BOT_MODE == "LIVE" else "paper",
+                score_floor    = self._score_floor,
+                context_floor  = self._context_floor,
+                max_positions  = MAX_POSITIONS,
+                supabase_client= supabase_client,
+                signal_store   = self.store,
+                tier_engine    = self.tier_engine,
+                feedback_loop  = self.feedback,
+            )
+            self.master_control.wire(
+                position_count_fn = lambda: self._position_count,
+                kill_switch_fn    = None,
+                mode_fn           = None,
+            )
 
         # Wire watcher callbacks
         self.entry_watcher.on_trigger    = self._on_entry_trigger
