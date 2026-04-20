@@ -400,8 +400,18 @@ class APExitEngine:
         # Quote fetch takes 1-5s on live Tradier. Kill may have fired during
         # that I/O window. Filter out non-protective exits but allow EOD/stop-loss.
         if self._kill_switch_fn and self._kill_switch_fn():
-            protective = [(p, d) for p, d in actions_to_take
-                          if (d.reason or "") in ("EOD_FORCE_CLOSE", "STOP_LOSS", "MAX_LOSS")]
+            def _is_protective(reason: str) -> bool:
+                """
+                Determine if an exit is protective (must execute even under kill switch).
+                Uses substring matching because reasons are descriptive strings like
+                "EOD FORCE CLOSE -- 15:31 ET" or "STOP HIT -- underlying at $190".
+                """
+                r = (reason or "").upper()
+                return any(k in r for k in (
+                    "EOD", "STOP", "MAX_LOSS", "THETA", "PROTECTIVE",
+                    "FORCE CLOSE", "STOP HIT", "STOP LOSS",
+                ))
+            protective = [(p, d) for p, d in actions_to_take if _is_protective(d.reason or "")]
             blocked = len(actions_to_take) - len(protective)
             if blocked:
                 log.warning(
@@ -438,7 +448,7 @@ class APExitEngine:
                     # Catches kill that fires between execute loop iterations.
                     exit_reason = decision.reason or ""
                     if self._kill_switch_fn and self._kill_switch_fn():
-                        if exit_reason not in ("EOD_FORCE_CLOSE", "STOP_LOSS", "MAX_LOSS"):
+                        if not _is_protective(exit_reason):
                             log.warning(
                                 f"[{pos.ticker}] Kill switch active — blocking non-protective exit: {exit_reason}"
                             )
@@ -451,7 +461,7 @@ class APExitEngine:
                     try:
                         self.on_exit(pos, decision)
                     except Exception as e:
-                        log.error("Exit order FAILED for %s — position remains tracked: %s", pos.symbol, e)
+                        log.error("Exit order FAILED for %s — position remains tracked: %s", pos.ticker, e)
                         continue  # don't remove, retry next cycle
                 # 2. Only mark closed after successful broker submission
                 pos.closed = True
