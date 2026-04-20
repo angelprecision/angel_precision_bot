@@ -236,7 +236,7 @@ class APBrokerReconciler:
                     broker_raw.get("filled_quantity") or 0
                 )
                 avg_fill = float(
-                    broker_raw.get("avg_fill_price") or
+                    broker_raw.get("avg_fill_price") or broker_raw.get("fill_price") or
                     broker_raw.get("price") or 0.0
                 )
                 log.warning(
@@ -321,7 +321,7 @@ class APBrokerReconciler:
                 c.execute(
                     """
                     SELECT local_order_id, broker_order_id, contract, kind,
-                           filled_qty, avg_fill_price, updated_at
+                           filled_qty, fill_price, updated_at
                     FROM orders
                     WHERE client_id=%s
                       AND status='FILLED'
