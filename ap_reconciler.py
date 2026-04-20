@@ -321,7 +321,7 @@ class APBrokerReconciler:
                 c.execute(
                     """
                     SELECT local_order_id, broker_order_id, contract, kind,
-                           filled_qty, fill_price, updated_at
+                           filled_qty, fill_price, updated_ts
                     FROM orders
                     WHERE client_id=%s
                       AND status='FILLED'
