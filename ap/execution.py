@@ -45,6 +45,8 @@ from ap.db import (
 )
 from ap.utils import json_dumps, now_utc_iso
 from ap.contract_selection import pick_expiration, resolve_contract_symbol
+# TODO: migrate pick_expiration + resolve_contract_symbol to ap/contract_selector.py
+# (functions don't exist there yet — kept here for now)
 from ap.state import (
     reserve_equity_if_available,
     release_equity,
