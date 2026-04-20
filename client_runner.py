@@ -34,6 +34,8 @@ from ap.order_monitor import APOrderMonitor
 from ap.position_sizer import APPositionSizer
 from ap.market_intelligence import APEarningsGuard, APIVRankFilter
 from ap.worker_health import get_monitor, init_monitor
+from ap_reconciler import APBrokerReconciler
+from ap_recovery   import APStartupRecovery
 from ap.self_healing import get_healer, init_self_healing
 from ap.utils import now_utc_iso
 
@@ -90,6 +92,7 @@ class ClientRunner(threading.Thread):
         # Control stack -- set during run()
         self.core              = None
         self.master_control    = None
+        self.reconciler        = None
         self.position_manager  = None
         self.order_state_machine = None
         self.contract_selector = None
@@ -267,6 +270,41 @@ class ClientRunner(threading.Thread):
                 mode_fn=lambda: getattr(self.core, "mode", "PAPER"),
             )
 
+            # Startup recovery: restore positions, verify pending orders, reseed dedup
+            try:
+                recovery = APStartupRecovery(
+                    client_id=self.email,
+                    broker=broker,
+                    osm=self.order_state_machine,
+                    pm=self.position_manager,
+                    master_control=self.master_control,
+                    exit_engine=getattr(self.core, "exit_eng", None),
+                )
+                rec_result = recovery.run()
+                logger.info(
+                    f"[{self.email}] Startup recovery complete: "
+                    f"positions={rec_result['positions_recovered']} "
+                    f"entries_corrected={rec_result['entries_corrected']} "
+                    f"exits={rec_result['exits_reattached']} "
+                    f"dedup={rec_result['dedup_seeded']}"
+                )
+            except Exception as _rec_err:
+                logger.error(f"[{self.email}] Startup recovery error: {_rec_err}")
+
+            # Broker reconciler: every 3 min, broker truth wins
+            try:
+                self.reconciler = APBrokerReconciler(
+                    broker=broker,
+                    client_id=self.email,
+                    osm=self.order_state_machine,
+                    pm=self.position_manager,
+                )
+                self.reconciler.start()
+                logger.info(f"[{self.email}] Broker reconciler started")
+            except Exception as _recon_err:
+                logger.error(f"[{self.email}] Reconciler start error: {_recon_err}")
+                self.reconciler = None
+
             # Pull live account equity so all % caps are per-client accurate
             self._sync_account_equity(broker)
 
@@ -313,6 +351,11 @@ class ClientRunner(threading.Thread):
         finally:
             if self.order_monitor:
                 self.order_monitor.stop()
+            if getattr(self, "reconciler", None):
+                try:
+                    self.reconciler.stop()
+                except Exception:
+                    pass
             if self.core:
                 self.core.stop()
             # Unregister from health monitor
