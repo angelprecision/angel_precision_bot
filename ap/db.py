@@ -208,19 +208,23 @@ class _ConnWrapper:
 
 def init_db():
     """
-    No-op for Postgres -- schema managed via Supabase SQL editor.
-    Verifies connection is healthy on startup.
-    Non-fatal: logs error but does not crash the bot if DB is temporarily unreachable.
+    Verifies Postgres connection on startup.
+    LIVE mode: DB failure is fatal -- raises RuntimeError to abort startup.
+    PAPER/SIM mode: logs error but does not crash (UptimeRobot keeps service awake).
     """
+    import os as _os_db
+    _bot_mode = _os_db.getenv("BOT_MODE", _os_db.getenv("MODE", "PAPER")).upper()
     try:
         with conn() as c:
             c.execute("SELECT 1")
         log.info("✅ Postgres connection verified")
     except Exception as e:
         log.error(f"❌ Postgres connection failed: {e}")
-        log.error("Bot will continue -- DB writes will fail until connection is restored.")
-        # Do NOT raise -- let the bot start so UptimeRobot keeps it awake
-        # and retries will reconnect on next write
+        if _bot_mode == "LIVE":
+            raise RuntimeError(
+                f"LIVE mode startup aborted -- Postgres unavailable: {e}"
+            )
+        log.error("Bot will continue in PAPER/SIM mode -- DB writes will fail until restored.")
 
 
 # =========================================================================
