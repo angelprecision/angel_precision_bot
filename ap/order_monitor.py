@@ -283,27 +283,37 @@ class APOrderMonitor:
             )
 
         if "cancel" in action:
+            broker_oid = self._get_broker_order_id(local_order_id)
+            cancel_result = None
             try:
-                # Attempt broker cancel first
-                self._cancel_broker_order(
-                    self._get_broker_order_id(local_order_id)
-                )
+                cancel_result = self._cancel_broker_order(broker_oid)
             except Exception as e:
-                log.warning(f"[{self.client_id}] Broker cancel failed: {e} — forcing local cancel")
+                log.warning(f"[{self.client_id}] Broker cancel failed: {e}")
 
-            # Force state machine to CANCELED regardless
-            ok = self.osm.transition(
-                local_order_id, "CANCELED",
-                last_error=reason,
-            )
-            if ok:
-                log.info(
-                    f"[{self.client_id}] Entry order CANCELED | {contract} "
-                    f"| {local_order_id}"
-                )
+            # Require broker-confirmed cancellation before marking local CANCELED
+            confirmed_status = ""
+            if isinstance(cancel_result, dict):
+                confirmed_status = str(cancel_result.get("status", "")).upper()
+            elif cancel_result is True:
+                confirmed_status = "CANCELED"  # legacy bool True = confirmed
+
+            is_confirmed = any(x in confirmed_status for x in ("CANCELED", "CANCELLED", "EXPIRED"))
+
+            if is_confirmed:
+                ok = self.osm.transition(local_order_id, "CANCELED", last_error=reason)
+                if ok:
+                    log.info(
+                        f"[{self.client_id}] Entry order CANCELED (broker-confirmed) | "
+                        f"{contract} | {local_order_id}"
+                    )
+                else:
+                    log.error(
+                        f"[{self.client_id}] Failed to transition entry order to CANCELED: {local_order_id}"
+                    )
             else:
-                log.error(
-                    f"[{self.client_id}] Failed to cancel entry order {local_order_id}"
+                self._alert(
+                    f"Cancel sent but NOT broker-confirmed | {self.client_id} | "
+                    f"{contract} | {local_order_id} | broker_status={confirmed_status or 'unknown'}"
                 )
 
     def _handle_stale_exit(
@@ -345,14 +355,28 @@ class APOrderMonitor:
             self._advance_from_broker_status(local_order_id, broker_status, contract)
             return
 
-        # Attempt broker cancel
-        canceled = False
+        # Attempt broker cancel — require confirmed status before local transition
+        cancel_result = None
         try:
-            canceled = self._cancel_broker_order(broker_oid)
+            cancel_result = self._cancel_broker_order(broker_oid)
         except Exception as e:
             log.warning(f"[{self.client_id}] Exit broker cancel failed: {e}")
 
-        if canceled:
+        confirmed_status = ""
+        if isinstance(cancel_result, dict):
+            confirmed_status = str(cancel_result.get("status", "")).upper()
+        elif cancel_result is True:
+            confirmed_status = "CANCELED"  # legacy bool True = confirmed
+
+        is_confirmed_canceled = any(x in confirmed_status for x in ("CANCELED", "CANCELLED", "EXPIRED"))
+
+        if not is_confirmed_canceled:
+            self._alert(
+                f"Exit cancel sent but NOT broker-confirmed | {self.client_id} | "
+                f"{contract} | {local_order_id} | broker_status={confirmed_status or 'unknown'}"
+            )
+
+        if is_confirmed_canceled:
             # Transition order to CANCELED
             self.osm.transition(local_order_id, "CANCELED", last_error=reason)
 
