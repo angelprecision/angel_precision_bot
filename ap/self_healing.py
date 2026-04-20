@@ -332,6 +332,22 @@ class APSelfHealingSystem:
                     components=components,
                 )
 
+        # Fix 7: if exit_engine is dead/unhealthy, gate new entries
+        exit_health = self._get_health(email, "exit_engine")
+        mc = getattr(runner, "master_control", None)
+        if mc is not None:
+            try:
+                if exit_health.state != HealthState.OK:
+                    mc.exit_engine_down = True
+                    log.warning(
+                        f"[{email}] exit_engine dead/unhealthy — "
+                        f"master_control.exit_engine_down=True (new entries blocked)"
+                    )
+                else:
+                    mc.exit_engine_down = False
+            except Exception:
+                pass
+
     def _handle_dead_component(
         self, email: str, runner, comp: str,
         health: ComponentHealth, auto_restart: bool, dead_severity: str,
