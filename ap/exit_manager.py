@@ -27,11 +27,11 @@ MAX_EXIT_ATTEMPTS       = 3
 MIN_EXIT_RETRY_SECONDS  = 60
 
 
-def audit(level: str, event: str, payload: dict):
+def audit(level: str, event: str, payload: dict, client_id: str = ""):
     with conn() as c:
         run_with_retry(lambda: c.execute(
-            "INSERT INTO audit_log (ts, level, event, payload) VALUES (?,?,?,?)",
-            (now_utc_iso(), level, event, json_dumps(payload)),
+            "INSERT INTO audit_log (ts, level, event, payload, client_id) VALUES (%s,%s,%s,%s,%s)",
+            (now_utc_iso(), level, event, json_dumps(payload), client_id or ""),
         ))
 
 
@@ -52,7 +52,7 @@ def mark_position_closing(position_id: str, reason: str):
         run_with_retry(lambda: c.execute("""
             UPDATE positions
             SET status='CLOSING', exit_reason=?
-            WHERE id=? AND status='OPEN'
+            WHERE id=%s AND status='OPEN'
         """, (reason, position_id)))
 
 
@@ -70,7 +70,7 @@ def mark_position_stuck(position_id: str, reason: str):
 def revert_position_open(position_id: str):
     with conn() as c:
         run_with_retry(lambda: c.execute(
-            "UPDATE positions SET status='OPEN', exit_reason=NULL WHERE id=?",
+            "UPDATE positions SET status='OPEN', exit_reason=NULL WHERE id=%s",
             (position_id,)
         ))
 
@@ -79,7 +79,7 @@ def get_failed_exit_count(position_id: str) -> int:
     with conn() as c:
         row = run_with_retry(lambda: c.execute("""
             SELECT COUNT(*) as cnt FROM orders
-            WHERE position_id=? AND kind='EXIT' AND status='REJECTED'
+            WHERE position_id=%s AND kind='EXIT' AND status='REJECTED'
         """, (position_id,)).fetchone())
         return row["cnt"] if row else 0
 
@@ -88,7 +88,7 @@ def get_last_exit_attempt_time(position_id: str):
     with conn() as c:
         row = run_with_retry(lambda: c.execute("""
             SELECT MAX(created_ts) as last_attempt FROM orders
-            WHERE position_id=? AND kind='EXIT'
+            WHERE position_id=%s AND kind='EXIT'
         """, (position_id,)).fetchone())
         if row and row["last_attempt"]:
             try:
@@ -102,7 +102,7 @@ def has_pending_exit_order(position_id: str) -> bool:
     with conn() as c:
         row = run_with_retry(lambda: c.execute("""
             SELECT 1 FROM orders
-            WHERE position_id=? AND kind='EXIT' AND status IN ('NEW','ACK','PARTIAL')
+            WHERE position_id=%s AND kind='EXIT' AND status IN ('NEW','ACK','PARTIAL')
             LIMIT 1
         """, (position_id,)).fetchone())
         return row is not None
@@ -120,7 +120,7 @@ def position_entry_filled(position_id: str, mode: str) -> bool:
     with conn() as c:
         row = run_with_retry(lambda: c.execute("""
             SELECT 1 FROM orders
-            WHERE position_id=? AND kind='ENTRY' AND status='FILLED'
+            WHERE position_id=%s AND kind='ENTRY' AND status='FILLED'
             LIMIT 1
         """, (position_id,)).fetchone())
         return row is not None
