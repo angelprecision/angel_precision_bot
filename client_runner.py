@@ -252,6 +252,8 @@ class ClientRunner(threading.Thread):
                 email=self.email,
                 position_manager=self.position_manager,
                 order_state_machine=self.order_state_machine,
+                data_broker=data_broker,         # live chains for exit engine quotes
+                master_control=self.master_control,  # ONE MC — no split-brain
             )
             self.core.start()
 
