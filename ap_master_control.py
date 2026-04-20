@@ -664,7 +664,8 @@ class APMasterControl:
                         _trigger.get("pt1") or _trigger.get("pt2"))
         # In PAPER mode: always execute immediately so orders hit Tradier sandbox.
         # In LIVE mode: use breach trigger so entry watcher waits for price confirmation.
-        _is_paper = (os.getenv("AP_MODE") or os.getenv("BOT_MODE") or "PAPER").upper() != "LIVE"
+        import os as _os_mc
+        _is_paper = (_os_mc.getenv("AP_MODE") or _os_mc.getenv("BOT_MODE") or "PAPER").upper() != "LIVE"
         trigger_type = "immediate" if _is_paper else ("breach" if entry_price else "immediate")
 
         plan = ApprovedExecutionPlan(
