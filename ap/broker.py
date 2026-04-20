@@ -127,6 +127,13 @@ class BrokerAdapter:
     def close_position(self, position_id: str) -> BrokerOrderResponse:
         raise NotImplementedError
 
+    def cancel_order(self, broker_order_id: str) -> dict:
+        """
+        Cancel a live broker order. Must query broker after cancel to confirm.
+        Returns: {"ok": bool, "status": str, "broker_order_id": str, "error": str|None}
+        """
+        raise NotImplementedError
+
 
 # ============================================================
 # SIM BROKER (for pipeline testing)
