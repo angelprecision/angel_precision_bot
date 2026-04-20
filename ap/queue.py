@@ -399,12 +399,12 @@ def _dispatch(
                                     f"broker_id={_broker_order_id} "
                                     f"status={getattr(_resp, 'status', '?')}"
                                 )
-                                # Save broker_order_id to orders table
+                                # Save broker_order_id directly — avoids state machine
+                                # transition rules blocking a SUBMITTED→SUBMITTED no-op
                                 if _broker_order_id:
-                                    order_state_machine.transition(
-                                        local_order_id, "SUBMITTED",
-                                        broker_order_id=_broker_order_id,
-                                    )
+                                    from ap.db import update_order as _upd_order
+                                    _upd_order(local_order_id,
+                                               broker_order_id=_broker_order_id)
                             except Exception as _be:
                                 log.warning(f"[{ticker}] Sandbox order failed ({_be}) -- continuing with local paper fill")
                                 _broker_order_id = ""
