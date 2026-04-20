@@ -662,7 +662,10 @@ class APMasterControl:
         stop_price   = signal.get("stop_price")  or _trigger.get("stop")
         target_price = (signal.get("target_price") or
                         _trigger.get("pt1") or _trigger.get("pt2"))
-        trigger_type = "breach" if entry_price else "immediate"
+        # In PAPER mode: always execute immediately so orders hit Tradier sandbox.
+        # In LIVE mode: use breach trigger so entry watcher waits for price confirmation.
+        _is_paper = (os.getenv("AP_MODE") or os.getenv("BOT_MODE") or "PAPER").upper() != "LIVE"
+        trigger_type = "immediate" if _is_paper else ("breach" if entry_price else "immediate")
 
         plan = ApprovedExecutionPlan(
             plan_id           = str(uuid.uuid4()),
