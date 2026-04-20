@@ -344,23 +344,18 @@ class APExitEngine:
             log.error("seed_from_db FAILED — open positions have NO exit protection: %s", e)
 
     def _exit_loop(self):
-        # Import worker health lazily to avoid circular imports
-        try:
-            from ap_worker_health import get_monitor as _get_monitor
-            _health_mon = _get_monitor()
-        except Exception:
-            _health_mon = None
-
         while self._running:
             try:
                 self._check_all_positions()
             except Exception as e:
                 log.error(f"Exit engine error: {e}", exc_info=True)
 
-            # Heartbeat ping so self-healer knows we are alive
+            # Heartbeat so self-healer knows exit engine is alive and progressing
             try:
-                if _health_mon is not None:
-                    _health_mon.ping(self._email, "exit_engine")
+                from ap.self_healing import get_healer as _get_healer
+                _healer = _get_healer()
+                if _healer is not None and self._email:
+                    _healer.heartbeat(self._email, "exit_engine")
             except Exception:
                 pass
 
