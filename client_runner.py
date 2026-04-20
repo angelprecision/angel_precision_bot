@@ -52,13 +52,15 @@ SUPABASE_URL         = os.getenv("SUPABASE_URL", "")
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY", "")
 
 # ── Encryption ────────────────────────────────────────────────────────────────
+# Defer ENCRYPTION_KEY validation to call time so supervisor can start even if
+# key is not set (it will fail when a specific client tries to decrypt their token).
 _raw_key = os.getenv("ENCRYPTION_KEY", "").strip()
-if not _raw_key:
-    raise RuntimeError("ENCRYPTION_KEY env var is required and not set")
-_key_bytes = hashlib.sha256(_raw_key.encode()).digest()
-_fernet    = Fernet(base64.urlsafe_b64encode(_key_bytes))
 
 def decrypt_token(ciphertext: str) -> str:
+    if not _raw_key:
+        raise RuntimeError("ENCRYPTION_KEY env var is required and not set")
+    _key_bytes = hashlib.sha256(_raw_key.encode()).digest()
+    _fernet    = Fernet(base64.urlsafe_b64encode(_key_bytes))
     return _fernet.decrypt(ciphertext.encode()).decode()
 
 # ── Active runner registry ────────────────────────────────────────────────────
