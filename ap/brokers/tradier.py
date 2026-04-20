@@ -268,3 +268,30 @@ class TradierBroker(BrokerAdapter):
             raw=None,
         )
 
+
+
+    def cancel_order(self, broker_order_id: str) -> dict:
+        """Cancel a live order via Tradier DELETE + confirm with re-query."""
+        try:
+            resp = self.session.delete(
+                f"{self.cfg.base_url}/v1/accounts/{self.cfg.account_id}/orders/{broker_order_id}",
+                headers={"Accept": "application/json"},
+            )
+            raw = resp.json() if resp.content else {}
+            status = str((raw.get("order") or raw).get("status", "")).lower()
+            ok = resp.status_code in (200, 204) or status in ("ok", "canceled", "cancelled")
+            confirmed_status = status
+            try:
+                confirmed = self.get_order(broker_order_id)
+                confirmed_status = confirmed.get("status", status)
+            except Exception:
+                pass
+            log.info("TRADIER_CANCEL | order=%s http=%d confirmed=%s",
+                     broker_order_id, resp.status_code, confirmed_status)
+            return {"ok": ok, "status": confirmed_status,
+                    "broker_order_id": broker_order_id, "raw": raw,
+                    "error": None if ok else f"cancel_http_{resp.status_code}"}
+        except Exception as e:
+            log.error("TRADIER_CANCEL_FAILED | order=%s error=%s", broker_order_id, e)
+            return {"ok": False, "status": "unknown",
+                    "broker_order_id": broker_order_id, "raw": {}, "error": str(e)}
