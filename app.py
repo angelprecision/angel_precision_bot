@@ -385,10 +385,17 @@ def create_app() -> Flask:
     log.info("✅ Broker initialized")
 
     if os.getenv("RUN_SUPERVISOR") == "1":
-        log.info("Supervisor active — skipping legacy worker threads")
+        log.info("Supervisor active — legacy worker threads DISABLED")
     else:
+        # Fix 5: hard block LIVE mode without supervisor
+        _mode_now = os.getenv("BOT_MODE", os.getenv("MODE", "PAPER")).upper()
+        if _mode_now == "LIVE":
+            raise RuntimeError(
+                "LIVE mode requires RUN_SUPERVISOR=1. "
+                "Set RUN_SUPERVISOR=1 in Render env vars or switch to PAPER mode."
+            )
         start_background_threads_once(broker)
-        log.info("Background threads started (legacy path)")
+        log.info("Background threads started (legacy path — PAPER/SIM only)")
 
     # Register blueprints
     # Blueprints not yet built -- routes registered inline above
