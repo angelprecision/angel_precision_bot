@@ -389,13 +389,25 @@ def _dispatch(
                                     side="buy_to_open",
                                 )
                                 _submitted_to_broker = True
+                                _broker_order_id = str(
+                                    getattr(_resp, "broker_order_id", None)
+                                    or getattr(_resp, "order_id", None)
+                                    or ""
+                                )
                                 log.info(
                                     f"[{ticker}] SANDBOX ORDER SUBMITTED | "
-                                    f"broker_id={getattr(_resp, 'broker_order_id', '?')} "
+                                    f"broker_id={_broker_order_id} "
                                     f"status={getattr(_resp, 'status', '?')}"
                                 )
+                                # Save broker_order_id to orders table
+                                if _broker_order_id:
+                                    order_state_machine.transition(
+                                        local_order_id, "SUBMITTED",
+                                        broker_order_id=_broker_order_id,
+                                    )
                             except Exception as _be:
                                 log.warning(f"[{ticker}] Sandbox order failed ({_be}) -- continuing with local paper fill")
+                                _broker_order_id = ""
 
                         order_state_machine.transition(
                             local_order_id, "FILLED",
