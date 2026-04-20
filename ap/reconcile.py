@@ -40,7 +40,7 @@ BROKER_CALL_SLEEP   = 0.15   # seconds between broker API calls — avoids rate-
 def audit(client_id: str, level: str, event: str, payload: dict):
     with conn() as c:
         run_with_retry(lambda: c.execute(
-            "INSERT INTO audit_log (ts, level, event, payload, client_id) VALUES (?,?,?,?,?)",
+            "INSERT INTO audit_log (ts, level, event, payload, client_id) VALUES (%s,%s,%s,%s,%s)",
             (now_utc_iso(), level, event, json_dumps(payload), client_id),
         ))
 
@@ -146,7 +146,7 @@ def _get_open_orders(client_id: str, limit: int = 50) -> list[dict]:
             SELECT id, local_order_id, broker_order_id, status, kind,
                    symbol, contract, qty, position_id, filled_qty, client_id
             FROM orders
-            WHERE client_id = ?
+            WHERE client_id = %s
               AND broker_order_id IS NOT NULL
               AND broker_order_id != 'N/A'
               AND status IN ('NEW', 'ACK', 'PARTIAL')
@@ -182,8 +182,8 @@ def _create_position_from_entry(order_row: dict, fill_price: float, filled_qty: 
         # Auto-cancel the order so it stops appearing in _get_open_orders
         with conn() as c:
             run_with_retry(lambda: c.execute(
-                "UPDATE orders SET status='CANCELED', last_error=?, updated_ts=? "
-                "WHERE local_order_id=?",
+                "UPDATE orders SET status='CANCELED', last_error=%s, updated_ts=%s "
+                "WHERE local_order_id=%s",
                 (
                     "auto-canceled: contract expired at reconcile time",
                     now_utc_iso(),
@@ -210,7 +210,7 @@ def _create_position_from_entry(order_row: dict, fill_price: float, filled_qty: 
                 id, client_id, underlying, contract, direction,
                 qty, avg_fill, entry_ts, tp_pct, sl_pct, status
             )
-            VALUES (?,?,?,?,?,?,?,?,?,?,?)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             """,
             (
                 pos_id,
@@ -229,7 +229,7 @@ def _create_position_from_entry(order_row: dict, fill_price: float, filled_qty: 
 
         # Link order -> position
         run_with_retry(lambda: c.execute(
-            "UPDATE orders SET position_id=?, updated_ts=? WHERE local_order_id=?",
+            "UPDATE orders SET position_id=%s, updated_ts=%s WHERE local_order_id=%s",
             (pos_id, now_utc_iso(), order_row["local_order_id"]),
         ))
 
@@ -255,7 +255,7 @@ def _close_position_from_exit(order_row: dict, fill_price: float):
 
     with conn() as c:
         pos = run_with_retry(lambda: c.execute(
-            "SELECT id, client_id, qty, avg_fill, status FROM positions WHERE id=? AND client_id=?",
+            "SELECT id, client_id, qty, avg_fill, status FROM positions WHERE id=%s AND client_id=%s",
             (position_id, client_id),
         ).fetchone())
 
@@ -279,9 +279,9 @@ def _close_position_from_exit(order_row: dict, fill_price: float):
         run_with_retry(lambda: c.execute(
             """
             UPDATE positions
-            SET status='CLOSED', exit_ts=?, exit_price=?,
+            SET status='CLOSED', exit_ts=%s, exit_price=%s,
                 exit_reason='EXIT_FILLED', realized_pnl=?
-            WHERE id=? AND client_id=?
+            WHERE id=%s AND client_id=%s
             """,
             (now_utc_iso(), float(fill_price), float(realized_pnl), position_id, client_id),
         ))
@@ -290,8 +290,8 @@ def _close_position_from_exit(order_row: dict, fill_price: float):
         run_with_retry(lambda: c.execute(
             """
             UPDATE client_state
-            SET realized_pnl_today = COALESCE(realized_pnl_today, 0.0) + ?
-            WHERE client_id = ?
+            SET realized_pnl_today = COALESCE(realized_pnl_today, 0.0) + %s
+            WHERE client_id = %s
             """,
             (float(realized_pnl), client_id),
         ))
