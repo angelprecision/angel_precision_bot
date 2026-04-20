@@ -593,12 +593,15 @@ def create_app() -> Flask:
         body["signal_id"] = _sig_id
 
         try:
-            route_signal_to_all_clients(body)
+            enqueued = route_signal_to_all_clients(body)
             log.info(
                 f"Signal routed: {body.get('ticker')} {body.get('side')} "
-                f"score={body.get('score')} sig={_sig_id}"
+                f"score={body.get('score')} sig={_sig_id} enqueued={enqueued}"
             )
-            payload = {"ok": True, "queued": True, "signal_id": _sig_id}
+            if not enqueued:
+                payload = {"ok": False, "error": "no_active_clients", "signal_id": _sig_id}
+                return jsonify(payload), 503
+            payload = {"ok": True, "queued": True, "signal_id": _sig_id, "enqueued": enqueued}
             _idem_set(idem_key, payload)
             return jsonify(payload), 202
         except Exception as _e:
