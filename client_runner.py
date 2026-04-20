@@ -183,20 +183,49 @@ class ClientRunner(threading.Thread):
                 min_history        = int(os.getenv("KELLY_MIN_HISTORY",    "20")),
             )
 
+            # ── Load per-client limits from clients table (overrides env defaults) ──
+            _client_cfg = {}
+            try:
+                from ap.db import run_with_retry, conn as _conn
+                def _load_cfg():
+                    with _conn() as _c:
+                        _c.execute(
+                            "SELECT max_trades_per_day, max_concurrent_positions, "
+                            "daily_max_loss_pct, initial_equity "
+                            "FROM clients WHERE client_id=%s",
+                            (self.email,)
+                        )
+                        return _c.fetchone()
+                _client_cfg = run_with_retry(_load_cfg) or {}
+            except Exception as _cfg_err:
+                logger.warning(f"[{self.email}] Could not load client config: {_cfg_err}")
+
+            _equity      = float(_client_cfg.get("initial_equity", os.getenv("ACCOUNT_EQUITY", "25000")) or 25000)
+            _max_trades  = int(_client_cfg.get("max_trades_per_day", os.getenv("MAX_TRADES_TODAY", "10")) or 10)
+            _max_pos     = int(_client_cfg.get("max_concurrent_positions", os.getenv("MAX_POSITIONS", "10")) or 10)
+            _loss_pct    = float(_client_cfg.get("daily_max_loss_pct", 0.06) or 0.06)
+            _max_loss    = -abs(_equity * _loss_pct)
+
+            logger.info(
+                f"[{self.email}] Client limits loaded | "
+                f"max_trades={_max_trades} max_pos={_max_pos} "
+                f"daily_loss=${_max_loss:.0f} ({_loss_pct*100:.0f}%)"
+            )
+
             self.master_control = APMasterControl(
                 mode=os.getenv("AP_MODE", "paper"),
                 client_id=self.email,
-                score_floor=float(os.getenv("SCORE_FLOOR", "65")),  # Tier B floor=65
-                context_floor=float(os.getenv("CONTEXT_FLOOR", "0.0")),  # disabled: 4.0→0.0
-                max_positions=int(os.getenv("MAX_POSITIONS", "10")),  # raised: 7→10
+                score_floor=float(os.getenv("SCORE_FLOOR", "65")),
+                context_floor=float(os.getenv("CONTEXT_FLOOR", "0.0")),
+                max_positions=_max_pos,
                 max_capital_pct=float(os.getenv("MAX_CAPITAL_PCT", "0.40")),
                 max_sector_pct=float(os.getenv("MAX_SECTOR_PCT", "0.25")),
                 max_ticker_pct=float(os.getenv("MAX_TICKER_PCT", "0.10")),
                 max_calls=int(os.getenv("MAX_CALLS", "5")),
                 max_puts=int(os.getenv("MAX_PUTS", "5")),
-                max_trades_today=int(os.getenv("MAX_TRADES_TODAY", "10")),
-                max_daily_loss=float(os.getenv("MAX_DAILY_LOSS", "-500")),
-                account_equity=float(os.getenv("ACCOUNT_EQUITY", "25000")),
+                max_trades_today=_max_trades,
+                max_daily_loss=_max_loss,
+                account_equity=_equity,
                 position_manager=self.position_manager,
                 position_sizer=position_sizer,
                 supabase_client=sb,
