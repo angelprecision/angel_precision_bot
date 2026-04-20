@@ -144,15 +144,22 @@ class APPositionSizer:
                 rows, premium_per_contract, account_equity
             )
             if kelly_raw is not None and kelly_raw <= 0:
-                log.info("Kelly edge <= 0 (raw=%.4f) -- blocking trade", kelly_raw)
+                # FIX: zero losses (all wins) or no edge → fall back to tier, not block.
+                # Blocking a trade because a client has only won is wrong behavior.
+                log.info(
+                    "Kelly edge <= 0 (raw=%.4f) -- falling back to tier sizing (not blocking)",
+                    kelly_raw
+                )
+                fallback_qty = self._tier_fallback(tier_upper)
                 return SizingResult(
-                    contracts=0,
-                    method="blocked",
+                    contracts=fallback_qty,
+                    method="tier_fallback",
                     win_rate=win_rate,
                     kelly_raw=kelly_raw,
                     throttle_applied=False,
                     drawdown_today=drawdown,
-                    reason=f"kelly_no_edge: win_rate={win_rate:.3f} kelly_raw={kelly_raw:.4f}",
+                    reason=(f"kelly_no_edge_tier_fallback: win_rate={win_rate:.3f} "
+                            f"kelly_raw={kelly_raw:.4f} → tier={tier_upper} {fallback_qty}c"),
                 )
             edge_per_dollar = (
                 (win_rate * kelly_raw) if (win_rate is not None and kelly_raw is not None)
