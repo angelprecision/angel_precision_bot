@@ -592,36 +592,15 @@ def worker_loop(
 
             # ── LEGACY FALLBACK (paper mode only) ────────────────────────────
             else:
-                # LIVE MODE: fallback is NEVER allowed -- block and alert
-                if live_mode:
-                    log.error(
-                        f"[{client_id}] LIVE MODE -- master_control required. "
-                        f"Rejecting {signal_id} without fallback."
-                    )
-                    _mark_job(job_id, "REJECTED",
-                              error="live_mode_no_fallback_no_master_control")
-                else:
-                    log.debug(f"[legacy/paper] processing {signal_id}")
-                    try:
-                        from ap.execution import process_signal
-                        result = process_signal(
-                            broker=broker,
-                            client_id=job_cid,
-                            signal_payload=payload,
-                        )
-                        ok     = bool(result.get("ok"))
-                        status = "DONE" if ok else "REJECTED"
-                        error  = None if ok else (
-                            result.get("error") or result.get("reason") or "unknown"
-                        )
-                        _mark_job(job_id, status, result=result, error=error)
-                        if ok:
-                            log.info(f"✅ [legacy/paper] {signal_id}: {result.get('contract')}")
-                        else:
-                            log.warning(f"❌ [legacy/paper] {signal_id}: {error}")
-                    except Exception as e:
-                        log.error(f"[legacy/paper] execution error: {e}", exc_info=True)
-                        _mark_job(job_id, "ERROR", error=str(e))
+                # ONE PATH ONLY — master_control is required in all modes.
+                # Legacy process_signal() fallback is permanently disabled.
+                # If master_control is missing, the runner failed to initialize.
+                log.error(
+                    f"[{client_id}] master_control not available — "
+                    f"rejecting {signal_id}. Check runner startup logs."
+                )
+                _mark_job(job_id, "REJECTED",
+                          error="master_control_required_not_initialized")
 
         except Exception as e:
             log.error(f"Worker loop error: {e}", exc_info=True)
