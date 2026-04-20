@@ -472,7 +472,7 @@ def route_signal_to_all_clients(signal: dict):
         if not active_emails:
             # Truly no members -- last resort fallback
             logger.error(f"Signal {signal_id} [{ticker}] -- no members found, dropping")
-            return
+            return 0
 
     # Fan-out: one queue entry per active client
     enqueued = 0
@@ -497,6 +497,7 @@ def route_signal_to_all_clients(signal: dict):
         f"Signal {signal_id} [{ticker}] fan-out complete -- "
         f"{enqueued}/{len(active_emails)} clients queued"
     )
+    return enqueued
 
 
 # =============================================================================
