@@ -372,6 +372,11 @@ class APMasterControl:
 
         # ── A. SYSTEM GATES ───────────────────────────────────────────────────
 
+        # Fix 7: hard gate -- if exit engine is down, refuse new entries
+        if getattr(self, 'exit_engine_down', False):
+            return self._block(signal_id, ticker, client_id,
+                               "blocked_system", "exit_engine_down__protective_systems_unavailable")
+
         if self._kill_switch_fn and self._kill_switch_fn():
             return self._block(signal_id, ticker, client_id,
                                "blocked_system", "kill_switch_active")
@@ -630,14 +635,10 @@ class APMasterControl:
                     f"throttle={sizing.throttle_applied} "
                     f"reason={sizing.reason}"
                 )
-                # Fix 2: force minimum 1 contract in paper mode instead of blocking
+                # Block if sizer says 0 (negative edge or hard stop)
                 if contracts <= 0:
-                    if self.mode.upper() != "LIVE":
-                        log.warning(f"[{ticker}] Sizer returned 0 contracts -- forcing 1 (paper mode data collection)")
-                        contracts = 1
-                    else:
-                        return self._block(signal_id, ticker, client_id, "blocked_risk",
-                                           f"sizer_blocked: {sizing.reason}")
+                    return self._block(signal_id, ticker, client_id, "blocked_risk",
+                                       f"sizer_blocked: {sizing.reason}")
                 # Intel cap still applies
                 if intel_avail and intel_contracts > 0:
                     contracts = min(contracts, intel_contracts)
@@ -662,11 +663,7 @@ class APMasterControl:
         stop_price   = signal.get("stop_price")  or _trigger.get("stop")
         target_price = (signal.get("target_price") or
                         _trigger.get("pt1") or _trigger.get("pt2"))
-        # In PAPER mode: always execute immediately so orders hit Tradier sandbox.
-        # In LIVE mode: use breach trigger so entry watcher waits for price confirmation.
-        import os as _os_mc
-        _is_paper = (_os_mc.getenv("AP_MODE") or _os_mc.getenv("BOT_MODE") or "PAPER").upper() != "LIVE"
-        trigger_type = "immediate" if _is_paper else ("breach" if entry_price else "immediate")
+        trigger_type = "breach" if entry_price else "immediate"
 
         plan = ApprovedExecutionPlan(
             plan_id           = str(uuid.uuid4()),
@@ -787,8 +784,7 @@ class APMasterControl:
             _trigger = signal.get("trigger") or {}
             price = (signal.get("entry_price") or _trigger.get("entry") or
                      signal.get("current_price") or 100.0)
-            result = run_intelligence_check(signal, underlying_price=float(price),
-                                              client_id=self._client_id)
+            result = run_intelligence_check(signal, underlying_price=float(price))
             result["_available"] = True
             return result
         except Exception as e:
@@ -1148,13 +1144,7 @@ class APMasterControl:
                     return c.fetchall()
             rows = run_with_retry(_load)
             for row in rows:
-                key = row["k"]
-                if key.startswith("dedup:setup:"):
-                    self._seen_signals.add(key[len("dedup:setup:"):])
-                elif key.startswith("dedup:sig:"):
-                    self._seen_signals.add(key[len("dedup:"):])
-                else:
-                    self._seen_signals.add(key.replace("dedup:", "", 1))
+                self._seen_signals.add(row["k"].replace("dedup:", "", 1))
             if rows:
                 log.info(
                     f"[{client_id}] Dedup seeded: {len(rows)} entries "
