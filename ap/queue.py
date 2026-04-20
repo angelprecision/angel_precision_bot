@@ -255,6 +255,7 @@ def _dispatch(
     entry_watcher,
     position_manager=None,
     exit_eng=None,
+    broker=None,
 ):
     """
     Unified control path:
@@ -574,6 +575,7 @@ def worker_loop(
                     entry_watcher=entry_watcher,
                     position_manager=position_manager,
                     exit_eng=exit_eng,
+                    broker=broker,
                 )
 
             # ── LEGACY FALLBACK (paper mode only) ────────────────────────────
