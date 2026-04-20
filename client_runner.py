@@ -50,7 +50,9 @@ SUPABASE_URL         = os.getenv("SUPABASE_URL", "")
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY", "")
 
 # ── Encryption ────────────────────────────────────────────────────────────────
-_raw_key   = os.getenv("ENCRYPTION_KEY", "angel-precision-encrypt-2026")
+_raw_key = os.getenv("ENCRYPTION_KEY", "").strip()
+if not _raw_key:
+    raise RuntimeError("ENCRYPTION_KEY env var is required and not set")
 _key_bytes = hashlib.sha256(_raw_key.encode()).digest()
 _fernet    = Fernet(base64.urlsafe_b64encode(_key_bytes))
 
@@ -255,6 +257,7 @@ class ClientRunner(threading.Thread):
                 position_manager=self.position_manager,
                 order_state_machine=self.order_state_machine,
                 data_broker=data_broker,  # live api.tradier.com for exit engine quotes
+                master_control=self.master_control,  # Fix: single decision authority per client
             )
             self.core.start()
 
