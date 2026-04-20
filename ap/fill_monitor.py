@@ -53,7 +53,15 @@ def get_pending_orders():
                 created_ts
             FROM orders
             WHERE kind IN ('ENTRY','EXIT')
-              AND status IN ('CREATED','SUBMITTED','ACKNOWLEDGED','PARTIAL_FILL') -- canonical statuses from APOrderStateMachine
+              AND status IN (
+              'CREATED',
+              'SUBMITTED',
+              'ACKNOWLEDGED',
+              'PARTIAL_FILL',
+              'EXIT_SUBMITTED',
+              'EXIT_ACKNOWLEDGED',
+              'EXIT_PARTIAL_FILL'
+            ) -- canonical statuses from APOrderStateMachine
               AND broker_order_id IS NOT NULL
               AND broker_order_id != 'N/A'
             ORDER BY created_ts ASC
@@ -203,13 +211,13 @@ def check_order_with_broker(broker: BrokerAdapter, order: dict) -> dict:
         status = (raw.get("status") or "").upper()
 
         status_map = {
-            "FILLED": "FILLED",
-            "OPEN": "ACK",
-            "PENDING": "ACK",
-            "PARTIALLY_FILLED": "PARTIAL",
-            "CANCELED": "CANCELED",
-            "REJECTED": "REJECTED",
-            "EXPIRED": "EXPIRED",
+            "FILLED":           "FILLED",
+            "OPEN":             "ACKNOWLEDGED",
+            "PENDING":          "ACKNOWLEDGED",
+            "PARTIALLY_FILLED": "PARTIAL_FILL",
+            "CANCELED":         "CANCELED",
+            "REJECTED":         "REJECTED",
+            "EXPIRED":          "EXPIRED",
         }
         our = status_map.get(status, "UNKNOWN")
 
@@ -284,8 +292,8 @@ def process_pending_order(broker: BrokerAdapter, order: dict):
         })
         return
 
-    if result["status"] == "PARTIAL":
-        update_order_status(local_id, "PARTIAL", filled_qty=result["filled_qty"])
+    if result["status"] == "PARTIAL_FILL":
+        update_order_status(local_id, "PARTIAL_FILL", filled_qty=result["filled_qty"])
         audit(client_id, "INFO", "ORDER_PARTIAL", {
             "local_order_id": local_id,
             "broker_order_id": broker_id,
@@ -316,7 +324,7 @@ def process_pending_order(broker: BrokerAdapter, order: dict):
         })
         return
 
-    if result["status"] == "ACK":
+    if result["status"] == "ACKNOWLEDGED":
         # Still pending - log a warning if it's been pending too long
         try:
             created = datetime.fromisoformat(order["created_ts"])
