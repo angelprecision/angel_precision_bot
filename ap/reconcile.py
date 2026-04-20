@@ -397,3 +397,30 @@ def reconcile_once(broker, client_id: str = "default", limit: int = 50) -> int:
             time.sleep(BROKER_CALL_SLEEP)
 
     return processed
+
+def run_reconciliation(client_id: str, broker=None, limit: int = 50) -> dict:
+    """
+    Compatibility wrapper called by admin_api.py.
+    Resolves broker from the active ClientRunner if not provided.
+    """
+    if broker is None:
+        try:
+            from client_runner import _active_runners
+            runner = _active_runners.get(client_id)
+            if runner is None:
+                # Try finding any runner for this client
+                for email, r in _active_runners.items():
+                    if email == client_id:
+                        runner = r
+                        break
+            broker = getattr(getattr(runner, "core", None), "broker", None) if runner else None
+        except Exception:
+            broker = None
+
+    if broker is None:
+        return {"ok": False, "client_id": client_id, "error": "no_broker_available",
+                "processed": 0}
+
+    processed = reconcile_once(broker=broker, client_id=client_id, limit=limit)
+    return {"ok": True, "client_id": client_id, "processed": processed}
+
