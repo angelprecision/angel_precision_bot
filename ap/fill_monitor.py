@@ -53,7 +53,7 @@ def get_pending_orders():
                 created_ts
             FROM orders
             WHERE kind IN ('ENTRY','EXIT')
-              AND status IN ('NEW','ACK','PARTIAL')
+              AND status IN ('CREATED','SUBMITTED','ACKNOWLEDGED','PARTIAL_FILL') -- canonical statuses from APOrderStateMachine
               AND broker_order_id IS NOT NULL
               AND broker_order_id != 'N/A'
             ORDER BY created_ts ASC
