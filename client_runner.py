@@ -394,9 +394,14 @@ class ClientRunner(threading.Thread):
             # Runs in its own daemon thread, dispatches via full control stack
             self._start_worker_thread(broker)
 
-            # Keep runner alive
+            # Keep runner alive — heartbeat so self-healer sees progress
+            _healer_ref = get_healer()
             while not self.stopped.wait(60):
-                pass
+                try:
+                    if _healer_ref:
+                        _healer_ref.heartbeat(self.email, "runner")
+                except Exception:
+                    pass
 
         except Exception as e:
             logger.error(f"[{self.email}] Runner crashed: {e}", exc_info=True)
@@ -458,8 +463,15 @@ class ClientRunner(threading.Thread):
 
         def _refresh_loop():
             nonlocal _reset_done_for_date
+            _eq_healer = get_healer()
             while not self.stopped.wait(900):  # 15 min
                 self._sync_account_equity(broker)
+                # Heartbeat — must be < STALL_THRESHOLD_SEC so raise threshold in self-healer
+                try:
+                    if _eq_healer:
+                        _eq_healer.heartbeat(self.email, "equity_refresh")
+                except Exception:
+                    pass
 
                 # Daily session reset at 9:30 AM ET
                 # Fires once per calendar date, within one 15-min cycle of open
