@@ -327,8 +327,8 @@ class APBrokerReconciler:
                       AND status='FILLED'
                       AND broker_order_id IS NOT NULL
                       AND broker_order_id NOT IN ('N/A','PENDING','')
-                      AND updated_at > NOW() - INTERVAL '2 hours'
-                    ORDER BY updated_at DESC
+                      AND updated_ts > NOW() - INTERVAL '2 hours'
+                    ORDER BY updated_ts DESC
                     LIMIT 20
                     """,
                     (self.client_id,),
@@ -482,7 +482,7 @@ class APBrokerReconciler:
                 with conn() as c:
                     c.execute(
                         "UPDATE positions SET status='OPEN', exit_reason=NULL, "
-                        "updated_at=NOW() WHERE id=%s AND client_id=%s AND status='CLOSING'",
+                        "updated_ts=NOW() WHERE id=%s AND client_id=%s AND status='CLOSING'",
                         (position_id, self.client_id),
                     )
             run_with_retry(_revert)
