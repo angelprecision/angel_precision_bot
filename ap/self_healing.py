@@ -308,21 +308,23 @@ class APSelfHealingSystem:
                 # component itself — never by the health checker.  This
                 # ensures stalls are detected even when the thread is alive.
                 age_secs = (_now() - health.last_seen).total_seconds()
-                if age_secs > STALL_THRESHOLD_SEC and health.state == HealthState.OK:
+                # equity_refresh sleeps 900s between runs — use a higher threshold
+                _comp_threshold = 1000 if comp == "equity_refresh" else STALL_THRESHOLD_SEC
+                if age_secs > _comp_threshold and health.state == HealthState.OK:
                     health.state = HealthState.WARNING
                     log.warning(
                         f"[{email}] {comp} STALLED — alive but no heartbeat "
-                        f"for {age_secs:.0f}s > {STALL_THRESHOLD_SEC}s threshold"
+                        f"for {age_secs:.0f}s > {_comp_threshold}s threshold"
                     )
                     if health.cooldown_ok():
                         self._alert(
                             email, comp, HealthState.WARNING,
                             f"Thread alive but stalled for {age_secs:.0f}s "
-                            f"(threshold={STALL_THRESHOLD_SEC}s). "
+                            f"(threshold={_comp_threshold}s). "
                             f"Consider manual investigation.",
                             health
                         )
-                elif age_secs <= STALL_THRESHOLD_SEC:
+                elif age_secs <= _comp_threshold:
                     health.state = HealthState.OK
             else:
                 self._handle_dead_component(
