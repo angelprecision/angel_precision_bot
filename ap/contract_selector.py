@@ -116,7 +116,7 @@ class APContractSelectionEngine:
         min_oi:         int   = 1,    # lowered 50→1 -- any open interest passes in paper mode
         min_volume:     int   = 0,    # lowered 10→0 -- volume check disabled for data collection
         min_premium:    float = 10.0,    # $0.10/share -- allow cheap weeklies
-        max_premium:    float = 400.0,   # $4.00/share = $400/contract hard cap
+        max_premium:    float = 200.0,   # $2.00/share = $200/contract hard cap (paper data quality)
         max_dte:        int   = 21,
         min_dte:        int   = 0,
         prefer_weekly:  bool  = True,
@@ -342,6 +342,14 @@ class APContractSelectionEngine:
         # Live mode: hard block — never trade what you can't afford
         if selected.affordable_contracts < 1:
             if self.mode.upper() != "LIVE":
+                # Hard ceiling: never force contracts that exceed max_premium
+                # This prevents $500+ fills from polluting paper data
+                if selected.premium_per_contract > self.max_premium:
+                    log.warning(
+                        "[%s] premium $%.0f > max $%.0f -- skipping (too expensive for paper)",
+                        ticker, selected.premium_per_contract, self.max_premium,
+                    )
+                    return None
                 log.warning(
                     "[%s] budget $%.0f < premium $%.0f -- forcing 1 contract (paper data collection)",
                     ticker, budget, selected.premium_per_contract,
