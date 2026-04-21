@@ -295,9 +295,8 @@ class APMasterControl:
                         FROM orders
                         WHERE client_id = %s
                           AND kind = 'ENTRY'
-                          AND status IN (
-                              'CREATED','SUBMITTED','ACKNOWLEDGED','PARTIAL_FILL'
-                          )
+                          AND status = 'CREATED'
+                          AND (broker_order_id IS NULL OR broker_order_id = '')
                         """,
                         (client_id,),
                     )
