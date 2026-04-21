@@ -855,17 +855,58 @@ class APExecutionCore:
         )
 
     def _fetch_0dte_chain(self, ticker: str) -> tuple[list, str]:
+        """
+        Fetch option chain for ticker. Tries today (0DTE) first,
+        then falls back to nearest available expiry (weekly).
+        Handles Tradier returning {"options": null} gracefully.
+        """
+        base_url = self._broker_base_url()
+        headers  = {"Accept": "application/json",
+                    "Authorization": f"Bearer {getattr(getattr(self.broker, 'cfg', None), 'access_token', '') or ''}"}
+
+        def _get_chain(expiry: str) -> list:
+            resp = self.broker.session.get(
+                f"{base_url}/v1/markets/options/chains",
+                params  = {"symbol": ticker, "expiration": expiry, "greeks": "true"},
+                headers = {"Accept": "application/json"},
+                timeout = 10,
+            )
+            raw     = resp.json() or {}
+            options = (raw.get("options") or {}).get("option", []) if raw.get("options") else []
+            if isinstance(options, dict):
+                options = [options]
+            return options or []
+
         today = date.today().strftime("%Y-%m-%d")
-        resp  = self.broker.session.get(
-            f"{self._broker_base_url()}/v1/markets/options/chains",
-            params  = {"symbol": ticker, "expiration": today, "greeks": "true"},
-            headers = {"Accept": "application/json"},
-            timeout = 10,
-        )
-        options = resp.json().get("options", {}).get("option", [])
-        if isinstance(options, dict):
-            options = [options]
-        return options or [], today
+
+        # Try today first (0DTE)
+        options = _get_chain(today)
+        if options:
+            return options, today
+
+        # Fall back to nearest expiry from broker
+        try:
+            exp_resp = self.broker.session.get(
+                f"{base_url}/v1/markets/options/expirations",
+                params  = {"symbol": ticker, "includeAllRoots": "true"},
+                headers = {"Accept": "application/json"},
+                timeout = 10,
+            )
+            exp_data = exp_resp.json() or {}
+            expirations = (exp_data.get("expirations") or {}).get("date", [])
+            if isinstance(expirations, str):
+                expirations = [expirations]
+            # Pick nearest future expiry
+            for exp in sorted(expirations):
+                if exp >= today:
+                    options = _get_chain(exp)
+                    if options:
+                        log.info(f"[{ticker}] No 0DTE chain — using nearest expiry {exp} ({len(options)} contracts)")
+                        return options, exp
+        except Exception as exp_err:
+            log.warning(f"[{ticker}] Expiry lookup failed: {exp_err}")
+
+        return [], today
 
     def _get_base_contracts(self, score: float) -> int:
         if score >= 95: return 4
