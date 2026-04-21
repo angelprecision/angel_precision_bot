@@ -75,9 +75,9 @@ MAX_POSITIONS       = int(os.getenv("MAX_POSITIONS", "7"))
 
 # ── Paper-mode gate thresholds ────────────────────────────────────────────────
 SCORE_FLOOR_LIVE    = 75   # live: only trade validated setups
-SCORE_FLOOR_PAPER   = 60   # paper: collect data on all qualifying signals
+SCORE_FLOOR_PAPER   = 45   # paper: collect data on all qualifying signals
 CONTEXT_FLOOR_LIVE  = 10.0
-CONTEXT_FLOOR_PAPER = 6.0  # paper: don't block on context -- collect the data
+CONTEXT_FLOOR_PAPER = 0.0  # paper: don't block on context -- collect the data
 
 # Paper-mode fallback exec quality scores (used when chain data absent)
 PAPER_SPREAD_DEFAULT    = 3.0   # /5
