@@ -1122,32 +1122,51 @@ class APMasterControl:
 
     def _seed_dedup_from_db(self, client_id: str = "default"):
         """
-        On startup, load TODAY's dedup keys for THIS client only.
-        Scoped by client_id prefix -- never loads other clients' dedup keys.
+        On startup, seed dedup ONLY from signals that actually executed
+        (reached a position or were filled). Signals that were approved but
+        expired/invalidated in the entry watcher are NOT seeded — they should
+        be re-evaluated on the next run.
+
+        This prevents the pattern where repeated resets + reprocessing of the
+        same signal IDs causes the dedup to fill up and block all future signals.
         """
         try:
             from ap.db import conn, run_with_retry
-            today        = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-            sig_prefix   = f"dedup:sig:%:{client_id}"
-            setup_prefix = f"dedup:setup:{client_id}:%"
+            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+            # Only seed from setups that have an OPEN/CLOSING position today
+            # or from signals explicitly marked as executed in ap_signals
             def _load():
                 with conn() as c:
+                    # Seed setup keys only for tickers with an active position
                     c.execute(
                         """
-                        SELECT k FROM kv
-                        WHERE (k LIKE %s OR k LIKE %s)
-                          AND updated_at::date = %s::date
+                        SELECT DISTINCT underlying, direction
+                        FROM positions
+                        WHERE client_id = %s
+                          AND status IN ('OPEN', 'CLOSING')
+                          AND entry_ts::date = %s::date
                         """,
-                        (sig_prefix, setup_prefix, today),
+                        (client_id, today),
                     )
                     return c.fetchall()
+
             rows = run_with_retry(_load)
+            count = 0
             for row in rows:
-                self._seen_signals.add(row["k"].replace("dedup:", "", 1))
-            if rows:
+                underlying = str(row.get("underlying") or row.get("ticker") or "")
+                direction  = str(row.get("direction") or "CALL").upper()
+                for tf in ("1d", "60m", "30m", "15m"):
+                    setup_key = f"{client_id}:{underlying.upper()}:{direction}:{tf}"
+                    self._seen_signals.add(setup_key)
+                    count += 1
+
+            if count:
                 log.info(
-                    f"[{client_id}] Dedup seeded: {len(rows)} entries "
-                    f"(today={today}, client-scoped)"
+                    f"[{client_id}] Dedup seeded: {count} setup keys from "
+                    f"{len(rows)} active positions (today={today})"
                 )
+            else:
+                log.info(f"[{client_id}] Dedup seeded: 0 entries — clean slate")
         except Exception as e:
             log.debug(f"Dedup seed failed (non-critical): {e}")
