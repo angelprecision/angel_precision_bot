@@ -799,6 +799,29 @@ class APExecutionCore:
 
         self.shadow.record_live_outcome(tier, opt_pnl)
 
+        # Log trade to edge intelligence
+        try:
+            from ap_edge_intelligence import APTradeLogger
+            _edge_logger = APTradeLogger()
+            _edge_logger.log_trade(
+                position={
+                    **(pos.__dict__ if hasattr(pos, "__dict__") else {}),
+                    "signal": sig,
+                    "ticker": pos.ticker,
+                    "direction": pos.side,
+                    "timeframe": sig.get("timeframe", "1d"),
+                },
+                exit_info={
+                    "exit_price": exit_price,
+                    "exit_reason": decision.reason,
+                    "exit_ts": datetime.now(timezone.utc).isoformat(),
+                    "underlying_exit": pos.current_underlying,
+                },
+                client_id=self._email,
+            )
+        except Exception as _e:
+            log.debug(f"Trade logger error (non-critical): {_e}")
+
         # Feed outcome back to intelligence audit log (builds learning dataset)
         if _record_intel_outcome:
             try:
