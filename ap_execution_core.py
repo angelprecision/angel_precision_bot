@@ -671,10 +671,26 @@ class APExecutionCore:
             f"[{decision.grade}] [{setup_status}]"
         )
 
-        # Place order
+        # Place order — PAPER mode submits to Tradier sandbox for real account tracking.
+        # This is critical: paper trades must show in the Tradier sandbox account
+        # so the account equity curve is visible and clients can see the paper run.
         if self.paper:
-            log.info(f"[{ticker}] PAPER -- simulating fill @ ${decision.mid_price:.2f}")
-            fill_price = decision.mid_price
+            # Submit to Tradier sandbox — same path as live, just a different base_url
+            log.info(f"[{ticker}] PAPER -- submitting to Tradier sandbox @ ${decision.mid_price:.2f}")
+            fill_price = self._place_option_order(
+                symbol      = decision.symbol,
+                contracts   = contracts,
+                side        = "buy_to_open",
+                limit_price = decision.mid_price,
+            )
+            if not fill_price:
+                # Sandbox rejected or unavailable — fall back to simulated fill
+                # so paper trading continues uninterrupted
+                log.warning(
+                    f"[{ticker}] Tradier sandbox order failed — falling back to simulated fill "
+                    f"@ ${decision.mid_price:.2f} (paper continuity)"
+                )
+                fill_price = decision.mid_price
         else:
             fill_price = self._place_option_order(
                 symbol      = decision.symbol,
