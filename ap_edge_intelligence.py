@@ -161,6 +161,26 @@ class APTradeLogger:
             except (ValueError, AttributeError):
                 signal_id_val = None
 
+        # Derive 6 intelligence fields from signal payload
+        import json as _json
+        _setup_reason      = sig.get("setup_reason") or f"{setup_combo} on {timeframe}"
+        _trigger_reason    = sig.get("trigger_reason") or (
+            f"breach at {trigger_price}" if trigger_price else exit_reason
+        )
+        _entry_reason      = sig.get("entry_reason") or (
+            f"score={score:.0f} tier={tier} setup={setup_combo}"
+        )
+        _confluence_json   = _json.dumps(sig.get("confluence") or {
+            "timeframe":   timeframe,
+            "setup_combo": setup_combo,
+            "scanner":     scanner_type,
+            "score":       score,
+            "tier":        tier,
+            "direction":   direction,
+        })
+        _htf_alignment     = sig.get("htf_alignment") or sig.get("spy_trend") or None
+        _liquidity_context = sig.get("liquidity_context") or sig.get("vol_regime") or None
+
         def _insert():
             with conn() as c:
                 c.execute(
@@ -173,7 +193,9 @@ class APTradeLogger:
                         contract_entry_price, contracts, planned_stop, planned_target,
                         underlying_exit, contract_exit_price,
                         gross_pnl, net_pnl, return_pct, r_multiple, win_flag,
-                        exit_reason, spread_at_entry
+                        exit_reason, spread_at_entry,
+                        setup_reason, trigger_reason, entry_reason,
+                        confluence_json, htf_alignment, liquidity_context
                     ) VALUES (
                         %s, %s, %s, CURRENT_DATE, %s, %s,
                         %s, %s, %s, %s, %s,
@@ -182,7 +204,9 @@ class APTradeLogger:
                         %s, %s, %s, %s,
                         %s, %s,
                         %s, %s, %s, %s, %s,
-                        %s, %s
+                        %s, %s,
+                        %s, %s, %s,
+                        %s, %s, %s
                     )
                     """,
                     (
@@ -194,6 +218,8 @@ class APTradeLogger:
                         underlying_exit or None, exit_price or None,
                         gross_pnl, net_pnl, return_pct, r_multiple, win_flag,
                         exit_reason, spread_at_entry or None,
+                        _setup_reason, _trigger_reason, _entry_reason,
+                        _confluence_json, _htf_alignment, _liquidity_context,
                     ),
                 )
 
