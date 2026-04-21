@@ -209,16 +209,19 @@ class APPositionManager:
     def pending_entry_count(self) -> int:
         """
         In-flight entry orders that have not yet filled.
-        These represent real intended exposure even with no open positions yet.
+        Only counts CREATED orders with no broker_order_id (truly unsubmitted).
+        SUBMITTED/ACKNOWLEDGED with a broker_id = real order at broker = already
+        counted as a position slot via the WATCHING mechanism.
+        Excludes them to prevent WATCHING signals from inflating the position cap.
         """
         def _fn():
             with conn() as c:
-                placeholders = ",".join(["%s"] * len(_PENDING_ENTRY_STATUSES))
                 c.execute(
-                    f"SELECT COUNT(*) AS n FROM orders "
-                    f"WHERE client_id=%s AND kind='ENTRY' "
-                    f"AND status IN ({placeholders})",
-                    (self.client_id, *_PENDING_ENTRY_STATUSES),
+                    "SELECT COUNT(*) AS n FROM orders "
+                    "WHERE client_id=%s AND kind='ENTRY' "
+                    "AND status = 'CREATED' "
+                    "AND (broker_order_id IS NULL OR broker_order_id = '')",
+                    (self.client_id,),
                 )
                 return int((c.fetchone() or {}).get("n") or 0)
         return run_with_retry(_fn)
