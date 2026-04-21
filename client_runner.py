@@ -169,6 +169,27 @@ class ClientRunner(threading.Thread):
                 account_id=self.account_id,
             )
             broker = TradierBroker(broker_cfg)
+
+            # Startup: cancel phantom orders that survived restart (no broker_id)
+            # Prevents them from inflating the position cap on every boot
+            try:
+                from ap.db import run_with_retry, conn as _conn
+                def _clear_phantoms():
+                    with _conn() as _c:
+                        _c.execute(
+                            "UPDATE orders SET status=%s, last_error=%s "
+                            "WHERE client_id=%s "
+                            "AND status IN ('CREATED','SUBMITTED','ACKNOWLEDGED') "
+                            "AND (broker_order_id IS NULL OR broker_order_id = '')",
+                            ('CANCELED', 'startup_phantom_clear', self.email)
+                        )
+                        return _c.rowcount
+                _n = run_with_retry(_clear_phantoms)
+                if _n:
+                    logger.info(f"[{self.email}] Startup: cleared {_n} phantom orders")
+            except Exception as _pe:
+                logger.warning(f"[{self.email}] Startup phantom clear: {_pe}")
+
             logger.info(f"[{self.email}] Broker initialized. Starting execution core.")
 
             sb = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY) if SUPABASE_URL else None
