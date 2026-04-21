@@ -755,8 +755,19 @@ class APExecutionCore:
             self._sector_counts[sector] = max(0, self._sector_counts.get(sector, 0) - 1)
 
         if self.paper:
-            exit_price = pos.current_option_price
-            log.info(f"[{pos.ticker}] PAPER CLOSE | P&L={pos.option_pnl_pct*100:+.1f}% | {decision.reason}")
+            # Submit real sell_to_close to Tradier sandbox so account P&L is visible
+            log.info(f"[{pos.ticker}] PAPER CLOSE -- submitting sell_to_close to Tradier sandbox | {decision.reason}")
+            sandbox_exit = self._place_option_order(
+                symbol      = pos.option_symbol,
+                contracts   = pos.quantity_remaining,
+                side        = "sell_to_close",
+                limit_price = pos.current_option_price,
+            )
+            exit_price = sandbox_exit or pos.current_option_price
+            log.info(
+                f"[{pos.ticker}] PAPER CLOSE | P&L={pos.option_pnl_pct*100:+.1f}% | "
+                f"exit=${exit_price:.2f} | sandbox={'OK' if sandbox_exit else 'SIMULATED'} | {decision.reason}"
+            )
         else:
             exit_price = self._place_option_order(
                 symbol      = pos.option_symbol,
