@@ -40,7 +40,7 @@ from ap.utils import now_utc_iso
 log = logging.getLogger("ap.order_monitor")
 
 # Timeout thresholds (seconds)
-TIMEOUT_CREATED       = int(os.getenv("ORDER_TIMEOUT_CREATED",       "120"))   # 2 min
+TIMEOUT_CREATED       = int(os.getenv("ORDER_TIMEOUT_CREATED",       "1800"))   # 2 min
 TIMEOUT_SUBMITTED     = int(os.getenv("ORDER_TIMEOUT_SUBMITTED",     "300"))   # 5 min
 TIMEOUT_ACKNOWLEDGED  = int(os.getenv("ORDER_TIMEOUT_ACKNOWLEDGED",  "600"))   # 10 min
 TIMEOUT_PARTIAL_FILL  = int(os.getenv("ORDER_TIMEOUT_PARTIAL_FILL",  "900"))   # 15 min
