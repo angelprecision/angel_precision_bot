@@ -479,6 +479,36 @@ class APExitEngine:
                 with self._lock:
                     self._positions = [p for p in self._positions if p is not pos]
 
+                # 3. Log trade to edge intelligence (non-critical)
+                try:
+                    from ap_edge_intelligence import APTradeLogger
+                    _tl = APTradeLogger()
+                    _tl.log_trade(
+                        position={
+                            "ticker":           pos.ticker,
+                            "direction":        pos.side,
+                            "contract":         pos.option_symbol,
+                            "underlying_entry": pos.underlying_entry,
+                            "entry_price":      pos.entry_price,
+                            "quantity":         pos.quantity_remaining,
+                            "entry_ts":         getattr(pos, "entry_ts", None),
+                            "signal_id":        getattr(pos, "signal_id", None),
+                            "score":            getattr(pos, "score", None),
+                            "tier":             getattr(pos, "tier", None),
+                            "pattern":          getattr(pos, "pattern", None),
+                            "timeframe":        getattr(pos, "timeframe", None),
+                            "signal":           getattr(pos, "signal", {}),
+                        },
+                        exit_info={
+                            "exit_price":          getattr(pos, "current_option_price", pos.entry_price),
+                            "exit_reason":         decision.reason,
+                            "underlying_exit":     getattr(pos, "current_underlying", None),
+                        },
+                        client_id=self._email or "default",
+                    )
+                except Exception as _tl_err:
+                    log.debug("Trade logger (non-critical): %s", _tl_err)
+
     def _fetch_quotes(self, tickers: list[str]) -> dict:
         try:
             resp = self._quote_broker.session.get(
