@@ -116,7 +116,7 @@ class APContractSelectionEngine:
         min_oi:         int   = 1,    # lowered 50→1 -- any open interest passes in paper mode
         min_volume:     int   = 0,    # lowered 10→0 -- volume check disabled for data collection
         min_premium:    float = 10.0,    # $0.10/share -- allow cheap weeklies
-        max_premium:    float = 200.0,   # $2.00/share = $200/contract hard cap (paper data quality)
+        max_premium:    float = 350.0,   # $3.50/share = $350/contract hard cap
         max_dte:        int   = 21,
         min_dte:        int   = 0,
         prefer_weekly:  bool  = True,
