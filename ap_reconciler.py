@@ -197,21 +197,29 @@ class APBrokerReconciler:
             kind       = order.get("kind", "ENTRY")
 
             if not broker_oid or broker_oid in ("N/A", "PENDING", ""):
-                # No broker ID yet — order may not have reached broker
-                # Only alert if it's been sitting too long
+                # No broker ID — order never reached broker
+                # Auto-cancel after 5 min to prevent cap inflation
                 created_ts = order.get("created_ts")
                 if created_ts:
                     try:
                         age = (datetime.now(timezone.utc) -
                                datetime.fromisoformat(str(created_ts).replace("Z", "+00:00"))
                                ).total_seconds()
-                        if age > 300:  # 5 min with no broker ID is suspicious
-                            self._alert(
-                                f"ORDER_NO_BROKER_ID | {contract} | {local_id} | "
-                                f"db_status={db_status} | age={age:.0f}s — "
-                                f"never submitted to broker?"
-                            )
-                            summary["orders_alerted"] += 1
+                        if age > 300:  # 5 min with no broker ID = phantom
+                            try:
+                                self.osm.transition(
+                                    local_id, "CANCELED",
+                                    last_error="reconciler_phantom_cancel_no_broker_id",
+                                )
+                                log.warning(
+                                    "[%s] RECONCILE_AUTO_CANCEL phantom | %s | %s | "
+                                    "age=%.0fs no broker_id",
+                                    self.client_id, contract, local_id, age
+                                )
+                                summary["orders_corrected"] += 1
+                            except Exception as _ce:
+                                log.error("[%s] Failed to cancel phantom %s: %s",
+                                          self.client_id, local_id, _ce)
                     except Exception:
                         pass
                 continue
