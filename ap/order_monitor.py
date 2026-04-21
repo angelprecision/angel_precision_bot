@@ -108,6 +108,14 @@ class APOrderMonitor:
                 self._check_exit_orders()
             except Exception as e:
                 log.error(f"[{self.client_id}] OrderMonitor loop error: {e}")
+            # Heartbeat so self-healer knows this thread is progressing
+            try:
+                from ap.self_healing import get_healer as _gh
+                _h = _gh()
+                if _h:
+                    _h.heartbeat(self.client_id, "order_monitor")
+            except Exception:
+                pass
 
     # =========================================================================
     # ENTRY ORDER CHECKS
