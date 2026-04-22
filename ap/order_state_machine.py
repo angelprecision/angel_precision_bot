@@ -38,6 +38,7 @@
 
 from __future__ import annotations
 
+import threading
 import uuid
 import logging
 from typing import Optional
@@ -49,17 +50,21 @@ log = logging.getLogger("ap.order_state_machine")
 
 # Registry so OSM can notify the right exit engine per client
 _exit_engine_registry: dict[str, object] = {}
+_registry_lock = threading.Lock()
 
 def register_exit_engine(client_id: str, exit_engine) -> None:
     """Called by ClientRunner to register the exit engine for this client."""
-    _exit_engine_registry[client_id] = exit_engine
+    with _registry_lock:
+        _exit_engine_registry[client_id] = exit_engine
 
 def unregister_exit_engine(client_id: str) -> None:
     """Called in ClientRunner.finally to prevent stale registry references."""
-    _exit_engine_registry.pop(client_id, None)
+    with _registry_lock:
+        _exit_engine_registry.pop(client_id, None)
 
 def _get_exit_engine_for_client(client_id: str):
-    return _exit_engine_registry.get(client_id)
+    with _registry_lock:
+        return _exit_engine_registry.get(client_id)
 
 
 # =============================================================================
@@ -419,8 +424,11 @@ class APOrderStateMachine:
                     if _ee:
                         if new_status == OrderStatus.EXIT_FILLED:
                             _ee.mark_position_closed(_pos_id, reason="EXIT_FILLED")
-                        elif new_status == OrderStatus.EXIT_PARTIAL_FILL and filled_qty:
-                            _ee.note_partial_exit_fill(_pos_id, filled_qty)
+                        elif new_status == OrderStatus.EXIT_PARTIAL_FILL and filled_qty is not None:
+                            prev_filled_qty = int(current.get("filled_qty") or 0)
+                            delta = max(0, int(filled_qty) - prev_filled_qty)
+                            if delta > 0:
+                                _ee.note_partial_exit_fill(_pos_id, delta)
                         elif new_status in (OrderStatus.CANCELED, OrderStatus.EXPIRED,
                                             OrderStatus.REJECTED):
                             _ee.clear_exit_in_flight(_pos_id)

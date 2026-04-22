@@ -233,7 +233,7 @@ class APOrderMonitor:
             if status in ("EXIT_REQUESTED", "EXIT_SUBMITTED"):
                 if age_secs > TIMEOUT_EXIT_PENDING:
                     broker_status = self._query_broker_order(broker_oid)
-                    if self._is_filled_status(broker_status):
+                    if self._is_executed_status(broker_status):
                         self._advance_from_broker_status(local_id, broker_status, contract)
                     else:
                         # Exit stall = ESCALATE — this is account risk
@@ -353,7 +353,7 @@ class APOrderMonitor:
         broker_oid    = self._get_broker_order_id(local_order_id)
         broker_status = self._query_broker_order(broker_oid)
 
-        if self._is_filled_status(broker_status):
+        if self._is_executed_status(broker_status):
             log.info(
                 f"[{self.client_id}] Exit actually filled at broker — "
                 f"advancing state machine: {local_order_id}"
@@ -491,6 +491,10 @@ class APOrderMonitor:
         """True only for a confirmed full fill."""
         return self._normalize_broker_status(raw_status) == "filled"
 
+    def _is_executed_status(self, raw_status) -> bool:
+        """True for both fully filled and partially filled broker statuses."""
+        return self._normalize_broker_status(raw_status) in {"filled", "partially_filled"}
+
     def _extract_broker_status(self, raw_result) -> str:
         """Pull a normalized status string from dict/str/None broker responses."""
         return self._normalize_broker_status(raw_result)
@@ -498,29 +502,44 @@ class APOrderMonitor:
     def _advance_from_broker_status(
         self, local_order_id: str, broker_status, contract: str
     ):
-        """Advance order state machine based on exact normalized broker status."""
+        """Advance order state machine based on normalized broker status.
+        EXIT orders map to EXIT_FILLED/EXIT_PARTIAL_FILL; ENTRY orders map
+        to FILLED/PARTIAL_FILL. Kind is read from OSM so callers never need
+        to pass it explicitly.
+        """
         s = self._normalize_broker_status(broker_status)
-        mapping = {
-            "filled":           "FILLED",
-            "partially_filled": "PARTIAL_FILL",
-            "canceled":         "CANCELED",
-            "rejected":         "REJECTED",
-            "expired":          "EXPIRED",
-            "pending":          "SUBMITTED",
-            "open":             "ACKNOWLEDGED",
-        }
+        order = self.osm.get_order(local_order_id) or {}
+        kind = str(order.get("kind") or "").upper()
+        if kind == "EXIT":
+            mapping = {
+                "filled":           "EXIT_FILLED",
+                "partially_filled": "EXIT_PARTIAL_FILL",
+                "canceled":         "CANCELED",
+                "rejected":         "REJECTED",
+                "expired":          "EXPIRED",
+                "pending":          "EXIT_SUBMITTED",
+                "open":             "EXIT_ACKNOWLEDGED",
+            }
+        else:
+            mapping = {
+                "filled":           "FILLED",
+                "partially_filled": "PARTIAL_FILL",
+                "canceled":         "CANCELED",
+                "rejected":         "REJECTED",
+                "expired":          "EXPIRED",
+                "pending":          "SUBMITTED",
+                "open":             "ACKNOWLEDGED",
+            }
         new_status = mapping.get(s)
         if not new_status:
             log.debug(
-                f"[{self.client_id}] Unknown/non-actionable broker status "
-                f"'{s or broker_status}' — no transition"
+                f"[{self.client_id}] Unknown broker status '{s}' — no transition"
             )
             return
         ok = self.osm.transition(local_order_id, new_status)
         if ok:
             log.info(
-                f"[{self.client_id}] Advanced from broker status | "
-                f"{contract} | {local_order_id} → {new_status}"
+                f"[{self.client_id}] Advanced | {contract} | {local_order_id} → {new_status}"
             )
 
     def _get_broker_order_id(self, local_order_id: str) -> Optional[str]:
