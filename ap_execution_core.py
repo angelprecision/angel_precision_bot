@@ -148,7 +148,7 @@ class RankingQueue:
             return len(self._queue)
 
     def available_slots(self, position_count: int) -> int:
-        return max(0, MAX_POSITIONS - position_count)
+        return max(0, self._max_positions - position_count)
 
 
 # =============================================================================
@@ -173,12 +173,14 @@ class APExecutionCore:
         self.email              = email
         self.position_manager   = position_manager    # APPositionManager (optional for now)
         self.order_state_machine = order_state_machine # APOrderStateMachine (optional for now)
+        # Mode: injected master_control is canonical; BOT_MODE is the env fallback.
+        # Resolved again after mc is assigned — see below.
         self.paper     = BOT_MODE != "LIVE"
         self.mode      = "LIVE" if not self.paper else "PAPER"
         self._pos_lock = threading.Lock()
         self._position_count = 0
 
-        # Mode-specific gate values
+        # Mode-specific gate values (may be overridden after mc injection)
         self._score_floor   = SCORE_FLOOR_PAPER   if self.paper else SCORE_FLOOR_LIVE
         self._context_floor = CONTEXT_FLOOR_PAPER if self.paper else CONTEXT_FLOOR_LIVE
 
@@ -200,7 +202,7 @@ class APExecutionCore:
         self.proof          = APProofLogger(
             supabase_client=supabase_client,
             client_email=email,
-            mode="paper" if BOT_MODE != "LIVE" else "live",
+            mode="paper" if self.paper else "live",
         )
 
         # ── MASTER CONTROL -- single decision authority ────────────────────────
@@ -238,6 +240,23 @@ class APExecutionCore:
                 "Set ALLOW_INTERNAL_MASTER_CONTROL=1 only for local tests."
             )
 
+        # ── Mode + limits canonical override from master_control ──────────────
+        # Now that mc is assigned, derive paper/mode/max_pos from the single
+        # authority so execution core is always cohesive with the runner.
+        if hasattr(self, "master_control") and self.master_control is not None:
+            _mc_mode   = getattr(self.master_control, "mode", self.mode).upper()
+            self.mode  = _mc_mode
+            self.paper = _mc_mode != "LIVE"
+            self._max_positions = getattr(self.master_control, "max_positions", MAX_POSITIONS)
+            # Re-derive floors from canonical mode
+            self._score_floor   = SCORE_FLOOR_PAPER   if self.paper else SCORE_FLOOR_LIVE
+            self._context_floor = CONTEXT_FLOOR_PAPER if self.paper else CONTEXT_FLOOR_LIVE
+            # Sync proof logger mode
+            if hasattr(self, "proof"):
+                self.proof.mode = "paper" if self.paper else "live"
+        else:
+            self._max_positions = MAX_POSITIONS
+
         # Wire watcher callbacks
         self.entry_watcher.on_trigger    = self._on_entry_trigger
         self.entry_watcher.on_expire     = self._on_signal_expire
@@ -249,8 +268,8 @@ class APExecutionCore:
 
         log.info(
             f"APExecutionCore initialized for {email} | "
-            f"Mode: {'PAPER' if self.paper else 'LIVE'} | "
-            f"MaxPos: {MAX_POSITIONS} | "
+            f"Mode: {self.mode} | "
+            f"MaxPos: {self._max_positions} | "
             f"ScoreFloor: {self._score_floor} | "
             f"ContextFloor: {self._context_floor}"
         )
@@ -595,15 +614,15 @@ class APExecutionCore:
         funnel.inc("watcher_triggered")
 
         # Re-check position count at breach time
-        if self._position_count >= MAX_POSITIONS:
+        if self._position_count >= self._max_positions:
             log.info(
                 f"[{ticker}] No slot at breach time -- positions full "
-                f"({self._position_count}/{MAX_POSITIONS}). Re-queuing signal."
+                f"({self._position_count}/{self._max_positions}). Re-queuing signal."
             )
             if signal_id:
                 self.store.update_signal_fields(signal_id, {
                     "decision_status": "requeued_after_trigger",
-                    "context_notes":   f"positions_full={self._position_count}/{MAX_POSITIONS} at breach",
+                    "context_notes":   f"positions_full={self._position_count}/{self._max_positions} at breach",
                 })
             self.rank_queue.add(sig)
             return
