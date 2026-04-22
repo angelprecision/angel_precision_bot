@@ -174,6 +174,7 @@ class APExecutionCore:
         self.position_manager   = position_manager    # APPositionManager (optional for now)
         self.order_state_machine = order_state_machine # APOrderStateMachine (optional for now)
         self.paper     = BOT_MODE != "LIVE"
+        self.mode      = "LIVE" if not self.paper else "PAPER"
         self._pos_lock = threading.Lock()
         self._position_count = 0
 
@@ -258,6 +259,12 @@ class APExecutionCore:
     def _exit_thread(self) -> Optional[threading.Thread]:
         """Expose exit engine thread so worker_health can check liveness."""
         return self.exit_eng._thread
+
+    def _score_and_context_floors(self) -> tuple[float, float]:
+        """Single source of truth for score/context floors per mode."""
+        if self.mode == "LIVE":
+            return SCORE_FLOOR_LIVE, CONTEXT_FLOOR_LIVE
+        return SCORE_FLOOR_PAPER, CONTEXT_FLOOR_PAPER
 
     def start(self):
         """Start all background threads."""
@@ -409,7 +416,7 @@ class APExecutionCore:
         return
 
         # ── LEGACY GATE CODE -- now owned by APMasterControl (kept for reference) ──
-        score_floor = self._score_floor
+        score_floor, _ = self._score_and_context_floors()
         if score < score_floor:
             log.info(
                 f"[{ticker}] REJECTED -- score {score:.1f} below "
@@ -614,6 +621,13 @@ class APExecutionCore:
 
         # Chain health check
         health = chain_health_report(chain, side, watched.trigger_price)
+        _chain_health  = health.get("status", "ok") if isinstance(health, dict) else "ok"
+        _used_fallback = health.get("used_fallback", False) if isinstance(health, dict) else False
+        _paper_only    = (self.mode != "LIVE") and bool(_used_fallback or _chain_health != "ok")
+        if self.mode == "LIVE" and (_used_fallback or _chain_health != "ok"):
+            log.warning("[%s] LIVE: rejecting — degraded chain | fallback=%s health=%s",
+                        ticker, _used_fallback, _chain_health)
+            return
         if not health["tradeable"]:
             log.warning(
                 f"[{ticker}] Chain health FAILED -- "
