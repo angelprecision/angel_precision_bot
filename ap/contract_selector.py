@@ -297,13 +297,24 @@ class APContractSelectionEngine:
                           sorted(_rejections.items(), key=lambda x: -x[1]))
                 if _rejections else "none",
             )
-            # Paper mode: use best available even if it failed quality checks
-            # Pick the one with highest OI as fallback — it's the most liquid
+            # Paper mode: use best available even if it failed quality checks.
+            # Enforce minimum sanity gates on fallback: delta >= 0.10, DTE <= max_dte,
+            # ask > 0. Pick highest OI among candidates that pass these gates.
             if self.mode.upper() != "LIVE" and chain:
-                best_fallback = max(chain, key=lambda o: int(o.get("open_interest") or 0))
-                bid_f = float(best_fallback.get("bid") or 0)
-                ask_f = float(best_fallback.get("ask") or 0)
-                if ask_f > 0:
+                _fallback_pool = [
+                    o for o in chain
+                    if float(o.get("ask") or 0) > 0
+                    and abs(float(o.get("delta") or o.get("greeks", {}).get("delta", 0) or 0)) >= 0.10
+                    and int(o.get("expiration_date", "9999-99-99").replace("-", "") or 99991231)
+                       <= int(today.strftime("%Y%m%d")) + self.max_dte  # rough DTE gate
+                ] or [
+                    # second pass: just require ask > 0
+                    o for o in chain if float(o.get("ask") or 0) > 0
+                ]
+                best_fallback = max(_fallback_pool, key=lambda o: int(o.get("open_interest") or 0)) if _fallback_pool else None
+                bid_f = float(best_fallback.get("bid") or 0) if best_fallback else 0
+                ask_f = float(best_fallback.get("ask") or 0) if best_fallback else 0
+                if best_fallback and ask_f > 0:
                     log.warning("[%s] QUALITY FILTER FALLBACK -- using best available contract", ticker)
                     survivors = [best_fallback]
                 else:
