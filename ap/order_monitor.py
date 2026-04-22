@@ -40,7 +40,7 @@ from ap.utils import now_utc_iso
 log = logging.getLogger("ap.order_monitor")
 
 # Timeout thresholds (seconds)
-TIMEOUT_CREATED       = int(os.getenv("ORDER_TIMEOUT_CREATED",       "1800"))   # 2 min
+TIMEOUT_CREATED       = int(os.getenv("ORDER_TIMEOUT_CREATED",       "120"))    # 2 min — CREATED = never reached broker
 TIMEOUT_SUBMITTED     = int(os.getenv("ORDER_TIMEOUT_SUBMITTED",     "300"))   # 5 min
 TIMEOUT_ACKNOWLEDGED  = int(os.getenv("ORDER_TIMEOUT_ACKNOWLEDGED",  "600"))   # 10 min
 TIMEOUT_PARTIAL_FILL  = int(os.getenv("ORDER_TIMEOUT_PARTIAL_FILL",  "900"))   # 15 min
@@ -442,16 +442,27 @@ class APOrderMonitor:
         return None
 
     def _cancel_broker_order(self, broker_order_id: Optional[str]) -> bool:
-        """Send cancel to broker. Returns True if canceled or already gone."""
+        """
+        Send cancel to broker. Returns actual broker response dict so callers
+        can inspect the real status. Never returns unconditional True.
+        Returns False if request failed or broker unavailable.
+        """
         if not broker_order_id or not self.broker:
             return False
         try:
             if hasattr(self.broker, "cancel_order"):
                 result = self.broker.cancel_order(broker_order_id)
-                log.info(
-                    f"[{self.client_id}] Broker cancel sent: {broker_order_id} → {result}"
-                )
-                return True
+                log.info(f"[{self.client_id}] Broker cancel sent: {broker_order_id} → {result}")
+                if isinstance(result, dict):
+                    return result
+                # Re-query to get confirmed state
+                try:
+                    requery = self.broker.get_order(broker_order_id)
+                    if isinstance(requery, dict):
+                        return requery
+                except Exception:
+                    pass
+            return False
         except Exception as e:
             log.warning(f"[{self.client_id}] Broker cancel error: {e}")
         return False
@@ -460,17 +471,19 @@ class APOrderMonitor:
         self, local_order_id: str, broker_status: str, contract: str
     ):
         """Advance order state machine based on broker status string."""
-        broker_status = broker_status.lower()
+        s = (broker_status or "").lower().strip()
+        # Exact Tradier status strings — no substring matching
         mapping = {
-            "filled":   "FILLED",
-            "fill":     "FILLED",
-            "canceled": "CANCELED",
-            "rejected": "REJECTED",
-            "expired":  "EXPIRED",
-            "pending":  "SUBMITTED",
-            "open":     "ACKNOWLEDGED",
-            "partial":  "PARTIAL_FILL",
+            "filled":           "FILLED",
+            "partially_filled": "PARTIAL_FILL",
+            "canceled":         "CANCELED",
+            "cancelled":        "CANCELED",
+            "rejected":         "REJECTED",
+            "expired":          "EXPIRED",
+            "pending":          "SUBMITTED",
+            "open":             "ACKNOWLEDGED",
         }
+        broker_status = s
         for keyword, new_status in mapping.items():
             if keyword in broker_status:
                 ok = self.osm.transition(local_order_id, new_status)
