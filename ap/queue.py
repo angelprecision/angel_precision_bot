@@ -389,14 +389,16 @@ def _dispatch(
                                     side="buy_to_open",
                                 )
                                 _submitted_to_broker = True
-                                _broker_order_id = str(
+                                _raw_broker_id = (
                                     getattr(_resp, "broker_order_id", None)
                                     or getattr(_resp, "order_id", None)
                                     or ""
                                 )
+                                # Only use the ID if it's a real broker ID (not N/A or empty)
+                                _broker_order_id = str(_raw_broker_id) if _raw_broker_id and str(_raw_broker_id) not in ("", "N/A", "None") else ""
                                 log.info(
                                     f"[{ticker}] SANDBOX ORDER SUBMITTED | "
-                                    f"broker_id={_broker_order_id} "
+                                    f"broker_id={_broker_order_id or 'REJECTED'} "
                                     f"status={getattr(_resp, 'status', '?')}"
                                 )
                                 # Save broker_order_id directly — avoids state machine
