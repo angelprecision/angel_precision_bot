@@ -189,7 +189,7 @@ def _release_entry_guards(order: dict):
 # CORE — process one pending order via OSM
 # =============================================================================
 
-def process_pending_order(broker: BrokerAdapter, order: dict, osm=None, pm=None):
+def process_pending_order(broker: BrokerAdapter, order: dict, osm=None, pm=None, exit_engine=None):
     """
     Poll broker and route ALL lifecycle transitions through APOrderStateMachine.
 
@@ -221,21 +221,48 @@ def process_pending_order(broker: BrokerAdapter, order: dict, osm=None, pm=None)
                           client_id, mapped, local_id, e)
             # Open position ONLY when transition succeeded — idempotent via plan_id/signal_id guards
             if ok and kind == "ENTRY" and pm:
+                _pos_id = None
                 try:
                     plan_id   = order.get("plan_id")   or order.get("signal_id") or local_id
                     signal_id = order.get("signal_id") or local_id
-                    pm.open_position(
-                        plan_id    = plan_id,
-                        signal_id  = signal_id,
-                        ticker     = (order.get("symbol") or "").upper(),
-                        contract   = order.get("contract") or order.get("symbol") or "",
-                        side       = (order.get("direction") or "CALL").upper(),
-                        qty        = result["filled_qty"] or int(order.get("qty") or 0),
-                        entry_price= result["avg_fill"],
+                    _pos_id = pm.open_position(
+                        plan_id           = plan_id,
+                        signal_id         = signal_id,
+                        ticker            = (order.get("symbol") or "").upper(),
+                        contract          = order.get("contract") or order.get("symbol") or "",
+                        side              = (order.get("direction") or "CALL").upper(),
+                        qty               = result["filled_qty"] or int(order.get("qty") or 0),
+                        entry_price       = result["avg_fill"],
+                        tier              = str(order.get("tier") or "B"),
+                        score             = float(order.get("score") or 0),
+                        pattern           = str(order.get("pattern") or ""),
+                        stop_underlying   = float(order.get("stop_underlying")) if order.get("stop_underlying") else None,
+                        target_underlying = float(order.get("target_underlying")) if order.get("target_underlying") else None,
                     )
                 except Exception as _pm_err:
                     log.error("[%s] pm.open_position failed for %s: %s",
                               client_id, local_id, _pm_err)
+                # Wire into exit engine so it monitors this position
+                if _pos_id and exit_engine:
+                    try:
+                        from ap_exit_engine import ManagedPosition as _MP
+                        _mp = _MP(
+                            ticker           = (order.get("symbol") or "").upper(),
+                            option_symbol    = order.get("contract") or order.get("symbol") or "",
+                            side             = (order.get("direction") or "CALL").upper(),
+                            quantity         = result["filled_qty"] or int(order.get("qty") or 0),
+                            entry_price      = result["avg_fill"],
+                            underlying_entry = float(order.get("trigger_price") or 0),
+                            underlying_target= float(order.get("target_underlying") or 0),
+                            underlying_stop  = float(order.get("stop_underlying") or 0),
+                        )
+                        _mp.position_id = _pos_id
+                        exit_engine.add_position(_mp)
+                        log.info("[%s] Exit engine seeded for %s pos=%s",
+                                 client_id, order.get("symbol","?"), _pos_id)
+                    except Exception as _ee_err:
+                        log.error("[%s] exit_engine.add_position failed for %s: %s",
+                                  client_id, local_id, _ee_err)
         else:
             # Legacy fallback — only used if caller didn't pass osm
             _legacy_update_order_status(local_id, "FILLED", filled_qty=result["filled_qty"])
@@ -348,21 +375,21 @@ def process_pending_order(broker: BrokerAdapter, order: dict, osm=None, pm=None)
 # MAIN LOOP
 # =============================================================================
 
-def fill_monitor_loop(broker: BrokerAdapter, poll_seconds: float = 10.0, osm=None, pm=None):
+def fill_monitor_loop(broker: BrokerAdapter, poll_seconds: float = 10.0, osm=None, pm=None, exit_engine=None):
     """
     Fill monitor must NEVER pause on kill switch — it's the reconciliation layer.
 
     osm — APOrderStateMachine instance. Pass it from client_runner so all
           transitions route through the canonical state machine.
     """
-    log.info("Fill monitor started (osm=%s pm=%s)", "wired" if osm else "legacy-fallback", "wired" if pm else "none")
+    log.info("Fill monitor started (osm=%s pm=%s ee=%s)", "wired" if osm else "legacy-fallback", "wired" if pm else "none", "wired" if exit_engine else "none")
 
     while True:
         try:
             pending = get_pending_orders()
             for order in pending:
                 try:
-                    process_pending_order(broker, order, osm=osm, pm=pm)
+                    process_pending_order(broker, order, osm=osm, pm=pm, exit_engine=exit_engine)
                 except Exception as e:
                     log.exception(
                         "Failed to process order %s: %s",
