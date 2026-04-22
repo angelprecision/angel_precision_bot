@@ -342,6 +342,14 @@ class ClientRunner(threading.Thread):
                 )
             except Exception as _rec_err:
                 logger.error(f"[{self.email}] Startup recovery error: {_rec_err}")
+            # Reseed exit engine with open positions after restart
+            try:
+                _exit_eng = getattr(self.core, "exit_eng", None)
+                if _exit_eng and hasattr(_exit_eng, "seed_from_db"):
+                    _exit_eng.seed_from_db(self.position_manager)
+                    logger.info(f"[{self.email}] Exit engine reseeded from DB")
+            except Exception as _seed_err:
+                logger.warning(f"[{self.email}] Exit engine seed: {_seed_err}")
 
             # Broker reconciler: every 3 min, broker truth wins
             try:
@@ -516,8 +524,9 @@ class ClientRunner(threading.Thread):
                     entry_watcher=entry_watcher,
                     position_manager=self.position_manager,
                     client_id=self.email,
-                    stop_event=self.stopped,    # clean shutdown when runner stops
-                    live_mode=is_live,           # disables legacy fallback in live
+                    stop_event=self.stopped,
+                    live_mode=is_live,
+                    exit_eng=getattr(self.core, "exit_eng", None),
                 )
             except Exception as e:
                 logger.error(f"[{self.email}] worker_loop crashed: {e}", exc_info=True)
