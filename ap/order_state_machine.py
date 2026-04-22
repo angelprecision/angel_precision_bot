@@ -54,6 +54,10 @@ def register_exit_engine(client_id: str, exit_engine) -> None:
     """Called by ClientRunner to register the exit engine for this client."""
     _exit_engine_registry[client_id] = exit_engine
 
+def unregister_exit_engine(client_id: str) -> None:
+    """Called in ClientRunner.finally to prevent stale registry references."""
+    _exit_engine_registry.pop(client_id, None)
+
 def _get_exit_engine_for_client(client_id: str):
     return _exit_engine_registry.get(client_id)
 
