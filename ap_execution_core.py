@@ -708,14 +708,27 @@ class APExecutionCore:
 
         if self.order_state_machine:
             plan = ApprovedExecutionPlan(
-                plan_id          = signal_id,
-                signal_id        = signal_id,
-                ticker           = ticker,
-                side             = side.upper(),
-                contracts        = contracts,
-                limit_price      = decision.mid_price,
-                max_position_usd = None,
-                contract_symbol  = decision.symbol,
+                plan_id           = signal_id,
+                signal_id         = signal_id,
+                client_id         = self.email,
+                ticker            = ticker,
+                side              = side.upper(),
+                direction         = side.upper(),
+                pattern           = str(sig.get("pattern", "") or ""),
+                timeframe         = str(sig.get("timeframe", "1d") or "1d"),
+                contracts         = contracts,
+                limit_price       = decision.mid_price,
+                max_position_usd  = float(decision.mid_price * contracts * 100),
+                contract_symbol   = decision.symbol,
+                tier              = str(tier or sig.get("tier", "B")),
+                score             = float(sig.get("score", 0) or 0),
+                intel_score       = float(sig.get("intel_score", 0) or 0),
+                confidence_bucket = str(decision.grade or sig.get("confidence_tag", "B")),
+                trigger_type      = "breach",
+                trigger_price     = watched.trigger_price,
+                stop_underlying   = watched.stop_level,
+                target_underlying = watched.target_price,
+                mode              = "live" if not self.paper else "paper",
             )
 
             log.info(
