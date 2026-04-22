@@ -99,6 +99,9 @@ class ClientRunner(threading.Thread):
         self.order_state_machine = None
         self.contract_selector = None
         self.order_monitor     = None
+        self.worker_thread     = None
+        self.equity_thread     = None
+        self.mode              = "PAPER"  # set in run() from AP_MODE env
 
     def _get_token(self) -> str | None:
         try:
@@ -120,23 +123,28 @@ class ClientRunner(threading.Thread):
             logger.error(f"[{self.email}] No token -- aborting runner")
             return
 
-        # Fix 8: live-mode startup assertions
-        _ap_mode = os.getenv("AP_MODE", "paper").upper()
-        if _ap_mode == "LIVE":
+        # Canonical mode — set once, used everywhere in this runner
+        self.mode = os.getenv("AP_MODE", "paper").upper()
+
+        # LIVE assertions validate per-member credentials, not global env vars
+        if self.mode == "LIVE":
             _missing = []
-            if not os.getenv("TRADIER_ACCESS_TOKEN", "").strip():
-                _missing.append("TRADIER_ACCESS_TOKEN")
-            if not os.getenv("TRADIER_ACCOUNT_ID", "").strip():
-                _missing.append("TRADIER_ACCOUNT_ID")
+            if not token:
+                _missing.append("member.tradier_access_token")
+            if not str(self.account_id or "").strip():
+                _missing.append("member.tradier_account_id")
             if not os.getenv("DATABASE_URL", "").strip():
                 _missing.append("DATABASE_URL")
             if _missing:
                 logger.error(
                     f"[{self.email}] LIVE mode startup aborted -- "
-                    f"missing required env vars: {', '.join(_missing)}"
+                    f"missing: {', '.join(_missing)}"
                 )
                 return
-            logger.info(f"[{self.email}] LIVE mode startup assertions PASSED")
+            logger.info(
+                f"[{self.email}] LIVE mode assertions PASSED | "
+                f"account_id={self.account_id} base_url={self.base_url}"
+            )
 
         # ── Imports ──────────────────────────────────────────────────────────
         try:
@@ -234,7 +242,7 @@ class ClientRunner(threading.Thread):
             )
 
             self.master_control = APMasterControl(
-                mode=os.getenv("AP_MODE", "paper"),
+                mode=self.mode.lower(),
                 client_id=self.email,
                 score_floor=float(os.getenv("SCORE_FLOOR", "65")),
                 context_floor=float(os.getenv("CONTEXT_FLOOR", "0.0")),
@@ -294,7 +302,7 @@ class ClientRunner(threading.Thread):
             self.contract_selector = APContractSelectionEngine(
                 broker=broker,        # execution broker -- gated by BOT_MODE
                 data_broker=data_broker,  # live data broker -- quotes + chains only
-                mode=os.getenv("AP_MODE", "paper"),
+                mode=self.mode.lower(),
                 target_delta=float(os.getenv("TARGET_DELTA", "0.50")),  # ATM
                 max_spread_pct=float(os.getenv("MAX_SPREAD_PCT", "0.50")),  # raised: 0.25→0.50 -- let wide spreads through
                 min_oi=int(os.getenv("MIN_OI", "1")),          # lowered: 5→1
@@ -319,7 +327,7 @@ class ClientRunner(threading.Thread):
             # Wire kill switch + mode into master control
             self.master_control.wire(
                 kill_switch_fn=lambda: getattr(self.core, "_kill_switch", False),
-                mode_fn=lambda: getattr(self.core, "mode", "PAPER"),
+                mode_fn=lambda: getattr(self.core, "mode", self.mode),
             )
 
             # Startup recovery: restore positions, verify pending orders, reseed dedup
@@ -401,9 +409,11 @@ class ClientRunner(threading.Thread):
 
             logger.info(
                 f"[{self.email}] Control stack initialized | "
-                f"mode={os.getenv('AP_MODE','paper').upper()} "
+                f"mode={self.mode} "
                 f"score_floor={os.getenv('SCORE_FLOOR','65')} "
-                f"max_pos={os.getenv('MAX_POSITIONS','7')}"
+                f"max_pos={_max_pos} "
+                f"max_trades={_max_trades} "
+                f"daily_loss=${_max_loss:.0f}"
             )
 
             # ── Queue worker -- NEW control path ───────────────────────────────
@@ -431,6 +441,12 @@ class ClientRunner(threading.Thread):
                     pass
             if self.core:
                 self.core.stop()
+            # Unregister exit engine from OSM registry to prevent stale references
+            try:
+                from ap.order_state_machine import unregister_exit_engine
+                unregister_exit_engine(self.email)
+            except Exception:
+                pass
             # Unregister from health monitor
             health_mon = get_monitor()
             if health_mon:
@@ -439,6 +455,9 @@ class ClientRunner(threading.Thread):
             healer = get_healer()
             if healer:
                 healer.unregister(self.email)
+            # Remove from active runner registry so supervisor replaces us promptly
+            with _registry_lock:
+                _active_runners.pop(self.email, None)
             logger.info(f"[{self.email}] ClientRunner stopped.")
 
     def stop(self):
@@ -506,12 +525,12 @@ class ClientRunner(threading.Thread):
                 except Exception as _re:
                     logger.debug(f"[{self.email}] Session reset check failed: {_re}")
 
-        t = threading.Thread(
+        self.equity_thread = threading.Thread(
             target=_refresh_loop,
             daemon=True,
             name=f"equity-refresh-{self.email}",
         )
-        t.start()
+        self.equity_thread.start()
 
     def _start_worker_thread(self, broker):
         """
@@ -520,7 +539,7 @@ class ClientRunner(threading.Thread):
         """
         entry_watcher = getattr(self.core, "entry_watcher", None)
 
-        is_live = os.getenv("AP_MODE", "paper").upper() == "LIVE"
+        is_live = self.mode == "LIVE"
 
         def _run_worker():
             try:
@@ -539,12 +558,12 @@ class ClientRunner(threading.Thread):
             except Exception as e:
                 logger.error(f"[{self.email}] worker_loop crashed: {e}", exc_info=True)
 
-        t = threading.Thread(
+        self.worker_thread = threading.Thread(
             target=_run_worker,
             daemon=True,
             name=f"worker-{self.email}",
         )
-        t.start()
+        self.worker_thread.start()
         logger.info(f"[{self.email}] Queue subscriber started")
 
 
@@ -720,8 +739,11 @@ def get_runner_status() -> list[dict]:
                 "order_osm":      r.order_state_machine is not None,
                 "contract_sel":   r.contract_selector is not None,
                 "earnings_guard": r.contract_selector is not None,   # bundled in selector
-                "iv_filter":      r.contract_selector is not None,   # bundled in selector
+                "iv_filter":      r.contract_selector is not None,
                 "order_monitor":  r.order_monitor is not None,
+                "worker_alive":   getattr(r, "worker_thread", None) is not None and r.worker_thread.is_alive(),
+                "equity_alive":   getattr(r, "equity_thread", None) is not None and r.equity_thread.is_alive(),
+                "mode":           getattr(r, "mode", "PAPER"),
             }
             for email, r in _active_runners.items()
         ]
