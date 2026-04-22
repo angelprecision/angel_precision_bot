@@ -147,8 +147,6 @@ class RankingQueue:
         with self._lock:
             return len(self._queue)
 
-    def available_slots(self, position_count: int, max_positions: int) -> int:
-        return max(0, max_positions - position_count)
 
 
 # =============================================================================
@@ -520,7 +518,7 @@ class APExecutionCore:
         def _loop():
             while self._rq_running:
                 try:
-                    slots = self.rank_queue.available_slots(self._position_count, self._max_positions)
+                    slots = max(0, self._max_positions - self._position_count)
                     if slots > 0 and self.rank_queue.size() > 0:
                         signals = self.rank_queue.drain(slots)
                         for sig in signals:
