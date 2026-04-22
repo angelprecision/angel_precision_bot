@@ -668,7 +668,6 @@ class APExecutionCore:
             return
 
         # Size: base x spread modifier x feedback modifier x tier multiplier
-        # FIX: B-tier always executes as 1 contract regardless of other multipliers
         tier      = sig.get("tier", Tier.A)
         if tier == Tier.B:
             contracts = 1   # B-tier: always 1 contract, no scaling
@@ -686,14 +685,11 @@ class APExecutionCore:
         )
 
         # ── ENTRY SUBMISSION ─────────────────────────────────────────────────
-        # Route through OSM when available (creates DB row + transitions lifecycle).
-        # Falls back to legacy _place_option_order when OSM not wired (dev/compat).
-        fill_price      = None
-        local_order_id  = None
-        broker_order_id = None
+        # Primary path: route through OSM. This creates DB row + transitions
+        # lifecycle. We do NOT mint a position here on success; that belongs
+        # to the FILLED transition path via fill monitor / reconciler.
 
         if self.order_state_machine:
-            # Build minimal plan for OSM
             plan = ApprovedExecutionPlan(
                 plan_id          = signal_id,
                 signal_id        = signal_id,
@@ -710,32 +706,51 @@ class APExecutionCore:
                 f"submitting entry via OSM @ ${decision.mid_price:.2f} x{contracts}"
             )
             submit_res = self.order_state_machine.submit_entry(
-                broker        = self.broker,
-                plan          = plan,
-                limit_price   = decision.mid_price,
+                broker      = self.broker,
+                plan        = plan,
+                limit_price = decision.mid_price,
             )
 
             if submit_res["ok"]:
                 local_order_id  = submit_res["local_order_id"]
                 broker_order_id = submit_res["broker_order_id"]
-                # Use mid_price as working fill price (fill monitor confirms real fill)
-                fill_price = decision.mid_price
+
+                if signal_id:
+                    self.store.update_signal_fields(signal_id, {
+                        "decision_status": "submitted",
+                        "context_notes": (
+                            f"entry_submitted local={local_order_id} "
+                            f"broker={broker_order_id}"
+                        ),
+                    })
+
+                log.info(
+                    f"[{ticker}] Entry submitted via OSM | "
+                    f"local={local_order_id} broker={broker_order_id} "
+                    f"{contracts}x {decision.symbol} @ ${decision.mid_price:.2f}"
+                )
+                # Do NOT create ManagedPosition here; wait for FILLED.
+                return
+
+            # OSM / broker submission failed
+            if self.paper:
+                # Paper continuity: sandbox may be unavailable — simulate fill
+                log.warning(
+                    f"[{ticker}] OSM/sandbox order failed — using simulated fill "
+                    f"@ ${decision.mid_price:.2f} (paper continuity) | "
+                    f"error={submit_res['error']}"
+                )
+                fill_price      = decision.mid_price
+                local_order_id  = submit_res.get("local_order_id")
+                broker_order_id = submit_res.get("broker_order_id")
+                synthetic       = True
             else:
-                if self.paper:
-                    # Paper continuity: sandbox may be unavailable — simulate fill
-                    log.warning(
-                        f"[{ticker}] OSM/sandbox order failed — using simulated fill "
-                        f"@ ${decision.mid_price:.2f} (paper continuity) | "
-                        f"error={submit_res['error']}"
-                    )
-                    fill_price = decision.mid_price
-                else:
-                    log.error(
-                        f"[{ticker}] Entry submit failed via OSM | "
-                        f"order={submit_res['local_order_id']} error={submit_res['error']}"
-                    )
-                    funnel.inc("order_failed")
-                    return
+                log.error(
+                    f"[{ticker}] Entry submit failed via OSM | "
+                    f"order={submit_res['local_order_id']} error={submit_res['error']}"
+                )
+                funnel.inc("order_failed")
+                return
         else:
             # Legacy path (no OSM wired) — paper keeps sandbox continuity
             log.info(
@@ -748,6 +763,10 @@ class APExecutionCore:
                 side        = "buy_to_open",
                 limit_price = decision.mid_price,
             )
+            synthetic       = False
+            local_order_id  = None
+            broker_order_id = None
+
             if not fill_price:
                 if self.paper:
                     log.warning(
@@ -755,17 +774,19 @@ class APExecutionCore:
                         f"@ ${decision.mid_price:.2f} (paper continuity)"
                     )
                     fill_price = decision.mid_price
+                    synthetic  = True
                 else:
                     log.error(f"[{ticker}] Order failed -- no fill price returned")
                     funnel.inc("order_failed")
                     return
 
+        # If we reach here, we are in a simulated or legacy fill path only.
         if not fill_price:
             log.error(f"[{ticker}] Order failed -- no fill price")
             funnel.inc("order_failed")
             return
 
-        # Register with exit engine
+        # Register with exit engine using simulated/legacy fill
         pos = ManagedPosition(
             ticker            = ticker,
             option_symbol     = decision.symbol,
@@ -781,6 +802,7 @@ class APExecutionCore:
         pos.current_option_price = fill_price
         pos.current_underlying   = watched.trigger_price
         pos.signal               = sig  # type: ignore[attr-defined]
+        pos.synthetic_entry      = synthetic  # type: ignore[attr-defined]
         if local_order_id:
             pos.local_order_id  = local_order_id   # type: ignore[attr-defined]
         if broker_order_id:
@@ -803,7 +825,8 @@ class APExecutionCore:
         )
 
         log.info(
-            f"[{ticker}] {'PAPER' if self.paper else 'LIVE'} OPEN | "
+            f"[{ticker}] {'PAPER' if self.paper else 'LIVE'} OPEN "
+            f"(synthetic={synthetic}) | "
             f"{contracts}x {decision.symbol} @ ${fill_price:.2f} | "
             f"target=${watched.target_price} stop=${watched.stop_level} | "
             f"tier={tier} score={watched.score:.0f}"
