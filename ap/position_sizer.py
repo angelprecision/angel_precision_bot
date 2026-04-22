@@ -20,10 +20,12 @@ import ap.db as db
 log = logging.getLogger("ap.position_sizer")
 
 # ── Tier max-contract limits ──────────────────────────────────────────────────
+# Scaled to account size — Kelly/budget sizing fills up to these per-tier caps.
+# Tier B is no longer capped at 1 — it buys however many contracts 2% budget allows.
 _TIER_MAX: dict[str, int] = {
-    "A+": 4,
-    "A":  2,
-    "B":  1,
+    "A+": 20,   # up to 20 contracts if Kelly supports it
+    "A":  10,
+    "B":  5,    # was 1 — now budget-driven (2% of equity / premium)
     "SHADOW": 0,
 }
 

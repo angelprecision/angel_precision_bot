@@ -687,9 +687,14 @@ class APExecutionCore:
         # Size: base x spread modifier x feedback modifier x tier multiplier
         tier      = sig.get("tier", Tier.A)
         if tier == Tier.B:
-            contracts = 1   # B-tier: always 1 contract, no scaling
-            base      = 1
-            tier_mult = 0.30
+            # B-tier: size by budget (2% of equity / premium), capped at 5
+            _equity       = getattr(self.master_control, "account_equity", 25000) or 25000
+            _budget       = _equity * 0.02  # 2% risk per trade
+            _premium      = decision.mid_price * 100  # cost per contract
+            _budget_qty   = max(1, int(_budget / _premium)) if _premium > 0 else 1
+            contracts     = min(_budget_qty, 5)  # cap at 5 for B-tier
+            base          = contracts
+            tier_mult     = 0.30
         else:
             tier_mult = 1.0 if tier == Tier.A_PLUS else 0.6
             base      = self._get_base_contracts(watched.score)
