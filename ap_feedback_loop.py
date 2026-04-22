@@ -82,6 +82,7 @@ class APFeedbackLoop:
         underlying_exit:      float,
         contracts:            int = 1,
         context_notes:        str = "",
+        synthetic_entry:      bool = False,
     ):
         """Call this every time a position closes."""
         ticker      = signal.get("ticker", "")
@@ -132,6 +133,7 @@ class APFeedbackLoop:
             "time_exit":          time_exit,
             "exit_reason":        exit_reason,
             "context_notes":      context_notes,
+            "synthetic_entry":    bool(synthetic_entry),
             "closed_at":          datetime.now(timezone.utc).isoformat(),
         }
 

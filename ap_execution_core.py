@@ -814,14 +814,16 @@ class APExecutionCore:
             self._position_count += 1
 
         if signal_id:
-            self.store.update_status(signal_id, "executed", timestamp_flag="executed_at")
+            _status = "executed_synthetic" if synthetic else "executed"
+            self.store.update_status(signal_id, _status, timestamp_flag="executed_at")
 
         self.proof.log_position_opened(
-            ticker    = ticker,
-            side      = side,
-            tier      = sig.get("tier", "A"),
-            score     = watched.score,
-            contracts = contracts,
+            ticker          = ticker,
+            side            = side,
+            tier            = sig.get("tier", "A"),
+            score           = watched.score,
+            contracts       = contracts,
+            synthetic_entry = bool(getattr(pos, "synthetic_entry", False)),
         )
 
         log.info(
@@ -930,6 +932,7 @@ class APExecutionCore:
             spread_pct         = float(sig.get("spread_pct", 0) or 0),
             chain_grade        = sig.get("chain_grade", ""),
             opened_at          = pos.opened_at if hasattr(pos, "opened_at") else None,
+            synthetic_entry    = bool(getattr(pos, "synthetic_entry", False)),
         )
 
         self.feedback.record_outcome(
@@ -941,6 +944,7 @@ class APExecutionCore:
             underlying_exit    = pos.current_underlying,
             contracts          = pos.quantity,
             context_notes      = f"mode={'paper' if self.paper else 'live'}",
+            synthetic_entry    = bool(getattr(pos, "synthetic_entry", False)),
         )
 
         # Belt-and-suspenders: mark closed here in addition to feedback loop
@@ -961,6 +965,7 @@ class APExecutionCore:
                     "ticker": pos.ticker,
                     "direction": pos.side,
                     "timeframe": sig.get("timeframe", "1d"),
+                    "synthetic_entry": bool(getattr(pos, "synthetic_entry", False)),
                 },
                 exit_info={
                     "exit_price": exit_price,

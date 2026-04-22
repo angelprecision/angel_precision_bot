@@ -197,13 +197,27 @@ class APProofLogger:
 
     # ── Increment executed at OPEN ─────────────────────────────────────────
 
-    def log_position_opened(self, ticker: str, side: str, tier: str, score: float, contracts: int):
+    def log_position_opened(
+        self,
+        ticker:          str,
+        side:            str,
+        tier:            str,
+        score:           float,
+        contracts:       int,
+        synthetic_entry: bool = False,
+    ):
         """
         Call this when a position is entered (order filled).
         This is when trades_executed should increment — not at close.
+        synthetic_entry=True means the fill was simulated (paper continuity fallback),
+        not broker-confirmed. Only broker-backed opens count as proof.
         """
-        funnel.inc("trades_executed")
-        log.info(f"[PROOF] OPENED {ticker} {side} {tier} score={score:.0f} qty={contracts}")
+        if not synthetic_entry:
+            funnel.inc("trades_executed")
+        log.info(
+            f"[PROOF] OPENED {ticker} {side} {tier} score={score:.0f} qty={contracts}"
+            f" {'[SYNTHETIC]' if synthetic_entry else '[BROKER]'}"
+        )
 
     # ── TRADE LOGGER (called at close) ────────────────────────────────────────
 
@@ -231,6 +245,7 @@ class APProofLogger:
         chain_grade:         str     = "",
         opened_at:           Optional[datetime] = None,
         closed_at:           Optional[datetime] = None,
+        synthetic_entry:     bool = False,
     ) -> dict:
         now = datetime.now(timezone.utc)
         row = {
@@ -259,6 +274,7 @@ class APProofLogger:
             "win":                win,
             "spread_pct":         round(spread_pct, 4),
             "chain_grade":        chain_grade,
+            "synthetic_entry":    bool(synthetic_entry),
         }
 
         # Cache for convenience — not source of truth
@@ -297,16 +313,18 @@ class APProofLogger:
         if not trades:
             log.info(f"[PROOF] No trades found in Supabase for {today} — generating zero summary")
 
-        wins   = [t for t in trades if t.get("win")]
-        losses = [t for t in trades if not t.get("win")]
+        broker_trades = [t for t in trades if not t.get("synthetic_entry")]
+        synth_trades  = [t for t in trades if t.get("synthetic_entry")]
+        wins   = [t for t in broker_trades if t.get("win")]
+        losses = [t for t in broker_trades if not t.get("win")]
         a_plus = [t for t in trades if t.get("tier") == "A+"]
         a_tier = [t for t in trades if t.get("tier") == "A"]
         b_tier = [t for t in trades if t.get("tier") == "B"]
 
-        pnls      = [float(t.get("option_pnl_pct", 0)) for t in trades]
+        pnls      = [float(t.get("option_pnl_pct", 0)) for t in broker_trades]
         win_pnls  = [float(t.get("option_pnl_pct", 0)) for t in wins]
         loss_pnls = [float(t.get("option_pnl_pct", 0)) for t in losses]
-        win_rate  = round(len(wins) / len(trades) * 100, 1) if trades else 0
+        win_rate  = round(len(wins) / len(broker_trades) * 100, 1) if broker_trades else 0
 
         summary = {
             "date":                  str(today),
@@ -324,8 +342,12 @@ class APProofLogger:
             "sector_capped":         snapshot["sector_capped"],
             "shadow_tracked":        snapshot["shadow_tracked"],
             "trades_executed":       snapshot["trades_executed"],
+            "synthetic_executed":     len(synth_trades),
 
-            # Results
+            # Provenance split
+            "broker_backed_trades":   len(broker_trades),
+            "synthetic_trades":       len(synth_trades),
+            # Results (broker-backed only)
             "wins":                  len(wins),
             "losses":                len(losses),
             "win_rate":              win_rate,
