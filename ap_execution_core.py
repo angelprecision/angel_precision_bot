@@ -944,6 +944,12 @@ class APExecutionCore:
         win     = opt_pnl > 0
         tier    = sig.get("tier", Tier.A_PLUS)
 
+        # Guard: only log once per position — exit_in_flight retries must not re-log
+        if getattr(pos, "proof_logged", False):
+            log.debug("[%s] proof.log_trade skipped — already logged for this position", pos.ticker)
+            return
+        pos.proof_logged = True  # type: ignore[attr-defined]
+
         self.proof.log_trade(
             ticker             = pos.ticker,
             pattern            = sig.get("pattern", ""),
