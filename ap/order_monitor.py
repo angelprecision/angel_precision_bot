@@ -82,6 +82,9 @@ class APOrderMonitor:
         self._thread: Optional[threading.Thread] = None
 
     def start(self):
+        if self._thread and self._thread.is_alive():
+            log.debug("[%s] APOrderMonitor already running", self.client_id)
+            return
         self._thread = threading.Thread(
             target=self._run,
             daemon=True,
