@@ -209,8 +209,9 @@ def process_pending_order(broker: BrokerAdapter, order: dict, osm=None, pm=None)
         mapped = result["status"]  # already kind-aware from check_order_with_broker
 
         if osm:
+            ok = False
             try:
-                osm.transition(
+                ok = osm.transition(
                     local_id, mapped,
                     filled_qty=result["filled_qty"],
                     fill_price=result["avg_fill"],
@@ -218,8 +219,8 @@ def process_pending_order(broker: BrokerAdapter, order: dict, osm=None, pm=None)
             except Exception as e:
                 log.error("[%s] OSM transition %s failed for %s: %s",
                           client_id, mapped, local_id, e)
-            # Open position in DB on confirmed ENTRY fill — idempotent via plan_id/signal_id guards
-            if kind == "ENTRY" and pm:
+            # Open position ONLY when transition succeeded — idempotent via plan_id/signal_id guards
+            if ok and kind == "ENTRY" and pm:
                 try:
                     plan_id   = order.get("plan_id")   or order.get("signal_id") or local_id
                     signal_id = order.get("signal_id") or local_id
