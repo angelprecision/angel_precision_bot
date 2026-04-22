@@ -541,8 +541,7 @@ class APStartupRecovery:
                 c.execute(
                     """
                     UPDATE trade_queue
-                    SET    status     = 'NEW',
-                           updated_ts = NOW()
+                    SET    status = 'NEW'
                     WHERE  client_id  = %s
                       AND  status     = 'WATCHING'
                       AND  created_ts >= %s
