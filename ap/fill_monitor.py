@@ -189,7 +189,7 @@ def _release_entry_guards(order: dict):
 # CORE — process one pending order via OSM
 # =============================================================================
 
-def process_pending_order(broker: BrokerAdapter, order: dict, osm=None):
+def process_pending_order(broker: BrokerAdapter, order: dict, osm=None, pm=None):
     """
     Poll broker and route ALL lifecycle transitions through APOrderStateMachine.
 
@@ -218,6 +218,23 @@ def process_pending_order(broker: BrokerAdapter, order: dict, osm=None):
             except Exception as e:
                 log.error("[%s] OSM transition %s failed for %s: %s",
                           client_id, mapped, local_id, e)
+            # Open position in DB on confirmed ENTRY fill — idempotent via plan_id/signal_id guards
+            if kind == "ENTRY" and pm:
+                try:
+                    plan_id   = order.get("plan_id")   or order.get("signal_id") or local_id
+                    signal_id = order.get("signal_id") or local_id
+                    pm.open_position(
+                        plan_id    = plan_id,
+                        signal_id  = signal_id,
+                        ticker     = (order.get("symbol") or "").upper(),
+                        contract   = order.get("contract") or order.get("symbol") or "",
+                        side       = (order.get("direction") or "CALL").upper(),
+                        qty        = result["filled_qty"] or int(order.get("qty") or 0),
+                        entry_price= result["avg_fill"],
+                    )
+                except Exception as _pm_err:
+                    log.error("[%s] pm.open_position failed for %s: %s",
+                              client_id, local_id, _pm_err)
         else:
             # Legacy fallback — only used if caller didn't pass osm
             _legacy_update_order_status(local_id, "FILLED", filled_qty=result["filled_qty"])
@@ -330,21 +347,21 @@ def process_pending_order(broker: BrokerAdapter, order: dict, osm=None):
 # MAIN LOOP
 # =============================================================================
 
-def fill_monitor_loop(broker: BrokerAdapter, poll_seconds: float = 10.0, osm=None):
+def fill_monitor_loop(broker: BrokerAdapter, poll_seconds: float = 10.0, osm=None, pm=None):
     """
     Fill monitor must NEVER pause on kill switch — it's the reconciliation layer.
 
     osm — APOrderStateMachine instance. Pass it from client_runner so all
           transitions route through the canonical state machine.
     """
-    log.info("Fill monitor started (osm=%s)", "wired" if osm else "legacy-fallback")
+    log.info("Fill monitor started (osm=%s pm=%s)", "wired" if osm else "legacy-fallback", "wired" if pm else "none")
 
     while True:
         try:
             pending = get_pending_orders()
             for order in pending:
                 try:
-                    process_pending_order(broker, order, osm=osm)
+                    process_pending_order(broker, order, osm=osm, pm=pm)
                 except Exception as e:
                     log.exception(
                         "Failed to process order %s: %s",

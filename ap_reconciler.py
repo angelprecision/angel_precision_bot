@@ -255,7 +255,7 @@ class APBrokerReconciler:
                     ok = self.osm.transition(
                         local_id, new_status,
                         filled_qty=filled_qty,
-                        avg_fill=avg_fill,
+                        fill_price=avg_fill,
                     )
                     if ok:
                         summary["orders_corrected"] += 1
@@ -264,6 +264,23 @@ class APBrokerReconciler:
                             f"DB was {db_status}, broker={broker_status} → advanced to {new_status} "
                             f"(qty={filled_qty} avg={avg_fill:.2f})"
                         )
+                        # Open position on confirmed ENTRY fill — idempotent
+                        if kind == "ENTRY" and new_status == "FILLED" and self.pm:
+                            try:
+                                plan_id   = order.get("plan_id")   or order.get("signal_id") or local_id
+                                signal_id_val = order.get("signal_id") or local_id
+                                self.pm.open_position(
+                                    plan_id    = plan_id,
+                                    signal_id  = signal_id_val,
+                                    ticker     = (order.get("symbol") or "").upper(),
+                                    contract   = order.get("contract") or order.get("symbol") or "",
+                                    side       = (order.get("direction") or "CALL").upper(),
+                                    qty        = filled_qty,
+                                    entry_price= avg_fill,
+                                )
+                            except Exception as _pm_err:
+                                log.error("[%s] RECONCILE pm.open_position failed %s: %s",
+                                          self.client_id, local_id, _pm_err)
                     else:
                         log.error(
                             "[%s] OSM transition failed for %s → %s",

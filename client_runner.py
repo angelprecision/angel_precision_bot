@@ -414,6 +414,7 @@ class ClientRunner(threading.Thread):
                         "broker":       broker,
                         "poll_seconds": 10.0,
                         "osm":          self.order_state_machine,
+                        "pm":           self.position_manager,
                     },
                     daemon=True,
                     name=f"fill-monitor-{self.email}",
