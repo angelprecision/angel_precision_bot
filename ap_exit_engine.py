@@ -359,6 +359,7 @@ class APExitEngine:
                     pos.exit_in_flight      = False
                     pos.pending_exit_reason = ""
                     pos.pending_exit_qty    = 0
+                    pos.last_exit_signal_ts = None
         log.info("[exit_eng] Exit in-flight cleared | pos_id=%s", position_id)
 
     def note_partial_exit_fill(self, position_id: str, qty_filled: int):
@@ -369,7 +370,10 @@ class APExitEngine:
             for pos in self._positions:
                 if pos.position_id == position_id:
                     pos.quantity_remaining = max(0, pos.quantity_remaining - int(qty_filled))
-                    pos.exit_in_flight     = False
+                    pos.exit_in_flight      = False
+                    pos.pending_exit_reason = ""
+                    pos.pending_exit_qty    = 0
+                    pos.last_exit_signal_ts = None
                     if pos.quantity_remaining == 0:
                         pos.closed = True
             self._positions = [p for p in self._positions if not p.closed]
@@ -481,6 +485,11 @@ class APExitEngine:
                     if bid > 0 and ask > 0:
                         pos.current_option_price = (bid + ask) / 2
 
+                # Gate: don't re-fire while an exit is in-flight
+                now_utc = datetime.now(timezone.utc)
+                if not self._eligible_for_new_exit(pos, now_utc):
+                    continue
+
                 # Evaluate exit
                 if pos.current_underlying > 0 and pos.current_option_price > 0:
                     decision = evaluate_exit(pos, now_et)
@@ -541,8 +550,6 @@ class APExitEngine:
                 continue
             else:
                 if self.on_exit:
-                    # ── Gap 3: Final per-position kill check before broker call ──
-                    # Catches kill that fires between execute loop iterations.
                     exit_reason = decision.reason or ""
                     if self._kill_switch_fn and self._kill_switch_fn():
                         if not _is_protective(exit_reason):
@@ -554,15 +561,26 @@ class APExitEngine:
                             log.info(
                                 f"[{pos.ticker}] Kill switch active but allowing protective exit: {exit_reason}"
                             )
-                    # 1. Call broker first
                     try:
                         self.on_exit(pos, decision)
+                        # Submission ≠ closure. Mark in-flight so we don't
+                        # re-fire every 30s. Closure via mark_position_closed().
+                        pos.exit_in_flight      = True
+                        pos.pending_exit_reason = decision.reason
+                        pos.pending_exit_qty    = decision.quantity
+                        pos.last_exit_signal_ts = datetime.now(timezone.utc)
                     except Exception as e:
-                        log.error("Exit order FAILED for %s — position remains tracked: %s", pos.ticker, e)
-                        continue  # don't remove, retry next cycle
-                # Submission ≠ closure — mark in-flight only.
-                # APOrderMonitor/APBrokerReconciler calls mark_position_closed()
-                # after broker + DB truth confirms the position is flat.
+                        log.error(
+                            "Exit order FAILED for %s — position remains tracked: %s",
+                            pos.ticker, e,
+                        )
+                        continue
+                else:
+                    log.warning(
+                        "[%s] Exit decision generated but no on_exit callback installed",
+                        pos.ticker,
+                    )
+                    continue
 
                 # 3. Log trade to edge intelligence (non-critical)
                 try:
