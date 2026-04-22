@@ -51,9 +51,15 @@ class WatchedSignal:
         _stop    = signal.get("stop_price")  or _trigger.get("stop")
         _target  = signal.get("target_price") or _trigger.get("pt1") or _trigger.get("pt2")
 
-        self.entry_trigger = float(_entry)
-        self.stop_level    = float(_stop)
-        self.target_price  = float(_target)
+        self.entry_trigger = float(_entry  or 0) or None
+        self.stop_level    = float(_stop   or 0) or None
+        self.target_price  = float(_target or 0) or None
+
+        if not self.entry_trigger:
+            raise ValueError(
+                f"[{signal.get('ticker','?')}] entry_price/trigger is None or zero — "
+                f"signal payload incomplete: entry={_entry} stop={_stop} target={_target}"
+            )
         self.score         = float(signal.get("score", 0))
         self.grade         = signal.get("grade", "B")
 
