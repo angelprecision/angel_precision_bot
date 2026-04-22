@@ -56,8 +56,9 @@ SCALE_OUT_2_THRESHOLD = 0.25   # +25%  → scale out 75% at window 2 (was +80%)
 PROTECT_3_THRESHOLD   = 0.15   # +15%  → exit all at window 3 (was +30%)
 
 # ── IMMEDIATE TAKE-PROFIT (any time, no window gate) ──────────────────────────
-IMMEDIATE_TP_PCT      = 0.50   # +50% → exit immediately regardless of time
-HARD_STOP_PCT         = -0.40  # -40% → exit immediately regardless of time
+IMMEDIATE_TP_PCT      = 0.20   # +20% → exit immediately regardless of time
+HARD_STOP_PCT         = -0.35  # -35% → exit immediately regardless of time
+PROFIT_LOCK_PCT       = 0.10   # once at +20%, don't let it fall below +10%
 
 
 # ── POSITION TRACKER ─────────────────────────────────────────────────────────
@@ -90,6 +91,7 @@ class ManagedPosition:
     current_underlying:   float = 0.0
     quantity_remaining:   int   = 0
     scale_outs_done:      int   = 0
+    peak_pnl_pct:         float = 0.0   # highest option P&L seen
     closed:               bool  = False
     close_reason:         str   = ""
     opened_at:            datetime = field(default_factory=lambda: datetime.now(timezone.utc))
@@ -203,6 +205,14 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
             action="STOP", quantity=qty_rem,
             reason=f"HARD STOP -- {option_pnl*100:.0f}% exceeded -{abs(HARD_STOP_PCT)*100:.0f}% max loss",
             urgency="IMMEDIATE", pnl_pct=option_pnl
+        )
+
+    # ── PROFIT LOCK (once we hit +20%, don't let it fall back below +10%) ──────
+    if pos.peak_pnl_pct >= IMMEDIATE_TP_PCT and option_pnl <= PROFIT_LOCK_PCT:
+        return ExitDecision(
+            action="CLOSE_ALL", quantity=qty_rem,
+            reason=f"PROFIT LOCK -- peaked at +{pos.peak_pnl_pct*100:.0f}%, protecting +{option_pnl*100:.0f}%",
+            urgency="HIGH", pnl_pct=option_pnl
         )
 
     # ── TREND DAY MULTIPLIERS (must be defined before all exit checks) ────────
@@ -512,6 +522,9 @@ class APExitEngine:
 
                 # Evaluate exit
                 if pos.current_underlying > 0 and pos.current_option_price > 0:
+                    # Track peak P&L for profit lock
+                    if pos.option_pnl_pct > pos.peak_pnl_pct:
+                        pos.peak_pnl_pct = pos.option_pnl_pct
                     decision = evaluate_exit(pos, now_et)
                     if decision.should_act:
                         actions_to_take.append((pos, decision))
