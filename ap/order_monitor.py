@@ -98,6 +98,8 @@ class APOrderMonitor:
 
     def stop(self):
         self._stop_event.set()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=min(POLL_INTERVAL, 5))
         log.info(f"[{self.client_id}] APOrderMonitor stopping")
 
     # =========================================================================
@@ -231,7 +233,7 @@ class APOrderMonitor:
             if status in ("EXIT_REQUESTED", "EXIT_SUBMITTED"):
                 if age_secs > TIMEOUT_EXIT_PENDING:
                     broker_status = self._query_broker_order(broker_oid)
-                    if broker_status and "fill" in broker_status.lower():
+                    if self._is_filled_status(broker_status):
                         self._advance_from_broker_status(local_id, broker_status, contract)
                     else:
                         # Exit stall = ESCALATE — this is account risk
@@ -301,16 +303,9 @@ class APOrderMonitor:
             except Exception as e:
                 log.warning(f"[{self.client_id}] Broker cancel failed: {e}")
 
-            # Require broker-confirmed cancellation before marking local CANCELED
-            confirmed_status = ""
-            if isinstance(cancel_result, dict):
-                confirmed_status = str(cancel_result.get("status", "")).upper()
-            elif cancel_result is True:
-                confirmed_status = "CANCELED"  # legacy bool True = confirmed
+            confirmed_status = self._extract_broker_status(cancel_result)
 
-            is_confirmed = any(x in confirmed_status for x in ("CANCELED", "CANCELLED", "EXPIRED"))
-
-            if is_confirmed:
+            if self._is_terminal_cancel_status(confirmed_status):
                 ok = self.osm.transition(local_order_id, "CANCELED", last_error=reason)
                 if ok:
                     log.info(
@@ -358,7 +353,7 @@ class APOrderMonitor:
         broker_oid    = self._get_broker_order_id(local_order_id)
         broker_status = self._query_broker_order(broker_oid)
 
-        if broker_status and "fill" in broker_status.lower():
+        if self._is_filled_status(broker_status):
             log.info(
                 f"[{self.client_id}] Exit actually filled at broker — "
                 f"advancing state machine: {local_order_id}"
@@ -373,13 +368,8 @@ class APOrderMonitor:
         except Exception as e:
             log.warning(f"[{self.client_id}] Exit broker cancel failed: {e}")
 
-        confirmed_status = ""
-        if isinstance(cancel_result, dict):
-            confirmed_status = str(cancel_result.get("status", "")).upper()
-        elif cancel_result is True:
-            confirmed_status = "CANCELED"  # legacy bool True = confirmed
-
-        is_confirmed_canceled = any(x in confirmed_status for x in ("CANCELED", "CANCELLED", "EXPIRED"))
+        confirmed_status = self._extract_broker_status(cancel_result)
+        is_confirmed_canceled = self._is_terminal_cancel_status(confirmed_status)
 
         if not is_confirmed_canceled:
             self._alert(
@@ -441,61 +431,97 @@ class APOrderMonitor:
             log.debug(f"[{self.client_id}] Broker order query failed: {e}")
         return None
 
-    def _cancel_broker_order(self, broker_order_id: Optional[str]) -> bool:
+    def _cancel_broker_order(self, broker_order_id: Optional[str]):
         """
-        Send cancel to broker. Returns actual broker response dict so callers
-        can inspect the real status. Never returns unconditional True.
-        Returns False if request failed or broker unavailable.
+        Send cancel to broker. Returns the most truthful broker response available:
+          - dict: broker order/cancel payload with 'status' key
+          - str:  normalized status string
+          - None: no usable confirmation
+
+        A successful cancel REQUEST is NOT the same as a canceled order.
+        Callers must use _is_terminal_cancel_status() to verify before
+        transitioning local state.
         """
         if not broker_order_id or not self.broker:
-            return False
+            return None
         try:
+            result = None
             if hasattr(self.broker, "cancel_order"):
                 result = self.broker.cancel_order(broker_order_id)
-                log.info(f"[{self.client_id}] Broker cancel sent: {broker_order_id} → {result}")
-                if isinstance(result, dict):
+                log.info(f"[{self.client_id}] Broker cancel requested: {broker_order_id} → {result}")
+
+            if isinstance(result, dict):
+                status = str(result.get("status") or result.get("order_status") or "").strip().lower()
+                if status:
                     return result
-                # Re-query to get confirmed state
-                try:
-                    requery = self.broker.get_order(broker_order_id)
-                    if isinstance(requery, dict):
-                        return requery
-                except Exception:
-                    pass
-            return False
+
+            if isinstance(result, str) and result.strip():
+                return result.strip().lower()
+
+            # Re-query after cancel request to learn actual broker state
+            queried = self._query_broker_order(broker_order_id)
+            if queried:
+                return queried
+
         except Exception as e:
             log.warning(f"[{self.client_id}] Broker cancel error: {e}")
-        return False
+        return None
+
+    def _normalize_broker_status(self, raw_status) -> str:
+        """Normalize broker status into lowercase canonical string. Returns "" for unknown."""
+        if raw_status is None:
+            return ""
+        if isinstance(raw_status, dict):
+            raw_status = raw_status.get("status") or raw_status.get("order_status") or ""
+        s = str(raw_status).strip().lower()
+        if not s:
+            return ""
+        aliases = {
+            "cancelled":       "canceled",
+            "partial_fill":    "partially_filled",
+            "partial_filled":  "partially_filled",
+        }
+        return aliases.get(s, s)
+
+    def _is_terminal_cancel_status(self, raw_status) -> bool:
+        """True only when broker confirms terminal cancel/expire — not mere request accepted."""
+        return self._normalize_broker_status(raw_status) in {"canceled", "expired"}
+
+    def _is_filled_status(self, raw_status) -> bool:
+        """True only for a confirmed full fill."""
+        return self._normalize_broker_status(raw_status) == "filled"
+
+    def _extract_broker_status(self, raw_result) -> str:
+        """Pull a normalized status string from dict/str/None broker responses."""
+        return self._normalize_broker_status(raw_result)
 
     def _advance_from_broker_status(
-        self, local_order_id: str, broker_status: str, contract: str
+        self, local_order_id: str, broker_status, contract: str
     ):
-        """Advance order state machine based on broker status string."""
-        s = (broker_status or "").lower().strip()
-        # Exact Tradier status strings — no substring matching
+        """Advance order state machine based on exact normalized broker status."""
+        s = self._normalize_broker_status(broker_status)
         mapping = {
             "filled":           "FILLED",
             "partially_filled": "PARTIAL_FILL",
             "canceled":         "CANCELED",
-            "cancelled":        "CANCELED",
             "rejected":         "REJECTED",
             "expired":          "EXPIRED",
             "pending":          "SUBMITTED",
             "open":             "ACKNOWLEDGED",
         }
-        broker_status = s
-        for keyword, new_status in mapping.items():
-            if keyword in broker_status:
-                ok = self.osm.transition(local_order_id, new_status)
-                if ok:
-                    log.info(
-                        f"[{self.client_id}] Advanced from broker status | "
-                        f"{contract} | {local_order_id} → {new_status}"
-                    )
-                return
-        log.debug(
-            f"[{self.client_id}] Unknown broker status '{broker_status}' — no transition"
-        )
+        new_status = mapping.get(s)
+        if not new_status:
+            log.debug(
+                f"[{self.client_id}] Unknown/non-actionable broker status "
+                f"'{s or broker_status}' — no transition"
+            )
+            return
+        ok = self.osm.transition(local_order_id, new_status)
+        if ok:
+            log.info(
+                f"[{self.client_id}] Advanced from broker status | "
+                f"{contract} | {local_order_id} → {new_status}"
+            )
 
     def _get_broker_order_id(self, local_order_id: str) -> Optional[str]:
         """Look up broker_order_id for a local_order_id."""
