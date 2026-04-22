@@ -79,6 +79,7 @@ class APStartupRecovery:
             "exits_reattached":    0,
             "buying_power_reserved": 0.0,
             "dedup_seeded":        0,
+            "watchers_requeued":   0,
             "errors":              [],
         }
 
@@ -114,15 +115,22 @@ class APStartupRecovery:
             log.error("[%s] Dedup reseed error: %s", self.client_id, e)
             result["errors"].append(f"dedup: {e}")
 
+        try:
+            self._reseed_watchers(result)
+        except Exception as e:
+            log.error("[%s] Watcher reseed error: %s", self.client_id, e)
+            result["errors"].append(f"watchers: {e}")
+
         log.info(
             "[%s] Recovery complete | positions=%d entries_verified=%d "
-            "entries_corrected=%d exits=%d dedup=%d buying_power=$%.2f errors=%d",
+            "entries_corrected=%d exits=%d dedup=%d watchers_requeued=%d buying_power=$%.2f errors=%d",
             self.client_id,
             result["positions_recovered"],
             result["entries_verified"],
             result["entries_corrected"],
             result["exits_reattached"],
             result["dedup_seeded"],
+            result["watchers_requeued"],
             result["buying_power_reserved"],
             len(result["errors"]),
         )
@@ -500,4 +508,53 @@ class APStartupRecovery:
         log.info(
             "[%s] RECOVERY: dedup reseeded with %d signals (lookback=%dh)",
             self.client_id, count, cutoff_hours,
+        )
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # 6. Watcher reseed — re-queue WATCHING signals so entry_watcher picks up
+    #    after a restart. WATCHING in DB means "queued for entry watcher" but
+    #    the watcher is in-memory; it loses state on restart.
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def _reseed_watchers(self, result: dict):
+        """
+        Reset WATCHING signals back to NEW so the queue worker re-processes
+        them and re-hands them to APEntryWatcher on startup.
+
+        Only resets signals created today (ET) to avoid re-triggering stale
+        multi-day signals that should have expired.
+        """
+        from ap.db import conn, run_with_retry
+        from datetime import datetime, timezone, timedelta
+        from zoneinfo import ZoneInfo
+
+        ET = ZoneInfo("America/New_York")
+        now_et    = datetime.now(ET)
+        today_et  = now_et.date()
+        # ET midnight in UTC
+        midnight_et = datetime(today_et.year, today_et.month, today_et.day,
+                               0, 0, 0, tzinfo=ET)
+        cutoff_utc  = midnight_et.astimezone(timezone.utc).isoformat()
+
+        def _reset():
+            with conn() as c:
+                c.execute(
+                    """
+                    UPDATE trade_queue
+                    SET    status     = 'NEW',
+                           updated_ts = NOW()
+                    WHERE  client_id  = %s
+                      AND  status     = 'WATCHING'
+                      AND  created_ts >= %s
+                    """,
+                    (self.client_id, cutoff_utc),
+                )
+                return c.rowcount
+
+        count = run_with_retry(_reset) or 0
+        result["watchers_requeued"] = count
+        log.info(
+            "[%s] RECOVERY: %d WATCHING signals reset to NEW for watcher reseed "
+            "(cutoff=%s ET)",
+            self.client_id, count, str(today_et),
         )
