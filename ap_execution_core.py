@@ -685,12 +685,63 @@ class APExecutionCore:
             f"[{decision.grade}] [{setup_status}]"
         )
 
-        # Place order — PAPER mode submits to Tradier sandbox for real account tracking.
-        # This is critical: paper trades must show in the Tradier sandbox account
-        # so the account equity curve is visible and clients can see the paper run.
-        if self.paper:
-            # Submit to Tradier sandbox — same path as live, just a different base_url
-            log.info(f"[{ticker}] PAPER -- submitting to Tradier sandbox @ ${decision.mid_price:.2f}")
+        # ── ENTRY SUBMISSION ─────────────────────────────────────────────────
+        # Route through OSM when available (creates DB row + transitions lifecycle).
+        # Falls back to legacy _place_option_order when OSM not wired (dev/compat).
+        fill_price      = None
+        local_order_id  = None
+        broker_order_id = None
+
+        if self.order_state_machine:
+            # Build minimal plan for OSM
+            plan = ApprovedExecutionPlan(
+                plan_id          = signal_id,
+                signal_id        = signal_id,
+                ticker           = ticker,
+                side             = side.upper(),
+                contracts        = contracts,
+                limit_price      = decision.mid_price,
+                max_position_usd = None,
+                contract_symbol  = decision.symbol,
+            )
+
+            log.info(
+                f"[{ticker}] {'PAPER' if self.paper else 'LIVE'} -- "
+                f"submitting entry via OSM @ ${decision.mid_price:.2f} x{contracts}"
+            )
+            submit_res = self.order_state_machine.submit_entry(
+                broker        = self.broker,
+                plan          = plan,
+                limit_price   = decision.mid_price,
+            )
+
+            if submit_res["ok"]:
+                local_order_id  = submit_res["local_order_id"]
+                broker_order_id = submit_res["broker_order_id"]
+                # Use mid_price as working fill price (fill monitor confirms real fill)
+                fill_price = decision.mid_price
+            else:
+                if self.paper:
+                    # Paper continuity: sandbox may be unavailable — simulate fill
+                    log.warning(
+                        f"[{ticker}] OSM/sandbox order failed — using simulated fill "
+                        f"@ ${decision.mid_price:.2f} (paper continuity) | "
+                        f"error={submit_res['error']}"
+                    )
+                    fill_price = decision.mid_price
+                else:
+                    log.error(
+                        f"[{ticker}] Entry submit failed via OSM | "
+                        f"order={submit_res['local_order_id']} error={submit_res['error']}"
+                    )
+                    funnel.inc("order_failed")
+                    return
+        else:
+            # Legacy path (no OSM wired) — paper keeps sandbox continuity
+            log.info(
+                f"[{ticker}] {'PAPER' if self.paper else 'LIVE'} -- "
+                f"submitting entry (legacy) @ ${decision.mid_price:.2f}"
+            )
             fill_price = self._place_option_order(
                 symbol      = decision.symbol,
                 contracts   = contracts,
@@ -698,23 +749,19 @@ class APExecutionCore:
                 limit_price = decision.mid_price,
             )
             if not fill_price:
-                # Sandbox rejected or unavailable — fall back to simulated fill
-                # so paper trading continues uninterrupted
-                log.warning(
-                    f"[{ticker}] Tradier sandbox order failed — falling back to simulated fill "
-                    f"@ ${decision.mid_price:.2f} (paper continuity)"
-                )
-                fill_price = decision.mid_price
-        else:
-            fill_price = self._place_option_order(
-                symbol      = decision.symbol,
-                contracts   = contracts,
-                side        = "buy_to_open",
-                limit_price = decision.mid_price,
-            )
+                if self.paper:
+                    log.warning(
+                        f"[{ticker}] Tradier sandbox order failed — falling back to simulated fill "
+                        f"@ ${decision.mid_price:.2f} (paper continuity)"
+                    )
+                    fill_price = decision.mid_price
+                else:
+                    log.error(f"[{ticker}] Order failed -- no fill price returned")
+                    funnel.inc("order_failed")
+                    return
 
         if not fill_price:
-            log.error(f"[{ticker}] Order failed -- no fill price returned")
+            log.error(f"[{ticker}] Order failed -- no fill price")
             funnel.inc("order_failed")
             return
 
@@ -734,6 +781,10 @@ class APExecutionCore:
         pos.current_option_price = fill_price
         pos.current_underlying   = watched.trigger_price
         pos.signal               = sig  # type: ignore[attr-defined]
+        if local_order_id:
+            pos.local_order_id  = local_order_id   # type: ignore[attr-defined]
+        if broker_order_id:
+            pos.broker_order_id = broker_order_id  # type: ignore[attr-defined]
 
         self.exit_eng.add_position(pos)
 
@@ -756,6 +807,7 @@ class APExecutionCore:
             f"{contracts}x {decision.symbol} @ ${fill_price:.2f} | "
             f"target=${watched.target_price} stop=${watched.stop_level} | "
             f"tier={tier} score={watched.score:.0f}"
+            + (f" | local={local_order_id} broker={broker_order_id}" if local_order_id else "")
         )
 
     # ── CALLBACK: Position Closed ─────────────────────────────────────────────
@@ -768,29 +820,64 @@ class APExecutionCore:
         with self._sector_lock:
             self._sector_counts[sector] = max(0, self._sector_counts.get(sector, 0) - 1)
 
-        if self.paper:
-            # Submit real sell_to_close to Tradier sandbox so account P&L is visible
-            log.info(f"[{pos.ticker}] PAPER CLOSE -- submitting sell_to_close to Tradier sandbox | {decision.reason}")
-            sandbox_exit = self._place_option_order(
-                symbol      = pos.option_symbol,
-                contracts   = pos.quantity_remaining,
-                side        = "sell_to_close",
-                limit_price = pos.current_option_price,
-            )
-            exit_price = sandbox_exit or pos.current_option_price
-            log.info(
-                f"[{pos.ticker}] PAPER CLOSE | P&L={pos.option_pnl_pct*100:+.1f}% | "
-                f"exit=${exit_price:.2f} | sandbox={'OK' if sandbox_exit else 'SIMULATED'} | {decision.reason}"
-            )
-        else:
-            exit_price = self._place_option_order(
-                symbol      = pos.option_symbol,
-                contracts   = pos.quantity_remaining,
-                side        = "sell_to_close",
-                limit_price = pos.current_option_price,
-            ) or pos.current_option_price
+        # ── EXIT SUBMISSION ─────────────────────────────────────────────────
+        sig = getattr(pos, "signal", {})
+        _sig_id = str(sig.get("signal_id", ""))
+        exit_price = pos.current_option_price  # working price; P&L confirmation comes from fill monitor
 
-        sig     = getattr(pos, "signal", {})
+        if self.order_state_machine and pos.position_id:
+            log.info(
+                f"[{pos.ticker}] {'PAPER' if self.paper else 'LIVE'} CLOSE -- "
+                f"submitting sell_to_close via OSM @ ${pos.current_option_price:.2f} | {decision.reason}"
+            )
+            exit_res = self.order_state_machine.submit_exit(
+                broker      = self.broker,
+                position_id = str(pos.position_id),
+                contract    = pos.option_symbol,
+                symbol      = pos.ticker,
+                direction   = pos.side,
+                qty         = pos.quantity_remaining,
+                limit_price = pos.current_option_price,
+                signal_id   = _sig_id or None,
+            )
+            if exit_res["ok"]:
+                log.info(
+                    f"[{pos.ticker}] Exit order submitted | "
+                    f"local={exit_res['local_order_id']} broker={exit_res['broker_order_id']} "
+                    f"qty={pos.quantity_remaining} @ ${pos.current_option_price:.2f}"
+                )
+            else:
+                log.error(
+                    f"[{pos.ticker}] Exit submit failed via OSM | "
+                    f"order={exit_res['local_order_id']} error={exit_res['error']} "
+                    f"-- falling back to direct order"
+                )
+                # Fallback so position doesn't get stuck
+                exit_price = self._place_option_order(
+                    symbol      = pos.option_symbol,
+                    contracts   = pos.quantity_remaining,
+                    side        = "sell_to_close",
+                    limit_price = pos.current_option_price,
+                ) or pos.current_option_price
+        else:
+            # Legacy path (no OSM/position_id) — keep sandbox visible for paper
+            log.info(
+                f"[{pos.ticker}] {'PAPER' if self.paper else 'LIVE'} CLOSE (legacy) -- "
+                f"submitting sell_to_close | {decision.reason}"
+            )
+            placed = self._place_option_order(
+                symbol      = pos.option_symbol,
+                contracts   = pos.quantity_remaining,
+                side        = "sell_to_close",
+                limit_price = pos.current_option_price,
+            )
+            exit_price = placed or pos.current_option_price
+            if self.paper:
+                log.info(
+                    f"[{pos.ticker}] PAPER CLOSE | P&L={pos.option_pnl_pct*100:+.1f}% | "
+                    f"exit=${exit_price:.2f} | sandbox={'OK' if placed else 'SIMULATED'} | {decision.reason}"
+                )
+
         opt_pnl = (exit_price - pos.entry_price) / pos.entry_price * 100 if pos.entry_price else 0
         win     = opt_pnl > 0
         tier    = sig.get("tier", Tier.A_PLUS)
@@ -891,8 +978,43 @@ class APExecutionCore:
         log.info(f"[{watched.ticker}] Signal invalidated -- wrong direction")
 
     def _on_position_scale(self, pos: ManagedPosition, decision):
-        log.info(f"[{pos.ticker}] SCALE OUT {decision.quantity}x | P&L={pos.option_pnl_pct*100:+.1f}% | {decision.reason}")
-        if not self.paper:
+        log.info(
+            f"[{pos.ticker}] SCALE OUT {decision.quantity}x | "
+            f"P&L={pos.option_pnl_pct*100:+.1f}% | {decision.reason}"
+        )
+        _sig_id = str(getattr(pos, "signal", {}).get("signal_id", "") or "")
+
+        if self.order_state_machine and pos.position_id:
+            scale_res = self.order_state_machine.submit_exit(
+                broker      = self.broker,
+                position_id = str(pos.position_id),
+                contract    = pos.option_symbol,
+                symbol      = pos.ticker,
+                direction   = pos.side,
+                qty         = decision.quantity,
+                limit_price = pos.current_option_price,
+                signal_id   = _sig_id or None,
+            )
+            if scale_res["ok"]:
+                log.info(
+                    f"[{pos.ticker}] Scale exit submitted | "
+                    f"local={scale_res['local_order_id']} broker={scale_res['broker_order_id']} "
+                    f"qty={decision.quantity} @ ${pos.current_option_price:.2f}"
+                )
+            else:
+                log.error(
+                    f"[{pos.ticker}] Scale exit failed via OSM | "
+                    f"order={scale_res['local_order_id']} error={scale_res['error']} "
+                    f"-- falling back to direct order"
+                )
+                self._place_option_order(
+                    symbol      = pos.option_symbol,
+                    contracts   = decision.quantity,
+                    side        = "sell_to_close",
+                    limit_price = pos.current_option_price,
+                )
+        else:
+            # Legacy path
             self._place_option_order(
                 symbol      = pos.option_symbol,
                 contracts   = decision.quantity,

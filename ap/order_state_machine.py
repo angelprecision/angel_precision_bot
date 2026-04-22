@@ -496,6 +496,208 @@ class APOrderStateMachine:
         return run_with_retry(_fn)
 
     # =========================================================================
+    # HIGH-LEVEL SUBMISSION HELPERS (BROKER + TRANSITION)
+    # =========================================================================
+
+    def submit_entry(
+        self,
+        *,
+        broker,
+        plan,
+        limit_price:   Optional[float] = None,
+        reserved_cost: Optional[float] = None,
+    ) -> dict:
+        """
+        Create an ENTRY order row for plan and submit it to broker.
+        Returns:
+            {
+              "ok": bool,
+              "local_order_id": str,
+              "broker_order_id": Optional[str],
+              "status": str,          # SUBMITTED or ERROR
+              "error": Optional[str]
+            }
+
+        Semantics:
+        - If an order for this plan already exists, reuse it (idempotent).
+        - On broker accepted, transition CREATED -> SUBMITTED + broker_order_id.
+        - On broker failure, transition CREATED -> ERROR + last_error.
+        - "ok/pending/open/accepted" from Tradier = accepted, NOT filled.
+        """
+        local_id = self.create_entry_order(
+            plan,
+            limit_price=limit_price,
+            reserved_cost=reserved_cost,
+        )
+
+        lp = float(limit_price or getattr(plan, "limit_price", 0) or 0)
+        symbol = getattr(plan, "contract_symbol", None) or plan.ticker
+
+        # Resolve broker URL + account the same way execution_core does
+        base_url   = (
+            getattr(broker, "base_url", None)
+            or getattr(getattr(broker, "cfg", None), "base_url", None)
+            or "https://sandbox.tradier.com"
+        )
+        account_id = (
+            getattr(broker, "account_id", None)
+            or getattr(getattr(broker, "cfg", None), "account_id", None)
+            or ""
+        )
+
+        error_msg       = None
+        broker_order_id = None
+        try:
+            resp = broker.session.post(
+                f"{base_url}/v1/accounts/{account_id}/orders",
+                data={
+                    "class":         "option",
+                    "symbol":        plan.ticker,
+                    "option_symbol": symbol,
+                    "side":          "buy_to_open",
+                    "quantity":      int(plan.contracts),
+                    "type":          "limit",
+                    "price":         round(lp, 2),
+                    "duration":      "day",
+                },
+                headers={"Accept": "application/json"},
+                timeout=10,
+            )
+            order_json      = resp.json() or {}
+            order           = order_json.get("order") or {}
+            status          = (order.get("status") or "").lower()
+            broker_order_id = order.get("id") or order.get("order_id")
+
+            if status in ("ok", "pending", "open", "accepted"):
+                self.transition(
+                    local_id,
+                    OrderStatus.SUBMITTED,
+                    broker_order_id=broker_order_id,
+                    submitted_ts=now_utc_iso(),
+                )
+                return {
+                    "ok":             True,
+                    "local_order_id": local_id,
+                    "broker_order_id": broker_order_id,
+                    "status":         OrderStatus.SUBMITTED,
+                    "error":          None,
+                }
+            else:
+                error_msg = f"broker_status:{status or 'unknown'}"
+        except Exception as e:
+            error_msg = f"broker_error:{e}"
+
+        self.transition(
+            local_id,
+            OrderStatus.ERROR,
+            last_error=error_msg or "unknown_error",
+        )
+        return {
+            "ok":             False,
+            "local_order_id": local_id,
+            "broker_order_id": broker_order_id,
+            "status":         OrderStatus.ERROR,
+            "error":          error_msg,
+        }
+
+    def submit_exit(
+        self,
+        *,
+        broker,
+        position_id: str,
+        contract:    str,
+        symbol:      str,
+        direction:   str,
+        qty:         int,
+        limit_price: float,
+        plan_id:     Optional[str] = None,
+        signal_id:   Optional[str] = None,
+    ) -> dict:
+        """
+        Create an EXIT_REQUESTED order for a position and submit it to broker.
+        Returns same shape dict as submit_entry().
+        """
+        local_id = self.create_exit_order(
+            position_id=position_id,
+            contract=contract,
+            symbol=symbol,
+            direction=direction,
+            qty=qty,
+            plan_id=plan_id,
+            signal_id=signal_id,
+            limit_price=limit_price,
+        )
+
+        base_url   = (
+            getattr(broker, "base_url", None)
+            or getattr(getattr(broker, "cfg", None), "base_url", None)
+            or "https://sandbox.tradier.com"
+        )
+        account_id = (
+            getattr(broker, "account_id", None)
+            or getattr(getattr(broker, "cfg", None), "account_id", None)
+            or ""
+        )
+
+        # Underlying ticker: strip suffixes (e.g. "AAPL 250117C00200000" -> "AAPL")
+        underlying = symbol.split()[0] if " " in symbol else symbol[:6]
+
+        error_msg       = None
+        broker_order_id = None
+        try:
+            resp = broker.session.post(
+                f"{base_url}/v1/accounts/{account_id}/orders",
+                data={
+                    "class":         "option",
+                    "symbol":        underlying,
+                    "option_symbol": contract,
+                    "side":          "sell_to_close",
+                    "quantity":      int(qty),
+                    "type":          "limit",
+                    "price":         round(limit_price, 2),
+                    "duration":      "day",
+                },
+                headers={"Accept": "application/json"},
+                timeout=10,
+            )
+            order_json      = resp.json() or {}
+            order           = order_json.get("order") or {}
+            status          = (order.get("status") or "").lower()
+            broker_order_id = order.get("id") or order.get("order_id")
+
+            if status in ("ok", "pending", "open", "accepted"):
+                self.transition(
+                    local_id,
+                    OrderStatus.EXIT_SUBMITTED,
+                    broker_order_id=broker_order_id,
+                    submitted_ts=now_utc_iso(),
+                )
+                return {
+                    "ok":              True,
+                    "local_order_id":  local_id,
+                    "broker_order_id": broker_order_id,
+                    "status":          OrderStatus.EXIT_SUBMITTED,
+                    "error":           None,
+                }
+            else:
+                error_msg = f"broker_status:{status or 'unknown'}"
+        except Exception as e:
+            error_msg = f"broker_error:{e}"
+
+        self.transition(
+            local_id,
+            OrderStatus.ERROR,
+            last_error=error_msg or "unknown_error",
+        )
+        return {
+            "ok":              False,
+            "local_order_id":  local_id,
+            "broker_order_id": broker_order_id,
+            "status":          OrderStatus.ERROR,
+            "error":           error_msg,
+        }
+
+    # =========================================================================
     # PRIVATE
     # =========================================================================
 
