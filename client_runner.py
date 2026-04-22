@@ -345,9 +345,17 @@ class ClientRunner(threading.Thread):
             # Reseed exit engine with open positions after restart
             try:
                 _exit_eng = getattr(self.core, "exit_eng", None)
-                if _exit_eng and hasattr(_exit_eng, "seed_from_db"):
-                    _exit_eng.seed_from_db(self.position_manager)
-                    logger.info(f"[{self.email}] Exit engine reseeded from DB")
+                if _exit_eng:
+                    # Register with OSM so transition() calls mark_position_closed etc.
+                    try:
+                        from ap.order_state_machine import register_exit_engine
+                        register_exit_engine(self.email, _exit_eng)
+                        logger.info(f"[{self.email}] Exit engine registered with OSM")
+                    except Exception as _reg_err:
+                        logger.warning(f"[{self.email}] OSM registration: {_reg_err}")
+                    if hasattr(_exit_eng, "seed_from_db"):
+                        _exit_eng.seed_from_db(self.position_manager)
+                        logger.info(f"[{self.email}] Exit engine reseeded from DB")
             except Exception as _seed_err:
                 logger.warning(f"[{self.email}] Exit engine seed: {_seed_err}")
 
