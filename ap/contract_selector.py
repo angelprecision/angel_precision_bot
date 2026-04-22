@@ -110,8 +110,8 @@ class APContractSelectionEngine:
         data_broker     = None,   # separate live-data broker for quotes/chains
                                   # if set, used for ALL market data calls
                                   # broker is used ONLY for order placement
-        target_delta:   float = 0.50,  # ATM
-        delta_band:     float = 0.15,  # ±0.15 around 0.50 = 0.35-0.65 delta range
+        target_delta:   float = 0.40,  # slightly OTM preferred
+        delta_band:     float = 0.30,  # ±0.30 = 0.10-0.70 delta range (covers 1-2 strikes OTM)
         max_spread_pct: float = 0.50,  # raised 0.35→0.50 -- data collection, wider acceptance
         min_oi:         int   = 1,    # lowered 50→1 -- any open interest passes in paper mode
         min_volume:     int   = 0,    # lowered 10→0 -- volume check disabled for data collection
