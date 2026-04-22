@@ -72,18 +72,29 @@ class ManagedPosition:
     underlying_target: float
     underlying_stop:   float
 
-    # Context flags (set from context engine at entry time)
-    is_trend_day:         bool  = False   # relaxes exit thresholds
-    trend_direction:      str   = ""      # "uptrend" / "downtrend" -- must match side
+    # DB / order identity
+    position_id:       str  = ""
+    client_id:         str  = ""
+    signal_id:         str  = ""
+
+    # Context flags
+    is_trend_day:         bool  = False
+    trend_direction:      str   = ""
 
     # State
     current_option_price: float = 0.0
     current_underlying:   float = 0.0
     quantity_remaining:   int   = 0
-    scale_outs_done:      int   = 0   # 0, 1, or 2
+    scale_outs_done:      int   = 0
     closed:               bool  = False
     close_reason:         str   = ""
     opened_at:            datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+    # Exit coordination — engine signals intent; order truth decides closure
+    exit_in_flight:       bool  = False
+    pending_exit_reason:  str   = ""
+    pending_exit_qty:     int   = 0
+    last_exit_signal_ts:  Optional[datetime] = None
 
     # P&L tracking
     realized_pnl:   float = 0.0
@@ -281,16 +292,27 @@ class APExitEngine:
 
     def add_position(self, pos: ManagedPosition):
         with self._lock:
+            for existing in self._positions:
+                same_id  = bool(pos.position_id and existing.position_id == pos.position_id)
+                same_sym = (existing.ticker == pos.ticker and
+                            existing.option_symbol == pos.option_symbol and
+                            not existing.closed)
+                if same_id or same_sym:
+                    log.debug("[%s] Exit engine already tracking %s | pos_id=%s",
+                              self._email or pos.ticker, pos.option_symbol, pos.position_id or "n/a")
+                    return
             self._positions.append(pos)
         log.info(
             f"[{pos.ticker}] Position added to exit engine | "
             f"{pos.side} {pos.quantity}x {pos.option_symbol} "
             f"@ ${pos.entry_price:.2f} | "
-            f"target=${pos.underlying_target} stop=${pos.underlying_stop}"
+            f"target=${pos.underlying_target} stop=${pos.underlying_stop} "
+            f"| pos_id={pos.position_id or 'n/a'}"
         )
 
     def start(self):
-        if self._running:
+        if self._thread and self._thread.is_alive():
+            log.debug("APExitEngine already running [%s]", self._email or "default")
             return
         self._running = True
         # Thread name must match self_healing's components dict:
@@ -311,6 +333,61 @@ class APExitEngine:
         with self._lock:
             return [p for p in self._positions if not p.closed]
 
+    # ── BROKER RECONCILIATION HOOKS ──────────────────────────────────────────
+    # Called by APOrderMonitor / APBrokerReconciler after confirming broker truth.
+
+    def mark_position_closed(self, position_id: str, reason: str = ""):
+        """Called after broker + DB confirm full exit fill."""
+        if not position_id:
+            return
+        with self._lock:
+            for pos in self._positions:
+                if pos.position_id == position_id:
+                    pos.closed = True
+                    pos.close_reason = reason or pos.close_reason
+            self._positions = [p for p in self._positions
+                                if not (p.position_id == position_id and p.closed)]
+        log.info("[exit_eng] Closed (broker-confirmed) | pos_id=%s reason=%s", position_id, reason)
+
+    def clear_exit_in_flight(self, position_id: str):
+        """Called when exit order is canceled/rejected/expired — engine may retry."""
+        if not position_id:
+            return
+        with self._lock:
+            for pos in self._positions:
+                if pos.position_id == position_id:
+                    pos.exit_in_flight      = False
+                    pos.pending_exit_reason = ""
+                    pos.pending_exit_qty    = 0
+        log.info("[exit_eng] Exit in-flight cleared | pos_id=%s", position_id)
+
+    def note_partial_exit_fill(self, position_id: str, qty_filled: int):
+        """Called when broker confirms a partial exit fill."""
+        if not position_id or qty_filled <= 0:
+            return
+        with self._lock:
+            for pos in self._positions:
+                if pos.position_id == position_id:
+                    pos.quantity_remaining = max(0, pos.quantity_remaining - int(qty_filled))
+                    pos.exit_in_flight     = False
+                    if pos.quantity_remaining == 0:
+                        pos.closed = True
+            self._positions = [p for p in self._positions if not p.closed]
+        log.info("[exit_eng] Partial fill noted | pos_id=%s qty_filled=%d", position_id, qty_filled)
+
+    def _eligible_for_new_exit(self, pos: "ManagedPosition", now_utc: datetime) -> bool:
+        """Returns True if position can receive a new exit signal."""
+        if not pos.exit_in_flight:
+            return True
+        # Safety valve: 5-min timeout if reconciler hasn't called back
+        if pos.last_exit_signal_ts:
+            age = (now_utc - pos.last_exit_signal_ts).total_seconds()
+            if age >= 300:
+                log.warning("[%s] Exit in-flight safety timeout (300s) — allowing retry", pos.ticker)
+                pos.exit_in_flight = False
+                return True
+        return False
+
     def seed_from_db(self, position_manager):
         """
         Re-hydrate in-memory positions from DB on startup.
@@ -325,16 +402,20 @@ class APExitEngine:
             for row in rows:
                 try:
                     mp = ManagedPosition(
-                        ticker=row.get("underlying", ""),
+                        ticker=row.get("underlying", "") or row.get("symbol", ""),
                         option_symbol=row.get("contract", ""),
                         side=row.get("direction", "CALL"),
-                        quantity=int(row.get("qty", 1)),
-                        entry_price=float(row.get("avg_fill", 0)),
-                        underlying_entry=0.0,
+                        quantity=int(row.get("qty", 1) or 1),
+                        entry_price=float(row.get("avg_fill", 0) or 0),
+                        underlying_entry=float(row.get("underlying_entry", 0) or 0),
                         underlying_target=float(row.get("target_underlying") or 0),
                         underlying_stop=float(row.get("stop_underlying") or 0),
+                        position_id=str(row.get("id") or ""),
+                        client_id=str(row.get("client_id") or ""),
+                        signal_id=str(row.get("signal_id") or ""),
                     )
-                    mp.current_option_price = float(row.get("avg_fill", 0))
+                    mp.current_option_price = float(row.get("avg_fill", 0) or 0)
+                    mp.current_underlying   = float(row.get("underlying_entry", 0) or 0)
                     self.add_position(mp)
                     seeded += 1
                 except Exception as e:
@@ -439,19 +520,25 @@ class APExitEngine:
                 f"qty={decision.quantity} | {decision.reason} | "
                 f"P&L={decision.pnl_pct*100:+.1f}%"
             )
+            if pos.exit_in_flight:
+                log.debug("[%s] Exit already in flight | %s | reason=%s",
+                          pos.ticker, pos.option_symbol, pos.pending_exit_reason)
+                continue
+
             if decision.action == "SCALE_OUT":
-                pos.scale_outs_done += 1
-                pos.quantity_remaining -= decision.quantity
                 if self.on_scale:
                     if self._kill_switch_fn and self._kill_switch_fn():
-                        log.warning(
-                            f"[{pos.ticker}] KILL ACTIVE at on_scale -- "
-                            f"reverting scale_out and skipping broker order"
-                        )
-                        pos.scale_outs_done   -= 1
-                        pos.quantity_remaining += decision.quantity
+                        log.warning(f"[{pos.ticker}] KILL ACTIVE at on_scale -- skipping")
                         continue
-                    self.on_scale(pos, decision)
+                    try:
+                        self.on_scale(pos, decision)
+                        pos.exit_in_flight      = True
+                        pos.pending_exit_reason = decision.reason
+                        pos.pending_exit_qty    = decision.quantity
+                        pos.last_exit_signal_ts = datetime.now(timezone.utc)
+                    except Exception as e:
+                        log.error("[%s] Scale-out FAILED — remains tracked: %s", pos.ticker, e)
+                continue
             else:
                 if self.on_exit:
                     # ── Gap 3: Final per-position kill check before broker call ──
@@ -473,11 +560,9 @@ class APExitEngine:
                     except Exception as e:
                         log.error("Exit order FAILED for %s — position remains tracked: %s", pos.ticker, e)
                         continue  # don't remove, retry next cycle
-                # 2. Only mark closed after successful broker submission
-                pos.closed = True
-                pos.close_reason = decision.reason
-                with self._lock:
-                    self._positions = [p for p in self._positions if p is not pos]
+                # Submission ≠ closure — mark in-flight only.
+                # APOrderMonitor/APBrokerReconciler calls mark_position_closed()
+                # after broker + DB truth confirms the position is flat.
 
                 # 3. Log trade to edge intelligence (non-critical)
                 try:
