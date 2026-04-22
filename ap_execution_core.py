@@ -878,12 +878,19 @@ class APExecutionCore:
         # ── EXIT SUBMISSION ─────────────────────────────────────────────────
         sig = getattr(pos, "signal", {})
         _sig_id = str(sig.get("signal_id", ""))
-        exit_price = pos.current_option_price  # working price; P&L confirmation comes from fill monitor
+        # Use bid for exit limit price — guarantees fill vs mid which often misses.
+        # If bid is not populated yet, fall back to mid.
+        _exit_limit = (
+            pos.current_bid
+            if getattr(pos, "current_bid", 0) > 0
+            else pos.current_option_price
+        )
+        exit_price = _exit_limit
 
         if self.order_state_machine and pos.position_id:
             log.info(
                 f"[{pos.ticker}] {'PAPER' if self.paper else 'LIVE'} CLOSE -- "
-                f"submitting sell_to_close via OSM @ ${pos.current_option_price:.2f} | {decision.reason}"
+                f"submitting sell_to_close via OSM @ ${_exit_limit:.2f} (bid) | {decision.reason}"
             )
             exit_res = self.order_state_machine.submit_exit(
                 broker      = self.broker,
@@ -892,7 +899,7 @@ class APExecutionCore:
                 symbol      = pos.ticker,
                 direction   = pos.side,
                 qty         = pos.quantity_remaining,
-                limit_price = pos.current_option_price,
+                limit_price = _exit_limit,
                 signal_id   = _sig_id or None,
             )
             if exit_res["ok"]:

@@ -88,6 +88,8 @@ class ManagedPosition:
 
     # State
     current_option_price: float = 0.0
+    current_bid:          float = 0.0
+    current_ask:          float = 0.0
     current_underlying:   float = 0.0
     quantity_remaining:   int   = 0
     scale_outs_done:      int   = 0
@@ -513,6 +515,8 @@ class APExitEngine:
                     bid = float(oq.get("bid", 0) or 0)
                     ask = float(oq.get("ask", 0) or 0)
                     if bid > 0 and ask > 0:
+                        pos.current_bid          = bid
+                        pos.current_ask          = ask
                         pos.current_option_price = (bid + ask) / 2
 
                 # Gate: don't re-fire while an exit is in-flight
