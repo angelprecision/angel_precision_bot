@@ -151,6 +151,20 @@ class APStartupRecovery:
             qty        = int(pos.get("qty") or pos.get("quantity") or 0)
             direction  = pos.get("direction", "CALL")
 
+            # Re-register with PositionManager if supported
+            try:
+                if self.pm and hasattr(self.pm, "register_recovered_position"):
+                    self.pm.register_recovered_position(pos)
+                elif self.pm and hasattr(self.pm, "add_position"):
+                    self.pm.add_position(pos)
+            except Exception as e:
+                log.error(
+                    "[%s] RECOVERY: failed to register recovered position %s: %s",
+                    self.client_id, pos_id, e,
+                )
+                result.setdefault("errors", []).append(f"positions_register:{pos_id}:{e}")
+                continue
+
             # Bump in-memory position count on master_control
             try:
                 if hasattr(self.mc, "_position_count"):
@@ -158,7 +172,7 @@ class APStartupRecovery:
             except Exception:
                 pass
 
-            # Bump sector/direction counts on master_control if tracked
+            # Bump sector counts on master_control if tracked
             try:
                 sector = pos.get("sector", "")
                 if sector and hasattr(self.mc, "_sector_counts"):
@@ -362,13 +376,30 @@ class APStartupRecovery:
                 except Exception as e:
                     log.error("[%s] RECOVERY: exit revert failed: %s", self.client_id, e)
             else:
-                # Exit is still live at broker — reattach to exit engine
+                # Exit is still live at broker — reattach to exit engine if available
                 log.info(
                     "[%s] RECOVERY: exit order still live at broker | "
                     "pos=%s %s | broker_status=%s",
                     self.client_id, pos_id, underlying, broker_status,
                 )
                 result["exits_reattached"] += 1
+
+                if self.exit_engine:
+                    try:
+                        if hasattr(self.exit_engine, "seed_from_db"):
+                            # Idempotent global seed; safe to call again on startup.
+                            self.exit_engine.seed_from_db()
+                        elif hasattr(self.exit_engine, "mark_exit_in_flight"):
+                            self.exit_engine.mark_exit_in_flight(
+                                position_id=pos_id,
+                                reason="recovery: exit order live at broker",
+                            )
+                    except Exception as e:
+                        log.error(
+                            "[%s] RECOVERY: failed to reattach exit protection for pos %s: %s",
+                            self.client_id, pos_id, e,
+                        )
+                        result.setdefault("errors", []).append(f"exits_reattach:{pos_id}:{e}")
 
     # ──────────────────────────────────────────────────────────────────────────
     # 4. Buying power reservation
@@ -430,7 +461,7 @@ class APStartupRecovery:
                            client_id, status
                     FROM trade_queue
                     WHERE client_id=%s
-                      AND created_ts > NOW() - INTERVAL '%s hours'
+                      AND created_ts > NOW() - (%s * INTERVAL '1 hour')
                       AND status IN ('NEW','PROCESSING','DONE','COMPLETED','ERROR')
                     ORDER BY created_ts DESC
                     LIMIT 500

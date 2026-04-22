@@ -419,7 +419,6 @@ class APOrderStateMachine:
             _kind   = current.get("kind", "ENTRY")
             if _pos_id and _kind == "EXIT":
                 try:
-                    from ap_exit_engine import _get_exit_engine_for_client
                     _ee = _get_exit_engine_for_client(self.client_id)
                     if _ee:
                         if new_status == OrderStatus.EXIT_FILLED:
