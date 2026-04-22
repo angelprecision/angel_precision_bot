@@ -72,9 +72,9 @@ def reserve_equity_if_available(
                 return
 
             # Read current reservation
-            c.execute("SELECT value FROM kv WHERE key = %s", (key,))
+            c.execute("SELECT v FROM kv WHERE k = %s", (key,))
             row = c.fetchone()
-            reserved = float(json_loads(row['value'])) if row else 0.0
+            reserved = float(json_loads(row['v'])) if row else 0.0
 
             available = max(0.0, current_equity - reserved)
             if amount > available:
@@ -85,10 +85,10 @@ def reserve_equity_if_available(
             reserved_new = reserved + amount
             c.execute(
                 """
-                INSERT INTO kv (key, value, updated_at)
+                INSERT INTO kv (k, v, updated_at)
                 VALUES (%s, %s, %s)
-                ON CONFLICT (key) DO UPDATE
-                    SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at
+                ON CONFLICT (k) DO UPDATE
+                    SET v = EXCLUDED.v, updated_at = EXCLUDED.updated_at
                 """,
                 (key, json_dumps(reserved_new), now_utc_iso()),
             )
@@ -127,16 +127,16 @@ def release_equity(client_id: str, amount: float) -> None:
                 log.warning(f"Release skipped (lock busy): {client_id}")
                 return
 
-            c.execute("SELECT value FROM kv WHERE key = %s", (key,))
+            c.execute("SELECT v FROM kv WHERE k = %s", (key,))
             row = c.fetchone()
-            reserved     = float(json_loads(row['value'])) if row else 0.0
+            reserved     = float(json_loads(row['v'])) if row else 0.0
             reserved_new = max(0.0, reserved - amount)
             c.execute(
                 """
-                INSERT INTO kv (key, value, updated_at)
+                INSERT INTO kv (k, v, updated_at)
                 VALUES (%s, %s, %s)
-                ON CONFLICT (key) DO UPDATE
-                    SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at
+                ON CONFLICT (k) DO UPDATE
+                    SET v = EXCLUDED.v, updated_at = EXCLUDED.updated_at
                 """,
                 (key, json_dumps(reserved_new), now_utc_iso()),
             )
@@ -151,9 +151,9 @@ def get_reserved_equity(client_id: str) -> float:
 
     def _read():
         with _conn()() as c:
-            c.execute("SELECT value FROM kv WHERE key = %s", (key,))
+            c.execute("SELECT v FROM kv WHERE k = %s", (key,))
             row = c.fetchone()
-            return float(json_loads(row['value'])) if row else 0.0
+            return float(json_loads(row['v'])) if row else 0.0
 
     return _run_with_retry(_read)
 
@@ -193,10 +193,10 @@ def acquire_symbol_lock(
                 return
 
             # Check if existing lock is still within TTL
-            c.execute("SELECT value FROM kv WHERE key = %s", (key,))
+            c.execute("SELECT v FROM kv WHERE k = %s", (key,))
             row = c.fetchone()
             if row:
-                payload  = json_loads(row['value'])
+                payload  = json_loads(row['v'])
                 lock_ts  = float(payload.get("ts") or 0.0)
                 if (now - lock_ts) < ttl_seconds:
                     ok = False
@@ -205,10 +205,10 @@ def acquire_symbol_lock(
             # Write new lock timestamp
             c.execute(
                 """
-                INSERT INTO kv (key, value, updated_at)
+                INSERT INTO kv (k, v, updated_at)
                 VALUES (%s, %s, %s)
-                ON CONFLICT (key) DO UPDATE
-                    SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at
+                ON CONFLICT (k) DO UPDATE
+                    SET v = EXCLUDED.v, updated_at = EXCLUDED.updated_at
                 """,
                 (key, json_dumps({"ts": now}), now_utc_iso()),
             )
@@ -231,7 +231,7 @@ def release_symbol_lock(client_id: str, symbol: str) -> None:
 
     def _delete():
         with _conn()() as c:
-            c.execute("DELETE FROM kv WHERE key = %s", (key,))
+            c.execute("DELETE FROM kv WHERE k = %s", (key,))
 
     _run_with_retry(_delete)
     log.info(f"Released lock: {client_id}:{symbol}")
@@ -249,11 +249,11 @@ def is_symbol_locked(
 
     def _read():
         with _conn()() as c:
-            c.execute("SELECT value FROM kv WHERE key = %s", (key,))
+            c.execute("SELECT v FROM kv WHERE k = %s", (key,))
             row = c.fetchone()
             if not row:
                 return False
-            payload = json_loads(row['value'])
+            payload = json_loads(row['v'])
             lock_ts = float(payload.get("ts") or 0.0)
             return (now - lock_ts) < ttl_seconds
 
