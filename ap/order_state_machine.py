@@ -47,6 +47,16 @@ from ap.utils import now_utc_iso
 
 log = logging.getLogger("ap.order_state_machine")
 
+# Registry so OSM can notify the right exit engine per client
+_exit_engine_registry: dict[str, object] = {}
+
+def register_exit_engine(client_id: str, exit_engine) -> None:
+    """Called by ClientRunner to register the exit engine for this client."""
+    _exit_engine_registry[client_id] = exit_engine
+
+def _get_exit_engine_for_client(client_id: str):
+    return _exit_engine_registry.get(client_id)
+
 
 # =============================================================================
 # STATUS CONSTANTS + LEGAL TRANSITIONS
@@ -388,6 +398,31 @@ class APOrderStateMachine:
             + (f" broker={broker_order_id}" if broker_order_id else "")
             + (f" fill={filled_qty}@{fill_price}" if fill_price else "")
         )
+
+        # ── Notify exit engine of confirmed order state changes ───────────────
+        # This is the glue that makes exit engine lifecycle honest:
+        # it learns about fills/cancels from here, not from its own assumptions.
+        if new_status in (
+            OrderStatus.EXIT_FILLED, OrderStatus.EXIT_PARTIAL_FILL,
+            OrderStatus.CANCELED, OrderStatus.EXPIRED, OrderStatus.REJECTED
+        ):
+            _pos_id = position_id or current.get("position_id")
+            _kind   = current.get("kind", "ENTRY")
+            if _pos_id and _kind == "EXIT":
+                try:
+                    from ap_exit_engine import _get_exit_engine_for_client
+                    _ee = _get_exit_engine_for_client(self.client_id)
+                    if _ee:
+                        if new_status == OrderStatus.EXIT_FILLED:
+                            _ee.mark_position_closed(_pos_id, reason="EXIT_FILLED")
+                        elif new_status == OrderStatus.EXIT_PARTIAL_FILL and filled_qty:
+                            _ee.note_partial_exit_fill(_pos_id, filled_qty)
+                        elif new_status in (OrderStatus.CANCELED, OrderStatus.EXPIRED,
+                                            OrderStatus.REJECTED):
+                            _ee.clear_exit_in_flight(_pos_id)
+                except Exception as _ee_err:
+                    log.debug("[%s] exit_eng hook (non-critical): %s", self.client_id, _ee_err)
+
         return True
 
     # =========================================================================
