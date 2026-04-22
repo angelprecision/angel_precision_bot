@@ -39,21 +39,25 @@ log = logging.getLogger("ap.exit_engine")
 ET  = ZoneInfo("America/New_York")
 
 # ── TIME THRESHOLDS (ET) ──────────────────────────────────────────────────────
-PROFIT_PROTECT_1_HOUR = 13   # 1:30 PM -- take 50% if +150%
-PROFIT_PROTECT_1_MIN  = 30
-PROFIT_PROTECT_2_HOUR = 14   # 2:30 PM -- take 75% if +80%
-PROFIT_PROTECT_2_MIN  = 30
-PROFIT_PROTECT_3_HOUR = 15   # 3:00 PM -- exit all if +30%
+PROFIT_PROTECT_1_HOUR = 11   # 11:00 AM -- scale out 50% if +40%
+PROFIT_PROTECT_1_MIN  = 0
+PROFIT_PROTECT_2_HOUR = 13   # 1:00 PM  -- scale out 75% if +25%
+PROFIT_PROTECT_2_MIN  = 0
+PROFIT_PROTECT_3_HOUR = 14   # 2:00 PM  -- exit all if +15%
 PROFIT_PROTECT_3_MIN  = 0
-EOD_HARD_CLOSE_HOUR   = 15   # 3:30 PM -- EXIT EVERYTHING
+EOD_HARD_CLOSE_HOUR   = 15   # 3:30 PM  -- EXIT EVERYTHING
 EOD_HARD_CLOSE_MIN    = 30
-POLL_INTERVAL_SEC     = 30   # check every 30 seconds
+POLL_INTERVAL_SEC     = 15   # check every 15 seconds (was 30)
 
 # ── P&L THRESHOLDS ────────────────────────────────────────────────────────────
-THETA_STOP_LOSS_PCT   = -0.50  # -50% on option → theta kill if past noon
-SCALE_OUT_1_THRESHOLD = 1.50   # +150% → scale out 50% at window 1
-SCALE_OUT_2_THRESHOLD = 0.80   # +80%  → scale out 75% at window 2
-PROTECT_3_THRESHOLD   = 0.30   # +30%  → exit all at window 3
+THETA_STOP_LOSS_PCT   = -0.35  # -35% on option → stop (was -50%)
+SCALE_OUT_1_THRESHOLD = 0.40   # +40%  → scale out 50% at window 1 (was +150%)
+SCALE_OUT_2_THRESHOLD = 0.25   # +25%  → scale out 75% at window 2 (was +80%)
+PROTECT_3_THRESHOLD   = 0.15   # +15%  → exit all at window 3 (was +30%)
+
+# ── IMMEDIATE TAKE-PROFIT (any time, no window gate) ──────────────────────────
+IMMEDIATE_TP_PCT      = 0.50   # +50% → exit immediately regardless of time
+HARD_STOP_PCT         = -0.40  # -40% → exit immediately regardless of time
 
 
 # ── POSITION TRACKER ─────────────────────────────────────────────────────────
@@ -182,6 +186,22 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
         return ExitDecision(
             action="STOP", quantity=qty_rem,
             reason=f"STOP HIT -- underlying ${pos.current_underlying:.2f} at stop ${pos.underlying_stop:.2f}",
+            urgency="IMMEDIATE", pnl_pct=option_pnl
+        )
+
+    # ── IMMEDIATE TAKE-PROFIT (fires any time, no window gate) ──────────────────
+    if option_pnl >= IMMEDIATE_TP_PCT:
+        return ExitDecision(
+            action="CLOSE_ALL", quantity=qty_rem,
+            reason=f"IMMEDIATE TP -- +{option_pnl*100:.0f}% hit {IMMEDIATE_TP_PCT*100:.0f}% target",
+            urgency="IMMEDIATE", pnl_pct=option_pnl
+        )
+
+    # ── HARD STOP (fires any time, no time gate) ─────────────────────────────
+    if option_pnl <= HARD_STOP_PCT:
+        return ExitDecision(
+            action="STOP", quantity=qty_rem,
+            reason=f"HARD STOP -- {option_pnl*100:.0f}% exceeded -{abs(HARD_STOP_PCT)*100:.0f}% max loss",
             urgency="IMMEDIATE", pnl_pct=option_pnl
         )
 
