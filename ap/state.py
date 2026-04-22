@@ -122,6 +122,11 @@ def release_equity(client_id: str, amount: float) -> None:
                 "SELECT pg_try_advisory_xact_lock(hashtext(%s))",
                 (key,)
             )
+            acquired = c.fetchone()['pg_try_advisory_xact_lock']
+            if not acquired:
+                log.warning(f"Release skipped (lock busy): {client_id}")
+                return
+
             c.execute("SELECT value FROM kv WHERE key = %s", (key,))
             row = c.fetchone()
             reserved     = float(json_loads(row['value'])) if row else 0.0

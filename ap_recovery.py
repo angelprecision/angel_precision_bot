@@ -240,7 +240,7 @@ class APStartupRecovery:
                         ok = self.osm.transition(
                             local_id, new_status,
                             filled_qty=filled_qty,
-                            avg_fill=avg_fill,
+                            fill_price=avg_fill,
                             last_error=(
                                 f"recovery: broker_status={broker_status}"
                                 if broker_status in BROKER_TERMINAL else None
@@ -338,7 +338,7 @@ class APStartupRecovery:
                     self.osm.transition(
                         local_id, "EXIT_FILLED",
                         filled_qty=filled_qty,
-                        avg_fill=avg_fill,
+                        fill_price=avg_fill,
                     )
                     log.info(
                         "[%s] RECOVERY: exit filled during downtime | pos=%s %s | "

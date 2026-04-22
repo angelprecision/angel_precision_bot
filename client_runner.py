@@ -98,9 +98,10 @@ class ClientRunner(threading.Thread):
         self.position_manager  = None
         self.order_state_machine = None
         self.contract_selector = None
-        self.order_monitor     = None
-        self.worker_thread     = None
-        self.equity_thread     = None
+        self.order_monitor        = None
+        self.fill_monitor_thread  = None
+        self.worker_thread        = None
+        self.equity_thread        = None
         self.mode              = "PAPER"  # set in run() from AP_MODE env
 
     def _get_token(self) -> str | None:
@@ -403,6 +404,24 @@ class ClientRunner(threading.Thread):
                 position_manager=self.position_manager,
             )
             self.order_monitor.start()
+
+            # Fill monitor -- polls broker and routes fills through OSM
+            try:
+                from ap.fill_monitor import fill_monitor_loop as _fml
+                self.fill_monitor_thread = threading.Thread(
+                    target=_fml,
+                    kwargs={
+                        "broker":       broker,
+                        "poll_seconds": 10.0,
+                        "osm":          self.order_state_machine,
+                    },
+                    daemon=True,
+                    name=f"fill-monitor-{self.email}",
+                )
+                self.fill_monitor_thread.start()
+                logger.info(f"[{self.email}] Fill monitor started (osm-wired)")
+            except Exception as _fm_err:
+                logger.error(f"[{self.email}] Fill monitor start error: {_fm_err}")
 
             # Periodic equity refresh in background (every 15 min)
             self._start_equity_refresh(broker)
