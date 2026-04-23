@@ -108,16 +108,21 @@ def get_prices_yfinance(ticker: str, start_date: str, end_date: str) -> pd.DataF
                          progress=False, group_by="ticker")
         if df.empty:
             return pd.DataFrame()
-        # yfinance ≥0.2.x returns MultiIndex columns like ("Close", "NVDA")
-        # Flatten: take first level (price type) and lowercase
-        if hasattr(df.columns, "levels"):
-            df.columns = [c[0].lower() if isinstance(c, tuple) else str(c).lower()
-                          for c in df.columns]
-        elif df.columns.dtype == object and any(isinstance(c, tuple) for c in df.columns):
-            df.columns = [c[0].lower() if isinstance(c, tuple) else str(c).lower()
-                          for c in df.columns]
-        else:
-            df.columns = [str(c).lower() for c in df.columns]
+        # yfinance MultiIndex flatten: with group_by="ticker" it returns tuples
+        # like ("NVDA", "Close") — ticker FIRST, field SECOND. Previous code took
+        # c[0] which gave the ticker name for every column and collapsed OHLCV
+        # into one duplicate column. Pick whichever tuple element matches a known
+        # OHLCV field name so we're robust to both layouts.
+        _OHLCV = {"open", "high", "low", "close", "adj close", "volume"}
+        def _pick(c):
+            if isinstance(c, tuple):
+                for part in c:
+                    if str(part).lower() in _OHLCV:
+                        return str(part).lower()
+                # Fallback: last element (yfinance group_by="ticker" layout)
+                return str(c[-1]).lower()
+            return str(c).lower()
+        df.columns = [_pick(c) for c in df.columns]
         # Remove duplicate columns (MultiIndex flatten can create them)
         df = df.loc[:, ~df.columns.duplicated()]
         df.index.name = "Date"
