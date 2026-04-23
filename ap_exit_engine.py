@@ -436,6 +436,52 @@ class APExitEngine:
             self._positions = [p for p in self._positions if not p.closed]
         log.info("[exit_eng] Partial fill noted | pos_id=%s qty_filled=%d", position_id, qty_filled)
 
+    def _run_sentinels(self):
+        """GPS trackers — scream loudly if a position is in a bad state with no action."""
+        from datetime import datetime, timezone as _tz
+        now = datetime.now(_tz.utc)
+        for pos in self._positions:
+            age_min = (now - pos.opened_at).total_seconds() / 60 if pos.opened_at else 0
+            pnl     = pos.option_pnl_pct
+            peak    = pos.peak_pnl_pct
+
+            # Sentinel 1: Hit TP threshold but no exit was ever submitted
+            if peak >= IMMEDIATE_TP_PCT and not pos.exit_in_flight and age_min > 1:
+                log.error(
+                    "[SENTINEL] %s | MISSED TP — peaked +%.0f%% but no exit submitted! "
+                    "pos=%s pnl=%.1f%% age=%.0fm",
+                    pos.ticker, peak*100, pos.position_id, pnl*100, age_min
+                )
+
+            # Sentinel 2: Hit hard stop but no exit submitted
+            if pnl <= HARD_STOP_PCT and not pos.exit_in_flight and age_min > 1:
+                log.error(
+                    "[SENTINEL] %s | MISSED STOP — at %.0f%% but no exit submitted! "
+                    "pos=%s age=%.0fm — FORCING EXIT NOW",
+                    pos.ticker, pnl*100, pos.position_id, age_min
+                )
+                # Force fire the exit callback directly
+                try:
+                    decision = ExitDecision(
+                        action="CLOSE_ALL", quantity=pos.quantity_remaining,
+                        reason=f"SENTINEL FORCED EXIT — {pnl*100:.0f}% with no exit order",
+                        urgency="IMMEDIATE", pnl_pct=pnl
+                    )
+                    if self.on_exit:
+                        self.on_exit(pos, decision)
+                except Exception as _e:
+                    log.error("[SENTINEL] Force exit failed for %s: %s", pos.ticker, _e)
+
+            # Sentinel 3: Exit in flight for > 5 min with no fill → alert
+            if pos.exit_in_flight and pos.last_exit_signal_ts:
+                flight_sec = (now - pos.last_exit_signal_ts).total_seconds()
+                if flight_sec > 300:
+                    log.warning(
+                        "[SENTINEL] %s | EXIT STUCK — in-flight %.0fs with no fill | "
+                        "pos=%s broker may have rejected silently",
+                        pos.ticker, flight_sec, pos.position_id
+                    )
+
     def _eligible_for_new_exit(self, pos: "ManagedPosition", now_utc: datetime) -> bool:
         """Returns True if position can receive a new exit signal."""
         if not pos.exit_in_flight:
@@ -514,6 +560,11 @@ class APExitEngine:
             time.sleep(POLL_INTERVAL_SEC)
 
     def _check_all_positions(self):
+        # Run sentinels first — catch stuck/missed exits
+        try:
+            self._run_sentinels()
+        except Exception as _se:
+            log.debug("[exit_eng] Sentinel error (non-critical): %s", _se)
         # ── Gap 1: Kill check at poll start (pre-fetch) ─────────────────────
         if self._kill_switch_fn and self._kill_switch_fn():
             log.debug("Exit engine poll skipped -- kill switch active")
