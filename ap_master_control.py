@@ -623,7 +623,21 @@ class APMasterControl:
         # premium_per_contract unknown pre-contract-selection -- use placeholder;
         # contract_selector.select() will revalidate with real premium.
         _placeholder_premium = 1 * 100 * DEFAULT_PREMIUM_ESTIMATE  # $500 est.
-        _pnl_today           = snap.get("realized_pnl_today", 0.0)
+        # Reset daily P&L for signals arriving outside market hours
+        # (post-close scanner signals are for NEXT session — don't carry today's loss)
+        _raw_pnl = snap.get("realized_pnl_today", 0.0)
+        try:
+            from zoneinfo import ZoneInfo as _ZI
+            from datetime import datetime as _dt, time as _t
+            _now_et = _dt.now(_ZI("America/New_York"))
+            _market_open = _t(9, 30)
+            _market_close = _t(16, 0)
+            _in_session = _market_open <= _now_et.time() <= _market_close
+        except Exception:
+            _in_session = True  # fail safe — apply drawdown if unsure
+        _pnl_today = _raw_pnl if _in_session else 0.0
+        if not _in_session and _raw_pnl < 0:
+            log.info(f"[{ticker}] Post-market signal — daily drawdown reset to 0 (was ${_raw_pnl:.2f})")
 
         if self.sizer:
             try:
