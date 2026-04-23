@@ -139,6 +139,9 @@ def get_prices(ticker: str, start_date: str, end_date: str) -> pd.DataFrame:
         df = get_prices_yfinance(ticker, start_date, end_date)
 
     if not df.empty:
+        # Normalize column names to lowercase so downstream code always finds 'close'
+        df.columns = [str(c).lower() for c in df.columns]
+        df = df.loc[:, ~df.columns.duplicated()]
         # Cache the valid result for this ticker
         _last_known_prices[ticker] = df
         return df
@@ -260,7 +263,7 @@ def get_spy_trend(lookback: int = 20) -> dict:
     end = datetime.date.today().strftime("%Y-%m-%d")
     start = (datetime.date.today() - datetime.timedelta(days=60)).strftime("%Y-%m-%d")
     df = get_prices("SPY", start, end)
-    if df.empty or len(df) < lookback:
+    if df.empty or len(df) < lookback or "close" not in df.columns:
         return {"trend": "UNKNOWN", "above_ma": None, "ma": None, "price": None}
 
     ma = df["close"].rolling(lookback).mean().iloc[-1]
