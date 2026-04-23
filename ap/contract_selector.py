@@ -304,11 +304,18 @@ class APContractSelectionEngine:
                 _fallback_pool = [
                     o for o in chain
                     if float(o.get("ask") or 0) > 0
+                    and float(o.get("bid") or 0) > 0
                     and abs(float(o.get("delta") or o.get("greeks", {}).get("delta", 0) or 0)) >= 0.10
+                    and int(o.get("open_interest") or 0) >= 50   # min OI on fallback
                     and int(o.get("expiration_date", "9999-99-99").replace("-", "") or 99991231)
-                       <= int(today.strftime("%Y%m%d")) + self.max_dte  # rough DTE gate
+                       <= int(today.strftime("%Y%m%d")) + self.max_dte
                 ] or [
-                    # second pass: just require ask > 0
+                    # second pass: relax OI but keep delta + bid requirements
+                    o for o in chain
+                    if float(o.get("bid") or 0) > 0
+                    and abs(float(o.get("delta") or o.get("greeks", {}).get("delta", 0) or 0)) >= 0.10
+                ] or [
+                    # final pass: just require ask > 0
                     o for o in chain if float(o.get("ask") or 0) > 0
                 ]
                 best_fallback = max(_fallback_pool, key=lambda o: int(o.get("open_interest") or 0)) if _fallback_pool else None

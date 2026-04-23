@@ -94,6 +94,10 @@ class APPositionSizer:
         self,
         *,
         client_id:            str,
+        # Cache for _tier_fallback equity-aware sizing
+        self.account_equity  = float(account_equity or 0)
+        self._last_premium   = float(premium_per_contract or 0) / 100  # per-share
+
         tier:                 str,
         premium_per_contract: float,
         account_equity:       float,
@@ -220,9 +224,30 @@ class APPositionSizer:
     # ── Internal: tier fallback ───────────────────────────────────────────────
 
     def _tier_fallback(self, tier: str) -> int:
-        """Return contract count based on tier alone (pre-Kelly fallback)."""
-        mapping = {"A+": 4, "A": 2, "B": 1, "SHADOW": 0}
-        return mapping.get(tier, 1)
+        """
+        Return contract count based on tier + account equity.
+        Uses aggressive sizing (10-15% per trade) scaled by premium.
+        Falls back to _TIER_MAX caps when no premium context available.
+        """
+        # Aggressive equity-based sizing — same curve as APExecutionCore._position_budget
+        equity = float(getattr(self, "account_equity", 0) or 0)
+        premium = float(getattr(self, "_last_premium", 0) or 0)  # $/share mid
+
+        if equity > 0 and premium > 0:
+            if equity <= 10_000:
+                risk_pct = 0.15
+            elif equity <= 25_000:
+                risk_pct = 0.10
+            else:
+                risk_pct = 0.05
+            budget       = max(300.0, min(equity * risk_pct, equity * 0.25))
+            per_contract = premium * 100
+            raw_qty      = int(budget // per_contract) if per_contract > 0 else 1
+            tier_cap     = _TIER_MAX.get((tier or "B").upper(), 3)
+            return max(1, min(raw_qty, tier_cap))
+
+        # No equity/premium context — use tier caps directly
+        return _TIER_MAX.get((tier or "B").upper(), 1)
 
     # ── Internal: Kelly sizing ────────────────────────────────────────────────
 
