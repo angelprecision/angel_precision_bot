@@ -94,10 +94,6 @@ class APPositionSizer:
         self,
         *,
         client_id:            str,
-        # Cache for _tier_fallback equity-aware sizing
-        self.account_equity  = float(account_equity or 0)
-        self._last_premium   = float(premium_per_contract or 0) / 100  # per-share
-
         tier:                 str,
         premium_per_contract: float,
         account_equity:       float,
@@ -110,6 +106,10 @@ class APPositionSizer:
 
         Returns a SizingResult with full audit trail.
         """
+        # Cache context for _tier_fallback equity-aware sizing
+        self.account_equity  = float(account_equity or 0)
+        self._last_premium   = float(premium_per_contract or 0) / 100
+
         tier_upper = str(tier).upper()
         drawdown   = realized_pnl_today
 
