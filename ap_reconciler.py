@@ -94,6 +94,8 @@ class APBrokerReconciler:
         self._stop       = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._run_count  = 0
+        self.exit_engine = None      # wired by client_runner after construction
+        self._ghost_tracker: dict = {}  # two-pass ghost detection per contract
 
     # ──────────────────────────────────────────────────────────────────────────
     # Lifecycle
@@ -146,6 +148,7 @@ class APBrokerReconciler:
             "orders_alerted": 0,
             "positions_checked": 0,
             "positions_alerted": 0,
+            "positions_corrected": 0,
             "errors": [],
         }
 
@@ -388,109 +391,243 @@ class APBrokerReconciler:
     # Position reconciliation
     # ──────────────────────────────────────────────────────────────────────────
 
+    # ──────────────────────────────────────────────────────────────────────────
+    # Position Reconciliation — evidence-based, contract-precise
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def _norm_contract(self, val: str) -> str:
+        return str(val or "").strip().upper()
+
+    def _norm_underlying(self, val: str) -> str:
+        return str(val or "").strip().upper()
+
+    def _safe_get_broker_positions(self) -> list:
+        """Fetch broker positions; return [] on error."""
+        try:
+            result = self.broker.list_positions()
+            if result is None:
+                return []
+            if isinstance(result, list):
+                return result
+            return []
+        except Exception as e:
+            log.error("[%s] Broker list_positions failed: %s", self.client_id, e)
+            return []
+
+    def _get_recent_exit_fill(self, contract: str, underlying: str) -> Optional[dict]:
+        """
+        Look up the most recent filled EXIT order for this contract.
+        Returns dict with fill_price and filled_qty, or None.
+        """
+        try:
+            from ap.db import conn, run_with_retry
+            def _fetch():
+                with conn() as c:
+                    c.execute(
+                        """
+                        SELECT fill_price, filled_qty, updated_ts
+                        FROM   orders
+                        WHERE  client_id = %s
+                          AND  kind = 'EXIT'
+                          AND  status IN ('FILLED', 'EXIT_FILLED')
+                          AND  (symbol = %s OR symbol = %s)
+                        ORDER  BY updated_ts DESC
+                        LIMIT  1
+                        """,
+                        (self.client_id, contract, underlying),
+                    )
+                    row = c.fetchone()
+                    return dict(row) if row else None
+            return run_with_retry(_fetch)
+        except Exception as e:
+            log.debug("[%s] Exit fill lookup failed for %s: %s", self.client_id, contract, e)
+            return None
+
+    def _mark_ghost_seen(self, contract: str) -> bool:
+        """
+        Two-pass ghost detection.
+        First call → returns False (wait one more pass).
+        Second consecutive call → returns True (confirmed gone).
+        Ghost tracker is cleared if position reappears.
+        """
+        if contract in self._ghost_tracker:
+            del self._ghost_tracker[contract]
+            return True  # second pass — confirmed gone
+        self._ghost_tracker[contract] = True
+        return False  # first pass — wait
+
     def _reconcile_positions(self, summary: dict):
-        from ap.db import list_positions, run_with_retry
+        """
+        Evidence-based position reconciliation.
 
-        # Get all DB open positions for this client
-        db_positions = run_with_retry(
-            lambda: list_positions(client_id=self.client_id, status="OPEN")
-        )
-        summary["positions_checked"] = len(db_positions)
+        Policy:
+        1. Match DB positions by exact contract symbol first.
+        2. Auto-close ONLY when there is evidence:
+           - A filled EXIT order exists at the broker, OR
+           - Position has been absent from broker for 2 consecutive passes.
+        3. PnL is computed cleanly as dollars and percent, separately.
+        4. Never blindly close on a single missing signal (API lag protection).
+        """
+        summary.setdefault("positions_corrected", 0)
 
-        if not db_positions:
-            return
-
-        # Get broker positions (if broker supports it)
-        broker_positions = self._get_broker_positions()
+        # ── Fetch broker positions ─────────────────────────────────────────────
+        broker_positions = self._safe_get_broker_positions()
         if broker_positions is None:
-            # Broker doesn't support position list — skip position reconcile
-            log.debug("[%s] Broker does not support list_positions — skipping", self.client_id)
+            log.debug("[%s] Broker positions unavailable — skipping", self.client_id)
             return
 
-        # Build broker lookup: underlying → position dict
-        broker_by_symbol: dict[str, dict] = {}
+        # Build lookup: contract → bp, underlying → [bp, ...]
+        broker_by_contract:    dict[str, dict] = {}
+        broker_by_underlying:  dict[str, list] = {}
         for bp in broker_positions:
-            sym = str(bp.get("symbol") or bp.get("underlying") or "").upper()
-            if sym:
-                broker_by_symbol[sym] = bp
+            c_sym = self._norm_contract(bp.get("symbol"))
+            u_sym = self._norm_underlying(bp.get("underlying") or c_sym[:6])
+            if c_sym:
+                broker_by_contract[c_sym] = bp
+            if u_sym:
+                broker_by_underlying.setdefault(u_sym, []).append(bp)
+
+        # ── Fetch DB open positions ────────────────────────────────────────────
+        try:
+            from ap.db import list_positions, run_with_retry
+            db_positions = run_with_retry(
+                lambda: list_positions(client_id=self.client_id, status="OPEN")
+            ) or []
+        except Exception as e:
+            log.error("[%s] Failed to fetch DB positions: %s", self.client_id, e)
+            return
+
+        summary["positions_checked"] = len(db_positions)
 
         for pos in db_positions:
             pos_id     = pos.get("id")
-            underlying = str(pos.get("underlying") or pos.get("ticker") or "").upper()
+            contract   = self._norm_contract(pos.get("contract") or pos.get("symbol") or "")
+            underlying = self._norm_underlying(pos.get("underlying") or pos.get("ticker") or contract[:6])
             db_qty     = int(pos.get("qty") or pos.get("quantity") or 0)
+            entry_px   = float(pos.get("avg_fill") or 0.0)
 
-            broker_pos = broker_by_symbol.get(underlying)
+            # ── 1. Exact contract match ──────────────────────────────────────
+            broker_pos = broker_by_contract.get(contract)
 
-            # ── Check E: DB position → no broker position ───────────────────
-            if broker_pos is None:
-                # Could be because it's an options position under contract symbol
-                # Don't false-alarm immediately — check by contract if available
-                contract = str(pos.get("contract") or "").upper()
-                if contract:
-                    broker_pos = broker_by_symbol.get(contract)
-
-            if broker_pos is None:
-                # Position not at broker — it was filled/closed.
-                # Look for a recent filled exit order to get the actual close price.
-                try:
-                    from ap.db import conn, run_with_retry as _rwr
-                    contract = str(pos.get("contract") or "").upper()
-                    _exit_fill = _rwr(lambda: conn().__enter__().execute(
-                        """
-                        SELECT fill_price, filled_qty, updated_ts
-                        FROM orders
-                        WHERE client_id=%s AND symbol=%s AND kind='EXIT'
-                          AND status IN ('FILLED','EXIT_FILLED')
-                        ORDER BY updated_ts DESC LIMIT 1
-                        """,
-                        (self.client_id, contract or underlying)
-                    ).fetchone())
-                    exit_price = float(_exit_fill["fill_price"]) if _exit_fill and _exit_fill.get("fill_price") else None
-                except Exception:
-                    exit_price = None
-
-                from datetime import datetime, timezone as _tz
-                _now = datetime.now(_tz.utc).isoformat()
-                _entry = float(pos.get("avg_fill") or 0)
-                _pnl   = round(((exit_price or _entry) - _entry) * (db_qty or 1) * 100, 2)
-
-                # Auto-close: broker has no position = it was sold
-                try:
-                    from ap.db import conn as _conn, run_with_retry as _rwr2
-                    _rwr2(lambda: _conn().__enter__().execute(
-                        "UPDATE positions SET status='CLOSED', exit_ts=%s, realized_pnl=%s WHERE id=%s",
-                        (_now, _pnl, pos_id)
-                    ))
-                    log.info(
-                        "[%s] RECONCILE_AUTO_CLOSE | %s | pos=%s | "
-                        "broker has no position → auto-closed in DB (exit=$%.2f pnl=$%.2f)",
-                        self.client_id, underlying, pos_id, exit_price or _entry, _pnl
+            # ── 2. Underlying match (only if unique) ─────────────────────────
+            if broker_pos is None and underlying:
+                matches = broker_by_underlying.get(underlying, [])
+                if len(matches) == 1:
+                    broker_pos = matches[0]
+                elif len(matches) > 1:
+                    log.warning(
+                        "[%s] RECONCILE_AMBIGUOUS | %s — %d broker positions for underlying, "
+                        "skipping auto-close",
+                        self.client_id, contract, len(matches)
                     )
-                    if self.exit_engine:
-                        try: self.exit_engine.mark_position_closed(pos_id, reason="reconciler_auto_close")
-                        except Exception: pass
-                    summary["positions_corrected"] = summary.get("positions_corrected", 0) + 1
-                except Exception as _e:
-                    log.error("[%s] RECONCILE auto-close failed for %s: %s", self.client_id, pos_id, _e)
-                    self._alert(
-                        f"GHOST_POSITION_WARNING | {underlying} | pos={pos_id} | "
-                        f"DB shows OPEN qty={db_qty} but NO broker position — auto-close failed: {_e}"
+                    # Clear ghost tracker — we found something
+                    self._ghost_tracker.pop(contract, None)
+                    continue
+
+            # ── CASE A: position found at broker — reconcile qty ──────────────
+            if broker_pos is not None:
+                self._ghost_tracker.pop(contract, None)  # reset ghost counter
+                broker_qty = int(broker_pos.get("quantity") or broker_pos.get("qty") or 0)
+                if broker_qty != db_qty and db_qty > 0:
+                    log.warning(
+                        "[%s] POSITION_QTY_MISMATCH | %s | DB=%d broker=%d",
+                        self.client_id, contract, db_qty, broker_qty
                     )
                     summary["positions_alerted"] += 1
                 continue
 
-            # ── Check F: qty mismatch ────────────────────────────────────────
-            broker_qty = int(
-                broker_pos.get("quantity") or broker_pos.get("qty") or 0
-            )
-            if broker_qty != db_qty and db_qty > 0:
-                delta = broker_qty - db_qty
-                self._alert(
-                    f"POSITION_QTY_MISMATCH | {underlying} | pos={pos_id} | "
-                    f"DB qty={db_qty} broker qty={broker_qty} delta={delta:+d} — "
-                    f"partial fill not reconciled?"
+            # ── CASE B: not at broker — gather evidence before closing ────────
+            # Priority 1: look for a filled exit order
+            exit_fill = self._get_recent_exit_fill(contract, underlying)
+
+            if exit_fill and float(exit_fill.get("fill_price") or 0) > 0:
+                exit_px         = float(exit_fill["fill_price"])
+                close_confidence = "HIGH"
+                log.info(
+                    "[%s] RECONCILE_CLOSE_EVIDENCE | %s | filled exit found @ $%.4f",
+                    self.client_id, contract, exit_px
                 )
-                summary["positions_alerted"] += 1
+            else:
+                # Priority 2: two-pass ghost detection
+                if not self._mark_ghost_seen(contract):
+                    log.warning(
+                        "[%s] GHOST_PASS_1 | %s | broker has no position — "
+                        "waiting one pass to confirm",
+                        self.client_id, contract
+                    )
+                    summary["positions_alerted"] += 1
+                    continue  # come back next reconcile cycle
+                exit_px          = entry_px  # use entry as fallback (0% PnL)
+                close_confidence = "MEDIUM"
+                log.warning(
+                    "[%s] GHOST_PASS_2 | %s | confirmed gone from broker — "
+                    "auto-closing with entry price (no fill found)",
+                    self.client_id, contract
+                )
+
+            # ── Compute PnL (explicit dollars AND percent) ────────────────────
+            pnl_dollars = round((exit_px - entry_px) * db_qty * 100, 2)
+            pnl_pct     = round(((exit_px - entry_px) / entry_px) * 100, 2) if entry_px > 0 else 0.0
+
+            # ── Write close to DB ─────────────────────────────────────────────
+            try:
+                from ap.db import conn, run_with_retry as _rwr
+                from datetime import datetime, timezone as _tz
+                _now = datetime.now(_tz.utc).isoformat()
+
+                def _close():
+                    with conn() as c:
+                        c.execute(
+                            """
+                            UPDATE positions
+                            SET    status            = 'CLOSED',
+                                   exit_ts           = %s,
+                                   realized_pnl      = %s,
+                                   realized_pnl_pct  = %s,
+                                   close_source      = %s,
+                                   close_confidence  = %s
+                            WHERE  id = %s
+                            """,
+                            (
+                                _now,
+                                pnl_dollars,
+                                pnl_pct,
+                                "RECONCILER_AUTO_CLOSE",
+                                close_confidence,
+                                pos_id,
+                            ),
+                        )
+                _rwr(_close)
+            except Exception as e:
+                # Columns may not exist yet — fall back to minimal update
+                try:
+                    from ap.db import conn, run_with_retry as _rwr2
+                    from datetime import datetime, timezone as _tz2
+                    _rwr2(lambda: conn().__class__.__enter__(conn()).execute(
+                        "UPDATE positions SET status='CLOSED', exit_ts=%s, realized_pnl=%s WHERE id=%s",
+                        (datetime.now(_tz2.utc).isoformat(), pnl_dollars, pos_id)
+                    ))
+                except Exception as e2:
+                    log.error("[%s] RECONCILE close DB write failed %s: %s / %s",
+                              self.client_id, pos_id, e, e2)
+                    summary["positions_alerted"] += 1
+                    continue
+
+            # ── Notify exit engine ─────────────────────────────────────────────
+            _ee = getattr(self, "exit_engine", None)
+            if _ee:
+                try:
+                    _ee.mark_position_closed(pos_id, reason="reconciler_auto_close")
+                except Exception:
+                    pass
+
+            log.info(
+                "[%s] RECONCILE_AUTO_CLOSE | %s | pos=%s | exit=$%.4f "
+                "pnl=$%.2f (%.1f%%) confidence=%s",
+                self.client_id, contract, pos_id,
+                exit_px, pnl_dollars, pnl_pct, close_confidence
+            )
+            summary["positions_corrected"] += 1
 
     def _get_broker_positions(self) -> Optional[list]:
         """

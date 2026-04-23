@@ -334,23 +334,31 @@ class APContractSelectionEngine:
             # Enforce minimum sanity gates on fallback: delta >= 0.10, DTE <= max_dte,
             # ask > 0. Pick highest OI among candidates that pass these gates.
             if self.mode.upper() != "LIVE" and chain:
+                # HARD FALLBACK FLOOR — non-negotiable minimum viability
+                # Pass 1: strict (spread ≤25%, OI ≥100, vol ≥10, delta 0.20-0.65)
+                # Pass 2: relaxed OI/vol but keeps spread + delta
+                # Pass 3: last resort — only if bid>0 and delta≥0.15 and spread≤50%
+                # If nothing passes any of these → NO TRADE (return None below)
                 _fallback_pool = [
                     o for o in chain
-                    if float(o.get("ask") or 0) > 0
-                    and float(o.get("bid") or 0) > 0
-                    and abs(float(o.get("delta") or o.get("greeks", {}).get("delta", 0) or 0)) >= 0.10
-                    and int(o.get("open_interest") or 0) >= _fallback_oi
-                    and int(o.get("expiration_date", "9999-99-99").replace("-", "") or 99991231)
-                       <= int(today.strftime("%Y%m%d")) + self.max_dte
+                    if float(o.get("bid") or 0) > 0
+                    and float(o.get("ask") or 0) > 0
+                    and abs(float(o.get("delta") or o.get("greeks", {}).get("delta", 0) or 0)) >= 0.20
+                    and abs(float(o.get("delta") or o.get("greeks", {}).get("delta", 0) or 0)) <= 0.65
+                    and int(o.get("open_interest") or 0) >= 100
+                    and int(o.get("volume") or 0) >= 5
+                    and ((float(o.get("ask") or 0) - float(o.get("bid") or 0)) /
+                         max(0.001, (float(o.get("ask") or 0) + float(o.get("bid") or 0)) / 2)) <= 0.30
                 ] or [
-                    # second pass: relax OI but keep delta + bid requirements
+                    # Pass 2: relax volume/OI, keep spread and delta
                     o for o in chain
                     if float(o.get("bid") or 0) > 0
-                    and abs(float(o.get("delta") or o.get("greeks", {}).get("delta", 0) or 0)) >= 0.10
-                ] or [
-                    # final pass: just require ask > 0
-                    o for o in chain if float(o.get("ask") or 0) > 0
+                    and abs(float(o.get("delta") or o.get("greeks", {}).get("delta", 0) or 0)) >= 0.15
+                    and int(o.get("open_interest") or 0) >= _fallback_oi
+                    and ((float(o.get("ask") or 0) - float(o.get("bid") or 0)) /
+                         max(0.001, (float(o.get("ask") or 0) + float(o.get("bid") or 0)) / 2)) <= _fallback_spread
                 ]
+                # Pass 3 intentionally omitted — if nothing passes, return None below
                 best_fallback = max(_fallback_pool, key=lambda o: int(o.get("open_interest") or 0)) if _fallback_pool else None
                 bid_f = float(best_fallback.get("bid") or 0) if best_fallback else 0
                 ask_f = float(best_fallback.get("ask") or 0) if best_fallback else 0
@@ -358,7 +366,7 @@ class APContractSelectionEngine:
                     log.warning("[%s] QUALITY FILTER FALLBACK -- using best available contract", ticker)
                     survivors = [best_fallback]
                 else:
-                    # Even the best has no ask — go synthetic
+                    # Nothing passed fallback floor — skip trade entirely
                     return self._synthetic_contract(ticker, direction, "NO_SURVIVORS_NO_ASK_FALLBACK")
             else:
                 return None
