@@ -68,8 +68,11 @@ MAX_PREMIUM_PER_SHARE = float(os.getenv("MAX_PREMIUM_PER_SHARE", "10.00"))
 MAX_BROKER_RETRIES = 3
 BROKER_RETRY_DELAY = 1.0
 
-# Indices that execute immediately with no time gate
-_INDICES = {"SPY", "QQQ", "IWM"}
+# Indices that bypass both the pre-10AM time gate AND the SPY-trend
+# execution gate. These ETFs ARE the broad-market regime, so blocking
+# a DIA PUT because "SPY is BULL" is circular. Must stay in sync with
+# INDEX_TICKERS in ap_intelligence-3/agents/ap_risk_manager.py.
+_INDICES = {"SPY", "QQQ", "IWM", "DIA"}
 
 
 def audit(client_id: str, level: str, event: str, payload: dict):
