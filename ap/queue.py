@@ -279,6 +279,39 @@ def _dispatch(
         log.info(f"[{ticker}] BLOCKED | stage={decision.stage} reason={decision.reason}")
         _mark_job(job_id, "REJECTED",
                   result={"stage": decision.stage, "reason": decision.reason})
+        # Write to ap_signals as 'watching' so post-market blocked signals
+        # are visible on dashboard and reseeded on next startup
+        try:
+            from zoneinfo import ZoneInfo as _ZI
+            from datetime import datetime as _dt, time as _t
+            _now_et = _dt.now(_ZI("America/New_York"))
+            _in_session = _t(9, 30) <= _now_et.time() <= _t(16, 0)
+            if not _in_session:
+                import uuid as _uuid
+                from ap_db_postgres import get_supabase_client as _sb
+                _sbc = _sb()
+                if _sbc:
+                    _sig_id = str(payload.get("signal_id") or _uuid.uuid4())
+                    _sbc.table("ap_signals").upsert({
+                        "signal_id":       _sig_id,
+                        "client_email":    client_id,
+                        "system_version":  "v2",
+                        "ticker":          ticker,
+                        "side":            str(payload.get("side") or payload.get("direction") or "CALL").upper(),
+                        "score":           float(payload.get("score") or payload.get("ev_score") or 0),
+                        "tier":            str(payload.get("tier") or "B"),
+                        "pattern":         str(payload.get("pattern") or ""),
+                        "timeframe":       str(payload.get("timeframe") or "1d"),
+                        "entry_trigger":   float(payload.get("entry_price") or payload.get("trigger_price") or 0) or None,
+                        "stop_price":      float(payload.get("stop_price") or 0) or None,
+                        "target_price":    float(payload.get("target_price") or 0) or None,
+                        "decision_status": "watching",
+                        "context_notes":   f"post_market_blocked: {decision.reason}",
+                        "raw_payload":     payload,
+                    }, on_conflict="signal_id").execute()
+                    log.info(f"[{ticker}] Written to ap_signals as watching (post-market queue)")
+        except Exception as _e:
+            log.debug(f"[{ticker}] ap_signals write skipped: {_e}")
         return
 
     plan = decision.plan
