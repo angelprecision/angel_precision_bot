@@ -263,6 +263,46 @@ class APEntryWatcher:
                 "pt1":   getattr(plan, "target_underlying", None),
             },
         }
+        # ── PRICE STALENESS CHECK ──────────────────────────────────────────────────
+        # If current price has already run past the trigger by more than 1%,
+        # the setup is stale — skip it rather than enter chasing a move.
+        _trigger  = signal_dict.get("entry_price")
+        _side     = signal_dict.get("side", "CALL").upper()
+        _ticker   = signal_dict.get("ticker", "")
+        _stop     = signal_dict.get("stop_price")
+        if _trigger and _trigger > 0:
+            try:
+                _q = self._get_quote(_ticker)
+                _bid = float(_q.get("bid") or 0)
+                _ask = float(_q.get("ask") or 0)
+                _mid = (_bid + _ask) / 2 if _bid > 0 and _ask > 0 else 0
+                if _mid > 0:
+                    _pct_from_trigger = (_mid - _trigger) / _trigger
+                    # CALL: price needs to be AT or BELOW trigger (breach = move up)
+                    # PUT: price needs to be AT or ABOVE trigger (breach = move down)
+                    _stale = False
+                    if _side == "CALL" and _pct_from_trigger > 0.015:   # price already ran +1.5% past trigger
+                        _stale = True
+                    elif _side == "PUT" and _pct_from_trigger < -0.015:  # price already fell -1.5% past trigger
+                        _stale = True
+                    # Also skip if price has already moved through the STOP level
+                    if _stop and _stop > 0:
+                        if _side == "CALL" and _mid < _stop:
+                            _stale = True
+                        elif _side == "PUT" and _mid > _stop:
+                            _stale = True
+                    if _stale:
+                        log.warning(
+                            "[%s] STALE SIGNAL — price $%.2f is %.1f%% from trigger $%.2f "
+                            "(side=%s) — skipping stale entry",
+                            _ticker, _mid, _pct_from_trigger*100, _trigger, _side
+                        )
+                        return False
+                    log.debug("[%s] Price check OK — $%.2f vs trigger $%.2f (%.1f%%)",
+                              _ticker, _mid, _trigger, _pct_from_trigger*100)
+            except Exception as _e:
+                log.debug("[%s] Price staleness check failed (continuing): %s", _ticker, _e)
+
         log.info(
             f"[{signal_dict['ticker']}] watch() | plan={getattr(plan,'plan_id','')} "
             f"order={local_order_id} trigger=${signal_dict['entry_price']} "
@@ -391,6 +431,14 @@ class APEntryWatcher:
                     self.on_invalidate(w)
                 except Exception as e:
                     log.error(f"on_invalidate callback failed: {e}")
+
+    def _get_quote(self, ticker: str) -> dict:
+        """Fetch single-ticker quote. Returns {} on error."""
+        try:
+            quotes = self._fetch_quotes([ticker])
+            return quotes.get(ticker, {})
+        except Exception:
+            return {}
 
     def _fetch_quotes(self, tickers: list[str]) -> dict:
         symbols = ",".join(tickers)

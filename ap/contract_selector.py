@@ -94,7 +94,7 @@ class APContractSelectionEngine:
         min_oi         -- minimum open interest (default 50)
         min_volume     -- minimum daily volume (default 10)
         min_premium    -- min premium per contract in $ (default 50 = $0.50/share)
-        max_premium    -- max premium per contract in $ (default 2000 = $20/share)
+        max_premium    -- max premium per contract in $ (default 350 = $3.50/share max)
         max_dte        -- maximum days to expiration (default 21)
         min_dte        -- minimum DTE (default 0 for 0DTE support)
         prefer_weekly  -- prefer weekly expirations (default True)
@@ -116,7 +116,7 @@ class APContractSelectionEngine:
         min_oi:         int   = 1,    # lowered 50→1 -- any open interest passes in paper mode
         min_volume:     int   = 0,    # lowered 10→0 -- volume check disabled for data collection
         min_premium:    float = 10.0,    # $0.10/share -- allow cheap weeklies
-        max_premium:    float = 350.0,   # $3.50/share = $350/contract hard cap
+        max_premium:    float = 350.0,    # $3.50/share = $350/contract hard cap
         max_dte:        int   = 21,
         min_dte:        int   = 0,
         prefer_weekly:  bool  = True,
