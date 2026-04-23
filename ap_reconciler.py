@@ -430,12 +430,53 @@ class APBrokerReconciler:
                     broker_pos = broker_by_symbol.get(contract)
 
             if broker_pos is None:
-                self._alert(
-                    f"GHOST_POSITION_WARNING | {underlying} | pos={pos_id} | "
-                    f"DB shows OPEN qty={db_qty} but NO matching broker position — "
-                    f"possible ghost position or broker not returning it"
-                )
-                summary["positions_alerted"] += 1
+                # Position not at broker — it was filled/closed.
+                # Look for a recent filled exit order to get the actual close price.
+                try:
+                    from ap.db import conn, run_with_retry as _rwr
+                    contract = str(pos.get("contract") or "").upper()
+                    _exit_fill = _rwr(lambda: conn().__enter__().execute(
+                        """
+                        SELECT fill_price, filled_qty, updated_ts
+                        FROM orders
+                        WHERE client_id=%s AND symbol=%s AND kind='EXIT'
+                          AND status IN ('FILLED','EXIT_FILLED')
+                        ORDER BY updated_ts DESC LIMIT 1
+                        """,
+                        (self.client_id, contract or underlying)
+                    ).fetchone())
+                    exit_price = float(_exit_fill["fill_price"]) if _exit_fill and _exit_fill.get("fill_price") else None
+                except Exception:
+                    exit_price = None
+
+                from datetime import datetime, timezone as _tz
+                _now = datetime.now(_tz.utc).isoformat()
+                _entry = float(pos.get("avg_fill") or 0)
+                _pnl   = round(((exit_price or _entry) - _entry) * (db_qty or 1) * 100, 2)
+
+                # Auto-close: broker has no position = it was sold
+                try:
+                    from ap.db import conn as _conn, run_with_retry as _rwr2
+                    _rwr2(lambda: _conn().__enter__().execute(
+                        "UPDATE positions SET status='CLOSED', exit_ts=%s, realized_pnl=%s WHERE id=%s",
+                        (_now, _pnl, pos_id)
+                    ))
+                    log.info(
+                        "[%s] RECONCILE_AUTO_CLOSE | %s | pos=%s | "
+                        "broker has no position → auto-closed in DB (exit=$%.2f pnl=$%.2f)",
+                        self.client_id, underlying, pos_id, exit_price or _entry, _pnl
+                    )
+                    if self.exit_engine:
+                        try: self.exit_engine.mark_position_closed(pos_id, reason="reconciler_auto_close")
+                        except Exception: pass
+                    summary["positions_corrected"] = summary.get("positions_corrected", 0) + 1
+                except Exception as _e:
+                    log.error("[%s] RECONCILE auto-close failed for %s: %s", self.client_id, pos_id, _e)
+                    self._alert(
+                        f"GHOST_POSITION_WARNING | {underlying} | pos={pos_id} | "
+                        f"DB shows OPEN qty={db_qty} but NO broker position — auto-close failed: {_e}"
+                    )
+                    summary["positions_alerted"] += 1
                 continue
 
             # ── Check F: qty mismatch ────────────────────────────────────────
