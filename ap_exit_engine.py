@@ -56,9 +56,10 @@ SCALE_OUT_2_THRESHOLD = 0.25   # +25%  → scale out 75% at window 2 (was +80%)
 PROTECT_3_THRESHOLD   = 0.15   # +15%  → exit all at window 3 (was +30%)
 
 # ── IMMEDIATE TAKE-PROFIT (any time, no window gate) ──────────────────────────
-IMMEDIATE_TP_PCT      = 0.20   # +20% → exit immediately regardless of time
-HARD_STOP_PCT         = -0.35  # -35% → exit immediately regardless of time
-PROFIT_LOCK_PCT       = 0.10   # once at +20%, don't let it fall below +10%
+IMMEDIATE_TP_PCT      = 0.25   # +25% → exit immediately regardless of time
+HARD_STOP_PCT         = -0.30  # -30% → exit immediately regardless of time
+PROFIT_LOCK_PCT       = 0.12   # once at +25%, lock: don't fall below +12%
+TRAIL_DROP_FROM_PEAK  = 0.10   # if peak was +25%+, exit if drops 10pts from peak
 
 
 # ── POSITION TRACKER ─────────────────────────────────────────────────────────
@@ -209,13 +210,23 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
             urgency="IMMEDIATE", pnl_pct=option_pnl
         )
 
-    # ── PROFIT LOCK (once we hit +20%, don't let it fall back below +10%) ──────
-    if pos.peak_pnl_pct >= IMMEDIATE_TP_PCT and option_pnl <= PROFIT_LOCK_PCT:
-        return ExitDecision(
-            action="CLOSE_ALL", quantity=qty_rem,
-            reason=f"PROFIT LOCK -- peaked at +{pos.peak_pnl_pct*100:.0f}%, protecting +{option_pnl*100:.0f}%",
-            urgency="HIGH", pnl_pct=option_pnl
-        )
+    # ── PROFIT LOCK (once we hit peak, don't give it all back) ──────────────────
+    if pos.peak_pnl_pct >= IMMEDIATE_TP_PCT:
+        # Hard floor: don't fall below PROFIT_LOCK_PCT
+        if option_pnl <= PROFIT_LOCK_PCT:
+            return ExitDecision(
+                action="CLOSE_ALL", quantity=qty_rem,
+                reason=f"PROFIT LOCK -- peaked at +{pos.peak_pnl_pct*100:.0f}%, fell to +{option_pnl*100:.0f}% — locking in",
+                urgency="HIGH", pnl_pct=option_pnl
+            )
+        # Trailing stop: if dropped 10+ points from peak, exit
+        drop_from_peak = pos.peak_pnl_pct - option_pnl
+        if drop_from_peak >= TRAIL_DROP_FROM_PEAK:
+            return ExitDecision(
+                action="CLOSE_ALL", quantity=qty_rem,
+                reason=f"TRAILING STOP -- peak +{pos.peak_pnl_pct*100:.0f}%, dropped {drop_from_peak*100:.0f}pts to +{option_pnl*100:.0f}%",
+                urgency="HIGH", pnl_pct=option_pnl
+            )
 
     # ── TREND DAY MULTIPLIERS (must be defined before all exit checks) ────────
     direction_aligns = (
