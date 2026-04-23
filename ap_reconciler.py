@@ -599,14 +599,25 @@ class APBrokerReconciler:
                         )
                 _rwr(_close)
             except Exception as e:
-                # Columns may not exist yet — fall back to minimal update
+                # Full write failed — retry with a safe minimal update
                 try:
                     from ap.db import conn, run_with_retry as _rwr2
                     from datetime import datetime, timezone as _tz2
-                    _rwr2(lambda: conn().__class__.__enter__(conn()).execute(
-                        "UPDATE positions SET status='CLOSED', exit_ts=%s, realized_pnl=%s WHERE id=%s",
-                        (datetime.now(_tz2.utc).isoformat(), pnl_dollars, pos_id)
-                    ))
+                    _now2 = datetime.now(_tz2.utc).isoformat()
+                    def _minimal_close():
+                        with conn() as _c:
+                            _c.execute(
+                                """
+                                UPDATE positions
+                                SET    status='CLOSED', exit_ts=%s, exit_price=%s,
+                                       realized_pnl=%s, realized_pnl_pct=%s,
+                                       close_source=%s, close_confidence=%s
+                                WHERE  id=%s
+                                """,
+                                (_now2, exit_px, pnl_dollars, pnl_pct,
+                                 "RECONCILER_AUTO_CLOSE", close_confidence, pos_id)
+                            )
+                    _rwr2(_minimal_close)
                 except Exception as e2:
                     log.error("[%s] RECONCILE close DB write failed %s: %s / %s",
                               self.client_id, pos_id, e, e2)
