@@ -979,6 +979,15 @@ class APExecutionCore:
         win     = opt_pnl > 0
         tier    = sig.get("tier", Tier.A_PLUS)
 
+        # Set 30-min same-direction cooldown on master_control
+        try:
+            import time as _t
+            _ck = f"{pos.ticker.upper()}:{pos.side.upper()}:cooldown"
+            if hasattr(self.master_control, "_trade_cooldowns"):
+                self.master_control._trade_cooldowns[_ck] = _t.time()
+        except Exception:
+            pass
+
         # Guard: only log once per position — exit_in_flight retries must not re-log
         if getattr(pos, "proof_logged", False):
             log.debug("[%s] proof.log_trade skipped — already logged for this position", pos.ticker)

@@ -210,6 +210,8 @@ class APMasterControl:
 
         # Session dedup cache -- in-memory + DB-backed
         self._seen_signals: set = set()
+        # Cooldown tracker: prevents re-entering same ticker+direction within 30 min
+        self._trade_cooldowns: dict = {}
         # Seed from DB on init so restarts don't lose dedup state
         self._seed_dedup_from_db(client_id=getattr(self, "_client_id", "default"))
 
@@ -513,6 +515,16 @@ class APMasterControl:
         if snap["open_tickers"] and ticker.upper() in snap["open_tickers"]:
             return self._block(signal_id, ticker, client_id, "blocked_risk",
                                f"ticker_already_active ({ticker})")
+
+        # Same-session cooldown: don't re-enter same ticker+direction within 30 min of a close
+        _cooldown_key = f"{ticker.upper()}:{direction_raw}:cooldown"
+        if hasattr(self, "_trade_cooldowns") and _cooldown_key in self._trade_cooldowns:
+            import time as _time
+            _elapsed = _time.time() - self._trade_cooldowns[_cooldown_key]
+            if _elapsed < 1800:  # 30 minutes
+                return self._block(signal_id, ticker, client_id, "blocked_risk",
+                                   f"same_setup_cooldown ({ticker} {direction_raw}, "
+                                   f"{int(1800-_elapsed)}s remaining)")
 
         # Pending entry for this ticker (order in-flight, no position yet)
         if self.pm:
