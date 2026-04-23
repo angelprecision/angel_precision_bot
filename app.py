@@ -542,6 +542,9 @@ def create_app() -> Flask:
     @app.post("/signal")
     @require_hmac
     def signal():
+        # Guard: return 503 if worker not ready — scanner will retry instead of silently dropping
+        if not THREADS_STARTED:
+            return jsonify({"ok": False, "error": "worker_not_ready", "hint": "Bot is starting up — retry in 5s"}), 503
         ip = _client_ip()
         client_id = _require_client_id_header()
         if not client_id:
