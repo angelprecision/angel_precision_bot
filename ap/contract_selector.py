@@ -256,13 +256,13 @@ class APContractSelectionEngine:
         except Exception as e:
             log.error("[%s] chain fetch failed: %s", ticker, e)
             if self.mode.upper() != "LIVE":
-                return self._synthetic_contract(ticker, direction, "CHAIN_FETCH_ERROR_FALLBACK")
+                return None  # hard reject — no synthetic fills ever
             return None
 
         if not chain:
             log.warning("[%s] EMPTY CHAIN for %s -- Tradier returned no options (sandbox data gap?)", ticker, direction)
             if self.mode.upper() != "LIVE":
-                return self._synthetic_contract(ticker, direction, "EMPTY_CHAIN_FALLBACK")
+                return None  # hard reject — no synthetic fills ever
             return None
 
         # Use plan's trigger price as underlying fallback if chain didn't return it
@@ -367,7 +367,7 @@ class APContractSelectionEngine:
                     survivors = [best_fallback]
                 else:
                     # Nothing passed fallback floor — skip trade entirely
-                    return self._synthetic_contract(ticker, direction, "NO_SURVIVORS_NO_ASK_FALLBACK")
+                    return None  # hard reject — no synthetic fills ever
             else:
                 return None
 
@@ -393,7 +393,7 @@ class APContractSelectionEngine:
         selected = self._build_selected(best, best_score, budget, today)
         if selected is None:
             if self.mode.upper() != "LIVE":
-                return self._synthetic_contract(ticker, direction, "BUILD_FAILED_FALLBACK")
+                return None  # hard reject — no synthetic fills ever
             return None
 
         # ── E. AFFORDABILITY GATE ────────────────────────────────────────────
@@ -444,7 +444,7 @@ class APContractSelectionEngine:
         # but if something slips through in paper mode, catch it here.
         if selected is None:
             if self.mode.upper() != "LIVE":
-                selected = self._synthetic_contract(ticker, direction, "FINAL_SAFETY_NET")
+                return None  # hard reject — no synthetic fills ever
             else:
                 return None
 
