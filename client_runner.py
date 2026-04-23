@@ -415,7 +415,7 @@ class ClientRunner(threading.Thread):
                         "poll_seconds": 10.0,
                         "osm":          self.order_state_machine,
                         "pm":           self.position_manager,
-                        "exit_engine":  self.exit_eng,
+                        "exit_engine":  getattr(self.core, "exit_eng", None),
                     },
                     daemon=True,
                     name=f"fill-monitor-{self.email}",
