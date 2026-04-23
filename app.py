@@ -380,6 +380,8 @@ def create_app() -> Flask:
     log.info("✅ Broker initialized")
 
     if os.getenv("RUN_SUPERVISOR") == "1":
+        global THREADS_STARTED
+        THREADS_STARTED = True   # supervisor owns the workers — mark ready
         log.info("Supervisor active — legacy worker threads DISABLED")
     else:
         # Fix 5: hard block LIVE mode without supervisor
