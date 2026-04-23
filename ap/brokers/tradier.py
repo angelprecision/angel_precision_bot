@@ -295,3 +295,32 @@ class TradierBroker(BrokerAdapter):
             log.error("TRADIER_CANCEL_FAILED | order=%s error=%s", broker_order_id, e)
             return {"ok": False, "status": "unknown",
                     "broker_order_id": broker_order_id, "raw": {}, "error": str(e)}
+
+    def list_positions(self) -> list:
+        """
+        Return open positions from Tradier account.
+        Returns list of dicts with: symbol, quantity, cost_basis, side
+        Returns [] if no positions or on error.
+        """
+        try:
+            resp = self._get(f"/v1/accounts/{self.cfg.account_id}/positions")
+            positions = resp.get("positions", {})
+            if not positions or positions == "null":
+                return []
+            pos_list = positions.get("position", [])
+            if isinstance(pos_list, dict):
+                pos_list = [pos_list]
+            result = []
+            for p in pos_list:
+                result.append({
+                    "symbol":     p.get("symbol", ""),
+                    "quantity":   float(p.get("quantity", 0)),
+                    "cost_basis": float(p.get("cost_basis", 0)),
+                    "side":       "CALL" if "C" in str(p.get("symbol","")) else "PUT",
+                    "raw":        p,
+                })
+            return result
+        except Exception as e:
+            log.error("TRADIER_LIST_POSITIONS_FAILED | error=%s", e)
+            return []
+
