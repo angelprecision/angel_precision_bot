@@ -637,6 +637,32 @@ class APExitEngine:
             time.sleep(POLL_INTERVAL_SEC)
 
     def _check_all_positions(self):
+        # Purge positions with contracts that expired yesterday or earlier
+        from datetime import date
+        today_str = date.today().strftime("%y%m%d")
+        to_remove = []
+        for pos in self._positions:
+            # Contract symbols encode expiry: AAPL260424C00200000 → 260424 = Apr 24 2026
+            sym = getattr(pos, "option_symbol", "") or ""
+            try:
+                # Extract 6-digit date from option symbol (chars 4-10 typically)
+                import re
+                m = re.search(r'(\d{6})[CP]', sym)
+                if m:
+                    exp_str = m.group(1)  # e.g. "260424"
+                    if exp_str < today_str:  # expired before today
+                        log.warning(
+                            "[exit_eng] EXPIRED CONTRACT detected | %s exp=%s today=%s — removing from engine",
+                            sym, exp_str, today_str
+                        )
+                        pos.closed = True
+                        to_remove.append(pos)
+            except Exception:
+                pass
+        if to_remove:
+            self._positions = [p for p in self._positions if not p.closed]
+            log.info("[exit_eng] Removed %d expired contract(s) from engine", len(to_remove))
+
         # Run sentinels first — catch stuck/missed exits
         try:
             self._run_sentinels()
