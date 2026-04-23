@@ -376,6 +376,7 @@ class ClientRunner(threading.Thread):
                     osm=self.order_state_machine,
                     pm=self.position_manager,
                 )
+                self.reconciler.exit_engine = getattr(self.core, "exit_eng", None)
                 self.reconciler.start()
                 logger.info(f"[{self.email}] Broker reconciler started")
             except Exception as _recon_err:

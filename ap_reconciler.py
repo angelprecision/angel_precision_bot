@@ -621,11 +621,14 @@ class APBrokerReconciler:
                 except Exception:
                     pass
 
+            # Clear ghost tracker — position is definitively closed
+            self._ghost_tracker.pop(contract, None)
+
             log.info(
-                "[%s] RECONCILE_AUTO_CLOSE | %s | pos=%s | exit=$%.4f "
-                "pnl=$%.2f (%.1f%%) confidence=%s",
+                "[%s] FINALIZED TRADE | %s | pos=%s | entry=%.4f exit=%.4f "
+                "pnl=$%.2f (%.1f%%) source=RECONCILER confidence=%s",
                 self.client_id, contract, pos_id,
-                exit_px, pnl_dollars, pnl_pct, close_confidence
+                entry_px, exit_px, pnl_dollars, pnl_pct, close_confidence
             )
             summary["positions_corrected"] += 1
 
