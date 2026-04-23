@@ -197,12 +197,45 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
         )
 
     # ── IMMEDIATE TAKE-PROFIT (fires any time, no window gate) ──────────────────
-    if option_pnl >= IMMEDIATE_TP_PCT:
-        return ExitDecision(
-            action="CLOSE_ALL", quantity=qty_rem,
-            reason=f"IMMEDIATE TP -- +{option_pnl*100:.0f}% hit {IMMEDIATE_TP_PCT*100:.0f}% target",
-            urgency="IMMEDIATE", pnl_pct=option_pnl
-        )
+    # Scale-out model: lock in the bulk, leave a runner.
+    #   1 contract  → CLOSE_ALL (can't split)
+    #   2 contracts → sell 1, run 1
+    #   3+          → sell 70%, run 30% (min 1 runner)
+    if option_pnl >= IMMEDIATE_TP_PCT and pos.scale_outs_done == 0:
+        if qty_rem == 1:
+            # Single contract — take it all
+            return ExitDecision(
+                action="CLOSE_ALL", quantity=qty_rem,
+                reason=f"IMMEDIATE TP (full) -- +{option_pnl*100:.0f}% | 1 contract, no split",
+                urgency="IMMEDIATE", pnl_pct=option_pnl
+            )
+        else:
+            # Multi-contract — sell 70%, keep runner(s)
+            qty_lock = max(1, round(qty_rem * 0.70))
+            qty_run  = qty_rem - qty_lock
+            return ExitDecision(
+                action="SCALE_OUT", quantity=qty_lock,
+                reason=(
+                    f"IMMEDIATE TP (partial) -- +{option_pnl*100:.0f}% | "
+                    f"locking {qty_lock}/{qty_rem} contracts, running {qty_run} with trail"
+                ),
+                urgency="IMMEDIATE", pnl_pct=option_pnl
+            )
+
+    # ── RUNNER TRAIL (after scale-out, protect the runner) ───────────────────
+    # Once we've done a scale-out, trail the remaining contracts tightly.
+    # Exit the runner if it drops more than 15pts from where we scaled.
+    if pos.scale_outs_done >= 1 and pos.peak_pnl_pct > 0:
+        runner_drop = pos.peak_pnl_pct - option_pnl
+        if runner_drop >= 0.15 or option_pnl <= 0:
+            return ExitDecision(
+                action="CLOSE_ALL", quantity=qty_rem,
+                reason=(
+                    f"RUNNER TRAIL EXIT -- peaked +{pos.peak_pnl_pct*100:.0f}%, "
+                    f"now +{option_pnl*100:.0f}%, protecting runner gains"
+                ),
+                urgency="HIGH", pnl_pct=option_pnl
+            )
 
     # ── TOUCHED PROFIT PROTECTION ──────────────────────────────────────────────
     # Was ever green → went negative → exit immediately. Capital protection first.
@@ -672,6 +705,8 @@ class APExitEngine:
                         pos.pending_exit_reason = decision.reason
                         pos.pending_exit_qty    = decision.quantity
                         pos.last_exit_signal_ts = datetime.now(timezone.utc)
+                        pos.scale_outs_done    += 1  # track so runner logic kicks in
+                        pos.quantity_remaining  = max(0, pos.quantity_remaining - decision.quantity)
                     except Exception as e:
                         log.error("[%s] Scale-out FAILED — remains tracked: %s", pos.ticker, e)
                 continue
