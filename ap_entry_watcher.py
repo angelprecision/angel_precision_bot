@@ -264,13 +264,28 @@ class APEntryWatcher:
             },
         }
         # ── PRICE STALENESS CHECK ──────────────────────────────────────────────────
-        # If current price has already run past the trigger by more than 1%,
+        # If current price has already run past the trigger by more than 1.5%,
         # the setup is stale — skip it rather than enter chasing a move.
+        #
+        # IMPORTANT: Skip this check for post-session / overnight signals.
+        # Scanners fire post-market (~6 PM ET) for next-day setups using the
+        # 4 PM close as the trigger. After-hours quotes drift away from that close,
+        # which would cause 100% of overnight signals to be rejected at queue time
+        # even though they should be (re-)evaluated at 9:30 AM next session.
+        _now_et = datetime.now(ET)
+        _post_session = (_now_et.hour > OVERNIGHT_THRESHOLD_HOUR or
+                         (_now_et.hour == OVERNIGHT_THRESHOLD_HOUR and _now_et.minute >= OVERNIGHT_THRESHOLD_MIN))
         _trigger  = signal_dict.get("entry_price")
         _side     = signal_dict.get("side", "CALL").upper()
         _ticker   = signal_dict.get("ticker", "")
         _stop     = signal_dict.get("stop_price")
-        if _trigger and _trigger > 0:
+        if _post_session:
+            log.info(
+                "[%s] Post-session queue — skipping staleness check, will evaluate at next open "
+                "(trigger=$%.2f side=%s)",
+                _ticker, float(_trigger or 0), _side
+            )
+        elif _trigger and _trigger > 0:
             try:
                 _q = self._get_quote(_ticker)
                 _bid = float(_q.get("bid") or 0)

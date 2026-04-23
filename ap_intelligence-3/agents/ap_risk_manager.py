@@ -461,7 +461,7 @@ class APRiskManager:
         end   = datetime.date.today().strftime("%Y-%m-%d")
         start = (datetime.date.today() - datetime.timedelta(days=70)).strftime("%Y-%m-%d")
         df = get_prices(ticker, start, end)
-        if df.empty or len(df) < 10:
+        if df.empty or len(df) < 10 or "close" not in df.columns:
             return None
         return df["close"].pct_change().dropna().rename(ticker)
 
@@ -469,7 +469,7 @@ class APRiskManager:
     # VOLATILITY CAP
     # ────────────────────────────────────────────
     def _calc_volatility(self, ticker: str, df: pd.DataFrame) -> dict:
-        if df.empty or len(df) < 5:
+        if df.empty or len(df) < 5 or "close" not in df.columns:
             return {"annualized": 0.40}
         returns = df["close"].pct_change().dropna()
         daily_vol = float(returns.tail(60).std())

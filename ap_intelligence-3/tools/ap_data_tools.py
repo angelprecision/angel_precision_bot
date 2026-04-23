@@ -142,9 +142,24 @@ def get_prices(ticker: str, start_date: str, end_date: str) -> pd.DataFrame:
         # Normalize column names to lowercase so downstream code always finds 'close'
         df.columns = [str(c).lower() for c in df.columns]
         df = df.loc[:, ~df.columns.duplicated()]
-        # Cache the valid result for this ticker
-        _last_known_prices[ticker] = df
-        return df
+        # Guarantee a 'close' column exists — yfinance with auto_adjust=True can emit
+        # 'adj close' only; Tradier edge cases can drop fields too. Alias the closest
+        # available price column so downstream df['close'] never KeyErrors.
+        if "close" not in df.columns:
+            for _alias in ("adj close", "adjclose", "adj_close", "last", "price"):
+                if _alias in df.columns:
+                    df["close"] = df[_alias]
+                    log.warning("[%s] get_prices: aliased '%s' -> 'close'", ticker, _alias)
+                    break
+            else:
+                # No usable close column — treat as no data rather than return a broken frame
+                log.warning("[%s] get_prices: no close-like column in %s — discarding",
+                            ticker, list(df.columns))
+                df = pd.DataFrame()
+        if not df.empty:
+            # Cache the valid result for this ticker
+            _last_known_prices[ticker] = df
+            return df
 
     # Both sources failed — use last known price if available
     cached = _last_known_prices.get(ticker)
