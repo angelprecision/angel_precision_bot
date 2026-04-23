@@ -705,8 +705,8 @@ class APMasterControl:
             metadata          = {
                 "setup_status":    setup_status,
                 "feedback_mod":    feedback_mod,
-                "sizing_method":   sizing.method if self.sizer and 'sizing' in dir() else "tier_fallback",
-                "sizing_reason":   sizing.reason if self.sizer and 'sizing' in dir() else "",
+                "sizing_method":   sizing.method if self.sizer and 'sizing' in locals() else "tier_fallback",
+                "sizing_reason":   sizing.reason if self.sizer and 'sizing' in locals() else "",
                 "intel_result":    intel,
                 "sector":          self.SECTOR_MAP.get(ticker.upper(), "other"),
                 "snapshot_at_eval": {
