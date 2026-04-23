@@ -354,6 +354,21 @@ class APMasterControl:
         Returns ControlDecision(ok=False, ...) on any block.
         """
         ticker    = signal.get("ticker", signal.get("symbol", "?"))
+        # Normalize index tickers to their tradable ETF equivalents BEFORE dedup,
+        # sector caps, capital buckets, etc. Without this, ^GSPC and SPY (or ^NDX
+        # and QQQ) are treated as separate tickers — both pass gates, both reach
+        # the contract selector, and the selector remaps both to the SAME ETF
+        # contract, resulting in duplicate orders with 2x intended exposure.
+        _INDEX_TO_ETF = {"^GSPC": "SPY", "^NDX": "QQQ", "^RUT": "IWM", "^DJI": "DIA"}
+        if ticker and ticker.upper() in _INDEX_TO_ETF:
+            _mapped = _INDEX_TO_ETF[ticker.upper()]
+            _orig = ticker
+            log.info("[%s] Index ticker normalized to %s at ingest (prevents duplicate orders)",
+                     _orig, _mapped)
+            ticker = _mapped
+            signal["ticker"] = _mapped
+            signal["symbol"] = _mapped
+            signal["_original_index_ticker"] = _orig  # preserve for audit
         score     = float(signal.get("score", 0) or 0)
         signal_id = str(signal.get("signal_id") or uuid.uuid4())
         signal["signal_id"] = signal_id
