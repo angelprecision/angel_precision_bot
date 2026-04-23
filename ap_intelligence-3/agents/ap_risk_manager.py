@@ -35,6 +35,16 @@ from ap_intelligence.ap_mode_config import APModeConfig
 
 
 # ─────────────────────────────────────────────
+# INDEX TICKERS — exempt from SPY regime gate
+# These ETFs/indices ARE the broad-market regime, so blocking a
+# SPY PUT because "SPY is BULL" is circular. 232 setups on indices
+# should be taken on their own technical merit regardless of regime.
+# (Post-dedupe in master_control, ^GSPC/^NDX/^RUT/^DJI arrive as
+# SPY/QQQ/IWM/DIA — matching those is sufficient.)
+# ─────────────────────────────────────────────
+INDEX_TICKERS = {"SPY", "QQQ", "IWM", "DIA"}
+
+# ─────────────────────────────────────────────
 # SECTOR / THEME BUCKETS
 # Maps tickers to exposure buckets for concentration tracking.
 # Add your full universe here.
@@ -193,17 +203,33 @@ class APRiskManager:
         spy = get_spy_trend()
         vix_data = get_vix()
 
-        if direction == "bullish" and spy["trend"] == "BEAR":
+        # Index tickers bypass the SPY regime gate — they ARE the regime,
+        # so a bearish 232 setup on SPY/QQQ/IWM/DIA should not be blocked
+        # by SPY trend. Non-index single names still gated below.
+        is_index = ticker.upper() in INDEX_TICKERS
+
+        if not is_index and direction == "bullish" and spy["trend"] == "BEAR":
             return self._reject(ticker, direction, option_premium, dte,
                                 bid_ask_spread_pct, open_interest, daily_volume_options,
                                 option_delta, "CALL blocked — SPY in BEAR trend",
                                 spy_trend=spy["trend"], vix=vix_data["vix"])
 
-        if direction == "bearish" and spy["trend"] == "BULL":
+        if not is_index and direction == "bearish" and spy["trend"] == "BULL":
             return self._reject(ticker, direction, option_premium, dte,
                                 bid_ask_spread_pct, open_interest, daily_volume_options,
                                 option_delta, "PUT blocked — SPY in BULL trend",
                                 spy_trend=spy["trend"], vix=vix_data["vix"])
+
+        if is_index and (
+            (direction == "bullish" and spy["trend"] == "BEAR") or
+            (direction == "bearish" and spy["trend"] == "BULL")
+        ):
+            # Log but allow — caller still sees full SPY context in result.
+            import logging as _lg
+            _lg.getLogger(__name__).info(
+                f"[{ticker}] Index regime exemption — {direction} allowed "
+                f"despite SPY trend={spy['trend']} (index setup judged on own merit)"
+            )
 
         if not vix_data["tradeable"]:
             return self._reject(ticker, direction, option_premium, dte,

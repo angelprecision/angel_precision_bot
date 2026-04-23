@@ -137,7 +137,7 @@ class APPortfolioManager:
                                f"Contract quality failed: {risk.get('contract_rejection', '')}")
 
         # ── SCORECARD ─────────────────────────────────────────
-        sb = self._score(scanner, technical, sentiment, fundamentals, risk, direction)
+        sb = self._score(scanner, technical, sentiment, fundamentals, risk, direction, ticker)
 
         tier_label, bucket, size_mult = _size_tier(sb.total, self.mode_cfg)
 
@@ -185,7 +185,7 @@ class APPortfolioManager:
     # ─────────────────────────────────────────────
     # SCORECARD
     # ─────────────────────────────────────────────
-    def _score(self, scanner, technical, sentiment, fundamentals, risk, direction) -> ScoreBreakdown:
+    def _score(self, scanner, technical, sentiment, fundamentals, risk, direction, ticker: str = "") -> ScoreBreakdown:
 
         # Pull weights from mode config (production vs research)
         w = self.mode_cfg.weights
@@ -208,9 +208,15 @@ class APPortfolioManager:
         spy_trend = risk.get("spy_trend", "UNKNOWN")
         vix       = risk.get("vix", 20)
 
+        # Index tickers get full regime credit — they ARE the regime,
+        # judged on their own 232 technical merit (mirrors risk_manager exemption).
+        is_index = (ticker or "").upper() in {"SPY", "QQQ", "IWM", "DIA"}
+
         if (direction == "bullish" and spy_trend == "BULL") or \
            (direction == "bearish" and spy_trend == "BEAR"):
             regime_score = w.regime_fit
+        elif is_index:
+            regime_score = w.regime_fit         # Full credit — index self-regime
         elif spy_trend == "CHOPPY":
             regime_score = w.regime_fit * 0.47   # ~7/15 in production
         else:
