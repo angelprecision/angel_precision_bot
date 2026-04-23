@@ -509,6 +509,9 @@ class APExitEngine:
         """GPS trackers — scream loudly if a position is in a bad state with no action."""
         from datetime import datetime, timezone as _tz
         now = datetime.now(_tz.utc)
+        try:
+            from ap_proof_logger import funnel as _sf
+        except Exception: _sf = None
         for pos in self._positions:
             age_min = (now - pos.opened_at).total_seconds() / 60 if pos.opened_at else 0
             pnl     = pos.option_pnl_pct
@@ -601,7 +604,12 @@ class APExitEngine:
                         signal_id=str(row.get("signal_id") or ""),
                     )
                     mp.current_option_price = float(row.get("avg_fill", 0) or 0)
-                    mp.current_underlying   = float(row.get("underlying_entry", 0) or 0)
+                    # Restore runner state from DB so restarts pick up mid-trade correctly
+                    mp.scale_outs_done    = int(row.get("scale_outs_done", 0) or 0)
+                    _db_qty = int(row.get("qty", 0) or 0)
+                    if _db_qty > 0:
+                        mp.quantity_remaining = _db_qty
+                    mp.current_underlying = float(row.get("underlying_entry", 0) or 0)
                     self.add_position(mp)
                     seeded += 1
                 except Exception as e:
@@ -743,6 +751,23 @@ class APExitEngine:
                         pos.last_exit_signal_ts = datetime.now(timezone.utc)
                         pos.scale_outs_done    += 1  # track so runner logic kicks in
                         pos.quantity_remaining  = max(0, pos.quantity_remaining - decision.quantity)
+                        # Persist scale_outs_done to DB so restarts know runner is active
+                        try:
+                            from ap.db import conn, run_with_retry as _rwr_s
+                            _sd = pos.scale_outs_done
+                            _qr = pos.quantity_remaining
+                            _pi = pos.position_id
+                            if _pi:
+                                def _save_scale():
+                                    with conn() as _c:
+                                        _c.execute(
+                                            "UPDATE positions SET scale_outs_done=%s, qty=%s WHERE id=%s",
+                                            (_sd, _qr, _pi)
+                                        )
+                                _rwr_s(_save_scale)
+                        except Exception as _se:
+                            log.debug("[%s] scale_outs_done persist failed (non-critical): %s",
+                                      pos.ticker, _se)
                     except Exception as e:
                         log.error("[%s] Scale-out FAILED — remains tracked: %s", pos.ticker, e)
                 continue

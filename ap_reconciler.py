@@ -642,6 +642,10 @@ class APBrokerReconciler:
                 entry_px, exit_px, pnl_dollars, pnl_pct, close_confidence
             )
             summary["positions_corrected"] += 1
+            try:
+                from ap_proof_logger import funnel as _funnel_r
+                _funnel_r.inc("reconciler_corrections")
+            except Exception: pass
 
     def _get_broker_positions(self) -> Optional[list]:
         """

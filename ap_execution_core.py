@@ -905,6 +905,11 @@ class APExecutionCore:
         with self._sector_lock:
             self._sector_counts[sector] = max(0, self._sector_counts.get(sector, 0) - 1)
 
+        # ── IDEMPOTENCY: skip if position already marked closed ──────────────
+        if getattr(pos, "closed", False):
+            log.debug("[%s] _on_position_close called but pos.closed=True — skipping", pos.ticker)
+            return
+
         # ── EXIT SUBMISSION ─────────────────────────────────────────────────
         sig = getattr(pos, "signal", {})
         _sig_id = str(sig.get("signal_id", ""))
@@ -1063,6 +1068,23 @@ class APExecutionCore:
                 pass
 
     # ── CALLBACKS: Expire / Invalidate ────────────────────────────────────────
+        # ── TRADE INTEGRITY CHECKLIST ───────────────────────────────────────────
+        if not getattr(pos, "_integrity_logged", False):
+            pos._integrity_logged = True  # type: ignore[attr-defined]
+            _checks = [
+                ("proof_logged",     getattr(pos, "proof_logged", False)),
+                ("has_position_id",  bool(getattr(pos, "position_id", ""))),
+                ("exit_px_positive", exit_price > 0),
+                ("pnl_recorded",     abs(opt_pnl) >= 0),
+            ]
+            _pass = all(v for _, v in _checks)
+            _str  = " ".join(f"{k}={'OK' if v else 'FAIL'}" for k, v in _checks)
+            log.info(
+                "[INTEGRITY] %s | %s | %s | pnl=%+.1f%% exit=$%.2f",
+                pos.ticker, "PASS" if _pass else "FAIL",
+                _str, opt_pnl * 100, exit_price,
+            )
+
 
     def _on_signal_expire(self, watched: WatchedSignal):
         signal_id = str(watched.signal.get("signal_id", ""))

@@ -79,6 +79,12 @@ class FunnelCounter:
             # ── execution ─────────────────────────────────────────────
             self.order_failed          = 0
             self.trades_executed       = 0   # incremented at position OPEN
+            # Operational health counters
+            self.scale_outs_executed   = 0
+            self.small_win_locks       = 0
+            self.no_contract_skipped   = 0
+            self.reconciler_corrections = 0
+            self.sentinel_alerts       = 0
             # ── market context ────────────────────────────────────────
             self.regime                = "unknown"
             self.was_trend_day         = False
@@ -120,6 +126,11 @@ class FunnelCounter:
                 "options_rejected":      self.options_rejected,
                 "order_failed":          self.order_failed,
                 "trades_executed":       self.trades_executed,
+                "scale_outs_executed":   self.scale_outs_executed,
+                "small_win_locks":       self.small_win_locks,
+                "no_contract_skipped":   self.no_contract_skipped,
+                "reconciler_corrections": self.reconciler_corrections,
+                "sentinel_alerts":       self.sentinel_alerts,
                 "regime":                self.regime,
                 "was_trend_day":         self.was_trend_day,
             }
