@@ -684,25 +684,50 @@ class APExecutionCore:
             log.warning(f"[{ticker}] BLOCKED -- setup DOWNGRADED (live WR diverged >25% from backtest)")
             return
 
-        # Size: base x spread modifier x feedback modifier x tier multiplier
-        tier      = sig.get("tier", Tier.A)
-        if tier == Tier.B:
-            # B-tier: size by budget (2% of equity / premium), capped at 5
-            _equity       = getattr(self.master_control, "account_equity", 25000) or 25000
-            _budget       = _equity * 0.02  # 2% risk per trade
-            _premium      = decision.mid_price * 100  # cost per contract
-            _budget_qty   = max(1, int(_budget / _premium)) if _premium > 0 else 1
-            contracts     = min(_budget_qty, 5)  # cap at 5 for B-tier
-            base          = contracts
-            tier_mult     = 0.30
-        else:
-            tier_mult = 1.0 if tier == Tier.A_PLUS else 0.6
-            base      = self._get_base_contracts(watched.score)
-            contracts = max(1, round(base * decision.size_modifier * feedback_mod * tier_mult))
+        # ── PREMIUM BOUNDS — last line of defense before sizing ────────────────
+        MIN_PREMIUM = 0.40   # $0.40/share min — avoid lottery tickets
+        MAX_PREMIUM = 15.00  # $15.00/share max — avoid over-priced contracts
+
+        if decision.mid_price < MIN_PREMIUM or decision.mid_price > MAX_PREMIUM:
+            log.info(
+                f"[{ticker}] Skipping {decision.symbol} mid=${decision.mid_price:.2f} "
+                f"outside premium bounds [${MIN_PREMIUM}–${MAX_PREMIUM}]"
+            )
+            funnel.inc("options_rejected")
+            return
+
+        # ── ET SESSION CUTOFF ────────────────────────────────────────────────
+        from datetime import time as _time
+        _now_et   = datetime.now(ET)
+        _cutoff   = _time(15, 15)
+        if _now_et.time() >= _cutoff:
+            log.info(
+                f"[{ticker}] Skipping new entry after cutoff "
+                f"({_now_et.strftime('%H:%M')} ET ≥ 15:15)"
+            )
+            funnel.inc("queue_expired")
+            return
+
+        # ── AGGRESSIVE SIZING ────────────────────────────────────────────────
+        tier     = sig.get("tier", Tier.A)
+        _equity  = getattr(self.master_control, "account_equity", 25000) or 25000
+        contracts = self._size_position(
+            tier         = str(tier),
+            option_price = decision.mid_price,
+            equity       = _equity,
+        )
+
+        if contracts <= 0:
+            log.info(
+                f"[{ticker}] Sizing → 0 contracts "
+                f"(tier={tier} equity=${_equity:.0f} price=${decision.mid_price:.2f}) — skipping"
+            )
+            funnel.inc("options_rejected")
+            return
 
         log.info(
-            f"[{ticker}] Sizing: base={base} x spread={decision.size_modifier:.2f} "
-            f"x feedback={feedback_mod:.2f} x tier={tier_mult:.1f} -> {contracts}x "
+            f"[{ticker}] Sizing: equity=${_equity:.0f} budget=${self._position_budget(_equity):.0f} "
+            f"price=${decision.mid_price:.2f} tier={tier} → {contracts}x "
             f"[{decision.grade}] [{setup_status}]"
         )
 
@@ -1169,6 +1194,52 @@ class APExecutionCore:
             log.warning(f"[{ticker}] Expiry lookup failed: {exp_err}")
 
         return [], today
+
+    # =========================================================================
+    # POSITION SIZING — AGGRESSIVE RISK CURVE
+    # =========================================================================
+
+    def _position_budget(self, equity: float) -> float:
+        """
+        Per-trade dollar allocation based on account size.
+        Aggressive curve for early beta phase — dial down as AUM grows.
+          ≤$10k  → 15% per trade
+          ≤$25k  → 10% per trade
+          >$25k  →  5% per trade
+        Floored at $300, capped at 25% of equity.
+        """
+        if equity <= 10_000:
+            risk_pct = 0.15
+        elif equity <= 25_000:
+            risk_pct = 0.10
+        else:
+            risk_pct = 0.05
+
+        raw    = equity * risk_pct
+        floor  = 300.0
+        cap    = equity * 0.25
+        return max(floor, min(raw, cap))
+
+    def _max_contracts_for_tier(self, tier: str) -> int:
+        """Hard contract caps per tier so cheap options can't snowball."""
+        t = (tier or "B").upper()
+        if t == "A+": return 10
+        if t == "A":  return 6
+        return 3   # B or unknown
+
+    def _size_position(self, tier: str, option_price: float, equity: float) -> int:
+        """
+        Return contract count = floor(budget / option_price), capped by tier.
+        option_price is the per-share mid-price (multiply by 100 for per-contract cost).
+        Returns 0 if sizing is impossible (zero price, etc.).
+        """
+        if option_price <= 0:
+            return 0
+        budget        = self._position_budget(equity)
+        per_contract  = option_price * 100          # e.g. $1.50 mid → $150/contract
+        raw_qty       = int(budget // per_contract) if per_contract > 0 else 0
+        tier_cap      = self._max_contracts_for_tier(tier)
+        return max(1, min(raw_qty, tier_cap))       # always at least 1 if we get here
 
     def _get_base_contracts(self, score: float) -> int:
         if score >= 95: return 4
