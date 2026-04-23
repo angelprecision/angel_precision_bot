@@ -338,15 +338,21 @@ def _dispatch(
     # ── 5. ROUTE -- BREACH vs IMMEDIATE ────────────────────────────────────────
     trigger_type = getattr(plan, "trigger_type", "immediate")
 
-    # Block new intraday entries after 3:15 PM ET — too close to close for 0DTE
+    # Block new intraday entries after 3:15 PM ET ONLY during market hours.
+    # Post-market signals (after 4 PM ET) should be held as WATCHING for next session,
+    # not rejected. Market hours = 9:30 AM - 4:00 PM ET.
     from datetime import datetime
     from zoneinfo import ZoneInfo
-    _now_et = datetime.now(ZoneInfo("America/New_York"))
-    _too_late = _now_et.hour > 15 or (_now_et.hour == 15 and _now_et.minute >= 15)
+    _now_et   = datetime.now(ZoneInfo("America/New_York"))
+    _in_session = (_now_et.hour > 9 or (_now_et.hour == 9 and _now_et.minute >= 30)) \
+                  and _now_et.hour < 16
+    _too_late = _in_session and (
+        _now_et.hour > 15 or (_now_et.hour == 15 and _now_et.minute >= 15)
+    )
     if _too_late and trigger_type == "breach":
         log.warning(
             "[%s] ENTRY BLOCKED — too late in session (%02d:%02d ET, cutoff 15:15) | "
-            "signal held overnight for next session",
+            "signal held as WATCHING for next session",
             ticker, _now_et.hour, _now_et.minute,
         )
         _mark_job(job_id, "REJECTED", error="entry_cutoff: too_late_in_session")
