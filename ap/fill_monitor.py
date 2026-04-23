@@ -522,3 +522,34 @@ def _legacy_close_position_from_exit_fill(order: dict, avg_fill_price: float):
         "realized_pnl_pct": realized_pnl_pct,
         "close_source": "FILL_MONITOR", "close_confidence": "HIGH",
     })
+
+    # Update proof_trades with actual broker fill price — Tradier is truth.
+    # The proof record written at submission time used an estimated price.
+    # Now that the real fill is confirmed, correct it.
+    try:
+        from ap.db import conn, run_with_retry
+        _epx = exit_px
+        _pct = realized_pnl_pct
+        _win = realized_pnl_pct > 0
+        _cid = client_id
+        def _update_proof():
+            with conn() as c:
+                c.execute(
+                    """
+                    UPDATE proof_trades
+                    SET    exit_option_price = %s,
+                           option_pnl_pct    = %s,
+                           win               = %s
+                    WHERE  client_email = %s
+                      AND  closed_at >= NOW() - INTERVAL '4 hours'
+                      AND  ABS(COALESCE(exit_option_price,0) - %s) > 0.05
+                    """,
+                    (_epx, _pct, _win, _cid, _epx)
+                )
+                return c.rowcount
+        updated = run_with_retry(_update_proof) or 0
+        if updated:
+            log.info("[%s] proof_trades corrected with actual fill $%.4f pnl=%.1f%%",
+                     client_id, exit_px, realized_pnl_pct)
+    except Exception as _pe:
+        log.debug("[%s] proof_trades correction (non-critical): %s", client_id, _pe)
