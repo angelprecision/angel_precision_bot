@@ -32,7 +32,7 @@ from ap.broker import SimBroker
 
 from ap.parsers import parse_scanner_text
 from ap.brokers.tradier import TradierBroker, TradierConfig
-from ap.exit_manager import exit_manager_loop
+# exit_manager_loop removed — APExitEngine is the sole exit manager
 
 # ap.client_api and ap.admin_api not yet built -- routes are inline in create_app()
 # from ap.client_api import client_bp
@@ -276,10 +276,6 @@ def start_worker(broker):
     t.start()
 
 
-def start_exit_manager(broker):
-    log.info("Starting exit manager thread...")
-    t = threading.Thread(target=exit_manager_loop, args=(broker,), daemon=True, name="ExitManagerThread")
-    t.start()
 
 
 def start_fill_monitor(broker):
@@ -299,7 +295,6 @@ def start_background_threads_once(broker):
         if THREADS_STARTED:
             return
         start_worker(broker)
-        start_exit_manager(broker)
         start_fill_monitor(broker)
         THREADS_STARTED = True
         log.info("✅ All background threads started")
