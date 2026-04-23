@@ -488,16 +488,24 @@ def _legacy_close_position_from_exit_fill(order: dict, avg_fill_price: float):
         log.error("Position not found: %s", position_id)
         return
 
-    pos          = dict(pos_row)
-    entry_price  = float(pos["avg_fill"])
-    qty          = int(pos["qty"])
-    realized_pnl = (float(avg_fill_price) - entry_price) * qty * OPT_MULTIPLIER
+    pos              = dict(pos_row)
+    entry_price      = float(pos["avg_fill"])
+    qty              = int(pos["qty"])
+    exit_px          = float(avg_fill_price)
+    realized_pnl     = (exit_px - entry_price) * qty * OPT_MULTIPLIER
+    realized_pnl_pct = round(((exit_px - entry_price) / entry_price) * 100, 2) if entry_price > 0 else 0.0
 
     with conn() as c:
         run_with_retry(lambda: c.execute(
-            "UPDATE positions SET status='CLOSED', exit_ts=%s, realized_pnl=%s "
-            "WHERE id=%s AND client_id=%s",
-            (now_utc_iso(), float(realized_pnl), position_id, client_id),
+            """
+            UPDATE positions
+            SET    status='CLOSED', exit_ts=%s, exit_price=%s,
+                   realized_pnl=%s, realized_pnl_pct=%s,
+                   close_source=%s, close_confidence=%s
+            WHERE  id=%s AND client_id=%s
+            """,
+            (now_utc_iso(), exit_px, float(realized_pnl), realized_pnl_pct,
+             "FILL_MONITOR", "HIGH", position_id, client_id),
         ))
     with conn() as c:
         run_with_retry(lambda: c.execute(
@@ -507,11 +515,10 @@ def _legacy_close_position_from_exit_fill(order: dict, avg_fill_price: float):
             (float(realized_pnl), client_id),
         ))
 
-    audit(client_id, "INFO", "POSITION_CLOSED_FROM_EXIT_LEGACY", {
-        "position_id": position_id,
-        "contract":    pos["contract"],
-        "entry_price": entry_price,
-        "exit_price":  float(avg_fill_price),
-        "qty":         qty,
-        "realized_pnl": float(realized_pnl),
+    audit(client_id, "INFO", "FINALIZED_TRADE_FROM_FILL_MONITOR", {
+        "position_id": position_id, "contract": pos["contract"],
+        "entry_price": entry_price, "exit_price": exit_px,
+        "qty": qty, "realized_pnl": float(realized_pnl),
+        "realized_pnl_pct": realized_pnl_pct,
+        "close_source": "FILL_MONITOR", "close_confidence": "HIGH",
     })

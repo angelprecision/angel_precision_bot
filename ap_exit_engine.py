@@ -47,7 +47,7 @@ PROFIT_PROTECT_3_HOUR = 14   # 2:00 PM  -- exit all if +15%
 PROFIT_PROTECT_3_MIN  = 0
 EOD_HARD_CLOSE_HOUR   = 15   # 3:30 PM  -- EXIT EVERYTHING
 EOD_HARD_CLOSE_MIN    = 30
-POLL_INTERVAL_SEC     = 15   # check every 15 seconds (was 30)
+POLL_INTERVAL_SEC     = 8    # check every 8 seconds — catch TP windows faster
 
 # ── P&L THRESHOLDS ────────────────────────────────────────────────────────────
 THETA_STOP_LOSS_PCT   = -0.35  # -35% on option → stop (was -50%)
@@ -95,6 +95,8 @@ class ManagedPosition:
     quantity_remaining:   int   = 0
     scale_outs_done:      int   = 0
     peak_pnl_pct:         float = 0.0   # highest option P&L seen
+    touched_profit:       bool  = False  # True once position was ever green
+    max_profit_seen:      float = 0.0   # highest positive P&L ever seen
     closed:               bool  = False
     close_reason:         str   = ""
     opened_at:            datetime = field(default_factory=lambda: datetime.now(timezone.utc))
@@ -199,6 +201,18 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
         return ExitDecision(
             action="CLOSE_ALL", quantity=qty_rem,
             reason=f"IMMEDIATE TP -- +{option_pnl*100:.0f}% hit {IMMEDIATE_TP_PCT*100:.0f}% target",
+            urgency="IMMEDIATE", pnl_pct=option_pnl
+        )
+
+    # ── TOUCHED PROFIT PROTECTION ──────────────────────────────────────────────
+    # Was ever green → went negative → exit immediately. Capital protection first.
+    if pos.touched_profit and option_pnl <= -0.05:
+        return ExitDecision(
+            action="CLOSE_ALL", quantity=qty_rem,
+            reason=(
+                f"TOUCHED PROFIT STOP — was +{pos.max_profit_seen*100:.0f}% "
+                f"now {option_pnl*100:.0f}% — protecting capital"
+            ),
             urgency="IMMEDIATE", pnl_pct=option_pnl
         )
 
@@ -550,6 +564,10 @@ class APExitEngine:
                     # Track peak P&L for profit lock
                     if pos.option_pnl_pct > pos.peak_pnl_pct:
                         pos.peak_pnl_pct = pos.option_pnl_pct
+                    if pos.option_pnl_pct > 0:
+                        pos.touched_profit   = True
+                        if pos.option_pnl_pct > pos.max_profit_seen:
+                            pos.max_profit_seen = pos.option_pnl_pct
                     decision = evaluate_exit(pos, now_et)
                     if decision.should_act:
                         actions_to_take.append((pos, decision))
