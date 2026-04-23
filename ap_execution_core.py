@@ -625,6 +625,25 @@ class APExecutionCore:
             self.rank_queue.add(sig)
             return
 
+        # ── MASTER CONTROL RE-GATE at breach time ───────────────────────────
+        # Re-run master_control.evaluate() so capital limits, ticker caps,
+        # sector exposure, cooldowns, and kill-switch are checked at the
+        # exact moment of execution — not just at signal-queue time.
+        if self.master_control:
+            mc_decision = self.master_control.evaluate(sig, client_id=self.email)
+            if not mc_decision.ok:
+                log.info(
+                    f"[{ticker}] Master control BLOCKED at breach: "
+                    f"{mc_decision.block_reason}"
+                )
+                funnel.inc("master_control_blocked")
+                if signal_id:
+                    self.store.update_signal_fields(signal_id, {
+                        "decision_status": "blocked_at_breach",
+                        "context_notes":   f"mc_block={mc_decision.block_reason}",
+                    })
+                return
+
         # Fetch 0DTE chain
         try:
             chain, expiration = self._fetch_0dte_chain(ticker)
