@@ -56,10 +56,12 @@ SCALE_OUT_2_THRESHOLD = 0.25   # +25%  → scale out 75% at window 2 (was +80%)
 PROTECT_3_THRESHOLD   = 0.15   # +15%  → exit all at window 3 (was +30%)
 
 # ── IMMEDIATE TAKE-PROFIT (any time, no window gate) ──────────────────────────
-IMMEDIATE_TP_PCT      = 0.25   # +25% → exit immediately regardless of time
+IMMEDIATE_TP_PCT      = 0.25   # +25% → scale out 70% immediately
 HARD_STOP_PCT         = -0.30  # -30% → exit immediately regardless of time
 PROFIT_LOCK_PCT       = 0.12   # once at +25%, lock: don't fall below +12%
 TRAIL_DROP_FROM_PEAK  = 0.10   # if peak was +25%+, exit if drops 10pts from peak
+SMALL_WIN_PCT         = 0.10   # +10% → small win capture (see time gates below)
+SMALL_WIN_TRAIL       = 0.07   # after +10% seen, don't let it fall below +3%
 
 
 # ── POSITION TRACKER ─────────────────────────────────────────────────────────
@@ -236,6 +238,40 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
                 ),
                 urgency="HIGH", pnl_pct=option_pnl
             )
+
+    # ── SMALL WIN CAPTURE ──────────────────────────────────────────────────────
+    # Once peak >= +10%, protect the gain:
+    #   Rule A: if it drops 7pts from peak while still positive → lock it in
+    #   Rule B: if underlying reached 60%+ toward signal target → take option gain
+    if pos.max_profit_seen >= SMALL_WIN_PCT:
+        floor = max(0.03, pos.max_profit_seen - SMALL_WIN_TRAIL)  # at least +3%
+        if 0 < option_pnl <= floor:
+            return ExitDecision(
+                action="CLOSE_ALL", quantity=qty_rem,
+                reason=(
+                    f"SMALL WIN LOCK — peaked +{pos.max_profit_seen*100:.0f}%, "
+                    f"protecting +{option_pnl*100:.0f}%"
+                ),
+                urgency="HIGH", pnl_pct=option_pnl
+            )
+
+    # Underlying progress: if 60%+ toward scanner target, take option gain now
+    _entry_u  = pos.underlying_entry
+    _target_u = pos.underlying_target
+    _curr_u   = pos.current_underlying
+    if _entry_u and _target_u and _curr_u:
+        _range = abs(_target_u - _entry_u)
+        if _range > 0:
+            _progress = abs(_curr_u - _entry_u) / _range
+            if _progress >= 0.60 and option_pnl >= 0.05:
+                return ExitDecision(
+                    action="CLOSE_ALL", quantity=qty_rem,
+                    reason=(
+                        f"UNDERLYING PROGRESS EXIT — {_progress*100:.0f}% toward target, "
+                        f"locking option +{option_pnl*100:.0f}%"
+                    ),
+                    urgency="HIGH", pnl_pct=option_pnl
+                )
 
     # ── TOUCHED PROFIT PROTECTION ──────────────────────────────────────────────
     # Was ever green → went negative → exit immediately. Capital protection first.
