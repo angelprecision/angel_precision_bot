@@ -431,6 +431,15 @@ class APOrderStateMachine:
                         elif new_status in (OrderStatus.CANCELED, OrderStatus.EXPIRED,
                                             OrderStatus.REJECTED):
                             _ee.clear_exit_in_flight(_pos_id)
+                            # Flag rejected exits so exit engine won't blindly retry
+                            if new_status == OrderStatus.REJECTED:
+                                try:
+                                    for _p in _ee._positions:
+                                        if str(getattr(_p, "position_id", "")) == str(_pos_id):
+                                            _p.last_exit_rejected = True
+                                            break
+                                except Exception:
+                                    pass
                 except Exception as _ee_err:
                     log.debug("[%s] exit_eng hook (non-critical): %s", self.client_id, _ee_err)
 

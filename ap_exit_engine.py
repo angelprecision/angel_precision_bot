@@ -415,10 +415,20 @@ class APExitEngine:
         """Returns True if position can receive a new exit signal."""
         if not pos.exit_in_flight:
             return True
-        # Safety valve: 5-min timeout if reconciler hasn't called back
+        # Safety valve: 5-min timeout if reconciler hasn't called back.
+        # But if the last exit was REJECTED (e.g. expired contract), don't blindly retry
+        # every 5 minutes — check broker status first via reconciler.
         if pos.last_exit_signal_ts:
             age = (now_utc - pos.last_exit_signal_ts).total_seconds()
             if age >= 300:
+                # Check if last exit attempt was rejected (contract expired/invalid)
+                if getattr(pos, "last_exit_rejected", False):
+                    # Don't retry rejected exits — position needs reconciler to handle it
+                    log.warning(
+                        "[%s] Exit was REJECTED (likely expired contract) — "
+                        "not retrying; reconciler will handle", pos.ticker
+                    )
+                    return False
                 log.warning("[%s] Exit in-flight safety timeout (300s) — allowing retry", pos.ticker)
                 pos.exit_in_flight = False
                 return True
