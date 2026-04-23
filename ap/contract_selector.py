@@ -178,6 +178,26 @@ class APContractSelectionEngine:
         direction = plan.side.upper()   # "CALL" | "PUT"
         budget    = plan.max_position_usd
 
+        # ── ETF vs single-stock quality rules ────────────────────────────────────────
+        # ETFs (SPY, QQQ, IWM, etc.) are highly liquid — hold to tighter standards.
+        # Single stocks (GS, MRNA, BLK, etc.) have less volume — adjusted rules.
+        _LIQUID_ETFS = {"SPY", "QQQ", "IWM", "DIA", "GLD", "TLT", "XLF",
+                        "XLE", "XLK", "XLV", "XLC", "TQQQ", "SQQQ", "UVXY"}
+        _is_etf = ticker.upper() in _LIQUID_ETFS
+
+        if _is_etf:
+            _eff_max_spread  = 0.25   # 25% max spread for liquid ETFs
+            _eff_min_oi      = 100    # higher OI floor for ETFs
+            _eff_min_volume  = 10     # require some live volume for ETFs
+            _fallback_spread = 0.35   # tighter fallback for ETFs
+            _fallback_oi     = 200
+        else:
+            _eff_max_spread  = self.max_spread_pct  # 50% — single stocks can be wider
+            _eff_min_oi      = 25     # lower OI floor for single stocks
+            _eff_min_volume  = 0      # volume check relaxed for single stocks
+            _fallback_spread = 0.60   # wider fallback allowed for singles
+            _fallback_oi     = 50
+
         # Index tickers (^GSPC etc) cannot be quoted via Tradier options API.
         # Remap to tradable ETFs, or skip entirely.
         _INDEX_MAP = {"^GSPC": "SPY", "^NDX": "QQQ", "^RUT": "IWM", "^DJI": None}
@@ -274,6 +294,14 @@ class APContractSelectionEngine:
                 )
 
         # ── B. HARD QUALITY FILTER ────────────────────────────────────────────
+        # Apply ETF vs single-stock effective thresholds for this call
+        _orig_spread        = self.max_spread_pct
+        _orig_oi            = self.min_oi
+        _orig_vol           = self.min_volume
+        self.max_spread_pct = _eff_max_spread
+        self.min_oi         = _eff_min_oi
+        self.min_volume     = _eff_min_volume
+
 
         today = date.today()
         survivors = []
@@ -288,6 +316,11 @@ class APContractSelectionEngine:
                     "[%s] filtered: %s -- %s",
                     ticker, opt.get("symbol", "?"), result,
                 )
+
+        # Restore original thresholds
+        self.max_spread_pct = _orig_spread
+        self.min_oi         = _orig_oi
+        self.min_volume     = _orig_vol
 
         if not survivors:
             log.warning(
@@ -306,7 +339,7 @@ class APContractSelectionEngine:
                     if float(o.get("ask") or 0) > 0
                     and float(o.get("bid") or 0) > 0
                     and abs(float(o.get("delta") or o.get("greeks", {}).get("delta", 0) or 0)) >= 0.10
-                    and int(o.get("open_interest") or 0) >= 50   # min OI on fallback
+                    and int(o.get("open_interest") or 0) >= _fallback_oi
                     and int(o.get("expiration_date", "9999-99-99").replace("-", "") or 99991231)
                        <= int(today.strftime("%Y%m%d")) + self.max_dte
                 ] or [
