@@ -432,85 +432,6 @@ class APExecutionCore:
         )
         return
 
-        # ── LEGACY GATE CODE -- now owned by APMasterControl (kept for reference) ──
-        score_floor, _ = self._score_and_context_floors()
-        if score < score_floor:
-            log.info(
-                f"[{ticker}] REJECTED -- score {score:.1f} below "
-                f"{'paper' if self.paper else 'live'} floor ({score_floor})"
-            )
-            funnel.inc("rejected_score")
-            self.store.update_status(signal_id, "rejected",
-                context_notes=f"score {score:.1f} below floor {score_floor}")
-            return
-        funnel.inc("passed_score")
-
-        # ── Gate 2: Context hard block ────────────────────────────────────────
-        # Fix D (corrected): check that real_time_ctx is actually present in
-        # score_breakdown before attempting to gate on it.
-        #
-        # Why this check is required:
-        #   _apply_paper_exec_fallbacks injects spread_score + liquidity_score
-        #   into score_breakdown, making it non-empty even when the scanner did
-        #   not send real_time_ctx. Checking only bool(score_breakdown) would
-        #   enter the gate with ctx=0.0 and block every signal from a scanner
-        #   that does not emit a context score. This check ensures the gate only
-        #   fires when the scanner explicitly computed and sent real_time_ctx.
-        score_breakdown = signal.get("score_breakdown")
-        has_breakdown   = bool(score_breakdown and "real_time_ctx" in score_breakdown)
-
-        if not has_breakdown:
-            log.info(
-                f"[{ticker}] Context gate SKIPPED -- real_time_ctx not in score_breakdown"
-            )
-        else:
-            context_score = float(score_breakdown.get("real_time_ctx", 0) or 0)
-            context_floor = self._context_floor
-            if context_score < context_floor:
-                log.info(
-                    f"[{ticker}] CONTEXT BLOCKED -- context={context_score:.1f}/20 "
-                    f"(floor={context_floor} {'paper' if self.paper else 'live'} | "
-                    f"score={score:.1f} but tape is wrong)"
-                )
-                funnel.inc("context_blocked")
-                self.store.update_status(signal_id, "context_blocked",
-                    context_notes=f"ctx={context_score:.1f} below floor {context_floor}")
-                return
-            log.debug(f"[{ticker}] Context OK: {context_score:.1f}/20 (floor={context_floor})")
-        funnel.inc("passed_context")
-
-        # ── Tier classify ─────────────────────────────────────────────────────
-        tier = Tier.from_score(score)
-
-        # ── SHADOW tier: paper track only, no capital ────────────────────────
-        # FIX: B-tier (78-84) now EXECUTES at 1 contract in paper mode.
-        #      Only SHADOW tier (75-77) is parked without live capital.
-        if tier == Tier.SHADOW:
-            if score_result:
-                td = self.tier_engine.classify(score_result)
-                self.shadow.log_shadow(signal, td)
-            funnel.inc("shadow_tracked")
-            self.store.update_status(signal_id, "shadow")
-            log.info(f"[{ticker}] SHADOW-TIER -- paper tracked only (score={score:.1f})")
-            return
-
-        # ── Hard reject ───────────────────────────────────────────────────────
-        if tier == Tier.REJECT:
-            log.info(f"[{ticker}] REJECTED -- score {score:.1f}")
-            self.store.update_status(signal_id, "rejected",
-                context_notes=f"tier=REJECT score={score:.1f}")
-            return
-
-        # ── A+ / A / B: add to ranking queue ─────────────────────────────────
-        # B-tier executes at 1 contract (30% size) -- probation tier
-        signal["tier"]         = tier
-        signal["auto_execute"] = (tier == Tier.A_PLUS)
-        self.rank_queue.add(signal)
-        self.store.update_status(signal_id, "queued", timestamp_flag="queued_at")
-        log.info(f"[{ticker}] {tier}-TIER queued (score={score:.1f}) -- {'1 contract probation' if tier == Tier.B else 'full execution'}")
-
-    # ── RANKING QUEUE PROCESSOR ───────────────────────────────────────────────
-
     def _start_ranking_processor(self):
         """Background thread: drains ranking queue into watcher every 5 seconds."""
         self._rq_running = True
@@ -1028,6 +949,22 @@ class APExecutionCore:
         except Exception:
             pass
 
+        # ── TRADE INTEGRITY CHECKLIST — runs every close, before proof guard ────────
+        if not getattr(pos, "_integrity_logged", False):
+            pos._integrity_logged = True  # type: ignore[attr-defined]
+            _checks = [
+                ("has_position_id",  bool(getattr(pos, "position_id", ""))),
+                ("exit_px_positive", exit_price > 0),
+                ("pnl_recorded",     abs(opt_pnl) >= 0),
+            ]
+            _pass = all(v for _, v in _checks)
+            _str  = " ".join(f"{k}={'OK' if v else 'FAIL'}" for k, v in _checks)
+            log.info(
+                "[INTEGRITY] %s | %s | %s | pnl=%+.1f%% exit=$%.2f",
+                pos.ticker, "PASS" if _pass else "FAIL",
+                _str, opt_pnl * 100, exit_price,
+            )
+
         # Guard: only log once per position — exit_in_flight retries must not re-log
         if getattr(pos, "proof_logged", False):
             log.debug("[%s] proof.log_trade skipped — already logged for this position", pos.ticker)
@@ -1100,7 +1037,7 @@ class APExecutionCore:
                     "exit_ts": datetime.now(timezone.utc).isoformat(),
                     "underlying_exit": pos.current_underlying,
                 },
-                client_id=self._email,
+                client_id=self.email,
             )
         except Exception as _e:
             log.debug(f"Trade logger error (non-critical): {_e}")
@@ -1117,23 +1054,6 @@ class APExecutionCore:
                 pass
 
     # ── CALLBACKS: Expire / Invalidate ────────────────────────────────────────
-        # ── TRADE INTEGRITY CHECKLIST ───────────────────────────────────────────
-        if not getattr(pos, "_integrity_logged", False):
-            pos._integrity_logged = True  # type: ignore[attr-defined]
-            _checks = [
-                ("proof_logged",     getattr(pos, "proof_logged", False)),
-                ("has_position_id",  bool(getattr(pos, "position_id", ""))),
-                ("exit_px_positive", exit_price > 0),
-                ("pnl_recorded",     abs(opt_pnl) >= 0),
-            ]
-            _pass = all(v for _, v in _checks)
-            _str  = " ".join(f"{k}={'OK' if v else 'FAIL'}" for k, v in _checks)
-            log.info(
-                "[INTEGRITY] %s | %s | %s | pnl=%+.1f%% exit=$%.2f",
-                pos.ticker, "PASS" if _pass else "FAIL",
-                _str, opt_pnl * 100, exit_price,
-            )
-
 
     def _on_signal_expire(self, watched: WatchedSignal):
         signal_id = str(watched.signal.get("signal_id", ""))
