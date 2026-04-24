@@ -398,31 +398,33 @@ class APContractSelectionEngine:
                     )
                     return None
 
-                # Momentum gate: zones that require momentum confirmation
+                # Momentum gate: zones that require momentum confirmation.
+                # Uses signal score as proxy for momentum until momentum_pct
+                # is added to ApprovedExecutionPlan (planned for next sprint).
+                # Breach is confirmed by definition at contract-selection time.
                 if iv_result.get("requires_momentum"):
-                    iv_zone       = iv_result.get("iv_zone", "soft")
-                    signal_score  = float(plan.score if hasattr(plan, "score") else (plan.get("score", 0) if isinstance(plan, dict) else 0))
-                    momentum_pct  = float(plan.momentum_pct if hasattr(plan, "momentum_pct") else (plan.get("momentum_pct", 0) if isinstance(plan, dict) else 0))
-                    breach_conf   = bool(plan.breach_confirmed if hasattr(plan, "breach_confirmed") else (plan.get("breach_confirmed", True) if isinstance(plan, dict) else True))
-                    min_score     = float(iv_result.get("momentum_min_score", 65.0))
-                    min_mom       = float(iv_result.get("momentum_min_pct", 0.40))
+                    iv_zone      = iv_result.get("iv_zone", "soft")
+                    signal_score = float(
+                        plan.score if hasattr(plan, "score")
+                        else (plan.get("score", 0) if isinstance(plan, dict) else 0)
+                    )
+                    min_score    = float(iv_result.get("momentum_min_score", 65.0))
 
-                    mom_ok = breach_conf and signal_score >= min_score and momentum_pct >= min_mom
+                    # Score gate — momentum_pct will be added to plan in future
+                    mom_ok = signal_score >= min_score
                     if not mom_ok:
                         log.warning(
-                            "[%s] IVGate reject | iv_zone=%s iv=%.1f score=%.1f breach=%s momentum=%.2f "
-                            "(need score>=%.0f mom>=%.2f)",
+                            "[%s] IVGate reject | iv_zone=%s iv=%.1f score=%.1f "
+                            "(need score>=%.0f for this IV zone)",
                             ticker, iv_zone,
-                            iv_result.get("iv_rank", 0), signal_score,
-                            breach_conf, momentum_pct, min_score, min_mom,
+                            iv_result.get("iv_rank", 0), signal_score, min_score,
                         )
                         return None
                     else:
                         log.info(
-                            "[%s] IVGate allow | tier=B iv_zone=%s iv=%.1f score=%.1f breach=%s momentum=%.2f",
+                            "[%s] IVGate allow | tier=B iv_zone=%s iv=%.1f score=%.1f",
                             ticker, iv_zone,
                             iv_result.get("iv_rank", 0), signal_score,
-                            breach_conf, momentum_pct,
                         )
 
                 # Apply tier cap from IV filter if set
