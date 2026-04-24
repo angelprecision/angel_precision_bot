@@ -200,9 +200,23 @@ class APBrokerReconciler:
             kind       = order.get("kind", "ENTRY")
 
             if not broker_oid or broker_oid in ("N/A", "PENDING", ""):
-                # No broker ID — order never reached broker
-                # Auto-cancel after 5 min to prevent cap inflation
+                # No broker ID — order never reached broker.
+                # EXEMPT overnight/deferred entries — entry_watcher owns these,
+                # broker submission is intentionally delayed until 9:30 AM ET.
+                # Detection: ENTRY kind + no contract + created after 20:00 UTC or before 09:00 UTC.
                 created_ts = order.get("created_ts")
+                _contract_raw = order.get("contract")
+                _is_no_contract = not _contract_raw or str(_contract_raw).strip() in ("", "None", "null")
+                if kind == "ENTRY" and _is_no_contract and created_ts:
+                    try:
+                        _ts = datetime.fromisoformat(str(created_ts).replace("Z", "+00:00"))
+                        if _ts.hour >= 20 or _ts.hour < 9:
+                            log.debug("[%s] skip phantom cancel — overnight entry watcher owns | %s",
+                                      self.client_id, local_id)
+                            continue
+                    except Exception:
+                        pass
+                # Auto-cancel after 5 min to prevent cap inflation
                 if created_ts:
                     try:
                         age = (datetime.now(timezone.utc) -
