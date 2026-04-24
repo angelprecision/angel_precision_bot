@@ -530,11 +530,10 @@ class APStartupRecovery:
 
         ET = ZoneInfo("America/New_York")
         now_et   = datetime.now(ET)
-        # Lookback window: 60h on Monday (covers Friday post-market signals),
-        # 36h all other days (catches yesterday's post-market signals).
-        # This ensures Friday scanner signals survive the weekend without expiring.
-        _weekday = now_et.weekday()  # 0=Mon, 4=Fri, 5=Sat, 6=Sun
-        _lookback_hours = 60 if _weekday == 0 else 36
+        # Look back 36 hours — catches yesterday's post-market scanner signals
+        # (sent at 4:15 PM ET the day before) that held overnight as WATCHING.
+        # Scanners run Sunday evening to provide fresh Monday setups.
+        _lookback_hours = 36
         cutoff_utc = (now_et.astimezone(timezone.utc) - timedelta(hours=_lookback_hours)).isoformat()
 
         def _reset():
