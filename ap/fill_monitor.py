@@ -274,6 +274,16 @@ def process_pending_order(broker: BrokerAdapter, order: dict, osm=None, pm=None,
                             underlying_stop  = float(order.get("stop_underlying") or 0),
                         )
                         _mp.position_id = _pos_id
+                        # Bug 7 fix: attach signal metadata so _on_position_close has
+                        # pattern/tier/score/timeframe for complete proof_trades records
+                        _mp.signal = {
+                            "signal_id":  signal_id,
+                            "pattern":    str(order.get("pattern") or ""),
+                            "tier":       str(order.get("tier") or "B"),
+                            "score":      float(order.get("score") or 0),
+                            "timeframe":  str(order.get("timeframe") or "1d"),
+                            "side":       (order.get("direction") or "CALL").upper(),
+                        }
                         exit_engine.add_position(_mp)
                         log.info("[%s] Exit engine seeded for %s pos=%s",
                                  client_id, order.get("symbol","?"), _pos_id)
