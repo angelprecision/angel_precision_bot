@@ -269,9 +269,9 @@ def process_pending_order(broker: BrokerAdapter, order: dict, osm=None, pm=None,
                             side             = (order.get("direction") or "CALL").upper(),
                             quantity         = result["filled_qty"] or int(order.get("qty") or 0),
                             entry_price      = result["avg_fill"],
-                            underlying_entry = float(order.get("trigger_price") or 0),
-                            underlying_target= float(order.get("target_underlying") or 0),
-                            underlying_stop  = float(order.get("stop_underlying") or 0),
+                            underlying_entry = float(order.get("trigger_price") or order.get("underlying_entry") or 0),
+                            underlying_target= float(order.get("target_underlying") or order.get("underlying_target") or 0),
+                            underlying_stop  = float(order.get("stop_underlying") or order.get("underlying_stop") or 0),
                         )
                         _mp.position_id = _pos_id
                         # Bug 7 fix: attach signal metadata so _on_position_close has
