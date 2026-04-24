@@ -543,6 +543,10 @@ class APExecutionCore:
                     "decision_status": "requeued_after_trigger",
                     "context_notes":   f"positions_full={self._position_count}/{self._max_positions} at breach",
                 })
+            # Decrement sector count — signal never executed, slot must be returned
+            _sector_key = sig.get("sector", ticker)
+            with self._sector_lock:
+                self._sector_counts[_sector_key] = max(0, self._sector_counts.get(_sector_key, 0) - 1)
             self.rank_queue.add(sig)
             return
 
@@ -563,6 +567,10 @@ class APExecutionCore:
                         "decision_status": "blocked_at_breach",
                         "context_notes":   f"mc_block={mc_decision.block_reason}",
                     })
+                # Decrement sector count — signal blocked, slot must be returned
+                _sector = sig.get("sector", ticker)
+                with self._sector_lock:
+                    self._sector_counts[_sector] = max(0, self._sector_counts.get(_sector, 0) - 1)
                 return
 
         # Fetch 0DTE chain
