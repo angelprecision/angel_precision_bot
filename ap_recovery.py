@@ -530,10 +530,10 @@ class APStartupRecovery:
 
         ET = ZoneInfo("America/New_York")
         now_et   = datetime.now(ET)
-        # Look back 36 hours — catches yesterday's post-market scanner signals
-        # (sent at 4:15 PM ET the day before) that held overnight as WATCHING.
-        # Scanners run Sunday evening to provide fresh Monday setups.
-        _lookback_hours = 36
+        # Look back 48 hours — covers Sunday evening scanner signals for Monday open.
+        # 48h ensures Sunday 4:15 PM ET signals are still in window at any
+        # Monday restart time (Sunday 4:15 PM ET = ~28h before Monday close).
+        _lookback_hours = 48
         cutoff_utc = (now_et.astimezone(timezone.utc) - timedelta(hours=_lookback_hours)).isoformat()
 
         def _reset():
@@ -554,6 +554,6 @@ class APStartupRecovery:
         result["watchers_requeued"] = count
         log.info(
             "[%s] RECOVERY: %d WATCHING signals reset to NEW for watcher reseed "
-            "(lookback=36h cutoff=%s)",
-            self.client_id, count, cutoff_utc[:19],
+            "(lookback=%dh cutoff=%s)",
+            self.client_id, count, _lookback_hours, cutoff_utc[:19],
         )
