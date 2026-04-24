@@ -5,7 +5,7 @@
 #   Scanners fire post-market (~6 PM ET) for next-day setups.
 #   Signals arriving after 3:30 PM ET are accepted and held overnight.
 #   They activate at the next session open (9:30 AM ET).
-#   TTL is 20 hours — covers any post-market send time through next day's close.
+#   TTL is 72 hours — covers weekend holds (Friday PM scanner → Monday open).
 #   Force-expire at 4 PM only applies to same-day signals, not overnight ones.
 # =============================================================================
 
@@ -23,7 +23,7 @@ log = logging.getLogger("ap.entry_watcher")
 ET  = ZoneInfo("America/New_York")
 
 POLL_INTERVAL_SEC       = 15
-MAX_WATCH_MINUTES       = 1200   # 20 hours — holds overnight post-market → next session
+MAX_WATCH_MINUTES       = 4320   # 72 hours — holds through weekend (Fri PM → Mon open)
 EOD_CUTOFF_HOUR         = 15
 EOD_CUTOFF_MIN          = 30
 WRONG_DIR_BUFFER_PCT    = 0.001
