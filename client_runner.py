@@ -296,8 +296,9 @@ class ClientRunner(threading.Thread):
 
             # IV rank filter -- blocks buying expensive premium (rank > threshold)
             iv_filter = APIVRankFilter(
-                broker=data_broker,   # use live data broker for IV data
-                max_iv_rank=float(os.getenv("MAX_IV_RANK", "100")),  # disabled: 85→100 (only blocks rank>100 which is impossible)
+                broker=data_broker,
+                max_iv_rank=float(os.getenv("MAX_IV_RANK", "100")),  # soft zone: allow B-tier above this
+                hard_cap=float(os.getenv("IV_HARD_CAP", "150")),     # hard cap: always reject above this
             )
 
             self.contract_selector = APContractSelectionEngine(
