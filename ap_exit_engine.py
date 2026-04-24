@@ -606,9 +606,18 @@ class APExitEngine:
                     mp.current_option_price = float(row.get("avg_fill", 0) or 0)
                     # Restore runner state from DB so restarts pick up mid-trade correctly
                     mp.scale_outs_done    = int(row.get("scale_outs_done", 0) or 0)
-                    _db_qty = int(row.get("qty", 0) or 0)
-                    if _db_qty > 0:
-                        mp.quantity_remaining = _db_qty
+                    # Bug fix: use quantity_remaining if stored, else fall back to original qty
+                    # quantity_remaining reflects partial closes/scale-outs; qty is the original fill
+                    _qty_remaining = int(row.get("quantity_remaining", 0) or 0)
+                    _db_qty        = int(row.get("qty", 0) or 0)
+                    _resolved_qty  = _qty_remaining if _qty_remaining > 0 else _db_qty
+                    if _resolved_qty > 0:
+                        mp.quantity          = _resolved_qty   # update base qty to remaining
+                        mp.quantity_remaining = _resolved_qty
+                        log.debug(
+                            "seed_from_db: %s qty_remaining=%d (db_qty=%d scale_outs=%d)",
+                            mp.ticker, _resolved_qty, _db_qty, mp.scale_outs_done
+                        )
                     mp.current_underlying = float(row.get("underlying_entry", 0) or 0)
                     self.add_position(mp)
                     seeded += 1
