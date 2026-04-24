@@ -905,6 +905,27 @@ class APExecutionCore:
             synthetic_entry = bool(getattr(pos, "synthetic_entry", False)),
         )
 
+        # ── SLIPPAGE TRACKER ────────────────────────────────────────
+        # Compare actual fill to the mid we expected. Log once per entry
+        # for later bucket analysis (slippage vs spread_pct vs ticker tier).
+        # Not logged for synthetic fills (those ARE the mid by construction).
+        try:
+            _quote_mid    = float(getattr(decision, "mid_price", 0) or 0)
+            _quote_spread = float(getattr(decision, "spread_pct", 0) or 0)
+            if _quote_mid > 0 and fill_price and not synthetic:
+                # BUY slippage: positive = paid above mid (bad for us)
+                _slip_vs_mid = fill_price - _quote_mid
+                _slip_bps    = (_slip_vs_mid / _quote_mid) * 10_000
+                log.info(
+                    f"[SLIPPAGE] {ticker} {decision.symbol} side=BUY qty={contracts} "
+                    f"mid={_quote_mid:.2f} fill={fill_price:.2f} "
+                    f"spread_pct={_quote_spread:.3f} "
+                    f"slip_vs_mid=${_slip_vs_mid:+.2f} slip_bps={_slip_bps:+.0f} "
+                    f"pro_tier={sig.get('_pro_tier', '?')}"
+                )
+        except Exception as _e:
+            log.debug(f"[{ticker}] slippage log failed: {_e}")
+
         log.info(
             f"[{ticker}] {'PAPER' if self.paper else 'LIVE'} OPEN "
             f"(synthetic={synthetic}) | "
