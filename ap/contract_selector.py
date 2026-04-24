@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import math
 import logging
+from ap.trace import trace_gate
 import os
 from dataclasses import dataclass, field
 from datetime import date, timedelta
@@ -396,6 +397,9 @@ class APContractSelectionEngine:
                         "[%s] BLOCKED by IVRankFilter -- %s",
                         ticker, reason,
                     )
+                    _sig_id = getattr(plan, "signal_id", "") or (plan.get("signal_id","") if isinstance(plan,dict) else "")
+                    trace_gate(str(_sig_id), ticker, "IV_GATE", "REJECT",
+                               reason="iv_extreme", iv_rank=iv_result.get("iv_rank"))
                     return None
 
                 # Momentum gate: zones that require momentum confirmation.
@@ -419,6 +423,10 @@ class APContractSelectionEngine:
                             ticker, iv_zone,
                             iv_result.get("iv_rank", 0), signal_score, min_score,
                         )
+                        _sig_id = getattr(plan, "signal_id", "") or (plan.get("signal_id","") if isinstance(plan,dict) else "")
+                        trace_gate(str(_sig_id), ticker, "IV_GATE", "REJECT",
+                                   reason=f"iv_zone={iv_zone}_score_too_low",
+                                   score=signal_score, iv_rank=iv_result.get("iv_rank"))
                         return None
                     else:
                         log.info(
@@ -426,6 +434,10 @@ class APContractSelectionEngine:
                             ticker, iv_zone,
                             iv_result.get("iv_rank", 0), signal_score,
                         )
+                        _sig_id = getattr(plan, "signal_id", "") or (plan.get("signal_id","") if isinstance(plan,dict) else "")
+                        trace_gate(str(_sig_id), ticker, "IV_GATE", "ALLOW",
+                                   reason=f"iv_zone={iv_zone}",
+                                   score=signal_score, iv_rank=iv_result.get("iv_rank"))
 
                 # Apply tier cap from IV filter if set
                 if iv_result.get("tier_cap"):
