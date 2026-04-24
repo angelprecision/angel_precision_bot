@@ -434,9 +434,15 @@ class APOrderStateMachine:
                             # Flag rejected exits so exit engine won't blindly retry
                             if new_status == OrderStatus.REJECTED:
                                 try:
+                                    import time as _time
                                     for _p in _ee._positions:
                                         if str(getattr(_p, "position_id", "")) == str(_pos_id):
                                             _p.last_exit_rejected = True
+                                            _p.last_rejection_ts  = _time.time()  # start 30s cooldown
+                                            log.info(
+                                                "[%s] Exit REJECTED — 30s cooldown started",
+                                                getattr(_p, "ticker", _pos_id)
+                                            )
                                             break
                                 except Exception:
                                     pass
