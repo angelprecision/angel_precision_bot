@@ -84,12 +84,11 @@ def _effective_thresholds(pos: "ManagedPosition") -> tuple:
 
     is_index = any(symbol.startswith(t) for t in _INDEX_ETFS) or ticker in _INDEX_ETFS
 
-    if dte == 0 and is_index:
-        return -0.20, 0.20, 0.08   # 0DTE index: -20% stop, +20% TP, +8% lock
-    elif dte <= 1:
-        return -0.25, 0.22, 0.10   # 1DTE: -25% stop, +22% TP, +10% lock
-    else:
-        return HARD_STOP_PCT, IMMEDIATE_TP_PCT, PROFIT_LOCK_PCT
+    # All tiers use the same option P&L stop (-30%).
+    # Underlying-level stop (is_at_stop) is the primary protection on 0DTE.
+    # Option P&L stop is the last-resort backstop — keep it wide enough to
+    # survive intraday noise (a 0.5% QQQ move = ~40% option move on delta 0.25).
+    return HARD_STOP_PCT, IMMEDIATE_TP_PCT, PROFIT_LOCK_PCT
 TRAIL_DROP_FROM_PEAK  = 0.10   # if peak was +25%+, exit if drops 10pts from peak
 SMALL_WIN_PCT         = 0.10   # +10% → small win capture (see time gates below)
 SMALL_WIN_TRAIL       = 0.07   # after +10% seen, don't let it fall below +3%
@@ -322,7 +321,10 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
     # ── FAST STOP: never-green trades cut early ──────────────────────────────
     # If the trade never touched profit and is already at -12%, exit immediately.
     # 0DTE options can collapse in seconds — don't wait for -20% hard stop.
-    FAST_STOP_PCT = -0.12
+    # Fast stop: only fires if position never went green AND is down 20%.
+    # -12% was too tight — on a $0.46 0DTE option that's $0.055, which is
+    # bid/ask spread noise. -20% requires a meaningful adverse move to trigger.
+    FAST_STOP_PCT = -0.20
     if not pos.touched_profit and option_pnl <= FAST_STOP_PCT:
         return ExitDecision(
             action="CLOSE_ALL", quantity=qty_rem,
