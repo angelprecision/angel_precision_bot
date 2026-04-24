@@ -296,9 +296,9 @@ class APEntryWatcher:
                     # CALL: price needs to be AT or BELOW trigger (breach = move up)
                     # PUT: price needs to be AT or ABOVE trigger (breach = move down)
                     _stale = False
-                    if _side == "CALL" and _pct_from_trigger > 0.015:   # price already ran +1.5% past trigger
+                    if _side == "CALL" and _pct_from_trigger > 0.030:   # price already ran +3.0% past trigger
                         _stale = True
-                    elif _side == "PUT" and _pct_from_trigger < -0.015:  # price already fell -1.5% past trigger
+                    elif _side == "PUT" and _pct_from_trigger < -0.030:  # price already fell -3.0% past trigger
                         _stale = True
                     # Also skip if price has already moved through the STOP level
                     if _stop and _stop > 0:
