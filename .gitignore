@@ -4,3 +4,5 @@ ap_state.db-wal
 ap_state.db
 ap_state.db-shm
 ap_state.db-wal
+__pycache__/
+*.pyc
