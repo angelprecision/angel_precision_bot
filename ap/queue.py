@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import logging
+from ap.trace import trace_gate
 import os
 import time
 from datetime import datetime, timezone
@@ -277,6 +278,8 @@ def _dispatch(
 
     if not decision.ok:
         log.info(f"[{ticker}] BLOCKED | stage={decision.stage} reason={decision.reason}")
+        trace_gate(str(payload.get("signal_id","")), ticker, "MC_REJECTED", "REJECT",
+                   reason=decision.reason, score=float(payload.get("score") or 0))
         _mark_job(job_id, "REJECTED",
                   result={"stage": decision.stage, "reason": decision.reason})
         # Write to ap_signals as 'watching' so post-market blocked signals
@@ -340,6 +343,8 @@ def _dispatch(
             if selected is None:
                 # Fail loudly -- no silent fallback, no improvised contract
                 log.warning(f"[{ticker}] Contract selection failed -- no suitable contract")
+                trace_gate(str(payload.get("signal_id","")), ticker, "QUALITY_FILTER", "REJECT",
+                           reason="no_eligible_contracts", score=float(payload.get("score") or 0))
                 _mark_job(job_id, "REJECTED",
                           result={"stage": "contract_selection",
                                   "reason": "no_contract_found",
