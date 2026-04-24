@@ -381,9 +381,10 @@ class APIVRankFilter:
     _CACHE_TTL_SECONDS: int = 30 * 60  # 30 minutes
     _ABSOLUTE_IV_BLOCK_THRESHOLD: float = 0.80  # fallback when no history
 
-    def __init__(self, broker, max_iv_rank: float = 70.0) -> None:
-        self.broker = broker
+    def __init__(self, broker, max_iv_rank: float = 70.0, hard_cap: float = None) -> None:
+        self.broker      = broker
         self.max_iv_rank = max_iv_rank
+        self.hard_cap = hard_cap if hard_cap is not None else max(150.0, max_iv_rank * 1.5)
         # Cache: {ticker: (fetched_at_epoch, result_dict)}
         self._cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
         log.info(
@@ -504,15 +505,27 @@ class APIVRankFilter:
             "iv_52w_high": round(iv_52w_high, 4),
         }
 
-        if iv_rank > self.max_iv_rank:
+        if iv_rank > self.hard_cap:
+            # Absolute ceiling — never trade extreme vol
             reason = (
-                f"IV rank {iv_rank:.0f} > max {self.max_iv_rank:.0f} "
+                f"IV rank {iv_rank:.0f} > hard_cap {self.hard_cap:.0f} "
                 f"(current_iv={current_iv:.2f} "
                 f"range=[{iv_52w_low:.2f}, {iv_52w_high:.2f}])"
             )
-            log.warning("[%s] IVRankFilter: BLOCKED — %s", ticker, reason)
+            log.warning("[%s] IVRankFilter: BLOCKED (extreme) — %s", ticker, reason)
             result["blocked"] = True
             result["reason"] = reason
+        elif iv_rank > self.max_iv_rank:
+            # Soft zone — allow but flag for B-tier downgrade
+            reason = (
+                f"IV rank {iv_rank:.0f} > soft_zone {self.max_iv_rank:.0f} "
+                f"(current_iv={current_iv:.2f} "
+                f"range=[{iv_52w_low:.2f}, {iv_52w_high:.2f}])"
+            )
+            log.info("[%s] IVRankFilter: HIGH_IV_ALLOWED (B-tier) — %s", ticker, reason)
+            result["blocked"]    = False
+            result["tier_cap"]   = "B"   # contract selector will cap at B-tier
+            result["reason"]     = f"iv_high_allowed: {reason}"
         else:
             result["reason"] = (
                 f"IV rank {iv_rank:.0f} <= max {self.max_iv_rank:.0f} "
