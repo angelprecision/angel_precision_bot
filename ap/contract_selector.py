@@ -32,6 +32,117 @@ log = logging.getLogger("ap.contract_selector")
 
 
 # =============================================================================
+# PRO-LEVEL CONTRACT QUALITY THRESHOLDS
+# =============================================================================
+# Hard gates + A/B tiering. Applied BEFORE the legacy _quality_filter so a
+# contract that fails pro gates never reaches ranking or fallback.
+#
+# Indices + mega-caps get tighter spread limits because they have the liquidity
+# to deserve it. Everything else gets a still-strict but slightly wider band.
+#
+# No fallback. If zero contracts pass hard gates, the signal is skipped.
+# =============================================================================
+
+# Toggle: set PRO_CONTRACT_QUALITY=false to fall back to legacy gates.
+# Default ON. Leave as an escape hatch, not a default.
+_PRO_QUALITY_ENABLED = os.getenv("PRO_CONTRACT_QUALITY", "true").lower() != "false"
+
+# Tier 1: indices + mega-caps. Tight spreads earned.
+_PRO_TIER1_TICKERS = {
+    "SPY", "QQQ", "IWM", "DIA",                            # indices
+    "AAPL", "MSFT", "NVDA", "AMD", "META", "GOOG", "GOOGL",  # mega-caps
+    "TSLA", "AMZN", "NFLX",                                # high-volume tech
+}
+
+# Hard-reject if any of these fire
+_PRO_MIN_BID            = 0.10   # below this, fills are too noisy
+_PRO_MIN_BID_SIZE_HARD  = 3      # either side < 3 = instant reject
+
+# Tier 1 (indices + mega-caps)
+_PRO_T1_SPREAD_HARD_MAX = 0.06   # 6% max spread
+_PRO_T1_SPREAD_A_TIER   = 0.03   # <=3% = A-tier
+_PRO_T1_SIZE_MIN        = 10     # both sides >= 10
+
+# Tier 2 (everything else)
+_PRO_T2_SPREAD_HARD_MAX = 0.08   # 8% max spread
+_PRO_T2_SPREAD_A_TIER   = 0.04   # <=4% = A-tier
+_PRO_T2_SIZE_MIN        = 5      # both sides >= 5
+
+
+def _pro_contract_quality(opt: dict, ticker: str, dte: int) -> tuple[str, str]:
+    """
+    Pro-level hard gates + A/B tiering.
+
+    Returns (tier, reason):
+      - ('A', 'tight_liquid')     passes + tight spread + strong size/liq
+      - ('B', 'ok_liquid')        passes hard gates, mid-pack
+      - ('REJECT', '<reason>')    failed a hard gate — skip, no fallback
+
+    Tier 1 tickers (indices + mega-caps): 6% spread hard cap, 3% for A-tier.
+    Tier 2 (everything else): 8% spread hard cap, 4% for A-tier.
+    """
+    is_t1 = ticker.upper() in _PRO_TIER1_TICKERS
+
+    bid = float(opt.get("bid") or 0)
+    ask = float(opt.get("ask") or 0)
+    vol = int(opt.get("volume") or 0)
+    oi  = int(opt.get("open_interest") or 0)
+
+    # Top-of-book size — Tradier returns bidsize/asksize or size.bid/ask
+    bid_size = int(opt.get("bid_size") or opt.get("bidsize") or 0)
+    ask_size = int(opt.get("ask_size") or opt.get("asksize") or 0)
+
+    # A. Price sanity
+    if bid <= 0 or ask <= 0:
+        return "REJECT", "zero_bid_or_ask"
+    if ask < bid:
+        return "REJECT", "ask_below_bid"
+    if bid < _PRO_MIN_BID:
+        return "REJECT", f"bid_below_{_PRO_MIN_BID}"
+
+    # B. Spread
+    mid = (bid + ask) / 2
+    if mid <= 0:
+        return "REJECT", "zero_mid"
+    spread_pct = (ask - bid) / mid
+
+    hard_spread = _PRO_T1_SPREAD_HARD_MAX if is_t1 else _PRO_T2_SPREAD_HARD_MAX
+    a_spread    = _PRO_T1_SPREAD_A_TIER  if is_t1 else _PRO_T2_SPREAD_A_TIER
+
+    if spread_pct > hard_spread:
+        return "REJECT", f"spread_too_wide_{spread_pct*100:.1f}%_max_{hard_spread*100:.0f}%"
+
+    # C. Top-of-book size (only if broker surfaced it)
+    if bid_size or ask_size:
+        if bid_size < _PRO_MIN_BID_SIZE_HARD or ask_size < _PRO_MIN_BID_SIZE_HARD:
+            return "REJECT", f"size_too_thin_bid{bid_size}_ask{ask_size}"
+
+    # D. Volume + OI (per DTE)
+    if dte <= 1:
+        min_vol, min_oi = 100, 500
+    elif dte <= 7:
+        min_vol, min_oi = 200, 1000
+    else:
+        min_vol, min_oi = 500, 2000
+
+    if vol < min_vol and oi < min_oi:
+        return "REJECT", f"illiquid_vol{vol}_oi{oi}_need_v{min_vol}_or_oi{min_oi}"
+
+    # E. Tier the survivor
+    size_ok_A   = (bid_size >= _PRO_T1_SIZE_MIN and ask_size >= _PRO_T1_SIZE_MIN) if is_t1 \
+                  else (bid_size >= _PRO_T2_SIZE_MIN and ask_size >= _PRO_T2_SIZE_MIN)
+    # If broker didn't surface size, don't penalize — require only vol/oi strength
+    has_size    = bool(bid_size or ask_size)
+
+    strong_liq  = (vol >= min_vol * 2) or (oi >= min_oi * 2)
+
+    if spread_pct <= a_spread and strong_liq and (size_ok_A or not has_size):
+        return "A", "tight_liquid"
+
+    return "B", "ok_liquid"
+
+
+# =============================================================================
 # OUTPUT DATACLASS
 # =============================================================================
 
@@ -306,7 +417,30 @@ class APContractSelectionEngine:
         today = date.today()
         survivors = []
         _rejections: dict = {}
+        _pro_tiers:  dict = {"A": 0, "B": 0}
+
         for opt in chain:
+            # ── PRO GATE (new, default ON) ────────────────────────────────
+            # Hard gates + A/B tiering. Failed contracts never reach ranking.
+            # No fallback — if nothing passes, we skip the signal.
+            if _PRO_QUALITY_ENABLED:
+                # Compute DTE for pro-gate liquidity bucket
+                exp_str = opt.get("expiration_date", "")
+                _dte = 0
+                if exp_str:
+                    try:
+                        _dte = (date.fromisoformat(exp_str) - today).days
+                    except Exception:
+                        _dte = 0
+                pro_tier, pro_reason = _pro_contract_quality(opt, ticker, _dte)
+                if pro_tier == "REJECT":
+                    _rejections[pro_reason] = _rejections.get(pro_reason, 0) + 1
+                    continue
+                # Tag for downstream ranking
+                opt["_pro_tier"] = pro_tier
+                _pro_tiers[pro_tier] = _pro_tiers.get(pro_tier, 0) + 1
+
+            # ── LEGACY GATE (still runs — belt and braces) ────────────────
             result = self._quality_filter(opt, today)
             if result is None:
                 survivors.append(opt)
@@ -324,54 +458,26 @@ class APContractSelectionEngine:
 
         if not survivors:
             log.warning(
-                "[%s] no contracts passed quality filter | chain=%d | rejections: %s",
+                "[%s] CONTRACT_SELECTOR: NO_ELIGIBLE_CONTRACTS | chain=%d | rejections: %s",
                 ticker, len(chain),
                 ", ".join(f"{k}({v})" for k, v in
                           sorted(_rejections.items(), key=lambda x: -x[1]))
                 if _rejections else "none",
             )
-            # Paper mode: use best available even if it failed quality checks.
-            # Enforce minimum sanity gates on fallback: delta >= 0.10, DTE <= max_dte,
-            # ask > 0. Pick highest OI among candidates that pass these gates.
-            if self.mode.upper() != "LIVE" and chain:
-                # HARD FALLBACK FLOOR — non-negotiable minimum viability
-                # Pass 1: strict (spread ≤25%, OI ≥100, vol ≥10, delta 0.20-0.65)
-                # Pass 2: relaxed OI/vol but keeps spread + delta
-                # Pass 3: last resort — only if bid>0 and delta≥0.15 and spread≤50%
-                # If nothing passes any of these → NO TRADE (return None below)
-                _fallback_pool = [
-                    o for o in chain
-                    if float(o.get("bid") or 0) > 0
-                    and float(o.get("ask") or 0) > 0
-                    and abs(float(o.get("delta") or o.get("greeks", {}).get("delta", 0) or 0)) >= 0.20
-                    and abs(float(o.get("delta") or o.get("greeks", {}).get("delta", 0) or 0)) <= 0.65
-                    and int(o.get("open_interest") or 0) >= 100
-                    and int(o.get("volume") or 0) >= 5
-                    and ((float(o.get("ask") or 0) - float(o.get("bid") or 0)) /
-                         max(0.001, (float(o.get("ask") or 0) + float(o.get("bid") or 0)) / 2)) <= 0.30
-                ] or [
-                    # Pass 2: relax volume/OI, keep spread and delta
-                    o for o in chain
-                    if float(o.get("bid") or 0) > 0
-                    and abs(float(o.get("delta") or o.get("greeks", {}).get("delta", 0) or 0)) >= 0.15
-                    and int(o.get("open_interest") or 0) >= _fallback_oi
-                    and ((float(o.get("ask") or 0) - float(o.get("bid") or 0)) /
-                         max(0.001, (float(o.get("ask") or 0) + float(o.get("bid") or 0)) / 2)) <= _fallback_spread
-                ]
-                # Pass 3 intentionally omitted — if nothing passes, return None below
-                best_fallback = max(_fallback_pool, key=lambda o: int(o.get("open_interest") or 0)) if _fallback_pool else None
-                bid_f = float(best_fallback.get("bid") or 0) if best_fallback else 0
-                ask_f = float(best_fallback.get("ask") or 0) if best_fallback else 0
-                if best_fallback and ask_f > 0:
-                    log.warning("[%s] QUALITY FILTER FALLBACK -- using best available contract", ticker)
-                    survivors = [best_fallback]
-                else:
-                    # Nothing passed fallback floor — skip trade entirely
-                    return None  # hard reject — no synthetic fills ever
-            else:
-                return None
+            # NO FALLBACK. Ever. Paper or live.
+            # Previously paper mode would force "best available" which shipped
+            # 50%+ spread contracts with zero volume. That's the bug we're
+            # killing. If nothing passes hard gates, the signal is skipped —
+            # fewer trades is the point, not the cost.
+            return None
 
-        log.info("[%s] %d contracts passed quality filter", ticker, len(survivors))
+        if _PRO_QUALITY_ENABLED:
+            log.info(
+                "[%s] %d contracts passed pro quality | A=%d B=%d",
+                ticker, len(survivors), _pro_tiers.get("A", 0), _pro_tiers.get("B", 0),
+            )
+        else:
+            log.info("[%s] %d contracts passed quality filter", ticker, len(survivors))
 
         # ── C. RANK ───────────────────────────────────────────────────────────
 
