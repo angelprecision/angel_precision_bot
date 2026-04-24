@@ -316,8 +316,25 @@ def _dispatch(
 
     plan = decision.plan
 
-    # ── 2. CONTRACT SELECTION -- replaces placeholder with real premium ─────────
-    if contract_selector:
+    # ── 2. CONTRACT SELECTION -- skip outside market hours ──────────────────────
+    # Outside 9:30-4:00 ET, options spreads are blown out (post-market quotes).
+    # Contract selection runs at breach time instead (live quotes, tight spreads).
+    _skip_contract_selection = False
+    try:
+        from zoneinfo import ZoneInfo as _ZI2
+        from datetime import datetime as _dt2, time as _t2
+        _now_et2 = _dt2.now(_ZI2("America/New_York"))
+        _in_mkt = _t2(9, 30) <= _now_et2.time() <= _t2(16, 0)
+        if not _in_mkt and contract_selector:
+            _skip_contract_selection = True
+            log.info(
+                f"[{ticker}] Post-market signal — skipping contract selection "
+                f"(stale quotes). Will select at breach time with live quotes."
+            )
+    except Exception:
+        pass
+
+    if contract_selector and not _skip_contract_selection:
         try:
             selected = contract_selector.select(plan)
             if selected is None:
