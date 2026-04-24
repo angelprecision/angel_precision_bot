@@ -129,6 +129,7 @@ class ManagedPosition:
     scale_outs_done:      int   = 0
     peak_pnl_pct:         float = 0.0   # highest option P&L seen
     touched_profit:       bool  = False  # True once position was ever green
+    last_rejection_ts:    Optional[float] = None  # epoch when last exit was rejected
     max_profit_seen:      float = 0.0   # highest positive P&L ever seen
     closed:               bool  = False
     close_reason:         str   = ""
@@ -316,6 +317,17 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
                 f"now {option_pnl*100:.0f}% — protecting capital"
             ),
             urgency="IMMEDIATE", pnl_pct=option_pnl
+        )
+
+    # ── FAST STOP: never-green trades cut early ──────────────────────────────
+    # If the trade never touched profit and is already at -12%, exit immediately.
+    # 0DTE options can collapse in seconds — don't wait for -20% hard stop.
+    FAST_STOP_PCT = -0.12
+    if not pos.touched_profit and option_pnl <= FAST_STOP_PCT:
+        return ExitDecision(
+            action="CLOSE_ALL", quantity=qty_rem,
+            reason=f"FAST STOP -- {option_pnl*100:.0f}% never-green cut at {FAST_STOP_PCT*100:.0f}%",
+            limit_price=current_bid,
         )
 
     # ── HARD STOP (fires any time, no time gate) ─────────────────────────────
@@ -590,6 +602,16 @@ class APExitEngine:
     def _eligible_for_new_exit(self, pos: "ManagedPosition", now_utc: datetime) -> bool:
         """Returns True if position can receive a new exit signal."""
         if not pos.exit_in_flight:
+            # Check rejection cooldown — don't retry within 30s of a rejection
+            if pos.last_rejection_ts is not None:
+                import time as _time
+                elapsed = _time.time() - pos.last_rejection_ts
+                if elapsed < 30:
+                    log.debug("[%s] Exit cooldown active — %ds since last rejection (wait 30s)",
+                              pos.ticker, int(elapsed))
+                    return False
+                else:
+                    pos.last_rejection_ts = None  # cooldown expired, clear it
             return True
         # Safety valve: 5-min timeout if reconciler hasn't called back.
         # But if the last exit was REJECTED (e.g. expired contract), don't blindly retry
