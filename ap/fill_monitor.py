@@ -227,8 +227,19 @@ def process_pending_order(broker: BrokerAdapter, order: dict, osm=None, pm=None,
                     plan_id   = order.get("plan_id")   or order.get("signal_id") or local_id
                     signal_id = order.get("signal_id") or local_id
                     _ticker   = (order.get("symbol") or "").upper()
-                    _qty      = int(result.get("qty") or order.get("contracts") or 0)
-                    _price    = float(result.get("avg_fill") or 0)
+                    _qty = int(
+                        result.get("filled_qty")
+                        or result.get("qty")
+                        or order.get("filled_qty")
+                        or order.get("contracts")
+                        or 0
+                    )
+                    _price = float(
+                        result.get("avg_fill")
+                        or result.get("avg_fill_price")
+                        or order.get("fill_price")
+                        or 0
+                    )
                     trace_gate(str(signal_id), _ticker, "ORDER_FILLED", "PASS",
                                reason="entry_filled", trigger_price=_price, contracts=_qty)
                     _pos_id = pm.open_position(
