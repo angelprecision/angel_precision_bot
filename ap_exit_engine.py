@@ -329,7 +329,7 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
         return ExitDecision(
             action="CLOSE_ALL", quantity=qty_rem,
             reason=f"FAST STOP -- {option_pnl*100:.0f}% never-green cut at {FAST_STOP_PCT*100:.0f}%",
-            limit_price=current_bid,
+            limit_price=pos.current_bid,   # use pos.current_bid — current_bid is not local here
         )
 
     # ── HARD STOP (fires any time, no time gate) ─────────────────────────────
