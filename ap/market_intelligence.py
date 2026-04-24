@@ -381,17 +381,28 @@ class APIVRankFilter:
     _CACHE_TTL_SECONDS: int = 30 * 60  # 30 minutes
     _ABSOLUTE_IV_BLOCK_THRESHOLD: float = 0.80  # fallback when no history
 
-    def __init__(self, broker, max_iv_rank: float = 70.0, hard_cap: float = None) -> None:
+    def __init__(self, broker, max_iv_rank: float = 70.0, hard_cap: float = None, mode: str = "RESEARCH") -> None:
         self.broker      = broker
-        self.max_iv_rank = max_iv_rank
-        self.hard_cap = hard_cap if hard_cap is not None else max(150.0, max_iv_rank * 1.5)
+        self.mode        = (mode or "RESEARCH").upper()
+        # Zone thresholds vary by mode
+        # PAPER/RESEARCH: soft=100, hard=150, extreme=180
+        # LIVE/PROD:      soft=100, hard=120, extreme=140
+        if self.mode in ("LIVE", "PROD"):
+            self.soft_cap    = 100.0
+            self.max_iv_rank = min(float(max_iv_rank), 100.0)
+            self.hard_cap    = hard_cap if hard_cap is not None else 120.0
+            self.extreme_cap = 140.0
+        else:
+            self.soft_cap    = 100.0
+            self.max_iv_rank = float(max_iv_rank)   # env override respected
+            self.hard_cap    = hard_cap if hard_cap is not None else 150.0
+            self.extreme_cap = 180.0
         # Cache: {ticker: (fetched_at_epoch, result_dict)}
         self._cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
         log.info(
-            "APIVRankFilter | max_iv_rank=%.0f cache_ttl=%dm abs_fallback=%.0f%%",
-            max_iv_rank,
+            "APIVRankFilter | mode=%s soft=%.0f hard=%.0f extreme=%.0f cache_ttl=%dm",
+            self.mode, self.soft_cap, self.hard_cap, self.extreme_cap,
             self._CACHE_TTL_SECONDS // 60,
-            self._ABSOLUTE_IV_BLOCK_THRESHOLD * 100,
         )
 
     # ------------------------------------------------------------------
@@ -505,34 +516,47 @@ class APIVRankFilter:
             "iv_52w_high": round(iv_52w_high, 4),
         }
 
-        if iv_rank > self.hard_cap:
-            # Absolute ceiling — never trade extreme vol
-            reason = (
-                f"IV rank {iv_rank:.0f} > hard_cap {self.hard_cap:.0f} "
-                f"(current_iv={current_iv:.2f} "
-                f"range=[{iv_52w_low:.2f}, {iv_52w_high:.2f}])"
-            )
-            log.warning("[%s] IVRankFilter: BLOCKED (extreme) — %s", ticker, reason)
-            result["blocked"] = True
-            result["reason"] = reason
-        elif iv_rank > self.max_iv_rank:
-            # Soft zone — allow but flag for B-tier downgrade
-            reason = (
-                f"IV rank {iv_rank:.0f} > soft_zone {self.max_iv_rank:.0f} "
-                f"(current_iv={current_iv:.2f} "
-                f"range=[{iv_52w_low:.2f}, {iv_52w_high:.2f}])"
-            )
-            log.info("[%s] IVRankFilter: HIGH_IV_ALLOWED (B-tier) — %s", ticker, reason)
-            result["blocked"]    = False
-            result["tier_cap"]   = "B"   # contract selector will cap at B-tier
-            result["reason"]     = f"iv_high_allowed: {reason}"
+        ctx = f"(current_iv={current_iv:.2f} range=[{iv_52w_low:.2f}, {iv_52w_high:.2f}])"
+
+        if iv_rank > self.extreme_cap:
+            # Zone 4: extreme IV — always reject
+            reason = f"IV rank {iv_rank:.0f} > extreme_cap {self.extreme_cap:.0f} {ctx}"
+            log.warning("[%s] IVGate reject | iv=%.1f reason=iv_extreme", ticker, iv_rank)
+            result["blocked"]           = True
+            result["reason"]            = reason
+            result["iv_zone"]           = "extreme"
+            result["requires_momentum"] = False
+
+        elif iv_rank > self.hard_cap:
+            # Zone 3: hard cap zone — allow only with STRONG momentum (score>=72, momentum>=0.60)
+            reason = f"IV rank {iv_rank:.0f} in hard zone ({self.hard_cap:.0f}–{self.extreme_cap:.0f}) {ctx}"
+            log.info("[%s] IVGate hard_zone | iv=%.1f — requires strong momentum (score>=72, mom>=0.60)", ticker, iv_rank)
+            result["blocked"]           = False
+            result["tier_cap"]          = "B"
+            result["reason"]            = reason
+            result["iv_zone"]           = "hard"
+            result["requires_momentum"] = True
+            result["momentum_min_score"]= 72.0
+            result["momentum_min_pct"]  = 0.60
+
+        elif iv_rank > self.soft_cap:
+            # Zone 2: soft zone — allow with moderate momentum (score>=65, momentum>=0.40)
+            reason = f"IV rank {iv_rank:.0f} in soft zone ({self.soft_cap:.0f}–{self.hard_cap:.0f}) {ctx}"
+            log.info("[%s] IVGate soft_zone | iv=%.1f — requires momentum (score>=65, mom>=0.40)", ticker, iv_rank)
+            result["blocked"]           = False
+            result["tier_cap"]          = "B"
+            result["reason"]            = reason
+            result["iv_zone"]           = "soft"
+            result["requires_momentum"] = True
+            result["momentum_min_score"]= 65.0
+            result["momentum_min_pct"]  = 0.40
+
         else:
-            result["reason"] = (
-                f"IV rank {iv_rank:.0f} <= max {self.max_iv_rank:.0f} "
-                f"(current_iv={current_iv:.2f} "
-                f"range=[{iv_52w_low:.2f}, {iv_52w_high:.2f}])"
-            )
-            log.debug("[%s] IVRankFilter: PASS — %s", ticker, result["reason"])
+            # Zone 1: normal IV — allow freely
+            result["reason"]            = f"IV rank {iv_rank:.0f} <= soft_cap {self.soft_cap:.0f} {ctx}"
+            result["iv_zone"]           = "normal"
+            result["requires_momentum"] = False
+            log.debug("[%s] IVGate allow | iv=%.1f zone=normal", ticker, iv_rank)
 
         return result
 
