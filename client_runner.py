@@ -295,10 +295,12 @@ class ClientRunner(threading.Thread):
             )
 
             # IV rank filter -- blocks buying expensive premium (rank > threshold)
+            _bot_mode = os.getenv("BOT_MODE", "PAPER").upper()
             iv_filter = APIVRankFilter(
                 broker=data_broker,
-                max_iv_rank=float(os.getenv("MAX_IV_RANK", "100")),  # soft zone: allow B-tier above this
-                hard_cap=float(os.getenv("IV_HARD_CAP", "150")),     # hard cap: always reject above this
+                max_iv_rank=float(os.getenv("MAX_IV_RANK", "100")),  # soft zone threshold
+                hard_cap=float(os.getenv("IV_HARD_CAP", "150")),     # hard zone ceiling
+                mode=_bot_mode,                                        # drives extreme_cap (180 paper / 140 live)
             )
 
             self.contract_selector = APContractSelectionEngine(
