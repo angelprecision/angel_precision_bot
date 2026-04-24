@@ -551,27 +551,32 @@ class APExecutionCore:
             return
 
         # ── MASTER CONTROL RE-GATE at breach time ───────────────────────────
-        # Re-run master_control.evaluate() so capital limits, ticker caps,
-        # sector exposure, cooldowns, and kill-switch are checked at the
-        # exact moment of execution — not just at signal-queue time.
+        # Lightweight re-check at breach: only verify kill-switch, position
+        # count, and capital. Do NOT re-run dedup (signal already approved
+        # and mid-flight — duplicate_signal_id at this stage is wrong behavior).
         if self.master_control:
             mc_decision = self.master_control.evaluate(sig, client_id=self.email)
             if not mc_decision.ok:
-                log.info(
-                    f"[{ticker}] Master control BLOCKED at breach: "
-                    f"{mc_decision.block_reason}"
-                )
-                funnel.inc("master_control_blocked")
-                if signal_id:
-                    self.store.update_signal_fields(signal_id, {
-                        "decision_status": "blocked_at_breach",
-                        "context_notes":   f"mc_block={mc_decision.block_reason}",
-                    })
-                # Decrement sector count — signal blocked, slot must be returned
-                _sector = sig.get("sector", ticker)
-                with self._sector_lock:
-                    self._sector_counts[_sector] = max(0, self._sector_counts.get(_sector, 0) - 1)
-                return
+                # Skip duplicate_signal_id blocks — signal is already in flight
+                _block_reason = getattr(mc_decision, "reason", "") or ""
+                if "duplicate_signal_id" in _block_reason:
+                    log.info(f"[{ticker}] Breach re-gate: ignoring duplicate_signal_id (signal already approved and mid-flight)")
+                else:
+                    log.info(
+                        f"[{ticker}] Master control BLOCKED at breach: "
+                        f"{_block_reason}"
+                    )
+                    funnel.inc("master_control_blocked")
+                    if signal_id:
+                        self.store.update_signal_fields(signal_id, {
+                            "decision_status": "blocked_at_breach",
+                            "context_notes":   f"mc_block={_block_reason}",
+                        })
+                    # Decrement sector count — signal blocked, slot must be returned
+                    _sector = sig.get("sector", ticker)
+                    with self._sector_lock:
+                        self._sector_counts[_sector] = max(0, self._sector_counts.get(_sector, 0) - 1)
+                    return
 
         # Fetch 0DTE chain
         try:
