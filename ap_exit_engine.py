@@ -59,6 +59,37 @@ PROTECT_3_THRESHOLD   = 0.15   # +15%  → exit all at window 3 (was +30%)
 IMMEDIATE_TP_PCT      = 0.25   # +25% → scale out 70% immediately
 HARD_STOP_PCT         = -0.30  # -30% → exit immediately regardless of time
 PROFIT_LOCK_PCT       = 0.12   # once at +25%, lock: don't fall below +12%
+
+_INDEX_ETFS = {"QQQ", "SPY", "IWM", "DIA", "SPX"}
+
+def _effective_thresholds(pos: "ManagedPosition") -> tuple:
+    """
+    Returns (hard_stop, immediate_tp, profit_lock) adjusted for DTE and instrument.
+    0DTE index options move too fast for the default -30% stop — tighter controls required.
+    """
+    import re
+    from datetime import date as _date
+    symbol = pos.option_symbol or ""
+    ticker = (pos.ticker or "").upper()
+
+    # Extract DTE from option symbol (YYMMDD embedded e.g. QQQ260424P)
+    m = re.search(r'(\d{6})[CP]', symbol)
+    dte = 999
+    if m:
+        try:
+            exp = _date.strptime(m.group(1), "%y%m%d")
+            dte = (exp - _date.today()).days
+        except Exception:
+            pass
+
+    is_index = any(symbol.startswith(t) for t in _INDEX_ETFS) or ticker in _INDEX_ETFS
+
+    if dte == 0 and is_index:
+        return -0.20, 0.20, 0.08   # 0DTE index: -20% stop, +20% TP, +8% lock
+    elif dte <= 1:
+        return -0.25, 0.22, 0.10   # 1DTE: -25% stop, +22% TP, +10% lock
+    else:
+        return HARD_STOP_PCT, IMMEDIATE_TP_PCT, PROFIT_LOCK_PCT
 TRAIL_DROP_FROM_PEAK  = 0.10   # if peak was +25%+, exit if drops 10pts from peak
 SMALL_WIN_PCT         = 0.10   # +10% → small win capture (see time gates below)
 SMALL_WIN_TRAIL       = 0.07   # after +10% seen, don't let it fall below +3%
@@ -177,6 +208,8 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
     """
     if now_et is None:
         now_et = datetime.now(ET)
+    # Use DTE-adjusted thresholds — tighter stops on 0DTE index options
+    _hard_stop, _immediate_tp, _profit_lock = _effective_thresholds(pos)
 
     hour, minute = now_et.hour, now_et.minute
     option_pnl   = pos.option_pnl_pct
@@ -203,7 +236,7 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
     #   1 contract  → CLOSE_ALL (can't split)
     #   2 contracts → sell 1, run 1
     #   3+          → sell 70%, run 30% (min 1 runner)
-    if option_pnl >= IMMEDIATE_TP_PCT and pos.scale_outs_done == 0:
+    if option_pnl >= _immediate_tp and pos.scale_outs_done == 0:
         if qty_rem == 1:
             # Single contract — take it all
             return ExitDecision(
@@ -286,17 +319,17 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
         )
 
     # ── HARD STOP (fires any time, no time gate) ─────────────────────────────
-    if option_pnl <= HARD_STOP_PCT:
+    if option_pnl <= _hard_stop:
         return ExitDecision(
             action="STOP", quantity=qty_rem,
-            reason=f"HARD STOP -- {option_pnl*100:.0f}% exceeded -{abs(HARD_STOP_PCT)*100:.0f}% max loss",
+            reason=f"HARD STOP -- {option_pnl*100:.0f}% exceeded -{abs(_hard_stop)*100:.0f}% max loss",
             urgency="IMMEDIATE", pnl_pct=option_pnl
         )
 
     # ── PROFIT LOCK (once we hit peak, don't give it all back) ──────────────────
-    if pos.peak_pnl_pct >= IMMEDIATE_TP_PCT:
+    if pos.peak_pnl_pct >= _immediate_tp:
         # Hard floor: don't fall below PROFIT_LOCK_PCT
-        if option_pnl <= PROFIT_LOCK_PCT:
+        if option_pnl <= _profit_lock:
             return ExitDecision(
                 action="CLOSE_ALL", quantity=qty_rem,
                 reason=f"PROFIT LOCK -- peaked at +{pos.peak_pnl_pct*100:.0f}%, fell to +{option_pnl*100:.0f}% — locking in",
