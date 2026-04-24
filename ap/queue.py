@@ -291,8 +291,11 @@ def _dispatch(
             _in_session = _t(9, 30) <= _now_et.time() <= _t(16, 0)
             if not _in_session:
                 import uuid as _uuid
-                from ap_db_postgres import get_supabase_client as _sb
-                _sbc = _sb()
+                import os as _os
+                from supabase import create_client as _create_client
+                _sb_url = _os.getenv("SUPABASE_URL", "")
+                _sb_key = _os.getenv("SUPABASE_SERVICE_KEY", "")
+                _sbc = _create_client(_sb_url, _sb_key) if _sb_url and _sb_key else None
                 if _sbc:
                     _sig_id = str(payload.get("signal_id") or _uuid.uuid4())
                     _sbc.table("ap_signals").upsert({
