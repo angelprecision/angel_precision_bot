@@ -282,14 +282,18 @@ def _dispatch(
                    reason=decision.reason, score=float(payload.get("score") or 0))
         _mark_job(job_id, "REJECTED",
                   result={"stage": decision.stage, "reason": decision.reason})
-        # Write to ap_signals as 'watching' so post-market blocked signals
-        # are visible on dashboard and reseeded on next startup
+        # Write to ap_signals as 'watching' ONLY for post-market blocks caused by
+        # daily_stop or after_hours — these are deferred to next session.
+        # MC blocks (duplicate, sector cap, pending_entry) must NOT become watching
+        # rows — they are permanent rejections, not deferred entries.
+        _block_reason = str(decision.reason or "")
+        _is_deferrable = any(k in _block_reason for k in ("daily_stop", "sizer_blocked", "after_hours"))
         try:
             from zoneinfo import ZoneInfo as _ZI
             from datetime import datetime as _dt, time as _t
             _now_et = _dt.now(_ZI("America/New_York"))
             _in_session = _t(9, 30) <= _now_et.time() <= _t(16, 0)
-            if not _in_session:
+            if not _in_session and _is_deferrable:
                 import uuid as _uuid
                 import os as _os
                 from supabase import create_client as _create_client
