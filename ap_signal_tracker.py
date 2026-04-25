@@ -25,6 +25,7 @@ ET = ZoneInfo("America/New_York")
 
 POLL_INTERVAL_SEC = 60
 TRACKING_WINDOW   = timedelta(minutes=90)
+MIN_TRACKING_MINUTES = 15   # must observe at least 15 min of market action before finalization
 EOD_HOUR, EOD_MIN = 15, 30
 LOOKBACK_HOURS    = 6
 
@@ -69,9 +70,18 @@ class _State:
         return self.created_at + TRACKING_WINDOW
 
     def is_expired(self, now: datetime) -> bool:
+        # Require minimum market observation time before finalizing.
+        # Post-market signals have created_at after market close — their EOD
+        # cutoff has already passed, so they'd finalize instantly as noise.
+        # Guard: must have at least MIN_TRACKING_MINUTES of real market time.
+        et = now.astimezone(ET)
+        market_open = et.replace(hour=9, minute=30, second=0, microsecond=0)
+        market_age_seconds = (now - max(self.created_at, market_open.astimezone(timezone.utc))).total_seconds()
+        if market_age_seconds < MIN_TRACKING_MINUTES * 60:
+            return False  # not enough market time yet — do not finalize
+
         if now >= self.expires_at:
             return True
-        et = now.astimezone(ET)
         cutoff = et.replace(hour=EOD_HOUR, minute=EOD_MIN, second=0, microsecond=0)
         return et >= cutoff
 
