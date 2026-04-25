@@ -470,6 +470,19 @@ class APContractSelectionEngine:
                     ticker, exc,
                 )
 
+        # Fail closed on stub price data — intel ran on degraded data, not real quotes.
+        # A trade approved on stub data is worse than no trade.
+        if isinstance(plan, dict):
+            _intel = plan.get("intel_result") or {}
+        else:
+            _intel = getattr(plan, "intel_result", {}) or {}
+        if _intel.get("price_data_stub"):
+            log.warning(
+                "[%s] CONTRACT_SELECTOR: BLOCKED — price data was stub/unavailable during intel gate. "
+                "No trade on degraded data.", ticker
+            )
+            return None
+
         # ── B. HARD QUALITY FILTER ────────────────────────────────────────────
         # Apply ETF vs single-stock effective thresholds for this call
         _orig_spread        = self.max_spread_pct
