@@ -275,6 +275,7 @@ def run_intelligence_check(signal: dict, underlying_price: float,
 
     _fail_open = {
         "approved": True, "score": score_in, "contracts": 1,
+        "price_data_stub": True,   # downstream: data quality degraded — log but allow
         "reasoning": "intel_unavailable",
         "intel_status": "UNAVAILABLE", "intel_score": None,
     }
