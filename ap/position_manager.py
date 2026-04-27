@@ -242,8 +242,11 @@ class APPositionManager:
 
     def has_pending_entry(self, ticker: str) -> bool:
         """
-        True if there is an in-flight entry order for this underlying.
-        Prevents double-entry when position not yet opened but order is live.
+        True if ticker has a BROKER-CONFIRMED pending entry order.
+
+        CRITICAL: Only orders with a real broker_order_id count.
+        Ghost orders (CREATED/SUBMITTED with no broker ack) are watch-plans,
+        not live orders — they must not block valid new signals.
         """
         def _fn():
             with conn() as c:
@@ -251,7 +254,10 @@ class APPositionManager:
                 c.execute(
                     f"SELECT 1 FROM orders "
                     f"WHERE client_id=%s AND symbol=%s AND kind='ENTRY' "
-                    f"AND status IN ({placeholders}) LIMIT 1",
+                    f"AND status IN ({placeholders}) "
+                    f"AND broker_order_id IS NOT NULL "
+                    f"AND broker_order_id NOT IN ('', 'PENDING', 'N/A') "
+                    f"LIMIT 1",
                     (self.client_id, ticker.upper(), *_PENDING_ENTRY_STATUSES),
                 )
                 return c.fetchone() is not None
