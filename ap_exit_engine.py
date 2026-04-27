@@ -616,15 +616,69 @@ class APExitEngine:
                 except Exception as _e:
                     log.error("[SENTINEL] Force exit failed for %s: %s", pos.ticker, _e)
 
-            # Sentinel 3: Exit in flight for > 5 min with no fill → alert
+            # Sentinel 3: Exit in flight for > 5 min → escalate after second timeout
             if pos.exit_in_flight and pos.last_exit_signal_ts:
                 flight_sec = (now - pos.last_exit_signal_ts).total_seconds()
                 if flight_sec > 300:
-                    log.warning(
-                        "[SENTINEL] %s | EXIT STUCK — in-flight %.0fs with no fill | "
-                        "pos=%s broker may have rejected silently",
-                        pos.ticker, flight_sec, pos.position_id
+                    _stuck_count = getattr(pos, "_exit_stuck_count", 0) + 1
+                    pos._exit_stuck_count = _stuck_count
+                    if _stuck_count >= 2:
+                        # Second timeout — mark rejected so reconciler handles it
+                        pos.last_exit_rejected = True
+                        log.error(
+                            "[SENTINEL] %s | EXIT STUCK x%d — %.0fs in-flight, no fill | "
+                            "pos=%s — marking rejected, reconciler must handle",
+                            pos.ticker, _stuck_count, flight_sec, pos.position_id
+                        )
+                    else:
+                        log.warning(
+                            "[SENTINEL] %s | EXIT STUCK — in-flight %.0fs with no fill | "
+                            "pos=%s broker may have rejected silently",
+                            pos.ticker, flight_sec, pos.position_id
+                        )
+
+            # Sentinel 4: Dead trade — open too long with no confirmation, thesis failed
+            # Catches losers that slip past all other exits (ranging day, no target, no stop)
+            DEAD_TRADE_MIN  = 45   # minutes in trade with no meaningful progress
+            DEAD_TRADE_LOW  = -0.08  # below -8% and still alive = likely dead
+            DEAD_TRADE_HIGH = 0.05   # never got above +5% = thesis never confirmed
+            if (not pos.exit_in_flight
+                    and age_min >= DEAD_TRADE_MIN
+                    and DEAD_TRADE_LOW <= pnl <= DEAD_TRADE_HIGH
+                    and pos.max_profit_seen < DEAD_TRADE_HIGH):
+                # Check underlying progress toward target
+                _entry_u  = pos.underlying_entry
+                _target_u = pos.underlying_target
+                _curr_u   = pos.current_underlying
+                _progress = 0.0
+                if _entry_u and _target_u and _curr_u and abs(_target_u - _entry_u) > 0:
+                    _progress = abs(_curr_u - _entry_u) / abs(_target_u - _entry_u)
+                if _progress < 0.30:  # less than 30% of the way to target
+                    log.error(
+                        "[SENTINEL] %s | DEAD TRADE — %.0fmin open, pnl=%.1f%%, "
+                        "peak=%.1f%%, progress=%.0f%% toward target | "
+                        "pos=%s — FORCING TIME STOP",
+                        pos.ticker, age_min, pnl*100, peak*100, _progress*100,
+                        pos.position_id,
                     )
+                    try:
+                        decision = ExitDecision(
+                            action="CLOSE_ALL", quantity=pos.quantity_remaining,
+                            reason=(
+                                f"TIME STOP — thesis not confirmed after {age_min:.0f}min "
+                                f"pnl={pnl*100:.1f}% progress={_progress*100:.0f}% toward target"
+                            ),
+                            urgency="HIGH", pnl_pct=pnl,
+                        )
+                        if self.on_exit:
+                            self.on_exit(pos, decision)
+                            pos.exit_in_flight      = True
+                            pos.pending_exit_reason = decision.reason
+                            pos.pending_exit_qty    = pos.quantity_remaining
+                            pos.last_exit_signal_ts = datetime.now(timezone.utc)
+                    except Exception as _de:
+                        log.error("[SENTINEL] Dead trade exit failed for %s: %s",
+                                  pos.ticker, _de)
 
     def _eligible_for_new_exit(self, pos: "ManagedPosition", now_utc: datetime) -> bool:
         """Returns True if position can receive a new exit signal."""
