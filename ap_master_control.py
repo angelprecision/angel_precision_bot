@@ -367,6 +367,9 @@ class APMasterControl:
         Returns ControlDecision(ok=True, plan=...) on approval.
         Returns ControlDecision(ok=False, ...) on any block.
         """
+        # Sentinel: initialize before any gate — prevents NameError on early returns
+        _bootstrap_mode = False
+        _total_trades   = 0
         ticker    = signal.get("ticker", signal.get("symbol", "?"))
         # Normalize index tickers to their tradable ETF equivalents BEFORE dedup,
         # sector caps, capital buckets, etc. Without this, ^GSPC and SPY (or ^NDX
