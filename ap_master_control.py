@@ -629,6 +629,9 @@ class APMasterControl:
                                f"intel_rejected: {intel_reason[:80]}")
 
         intel_contracts = int(intel.get("contracts", 1) or 1)
+        # Bootstrap final enforcement — overrides intel_contracts if in bootstrap mode
+        if _bootstrap_mode:
+            intel_contracts = 1
 
         # ── H. FEEDBACK MODIFIER ──────────────────────────────────────────────
 
@@ -744,7 +747,7 @@ class APMasterControl:
             pattern           = signal.get("pattern", signal.get("pattern_id", "")),
             timeframe         = signal.get("timeframe", "1d"),
             contracts         = contracts,
-            max_position_usd  = contracts * 100 * _estimate_premium(ticker),
+            max_position_usd  = (1 if _bootstrap_mode else contracts) * 100 * _estimate_premium(ticker),
             tier              = str(tier),
             score             = score,
             intel_score       = intel_score,
