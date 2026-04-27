@@ -30,6 +30,15 @@ WRONG_DIR_BUFFER_PCT    = 0.001
 OVERNIGHT_THRESHOLD_HOUR = 15
 OVERNIGHT_THRESHOLD_MIN  = 30
 
+# Intraday stale-move invalidation
+# If we've been watching this long AND price drifted this far, the move is gone
+MAX_INTRADAY_WATCH_MIN  = 5      # minutes watching before stale check fires
+MAX_INTRADAY_DRIFT_PCT  = 0.015  # 1.5% drift from trigger = stale, move missed
+
+# Overnight open-time revalidation
+# At market open, expire overnight signals if underlying moved too far overnight
+OVERNIGHT_MAX_DRIFT_PCT = 0.020  # 2.0% drift overnight = setup invalid
+
 
 class WatchState:
     PENDING     = "PENDING"
@@ -107,6 +116,29 @@ class WatchedSignal:
             except Exception:
                 pass
             return self.state
+
+        # ── INTRADAY STALE-MOVE INVALIDATION ─────────────────────────────────────
+        # If we've been watching > MAX_INTRADAY_WATCH_MIN AND price has drifted
+        # past the trigger beyond MAX_INTRADAY_DRIFT_PCT, the move is already done.
+        # Entering now = chasing. Expire the signal instead.
+        if not self.overnight and self.minutes_watching >= MAX_INTRADAY_WATCH_MIN:
+            _mid = (bid + ask) / 2 if bid > 0 and ask > 0 else max(bid, ask)
+            if _mid > 0 and self.entry_trigger:
+                _drift = (_mid - self.entry_trigger) / self.entry_trigger
+                _stale = False
+                if self.side == "CALL" and _drift > MAX_INTRADAY_DRIFT_PCT:
+                    _stale = True
+                elif self.side == "PUT" and _drift < -MAX_INTRADAY_DRIFT_PCT:
+                    _stale = True
+                if _stale:
+                    self.state = WatchState.EXPIRED
+                    log.info(
+                        "[%s] STALE ENTRY — watching %.1fmin, price drifted %.2f%% "
+                        "from trigger $%.2f. Move missed — expiring.",
+                        self.ticker, self.minutes_watching,
+                        _drift * 100.0, self.entry_trigger,
+                    )
+                    return self.state
 
         if self.side == "CALL":
             if ask >= self.entry_trigger:
@@ -410,6 +442,89 @@ class APEntryWatcher:
         # Outside session hours (before 9:30 AM ET): hold, don't poll
         if now_et.hour < 9 or (now_et.hour == 9 and now_et.minute < 30):
             return
+
+        # ── OVERNIGHT OPEN-TIME REVALIDATION ─────────────────────────────────────
+        # One-time check at market open for overnight signals:
+        # If price has moved too far from trigger overnight, expire the signal.
+        # This prevents Friday setups from firing Monday on stale levels.
+        with self._lock:
+            overnight_active = [w for w in self._pending
+                                 if w.is_active and w.overnight]
+
+        if overnight_active:
+            tickers_overnight = list({w.ticker for w in overnight_active})
+            try:
+                quotes_overnight = self._fetch_quotes(tickers_overnight)
+            except Exception as _qe:
+                log.warning("[WATCHER] Overnight revalidation quote fetch failed: %s", _qe)
+                quotes_overnight = {}
+
+            _to_expire_overnight = []
+            for w in overnight_active:
+                q = quotes_overnight.get(w.ticker) or {}
+                _bid = float(q.get("bid") or 0)
+                _ask = float(q.get("ask") or 0)
+                if _bid == 0 and _ask == 0:
+                    _last = float(q.get("last") or 0)
+                    _bid = _ask = _last
+                if not (_bid or _ask) or not w.entry_trigger:
+                    # Mark overnight as validated (no data = fail open, let it watch)
+                    w.overnight = False  # promote to same-day watcher
+                    continue
+
+                _mid = (_bid + _ask) / 2.0 if _bid and _ask else max(_bid, _ask)
+                if not _mid:
+                    w.overnight = False
+                    continue
+
+                _drift = (_mid - w.entry_trigger) / w.entry_trigger
+
+                # Check if underlying already blew through trigger pre-market (move done)
+                _premarket_breached = False
+                if w.side == "CALL" and _mid >= w.entry_trigger * 1.005:
+                    _premarket_breached = True
+                elif w.side == "PUT" and _mid <= w.entry_trigger * 0.995:
+                    _premarket_breached = True
+
+                # Check if too far from trigger to be valid
+                _too_far = False
+                if w.side == "CALL" and _drift > OVERNIGHT_MAX_DRIFT_PCT:
+                    _too_far = True
+                elif w.side == "PUT" and _drift < -OVERNIGHT_MAX_DRIFT_PCT:
+                    _too_far = True
+
+                if _premarket_breached:
+                    w.state = WatchState.EXPIRED
+                    log.info(
+                        "[%s] OVERNIGHT INVALIDATED — pre-market breach detected. "
+                        "Price $%.2f already through trigger $%.2f. Move done; expiring.",
+                        w.ticker, _mid, w.entry_trigger,
+                    )
+                    _to_expire_overnight.append(w)
+                elif _too_far:
+                    w.state = WatchState.EXPIRED
+                    log.info(
+                        "[%s] OVERNIGHT INVALIDATED — price $%.2f drifted %.2f%% "
+                        "from trigger $%.2f overnight. Expiring stale setup.",
+                        w.ticker, _mid, _drift * 100.0, w.entry_trigger,
+                    )
+                    _to_expire_overnight.append(w)
+                else:
+                    # Valid at open — promote from overnight to same-day watcher
+                    w.overnight = False
+                    log.info(
+                        "[%s] OVERNIGHT VALIDATED at open — price $%.2f within %.2f%% "
+                        "of trigger $%.2f. Arming for breach detection.",
+                        w.ticker, _mid, _drift * 100.0, w.entry_trigger,
+                    )
+
+            if _to_expire_overnight:
+                with self._lock:
+                    _done_ids = {id(w) for w in _to_expire_overnight}
+                    self._pending = [w for w in self._pending
+                                     if id(w) not in _done_ids]
+                log.info("[WATCHER] Overnight revalidation: %d expired, check complete",
+                         len(_to_expire_overnight))
 
         with self._lock:
             active = [w for w in self._pending if w.is_active]
