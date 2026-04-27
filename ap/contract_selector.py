@@ -47,6 +47,22 @@ from dataclasses import dataclass, field
 from datetime import date, timedelta
 from typing import Optional
 
+TICKER_MAX_PREMIUM_PER_CONTRACT = {
+    "NVDA":  1500.0,  "TSLA": 1200.0,  "MSTR": 2000.0,
+    "META":   800.0,  "MSFT":  800.0,  "AMZN":  800.0,
+    "GOOGL":  800.0,  "NFLX":  800.0,  "AVGO":  800.0,
+    "AAPL":   600.0,  "AMD":   600.0,  "CRM":   600.0,
+    "SPY":    400.0,  "QQQ":   500.0,  "IWM":   300.0,
+    "_DEFAULT": 800.0,
+}
+
+def _get_max_premium(ticker: str) -> float:
+    return TICKER_MAX_PREMIUM_PER_CONTRACT.get(
+        (ticker or "").upper(),
+        TICKER_MAX_PREMIUM_PER_CONTRACT["_DEFAULT"]
+    )
+
+
 log = logging.getLogger("ap.contract_selector")
 
 
@@ -633,6 +649,13 @@ class APContractSelectionEngine:
             else:
                 return None
 
+        # Final per-ticker premium gate — blocks after pro quality select
+        _final_prem_cap = _get_max_premium(ticker)
+        if selected.premium_per_contract > _final_prem_cap:
+            log.warning("[%s] FINAL PREMIUM GATE: $%.0f > $%.0f — blocking",
+                        ticker, selected.premium_per_contract, _final_prem_cap)
+            return None
+
         # ── F. UPDATE PLAN IN-PLACE ───────────────────────────────────────────
 
         plan.contract_symbol = selected.contract_symbol
@@ -771,6 +794,7 @@ class APContractSelectionEngine:
         if underlying_price:
             for o in options:
                 o["_underlying_price"] = underlying_price
+            o["_ticker"] = ticker
 
         filtered = [o for o in options
                     if o.get("option_type", "").lower() == option_type]
@@ -877,8 +901,10 @@ class APContractSelectionEngine:
         premium = mid * 100
         if premium < self.min_premium:
             return "premium_too_low_$%.0f" % premium
-        if premium > self.max_premium:
-            return "premium_too_high_$%.0f" % premium
+        _opt_ticker = opt.get("_ticker", "")
+        _ticker_max = _get_max_premium(_opt_ticker) if _opt_ticker else self.max_premium
+        if premium > _ticker_max:
+            return "premium_too_high_$%.0f_max_$%.0f" % (premium, _ticker_max)
 
         # DTE
         exp_str = opt.get("expiration_date", "")
