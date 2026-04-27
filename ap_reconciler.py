@@ -43,7 +43,20 @@ from typing import Optional
 
 log = logging.getLogger("ap.reconciler")
 
-RECONCILE_INTERVAL_SEC = int(os.getenv("RECONCILE_INTERVAL_SEC", "180"))  # 3 min
+RECONCILE_INTERVAL_SEC = int(os.getenv("RECONCILE_INTERVAL_SEC", "60"))   # 60s during market hours
+# Market hours: 9:30 AM – 4:00 PM ET.  Outside hours drops back to 3 min.
+
+def _market_hours_interval() -> int:
+    """60s during session, 180s outside — reduces Tradier API calls after close."""
+    try:
+        from zoneinfo import ZoneInfo
+        from datetime import datetime, time
+        et = datetime.now(ZoneInfo("America/New_York"))
+        if time(9, 25) <= et.time() <= time(16, 5):
+            return 60
+    except Exception:
+        pass
+    return 180
 
 # Statuses we consider "open" in DB — broker should have a matching live order
 DB_OPEN_STATUSES = frozenset({
@@ -128,7 +141,7 @@ class APBrokerReconciler:
     def _loop(self):
         # Stagger startup to avoid hammering broker on restart
         time.sleep(min(30, self._interval // 4))
-        while not self._stop.wait(self._interval):
+        while not self._stop.wait(_market_hours_interval()):
             try:
                 self.run_once()
             except Exception as e:
