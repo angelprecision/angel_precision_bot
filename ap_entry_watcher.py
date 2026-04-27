@@ -97,6 +97,15 @@ class WatchedSignal:
         if now >= self.expire_at:
             self.state = WatchState.EXPIRED
             log.info(f"[{self.ticker}] EXPIRED — no breach in {MAX_WATCH_MINUTES}min")
+            # Release dedup key on TTL expiry — allows same setup to re-queue next session
+            try:
+                if hasattr(self, "_watcher_ref") and self._watcher_ref:
+                    _ds = getattr(self._watcher_ref, "_dedup_set", None)
+                    if _ds and self.signal_id:
+                        _ds.discard(str(self.signal_id))
+                        log.debug("[%s] Dedup key released on TTL expire", self.ticker)
+            except Exception:
+                pass
             return self.state
 
         if self.side == "CALL":
@@ -380,6 +389,14 @@ class APEntryWatcher:
                         w.state = WatchState.EXPIRED
                         expired.append(w)
                         log.info(f"[{w.ticker}] Force-expired at market close (same-day signal)")
+                        # Release dedup key so same setup can re-queue next session
+                        try:
+                            if hasattr(self, "_dedup_set") and w.signal_id:
+                                self._dedup_set.discard(str(w.signal_id))
+                                log.debug("[%s] Dedup key released on EOD expire | signal=%s",
+                                          w.ticker, w.signal_id)
+                        except Exception:
+                            pass
                     else:
                         surviving.append(w)
                 self._pending = surviving
