@@ -128,14 +128,14 @@ class ClientRunner(threading.Thread):
         # Per-client mode: derived from each client's tradier_base_url.
         # sandbox.tradier.com → PAPER, api.tradier.com → LIVE.
         # This allows paper and live clients to coexist on the same bot instance.
-        _base_url = self.member.get("tradier_base_url", "https://sandbox.tradier.com")
+        _base_url = self.base_url  # set in __init__ from member["tradier_base_url"]
         if "sandbox" in _base_url.lower():
             self.mode = "PAPER"
         elif os.getenv("AP_MODE", "paper").upper() == "LIVE":
             self.mode = "LIVE"
         else:
             self.mode = "PAPER"  # default safe
-        logger.info("[%s] Client mode: %s (from tradier_base_url)", self.email, self.mode)
+        log.info("[%s] Client mode: %s (from tradier_base_url)", self.email, self.mode)
 
         # LIVE assertions validate per-member credentials, not global env vars
         if self.mode == "LIVE":
