@@ -416,6 +416,7 @@ class ClientRunner(threading.Thread):
                 broker=broker,
                 order_state_machine=self.order_state_machine,
                 position_manager=self.position_manager,
+                exit_engine=getattr(self.core, "exit_eng", None),
             )
             self.order_monitor.start()
 
