@@ -727,12 +727,6 @@ class APExitEngine:
 
             time.sleep(POLL_INTERVAL_SEC)
 
-def _is_protective_exit(reason: str) -> bool:
-    """True if exit reason is protective — module-level so it's always in scope."""
-    r = (reason or "").upper()
-    return any(k in r for k in ("EOD", "STOP", "MAX_LOSS", "THETA", "PROTECTIVE", "FORCE CLOSE", "SENTINEL"))
-
-
     def _check_all_positions(self):
         # Purge positions with contracts that expired yesterday or earlier
         from datetime import date
@@ -989,3 +983,9 @@ def _is_protective_exit(reason: str) -> bool:
         except Exception as e:
             log.error("Option quote fetch failed: %s", e, exc_info=True)
             return {}  # caller must handle empty dict as "no data available"
+            
+
+    def _is_protective_exit(reason: str) -> bool:
+        """True if exit reason is protective — module-level so it's always in scope."""
+        r = (reason or "").upper()
+        return any(k in r for k in ("EOD", "STOP", "MAX_LOSS", "THETA", "PROTECTIVE", "FORCE CLOSE", "SENTINEL"))
