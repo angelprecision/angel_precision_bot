@@ -160,6 +160,32 @@ class RankingQueue:
 #   → APPositionManager
 # receive_signal() is NOT in the production path.
 # ═══════════════════════════════════════════════════════════
+# ── Quote cache — survives Tradier timeouts so valid breach signals aren't dropped ──
+_last_quote_cache: dict = {}  # {ticker: {"price": float, "ts": float}}
+
+def _get_underlying_price_cached(ticker: str, broker, max_age_seconds: int = 300) -> float:
+    """
+    Fetch live quote with fallback to recent cache.
+    Raises if cache is stale/empty and live fetch fails — legitimate abort.
+    """
+    import time as _time
+    try:
+        price = broker.get_quote(ticker)
+        _last_quote_cache[ticker] = {"price": float(price), "ts": _time.time()}
+        return float(price)
+    except Exception as exc:
+        cached = _last_quote_cache.get(ticker)
+        if cached and (_time.time() - cached["ts"]) < max_age_seconds:
+            age = int(_time.time() - cached["ts"])
+            log.warning(
+                "[%s] Live quote failed (%s) — using cached price $%.2f (age=%ds)",
+                ticker, exc, cached["price"], age,
+            )
+            return cached["price"]
+        log.error("[%s] Quote fetch failed and cache empty/stale — aborting", ticker)
+        raise
+
+
 class APExecutionCore:
     """
     One instance per client (per ClientRunner thread).
