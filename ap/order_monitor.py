@@ -78,6 +78,7 @@ class APOrderMonitor:
         self.osm         = order_state_machine
         self.pm          = position_manager
         self.alert_fn    = alert_fn
+        self.exit_engine = exit_engine
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
