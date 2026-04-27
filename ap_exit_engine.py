@@ -275,7 +275,9 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
                     import os as _os, requests as _req, time as _time
                     _wh = _os.getenv("DISCORD_WEBHOOK_RUNNER", "") or _os.getenv("DISCORD_WEBHOOK_URL", "")
                     if _wh:
-                        _dur = int((_time.time() - (pos.opened_at or _time.time())) / 60)
+                        # opened_at is datetime — convert to timestamp before subtraction
+                        _opened_ts = pos.opened_at.timestamp() if hasattr(pos.opened_at, "timestamp") else _time.time()
+                        _dur = int((_time.time() - _opened_ts) / 60)
                         _req.post(_wh, json={"embeds": [{
                             "title":       f"🏆 RUNNER CLOSED · {pos.ticker}",
                             "description": (
@@ -725,6 +727,12 @@ class APExitEngine:
 
             time.sleep(POLL_INTERVAL_SEC)
 
+def _is_protective_exit(reason: str) -> bool:
+    """True if exit reason is protective — module-level so it's always in scope."""
+    r = (reason or "").upper()
+    return any(k in r for k in ("EOD", "STOP", "MAX_LOSS", "THETA", "PROTECTIVE", "FORCE CLOSE", "SENTINEL"))
+
+
     def _check_all_positions(self):
         # Purge positions with contracts that expired yesterday or earlier
         from datetime import date
@@ -830,7 +838,7 @@ class APExitEngine:
                     "EOD", "STOP", "MAX_LOSS", "THETA", "PROTECTIVE",
                     "FORCE CLOSE", "STOP HIT", "STOP LOSS",
                 ))
-            protective = [(p, d) for p, d in actions_to_take if _is_protective(d.reason or "")]
+            protective = [(p, d) for p, d in actions_to_take if _is_protective_exit(d.reason or "")]
             blocked = len(actions_to_take) - len(protective)
             if blocked:
                 log.warning(
@@ -890,7 +898,7 @@ class APExitEngine:
                 if self.on_exit:
                     exit_reason = decision.reason or ""
                     if self._kill_switch_fn and self._kill_switch_fn():
-                        if not _is_protective(exit_reason):
+                        if not _is_protective_exit(exit_reason):
                             log.warning(
                                 f"[{pos.ticker}] Kill switch active — blocking non-protective exit: {exit_reason}"
                             )
