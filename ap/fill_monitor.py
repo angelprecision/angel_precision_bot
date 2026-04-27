@@ -263,6 +263,7 @@ def process_pending_order(broker: BrokerAdapter, order: dict, osm=None, pm=None,
                             headers={"Accept": "application/json"},
                             timeout=10,
                         ) if hasattr(osm, "_broker") else None
+                        import time as _t; _t.sleep(2)  # let Tradier process before status check
                         if _stop_resp and _stop_resp.status_code < 300:
                             _stop_data = _stop_resp.json().get("order", {}) or {}
                             _stop_id   = _stop_data.get("id", "?")
@@ -270,7 +271,7 @@ def process_pending_order(broker: BrokerAdapter, order: dict, osm=None, pm=None,
                             log.info("[%s] Standing stop placed @ $%.2f | broker_stop=%s status=%s",
                                      _ticker, _stop_px, _stop_id, _stop_stat)
                             # Verify stop reached acceptable broker state
-                            if _stop_stat not in ("ok", "open", "pending", "filled", "accepted"):
+                            if _stop_stat not in ("ok", "open", "pending", "filled", "accepted", "queued", "pending_review", "partially_filled"):
                                 log.warning(
                                     "[%s] ⚠️ Stop order status unexpected: %s — monitor manually",
                                     _ticker, _stop_stat
