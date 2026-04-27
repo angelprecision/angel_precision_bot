@@ -264,12 +264,26 @@ def process_pending_order(broker: BrokerAdapter, order: dict, osm=None, pm=None,
                             timeout=10,
                         ) if hasattr(osm, "_broker") else None
                         if _stop_resp and _stop_resp.status_code < 300:
-                            _stop_id = (_stop_resp.json().get("order", {}) or {}).get("id", "?")
-                            log.info("[%s] Standing stop placed @ $%.2f | broker_stop=%s",
-                                     _ticker, _stop_px, _stop_id)
+                            _stop_data = _stop_resp.json().get("order", {}) or {}
+                            _stop_id   = _stop_data.get("id", "?")
+                            _stop_stat = _stop_data.get("status", "unknown")
+                            log.info("[%s] Standing stop placed @ $%.2f | broker_stop=%s status=%s",
+                                     _ticker, _stop_px, _stop_id, _stop_stat)
+                            # Verify stop reached acceptable broker state
+                            if _stop_stat not in ("ok", "open", "pending", "filled", "accepted"):
+                                log.warning(
+                                    "[%s] ⚠️ Stop order status unexpected: %s — monitor manually",
+                                    _ticker, _stop_stat
+                                )
+                            else:
+                                log.info("[%s] ✅ Broker stop VERIFIED | status=%s stop_id=%s",
+                                         _ticker, _stop_stat, _stop_id)
                         else:
-                            log.warning("[%s] Standing stop order FAILED — exit engine is sole protection",
-                                        _ticker)
+                            _err_body = _stop_resp.text[:200] if _stop_resp else "no_response"
+                            log.warning(
+                                "[%s] ⚠️ Standing stop FAILED — exit engine is sole protection | %s",
+                                _ticker, _err_body
+                            )
                     except Exception as _se:
                         log.warning("[%s] Standing stop placement error: %s", _ticker, _se)
                     _pos_id = pm.open_position(
