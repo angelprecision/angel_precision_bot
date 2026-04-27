@@ -56,7 +56,7 @@ SCALE_OUT_2_THRESHOLD = 0.25   # +25%  → scale out 75% at window 2 (was +80%)
 PROTECT_3_THRESHOLD   = 0.15   # +15%  → exit all at window 3 (was +30%)
 
 # ── IMMEDIATE TAKE-PROFIT (any time, no window gate) ──────────────────────────
-IMMEDIATE_TP_PCT      = 0.25   # +25% → scale out 70% immediately
+IMMEDIATE_TP_PCT      = 0.18   # +18% → scale out 70% immediately (was 0.25 — lock earlier, more runner time)
 HARD_STOP_PCT         = -0.30  # -30% → exit immediately regardless of time
 PROFIT_LOCK_PCT       = 0.12   # once at +25%, lock: don't fall below +12%
 
@@ -266,8 +266,26 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
     # Once we've done a scale-out, trail the remaining contracts tightly.
     # Exit the runner if it drops more than 15pts from where we scaled.
     if pos.scale_outs_done >= 1 and pos.peak_pnl_pct > 0:
-        runner_drop = pos.peak_pnl_pct - option_pnl
-        if runner_drop >= 0.15 or option_pnl <= 0:
+        _runner_trail = 0.20 if pos.peak_pnl_pct >= 0.60 else 0.15  # wider trail on big runners
+        runner_drop   = pos.peak_pnl_pct - option_pnl
+        if runner_drop >= _runner_trail or option_pnl <= 0:
+            # 🏆 Discord alert when runner closes with meaningful gain — your sales machine
+            if pos.peak_pnl_pct >= 0.50:
+                try:
+                    import os as _os, requests as _req, time as _time
+                    _wh = _os.getenv("DISCORD_WEBHOOK_RUNNER", "") or _os.getenv("DISCORD_WEBHOOK_URL", "")
+                    if _wh:
+                        _dur = int((_time.time() - (pos.opened_at or _time.time())) / 60)
+                        _req.post(_wh, json={"embeds": [{
+                            "title":       f"🏆 RUNNER CLOSED · {pos.ticker}",
+                            "description": (
+                                f"**Peak: +{pos.peak_pnl_pct*100:.0f}%** → Exit: +{option_pnl*100:.0f}%\n"
+                                f"Held {_dur}m | Trail: {_runner_trail*100:.0f}pts | Contracts: {qty_rem}"
+                            ),
+                            "color": 0xF1C40F,
+                        }]}, timeout=3)
+                except Exception:
+                    pass  # never block exit on Discord failure
             return ExitDecision(
                 action="CLOSE_ALL", quantity=qty_rem,
                 reason=(
