@@ -684,7 +684,7 @@ class APMasterControl:
         # Bootstrap guard: with zero trade history Kelly can go negative → sizer blocks trades.
         # First 20 trades per client always use 1-contract sizing regardless of Kelly output.
         _total_trades = int(snap.get("total_trades") or 0)  # or 0 handles NULL from fresh client rows
-        _bootstrap_mode = (win_rate == 0.0 or _total_trades < 20)
+        _bootstrap_mode = (_total_trades < 20)
         if _bootstrap_mode:
             log.info("[%s] Bootstrap mode — %d total trades, forcing 1-contract minimum",
                      ticker, _total_trades)
