@@ -24,10 +24,24 @@ from typing import Optional, Any
 
 log = logging.getLogger("ap.master_control")
 
-# Pre-selection premium estimate -- used ONLY before contract_selector returns real cost.
-# After contract_selector runs and revalidate_exposure() fires, real premium is used.
-# Change this if your typical contract premium shifts significantly.
-DEFAULT_PREMIUM_ESTIMATE: float = 3.50  # $3.50/share target = $350/contract max
+# Per-ticker premium estimates — used BEFORE contract_selector returns real cost.
+# Based on typical ATM option prices. contract_selector replaces with real mid-price.
+_PREMIUM_ESTIMATES: dict = {
+    "NVDA": 9.50,  "TSLA": 7.00,  "META": 6.00,
+    "NFLX": 8.00,  "AMD":  4.50,  "MSFT": 5.00,
+    "AAPL": 3.00,  "SPY":  2.00,  "QQQ":  3.50,
+    "IWM":  1.50,  "DIA":  2.50,  "COIN": 5.00,
+    "PLTR": 1.50,  "MSTR": 18.00, "AMZN": 4.50,
+    "GOOG": 4.00,  "GOOGL": 4.00, "GS":   4.00,
+    "ORCL": 3.00,  "WFC":  2.50,  "MS":   3.50,
+}
+_DEFAULT_PREMIUM_FALLBACK: float = 3.50
+
+def _estimate_premium(ticker: str) -> float:
+    """Per-ticker premium estimate before real contract price is known."""
+    return _PREMIUM_ESTIMATES.get(str(ticker).upper().strip(), _DEFAULT_PREMIUM_FALLBACK)
+
+DEFAULT_PREMIUM_ESTIMATE: float = _DEFAULT_PREMIUM_FALLBACK  # backward compat
 
 
 # =============================================================================
@@ -452,7 +466,7 @@ class APMasterControl:
 
         # Total capital % limit -- projected: current + real pending cost + new trade estimate
         estimated_contracts_pre = max(1, self._base_contracts(score))
-        estimated_new_cost_pre  = estimated_contracts_pre * 100 * DEFAULT_PREMIUM_ESTIMATE
+        estimated_new_cost_pre  = estimated_contracts_pre * 100 * _estimate_premium(ticker)
         # Real pending capital from reserved_cost on pending entry orders
         pending_capital_real    = self._pending_orders_capital(client_id)
         projected_total         = (snap["capital_deployed"]
@@ -479,7 +493,7 @@ class APMasterControl:
         # contracts from plan sizing (base 1), $5 placeholder premium -- corrected
         # after contract selection updates plan.max_position_usd
         estimated_contracts = max(1, self._base_contracts(score))
-        estimated_new_cost  = estimated_contracts * 100 * DEFAULT_PREMIUM_ESTIMATE
+        estimated_new_cost  = estimated_contracts * 100 * _estimate_premium(ticker)
         projected_sector    = sector_deployed + estimated_new_cost
         # Use per-client equity (set via set_account_equity() or env default)
         effective_equity    = self.account_equity
@@ -496,7 +510,7 @@ class APMasterControl:
         ticker_deployed     = self._ticker_capital_deployed(
             snap["open_positions"] + snap["closing_positions"], ticker
         )
-        estimated_new_cost_ticker = estimated_contracts * 100 * DEFAULT_PREMIUM_ESTIMATE
+        estimated_new_cost_ticker = estimated_contracts * 100 * _estimate_premium(ticker)
         projected_ticker          = ticker_deployed + estimated_new_cost_ticker
         max_ticker_capital        = effective_equity * self.max_ticker_pct
         if projected_ticker > max_ticker_capital:
@@ -552,9 +566,16 @@ class APMasterControl:
 
         # ── D. SCORE GATE ─────────────────────────────────────────────────────
 
-        # Priority ETFs bypass score floor -- deepest chains, tightest spreads
-        _PRIORITY_TICKERS = {"SPY", "QQQ", "IWM", "SPX", "NDX"}
-        if score < self.score_floor and ticker.upper() not in _PRIORITY_TICKERS:
+        # Priority ETFs get a lower score floor (40) not zero — still need minimum conviction.
+        # They have the deepest chains, but garbage signals at 9:31AM should still fail.
+        _PRIORITY_TICKERS = {"SPY", "QQQ", "IWM", "SPX", "NDX", "DIA"}
+        _PRIORITY_FLOOR   = 40.0
+        if ticker.upper() in _PRIORITY_TICKERS:
+            if score < _PRIORITY_FLOOR:
+                log.info(f"[{ticker}] Priority ticker — below priority floor ({score:.1f}<{_PRIORITY_FLOOR})")
+                return ControlDecision(ok=False, stage="blocked_signal",
+                                       reason=f"score_below_priority_floor ({score:.1f}<{_PRIORITY_FLOOR})")
+        elif score < self.score_floor:
             self._store_update(signal_id, "rejected",
                                f"score {score:.1f} < floor {self.score_floor}")
             return self._block(signal_id, ticker, client_id, "blocked_score",
@@ -637,7 +658,7 @@ class APMasterControl:
         # Always applies drawdown throttle regardless of method.
         # premium_per_contract unknown pre-contract-selection -- use placeholder;
         # contract_selector.select() will revalidate with real premium.
-        _placeholder_premium = 1 * 100 * DEFAULT_PREMIUM_ESTIMATE  # $500 est.
+        _placeholder_premium = 1 * 100 * _estimate_premium(ticker)  # $500 est.
         # Reset daily P&L for signals arriving outside market hours
         # (post-close scanner signals are for NEXT session — don't carry today's loss)
         _raw_pnl = snap.get("realized_pnl_today", 0.0)
@@ -654,7 +675,15 @@ class APMasterControl:
         if not _in_session and _raw_pnl < 0:
             log.info(f"[{ticker}] Post-market signal — daily drawdown reset to 0 (was ${_raw_pnl:.2f})")
 
-        if self.sizer:
+        # Bootstrap guard: with zero trade history Kelly can go negative → sizer blocks trades.
+        # First 20 trades per client always use 1-contract sizing regardless of Kelly output.
+        _total_trades = int(snap.get("total_trades", 0) or 0)
+        _bootstrap_mode = (win_rate == 0.0 or _total_trades < 20)
+        if _bootstrap_mode:
+            log.info("[%s] Bootstrap mode — %d total trades, forcing 1-contract minimum",
+                     ticker, _total_trades)
+
+        if self.sizer and not _bootstrap_mode:
             try:
                 sizing = self.sizer.compute(
                     client_id        = client_id,
@@ -715,7 +744,7 @@ class APMasterControl:
             pattern           = signal.get("pattern", signal.get("pattern_id", "")),
             timeframe         = signal.get("timeframe", "1d"),
             contracts         = contracts,
-            max_position_usd  = contracts * 100 * DEFAULT_PREMIUM_ESTIMATE,
+            max_position_usd  = contracts * 100 * _estimate_premium(ticker),
             tier              = str(tier),
             score             = score,
             intel_score       = intel_score,
