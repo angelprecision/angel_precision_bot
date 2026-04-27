@@ -398,6 +398,23 @@ def _dispatch(
         return
 
     # ── 5. ROUTE -- BREACH vs IMMEDIATE ────────────────────────────────────────
+    # ── OVERNIGHT SIGNAL ENFORCEMENT ─────────────────────────────────────────
+    # Signals from previous date must go breach-only — never immediate execution.
+    _signal_date = (payload.get("created_at") or payload.get("timestamp_iso") or "")[:10]
+    _today_str   = __import__("datetime").date.today().isoformat()
+    if _signal_date and _signal_date < _today_str:
+        log.warning("[%s] Overnight signal (created %s) — forcing breach-only path",
+                    ticker, _signal_date)
+        trigger_type = "breach"
+        try:
+            plan.trigger_type = "breach"
+        except Exception:
+            pass
+        if not entry_watcher:
+            log.error("[%s] Dropping overnight signal — no entry watcher", ticker)
+            _mark_job(job_id, "REJECTED", error="overnight_signal_no_watcher")
+            return
+
     trigger_type = getattr(plan, "trigger_type", "immediate")
 
     # Block new intraday entries after 3:15 PM ET ONLY during market hours.
