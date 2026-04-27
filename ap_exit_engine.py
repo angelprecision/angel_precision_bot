@@ -45,8 +45,8 @@ PROFIT_PROTECT_2_HOUR = 13   # 1:00 PM  -- scale out 75% if +25%
 PROFIT_PROTECT_2_MIN  = 0
 PROFIT_PROTECT_3_HOUR = 14   # 2:00 PM  -- exit all if +15%
 PROFIT_PROTECT_3_MIN  = 0
-EOD_HARD_CLOSE_HOUR   = 15   # 3:30 PM  -- EXIT EVERYTHING
-EOD_HARD_CLOSE_MIN    = 30
+EOD_HARD_CLOSE_HOUR   = 15   # 3:45 PM  -- EXIT EVERYTHING (was 3:30, extended for runners)
+EOD_HARD_CLOSE_MIN    = 45
 POLL_INTERVAL_SEC     = 8    # check every 8 seconds — catch TP windows faster
 
 # ── P&L THRESHOLDS ────────────────────────────────────────────────────────────
@@ -84,11 +84,16 @@ def _effective_thresholds(pos: "ManagedPosition") -> tuple:
 
     is_index = any(symbol.startswith(t) for t in _INDEX_ETFS) or ticker in _INDEX_ETFS
 
-    # All tiers use the same option P&L stop (-30%).
-    # Underlying-level stop (is_at_stop) is the primary protection on 0DTE.
-    # Option P&L stop is the last-resort backstop — keep it wide enough to
-    # survive intraday noise (a 0.5% QQQ move = ~40% option move on delta 0.25).
-    return HARD_STOP_PCT, IMMEDIATE_TP_PCT, PROFIT_LOCK_PCT
+    # DTE-aware thresholds — tighter on 0DTE index, default on everything else.
+    # 0DTE index (QQQ/SPY/IWM/DIA): fast movers need tighter stops/targets.
+    # Underlying-level stop is primary protection; these are the P&L backstops.
+    if dte == 0 and is_index:
+        return -0.18, 0.20, 0.08   # 0DTE index: -18% stop, +20% TP, +8% lock
+    elif dte == 0:
+        return -0.22, 0.22, 0.10   # 0DTE equity: -22% stop, +22% TP, +10% lock
+    elif dte <= 2:
+        return -0.26, 0.25, 0.12   # 1-2 DTE: -26% stop, +25% TP, +12% lock
+    return HARD_STOP_PCT, IMMEDIATE_TP_PCT, PROFIT_LOCK_PCT  # default 2DTE+
 TRAIL_DROP_FROM_PEAK  = 0.10   # if peak was +25%+, exit if drops 10pts from peak
 SMALL_WIN_PCT         = 0.10   # +10% → small win capture (see time gates below)
 SMALL_WIN_TRAIL       = 0.07   # after +10% seen, don't let it fall below +3%
