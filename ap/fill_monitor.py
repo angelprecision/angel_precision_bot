@@ -242,6 +242,36 @@ def process_pending_order(broker: BrokerAdapter, order: dict, osm=None, pm=None,
                     )
                     trace_gate(str(signal_id), _ticker, "ORDER_FILLED", "PASS",
                                reason="entry_filled", trigger_price=_price, contracts=_qty)
+
+                    # Place a standing stop-loss order with Tradier immediately after fill.
+                    # This is belt-AND-suspenders — exit engine polls every 8s but if Render
+                    # restarts or the thread dies, the broker stop protects the position.
+                    try:
+                        _stop_pct  = 0.30        # -30% hard stop
+                        _stop_px   = round(_price * (1 - _stop_pct), 2)
+                        _stop_resp = osm._broker.session.post(
+                            f"{osm._broker._base_url}/v1/accounts/{osm._broker._account_id}/orders",
+                            data={
+                                "class":         "option",
+                                "option_symbol": order.get("contract", ""),
+                                "side":          "sell_to_close",
+                                "quantity":      _qty,
+                                "type":          "stop",
+                                "stop":          _stop_px,
+                                "duration":      "gtc",   # good-till-cancelled
+                            },
+                            headers={"Accept": "application/json"},
+                            timeout=10,
+                        ) if hasattr(osm, "_broker") else None
+                        if _stop_resp and _stop_resp.status_code < 300:
+                            _stop_id = (_stop_resp.json().get("order", {}) or {}).get("id", "?")
+                            log.info("[%s] Standing stop placed @ $%.2f | broker_stop=%s",
+                                     _ticker, _stop_px, _stop_id)
+                        else:
+                            log.warning("[%s] Standing stop order FAILED — exit engine is sole protection",
+                                        _ticker)
+                    except Exception as _se:
+                        log.warning("[%s] Standing stop placement error: %s", _ticker, _se)
                     _pos_id = pm.open_position(
                         plan_id           = plan_id,
                         signal_id         = signal_id,
