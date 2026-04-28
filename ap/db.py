@@ -340,7 +340,7 @@ def get_client_state(client_id: str = "default") -> dict:
                     "client_id": client_id, "current_equity": 0.0,
                     "starting_equity_today": 0.0, "realized_pnl_today": 0.0,
                     "trades_taken_today": 0, "daily_stop_hit": 0,
-                    "kill_switch": 0, "mode": "PAPER", "day_key": None,
+                    "kill_switch": False, "mode": "PAPER", "day_key": None,
                 }
             return row
     return run_with_retry(_fn)
@@ -379,7 +379,7 @@ def ensure_client_exists(client_id: str, equity: float = 25000.0) -> None:
                     client_id, current_equity, starting_equity_today,
                     realized_pnl_today, trades_taken_today, daily_stop_hit,
                     kill_switch, mode, day_key, updated_at
-                ) VALUES (%s,%s,%s,0.0,0,0,0,'PAPER',NULL,%s)
+                ) VALUES (%s,%s,%s,0.0,0,0,False,'PAPER',NULL,%s)
                 ON CONFLICT (client_id) DO NOTHING
                 """,
                 (client_id, float(equity), float(equity), now),
@@ -470,7 +470,7 @@ def create_client(
                     client_id, current_equity, starting_equity_today,
                     realized_pnl_today, trades_taken_today, daily_stop_hit,
                     kill_switch, mode, day_key
-                ) VALUES (%s,%s,%s,0.0,0,0,0,'PAPER',NULL)
+                ) VALUES (%s,%s,%s,0.0,0,0,False,'PAPER',NULL)
                 ON CONFLICT (client_id) DO NOTHING
                 """,
                 (client_id, float(initial_equity), float(initial_equity)),
