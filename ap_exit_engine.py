@@ -343,19 +343,79 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
             urgency="IMMEDIATE", pnl_pct=option_pnl
         )
 
-    # ── FAST STOP: never-green trades cut early ──────────────────────────────
-    # If the trade never touched profit and is already at -12%, exit immediately.
-    # 0DTE options can collapse in seconds — don't wait for -20% hard stop.
-    # Fast stop: only fires if position never went green AND is down 20%.
-    # -12% was too tight — on a $0.46 0DTE option that's $0.055, which is
-    # bid/ask spread noise. -20% requires a meaningful adverse move to trigger.
-    FAST_STOP_PCT = -0.20
-    if not pos.touched_profit and option_pnl <= FAST_STOP_PCT:
-        return ExitDecision(
-            action="CLOSE_ALL", quantity=qty_rem,
-            reason=f"FAST STOP -- {option_pnl*100:.0f}% never-green cut at {FAST_STOP_PCT*100:.0f}%",
-            urgency="IMMEDIATE", pnl_pct=option_pnl,
-        )
+    # ── NEVER-GREEN ESCALATING STOP ─────────────────────────────────────────
+    # If the trade NEVER touched profit, tighten the stop as time passes.
+    # Logic: the longer it sits without going green, the less likely it works.
+    # Preserves capital by getting out at -12% instead of -25%.
+    #
+    # DTE-aware — matches the same instrument classes as _effective_thresholds():
+    #
+    #   0DTE INDEX (SPY/QQQ/IWM): fastest confirmation required — moves happen NOW
+    #     0-3 min: -12%   5-8 min: -10%   8-15 min: -8%   15+ min: -6%
+    #
+    #   0DTE EQUITY: slightly more breathing room — single names can lag index
+    #     0-5 min: -15%   5-10 min: -12%   10-20 min: -10%   20+ min: -8%
+    #
+    #   1-2 DTE (any): more time to be right — theta slower, moves develop
+    #     0-10 min: -18%   10-20 min: -15%   20-40 min: -12%   40+ min: -10%
+    #
+    #   DEFAULT (2DTE+): swing scalp profile — most breathing room
+    #     0-5 min: -15%   5-10 min: -12%   10-20 min: -10%   20+ min: -8%
+    if not pos.touched_profit:
+        _age_min = (datetime.now(timezone.utc) - pos.opened_at).total_seconds() / 60                    if pos.opened_at else 0
+
+        # Reuse DTE + instrument class from _effective_thresholds context
+        import re as _re
+        from datetime import date as _date_ng
+        _sym_ng   = pos.option_symbol or ""
+        _tick_ng  = (pos.ticker or "").upper()
+        _m_ng     = _re.search(r'(\d{6})[CP]', _sym_ng)
+        _dte_ng   = 999
+        if _m_ng:
+            try:
+                _dte_ng = (_date_ng.strptime(_m_ng.group(1), "%y%m%d") - _date_ng.today()).days
+            except Exception:
+                pass
+        _is_idx_ng = any(_sym_ng.startswith(t) for t in _INDEX_ETFS) or _tick_ng in _INDEX_ETFS
+
+        if _dte_ng == 0 and _is_idx_ng:
+            # 0DTE index — fastest leash: SPY/QQQ/IWM move hard and fast
+            if _age_min < 3:    _ng_stop = -0.12
+            elif _age_min < 8:  _ng_stop = -0.10
+            elif _age_min < 15: _ng_stop = -0.08
+            else:               _ng_stop = -0.06
+        elif _dte_ng == 0:
+            # 0DTE equity — slightly more room
+            if _age_min < 5:    _ng_stop = -0.15
+            elif _age_min < 10: _ng_stop = -0.12
+            elif _age_min < 20: _ng_stop = -0.10
+            else:               _ng_stop = -0.08
+        elif _dte_ng <= 2:
+            # 1-2 DTE — more time to develop, theta slower
+            if _age_min < 10:   _ng_stop = -0.18
+            elif _age_min < 20: _ng_stop = -0.15
+            elif _age_min < 40: _ng_stop = -0.12
+            else:               _ng_stop = -0.10
+        else:
+            # Default 2DTE+ swing profile
+            if _age_min < 5:    _ng_stop = -0.15
+            elif _age_min < 10: _ng_stop = -0.12
+            elif _age_min < 20: _ng_stop = -0.10
+            else:               _ng_stop = -0.08
+
+        if option_pnl <= _ng_stop:
+            _profile = ("0DTE-idx" if (_dte_ng==0 and _is_idx_ng)
+                        else "0DTE-eq" if _dte_ng==0
+                        else f"{_dte_ng}DTE")
+            return ExitDecision(
+                action="CLOSE_ALL", quantity=qty_rem,
+                reason=(
+                    f"NEVER GREEN STOP [{_profile}] — {option_pnl*100:.0f}% "
+                    f"at {_age_min:.0f}min | threshold={_ng_stop*100:.0f}% | "
+                    f"thesis never confirmed"
+                ),
+                urgency="IMMEDIATE", pnl_pct=option_pnl,
+            )
 
     # ── HARD STOP (fires any time, no time gate) ─────────────────────────────
     if option_pnl <= _hard_stop:
@@ -458,6 +518,12 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
 
 
 # ── EXIT ENGINE ───────────────────────────────────────────────────────────────
+
+def _is_protective_exit(reason: str) -> bool:
+    """True if exit reason is protective — module-level so always in scope."""
+    r = (reason or "").upper()
+    return any(k in r for k in ("EOD", "STOP", "MAX_LOSS", "THETA", "PROTECTIVE", "FORCE CLOSE", "SENTINEL"))
+
 
 class APExitEngine:
     """
@@ -616,14 +682,13 @@ class APExitEngine:
                 except Exception as _e:
                     log.error("[SENTINEL] Force exit failed for %s: %s", pos.ticker, _e)
 
-            # Sentinel 3: Exit in flight for > 5 min → escalate after second timeout
+            # Sentinel 3: Exit in flight > 5 min → escalate after second timeout
             if pos.exit_in_flight and pos.last_exit_signal_ts:
                 flight_sec = (now - pos.last_exit_signal_ts).total_seconds()
                 if flight_sec > 300:
                     _stuck_count = getattr(pos, "_exit_stuck_count", 0) + 1
                     pos._exit_stuck_count = _stuck_count
                     if _stuck_count >= 2:
-                        # Second timeout — mark rejected so reconciler handles it
                         pos.last_exit_rejected = True
                         log.error(
                             "[SENTINEL] %s | EXIT STUCK x%d — %.0fs in-flight, no fill | "
@@ -637,23 +702,21 @@ class APExitEngine:
                             pos.ticker, flight_sec, pos.position_id
                         )
 
-            # Sentinel 4: Dead trade — open too long with no confirmation, thesis failed
-            # Catches losers that slip past all other exits (ranging day, no target, no stop)
-            DEAD_TRADE_MIN  = 45   # minutes in trade with no meaningful progress
-            DEAD_TRADE_LOW  = -0.08  # below -8% and still alive = likely dead
-            DEAD_TRADE_HIGH = 0.05   # never got above +5% = thesis never confirmed
+            # Sentinel 4: Dead trade — open too long, thesis never confirmed
+            DEAD_TRADE_MIN  = 45
+            DEAD_TRADE_LOW  = -0.08
+            DEAD_TRADE_HIGH = 0.05
             if (not pos.exit_in_flight
                     and age_min >= DEAD_TRADE_MIN
                     and DEAD_TRADE_LOW <= pnl <= DEAD_TRADE_HIGH
                     and pos.max_profit_seen < DEAD_TRADE_HIGH):
-                # Check underlying progress toward target
                 _entry_u  = pos.underlying_entry
                 _target_u = pos.underlying_target
                 _curr_u   = pos.current_underlying
                 _progress = 0.0
                 if _entry_u and _target_u and _curr_u and abs(_target_u - _entry_u) > 0:
                     _progress = abs(_curr_u - _entry_u) / abs(_target_u - _entry_u)
-                if _progress < 0.30:  # less than 30% of the way to target
+                if _progress < 0.30:
                     log.error(
                         "[SENTINEL] %s | DEAD TRADE — %.0fmin open, pnl=%.1f%%, "
                         "peak=%.1f%%, progress=%.0f%% toward target | "
@@ -899,6 +962,53 @@ class APExitEngine:
 
         # Execute actions
         for pos, decision in actions_to_take:
+            # ── STRUCTURED EXIT LOG ───────────────────────────────────────────
+            # Every exit decision logged with full context for analysis.
+            # Query later: filter reason for NEVER GREEN STOP, HARD STOP, etc.
+            # Compare pnl_pct vs peak_pnl_pct to measure exit efficiency.
+            try:
+                import re as _re_log
+                from datetime import date as _date_log
+                _sym_log  = pos.option_symbol or ""
+                _tick_log = (pos.ticker or "").upper()
+                _m_log    = _re_log.search(r'(\d{6})[CP]', _sym_log)
+                _dte_log  = 999
+                if _m_log:
+                    try:
+                        _dte_log = (_date_log.strptime(_m_log.group(1), "%y%m%d") - _date_log.today()).days
+                    except Exception:
+                        pass
+                _is_idx_log = any(_sym_log.startswith(t) for t in _INDEX_ETFS) or _tick_log in _INDEX_ETFS
+                _profile_log = (
+                    "0DTE-idx" if (_dte_log == 0 and _is_idx_log) else
+                    "0DTE-eq"  if  _dte_log == 0 else
+                    f"{_dte_log}DTE"
+                )
+                _age_log = (
+                    (datetime.now(timezone.utc) - pos.opened_at).total_seconds() / 60.0
+                    if pos.opened_at else 0.0
+                )
+                log.info(
+                    "[EXIT] client=%s ticker=%s sym=%s side=%s profile=%s "
+                    "action=%s pnl=%.1f%% age=%.1fmin peak=%.1f%% "
+                    "touched=%s qty_rem=%d qty_close=%d reason=%s",
+                    pos.client_id or "?",
+                    pos.ticker,
+                    pos.option_symbol,
+                    pos.side,
+                    _profile_log,
+                    decision.action,
+                    decision.pnl_pct * 100.0,
+                    _age_log,
+                    pos.peak_pnl_pct * 100.0,
+                    pos.touched_profit,
+                    pos.quantity_remaining,
+                    decision.quantity,
+                    decision.reason,
+                )
+            except Exception as _log_err:
+                log.debug("Exit structured log failed (non-critical): %s", _log_err)
+
             log.info(
                 f"[{pos.ticker}] EXIT SIGNAL: {decision.action} "
                 f"qty={decision.quantity} | {decision.reason} | "
@@ -1037,9 +1147,3 @@ class APExitEngine:
         except Exception as e:
             log.error("Option quote fetch failed: %s", e, exc_info=True)
             return {}  # caller must handle empty dict as "no data available"
-            
-
-    def _is_protective_exit(reason: str) -> bool:
-        """True if exit reason is protective — module-level so it's always in scope."""
-        r = (reason or "").upper()
-        return any(k in r for k in ("EOD", "STOP", "MAX_LOSS", "THETA", "PROTECTIVE", "FORCE CLOSE", "SENTINEL"))
