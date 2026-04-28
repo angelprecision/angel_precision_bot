@@ -157,6 +157,52 @@ class APOrderMonitor:
             elif status == "SUBMITTED":
                 ref_ts   = submitted_ts or created_ts
                 age_secs = (now - ref_ts).total_seconds()
+
+                # ── MISSED MOVE CANCEL ────────────────────────────────────────
+                # If entry limit is unfilled after 10 min AND option has moved
+                # 20%+ above our limit price, the move happened without us.
+                # Cancel immediately — waiting for a pullback to our stale limit
+                # means we'd be entering a reversed trade (CVX problem).
+                _MISSED_MOVE_MIN_SECS   = int(os.getenv("MISSED_MOVE_MIN_SECS",   "600"))   # 10 min
+                _MISSED_MOVE_PRICE_MULT = float(os.getenv("MISSED_MOVE_PRICE_MULT", "1.20")) # 20% above limit
+                if (broker_oid
+                        and age_secs >= _MISSED_MOVE_MIN_SECS
+                        and status == "SUBMITTED"):
+                    try:
+                        # limit_price is now in the DB SELECT above.
+                        # Fall back to osm.get_order() if schema differs.
+                        _limit_price = (
+                            order.get("limit_price")
+                            or order.get("price")
+                            or (self.osm.get_order(local_id) or {}).get("limit_price")
+                            or (self.osm.get_order(local_id) or {}).get("price")
+                        )
+                        _sym = order.get("contract") or order.get("symbol", "")
+                        if _limit_price and float(_limit_price) > 0 and _sym:
+                            _current = self._get_option_price(_sym)
+                            if _current and _current > float(_limit_price) * _MISSED_MOVE_PRICE_MULT:
+                                log.warning(
+                                    "[%s] MISSED MOVE CANCEL | %s | limit=$%.2f current=$%.2f "
+                                    "(%.0f%% above limit) after %.0fs — move happened without us",
+                                    self.client_id, _sym,
+                                    float(_limit_price), _current,
+                                    (_current / float(_limit_price) - 1) * 100,
+                                    age_secs,
+                                )
+                                self._handle_stale_entry(
+                                    local_id, status, contract, age_secs,
+                                    action="cancel",
+                                    reason=(
+                                        f"MISSED_MOVE — limit=${float(_limit_price):.2f} "
+                                        f"current=${_current:.2f} ({(_current/float(_limit_price)-1)*100:.0f}% above) "
+                                        f"after {age_secs:.0f}s — canceling stale entry"
+                                    ),
+                                )
+                                continue
+                    except Exception as _mme:
+                        log.debug("[%s] Missed-move check failed (non-critical): %s",
+                                  self.client_id, _mme)
+
                 if age_secs > TIMEOUT_SUBMITTED:
                     if not broker_oid:
                         log.debug(
@@ -575,6 +621,42 @@ class APOrderMonitor:
                 f"[{self.client_id}] Advanced | {contract} | {local_order_id} → {new_status}"
             )
 
+        # ── Sync real exit fill price to dashboard ────────────────────────────
+        # When exit fills at broker, update proof_trades with actual avg_fill
+        # so dashboard shows real P&L not limit price P&L
+        if ok and kind == "EXIT" and new_status == "EXIT_FILLED":
+            _pos_id   = (order or {}).get("position_id")
+
+            # Fix: use is not None to avoid skipping 0.0 fills
+            _avg_fill = (order or {}).get("avg_fill")
+            if _avg_fill is None:
+                _avg_fill = (order or {}).get("fill_price")
+
+            # Fix: pull entry_price from position record if not on order
+            _entry = (order or {}).get("entry_price")
+            if _entry is None and _pos_id and self.pm:
+                try:
+                    _pos   = self.pm.get_position(_pos_id) or {}
+                    _entry = _pos.get("entry_option_price") or _pos.get("entry_price")
+                except Exception:
+                    _entry = None
+
+            _tick = (order or {}).get("ticker") or contract
+
+            # Fix: use is not None not truthiness check
+            if _pos_id and _avg_fill is not None:
+                try:
+                    from ap.exit_price_sync import sync_exit_price_to_dashboard
+                    sync_exit_price_to_dashboard(
+                        position_id=_pos_id,
+                        exit_avg_fill=float(_avg_fill),
+                        entry_price=float(_entry) if _entry is not None else None,
+                        ticker=_tick,
+                    )
+                except Exception as _esp:
+                    log.debug("[%s] exit_price_sync failed (non-critical): %s",
+                              self.client_id, _esp)
+
         # ── Clear exit in-flight on broker-confirmed cancel/expire/reject ────
         # Covers the normal broker polling path (not just _handle_stale_exit).
         # Both paths must clear exit_in_flight or the engine stays stuck.
@@ -612,7 +694,8 @@ class APOrderMonitor:
                 c.execute(
                     """
                     SELECT local_order_id, broker_order_id, status, symbol,
-                           contract, position_id, created_ts, submitted_ts
+                           contract, position_id, created_ts, submitted_ts,
+                           limit_price, price
                     FROM orders
                     WHERE client_id=%s
                       AND kind='ENTRY'
@@ -667,6 +750,44 @@ class APOrderMonitor:
             return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
         except Exception:
             return None
+
+    def _get_option_price(self, symbol: str) -> Optional[float]:
+        """
+        Fetch current mid price for an option contract.
+        Used for missed-move detection on stale entry limits.
+        Returns None if quote unavailable.
+        """
+        if not symbol or not self.broker:
+            return None
+        try:
+            if hasattr(self.broker, "get_quote"):
+                q = self.broker.get_quote(symbol)
+                if isinstance(q, dict):
+                    bid = float(q.get("bid") or 0)
+                    ask = float(q.get("ask") or 0)
+                    if bid > 0 and ask > 0:
+                        return (bid + ask) / 2
+            if hasattr(self.broker, "session") and hasattr(self.broker, "cfg"):
+                import requests as _req
+                cfg     = self.broker.cfg
+                base    = getattr(cfg, "base_url", "https://sandbox.tradier.com")
+                token   = getattr(cfg, "access_token", None) or getattr(cfg, "token", "")
+                headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+                resp = _req.get(
+                    f"{base}/v1/markets/quotes",
+                    params={"symbols": symbol, "greeks": "false"},
+                    headers=headers, timeout=5,
+                )
+                if resp.status_code == 200:
+                    q = resp.json().get("quotes", {}).get("quote", {})
+                    if isinstance(q, dict):
+                        bid = float(q.get("bid") or 0)
+                        ask = float(q.get("ask") or 0)
+                        if bid > 0 and ask > 0:
+                            return (bid + ask) / 2
+        except Exception as e:
+            log.debug("[%s] _get_option_price(%s) failed: %s", self.client_id, symbol, e)
+        return None
 
     def _alert(self, msg: str):
         """Log at ERROR level and call optional external alert function."""
