@@ -71,14 +71,15 @@ class APOrderMonitor:
         broker,
         order_state_machine,
         position_manager,
+        exit_engine=None,  # APExitEngine — wired for clear_exit_in_flight() on cancel
         alert_fn=None,     # optional callable(msg: str) for external alerts
     ):
         self.client_id   = client_id
         self.broker      = broker
         self.osm         = order_state_machine
         self.pm          = position_manager
-        self.alert_fn    = alert_fn
         self.exit_engine = exit_engine
+        self.alert_fn    = alert_fn
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
@@ -157,15 +158,12 @@ class APOrderMonitor:
                 ref_ts   = submitted_ts or created_ts
                 age_secs = (now - ref_ts).total_seconds()
                 if age_secs > TIMEOUT_SUBMITTED:
-                    # If no broker_order_id, this order is held by the entry watcher
-                    # waiting for a price breach — do NOT cancel it, it's intentional.
                     if not broker_oid:
                         log.debug(
                             f"[{self.client_id}] Watcher-held order {local_id} "
                             f"({contract}) SUBMITTED for {age_secs:.0f}s — skipping stale cancel"
                         )
                     else:
-                        # Query broker first — may have filled or been rejected
                         broker_status = self._query_broker_order(broker_oid)
                         if broker_status:
                             self._advance_from_broker_status(local_id, broker_status, contract)
@@ -200,7 +198,6 @@ class APOrderMonitor:
                 ref_ts   = submitted_ts or created_ts
                 age_secs = (now - ref_ts).total_seconds()
                 if age_secs > TIMEOUT_PARTIAL_FILL:
-                    # Partial fill is real risk — alert but do NOT auto-cancel
                     self._alert(
                         f"⚠️ PARTIAL_FILL stalled | {self.client_id} | {contract} "
                         f"| {local_id} | {age_secs:.0f}s > {TIMEOUT_PARTIAL_FILL}s "
@@ -237,7 +234,6 @@ class APOrderMonitor:
                     if self._is_executed_status(broker_status):
                         self._advance_from_broker_status(local_id, broker_status, contract)
                     else:
-                        # Exit stall = ESCALATE — this is account risk
                         self._handle_stale_exit(
                             local_id, status, contract, age_secs,
                             position_id=position_id,
@@ -338,15 +334,15 @@ class APOrderMonitor:
         We:
           1. Alert loudly (this is account risk)
           2. Attempt broker cancel
-          3. If canceled: revert position to OPEN so exit can be retried
+          3. If canceled: notify exit engine to retry + revert position to OPEN
           4. If broker order is actually filled: advance state machine
         """
         log.error(
-            f"[{self.client_id}] 🚨 STALE EXIT | {contract} | {local_order_id} "
+            f"[{self.client_id}] STALE EXIT | {contract} | {local_order_id} "
             f"| status={status} | pos={position_id} | {reason}"
         )
         self._alert(
-            f"🚨 STALE EXIT ORDER — ACCOUNT RISK | {self.client_id} | {contract} "
+            f"STALE EXIT ORDER — ACCOUNT RISK | {self.client_id} | {contract} "
             f"| {local_order_id} | pos={position_id} | {reason}"
         )
 
@@ -382,6 +378,24 @@ class APOrderMonitor:
             # Transition order to CANCELED
             self.osm.transition(local_order_id, "CANCELED", last_error=reason)
 
+            # ── CRITICAL: notify exit engine so it retries within 8s ──────────
+            # Without this call, exit_in_flight stays True in memory and the
+            # exit engine never generates another exit signal for this position.
+            # This was the root cause of TTWO sitting at +26% with no retry.
+            if position_id and self.exit_engine:
+                try:
+                    self.exit_engine.clear_exit_in_flight(position_id)
+                    log.warning(
+                        "[%s] clear_exit_in_flight(%s) called — "
+                        "exit engine will retry within 8s",
+                        self.client_id, position_id,
+                    )
+                except Exception as _cef:
+                    log.error(
+                        "[%s] clear_exit_in_flight failed for pos=%s: %s",
+                        self.client_id, position_id, _cef,
+                    )
+
             # Revert position back to OPEN so exit can be retried cleanly
             if position_id and self.pm:
                 try:
@@ -391,19 +405,18 @@ class APOrderMonitor:
                         f"exit cancel — RETRY EXIT REQUIRED | pos={position_id}"
                     )
                     self._alert(
-                        f"⚠️ Position reverted to OPEN — exit must be retried | "
+                        f"Position reverted to OPEN — exit must be retried | "
                         f"{self.client_id} | {contract} | pos={position_id}"
                     )
                 except Exception as e:
                     log.error(f"[{self.client_id}] Failed to revert position: {e}")
         else:
-            # Can't cancel — leave in escalated state, alert again
             log.error(
                 f"[{self.client_id}] Exit order could not be canceled — "
                 f"MANUAL INTERVENTION REQUIRED | {local_order_id}"
             )
             self._alert(
-                f"🔴 MANUAL INTERVENTION REQUIRED | {self.client_id} | {contract} "
+                f"MANUAL INTERVENTION REQUIRED | {self.client_id} | {contract} "
                 f"| Exit order {local_order_id} stuck and cannot be canceled"
             )
 
@@ -434,11 +447,7 @@ class APOrderMonitor:
 
     def _cancel_broker_order(self, broker_order_id: Optional[str]):
         """
-        Send cancel to broker. Returns the most truthful broker response available:
-          - dict: broker order/cancel payload with 'status' key
-          - str:  normalized status string
-          - None: no usable confirmation
-
+        Send cancel to broker. Returns the most truthful broker response available.
         A successful cancel REQUEST is NOT the same as a canceled order.
         Callers must use _is_terminal_cancel_status() to verify before
         transitioning local state.
@@ -459,7 +468,6 @@ class APOrderMonitor:
             if isinstance(result, str) and result.strip():
                 return result.strip().lower()
 
-            # Re-query after cancel request to learn actual broker state
             queried = self._query_broker_order(broker_order_id)
             if queried:
                 return queried
@@ -542,6 +550,25 @@ class APOrderMonitor:
             log.info(
                 f"[{self.client_id}] Advanced | {contract} | {local_order_id} → {new_status}"
             )
+
+        # ── Clear exit in-flight on broker-confirmed cancel/expire/reject ────
+        # Covers the normal broker polling path (not just _handle_stale_exit).
+        # Both paths must clear exit_in_flight or the engine stays stuck.
+        if ok and kind == "EXIT" and s in {"canceled", "expired", "rejected"}:
+            _pos_id = (order or {}).get("position_id")
+            if _pos_id and self.exit_engine:
+                try:
+                    self.exit_engine.clear_exit_in_flight(_pos_id)
+                    log.warning(
+                        "[%s] clear_exit_in_flight(%s) from broker status=%s — "
+                        "exit engine will retry",
+                        self.client_id, _pos_id, s,
+                    )
+                except Exception as _e2:
+                    log.error(
+                        "[%s] clear_exit_in_flight failed for pos=%s status=%s: %s",
+                        self.client_id, _pos_id, s, _e2,
+                    )
 
     def _get_broker_order_id(self, local_order_id: str) -> Optional[str]:
         """Look up broker_order_id for a local_order_id."""
