@@ -69,53 +69,28 @@ log = logging.getLogger("ap.contract_selector")
 # =============================================================================
 # PRO-LEVEL CONTRACT QUALITY THRESHOLDS
 # =============================================================================
-# Hard gates + A/B tiering. Applied BEFORE the legacy _quality_filter so a
-# contract that fails pro gates never reaches ranking or fallback.
-#
-# Indices + mega-caps get tighter spread limits because they have the liquidity
-# to deserve it. Everything else gets a still-strict but slightly wider band.
-#
-# No fallback. If zero contracts pass hard gates, the signal is skipped.
-# =============================================================================
 
-# Toggle: set PRO_CONTRACT_QUALITY=false to fall back to legacy gates.
-# Default ON. Leave as an escape hatch, not a default.
 _PRO_QUALITY_ENABLED = os.getenv("PRO_CONTRACT_QUALITY", "true").lower() != "false"
 
-# Tier 1: indices + mega-caps. Tight spreads earned.
 _PRO_TIER1_TICKERS = {
-    "SPY", "QQQ", "IWM", "DIA",                            # indices
-    "AAPL", "MSFT", "NVDA", "AMD", "META", "GOOG", "GOOGL",  # mega-caps
-    "TSLA", "AMZN", "NFLX",                                # high-volume tech
+    "SPY", "QQQ", "IWM", "DIA",
+    "AAPL", "MSFT", "NVDA", "AMD", "META", "GOOG", "GOOGL",
+    "TSLA", "AMZN", "NFLX",
 }
 
-# Hard-reject if any of these fire
-_PRO_MIN_BID            = 0.10   # below this, fills are too noisy
-_PRO_MIN_BID_SIZE_HARD  = 3      # either side < 3 = instant reject
+_PRO_MIN_BID            = 0.10
+_PRO_MIN_BID_SIZE_HARD  = 3
 
-# Tier 1 (indices + mega-caps)
-_PRO_T1_SPREAD_HARD_MAX = 0.06   # 6% max spread
-_PRO_T1_SPREAD_A_TIER   = 0.03   # <=3% = A-tier
-_PRO_T1_SIZE_MIN        = 10     # both sides >= 10
+_PRO_T1_SPREAD_HARD_MAX = 0.06
+_PRO_T1_SPREAD_A_TIER   = 0.03
+_PRO_T1_SIZE_MIN        = 10
 
-# Tier 2 (everything else)
-_PRO_T2_SPREAD_HARD_MAX = 0.08   # 8% max spread
-_PRO_T2_SPREAD_A_TIER   = 0.04   # <=4% = A-tier
-_PRO_T2_SIZE_MIN        = 5      # both sides >= 5
+_PRO_T2_SPREAD_HARD_MAX = 0.08
+_PRO_T2_SPREAD_A_TIER   = 0.04
+_PRO_T2_SIZE_MIN        = 5
 
 
 def _pro_contract_quality(opt: dict, ticker: str, dte: int) -> tuple[str, str]:
-    """
-    Pro-level hard gates + A/B tiering.
-
-    Returns (tier, reason):
-      - ('A', 'tight_liquid')     passes + tight spread + strong size/liq
-      - ('B', 'ok_liquid')        passes hard gates, mid-pack
-      - ('REJECT', '<reason>')    failed a hard gate — skip, no fallback
-
-    Tier 1 tickers (indices + mega-caps): 6% spread hard cap, 3% for A-tier.
-    Tier 2 (everything else): 8% spread hard cap, 4% for A-tier.
-    """
     is_t1 = ticker.upper() in _PRO_TIER1_TICKERS
 
     bid = float(opt.get("bid") or 0)
@@ -123,11 +98,9 @@ def _pro_contract_quality(opt: dict, ticker: str, dte: int) -> tuple[str, str]:
     vol = int(opt.get("volume") or 0)
     oi  = int(opt.get("open_interest") or 0)
 
-    # Top-of-book size — Tradier returns bidsize/asksize or size.bid/ask
     bid_size = int(opt.get("bid_size") or opt.get("bidsize") or 0)
     ask_size = int(opt.get("ask_size") or opt.get("asksize") or 0)
 
-    # A. Price sanity
     if bid <= 0 or ask <= 0:
         return "REJECT", "zero_bid_or_ask"
     if ask < bid:
@@ -135,7 +108,6 @@ def _pro_contract_quality(opt: dict, ticker: str, dte: int) -> tuple[str, str]:
     if bid < _PRO_MIN_BID:
         return "REJECT", f"bid_below_{_PRO_MIN_BID}"
 
-    # B. Spread
     mid = (bid + ask) / 2
     if mid <= 0:
         return "REJECT", "zero_mid"
@@ -147,12 +119,10 @@ def _pro_contract_quality(opt: dict, ticker: str, dte: int) -> tuple[str, str]:
     if spread_pct > hard_spread:
         return "REJECT", f"spread_too_wide_{spread_pct*100:.1f}%_max_{hard_spread*100:.0f}%"
 
-    # C. Top-of-book size (only if broker surfaced it)
     if bid_size or ask_size:
         if bid_size < _PRO_MIN_BID_SIZE_HARD or ask_size < _PRO_MIN_BID_SIZE_HARD:
             return "REJECT", f"size_too_thin_bid{bid_size}_ask{ask_size}"
 
-    # D. Volume + OI (per DTE)
     if dte <= 1:
         min_vol, min_oi = 100, 500
     elif dte <= 7:
@@ -163,13 +133,9 @@ def _pro_contract_quality(opt: dict, ticker: str, dte: int) -> tuple[str, str]:
     if vol < min_vol and oi < min_oi:
         return "REJECT", f"illiquid_vol{vol}_oi{oi}_need_v{min_vol}_or_oi{min_oi}"
 
-    # E. Tier the survivor
-    size_ok_A   = (bid_size >= _PRO_T1_SIZE_MIN and ask_size >= _PRO_T1_SIZE_MIN) if is_t1 \
-                  else (bid_size >= _PRO_T2_SIZE_MIN and ask_size >= _PRO_T2_SIZE_MIN)
-    # If broker didn't surface size, don't penalize — require only vol/oi strength
-    has_size    = bool(bid_size or ask_size)
-
-    strong_liq  = (vol >= min_vol * 2) or (oi >= min_oi * 2)
+    size_ok_A = (bid_size >= _PRO_T1_SIZE_MIN and ask_size >= _PRO_T1_SIZE_MIN) if is_t1                 else (bid_size >= _PRO_T2_SIZE_MIN and ask_size >= _PRO_T2_SIZE_MIN)
+    has_size  = bool(bid_size or ask_size)
+    strong_liq = (vol >= min_vol * 2) or (oi >= min_oi * 2)
 
     if spread_pct <= a_spread and strong_liq and (size_ok_A or not has_size):
         return "A", "tight_liquid"
@@ -184,22 +150,22 @@ def _pro_contract_quality(opt: dict, ticker: str, dte: int) -> tuple[str, str]:
 @dataclass
 class SelectedContract:
     contract_symbol:       str
-    expiration:            str          # "YYYY-MM-DD"
+    expiration:            str
     strike:                float
-    option_type:           str          # "call" | "put"
+    option_type:           str
     bid:                   float
     ask:                   float
     mid:                   float
-    spread_pct:            float        # (ask-bid)/mid
+    spread_pct:            float
     delta:                 Optional[float]
     open_interest:         int
     volume:                int
-    premium_per_share:     float        # mid price (per share, not contract)
-    premium_per_contract:  float        # mid * 100
-    affordable_contracts:  int          # how many client can afford at plan budget
+    premium_per_share:     float
+    premium_per_contract:  float
+    affordable_contracts:  int
     selection_reason:      str
-    selection_score:       float        # internal ranking score
-    dte:                   int          # days to expiration
+    selection_score:       float
+    dte:                   int
 
     def to_dict(self) -> dict:
         return {
@@ -228,41 +194,20 @@ class SelectedContract:
 # =============================================================================
 
 class APContractSelectionEngine:
-    """
-    Selects the best tradable option contract for an ApprovedExecutionPlan.
-
-    Constructor args:
-        broker         -- Tradier broker instance (has option_chain method)
-        mode           -- "paper" | "live"
-        target_delta   -- preferred delta band center (default 0.40)
-        delta_band     -- +/- tolerance around target delta (default 0.15)
-        max_spread_pct -- max bid-ask spread as % of mid (default 0.20 = 20%)
-        min_oi         -- minimum open interest (default 50)
-        min_volume     -- minimum daily volume (default 10)
-        min_premium    -- min premium per contract in $ (default 50 = $0.50/share)
-        max_premium    -- max premium per contract in $ (default 350 = $3.50/share max)
-        max_dte        -- maximum days to expiration (default 21)
-        min_dte        -- minimum DTE (default 0 for 0DTE support)
-        prefer_weekly  -- prefer weekly expirations (default True)
-        earnings_guard -- APEarningsGuard instance (optional; skipped if None)
-        iv_filter      -- APIVRankFilter instance (optional; skipped if None)
-    """
 
     def __init__(
         self,
         broker,
         *,
         mode:           str   = "paper",
-        data_broker     = None,   # separate live-data broker for quotes/chains
-                                  # if set, used for ALL market data calls
-                                  # broker is used ONLY for order placement
-        target_delta:   float = 0.40,  # slightly OTM preferred
-        delta_band:     float = 0.30,  # ±0.30 = 0.10-0.70 delta range (covers 1-2 strikes OTM)
-        max_spread_pct: float = 0.50,  # raised 0.35→0.50 -- data collection, wider acceptance
-        min_oi:         int   = 1,    # lowered 50→1 -- any open interest passes in paper mode
-        min_volume:     int   = 0,    # lowered 10→0 -- volume check disabled for data collection
-        min_premium:    float = 10.0,    # $0.10/share -- allow cheap weeklies
-        max_premium:    float = 350.0,    # $3.50/share = $350/contract hard cap
+        data_broker     = None,
+        target_delta:   float = 0.40,
+        delta_band:     float = 0.30,
+        max_spread_pct: float = 0.50,
+        min_oi:         int   = 1,
+        min_volume:     int   = 0,
+        min_premium:    float = 10.0,
+        max_premium:    float = 350.0,
         max_dte:        int   = 21,
         min_dte:        int   = 0,
         prefer_weekly:  bool  = True,
@@ -270,14 +215,11 @@ class APContractSelectionEngine:
         iv_filter=None,
     ):
         self.broker         = broker
-        # data_broker: used only for market data (quotes, chains, expirations)
-        # Falls back to self.broker if not set
         self.data_broker    = data_broker if data_broker is not None else broker
         self.mode           = mode
         self.target_delta   = target_delta
         self.delta_band     = delta_band
-        # Allow runtime override via env -- loosen on high-vol days
-        self.max_spread_pct = float(os.getenv('MAX_SPREAD_PCT', str(max_spread_pct)))
+        self.max_spread_pct = float(os.getenv("MAX_SPREAD_PCT", str(max_spread_pct)))
         self.min_oi         = min_oi
         self.min_volume     = min_volume
         self.min_premium    = min_premium
@@ -289,16 +231,11 @@ class APContractSelectionEngine:
         self.iv_filter      = iv_filter
 
         log.info(
-            "APContractSelectionEngine | mode=%s "
-            "delta=%.2f±%.2f "
-            "max_spread=%d%% "
-            "dte=[%d,%d] "
-            "premium=[$%.0f,$%.0f] "
+            "APContractSelectionEngine | mode=%s delta=%.2f±%.2f "
+            "max_spread=%d%% dte=[%d,%d] premium=[$%.0f,$%.0f] "
             "earnings_guard=%s iv_filter=%s",
-            mode,
-            target_delta, delta_band,
-            int(max_spread_pct * 100),
-            min_dte, max_dte,
+            mode, target_delta, delta_band,
+            int(max_spread_pct * 100), min_dte, max_dte,
             min_premium, max_premium,
             type(earnings_guard).__name__ if earnings_guard is not None else "None",
             type(iv_filter).__name__ if iv_filter is not None else "None",
@@ -309,43 +246,23 @@ class APContractSelectionEngine:
     # =========================================================================
 
     def select(self, plan) -> Optional[SelectedContract]:
-        """
-        Given an ApprovedExecutionPlan, return the best SelectedContract.
-        Returns None if no suitable contract found or a gate blocks the trade.
-
-        Gate order:
-          1. APEarningsGuard.check(ticker)   -- BEFORE chain fetch
-          2. Chain fetch
-          3. APIVRankFilter.check(...)       -- AFTER chain fetch
-          4. Quality filter + ranking
-          5. Affordability gate
-        """
         ticker    = plan.ticker
-        direction = plan.side.upper()   # "CALL" | "PUT"
+        direction = plan.side.upper()
         budget    = plan.max_position_usd
 
-        # ── ETF vs single-stock quality rules ────────────────────────────────────────
-        # ETFs (SPY, QQQ, IWM, etc.) are highly liquid — hold to tighter standards.
-        # Single stocks (GS, MRNA, BLK, etc.) have less volume — adjusted rules.
         _LIQUID_ETFS = {"SPY", "QQQ", "IWM", "DIA", "GLD", "TLT", "XLF",
                         "XLE", "XLK", "XLV", "XLC", "TQQQ", "SQQQ", "UVXY"}
         _is_etf = ticker.upper() in _LIQUID_ETFS
 
         if _is_etf:
-            _eff_max_spread  = 0.25   # 25% max spread for liquid ETFs
-            _eff_min_oi      = 100    # higher OI floor for ETFs
-            _eff_min_volume  = 10     # require some live volume for ETFs
-            _fallback_spread = 0.35   # tighter fallback for ETFs
-            _fallback_oi     = 200
+            _eff_max_spread  = 0.25
+            _eff_min_oi      = 100
+            _eff_min_volume  = 10
         else:
-            _eff_max_spread  = self.max_spread_pct  # 50% — single stocks can be wider
-            _eff_min_oi      = 25     # lower OI floor for single stocks
-            _eff_min_volume  = 0      # volume check relaxed for single stocks
-            _fallback_spread = 0.60   # wider fallback allowed for singles
-            _fallback_oi     = 50
+            _eff_max_spread  = self.max_spread_pct
+            _eff_min_oi      = 25
+            _eff_min_volume  = 0
 
-        # Index tickers (^GSPC etc) cannot be quoted via Tradier options API.
-        # Remap to tradable ETFs, or skip entirely.
         _INDEX_MAP = {"^GSPC": "SPY", "^NDX": "QQQ", "^RUT": "IWM", "^DJI": None}
         if ticker.startswith("^"):
             mapped = _INDEX_MAP.get(ticker.upper())
@@ -355,14 +272,11 @@ class APContractSelectionEngine:
             else:
                 log.warning("[%s] Index ticker has no options mapping -- skipping", ticker)
                 return None
-        # PT1 = first price target (wick cluster level) -- expected move destination.
-        # Used ONLY as expected move % to calibrate OTM bias. NOT a strike anchor.
+
         pt1 = getattr(plan, "target_underlying", None)
-        # wick_targets from signal enrichment: [{price, confidence, distance_pct, ...}]
         wick_targets = getattr(plan, "wick_targets", None) or []
-        # expected_move_pct: how far price is expected to travel (sets OTM bias)
         _expected_move_pct = 0.0
-        _wick_confidence   = 0.5  # default if no wick data
+        _wick_confidence   = 0.5
         if wick_targets:
             _expected_move_pct = float(wick_targets[0].get("distance_pct", 0) or 0)
             _wick_confidence   = float(wick_targets[0].get("confidence", 0.5) or 0.5)
@@ -370,137 +284,83 @@ class APContractSelectionEngine:
             entry_approx = getattr(plan, "trigger_price", pt1) or pt1
             _expected_move_pct = abs(pt1 - entry_approx) / entry_approx * 100 if entry_approx else 0
 
-        log.info(
-            "[%s] ContractSelector | direction=%s budget=$%.0f tier=%s pt1=%s",
-            ticker, direction, budget, plan.tier, pt1,
-        )
+        log.info("[%s] ContractSelector | direction=%s budget=$%.0f tier=%s pt1=%s",
+                 ticker, direction, budget, plan.tier, pt1)
 
         # ── GATE 1: EARNINGS BLACKOUT ─────────────────────────────────────────
-        # Check BEFORE fetching the chain to avoid unnecessary API calls.
-
         if self.earnings_guard is not None:
             try:
                 eg_result = self.earnings_guard.check(ticker)
                 if eg_result.get("blocked"):
-                    reason = eg_result.get("reason", "earnings blackout")
-                    log.warning(
-                        "[%s] BLOCKED by EarningsGuard -- %s",
-                        ticker, reason,
-                    )
+                    log.warning("[%s] BLOCKED by EarningsGuard -- %s",
+                                ticker, eg_result.get("reason", "earnings blackout"))
                     return None
             except Exception as exc:
-                # Fail open: log warning, do not block
-                log.warning(
-                    "[%s] EarningsGuard raised unexpectedly (%s) -- continuing (fail open)",
-                    ticker, exc,
-                )
+                log.warning("[%s] EarningsGuard raised unexpectedly (%s) -- continuing (fail open)",
+                            ticker, exc)
 
         # ── A. FETCH CHAIN ────────────────────────────────────────────────────
-
         try:
             chain, underlying_price = self._fetch_chain_with_price(ticker, direction)
         except Exception as e:
             log.error("[%s] chain fetch failed: %s", ticker, e)
-            if self.mode.upper() != "LIVE":
-                return None  # hard reject — no synthetic fills ever
             return None
 
         if not chain:
-            log.warning("[%s] EMPTY CHAIN for %s -- Tradier returned no options (sandbox data gap?)", ticker, direction)
-            if self.mode.upper() != "LIVE":
-                return None  # hard reject — no synthetic fills ever
+            log.warning("[%s] EMPTY CHAIN -- Tradier returned no options", ticker)
             return None
 
-        # Use plan's trigger price as underlying fallback if chain didn't return it
         if not underlying_price:
             underlying_price = getattr(plan, "trigger_price", None)
 
         # ── GATE 2: IV RANK FILTER ────────────────────────────────────────────
-        # Check AFTER fetching the chain (we need chain data for ATM IV).
-
         if self.iv_filter is not None:
             try:
                 iv_result = self.iv_filter.check(
-                    ticker,
-                    option_chain=chain,
+                    ticker, option_chain=chain,
                     underlying_price=underlying_price or 0.0,
                 )
                 if iv_result.get("blocked"):
-                    reason = iv_result.get("reason", "IV rank too high")
-                    log.warning(
-                        "[%s] BLOCKED by IVRankFilter -- %s",
-                        ticker, reason,
-                    )
-                    _sig_id = getattr(plan, "signal_id", "") or (plan.get("signal_id","") if isinstance(plan,dict) else "")
+                    log.warning("[%s] BLOCKED by IVRankFilter -- %s",
+                                ticker, iv_result.get("reason", "IV rank too high"))
+                    _sig_id = getattr(plan, "signal_id", "") or ""
                     trace_gate(str(_sig_id), ticker, "IV_GATE", "REJECT",
                                reason="iv_extreme", iv_rank=iv_result.get("iv_rank"))
                     return None
 
-                # Momentum gate: zones that require momentum confirmation.
-                # Uses signal score as proxy for momentum until momentum_pct
-                # is added to ApprovedExecutionPlan (planned for next sprint).
-                # Breach is confirmed by definition at contract-selection time.
                 if iv_result.get("requires_momentum"):
                     iv_zone      = iv_result.get("iv_zone", "soft")
-                    signal_score = float(
-                        plan.score if hasattr(plan, "score")
-                        else (plan.get("score", 0) if isinstance(plan, dict) else 0)
-                    )
+                    signal_score = float(plan.score if hasattr(plan, "score") else 0)
                     min_score    = float(iv_result.get("momentum_min_score", 65.0))
-
-                    # Score gate — momentum_pct will be added to plan in future
-                    mom_ok = signal_score >= min_score
+                    mom_ok       = signal_score >= min_score
+                    _sig_id      = getattr(plan, "signal_id", "") or ""
                     if not mom_ok:
-                        log.warning(
-                            "[%s] IVGate reject | iv_zone=%s iv=%.1f score=%.1f "
-                            "(need score>=%.0f for this IV zone)",
-                            ticker, iv_zone,
-                            iv_result.get("iv_rank", 0), signal_score, min_score,
-                        )
-                        _sig_id = getattr(plan, "signal_id", "") or (plan.get("signal_id","") if isinstance(plan,dict) else "")
+                        log.warning("[%s] IVGate reject | iv_zone=%s score=%.1f need>=%.0f",
+                                    ticker, iv_zone, signal_score, min_score)
                         trace_gate(str(_sig_id), ticker, "IV_GATE", "REJECT",
                                    reason=f"iv_zone={iv_zone}_score_too_low",
                                    score=signal_score, iv_rank=iv_result.get("iv_rank"))
                         return None
                     else:
-                        log.info(
-                            "[%s] IVGate allow | tier=B iv_zone=%s iv=%.1f score=%.1f",
-                            ticker, iv_zone,
-                            iv_result.get("iv_rank", 0), signal_score,
-                        )
-                        _sig_id = getattr(plan, "signal_id", "") or (plan.get("signal_id","") if isinstance(plan,dict) else "")
+                        log.info("[%s] IVGate allow | iv_zone=%s score=%.1f",
+                                 ticker, iv_zone, signal_score)
                         trace_gate(str(_sig_id), ticker, "IV_GATE", "ALLOW",
                                    reason=f"iv_zone={iv_zone}",
                                    score=signal_score, iv_rank=iv_result.get("iv_rank"))
-
-                # Apply tier cap from IV filter if set
-                if iv_result.get("tier_cap"):
-                    plan_tier = getattr(plan, "tier", None) or (plan.get("tier") if isinstance(plan, dict) else None)
-                    if plan_tier and plan_tier < iv_result["tier_cap"]:
-                        log.info("[%s] IV tier_cap applied: %s → %s", ticker, plan_tier, iv_result["tier_cap"])
-
             except Exception as exc:
-                # Fail open: log warning, do not block
-                log.warning(
-                    "[%s] IVRankFilter raised unexpectedly (%s) -- continuing (fail open)",
-                    ticker, exc,
-                )
+                log.warning("[%s] IVRankFilter raised unexpectedly (%s) -- continuing (fail open)",
+                            ticker, exc)
 
-        # Fail closed on stub price data — intel ran on degraded data, not real quotes.
-        # A trade approved on stub data is worse than no trade.
+        # Fail closed on stub price data
         if isinstance(plan, dict):
             _intel = plan.get("intel_result") or {}
         else:
             _intel = getattr(plan, "intel_result", {}) or {}
         if _intel.get("price_data_stub"):
-            log.warning(
-                "[%s] CONTRACT_SELECTOR: BLOCKED — price data was stub/unavailable during intel gate. "
-                "No trade on degraded data.", ticker
-            )
+            log.warning("[%s] BLOCKED — price data was stub during intel gate", ticker)
             return None
 
         # ── B. HARD QUALITY FILTER ────────────────────────────────────────────
-        # Apply ETF vs single-stock effective thresholds for this call
         _orig_spread        = self.max_spread_pct
         _orig_oi            = self.min_oi
         _orig_vol           = self.min_volume
@@ -508,18 +368,13 @@ class APContractSelectionEngine:
         self.min_oi         = _eff_min_oi
         self.min_volume     = _eff_min_volume
 
-
-        today = date.today()
-        survivors = []
+        today      = date.today()
+        survivors  = []
         _rejections: dict = {}
         _pro_tiers:  dict = {"A": 0, "B": 0}
 
         for opt in chain:
-            # ── PRO GATE (new, default ON) ────────────────────────────────
-            # Hard gates + A/B tiering. Failed contracts never reach ranking.
-            # No fallback — if nothing passes, we skip the signal.
             if _PRO_QUALITY_ENABLED:
-                # Compute DTE for pro-gate liquidity bucket
                 exp_str = opt.get("expiration_date", "")
                 _dte = 0
                 if exp_str:
@@ -531,22 +386,16 @@ class APContractSelectionEngine:
                 if pro_tier == "REJECT":
                     _rejections[pro_reason] = _rejections.get(pro_reason, 0) + 1
                     continue
-                # Tag for downstream ranking
                 opt["_pro_tier"] = pro_tier
                 _pro_tiers[pro_tier] = _pro_tiers.get(pro_tier, 0) + 1
 
-            # ── LEGACY GATE (still runs — belt and braces) ────────────────
             result = self._quality_filter(opt, today)
             if result is None:
                 survivors.append(opt)
             else:
                 _rejections[result] = _rejections.get(result, 0) + 1
-                log.debug(
-                    "[%s] filtered: %s -- %s",
-                    ticker, opt.get("symbol", "?"), result,
-                )
+                log.debug("[%s] filtered: %s -- %s", ticker, opt.get("symbol", "?"), result)
 
-        # Restore original thresholds
         self.max_spread_pct = _orig_spread
         self.min_oi         = _orig_oi
         self.min_volume     = _orig_vol
@@ -559,23 +408,15 @@ class APContractSelectionEngine:
                           sorted(_rejections.items(), key=lambda x: -x[1]))
                 if _rejections else "none",
             )
-            # NO FALLBACK. Ever. Paper or live.
-            # Previously paper mode would force "best available" which shipped
-            # 50%+ spread contracts with zero volume. That's the bug we're
-            # killing. If nothing passes hard gates, the signal is skipped —
-            # fewer trades is the point, not the cost.
             return None
 
         if _PRO_QUALITY_ENABLED:
-            log.info(
-                "[%s] %d contracts passed pro quality | A=%d B=%d",
-                ticker, len(survivors), _pro_tiers.get("A", 0), _pro_tiers.get("B", 0),
-            )
+            log.info("[%s] %d contracts passed pro quality | A=%d B=%d",
+                     ticker, len(survivors), _pro_tiers.get("A", 0), _pro_tiers.get("B", 0))
         else:
             log.info("[%s] %d contracts passed quality filter", ticker, len(survivors))
 
         # ── C. RANK ───────────────────────────────────────────────────────────
-
         scored = []
         for opt in survivors:
             s = self._rank_score(
@@ -590,80 +431,84 @@ class APContractSelectionEngine:
         best_score, best = scored[0]
 
         # ── D. BUILD SELECTED CONTRACT ────────────────────────────────────────
-
         selected = self._build_selected(best, best_score, budget, today)
         if selected is None:
-            if self.mode.upper() != "LIVE":
-                return None  # hard reject — no synthetic fills ever
             return None
 
         # ── E. AFFORDABILITY GATE ────────────────────────────────────────────
-        # Paper mode: force 1 contract if budget can't cover it (data collection)
-        # Live mode: hard block — never trade what you can't afford
         if selected.affordable_contracts < 1:
             if self.mode.upper() != "LIVE":
-                # Hard ceiling: never force contracts that exceed max_premium
-                # This prevents $500+ fills from polluting paper data
                 if selected.premium_per_contract > self.max_premium:
-                    log.warning(
-                        "[%s] premium $%.0f > max $%.0f -- skipping (too expensive for paper)",
-                        ticker, selected.premium_per_contract, self.max_premium,
-                    )
+                    log.warning("[%s] premium $%.0f > max $%.0f -- skipping (too expensive for paper)",
+                                ticker, selected.premium_per_contract, self.max_premium)
                     return None
-                log.warning(
-                    "[%s] budget $%.0f < premium $%.0f -- forcing 1 contract (paper data collection)",
-                    ticker, budget, selected.premium_per_contract,
-                )
+                log.warning("[%s] budget $%.0f < premium $%.0f -- forcing 1 contract",
+                            ticker, budget, selected.premium_per_contract)
                 selected = SelectedContract(
-                    contract_symbol=selected.contract_symbol,
-                    expiration=selected.expiration,
-                    strike=selected.strike,
-                    option_type=selected.option_type,
-                    bid=selected.bid,
-                    ask=selected.ask,
-                    mid=selected.mid,
-                    spread_pct=selected.spread_pct,
-                    delta=selected.delta,
-                    open_interest=selected.open_interest,
-                    volume=selected.volume,
-                    premium_per_share=selected.premium_per_share,
-                    premium_per_contract=selected.premium_per_contract,
-                    affordable_contracts=1,
-                    selection_reason=selected.selection_reason + " [forced_1]",
-                    selection_score=selected.selection_score,
-                    dte=selected.dte,
+                    contract_symbol      = selected.contract_symbol,
+                    expiration           = selected.expiration,
+                    strike               = selected.strike,
+                    option_type          = selected.option_type,
+                    bid                  = selected.bid,
+                    ask                  = selected.ask,
+                    mid                  = selected.mid,
+                    spread_pct           = selected.spread_pct,
+                    delta                = selected.delta,
+                    open_interest        = selected.open_interest,
+                    volume               = selected.volume,
+                    premium_per_share    = selected.premium_per_share,
+                    premium_per_contract = selected.premium_per_contract,
+                    affordable_contracts = 1,
+                    selection_reason     = selected.selection_reason + " [forced_1]",
+                    selection_score      = selected.selection_score,
+                    dte                  = selected.dte,
                 )
             else:
-                log.warning(
-                    "[%s] BLOCKED -- budget $%.0f cannot afford %s @ $%.0f/contract",
-                    ticker, budget, selected.contract_symbol, selected.premium_per_contract,
-                )
+                log.warning("[%s] BLOCKED -- budget $%.0f cannot afford %s @ $%.0f/contract",
+                            ticker, budget, selected.contract_symbol, selected.premium_per_contract)
                 return None
 
-        # ── FINAL SAFETY NET ─────────────────────────────────────────────────
-        # Should never reach here with selected=None after all the fallbacks above,
-        # but if something slips through in paper mode, catch it here.
         if selected is None:
-            if self.mode.upper() != "LIVE":
-                return None  # hard reject — no synthetic fills ever
-            else:
+            return None
+
+        # ── DEEP OTM GATE ────────────────────────────────────────────────────
+        # Reject contracts where delta is too low (too far OTM).
+        # A delta below 0.10 means the option barely moves with the stock.
+        # META $610 put when stock at $672 = 9% OTM, delta ~0.05 = lottery ticket.
+        # Better to skip the trade than buy a contract that can't win.
+        _MIN_DELTA = float(os.getenv("MIN_CONTRACT_DELTA", "0.10"))
+        if selected.delta is not None and selected.delta < _MIN_DELTA:
+            log.warning(
+                "[%s] DEEP OTM GATE: delta=%.2f < min=%.2f — contract too far OTM, skipping",
+                ticker, selected.delta, _MIN_DELTA,
+            )
+            return None
+
+        # Also check moneyness if underlying price available
+        # Block if strike is more than 12% away from current price
+        _MAX_OTM_PCT = float(os.getenv("MAX_OTM_PCT", "0.12"))
+        if underlying_price and underlying_price > 0 and selected.strike > 0:
+            _otm_pct = abs(selected.strike - underlying_price) / underlying_price
+            if _otm_pct > _MAX_OTM_PCT:
+                log.warning(
+                    "[%s] DEEP OTM GATE: strike=%.2f underlying=%.2f OTM=%.1f%% > max=%.0f%% — skipping",
+                    ticker, selected.strike, underlying_price,
+                    _otm_pct * 100, _MAX_OTM_PCT * 100,
+                )
                 return None
 
-        # Final per-ticker premium gate — blocks after pro quality select
+        # ── FINAL PREMIUM GATE (per-ticker cap) ──────────────────────────────
         _final_prem_cap = _get_max_premium(ticker)
         if selected.premium_per_contract > _final_prem_cap:
-            log.warning("[%s] FINAL PREMIUM GATE: $%.0f > $%.0f — blocking",
+            log.warning("[%s] FINAL PREMIUM GATE: $%.0f > $%.0f per-ticker cap — blocking",
                         ticker, selected.premium_per_contract, _final_prem_cap)
             return None
 
         # ── F. UPDATE PLAN IN-PLACE ───────────────────────────────────────────
-
-        plan.contract_symbol = selected.contract_symbol
-        plan.limit_price     = selected.ask   # use ask as limit for entry
-        plan.contracts       = selected.affordable_contracts  # never forced to 1
-        # Recalculate max_position_usd with real premium
+        plan.contract_symbol  = selected.contract_symbol
+        plan.limit_price      = selected.ask
+        plan.contracts        = selected.affordable_contracts
         plan.max_position_usd = plan.contracts * selected.premium_per_contract
-        # Inject wick confidence so sizer can scale qty (high conf = more contracts)
         if _wick_confidence and not getattr(plan, "wick_confidence", None):
             try:
                 plan.wick_confidence = _wick_confidence
@@ -671,14 +516,8 @@ class APContractSelectionEngine:
                 pass
 
         log.info(
-            "[%s] SELECTED | %s "
-            "bid=%s ask=%s mid=%.2f "
-            "spread=%.1f%% "
-            "delta=%s OI=%d "
-            "vol=%d DTE=%d "
-            "premium=$%.0f "
-            "contracts=%d "
-            "score=%.2f",
+            "[%s] SELECTED | %s bid=%s ask=%s mid=%.2f spread=%.1f%% "
+            "delta=%s OI=%d vol=%d DTE=%d premium=$%.0f contracts=%d score=%.2f",
             ticker, selected.contract_symbol,
             selected.bid, selected.ask, selected.mid,
             selected.spread_pct * 100,
@@ -694,57 +533,30 @@ class APContractSelectionEngine:
     # PRIVATE -- CHAIN FETCH
     # =========================================================================
 
-    def _fetch_chain_with_price(
-        self, ticker: str, direction: str
-    ) -> tuple[list[dict], Optional[float]]:
-        """
-        Fetch option chain and underlying price from broker.
-        Returns (chain_list, underlying_price_or_None).
-        """
-        option_type = direction.lower()   # "call" | "put"
-
-        # Always use _fetch_tradier_chain for full chain + expiration selection.
-        # TradierBroker.get_option_chain(ticker, expiration) requires an expiration
-        # date we don't have yet -- that logic lives inside _fetch_tradier_chain.
-        # Calling it with option_type= causes: got an unexpected keyword argument 'option_type'
+    def _fetch_chain_with_price(self, ticker: str, direction: str) -> tuple[list[dict], Optional[float]]:
+        option_type = direction.lower()
         return self._fetch_tradier_chain(ticker, option_type)
 
     def _fetch_chain(self, ticker: str, direction: str) -> list[dict]:
-        """
-        Thin wrapper kept for backward compatibility.
-        Returns chain list only (discards underlying price).
-        """
         chain, _ = self._fetch_chain_with_price(ticker, direction)
         return chain
 
-    def _fetch_tradier_chain(
-        self, ticker: str, option_type: str
-    ) -> tuple[list[dict], Optional[float]]:
-        """Direct Tradier API call for option chain. Returns (chain, underlying_price).
-
-        Always uses self.data_broker for ALL market data calls.
-        self.broker (execution broker) is NEVER used here -- stays gated by BOT_MODE.
-        """
+    def _fetch_tradier_chain(self, ticker: str, option_type: str) -> tuple[list[dict], Optional[float]]:
+        """Direct Tradier API call for option chain. Returns (chain, underlying_price)."""
         import requests
 
-        # Use data_broker for all market data -- live API if configured
-        # TradierConfig stores token as .access_token (not .token)
         cfg      = getattr(self.data_broker, "cfg", None)
-        base_url = (
-            getattr(cfg, "base_url", None)
-            or getattr(self.data_broker, "base_url", "https://sandbox.tradier.com")
-        )
-        token = (
-            getattr(cfg, "access_token", None)      # TradierConfig field name
-            or getattr(cfg, "token", None)           # fallback alias
-            or getattr(self.data_broker, "access_token", None)
-            or getattr(self.data_broker, "token", "")
-        ) or ""
+        base_url = (getattr(cfg, "base_url", None)
+                    or getattr(self.data_broker, "base_url", "https://sandbox.tradier.com"))
+        token = (getattr(cfg, "access_token", None)
+                 or getattr(cfg, "token", None)
+                 or getattr(self.data_broker, "access_token", None)
+                 or getattr(self.data_broker, "token", "")) or ""
         if not token:
             log.error("[%s] No Tradier token found on data_broker -- chain fetch will 401", ticker)
-        headers  = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+        headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
 
-        # 1. Fetch underlying quote for moneyness fallback when delta unavailable
+        # 1. Fetch underlying quote
         underlying_price = None
         try:
             q_resp = requests.get(
@@ -755,9 +567,7 @@ class APContractSelectionEngine:
             if q_resp.status_code == 200:
                 quotes = q_resp.json().get("quotes", {}).get("quote", {})
                 if isinstance(quotes, dict):
-                    underlying_price = (
-                        float(quotes.get("last") or quotes.get("bid") or 0) or None
-                    )
+                    underlying_price = float(quotes.get("last") or quotes.get("bid") or 0) or None
         except Exception:
             pass
 
@@ -790,21 +600,20 @@ class APContractSelectionEngine:
 
         options = chain_resp.json().get("options", {}).get("option", []) or []
 
-        # 5. Inject underlying price for moneyness fallback in quality filter
+        # 5. Inject underlying price AND ticker into every option dict
+        # CRITICAL: both injections must be INSIDE the for loop so every
+        # option gets them — not just the last one
         if underlying_price:
             for o in options:
                 o["_underlying_price"] = underlying_price
-                o["_ticker"] = ticker
+                o["_ticker"] = ticker          # ← INSIDE loop (was outside = bug)
 
-        filtered = [o for o in options
-                    if o.get("option_type", "").lower() == option_type]
-
+        filtered = [o for o in options if o.get("option_type", "").lower() == option_type]
         return filtered, underlying_price
 
     def _pick_expiration(self, dates: list[str]) -> Optional[str]:
-        """Choose target expiration from available dates."""
-        today    = date.today()
-        valid    = []
+        today = date.today()
+        valid = []
 
         for d_str in dates:
             try:
@@ -816,7 +625,6 @@ class APContractSelectionEngine:
                 continue
 
         if not valid:
-            # Relax DTE if nothing fits -- take nearest after min_dte
             for d_str in dates:
                 try:
                     d = date.fromisoformat(d_str)
@@ -831,10 +639,8 @@ class APContractSelectionEngine:
             return None
 
         valid.sort()
-        # Prefer weekly (Fridays) if enabled
         if self.prefer_weekly:
-            fridays = [(dte, d) for dte, d in valid
-                       if date.fromisoformat(d).weekday() == 4]
+            fridays = [(dte, d) for dte, d in valid if date.fromisoformat(d).weekday() == 4]
             if fridays:
                 return fridays[0][1]
 
@@ -844,46 +650,28 @@ class APContractSelectionEngine:
     # PRIVATE -- QUALITY FILTER
     # =========================================================================
 
-
     def _synthetic_contract(self, ticker: str, direction: str, reason: str) -> "SelectedContract":
-        """Last-resort fallback for paper mode — guarantees a fill for data collection."""
         log.warning("[%s] SYNTHETIC CONTRACT -- %s", ticker, reason)
         return SelectedContract(
-            contract_symbol=f"{ticker}_SIM",
-            expiration="SIM",
-            strike=0,
-            option_type=direction.lower(),
-            bid=0.50,
-            ask=1.00,
-            mid=0.75,
-            spread_pct=0.20,
-            delta=0.50,
-            open_interest=1,
-            volume=1,
-            premium_per_share=0.75,
-            premium_per_contract=75.0,
-            affordable_contracts=1,
-            selection_reason=reason,
-            selection_score=0,
-            dte=0,
+            contract_symbol="f{ticker}_SIM", expiration="SIM", strike=0,
+            option_type=direction.lower(), bid=0.50, ask=1.00, mid=0.75,
+            spread_pct=0.20, delta=0.50, open_interest=1, volume=1,
+            premium_per_share=0.75, premium_per_contract=75.0,
+            affordable_contracts=1, selection_reason=reason,
+            selection_score=0, dte=0,
         )
 
     def _quality_filter(self, opt: dict, today: date) -> Optional[str]:
-        """
-        Returns None if contract passes, or a reason string if it fails.
-        """
         bid = float(opt.get("bid") or 0)
         ask = float(opt.get("ask") or 0)
         oi  = int(opt.get("open_interest") or 0)
         vol = int(opt.get("volume") or 0)
 
-        # Must have valid prices
         if bid <= 0 or ask <= 0:
             return "zero_bid_or_ask"
         if ask < bid:
             return "ask_below_bid"
 
-        # Spread check
         mid = (bid + ask) / 2
         if mid <= 0:
             return "zero_mid"
@@ -891,22 +679,20 @@ class APContractSelectionEngine:
         if spread_pct > self.max_spread_pct:
             return "spread_too_wide_%.1f%%" % (spread_pct * 100)
 
-        # OI / volume
         if oi < self.min_oi:
             return "low_oi_%d" % oi
         if vol < self.min_volume:
             return "low_volume_%d" % vol
 
-        # Premium range
         premium = mid * 100
         if premium < self.min_premium:
             return "premium_too_low_$%.0f" % premium
+        # Per-ticker premium cap (uses _ticker injected in _fetch_tradier_chain)
         _opt_ticker = opt.get("_ticker", "")
         _ticker_max = _get_max_premium(_opt_ticker) if _opt_ticker else self.max_premium
         if premium > _ticker_max:
             return "premium_too_high_$%.0f_max_$%.0f" % (premium, _ticker_max)
 
-        # DTE
         exp_str = opt.get("expiration_date", "")
         if exp_str:
             try:
@@ -919,9 +705,8 @@ class APContractSelectionEngine:
             except Exception:
                 return "invalid_expiration"
 
-        # Delta check -- if greeks available use delta band; else use moneyness proxy
         greeks = opt.get("greeks") or {}
-        delta = greeks.get("delta")
+        delta  = greeks.get("delta")
         if delta is not None:
             try:
                 delta = abs(float(delta))
@@ -932,42 +717,26 @@ class APContractSelectionEngine:
             except Exception:
                 pass
         else:
-            # Moneyness proxy when delta unavailable (injected via _underlying_price)
             underlying_price = opt.get("_underlying_price")
             strike = float(opt.get("strike") or 0)
             if underlying_price and strike:
-                moneyness = strike / float(underlying_price)
+                moneyness   = strike / float(underlying_price)
                 option_type = opt.get("option_type", "").lower()
-                # CALLs: slightly OTM to slightly ITM (0.93x-1.12x spot)
-                # PUTs:  slightly OTM to slightly ITM (0.88x-1.07x spot)
                 if option_type == "call" and not (0.93 <= moneyness <= 1.12):
                     return "moneyness_out_of_range_%.3f" % moneyness
                 if option_type == "put" and not (0.88 <= moneyness <= 1.07):
                     return "moneyness_out_of_range_%.3f" % moneyness
 
-        return None  # passed
+        return None
 
     # =========================================================================
     # PRIVATE -- RANKING
     # =========================================================================
 
     def _rank_score(self, opt: dict, budget: float,
-                     expected_move_pct: float = 0.0,
-                     underlying_price: float = 0.0,
-                     tier: str = "B") -> float:
-        """
-        Ranking score -- higher is better.
-
-        Priority order (probability-first):
-          1. Delta proximity -- ATM (0.50) = fastest reaction, highest hit rate
-          2. Spread tightness -- clean fills, less slippage on entry/exit
-          3. Liquidity (OI + volume, log scale) -- real market, avoids dead contracts
-          4. Premium size -- still respected, no longer dominant
-          5. Expected move context (tiny otm_bias)
-
-        The goal is the BEST PROBABILITY CONTRACT, then affordable.
-        PT1/PT2 are exits, not strikes.
-        """
+                    expected_move_pct: float = 0.0,
+                    underlying_price: float = 0.0,
+                    tier: str = "B") -> float:
         bid = float(opt.get("bid") or 0)
         ask = float(opt.get("ask") or 0)
         oi  = int(opt.get("open_interest") or 0)
@@ -977,7 +746,7 @@ class APContractSelectionEngine:
             return -9999.0
 
         spread_pct = (ask - bid) / mid
-        premium    = mid * 100  # cost per contract
+        premium    = mid * 100
 
         greeks = opt.get("greeks") or {}
         try:
@@ -985,42 +754,24 @@ class APContractSelectionEngine:
         except Exception:
             delta = self.target_delta
 
-        # ── 1. Premium penalty (dominant weight) ──────────────────────────
-        # Ideal premium: $3.50/share ($350/contract). Hard cap $5.00 ($500).
-        # Penalize contracts above ideal heavily; reward contracts below it.
         MAX_IDEAL_PREMIUM = float(os.getenv("MAX_IDEAL_PREMIUM", "3.50"))
-        MAX_HARD_PREMIUM  = float(os.getenv("MAX_HARD_PREMIUM",  "4.00"))
-        # No hard kill -- expensive contracts get a heavy penalty and rank last.
-        # The quality filter (max_premium) handles the true ceiling.
-        # Killing here meant "no contracts passed" even when expensive was the only option.
-        premium_penalty = max(0.0, mid - MAX_IDEAL_PREMIUM)  # 0 if at/below ideal
+        premium_penalty   = max(0.0, mid - MAX_IDEAL_PREMIUM)
 
-        # Affordable? 0 if not (gate fires in select())
         effective_budget = min(budget, float(os.getenv("MAX_TRADE_USD", "500")))
         affordable = int(effective_budget / premium) if premium > 0 else 0
-        # Don't hard-kill here -- let select() handle affordability gate.
-        # Returning -9999 here caused valid contracts to be invisible to the ranker.
 
-        # ── 2. Delta proximity (ATM bias) ────────────────────────────────
         delta_distance = abs(delta - self.target_delta)
 
-        # -- 3. Expected move OTM bias (tiny weight) ──────────────────────
-        # Wick targets tell us HOW FAR price may go, NOT where to strike.
-        # ATM (delta 0.50) always wins. This is a tiny 8-point adjustment.
         otm_bias = 0.0
         if underlying_price > 0:
             strike = float(opt.get("strike") or 0)
             if strike <= underlying_price:
-                otm_bias = 0.2   # ATM or ITM: small bonus
+                otm_bias = 0.2
             elif expected_move_pct >= 1.5:
                 otm_dist = (strike - underlying_price) / underlying_price * 100
                 if otm_dist <= 0.5:
-                    otm_bias = 0.1   # large expected move + barely OTM: tiny bonus
+                    otm_bias = 0.1
 
-        # ── Tier-based weight adjustment ─────────────────────────────────
-        # A+/A: best signal quality -- prioritize best contract, relax cost
-        # B:    default balanced weights
-        # C:    weaker signal -- tighter cost control, still want ATM
         if tier in ("A+", "A"):
             delta_weight   = -140
             spread_weight  =  -90
@@ -1029,34 +780,29 @@ class APContractSelectionEngine:
             delta_weight   = -130
             spread_weight  =  -80
             premium_weight =  -35
-        else:  # C or unknown
+        else:
             delta_weight   = -120
             spread_weight  =  -70
             premium_weight =  -50
 
-        score = (
-            (delta_distance    * delta_weight)   +   # 1st: probability -- ATM
-            (spread_pct        * spread_weight)  +   # 2nd: execution quality
-            (math.log(oi + 1)  *   12)           +   # 3rd: liquidity
-            (math.log(vol + 1) *    6)           +   # 4th: volume
-            (premium_penalty   * premium_weight) +   # 5th: cost (tier-scaled)
-            (otm_bias          *    6)               # tiny: expected move context
+        return (
+            (delta_distance  * delta_weight)   +
+            (spread_pct      * spread_weight)  +
+            (math.log(oi+1)  * 12)             +
+            (math.log(vol+1) *  6)             +
+            (premium_penalty * premium_weight) +
+            (otm_bias        *  6)
         )
-        return score
 
     # =========================================================================
     # PRIVATE -- BUILD SelectedContract
     # =========================================================================
 
-    def _build_selected(
-        self, opt: dict, score: float, budget: float, today: date
-    ) -> Optional[SelectedContract]:
-
+    def _build_selected(self, opt: dict, score: float, budget: float, today: date) -> Optional[SelectedContract]:
         try:
             bid = float(opt.get("bid") or 0)
             ask = float(opt.get("ask") or 0)
             mid = (bid + ask) / 2
-
             spread_pct = (ask - bid) / mid if mid > 0 else 0
 
             greeks = opt.get("greeks") or {}
@@ -1076,13 +822,9 @@ class APContractSelectionEngine:
 
             premium_per_share    = mid
             premium_per_contract = mid * 100
-            # Hard cap: max $500 per trade regardless of budget passed in.
-            # Budget caps contracts from above; hard cap prevents runaway qty.
-            # Kelly/tier sizer sets budget -- this is the final safety net.
-            MAX_TRADE_USD = float(os.getenv("MAX_TRADE_USD", "500"))
-            effective_budget = min(budget, MAX_TRADE_USD)
-            # 0 = unaffordable -- select() will block the trade
-            affordable = int(effective_budget / premium_per_contract) if premium_per_contract > 0 else 0
+            MAX_TRADE_USD        = float(os.getenv("MAX_TRADE_USD", "500"))
+            effective_budget     = min(budget, MAX_TRADE_USD)
+            affordable           = int(effective_budget / premium_per_contract) if premium_per_contract > 0 else 0
 
             return SelectedContract(
                 contract_symbol      = opt.get("symbol", ""),
@@ -1101,11 +843,10 @@ class APContractSelectionEngine:
                 affordable_contracts = affordable,
                 selection_reason     = (
                     "delta=%.2f spread=%.1f%% OI=%d vol=%d DTE=%d premium=$%.0f" % (
-                        delta, spread_pct * 100, oi, vol, dte, premium_per_contract
-                    )
-                    if delta else
+                        delta, spread_pct*100, oi, vol, dte, premium_per_contract
+                    ) if delta else
                     "spread=%.1f%% OI=%d vol=%d DTE=%d premium=$%.0f" % (
-                        spread_pct * 100, oi, vol, dte, premium_per_contract
+                        spread_pct*100, oi, vol, dte, premium_per_contract
                     )
                 ),
                 selection_score      = score,
