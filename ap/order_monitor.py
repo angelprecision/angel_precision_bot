@@ -231,7 +231,7 @@ class APOrderMonitor:
             if status in ("EXIT_REQUESTED", "EXIT_SUBMITTED"):
                 if age_secs > TIMEOUT_EXIT_PENDING:
                     broker_status = self._query_broker_order(broker_oid)
-                    if self._is_executed_status(broker_status):
+                    if self._is_executed_status(broker_status) or self._is_terminal_failure_status(broker_status):
                         self._advance_from_broker_status(local_id, broker_status, contract)
                     else:
                         self._handle_stale_exit(
@@ -294,6 +294,22 @@ class APOrderMonitor:
 
         if "cancel" in action:
             broker_oid = self._get_broker_order_id(local_order_id)
+
+            # CREATED means it never reached broker — no broker confirmation needed.
+            # Requiring broker cancel would leave dead local rows stuck forever.
+            if status == "CREATED" and not broker_oid:
+                ok = self.osm.transition(local_order_id, "CANCELED", last_error=reason)
+                if ok:
+                    log.info(
+                        f"[{self.client_id}] Entry order CANCELED locally | "
+                        f"{contract} | {local_order_id} | CREATED/no broker_id"
+                    )
+                else:
+                    log.error(
+                        f"[{self.client_id}] Failed local cancel for CREATED entry: {local_order_id}"
+                    )
+                return
+
             cancel_result = None
             try:
                 cancel_result = self._cancel_broker_order(broker_oid)
@@ -495,6 +511,14 @@ class APOrderMonitor:
     def _is_terminal_cancel_status(self, raw_status) -> bool:
         """True only when broker confirms terminal cancel/expire — not mere request accepted."""
         return self._normalize_broker_status(raw_status) in {"canceled", "expired"}
+
+    def _is_terminal_failure_status(self, raw_status) -> bool:
+        """True when broker confirms order is terminal but not filled."""
+        return self._normalize_broker_status(raw_status) in {
+            "canceled",
+            "expired",
+            "rejected",
+        }
 
     def _is_filled_status(self, raw_status) -> bool:
         """True only for a confirmed full fill."""
