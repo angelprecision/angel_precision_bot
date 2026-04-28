@@ -2,7 +2,7 @@
 # =============================================================================
 # Architecture:
 #   enqueue_signal() → trade_queue table
-#   worker_loop()    → claim job → master_control.evaluate() → 
+#   worker_loop()    → claim job → master_control.evaluate() →
 #                      contract_selector.select() → order_state_machine.create_entry_order()
 #                      → APEntryWatcher (breach) OR immediate execution
 #
@@ -20,6 +20,11 @@
 #   ✅ _claim_one_job()        -- atomic claim + stale reclaim
 #   ✅ _mark_job()             -- terminal status
 #   ✅ worker_loop()           -- poll + dispatch
+#
+# Upgrades in this version:
+#   ✅ restart_guard           -- blocks overnight signals on mid-session restart
+#   ✅ 1-1 pair manager        -- cancels opposite side on fill
+#   ✅ rejection feed          -- every rejection posted to Discord
 # =============================================================================
 
 from __future__ import annotations
@@ -32,8 +37,6 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-# Deferred imports to avoid circular: app.py loads ap.db then ap.queue,
-# but ap.queue importing ap.db at module level crashes while ap.db is mid-load.
 from ap.state import update_state
 
 def _conn():
@@ -49,18 +52,30 @@ def _init_db():
     return init_db
 
 from ap.utils import now_utc_iso
+from zoneinfo import ZoneInfo
+from datetime import datetime, timezone, time as dtime
 
 log = logging.getLogger("ap.queue")
 
+ET = ZoneInfo("America/New_York")
+
+def _now_et() -> datetime:
+    """Current datetime in US/Eastern."""
+    return datetime.now(ET)
+
+def _is_regular_session_et(dt=None) -> bool:
+    """True if dt (or now) is within regular market hours Mon-Fri 9:30-16:00 ET."""
+    dt = dt or _now_et()
+    return dt.weekday() < 5 and dtime(9, 30) <= dt.time() < dtime(16, 0)
+
 POLL_INTERVAL         = float(os.getenv("QUEUE_POLL_INTERVAL", "1.0"))
-PROCESSING_STALE_SECS = int(os.getenv("PROCESSING_STALE_SECS", "120"))  # 2 min -- was 15min
+PROCESSING_STALE_SECS = int(os.getenv("PROCESSING_STALE_SECS", "120"))
 
 
 # =============================================================================
 # HELPERS
 # =============================================================================
 
-# MED-011: removed duplicate _now_iso(), using now_utc_iso from ap.utils
 def _now_iso() -> str:
     return now_utc_iso()
 
@@ -100,19 +115,16 @@ def enqueue_signal(
     else:
         raise TypeError(f"Unsupported signal type: {type(sig)}")
 
-    # Normalize ticker/symbol -- both fields must be present
     if not payload.get("ticker") and payload.get("symbol"):
         payload["ticker"] = payload["symbol"]
     if not payload.get("symbol") and payload.get("ticker"):
         payload["symbol"] = payload["ticker"]
-    # Normalize score -- scanner may not send it; default to 65.0 (Tier B floor)
+
     if payload.get("score") is None:
         payload["score"] = 65.0
     if payload.get("ev_score") is None:
         payload["ev_score"] = payload["score"]
 
-    # Normalize side/direction -- scanner embeds direction in signal_id
-    # e.g. "2026-04-15:1-1:DLTR:Daily:PUT" -> side=PUT
     if not payload.get("side") and not payload.get("direction"):
         sig_id = str(payload.get("signal_id", "")).upper()
         if sig_id.endswith(":PUT") or ":PUT:" in sig_id:
@@ -125,6 +137,7 @@ def enqueue_signal(
         payload["direction"] = payload["side"]
     elif not payload.get("side"):
         payload["side"] = payload["direction"]
+
     signal_id = payload.get("signal_id") or f"signal_{_now_iso()}"
     if not idempotency_key:
         idempotency_key = f"{client_id}:{signal_id}"
@@ -189,16 +202,11 @@ def _mark_job(
 def _claim_one_job(client_id: str = "default") -> Optional[dict]:
     """
     Atomically claim one NEW job for this specific client_id.
-
-    Uses a single CTE with FOR UPDATE SKIP LOCKED -- eliminates the 3-query
-    SELECT / UPDATE / re-read race condition. Only one worker can ever claim
-    a given row because SKIP LOCKED skips rows held by another transaction.
-
+    Uses a single CTE with FOR UPDATE SKIP LOCKED — no race conditions.
     Also reclaims stale PROCESSING jobs in the same transaction.
     """
     def _atomic_claim():
         with _conn()() as c:
-            # Step 1: reclaim stale PROCESSING rows for this client
             c.execute(
                 f"""
                 UPDATE trade_queue
@@ -212,9 +220,6 @@ def _claim_one_job(client_id: str = "default") -> Optional[dict]:
                 """,
                 (client_id,),
             )
-
-            # Step 2: atomic claim via CTE -- FOR UPDATE SKIP LOCKED guarantees
-            # no two workers ever claim the same row, even across gunicorn workers.
             c.execute(
                 """
                 WITH next_job AS (
@@ -260,13 +265,39 @@ def _dispatch(
 ):
     """
     Unified control path:
-      1. master_control.evaluate()      → gate with placeholder estimate → ApprovedExecutionPlan
+      0. restart_guard          → block overnight signals if bot restarted mid-session
+      1. master_control.evaluate()      → gate with placeholder estimate
       2. contract_selector.select()     → real premium, updates plan in-place
       3. master_control.revalidate()    → re-check capital/sector/ticker with REAL premium
       4. order_state_machine.create_entry_order()
       5. breach → entry_watcher  |  immediate → SUBMITTED transition
     """
     ticker = payload.get("ticker") or payload.get("symbol", "?")
+
+    # ── 0. RESTART GUARD ─────────────────────────────────────────────────────
+    # Blocks overnight (previous-day) signals during market hours.
+    # Prevents 47-signal mass re-fire when bot restarts mid-session.
+    # Pre-market restarts are allowed through for morning revalidation.
+    try:
+        from ap.restart_guard import should_skip_on_restart
+        if should_skip_on_restart(payload):
+            log.warning("[%s] RESTART GUARD — overnight signal blocked", ticker)
+            _mark_job(job_id, "REJECTED", error="restart_guard:overnight_skip")
+            try:
+                from ap.rejection_feed import post_master_control_block
+                post_master_control_block(
+                    ticker=ticker,
+                    side=payload.get("side", ""),
+                    stage="restart_guard",
+                    reason="restart_guard:overnight_skip",
+                    score=float(payload.get("score") or 0),
+                    pattern=payload.get("pattern_id") or payload.get("pattern", ""),
+                )
+            except Exception:
+                pass
+            return
+    except ImportError:
+        pass  # restart_guard not yet deployed — skip silently
 
     # ── 1. MASTER CONTROL (initial gate, placeholder estimate) ────────────────
     try:
@@ -282,17 +313,27 @@ def _dispatch(
                    reason=decision.reason, score=float(payload.get("score") or 0))
         _mark_job(job_id, "REJECTED",
                   result={"stage": decision.stage, "reason": decision.reason})
-        # Write to ap_signals as 'watching' ONLY for post-market blocks caused by
-        # daily_stop or after_hours — these are deferred to next session.
-        # MC blocks (duplicate, sector cap, pending_entry) must NOT become watching
-        # rows — they are permanent rejections, not deferred entries.
+
+        # Post rejection to Discord
+        try:
+            from ap.rejection_feed import post_master_control_block
+            post_master_control_block(
+                ticker=ticker,
+                side=payload.get("side", ""),
+                stage=decision.stage,
+                reason=decision.reason,
+                score=float(payload.get("score") or 0),
+                pattern=payload.get("pattern_id") or payload.get("pattern", ""),
+            )
+        except Exception:
+            pass
+
+        # Write to ap_signals as watching for deferrable post-market blocks only
         _block_reason = str(decision.reason or "")
         _is_deferrable = any(k in _block_reason for k in ("daily_stop", "sizer_blocked", "after_hours"))
         try:
-            from zoneinfo import ZoneInfo as _ZI
-            from datetime import datetime as _dt, time as _t
-            _now_et = _dt.now(_ZI("America/New_York"))
-            _in_session = _t(9, 30) <= _now_et.time() <= _t(16, 0)
+            _now_et_def = _now_et()
+            _in_session = _is_regular_session_et(_now_et_def)
             if not _in_session and _is_deferrable:
                 import uuid as _uuid
                 import os as _os
@@ -326,15 +367,26 @@ def _dispatch(
 
     plan = decision.plan
 
+    # ── 1-1 PAIR MANAGER — register signal so opposite side cancels on fill ──
+    try:
+        from ap.signal_pair_manager import get_pair_manager
+        _pm = get_pair_manager()
+        _pair_key = _pm.register(
+            ticker=ticker,
+            side=payload.get("side", ""),
+            local_order_id=signal_id,
+            pattern_id=payload.get("pattern_id") or payload.get("pattern", ""),
+        )
+        if _pair_key:
+            log.info("[%s] Registered as 1-1 pair: %s", ticker, _pair_key)
+    except Exception:
+        pass
+
     # ── 2. CONTRACT SELECTION -- skip outside market hours ──────────────────────
-    # Outside 9:30-4:00 ET, options spreads are blown out (post-market quotes).
-    # Contract selection runs at breach time instead (live quotes, tight spreads).
     _skip_contract_selection = False
     try:
-        from zoneinfo import ZoneInfo as _ZI2
-        from datetime import datetime as _dt2, time as _t2
-        _now_et2 = _dt2.now(_ZI2("America/New_York"))
-        _in_mkt = _t2(9, 30) <= _now_et2.time() <= _t2(16, 0)
+        _now_et2 = _now_et()
+        _in_mkt  = _is_regular_session_et(_now_et2)
         if not _in_mkt and contract_selector:
             _skip_contract_selection = True
             log.info(
@@ -348,7 +400,6 @@ def _dispatch(
         try:
             selected = contract_selector.select(plan)
             if selected is None:
-                # Fail loudly -- no silent fallback, no improvised contract
                 log.warning(f"[{ticker}] Contract selection failed -- no suitable contract")
                 trace_gate(str(payload.get("signal_id","")), ticker, "QUALITY_FILTER", "REJECT",
                            reason="no_eligible_contracts", score=float(payload.get("score") or 0))
@@ -356,9 +407,19 @@ def _dispatch(
                           result={"stage": "contract_selection",
                                   "reason": "no_contract_found",
                                   "ticker": ticker})
+                try:
+                    from ap.rejection_feed import post_no_contracts
+                    post_no_contracts(
+                        ticker=ticker,
+                        side=payload.get("side", ""),
+                        chain_size=0,
+                        top_rejections={},
+                        score=float(payload.get("score") or 0),
+                        pattern=payload.get("pattern_id") or payload.get("pattern", ""),
+                    )
+                except Exception:
+                    pass
                 return
-            # plan.contract_symbol, plan.limit_price, plan.contracts,
-            # plan.max_position_usd now reflect REAL premium (set by selector)
             log.info(
                 f"[{ticker}] Contract selected: {selected.contract_symbol} "
                 f"@ ${selected.mid:.2f} x{plan.contracts} "
@@ -372,8 +433,6 @@ def _dispatch(
         log.debug(f"[{ticker}] No contract selector -- plan uses placeholder sizing")
 
     # ── 3. RE-VALIDATE with REAL premium ──────────────────────────────────────
-    # Now that plan.max_position_usd is the actual cost, re-check capital/sector/ticker caps.
-    # This replaces the placeholder-based gate from step 1.
     revalidation = master_control.revalidate_exposure(plan, client_id=client_id)
     if not revalidation.ok:
         log.warning(
@@ -398,14 +457,16 @@ def _dispatch(
         return
 
     # ── 5. ROUTE -- BREACH vs IMMEDIATE ────────────────────────────────────────
-    # ── OVERNIGHT SIGNAL ENFORCEMENT ─────────────────────────────────────────
-    # Signals from previous date must go breach-only — never immediate execution.
-    _signal_date = (payload.get("created_at") or payload.get("timestamp_iso") or "")[:10]
-    _today_str   = __import__("datetime").date.today().isoformat()
+    # Overnight signals always go breach-only — never immediate execution.
+    # Use ET date to avoid UTC/ET day-boundary misclassification.
+    _signal_date  = (payload.get("created_at") or payload.get("timestamp_iso") or "")[:10]
+    _today_str    = _now_et().date().isoformat()
+    forced_breach = False
+
     if _signal_date and _signal_date < _today_str:
+        forced_breach = True
         log.warning("[%s] Overnight signal (created %s) — forcing breach-only path",
                     ticker, _signal_date)
-        trigger_type = "breach"
         try:
             plan.trigger_type = "breach"
         except Exception:
@@ -415,41 +476,49 @@ def _dispatch(
             _mark_job(job_id, "REJECTED", error="overnight_signal_no_watcher")
             return
 
-    trigger_type = getattr(plan, "trigger_type", "immediate")
+    # forced_breach is sticky — getattr cannot override it
+    trigger_type = "breach" if forced_breach else getattr(plan, "trigger_type", "immediate")
 
-    # Block new intraday entries after 3:15 PM ET ONLY during market hours.
-    # Post-market signals (after 4 PM ET) should be held as WATCHING for next session,
-    # not rejected. Market hours = 9:30 AM - 4:00 PM ET.
-    from datetime import datetime
-    from zoneinfo import ZoneInfo
-    _now_et   = datetime.now(ZoneInfo("America/New_York"))
-    _in_session = (_now_et.hour > 9 or (_now_et.hour == 9 and _now_et.minute >= 30)) \
-                  and _now_et.hour < 16
-    _too_late = _in_session and (
-        _now_et.hour > 15 or (_now_et.hour == 15 and _now_et.minute >= 15)
+    # Block entries after 3:15 PM ET during market hours (weekdays only)
+    _now_et_cut  = _now_et()
+    _in_session  = _is_regular_session_et(_now_et_cut)
+    _too_late    = _in_session and (
+        _now_et_cut.hour > 15 or (_now_et_cut.hour == 15 and _now_et_cut.minute >= 15)
     )
     if _too_late and trigger_type == "breach":
         log.warning(
-            "[%s] ENTRY BLOCKED — too late in session (%02d:%02d ET, cutoff 15:15) | "
-            "signal held as WATCHING for next session",
-            ticker, _now_et.hour, _now_et.minute,
+            "[%s] ENTRY BLOCKED — too late in session (%02d:%02d ET, cutoff 15:15)",
+            ticker, _now_et_cut.hour, _now_et_cut.minute,
         )
         _mark_job(job_id, "REJECTED", error="entry_cutoff: too_late_in_session")
         return
 
     if trigger_type == "breach" and entry_watcher:
         try:
+            # Register with watcher — no broker submit yet
             entry_watcher.watch(plan=plan, local_order_id=local_order_id)
             log.info(
                 f"[{ticker}] Handed to entry watcher | "
                 f"trigger=${getattr(plan, 'trigger_price', '?')}"
             )
-            # Transition order to SUBMITTED so order_monitor doesn't stale-cancel it.
-            # The order is legitimately alive — it's waiting for breach confirmation.
-            order_state_machine.transition(
-                local_order_id, "SUBMITTED",
-                submitted_ts=now_utc_iso(),
-            )
+
+            # Transition to PENDING_TRIGGER — truthfully reflects
+            # "watching for breach" not "order at broker".
+            # SUBMITTED is only set by entry_watcher when broker.place_order() succeeds.
+            try:
+                order_state_machine.transition(
+                    local_order_id, "PENDING_TRIGGER",
+                    submitted_ts=None,
+                )
+            except Exception as _st:
+                # PENDING_TRIGGER may not exist in older OSM schemas —
+                # fall back to leaving order at CREATED (still truthful)
+                log.warning(
+                    "[%s] PENDING_TRIGGER transition failed — order stays CREATED: %s",
+                    ticker, _st,
+                )
+
+            # Queue job = WATCHING (correct at queue level)
             _mark_job(job_id, "WATCHING",
                       result={"plan_id": plan.plan_id,
                               "local_order_id": local_order_id,
@@ -465,18 +534,12 @@ def _dispatch(
                                            submitted_ts=now_utc_iso())
             log.info(f"[{ticker}] Order submitted immediately: {local_order_id}")
 
-            # PAPER MODE: simulate immediate fill at limit price
-            # In paper mode there is no real broker to confirm the order --
-            # transition straight to FILLED so the position goes live.
             import os as _os
             _bot_mode = (_os.getenv("AP_MODE") or _os.getenv("BOT_MODE") or "PAPER").upper()
             if _bot_mode != "LIVE":
                 fill_price = getattr(plan, "limit_price", None)
                 if fill_price:
                     try:
-                        # ── Submit real order to Tradier sandbox ──────────────
-                        # This makes trades visible in the Tradier sandbox account
-                        # while keeping all local tracking/exit engine intact.
                         _submitted_to_broker = False
                         if broker is not None:
                             try:
@@ -493,15 +556,12 @@ def _dispatch(
                                     or getattr(_resp, "order_id", None)
                                     or ""
                                 )
-                                # Only use the ID if it's a real broker ID (not N/A or empty)
                                 _broker_order_id = str(_raw_broker_id) if _raw_broker_id and str(_raw_broker_id) not in ("", "N/A", "None") else ""
                                 log.info(
                                     f"[{ticker}] SANDBOX ORDER SUBMITTED | "
                                     f"broker_id={_broker_order_id or 'REJECTED'} "
                                     f"status={getattr(_resp, 'status', '?')}"
                                 )
-                                # Save broker_order_id directly — avoids state machine
-                                # transition rules blocking a SUBMITTED→SUBMITTED no-op
                                 if _broker_order_id:
                                     from ap.db import update_order as _upd_order
                                     _upd_order(local_order_id,
@@ -520,7 +580,7 @@ def _dispatch(
                             f"[{ticker}] PAPER FILL | {getattr(plan, 'contract_symbol', '?')} "
                             f"@ ${fill_price:.2f} x{getattr(plan, 'contracts', 1)}"
                         )
-                        # ── Open position so exit engine can monitor it ──────
+
                         _pos_id = None
                         if position_manager is not None:
                             try:
@@ -540,15 +600,12 @@ def _dispatch(
                                     stop_underlying=getattr(plan, "stop_price", None),
                                     target_underlying=getattr(plan, "target_underlying", None),
                                 )
-                                # Link position_id back to the order
                                 order_state_machine.transition(
                                     local_order_id, "FILLED",
                                     position_id=_pos_id,
                                 )
-                                log.info(
-                                    f"[{ticker}] POSITION CREATED | id={_pos_id}"
-                                )
-                                # ── Register with exit engine for stop/target/EOD monitoring ──
+                                log.info(f"[{ticker}] POSITION CREATED | id={_pos_id}")
+
                                 if exit_eng is not None:
                                     try:
                                         from ap_exit_engine import ManagedPosition
@@ -559,9 +616,6 @@ def _dispatch(
                                             quantity=getattr(plan, "contracts", 1),
                                             entry_price=fill_price,
                                             underlying_entry=getattr(plan, "trigger_price", 0.0) or 0.0,
-                                            # Use real levels when available.
-                                            # When absent: target=inf (CALL) or 0 (PUT) so TARGET HIT never
-                                            # fires on first poll. is_at_target guards 0 too, but inf is explicit.
                                             underlying_target=float(
                                                 getattr(plan, "target_underlying", None)
                                                 or (float("inf") if getattr(plan, "side", "CALL") == "CALL"
@@ -582,6 +636,7 @@ def _dispatch(
                                 log.warning(f"[{ticker}] open_position failed: {ope}")
                         else:
                             log.warning(f"[{ticker}] position_manager not injected -- position not tracked")
+
                         _mark_job(job_id, "COMPLETED",
                                   result={"plan_id": plan.plan_id,
                                           "local_order_id": local_order_id,
@@ -620,18 +675,13 @@ def worker_loop(
     position_manager=None,
     exit_eng=None,
     client_id: str = "default",
-    stop_event=None,           # threading.Event -- worker exits when set
-    live_mode: bool = False,   # if True, legacy fallback is DISABLED
+    stop_event=None,
+    live_mode: bool = False,
 ):
     """
     Main queue worker.
-
-    Pass master_control, contract_selector, order_state_machine, entry_watcher
-    from client_runner so the worker has the full control stack.
-
-    stop_event: threading.Event -- set by ClientRunner.stop() to cleanly exit.
+    stop_event: threading.Event — set by ClientRunner.stop() to cleanly exit.
     live_mode:  if True, legacy process_signal() fallback is disabled entirely.
-                Paper mode can fall back; live mode requires full control stack.
     """
     _init_db()()
     mode_label = "control" if master_control else ("LIVE-NO-FALLBACK" if live_mode else "legacy")
@@ -639,13 +689,18 @@ def worker_loop(
         f"🤖 Worker started | client={client_id} poll={poll_seconds}s path={mode_label}"
     )
 
+    # Log restart guard status on startup
+    try:
+        from ap.restart_guard import log_startup
+        log_startup()
+    except Exception:
+        pass
+
     while True:
-        # Clean shutdown check
         if stop_event and stop_event.is_set():
             log.info(f"[{client_id}] Worker stop_event set -- exiting cleanly")
             return
 
-        # Heartbeat -- advance bot_status AND self-healing stall detection
         try:
             update_state({"last_heartbeat_ts": now_utc_iso()}, client_id=client_id)
         except Exception:
@@ -678,7 +733,6 @@ def worker_loop(
                 _mark_job(job_id, "REJECTED", error=f"parse_error: {e}")
                 continue
 
-            # ── NEW CONTROL PATH ──────────────────────────────────────────────
             if master_control is not None:
                 _dispatch(
                     job_id, job_cid, signal_id, payload,
@@ -690,12 +744,7 @@ def worker_loop(
                     exit_eng=exit_eng,
                     broker=broker,
                 )
-
-            # ── LEGACY FALLBACK (paper mode only) ────────────────────────────
             else:
-                # ONE PATH ONLY — master_control is required in all modes.
-                # Legacy process_signal() fallback is permanently disabled.
-                # If master_control is missing, the runner failed to initialize.
                 log.error(
                     f"[{client_id}] master_control not available — "
                     f"rejecting {signal_id}. Check runner startup logs."
