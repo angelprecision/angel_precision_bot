@@ -794,7 +794,7 @@ class APContractSelectionEngine:
         if underlying_price:
             for o in options:
                 o["_underlying_price"] = underlying_price
-            o["_ticker"] = ticker
+                o["_ticker"] = ticker
 
         filtered = [o for o in options
                     if o.get("option_type", "").lower() == option_type]
