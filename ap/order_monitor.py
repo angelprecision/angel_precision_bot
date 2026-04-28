@@ -695,7 +695,7 @@ class APOrderMonitor:
                     """
                     SELECT local_order_id, broker_order_id, status, symbol,
                            contract, position_id, created_ts, submitted_ts,
-                           limit_price, 
+                           limit_price
                     FROM orders
                     WHERE client_id=%s
                       AND kind='ENTRY'
