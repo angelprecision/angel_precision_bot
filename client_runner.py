@@ -135,7 +135,7 @@ class ClientRunner(threading.Thread):
             self.mode = "LIVE"
         else:
             self.mode = "PAPER"  # default safe
-        log.info("[%s] Client mode: %s (from tradier_base_url)", self.email, self.mode)
+        logger.info("[%s] Client mode: %s (from tradier_base_url)", self.email, self.mode)
 
         # LIVE assertions validate per-member credentials, not global env vars
         if self.mode == "LIVE":
