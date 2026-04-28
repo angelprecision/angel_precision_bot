@@ -198,6 +198,8 @@ class ExitDecision:
     reason:         str
     urgency:        str    # "NORMAL", "HIGH", "IMMEDIATE"
     pnl_pct:        float  = 0.0
+    suggested_limit: float = 0.0  # live bid at decision time — use as sell limit price
+                                  # 0.0 means caller should query fresh bid themselves
 
     @property
     def should_act(self) -> bool:
@@ -266,7 +268,19 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
     # Once we've done a scale-out, trail the remaining contracts tightly.
     # Exit the runner if it drops more than 15pts from where we scaled.
     if pos.scale_outs_done >= 1 and pos.peak_pnl_pct > 0:
-        _runner_trail = 0.20 if pos.peak_pnl_pct >= 0.60 else 0.15  # wider trail on big runners
+        # Tiered trail — tighter as peak gets bigger, protect more of the gain
+        # Peak >80%: 10pt trail (e.g. 86% peak → close at 76%)
+        # Peak >60%: 13pt trail (e.g. 70% peak → close at 57%)
+        # Peak >40%: 15pt trail
+        # Below 40%: 20pt trail (more room at lower peaks)
+        if pos.peak_pnl_pct >= 0.80:
+            _runner_trail = 0.10
+        elif pos.peak_pnl_pct >= 0.60:
+            _runner_trail = 0.13
+        elif pos.peak_pnl_pct >= 0.40:
+            _runner_trail = 0.15
+        else:
+            _runner_trail = 0.20
         runner_drop   = pos.peak_pnl_pct - option_pnl
         if runner_drop >= _runner_trail or option_pnl <= 0:
             # 🏆 Discord alert when runner closes with meaningful gain — your sales machine
@@ -918,7 +932,24 @@ class APExitEngine:
 
                 # Gate: don't re-fire while an exit is in-flight
                 now_utc = datetime.now(timezone.utc)
-                if not self._eligible_for_new_exit(pos, now_utc):
+                # Runner trail bypass: if scale-out done and runner is giving
+                # back massive gains, close regardless of exit_in_flight.
+                # This prevents a pending scale-out fill from blocking the
+                # runner trail while price collapses (NFLX 86%→35% case).
+                _force_runner_check = False
+                if pos.scale_outs_done >= 1 and pos.peak_pnl_pct >= 0.40:
+                    _runner_drop_now = pos.peak_pnl_pct - option_pnl
+                    _emergency_trail = 0.15  # tighter emergency trail
+                    if _runner_drop_now >= _emergency_trail:
+                        _force_runner_check = True
+                        log.warning(
+                            "[%s] RUNNER EMERGENCY — peak=%.0f%% now=%.0f%% "
+                            "drop=%.0f%% > %.0f%% — bypassing exit_in_flight",
+                            pos.ticker, pos.peak_pnl_pct*100, option_pnl*100,
+                            _runner_drop_now*100, _emergency_trail*100,
+                        )
+
+                if not _force_runner_check and not self._eligible_for_new_exit(pos, now_utc):
                     continue
 
                 # Evaluate exit
@@ -962,6 +993,14 @@ class APExitEngine:
 
         # Execute actions
         for pos, decision in actions_to_take:
+            # ── INJECT LIVE BID AS SUGGESTED LIMIT ───────────────────────────
+            # Use live bid (not stale mid) so execution_core submits tight limit.
+            # META sold at $3.75 limit when bid was $4.15 — that's a $0.40 miss.
+            # Using bid at decision time fixes this.
+            if decision.suggested_limit == 0.0 and pos.current_bid > 0:
+                decision.suggested_limit = round(pos.current_bid * 0.99, 2)
+                # 1% below bid = aggressive but fills immediately
+                # Prevents hanging sell orders if bid moves slightly
             # ── STRUCTURED EXIT LOG ───────────────────────────────────────────
             # Every exit decision logged with full context for analysis.
             # Query later: filter reason for NEVER GREEN STOP, HARD STOP, etc.
@@ -1031,19 +1070,24 @@ class APExitEngine:
                         pos.pending_exit_qty    = decision.quantity
                         pos.last_exit_signal_ts = datetime.now(timezone.utc)
                         pos.scale_outs_done    += 1  # track so runner logic kicks in
-                        pos.quantity_remaining  = max(0, pos.quantity_remaining - decision.quantity)
+                        # NOTE: quantity_remaining is NOT decremented here.
+                        # It is decremented in note_partial_exit_fill() on actual broker fill.
+                        # pending_exit_qty tracks what is in-flight so evaluate_exit
+                        # does not double-exit the same contracts.
+                        # This prevents the scale-out state corruption where the engine
+                        # thinks contracts were sold before broker confirms the fill.
                         # Persist scale_outs_done to DB so restarts know runner is active
                         try:
                             from ap.db import conn, run_with_retry as _rwr_s
                             _sd = pos.scale_outs_done
-                            _qr = pos.quantity_remaining
+                            # qty NOT saved here — will be saved after broker fill confirmation
                             _pi = pos.position_id
                             if _pi:
                                 def _save_scale():
                                     with conn() as _c:
                                         _c.execute(
-                                            "UPDATE positions SET scale_outs_done=%s, qty=%s WHERE id=%s",
-                                            (_sd, _qr, _pi)
+                                            "UPDATE positions SET scale_outs_done=%s WHERE id=%s",
+                                            (_sd, _pi)
                                         )
                                 _rwr_s(_save_scale)
                         except Exception as _se:
@@ -1147,3 +1191,5 @@ class APExitEngine:
         except Exception as e:
             log.error("Option quote fetch failed: %s", e, exc_info=True)
             return {}  # caller must handle empty dict as "no data available"
+            
+
