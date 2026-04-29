@@ -1,50 +1,3 @@
-# =============================================================================
-# WARNING: EXECUTION CORE IS NOW ORCHESTRATION-ONLY
-# =============================================================================
-# Production entry authority is:
-#   /signal → trade_queue → worker_loop → APMasterControl →
-#   APContractSelector → APOrderStateMachine → APEntryWatcher
-#
-# This module still owns runtime components:
-#   - APEntryWatcher
-#   - APExitEngine
-#   - APSignalTracker
-#   - callback wiring
-#
-# Legacy direct execution paths (receive_signal, ranking queue, direct order flow)
-# are DISABLED by default and must NOT be used in production.
-#
-# To explicitly enable legacy behavior (DEV ONLY):
-#   ENABLE_LEGACY_EXECUTION_CORE=1
-#
-# DO NOT enable this flag in production environments.
-# ============================================================================= ap_execution_core.py -- Angel Precision Execution Core
-# =============================================================================
-# Ties all execution modules together into one clean interface.
-# One instance per client (per ClientRunner thread).
-#
-# Signal flow:
-#   receive_signal()
-#     -> score gate (85 live / 75 paper)
-#     -> context hard block (context < 12/20 live / 8/20 paper -> reject)
-#     -> tier classify (A+/A/B)
-#     -> B tier -> shadow tracker (paper only)
-#     -> A/A+ -> RankingQueue (signals compete by score)
-#         -> every 5s: highest scores fill available slots first
-#         -> EntryWatcher parks signal -> waits for breach (2 polls)
-#         -> breach confirmed -> options intelligence gate
-#         -> order placed -> ExitEngine monitors position
-#         -> position closed -> FeedbackLoop records outcome
-#
-# PAPER MODE FIXES:
-#   Fix A: Fallback exec quality scores when no real chain data (paper only)
-#   Fix B: Score floor lowered to 75 in paper mode (85 live)
-#   Fix C: Context floor lowered to 8.0 in paper mode (12.0 live)
-#   Fix D: Skip context gate when score_breakdown missing OR real_time_ctx absent
-#           _apply_paper_exec_fallbacks injects spread/liquidity into score_breakdown,
-#           making it non-empty. Checking only bool(score_breakdown) would then trigger
-#           the context gate with ctx=0.0 and block every signal. The fix requires
-#           real_time_ctx to actually be present before gating on it.
 # ap_execution_core.py -- Angel Precision Execution Core
 # =============================================================================
 # Ties all execution modules together into one clean interface.
@@ -1033,11 +986,26 @@ class APExecutionCore:
                 f"[{ticker}] {'PAPER' if self.paper else 'LIVE'} -- "
                 f"submitting entry via OSM @ ${decision.mid_price:.2f} x{contracts}"
             )
-            submit_res = self.order_state_machine.submit_entry(
-                broker      = self.broker,
-                plan        = plan,
-                limit_price = decision.mid_price,
-            )
+            queue_local_order_id = str(sig.get("local_order_id") or "")
+            if queue_local_order_id and hasattr(self.order_state_machine, "submit_existing_entry"):
+                # Queue-created watcher order path.
+                # Money-safe rule: broker accepts first, then OSM transitions the
+                # EXISTING PENDING_TRIGGER order to SUBMITTED with broker_order_id.
+                submit_res = self.order_state_machine.submit_existing_entry(
+                    local_order_id = queue_local_order_id,
+                    broker         = self.broker,
+                    plan           = plan,
+                    limit_price    = decision.mid_price,
+                )
+            else:
+                # Legacy/dev path only. Creates a new entry order then submits it.
+                # submit_entry itself is money-safe: it transitions to SUBMITTED
+                # only after broker accepts and returns a broker_order_id.
+                submit_res = self.order_state_machine.submit_entry(
+                    broker      = self.broker,
+                    plan        = plan,
+                    limit_price = decision.mid_price,
+                )
 
             if submit_res["ok"]:
                 local_order_id  = submit_res["local_order_id"]
@@ -1593,15 +1561,3 @@ class APExecutionCore:
         except Exception as e:
             log.error(f"Order error: {e}")
             return None
-# SIGNAL INTELLIGENCE:
-#   Every signal is a first-class persistent object in ap_signals.
-#   Full lifecycle: received -> queued -> watching -> triggered -> executed -> closed
-#   Dropped signals record WHY: rejected / context_blocked / shadow /
-#   sector_cap / context_recheck_fail / requeued_after_trigger / legacy_routed
-#
-# FUNNEL COUNTER:
-#   All funnel.inc() calls wired: signals_received, rejected_score, passed_score,
-#   context_blocked, passed_context, shadow_tracked, sector_capped, queue_expired,
-#   watcher_sent, watcher_triggered, watcher_expired, watcher_invalidated,
-#   options_rejected, order_failed, trades_executed
-# =============================================================================
