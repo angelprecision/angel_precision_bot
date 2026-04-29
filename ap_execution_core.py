@@ -1,3 +1,50 @@
+# =============================================================================
+# WARNING: EXECUTION CORE IS NOW ORCHESTRATION-ONLY
+# =============================================================================
+# Production entry authority is:
+#   /signal → trade_queue → worker_loop → APMasterControl →
+#   APContractSelector → APOrderStateMachine → APEntryWatcher
+#
+# This module still owns runtime components:
+#   - APEntryWatcher
+#   - APExitEngine
+#   - APSignalTracker
+#   - callback wiring
+#
+# Legacy direct execution paths (receive_signal, ranking queue, direct order flow)
+# are DISABLED by default and must NOT be used in production.
+#
+# To explicitly enable legacy behavior (DEV ONLY):
+#   ENABLE_LEGACY_EXECUTION_CORE=1
+#
+# DO NOT enable this flag in production environments.
+# ============================================================================= ap_execution_core.py -- Angel Precision Execution Core
+# =============================================================================
+# Ties all execution modules together into one clean interface.
+# One instance per client (per ClientRunner thread).
+#
+# Signal flow:
+#   receive_signal()
+#     -> score gate (85 live / 75 paper)
+#     -> context hard block (context < 12/20 live / 8/20 paper -> reject)
+#     -> tier classify (A+/A/B)
+#     -> B tier -> shadow tracker (paper only)
+#     -> A/A+ -> RankingQueue (signals compete by score)
+#         -> every 5s: highest scores fill available slots first
+#         -> EntryWatcher parks signal -> waits for breach (2 polls)
+#         -> breach confirmed -> options intelligence gate
+#         -> order placed -> ExitEngine monitors position
+#         -> position closed -> FeedbackLoop records outcome
+#
+# PAPER MODE FIXES:
+#   Fix A: Fallback exec quality scores when no real chain data (paper only)
+#   Fix B: Score floor lowered to 75 in paper mode (85 live)
+#   Fix C: Context floor lowered to 8.0 in paper mode (12.0 live)
+#   Fix D: Skip context gate when score_breakdown missing OR real_time_ctx absent
+#           _apply_paper_exec_fallbacks injects spread/liquidity into score_breakdown,
+#           making it non-empty. Checking only bool(score_breakdown) would then trigger
+#           the context gate with ctx=0.0 and block every signal. The fix requires
+#           real_time_ctx to actually be present before gating on it.
 # ap_execution_core.py -- Angel Precision Execution Core
 # =============================================================================
 # Ties all execution modules together into one clean interface.
@@ -48,6 +95,7 @@ import logging
 import threading
 from datetime import datetime, timezone, date
 from typing import Optional
+from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 from ap_entry_watcher        import APEntryWatcher, WatchedSignal
@@ -71,6 +119,7 @@ ET  = ZoneInfo("America/New_York")
 
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
 BOT_MODE            = (os.getenv("AP_MODE") or os.getenv("BOT_MODE") or "PAPER").upper()
+ENABLE_LEGACY_EXECUTION_CORE = os.getenv("ENABLE_LEGACY_EXECUTION_CORE", "0").strip().lower() in {"1", "true", "yes", "on"}
 MAX_POSITIONS       = int(os.getenv("MAX_POSITIONS", "7"))
 
 # ── Paper-mode gate thresholds ────────────────────────────────────────────────
@@ -349,6 +398,82 @@ class APExecutionCore:
         pending_entries = self._current_pending_entry_count()
         return max(0, int(self._max_positions) - open_count - pending_entries)
 
+    def _recover_plan_for_revalidation(self, watched: WatchedSignal):
+        """
+        Recover a minimal ApprovedExecutionPlan-like object for breach-time
+        exposure revalidation when the watcher signal came from queue.watch(plan)
+        and did not carry _approved_plan through the signal dict.
+
+        This keeps the queue as the production entry authority while preserving
+        LIVE-mode capital protection at breach time. If recovery cannot prove
+        a real reserved/limit cost, LIVE mode will block rather than fail open.
+        """
+        sig = watched.signal or {}
+        existing = sig.get("_approved_plan")
+        if existing is not None:
+            return existing
+
+        local_order_id = str(sig.get("local_order_id") or "")
+        if not local_order_id or self.order_state_machine is None:
+            return None
+
+        try:
+            order = self.order_state_machine.get_order(local_order_id)
+        except Exception as exc:
+            log.warning(
+                "[%s] Could not recover approved plan from OSM order %s: %s",
+                watched.ticker, local_order_id, exc,
+            )
+            return None
+
+        if not order:
+            return None
+
+        try:
+            qty = int(order.get("qty") or 0)
+            reserved = float(order.get("reserved_cost") or 0)
+            limit_price = float(order.get("limit_price") or 0)
+            real_cost = reserved if reserved > 0 else (limit_price * qty * 100 if limit_price > 0 and qty > 0 else 0.0)
+            if real_cost <= 0:
+                log.critical(
+                    "[%s] Recovered OSM order %s but could not prove real_cost for LIVE breach revalidation",
+                    watched.ticker, local_order_id,
+                )
+                return None
+
+            recovered = SimpleNamespace(
+                plan_id=str(order.get("plan_id") or sig.get("plan_id") or local_order_id),
+                signal_id=str(order.get("signal_id") or sig.get("signal_id") or local_order_id),
+                client_id=str(order.get("client_id") or self.email or "default"),
+                ticker=str(order.get("symbol") or watched.ticker),
+                side=str(order.get("direction") or watched.side),
+                direction=str(order.get("direction") or watched.side),
+                pattern=str(sig.get("pattern") or ""),
+                timeframe=str(sig.get("timeframe") or "1d"),
+                contracts=qty,
+                max_position_usd=real_cost,
+                tier=str(sig.get("grade") or sig.get("tier") or "B"),
+                score=float(sig.get("score") or 0),
+                trigger_type="breach",
+                trigger_price=watched.entry_trigger,
+                stop_underlying=watched.stop_level,
+                target_underlying=watched.target_price,
+                contract_symbol=str(order.get("contract") or sig.get("contract_symbol") or ""),
+                limit_price=limit_price if limit_price > 0 else None,
+            )
+            sig["_approved_plan"] = recovered
+            log.info(
+                "[%s] Recovered approved plan for breach revalidation from OSM order %s | cost=$%.0f",
+                watched.ticker, local_order_id, real_cost,
+            )
+            return recovered
+        except Exception as exc:
+            log.warning(
+                "[%s] Failed to recover breach revalidation plan from OSM order %s: %s",
+                watched.ticker, local_order_id, exc,
+            )
+            return None
+
     def _breach_risk_check(self, watched: WatchedSignal) -> bool:
         """
         Lightweight breach-time safety check.
@@ -407,7 +532,7 @@ class APExecutionCore:
             self.rank_queue.add(sig)
             return False
 
-        approved_plan = sig.get("_approved_plan")
+        approved_plan = self._recover_plan_for_revalidation(watched)
         if approved_plan is None:
             msg = "approved_plan_missing_at_breach_revalidation"
             if self.mode == "LIVE":
@@ -472,12 +597,22 @@ class APExecutionCore:
         return True
 
     def start(self):
-        """Start all background threads."""
+        """Start all background threads.
+
+        Production mode keeps ExecutionCore as an orchestration shell:
+        watcher + exit engine + tracker. The legacy receive_signal/ranking
+        path is disabled unless ENABLE_LEGACY_EXECUTION_CORE=1.
+        """
         self.entry_watcher.start()
         self.exit_eng.start()
         self.tracker.start()
-        self._start_ranking_processor()
-        log.info(f"[{self.email}] Execution core started (watcher + exit engine + tracker + ranking queue)")
+        if ENABLE_LEGACY_EXECUTION_CORE:
+            self._start_ranking_processor()
+            _legacy_note = " + legacy ranking queue"
+        else:
+            self._rq_running = False
+            _legacy_note = " (legacy ranking disabled; queue is entry authority)"
+        log.info(f"[{self.email}] Execution core started (watcher + exit engine + tracker{_legacy_note})")
 
     def stop(self):
         self.entry_watcher.stop()
@@ -535,6 +670,30 @@ class APExecutionCore:
         Master control handles: gates, intelligence, tier, sizing, plan creation.
         Execution core only dispatches the approved plan.
         """
+        if not ENABLE_LEGACY_EXECUTION_CORE:
+            # Production decommission path: ExecutionCore no longer owns initial
+            # signal evaluation/ranking. Route to the unified Postgres queue,
+            # where master_control + contract_selector + OSM are the authority.
+            try:
+                from ap.queue import enqueue_signal
+                signal_id = str(signal.get("signal_id") or uuid.uuid4())
+                signal["signal_id"] = signal_id
+                ok = enqueue_signal(
+                    signal,
+                    client_id=self.email or "default",
+                    idempotency_key=f"{signal_id}:{self.email or 'default'}",
+                )
+                log.warning(
+                    "[%s] receive_signal legacy path disabled — routed to queue | inserted=%s",
+                    signal.get("ticker") or signal.get("symbol") or "?", ok,
+                )
+            except Exception as exc:
+                log.critical(
+                    "[%s] receive_signal legacy path disabled and queue route failed: %s",
+                    signal.get("ticker") or signal.get("symbol") or "?", exc,
+                )
+            return
+
         ticker = signal.get("ticker", "")
         score  = float(signal.get("score", 0) or 0)
 
@@ -624,7 +783,11 @@ class APExecutionCore:
         return
 
     def _start_ranking_processor(self):
-        """Background thread: drains ranking queue into watcher every 5 seconds."""
+        """Background thread: drains legacy ranking queue into watcher every 5 seconds."""
+        if not ENABLE_LEGACY_EXECUTION_CORE:
+            self._rq_running = False
+            log.info("[%s] RankingQueueProcessor not started — legacy ExecutionCore entries disabled", self.email)
+            return
         self._rq_running = True
 
         def _loop():
@@ -1430,3 +1593,15 @@ class APExecutionCore:
         except Exception as e:
             log.error(f"Order error: {e}")
             return None
+# SIGNAL INTELLIGENCE:
+#   Every signal is a first-class persistent object in ap_signals.
+#   Full lifecycle: received -> queued -> watching -> triggered -> executed -> closed
+#   Dropped signals record WHY: rejected / context_blocked / shadow /
+#   sector_cap / context_recheck_fail / requeued_after_trigger / legacy_routed
+#
+# FUNNEL COUNTER:
+#   All funnel.inc() calls wired: signals_received, rejected_score, passed_score,
+#   context_blocked, passed_context, shadow_tracked, sector_capped, queue_expired,
+#   watcher_sent, watcher_triggered, watcher_expired, watcher_invalidated,
+#   options_rejected, order_failed, trades_executed
+# =============================================================================
