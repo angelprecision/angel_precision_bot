@@ -309,6 +309,168 @@ class APExecutionCore:
             return SCORE_FLOOR_LIVE, CONTEXT_FLOOR_LIVE
         return SCORE_FLOOR_PAPER, CONTEXT_FLOOR_PAPER
 
+    def _current_open_position_count(self) -> int:
+        """
+        Return the most reliable open-position count available.
+
+        Production path uses APPositionManager/Postgres truth. The local
+        _position_count is kept only as a fallback for legacy/synthetic paper
+        paths that do not create a DB position through OSM/fill_monitor.
+        """
+        if self.position_manager is not None:
+            try:
+                snap = self.position_manager.snapshot()
+                return int(snap.get("open_count") or 0)
+            except Exception as exc:
+                log.warning(
+                    "[%s] position_manager.snapshot failed — falling back to local count: %s",
+                    self.email, exc,
+                )
+        with self._pos_lock:
+            return int(self._position_count or 0)
+
+    def _current_pending_entry_count(self) -> int:
+        """Return pending entry count from position-manager snapshot when available."""
+        if self.position_manager is not None:
+            try:
+                snap = self.position_manager.snapshot()
+                return int(snap.get("pending_entries") or 0)
+            except Exception:
+                return 0
+        return 0
+
+    def _available_position_slots(self) -> int:
+        """
+        Slots based on broker/DB truth first, local legacy count second.
+        This prevents the ranking queue from over-dispatching just because
+        _position_count only tracks synthetic/legacy positions.
+        """
+        open_count = self._current_open_position_count()
+        pending_entries = self._current_pending_entry_count()
+        return max(0, int(self._max_positions) - open_count - pending_entries)
+
+    def _breach_risk_check(self, watched: WatchedSignal) -> bool:
+        """
+        Lightweight breach-time safety check.
+
+        IMPORTANT: Do not call master_control.evaluate() here. The signal was
+        already approved and armed, and evaluate() performs dedup/persistence
+        side effects that are wrong for an in-flight signal. This check only
+        verifies kill-switch and current position capacity using live state.
+        """
+        sig = watched.signal
+        ticker = watched.ticker
+        signal_id = str(sig.get("signal_id", "") or "")
+
+        if getattr(self, "_kill_switch", False):
+            log.critical("[%s] Breach blocked — execution core kill switch active", ticker)
+            if signal_id:
+                self.store.update_signal_fields(signal_id, {
+                    "decision_status": "blocked_at_breach",
+                    "context_notes": "kill_switch_active_at_breach",
+                })
+            return False
+
+        if self.master_control is not None:
+            try:
+                kill_fn = getattr(self.master_control, "_kill_switch_fn", None)
+                if kill_fn and kill_fn():
+                    log.critical("[%s] Breach blocked — master control kill switch active", ticker)
+                    if signal_id:
+                        self.store.update_signal_fields(signal_id, {
+                            "decision_status": "blocked_at_breach",
+                            "context_notes": "master_control_kill_switch_active_at_breach",
+                        })
+                    return False
+            except Exception as exc:
+                log.warning("[%s] Kill-switch check failed at breach: %s", ticker, exc)
+
+        open_count = self._current_open_position_count()
+        pending_entries = self._current_pending_entry_count()
+        effective_count = open_count + pending_entries
+        if effective_count >= int(self._max_positions):
+            log.info(
+                "[%s] No slot at breach time — open=%s pending=%s max=%s. Re-queuing signal.",
+                ticker, open_count, pending_entries, self._max_positions,
+            )
+            if signal_id:
+                self.store.update_signal_fields(signal_id, {
+                    "decision_status": "requeued_after_trigger",
+                    "context_notes": (
+                        f"positions_full_at_breach open={open_count} "
+                        f"pending={pending_entries} max={self._max_positions}"
+                    ),
+                })
+            _sector = sig.get("sector") or sig.get("correlation_bucket") or ticker
+            with self._sector_lock:
+                self._sector_counts[_sector] = max(0, self._sector_counts.get(_sector, 0) - 1)
+            self.rank_queue.add(sig)
+            return False
+
+        approved_plan = sig.get("_approved_plan")
+        if approved_plan is None:
+            msg = "approved_plan_missing_at_breach_revalidation"
+            if self.mode == "LIVE":
+                log.critical(
+                    "[%s] LIVE BREACH BLOCK — _approved_plan missing; cannot revalidate exposure safely",
+                    ticker,
+                )
+                if signal_id:
+                    self.store.update_signal_fields(signal_id, {
+                        "decision_status": "blocked_at_breach",
+                        "context_notes": msg,
+                    })
+                _sector = sig.get("sector") or sig.get("correlation_bucket") or ticker
+                with self._sector_lock:
+                    self._sector_counts[_sector] = max(0, self._sector_counts.get(_sector, 0) - 1)
+                return False
+
+            log.critical(
+                "[%s] PAPER BREACH WARNING — _approved_plan missing; continuing without exposure revalidation",
+                ticker,
+            )
+            if signal_id:
+                self.store.update_signal_fields(signal_id, {
+                    "context_notes": msg + "_paper_fail_open",
+                })
+
+        if approved_plan is not None and self.master_control is not None:
+            try:
+                reval = self.master_control.revalidate_exposure(
+                    approved_plan,
+                    client_id=self.email or "default",
+                )
+                if not getattr(reval, "ok", False):
+                    reason = getattr(reval, "reason", "revalidation_failed")
+                    log.info("[%s] Breach exposure revalidation blocked: %s", ticker, reason)
+                    if signal_id:
+                        self.store.update_signal_fields(signal_id, {
+                            "decision_status": "blocked_at_breach",
+                            "context_notes": f"exposure_revalidation={reason}",
+                        })
+                    _sector = sig.get("sector") or sig.get("correlation_bucket") or ticker
+                    with self._sector_lock:
+                        self._sector_counts[_sector] = max(0, self._sector_counts.get(_sector, 0) - 1)
+                    return False
+            except Exception as exc:
+                if self.mode == "LIVE":
+                    log.critical(
+                        "[%s] LIVE BREACH BLOCK — exposure revalidation errored: %s",
+                        ticker, exc,
+                    )
+                    if signal_id:
+                        self.store.update_signal_fields(signal_id, {
+                            "decision_status": "blocked_at_breach",
+                            "context_notes": f"exposure_revalidation_error={exc}",
+                        })
+                    _sector = sig.get("sector") or sig.get("correlation_bucket") or ticker
+                    with self._sector_lock:
+                        self._sector_counts[_sector] = max(0, self._sector_counts.get(_sector, 0) - 1)
+                    return False
+                log.warning("[%s] PAPER breach exposure revalidation failed open: %s", ticker, exc)
+
+        return True
+
     def start(self):
         """Start all background threads."""
         self.entry_watcher.start()
@@ -443,8 +605,11 @@ class APExecutionCore:
                 funnel.inc("rejected_score")
             return
 
-        # Plan approved -- attach tier and dispatch to ranking queue
+        # Plan approved -- attach approved execution plan and dispatch to ranking queue.
+        # IMPORTANT: _breach_risk_check() uses this exact plan for lightweight
+        # exposure revalidation at breach time. Do not drop it before watcher handoff.
         plan = decision.plan
+        signal["_approved_plan"] = plan
         signal["tier"]         = plan.tier
         signal["auto_execute"] = (plan.tier == "A+")
         funnel.inc("passed_score")
@@ -465,7 +630,7 @@ class APExecutionCore:
         def _loop():
             while self._rq_running:
                 try:
-                    slots = max(0, self._max_positions - self._position_count)
+                    slots = self._available_position_slots()
                     if slots > 0 and self.rank_queue.size() > 0:
                         signals = self.rank_queue.drain(slots)
                         for sig in signals:
@@ -558,51 +723,12 @@ class APExecutionCore:
             self.store.update_status(signal_id, "triggered", timestamp_flag="triggered_at")
         funnel.inc("watcher_triggered")
 
-        # Re-check position count at breach time
-        if self._position_count >= self._max_positions:
-            log.info(
-                f"[{ticker}] No slot at breach time -- positions full "
-                f"({self._position_count}/{self._max_positions}). Re-queuing signal."
-            )
-            if signal_id:
-                self.store.update_signal_fields(signal_id, {
-                    "decision_status": "requeued_after_trigger",
-                    "context_notes":   f"positions_full={self._position_count}/{self._max_positions} at breach",
-                })
-            # Decrement sector count — signal never executed, slot must be returned
-            _sector_key = sig.get("sector", ticker)
-            with self._sector_lock:
-                self._sector_counts[_sector_key] = max(0, self._sector_counts.get(_sector_key, 0) - 1)
-            self.rank_queue.add(sig)
+        # Lightweight breach risk check only.
+        # Do NOT call master_control.evaluate() here: this signal is already
+        # approved/armed, and full evaluate() would re-run dedup/persistence.
+        if not self._breach_risk_check(watched):
+            funnel.inc("master_control_blocked")
             return
-
-        # ── MASTER CONTROL RE-GATE at breach time ───────────────────────────
-        # Lightweight re-check at breach: only verify kill-switch, position
-        # count, and capital. Do NOT re-run dedup (signal already approved
-        # and mid-flight — duplicate_signal_id at this stage is wrong behavior).
-        if self.master_control:
-            mc_decision = self.master_control.evaluate(sig, client_id=self.email)
-            if not mc_decision.ok:
-                # Skip duplicate_signal_id blocks — signal is already in flight
-                _block_reason = getattr(mc_decision, "reason", "") or ""
-                if "duplicate_signal_id" in _block_reason:
-                    log.info(f"[{ticker}] Breach re-gate: ignoring duplicate_signal_id (signal already approved and mid-flight)")
-                else:
-                    log.info(
-                        f"[{ticker}] Master control BLOCKED at breach: "
-                        f"{_block_reason}"
-                    )
-                    funnel.inc("master_control_blocked")
-                    if signal_id:
-                        self.store.update_signal_fields(signal_id, {
-                            "decision_status": "blocked_at_breach",
-                            "context_notes":   f"mc_block={_block_reason}",
-                        })
-                    # Decrement sector count — signal blocked, slot must be returned
-                    _sector = sig.get("sector", ticker)
-                    with self._sector_lock:
-                        self._sector_counts[_sector] = max(0, self._sector_counts.get(_sector, 0) - 1)
-                    return
 
         # Fetch 0DTE chain
         try:
@@ -773,10 +899,11 @@ class APExecutionCore:
 
             # OSM / broker submission failed
             if self.paper:
-                # Paper continuity: sandbox may be unavailable — simulate fill
-                log.warning(
-                    f"[{ticker}] OSM/sandbox order failed — using simulated fill "
-                    f"@ ${decision.mid_price:.2f} (paper continuity) | "
+                # Paper continuity only. This intentionally bypasses DB/OSM truth,
+                # so the log must be loud and searchable.
+                log.critical(
+                    f"[{ticker}] SYNTHETIC_ONLY_NO_DB_POSITION — OSM/sandbox order failed; "
+                    f"creating in-memory paper position only @ ${decision.mid_price:.2f} | "
                     f"error={submit_res['error']}"
                 )
                 fill_price      = decision.mid_price
@@ -808,9 +935,9 @@ class APExecutionCore:
 
             if not fill_price:
                 if self.paper:
-                    log.warning(
-                        f"[{ticker}] Tradier sandbox order failed — falling back to simulated fill "
-                        f"@ ${decision.mid_price:.2f} (paper continuity)"
+                    log.critical(
+                        f"[{ticker}] SYNTHETIC_ONLY_NO_DB_POSITION — legacy sandbox order failed; "
+                        f"creating in-memory paper position only @ ${decision.mid_price:.2f}"
                     )
                     fill_price = decision.mid_price
                     synthetic  = True
