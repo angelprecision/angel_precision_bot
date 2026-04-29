@@ -577,134 +577,45 @@ def _dispatch(
             "[%s] IMMEDIATE EXECUTION PATH ENABLED — this should only run when ALLOW_IMMEDIATE_EXECUTION=1",
             ticker,
         )
+
+        # Money-safe immediate path:
+        # Never mark SUBMITTED before broker acceptance. We submit the existing
+        # CREATED order through OSM, and OSM transitions to SUBMITTED only after
+        # broker accepts and returns broker_order_id.
         try:
-            order_state_machine.transition(local_order_id, "SUBMITTED",
-                                           submitted_ts=now_utc_iso())
-            log.info(f"[{ticker}] Order submitted immediately: {local_order_id}")
+            if not hasattr(order_state_machine, "submit_existing_entry"):
+                raise RuntimeError("order_state_machine_missing_submit_existing_entry")
 
-            import os as _os
-            _bot_mode = (_os.getenv("AP_MODE") or _os.getenv("BOT_MODE") or "PAPER").upper()
-            if _bot_mode != "LIVE":
-                fill_price = getattr(plan, "limit_price", None)
-                if fill_price:
-                    try:
-                        _submitted_to_broker = False
-                        if broker is not None:
-                            try:
-                                _resp = broker.place_order(
-                                    symbol=ticker,
-                                    contract=getattr(plan, "contract_symbol", ""),
-                                    qty=getattr(plan, "contracts", 1),
-                                    limit_price=fill_price,
-                                    side="buy_to_open",
-                                )
-                                _submitted_to_broker = True
-                                _raw_broker_id = (
-                                    getattr(_resp, "broker_order_id", None)
-                                    or getattr(_resp, "order_id", None)
-                                    or ""
-                                )
-                                _broker_order_id = str(_raw_broker_id) if _raw_broker_id and str(_raw_broker_id) not in ("", "N/A", "None") else ""
-                                log.info(
-                                    f"[{ticker}] SANDBOX ORDER SUBMITTED | "
-                                    f"broker_id={_broker_order_id or 'REJECTED'} "
-                                    f"status={getattr(_resp, 'status', '?')}"
-                                )
-                                if _broker_order_id:
-                                    from ap.db import update_order as _upd_order
-                                    _upd_order(local_order_id,
-                                               broker_order_id=_broker_order_id)
-                            except Exception as _be:
-                                log.warning(f"[{ticker}] Sandbox order failed ({_be}) -- continuing with local paper fill")
-                                _broker_order_id = ""
+            submit_res = order_state_machine.submit_existing_entry(
+                local_order_id=local_order_id,
+                broker=broker,
+                plan=plan,
+                limit_price=getattr(plan, "limit_price", None),
+            )
 
-                        order_state_machine.transition(
-                            local_order_id, "FILLED",
-                            fill_price=fill_price,
-                            filled_qty=getattr(plan, "contracts", 1),
-                            filled_ts=now_utc_iso(),
-                        )
-                        log.info(
-                            f"[{ticker}] PAPER FILL | {getattr(plan, 'contract_symbol', '?')} "
-                            f"@ ${fill_price:.2f} x{getattr(plan, 'contracts', 1)}"
-                        )
+            if not submit_res.get("ok"):
+                log.error(
+                    "[%s] Immediate submit failed safely | local=%s error=%s",
+                    ticker, local_order_id, submit_res.get("error"),
+                )
+                _mark_job(job_id, "ERROR", error=f"submit_error:{submit_res.get('error')}")
+                return
 
-                        _pos_id = None
-                        if position_manager is not None:
-                            try:
-                                _pos_id = position_manager.open_position(
-                                    plan_id=plan.plan_id,
-                                    signal_id=signal_id,
-                                    ticker=ticker,
-                                    contract=getattr(plan, "contract_symbol", ""),
-                                    side=getattr(plan, "side", "CALL"),
-                                    qty=getattr(plan, "contracts", 1),
-                                    entry_price=fill_price,
-                                    tier=str(getattr(plan, "tier", "B")),
-                                    score=float(getattr(plan, "score", 0.0) or 0),
-                                    pattern=str(getattr(plan, "pattern", "") or ""),
-                                    tp_pct=float(getattr(plan, "tp_pct", 0.20) or 0.20),
-                                    sl_pct=float(getattr(plan, "sl_pct", 0.25) or 0.25),
-                                    stop_underlying=getattr(plan, "stop_price", None),
-                                    target_underlying=getattr(plan, "target_underlying", None),
-                                )
-                                order_state_machine.transition(
-                                    local_order_id, "FILLED",
-                                    position_id=_pos_id,
-                                )
-                                log.info(f"[{ticker}] POSITION CREATED | id={_pos_id}")
-
-                                if exit_eng is not None:
-                                    try:
-                                        from ap_exit_engine import ManagedPosition
-                                        mp = ManagedPosition(
-                                            ticker=ticker,
-                                            option_symbol=getattr(plan, "contract_symbol", ""),
-                                            side=getattr(plan, "side", "CALL"),
-                                            quantity=getattr(plan, "contracts", 1),
-                                            entry_price=fill_price,
-                                            underlying_entry=getattr(plan, "trigger_price", 0.0) or 0.0,
-                                            underlying_target=float(
-                                                getattr(plan, "target_underlying", None)
-                                                or (float("inf") if getattr(plan, "side", "CALL") == "CALL"
-                                                    else 0.0)
-                                            ),
-                                            underlying_stop=float(
-                                                getattr(plan, "stop_underlying", None) or 0.0
-                                            ),
-                                        )
-                                        mp.current_option_price = fill_price
-                                        exit_eng.add_position(mp)
-                                        log.info("[%s] Registered with exit engine | %s", ticker, getattr(plan, 'contract_symbol', ''))
-                                    except Exception as e:
-                                        log.error("[%s] EXIT ENGINE REGISTRATION FAILED — position has NO stop loss: %s", ticker, e)
-                                else:
-                                    log.error("[%s] exit_eng not injected — position has NO stop loss protection", ticker)
-                            except Exception as ope:
-                                log.warning(f"[{ticker}] open_position failed: {ope}")
-                        else:
-                            log.warning(f"[{ticker}] position_manager not injected -- position not tracked")
-
-                        _mark_job(job_id, "COMPLETED",
-                                  result={"plan_id": plan.plan_id,
-                                          "local_order_id": local_order_id,
-                                          "contract": getattr(plan, "contract_symbol", ""),
-                                          "fill_price": fill_price,
-                                          "real_cost": plan.max_position_usd,
-                                          "position_id": _pos_id,
-                                          "trigger_type": "immediate_paper_fill"})
-                        return
-                    except Exception as pe:
-                        log.warning(f"[{ticker}] Paper fill transition failed: {pe}")
+            log.info(
+                "[%s] Order submitted immediately after broker acceptance | local=%s broker=%s",
+                ticker, local_order_id, submit_res.get("broker_order_id"),
+            )
 
             _mark_job(job_id, "SUBMITTED",
                       result={"plan_id": plan.plan_id,
                               "local_order_id": local_order_id,
+                              "broker_order_id": submit_res.get("broker_order_id"),
                               "contract": getattr(plan, "contract_symbol", ""),
                               "real_cost": plan.max_position_usd,
                               "trigger_type": "immediate"})
+            return
         except Exception as e:
-            log.error(f"[{ticker}] immediate submit failed: {e}")
+            log.error(f"[{ticker}] immediate submit failed: {e}", exc_info=True)
             _mark_job(job_id, "ERROR", error=f"submit_error: {e}")
 
 
