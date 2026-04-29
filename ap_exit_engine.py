@@ -27,6 +27,7 @@
 
 from __future__ import annotations
 
+import os
 import time
 import threading
 import logging
@@ -34,6 +35,15 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional, Callable
 from zoneinfo import ZoneInfo
+
+
+try:
+    from ap.observability import emit_decision_event, get_git_commit
+except Exception:
+    emit_decision_event = None
+
+    def get_git_commit(default: str = "unknown") -> str:
+        return default
 
 log = logging.getLogger("ap.exit_engine")
 ET  = ZoneInfo("America/New_York")
@@ -568,6 +578,87 @@ class APExitEngine:
         self.on_scale: Optional[Callable] = None   # callback(pos, ExitDecision, qty)
         self._kill_switch_fn  = kill_switch_fn     # callable() → bool | None
 
+        # Observability metadata. Never let analytics break live exits.
+        self.run_id = os.getenv("AP_RUN_ID", "unknown")
+        self.strategy_version = os.getenv("AP_STRATEGY_VERSION", "ap_live_beta")
+        self.git_commit = get_git_commit()
+
+    def _emit_exit_event(
+        self,
+        pos: ManagedPosition,
+        decision: str,
+        reason_code: Optional[str],
+        explanation: str,
+        stage: str = "exit_decision",
+        extra_inputs: Optional[dict] = None,
+        extra_context: Optional[dict] = None,
+    ) -> None:
+        """Emit structured exit telemetry without risking the exit loop."""
+        if emit_decision_event is None:
+            return
+        try:
+            emit_decision_event(
+                run_id=self.run_id,
+                candidate_id=getattr(pos, "signal_id", None) or getattr(pos, "position_id", None),
+                trade_id=getattr(pos, "position_id", None),
+                position_id=getattr(pos, "position_id", None),
+                client_id=getattr(pos, "client_id", None) or self._email or "default",
+                stage=stage,
+                decision=decision,
+                reason_code=reason_code,
+                explanation=explanation,
+                symbol=getattr(pos, "ticker", None),
+                contract=getattr(pos, "option_symbol", None),
+                strategy_version=self.strategy_version,
+                git_commit=self.git_commit,
+                inputs={
+                    "option_pnl_pct": getattr(pos, "option_pnl_pct", 0.0),
+                    "peak_pnl_pct": getattr(pos, "peak_pnl_pct", 0.0),
+                    "max_profit_seen": getattr(pos, "max_profit_seen", 0.0),
+                    "touched_profit": getattr(pos, "touched_profit", False),
+                    "qty_remaining": getattr(pos, "quantity_remaining", 0),
+                    "scale_outs_done": getattr(pos, "scale_outs_done", 0),
+                    "exit_in_flight": getattr(pos, "exit_in_flight", False),
+                    **(extra_inputs or {}),
+                },
+                context=extra_context or {},
+            )
+        except Exception as e:
+            log.debug("Exit observability emit failed (non-critical): %s", e)
+
+    def _exit_reason_code(self, decision: ExitDecision) -> Optional[str]:
+        r = (getattr(decision, "reason", "") or "").upper()
+        action = (getattr(decision, "action", "") or "").upper()
+        if "SENTINEL" in r:
+            return "SENTINEL_FORCED_EXIT"
+        if "EOD FORCE CLOSE" in r:
+            return "EOD_FORCE_CLOSE"
+        if "THETA STOP" in r:
+            return "THETA_STOP"
+        if "HARD STOP" in r or "STOP HIT" in r:
+            return "HARD_STOP"
+        if "RUNNER TRAIL" in r:
+            return "RUNNER_TRAIL"
+        if "SMALL WIN LOCK" in r:
+            return "SMALL_WIN_LOCK"
+        if "TOUCHED PROFIT STOP" in r:
+            return "TOUCHED_PROFIT_STOP"
+        if "UNDERLYING PROGRESS EXIT" in r:
+            return "UNDERLYING_PROGRESS_EXIT"
+        if "NEVER GREEN STOP" in r:
+            return "NEVER_GREEN_STOP"
+        if "PROFIT LOCK" in r:
+            return "PROFIT_LOCK"
+        if "TRAILING STOP" in r:
+            return "TRAILING_STOP"
+        if "IMMEDIATE TP" in r or action == "SCALE_OUT":
+            return "TP_SCALE_OUT" if action == "SCALE_OUT" else "IMMEDIATE_TP"
+        if "TARGET HIT" in r:
+            return "TARGET_HIT"
+        if "TIME STOP" in r:
+            return "TIME_STOP"
+        return None
+
     def add_position(self, pos: ManagedPosition):
         with self._lock:
             for existing in self._positions:
@@ -691,6 +782,14 @@ class APExitEngine:
                         reason=f"SENTINEL FORCED EXIT — {pnl*100:.0f}% with no exit order",
                         urgency="IMMEDIATE", pnl_pct=pnl
                     )
+                    self._emit_exit_event(
+                        pos,
+                        decision="FORCE_EXIT",
+                        reason_code="SENTINEL_FORCED_EXIT",
+                        explanation=decision.reason,
+                        stage="system_alert",
+                        extra_inputs={"age_min": age_min, "pnl_pct": pnl, "peak_pnl_pct": peak},
+                    )
                     if self.on_exit:
                         self.on_exit(pos, decision)
                 except Exception as _e:
@@ -715,6 +814,18 @@ class APExitEngine:
                             "pos=%s broker may have rejected silently",
                             pos.ticker, flight_sec, pos.position_id
                         )
+                    self._emit_exit_event(
+                        pos,
+                        decision="ALERT",
+                        reason_code="EXIT_RETRY_BLOCKED" if getattr(pos, "last_exit_rejected", False) else "EXIT_STUCK_IN_FLIGHT",
+                        explanation=f"Exit stuck in flight for {flight_sec:.0f}s",
+                        stage="system_alert",
+                        extra_inputs={
+                            "flight_sec": flight_sec,
+                            "stuck_count": getattr(pos, "_exit_stuck_count", 0),
+                            "last_exit_rejected": getattr(pos, "last_exit_rejected", False),
+                        },
+                    )
 
             # Sentinel 4: Dead trade — open too long, thesis never confirmed
             DEAD_TRADE_MIN  = 45
@@ -932,6 +1043,7 @@ class APExitEngine:
 
                 # Gate: don't re-fire while an exit is in-flight
                 now_utc = datetime.now(timezone.utc)
+                option_pnl = pos.option_pnl_pct
                 # Runner trail bypass: if scale-out done and runner is giving
                 # back massive gains, close regardless of exit_in_flight.
                 # This prevents a pending scale-out fill from blocking the
@@ -963,30 +1075,46 @@ class APExitEngine:
                             pos.max_profit_seen = pos.option_pnl_pct
                     decision = evaluate_exit(pos, now_et)
                     if decision.should_act:
+                        self._emit_exit_event(
+                            pos,
+                            decision="SUBMIT",
+                            reason_code=self._exit_reason_code(decision),
+                            explanation=decision.reason,
+                            stage="exit_decision",
+                            extra_inputs={
+                                "decision_action": decision.action,
+                                "decision_qty": decision.quantity,
+                                "decision_pnl_pct": decision.pnl_pct,
+                                "suggested_limit": decision.suggested_limit,
+                            },
+                        )
                         actions_to_take.append((pos, decision))
 
         # ── Gap 2: Kill check post-fetch, pre-execute ───────────────────────────
         # Quote fetch takes 1-5s on live Tradier. Kill may have fired during
         # that I/O window. Filter out non-protective exits but allow EOD/stop-loss.
         if self._kill_switch_fn and self._kill_switch_fn():
-            def _is_protective(reason: str) -> bool:
-                """
-                Determine if an exit is protective (must execute even under kill switch).
-                Uses substring matching because reasons are descriptive strings like
-                "EOD FORCE CLOSE -- 15:31 ET" or "STOP HIT -- underlying at $190".
-                """
-                r = (reason or "").upper()
-                return any(k in r for k in (
-                    "EOD", "STOP", "MAX_LOSS", "THETA", "PROTECTIVE",
-                    "FORCE CLOSE", "STOP HIT", "STOP LOSS",
-                ))
             protective = [(p, d) for p, d in actions_to_take if _is_protective_exit(d.reason or "")]
-            blocked = len(actions_to_take) - len(protective)
+            blocked_actions = [(p, d) for p, d in actions_to_take if not _is_protective_exit(d.reason or "")]
+            blocked = len(blocked_actions)
             if blocked:
                 log.warning(
                     f"Exit engine: kill switch active -- blocking {blocked} non-protective exit(s), "
                     f"allowing {len(protective)} protective exit(s)"
                 )
+                for _bp, _bd in blocked_actions:
+                    self._emit_exit_event(
+                        _bp,
+                        decision="REJECT",
+                        reason_code="KILL_SWITCH_ACTIVE",
+                        explanation=f"Kill switch blocked non-protective exit: {_bd.reason}",
+                        stage="exit_decision",
+                        extra_inputs={
+                            "decision_action": _bd.action,
+                            "decision_qty": _bd.quantity,
+                            "decision_pnl_pct": _bd.pnl_pct,
+                        },
+                    )
             actions_to_take = protective
             if not actions_to_take:
                 return
@@ -1104,6 +1232,18 @@ class APExitEngine:
                             log.warning(
                                 f"[{pos.ticker}] Kill switch active — blocking non-protective exit: {exit_reason}"
                             )
+                            self._emit_exit_event(
+                                pos,
+                                decision="REJECT",
+                                reason_code="KILL_SWITCH_ACTIVE",
+                                explanation=f"Kill switch blocked non-protective exit: {exit_reason}",
+                                stage="exit_decision",
+                                extra_inputs={
+                                    "decision_action": decision.action,
+                                    "decision_qty": decision.quantity,
+                                    "decision_pnl_pct": decision.pnl_pct,
+                                },
+                            )
                             continue
                         else:
                             log.info(
@@ -1192,4 +1332,3 @@ class APExitEngine:
             log.error("Option quote fetch failed: %s", e, exc_info=True)
             return {}  # caller must handle empty dict as "no data available"
             
-
