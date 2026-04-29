@@ -651,6 +651,91 @@ class APOrderStateMachine:
     # Broker submit helpers
     # ---------------------------------------------------------------------
 
+    def submit_existing_entry(self, *, local_order_id: str, broker, plan=None, limit_price=None) -> dict:
+        """Submit an already-created ENTRY order after watcher breach.
+
+        Money-safe invariant: broker accepts and returns a real broker_order_id
+        first; only then does OSM transition CREATED/PENDING_TRIGGER -> SUBMITTED.
+        """
+        current = self._get_order(local_order_id)
+        if not current:
+            error_msg = "existing_entry_order_not_found"
+            log.critical("[%s] submit_existing_entry failed — %s | %s", self.client_id, error_msg, local_order_id)
+            return {"ok": False, "local_order_id": local_order_id, "broker_order_id": None, "status": OrderStatus.ERROR, "error": error_msg}
+
+        current = dict(current)
+        kind = str(current.get("kind") or "").upper()
+        status = str(current.get("status") or "").upper()
+
+        if kind != "ENTRY":
+            error_msg = f"submit_existing_entry_wrong_kind:{kind}"
+            self.transition(local_order_id, OrderStatus.ERROR, last_error=error_msg)
+            return {"ok": False, "local_order_id": local_order_id, "broker_order_id": None, "status": OrderStatus.ERROR, "error": error_msg}
+
+        if status in (OrderStatus.SUBMITTED, OrderStatus.ACKNOWLEDGED, OrderStatus.PARTIAL_FILL, OrderStatus.FILLED):
+            return {"ok": True, "local_order_id": local_order_id, "broker_order_id": current.get("broker_order_id"), "status": status, "error": None}
+
+        if status not in (OrderStatus.CREATED, OrderStatus.PENDING_TRIGGER):
+            error_msg = f"submit_existing_entry_invalid_status:{status}"
+            log.critical("[%s] submit_existing_entry blocked — %s | %s", self.client_id, error_msg, local_order_id)
+            self.transition(local_order_id, OrderStatus.ERROR, last_error=error_msg)
+            return {"ok": False, "local_order_id": local_order_id, "broker_order_id": None, "status": OrderStatus.ERROR, "error": error_msg}
+
+        lp = float(limit_price or current.get("limit_price") or getattr(plan, "limit_price", 0) or 0)
+        contract = current.get("contract") or getattr(plan, "contract_symbol", None) or current.get("symbol") or getattr(plan, "ticker", "")
+        ticker = current.get("symbol") or getattr(plan, "ticker", "")
+        qty = int(current.get("qty") or getattr(plan, "contracts", 0) or 0)
+
+        if lp <= 0:
+            error_msg = "invalid_existing_entry_limit_price"
+            self.transition(local_order_id, OrderStatus.ERROR, last_error=error_msg)
+            return {"ok": False, "local_order_id": local_order_id, "broker_order_id": None, "status": OrderStatus.ERROR, "error": error_msg}
+        if qty <= 0:
+            error_msg = "invalid_existing_entry_qty"
+            self.transition(local_order_id, OrderStatus.ERROR, last_error=error_msg)
+            return {"ok": False, "local_order_id": local_order_id, "broker_order_id": None, "status": OrderStatus.ERROR, "error": error_msg}
+        if not contract:
+            error_msg = "missing_existing_entry_contract"
+            self.transition(local_order_id, OrderStatus.ERROR, last_error=error_msg)
+            return {"ok": False, "local_order_id": local_order_id, "broker_order_id": None, "status": OrderStatus.ERROR, "error": error_msg}
+
+        base_url = getattr(broker, "base_url", None) or getattr(getattr(broker, "cfg", None), "base_url", None) or "https://sandbox.tradier.com"
+        account_id = getattr(broker, "account_id", None) or getattr(getattr(broker, "cfg", None), "account_id", None) or ""
+
+        error_msg = broker_order_id = None
+        try:
+            resp = broker.session.post(
+                f"{base_url}/v1/accounts/{account_id}/orders",
+                data={
+                    "class": "option",
+                    "symbol": ticker,
+                    "option_symbol": contract,
+                    "side": "buy_to_open",
+                    "quantity": qty,
+                    "type": "limit",
+                    "price": round(lp, 2),
+                    "duration": "day",
+                },
+                headers={"Accept": "application/json"},
+                timeout=10,
+            )
+            order = (resp.json() or {}).get("order") or {}
+            broker_status = str(order.get("status") or "").lower().strip()
+            broker_order_id = order.get("id") or order.get("order_id")
+
+            if broker_status in ("ok", "pending", "open", "accepted", "filled") and broker_order_id:
+                ok = self.transition(local_order_id, OrderStatus.SUBMITTED, broker_order_id=broker_order_id, submitted_ts=now_utc_iso())
+                if ok:
+                    return {"ok": True, "local_order_id": local_order_id, "broker_order_id": broker_order_id, "status": OrderStatus.SUBMITTED, "error": None}
+                error_msg = "submitted_transition_failed_after_broker_accept"
+            else:
+                error_msg = f"broker_status:{broker_status or 'unknown'} broker_order_id_missing:{not bool(broker_order_id)}"
+        except Exception as e:
+            error_msg = f"broker_error:{e}"
+
+        self.transition(local_order_id, OrderStatus.ERROR, last_error=error_msg or "unknown_error")
+        return {"ok": False, "local_order_id": local_order_id, "broker_order_id": broker_order_id, "status": OrderStatus.ERROR, "error": error_msg}
+
     def submit_entry(self, *, broker, plan, limit_price=None, reserved_cost=None) -> dict:
         local_id = self.create_entry_order(plan, limit_price=limit_price, reserved_cost=reserved_cost)
         lp = float(limit_price or getattr(plan, "limit_price", 0) or 0)
@@ -684,10 +769,10 @@ class APOrderStateMachine:
             order = (resp.json() or {}).get("order") or {}
             status = (order.get("status") or "").lower()
             broker_order_id = order.get("id") or order.get("order_id")
-            if status in ("ok", "pending", "open", "accepted"):
+            if status in ("ok", "pending", "open", "accepted", "filled") and broker_order_id:
                 self.transition(local_id, OrderStatus.SUBMITTED, broker_order_id=broker_order_id, submitted_ts=now_utc_iso())
                 return {"ok": True, "local_order_id": local_id, "broker_order_id": broker_order_id, "status": OrderStatus.SUBMITTED, "error": None}
-            error_msg = f"broker_status:{status or 'unknown'}"
+            error_msg = f"broker_status:{status or 'unknown'} broker_order_id_missing:{not bool(broker_order_id)}"
         except Exception as e:
             error_msg = f"broker_error:{e}"
 
