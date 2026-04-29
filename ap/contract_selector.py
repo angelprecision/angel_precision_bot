@@ -62,7 +62,74 @@ def _get_max_premium(ticker: str) -> float:
         TICKER_MAX_PREMIUM_PER_CONTRACT["_DEFAULT"]
     )
 
+# =============================================================================
+# REASON CODE NORMALIZER
+# Maps internal free-form rejection strings → canonical observability codes
+# so every reject lands in decision_events with a queryable, structured code.
+# =============================================================================
 
+_REASON_CODE_MAP: dict[str, str] = {
+    "zero_bid_or_ask":       "NO_CHAIN_DATA",
+    "ask_below_bid":         "NO_CHAIN_DATA",
+    "zero_mid":              "NO_CHAIN_DATA",
+    "size_too_thin":         "VOLUME_TOO_LOW",
+    "spread_too_wide":       "SPREAD_TOO_WIDE",
+    "illiquid_vol":          "OI_TOO_LOW",
+    "bid_below":             "NO_AFFORDABLE_CONTRACT",
+    "oi_too_low":            "OI_TOO_LOW",
+    "volume_too_low":        "VOLUME_TOO_LOW",
+    "dte_out_of_range":      "DTE_OUT_OF_RANGE",
+    "delta_out_of_range":    "DELTA_OUT_OF_RANGE",
+    "premium_too_high":      "PREMIUM_CAP_EXCEEDED",
+    "moneyness_out_of_range": "DELTA_OUT_OF_RANGE",   # canonical: OTM moneyness = delta out of range
+    "premium_too_low":        "NO_AFFORDABLE_CONTRACT",
+    "low_oi":                 "OI_TOO_LOW",
+    "low_volume":             "VOLUME_TOO_LOW",
+    "dte_too_low":            "DTE_OUT_OF_RANGE",
+    "dte_too_high":           "DTE_OUT_OF_RANGE",
+    "invalid_expiration":     "DTE_OUT_OF_RANGE",
+    "delta_out_of_band":      "DELTA_OUT_OF_RANGE",
+}
+
+def _normalize_reason_code(raw_reason: str) -> str:
+    """
+    Maps a free-form internal rejection string to a canonical observability
+    reason code from REASON_CODES in ap/observability.py.
+    Falls back gracefully so emit never crashes on unknown strings.
+    """
+    if not raw_reason:
+        return "UNKNOWN_REJECTION"
+    r = raw_reason.lower()
+    for key, code in _REASON_CODE_MAP.items():
+        if key in r:
+            return code
+    return raw_reason.upper()
+
+
+def _safe_float(val, default: float = 0.0) -> float:
+    """Coerce any value to float safely — never raises."""
+    try:
+        return float(val) if val is not None else default
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_plan_attr(plan, attr: str, default=None):
+    """Get attribute from plan whether it is an object or dict."""
+    try:
+        return getattr(plan, attr, default)
+    except Exception:
+        pass
+    try:
+        return plan.get(attr, default) if isinstance(plan, dict) else default
+    except Exception:
+        return default
+
+
+
+
+
+from ap.observability import emit_decision_event, get_git_commit, make_config_hash
 log = logging.getLogger("ap.contract_selector")
 
 
@@ -230,6 +297,36 @@ class APContractSelectionEngine:
         self.earnings_guard = earnings_guard
         self.iv_filter      = iv_filter
 
+        self.strategy_version = os.getenv("AP_STRATEGY_VERSION", "ap_live_beta")
+        self.git_commit       = get_git_commit()
+        self.config_hash = make_config_hash({
+            "mode":                   mode,
+            "target_delta":           self.target_delta,
+            "delta_band":             self.delta_band,
+            "max_spread_pct":         self.max_spread_pct,
+            "min_oi":                 self.min_oi,
+            "min_volume":             self.min_volume,
+            "min_premium":            self.min_premium,
+            "max_premium":            self.max_premium,
+            "min_dte":                self.min_dte,
+            "max_dte":                self.max_dte,
+            "prefer_weekly":          self.prefer_weekly,
+            "pro_quality_enabled":    _PRO_QUALITY_ENABLED,
+            "pro_min_bid":            _PRO_MIN_BID,
+            "pro_min_bid_size_hard":  _PRO_MIN_BID_SIZE_HARD,
+            "pro_t1_spread_hard_max": _PRO_T1_SPREAD_HARD_MAX,
+            "pro_t1_spread_a_tier":   _PRO_T1_SPREAD_A_TIER,
+            "pro_t1_size_min":        _PRO_T1_SIZE_MIN,
+            "pro_t2_spread_hard_max": _PRO_T2_SPREAD_HARD_MAX,
+            "pro_t2_spread_a_tier":   _PRO_T2_SPREAD_A_TIER,
+            "pro_t2_size_min":        _PRO_T2_SIZE_MIN,
+            "min_contract_delta":     float(os.getenv("MIN_CONTRACT_DELTA", "0.10")),
+            "max_otm_pct":            float(os.getenv("MAX_OTM_PCT", "0.12")),
+            "max_trade_usd":          float(os.getenv("MAX_TRADE_USD", "500")),
+            "max_ideal_premium":      float(os.getenv("MAX_IDEAL_PREMIUM", "3.50")),
+            "ticker_premium_caps":    TICKER_MAX_PREMIUM_PER_CONTRACT,
+        })
+
         log.info(
             "APContractSelectionEngine | mode=%s delta=%.2f±%.2f "
             "max_spread=%d%% dte=[%d,%d] premium=[$%.0f,$%.0f] "
@@ -241,14 +338,65 @@ class APContractSelectionEngine:
             type(iv_filter).__name__ if iv_filter is not None else "None",
         )
 
+
+    def _emit_selector_event(
+        self,
+        plan,
+        stage: str,
+        decision: str,
+        reason_code: Optional[str],
+        explanation: str,
+        contract: Optional[str] = None,
+        inputs: Optional[dict] = None,
+        thresholds: Optional[dict] = None,
+        context: Optional[dict] = None,
+    ) -> None:
+        """Emit a structured observability event for every contract selection decision."""
+        try:
+            _sig_id    = _safe_plan_attr(plan, "signal_id") or ""
+            _client_id = _safe_plan_attr(plan, "client_id") or "default"
+            emit_decision_event(
+                run_id=os.getenv("AP_RUN_ID", "unknown"),
+                candidate_id=str(_sig_id),
+                client_id=_client_id,
+                stage=stage,
+                decision=decision,
+                reason_code=reason_code,
+                explanation=explanation,
+                symbol=getattr(plan, "ticker", None) or (plan.get("ticker") if isinstance(plan, dict) else None),
+                contract=contract,
+                setup_type=getattr(plan, "pattern", None),
+                timeframe=getattr(plan, "timeframe", None),
+                strategy_version=self.strategy_version,
+                config_hash=self.config_hash,
+                git_commit=self.git_commit,
+                inputs=inputs or {},
+                thresholds=thresholds or {},
+                context=context or {},
+            )
+        except Exception as e:
+            log.debug("Selector observability emit failed (non-critical): %s", e)
+
     # =========================================================================
     # PUBLIC -- select(plan) → SelectedContract | None
     # =========================================================================
 
+
     def select(self, plan) -> Optional[SelectedContract]:
-        ticker    = plan.ticker
-        direction = plan.side.upper()
-        budget    = plan.max_position_usd
+        ticker    = _safe_plan_attr(plan, "ticker")
+        direction = str(_safe_plan_attr(plan, "side", "") or "").upper()
+        budget    = float(_safe_plan_attr(plan, "max_position_usd", 0) or 0)
+
+        if not ticker or direction not in {"CALL", "PUT"}:
+            self._emit_selector_event(
+                plan,
+                stage="selector_entry",
+                decision="REJECT",
+                reason_code="INVALID_PLAN",
+                explanation=f"Invalid plan inputs: ticker={ticker}, side={direction}",
+                inputs={"ticker": ticker, "side": direction, "budget": budget},
+            )
+            return None
 
         _LIQUID_ETFS = {"SPY", "QQQ", "IWM", "DIA", "GLD", "TLT", "XLF",
                         "XLE", "XLK", "XLV", "XLC", "TQQQ", "SQQQ", "UVXY"}
@@ -271,6 +419,14 @@ class APContractSelectionEngine:
                 ticker = mapped
             else:
                 log.warning("[%s] Index ticker has no options mapping -- skipping", ticker)
+                self._emit_selector_event(
+                    plan,
+                    stage="selector_entry",
+                    decision="REJECT",
+                    reason_code="UNSUPPORTED_INDEX_MAPPING",
+                    explanation=f"Index ticker {ticker} has no supported options mapping",
+                    inputs={"ticker": ticker},
+                )
                 return None
 
         pt1 = getattr(plan, "target_underlying", None)
@@ -294,20 +450,52 @@ class APContractSelectionEngine:
                 if eg_result.get("blocked"):
                     log.warning("[%s] BLOCKED by EarningsGuard -- %s",
                                 ticker, eg_result.get("reason", "earnings blackout"))
+                    self._emit_selector_event(
+                        plan,
+                stage="earnings_gate",
+                        decision="REJECT",
+                        reason_code="EARNINGS_LOCKOUT",
+                        explanation=f"Blocked by EarningsGuard: {eg_result.get('reason','earnings blackout')}",
+                        thresholds={"blackout_days": getattr(self.earnings_guard, "blackout_days", None)},
+                    )
                     return None
             except Exception as exc:
                 log.warning("[%s] EarningsGuard raised unexpectedly (%s) -- continuing (fail open)",
                             ticker, exc)
+                self._emit_selector_event(
+                    plan,
+                    stage="earnings_gate",
+                    decision="ERROR",
+                    reason_code="EARNINGS_GUARD_ERROR",
+                    explanation=f"EarningsGuard exception; selector continued fail-open: {exc}",
+                    inputs={"ticker": ticker},
+                    context={"fail_open": True},
+                )
 
         # ── A. FETCH CHAIN ────────────────────────────────────────────────────
         try:
             chain, underlying_price = self._fetch_chain_with_price(ticker, direction)
         except Exception as e:
             log.error("[%s] chain fetch failed: %s", ticker, e)
+            self._emit_selector_event(
+                plan,
+                stage="chain_fetch",
+                decision="REJECT",
+                reason_code="NO_CHAIN_DATA",
+                explanation=f"Chain fetch failed: {e}",
+                inputs={"ticker": ticker, "direction": direction},
+            )
             return None
 
         if not chain:
             log.warning("[%s] EMPTY CHAIN -- Tradier returned no options", ticker)
+            self._emit_selector_event(
+                plan,
+                decision="REJECT",
+                reason_code="NO_CHAIN_DATA",
+                explanation="Tradier returned empty options chain",
+                inputs={"ticker": ticker, "direction": direction},
+            )
             return None
 
         if not underlying_price:
@@ -326,6 +514,14 @@ class APContractSelectionEngine:
                     _sig_id = getattr(plan, "signal_id", "") or ""
                     trace_gate(str(_sig_id), ticker, "IV_GATE", "REJECT",
                                reason="iv_extreme", iv_rank=iv_result.get("iv_rank"))
+                    self._emit_selector_event(
+                        plan,
+                stage="iv_gate",
+                        decision="REJECT",
+                        reason_code="IV_RANK_TOO_HIGH",
+                        explanation=f"Blocked by IVRankFilter: {iv_result.get('reason','IV rank too high')}",
+                        inputs={"iv_rank": iv_result.get("iv_rank"), "iv_zone": iv_result.get("iv_zone")},
+                    )
                     return None
 
                 if iv_result.get("requires_momentum"):
@@ -340,6 +536,23 @@ class APContractSelectionEngine:
                         trace_gate(str(_sig_id), ticker, "IV_GATE", "REJECT",
                                    reason=f"iv_zone={iv_zone}_score_too_low",
                                    score=signal_score, iv_rank=iv_result.get("iv_rank"))
+                        self._emit_selector_event(
+                            plan,
+                stage="iv_gate",
+                            decision="REJECT",
+                            reason_code="IV_ZONE_SCORE_TOO_LOW",
+                            explanation=(
+                                f"IV zone {iv_zone} requires momentum score >= {min_score:.0f}, "
+                                f"signal score={signal_score:.1f} is below threshold"
+                            ),
+                            inputs={
+                                "iv_rank":   iv_result.get("iv_rank"),
+                                "iv_zone":   iv_zone,
+                                "score":     signal_score,
+                                "min_score": min_score,
+                            },
+                            thresholds={"momentum_min_score": min_score},
+                        )
                         return None
                     else:
                         log.info("[%s] IVGate allow | iv_zone=%s score=%.1f",
@@ -347,9 +560,32 @@ class APContractSelectionEngine:
                         trace_gate(str(_sig_id), ticker, "IV_GATE", "ALLOW",
                                    reason=f"iv_zone={iv_zone}",
                                    score=signal_score, iv_rank=iv_result.get("iv_rank"))
+                        self._emit_selector_event(
+                            plan,
+                stage="iv_gate",
+                            decision="ALLOW",
+                            reason_code="IV_ZONE_OK",
+                            explanation=f"IV zone {iv_zone} passed with momentum score {signal_score:.1f}",
+                            inputs={
+                                "iv_rank":   iv_result.get("iv_rank"),
+                                "iv_zone":   iv_zone,
+                                "score":     signal_score,
+                                "min_score": min_score,
+                            },
+                            thresholds={"momentum_min_score": min_score},
+                        )
             except Exception as exc:
                 log.warning("[%s] IVRankFilter raised unexpectedly (%s) -- continuing (fail open)",
                             ticker, exc)
+                self._emit_selector_event(
+                    plan,
+                    stage="iv_gate",
+                    decision="ERROR",
+                    reason_code="IV_FILTER_ERROR",
+                    explanation=f"IVRankFilter exception; selector continued fail-open: {exc}",
+                    inputs={"ticker": ticker, "underlying_price": _safe_float(underlying_price)},
+                    context={"fail_open": True},
+                )
 
         # Fail closed on stub price data
         if isinstance(plan, dict):
@@ -358,47 +594,116 @@ class APContractSelectionEngine:
             _intel = getattr(plan, "intel_result", {}) or {}
         if _intel.get("price_data_stub"):
             log.warning("[%s] BLOCKED — price data was stub during intel gate", ticker)
+            self._emit_selector_event(
+                plan,
+                stage="chain_fetch",
+                decision="REJECT",
+                reason_code="NO_CHAIN_DATA",
+                explanation="Price data was a stub during intel gate — signal quality insufficient",
+                inputs={"price_data_stub": True},
+            )
             return None
 
         # ── B. HARD QUALITY FILTER ────────────────────────────────────────────
         _orig_spread        = self.max_spread_pct
         _orig_oi            = self.min_oi
         _orig_vol           = self.min_volume
-        self.max_spread_pct = _eff_max_spread
-        self.min_oi         = _eff_min_oi
-        self.min_volume     = _eff_min_volume
+        try:
+            self.max_spread_pct = _eff_max_spread
+            self.min_oi         = _eff_min_oi
+            self.min_volume     = _eff_min_volume
 
-        today      = date.today()
-        survivors  = []
-        _rejections: dict = {}
-        _pro_tiers:  dict = {"A": 0, "B": 0}
+            today      = date.today()
+            survivors  = []
+            _rejections: dict = {}
+            _pro_tiers:  dict = {"A": 0, "B": 0}
 
-        for opt in chain:
-            if _PRO_QUALITY_ENABLED:
-                exp_str = opt.get("expiration_date", "")
-                _dte = 0
-                if exp_str:
+            for opt in chain:
+                if _PRO_QUALITY_ENABLED:
+                    exp_str = opt.get("expiration_date", "")
+                    _dte = 0
+                    if exp_str:
+                        try:
+                            _dte = (date.fromisoformat(exp_str) - today).days
+                        except Exception:
+                            _dte = 0
+                    pro_tier, pro_reason = _pro_contract_quality(opt, ticker, _dte)
+                    if pro_tier == "REJECT":
+                        _rejections[pro_reason] = _rejections.get(pro_reason, 0) + 1
+                        try:
+                            self._emit_selector_event(
+                                plan,
+                                stage="quality_filter",
+                                decision="REJECT",
+                                reason_code=_normalize_reason_code(pro_reason),
+                                explanation=pro_reason,
+                                contract=opt.get("symbol"),
+                                inputs={
+                                    "bid":        _safe_float(opt.get("bid")),
+                                    "ask":        _safe_float(opt.get("ask")),
+                                    "volume":     int(opt.get("volume") or 0),
+                                    "oi":         int(opt.get("open_interest") or 0),
+                                    "dte":        _dte,
+                                    "spread_pct": round(
+                                        ((_safe_float(opt.get("ask")) - _safe_float(opt.get("bid")))
+                                         / max((_safe_float(opt.get("ask")) + _safe_float(opt.get("bid"))) / 2, 0.01)),
+                                        4
+                                    ),
+                                },
+                                thresholds={
+                                    "hard_spread": (
+                                        _PRO_T1_SPREAD_HARD_MAX
+                                        if (ticker.upper() in _PRO_TIER1_TICKERS)
+                                        else _PRO_T2_SPREAD_HARD_MAX
+                                    ),
+                                    "min_bid": _PRO_MIN_BID,
+                                    "min_bid_size": _PRO_MIN_BID_SIZE_HARD,
+                                },
+                            )
+                        except Exception:
+                            pass  # per-contract pro-quality emit — non-critical
+                        continue
+                    opt["_pro_tier"] = pro_tier
+                    _pro_tiers[pro_tier] = _pro_tiers.get(pro_tier, 0) + 1
+
+                result = self._quality_filter(opt, today)
+                if result is None:
+                    survivors.append(opt)
+                else:
+                    _rejections[result] = _rejections.get(result, 0) + 1
+                    log.debug("[%s] filtered: %s -- %s", ticker, opt.get("symbol", "?"), result)
                     try:
-                        _dte = (date.fromisoformat(exp_str) - today).days
+                        self._emit_selector_event(
+                            plan,
+                            stage="quality_filter",
+                            decision="REJECT",
+                            reason_code=_normalize_reason_code(result),
+                            explanation=result,
+                            contract=opt.get("symbol"),
+                            inputs={
+                                "bid":     _safe_float(opt.get("bid")),
+                                "ask":     _safe_float(opt.get("ask")),
+                                "volume":  int(opt.get("volume") or 0),
+                                "oi":      int(opt.get("open_interest") or 0),
+                                "premium": round(
+                                            ((_safe_float(opt.get("bid")) + _safe_float(opt.get("ask"))) / 2) * 100,
+                                            2
+                                        ) if opt.get("bid") is not None and opt.get("ask") is not None else 0,
+                            },
+                            thresholds={
+                                "max_spread_pct": _safe_float(_eff_max_spread),
+                                "min_oi":         _safe_float(_eff_min_oi),
+                                "min_premium":    self.min_premium,
+                                "max_premium":    self.max_premium,
+                            },
+                        )
                     except Exception:
-                        _dte = 0
-                pro_tier, pro_reason = _pro_contract_quality(opt, ticker, _dte)
-                if pro_tier == "REJECT":
-                    _rejections[pro_reason] = _rejections.get(pro_reason, 0) + 1
-                    continue
-                opt["_pro_tier"] = pro_tier
-                _pro_tiers[pro_tier] = _pro_tiers.get(pro_tier, 0) + 1
+                        pass  # per-contract quality-filter emit — non-critical
 
-            result = self._quality_filter(opt, today)
-            if result is None:
-                survivors.append(opt)
-            else:
-                _rejections[result] = _rejections.get(result, 0) + 1
-                log.debug("[%s] filtered: %s -- %s", ticker, opt.get("symbol", "?"), result)
-
-        self.max_spread_pct = _orig_spread
-        self.min_oi         = _orig_oi
-        self.min_volume     = _orig_vol
+        finally:
+            self.max_spread_pct = _orig_spread
+            self.min_oi         = _orig_oi
+            self.min_volume     = _orig_vol
 
         if not survivors:
             log.warning(
@@ -407,6 +712,33 @@ class APContractSelectionEngine:
                 ", ".join(f"{k}({v})" for k, v in
                           sorted(_rejections.items(), key=lambda x: -x[1]))
                 if _rejections else "none",
+            )
+            _top_reject = (
+                sorted(_rejections.items(), key=lambda x: -x[1])[0][0]
+                if _rejections else None
+            )
+            _obs_reason = _normalize_reason_code(_top_reject) if _top_reject else "NO_CONTRACT_AFTER_FILTERS"
+            self._emit_selector_event(
+                plan,
+                stage="quality_summary",
+                decision="REJECT",
+                reason_code=_obs_reason,
+                explanation=(
+                    "No contracts passed quality gates | chain=" + str(len(chain)) + " | "
+                    "top_reason=" + (_top_reject or "none") + " | "
+                    + (", ".join(f"{k}({v})" for k, v in
+                       sorted(_rejections.items(), key=lambda x: -x[1]))
+                       if _rejections else "none")
+                ),
+                inputs={
+                    "chain_size":       len(chain),
+                    "rejection_counts": {_normalize_reason_code(k): v for k, v in _rejections.items()},
+                    "raw_rejection_counts": _rejections,
+                },
+                thresholds={
+                    "max_spread_pct": _safe_float(_eff_max_spread),
+                    "min_oi":         _safe_float(_eff_min_oi),
+                },
             )
             return None
 
@@ -441,9 +773,43 @@ class APContractSelectionEngine:
                 if selected.premium_per_contract > self.max_premium:
                     log.warning("[%s] premium $%.0f > max $%.0f -- skipping (too expensive for paper)",
                                 ticker, selected.premium_per_contract, self.max_premium)
+                    self._emit_selector_event(
+                        plan,
+                stage="affordability_gate",
+                        decision="REJECT",
+                        reason_code="PAPER_PREMIUM_CAP",
+                        explanation=(
+                            f"Paper premium cap: ${selected.premium_per_contract:.0f} "
+                            f"> max ${self.max_premium:.0f} — valid contract but too expensive for paper."
+                        ),
+                        contract=selected.contract_symbol,
+                        inputs={
+                            "premium_per_contract": _safe_float(selected.premium_per_contract),
+                            "max_premium":          _safe_float(self.max_premium),
+                        },
+                        thresholds={"max_premium": self.max_premium},
+                        context={"mode": self.mode},
+                    )
                     return None
                 log.warning("[%s] budget $%.0f < premium $%.0f -- forcing 1 contract",
                             ticker, budget, selected.premium_per_contract)
+                self._emit_selector_event(
+                    plan,
+                stage="affordability_gate",
+                    decision="ALLOW",
+                    reason_code="FORCED_1_FOR_PAPER",
+                    explanation=(
+                        f"Paper override: budget ${budget:.0f} < premium "
+                        f"${selected.premium_per_contract:.0f} — forcing 1 contract. "
+                        "NOT valid for live trading."
+                    ),
+                    contract=selected.contract_symbol,
+                    inputs={
+                        "budget":               _safe_float(budget),
+                        "premium_per_contract": _safe_float(selected.premium_per_contract),
+                    },
+                    context={"mode": self.mode, "simulation_override": True},
+                )
                 selected = SelectedContract(
                     contract_symbol      = selected.contract_symbol,
                     expiration           = selected.expiration,
@@ -466,6 +832,23 @@ class APContractSelectionEngine:
             else:
                 log.warning("[%s] BLOCKED -- budget $%.0f cannot afford %s @ $%.0f/contract",
                             ticker, budget, selected.contract_symbol, selected.premium_per_contract)
+                self._emit_selector_event(
+                    plan,
+                stage="affordability_gate",
+                    decision="REJECT",
+                    reason_code="NO_AFFORDABLE_CONTRACT",
+                    explanation=(
+                        f"Budget ${budget:.0f} cannot afford "
+                        f"{selected.contract_symbol} @ ${selected.premium_per_contract:.0f}/contract"
+                    ),
+                    contract=selected.contract_symbol,
+                    inputs={
+                        "budget":               _safe_float(budget),
+                        "premium_per_contract": _safe_float(selected.premium_per_contract),
+                        "affordable_contracts": selected.affordable_contracts,
+                    },
+                    thresholds={"min_contracts": 1},
+                )
                 return None
 
         if selected is None:
@@ -482,6 +865,16 @@ class APContractSelectionEngine:
                 "[%s] DEEP OTM GATE: delta=%.2f < min=%.2f — contract too far OTM, skipping",
                 ticker, selected.delta, _MIN_DELTA,
             )
+            self._emit_selector_event(
+                plan,
+                stage="deep_otm_gate",
+                decision="REJECT",
+                reason_code="DELTA_OUT_OF_RANGE",
+                explanation=f"Deep OTM gate: delta={selected.delta:.2f} < min={_MIN_DELTA:.2f}",
+                contract=selected.contract_symbol,
+                inputs={"delta": selected.delta, "strike": selected.strike},
+                thresholds={"min_delta": _MIN_DELTA},
+            )
             return None
 
         # Also check moneyness if underlying price available
@@ -495,6 +888,24 @@ class APContractSelectionEngine:
                     ticker, selected.strike, underlying_price,
                     _otm_pct * 100, _MAX_OTM_PCT * 100,
                 )
+                self._emit_selector_event(
+                    plan,
+                    decision="REJECT",
+                    reason_code="DELTA_OUT_OF_RANGE",
+                    explanation=(
+                        f"Deep OTM gate: strike={selected.strike:.2f} "
+                        f"underlying={underlying_price:.2f} "
+                        f"OTM={_otm_pct*100:.1f}% > max={_MAX_OTM_PCT*100:.0f}%"
+                    ),
+                    contract=selected.contract_symbol,
+                    inputs={
+                        "strike":           _safe_float(selected.strike),
+                        "underlying_price": _safe_float(underlying_price),
+                        "otm_pct":          round(_otm_pct, 4),
+                        "delta":            _safe_float(selected.delta),
+                    },
+                    thresholds={"max_otm_pct": _MAX_OTM_PCT},
+                )
                 return None
 
         # ── FINAL PREMIUM GATE (per-ticker cap) ──────────────────────────────
@@ -502,18 +913,73 @@ class APContractSelectionEngine:
         if selected.premium_per_contract > _final_prem_cap:
             log.warning("[%s] FINAL PREMIUM GATE: $%.0f > $%.0f per-ticker cap — blocking",
                         ticker, selected.premium_per_contract, _final_prem_cap)
+            self._emit_selector_event(
+                plan,
+                stage="premium_gate",
+                decision="REJECT",
+                reason_code="PREMIUM_CAP_EXCEEDED",
+                explanation=(
+                    f"Final premium gate: ${selected.premium_per_contract:.0f} "
+                    f"> ${_final_prem_cap:.0f} per-ticker cap for {ticker}"
+                ),
+                contract=selected.contract_symbol,
+                inputs={
+                    "premium_per_contract": _safe_float(selected.premium_per_contract),
+                    "ticker_cap":           _safe_float(_final_prem_cap),
+                },
+                thresholds={"ticker_premium_cap": _final_prem_cap},
+            )
             return None
 
         # ── F. UPDATE PLAN IN-PLACE ───────────────────────────────────────────
-        plan.contract_symbol  = selected.contract_symbol
-        plan.limit_price      = selected.ask
-        plan.contracts        = selected.affordable_contracts
-        plan.max_position_usd = plan.contracts * selected.premium_per_contract
+        if isinstance(plan, dict):
+            plan["contract_symbol"] = selected.contract_symbol
+            plan["limit_price"]     = selected.ask
+            plan["contracts"]       = selected.affordable_contracts
+            plan["max_position_usd"] = plan["contracts"] * selected.premium_per_contract
+        else:
+            plan.contract_symbol  = selected.contract_symbol
+            plan.limit_price      = selected.ask
+            plan.contracts        = selected.affordable_contracts
+            plan.max_position_usd = plan.contracts * selected.premium_per_contract
         if _wick_confidence and not getattr(plan, "wick_confidence", None):
             try:
                 plan.wick_confidence = _wick_confidence
             except Exception:
                 pass
+
+        self._emit_selector_event(
+            plan,
+                stage="contract_selected",
+            decision="ALLOW",
+            reason_code="SELECTED",
+            explanation=(
+                f"Contract selected | score={selected.selection_score:.2f} | "
+                f"{selected.selection_reason}"
+            ),
+            contract=selected.contract_symbol,
+            inputs={
+                "selection_score":      selected.selection_score,
+                "premium_per_contract": selected.premium_per_contract,
+                "spread_pct":           selected.spread_pct,
+                "oi":                   selected.open_interest,
+                "volume":               selected.volume,
+                "delta":                selected.delta,
+                "dte":                  selected.dte,
+                "affordable_contracts": selected.affordable_contracts,
+            },
+            thresholds={
+                "max_spread_pct": _eff_max_spread,
+                "min_oi":         _eff_min_oi,
+                "budget":         budget,
+            },
+            context={
+                "is_etf":              _is_etf,
+                "selection_reason":    selected.selection_reason,
+                "mode":                self.mode,
+                "simulation_override": "[forced_1]" in (selected.selection_reason or ""),
+            },
+        )
 
         log.info(
             "[%s] SELECTED | %s bid=%s ask=%s mid=%.2f spread=%.1f%% "
@@ -653,7 +1119,7 @@ class APContractSelectionEngine:
     def _synthetic_contract(self, ticker: str, direction: str, reason: str) -> "SelectedContract":
         log.warning("[%s] SYNTHETIC CONTRACT -- %s", ticker, reason)
         return SelectedContract(
-            contract_symbol="f{ticker}_SIM", expiration="SIM", strike=0,
+            contract_symbol=f"{ticker}_SIM", expiration="SIM", strike=0,
             option_type=direction.lower(), bid=0.50, ask=1.00, mid=0.75,
             spread_pct=0.20, delta=0.50, open_interest=1, volume=1,
             premium_per_share=0.75, premium_per_contract=75.0,
