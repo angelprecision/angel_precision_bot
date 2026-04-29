@@ -1,5 +1,4 @@
-
-      # ap_entry_watcher.py — Angel Precision Real-Time Entry Watcher
+# ap_entry_watcher.py — Angel Precision Real-Time Entry Watcher
 # =============================================================================
 # Overnight signal support:
 #   Scanners fire post-market (~6 PM ET) for next-day setups.
@@ -7,6 +6,12 @@
 #   They activate at the next session open (9:30 AM ET).
 #   TTL is 72 hours — covers weekend holds (Friday PM scanner → Monday open).
 #   Force-expire at 4 PM only applies to same-day signals, not overnight ones.
+#
+# OVERNIGHT DAILY SIGNALS (The Strat daily timeframe):
+#   Validated by ap.overnight_daily_validator — NOT by generic drift/stale logic.
+#   CALL: invalid if session low < prior_day_low (downside already shown)
+#   PUT:  invalid if session high > prior_day_high (upside already shown)
+#   See ap/overnight_daily_validator.py for full spec.
 # =============================================================================
 
 from __future__ import annotations
@@ -19,25 +24,32 @@ from datetime import datetime, timezone, timedelta
 from typing import Callable, Optional
 from zoneinfo import ZoneInfo
 
+from ap.overnight_daily_validator import (
+    recheck_overnight_daily,
+    _is_daily_signal,
+    OvernightWatchState,
+)
+
 log = logging.getLogger("ap.entry_watcher")
 ET  = ZoneInfo("America/New_York")
 
 POLL_INTERVAL_SEC       = 15
-MAX_WATCH_MINUTES       = 4320   # 72 hours — holds through weekend (Fri PM → Mon open)
+MAX_WATCH_MINUTES       = 4320   # 72 hours — holds through weekend
 EOD_CUTOFF_HOUR         = 15
 EOD_CUTOFF_MIN          = 30
 WRONG_DIR_BUFFER_PCT    = 0.001
 OVERNIGHT_THRESHOLD_HOUR = 15
 OVERNIGHT_THRESHOLD_MIN  = 30
 
-# Intraday stale-move invalidation
-# If we've been watching this long AND price drifted this far, the move is gone
-MAX_INTRADAY_WATCH_MIN  = 5      # minutes watching before stale check fires
-MAX_INTRADAY_DRIFT_PCT  = 0.015  # 1.5% drift from trigger = stale, move missed
+MAX_INTRADAY_WATCH_MIN  = 5
+MAX_INTRADAY_DRIFT_PCT  = 0.015
+OVERNIGHT_MAX_DRIFT_PCT = 0.020  # still used for NON-daily overnight signals
 
-# Overnight open-time revalidation
-# At market open, expire overnight signals if underlying moved too far overnight
-OVERNIGHT_MAX_DRIFT_PCT = 0.020  # 2.0% drift overnight = setup invalid
+# Opening auction / first-print protection.
+# Prevents the watcher from firing multiple entries into the most chaotic window
+# of the session while still allowing normal operation after the protection window.
+OPEN_PROTECT_MINUTES   = 5
+MAX_OPEN_TRIGGERS      = 1
 
 
 class WatchState:
@@ -82,6 +94,11 @@ class WatchedSignal:
         self.breach_price:    float = 0.0
         self.last_quote_bid:  float = 0.0
         self.last_quote_ask:  float = 0.0
+        self.signal_id:       str   = signal.get("signal_id") or str(uuid.uuid4())
+
+        # Set initial queue_status for daily overnight signals
+        if overnight and _is_daily_signal(self):
+            self.signal["queue_status"] = OvernightWatchState.OVERNIGHT_QUEUED
 
         if overnight:
             log.info(
@@ -106,22 +123,21 @@ class WatchedSignal:
         if now >= self.expire_at:
             self.state = WatchState.EXPIRED
             log.info(f"[{self.ticker}] EXPIRED — no breach in {MAX_WATCH_MINUTES}min")
-            # Release dedup key on TTL expiry — allows same setup to re-queue next session
             try:
                 if hasattr(self, "_watcher_ref") and self._watcher_ref:
                     _ds = getattr(self._watcher_ref, "_dedup_set", None)
                     if _ds and self.signal_id:
                         _ds.discard(str(self.signal_id))
-                        log.debug("[%s] Dedup key released on TTL expire", self.ticker)
             except Exception:
                 pass
             return self.state
 
-        # ── INTRADAY STALE-MOVE INVALIDATION ─────────────────────────────────────
-        # If we've been watching > MAX_INTRADAY_WATCH_MIN AND price has drifted
-        # past the trigger beyond MAX_INTRADAY_DRIFT_PCT, the move is already done.
-        # Entering now = chasing. Expire the signal instead.
-        if not self.overnight and self.minutes_watching >= MAX_INTRADAY_WATCH_MIN:
+        # Intraday stale-move invalidation (NOT for daily overnight signals)
+        if (
+            not self.overnight
+            and not _is_daily_signal(self)
+            and self.minutes_watching >= MAX_INTRADAY_WATCH_MIN
+        ):
             _mid = (bid + ask) / 2 if bid > 0 and ask > 0 else max(bid, ask)
             if _mid > 0 and self.entry_trigger:
                 _drift = (_mid - self.entry_trigger) / self.entry_trigger
@@ -144,7 +160,6 @@ class WatchedSignal:
             if ask >= self.entry_trigger:
                 if self.breach_count == 0:
                     self.breach_price = ask
-                    log.debug(f"[{self.ticker}] CALL breach candidate — ask=${ask:.2f} > ${self.entry_trigger:.2f} (poll 1/{self.MOMENTUM_POLLS_REQUIRED})")
                 self.breach_count += 1
                 if self.breach_count >= self.MOMENTUM_POLLS_REQUIRED:
                     self.state         = WatchState.TRIGGERED
@@ -155,23 +170,18 @@ class WatchedSignal:
                         f"held above ${self.entry_trigger:.2f} for {self.breach_count} polls"
                     )
             else:
-                if self.breach_count > 0:
-                    log.debug(f"[{self.ticker}] CALL breach reset — ask=${ask:.2f} pulled back")
                 self.breach_count = 0
-
-            if bid <= self.stop_level * (1 - WRONG_DIR_BUFFER_PCT):
+            if self.stop_level and bid <= self.stop_level * (1 - WRONG_DIR_BUFFER_PCT):
                 self.state = WatchState.INVALIDATED
                 self.breach_count = 0
                 log.info(
                     f"[{self.ticker}] INVALIDATED — bid=${bid:.2f} "
                     f"broke stop=${self.stop_level:.2f} before trigger"
                 )
-
         else:  # PUT
             if bid <= self.entry_trigger:
                 if self.breach_count == 0:
                     self.breach_price = bid
-                    log.debug(f"[{self.ticker}] PUT breach candidate — bid=${bid:.2f} < ${self.entry_trigger:.2f} (poll 1/{self.MOMENTUM_POLLS_REQUIRED})")
                 self.breach_count += 1
                 if self.breach_count >= self.MOMENTUM_POLLS_REQUIRED:
                     self.state         = WatchState.TRIGGERED
@@ -182,11 +192,8 @@ class WatchedSignal:
                         f"held below ${self.entry_trigger:.2f} for {self.breach_count} polls"
                     )
             else:
-                if self.breach_count > 0:
-                    log.debug(f"[{self.ticker}] PUT breach reset — bid=${bid:.2f} pulled back")
                 self.breach_count = 0
-
-            if ask >= self.stop_level * (1 + WRONG_DIR_BUFFER_PCT):
+            if self.stop_level and ask >= self.stop_level * (1 + WRONG_DIR_BUFFER_PCT):
                 self.state = WatchState.INVALIDATED
                 self.breach_count = 0
                 log.info(
@@ -206,14 +213,6 @@ class WatchedSignal:
 
 
 class APEntryWatcher:
-    """
-    Watches pending signals for entry breach confirmation.
-    Runs as a background thread.
-
-    Supports overnight signals: post-market scanner setups are held
-    overnight and activated at the next session open (9:30 AM ET).
-    """
-
     def __init__(self, broker):
         self.broker         = broker
         self._pending:  list[WatchedSignal] = []
@@ -225,27 +224,19 @@ class APEntryWatcher:
         self.on_expire:     Optional[Callable] = None
         self.on_invalidate: Optional[Callable] = None
 
+        # Per-session open protection state. Resets once per ET calendar date.
+        self._open_trigger_count = 0
+        self._open_protect_date  = None
+
     def add_signal(self, signal: dict) -> bool:
-        """
-        Add a signal to the watch queue.
-
-        POLICY:
-          - Session hours (9:30 AM – 3:30 PM ET): accept, watch immediately.
-          - Post-session (3:30 PM – midnight ET): ACCEPT as overnight signal.
-            Scanner fires post-market for next-day setups. Signal held overnight,
-            activates at 9:30 AM next morning.
-          - Pre-market (midnight – 9:29 AM ET): accept, waits for open.
-
-        All signals use 20-hour TTL. Force-expire at 4 PM applies to same-day
-        signals only — overnight signals survive to next session.
-        """
         now_et = datetime.now(ET)
         hour, minute = now_et.hour, now_et.minute
-
-        post_session = (hour > OVERNIGHT_THRESHOLD_HOUR or
-                        (hour == OVERNIGHT_THRESHOLD_HOUR and minute >= OVERNIGHT_THRESHOLD_MIN))
-
-        overnight = post_session
+        post_session = (
+            hour > OVERNIGHT_THRESHOLD_HOUR
+            or (hour == OVERNIGHT_THRESHOLD_HOUR and minute >= OVERNIGHT_THRESHOLD_MIN)
+        )
+        pre_market = (hour < 9 or (hour == 9 and minute < 30))
+        overnight = post_session or pre_market
 
         if overnight:
             log.info(
@@ -255,36 +246,85 @@ class APEntryWatcher:
             )
 
         watched = WatchedSignal(signal, overnight=overnight)
+
         with self._lock:
-            existing = [w for w in self._pending
-                        if w.ticker == watched.ticker and w.side == watched.side]
-            if existing:
-                log.info(
-                    f"[{watched.ticker}] Already watching {watched.side} — "
-                    f"replacing with higher-score signal"
-                )
-                if watched.score > existing[0].score:
-                    self._pending = [w for w in self._pending if w not in existing]
+            same_side = [
+                w for w in self._pending
+                if w.is_active
+                and w.ticker == watched.ticker
+                and w.side == watched.side
+            ]
+
+            opposite_side = [
+                w for w in self._pending
+                if w.is_active
+                and w.ticker == watched.ticker
+                and w.side != watched.side
+            ]
+
+            # SAFE MODE:
+            # Calls and puts are allowed across the portfolio, but the watcher
+            # must never keep both directions armed for the same ticker.
+            # Higher score wins; equal/lower score is blocked.
+            if opposite_side:
+                best_opp = max(opposite_side, key=lambda w: w.score)
+
+                if watched.score > best_opp.score:
+                    for w in opposite_side:
+                        w.state = WatchState.CANCELLED
+                        log.info(
+                            "[%s] SAFE_MODE_DIRECTION_FLIP — cancelling %s score=%.1f "
+                            "for stronger %s score=%.1f",
+                            watched.ticker, w.side, w.score, watched.side, watched.score,
+                        )
+                    self._pending = [w for w in self._pending if w not in opposite_side]
                 else:
+                    log.info(
+                        "[%s] SAFE_MODE_BLOCK_OPPOSITE — keeping existing %s score=%.1f, "
+                        "blocking new %s score=%.1f",
+                        watched.ticker, best_opp.side, best_opp.score, watched.side, watched.score,
+                    )
+                    return False
+
+            # Same-side dedup: keep only the strongest active watcher for the
+            # same ticker/direction. This prevents duplicate queue entries while
+            # still allowing a stronger refreshed setup to replace the weaker one.
+            if same_side:
+                best_same = max(same_side, key=lambda w: w.score)
+                if watched.score > best_same.score:
+                    for w in same_side:
+                        w.state = WatchState.CANCELLED
+                        log.info(
+                            "[%s] SAME_SIDE_REPLACE — cancelling %s score=%.1f "
+                            "for stronger same-side score=%.1f",
+                            watched.ticker, w.side, w.score, watched.score,
+                        )
+                    self._pending = [w for w in self._pending if w not in same_side]
+                else:
+                    log.info(
+                        "[%s] SAME_SIDE_BLOCK — keeping %s score=%.1f, "
+                        "blocking weaker same-side score=%.1f",
+                        watched.ticker, watched.side, best_same.score, watched.score,
+                    )
                     return False
 
             self._pending.append(watched)
 
-        overnight_count = sum(1 for w in self._pending if w.overnight)
-        same_day_count  = sum(1 for w in self._pending if not w.overnight)
+            overnight_count = sum(1 for w in self._pending if w.overnight and w.is_active)
+            same_day_count  = sum(1 for w in self._pending if not w.overnight and w.is_active)
+            active_total    = sum(1 for w in self._pending if w.is_active)
+
         log.info(
             f"[{watched.ticker}] Added to watch queue — "
-            f"{same_day_count} same-day + {overnight_count} overnight = {len(self._pending)} total"
+            f"{same_day_count} same-day + {overnight_count} overnight = {active_total} active"
         )
         return True
 
     def watch(self, plan, local_order_id: str) -> bool:
-        """
-        Plan-aware entry called by ap/queue.py _dispatch().
-        """
         if plan is None:
             log.warning("watch() called with None plan -- skipping")
             return False
+
         signal_dict = {
             "signal_id":       getattr(plan, "signal_id",         str(uuid.uuid4())),
             "ticker":          getattr(plan, "ticker",            ""),
@@ -298,28 +338,30 @@ class APEntryWatcher:
             "local_order_id":  local_order_id,
             "contract_symbol": getattr(plan, "contract_symbol",  ""),
             "pattern":         getattr(plan, "pattern",           ""),
+            # ── OVERNIGHT DAILY FIELDS ───────────────────────────────────────
+            "prior_day_high":  getattr(plan, "prior_day_high",   None),
+            "prior_day_low":   getattr(plan, "prior_day_low",    None),
+            "timeframe":       getattr(plan, "timeframe",        "1d"),
+            "strategy_type":   getattr(plan, "strategy_type",    ""),
+            # queue_status set in WatchedSignal.__init__ for OVERNIGHT_DAILY
+            # ────────────────────────────────────────────────────────────────
             "trigger": {
                 "entry": getattr(plan, "trigger_price",     None),
                 "stop":  getattr(plan, "stop_underlying",   None),
                 "pt1":   getattr(plan, "target_underlying", None),
             },
         }
-        # ── PRICE STALENESS CHECK ──────────────────────────────────────────────────
-        # If current price has already run past the trigger by more than 1.5%,
-        # the setup is stale — skip it rather than enter chasing a move.
-        #
-        # IMPORTANT: Skip this check for post-session / overnight signals.
-        # Scanners fire post-market (~6 PM ET) for next-day setups using the
-        # 4 PM close as the trigger. After-hours quotes drift away from that close,
-        # which would cause 100% of overnight signals to be rejected at queue time
-        # even though they should be (re-)evaluated at 9:30 AM next session.
+
+        # Staleness check (skip for post-session)
         _now_et = datetime.now(ET)
         _post_session = (_now_et.hour > OVERNIGHT_THRESHOLD_HOUR or
-                         (_now_et.hour == OVERNIGHT_THRESHOLD_HOUR and _now_et.minute >= OVERNIGHT_THRESHOLD_MIN))
-        _trigger  = signal_dict.get("entry_price")
-        _side     = signal_dict.get("side", "CALL").upper()
-        _ticker   = signal_dict.get("ticker", "")
-        _stop     = signal_dict.get("stop_price")
+                         (_now_et.hour == OVERNIGHT_THRESHOLD_HOUR and
+                          _now_et.minute >= OVERNIGHT_THRESHOLD_MIN))
+        _trigger = signal_dict.get("entry_price")
+        _side    = signal_dict.get("side", "CALL").upper()
+        _ticker  = signal_dict.get("ticker", "")
+        _stop    = signal_dict.get("stop_price")
+
         if _post_session:
             log.info(
                 "[%s] Post-session queue — skipping staleness check, will evaluate at next open "
@@ -334,14 +376,11 @@ class APEntryWatcher:
                 _mid = (_bid + _ask) / 2 if _bid > 0 and _ask > 0 else 0
                 if _mid > 0:
                     _pct_from_trigger = (_mid - _trigger) / _trigger
-                    # CALL: price needs to be AT or BELOW trigger (breach = move up)
-                    # PUT: price needs to be AT or ABOVE trigger (breach = move down)
                     _stale = False
-                    if _side == "CALL" and _pct_from_trigger > 0.030:   # price already ran +3.0% past trigger
+                    if _side == "CALL" and _pct_from_trigger > 0.030:
                         _stale = True
-                    elif _side == "PUT" and _pct_from_trigger < -0.030:  # price already fell -3.0% past trigger
+                    elif _side == "PUT" and _pct_from_trigger < -0.030:
                         _stale = True
-                    # Also skip if price has already moved through the STOP level
                     if _stop and _stop > 0:
                         if _side == "CALL" and _mid < _stop:
                             _stale = True
@@ -354,8 +393,6 @@ class APEntryWatcher:
                             _ticker, _mid, _pct_from_trigger*100, _trigger, _side
                         )
                         return False
-                    log.debug("[%s] Price check OK — $%.2f vs trigger $%.2f (%.1f%%)",
-                              _ticker, _mid, _trigger, _pct_from_trigger*100)
             except Exception as _e:
                 log.debug("[%s] Price staleness check failed (continuing): %s", _ticker, _e)
 
@@ -395,6 +432,8 @@ class APEntryWatcher:
                     "score":         w.score,
                     "grade":         w.grade,
                     "overnight":     w.overnight,
+                    "queue_status":  w.signal.get("queue_status", ""),
+                    "strategy_type": w.signal.get("strategy_type", ""),
                 }
                 for w in self._pending
             ]
@@ -410,8 +449,18 @@ class APEntryWatcher:
     def _check_all(self):
         now_et = datetime.now(ET)
 
-        # At 4 PM ET: force-expire SAME-DAY signals only.
-        # Overnight signals (post-market scanner setups) survive to next session.
+        # Reset open-protection trigger counter once per ET calendar date.
+        today_et = now_et.date()
+        if self._open_protect_date != today_et:
+            self._open_protect_date = today_et
+            self._open_trigger_count = 0
+
+        open_protect_active = (
+            now_et.hour == 9
+            and 30 <= now_et.minute < 30 + OPEN_PROTECT_MINUTES
+        )
+
+        # EOD force-expire same-day signals only
         if now_et.hour >= 16:
             with self._lock:
                 expired   = []
@@ -421,12 +470,9 @@ class APEntryWatcher:
                         w.state = WatchState.EXPIRED
                         expired.append(w)
                         log.info(f"[{w.ticker}] Force-expired at market close (same-day signal)")
-                        # Release dedup key so same setup can re-queue next session
                         try:
                             if hasattr(self, "_dedup_set") and w.signal_id:
                                 self._dedup_set.discard(str(w.signal_id))
-                                log.debug("[%s] Dedup key released on EOD expire | signal=%s",
-                                          w.ticker, w.signal_id)
                         except Exception:
                             pass
                     else:
@@ -435,32 +481,54 @@ class APEntryWatcher:
                 if expired:
                     log.info(
                         f"EOD force-expire: {len(expired)} same-day signals expired, "
-                        f"{len(surviving)} overnight signals held for next session"
+                        f"{len(surviving)} overnight signals held"
                     )
             return
 
-        # Outside session hours (before 9:30 AM ET): hold, don't poll
+        # Pre-market hold
         if now_et.hour < 9 or (now_et.hour == 9 and now_et.minute < 30):
             return
 
-        # ── OVERNIGHT OPEN-TIME REVALIDATION ─────────────────────────────────────
-        # One-time check at market open for overnight signals:
-        # If price has moved too far from trigger overnight, expire the signal.
-        # This prevents Friday setups from firing Monday on stale levels.
+        # ── OVERNIGHT OPEN-TIME REVALIDATION ─────────────────────────────────
         with self._lock:
-            overnight_active = [w for w in self._pending
-                                 if w.is_active and w.overnight]
+            overnight_active = [w for w in self._pending if w.is_active and w.overnight]
 
         if overnight_active:
-            tickers_overnight = list({w.ticker for w in overnight_active})
-            try:
-                quotes_overnight = self._fetch_quotes(tickers_overnight)
-            except Exception as _qe:
-                log.warning("[WATCHER] Overnight revalidation quote fetch failed: %s", _qe)
-                quotes_overnight = {}
-
             _to_expire_overnight = []
+
             for w in overnight_active:
+                # ── DAILY TIMEFRAME: structural validator (The Strat rule) ────
+                if _is_daily_signal(w):
+                    w.signal["queue_status"] = OvernightWatchState.OPEN_RECHECK_PENDING
+                    result = recheck_overnight_daily(w, self.broker)
+
+                    if not result.valid:
+                        w.state = WatchState.INVALIDATED
+                        w.signal["queue_status"] = OvernightWatchState.INVALIDATED
+                        log.info(
+                            "[%s] OVERNIGHT_DAILY_INVALIDATED | side=%s | %s | %s",
+                            w.ticker, w.side, result.reason_code, result.reason_text,
+                        )
+                        _to_expire_overnight.append(w)
+                    else:
+                        # Promote to same-day active watcher with explicit armed state
+                        w.overnight = False
+                        w.signal["queue_status"] = OvernightWatchState.VALID_AWAITING_BREACH
+                        log.info(
+                            "[%s] OVERNIGHT_DAILY_ARMED | side=%s | queue_status=%s | %s",
+                            w.ticker, w.side,
+                            OvernightWatchState.VALID_AWAITING_BREACH,
+                            result.reason_text,
+                        )
+                    continue  # skip generic stale/drift check below
+
+                # ── INTRADAY / NON-DAILY: existing drift/premarket logic ──────
+                try:
+                    quotes_overnight = self._fetch_quotes([w.ticker])
+                except Exception as _qe:
+                    log.warning("[WATCHER] Overnight quote fetch failed: %s", _qe)
+                    quotes_overnight = {}
+
                 q = quotes_overnight.get(w.ticker) or {}
                 _bid = float(q.get("bid") or 0)
                 _ask = float(q.get("ask") or 0)
@@ -468,8 +536,7 @@ class APEntryWatcher:
                     _last = float(q.get("last") or 0)
                     _bid = _ask = _last
                 if not (_bid or _ask) or not w.entry_trigger:
-                    # Mark overnight as validated (no data = fail open, let it watch)
-                    w.overnight = False  # promote to same-day watcher
+                    w.overnight = False
                     continue
 
                 _mid = (_bid + _ask) / 2.0 if _bid and _ask else max(_bid, _ask)
@@ -479,14 +546,12 @@ class APEntryWatcher:
 
                 _drift = (_mid - w.entry_trigger) / w.entry_trigger
 
-                # Check if underlying already blew through trigger pre-market (move done)
                 _premarket_breached = False
                 if w.side == "CALL" and _mid >= w.entry_trigger * 1.005:
                     _premarket_breached = True
                 elif w.side == "PUT" and _mid <= w.entry_trigger * 0.995:
                     _premarket_breached = True
 
-                # Check if too far from trigger to be valid
                 _too_far = False
                 if w.side == "CALL" and _drift > OVERNIGHT_MAX_DRIFT_PCT:
                     _too_far = True
@@ -510,7 +575,6 @@ class APEntryWatcher:
                     )
                     _to_expire_overnight.append(w)
                 else:
-                    # Valid at open — promote from overnight to same-day watcher
                     w.overnight = False
                     log.info(
                         "[%s] OVERNIGHT VALIDATED at open — price $%.2f within %.2f%% "
@@ -521,11 +585,10 @@ class APEntryWatcher:
             if _to_expire_overnight:
                 with self._lock:
                     _done_ids = {id(w) for w in _to_expire_overnight}
-                    self._pending = [w for w in self._pending
-                                     if id(w) not in _done_ids]
-                log.info("[WATCHER] Overnight revalidation: %d expired, check complete",
-                         len(_to_expire_overnight))
+                    self._pending = [w for w in self._pending if id(w) not in _done_ids]
+                log.info("[WATCHER] Overnight revalidation: %d expired", len(_to_expire_overnight))
 
+        # ── REGULAR POLL ──────────────────────────────────────────────────────
         with self._lock:
             active = [w for w in self._pending if w.is_active]
 
@@ -545,7 +608,6 @@ class APEntryWatcher:
                 quote = quotes.get(w.ticker)
                 if not quote:
                     continue
-
                 bid = float(quote.get("bid", 0) or 0)
                 ask = float(quote.get("ask", 0) or 0)
                 if bid == 0 and ask == 0:
@@ -553,9 +615,17 @@ class APEntryWatcher:
                     bid = ask = last
 
                 new_state = w.check(bid, ask)
-
                 if new_state == WatchState.TRIGGERED:
-                    completed.append(("trigger", w))
+                    if open_protect_active and self._open_trigger_count >= MAX_OPEN_TRIGGERS:
+                        w.state = WatchState.EXPIRED
+                        completed.append(("done", w))
+                        log.info(
+                            "[%s] OPEN_PROTECTION_BLOCK — max open triggers reached (%s/%s)",
+                            w.ticker, self._open_trigger_count, MAX_OPEN_TRIGGERS,
+                        )
+                    else:
+                        self._open_trigger_count += 1
+                        completed.append(("trigger", w))
                 elif new_state in (WatchState.EXPIRED, WatchState.INVALIDATED):
                     completed.append(("done", w))
 
@@ -580,7 +650,6 @@ class APEntryWatcher:
                     log.error(f"on_invalidate callback failed: {e}")
 
     def _get_quote(self, ticker: str) -> dict:
-        """Fetch single-ticker quote. Returns {} on error."""
         try:
             quotes = self._fetch_quotes([ticker])
             return quotes.get(ticker, {})
