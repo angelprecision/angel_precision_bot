@@ -59,6 +59,15 @@ EOD_HARD_CLOSE_HOUR   = 15   # 3:45 PM  -- EXIT EVERYTHING (was 3:30, extended f
 EOD_HARD_CLOSE_MIN    = 45
 POLL_INTERVAL_SEC     = 8    # check every 8 seconds — catch TP windows faster
 
+# Kill switch policy: exits reduce risk, so the engine must never pause
+# evaluation under kill switch. By default, all exit actions are allowed.
+# Set EXIT_ENGINE_KILL_BLOCKS_NON_PROTECTIVE=1 only if you explicitly want
+# kill switch to block non-protective exits while still allowing stops/EOD/theta.
+KILL_BLOCKS_NON_PROTECTIVE_EXITS = (
+    os.getenv("EXIT_ENGINE_KILL_BLOCKS_NON_PROTECTIVE", "0").strip().lower()
+    in {"1", "true", "yes", "on"}
+)
+
 # ── P&L THRESHOLDS ────────────────────────────────────────────────────────────
 THETA_STOP_LOSS_PCT   = -0.35  # -35% on option → stop (was -50%)
 SCALE_OUT_1_THRESHOLD = 0.40   # +40%  → scale out 50% at window 1 (was +150%)
@@ -1001,10 +1010,23 @@ class APExitEngine:
             self._run_sentinels()
         except Exception as _se:
             log.debug("[exit_eng] Sentinel error (non-critical): %s", _se)
-        # ── Gap 1: Kill check at poll start (pre-fetch) ─────────────────────
-        if self._kill_switch_fn and self._kill_switch_fn():
-            log.debug("Exit engine poll skipped -- kill switch active")
-            return
+        # ── Kill switch snapshot (DO NOT RETURN) ────────────────────────────
+        # Kill switch means "do not add new risk". It must never stop the
+        # exit engine from evaluating/placing risk-reducing exits.
+        kill_active = False
+        if self._kill_switch_fn:
+            try:
+                kill_active = bool(self._kill_switch_fn())
+            except Exception as _ks_err:
+                # Exit protection is more important than a failed kill-switch read.
+                # Do not block exits because the kill-switch function errored.
+                log.warning("Exit engine kill-switch check failed; continuing exit evaluation: %s", _ks_err)
+                kill_active = False
+        if kill_active:
+            log.warning(
+                "Exit engine kill switch active — continuing exit evaluation; "
+                "risk-reducing exits remain enabled"
+            )
         now_et = datetime.now(ET)
         active = self.active_positions()
         if not active:
@@ -1090,17 +1112,20 @@ class APExitEngine:
                         )
                         actions_to_take.append((pos, decision))
 
-        # ── Gap 2: Kill check post-fetch, pre-execute ───────────────────────────
-        # Quote fetch takes 1-5s on live Tradier. Kill may have fired during
-        # that I/O window. Filter out non-protective exits but allow EOD/stop-loss.
-        if self._kill_switch_fn and self._kill_switch_fn():
+        # ── Kill check post-fetch, pre-execute ───────────────────────────────
+        # Default policy: kill switch DOES NOT block exits. Exits reduce risk.
+        # Optional strict mode can block non-protective exits, but still allows
+        # hard stops, theta stops, EOD, sentinel/time stops, and other protective exits.
+        if kill_active and KILL_BLOCKS_NON_PROTECTIVE_EXITS:
             protective = [(p, d) for p, d in actions_to_take if _is_protective_exit(d.reason or "")]
             blocked_actions = [(p, d) for p, d in actions_to_take if not _is_protective_exit(d.reason or "")]
             blocked = len(blocked_actions)
             if blocked:
                 log.warning(
-                    f"Exit engine: kill switch active -- blocking {blocked} non-protective exit(s), "
-                    f"allowing {len(protective)} protective exit(s)"
+                    "Exit engine: kill switch active strict mode -- blocking %d non-protective exit(s), "
+                    "allowing %d protective exit(s)",
+                    blocked,
+                    len(protective),
                 )
                 for _bp, _bd in blocked_actions:
                     self._emit_exit_event(
@@ -1118,6 +1143,11 @@ class APExitEngine:
             actions_to_take = protective
             if not actions_to_take:
                 return
+        elif kill_active and actions_to_take:
+            log.warning(
+                "Exit engine: kill switch active but allowing %d risk-reducing exit action(s)",
+                len(actions_to_take),
+            )
 
         # Execute actions
         for pos, decision in actions_to_take:
@@ -1188,8 +1218,24 @@ class APExitEngine:
 
             if decision.action == "SCALE_OUT":
                 if self.on_scale:
-                    if self._kill_switch_fn and self._kill_switch_fn():
-                        log.warning(f"[{pos.ticker}] KILL ACTIVE at on_scale -- skipping")
+                    if kill_active and KILL_BLOCKS_NON_PROTECTIVE_EXITS and not _is_protective_exit(decision.reason or ""):
+                        log.warning(
+                            "[%s] Kill switch strict mode — blocking non-protective scale-out: %s",
+                            pos.ticker,
+                            decision.reason,
+                        )
+                        self._emit_exit_event(
+                            pos,
+                            decision="REJECT",
+                            reason_code="KILL_SWITCH_ACTIVE",
+                            explanation=f"Kill switch blocked non-protective scale-out: {decision.reason}",
+                            stage="exit_decision",
+                            extra_inputs={
+                                "decision_action": decision.action,
+                                "decision_qty": decision.quantity,
+                                "decision_pnl_pct": decision.pnl_pct,
+                            },
+                        )
                         continue
                     try:
                         self.on_scale(pos, decision)
@@ -1227,10 +1273,12 @@ class APExitEngine:
             else:
                 if self.on_exit:
                     exit_reason = decision.reason or ""
-                    if self._kill_switch_fn and self._kill_switch_fn():
-                        if not _is_protective_exit(exit_reason):
+                    if kill_active:
+                        if KILL_BLOCKS_NON_PROTECTIVE_EXITS and not _is_protective_exit(exit_reason):
                             log.warning(
-                                f"[{pos.ticker}] Kill switch active — blocking non-protective exit: {exit_reason}"
+                                "[%s] Kill switch strict mode — blocking non-protective exit: %s",
+                                pos.ticker,
+                                exit_reason,
                             )
                             self._emit_exit_event(
                                 pos,
@@ -1245,10 +1293,11 @@ class APExitEngine:
                                 },
                             )
                             continue
-                        else:
-                            log.info(
-                                f"[{pos.ticker}] Kill switch active but allowing protective exit: {exit_reason}"
-                            )
+                        log.info(
+                            "[%s] Kill switch active — allowing risk-reducing exit: %s",
+                            pos.ticker,
+                            exit_reason,
+                        )
                     try:
                         self.on_exit(pos, decision)
                         # Submission ≠ closure. Mark in-flight so we don't
