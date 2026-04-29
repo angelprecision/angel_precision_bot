@@ -70,6 +70,7 @@ def _is_regular_session_et(dt=None) -> bool:
 
 POLL_INTERVAL         = float(os.getenv("QUEUE_POLL_INTERVAL", "1.0"))
 PROCESSING_STALE_SECS = int(os.getenv("PROCESSING_STALE_SECS", "120"))
+ALLOW_IMMEDIATE_EXECUTION = os.getenv("ALLOW_IMMEDIATE_EXECUTION", "0").lower() in {"1", "true", "yes", "on"}
 
 
 # =============================================================================
@@ -393,6 +394,17 @@ def _dispatch(
                 f"[{ticker}] Post-market signal — skipping contract selection "
                 f"(stale quotes). Will select at breach time with live quotes."
             )
+            # Explicitly mark this plan as watcher/breach-time contract selection.
+            # Prevents downstream confusion: no broker order should be submitted
+            # until live quotes are available at breach.
+            try:
+                plan.contract_symbol = None
+                setattr(plan, "_needs_contract_selection", True)
+                if hasattr(plan, "metadata") and isinstance(plan.metadata, dict):
+                    plan.metadata["needs_contract_selection"] = True
+                    plan.metadata["contract_selection_deferred"] = "outside_regular_session"
+            except Exception:
+                pass
     except Exception:
         pass
 
@@ -476,8 +488,39 @@ def _dispatch(
             _mark_job(job_id, "REJECTED", error="overnight_signal_no_watcher")
             return
 
-    # forced_breach is sticky — getattr cannot override it
-    trigger_type = "breach" if forced_breach else getattr(plan, "trigger_type", "immediate")
+    # Breach-first policy:
+    #   - forced_breach is sticky
+    #   - immediate execution is disabled by default
+    #   - set ALLOW_IMMEDIATE_EXECUTION=1 only for controlled internal testing
+    raw_trigger_type = str(getattr(plan, "trigger_type", "breach") or "breach").lower()
+    if forced_breach:
+        trigger_type = "breach"
+    elif raw_trigger_type == "immediate" and ALLOW_IMMEDIATE_EXECUTION:
+        trigger_type = "immediate"
+    else:
+        if raw_trigger_type == "immediate" and not ALLOW_IMMEDIATE_EXECUTION:
+            log.warning(
+                "[%s] Immediate execution requested but disabled — forcing breach/watch path",
+                ticker,
+            )
+        trigger_type = "breach"
+
+    if trigger_type == "breach" and not entry_watcher:
+        log.critical("[%s] ENTRY WATCHER MISSING — cannot arm breach entry", ticker)
+        _mark_job(job_id, "REJECTED", error="entry_watcher_missing")
+        try:
+            from ap.rejection_feed import post_master_control_block
+            post_master_control_block(
+                ticker=ticker,
+                side=payload.get("side", ""),
+                stage="entry_watcher",
+                reason="entry_watcher_missing",
+                score=float(payload.get("score") or 0),
+                pattern=payload.get("pattern_id") or payload.get("pattern", ""),
+            )
+        except Exception:
+            pass
+        return
 
     # Block entries after 3:15 PM ET during market hours (weekdays only)
     _now_et_cut  = _now_et()
@@ -493,7 +536,7 @@ def _dispatch(
         _mark_job(job_id, "REJECTED", error="entry_cutoff: too_late_in_session")
         return
 
-    if trigger_type == "breach" and entry_watcher:
+    if trigger_type == "breach":
         try:
             # Register with watcher — no broker submit yet
             entry_watcher.watch(plan=plan, local_order_id=local_order_id)
@@ -524,11 +567,16 @@ def _dispatch(
                               "local_order_id": local_order_id,
                               "contract": getattr(plan, "contract_symbol", ""),
                               "real_cost": plan.max_position_usd,
-                              "trigger_type": "breach"})
+                              "trigger_type": "breach",
+                              "needs_contract_selection": bool(getattr(plan, "_needs_contract_selection", False))})
         except Exception as e:
             log.error(f"[{ticker}] entry_watcher.watch() failed: {e}")
             _mark_job(job_id, "ERROR", error=f"watcher_error: {e}")
     else:
+        log.warning(
+            "[%s] IMMEDIATE EXECUTION PATH ENABLED — this should only run when ALLOW_IMMEDIATE_EXECUTION=1",
+            ticker,
+        )
         try:
             order_state_machine.transition(local_order_id, "SUBMITTED",
                                            submitted_ts=now_utc_iso())
