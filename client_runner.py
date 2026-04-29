@@ -338,6 +338,13 @@ class ClientRunner(threading.Thread):
             )
             self.core.start()
 
+            _exit_eng = getattr(self.core, "exit_eng", None)
+            if _exit_eng is None:
+                logger.critical(
+                    "[%s] EXIT ENGINE NOT INITIALIZED — positions have no PL-based protection",
+                    self.email,
+                )
+
             # Wire kill switch + mode into master control
             self.master_control.wire(
                 kill_switch_fn=lambda: getattr(self.core, "_kill_switch", False),
@@ -436,7 +443,13 @@ class ClientRunner(threading.Thread):
                     name=f"fill-monitor-{self.email}",
                 )
                 self.fill_monitor_thread.start()
-                logger.info(f"[{self.email}] Fill monitor started (osm-wired)")
+                if not self.fill_monitor_thread.is_alive():
+                    logger.critical(
+                        "[%s] Fill monitor thread failed to start — fills will not reconcile",
+                        self.email,
+                    )
+                else:
+                    logger.info("[%s] Fill monitor started (osm-wired)", self.email)
             except Exception as _fm_err:
                 logger.error(f"[{self.email}] Fill monitor start error: {_fm_err}")
 
@@ -574,6 +587,11 @@ class ClientRunner(threading.Thread):
         Passes full control stack -- master control is the sole decision authority.
         """
         entry_watcher = getattr(self.core, "entry_watcher", None)
+        if entry_watcher is None:
+            logger.critical(
+                "[%s] ENTRY WATCHER MISSING — worker_loop will not be able to place new trades",
+                self.email,
+            )
 
         is_live = self.mode == "LIVE"
 
