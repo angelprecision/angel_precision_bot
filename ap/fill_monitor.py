@@ -22,6 +22,7 @@ Upgrades in this version:
 from __future__ import annotations
 
 import time
+import os
 from datetime import datetime, timezone
 
 from ap.trace import trace_gate
@@ -31,11 +32,15 @@ from ap.logger import get_logger
 from ap.config import Config
 from ap.state import release_equity, release_symbol_lock
 from ap.broker import BrokerAdapter
+from ap.observability import emit_decision_event, get_git_commit
 
 log = get_logger("ap.fill_monitor")
 cfg = Config()
 
 OPT_MULTIPLIER = 100
+RUN_ID = os.getenv("AP_RUN_ID", "unknown")
+STRATEGY_VERSION = os.getenv("AP_STRATEGY_VERSION", "ap_live_beta")
+GIT_COMMIT = get_git_commit()
 
 # =============================================================================
 # AUDIT LOG
@@ -51,6 +56,57 @@ def audit(client_id: str, level: str, event: str, payload: dict):
                 (now_utc_iso(), level, event, json_dumps(payload), client_id),
             )
         )
+
+
+def emit_fill_event(
+    order: dict,
+    *,
+    decision: str,
+    reason_code: str,
+    explanation: str,
+    result: dict | None = None,
+    stage: str = "fill_monitor",
+    extra_inputs: dict | None = None,
+    extra_context: dict | None = None,
+):
+    """
+    Lightweight fill-monitor observability.
+
+    Emits only meaningful broker lifecycle events:
+    FILLED / PARTIAL / TERMINAL FAILURE / BROKER ERROR.
+    It intentionally does not emit every poll or every unchanged pending state.
+    """
+    try:
+        result = result or {}
+        emit_decision_event(
+            run_id=RUN_ID,
+            candidate_id=str(order.get("signal_id") or order.get("local_order_id") or ""),
+            trade_id=str(order.get("local_order_id") or ""),
+            position_id=str(order.get("position_id") or ""),
+            client_id=str(order.get("client_id") or "default"),
+            stage=stage,
+            decision=decision,
+            reason_code=reason_code,
+            explanation=explanation,
+            symbol=order.get("symbol"),
+            contract=order.get("contract"),
+            setup_type=order.get("pattern"),
+            timeframe=order.get("timeframe"),
+            strategy_version=STRATEGY_VERSION,
+            git_commit=GIT_COMMIT,
+            inputs={
+                "kind": order.get("kind"),
+                "broker_order_id": order.get("broker_order_id"),
+                "local_order_id": order.get("local_order_id"),
+                "filled_qty": result.get("filled_qty"),
+                "avg_fill": result.get("avg_fill"),
+                "broker_reason": result.get("reason"),
+                **(extra_inputs or {}),
+            },
+            context=extra_context or {},
+        )
+    except Exception as e:
+        log.debug("Fill monitor observability emit failed (non-critical): %s", e)
 
 
 # =============================================================================
@@ -302,6 +358,15 @@ def process_pending_order(
     # ── FILLED / EXIT_FILLED ────────────────────────────────────────────────
     if result["status"] in ("FILLED", "EXIT_FILLED"):
         mapped = result["status"]
+
+        emit_fill_event(
+            order,
+            decision="CONFIRMED",
+            reason_code="ORDER_FILLED" if kind == "ENTRY" else "EXIT_FILLED",
+            explanation=f"{kind} filled via broker",
+            result=result,
+            extra_context={"osm_status": mapped},
+        )
 
         if osm:
             ok = False
@@ -584,6 +649,16 @@ def process_pending_order(
     # ── PARTIAL FILL / EXIT_PARTIAL_FILL ─────────────────────────────────
     if result["status"] in ("PARTIAL_FILL", "EXIT_PARTIAL_FILL"):
         mapped = result["status"]
+
+        emit_fill_event(
+            order,
+            decision="PARTIAL_FILL",
+            reason_code="ORDER_PARTIAL_FILL" if kind == "ENTRY" else "EXIT_PARTIAL_FILL",
+            explanation=f"{kind} partially filled via broker",
+            result=result,
+            extra_context={"osm_status": mapped},
+        )
+
         if osm:
             try:
                 osm.transition(local_id, mapped, filled_qty=result["filled_qty"])
@@ -618,6 +693,16 @@ def process_pending_order(
     # ── TERMINAL FAILURES ────────────────────────────────────────────────
     if result["status"] in ("REJECTED", "CANCELED", "EXPIRED"):
         terminal = result["status"]
+
+        emit_fill_event(
+            order,
+            decision="REJECT",
+            reason_code=f"ORDER_{terminal}",
+            explanation=f"{kind} terminal broker status: {terminal} — {result.get('reason')}",
+            result=result,
+            extra_context={"terminal_status": terminal},
+        )
+
         if osm:
             try:
                 osm.transition(
@@ -693,6 +778,14 @@ def process_pending_order(
 
     # ── BROKER ERROR ─────────────────────────────────────────────────-----
     if result["status"] == "ERROR":
+        emit_fill_event(
+            order,
+            decision="ERROR",
+            reason_code="BROKER_FILL_CHECK_ERROR",
+            explanation=f"Broker fill check failed: {result.get('reason')}",
+            result=result,
+        )
+
         audit(
             client_id,
             "ERROR",
