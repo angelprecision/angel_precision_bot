@@ -796,6 +796,7 @@ def get_runner_status() -> list[dict]:
                 "iv_filter":      r.contract_selector is not None,
                 "order_monitor":  r.order_monitor is not None,
                 "worker_alive":   getattr(r, "worker_thread", None) is not None and r.worker_thread.is_alive(),
+                "fill_monitor_alive": getattr(r, "fill_monitor_thread", None) is not None and r.fill_monitor_thread.is_alive(),
                 "equity_alive":   getattr(r, "equity_thread", None) is not None and r.equity_thread.is_alive(),
                 "mode":           getattr(r, "mode", "PAPER"),
             }
