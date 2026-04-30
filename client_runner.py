@@ -177,6 +177,60 @@ class ClientRunner(threading.Thread):
         if stop_runner:
             self.stopped.set()
 
+    def _reason_key(self, reason: str) -> str:
+        return str(reason or "").split(":", 1)[0]
+
+    def _clear_degraded_reason_key(self, key: str):
+        key = str(key or "")
+        if not key:
+            return
+        self.degraded_reasons = {
+            r for r in self.degraded_reasons
+            if self._reason_key(r) != key
+        }
+
+    def _try_recover_degraded_mode(self):
+        """
+        Clear transient degraded state once the runtime stack is healthy again.
+
+        Critical startup/control-stack failures remain sticky. Runtime worker/fill
+        monitor failures are recoverable because those loops are self-restarting.
+        """
+        if self.failed.is_set() or self.stopping.is_set() or self.stopped.is_set():
+            return False
+
+        worker_alive = bool(self.worker_thread and self.worker_thread.is_alive())
+        fill_alive = bool(self.fill_monitor_thread and self.fill_monitor_thread.is_alive())
+        core_present = self.core is not None
+        exit_present = getattr(self.core, "exit_eng", None) is not None if self.core else False
+
+        if not (worker_alive and fill_alive and core_present and exit_present):
+            return False
+
+        recoverable = {
+            "worker_dead",
+            "fill_monitor_dead",
+            "worker_loop_crashed",
+            "worker_loop_returned",
+            "fill_monitor_loop_crashed",
+            "fill_monitor_loop_returned",
+        }
+
+        remaining = {
+            r for r in self.degraded_reasons
+            if self._reason_key(r) not in recoverable
+        }
+
+        self.degraded_reasons = remaining
+        if not self.degraded_reasons:
+            if self.degraded.is_set():
+                logger.warning("[%s] RECOVERED from transient degraded mode", self.email)
+            self.degraded.clear()
+            self._set_entry_permission()
+            return True
+
+        return False
+
     def _set_entry_permission(self):
         ready = (
             self.is_alive()
@@ -314,9 +368,15 @@ class ClientRunner(threading.Thread):
                     break
                 if not fill_alive:
                     self._enter_degraded_mode("fill_monitor_dead", stop_runner=False)
+                else:
+                    self._clear_degraded_reason_key("fill_monitor_dead")
+
                 if not worker_alive:
                     self._enter_degraded_mode("worker_dead", stop_runner=False)
+                else:
+                    self._clear_degraded_reason_key("worker_dead")
 
+                self._try_recover_degraded_mode()
                 self._set_entry_permission()
 
                 try:
@@ -332,6 +392,62 @@ class ClientRunner(threading.Thread):
         )
         self.health_thread.start()
         logger.info("[%s] Runtime health loop started", self.email)
+
+    def _validate_execution_core_started(self):
+        """
+        Fail fast immediately after APExecutionCore.start().
+
+        This catches the exact class of bug where the core object exists but
+        watcher/exit/tracker did not actually initialize or start correctly.
+        """
+        problems = []
+
+        if self.core is None:
+            problems.append("core_missing")
+            self._mark_failed("execution_core_start_validation_failed:" + ",".join(problems))
+            self.stopped.set()
+            raise RuntimeError(f"[{self.email}] execution core validation failed: {problems}")
+
+        entry_watcher = getattr(self.core, "entry_watcher", None)
+        exit_eng = getattr(self.core, "exit_eng", None)
+        tracker = getattr(self.core, "tracker", None)
+
+        if entry_watcher is None:
+            problems.append("entry_watcher_missing")
+        if exit_eng is None:
+            problems.append("exit_engine_missing")
+        if tracker is None:
+            problems.append("tracker_missing")
+
+        # Thread liveness checks are intentionally conditional because exact
+        # attribute names can vary across versions. If a component exposes a
+        # thread handle and it is already dead immediately after start(), fail.
+        thread_checks = [
+            ("entry_watcher_thread_dead", getattr(entry_watcher, "_thread", None) if entry_watcher else None),
+            ("exit_engine_thread_dead", getattr(exit_eng, "_thread", None) if exit_eng else None),
+            ("tracker_thread_dead", getattr(tracker, "_thread", None) if tracker else None),
+        ]
+        for reason, thread in thread_checks:
+            if thread is not None and not thread.is_alive():
+                problems.append(reason)
+
+        # Some watcher/tracker implementations use alternate names.
+        alt_thread_checks = [
+            ("entry_watcher_loop_dead", getattr(entry_watcher, "thread", None) if entry_watcher else None),
+            ("tracker_loop_dead", getattr(tracker, "thread", None) if tracker else None),
+        ]
+        for reason, thread in alt_thread_checks:
+            if thread is not None and not thread.is_alive():
+                problems.append(reason)
+
+        if problems:
+            reason = "execution_core_start_validation_failed:" + ",".join(problems)
+            self._mark_failed(reason)
+            self.stopped.set()
+            raise RuntimeError(f"[{self.email}] {reason}")
+
+        logger.info("[%s] Execution core startup validation PASSED", self.email)
+        return True
 
     def run(self):
         try:
@@ -492,6 +608,7 @@ class ClientRunner(threading.Thread):
             master_control=self.master_control,
         )
         self.core.start()
+        self._validate_execution_core_started()
 
         exit_eng = getattr(self.core, "exit_eng", None)
         if exit_eng is None:
@@ -564,6 +681,7 @@ class ClientRunner(threading.Thread):
                     healer_ref.heartbeat(self.email, "runner")
             except Exception:
                 pass
+            self._try_recover_degraded_mode()
             self._set_entry_permission()
 
     def stop(self):
@@ -738,17 +856,34 @@ class ClientRunner(threading.Thread):
     def _start_fill_monitor(self, broker, exit_eng):
         from ap.fill_monitor import fill_monitor_loop
 
+        restart_sleep = float(os.getenv("FILL_MONITOR_RESTART_SLEEP_SEC", "2"))
+
+        def _run_fill_monitor():
+            while not self.stopped.is_set():
+                try:
+                    fill_monitor_loop(
+                        broker=broker,
+                        poll_seconds=10.0,
+                        osm=self.order_state_machine,
+                        pm=self.position_manager,
+                        exit_engine=exit_eng,
+                        stop_event=self.stopped,
+                        client_id=self.email,
+                    )
+                    if self.stopped.is_set():
+                        break
+                    self._enter_degraded_mode("fill_monitor_loop_returned", stop_runner=False)
+                    logger.warning("[%s] fill_monitor_loop returned unexpectedly -- restarting in %.1fs", self.email, restart_sleep)
+                    time.sleep(restart_sleep)
+                except Exception as exc:
+                    if self.stopped.is_set():
+                        break
+                    self._enter_degraded_mode(f"fill_monitor_loop_crashed:{exc}", stop_runner=False)
+                    logger.error("[%s] fill_monitor_loop crashed: %s -- restarting in %.1fs", self.email, exc, restart_sleep, exc_info=True)
+                    time.sleep(restart_sleep)
+
         self.fill_monitor_thread = threading.Thread(
-            target=fill_monitor_loop,
-            kwargs={
-                "broker": broker,
-                "poll_seconds": 10.0,
-                "osm": self.order_state_machine,
-                "pm": self.position_manager,
-                "exit_engine": exit_eng,
-                "stop_event": self.stopped,
-                "client_id": self.email,
-            },
+            target=_run_fill_monitor,
             daemon=True,
             name=f"fill-monitor-{self.email}",
         )
@@ -820,24 +955,32 @@ class ClientRunner(threading.Thread):
         is_live = self.mode == "LIVE"
 
         def _run_worker():
-            try:
-                worker_loop(
-                    broker,
-                    master_control=self.master_control,
-                    contract_selector=self.contract_selector,
-                    order_state_machine=self.order_state_machine,
-                    entry_watcher=entry_watcher,
-                    position_manager=self.position_manager,
-                    client_id=self.email,
-                    stop_event=self.stopped,
-                    live_mode=is_live,
-                    exit_eng=getattr(self.core, "exit_eng", None),
-                )
-            except Exception as exc:
-                logger.error("[%s] worker_loop crashed: %s", self.email, exc, exc_info=True)
-                self._enter_degraded_mode(f"worker_loop_crashed:{exc}", stop_runner=False)
-                self._mark_failed(f"worker_loop_crashed:{exc}")
-                self.stopped.set()
+            restart_sleep = float(os.getenv("WORKER_RESTART_SLEEP_SEC", "2"))
+            while not self.stopped.is_set():
+                try:
+                    worker_loop(
+                        broker,
+                        master_control=self.master_control,
+                        contract_selector=self.contract_selector,
+                        order_state_machine=self.order_state_machine,
+                        entry_watcher=entry_watcher,
+                        position_manager=self.position_manager,
+                        client_id=self.email,
+                        stop_event=self.stopped,
+                        live_mode=is_live,
+                        exit_eng=getattr(self.core, "exit_eng", None),
+                    )
+                    if self.stopped.is_set():
+                        break
+                    self._enter_degraded_mode("worker_loop_returned", stop_runner=False)
+                    logger.warning("[%s] worker_loop returned unexpectedly -- restarting in %.1fs", self.email, restart_sleep)
+                    time.sleep(restart_sleep)
+                except Exception as exc:
+                    if self.stopped.is_set():
+                        break
+                    self._enter_degraded_mode(f"worker_loop_crashed:{exc}", stop_runner=False)
+                    logger.error("[%s] worker_loop crashed: %s -- restarting in %.1fs", self.email, exc, restart_sleep, exc_info=True)
+                    time.sleep(restart_sleep)
 
         self.worker_thread = threading.Thread(target=_run_worker, daemon=True, name=f"worker-{self.email}")
         self.worker_thread.start()
