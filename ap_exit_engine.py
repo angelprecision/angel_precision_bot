@@ -1,28 +1,21 @@
 # ap_exit_engine.py -- Angel Precision Time-Aware Exit Engine
 # =============================================================================
-# Gap 3 fix: 0DTE options have a hard enemy -- time. This engine knows that.
+# 0DTE / short-dated option exit protection.
 #
-# The 4 exit conditions (checked in order every 30 seconds):
+# Current constants in this file:
+#   - Poll interval: 8 seconds
+#   - Profit protect W1: 11:00 AM ET, scale out 50% if option P&L >= +40%
+#   - Profit protect W2: 1:00 PM ET, scale out 75% if option P&L >= +25%
+#   - Profit protect W3: 2:00 PM ET, close all if option P&L >= +15%
+#   - EOD hard close: 3:45 PM ET, close all remaining contracts
+#   - Theta stop: after noon, close if option P&L <= -35%
+#   - Immediate TP: +18% option P&L; 1 contract closes all, multi-contract scales
+#   - Hard stop: DTE/instrument-adjusted; default -30%, tighter on 0DTE index
 #
-#   1. TARGET HIT -- underlying reaches the wick target price → EXIT full position
-#
-#   2. STOP HIT   -- underlying hits stop level → EXIT full position
-#
-#   3. PROFIT PROTECTION (time-aware)
-#      If you're sitting on a good gain AND time is running out, lock it in.
-#      Logic:
-#        After 1:30 PM ET: if option P&L ≥ +150%, take 50% off the table
-#        After 2:30 PM ET: if option P&L ≥ +80%, take 75% off
-#        After 3:00 PM ET: if option P&L ≥ +30%, exit EVERYTHING
-#        After 3:30 PM ET: EXIT EVERYTHING -- no exceptions
-#
-#   4. THETA STOP (decay kill switch)
-#      If option has lost >50% of its value AND it's past noon → EXIT
-#      Theta is accelerating, the trade is against you, don't let it go to zero.
-#
-# Philosophy:
-#   A winning 0DTE trade that goes to zero because you held too long
-#   is not a loss you can backtest away. This engine prevents it.
+# Money-safety invariant:
+#   - Submitting an exit order is NOT a fill.
+#   - scale_outs_done increments only after broker-confirmed exit fill.
+#   - Every exit path, including sentinels, must respect exit_in_flight gating.
 # =============================================================================
 
 from __future__ import annotations
@@ -81,38 +74,66 @@ PROFIT_LOCK_PCT       = 0.12   # once at +25%, lock: don't fall below +12%
 
 _INDEX_ETFS = {"QQQ", "SPY", "IWM", "DIA", "SPX"}
 
+
+def _et_session_date():
+    """Return the current market/session calendar date in America/New_York."""
+    return datetime.now(ET).date()
+
+
+def _option_expiration_date(option_symbol: str):
+    """Parse OCC-style YYMMDD expiration from an option symbol. Returns date or None."""
+    import re
+    m = re.search(r"(\d{6})[CP]", option_symbol or "")
+    if not m:
+        return None
+    try:
+        return datetime.strptime(m.group(1), "%y%m%d").date()
+    except Exception:
+        return None
+
+
+def _option_dte(option_symbol: str, *, session_date=None) -> int:
+    """DTE anchored to ET session date, never host-local/UTC date."""
+    exp = _option_expiration_date(option_symbol or "")
+    if exp is None:
+        return 999
+    sd = session_date or _et_session_date()
+    return (exp - sd).days
+
+
+def _option_root(option_symbol: str) -> str:
+    """Best-effort OCC/root extraction before YYMMDD date. Handles SPXW-style roots."""
+    import re
+    sym = (option_symbol or "").upper().strip()
+    m = re.search(r"(\d{6})[CP]", sym)
+    if not m:
+        return sym[:8]
+    return sym[:m.start()].strip()
+
+
+def _option_profile(pos: "ManagedPosition") -> tuple[int, bool, str]:
+    symbol = (pos.option_symbol or "").upper()
+    ticker = (pos.ticker or "").upper()
+    root = _option_root(symbol)
+    dte = _option_dte(symbol)
+    index_roots = _INDEX_ETFS | {"SPXW", "NDX", "NDXP", "RUT", "RUTW"}
+    is_index = root in index_roots or ticker in index_roots or any(root.startswith(t) for t in _INDEX_ETFS)
+    profile = "0DTE-idx" if (dte == 0 and is_index) else "0DTE-eq" if dte == 0 else f"{dte}DTE"
+    return dte, is_index, profile
+
+
 def _effective_thresholds(pos: "ManagedPosition") -> tuple:
     """
-    Returns (hard_stop, immediate_tp, profit_lock) adjusted for DTE and instrument.
-    0DTE index options move too fast for the default -30% stop — tighter controls required.
+    Returns (hard_stop, immediate_tp, profit_lock) adjusted for ET-session DTE and instrument.
     """
-    import re
-    from datetime import date as _date
-    symbol = pos.option_symbol or ""
-    ticker = (pos.ticker or "").upper()
-
-    # Extract DTE from option symbol (YYMMDD embedded e.g. QQQ260424P)
-    m = re.search(r'(\d{6})[CP]', symbol)
-    dte = 999
-    if m:
-        try:
-            exp = _date.strptime(m.group(1), "%y%m%d")
-            dte = (exp - _date.today()).days
-        except Exception:
-            pass
-
-    is_index = any(symbol.startswith(t) for t in _INDEX_ETFS) or ticker in _INDEX_ETFS
-
-    # DTE-aware thresholds — tighter on 0DTE index, default on everything else.
-    # 0DTE index (QQQ/SPY/IWM/DIA): fast movers need tighter stops/targets.
-    # Underlying-level stop is primary protection; these are the P&L backstops.
+    dte, is_index, _ = _option_profile(pos)
     if dte == 0 and is_index:
-        return -0.18, 0.20, 0.08   # 0DTE index: -18% stop, +20% TP, +8% lock
-    elif dte == 0:
-        return -0.22, 0.22, 0.10   # 0DTE equity: -22% stop, +22% TP, +10% lock
-    elif dte <= 2:
-        return -0.26, 0.25, 0.12   # 1-2 DTE: -26% stop, +25% TP, +12% lock
-    return HARD_STOP_PCT, IMMEDIATE_TP_PCT, PROFIT_LOCK_PCT  # default 2DTE+
+        return -0.18, 0.20, 0.08
+    if dte == 0:
+        return -0.22, 0.22, 0.10
+    if dte <= 2:
+        return -0.26, 0.25, 0.12
+    return HARD_STOP_PCT, IMMEDIATE_TP_PCT, PROFIT_LOCK_PCT
 TRAIL_DROP_FROM_PEAK  = 0.10   # if peak was +25%+, exit if drops 10pts from peak
 SMALL_WIN_PCT         = 0.10   # +10% → small win capture (see time gates below)
 SMALL_WIN_TRAIL       = 0.07   # after +10% seen, don't let it fall below +3%
@@ -153,6 +174,8 @@ class ManagedPosition:
     peak_pnl_pct:         float = 0.0   # highest option P&L seen
     touched_profit:       bool  = False  # True once position was ever green
     last_rejection_ts:    Optional[float] = None  # epoch when last exit was rejected
+    last_exit_rejected:  bool = False
+    _exit_stuck_count:   int = 0
     max_profit_seen:      float = 0.0   # highest positive P&L ever seen
     closed:               bool  = False
     close_reason:         str   = ""
@@ -162,6 +185,16 @@ class ManagedPosition:
     exit_in_flight:       bool  = False
     pending_exit_reason:  str   = ""
     pending_exit_qty:     int   = 0
+    pending_exit_filled_qty: int = 0
+    pending_scale_counted: bool = False
+    # Exact broker/local exit order identity. These fields make broker fill
+    # callbacks idempotent and prevent a stale event for one exit order from
+    # mutating a different in-flight exit.
+    pending_exit_local_order_id: str = ""
+    pending_exit_broker_order_id: str = ""
+    last_applied_exit_local_order_id: str = ""
+    last_applied_exit_broker_order_id: str = ""
+    last_applied_exit_cum_fill: int = 0
     last_exit_signal_ts:  Optional[datetime] = None
 
     # P&L tracking
@@ -365,8 +398,10 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
                 )
 
     # ── TOUCHED PROFIT PROTECTION ──────────────────────────────────────────────
-    # Was ever green → went negative → exit immediately. Capital protection first.
-    if pos.touched_profit and option_pnl <= -0.05:
+    # Was ever green → went negative → exit immediately.
+    # After a confirmed scale-out, runner protection is handled by RUNNER TRAIL
+    # and max_profit_seen logic. Do not let this global rule fight runners.
+    if pos.scale_outs_done == 0 and pos.touched_profit and option_pnl <= -0.05:
         return ExitDecision(
             action="CLOSE_ALL", quantity=qty_rem,
             reason=(
@@ -397,19 +432,8 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
     if not pos.touched_profit:
         _age_min = (datetime.now(timezone.utc) - pos.opened_at).total_seconds() / 60                    if pos.opened_at else 0
 
-        # Reuse DTE + instrument class from _effective_thresholds context
-        import re as _re
-        from datetime import date as _date_ng
-        _sym_ng   = pos.option_symbol or ""
-        _tick_ng  = (pos.ticker or "").upper()
-        _m_ng     = _re.search(r'(\d{6})[CP]', _sym_ng)
-        _dte_ng   = 999
-        if _m_ng:
-            try:
-                _dte_ng = (_date_ng.strptime(_m_ng.group(1), "%y%m%d") - _date_ng.today()).days
-            except Exception:
-                pass
-        _is_idx_ng = any(_sym_ng.startswith(t) for t in _INDEX_ETFS) or _tick_ng in _INDEX_ETFS
+        # Reuse ET-session DTE + instrument class from _effective_thresholds context
+        _dte_ng, _is_idx_ng, _profile_ng = _option_profile(pos)
 
         if _dte_ng == 0 and _is_idx_ng:
             # 0DTE index — fastest leash: SPY/QQQ/IWM move hard and fast
@@ -511,7 +535,9 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
     # ── 5. PROFIT PROTECTION -- WINDOW 2 (2:30 PM+, or 3:00 PM on trend day) ─
     w2_hour = PROFIT_PROTECT_2_HOUR
     w2_min  = PROFIT_PROTECT_2_MIN + trend_bonus_window
-    if w2_min >= 60: w2_hour += 1; w2_min -= 60
+    while w2_min >= 60:
+        w2_hour += 1
+        w2_min -= 60
     past_window2 = (hour > w2_hour or (hour == w2_hour and minute >= w2_min))
     scale2_threshold = SCALE_OUT_2_THRESHOLD * trend_bonus_threshold
     if past_window2 and option_pnl >= scale2_threshold and pos.scale_outs_done < 2:
@@ -526,7 +552,9 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
     # ── 6. PROFIT PROTECTION -- WINDOW 1 (1:30 PM+, or 2:00 PM on trend day) ─
     w1_hour = PROFIT_PROTECT_1_HOUR
     w1_min  = PROFIT_PROTECT_1_MIN + trend_bonus_window
-    if w1_min >= 60: w1_hour += 1; w1_min -= 60
+    while w1_min >= 60:
+        w1_hour += 1
+        w1_min -= 60
     past_window1 = (hour > w1_hour or (hour == w1_hour and minute >= w1_min))
     scale1_threshold = SCALE_OUT_1_THRESHOLD * trend_bonus_threshold
     if past_window1 and option_pnl >= scale1_threshold and pos.scale_outs_done < 1:
@@ -555,7 +583,11 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
 def _is_protective_exit(reason: str) -> bool:
     """True if exit reason is protective — module-level so always in scope."""
     r = (reason or "").upper()
-    return any(k in r for k in ("EOD", "STOP", "MAX_LOSS", "THETA", "PROTECTIVE", "FORCE CLOSE", "SENTINEL"))
+    return any(k in r for k in (
+        "EOD", "STOP", "MAX_LOSS", "THETA", "PROTECTIVE", "FORCE CLOSE", "SENTINEL",
+        "TARGET HIT", "IMMEDIATE TP", "PROFIT PROTECT", "SMALL WIN", "RUNNER TRAIL",
+        "PROFIT LOCK", "TOUCHED PROFIT", "NEVER GREEN", "DEAD TRADE"
+    ))
 
 
 class APExitEngine:
@@ -711,21 +743,212 @@ class APExitEngine:
         with self._lock:
             return [p for p in self._positions if not p.closed]
 
+    def get_position(self, position_id: str) -> Optional[ManagedPosition]:
+        """Return the in-memory managed position, if currently tracked."""
+        if not position_id:
+            return None
+        with self._lock:
+            for pos in self._positions:
+                if str(pos.position_id) == str(position_id) and not pos.closed:
+                    return pos
+        return None
+
+    def set_pending_exit_order(
+        self,
+        position_id: str,
+        *,
+        local_order_id: str = "",
+        broker_order_id: str = "",
+        qty: int = 0,
+        reason: str = "",
+    ) -> bool:
+        """Bind the currently in-flight exit to the exact local/broker order.
+
+        Called by OSM only after the broker accepted the exit order. This is the
+        handshake that makes later fill/reject/cancel callbacks attributable.
+        """
+        if not position_id:
+            return False
+        with self._lock:
+            for pos in self._positions:
+                if str(pos.position_id) != str(position_id) or pos.closed:
+                    continue
+                if local_order_id:
+                    pos.pending_exit_local_order_id = str(local_order_id)
+                if broker_order_id:
+                    pos.pending_exit_broker_order_id = str(broker_order_id)
+                if qty:
+                    pos.pending_exit_qty = int(qty)
+                if reason:
+                    pos.pending_exit_reason = reason
+                pos.exit_in_flight = True
+                pos.pending_exit_filled_qty = 0
+                pos.pending_scale_counted = False
+                pos.last_applied_exit_cum_fill = 0
+                log.info(
+                    "[exit_eng] Pending exit identity set | pos_id=%s local=%s broker=%s qty=%s",
+                    position_id, local_order_id or "?", broker_order_id or "?", qty or pos.pending_exit_qty,
+                )
+                return True
+        return False
+
+    @staticmethod
+    def _same_nonempty(a, b) -> bool:
+        return bool(a) and bool(b) and str(a) == str(b)
+
+    def _exit_event_is_allowed(
+        self,
+        pos: ManagedPosition,
+        *,
+        local_order_id: str = "",
+        broker_order_id: str = "",
+        cumulative_filled: int | None = None,
+    ) -> bool:
+        """Validate that a broker event belongs to this position's pending exit.
+
+        Also rejects replayed cumulative fill events for the same local/broker
+        order. This is intentionally strict when a pending order id is known and
+        permissive only for legacy paths where OSM cannot supply identity.
+        """
+        local_order_id = str(local_order_id or "")
+        broker_order_id = str(broker_order_id or "")
+        pending_local = str(getattr(pos, "pending_exit_local_order_id", "") or "")
+        pending_broker = str(getattr(pos, "pending_exit_broker_order_id", "") or "")
+
+        if pending_local and local_order_id and pending_local != local_order_id:
+            log.warning(
+                "[exit_eng] Ignoring exit event for non-pending local order | pos_id=%s pending=%s event=%s",
+                pos.position_id, pending_local, local_order_id,
+            )
+            return False
+        if pending_broker and broker_order_id and pending_broker != broker_order_id:
+            log.warning(
+                "[exit_eng] Ignoring exit event for non-pending broker order | pos_id=%s pending=%s event=%s",
+                pos.position_id, pending_broker, broker_order_id,
+            )
+            return False
+
+        # Replay guard after a final/partial callback already advanced state.
+        same_local = self._same_nonempty(local_order_id, getattr(pos, "last_applied_exit_local_order_id", ""))
+        same_broker = self._same_nonempty(broker_order_id, getattr(pos, "last_applied_exit_broker_order_id", ""))
+        if (same_local or same_broker) and cumulative_filled is not None:
+            last_cum = int(getattr(pos, "last_applied_exit_cum_fill", 0) or 0)
+            if int(cumulative_filled) <= last_cum:
+                log.info(
+                    "[exit_eng] Duplicate exit fill event ignored | pos_id=%s local=%s broker=%s cum=%s last=%s",
+                    pos.position_id, local_order_id, broker_order_id, cumulative_filled, last_cum,
+                )
+                return False
+        return True
+
+    def _record_applied_exit_event(
+        self,
+        pos: ManagedPosition,
+        *,
+        local_order_id: str = "",
+        broker_order_id: str = "",
+        cumulative_filled: int | None = None,
+    ) -> None:
+        if local_order_id:
+            pos.last_applied_exit_local_order_id = str(local_order_id)
+        if broker_order_id:
+            pos.last_applied_exit_broker_order_id = str(broker_order_id)
+        if cumulative_filled is not None:
+            pos.last_applied_exit_cum_fill = max(
+                int(getattr(pos, "last_applied_exit_cum_fill", 0) or 0),
+                int(cumulative_filled),
+            )
+
+    def _clear_pending_exit_identity(self, pos: ManagedPosition) -> None:
+        pos.pending_exit_local_order_id = ""
+        pos.pending_exit_broker_order_id = ""
+
     # ── BROKER RECONCILIATION HOOKS ──────────────────────────────────────────
     # Called by APOrderMonitor / APBrokerReconciler after confirming broker truth.
 
-    def mark_position_closed(self, position_id: str, reason: str = ""):
-        """Called after broker + DB confirm full exit fill."""
+    def mark_position_closed(
+        self,
+        position_id: str,
+        reason: str = "",
+        qty_filled: int | None = None,
+        *,
+        fill_price: float | None = None,
+        local_order_id: str = "",
+        broker_order_id: str = "",
+        cumulative_filled: int | None = None,
+    ):
+        """Called after broker confirms an EXIT order fill.
+
+        EXIT_FILLED means the exit order filled, not always that the entire
+        position is gone. If the filled order was a scale-out, reduce
+        quantity_remaining and keep the runner alive. Only remove from memory
+        when the confirmed fill closes the remaining quantity.
+        """
         if not position_id:
             return
+
+        closed_now = False
         with self._lock:
             for pos in self._positions:
-                if pos.position_id == position_id:
-                    pos.closed = True
-                    pos.close_reason = reason or pos.close_reason
-            self._positions = [p for p in self._positions
-                                if not (p.position_id == position_id and p.closed)]
-        log.info("[exit_eng] Closed (broker-confirmed) | pos_id=%s reason=%s", position_id, reason)
+                if pos.position_id != position_id:
+                    continue
+                if not self._exit_event_is_allowed(
+                    pos,
+                    local_order_id=local_order_id,
+                    broker_order_id=broker_order_id,
+                    cumulative_filled=cumulative_filled,
+                ):
+                    return
+
+                remaining_before = int(getattr(pos, "quantity_remaining", 0) or 0)
+                pending_qty = int(getattr(pos, "pending_exit_qty", 0) or 0)
+                fill_qty = int(qty_filled or pending_qty or remaining_before or 0)
+                fill_qty = max(0, min(fill_qty, remaining_before))
+                self._record_applied_exit_event(
+                    pos,
+                    local_order_id=local_order_id,
+                    broker_order_id=broker_order_id,
+                    cumulative_filled=cumulative_filled if cumulative_filled is not None else fill_qty,
+                )
+
+                if fill_qty > 0 and fill_qty < remaining_before:
+                    pos.quantity_remaining = remaining_before - fill_qty
+                    exit_reason = (getattr(pos, "pending_exit_reason", "") or reason or "").upper()
+                    is_scale_action = (
+                        "SCALE" in exit_reason
+                        or "PARTIAL" in exit_reason
+                        or "IMMEDIATE TP (PARTIAL)" in exit_reason
+                        or "PROFIT PROTECT" in exit_reason
+                    )
+                    if is_scale_action and not getattr(pos, "pending_scale_counted", False):
+                        pos.scale_outs_done += 1
+                        pos.pending_scale_counted = True
+
+                    pos.exit_in_flight = False
+                    pos.pending_exit_reason = ""
+                    pos.pending_exit_qty = 0
+                    pos.pending_exit_filled_qty = 0
+                    pos.pending_scale_counted = False
+                    self._clear_pending_exit_identity(pos)
+                    pos.last_exit_signal_ts = None
+                    log.info(
+                        "[exit_eng] Exit order filled as scale-out | pos_id=%s qty=%s remaining=%s reason=%s",
+                        position_id, fill_qty, pos.quantity_remaining, reason,
+                    )
+                    # CRITICAL: scale-out EXIT_FILLED must not fall through into full close.
+                    return
+
+                self._clear_pending_exit_identity(pos)
+                pos.quantity_remaining = 0
+                pos.closed = True
+                pos.close_reason = reason or pos.close_reason
+                closed_now = True
+                break
+
+            self._positions = [p for p in self._positions if not p.closed]
+
+        if closed_now:
+            log.info("[exit_eng] Closed (broker-confirmed) | pos_id=%s reason=%s", position_id, reason)
 
     def clear_exit_in_flight(self, position_id: str):
         """Called when exit order is canceled/rejected/expired — engine may retry."""
@@ -737,23 +960,101 @@ class APExitEngine:
                     pos.exit_in_flight      = False
                     pos.pending_exit_reason = ""
                     pos.pending_exit_qty    = 0
+                    pos.pending_exit_filled_qty = 0
+                    pos.pending_scale_counted = False
+                    self._clear_pending_exit_identity(pos)
                     pos.last_exit_signal_ts = None
         log.info("[exit_eng] Exit in-flight cleared | pos_id=%s", position_id)
 
-    def note_partial_exit_fill(self, position_id: str, qty_filled: int):
-        """Called when broker confirms a partial exit fill."""
-        if not position_id or qty_filled <= 0:
+    def on_exit_failure(self, position_id: str):
+        """Broker-confirmed exit rejection/cancel/expiry. Clears in-flight state.
+        Scale state is based only on confirmed fills, so there is no submit-time rollback.
+        """
+        if not position_id:
             return
         with self._lock:
             for pos in self._positions:
                 if pos.position_id == position_id:
-                    pos.quantity_remaining = max(0, pos.quantity_remaining - int(qty_filled))
-                    pos.exit_in_flight      = False
+                    pos.exit_in_flight = False
                     pos.pending_exit_reason = ""
-                    pos.pending_exit_qty    = 0
+                    pos.pending_exit_qty = 0
+                    pos.pending_exit_filled_qty = 0
+                    pos.pending_scale_counted = False
+                    self._clear_pending_exit_identity(pos)
                     pos.last_exit_signal_ts = None
-                    if pos.quantity_remaining == 0:
-                        pos.closed = True
+                    pos.last_exit_rejected = True
+                    pos.last_rejection_ts = time.time()
+                    break
+        log.info("[exit_eng] Exit failure handled | pos_id=%s", position_id)
+
+    def note_partial_exit_fill(
+        self,
+        position_id: str,
+        qty_filled: int,
+        *,
+        fill_price: float | None = None,
+        local_order_id: str = "",
+        broker_order_id: str = "",
+        cumulative_filled: int | None = None,
+    ):
+        """
+        Called when broker confirms an exit fill smaller than the original position.
+
+        One scale-out order can fill in multiple broker executions. We only
+        increment scale_outs_done once the intended pending scale quantity is
+        completely filled, not on every partial execution callback.
+        """
+        if not position_id or qty_filled <= 0:
+            return
+        qty_filled = int(qty_filled)
+        with self._lock:
+            for pos in self._positions:
+                if pos.position_id != position_id:
+                    continue
+                if not self._exit_event_is_allowed(
+                    pos,
+                    local_order_id=local_order_id,
+                    broker_order_id=broker_order_id,
+                    cumulative_filled=cumulative_filled,
+                ):
+                    return
+
+                pos.quantity_remaining = max(0, pos.quantity_remaining - qty_filled)
+                pos.pending_exit_filled_qty = int(getattr(pos, "pending_exit_filled_qty", 0) or 0) + qty_filled
+                self._record_applied_exit_event(
+                    pos,
+                    local_order_id=local_order_id,
+                    broker_order_id=broker_order_id,
+                    cumulative_filled=cumulative_filled if cumulative_filled is not None else pos.pending_exit_filled_qty,
+                )
+
+                pending_qty = int(getattr(pos, "pending_exit_qty", 0) or 0)
+                reason = (getattr(pos, "pending_exit_reason", "") or "").upper()
+                is_scale_action = (
+                    "SCALE" in reason
+                    or "PARTIAL" in reason
+                    or "IMMEDIATE TP (PARTIAL)" in reason
+                    or "PROFIT PROTECT" in reason
+                )
+                pending_complete = pending_qty <= 0 or pos.pending_exit_filled_qty >= pending_qty
+
+                if is_scale_action and pending_complete and not getattr(pos, "pending_scale_counted", False):
+                    pos.scale_outs_done += 1
+                    pos.pending_scale_counted = True
+
+                if pending_complete or pos.quantity_remaining == 0:
+                    pos.exit_in_flight = False
+                    pos.pending_exit_reason = ""
+                    pos.pending_exit_qty = 0
+                    pos.pending_exit_filled_qty = 0
+                    pos.pending_scale_counted = False
+                    self._clear_pending_exit_identity(pos)
+                    pos.last_exit_signal_ts = None
+
+                if pos.quantity_remaining == 0:
+                    pos.closed = True
+                break
+
             self._positions = [p for p in self._positions if not p.closed]
         log.info("[exit_eng] Partial fill noted | pos_id=%s qty_filled=%d", position_id, qty_filled)
 
@@ -769,26 +1070,61 @@ class APExitEngine:
             pnl     = pos.option_pnl_pct
             peak    = pos.peak_pnl_pct
 
-            # Sentinel 1: Hit TP threshold but no exit was ever submitted
-            if peak >= IMMEDIATE_TP_PCT and not pos.exit_in_flight and age_min > 1:
-                log.error(
-                    "[SENTINEL] %s | MISSED TP — peaked +%.0f%% but no exit submitted! "
-                    "pos=%s pnl=%.1f%% age=%.0fm",
-                    pos.ticker, peak*100, pos.position_id, pnl*100, age_min
-                )
+            # Sentinel 1: Hit TP threshold but no exit was ever submitted.
+            # This is now an action sentinel, not only observability. If current
+            # P&L is still positive and eligible, submit a profit-preserving exit.
+            _hard_stop, _immediate_tp, _profit_lock = _effective_thresholds(pos)
+            if peak >= _immediate_tp and not pos.exit_in_flight and age_min > 1:
+                if pnl > 0 and self._eligible_for_new_exit(pos, now):
+                    log.error(
+                        "[SENTINEL] %s | MISSED TP — peaked +%.0f%%, current +%.0f%%, "
+                        "no exit submitted | pos=%s age=%.0fm — FORCING PROFIT EXIT",
+                        pos.ticker, peak*100, pnl*100, pos.position_id, age_min,
+                    )
+                    try:
+                        decision = ExitDecision(
+                            action="CLOSE_ALL",
+                            quantity=pos.quantity_remaining,
+                            reason=f"SENTINEL MISSED TP — peak +{peak*100:.0f}% current +{pnl*100:.0f}%",
+                            urgency="HIGH",
+                            pnl_pct=pnl,
+                        )
+                        self._emit_exit_event(
+                            pos,
+                            decision="FORCE_EXIT",
+                            reason_code="SENTINEL_MISSED_TP_EXIT",
+                            explanation=decision.reason,
+                            stage="system_alert",
+                            extra_inputs={"age_min": age_min, "pnl_pct": pnl, "peak_pnl_pct": peak},
+                        )
+                        if self.on_exit:
+                            self.on_exit(pos, decision)
+                            pos.exit_in_flight = True
+                            pos.pending_exit_reason = decision.reason
+                            pos.pending_exit_qty = decision.quantity
+                            pos.pending_exit_filled_qty = 0
+                            pos.pending_scale_counted = False
+                            pos.last_exit_signal_ts = datetime.now(timezone.utc)
+                    except Exception as _e:
+                        log.error("[SENTINEL] Missed TP force exit failed for %s: %s", pos.ticker, _e)
+                else:
+                    log.error(
+                        "[SENTINEL] %s | MISSED TP observed — peak +%.0f%% but current pnl %.1f%% "
+                        "is not profit-preserving/eligible | pos=%s age=%.0fm",
+                        pos.ticker, peak*100, pnl*100, pos.position_id, age_min,
+                    )
 
-            # Sentinel 2: Hit hard stop but no exit submitted
-            if pnl <= HARD_STOP_PCT and not pos.exit_in_flight and age_min > 1:
+            # Sentinel 2: Hit DTE/profile-adjusted hard stop but no exit submitted.
+            if pnl <= _hard_stop and age_min > 1 and self._eligible_for_new_exit(pos, now):
                 log.error(
-                    "[SENTINEL] %s | MISSED STOP — at %.0f%% but no exit submitted! "
-                    "pos=%s age=%.0fm — FORCING EXIT NOW",
-                    pos.ticker, pnl*100, pos.position_id, age_min
+                    "[SENTINEL] %s | MISSED STOP — at %.0f%% <= %.0f%% profile stop, "
+                    "no exit submitted! pos=%s age=%.0fm — FORCING EXIT NOW",
+                    pos.ticker, pnl*100, _hard_stop*100, pos.position_id, age_min
                 )
-                # Force fire the exit callback directly
                 try:
                     decision = ExitDecision(
                         action="CLOSE_ALL", quantity=pos.quantity_remaining,
-                        reason=f"SENTINEL FORCED EXIT — {pnl*100:.0f}% with no exit order",
+                        reason=f"SENTINEL FORCED EXIT — {pnl*100:.0f}% breached profile stop {_hard_stop*100:.0f}%",
                         urgency="IMMEDIATE", pnl_pct=pnl
                     )
                     self._emit_exit_event(
@@ -797,10 +1133,16 @@ class APExitEngine:
                         reason_code="SENTINEL_FORCED_EXIT",
                         explanation=decision.reason,
                         stage="system_alert",
-                        extra_inputs={"age_min": age_min, "pnl_pct": pnl, "peak_pnl_pct": peak},
+                        extra_inputs={"age_min": age_min, "pnl_pct": pnl, "peak_pnl_pct": peak, "profile_hard_stop": _hard_stop},
                     )
                     if self.on_exit:
                         self.on_exit(pos, decision)
+                        pos.exit_in_flight = True
+                        pos.pending_exit_reason = decision.reason
+                        pos.pending_exit_qty = decision.quantity
+                        pos.pending_exit_filled_qty = 0
+                        pos.pending_scale_counted = False
+                        pos.last_exit_signal_ts = datetime.now(timezone.utc)
                 except Exception as _e:
                     log.error("[SENTINEL] Force exit failed for %s: %s", pos.ticker, _e)
 
@@ -840,7 +1182,7 @@ class APExitEngine:
             DEAD_TRADE_MIN  = 45
             DEAD_TRADE_LOW  = -0.08
             DEAD_TRADE_HIGH = 0.05
-            if (not pos.exit_in_flight
+            if (self._eligible_for_new_exit(pos, now)
                     and age_min >= DEAD_TRADE_MIN
                     and DEAD_TRADE_LOW <= pnl <= DEAD_TRADE_HIGH
                     and pos.max_profit_seen < DEAD_TRADE_HIGH):
@@ -872,6 +1214,8 @@ class APExitEngine:
                             pos.exit_in_flight      = True
                             pos.pending_exit_reason = decision.reason
                             pos.pending_exit_qty    = pos.quantity_remaining
+                            pos.pending_exit_filled_qty = 0
+                            pos.pending_scale_counted = False
                             pos.last_exit_signal_ts = datetime.now(timezone.utc)
                     except Exception as _de:
                         log.error("[SENTINEL] Dead trade exit failed for %s: %s",
@@ -979,28 +1323,33 @@ class APExitEngine:
             time.sleep(POLL_INTERVAL_SEC)
 
     def _check_all_positions(self):
-        # Purge positions with contracts that expired yesterday or earlier
-        from datetime import date
-        today_str = date.today().strftime("%y%m%d")
+        # Detect contracts that expired before the current ET session date.
+        # Do not silently discard without observability: emit a terminal cleanup
+        # event so reconciler/dashboard gaps are visible.
+        today_et = _et_session_date()
         to_remove = []
         for pos in self._positions:
-            # Contract symbols encode expiry: AAPL260424C00200000 → 260424 = Apr 24 2026
             sym = getattr(pos, "option_symbol", "") or ""
             try:
-                # Extract 6-digit date from option symbol (chars 4-10 typically)
-                import re
-                m = re.search(r'(\d{6})[CP]', sym)
-                if m:
-                    exp_str = m.group(1)  # e.g. "260424"
-                    if exp_str < today_str:  # expired before today
-                        log.warning(
-                            "[exit_eng] EXPIRED CONTRACT detected | %s exp=%s today=%s — removing from engine",
-                            sym, exp_str, today_str
-                        )
-                        pos.closed = True
-                        to_remove.append(pos)
-            except Exception:
-                pass
+                exp = _option_expiration_date(sym)
+                if exp and exp < today_et:
+                    log.warning(
+                        "[exit_eng] EXPIRED CONTRACT detected | %s exp=%s today_et=%s — local engine cleanup",
+                        sym, exp.isoformat(), today_et.isoformat()
+                    )
+                    self._emit_exit_event(
+                        pos,
+                        decision="ALERT",
+                        reason_code="EXPIRED_CONTRACT_LOCAL_CLEANUP",
+                        explanation=f"Expired contract removed from exit engine tracking: {sym}",
+                        stage="system_alert",
+                        extra_inputs={"expiration": exp.isoformat(), "session_date_et": today_et.isoformat()},
+                    )
+                    pos.closed = True
+                    pos.close_reason = "expired_contract_local_cleanup"
+                    to_remove.append(pos)
+            except Exception as _exp_err:
+                log.debug("[exit_eng] Expired-contract cleanup check failed for %s: %s", sym, _exp_err)
         if to_remove:
             self._positions = [p for p in self._positions if not p.closed]
             log.info("[exit_eng] Removed %d expired contract(s) from engine", len(to_remove))
@@ -1078,11 +1427,17 @@ class APExitEngine:
                         _force_runner_check = True
                         log.warning(
                             "[%s] RUNNER EMERGENCY — peak=%.0f%% now=%.0f%% "
-                            "drop=%.0f%% > %.0f%% — bypassing exit_in_flight",
+                            "drop=%.0f%% > %.0f%% — emergency runner check",
                             pos.ticker, pos.peak_pnl_pct*100, option_pnl*100,
                             _runner_drop_now*100, _emergency_trail*100,
                         )
 
+                if _force_runner_check and pos.exit_in_flight:
+                    log.warning(
+                        "[%s] RUNNER EMERGENCY suppressed — exit already in flight | %s | reason=%s",
+                        pos.ticker, pos.option_symbol, pos.pending_exit_reason
+                    )
+                    continue
                 if not _force_runner_check and not self._eligible_for_new_exit(pos, now_utc):
                     continue
 
@@ -1164,23 +1519,8 @@ class APExitEngine:
             # Query later: filter reason for NEVER GREEN STOP, HARD STOP, etc.
             # Compare pnl_pct vs peak_pnl_pct to measure exit efficiency.
             try:
-                import re as _re_log
-                from datetime import date as _date_log
                 _sym_log  = pos.option_symbol or ""
-                _tick_log = (pos.ticker or "").upper()
-                _m_log    = _re_log.search(r'(\d{6})[CP]', _sym_log)
-                _dte_log  = 999
-                if _m_log:
-                    try:
-                        _dte_log = (_date_log.strptime(_m_log.group(1), "%y%m%d") - _date_log.today()).days
-                    except Exception:
-                        pass
-                _is_idx_log = any(_sym_log.startswith(t) for t in _INDEX_ETFS) or _tick_log in _INDEX_ETFS
-                _profile_log = (
-                    "0DTE-idx" if (_dte_log == 0 and _is_idx_log) else
-                    "0DTE-eq"  if  _dte_log == 0 else
-                    f"{_dte_log}DTE"
-                )
+                _dte_log, _is_idx_log, _profile_log = _option_profile(pos)
                 _age_log = (
                     (datetime.now(timezone.utc) - pos.opened_at).total_seconds() / 60.0
                     if pos.opened_at else 0.0
@@ -1242,31 +1582,12 @@ class APExitEngine:
                         pos.exit_in_flight      = True
                         pos.pending_exit_reason = decision.reason
                         pos.pending_exit_qty    = decision.quantity
+                        pos.pending_exit_filled_qty = 0
+                        pos.pending_scale_counted = False
                         pos.last_exit_signal_ts = datetime.now(timezone.utc)
-                        pos.scale_outs_done    += 1  # track so runner logic kicks in
-                        # NOTE: quantity_remaining is NOT decremented here.
-                        # It is decremented in note_partial_exit_fill() on actual broker fill.
-                        # pending_exit_qty tracks what is in-flight so evaluate_exit
-                        # does not double-exit the same contracts.
-                        # This prevents the scale-out state corruption where the engine
-                        # thinks contracts were sold before broker confirms the fill.
-                        # Persist scale_outs_done to DB so restarts know runner is active
-                        try:
-                            from ap.db import conn, run_with_retry as _rwr_s
-                            _sd = pos.scale_outs_done
-                            # qty NOT saved here — will be saved after broker fill confirmation
-                            _pi = pos.position_id
-                            if _pi:
-                                def _save_scale():
-                                    with conn() as _c:
-                                        _c.execute(
-                                            "UPDATE positions SET scale_outs_done=%s WHERE id=%s",
-                                            (_sd, _pi)
-                                        )
-                                _rwr_s(_save_scale)
-                        except Exception as _se:
-                            log.debug("[%s] scale_outs_done persist failed (non-critical): %s",
-                                      pos.ticker, _se)
+                        # Submission != confirmed scale-out. Do NOT increment scale_outs_done here.
+                        # OSM/fill_monitor calls note_partial_exit_fill() only after broker confirms fill.
+                        # pending_exit_qty blocks duplicate exits while the broker order is in-flight.
                     except Exception as e:
                         log.error("[%s] Scale-out FAILED — remains tracked: %s", pos.ticker, e)
                 continue
@@ -1305,6 +1626,8 @@ class APExitEngine:
                         pos.exit_in_flight      = True
                         pos.pending_exit_reason = decision.reason
                         pos.pending_exit_qty    = decision.quantity
+                        pos.pending_exit_filled_qty = 0
+                        pos.pending_scale_counted = False
                         pos.last_exit_signal_ts = datetime.now(timezone.utc)
                     except Exception as e:
                         log.error(
