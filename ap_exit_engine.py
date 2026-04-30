@@ -184,6 +184,7 @@ class ManagedPosition:
     # Exit coordination — engine signals intent; order truth decides closure
     exit_in_flight:       bool  = False
     pending_exit_reason:  str   = ""
+    pending_exit_action:  str   = ""  # SCALE_OUT / CLOSE_ALL / STOP; used for fill-safe reconciliation
     pending_exit_qty:     int   = 0
     pending_exit_filled_qty: int = 0
     pending_scale_counted: bool = False
@@ -196,6 +197,19 @@ class ManagedPosition:
     last_applied_exit_broker_order_id: str = ""
     last_applied_exit_cum_fill: int = 0
     last_exit_signal_ts:  Optional[datetime] = None
+    last_callback_identity_missing: bool = False
+    last_callback_identity_missing_ts: Optional[datetime] = None
+
+    # Quote-health fields are explicit dataclass state so dashboard/watchdog code
+    # does not depend on dynamic attributes being added during polling.
+    # Aggregate fields stay for backward compatibility; leg-specific fields make
+    # it visible when the underlying is fresh but the option quote is stale.
+    last_quote_update_ts: Optional[datetime] = None
+    last_quote_missing_ts: Optional[datetime] = None
+    last_underlying_quote_update_ts: Optional[datetime] = None
+    last_underlying_quote_missing_ts: Optional[datetime] = None
+    last_option_quote_update_ts: Optional[datetime] = None
+    last_option_quote_missing_ts: Optional[datetime] = None
 
     # P&L tracking
     realized_pnl:   float = 0.0
@@ -253,6 +267,7 @@ class ExitDecision:
     pnl_pct:        float  = 0.0
     suggested_limit: float = 0.0  # live bid at decision time — use as sell limit price
                                   # 0.0 means caller should query fresh bid themselves
+    reason_code:    str    = ""   # machine-readable control code; text reason is human-only
 
     @property
     def should_act(self) -> bool:
@@ -581,6 +596,119 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
 
 # ── EXIT ENGINE ───────────────────────────────────────────────────────────────
 
+EXIT_RULE_PRECEDENCE = (
+    # Lower number = higher priority. This is now executable, not decorative.
+    "STOP_HIT",
+    "HARD_STOP",
+    "EOD_FORCE_CLOSE",
+    "SENTINEL_FORCED_EXIT",
+    "NEVER_GREEN_STOP",
+    "TOUCHED_PROFIT_STOP",
+    "RUNNER_TRAIL",
+    "TARGET_HIT",
+    "IMMEDIATE_TP",
+    "PROFIT_LOCK",
+    "TRAILING_STOP",
+    "SMALL_WIN_LOCK",
+    "UNDERLYING_PROGRESS_EXIT",
+    "PROFIT_PROTECT_W3",
+    "PROFIT_PROTECT_W2",
+    "PROFIT_PROTECT_W1",
+    "THETA_STOP",
+    "TIME_STOP",
+    "TP_SCALE_OUT",
+)
+
+EXIT_RULE_PRIORITY = {code: idx for idx, code in enumerate(EXIT_RULE_PRECEDENCE)}
+LOWEST_EXIT_PRIORITY = len(EXIT_RULE_PRIORITY) + 100
+
+# Quote and identity safety contract. Normal exits require fresh option marks.
+# Only broker-independent/forced-risk exits may proceed in degraded quote mode.
+STALE_OPTION_QUOTE_MAX_AGE_SEC = int(os.getenv("EXIT_ENGINE_STALE_OPTION_QUOTE_SEC", "20"))
+FORCED_RISK_EXIT_CODES = {"EOD_FORCE_CLOSE", "STOP_HIT", "SENTINEL_FORCED_EXIT"}
+
+
+def _classify_exit_decision(decision: "ExitDecision") -> str:
+    """Stable reason-code classifier used for precedence, telemetry, and gating.
+
+    Preferred source is ExitDecision.reason_code. The string parser remains only
+    as a backward-compatible fallback for older callers/tests.
+    """
+    explicit_code = (getattr(decision, "reason_code", "") or "").upper().strip()
+    if explicit_code:
+        return explicit_code
+    r = (getattr(decision, "reason", "") or "").upper()
+    action = (getattr(decision, "action", "") or "").upper()
+    if "SENTINEL" in r:
+        return "SENTINEL_FORCED_EXIT"
+    if "EOD FORCE CLOSE" in r:
+        return "EOD_FORCE_CLOSE"
+    if "THETA STOP" in r:
+        return "THETA_STOP"
+    if "STOP HIT" in r:
+        return "STOP_HIT"
+    if "HARD STOP" in r:
+        return "HARD_STOP"
+    if "RUNNER TRAIL" in r or "RUNNER EMERGENCY" in r:
+        return "RUNNER_TRAIL"
+    if "SMALL WIN LOCK" in r:
+        return "SMALL_WIN_LOCK"
+    if "TOUCHED PROFIT STOP" in r:
+        return "TOUCHED_PROFIT_STOP"
+    if "UNDERLYING PROGRESS EXIT" in r:
+        return "UNDERLYING_PROGRESS_EXIT"
+    if "NEVER GREEN STOP" in r:
+        return "NEVER_GREEN_STOP"
+    if "PROFIT LOCK" in r:
+        return "PROFIT_LOCK"
+    if "TRAILING STOP" in r:
+        return "TRAILING_STOP"
+    if "IMMEDIATE TP" in r:
+        return "IMMEDIATE_TP"
+    if "TARGET HIT" in r:
+        return "TARGET_HIT"
+    if "PROFIT PROTECT W3" in r:
+        return "PROFIT_PROTECT_W3"
+    if "PROFIT PROTECT W2" in r:
+        return "PROFIT_PROTECT_W2"
+    if "PROFIT PROTECT W1" in r:
+        return "PROFIT_PROTECT_W1"
+    if "TIME STOP" in r or "DEAD TRADE" in r:
+        return "TIME_STOP"
+    if action == "SCALE_OUT":
+        return "TP_SCALE_OUT"
+    return "UNKNOWN_EXIT"
+
+
+def _exit_priority(decision_or_code) -> int:
+    code = decision_or_code if isinstance(decision_or_code, str) else _classify_exit_decision(decision_or_code)
+    return EXIT_RULE_PRIORITY.get(code, LOWEST_EXIT_PRIORITY)
+
+
+def _is_option_quote_stale(pos: "ManagedPosition", now_utc: Optional[datetime] = None) -> tuple[bool, Optional[float], str]:
+    """Return (is_stale, age_sec, reason) for option quote freshness.
+
+    Option marks drive option P&L and sell limits; normal exits must not submit
+    from stale option quotes. Underlying/EOD/sentinel forced-risk exits are
+    handled separately by the submit gate.
+    """
+    now_utc = now_utc or datetime.now(timezone.utc)
+    ts = getattr(pos, "last_option_quote_update_ts", None)
+    if ts is None:
+        return True, None, "missing_option_quote"
+    try:
+        age = max(0.0, (now_utc - ts).total_seconds())
+    except Exception:
+        return True, None, "invalid_option_quote_ts"
+    if age > STALE_OPTION_QUOTE_MAX_AGE_SEC:
+        return True, age, "stale_option_quote"
+    return False, age, "fresh_option_quote"
+
+
+def _is_forced_risk_exit_code(code: str) -> bool:
+    return (code or "").upper() in FORCED_RISK_EXIT_CODES
+
+
 def _is_protective_exit(reason: str) -> bool:
     """True if exit reason is protective — module-level so always in scope."""
     r = (reason or "").upper()
@@ -641,25 +769,389 @@ class APExitEngine:
         self.run_id = os.getenv("AP_RUN_ID", "unknown")
         self.strategy_version = os.getenv("AP_STRATEGY_VERSION", "ap_live_beta")
         self.git_commit = get_git_commit()
+    def add_position(self, pos: ManagedPosition):
+        """Track a newly broker-confirmed open position for exit protection."""
+        if pos is None:
+            return
+        with self._lock:
+            for existing in self._positions:
+                same_id = bool(pos.position_id and existing.position_id == pos.position_id)
+                same_sym = (
+                    existing.ticker == pos.ticker
+                    and existing.option_symbol == pos.option_symbol
+                    and not existing.closed
+                )
+                if same_id or same_sym:
+                    log.debug(
+                        "[%s] Exit engine already tracking %s | pos_id=%s",
+                        self._email or pos.ticker,
+                        pos.option_symbol,
+                        pos.position_id or "n/a",
+                    )
+                    return
+            self._assert_position_invariants(pos, "add_position")
+            self._positions.append(pos)
+        log.info(
+            "[%s] Position added to exit engine | %s %sx %s @ $%.2f | target=%s stop=%s | pos_id=%s",
+            pos.ticker,
+            pos.side,
+            pos.quantity,
+            pos.option_symbol,
+            pos.entry_price,
+            pos.underlying_target,
+            pos.underlying_stop,
+            pos.position_id or "n/a",
+        )
+
     def start(self):
         """Start exit engine background loop."""
-        if self._running:
+        if self._thread and self._thread.is_alive():
+            log.debug("APExitEngine already running [%s]", self._email or "default")
+            self._running = True
             return
+
         self._running = True
+        # Keep compatibility with self-healing / supervisor component registry.
+        thread_name = f"ap-exit-engine-{self._email}" if self._email else "ap-exit-engine"
         self._thread = threading.Thread(
             target=self._exit_loop,
-            name=f"APExitEngine-{self._email or 'default'}",
+            name=thread_name,
             daemon=True,
         )
         self._thread.start()
-        log.info("[%s] APExitEngine started", self._email or "default")
+        log.info("APExitEngine started [%s]", thread_name)
 
     def stop(self):
-        """Stop exit engine background loop."""
+        """Stop exit engine background loop and reset thread state for clean restart."""
         self._running = False
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=5)
+        self._thread = None
         log.info("[%s] APExitEngine stopped", self._email or "default")
+
+    def active_positions(self) -> list[ManagedPosition]:
+        """Return a snapshot of currently tracked, non-closed positions."""
+        with self._lock:
+            return [p for p in self._positions if not p.closed and int(p.quantity_remaining or 0) > 0]
+
+    # ── BROKER / OSM RECONCILIATION HOOKS ───────────────────────────────────
+    # These methods are intentionally backward compatible with older callers
+    # while supporting exact OSM/local/broker order identity when supplied.
+
+    def mark_position_closed(
+        self,
+        position_id: str,
+        reason: str = "",
+        *,
+        local_order_id: str = "",
+        broker_order_id: str = "",
+    ):
+        """Called after broker + DB confirm the position is fully closed."""
+        if not position_id:
+            return
+        with self._lock:
+            for pos in self._positions:
+                if pos.position_id == position_id:
+                    pos.closed = True
+                    pos.close_reason = reason or pos.close_reason or "broker_confirmed_closed"
+                    pos.quantity_remaining = 0
+                    pos.exit_in_flight = False
+                    pos.pending_exit_reason = ""
+                    pos.pending_exit_action = ""
+                    pos.pending_exit_qty = 0
+                    pos.pending_exit_filled_qty = 0
+                    pos.pending_scale_counted = False
+                    pos.last_applied_exit_local_order_id = local_order_id or pos.pending_exit_local_order_id or pos.last_applied_exit_local_order_id
+                    pos.last_applied_exit_broker_order_id = broker_order_id or pos.pending_exit_broker_order_id or pos.last_applied_exit_broker_order_id
+                    pos.last_exit_signal_ts = None
+                    pos.last_callback_identity_missing = False
+                    pos.last_callback_identity_missing_ts = None
+                    self._emit_exit_event(
+                        pos,
+                        decision="CLOSED",
+                        reason_code="BROKER_CONFIRMED_CLOSED",
+                        explanation=pos.close_reason,
+                        stage="exit_reconciliation",
+                        extra_inputs={
+                            "local_order_id": local_order_id,
+                            "broker_order_id": broker_order_id,
+                        },
+                    )
+            self._positions = [p for p in self._positions if not p.closed]
+        log.info("[exit_eng] Closed (broker-confirmed) | pos_id=%s reason=%s", position_id, reason)
+
+    def clear_exit_in_flight(
+        self,
+        position_id: str,
+        *,
+        reason: str = "",
+        local_order_id: str = "",
+        broker_order_id: str = "",
+        rejected: bool = False,
+    ):
+        """Called when exit order is canceled/rejected/expired so the engine may retry."""
+        if not position_id:
+            return
+        with self._lock:
+            for pos in self._positions:
+                if pos.position_id == position_id:
+                    pos.exit_in_flight = False
+                    pos.pending_exit_reason = ""
+                    pos.pending_exit_action = ""
+                    pos.pending_exit_qty = 0
+                    pos.pending_exit_filled_qty = 0
+                    pos.pending_scale_counted = False
+                    pos.pending_exit_local_order_id = ""
+                    pos.pending_exit_broker_order_id = ""
+                    pos.last_exit_signal_ts = None
+                    pos.last_exit_rejected = bool(rejected)
+                    pos.last_rejection_ts = time.time() if rejected else None
+                    pos.last_callback_identity_missing = False
+                    pos.last_callback_identity_missing_ts = None
+                    self._assert_position_invariants(pos, "clear_exit_in_flight")
+                    self._emit_exit_event(
+                        pos,
+                        decision="ALERT" if rejected else "CLEARED",
+                        reason_code="EXIT_REJECTED" if rejected else "EXIT_IN_FLIGHT_CLEARED",
+                        explanation=reason or ("Exit order rejected/cleared" if rejected else "Exit in-flight cleared"),
+                        stage="exit_reconciliation",
+                        extra_inputs={
+                            "local_order_id": local_order_id,
+                            "broker_order_id": broker_order_id,
+                            "rejected": rejected,
+                        },
+                    )
+        log.info("[exit_eng] Exit in-flight cleared | pos_id=%s rejected=%s reason=%s", position_id, rejected, reason)
+
+    def note_partial_exit_fill(
+        self,
+        position_id: str,
+        qty_filled: int,
+        *,
+        local_order_id: str = "",
+        broker_order_id: str = "",
+        cumulative_filled_qty: Optional[int] = None,
+    ):
+        """Called when broker confirms an exit fill.
+
+        qty_filled is treated as a delta by default. If cumulative_filled_qty is
+        supplied by OSM/reconciler, this method computes an idempotent delta.
+        """
+        if not position_id:
+            return
+        with self._lock:
+            for pos in self._positions:
+                if pos.position_id != position_id:
+                    continue
+
+                if local_order_id and pos.pending_exit_local_order_id and local_order_id != pos.pending_exit_local_order_id:
+                    log.warning(
+                        "[exit_eng] Ignoring stale local exit fill | pos_id=%s got=%s expected=%s",
+                        position_id, local_order_id, pos.pending_exit_local_order_id,
+                    )
+                    return
+                if broker_order_id and pos.pending_exit_broker_order_id and broker_order_id != pos.pending_exit_broker_order_id:
+                    log.warning(
+                        "[exit_eng] Ignoring stale broker exit fill | pos_id=%s got=%s expected=%s",
+                        position_id, broker_order_id, pos.pending_exit_broker_order_id,
+                    )
+                    return
+
+                if cumulative_filled_qty is not None:
+                    cum = max(0, int(cumulative_filled_qty or 0))
+                    delta = max(0, cum - int(pos.last_applied_exit_cum_fill or 0))
+                    pos.last_applied_exit_cum_fill = max(int(pos.last_applied_exit_cum_fill or 0), cum)
+                else:
+                    delta = max(0, int(qty_filled or 0))
+                    pos.last_applied_exit_cum_fill += delta
+
+                if delta <= 0:
+                    self._emit_exit_event(
+                        pos,
+                        decision="HOLD",
+                        reason_code="DUPLICATE_EXIT_FILL_IGNORED",
+                        explanation="Duplicate or zero-delta exit fill ignored",
+                        stage="exit_reconciliation",
+                    )
+                    return
+
+                pos.pending_exit_filled_qty += delta
+                pos.quantity_remaining = max(0, int(pos.quantity_remaining or 0) - delta)
+                pos.last_applied_exit_local_order_id = local_order_id or pos.pending_exit_local_order_id or pos.last_applied_exit_local_order_id
+                pos.last_applied_exit_broker_order_id = broker_order_id or pos.pending_exit_broker_order_id or pos.last_applied_exit_broker_order_id
+                if local_order_id or broker_order_id or pos.pending_exit_local_order_id or pos.pending_exit_broker_order_id:
+                    pos.last_callback_identity_missing = False
+                    pos.last_callback_identity_missing_ts = None
+
+                # Count scale-out only after broker-confirmed fill, never on submit.
+                if (
+                    (pos.pending_exit_action or "").upper() == "SCALE_OUT"
+                    and pos.pending_exit_qty > 0
+                    and not pos.pending_scale_counted
+                    and pos.quantity_remaining > 0
+                ):
+                    pos.scale_outs_done += 1
+                    pos.pending_scale_counted = True
+                    try:
+                        from ap.db import conn, run_with_retry as _rwr_s
+                        _sd = pos.scale_outs_done
+                        _qr = pos.quantity_remaining
+                        _pi = pos.position_id
+                        if _pi:
+                            def _save_scale():
+                                with conn() as _c:
+                                    _c.execute(
+                                        "UPDATE positions SET scale_outs_done=%s, quantity_remaining=%s WHERE id=%s",
+                                        (_sd, _qr, _pi),
+                                    )
+                            _rwr_s(_save_scale)
+                    except Exception as _se:
+                        log.debug("[%s] scale/qty persist failed (non-critical): %s", pos.ticker, _se)
+
+                fully_filled_pending = (
+                    pos.pending_exit_qty > 0
+                    and pos.pending_exit_filled_qty >= pos.pending_exit_qty
+                )
+                if pos.quantity_remaining <= 0:
+                    pos.closed = True
+                    pos.close_reason = pos.pending_exit_reason or "exit_fill_closed"
+                if fully_filled_pending or pos.closed:
+                    pos.exit_in_flight = False
+                    pos.pending_exit_reason = ""
+                    pos.pending_exit_action = ""
+                    pos.pending_exit_qty = 0
+                    pos.pending_exit_filled_qty = 0
+                    pos.pending_scale_counted = False
+                    pos.pending_exit_local_order_id = ""
+                    pos.pending_exit_broker_order_id = ""
+                    pos.last_exit_signal_ts = None
+                    pos._exit_stuck_count = 0
+
+                self._assert_position_invariants(pos, "note_partial_exit_fill")
+                self._emit_exit_event(
+                    pos,
+                    decision="FILL",
+                    reason_code="EXIT_FILL_APPLIED",
+                    explanation=f"Applied broker-confirmed exit fill delta={delta}",
+                    stage="exit_reconciliation",
+                    extra_inputs={
+                        "delta_qty": delta,
+                        "cumulative_filled_qty": cumulative_filled_qty,
+                        "local_order_id": local_order_id,
+                        "broker_order_id": broker_order_id,
+                    },
+                )
+                break
+            self._positions = [p for p in self._positions if not p.closed]
+        log.info("[exit_eng] Exit fill noted | pos_id=%s qty_delta=%d", position_id, int(qty_filled or 0))
+
+    def _mark_exit_submitted(
+        self,
+        pos: ManagedPosition,
+        decision: ExitDecision,
+        *,
+        local_order_id: str = "",
+        broker_order_id: str = "",
+    ) -> None:
+        """Mark an exit as submitted after downstream callback accepts the intent."""
+        pos.exit_in_flight = True
+        pos.pending_exit_reason = decision.reason or ""
+        pos.pending_exit_action = (decision.action or "").upper()
+        pos.pending_exit_qty = max(0, int(decision.quantity or 0))
+        pos.pending_exit_filled_qty = 0
+        pos.pending_scale_counted = False
+        pos.pending_exit_local_order_id = local_order_id or pos.pending_exit_local_order_id or ""
+        pos.pending_exit_broker_order_id = broker_order_id or pos.pending_exit_broker_order_id or ""
+        pos.last_exit_signal_ts = datetime.now(timezone.utc)
+        pos.last_exit_rejected = False
+        pos._exit_stuck_count = 0
+
+    def _eligible_for_new_exit(self, pos: ManagedPosition, now_utc: datetime) -> bool:
+        """Compatibility wrapper around centralized submit gate."""
+        return self._can_submit_exit(pos, now_utc, reason=pos.pending_exit_reason or "poll")
+
+    def _run_sentinels(self):
+        """Safety sentinels for missed TP/stop, stuck exits, and dead trades.
+
+        Sentinels never submit directly. They route through _submit_exit_decision
+        so duplicate/in-flight gating and observability remain consistent.
+        """
+        now = datetime.now(timezone.utc)
+        for pos in list(self._positions):
+            if pos.closed or int(pos.quantity_remaining or 0) <= 0:
+                continue
+            age_min = (now - pos.opened_at).total_seconds() / 60 if pos.opened_at else 0
+            pnl = pos.option_pnl_pct
+            peak = pos.peak_pnl_pct
+
+            if peak >= IMMEDIATE_TP_PCT and not pos.exit_in_flight and age_min > 1:
+                log.error(
+                    "[SENTINEL] %s | MISSED TP — peaked +%.0f%% but no exit submitted | pos=%s pnl=%.1f%% age=%.0fm",
+                    pos.ticker, peak * 100, pos.position_id, pnl * 100, age_min,
+                )
+
+            if pnl <= HARD_STOP_PCT and not pos.exit_in_flight and age_min > 1:
+                decision = ExitDecision(
+                    action="CLOSE_ALL",
+                    quantity=pos.quantity_remaining,
+                    reason=f"SENTINEL FORCED EXIT — {pnl*100:.0f}% with no exit order",
+                    urgency="IMMEDIATE",
+                    pnl_pct=pnl,
+                )
+                self._submit_exit_decision(pos, decision, from_sentinel=True, allow_inflight_override=True)
+                continue
+
+            if pos.exit_in_flight and pos.last_exit_signal_ts:
+                flight_sec = (now - pos.last_exit_signal_ts).total_seconds()
+                if flight_sec > 300:
+                    pos._exit_stuck_count = int(getattr(pos, "_exit_stuck_count", 0) or 0) + 1
+                    if pos._exit_stuck_count >= 2:
+                        pos.last_exit_rejected = True
+                        log.error(
+                            "[SENTINEL] %s | EXIT STUCK x%d — %.0fs in-flight, no fill | pos=%s",
+                            pos.ticker, pos._exit_stuck_count, flight_sec, pos.position_id,
+                        )
+                        self._emit_exit_event(
+                            pos,
+                            decision="ALERT",
+                            reason_code="EXIT_STUCK",
+                            explanation=f"Exit in flight for {flight_sec:.0f}s with no fill",
+                            stage="system_alert",
+                            extra_inputs={"flight_sec": flight_sec, "stuck_count": pos._exit_stuck_count},
+                        )
+                    else:
+                        log.warning(
+                            "[SENTINEL] %s | EXIT STUCK — %.0fs in-flight, no fill | pos=%s",
+                            pos.ticker, flight_sec, pos.position_id,
+                        )
+
+            DEAD_TRADE_MIN = 45
+            DEAD_TRADE_LOW = -0.08
+            DEAD_TRADE_HIGH = 0.05
+            if (
+                not pos.exit_in_flight
+                and age_min >= DEAD_TRADE_MIN
+                and DEAD_TRADE_LOW <= pnl <= DEAD_TRADE_HIGH
+                and pos.max_profit_seen < DEAD_TRADE_HIGH
+            ):
+                progress = 0.0
+                if pos.underlying_entry and pos.underlying_target and pos.current_underlying:
+                    denom = abs(pos.underlying_target - pos.underlying_entry)
+                    if denom > 0:
+                        progress = abs(pos.current_underlying - pos.underlying_entry) / denom
+                if progress < 0.30:
+                    decision = ExitDecision(
+                        action="CLOSE_ALL",
+                        quantity=pos.quantity_remaining,
+                        reason=(
+                            f"TIME STOP — thesis not confirmed after {age_min:.0f}min "
+                            f"pnl={pnl*100:.1f}% progress={progress*100:.0f}% toward target"
+                        ),
+                        urgency="HIGH",
+                        pnl_pct=pnl,
+                    )
+                    self._submit_exit_decision(pos, decision, from_sentinel=True)
+
     def _emit_exit_event(
         self,
         pos: ManagedPosition,
@@ -698,6 +1190,7 @@ class APExitEngine:
                     "quantity": getattr(pos, "quantity", 0),
                     "scale_outs_done": getattr(pos, "scale_outs_done", 0),
                     "exit_in_flight": getattr(pos, "exit_in_flight", False),
+                    "pending_exit_action": getattr(pos, "pending_exit_action", ""),
                     "pending_exit_qty": getattr(pos, "pending_exit_qty", 0),
                     "pending_exit_filled_qty": getattr(pos, "pending_exit_filled_qty", 0),
                     "pending_exit_local_order_id": getattr(pos, "pending_exit_local_order_id", ""),
@@ -710,37 +1203,8 @@ class APExitEngine:
             log.debug("Exit observability emit failed (non-critical): %s", e)
 
     def _exit_reason_code(self, decision: ExitDecision) -> Optional[str]:
-        r = (getattr(decision, "reason", "") or "").upper()
-        action = (getattr(decision, "action", "") or "").upper()
-        if "SENTINEL" in r:
-            return "SENTINEL_FORCED_EXIT"
-        if "EOD FORCE CLOSE" in r:
-            return "EOD_FORCE_CLOSE"
-        if "THETA STOP" in r:
-            return "THETA_STOP"
-        if "HARD STOP" in r or "STOP HIT" in r:
-            return "HARD_STOP"
-        if "RUNNER TRAIL" in r:
-            return "RUNNER_TRAIL"
-        if "SMALL WIN LOCK" in r:
-            return "SMALL_WIN_LOCK"
-        if "TOUCHED PROFIT STOP" in r:
-            return "TOUCHED_PROFIT_STOP"
-        if "UNDERLYING PROGRESS EXIT" in r:
-            return "UNDERLYING_PROGRESS_EXIT"
-        if "NEVER GREEN STOP" in r:
-            return "NEVER_GREEN_STOP"
-        if "PROFIT LOCK" in r:
-            return "PROFIT_LOCK"
-        if "TRAILING STOP" in r:
-            return "TRAILING_STOP"
-        if "IMMEDIATE TP" in r or action == "SCALE_OUT":
-            return "TP_SCALE_OUT" if action == "SCALE_OUT" else "IMMEDIATE_TP"
-        if "TARGET HIT" in r:
-            return "TARGET_HIT"
-        if "TIME STOP" in r:
-            return "TIME_STOP"
-        return None
+        code = _classify_exit_decision(decision)
+        return None if code == "UNKNOWN_EXIT" else code
 
     def _assert_position_invariants(self, pos: ManagedPosition, context: str = "") -> None:
         if pos.quantity_remaining < 0 or pos.quantity_remaining > pos.quantity:
@@ -774,6 +1238,24 @@ class APExitEngine:
         if pos.closed or int(pos.quantity_remaining or 0) <= 0:
             return False
 
+        if pos.exit_in_flight and getattr(pos, "last_callback_identity_missing", False):
+            self._emit_exit_event(
+                pos,
+                "HOLD",
+                "EXIT_IDENTITY_QUARANTINE_BLOCK",
+                (
+                    "Exit suppressed because the prior accepted callback returned no "
+                    "local/broker order identity. Reconciler must clear, reject, or fill it first."
+                ),
+                extra_inputs={
+                    "pending_exit_reason": pos.pending_exit_reason,
+                    "pending_exit_action": pos.pending_exit_action,
+                    "pending_exit_qty": pos.pending_exit_qty,
+                    "last_callback_identity_missing_ts": str(pos.last_callback_identity_missing_ts or ""),
+                },
+            )
+            return False
+
         if pos.exit_in_flight and not allow_inflight_override:
             self._emit_exit_event(
                 pos,
@@ -794,14 +1276,43 @@ class APExitEngine:
             if pos.last_exit_signal_ts:
                 flight_sec = (now_utc - pos.last_exit_signal_ts).total_seconds()
 
+            # Executable precedence guard:
+            # do not allow a lower/equal priority exit to override a fresh higher/equal pending exit.
+            # Stale pending exits may still be overridden so the system can rescue stuck risk.
             stale_enough = flight_sec >= 20.0
+            new_code = _classify_exit_decision(ExitDecision("CLOSE_ALL", 0, reason or "", "IMMEDIATE"))
+            pending_code = _classify_exit_decision(ExitDecision(pos.pending_exit_action or "CLOSE_ALL", 0, pos.pending_exit_reason or "", "IMMEDIATE"))
+            new_pri = _exit_priority(new_code)
+            pending_pri = _exit_priority(pending_code)
+            if not stale_enough and pending_code != "UNKNOWN_EXIT" and new_pri >= pending_pri:
+                self._emit_exit_event(
+                    pos,
+                    "HOLD",
+                    "EXIT_OVERRIDE_DENIED_PRECEDENCE",
+                    (
+                        f"Inflight override denied by precedence; pending={pending_code} "
+                        f"new={new_code} flight={flight_sec:.1f}s"
+                    ),
+                    extra_inputs={
+                        "flight_sec": flight_sec,
+                        "pending_exit_reason": pos.pending_exit_reason,
+                        "override_reason": reason,
+                        "pending_code": pending_code,
+                        "new_code": new_code,
+                        "pending_priority": pending_pri,
+                        "new_priority": new_pri,
+                    },
+                )
+                return False
+
+            higher_priority_override = (new_pri < pending_pri)
             emergency_reason = _is_runner_protective_reason(reason)
             already_same_runner_protection = _is_same_or_equivalent_runner_protection(
                 pos.pending_exit_reason,
                 reason,
             )
 
-            if already_same_runner_protection and not stale_enough:
+            if already_same_runner_protection and not stale_enough and not higher_priority_override:
                 self._emit_exit_event(
                     pos,
                     "HOLD",
@@ -818,7 +1329,7 @@ class APExitEngine:
                 )
                 return False
 
-            if not stale_enough and not emergency_reason:
+            if not stale_enough and not emergency_reason and not higher_priority_override:
                 self._emit_exit_event(
                     pos,
                     "HOLD",
@@ -828,6 +1339,11 @@ class APExitEngine:
                         "flight_sec": flight_sec,
                         "pending_exit_reason": pos.pending_exit_reason,
                         "override_reason": reason,
+                        "pending_code": pending_code,
+                        "new_code": new_code,
+                        "pending_priority": pending_pri,
+                        "new_priority": new_pri,
+                        "higher_priority_override": higher_priority_override,
                     },
                 )
                 return False
@@ -844,6 +1360,11 @@ class APExitEngine:
                     "pending_exit_filled_qty": pos.pending_exit_filled_qty,
                     "stale_enough": stale_enough,
                     "emergency_reason": emergency_reason,
+                    "higher_priority_override": higher_priority_override,
+                    "pending_code": pending_code,
+                    "new_code": new_code,
+                    "pending_priority": pending_pri,
+                    "new_priority": new_pri,
                 },
             )
             log.warning(
@@ -1015,10 +1536,15 @@ class APExitEngine:
                 uq = underlying_quotes.get(pos.ticker, {})
                 oq = option_quotes.get(pos.option_symbol, {})
 
+                now_utc = datetime.now(timezone.utc)
+                underlying_progressed = False
+                option_progressed = False
+
                 if uq:
                     last = float(uq.get("last") or uq.get("bid") or 0)
                     if last > 0:
                         pos.current_underlying = last
+                        underlying_progressed = True
 
                 if oq:
                     bid = float(oq.get("bid", 0) or 0)
@@ -1027,9 +1553,27 @@ class APExitEngine:
                         pos.current_bid          = bid
                         pos.current_ask          = ask
                         pos.current_option_price = (bid + ask) / 2
+                        option_progressed = True
+
+                if underlying_progressed:
+                    pos.last_underlying_quote_update_ts = now_utc
+                    pos.last_underlying_quote_missing_ts = None
+                else:
+                    pos.last_underlying_quote_missing_ts = now_utc
+
+                if option_progressed:
+                    pos.last_option_quote_update_ts = now_utc
+                    pos.last_option_quote_missing_ts = None
+                else:
+                    pos.last_option_quote_missing_ts = now_utc
+
+                if underlying_progressed or option_progressed:
+                    pos.last_quote_update_ts = now_utc
+                    pos.last_quote_missing_ts = None
+                else:
+                    pos.last_quote_missing_ts = now_utc
 
                 # Gate: don't re-fire while an exit is in-flight
-                now_utc = datetime.now(timezone.utc)
                 option_pnl = pos.option_pnl_pct
                 # Runner trail bypass: if scale-out done and runner is giving
                 # back massive gains, close regardless of exit_in_flight.
@@ -1069,7 +1613,44 @@ class APExitEngine:
                         if pos.option_pnl_pct > pos.max_profit_seen:
                             pos.max_profit_seen = pos.option_pnl_pct
                     decision = evaluate_exit(pos, now_et)
+                    decision.reason_code = _classify_exit_decision(decision)
                     if decision.should_act:
+                        # Decision-path quote freshness gate. This prevents stale option
+                        # marks from even entering the submit queue for normal exits.
+                        # _submit_exit_decision() repeats the same check as defense in depth.
+                        option_quote_stale, option_quote_age_sec, option_quote_state = _is_option_quote_stale(pos, now_utc)
+                        if option_quote_stale and not _is_forced_risk_exit_code(decision.reason_code):
+                            self._emit_exit_event(
+                                pos,
+                                decision="HOLD",
+                                reason_code="OPTION_QUOTE_STALE_DECISION_SUPPRESSED",
+                                explanation=(
+                                    f"Suppressed {decision.reason_code} before submit queue because option quote is not fresh: "
+                                    f"{option_quote_state} age={option_quote_age_sec}"
+                                ),
+                                stage="exit_decision",
+                                extra_inputs={
+                                    "decision_action": decision.action,
+                                    "decision_qty": decision.quantity,
+                                    "decision_pnl_pct": decision.pnl_pct,
+                                    "decision_reason_code": decision.reason_code,
+                                    "option_quote_state": option_quote_state,
+                                    "option_quote_age_sec": option_quote_age_sec,
+                                    "last_option_quote_update_ts": (
+                                        pos.last_option_quote_update_ts.isoformat()
+                                        if getattr(pos, "last_option_quote_update_ts", None) else ""
+                                    ),
+                                },
+                            )
+                            log.error(
+                                "[%s] EXIT DECISION SUPPRESSED: stale option quote | code=%s age=%s state=%s pos_id=%s",
+                                pos.ticker, decision.reason_code, option_quote_age_sec, option_quote_state, pos.position_id or "?"
+                            )
+                            continue
+
+                        if option_quote_stale and _is_forced_risk_exit_code(decision.reason_code):
+                            decision.reason = f"{decision.reason} | DEGRADED_QUOTE_MODE:{option_quote_state}"
+
                         self._emit_exit_event(
                             pos,
                             decision="SUBMIT",
@@ -1080,6 +1661,10 @@ class APExitEngine:
                                 "decision_action": decision.action,
                                 "decision_qty": decision.quantity,
                                 "decision_pnl_pct": decision.pnl_pct,
+                                "decision_reason_code": decision.reason_code,
+                                "option_quote_stale": option_quote_stale,
+                                "option_quote_age_sec": option_quote_age_sec,
+                                "option_quote_state": option_quote_state,
                                 "suggested_limit": decision.suggested_limit,
                             },
                         )
@@ -1139,6 +1724,164 @@ class APExitEngine:
                 allow_inflight_override=bool(_force_runner_submit),
             )
 
+    def _extract_exit_order_identity(self, callback_result) -> dict:
+        """Best-effort bridge from execution callback return value to OSM identity.
+
+        Supported callback returns:
+        - None: legacy callback, no identity returned
+        - False: explicit failure, do not mark submitted
+        - dict/object with local_order_id / broker_order_id / order_id / id
+        - tuple(local_order_id, broker_order_id)
+        """
+        identity = {
+            "accepted": True,
+            "local_order_id": "",
+            "broker_order_id": "",
+            "raw_status": "",
+        }
+        if callback_result is False:
+            identity["accepted"] = False
+            identity["raw_status"] = "callback_false"
+            return identity
+        if callback_result is None:
+            return identity
+
+        def _get(obj, *names):
+            for name in names:
+                if isinstance(obj, dict) and name in obj:
+                    return obj.get(name)
+                if hasattr(obj, name):
+                    return getattr(obj, name)
+            return None
+
+        if isinstance(callback_result, (tuple, list)):
+            if len(callback_result) >= 1 and callback_result[0] is not None:
+                identity["local_order_id"] = str(callback_result[0])
+            if len(callback_result) >= 2 and callback_result[1] is not None:
+                identity["broker_order_id"] = str(callback_result[1])
+            return identity
+
+        status = _get(callback_result, "status", "raw_status", "state")
+        if status is not None:
+            identity["raw_status"] = str(status)
+
+        accepted = _get(callback_result, "accepted", "ok", "success")
+        if accepted is False:
+            identity["accepted"] = False
+
+        local_id = _get(
+            callback_result,
+            "local_order_id",
+            "exit_local_order_id",
+            "order_local_id",
+            "client_order_id",
+        )
+        broker_id = _get(
+            callback_result,
+            "broker_order_id",
+            "exit_broker_order_id",
+            "order_id",
+            "broker_id",
+            "id",
+        )
+
+        if local_id is not None:
+            identity["local_order_id"] = str(local_id)
+        if broker_id is not None:
+            identity["broker_order_id"] = str(broker_id)
+
+        return identity
+
+    def health_snapshot(self, *, stale_after_sec: float = 60.0) -> dict:
+        """Return watchdog-friendly health state for dashboard/self-healing.
+
+        This does not submit, cancel, or mutate orders. It is safe for polling.
+        """
+        now = datetime.now(timezone.utc)
+        with self._lock:
+            positions = []
+            stale_inflight = []
+            stale_quotes = []
+            stale_underlying_quotes = []
+            stale_option_quotes = []
+            missing_callback_identity = []
+            for pos in self._positions:
+                flight_sec = None
+                quote_age_sec = None
+                underlying_quote_age_sec = None
+                option_quote_age_sec = None
+                ident = pos.position_id or pos.option_symbol or pos.ticker
+                if pos.exit_in_flight and pos.last_exit_signal_ts:
+                    flight_sec = max(0.0, (now - pos.last_exit_signal_ts).total_seconds())
+                    if flight_sec >= stale_after_sec:
+                        stale_inflight.append(ident)
+                if pos.last_quote_update_ts:
+                    quote_age_sec = max(0.0, (now - pos.last_quote_update_ts).total_seconds())
+                    if quote_age_sec >= stale_after_sec and not pos.closed:
+                        stale_quotes.append(ident)
+                elif not pos.closed:
+                    stale_quotes.append(ident)
+                if pos.last_underlying_quote_update_ts:
+                    underlying_quote_age_sec = max(0.0, (now - pos.last_underlying_quote_update_ts).total_seconds())
+                    if underlying_quote_age_sec >= stale_after_sec and not pos.closed:
+                        stale_underlying_quotes.append(ident)
+                elif not pos.closed:
+                    stale_underlying_quotes.append(ident)
+                if pos.last_option_quote_update_ts:
+                    option_quote_age_sec = max(0.0, (now - pos.last_option_quote_update_ts).total_seconds())
+                    if option_quote_age_sec >= stale_after_sec and not pos.closed:
+                        stale_option_quotes.append(ident)
+                elif not pos.closed:
+                    stale_option_quotes.append(ident)
+                if getattr(pos, "last_callback_identity_missing", False) and pos.exit_in_flight:
+                    missing_callback_identity.append(pos.position_id or pos.option_symbol or pos.ticker)
+                positions.append({
+                    "position_id": pos.position_id,
+                    "ticker": pos.ticker,
+                    "option_symbol": pos.option_symbol,
+                    "quantity_remaining": pos.quantity_remaining,
+                    "closed": pos.closed,
+                    "exit_in_flight": pos.exit_in_flight,
+                    "pending_exit_action": pos.pending_exit_action,
+                    "pending_exit_qty": pos.pending_exit_qty,
+                    "pending_exit_filled_qty": pos.pending_exit_filled_qty,
+                    "pending_exit_local_order_id": pos.pending_exit_local_order_id,
+                    "pending_exit_broker_order_id": pos.pending_exit_broker_order_id,
+                    "flight_sec": flight_sec,
+                    "quote_age_sec": quote_age_sec,
+                    "underlying_quote_age_sec": underlying_quote_age_sec,
+                    "option_quote_age_sec": option_quote_age_sec,
+                    "last_quote_update_ts": pos.last_quote_update_ts.isoformat() if pos.last_quote_update_ts else "",
+                    "last_quote_missing_ts": pos.last_quote_missing_ts.isoformat() if pos.last_quote_missing_ts else "",
+                    "last_underlying_quote_update_ts": pos.last_underlying_quote_update_ts.isoformat() if pos.last_underlying_quote_update_ts else "",
+                    "last_underlying_quote_missing_ts": pos.last_underlying_quote_missing_ts.isoformat() if pos.last_underlying_quote_missing_ts else "",
+                    "last_option_quote_update_ts": pos.last_option_quote_update_ts.isoformat() if pos.last_option_quote_update_ts else "",
+                    "last_option_quote_missing_ts": pos.last_option_quote_missing_ts.isoformat() if pos.last_option_quote_missing_ts else "",
+                    "last_callback_identity_missing": getattr(pos, "last_callback_identity_missing", False),
+                    "last_callback_identity_missing_ts": (
+                        pos.last_callback_identity_missing_ts.isoformat()
+                        if pos.last_callback_identity_missing_ts else ""
+                    ),
+                })
+            thread_alive = bool(self._thread and self._thread.is_alive())
+            return {
+                "running_flag": bool(self._running),
+                "thread_alive": thread_alive,
+                "thread_name": self._thread.name if self._thread else "",
+                "position_count": len(positions),
+                "stale_inflight_count": len(stale_inflight),
+                "stale_inflight": stale_inflight,
+                "stale_quote_count": len(stale_quotes),
+                "stale_quotes": stale_quotes,
+                "stale_underlying_quote_count": len(stale_underlying_quotes),
+                "stale_underlying_quotes": stale_underlying_quotes,
+                "stale_option_quote_count": len(stale_option_quotes),
+                "stale_option_quotes": stale_option_quotes,
+                "missing_callback_identity_count": len(missing_callback_identity),
+                "missing_callback_identity": missing_callback_identity,
+                "positions": positions,
+            }
+
     def _submit_exit_decision(
         self,
         pos: ManagedPosition,
@@ -1156,6 +1899,9 @@ class APExitEngine:
           external code and may touch OSM/broker/reconciler paths.
         """
         now_utc = datetime.now(timezone.utc)
+        ticker = str(pos.ticker or "")
+        option_symbol = str(pos.option_symbol or "")
+        position_id = str(pos.position_id or "")
 
         # 1) Short critical section: validate and capture submit snapshot.
         with self._lock:
@@ -1166,6 +1912,60 @@ class APExitEngine:
                 allow_inflight_override=allow_inflight_override,
             ):
                 return False
+
+            decision.reason_code = _classify_exit_decision(decision)
+
+            option_quote_stale, option_quote_age_sec, option_quote_state = _is_option_quote_stale(pos, now_utc)
+            if option_quote_stale and not _is_forced_risk_exit_code(decision.reason_code):
+                self._emit_exit_event(
+                    pos,
+                    decision="REJECT",
+                    reason_code="OPTION_QUOTE_STALE_BLOCK",
+                    explanation=(
+                        f"Blocked {decision.reason_code} because option quote is not fresh: "
+                        f"{option_quote_state} age={option_quote_age_sec}"
+                    ),
+                    stage="exit_submission",
+                    extra_inputs={
+                        "decision_action": decision.action,
+                        "decision_qty": decision.quantity,
+                        "decision_reason_code": decision.reason_code,
+                        "option_quote_state": option_quote_state,
+                        "option_quote_age_sec": option_quote_age_sec,
+                        "last_option_quote_update_ts": (
+                            pos.last_option_quote_update_ts.isoformat()
+                            if getattr(pos, "last_option_quote_update_ts", None) else ""
+                        ),
+                    },
+                )
+                log.error(
+                    "[%s] EXIT BLOCKED: stale option quote | code=%s age=%s state=%s pos_id=%s",
+                    ticker, decision.reason_code, option_quote_age_sec, option_quote_state, pos.position_id or "?"
+                )
+                return False
+
+            if option_quote_stale and _is_forced_risk_exit_code(decision.reason_code):
+                self._emit_exit_event(
+                    pos,
+                    decision="ALERT",
+                    reason_code="FORCED_EXIT_DEGRADED_OPTION_QUOTE",
+                    explanation=(
+                        f"Forced-risk exit allowed despite stale/missing option quote: "
+                        f"{decision.reason_code} {option_quote_state} age={option_quote_age_sec}"
+                    ),
+                    stage="exit_submission",
+                    extra_inputs={
+                        "decision_action": decision.action,
+                        "decision_qty": decision.quantity,
+                        "decision_reason_code": decision.reason_code,
+                        "option_quote_state": option_quote_state,
+                        "option_quote_age_sec": option_quote_age_sec,
+                    },
+                )
+                log.warning(
+                    "[%s] FORCED EXIT IN DEGRADED QUOTE MODE | code=%s age=%s state=%s pos_id=%s",
+                    ticker, decision.reason_code, option_quote_age_sec, option_quote_state, pos.position_id or "?"
+                )
 
             if kill_active and KILL_BLOCKS_NON_PROTECTIVE_EXITS and not _is_protective_exit(decision.reason or ""):
                 self._emit_exit_event(
@@ -1180,9 +1980,6 @@ class APExitEngine:
             if decision.suggested_limit == 0.0 and pos.current_bid > 0:
                 decision.suggested_limit = round(pos.current_bid * 0.99, 2)
 
-            position_id = str(pos.position_id or "")
-            option_symbol = str(pos.option_symbol or "")
-            ticker = str(pos.ticker or "")
             pre_submit_qty = int(pos.quantity_remaining or 0)
 
             log.info(
@@ -1200,17 +1997,31 @@ class APExitEngine:
             )
 
         # 2) External callback outside lock.
+        callback_result = None
+        callback_identity = {"accepted": True, "local_order_id": "", "broker_order_id": "", "raw_status": ""}
         try:
             if decision.action == "SCALE_OUT":
                 if not self.on_scale:
                     log.warning("[%s] Scale-out decision generated but no on_scale callback installed", ticker)
                     return False
-                self.on_scale(pos, decision)
+                callback_result = self.on_scale(pos, decision)
             else:
                 if not self.on_exit:
                     log.warning("[%s] Exit decision generated but no on_exit callback installed", ticker)
                     return False
-                self.on_exit(pos, decision)
+                callback_result = self.on_exit(pos, decision)
+
+            callback_identity = self._extract_exit_order_identity(callback_result)
+            if not callback_identity.get("accepted", True):
+                self._emit_exit_event(
+                    pos,
+                    decision="ERROR",
+                    reason_code="EXIT_CALLBACK_NOT_ACCEPTED",
+                    explanation=f"Exit callback returned non-accepted status: {callback_identity.get('raw_status', '')}",
+                    stage="exit_submission",
+                    extra_inputs={"decision_action": decision.action, "decision_qty": decision.quantity},
+                )
+                return False
         except Exception as exc:
             log.error("[%s] Exit submit failed; position remains tracked: %s", ticker, exc)
             self._emit_exit_event(
@@ -1264,7 +2075,39 @@ class APExitEngine:
                 )
                 return True
 
-            self._mark_exit_submitted(current_pos, decision)
+            self._mark_exit_submitted(
+                current_pos,
+                decision,
+                local_order_id=callback_identity.get("local_order_id", ""),
+                broker_order_id=callback_identity.get("broker_order_id", ""),
+            )
+            if not current_pos.pending_exit_local_order_id and not current_pos.pending_exit_broker_order_id:
+                current_pos.last_callback_identity_missing = True
+                current_pos.last_callback_identity_missing_ts = datetime.now(timezone.utc)
+                log.error(
+                    "[%s] EXIT SUBMITTED WITHOUT ORDER ID | pos_id=%s sym=%s action=%s qty=%s status=%s",
+                    ticker,
+                    current_pos.position_id or "?",
+                    current_pos.option_symbol or option_symbol,
+                    decision.action,
+                    decision.quantity,
+                    callback_identity.get("raw_status", ""),
+                )
+                self._emit_exit_event(
+                    current_pos,
+                    decision="ALERT",
+                    reason_code="EXIT_SUBMITTED_WITHOUT_ORDER_ID",
+                    explanation=(
+                        "Exit callback accepted but returned no local/broker order identity; "
+                        "reconciler must still write identity/fill truth back."
+                    ),
+                    stage="exit_submission",
+                    extra_inputs={
+                        "decision_action": decision.action,
+                        "decision_qty": decision.quantity,
+                        "callback_status": callback_identity.get("raw_status", ""),
+                    },
+                )
             self._assert_position_invariants(current_pos, "submit_exit_decision")
 
         self._emit_exit_event(
@@ -1278,6 +2121,9 @@ class APExitEngine:
                 "decision_qty": decision.quantity,
                 "from_sentinel": from_sentinel,
                 "pre_submit_qty": pre_submit_qty,
+                "local_order_id": callback_identity.get("local_order_id", ""),
+                "broker_order_id": callback_identity.get("broker_order_id", ""),
+                "callback_status": callback_identity.get("raw_status", ""),
             },
         )
         return True
