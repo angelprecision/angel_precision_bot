@@ -18,6 +18,7 @@ import sys
 import threading
 import time
 import concurrent.futures
+import atexit
 from typing import Optional
 
 log = logging.getLogger("intelligence_bridge")
@@ -81,6 +82,51 @@ INTELLIGENCE_AVAILABLE: bool = _package_ready  # MED-008: derive from actual reg
 
 INTEL_TIMEOUT_SECONDS:   float = float(os.getenv("INTEL_TIMEOUT_SECONDS",  "8.0"))
 INTEL_APPROVE_THRESHOLD: float = float(os.getenv("INTEL_APPROVE_THRESHOLD", "35.0"))
+
+# Gate G policy:
+# - LIVE defaults fail-closed: intel unavailable/timeout/error/skip/low-score/risk-veto blocks.
+# - Paper/research may opt into 1-contract data-collection overrides.
+# - To intentionally collect data in LIVE, set INTEL_DATA_COLLECTION_OVERRIDE=1.
+_AP_MODE = (os.getenv("AP_MODE") or os.getenv("BOT_MODE") or "paper").lower()
+_INTEL_DATA_COLLECTION_OVERRIDE = os.getenv("INTEL_DATA_COLLECTION_OVERRIDE", "0") == "1"
+_INTEL_FAIL_OPEN_UNAVAILABLE = os.getenv("INTEL_FAIL_OPEN_UNAVAILABLE", "0") == "1"
+_INTEL_ENFORCE_RISK_VETO = os.getenv("INTEL_ENFORCE_RISK_VETO", "1") != "0"
+_INTEL_IS_LIVE = _AP_MODE == "live"
+
+# One shared executor for non-blocking audit writes. Do not spin up a new
+# ThreadPoolExecutor for every signal.
+_AUDIT_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=int(os.getenv("INTEL_AUDIT_WORKERS", "1")),
+    thread_name_prefix="intel-audit",
+)
+atexit.register(lambda: _AUDIT_EXECUTOR.shutdown(wait=False, cancel_futures=True))
+
+def _data_collection_allowed() -> bool:
+    return _INTEL_DATA_COLLECTION_OVERRIDE or not _INTEL_IS_LIVE
+
+def _block_gate(*, status: str, score: float, reasoning: str, risk_detail=None, price_data_stub: bool = False) -> dict:
+    return {
+        "approved": False,
+        "score": round(float(score or 0), 1),
+        "contracts": 0,
+        "reasoning": reasoning,
+        "intel_status": status,
+        "intel_score": round(float(score or 0), 1) if score is not None else None,
+        "risk_detail": risk_detail or {},
+        "price_data_stub": price_data_stub,
+    }
+
+def _collect_gate(*, status: str, score: float, reasoning: str, risk_detail=None, price_data_stub: bool = False) -> dict:
+    return {
+        "approved": True,
+        "score": max(round(float(score or 0), 1), 50.0),
+        "contracts": 1,
+        "reasoning": reasoning,
+        "intel_status": status,
+        "intel_score": round(float(score or 0), 1) if score is not None else None,
+        "risk_detail": risk_detail or {},
+        "price_data_stub": price_data_stub,
+    }
 
 # FIX 4: Retry logic — transient errors don't permanently disable intel
 # HIGH-002: Per-client pipeline state — prevents one client's failures from
@@ -181,43 +227,103 @@ def _signal_to_direction(signal: dict) -> str:
     return "neutral"
 
 
-def _map_result(result: dict, fallback_score: float) -> dict:
-    action    = str(result.get("action", "execute")).lower()
-    confidence= float(result.get("confidence") or 0)
-    score     = float(result.get("score") or confidence or fallback_score)
-    contracts = int(result.get("contracts") or 1)
-    reasoning = str(result.get("reasoning") or "")
-    risk      = result.get("risk_detail") or {}
-    # Paper mode: ignore risk veto — incomplete price data makes it unreliable
-    risk_ok   = True
-    risk_reason=risk.get("reason", "")
+def _risk_allows_trade(risk: dict) -> tuple[bool, str]:
+    """Return (risk_ok, reason) from flexible intelligence risk payloads."""
+    if not isinstance(risk, dict):
+        return True, ""
 
-    if not risk_ok:
-        # Data collection mode: approve at 1 contract instead of hard blocking
-        # Risk manager runs on incomplete data (no price history) — veto is unreliable
-        return {"approved": True, "score": max(score, 50.0), "contracts": 1,
-                "reasoning": f"risk_veto_override: {risk_reason} (1 contract data collection)",
-                "intel_status": "RISK_VETO_OVERRIDE", "intel_score": score, "risk_detail": risk}
+    # Common explicit veto shapes.
+    for key in ("risk_ok", "ok", "approved", "pass", "passed", "allow", "allowed"):
+        if key in risk:
+            val = risk.get(key)
+            if isinstance(val, str):
+                val_norm = val.strip().lower()
+                if val_norm in {"false", "no", "0", "fail", "failed", "reject", "veto", "blocked"}:
+                    return False, str(risk.get("reason") or f"{key}={val}")
+                if val_norm in {"true", "yes", "1", "pass", "passed", "allow", "allowed", "ok"}:
+                    return True, str(risk.get("reason") or "")
+            elif val is False:
+                return False, str(risk.get("reason") or f"{key}=False")
+            elif val is True:
+                return True, str(risk.get("reason") or "")
+
+    for key in ("veto", "blocked", "rejected", "hard_block"):
+        if bool(risk.get(key)):
+            return False, str(risk.get("reason") or f"{key}=True")
+
+    status = str(risk.get("status") or risk.get("decision") or "").strip().lower()
+    if status in {"reject", "rejected", "block", "blocked", "veto", "fail", "failed"}:
+        return False, str(risk.get("reason") or f"status={status}")
+
+    return True, str(risk.get("reason") or "")
+
+
+def _map_result(result: dict, fallback_score: float) -> dict:
+    action     = str(result.get("action", "execute")).lower()
+    confidence = float(result.get("confidence") or 0)
+    score      = float(result.get("score") or confidence or fallback_score)
+    contracts  = int(result.get("contracts") or 1)
+    reasoning  = str(result.get("reasoning") or "")
+    risk       = result.get("risk_detail") or {}
+
+    risk_ok, risk_reason = _risk_allows_trade(risk)
+    allow_collect = _data_collection_allowed()
+
+    if _INTEL_ENFORCE_RISK_VETO and not risk_ok:
+        if allow_collect:
+            return _collect_gate(
+                status="RISK_VETO_OVERRIDE",
+                score=score,
+                reasoning=f"risk_veto_override: {risk_reason} (1 contract data collection)",
+                risk_detail=risk,
+            )
+        return _block_gate(
+            status="RISK_VETO",
+            score=score,
+            reasoning=f"risk_veto: {risk_reason}",
+            risk_detail=risk,
+        )
 
     if action == "skip":
-        # Fix 4: data collection mode — approve at min size instead of blocking
-        # Intel skip = uncertainty, not certainty of loss. Let it trade 1 contract.
-        return {"approved": True, "score": max(score, 50.0), "contracts": 1,
-                "reasoning": f"intel_skip_override: {reasoning[:100]} (1 contract data collection)",
-                "intel_status": "SKIP_OVERRIDE", "intel_score": score, "risk_detail": risk}
+        if allow_collect:
+            return _collect_gate(
+                status="SKIP_OVERRIDE",
+                score=score,
+                reasoning=f"intel_skip_override: {reasoning[:100]} (1 contract data collection)",
+                risk_detail=risk,
+            )
+        return _block_gate(
+            status="SKIP",
+            score=score,
+            reasoning=f"intel_skip: {reasoning[:160]}",
+            risk_detail=risk,
+        )
 
     if score < INTEL_APPROVE_THRESHOLD:
-        # Fix 4: low confidence → approve at 1 contract instead of blocking
-        # Need data to calibrate the threshold — can't learn from zero trades
-        return {"approved": True, "score": max(score, 50.0), "contracts": 1,
-                "reasoning": f"intel_low_conf_override: {score:.1f} (1 contract data collection)",
-                "intel_status": "LOW_CONF_OVERRIDE", "intel_score": score, "risk_detail": risk}
+        if allow_collect:
+            return _collect_gate(
+                status="LOW_CONF_OVERRIDE",
+                score=score,
+                reasoning=f"intel_low_conf_override: {score:.1f} (1 contract data collection)",
+                risk_detail=risk,
+            )
+        return _block_gate(
+            status="LOW_CONFIDENCE",
+            score=score,
+            reasoning=f"intel_score {score:.1f} below threshold {INTEL_APPROVE_THRESHOLD:.1f}",
+            risk_detail=risk,
+        )
 
-    # FIX 3: intel contracts is a CAP — MC does min(kelly, intel_cap) at Gate I
-    return {"approved": True, "score": round(score, 1), "contracts": max(1, contracts),
-            "reasoning": reasoning[:200],
-            "intel_status": "APPROVED", "intel_score": round(score, 1), "risk_detail": risk}
-
+    # Intel contracts is a CAP — MC should still apply min(kelly, risk cap, intel cap).
+    return {
+        "approved": True,
+        "score": round(score, 1),
+        "contracts": max(1, contracts),
+        "reasoning": reasoning[:200],
+        "intel_status": "APPROVED",
+        "intel_score": round(score, 1),
+        "risk_detail": risk,
+    }
 
 def _persist_audit(result: dict, gate: dict, signal: dict) -> None:
     audit = _get_audit_log()
@@ -268,21 +374,33 @@ def record_trade_outcome(ticker: str, signal_id: str, pnl_pct: float) -> None:
 
 def run_intelligence_check(signal: dict, underlying_price: float,
                            client_id: str = "default") -> dict:
-    """Called by APMasterControl._run_intelligence(). Always fails open."""
+    """Called by APMasterControl._run_intelligence().
+
+    LIVE default: hard-veto on unavailable/timeout/error/skip/low-score/risk-veto.
+    Paper/research default: 1-contract data-collection override.
+    """
     ticker    = signal.get("ticker") or signal.get("symbol", "UNKNOWN")
     direction = _signal_to_direction(signal)
     score_in  = float(signal.get("score") or signal.get("ev_score") or 65.0)
 
-    _fail_open = {
-        "approved": True, "score": score_in, "contracts": 1,
-        "price_data_stub": True,   # downstream: data quality degraded — log but allow
-        "reasoning": "intel_unavailable",
-        "intel_status": "UNAVAILABLE", "intel_score": None,
-    }
+    def _unavailable_gate(status: str, reason: str) -> dict:
+        if _INTEL_FAIL_OPEN_UNAVAILABLE or _data_collection_allowed():
+            return _collect_gate(
+                status=status,
+                score=score_in,
+                reasoning=reason,
+                price_data_stub=True,
+            )
+        return _block_gate(
+            status=status,
+            score=score_in,
+            reasoning=reason,
+            price_data_stub=True,
+        )
 
     pipeline = _get_pipeline(client_id=client_id)
     if pipeline is None:
-        return _fail_open
+        return _unavailable_gate("UNAVAILABLE", "intel_unavailable")
 
     def _run():
         return pipeline.run_quick(
@@ -301,11 +419,9 @@ def run_intelligence_check(signal: dict, underlying_price: float,
 
         gate = _map_result(result, score_in)
 
-        # FIX 2: Async audit persist — never blocks execution
+        # Async audit persist — never blocks execution. Uses one shared executor.
         try:
-            _t = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-            _t.submit(_persist_audit, result, gate, signal)
-            _t.shutdown(wait=False)
+            _AUDIT_EXECUTOR.submit(_persist_audit, result, gate, signal)
         except Exception:
             pass
 
@@ -317,11 +433,15 @@ def run_intelligence_check(signal: dict, underlying_price: float,
         return gate
 
     except concurrent.futures.TimeoutError:
-        log.warning(f"[{ticker}] Intel timeout after {INTEL_TIMEOUT_SECONDS}s — fail open")
-        return {**_fail_open, "reasoning": f"intel_timeout_{INTEL_TIMEOUT_SECONDS}s",
-                "intel_status": "TIMEOUT"}
+        log.warning(
+            f"[{ticker}] Intel timeout after {INTEL_TIMEOUT_SECONDS}s — "
+            f"{'data-collection override' if (_INTEL_FAIL_OPEN_UNAVAILABLE or _data_collection_allowed()) else 'blocking'}"
+        )
+        return _unavailable_gate("TIMEOUT", f"intel_timeout_{INTEL_TIMEOUT_SECONDS}s")
 
     except Exception as e:
-        log.warning(f"[{ticker}] Intel error ({e}) — fail open")
-        return {**_fail_open, "reasoning": f"intel_error:{str(e)[:60]}",
-                "intel_status": "ERROR"}
+        log.warning(
+            f"[{ticker}] Intel error ({e}) — "
+            f"{'data-collection override' if (_INTEL_FAIL_OPEN_UNAVAILABLE or _data_collection_allowed()) else 'blocking'}"
+        )
+        return _unavailable_gate("ERROR", f"intel_error:{str(e)[:60]}")
