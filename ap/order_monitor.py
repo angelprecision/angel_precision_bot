@@ -50,6 +50,15 @@ TIMEOUT_EXIT_ACK      = int(os.getenv("ORDER_TIMEOUT_EXIT_ACK",      "600"))   #
 
 POLL_INTERVAL = int(os.getenv("ORDER_MONITOR_POLL", "60"))  # seconds
 
+# Watchdog ownership controls.
+# Default is intentionally passive: this monitor alerts only and does not become
+# a second lifecycle authority alongside fill monitor, reconciler, OSM, and exit engine.
+ORDER_MONITOR_MODE = os.getenv("ORDER_MONITOR_MODE", "watchdog").strip().lower()
+ENABLE_MISSED_MOVE_CANCEL = os.getenv("ENABLE_MISSED_MOVE_CANCEL", "0").strip() == "1"
+ALLOW_ORDER_MONITOR_POSITION_REOPEN = os.getenv("ALLOW_ORDER_MONITOR_POSITION_REOPEN", "0").strip() == "1"
+ORDER_MONITOR_CAN_ACT = ORDER_MONITOR_MODE in {"active", "actor", "enforce", "enforced"}
+
+
 
 class APOrderMonitor:
     """
@@ -95,6 +104,9 @@ class APOrderMonitor:
             "timeout_exit_pending":   TIMEOUT_EXIT_PENDING,
             "timeout_exit_ack":       TIMEOUT_EXIT_ACK,
             "poll_interval":          POLL_INTERVAL,
+            "order_monitor_mode":     ORDER_MONITOR_MODE,
+            "enable_missed_move_cancel": ENABLE_MISSED_MOVE_CANCEL,
+            "allow_position_reopen":  ALLOW_ORDER_MONITOR_POSITION_REOPEN,
             "missed_move_min_secs":   int(os.getenv("MISSED_MOVE_MIN_SECS",    "600")),
             "missed_move_price_mult": float(os.getenv("MISSED_MOVE_PRICE_MULT", "1.20")),
         })
@@ -209,7 +221,7 @@ class APOrderMonitor:
                 #         Increase to 1.30+ to reduce false cancels in high-volatility markets.
                 _MISSED_MOVE_MIN_SECS = int(os.getenv("MISSED_MOVE_MIN_SECS", "600"))
                 _MISSED_MOVE_PRICE_MULT = float(os.getenv("MISSED_MOVE_PRICE_MULT", "1.20"))
-                if broker_oid and age_secs >= _MISSED_MOVE_MIN_SECS and status == "SUBMITTED":
+                if ENABLE_MISSED_MOVE_CANCEL and broker_oid and age_secs >= _MISSED_MOVE_MIN_SECS and status == "SUBMITTED":
                     try:
                         _limit_price = (
                             order.get("limit_price")
@@ -250,7 +262,7 @@ class APOrderMonitor:
                         )
                         self._emit_order_event(
                             local_order_id=local_id,
-                            stage="fill_monitor",
+                            stage="order_monitor",
                             decision="ALERT",
                             reason_code="NO_BROKER_ACK",
                             explanation=f"Order SUBMITTED for {age_secs:.0f}s but has no broker_order_id — watcher-held, skipping cancel",
@@ -298,7 +310,7 @@ class APOrderMonitor:
                     # Mitigation: exit engine manages the filled portion independently.
                     self._emit_order_event(
                         local_order_id=local_id,
-                        stage="fill_monitor",
+                        stage="order_monitor",
                         decision="ALERT",
                         reason_code="PARTIAL_FILL_STALLED",
                         explanation=f"PARTIAL_FILL stalled for {age_secs:.0f}s > {TIMEOUT_PARTIAL_FILL}s",
@@ -370,7 +382,7 @@ class APOrderMonitor:
                     # Policy: alert at CRITICAL level, require manual review.
                     self._emit_order_event(
                         local_order_id=local_id,
-                        stage="exit_monitor",
+                        stage="order_monitor",
                         decision="ALERT",
                         reason_code="PARTIAL_FILL_STALLED",
                         explanation=f"EXIT_PARTIAL_FILL stalled for {age_secs:.0f}s > {TIMEOUT_PARTIAL_FILL}s",
@@ -396,7 +408,7 @@ class APOrderMonitor:
     ):
         self._emit_order_event(
             local_order_id=local_order_id,
-            stage="fill_monitor",
+            stage="order_monitor",
             decision="ESCALATE",
             reason_code="STALE_ENTRY_TIMEOUT",
             explanation=reason,
@@ -419,6 +431,17 @@ class APOrderMonitor:
                 f"⚠️ STALE ENTRY ORDER | {self.client_id} | {contract} "
                 f"| {local_order_id} | {reason}"
             )
+
+        if not ORDER_MONITOR_CAN_ACT:
+            self._alert(
+                f"[WATCHDOG ONLY] Stale entry detected; no cancel attempted | "
+                f"{self.client_id} | {contract} | {local_order_id} | {reason}"
+            )
+            log.warning(
+                "[%s] WATCHDOG MODE — stale entry action suppressed | order=%s status=%s action=%s",
+                self.client_id, local_order_id, status, action,
+            )
+            return
 
         if "cancel" in action:
             broker_oid = self._get_broker_order_id(local_order_id)
@@ -472,7 +495,7 @@ class APOrderMonitor:
                 # precise enough; a new canonical code can be added centrally if needed.
                 self._emit_order_event(
                     local_order_id=local_order_id,
-                    stage="fill_monitor",
+                    stage="order_monitor",
                     decision="ALERT",
                     reason_code=None,
                     explanation=(
@@ -499,7 +522,7 @@ class APOrderMonitor:
     ):
         self._emit_order_event(
             local_order_id=local_order_id,
-            stage="exit_monitor",
+            stage="order_monitor",
             decision="ESCALATE",
             reason_code="STALE_EXIT_TIMEOUT",
             explanation=reason,
@@ -520,6 +543,17 @@ class APOrderMonitor:
             f"STALE EXIT ORDER — ACCOUNT RISK | {self.client_id} | {contract} "
             f"| {local_order_id} | pos={position_id} | {reason}"
         )
+
+        if not ORDER_MONITOR_CAN_ACT:
+            self._alert(
+                f"[WATCHDOG ONLY] Stale exit detected; no cancel/clear/reopen attempted | "
+                f"{self.client_id} | {contract} | {local_order_id} | pos={position_id} | {reason}"
+            )
+            log.warning(
+                "[%s] WATCHDOG MODE — stale exit action suppressed | order=%s status=%s pos=%s",
+                self.client_id, local_order_id, status, position_id,
+            )
+            return
 
         broker_oid = self._get_broker_order_id(local_order_id)
         broker_status = self._query_broker_order(broker_oid)
@@ -544,7 +578,7 @@ class APOrderMonitor:
         if not is_confirmed_canceled:
             self._emit_order_event(
                 local_order_id=local_order_id,
-                stage="exit_monitor",
+                stage="order_monitor",
                 decision="ALERT",
                 reason_code="MANUAL_INTERVENTION_REQUIRED",
                 explanation="Exit order stuck and cancel not broker-confirmed",
@@ -575,18 +609,12 @@ class APOrderMonitor:
                     )
 
             if position_id and self.pm:
-                try:
-                    self.pm.update_position(position_id, status="OPEN")
-                    log.warning(
-                        f"[{self.client_id}] Position reverted to OPEN after "
-                        f"exit cancel — RETRY EXIT REQUIRED | pos={position_id}"
-                    )
-                    self._alert(
-                        f"Position reverted to OPEN — exit must be retried | "
-                        f"{self.client_id} | {contract} | pos={position_id}"
-                    )
-                except Exception as e:
-                    log.error(f"[{self.client_id}] Failed to revert position: {e}")
+                self._guarded_revert_position_open_after_exit_cancel(
+                    position_id=position_id,
+                    canceled_exit_order_id=local_order_id,
+                    contract=contract,
+                    reason=reason,
+                )
         else:
             log.error(
                 f"[{self.client_id}] Exit order could not be canceled — "
@@ -594,7 +622,7 @@ class APOrderMonitor:
             )
             self._emit_order_event(
                 local_order_id=local_order_id,
-                stage="exit_monitor",
+                stage="order_monitor",
                 decision="ALERT",
                 reason_code="MANUAL_INTERVENTION_REQUIRED",
                 explanation="Exit order stuck — cancel not broker-confirmed, manual action required",
@@ -606,6 +634,174 @@ class APOrderMonitor:
                 f"MANUAL INTERVENTION REQUIRED | {self.client_id} | {contract} "
                 f"| Exit order {local_order_id} stuck and cannot be canceled"
             )
+
+    def _guarded_revert_position_open_after_exit_cancel(
+        self,
+        *,
+        position_id: str,
+        canceled_exit_order_id: str,
+        contract: str,
+        reason: str,
+    ) -> bool:
+        """Safely reopen a position after a stale EXIT cancel is broker-confirmed."""
+        if not ALLOW_ORDER_MONITOR_POSITION_REOPEN:
+            log.warning(
+                "[%s] Position reopen skipped — ALLOW_ORDER_MONITOR_POSITION_REOPEN=0 | pos=%s old_exit=%s",
+                self.client_id, position_id, canceled_exit_order_id,
+            )
+            self._emit_order_event(
+                local_order_id=canceled_exit_order_id,
+                stage="order_monitor",
+                decision="BLOCK",
+                reason_code="POSITION_REOPEN_DISABLED",
+                explanation="Order monitor position reopen is disabled by configuration",
+                contract=contract,
+                position_id=position_id,
+                inputs={"allow_position_reopen": ALLOW_ORDER_MONITOR_POSITION_REOPEN},
+            )
+            return False
+
+        try:
+            replacement = self._get_newer_active_exit_order(
+                position_id=position_id,
+                canceled_exit_order_id=canceled_exit_order_id,
+            )
+            if replacement:
+                repl_id = replacement.get("local_order_id")
+                repl_status = replacement.get("status")
+                log.warning(
+                    "[%s] Position reopen skipped after stale exit cancel — newer active "
+                    "replacement exit exists | pos=%s old_exit=%s new_exit=%s status=%s",
+                    self.client_id, position_id, canceled_exit_order_id, repl_id, repl_status,
+                )
+                self._emit_order_event(
+                    local_order_id=canceled_exit_order_id,
+                    stage="order_monitor",
+                    decision="BLOCK",
+                    reason_code="POSITION_REOPEN_SKIPPED_REPLACEMENT_EXIT_ACTIVE",
+                    explanation=(
+                        "Skipped reverting position to OPEN after stale exit cancel because "
+                        "a newer active replacement exit already exists"
+                    ),
+                    contract=contract,
+                    position_id=position_id,
+                    inputs={
+                        "canceled_exit_order_id": canceled_exit_order_id,
+                        "replacement_exit_order_id": repl_id,
+                        "replacement_status": repl_status,
+                    },
+                )
+                return False
+
+            for method_name in (
+                "revert_position_to_open",
+                "revertpositiontoopen",
+                "revert_to_open_after_exit_cancel",
+            ):
+                method = getattr(self.pm, method_name, None)
+                if not callable(method):
+                    continue
+                try:
+                    ok = method(
+                        position_id,
+                        canceled_exit_order_id=canceled_exit_order_id,
+                        reason=reason,
+                    )
+                except TypeError:
+                    try:
+                        ok = method(position_id, reason=reason)
+                    except TypeError:
+                        ok = method(position_id)
+                if ok is False:
+                    log.warning(
+                        "[%s] %s declined position reopen | pos=%s old_exit=%s",
+                        self.client_id, method_name, position_id, canceled_exit_order_id,
+                    )
+                    return False
+                log.warning(
+                    "[%s] Position reverted to OPEN via %s after broker-confirmed "
+                    "exit cancel — RETRY EXIT REQUIRED | pos=%s old_exit=%s",
+                    self.client_id, method_name, position_id, canceled_exit_order_id,
+                )
+                self._alert(
+                    f"Position reverted to OPEN — exit must be retried | "
+                    f"{self.client_id} | {contract} | pos={position_id}"
+                )
+                return True
+
+            self.pm.update_position(position_id, status="OPEN")
+            log.warning(
+                "[%s] Position reverted to OPEN after broker-confirmed exit cancel "
+                "using guarded update_position fallback — RETRY EXIT REQUIRED | pos=%s old_exit=%s",
+                self.client_id, position_id, canceled_exit_order_id,
+            )
+            self._alert(
+                f"Position reverted to OPEN — exit must be retried | "
+                f"{self.client_id} | {contract} | pos={position_id}"
+            )
+            return True
+        except Exception as e:
+            log.error(
+                "[%s] Failed guarded position reopen after exit cancel | pos=%s old_exit=%s: %s",
+                self.client_id, position_id, canceled_exit_order_id, e,
+            )
+            return False
+
+    def _get_newer_active_exit_order(
+        self,
+        *,
+        position_id: str,
+        canceled_exit_order_id: str,
+    ) -> Optional[dict]:
+        """Return a newer active replacement EXIT order for this position, if any."""
+        if not position_id or not canceled_exit_order_id:
+            return None
+
+        def _fn():
+            with conn() as c:
+                c.execute(
+                    """
+                    WITH canceled AS (
+                        SELECT created_ts
+                        FROM orders
+                        WHERE client_id=%s
+                          AND local_order_id=%s
+                          AND kind='EXIT'
+                        LIMIT 1
+                    )
+                    SELECT local_order_id, broker_order_id, status, created_ts, submitted_ts
+                    FROM orders
+                    WHERE client_id=%s
+                      AND position_id=%s
+                      AND kind='EXIT'
+                      AND local_order_id<>%s
+                      AND status IN (
+                          'EXIT_REQUESTED','EXIT_SUBMITTED',
+                          'EXIT_ACKNOWLEDGED','EXIT_PARTIAL_FILL'
+                      )
+                      AND (
+                          (SELECT created_ts FROM canceled) IS NULL
+                          OR created_ts >= (SELECT created_ts FROM canceled)
+                      )
+                    ORDER BY created_ts DESC
+                    LIMIT 1
+                    """,
+                    (
+                        self.client_id, canceled_exit_order_id,
+                        self.client_id, position_id, canceled_exit_order_id,
+                    ),
+                )
+                return c.fetchone()
+
+        try:
+            row = run_with_retry(_fn)
+            return dict(row) if row else None
+        except Exception as e:
+            log.error(
+                "[%s] Failed checking newer replacement exit | pos=%s old_exit=%s: %s",
+                self.client_id, position_id, canceled_exit_order_id, e,
+            )
+            return {"local_order_id": "UNKNOWN_REPLACEMENT_CHECK_FAILED", "status": "UNKNOWN"}
 
     def _query_broker_order(self, broker_order_id: Optional[str]) -> Optional[str]:
         if not broker_order_id or not self.broker:
@@ -716,7 +912,7 @@ class APOrderMonitor:
             log.info(f"[{self.client_id}] Advanced | {contract} | {local_order_id} → {new_status}")
             self._emit_order_event(
                 local_order_id=local_order_id,
-                stage="broker_ack" if kind != "EXIT" else "exit_monitor",
+                stage="order_monitor",
                 decision="FILL" if "FILLED" in new_status else "ACKNOWLEDGE",
                 reason_code=(
                     "BROKER_REJECTED" if new_status == "REJECTED" else
