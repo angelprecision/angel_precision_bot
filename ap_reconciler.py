@@ -11,7 +11,9 @@ Truth policy:
 Critical recovery invariant:
   If the broker has an open option position and the DB has no matching OPEN/CLOSING
   position, the reconciler imports a conservative OPEN position into DB and seeds
-  the exit engine. This prevents restart/orphan failures.
+  the exit engine. This prevents restart/orphan failures. Imported/reseeded
+  positions must carry the best available underlying_entry and price-trust flags
+  so exit logic does not silently operate on fake state.
 
 Checks:
   Orders:
@@ -394,7 +396,11 @@ class APBrokerReconciler:
             if kind == "EXIT":
                 position_id = order.get("position_id")
                 if position_id:
-                    self._revert_position_to_open(position_id, contract)
+                    self._revert_position_to_open(
+                        position_id,
+                        contract,
+                        failed_exit_order_id=local_id,
+                    )
             self._alert(
                 f"RECONCILE_AUTO_CORRECT | {contract} | {local_id} | "
                 f"DB was {db_status}, broker={broker_status} → {new_status}"
@@ -886,15 +892,28 @@ class APBrokerReconciler:
 
             underlying = self._broker_position_underlying(bp)
             entry_px = self._broker_position_entry_price(bp)
+            price_untrusted = False
 
-            # If entry price is unknown, still import at a tiny safe placeholder so the
-            # exit engine can track/alert. The operator should review immediately.
+            # Prefer real broker cost-basis/avg price. If missing, try a contract mark/last
+            # before falling back to a tiny placeholder. Placeholder imports are clearly
+            # flagged so the exit engine/dashboard do not silently trust distorted PnL math.
+            if entry_px <= 0:
+                entry_px = self._broker_position_mark_price(bp)
+            if entry_px <= 0:
+                entry_px = self._get_current_option_price(contract)
             if entry_px <= 0:
                 entry_px = 0.01
+                price_untrusted = True
                 self._alert(
                     f"BROKER_POSITION_IMPORT_PRICE_UNKNOWN | {contract} | "
-                    "using placeholder entry=0.01 — MANUAL REVIEW REQUIRED"
+                    "using emergency placeholder entry=0.01; price_untrusted=True — MANUAL REVIEW REQUIRED"
                 )
+
+            underlying_entry = self._derive_underlying_entry_from_broker_position(
+                bp,
+                underlying=underlying,
+                contract=contract,
+            )
 
             side = self._broker_position_side(bp)
 
@@ -911,6 +930,8 @@ class APBrokerReconciler:
                 qty=qty,
                 entry_px=entry_px,
                 broker_position=bp,
+                underlying_entry=underlying_entry,
+                price_untrusted=price_untrusted,
             )
 
             if not pos_id:
@@ -934,11 +955,15 @@ class APBrokerReconciler:
                     side=side,
                     qty=qty,
                     entry_px=entry_px,
+                    underlying_entry=underlying_entry,
+                    price_untrusted=price_untrusted,
                 )
 
             msg = (
                 f"BROKER_POSITION_IMPORTED | {underlying or '?'} {side} | "
-                f"{contract} | qty={qty} entry={entry_px:.4f} pos={pos_id}"
+                f"{contract} | qty={qty} entry={entry_px:.4f} "
+                f"underlying_entry={underlying_entry:.4f} "
+                f"price_untrusted={price_untrusted} pos={pos_id}"
             )
             log.critical("[%s] %s", self.client_id, msg)
             self._alert(msg)
@@ -957,6 +982,8 @@ class APBrokerReconciler:
         qty: int,
         entry_px: float,
         broker_position: dict,
+        underlying_entry: float = 0.0,
+        price_untrusted: bool = False,
     ) -> Optional[str]:
         """
         Create an OPEN DB row for a broker-open position missing from DB.
@@ -977,7 +1004,7 @@ class APBrokerReconciler:
                     entry_price=entry_px,
                     tier="RECONCILED",
                     score=0.0,
-                    pattern="BROKER_IMPORT",
+                    pattern="BROKER_IMPORT_PRICE_UNTRUSTED" if price_untrusted else "BROKER_IMPORT",
                     stop_underlying=None,
                     target_underlying=None,
                 )
@@ -1020,7 +1047,7 @@ class APBrokerReconciler:
                             imported_plan_id,
                             imported_signal_id,
                             "RECONCILER_IMPORT",
-                            "BROKER_OPEN",
+                            "BROKER_OPEN_PRICE_UNTRUSTED" if price_untrusted else "BROKER_OPEN",
                         ),
                     )
 
@@ -1120,7 +1147,16 @@ class APBrokerReconciler:
         underlying = self._norm_underlying(pos.get("underlying") or pos.get("ticker") or contract[:6])
         side = str(pos.get("direction") or pos.get("side") or "CALL").upper()
         qty = int(pos.get("qty") or pos.get("quantity") or pos.get("quantity_remaining") or 0)
-        entry_px = float(pos.get("avg_fill") or pos.get("entry_price") or 0.0)
+        entry_px = self._safe_float(pos.get("avg_fill") or pos.get("entry_price"), 0.0)
+        underlying_entry = self._derive_underlying_entry_from_position(
+            pos,
+            underlying=underlying,
+            contract=contract,
+        )
+        price_untrusted = bool(
+            pos.get("price_untrusted")
+            or str(pos.get("close_confidence") or "").upper().endswith("PRICE_UNTRUSTED")
+        )
 
         if qty <= 0 or entry_px <= 0 or not contract:
             return
@@ -1134,6 +1170,8 @@ class APBrokerReconciler:
             entry_px=entry_px,
             stop_underlying=pos.get("stop_underlying") or pos.get("underlying_stop") or 0.0,
             target_underlying=pos.get("target_underlying") or pos.get("underlying_target") or 0.0,
+            underlying_entry=underlying_entry,
+            price_untrusted=price_untrusted,
         )
 
     def _seed_exit_engine_from_import(
@@ -1147,6 +1185,8 @@ class APBrokerReconciler:
         entry_px: float,
         stop_underlying=0.0,
         target_underlying=0.0,
+        underlying_entry: float = 0.0,
+        price_untrusted: bool = False,
     ) -> None:
         _ee = getattr(self, "exit_engine", None)
         if not _ee:
@@ -1159,28 +1199,256 @@ class APBrokerReconciler:
         try:
             from ap_exit_engine import ManagedPosition
 
+            stop_u = self._safe_float(stop_underlying, 0.0)
+            target_u = self._safe_float(target_underlying, 0.0)
+            underlying_entry_u = self._safe_float(underlying_entry, 0.0)
+            if underlying_entry_u <= 0:
+                underlying_entry_u = self._get_current_underlying_price(underlying)
+            if underlying_entry_u <= 0:
+                self._alert(
+                    f"EXIT_ENGINE_SEED_UNDERLYING_ENTRY_UNKNOWN | {contract} | "
+                    "underlying_entry remains 0.0; underlying_price_untrusted=True — MANUAL REVIEW REQUIRED"
+                )
+
             mp = ManagedPosition(
                 ticker=underlying or contract[:6],
                 option_symbol=contract,
                 side=side,
                 quantity=int(qty),
                 entry_price=float(entry_px),
-                underlying_entry=0.0,
-                underlying_target=float(target_underlying or 0.0),
-                underlying_stop=float(stop_underlying or 0.0),
+                underlying_entry=float(underlying_entry_u),
+                underlying_target=float(target_u),
+                underlying_stop=float(stop_u),
             )
             mp.position_id = str(pos_id or "")
             mp.client_id = self.client_id
             mp.signal_id = f"reconciled:{contract}"
             mp.current_option_price = float(entry_px)
+            mp.price_untrusted = bool(price_untrusted)
+            mp.underlying_entry_untrusted = bool(underlying_entry_u <= 0)
+            mp.imported_by_reconciler = True
             _ee.add_position(mp)
             log.critical(
-                "[%s] EXIT_ENGINE_SEEDED_FROM_RECONCILER | %s | qty=%s entry=%.4f pos=%s",
-                self.client_id, contract, qty, entry_px, pos_id or "n/a"
+                "[%s] EXIT_ENGINE_SEEDED_FROM_RECONCILER | %s | qty=%s entry=%.4f "
+                "underlying_entry=%.4f price_untrusted=%s pos=%s",
+                self.client_id, contract, qty, entry_px, underlying_entry_u, bool(price_untrusted), pos_id or "n/a"
             )
         except Exception as e:
             log.error("[%s] Failed to seed exit engine for %s: %s",
                       self.client_id, contract, e)
+
+    def _safe_float(self, value, default: float = 0.0) -> float:
+        try:
+            if value is None or value == "":
+                return float(default)
+            out = float(value)
+            if out != out:  # NaN guard
+                return float(default)
+            return out
+        except Exception:
+            return float(default)
+
+    def _broker_position_mark_price(self, bp: dict) -> float:
+        """Best-effort option mark/last extraction when cost basis is missing."""
+        for key in (
+            "mark",
+            "mark_price",
+            "last",
+            "last_price",
+            "close",
+            "current_price",
+            "market_value_price",
+        ):
+            val = self._safe_float(bp.get(key), 0.0)
+            if val > 0:
+                return val
+
+        bid = self._safe_float(bp.get("bid"), 0.0)
+        ask = self._safe_float(bp.get("ask"), 0.0)
+        if bid > 0 and ask > 0:
+            return round((bid + ask) / 2.0, 4)
+        return 0.0
+
+    def _get_current_option_price(self, contract: str) -> float:
+        """Best-effort contract mark/last from broker quote APIs, if available."""
+        contract = self._norm_contract(contract)
+        if not contract:
+            return 0.0
+
+        quote = None
+        for method_name, args in (
+            ("get_option_quote", (contract,)),
+            ("get_quote", (contract,)),
+            ("quote", (contract,)),
+        ):
+            method = getattr(self.broker, method_name, None)
+            if not callable(method):
+                continue
+            try:
+                quote = method(*args)
+                if quote:
+                    break
+            except Exception:
+                continue
+
+        if isinstance(quote, list) and quote:
+            quote = quote[0]
+        if not isinstance(quote, dict):
+            return 0.0
+
+        for key in ("mark", "last", "last_price", "price", "close", "mid"):
+            val = self._safe_float(quote.get(key), 0.0)
+            if val > 0:
+                return val
+        bid = self._safe_float(quote.get("bid"), 0.0)
+        ask = self._safe_float(quote.get("ask"), 0.0)
+        if bid > 0 and ask > 0:
+            return round((bid + ask) / 2.0, 4)
+        return 0.0
+
+    def _get_current_underlying_price(self, underlying: str) -> float:
+        """Best-effort underlying mark/last from broker quote APIs, if available."""
+        underlying = self._norm_underlying(underlying)
+        if not underlying:
+            return 0.0
+
+        quote = None
+        for method_name in ("get_quote", "quote", "get_stock_quote"):
+            method = getattr(self.broker, method_name, None)
+            if not callable(method):
+                continue
+            try:
+                quote = method(underlying)
+                if quote:
+                    break
+            except Exception:
+                continue
+
+        if isinstance(quote, list) and quote:
+            quote = quote[0]
+        if not isinstance(quote, dict):
+            return 0.0
+
+        for key in ("last", "last_price", "price", "mark", "close", "mid"):
+            val = self._safe_float(quote.get(key), 0.0)
+            if val > 0:
+                return val
+        bid = self._safe_float(quote.get("bid"), 0.0)
+        ask = self._safe_float(quote.get("ask"), 0.0)
+        if bid > 0 and ask > 0:
+            return round((bid + ask) / 2.0, 4)
+        return 0.0
+
+    def _derive_underlying_entry_from_broker_position(
+        self,
+        bp: dict,
+        *,
+        underlying: str,
+        contract: str,
+    ) -> float:
+        """
+        Imported positions should not seed the exit engine with underlying_entry=0
+        if the broker or quote path exposes anything better.
+        """
+        for key in (
+            "underlying_entry",
+            "underlying_entry_price",
+            "entry_underlying",
+            "underlying_price_at_entry",
+            "underlying_price",
+            "underlier_price",
+            "root_price",
+            "underlying_last",
+            "current_underlying",
+        ):
+            val = self._safe_float(bp.get(key), 0.0)
+            if val > 0:
+                return val
+
+        # Last resort: current underlying is safer than hardcoded zero, but still
+        # treated as approximate by the exit engine via underlying_entry_untrusted.
+        return self._get_current_underlying_price(underlying or contract[:6])
+
+    def _derive_underlying_entry_from_position(
+        self,
+        pos: dict,
+        *,
+        underlying: str,
+        contract: str,
+    ) -> float:
+        """Use DB metadata first when reseeding an existing open position."""
+        for key in (
+            "underlying_entry",
+            "entry_underlying",
+            "trigger_price",
+            "underlying_entry_price",
+            "entry_underlying_price",
+            "opened_underlying",
+        ):
+            val = self._safe_float(pos.get(key), 0.0)
+            if val > 0:
+                return val
+
+        # Do NOT infer entry from stop/target; that corrupts progress math.
+        return self._get_current_underlying_price(underlying or contract[:6])
+
+    def _active_exit_order_exists(
+        self,
+        *,
+        position_id: str,
+        failed_exit_order_id: str | None = None,
+    ) -> Optional[dict]:
+        """
+        Return a newer/other active exit order for this position, if present.
+        This prevents the reconciler from reopening a position while a replacement
+        exit is already working.
+        """
+        if not position_id:
+            return None
+        try:
+            from ap.db import conn, run_with_retry
+
+            active_statuses = (
+                "CREATED",
+                "SUBMITTED",
+                "ACKNOWLEDGED",
+                "PARTIAL_FILL",
+                "EXIT_REQUESTED",
+                "EXIT_SUBMITTED",
+                "EXIT_ACKNOWLEDGED",
+                "EXIT_PARTIAL_FILL",
+                "PENDING_CANCEL",
+            )
+
+            def _fetch():
+                with conn() as c:
+                    c.execute(
+                        """
+                        SELECT local_order_id, broker_order_id, status, created_ts, updated_ts
+                        FROM orders
+                        WHERE client_id=%s
+                          AND kind='EXIT'
+                          AND position_id=%s
+                          AND (%s IS NULL OR local_order_id <> %s)
+                          AND status = ANY(%s)
+                        ORDER BY created_ts DESC NULLS LAST, updated_ts DESC NULLS LAST
+                        LIMIT 1
+                        """,
+                        (self.client_id, position_id, failed_exit_order_id, failed_exit_order_id, list(active_statuses)),
+                    )
+                    row = c.fetchone()
+                    return dict(row) if row else None
+
+            return run_with_retry(_fetch)
+        except Exception as exc:
+            log.warning(
+                "[%s] Could not check active replacement exit for pos=%s: %s",
+                self.client_id,
+                position_id,
+                exc,
+            )
+            # Fail safe: unknown means do not force reopen.
+            return {"status": "UNKNOWN_CHECK_FAILED", "error": str(exc)}
 
     def _get_broker_positions(self) -> Optional[list]:
         """Compatibility wrapper."""
@@ -1228,8 +1496,32 @@ class APBrokerReconciler:
     # Helpers
     # ──────────────────────────────────────────────────────────────────────────
 
-    def _revert_position_to_open(self, position_id: str, contract: str):
+    def _revert_position_to_open(
+        self,
+        position_id: str,
+        contract: str,
+        *,
+        failed_exit_order_id: str | None = None,
+    ):
+        """
+        Reopen a CLOSING position only when the terminal EXIT order is the only
+        active exit path. This avoids "old canceled exit reopens position while a
+        newer replacement exit is already working" races.
+        """
         from ap.db import run_with_retry, conn
+
+        replacement = self._active_exit_order_exists(
+            position_id=str(position_id),
+            failed_exit_order_id=failed_exit_order_id,
+        )
+        if replacement:
+            self._alert(
+                f"RECONCILE_SKIP_REOPEN_ACTIVE_EXIT | {contract} | pos={position_id} | "
+                f"failed_exit={failed_exit_order_id or 'unknown'} | "
+                f"active_exit={replacement.get('local_order_id','?')} status={replacement.get('status','?')}"
+            )
+            return
+
         try:
             def _revert():
                 with conn() as c:
@@ -1238,11 +1530,20 @@ class APBrokerReconciler:
                         "updated_ts=NOW() WHERE id=%s AND client_id=%s AND status='CLOSING'",
                         (position_id, self.client_id),
                     )
-            run_with_retry(_revert)
-            log.warning(
-                "[%s] RECONCILE: reverted pos %s to OPEN after terminal exit order | %s",
-                self.client_id, position_id, contract,
-            )
+                    return getattr(c, "rowcount", 0)
+
+            changed = run_with_retry(_revert) or 0
+            if changed:
+                log.warning(
+                    "[%s] RECONCILE: reverted pos %s to OPEN after terminal exit order | %s",
+                    self.client_id, position_id, contract,
+                )
+            else:
+                log.info(
+                    "[%s] RECONCILE: no OPEN revert needed for pos %s | %s "
+                    "(not currently CLOSING or already handled)",
+                    self.client_id, position_id, contract,
+                )
         except Exception as e:
             log.error("[%s] Failed to revert position %s: %s",
                       self.client_id, position_id, e)
