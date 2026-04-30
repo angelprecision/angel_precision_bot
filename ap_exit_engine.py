@@ -641,7 +641,25 @@ class APExitEngine:
         self.run_id = os.getenv("AP_RUN_ID", "unknown")
         self.strategy_version = os.getenv("AP_STRATEGY_VERSION", "ap_live_beta")
         self.git_commit = get_git_commit()
+    def start(self):
+        """Start exit engine background loop."""
+        if self._running:
+            return
+        self._running = True
+        self._thread = threading.Thread(
+            target=self._exit_loop,
+            name=f"APExitEngine-{self._email or 'default'}",
+            daemon=True,
+        )
+        self._thread.start()
+        log.info("[%s] APExitEngine started", self._email or "default")
 
+    def stop(self):
+        """Stop exit engine background loop."""
+        self._running = False
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=5)
+        log.info("[%s] APExitEngine stopped", self._email or "default")
     def _emit_exit_event(
         self,
         pos: ManagedPosition,
