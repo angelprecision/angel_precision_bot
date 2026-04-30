@@ -75,19 +75,48 @@ ACTIVE_BROKER_STATUSES = {
 
 TERMINAL_FAILURE_STATUSES = {"REJECTED", "CANCELED", "EXPIRED"}
 
+UNKNOWN_ERROR_ESCALATE_AFTER = int(os.getenv("FILL_MONITOR_UNKNOWN_ERROR_ESCALATE_AFTER", "3"))
+FILL_ANOMALY_STATUS = os.getenv("FILL_MONITOR_ANOMALY_STATUS", "BROKER_FILL_ANOMALY").strip().upper()
+
+_BROKER_STATE_ANOMALY_COUNTS: dict[str, int] = {}
+
+
+def _order_count_key(client_id: str, local_order_id: str, broker_order_id: str | None = None) -> str:
+    return f"{client_id}:{local_order_id}:{broker_order_id or ''}"
+
+
+def _reset_broker_anomaly_count(client_id: str, local_order_id: str, broker_order_id: str | None = None) -> None:
+    _BROKER_STATE_ANOMALY_COUNTS.pop(_order_count_key(client_id, local_order_id, broker_order_id), None)
+
+
+def _increment_broker_anomaly_count(client_id: str, local_order_id: str, broker_order_id: str | None = None) -> int:
+    key = _order_count_key(client_id, local_order_id, broker_order_id)
+    count = int(_BROKER_STATE_ANOMALY_COUNTS.get(key, 0)) + 1
+    _BROKER_STATE_ANOMALY_COUNTS[key] = count
+    return count
+
 
 # =============================================================================
 # AUDIT / OBSERVABILITY
 # =============================================================================
 
 def audit(client_id: str, level: str, event: str, payload: dict):
-    with conn() as c:
-        run_with_retry(
-            lambda: c.execute(
-                "INSERT INTO audit_log (ts, level, event, payload, client_id) "
-                "VALUES (%s,%s,%s,%s,%s)",
-                (now_utc_iso(), level, event, json_dumps(payload), client_id),
+    """Best-effort audit write. Audit failures must never block reconciliation."""
+    try:
+        with conn() as c:
+            run_with_retry(
+                lambda: c.execute(
+                    "INSERT INTO audit_log (ts, level, event, payload, client_id) "
+                    "VALUES (%s,%s,%s,%s,%s)",
+                    (now_utc_iso(), level, event, json_dumps(payload), client_id),
+                )
             )
+    except Exception as exc:
+        log.warning(
+            "Audit write failed non-fatal | client=%s event=%s error=%s",
+            client_id,
+            event,
+            exc,
         )
 
 
@@ -614,6 +643,88 @@ def _seed_exit_engine(exit_engine, position_id: str, order: dict, result: dict, 
 
 
 # =============================================================================
+# BROKER FILL SANITY / ANOMALY ESCALATION
+# =============================================================================
+
+def _sanitize_cumulative_filled(order: dict, result: dict) -> tuple[int, bool]:
+    """Clamp broker cumulative fill to local order qty and audit impossible broker values."""
+    client_id = str(order.get("client_id") or "default")
+    local_id = str(order.get("local_order_id") or "")
+    broker_id = order.get("broker_order_id")
+
+    raw_filled = int(result.get("filled_qty") or 0)
+    order_qty = int(order.get("qty") or 0)
+
+    if order_qty > 0 and raw_filled > order_qty:
+        clamped = order_qty
+        log.critical(
+            "[%s] Broker overfill anomaly clamped | order=%s broker=%s raw_filled=%s order_qty=%s",
+            client_id,
+            local_id,
+            broker_id,
+            raw_filled,
+            order_qty,
+        )
+        result["filled_qty_raw"] = raw_filled
+        result["filled_qty"] = clamped
+        audit(
+            client_id,
+            "CRITICAL",
+            "BROKER_OVERFILL_CLAMPED",
+            {
+                "local_order_id": local_id,
+                "broker_order_id": broker_id,
+                "raw_filled_qty": raw_filled,
+                "clamped_filled_qty": clamped,
+                "order_qty": order_qty,
+                "broker_reason": result.get("reason"),
+            },
+        )
+        emit_fill_event(
+            order,
+            decision="ERROR",
+            reason_code="BROKER_OVERFILL_CLAMPED",
+            explanation="Broker returned cumulative filled quantity greater than local order quantity; clamped before OSM/PM side effects.",
+            result=result,
+            extra_context={
+                "raw_filled_qty": raw_filled,
+                "clamped_filled_qty": clamped,
+                "order_qty": order_qty,
+            },
+        )
+        return clamped, True
+
+    return raw_filled, False
+
+
+def _mark_broker_fill_anomaly(osm, order: dict, *, reason: str, mapped: str | None = None) -> bool:
+    """Best-effort special OSM quarantine transition for impossible broker/fill data."""
+    if not osm:
+        return False
+
+    local_id = order.get("local_order_id")
+    broker_id = order.get("broker_order_id")
+    try:
+        return bool(
+            osm.transition(
+                local_id,
+                FILL_ANOMALY_STATUS,
+                broker_order_id=broker_id,
+                last_error=reason,
+            )
+        )
+    except Exception as exc:
+        log.error(
+            "[%s] OSM anomaly transition failed | order=%s status=%s mapped=%s error=%s",
+            order.get("client_id"),
+            local_id,
+            FILL_ANOMALY_STATUS,
+            mapped,
+            exc,
+        )
+        return False
+
+# =============================================================================
 # CORE — PROCESS ONE PENDING ORDER
 # =============================================================================
 
@@ -636,7 +747,10 @@ def process_pending_order(
     mapped = result.get("status", "UNKNOWN")
 
     prev_filled = int(order.get("filled_qty") or 0)
-    new_filled = int(result.get("filled_qty") or 0)
+    new_filled, overfill_clamped = _sanitize_cumulative_filled(order, result)
+
+    if mapped not in ("UNKNOWN", "ERROR"):
+        _reset_broker_anomaly_count(client_id, local_id, broker_id)
 
     if new_filled < prev_filled:
         log.critical(
@@ -654,6 +768,12 @@ def process_pending_order(
             "ERROR",
             "FILL_REGRESSION_BLOCKED",
             {"local_order_id": local_id, "broker_order_id": broker_id, "prev": prev_filled, "new": new_filled},
+        )
+        _mark_broker_fill_anomaly(
+            osm,
+            order,
+            reason=f"broker fill regression prev={prev_filled} new={new_filled}",
+            mapped=mapped,
         )
         return
 
@@ -871,6 +991,8 @@ def process_pending_order(
             mapped,
             result.get("reason"),
         )
+        anomaly_count = _increment_broker_anomaly_count(client_id, local_id, broker_id)
+
         if osm:
             osm.increment_retry(local_id)
 
@@ -878,8 +1000,57 @@ def process_pending_order(
             client_id,
             "ERROR" if mapped == "ERROR" else "WARNING",
             "ORDER_CHECK_ERROR" if mapped == "ERROR" else "ORDER_STATUS_UNKNOWN",
-            {"local_order_id": local_id, "broker_order_id": broker_id, "reason": result.get("reason")},
+            {
+                "local_order_id": local_id,
+                "broker_order_id": broker_id,
+                "reason": result.get("reason"),
+                "consecutive_count": anomaly_count,
+                "escalate_after": UNKNOWN_ERROR_ESCALATE_AFTER,
+            },
         )
+
+        if anomaly_count >= UNKNOWN_ERROR_ESCALATE_AFTER:
+            reason = (
+                f"consecutive broker {mapped} states reached {anomaly_count}/"
+                f"{UNKNOWN_ERROR_ESCALATE_AFTER}: {result.get('reason')}"
+            )
+            log.critical(
+                "[%s] Broker state anomaly escalation | order=%s broker=%s status=%s count=%s reason=%s",
+                client_id,
+                local_id,
+                broker_id,
+                mapped,
+                anomaly_count,
+                result.get("reason"),
+            )
+            emit_fill_event(
+                order,
+                decision="ERROR",
+                reason_code="BROKER_FILL_ANOMALY",
+                explanation=reason,
+                result=result,
+                extra_context={
+                    "mapped_status": mapped,
+                    "consecutive_count": anomaly_count,
+                    "escalate_after": UNKNOWN_ERROR_ESCALATE_AFTER,
+                    "anomaly_status": FILL_ANOMALY_STATUS,
+                },
+            )
+            audit(
+                client_id,
+                "CRITICAL",
+                "BROKER_FILL_ANOMALY_ESCALATED",
+                {
+                    "local_order_id": local_id,
+                    "broker_order_id": broker_id,
+                    "mapped_status": mapped,
+                    "reason": result.get("reason"),
+                    "consecutive_count": anomaly_count,
+                    "anomaly_status": FILL_ANOMALY_STATUS,
+                },
+            )
+            _mark_broker_fill_anomaly(osm, order, reason=reason, mapped=mapped)
+
         return
 
     # Fallback guard
