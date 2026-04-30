@@ -2,22 +2,23 @@
 # =============================================================================
 # Enforced order lifecycle controller.
 #
-# This module is the canonical order-state authority:
+# Canonical order-state authority:
 #   - validates legal state transitions
 #   - persists order status updates
+#   - supports watcher-armed queue entries via PENDING_TRIGGER
+#   - submits queue-created entries only after watcher breach
 #   - coordinates exit-engine hooks after broker-confirmed exit events
 #   - emits structured observability for transition success/failure
 #
-# It should remain small, deterministic, and conservative. Fill monitor and
-# order monitor may observe broker reality, but this state machine decides
-# whether the requested lifecycle move is legal.
+# CONTRACT: Any caller that passes filled_qty MUST pass broker cumulative filled
+# quantity for that order, not an incremental fill delta.
 # =============================================================================
 
-# CONTRACT: Any caller that passes filled_qty MUST pass the broker cumulative filled quantity for that order, not an incremental fill delta.
 from __future__ import annotations
 
 import logging
 import os
+import re
 import threading
 import uuid
 from typing import Optional
@@ -81,15 +82,11 @@ class OrderStatus:
     EXPIRED = "EXPIRED"
     ERROR = "ERROR"
 
-    # State sets
     ENTRY_ACTIVE = {CREATED, PENDING_TRIGGER, SUBMITTED, ACKNOWLEDGED, PARTIAL_FILL}
     EXIT_ACTIVE = {EXIT_REQUESTED, EXIT_SUBMITTED, EXIT_ACKNOWLEDGED, EXIT_PARTIAL_FILL}
     TERMINAL = {FILLED, EXIT_FILLED, REJECTED, CANCELED, EXPIRED, ERROR}
     ACTIVE = ENTRY_ACTIVE | EXIT_ACTIVE
 
-    # Legal transitions.
-    # Conservative rule: terminal states are final; active states can resolve to
-    # broker terminal failures when broker/reconciler confirms reality.
     TRANSITIONS: dict[str, set[str]] = {
         CREATED: {PENDING_TRIGGER, SUBMITTED, ERROR, CANCELED, EXPIRED, REJECTED},
         PENDING_TRIGGER: {SUBMITTED, ERROR, CANCELED, EXPIRED, REJECTED},
@@ -146,9 +143,32 @@ class APOrderStateMachine:
         )
         log.info("[%s] APOrderStateMachine initialized", client_id)
 
-    # ---------------------------------------------------------------------
+    @staticmethod
+    def _is_broker_accept_status(status: str) -> bool:
+        """Return True for broker statuses that mean the order was accepted.
+
+        Different broker/adapters may return accepted-ish strings across
+        environments. The hard requirement is still a real broker_order_id.
+        """
+        normalized = str(status or "").lower().strip().replace("-", "_").replace(" ", "_")
+        return normalized in {
+            "ok",
+            "pending",
+            "open",
+            "accepted",
+            "filled",
+            "submitted",
+            "queued",
+            "ack",
+            "acked",
+            "acknowledged",
+            "received",
+            "working",
+        }
+
+    # ------------------------------------------------------------------
     # Observability
-    # ---------------------------------------------------------------------
+    # ------------------------------------------------------------------
 
     def _reason_code_for_transition(self, old_status: str, new_status: str, kind: str = "") -> str:
         if new_status == OrderStatus.FILLED:
@@ -228,9 +248,9 @@ class APOrderStateMachine:
         except Exception as e:
             log.debug("OSM observability emit failed (non-critical): %s", e)
 
-    # ---------------------------------------------------------------------
+    # ------------------------------------------------------------------
     # Order creation
-    # ---------------------------------------------------------------------
+    # ------------------------------------------------------------------
 
     def create_entry_order(self, plan, *, limit_price=None, reserved_cost=None) -> str:
         existing = self._get_order_by_plan(plan.plan_id, kind="ENTRY")
@@ -287,13 +307,7 @@ class APOrderStateMachine:
                 )
 
         run_with_retry(_fn)
-        log.info(
-            "[%s] ORDER CREATED (entry) | %s x%s | local_order_id=%s",
-            self.client_id,
-            contract,
-            plan.contracts,
-            local_order_id,
-        )
+        log.info("[%s] ORDER CREATED (entry) | %s x%s | local_order_id=%s", self.client_id, contract, plan.contracts, local_order_id)
         return local_order_id
 
     def create_exit_order(
@@ -362,19 +376,82 @@ class APOrderStateMachine:
                 )
 
         run_with_retry(_fn)
-        log.info(
-            "[%s] ORDER CREATED (exit) | %s x%s pos=%s | local_order_id=%s",
-            self.client_id,
-            contract,
-            qty,
-            position_id,
-            local_id,
-        )
+        log.info("[%s] ORDER CREATED (exit) | %s x%s pos=%s | local_order_id=%s", self.client_id, contract, qty, position_id, local_id)
         return local_id
 
-    # ---------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Watcher/queue entry-state helpers
+    # ------------------------------------------------------------------
+
+    def mark_entry_pending_trigger(self, local_order_id: str) -> bool:
+        """Mark a queue-created ENTRY as watcher-armed and waiting for breach."""
+        current = self._get_order(local_order_id)
+        if not current:
+            log.error("[%s] mark_entry_pending_trigger: order %s not found", self.client_id, local_order_id)
+            return False
+
+        current = dict(current)
+        kind = str(current.get("kind") or "").upper()
+        status = str(current.get("status") or "").upper()
+
+        if kind != "ENTRY":
+            log.critical("[%s] mark_entry_pending_trigger blocked — wrong kind %s for order=%s", self.client_id, kind, local_order_id)
+            return False
+        if status == OrderStatus.PENDING_TRIGGER:
+            return True
+        if status != OrderStatus.CREATED:
+            log.warning("[%s] mark_entry_pending_trigger blocked — invalid status %s for order=%s", self.client_id, status, local_order_id)
+            return False
+
+        return self.transition(local_order_id, OrderStatus.PENDING_TRIGGER)
+
+    def expire_pending_entry(self, local_order_id: str, *, reason: str = "watcher_expired") -> bool:
+        """Move a non-submitted watcher entry to EXPIRED after watcher expiry."""
+        current = self._get_order(local_order_id)
+        if not current:
+            log.error("[%s] expire_pending_entry: order %s not found", self.client_id, local_order_id)
+            return False
+
+        current = dict(current)
+        kind = str(current.get("kind") or "").upper()
+        status = str(current.get("status") or "").upper()
+
+        if kind != "ENTRY":
+            log.critical("[%s] expire_pending_entry blocked — wrong kind %s | %s", self.client_id, kind, local_order_id)
+            return False
+        if status == OrderStatus.EXPIRED:
+            return True
+        if status not in (OrderStatus.CREATED, OrderStatus.PENDING_TRIGGER):
+            log.warning("[%s] expire_pending_entry blocked — status=%s order=%s", self.client_id, status, local_order_id)
+            return False
+
+        return self.transition(local_order_id, OrderStatus.EXPIRED, last_error=reason)
+
+    def cancel_pending_entry(self, local_order_id: str, *, reason: str = "watcher_invalidated") -> bool:
+        """Move a non-submitted watcher entry to CANCELED after invalidation."""
+        current = self._get_order(local_order_id)
+        if not current:
+            log.error("[%s] cancel_pending_entry: order %s not found", self.client_id, local_order_id)
+            return False
+
+        current = dict(current)
+        kind = str(current.get("kind") or "").upper()
+        status = str(current.get("status") or "").upper()
+
+        if kind != "ENTRY":
+            log.critical("[%s] cancel_pending_entry blocked — wrong kind %s | %s", self.client_id, kind, local_order_id)
+            return False
+        if status == OrderStatus.CANCELED:
+            return True
+        if status not in (OrderStatus.CREATED, OrderStatus.PENDING_TRIGGER):
+            log.warning("[%s] cancel_pending_entry blocked — status=%s order=%s", self.client_id, status, local_order_id)
+            return False
+
+        return self.transition(local_order_id, OrderStatus.CANCELED, last_error=reason)
+
+    # ------------------------------------------------------------------
     # State transition authority
-    # ---------------------------------------------------------------------
+    # ------------------------------------------------------------------
 
     def transition(
         self,
@@ -403,13 +480,11 @@ class APOrderStateMachine:
             return False
 
         current = dict(current)
-        old_status = current.get("status", "")
-        kind = current.get("kind", "")
-
+        old_status = str(current.get("status") or "")
+        kind = str(current.get("kind") or "")
         prev_filled = self._safe_int(current.get("filled_qty"), 0)
         same_state_fill_update = False
 
-        # filled_qty contract: broker cumulative quantity only, never incremental.
         if filled_qty is not None:
             incoming_filled = self._safe_int(filled_qty, None)
             if incoming_filled is None:
@@ -418,16 +493,21 @@ class APOrderStateMachine:
             if incoming_filled < prev_filled:
                 log.critical("[%s] INVALID CUMULATIVE FILL REGRESSION | order=%s new=%s prev=%s", self.client_id, local_order_id, incoming_filled, prev_filled)
                 self._emit_transition_event(
-                    local_order_id=local_order_id, old_status=old_status, new_status=new_status,
-                    order=current, decision="REJECT", reason_code="FILL_QTY_REGRESSION",
+                    local_order_id=local_order_id,
+                    old_status=old_status,
+                    new_status=new_status,
+                    order=current,
+                    decision="REJECT",
+                    reason_code="FILL_QTY_REGRESSION",
                     explanation=f"filled_qty must be cumulative: new={incoming_filled} prev={prev_filled}",
-                    broker_order_id=broker_order_id, filled_qty=filled_qty, fill_price=fill_price, last_error=last_error,
+                    broker_order_id=broker_order_id,
+                    filled_qty=filled_qty,
+                    fill_price=fill_price,
+                    last_error=last_error,
                 )
                 return False
 
         if old_status == new_status:
-            # Same-state fill updates are not no-ops.
-            # Brokers can report EXIT_PARTIAL_FILL cum=1 then EXIT_PARTIAL_FILL cum=2.
             if new_status in (OrderStatus.PARTIAL_FILL, OrderStatus.EXIT_PARTIAL_FILL):
                 same_state_fill_update = True
             else:
@@ -436,13 +516,7 @@ class APOrderStateMachine:
 
         if OrderStatus.is_terminal(old_status):
             reason = f"terminal_transition_blocked:{old_status}->{new_status}"
-            log.warning(
-                "[%s] TRANSITION BLOCKED — %s already terminal (%s), cannot move to %s",
-                self.client_id,
-                local_order_id,
-                old_status,
-                new_status,
-            )
+            log.warning("[%s] TRANSITION BLOCKED — %s already terminal (%s), cannot move to %s", self.client_id, local_order_id, old_status, new_status)
             self._record_error(local_order_id, reason)
             self._emit_transition_event(
                 local_order_id=local_order_id,
@@ -487,7 +561,6 @@ class APOrderStateMachine:
 
         updates = ["status=%s", "updated_ts=NOW()"]
         params = [new_status]
-
         if broker_order_id:
             updates.append("broker_order_id=%s")
             params.append(broker_order_id)
@@ -516,9 +589,7 @@ class APOrderStateMachine:
         def _fn():
             with conn() as c:
                 cur = c.execute(sql, tuple(params))
-                # psycopg2 returns cursor; psycopg3 may return cursor-like object.
-                rowcount = getattr(cur, "rowcount", getattr(c, "rowcount", None))
-                return rowcount
+                return getattr(cur, "rowcount", getattr(c, "rowcount", None))
 
         rowcount = run_with_retry(_fn)
         if rowcount == 0:
@@ -545,7 +616,6 @@ class APOrderStateMachine:
             f" broker={broker_order_id}" if broker_order_id else "",
             f" fill={filled_qty}@{fill_price}" if fill_price is not None else "",
         )
-
         self._emit_transition_event(
             local_order_id=local_order_id,
             old_status=old_status,
@@ -557,7 +627,6 @@ class APOrderStateMachine:
             fill_price=fill_price,
             last_error=last_error,
         )
-
         self._handle_exit_engine_hooks(
             current=current,
             new_status=new_status,
@@ -567,7 +636,6 @@ class APOrderStateMachine:
             broker_order_id=broker_order_id or current.get("broker_order_id"),
             local_order_id=local_order_id,
         )
-
         return True
 
     def _handle_exit_engine_hooks(
@@ -583,13 +651,9 @@ class APOrderStateMachine:
     ) -> None:
         """Coordinate broker-confirmed EXIT events with the exit engine.
 
-        Critical invariant:
-            EXIT_FILLED means "this EXIT order fully filled".
-            It does NOT always mean "the whole position is flat".
-
-        Therefore, when a scale-out order reaches EXIT_FILLED, we must apply
-        only that order's filled quantity to the ManagedPosition and keep the
-        runner alive unless quantity_remaining reaches zero.
+        EXIT_FILLED means this EXIT order fully filled, not necessarily that
+        the whole position is flat. Scale-outs must update remaining quantity
+        without killing runners.
         """
         if new_status not in (
             OrderStatus.EXIT_SUBMITTED,
@@ -609,10 +673,7 @@ class APOrderStateMachine:
         try:
             _ee = _get_exit_engine_for_client(self.client_id)
             if not _ee:
-                log.warning(
-                    "[%s] EXIT hook skipped — no exit engine registered | order=%s pos=%s status=%s",
-                    self.client_id, local_order_id or current.get("local_order_id"), _pos_id, new_status,
-                )
+                log.warning("[%s] EXIT hook skipped — no exit engine registered | order=%s pos=%s status=%s", self.client_id, local_order_id or current.get("local_order_id"), _pos_id, new_status)
                 return
 
             _local_id = local_order_id or current.get("local_order_id")
@@ -622,148 +683,298 @@ class APOrderStateMachine:
             _cum_filled = self._safe_int(filled_qty, None)
 
             if _cum_filled is not None and _cum_filled < _prev_filled:
-                log.critical(
-                    "[%s] INVALID EXIT CUMULATIVE FILL | order=%s pos=%s new=%s prev=%s",
-                    self.client_id, _local_id, _pos_id, _cum_filled, _prev_filled,
-                )
+                log.critical("[%s] INVALID EXIT CUMULATIVE FILL | order=%s pos=%s new=%s prev=%s", self.client_id, _local_id, _pos_id, _cum_filled, _prev_filled)
                 return
 
             if new_status == OrderStatus.EXIT_SUBMITTED:
                 if not _broker_id:
-                    log.critical(
-                        "[%s] EXIT_SUBMITTED hook missing broker_order_id | order=%s pos=%s",
-                        self.client_id, _local_id, _pos_id,
-                    )
+                    log.critical("[%s] EXIT_SUBMITTED hook missing broker_order_id | order=%s pos=%s", self.client_id, _local_id, _pos_id)
                     return
-                self._call_exit_engine(
-                    _ee,
-                    "set_pending_exit_order",
-                    _pos_id,
-                    local_order_id=_local_id,
-                    broker_order_id=_broker_id,
-                    qty=_order_qty,
-                    reason=str(current.get("last_error") or ""),
-                )
+                self._call_exit_engine(_ee, "set_pending_exit_order", _pos_id, local_order_id=_local_id, broker_order_id=_broker_id, qty=_order_qty, reason=str(current.get("last_error") or ""))
                 return
 
             if new_status == OrderStatus.EXIT_PARTIAL_FILL:
                 if _cum_filled is None:
-                    log.warning(
-                        "[%s] EXIT_PARTIAL_FILL missing filled_qty | order=%s pos=%s — not applying engine fill",
-                        self.client_id, _local_id, _pos_id,
-                    )
+                    log.warning("[%s] EXIT_PARTIAL_FILL missing filled_qty | order=%s pos=%s — not applying engine fill", self.client_id, _local_id, _pos_id)
                     return
                 _delta = max(0, _cum_filled - _prev_filled)
                 if _delta > 0:
-                    self._call_exit_engine(
-                        _ee,
-                        "note_partial_exit_fill",
-                        _pos_id,
-                        _delta,
-                        fill_price=fill_price,
-                        local_order_id=_local_id,
-                        broker_order_id=_broker_id,
-                        cumulative_filled=_cum_filled,
-                    )
+                    self._call_exit_engine(_ee, "note_partial_exit_fill", _pos_id, _delta, fill_price=fill_price, local_order_id=_local_id, broker_order_id=_broker_id, cumulative_filled=_cum_filled)
                 return
 
             if new_status == OrderStatus.EXIT_FILLED:
-                # For a fully-filled EXIT order, apply only the unaccounted delta.
-                # If broker did not provide cumulative filled_qty, the order is fully
-                # filled, so use order qty as the cumulative amount for this order.
                 if _cum_filled is None or _cum_filled <= 0:
                     _cum_filled = _order_qty
                 _delta = max(0, _cum_filled - _prev_filled)
-
-                # Determine whether this filled EXIT order flattens the whole position.
                 _pos = self._get_exit_engine_position(_ee, _pos_id)
                 _remaining_before = self._safe_int(getattr(_pos, "quantity_remaining", None), None) if _pos else None
                 if _remaining_before is None:
                     _remaining_before = self._get_position_remaining_from_db(_pos_id)
 
                 if _delta <= 0:
-                    log.info(
-                        "[%s] EXIT_FILLED hook no-op — no new filled qty | order=%s pos=%s prev=%s cum=%s",
-                        self.client_id, _local_id, _pos_id, _prev_filled, _cum_filled,
-                    )
-                    self._call_exit_engine(
-                        _ee,
-                        "clear_exit_in_flight",
-                        _pos_id,
-                        local_order_id=_local_id,
-                        broker_order_id=_broker_id,
-                    )
+                    log.info("[%s] EXIT_FILLED hook no-op — no new filled qty | order=%s pos=%s prev=%s cum=%s", self.client_id, _local_id, _pos_id, _prev_filled, _cum_filled)
+                    self._call_exit_engine(_ee, "clear_exit_in_flight", _pos_id, local_order_id=_local_id, broker_order_id=_broker_id)
                     return
 
-                # If this exit order sold less than the current remaining position,
-                # it is a completed scale-out order, not a full close.
                 if _remaining_before is not None and _delta < int(_remaining_before):
-                    log.info(
-                        "[%s] EXIT_FILLED treated as completed scale-out | order=%s pos=%s delta=%s remaining_before=%s",
-                        self.client_id, _local_id, _pos_id, _delta, _remaining_before,
-                    )
-                    self._call_exit_engine(
-                        _ee,
-                        "note_partial_exit_fill",
-                        _pos_id,
-                        _delta,
-                        fill_price=fill_price,
-                        local_order_id=_local_id,
-                        broker_order_id=_broker_id,
-                        cumulative_filled=_cum_filled,
-                    )
+                    log.info("[%s] EXIT_FILLED treated as completed scale-out | order=%s pos=%s delta=%s remaining_before=%s", self.client_id, _local_id, _pos_id, _delta, _remaining_before)
+                    self._call_exit_engine(_ee, "note_partial_exit_fill", _pos_id, _delta, fill_price=fill_price, local_order_id=_local_id, broker_order_id=_broker_id, cumulative_filled=_cum_filled)
                     return
 
-                # Full flatten: order fill quantity equals/exceeds remaining size.
-                log.info(
-                    "[%s] EXIT_FILLED treated as full close | order=%s pos=%s delta=%s remaining_before=%s",
-                    self.client_id, _local_id, _pos_id, _delta, _remaining_before,
-                )
-                self._call_exit_engine(
-                    _ee,
-                    "mark_position_closed",
-                    _pos_id,
-                    reason="EXIT_FILLED",
-                    qty_filled=_delta,
-                    fill_price=fill_price,
-                    local_order_id=_local_id,
-                    broker_order_id=_broker_id,
-                    cumulative_filled=_cum_filled,
-                )
+                log.info("[%s] EXIT_FILLED treated as full close | order=%s pos=%s delta=%s remaining_before=%s", self.client_id, _local_id, _pos_id, _delta, _remaining_before)
+                self._call_exit_engine(_ee, "mark_position_closed", _pos_id, reason="EXIT_FILLED", qty_filled=_delta, fill_price=fill_price, local_order_id=_local_id, broker_order_id=_broker_id, cumulative_filled=_cum_filled)
                 return
 
             if new_status in (OrderStatus.CANCELED, OrderStatus.EXPIRED, OrderStatus.REJECTED):
                 if hasattr(_ee, "on_exit_failure"):
-                    _ee.on_exit_failure(
-                        _pos_id,
-                        local_order_id=_local_id,
-                        broker_order_id=_broker_id,
-                        status=new_status,
-                    )
+                    _ee.on_exit_failure(_pos_id, local_order_id=_local_id, broker_order_id=_broker_id, status=new_status)
                 elif hasattr(_ee, "clear_exit_in_flight"):
                     _ee.clear_exit_in_flight(_pos_id)
                 else:
-                    log.critical(
-                        "[%s] Exit failure hook missing on exit engine | order=%s pos=%s status=%s",
-                        self.client_id, _local_id, _pos_id, new_status,
-                    )
+                    log.critical("[%s] Exit failure hook missing on exit engine | order=%s pos=%s status=%s", self.client_id, _local_id, _pos_id, new_status)
                 if new_status == OrderStatus.REJECTED:
                     try:
                         import time as _time
-
                         for _p in getattr(_ee, "_positions", []):
                             if str(getattr(_p, "position_id", "")) == str(_pos_id):
                                 _p.last_exit_rejected = True
                                 _p.last_rejection_ts = _time.time()
-                                log.info(
-                                    "[%s] Exit REJECTED — 30s cooldown started",
-                                    getattr(_p, "ticker", _pos_id),
-                                )
+                                log.info("[%s] Exit REJECTED — 30s cooldown started", getattr(_p, "ticker", _pos_id))
                                 break
                     except Exception:
                         pass
         except Exception as _ee_err:
             log.exception("[%s] exit_eng hook failed: %s", self.client_id, _ee_err)
+
+    # ------------------------------------------------------------------
+    # Readers / mutators
+    # ------------------------------------------------------------------
+
+    def apply_fill_update(self, local_order_id: str, *, cumulative_filled: int, fill_price=None, broker_order_id=None) -> bool:
+        """Apply broker cumulative fill update without requiring a state change."""
+        order = self._get_order(local_order_id)
+        if not order:
+            log.error("[%s] apply_fill_update: order %s not found", self.client_id, local_order_id)
+            return False
+        order = dict(order)
+        status = str(order.get("status") or "")
+        kind = str(order.get("kind") or "").upper()
+        if status not in (OrderStatus.PARTIAL_FILL, OrderStatus.EXIT_PARTIAL_FILL):
+            log.warning("[%s] apply_fill_update blocked — order=%s status=%s is not partial-fill", self.client_id, local_order_id, status)
+            return False
+        if status == OrderStatus.EXIT_PARTIAL_FILL and kind != "EXIT":
+            log.critical("[%s] apply_fill_update blocked — EXIT_PARTIAL_FILL on non-EXIT order=%s kind=%s", self.client_id, local_order_id, kind)
+            return False
+        return self.transition(local_order_id, status, broker_order_id=broker_order_id or order.get("broker_order_id"), filled_qty=cumulative_filled, fill_price=fill_price)
+
+    def increment_retry(self, local_order_id: str):
+        def _fn():
+            with conn() as c:
+                c.execute("UPDATE orders SET retries=retries+1, updated_ts=NOW() WHERE local_order_id=%s AND client_id=%s", (local_order_id, self.client_id))
+        run_with_retry(_fn)
+
+    def get_order(self, local_order_id: str):
+        return self._get_order(local_order_id)
+
+    def get_orders_for_position(self, position_id: str) -> list:
+        def _fn():
+            with conn() as c:
+                c.execute("SELECT * FROM orders WHERE client_id=%s AND position_id=%s ORDER BY created_ts DESC", (self.client_id, position_id))
+                return c.fetchall()
+        return run_with_retry(_fn)
+
+    def get_active_entry_orders(self) -> list:
+        def _fn():
+            with conn() as c:
+                c.execute(
+                    "SELECT * FROM orders WHERE client_id=%s AND kind='ENTRY' "
+                    "AND status IN ('CREATED','PENDING_TRIGGER','SUBMITTED','ACKNOWLEDGED','PARTIAL_FILL') "
+                    "ORDER BY created_ts DESC",
+                    (self.client_id,),
+                )
+                return c.fetchall()
+        return run_with_retry(_fn)
+
+    def get_active_exit_orders(self) -> list:
+        def _fn():
+            with conn() as c:
+                c.execute(
+                    "SELECT * FROM orders WHERE client_id=%s AND kind='EXIT' "
+                    "AND status IN ('EXIT_REQUESTED','EXIT_SUBMITTED','EXIT_ACKNOWLEDGED','EXIT_PARTIAL_FILL') "
+                    "ORDER BY created_ts DESC",
+                    (self.client_id,),
+                )
+                return c.fetchall()
+        return run_with_retry(_fn)
+
+    # ------------------------------------------------------------------
+    # Broker submit helpers
+    # ------------------------------------------------------------------
+
+    def submit_existing_entry(self, *, local_order_id: str, broker, plan=None, limit_price=None) -> dict:
+        """Submit an already-created ENTRY order after watcher breach.
+
+        Money-safe invariant: broker accepts and returns a real broker_order_id
+        first; only then does OSM transition CREATED/PENDING_TRIGGER -> SUBMITTED.
+        """
+        current = self._get_order(local_order_id)
+        if not current:
+            error_msg = "existing_entry_order_not_found"
+            log.critical("[%s] submit_existing_entry failed — %s | %s", self.client_id, error_msg, local_order_id)
+            return {"ok": False, "local_order_id": local_order_id, "broker_order_id": None, "status": OrderStatus.ERROR, "error": error_msg}
+
+        current = dict(current)
+        kind = str(current.get("kind") or "").upper()
+        status = str(current.get("status") or "").upper()
+
+        if kind != "ENTRY":
+            error_msg = f"submit_existing_entry_wrong_kind:{kind}"
+            self.transition(local_order_id, OrderStatus.ERROR, last_error=error_msg)
+            return {"ok": False, "local_order_id": local_order_id, "broker_order_id": current.get("broker_order_id"), "status": OrderStatus.ERROR, "error": error_msg}
+
+        if status in (OrderStatus.SUBMITTED, OrderStatus.ACKNOWLEDGED, OrderStatus.PARTIAL_FILL, OrderStatus.FILLED):
+            return {"ok": True, "local_order_id": local_order_id, "broker_order_id": current.get("broker_order_id"), "status": status, "error": None}
+
+        if status in (OrderStatus.REJECTED, OrderStatus.CANCELED, OrderStatus.EXPIRED, OrderStatus.ERROR):
+            error_msg = f"submit_existing_entry_terminal_status:{status}"
+            log.warning("[%s] submit_existing_entry blocked — terminal status %s | %s", self.client_id, status, local_order_id)
+            return {"ok": False, "local_order_id": local_order_id, "broker_order_id": current.get("broker_order_id"), "status": status, "error": error_msg}
+
+        if status not in (OrderStatus.CREATED, OrderStatus.PENDING_TRIGGER):
+            error_msg = f"submit_existing_entry_invalid_status:{status}"
+            log.critical("[%s] submit_existing_entry blocked — %s | %s", self.client_id, error_msg, local_order_id)
+            return {"ok": False, "local_order_id": local_order_id, "broker_order_id": current.get("broker_order_id"), "status": status, "error": error_msg}
+
+        lp = float(limit_price or current.get("limit_price") or getattr(plan, "limit_price", 0) or 0)
+        contract = current.get("contract") or getattr(plan, "contract_symbol", None) or current.get("symbol") or getattr(plan, "ticker", "")
+        ticker = current.get("symbol") or getattr(plan, "ticker", "")
+        qty = int(current.get("qty") or getattr(plan, "contracts", 0) or 0)
+
+        if lp <= 0:
+            error_msg = "invalid_existing_entry_limit_price"
+            self.transition(local_order_id, OrderStatus.ERROR, last_error=error_msg)
+            return {"ok": False, "local_order_id": local_order_id, "broker_order_id": current.get("broker_order_id"), "status": OrderStatus.ERROR, "error": error_msg}
+        if qty <= 0:
+            error_msg = "invalid_existing_entry_qty"
+            self.transition(local_order_id, OrderStatus.ERROR, last_error=error_msg)
+            return {"ok": False, "local_order_id": local_order_id, "broker_order_id": current.get("broker_order_id"), "status": OrderStatus.ERROR, "error": error_msg}
+        if not contract:
+            error_msg = "missing_existing_entry_contract"
+            self.transition(local_order_id, OrderStatus.ERROR, last_error=error_msg)
+            return {"ok": False, "local_order_id": local_order_id, "broker_order_id": current.get("broker_order_id"), "status": OrderStatus.ERROR, "error": error_msg}
+
+        # Stale-read protection: watcher can expire/invalidate between the first
+        # read and the broker POST. Never submit after a terminal watcher outcome.
+        latest = self._get_order(local_order_id)
+        if not latest:
+            return {"ok": False, "local_order_id": local_order_id, "broker_order_id": None, "status": OrderStatus.ERROR, "error": "existing_entry_order_disappeared_before_submit"}
+        latest = dict(latest)
+        latest_status = str(latest.get("status") or "").upper()
+        if latest_status in (OrderStatus.REJECTED, OrderStatus.CANCELED, OrderStatus.EXPIRED, OrderStatus.ERROR):
+            return {"ok": False, "local_order_id": local_order_id, "broker_order_id": latest.get("broker_order_id"), "status": latest_status, "error": f"submit_existing_entry_terminal_status:{latest_status}"}
+        if latest_status not in (OrderStatus.CREATED, OrderStatus.PENDING_TRIGGER):
+            return {"ok": False, "local_order_id": local_order_id, "broker_order_id": latest.get("broker_order_id"), "status": latest_status, "error": f"submit_existing_entry_invalid_status:{latest_status}"}
+
+        base_url = getattr(broker, "base_url", None) or getattr(getattr(broker, "cfg", None), "base_url", None) or "https://sandbox.tradier.com"
+        account_id = getattr(broker, "account_id", None) or getattr(getattr(broker, "cfg", None), "account_id", None) or ""
+
+        error_msg = broker_order_id = None
+        try:
+            resp = broker.session.post(
+                f"{base_url}/v1/accounts/{account_id}/orders",
+                data={"class": "option", "symbol": ticker, "option_symbol": contract, "side": "buy_to_open", "quantity": qty, "type": "limit", "price": round(lp, 2), "duration": "day"},
+                headers={"Accept": "application/json"},
+                timeout=10,
+            )
+            order = (resp.json() or {}).get("order") or {}
+            broker_status = str(order.get("status") or "").lower().strip()
+            broker_order_id = order.get("id") or order.get("order_id")
+            if self._is_broker_accept_status(broker_status) and broker_order_id:
+                ok = self.transition(local_order_id, OrderStatus.SUBMITTED, broker_order_id=broker_order_id, submitted_ts=now_utc_iso())
+                if ok:
+                    return {"ok": True, "local_order_id": local_order_id, "broker_order_id": broker_order_id, "status": OrderStatus.SUBMITTED, "error": None}
+                error_msg = "submitted_transition_failed_after_broker_accept"
+            else:
+                error_msg = f"broker_status:{broker_status or 'unknown'} broker_order_id_missing:{not bool(broker_order_id)}"
+        except Exception as e:
+            error_msg = f"broker_error:{e}"
+
+        self.transition(local_order_id, OrderStatus.ERROR, last_error=error_msg or "unknown_error")
+        return {"ok": False, "local_order_id": local_order_id, "broker_order_id": broker_order_id, "status": OrderStatus.ERROR, "error": error_msg}
+
+    def submit_entry(self, *, broker, plan, limit_price=None, reserved_cost=None) -> dict:
+        local_id = self.create_entry_order(plan, limit_price=limit_price, reserved_cost=reserved_cost)
+        lp = float(limit_price or getattr(plan, "limit_price", 0) or 0)
+        symbol = getattr(plan, "contract_symbol", None) or plan.ticker
+        if lp <= 0:
+            error_msg = "invalid_entry_limit_price"
+            self.transition(local_id, OrderStatus.ERROR, last_error=error_msg)
+            return {"ok": False, "local_order_id": local_id, "broker_order_id": None, "status": OrderStatus.ERROR, "error": error_msg}
+
+        base_url = getattr(broker, "base_url", None) or getattr(getattr(broker, "cfg", None), "base_url", None) or "https://sandbox.tradier.com"
+        account_id = getattr(broker, "account_id", None) or getattr(getattr(broker, "cfg", None), "account_id", None) or ""
+        error_msg = broker_order_id = None
+        try:
+            resp = broker.session.post(
+                f"{base_url}/v1/accounts/{account_id}/orders",
+                data={"class": "option", "symbol": plan.ticker, "option_symbol": symbol, "side": "buy_to_open", "quantity": int(plan.contracts), "type": "limit", "price": round(lp, 2), "duration": "day"},
+                headers={"Accept": "application/json"},
+                timeout=10,
+            )
+            order = (resp.json() or {}).get("order") or {}
+            status = str(order.get("status") or "").lower().strip()
+            broker_order_id = order.get("id") or order.get("order_id")
+            if self._is_broker_accept_status(status) and broker_order_id:
+                ok = self.transition(local_id, OrderStatus.SUBMITTED, broker_order_id=broker_order_id, submitted_ts=now_utc_iso())
+                if ok:
+                    return {"ok": True, "local_order_id": local_id, "broker_order_id": broker_order_id, "status": OrderStatus.SUBMITTED, "error": None}
+                error_msg = "submitted_transition_failed_after_broker_accept"
+            else:
+                error_msg = f"broker_status:{status or 'unknown'} broker_order_id_missing:{not bool(broker_order_id)}"
+        except Exception as e:
+            error_msg = f"broker_error:{e}"
+
+        self.transition(local_id, OrderStatus.ERROR, last_error=error_msg or "unknown_error")
+        return {"ok": False, "local_order_id": local_id, "broker_order_id": broker_order_id, "status": OrderStatus.ERROR, "error": error_msg}
+
+    def submit_exit(self, *, broker, position_id, contract, symbol, direction, qty, limit_price, plan_id=None, signal_id=None) -> dict:
+        local_id = self.create_exit_order(position_id=position_id, contract=contract, symbol=symbol, direction=direction, qty=qty, plan_id=plan_id, signal_id=signal_id, limit_price=limit_price)
+        lp = float(limit_price or 0)
+        if lp <= 0:
+            error_msg = "invalid_exit_limit_price"
+            self.transition(local_id, OrderStatus.ERROR, last_error=error_msg)
+            return {"ok": False, "local_order_id": local_id, "broker_order_id": None, "status": OrderStatus.ERROR, "error": error_msg}
+
+        base_url = getattr(broker, "base_url", None) or getattr(getattr(broker, "cfg", None), "base_url", None) or "https://sandbox.tradier.com"
+        account_id = getattr(broker, "account_id", None) or getattr(getattr(broker, "cfg", None), "account_id", None) or ""
+        underlying = self._resolve_underlying_symbol(symbol=symbol, contract=contract)
+        error_msg = broker_order_id = None
+        try:
+            resp = broker.session.post(
+                f"{base_url}/v1/accounts/{account_id}/orders",
+                data={"class": "option", "symbol": underlying, "option_symbol": contract, "side": "sell_to_close", "quantity": int(qty), "type": "limit", "price": round(lp, 2), "duration": "day"},
+                headers={"Accept": "application/json"},
+                timeout=10,
+            )
+            order = (resp.json() or {}).get("order") or {}
+            status = str(order.get("status") or "").lower().strip()
+            broker_order_id = order.get("id") or order.get("order_id")
+            if self._is_broker_accept_status(status) and broker_order_id:
+                ok = self.transition(local_id, OrderStatus.EXIT_SUBMITTED, broker_order_id=broker_order_id, submitted_ts=now_utc_iso())
+                if ok:
+                    return {"ok": True, "local_order_id": local_id, "broker_order_id": broker_order_id, "status": OrderStatus.EXIT_SUBMITTED, "error": None}
+                error_msg = "exit_submitted_transition_failed_after_broker_accept"
+            else:
+                error_msg = f"broker_status:{status or 'unknown'} broker_order_id_missing:{not bool(broker_order_id)}"
+        except Exception as e:
+            error_msg = f"broker_error:{e}"
+
+        self.transition(local_id, OrderStatus.ERROR, last_error=error_msg or "unknown_error")
+        return {"ok": False, "local_order_id": local_id, "broker_order_id": broker_order_id, "status": OrderStatus.ERROR, "error": error_msg}
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
 
     @staticmethod
     def _safe_int(value, default=0):
@@ -776,12 +987,7 @@ class APOrderStateMachine:
 
     @staticmethod
     def _call_exit_engine(exit_engine, method_name: str, *args, **kwargs):
-        """Strictly call an exit-engine hook.
-
-        Do not filter kwargs or fall back to positional-only calls. Signature
-        mismatches must surface because they can hide lost order identity or
-        lost cumulative-fill attribution.
-        """
+        """Strictly call exit-engine hook; signature mismatches must surface."""
         method = getattr(exit_engine, method_name, None)
         if not method:
             return None
@@ -803,20 +1009,12 @@ class APOrderStateMachine:
         return None
 
     def _get_position_remaining_from_db(self, position_id: str):
-        """Best-effort fallback when exit engine is not seeded.
-
-        Supports both older schema (qty only) and hardened schema
-        (quantity_remaining). Returns None if unavailable.
-        """
         if not position_id:
             return None
         try:
             def _fn():
                 with conn() as c:
-                    c.execute(
-                        "SELECT * FROM positions WHERE client_id=%s AND id=%s LIMIT 1",
-                        (self.client_id, position_id),
-                    )
+                    c.execute("SELECT * FROM positions WHERE client_id=%s AND id=%s LIMIT 1", (self.client_id, position_id))
                     return c.fetchone()
             row = run_with_retry(_fn) or {}
             if not row:
@@ -827,335 +1025,22 @@ class APOrderStateMachine:
         except Exception:
             return None
 
-    def apply_fill_update(
-        self,
-        local_order_id: str,
-        *,
-        cumulative_filled: int,
-        fill_price=None,
-        broker_order_id=None,
-    ) -> bool:
-        """Apply a broker cumulative fill update without requiring a state change.
-
-        Use this when an order is already PARTIAL_FILL / EXIT_PARTIAL_FILL and
-        the broker reports a larger cumulative filled quantity for the same
-        lifecycle state. The cumulative_filled value MUST be broker cumulative
-        quantity for this order, not an incremental delta.
-        """
-        order = self._get_order(local_order_id)
-        if not order:
-            log.error("[%s] apply_fill_update: order %s not found", self.client_id, local_order_id)
-            return False
-
-        order = dict(order)
-        status = str(order.get("status") or "")
-        kind = str(order.get("kind") or "").upper()
-
-        if status not in (OrderStatus.PARTIAL_FILL, OrderStatus.EXIT_PARTIAL_FILL):
-            log.warning(
-                "[%s] apply_fill_update blocked — order=%s status=%s is not partial-fill",
-                self.client_id, local_order_id, status,
-            )
-            return False
-
-        if status == OrderStatus.EXIT_PARTIAL_FILL and kind != "EXIT":
-            log.critical(
-                "[%s] apply_fill_update blocked — EXIT_PARTIAL_FILL on non-EXIT order=%s kind=%s",
-                self.client_id, local_order_id, kind,
-            )
-            return False
-
-        return self.transition(
-            local_order_id,
-            status,
-            broker_order_id=broker_order_id or order.get("broker_order_id"),
-            filled_qty=cumulative_filled,
-            fill_price=fill_price,
-        )
-
-    # ---------------------------------------------------------------------
-    # Public readers / mutators
-    # ---------------------------------------------------------------------
-
-    def increment_retry(self, local_order_id: str):
-        def _fn():
-            with conn() as c:
-                c.execute(
-                    "UPDATE orders SET retries=retries+1, updated_ts=NOW() WHERE local_order_id=%s AND client_id=%s",
-                    (local_order_id, self.client_id),
-                )
-
-        run_with_retry(_fn)
-
-    def get_order(self, local_order_id: str):
-        return self._get_order(local_order_id)
-
-    def get_orders_for_position(self, position_id: str) -> list:
-        def _fn():
-            with conn() as c:
-                c.execute(
-                    "SELECT * FROM orders WHERE client_id=%s AND position_id=%s ORDER BY created_ts DESC",
-                    (self.client_id, position_id),
-                )
-                return c.fetchall()
-
-        return run_with_retry(_fn)
-
-    def get_active_entry_orders(self) -> list:
-        def _fn():
-            with conn() as c:
-                c.execute(
-                    "SELECT * FROM orders WHERE client_id=%s AND kind='ENTRY' "
-                    "AND status IN ('CREATED','PENDING_TRIGGER','SUBMITTED','ACKNOWLEDGED','PARTIAL_FILL') "
-                    "ORDER BY created_ts DESC",
-                    (self.client_id,),
-                )
-                return c.fetchall()
-
-        return run_with_retry(_fn)
-
-    def get_active_exit_orders(self) -> list:
-        def _fn():
-            with conn() as c:
-                c.execute(
-                    "SELECT * FROM orders WHERE client_id=%s AND kind='EXIT' "
-                    "AND status IN ('EXIT_REQUESTED','EXIT_SUBMITTED','EXIT_ACKNOWLEDGED','EXIT_PARTIAL_FILL') "
-                    "ORDER BY created_ts DESC",
-                    (self.client_id,),
-                )
-                return c.fetchall()
-
-        return run_with_retry(_fn)
-
-    # ---------------------------------------------------------------------
-    # Broker submit helpers
-    # ---------------------------------------------------------------------
-
-    def submit_existing_entry(self, *, local_order_id: str, broker, plan=None, limit_price=None) -> dict:
-        """Submit an already-created ENTRY order after watcher breach.
-
-        Money-safe invariant: broker accepts and returns a real broker_order_id
-        first; only then does OSM transition CREATED/PENDING_TRIGGER -> SUBMITTED.
-        """
-        current = self._get_order(local_order_id)
-        if not current:
-            error_msg = "existing_entry_order_not_found"
-            log.critical("[%s] submit_existing_entry failed — %s | %s", self.client_id, error_msg, local_order_id)
-            return {"ok": False, "local_order_id": local_order_id, "broker_order_id": None, "status": OrderStatus.ERROR, "error": error_msg}
-
-        current = dict(current)
-        kind = str(current.get("kind") or "").upper()
-        status = str(current.get("status") or "").upper()
-
-        if kind != "ENTRY":
-            error_msg = f"submit_existing_entry_wrong_kind:{kind}"
-            self.transition(local_order_id, OrderStatus.ERROR, last_error=error_msg)
-            return {"ok": False, "local_order_id": local_order_id, "broker_order_id": None, "status": OrderStatus.ERROR, "error": error_msg}
-
-        if status in (OrderStatus.SUBMITTED, OrderStatus.ACKNOWLEDGED, OrderStatus.PARTIAL_FILL, OrderStatus.FILLED):
-            return {"ok": True, "local_order_id": local_order_id, "broker_order_id": current.get("broker_order_id"), "status": status, "error": None}
-
-        if status not in (OrderStatus.CREATED, OrderStatus.PENDING_TRIGGER):
-            error_msg = f"submit_existing_entry_invalid_status:{status}"
-            log.critical("[%s] submit_existing_entry blocked — %s | %s", self.client_id, error_msg, local_order_id)
-            self.transition(local_order_id, OrderStatus.ERROR, last_error=error_msg)
-            return {"ok": False, "local_order_id": local_order_id, "broker_order_id": None, "status": OrderStatus.ERROR, "error": error_msg}
-
-        lp = float(limit_price or current.get("limit_price") or getattr(plan, "limit_price", 0) or 0)
-        contract = current.get("contract") or getattr(plan, "contract_symbol", None) or current.get("symbol") or getattr(plan, "ticker", "")
-        ticker = current.get("symbol") or getattr(plan, "ticker", "")
-        qty = int(current.get("qty") or getattr(plan, "contracts", 0) or 0)
-
-        if lp <= 0:
-            error_msg = "invalid_existing_entry_limit_price"
-            self.transition(local_order_id, OrderStatus.ERROR, last_error=error_msg)
-            return {"ok": False, "local_order_id": local_order_id, "broker_order_id": None, "status": OrderStatus.ERROR, "error": error_msg}
-        if qty <= 0:
-            error_msg = "invalid_existing_entry_qty"
-            self.transition(local_order_id, OrderStatus.ERROR, last_error=error_msg)
-            return {"ok": False, "local_order_id": local_order_id, "broker_order_id": None, "status": OrderStatus.ERROR, "error": error_msg}
-        if not contract:
-            error_msg = "missing_existing_entry_contract"
-            self.transition(local_order_id, OrderStatus.ERROR, last_error=error_msg)
-            return {"ok": False, "local_order_id": local_order_id, "broker_order_id": None, "status": OrderStatus.ERROR, "error": error_msg}
-
-        base_url = getattr(broker, "base_url", None) or getattr(getattr(broker, "cfg", None), "base_url", None) or "https://sandbox.tradier.com"
-        account_id = getattr(broker, "account_id", None) or getattr(getattr(broker, "cfg", None), "account_id", None) or ""
-
-        error_msg = broker_order_id = None
-        try:
-            resp = broker.session.post(
-                f"{base_url}/v1/accounts/{account_id}/orders",
-                data={
-                    "class": "option",
-                    "symbol": ticker,
-                    "option_symbol": contract,
-                    "side": "buy_to_open",
-                    "quantity": qty,
-                    "type": "limit",
-                    "price": round(lp, 2),
-                    "duration": "day",
-                },
-                headers={"Accept": "application/json"},
-                timeout=10,
-            )
-            order = (resp.json() or {}).get("order") or {}
-            broker_status = str(order.get("status") or "").lower().strip()
-            broker_order_id = order.get("id") or order.get("order_id")
-
-            if broker_status in ("ok", "pending", "open", "accepted", "filled") and broker_order_id:
-                ok = self.transition(local_order_id, OrderStatus.SUBMITTED, broker_order_id=broker_order_id, submitted_ts=now_utc_iso())
-                if ok:
-                    return {"ok": True, "local_order_id": local_order_id, "broker_order_id": broker_order_id, "status": OrderStatus.SUBMITTED, "error": None}
-                error_msg = "submitted_transition_failed_after_broker_accept"
-            else:
-                error_msg = f"broker_status:{broker_status or 'unknown'} broker_order_id_missing:{not bool(broker_order_id)}"
-        except Exception as e:
-            error_msg = f"broker_error:{e}"
-
-        self.transition(local_order_id, OrderStatus.ERROR, last_error=error_msg or "unknown_error")
-        return {"ok": False, "local_order_id": local_order_id, "broker_order_id": broker_order_id, "status": OrderStatus.ERROR, "error": error_msg}
-
-    def submit_entry(self, *, broker, plan, limit_price=None, reserved_cost=None) -> dict:
-        local_id = self.create_entry_order(plan, limit_price=limit_price, reserved_cost=reserved_cost)
-        lp = float(limit_price or getattr(plan, "limit_price", 0) or 0)
-        symbol = getattr(plan, "contract_symbol", None) or plan.ticker
-
-        if lp <= 0:
-            error_msg = "invalid_entry_limit_price"
-            self.transition(local_id, OrderStatus.ERROR, last_error=error_msg)
-            return {"ok": False, "local_order_id": local_id, "broker_order_id": None, "status": OrderStatus.ERROR, "error": error_msg}
-
-        base_url = getattr(broker, "base_url", None) or getattr(getattr(broker, "cfg", None), "base_url", None) or "https://sandbox.tradier.com"
-        account_id = getattr(broker, "account_id", None) or getattr(getattr(broker, "cfg", None), "account_id", None) or ""
-
-        error_msg = broker_order_id = None
-        try:
-            resp = broker.session.post(
-                f"{base_url}/v1/accounts/{account_id}/orders",
-                data={
-                    "class": "option",
-                    "symbol": plan.ticker,
-                    "option_symbol": symbol,
-                    "side": "buy_to_open",
-                    "quantity": int(plan.contracts),
-                    "type": "limit",
-                    "price": round(lp, 2),
-                    "duration": "day",
-                },
-                headers={"Accept": "application/json"},
-                timeout=10,
-            )
-            order = (resp.json() or {}).get("order") or {}
-            status = (order.get("status") or "").lower()
-            broker_order_id = order.get("id") or order.get("order_id")
-            if status in ("ok", "pending", "open", "accepted", "filled") and broker_order_id:
-                ok = self.transition(local_id, OrderStatus.SUBMITTED, broker_order_id=broker_order_id, submitted_ts=now_utc_iso())
-                if ok:
-                    return {"ok": True, "local_order_id": local_id, "broker_order_id": broker_order_id, "status": OrderStatus.SUBMITTED, "error": None}
-                error_msg = "submitted_transition_failed_after_broker_accept"
-            else:
-                error_msg = f"broker_status:{status or 'unknown'} broker_order_id_missing:{not bool(broker_order_id)}"
-        except Exception as e:
-            error_msg = f"broker_error:{e}"
-
-        self.transition(local_id, OrderStatus.ERROR, last_error=error_msg or "unknown_error")
-        return {"ok": False, "local_order_id": local_id, "broker_order_id": broker_order_id, "status": OrderStatus.ERROR, "error": error_msg}
-
-    def submit_exit(
-        self,
-        *,
-        broker,
-        position_id,
-        contract,
-        symbol,
-        direction,
-        qty,
-        limit_price,
-        plan_id=None,
-        signal_id=None,
-    ) -> dict:
-        local_id = self.create_exit_order(
-            position_id=position_id,
-            contract=contract,
-            symbol=symbol,
-            direction=direction,
-            qty=qty,
-            plan_id=plan_id,
-            signal_id=signal_id,
-            limit_price=limit_price,
-        )
-        lp = float(limit_price or 0)
-        if lp <= 0:
-            error_msg = "invalid_exit_limit_price"
-            self.transition(local_id, OrderStatus.ERROR, last_error=error_msg)
-            return {"ok": False, "local_order_id": local_id, "broker_order_id": None, "status": OrderStatus.ERROR, "error": error_msg}
-
-        base_url = getattr(broker, "base_url", None) or getattr(getattr(broker, "cfg", None), "base_url", None) or "https://sandbox.tradier.com"
-        account_id = getattr(broker, "account_id", None) or getattr(getattr(broker, "cfg", None), "account_id", None) or ""
-        underlying = self._resolve_underlying_symbol(symbol=symbol, contract=contract)
-
-        error_msg = broker_order_id = None
-        try:
-            resp = broker.session.post(
-                f"{base_url}/v1/accounts/{account_id}/orders",
-                data={
-                    "class": "option",
-                    "symbol": underlying,
-                    "option_symbol": contract,
-                    "side": "sell_to_close",
-                    "quantity": int(qty),
-                    "type": "limit",
-                    "price": round(lp, 2),
-                    "duration": "day",
-                },
-                headers={"Accept": "application/json"},
-                timeout=10,
-            )
-            order = (resp.json() or {}).get("order") or {}
-            status = (order.get("status") or "").lower()
-            broker_order_id = order.get("id") or order.get("order_id")
-            if status in ("ok", "pending", "open", "accepted", "filled") and broker_order_id:
-                ok = self.transition(local_id, OrderStatus.EXIT_SUBMITTED, broker_order_id=broker_order_id, submitted_ts=now_utc_iso())
-                if ok:
-                    return {"ok": True, "local_order_id": local_id, "broker_order_id": broker_order_id, "status": OrderStatus.EXIT_SUBMITTED, "error": None}
-                error_msg = "exit_submitted_transition_failed_after_broker_accept"
-            else:
-                error_msg = f"broker_status:{status or 'unknown'} broker_order_id_missing:{not bool(broker_order_id)}"
-        except Exception as e:
-            error_msg = f"broker_error:{e}"
-
-        self.transition(local_id, OrderStatus.ERROR, last_error=error_msg or "unknown_error")
-        return {"ok": False, "local_order_id": local_id, "broker_order_id": broker_order_id, "status": OrderStatus.ERROR, "error": error_msg}
-
     @staticmethod
     def _resolve_underlying_symbol(*, symbol: str, contract: str) -> str:
-        """Resolve Tradier order `symbol` safely from underlying/contract fields."""
         raw_symbol = (symbol or "").strip().upper()
         raw_contract = (contract or "").strip().upper()
         if raw_symbol and not any(ch.isdigit() for ch in raw_symbol):
             return raw_symbol
-        # OCC style option symbols start with underlying letters before YYMMDD.
-        import re
-
         m = re.match(r"^([A-Z]{1,10})\d{6}[CP]", raw_contract or raw_symbol)
         if m:
             return m.group(1)
         return raw_symbol if raw_symbol else raw_contract
 
-    # ---------------------------------------------------------------------
-    # Internal DB helpers
-    # ---------------------------------------------------------------------
-
     def _get_order(self, local_order_id: str):
         def _fn():
             with conn() as c:
-                c.execute(
-                    "SELECT * FROM orders WHERE local_order_id=%s AND client_id=%s",
-                    (local_order_id, self.client_id),
-                )
+                c.execute("SELECT * FROM orders WHERE local_order_id=%s AND client_id=%s", (local_order_id, self.client_id))
                 return c.fetchone()
-
         return run_with_retry(_fn)
 
     def _get_order_by_plan(self, plan_id: str, kind: str = "ENTRY"):
@@ -1163,12 +1048,11 @@ class APOrderStateMachine:
             with conn() as c:
                 c.execute(
                     "SELECT * FROM orders WHERE client_id=%s AND plan_id=%s AND kind=%s "
-                    "AND status NOT IN ( 'FILLED', 'EXIT_FILLED', 'REJECTED', 'CANCELED', 'EXPIRED', 'ERROR' ) "
+                    "AND status NOT IN ('FILLED','EXIT_FILLED','REJECTED','CANCELED','EXPIRED','ERROR') "
                     "ORDER BY created_ts DESC LIMIT 1",
                     (self.client_id, plan_id, kind),
                 )
                 return c.fetchone()
-
         return run_with_retry(_fn)
 
     def _get_active_exit_order(self, position_id: str):
@@ -1176,22 +1060,17 @@ class APOrderStateMachine:
             with conn() as c:
                 c.execute(
                     "SELECT * FROM orders WHERE client_id=%s AND position_id=%s AND kind='EXIT' "
-                    "AND status NOT IN ('EXIT_FILLED', 'REJECTED', 'CANCELED', 'EXPIRED', 'ERROR') "
+                    "AND status NOT IN ('EXIT_FILLED','REJECTED','CANCELED','EXPIRED','ERROR') "
                     "ORDER BY created_ts DESC LIMIT 1",
                     (self.client_id, position_id),
                 )
                 return c.fetchone()
-
         return run_with_retry(_fn)
 
     def _record_error(self, local_order_id: str, error_msg: str):
         def _fn():
             with conn() as c:
-                c.execute(
-                    "UPDATE orders SET last_error=%s, updated_ts=NOW() WHERE local_order_id=%s AND client_id=%s",
-                    (error_msg, local_order_id, self.client_id),
-                )
-
+                c.execute("UPDATE orders SET last_error=%s, updated_ts=NOW() WHERE local_order_id=%s AND client_id=%s", (error_msg, local_order_id, self.client_id))
         try:
             run_with_retry(_fn)
         except Exception:
