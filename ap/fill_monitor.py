@@ -32,6 +32,7 @@ Critical safety rules:
 
 from __future__ import annotations
 
+import importlib
 import inspect
 import os
 import time
@@ -594,7 +595,50 @@ def _place_standing_stop_best_effort(
         log.warning("[%s] Standing stop placement error: %s", order.get("symbol", "?"), exc)
 
 
+def _load_managed_position_class():
+    """Resolve ManagedPosition across legacy/hardened exit-engine module paths."""
+    configured = os.getenv("AP_MANAGED_POSITION_MODULE", "").strip()
+    candidates = []
+    if configured:
+        candidates.append(configured)
+
+    # Keep all known paths so fill-monitor seeding does not break during repo renames.
+    candidates.extend([
+        "ap_exit_engine",
+        "ap.exit_engine",
+        "ap.exitengine",
+        "ap.exit_engine_hardened",
+    ])
+
+    seen = set()
+    last_error = None
+    for module_name in candidates:
+        if not module_name or module_name in seen:
+            continue
+        seen.add(module_name)
+        try:
+            module = importlib.import_module(module_name)
+            cls = getattr(module, "ManagedPosition", None)
+            if cls is not None:
+                return cls
+            last_error = RuntimeError(f"{module_name}.ManagedPosition missing")
+        except Exception as exc:
+            last_error = exc
+
+    raise ImportError(f"Could not import ManagedPosition from known exit-engine paths: {last_error}")
+
+
+def _safe_float(value, default: float = 0.0) -> float:
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
 def _seed_exit_engine(exit_engine, position_id: str, order: dict, result: dict, signal_id: str):
+    """Seed the exit engine after confirmed ENTRY fill without faking live quote state."""
     if not exit_engine or not position_id:
         return
 
@@ -613,21 +657,45 @@ def _seed_exit_engine(exit_engine, position_id: str, order: dict, result: dict, 
         log.debug("exit_engine.seed_position failed; trying add_position path: %s", exc)
 
     try:
-        from ap_exit_engine import ManagedPosition as _MP
+        _MP = _load_managed_position_class()
+
+        underlying_entry = _safe_float(
+            order.get("trigger_price")
+            or order.get("underlying_entry")
+            or order.get("entry_underlying")
+            or 0.0
+        )
+        entry_option_price = _safe_float(result.get("avg_fill") or order.get("fill_price") or 0.0)
 
         mp = _MP(
             ticker=(order.get("symbol") or "").upper(),
             option_symbol=order.get("contract") or order.get("symbol") or "",
             side=(order.get("direction") or "CALL").upper(),
             quantity=int(result.get("filled_qty") or order.get("qty") or 0),
-            entry_price=float(result.get("avg_fill") or 0.0),
-            underlying_entry=float(order.get("trigger_price") or order.get("underlying_entry") or 0),
-            underlying_target=float(order.get("target_underlying") or order.get("underlying_target") or 0),
-            underlying_stop=float(order.get("stop_underlying") or order.get("underlying_stop") or 0),
+            entry_price=entry_option_price,
+            underlying_entry=underlying_entry,
+            underlying_target=_safe_float(order.get("target_underlying") or order.get("underlying_target") or 0.0),
+            underlying_stop=_safe_float(order.get("stop_underlying") or order.get("underlying_stop") or 0.0),
         )
         mp.position_id = position_id
         mp.client_id = str(order.get("client_id") or "")
         mp.signal_id = signal_id
+
+        # Do not replay entry underlying as current underlying. Current quote fields are
+        # deliberately unknown/provisional until the exit engine hydrates live quotes.
+        try:
+            mp.current_underlying = _safe_float(order.get("last_underlying_price") or 0.0)
+            mp.current_option_price = entry_option_price
+            mp.current_bid = 0.0
+            mp.current_ask = 0.0
+            mp.quote_fresh = False
+            mp.quote_source = "fill_monitor_seed_unhydrated"
+            mp.quote_ts = None
+            mp.last_quote_ts = None
+            mp.needs_quote_refresh = True
+        except Exception:
+            pass
+
         mp.signal = {
             "signal_id": signal_id,
             "pattern": str(order.get("pattern") or ""),
@@ -635,9 +703,24 @@ def _seed_exit_engine(exit_engine, position_id: str, order: dict, result: dict, 
             "score": float(order.get("score") or 0),
             "timeframe": str(order.get("timeframe") or "1d"),
             "side": (order.get("direction") or "CALL").upper(),
+            "quote_fresh": False,
+            "seed_source": "fill_monitor",
         }
         exit_engine.add_position(mp)
-        log.info("[%s] Exit engine seeded for pos=%s", order.get("client_id"), position_id)
+
+        refresher = getattr(exit_engine, "request_quote_refresh", None)
+        if callable(refresher):
+            try:
+                refresher(position_id)
+            except Exception as exc:
+                log.debug("[%s] exit_engine.request_quote_refresh failed non-critical for %s: %s", order.get("client_id"), position_id, exc)
+
+        log.info(
+            "[%s] Exit engine seeded for pos=%s quote_fresh=False current_underlying=%s",
+            order.get("client_id"),
+            position_id,
+            getattr(mp, "current_underlying", None),
+        )
     except Exception as exc:
         log.error("[%s] exit_engine.add_position failed: %s", order.get("client_id"), exc)
 
