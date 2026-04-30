@@ -1,29 +1,42 @@
-# ap/fill_monitor.py — Fill Monitor (OSM-routed)
+# ap/fill_monitor.py — Fill Monitor (OSM-routed, rich final)
 """
-Fill Monitor — polls broker to confirm order fills and routes all lifecycle
-transitions through APOrderStateMachine.
+Fill Monitor — broker reconciliation poller + side-effect orchestrator.
 
-DESIGN:
-- This module is a PURE BROKER POLLER. It has NO lifecycle authority.
-- It queries broker status, then calls osm.transition() with the mapped status.
-- APOrderStateMachine owns all DB writes, position creation, and exit-engine hooks.
-- No direct writes to orders/positions/client_state from here.
+This file preserves the production behaviors from the larger legacy monitor:
+- audit_log writes
+- structured observability events
+- entry equity/symbol-lock release
+- 1-1 pair cancel after confirmed entry fill
+- optional broker-side standing stop after local position persistence
+- exit price/dashboard sync
+- legacy fallback helpers, but disabled in production unless explicitly allowed
 
-CRITICAL RULE:
-- Fill monitor MUST NEVER pause on kill switch. It reconciles reality.
-- Equity/symbol-lock release is still done here for ENTRY orders (OSM does
-  not own the in-memory equity/lock state — that lives in ap.state).
+Architecture:
+- APOrderStateMachine owns order lifecycle truth.
+- APPositionManager owns position truth.
+- APExitEngine owns exit behavior, scale-outs, runner state, and full-close logic.
+- Fill monitor polls broker reality, maps broker status to canonical OSM states,
+  enforces cumulative fill sanity, calls OSM, then runs side effects only after
+  successful OSM confirmation.
 
-Upgrades in this version:
-- 1-1 pair manager: on ENTRY fill, cancel opposite side of inside-bar pair
-- exit_price_sync: on EXIT fill, push real avg_fill to dashboard proof_trades
+Critical safety rules:
+- MUST filter by client_id.
+- MUST support stop_event so old runners do not become zombie reconcilers.
+- MUST NOT poll non-broker PENDING_TRIGGER watch plans.
+- MUST NOT use legacy direct DB lifecycle writes in production unless
+  ALLOW_LEGACY_FILL_MONITOR=1.
+- MUST persist local position before optional broker-side standing stop.
+- MUST cancel broker order before marking pair-opposite local order CANCELED.
+- filled_qty MUST be cumulative broker fill quantity, not incremental.
 """
 
 from __future__ import annotations
 
-import time
+import inspect
 import os
+import time
 from datetime import datetime, timezone
+from typing import Optional
 
 from ap.trace import trace_gate
 from ap.db import conn, run_with_retry
@@ -42,10 +55,30 @@ RUN_ID = os.getenv("AP_RUN_ID", "unknown")
 STRATEGY_VERSION = os.getenv("AP_STRATEGY_VERSION", "ap_live_beta")
 GIT_COMMIT = get_git_commit()
 
-# =============================================================================
-# AUDIT LOG
-# =============================================================================
+ALLOW_LEGACY_FILL_MONITOR = (
+    os.getenv("ALLOW_LEGACY_FILL_MONITOR", "0").strip().lower()
+    in {"1", "true", "yes", "on"}
+)
 
+ACTIVE_BROKER_STATUSES = {
+    "OPEN",
+    "PENDING",
+    "ACCEPTED",
+    "WORKING",
+    "LIVE",
+    "QUEUED",
+    "HELD",
+    "ROUTED",
+    "NEW",
+    "PENDING_REVIEW",
+}
+
+TERMINAL_FAILURE_STATUSES = {"REJECTED", "CANCELED", "EXPIRED"}
+
+
+# =============================================================================
+# AUDIT / OBSERVABILITY
+# =============================================================================
 
 def audit(client_id: str, level: str, event: str, payload: dict):
     with conn() as c:
@@ -69,13 +102,7 @@ def emit_fill_event(
     extra_inputs: dict | None = None,
     extra_context: dict | None = None,
 ):
-    """
-    Lightweight fill-monitor observability.
-
-    Emits only meaningful broker lifecycle events:
-    FILLED / PARTIAL / TERMINAL FAILURE / BROKER ERROR.
-    It intentionally does not emit every poll or every unchanged pending state.
-    """
+    """Emit structured fill-monitor observability without blocking reconciliation."""
     try:
         result = result or {}
         emit_decision_event(
@@ -110,11 +137,20 @@ def emit_fill_event(
 
 
 # =============================================================================
-# DB QUERY — pending orders
+# DB QUERY — CLIENT-SAFE BROKER-BACKED ORDERS ONLY
 # =============================================================================
 
+def get_pending_orders(client_id: str) -> list[dict]:
+    """
+    Return broker-backed orders for one client.
 
-def get_pending_orders() -> list[dict]:
+    PENDING_TRIGGER is intentionally excluded because those are watcher plans,
+    not live broker orders. They should only enter this monitor after the watcher
+    submits to broker and OSM moves them to SUBMITTED.
+    """
+    if not client_id:
+        raise ValueError("get_pending_orders requires client_id")
+
     with conn() as c:
         rows = run_with_retry(
             lambda: c.execute(
@@ -141,23 +177,26 @@ def get_pending_orders() -> list[dict]:
                     stop_underlying,
                     target_underlying,
                     trigger_price,
-                    timeframe
+                    timeframe,
+                    filled_qty,
+                    fill_price
                 FROM orders
-                WHERE kind IN ('ENTRY','EXIT')
+                WHERE client_id = %s
+                  AND kind IN ('ENTRY','EXIT')
                   AND status IN (
-                    'CREATED',
                     'SUBMITTED',
                     'ACKNOWLEDGED',
                     'PARTIAL_FILL',
-                    'PENDING_TRIGGER',
                     'EXIT_SUBMITTED',
                     'EXIT_ACKNOWLEDGED',
                     'EXIT_PARTIAL_FILL'
                   )
                   AND broker_order_id IS NOT NULL
+                  AND broker_order_id != ''
                   AND broker_order_id != 'N/A'
                 ORDER BY created_ts ASC
-                """
+                """,
+                (client_id,),
             ).fetchall()
         )
     return [dict(r) for r in rows]
@@ -167,17 +206,24 @@ def get_pending_orders() -> list[dict]:
 # BROKER CHECK
 # =============================================================================
 
-
 def check_order_with_broker(broker: BrokerAdapter, order: dict) -> dict:
     """
     Query broker for actual order status.
-    Returns: {"status": str, "filled_qty": int, "avg_fill": float,
-              "reason": str, "raw": dict}
-    Maps broker statuses to canonical OSM statuses, with EXIT-kind awareness.
+
+    Contract:
+    - returned filled_qty is broker cumulative filled quantity, not incremental
+    - raw order quantity is used as fallback only when broker status is truly FILLED
+    - active broker statuses map to ACKNOWLEDGED / EXIT_ACKNOWLEDGED
     """
     broker_order_id = order.get("broker_order_id")
     if not broker_order_id or broker_order_id == "N/A":
-        return {"status": "UNKNOWN", "reason": "NO_BROKER_ID"}
+        return {
+            "status": "UNKNOWN",
+            "filled_qty": 0,
+            "avg_fill": 0.0,
+            "reason": "NO_BROKER_ID",
+            "raw": {},
+        }
 
     kind = (order.get("kind") or "ENTRY").upper()
 
@@ -188,32 +234,33 @@ def check_order_with_broker(broker: BrokerAdapter, order: dict) -> dict:
         if kind == "EXIT":
             status_map = {
                 "FILLED": "EXIT_FILLED",
-                "OPEN": "EXIT_ACKNOWLEDGED",
-                "PENDING": "EXIT_ACKNOWLEDGED",
                 "PARTIALLY_FILLED": "EXIT_PARTIAL_FILL",
+                "PARTIAL": "EXIT_PARTIAL_FILL",
                 "CANCELED": "CANCELED",
+                "CANCELLED": "CANCELED",
                 "REJECTED": "REJECTED",
                 "EXPIRED": "EXPIRED",
             }
+            our = "EXIT_ACKNOWLEDGED" if status in ACTIVE_BROKER_STATUSES else status_map.get(status, "UNKNOWN")
         else:
             status_map = {
                 "FILLED": "FILLED",
-                "OPEN": "ACKNOWLEDGED",
-                "PENDING": "ACKNOWLEDGED",
                 "PARTIALLY_FILLED": "PARTIAL_FILL",
+                "PARTIAL": "PARTIAL_FILL",
                 "CANCELED": "CANCELED",
+                "CANCELLED": "CANCELED",
                 "REJECTED": "REJECTED",
                 "EXPIRED": "EXPIRED",
             }
+            our = "ACKNOWLEDGED" if status in ACTIVE_BROKER_STATUSES else status_map.get(status, "UNKNOWN")
 
-        our = status_map.get(status, "UNKNOWN")
-
-        filled_qty = int(
-            raw.get("exec_quantity")
-            or raw.get("filled_quantity")
-            or raw.get("quantity")
-            or 0
-        )
+        explicit_filled_qty = raw.get("exec_quantity") or raw.get("filled_quantity")
+        if explicit_filled_qty is not None:
+            filled_qty = int(explicit_filled_qty or 0)
+        elif our in ("FILLED", "EXIT_FILLED"):
+            filled_qty = int(raw.get("quantity") or 0)
+        else:
+            filled_qty = 0
 
         avg_fill = float(raw.get("avg_fill_price") or raw.get("price") or 0.0)
 
@@ -227,7 +274,7 @@ def check_order_with_broker(broker: BrokerAdapter, order: dict) -> dict:
 
     except Exception as e:
         audit(
-            order["client_id"],
+            str(order.get("client_id") or "default"),
             "ERROR",
             "FILL_CHECK_FAILED",
             {
@@ -236,19 +283,15 @@ def check_order_with_broker(broker: BrokerAdapter, order: dict) -> dict:
                 "local_order_id": order.get("local_order_id"),
             },
         )
-        return {"status": "ERROR", "reason": str(e)}
+        return {"status": "ERROR", "filled_qty": 0, "avg_fill": 0.0, "reason": str(e), "raw": {}}
 
 
 # =============================================================================
-# EQUITY / LOCK RELEASE (entry orders only — in-memory, not in OSM)
+# ENTRY GUARDS / LOCK RELEASE
 # =============================================================================
-
 
 def _release_entry_guards(order: dict):
-    """
-    Release reserved equity and symbol lock for ENTRY orders.
-    Uses orders.reserved_cost if present, else limit_price * qty * 100.
-    """
+    """Release reserved equity and symbol lock for ENTRY orders."""
     client_id = order["client_id"]
     symbol = order["symbol"]
 
@@ -272,67 +315,307 @@ def _release_entry_guards(order: dict):
 
 
 # =============================================================================
-# PAIR MANAGER HELPER
+# PAIR MANAGER HELPER — BROKER CANCEL FIRST
 # =============================================================================
 
-
-def _cancel_pair_opposite(order: dict, osm) -> None:
+def _cancel_pair_opposite(order: dict, broker: BrokerAdapter, osm) -> None:
     """
-    On ENTRY fill: cancel the opposite side of a 1-1 (inside bar) pair.
-    Prevents the bot from holding both a CALL and PUT on the same ticker.
-    Non-blocking — failure here never stops fill processing.
+    On ENTRY fill: cancel the opposite side of a 1-1 pair.
+
+    Broker cancel is attempted before local CANCELED transition.
+    If broker id cannot be resolved, local order is not marked canceled.
     """
     if not osm:
         return
+
     try:
         from ap.signal_pair_manager import get_pair_manager
 
-        _pm = get_pair_manager()
-        _ticker = (order.get("symbol") or "").upper()
-        _side = (order.get("direction") or "CALL").upper()
-        _local_id = order.get("local_order_id", "")
+        pair_manager = get_pair_manager()
+        ticker = (order.get("symbol") or "").upper()
+        side = (order.get("direction") or "CALL").upper()
+        filled_local_id = order.get("local_order_id", "")
 
-        cancel_id = _pm.on_fill(
-            ticker=_ticker,
-            side=_side,
-            local_order_id=_local_id,
+        cancel_local_id = pair_manager.on_fill(
+            ticker=ticker,
+            side=side,
+            local_order_id=filled_local_id,
         )
 
-        if cancel_id:
+        if not cancel_local_id:
+            return
+
+        log.warning(
+            "[%s] 1-1 PAIR FILL — canceling opposite local_order_id=%s",
+            ticker,
+            cancel_local_id,
+        )
+
+        resolved_broker_id = None
+        try:
+            existing = osm.get_order(cancel_local_id)
+            resolved_broker_id = (existing or {}).get("broker_order_id")
+        except Exception as exc:
+            log.warning("[%s] Could not resolve opposite broker id: %s", ticker, exc)
+
+        if not resolved_broker_id:
             log.warning(
-                "[%s] 1-1 PAIR FILL — canceling opposite side order=%s",
-                _ticker,
-                cancel_id,
+                "[%s] Pair cancel skipped — no broker_order_id for local_order_id=%s",
+                ticker,
+                cancel_local_id,
             )
-            try:
-                osm.transition(
-                    cancel_id,
-                    "CANCELED",
-                    last_error="pair_fill_cancel",
-                )
-                log.info(
-                    "[%s] Opposite side CANCELED | order=%s",
-                    _ticker,
-                    cancel_id,
-                )
-            except Exception as _te:
-                log.error(
-                    "[%s] Failed to cancel pair opposite %s: %s",
-                    _ticker,
-                    cancel_id,
-                    _te,
-                )
+            return
+
+        try:
+            if hasattr(broker, "cancel_order"):
+                broker.cancel_order(resolved_broker_id)
+            else:
+                _cancel_with_session(broker, resolved_broker_id)
+        except Exception as exc:
+            log.warning(
+                "[%s] Broker pair cancel failed | local=%s broker=%s error=%s",
+                ticker,
+                cancel_local_id,
+                resolved_broker_id,
+                exc,
+            )
+            return
+
+        ok = osm.transition(
+            cancel_local_id,
+            "CANCELED",
+            broker_order_id=resolved_broker_id,
+            last_error="pair_fill_cancel_broker_confirmed",
+        )
+        if ok:
+            log.info(
+                "[%s] Opposite side CANCELED | local=%s broker=%s",
+                ticker,
+                cancel_local_id,
+                resolved_broker_id,
+            )
+
     except ImportError:
-        # pair manager not yet deployed — skip silently
         pass
-    except Exception as _e:
-        log.debug("Pair manager cancel failed (non-critical): %s", _e)
+    except Exception as exc:
+        log.debug("Pair manager cancel failed (non-critical): %s", exc)
+
+
+def _cancel_with_session(broker: BrokerAdapter, broker_order_id: str):
+    base_url = (
+        getattr(broker, "base_url", None)
+        or getattr(getattr(broker, "cfg", None), "base_url", None)
+        or getattr(broker, "_base_url", None)
+    )
+    account_id = (
+        getattr(broker, "account_id", None)
+        or getattr(getattr(broker, "cfg", None), "account_id", None)
+        or getattr(broker, "_account_id", None)
+    )
+    if not base_url or not account_id or not getattr(broker, "session", None):
+        raise RuntimeError("broker cancel not available: missing base_url/account_id/session")
+
+    resp = broker.session.delete(
+        f"{base_url}/v1/accounts/{account_id}/orders/{broker_order_id}",
+        headers={"Accept": "application/json"},
+        timeout=10,
+    )
+    if getattr(resp, "status_code", 500) >= 300:
+        raise RuntimeError(f"broker cancel failed HTTP {resp.status_code}: {getattr(resp, 'text', '')[:200]}")
 
 
 # =============================================================================
-# CORE — process one pending order via OSM
+# SAFE HELPERS
 # =============================================================================
 
+def _call_with_supported_kwargs(fn, **kwargs):
+    """Call a function with only supported keyword args for compatibility."""
+    sig = inspect.signature(fn)
+    supported = {k: v for k, v in kwargs.items() if k in sig.parameters}
+    return fn(**supported)
+
+
+def _get_existing_position_by_order(pm, local_order_id: str, broker_order_id: Optional[str]):
+    for method_name, arg in (
+        ("get_position_by_local_order", local_order_id),
+        ("get_position_by_broker_order", broker_order_id),
+    ):
+        if not arg:
+            continue
+        method = getattr(pm, method_name, None)
+        if callable(method):
+            try:
+                found = method(arg)
+                if found:
+                    return found
+            except Exception:
+                pass
+    return None
+
+
+def _open_position_safe(pm, *, order: dict, result: dict, plan_id: str, signal_id: str, local_id: str) -> Optional[str]:
+    """Open position with idempotency keys when the PM supports them."""
+    existing = _get_existing_position_by_order(pm, local_id, order.get("broker_order_id"))
+    if existing:
+        return existing.get("id") or existing.get("position_id")
+
+    kwargs = {
+        "plan_id": plan_id,
+        "signal_id": signal_id,
+        "ticker": (order.get("symbol") or "").upper(),
+        "contract": order.get("contract") or order.get("symbol") or "",
+        "side": (order.get("direction") or "CALL").upper(),
+        "qty": int(result.get("filled_qty") or order.get("qty") or 0),
+        "entry_price": float(result.get("avg_fill") or 0.0),
+        "tier": str(order.get("tier") or "B"),
+        "score": float(order.get("score") or 0),
+        "pattern": str(order.get("pattern") or ""),
+        "stop_underlying": float(order.get("stop_underlying")) if order.get("stop_underlying") is not None else None,
+        "target_underlying": float(order.get("target_underlying")) if order.get("target_underlying") is not None else None,
+        "local_order_id": local_id,
+        "broker_order_id": order.get("broker_order_id"),
+    }
+
+    try:
+        return pm.open_position(**kwargs)
+    except TypeError:
+        # Compatibility with older PM signature that does not yet accept local/broker order ids.
+        return _call_with_supported_kwargs(pm.open_position, **kwargs)
+
+
+def _place_standing_stop_best_effort(
+    *,
+    broker: BrokerAdapter,
+    order: dict,
+    qty: int,
+    entry_price: float,
+):
+    """Optional secondary broker-side stop, after local position persistence."""
+    try:
+        if qty <= 0 or entry_price <= 0:
+            return
+
+        stop_pct = float(os.getenv("BROKER_STANDING_STOP_PCT", "0.30"))
+        stop_px = round(entry_price * (1 - stop_pct), 2)
+        contract = order.get("contract", "")
+        ticker = (order.get("symbol") or "").upper()
+
+        if hasattr(broker, "place_stop_order"):
+            broker.place_stop_order(symbol=contract, qty=qty, stop_price=stop_px)
+            log.info("[%s] Standing stop placed via broker helper @ $%.2f", ticker, stop_px)
+            return
+
+        base_url = (
+            getattr(broker, "base_url", None)
+            or getattr(getattr(broker, "cfg", None), "base_url", None)
+            or getattr(broker, "_base_url", None)
+        )
+        account_id = (
+            getattr(broker, "account_id", None)
+            or getattr(getattr(broker, "cfg", None), "account_id", None)
+            or getattr(broker, "_account_id", None)
+        )
+
+        if not base_url or not account_id or not getattr(broker, "session", None):
+            log.warning("[%s] Standing stop skipped — broker stop interface unavailable", ticker)
+            return
+
+        resp = broker.session.post(
+            f"{base_url}/v1/accounts/{account_id}/orders",
+            data={
+                "class": "option",
+                "option_symbol": contract,
+                "side": "sell_to_close",
+                "quantity": qty,
+                "type": "stop",
+                "stop": stop_px,
+                "duration": "gtc",
+            },
+            headers={"Accept": "application/json"},
+            timeout=10,
+        )
+
+        if resp.status_code < 300:
+            stop_data = (resp.json() or {}).get("order", {}) or {}
+            stop_id = stop_data.get("id", "?")
+            stop_stat = stop_data.get("status", "unknown")
+            log.info(
+                "[%s] Standing stop placed @ $%.2f | broker_stop=%s status=%s",
+                ticker,
+                stop_px,
+                stop_id,
+                stop_stat,
+            )
+        else:
+            err_body = getattr(resp, "text", "")[:200]
+            log.warning("[%s] Standing stop FAILED — exit engine sole protection | %s", ticker, err_body)
+            audit(
+                order["client_id"],
+                "WARNING",
+                "STOP_ORDER_FAILED",
+                {
+                    "local_order_id": order.get("local_order_id"),
+                    "ticker": ticker,
+                    "stop_px": stop_px,
+                    "body": err_body,
+                },
+            )
+
+    except Exception as exc:
+        log.warning("[%s] Standing stop placement error: %s", order.get("symbol", "?"), exc)
+
+
+def _seed_exit_engine(exit_engine, position_id: str, order: dict, result: dict, signal_id: str):
+    if not exit_engine or not position_id:
+        return
+
+    try:
+        getter = getattr(exit_engine, "get_position", None)
+        if callable(getter) and getter(position_id):
+            return
+    except Exception:
+        pass
+
+    try:
+        if hasattr(exit_engine, "seed_position"):
+            exit_engine.seed_position(position_id, order, result)
+            return
+    except Exception as exc:
+        log.debug("exit_engine.seed_position failed; trying add_position path: %s", exc)
+
+    try:
+        from ap_exit_engine import ManagedPosition as _MP
+
+        mp = _MP(
+            ticker=(order.get("symbol") or "").upper(),
+            option_symbol=order.get("contract") or order.get("symbol") or "",
+            side=(order.get("direction") or "CALL").upper(),
+            quantity=int(result.get("filled_qty") or order.get("qty") or 0),
+            entry_price=float(result.get("avg_fill") or 0.0),
+            underlying_entry=float(order.get("trigger_price") or order.get("underlying_entry") or 0),
+            underlying_target=float(order.get("target_underlying") or order.get("underlying_target") or 0),
+            underlying_stop=float(order.get("stop_underlying") or order.get("underlying_stop") or 0),
+        )
+        mp.position_id = position_id
+        mp.client_id = str(order.get("client_id") or "")
+        mp.signal_id = signal_id
+        mp.signal = {
+            "signal_id": signal_id,
+            "pattern": str(order.get("pattern") or ""),
+            "tier": str(order.get("tier") or "B"),
+            "score": float(order.get("score") or 0),
+            "timeframe": str(order.get("timeframe") or "1d"),
+            "side": (order.get("direction") or "CALL").upper(),
+        }
+        exit_engine.add_position(mp)
+        log.info("[%s] Exit engine seeded for pos=%s", order.get("client_id"), position_id)
+    except Exception as exc:
+        log.error("[%s] exit_engine.add_position failed: %s", order.get("client_id"), exc)
+
+
+# =============================================================================
+# CORE — PROCESS ONE PENDING ORDER
+# =============================================================================
 
 def process_pending_order(
     broker: BrokerAdapter,
@@ -341,24 +624,41 @@ def process_pending_order(
     pm=None,
     exit_engine=None,
 ):
-    """
-    Poll broker and route ALL lifecycle transitions through APOrderStateMachine.
+    if osm is None and not ALLOW_LEGACY_FILL_MONITOR:
+        raise RuntimeError("fill_monitor requires OSM unless ALLOW_LEGACY_FILL_MONITOR=1")
 
-    osm — APOrderStateMachine instance (required for full routing).
-    If None, falls back to legacy direct-DB path for backward compat
-    during the transition period. Pass osm whenever possible.
-    """
     client_id = order["client_id"]
     local_id = order["local_order_id"]
     broker_id = order.get("broker_order_id")
     kind = (order.get("kind") or "ENTRY").upper()
 
     result = check_order_with_broker(broker, order)
+    mapped = result.get("status", "UNKNOWN")
+
+    prev_filled = int(order.get("filled_qty") or 0)
+    new_filled = int(result.get("filled_qty") or 0)
+
+    if new_filled < prev_filled:
+        log.critical(
+            "[%s] Fill regression blocked | order=%s broker=%s prev=%s new=%s",
+            client_id,
+            local_id,
+            broker_id,
+            prev_filled,
+            new_filled,
+        )
+        if osm:
+            osm.increment_retry(local_id)
+        audit(
+            client_id,
+            "ERROR",
+            "FILL_REGRESSION_BLOCKED",
+            {"local_order_id": local_id, "broker_order_id": broker_id, "prev": prev_filled, "new": new_filled},
+        )
+        return
 
     # ── FILLED / EXIT_FILLED ────────────────────────────────────────────────
-    if result["status"] in ("FILLED", "EXIT_FILLED"):
-        mapped = result["status"]
-
+    if mapped in ("FILLED", "EXIT_FILLED"):
         emit_fill_event(
             order,
             decision="CONFIRMED",
@@ -368,265 +668,73 @@ def process_pending_order(
             extra_context={"osm_status": mapped},
         )
 
+        ok = False
         if osm:
-            ok = False
             try:
                 ok = osm.transition(
                     local_id,
                     mapped,
-                    filled_qty=result["filled_qty"],
-                    fill_price=result["avg_fill"],
+                    filled_qty=new_filled,
+                    fill_price=result.get("avg_fill"),
+                    broker_order_id=broker_id,
                 )
-            except Exception as e:
-                log.error(
-                    "[%s] OSM transition %s failed for %s: %s",
-                    client_id,
-                    mapped,
-                    local_id,
-                    e,
-                )
-
-            # ── ENTRY FILL: open position + cancel pair + seed exit engine ─
-            if ok and kind == "ENTRY" and pm:
-                _pos_id = None
-                try:
-                    plan_id = order.get("plan_id") or order.get("signal_id") or local_id
-                    signal_id = order.get("signal_id") or local_id
-                    _ticker = (order.get("symbol") or "").upper()
-                    _qty = int(
-                        result.get("filled_qty")
-                        or result.get("qty")
-                        or order.get("filled_qty")
-                        or order.get("contracts")
-                        or 0
-                    )
-                    _price = float(
-                        result.get("avg_fill")
-                        or result.get("avg_fill_price")
-                        or order.get("fill_price")
-                        or 0
-                    )
-
-                    # Event for reporting/trace
-                    trace_gate(
-                        str(signal_id),
-                        _ticker,
-                        "ORDER_FILLED",
-                        "PASS",
-                        reason="entry_filled",
-                        trigger_price=_price,
-                        contracts=_qty,
-                        side=(order.get("direction") or "CALL").upper(),
-                        kind="ENTRY",
-                        tier=str(order.get("tier") or "B"),
-                        plan_id=str(plan_id or ""),
-                    )
-
-                    # 1-1 PAIR CANCEL — immediate on fill
-                    _cancel_pair_opposite(order, osm)
-
-                    # Standing broker stop (best-effort)
-                    try:
-                        _stop_pct = 0.30
-                        _stop_px = round(_price * (1 - _stop_pct), 2)
-                        _stop_resp = (
-                            osm._broker.session.post(
-                                f"{osm._broker._base_url}/v1/accounts/{osm._broker._account_id}/orders",
-                                data={
-                                    "class": "option",
-                                    "option_symbol": order.get("contract", ""),
-                                    "side": "sell_to_close",
-                                    "quantity": _qty,
-                                    "type": "stop",
-                                    "stop": _stop_px,
-                                    "duration": "gtc",
-                                },
-                                headers={"Accept": "application/json"},
-                                timeout=10,
-                            )
-                            if hasattr(osm, "_broker")
-                            else None
-                        )
-
-                        import time as _t
-
-                        _t.sleep(2)
-
-                        if _stop_resp and _stop_resp.status_code < 300:
-                            _stop_data = _stop_resp.json().get("order", {}) or {}
-                            _stop_id = _stop_data.get("id", "?")
-                            _stop_stat = _stop_data.get("status", "unknown")
-                            log.info(
-                                "[%s] Standing stop placed @ $%.2f | broker_stop=%s status=%s",
-                                _ticker,
-                                _stop_px,
-                                _stop_id,
-                                _stop_stat,
-                            )
-                            if _stop_stat not in (
-                                "ok",
-                                "open",
-                                "pending",
-                                "filled",
-                                "accepted",
-                                "queued",
-                                "pending_review",
-                                "partially_filled",
-                            ):
-                                log.warning(
-                                    "[%s] Stop order status unexpected: %s",
-                                    _ticker,
-                                    _stop_stat,
-                                )
-                        else:
-                            _err_body = (
-                                _stop_resp.text[:200] if _stop_resp else "no_response"
-                            )
-                            log.warning(
-                                "[%s] Standing stop FAILED — exit engine sole protection | %s",
-                                _ticker,
-                                _err_body,
-                            )
-                            audit(
-                                client_id,
-                                "WARNING",
-                                "STOP_ORDER_FAILED",
-                                {
-                                    "local_order_id": local_id,
-                                    "ticker": _ticker,
-                                    "stop_px": _stop_px,
-                                    "body": _err_body,
-                                },
-                            )
-                    except Exception as _se:
-                        log.warning(
-                            "[%s] Standing stop placement error: %s", _ticker, _se
-                        )
-
-                    _pos_id = pm.open_position(
-                        plan_id=plan_id,
-                        signal_id=signal_id,
-                        ticker=_ticker,
-                        contract=order.get("contract")
-                        or order.get("symbol")
-                        or "",
-                        side=(order.get("direction") or "CALL").upper(),
-                        qty=result["filled_qty"]
-                        or int(order.get("qty") or 0),
-                        entry_price=result["avg_fill"],
-                        tier=str(order.get("tier") or "B"),
-                        score=float(order.get("score") or 0),
-                        pattern=str(order.get("pattern") or ""),
-                        stop_underlying=float(order.get("stop_underlying"))
-                        if order.get("stop_underlying")
-                        else None,
-                        target_underlying=float(order.get("target_underlying"))
-                        if order.get("target_underlying")
-                        else None,
-                    )
-                except Exception as _pm_err:
-                    log.error(
-                        "[%s] pm.open_position failed for %s: %s",
-                        client_id,
-                        local_id,
-                        _pm_err,
-                    )
-
-                # Wire into exit engine
-                if _pos_id and exit_engine:
-                    try:
-                        from ap_exit_engine import ManagedPosition as _MP
-
-                        _mp = _MP(
-                            ticker=(order.get("symbol") or "").upper(),
-                            option_symbol=order.get("contract")
-                            or order.get("symbol")
-                            or "",
-                            side=(order.get("direction") or "CALL").upper(),
-                            quantity=result["filled_qty"]
-                            or int(order.get("qty") or 0),
-                            entry_price=result["avg_fill"],
-                            underlying_entry=float(
-                                order.get("trigger_price")
-                                or order.get("underlying_entry")
-                                or 0
-                            ),
-                            underlying_target=float(
-                                order.get("target_underlying")
-                                or order.get("underlying_target")
-                                or 0
-                            ),
-                            underlying_stop=float(
-                                order.get("stop_underlying")
-                                or order.get("underlying_stop")
-                                or 0
-                            ),
-                        )
-                        _mp.position_id = _pos_id
-                        _mp.signal = {
-                            "signal_id": signal_id,
-                            "pattern": str(order.get("pattern") or ""),
-                            "tier": str(order.get("tier") or "B"),
-                            "score": float(order.get("score") or 0),
-                            "timeframe": str(order.get("timeframe") or "1d"),
-                            "side": (order.get("direction") or "CALL").upper(),
-                        }
-                        exit_engine.add_position(_mp)
-                        log.info(
-                            "[%s] Exit engine seeded for %s pos=%s",
-                            client_id,
-                            order.get("symbol", "?"),
-                            _pos_id,
-                        )
-                    except Exception as _ee_err:
-                        log.error(
-                            "[%s] exit_engine.add_position failed for %s: %s",
-                            client_id,
-                            local_id,
-                            _ee_err,
-                        )
-
-            # ── EXIT FILL: sync real price to dashboard ─────────────
-            if ok and kind == "EXIT":
-                try:
-                    from ap.exit_price_sync import sync_exit_price_to_dashboard
-
-                    _pos_id_exit = order.get("position_id")
-                    _avg_fill_exit = result.get("avg_fill")
-                    _entry_price = (
-                        order.get("entry_price") or order.get("fill_price")
-                    )
-                    _ticker_exit = (order.get("symbol") or "").upper()
-
-                    if _pos_id_exit and _avg_fill_exit is not None:
-                        sync_exit_price_to_dashboard(
-                            position_id=str(_pos_id_exit),
-                            exit_avg_fill=float(_avg_fill_exit),
-                            entry_price=float(_entry_price)
-                            if _entry_price
-                            else None,
-                            ticker=_ticker_exit,
-                        )
-                except ImportError:
-                    # exit_price_sync not yet deployed
-                    pass
-                except Exception as _eps:
-                    log.debug(
-                        "[%s] exit_price_sync failed (non-critical): %s",
-                        client_id,
-                        _eps,
-                    )
+            except Exception as exc:
+                log.error("[%s] OSM transition %s failed for %s: %s", client_id, mapped, local_id, exc)
         else:
-            # Legacy fallback
-            _legacy_update_order_status(
-                local_id, "FILLED", filled_qty=result["filled_qty"]
-            )
-            if kind == "ENTRY":
-                _legacy_create_position_from_fill(
-                    order, result["avg_fill"], result["filled_qty"]
+            _legacy_update_order_status(local_id, "FILLED", filled_qty=new_filled)
+            ok = True
+
+        if ok and kind == "ENTRY" and pm:
+            position_id = None
+            try:
+                plan_id = order.get("plan_id") or order.get("signal_id") or local_id
+                signal_id = order.get("signal_id") or local_id
+                ticker = (order.get("symbol") or "").upper()
+                qty = int(new_filled or order.get("qty") or 0)
+                price = float(result.get("avg_fill") or 0.0)
+
+                trace_gate(
+                    str(signal_id),
+                    ticker,
+                    "ORDER_FILLED",
+                    "PASS",
+                    reason="entry_filled",
+                    trigger_price=price,
+                    contracts=qty,
+                    side=(order.get("direction") or "CALL").upper(),
+                    kind="ENTRY",
+                    tier=str(order.get("tier") or "B"),
+                    plan_id=str(plan_id or ""),
                 )
-            elif kind == "EXIT":
-                _legacy_close_position_from_exit_fill(order, result["avg_fill"])
+
+                # Pair cancel is broker-first/local-second.
+                _cancel_pair_opposite(order, broker, osm)
+
+                # Persist local position BEFORE placing optional standing stop.
+                position_id = _open_position_safe(
+                    pm,
+                    order=order,
+                    result=result,
+                    plan_id=plan_id,
+                    signal_id=signal_id,
+                    local_id=local_id,
+                )
+
+                # Secondary broker-side stop is best-effort only.
+                _place_standing_stop_best_effort(
+                    broker=broker,
+                    order=order,
+                    qty=qty,
+                    entry_price=price,
+                )
+
+                _seed_exit_engine(exit_engine, position_id, order, result, signal_id)
+
+            except Exception as exc:
+                log.error("[%s] ENTRY fill side-effects failed for %s: %s", client_id, local_id, exc)
+
+        elif ok and kind == "EXIT":
+            _sync_exit_price(order, result)
 
         if kind == "ENTRY":
             _release_entry_guards(order)
@@ -640,16 +748,14 @@ def process_pending_order(
                 "broker_order_id": broker_id,
                 "kind": kind,
                 "osm_status": mapped,
-                "filled_qty": result["filled_qty"],
-                "avg_fill": result["avg_fill"],
+                "filled_qty": new_filled,
+                "avg_fill": result.get("avg_fill"),
             },
         )
         return
 
     # ── PARTIAL FILL / EXIT_PARTIAL_FILL ─────────────────────────────────
-    if result["status"] in ("PARTIAL_FILL", "EXIT_PARTIAL_FILL"):
-        mapped = result["status"]
-
+    if mapped in ("PARTIAL_FILL", "EXIT_PARTIAL_FILL"):
         emit_fill_event(
             order,
             decision="PARTIAL_FILL",
@@ -661,19 +767,26 @@ def process_pending_order(
 
         if osm:
             try:
-                osm.transition(local_id, mapped, filled_qty=result["filled_qty"])
-            except Exception as e:
-                log.error(
-                    "[%s] OSM transition %s failed for %s: %s",
-                    client_id,
-                    mapped,
-                    local_id,
-                    e,
-                )
+                current_status = str(order.get("status") or "").upper()
+                if current_status == mapped and current_status in ("PARTIAL_FILL", "EXIT_PARTIAL_FILL"):
+                    osm.apply_fill_update(
+                        local_order_id=local_id,
+                        cumulative_filled=new_filled,
+                        fill_price=result.get("avg_fill"),
+                        broker_order_id=broker_id,
+                    )
+                else:
+                    osm.transition(
+                        local_id,
+                        mapped,
+                        filled_qty=new_filled,
+                        fill_price=result.get("avg_fill"),
+                        broker_order_id=broker_id,
+                    )
+            except Exception as exc:
+                log.error("[%s] OSM partial update %s failed for %s: %s", client_id, mapped, local_id, exc)
         else:
-            _legacy_update_order_status(
-                local_id, "PARTIAL_FILL", filled_qty=result["filled_qty"]
-            )
+            _legacy_update_order_status(local_id, "PARTIAL_FILL", filled_qty=new_filled)
 
         audit(
             client_id,
@@ -684,56 +797,51 @@ def process_pending_order(
                 "broker_order_id": broker_id,
                 "kind": kind,
                 "osm_status": mapped,
-                "filled_qty": result["filled_qty"],
-                "total_qty": int(order["qty"]),
+                "filled_qty": new_filled,
+                "total_qty": int(order.get("qty") or 0),
             },
         )
         return
 
-    # ── TERMINAL FAILURES ────────────────────────────────────────────────
-    if result["status"] in ("REJECTED", "CANCELED", "EXPIRED"):
-        terminal = result["status"]
+    # ── ACKNOWLEDGED / BROKER ACTIVE ─────────────────────────────────────
+    if mapped in ("ACKNOWLEDGED", "EXIT_ACKNOWLEDGED"):
+        if osm:
+            try:
+                current_status = str(order.get("status") or "").upper()
+                if current_status != mapped:
+                    osm.transition(local_id, mapped, broker_order_id=broker_id)
+            except Exception as exc:
+                log.error("[%s] OSM ack transition %s failed for %s: %s", client_id, mapped, local_id, exc)
 
+        _audit_long_pending(order, kind, client_id, local_id, broker_id)
+        return
+
+    # ── TERMINAL FAILURES ────────────────────────────────────────────────
+    if mapped in TERMINAL_FAILURE_STATUSES:
         emit_fill_event(
             order,
             decision="REJECT",
-            reason_code=f"ORDER_{terminal}",
-            explanation=f"{kind} terminal broker status: {terminal} — {result.get('reason')}",
+            reason_code=f"ORDER_{mapped}",
+            explanation=f"{kind} terminal broker status: {mapped} — {result.get('reason')}",
             result=result,
-            extra_context={"terminal_status": terminal},
+            extra_context={"terminal_status": mapped},
         )
 
         if osm:
             try:
                 osm.transition(
                     local_id,
-                    terminal,
+                    mapped,
+                    broker_order_id=broker_id,
                     last_error=result.get("reason"),
                 )
-            except Exception as e:
-                log.error(
-                    "[%s] OSM transition %s failed for %s: %s",
-                    client_id,
-                    terminal,
-                    local_id,
-                    e,
-                )
+            except Exception as exc:
+                log.error("[%s] OSM terminal transition %s failed for %s: %s", client_id, mapped, local_id, exc)
         else:
-            _legacy_update_order_status(
-                local_id, terminal, error=result.get("reason")
-            )
+            _legacy_update_order_status(local_id, mapped, error=result.get("reason"))
 
-        # EXIT failure: revert position status to OPEN
-        if kind == "EXIT" and order.get("position_id"):
-            with conn() as c:
-                run_with_retry(
-                    lambda: c.execute(
-                        "UPDATE positions "
-                        "SET status='OPEN', exit_reason=NULL "
-                        "WHERE id=%s AND client_id=%s",
-                        (order["position_id"], client_id),
-                    )
-                )
+        # IMPORTANT: no direct positions table mutation here.
+        # EXIT failure repair is handled by OSM + exit-engine hooks.
 
         if kind == "ENTRY":
             _release_entry_guards(order)
@@ -741,67 +849,97 @@ def process_pending_order(
         audit(
             client_id,
             "WARNING",
-            f"ORDER_{terminal}",
-            {
-                "local_order_id": local_id,
-                "broker_order_id": broker_id,
-                "kind": kind,
-                "reason": result.get("reason"),
-            },
+            f"ORDER_{mapped}",
+            {"local_order_id": local_id, "broker_order_id": broker_id, "kind": kind, "reason": result.get("reason")},
         )
         return
 
-    # ── STILL PENDING / ACKNOWLEDGED ─────────────────────────────────────
-    if result["status"] in ("ACKNOWLEDGED", "EXIT_ACKNOWLEDGED", "UNKNOWN"):
-        try:
-            created_raw = order.get("created_ts")
-            if isinstance(created_raw, str):
-                created = datetime.fromisoformat(created_raw)
-            else:
-                created = created_raw  # assume datetime
-            age = (datetime.now(timezone.utc) - created).total_seconds()
-            if age > 300:
-                audit(
-                    client_id,
-                    "WARNING",
-                    "ORDER_PENDING_LONG",
-                    {
-                        "local_order_id": local_id,
-                        "broker_order_id": broker_id,
-                        "kind": kind,
-                        "age_seconds": age,
-                    },
-                )
-        except Exception:
-            pass
-        return
-
-    # ── BROKER ERROR ─────────────────────────────────────────────────-----
-    if result["status"] == "ERROR":
+    # ── UNKNOWN / ERROR ──────────────────────────────────────────────────
+    if mapped in ("UNKNOWN", "ERROR"):
         emit_fill_event(
             order,
-            decision="ERROR",
-            reason_code="BROKER_FILL_CHECK_ERROR",
-            explanation=f"Broker fill check failed: {result.get('reason')}",
+            decision="ERROR" if mapped == "ERROR" else "ALERT",
+            reason_code="BROKER_FILL_CHECK_ERROR" if mapped == "ERROR" else "BROKER_STATUS_UNKNOWN",
+            explanation=f"Broker fill check unresolved: {result.get('reason')}",
             result=result,
         )
+        log.warning(
+            "[%s] Unresolved broker state | order=%s broker=%s status=%s reason=%s",
+            client_id,
+            local_id,
+            broker_id,
+            mapped,
+            result.get("reason"),
+        )
+        if osm:
+            osm.increment_retry(local_id)
 
         audit(
             client_id,
-            "ERROR",
-            "ORDER_CHECK_ERROR",
-            {
-                "local_order_id": local_id,
-                "broker_order_id": broker_id,
-                "reason": result.get("reason"),
-            },
+            "ERROR" if mapped == "ERROR" else "WARNING",
+            "ORDER_CHECK_ERROR" if mapped == "ERROR" else "ORDER_STATUS_UNKNOWN",
+            {"local_order_id": local_id, "broker_order_id": broker_id, "reason": result.get("reason")},
         )
+        return
+
+    # Fallback guard
+    log.warning(
+        "[%s] Unhandled broker mapped status | order=%s broker=%s mapped=%s",
+        client_id,
+        local_id,
+        broker_id,
+        mapped,
+    )
+    if osm:
+        osm.increment_retry(local_id)
+
+
+def _audit_long_pending(order: dict, kind: str, client_id: str, local_id: str, broker_id: str):
+    try:
+        created_raw = order.get("created_ts")
+        if isinstance(created_raw, str):
+            created = datetime.fromisoformat(created_raw)
+        else:
+            created = created_raw
+        if not created:
+            return
+        age = (datetime.now(timezone.utc) - created).total_seconds()
+        if age > 300:
+            audit(
+                client_id,
+                "WARNING",
+                "ORDER_PENDING_LONG",
+                {"local_order_id": local_id, "broker_order_id": broker_id, "kind": kind, "age_seconds": age},
+            )
+    except Exception:
+        pass
+
+
+def _sync_exit_price(order: dict, result: dict):
+    try:
+        from ap.exit_price_sync import sync_exit_price_to_dashboard
+
+        pos_id = order.get("position_id")
+        avg_fill = result.get("avg_fill")
+        entry_price = order.get("entry_price") or order.get("fill_price")
+        ticker = (order.get("symbol") or "").upper()
+
+        if pos_id and avg_fill is not None:
+            sync_exit_price_to_dashboard(
+                position_id=str(pos_id),
+                exit_avg_fill=float(avg_fill),
+                entry_price=float(entry_price) if entry_price else None,
+                ticker=ticker,
+            )
+    except ImportError:
+        pass
+    except Exception as exc:
+        log.debug("[%s] exit_price_sync failed (non-critical): %s", order.get("client_id"), exc)
 
 
 # =============================================================================
-# MAIN LOOP
+# MAIN LOOP — STOP-EVENT SAFE
 # =============================================================================
-
 
 def fill_monitor_loop(
     broker: BrokerAdapter,
@@ -809,23 +947,29 @@ def fill_monitor_loop(
     osm=None,
     pm=None,
     exit_engine=None,
+    stop_event=None,
+    client_id: str | None = None,
 ):
-    """
-    Fill monitor must NEVER pause on kill switch — it's the reconciliation layer.
+    """Fill monitor must never pause on kill switch — it reconciles reality."""
+    if osm is None and not ALLOW_LEGACY_FILL_MONITOR:
+        raise RuntimeError("fill_monitor_loop requires OSM unless ALLOW_LEGACY_FILL_MONITOR=1")
 
-    osm — APOrderStateMachine instance. Pass it from client_runner so all
-    transitions route through the canonical state machine.
-    """
+    if not client_id:
+        client_id = getattr(osm, "client_id", None) or getattr(pm, "client_id", None)
+    if not client_id:
+        raise ValueError("fill_monitor_loop requires client_id or osm/pm with client_id")
+
     log.info(
-        "Fill monitor started (osm=%s pm=%s ee=%s)",
+        "Fill monitor started | client_id=%s osm=%s pm=%s ee=%s",
+        client_id,
         "wired" if osm else "legacy-fallback",
         "wired" if pm else "none",
         "wired" if exit_engine else "none",
     )
 
-    while True:
+    while not (stop_event and stop_event.is_set()):
         try:
-            pending = get_pending_orders()
+            pending = get_pending_orders(client_id)
             for order in pending:
                 try:
                     process_pending_order(
@@ -835,22 +979,25 @@ def fill_monitor_loop(
                         pm=pm,
                         exit_engine=exit_engine,
                     )
-                except Exception as e:
-                    log.exception(
-                        "Failed to process order %s: %s",
-                        order.get("local_order_id"),
-                        e,
-                    )
-            time.sleep(poll_seconds)
-        except Exception as e:
-            log.exception("Fill monitor loop error: %s", e)
-            time.sleep(poll_seconds * 2)
+                except Exception as exc:
+                    log.exception("Failed to process order %s: %s", order.get("local_order_id"), exc)
+
+            if stop_event:
+                stop_event.wait(poll_seconds)
+            else:
+                time.sleep(poll_seconds)
+
+        except Exception as exc:
+            log.exception("Fill monitor loop error: %s", exc)
+            if stop_event:
+                stop_event.wait(poll_seconds * 2)
+            else:
+                time.sleep(poll_seconds * 2)
 
 
 # =============================================================================
-# LEGACY FALLBACK HELPERS (deprecated — used only when osm=None)
+# LEGACY FALLBACK HELPERS (deprecated — used only when ALLOW_LEGACY_FILL_MONITOR=1)
 # =============================================================================
-
 
 def _legacy_update_order_status(
     local_order_id: str,
@@ -859,6 +1006,9 @@ def _legacy_update_order_status(
     error: str | None = None,
 ):
     """DEPRECATED: Direct DB write. Use osm.transition() instead."""
+    if not ALLOW_LEGACY_FILL_MONITOR:
+        raise RuntimeError("legacy fill monitor path disabled")
+
     with conn() as c:
         updates = ["status=%s", "updated_ts=%s"]
         params = [status, now_utc_iso()]
@@ -873,10 +1023,11 @@ def _legacy_update_order_status(
         run_with_retry(lambda: c.execute(sql, params))
 
 
-def _legacy_create_position_from_fill(
-    order: dict, avg_fill_price: float, filled_qty: int
-):
-    """DEPRECATED: Direct DB write. OSM.transition(FILLED) handles this via position_manager."""
+def _legacy_create_position_from_fill(order: dict, avg_fill_price: float, filled_qty: int):
+    """DEPRECATED: Direct DB write. OSM/PM path should handle position opening."""
+    if not ALLOW_LEGACY_FILL_MONITOR:
+        raise RuntimeError("legacy fill monitor path disabled")
+
     import uuid
 
     pos_id = str(uuid.uuid4())
@@ -932,7 +1083,10 @@ def _legacy_create_position_from_fill(
 
 
 def _legacy_close_position_from_exit_fill(order: dict, avg_fill_price: float):
-    """DEPRECATED: Direct DB write. OSM.transition(EXIT_FILLED) via exit engine handles this."""
+    """DEPRECATED: Direct DB write. OSM.transition(EXIT_FILLED) via exit engine should handle this."""
+    if not ALLOW_LEGACY_FILL_MONITOR:
+        raise RuntimeError("legacy fill monitor path disabled")
+
     client_id = order["client_id"]
     position_id = order.get("position_id")
 
@@ -957,11 +1111,7 @@ def _legacy_close_position_from_exit_fill(order: dict, avg_fill_price: float):
     qty = int(pos["qty"])
     exit_px = float(avg_fill_price)
     realized_pnl = (exit_px - entry_price) * qty * OPT_MULTIPLIER
-    realized_pnl_pct = (
-        round(((exit_px - entry_price) / entry_price) * 100, 2)
-        if entry_price > 0
-        else 0.0
-    )
+    realized_pnl_pct = round(((exit_px - entry_price) / entry_price) * 100, 2) if entry_price > 0 else 0.0
 
     with conn() as c:
         run_with_retry(
@@ -1013,12 +1163,11 @@ def _legacy_close_position_from_exit_fill(order: dict, avg_fill_price: float):
         },
     )
 
-    # Update proof_trades with actual broker fill price (non-critical)
     try:
-        _epx = exit_px
-        _pct = realized_pnl_pct
-        _win = realized_pnl_pct > 0
-        _cid = client_id
+        epx = exit_px
+        pct = realized_pnl_pct
+        win = realized_pnl_pct > 0
+        cid = client_id
 
         def _update_proof():
             with conn() as c2:
@@ -1032,21 +1181,12 @@ def _legacy_close_position_from_exit_fill(order: dict, avg_fill_price: float):
                       AND closed_at >= NOW() - INTERVAL '4 hours'
                       AND ABS(COALESCE(exit_option_price,0) - %s) > 0.05
                     """,
-                    (_epx, _pct, _win, _cid, _epx),
+                    (epx, pct, win, cid, epx),
                 )
                 return c2.rowcount
 
         updated = run_with_retry(_update_proof) or 0
         if updated:
-            log.info(
-                "[%s] proof_trades corrected with actual fill $%.4f pnl=%.1f%%",
-                client_id,
-                exit_px,
-                realized_pnl_pct,
-            )
-    except Exception as _pe:
-        log.debug(
-            "[%s] proof_trades correction (non-critical): %s",
-            client_id,
-            _pe,
-        )
+            log.info("[%s] proof_trades corrected with actual fill $%.4f pnl=%.1f%%", client_id, exit_px, realized_pnl_pct)
+    except Exception as exc:
+        log.debug("[%s] proof_trades correction (non-critical): %s", client_id, exc)
