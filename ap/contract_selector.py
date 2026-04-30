@@ -139,6 +139,27 @@ log = logging.getLogger("ap.contract_selector")
 
 _PRO_QUALITY_ENABLED = os.getenv("PRO_CONTRACT_QUALITY", "true").lower() != "false"
 
+# Safety defaults:
+# - Guard subsystem errors fail closed unless explicitly overridden.
+# - Budget clipping is explicit and observable so upstream sizing does not silently disagree.
+_SELECTOR_FAIL_OPEN_GUARD_ERRORS = os.getenv("SELECTOR_FAIL_OPEN_GUARD_ERRORS", "0") == "1"
+_QUALITY_RULES_VERSION = os.getenv("CONTRACT_QUALITY_RULES_VERSION", "contract_selector_v1")
+
+def _max_trade_usd() -> float:
+    try:
+        return float(os.getenv("MAX_TRADE_USD", "500"))
+    except Exception:
+        return 500.0
+
+def _effective_budget(raw_budget: float) -> tuple[float, float, bool]:
+    cap = _max_trade_usd()
+    try:
+        budget = float(raw_budget or 0)
+    except Exception:
+        budget = 0.0
+    eff = min(budget, cap)
+    return eff, cap, bool(budget > cap)
+
 _PRO_TIER1_TICKERS = {
     "SPY", "QQQ", "IWM", "DIA",
     "AAPL", "MSFT", "NVDA", "AMD", "META", "GOOG", "GOOGL",
@@ -233,6 +254,10 @@ class SelectedContract:
     selection_reason:      str
     selection_score:       float
     dte:                   int
+    scoring_price_per_share: float = 0.0
+    execution_price_per_share: float = 0.0
+    effective_budget: float = 0.0
+    budget_clipped: bool = False
 
     def to_dict(self) -> dict:
         return {
@@ -253,6 +278,10 @@ class SelectedContract:
             "selection_reason":     self.selection_reason,
             "selection_score":      self.selection_score,
             "dte":                  self.dte,
+            "scoring_price_per_share": self.scoring_price_per_share,
+            "execution_price_per_share": self.execution_price_per_share,
+            "effective_budget": self.effective_budget,
+            "budget_clipped": self.budget_clipped,
         }
 
 
@@ -312,6 +341,8 @@ class APContractSelectionEngine:
             "max_dte":                self.max_dte,
             "prefer_weekly":          self.prefer_weekly,
             "pro_quality_enabled":    _PRO_QUALITY_ENABLED,
+            "guard_error_fail_open":   _SELECTOR_FAIL_OPEN_GUARD_ERRORS,
+            "quality_rules_version":   _QUALITY_RULES_VERSION,
             "pro_min_bid":            _PRO_MIN_BID,
             "pro_min_bid_size_hard":  _PRO_MIN_BID_SIZE_HARD,
             "pro_t1_spread_hard_max": _PRO_T1_SPREAD_HARD_MAX,
@@ -460,17 +491,25 @@ class APContractSelectionEngine:
                     )
                     return None
             except Exception as exc:
-                log.warning("[%s] EarningsGuard raised unexpectedly (%s) -- continuing (fail open)",
-                            ticker, exc)
+                fail_open = bool(_SELECTOR_FAIL_OPEN_GUARD_ERRORS)
+                log.warning(
+                    "[%s] EarningsGuard raised unexpectedly (%s) -- %s",
+                    ticker, exc, "continuing by override" if fail_open else "blocking fail-closed",
+                )
                 self._emit_selector_event(
                     plan,
                     stage="earnings_gate",
-                    decision="ERROR",
+                    decision="ERROR" if fail_open else "REJECT",
                     reason_code="EARNINGS_GUARD_ERROR",
-                    explanation=f"EarningsGuard exception; selector continued fail-open: {exc}",
+                    explanation=(
+                        f"EarningsGuard exception; selector "
+                        f"{'continued fail-open by env override' if fail_open else 'blocked fail-closed'}: {exc}"
+                    ),
                     inputs={"ticker": ticker},
-                    context={"fail_open": True},
+                    context={"fail_open": fail_open},
                 )
+                if not fail_open:
+                    return None
 
         # ── A. FETCH CHAIN ────────────────────────────────────────────────────
         try:
@@ -491,6 +530,7 @@ class APContractSelectionEngine:
             log.warning("[%s] EMPTY CHAIN -- Tradier returned no options", ticker)
             self._emit_selector_event(
                 plan,
+                stage="chain_fetch",
                 decision="REJECT",
                 reason_code="NO_CHAIN_DATA",
                 explanation="Tradier returned empty options chain",
@@ -575,17 +615,25 @@ class APContractSelectionEngine:
                             thresholds={"momentum_min_score": min_score},
                         )
             except Exception as exc:
-                log.warning("[%s] IVRankFilter raised unexpectedly (%s) -- continuing (fail open)",
-                            ticker, exc)
+                fail_open = bool(_SELECTOR_FAIL_OPEN_GUARD_ERRORS)
+                log.warning(
+                    "[%s] IVRankFilter raised unexpectedly (%s) -- %s",
+                    ticker, exc, "continuing by override" if fail_open else "blocking fail-closed",
+                )
                 self._emit_selector_event(
                     plan,
                     stage="iv_gate",
-                    decision="ERROR",
+                    decision="ERROR" if fail_open else "REJECT",
                     reason_code="IV_FILTER_ERROR",
-                    explanation=f"IVRankFilter exception; selector continued fail-open: {exc}",
+                    explanation=(
+                        f"IVRankFilter exception; selector "
+                        f"{'continued fail-open by env override' if fail_open else 'blocked fail-closed'}: {exc}"
+                    ),
                     inputs={"ticker": ticker, "underlying_price": _safe_float(underlying_price)},
-                    context={"fail_open": True},
+                    context={"fail_open": fail_open},
                 )
+                if not fail_open:
+                    return None
 
         # Fail closed on stub price data
         if isinstance(plan, dict):
@@ -767,6 +815,32 @@ class APContractSelectionEngine:
         if selected is None:
             return None
 
+        _effective_budget_used, _max_trade_cap, _budget_was_clipped = _effective_budget(budget)
+        if _budget_was_clipped:
+            log.warning(
+                "[%s] Budget clipped by selector | upstream_budget=$%.0f max_trade_usd=$%.0f effective_budget=$%.0f",
+                ticker, budget, _max_trade_cap, _effective_budget_used,
+            )
+            self._emit_selector_event(
+                plan,
+                stage="budget_gate",
+                decision="ALLOW",
+                reason_code="BUDGET_CLIPPED_BY_SELECTOR",
+                explanation=(
+                    f"Upstream budget ${budget:.0f} clipped to MAX_TRADE_USD "
+                    f"${_max_trade_cap:.0f}; effective selector budget=${_effective_budget_used:.0f}"
+                ),
+                contract=selected.contract_symbol,
+                inputs={
+                    "upstream_budget": _safe_float(budget),
+                    "effective_budget": _safe_float(_effective_budget_used),
+                    "max_trade_usd": _safe_float(_max_trade_cap),
+                    "premium_per_contract": _safe_float(selected.premium_per_contract),
+                },
+                thresholds={"max_trade_usd": _max_trade_cap},
+                context={"budget_clipped": True},
+            )
+
         # ── E. AFFORDABILITY GATE ────────────────────────────────────────────
         if selected.affordable_contracts < 1:
             if self.mode.upper() != "LIVE":
@@ -825,6 +899,10 @@ class APContractSelectionEngine:
                     premium_per_share    = selected.premium_per_share,
                     premium_per_contract = selected.premium_per_contract,
                     affordable_contracts = 1,
+                    scoring_price_per_share   = selected.scoring_price_per_share,
+                    execution_price_per_share = selected.execution_price_per_share,
+                    effective_budget          = selected.effective_budget,
+                    budget_clipped            = selected.budget_clipped,
                     selection_reason     = selected.selection_reason + " [forced_1]",
                     selection_score      = selected.selection_score,
                     dte                  = selected.dte,
@@ -890,6 +968,7 @@ class APContractSelectionEngine:
                 )
                 self._emit_selector_event(
                     plan,
+                    stage="deep_otm_gate",
                     decision="REJECT",
                     reason_code="DELTA_OUT_OF_RANGE",
                     explanation=(
@@ -937,11 +1016,21 @@ class APContractSelectionEngine:
             plan["limit_price"]     = selected.ask
             plan["contracts"]       = selected.affordable_contracts
             plan["max_position_usd"] = plan["contracts"] * selected.premium_per_contract
+            plan["selector_effective_budget"] = selected.effective_budget
+            plan["selector_budget_clipped"] = selected.budget_clipped
+            plan["selector_scoring_price"] = selected.scoring_price_per_share
+            plan["selector_execution_price"] = selected.execution_price_per_share
+            plan["selector_pricing_basis"] = "ASK_EXECUTION"
         else:
             plan.contract_symbol  = selected.contract_symbol
             plan.limit_price      = selected.ask
             plan.contracts        = selected.affordable_contracts
             plan.max_position_usd = plan.contracts * selected.premium_per_contract
+            plan.selector_effective_budget = selected.effective_budget
+            plan.selector_budget_clipped = selected.budget_clipped
+            plan.selector_scoring_price = selected.scoring_price_per_share
+            plan.selector_execution_price = selected.execution_price_per_share
+            plan.selector_pricing_basis = "ASK_EXECUTION"
         if _wick_confidence and not getattr(plan, "wick_confidence", None):
             try:
                 plan.wick_confidence = _wick_confidence
@@ -961,6 +1050,11 @@ class APContractSelectionEngine:
             inputs={
                 "selection_score":      selected.selection_score,
                 "premium_per_contract": selected.premium_per_contract,
+                "scoring_price_per_share": selected.scoring_price_per_share,
+                "execution_price_per_share": selected.execution_price_per_share,
+                "effective_budget": selected.effective_budget,
+                "budget_clipped": selected.budget_clipped,
+                "pricing_basis": "ASK_EXECUTION",
                 "spread_pct":           selected.spread_pct,
                 "oi":                   selected.open_interest,
                 "volume":               selected.volume,
@@ -978,6 +1072,8 @@ class APContractSelectionEngine:
                 "selection_reason":    selected.selection_reason,
                 "mode":                self.mode,
                 "simulation_override": "[forced_1]" in (selected.selection_reason or ""),
+                "quality_rules_version": _QUALITY_RULES_VERSION,
+                "budget_clipped":       _budget_was_clipped,
             },
         )
 
@@ -1223,7 +1319,7 @@ class APContractSelectionEngine:
         MAX_IDEAL_PREMIUM = float(os.getenv("MAX_IDEAL_PREMIUM", "3.50"))
         premium_penalty   = max(0.0, mid - MAX_IDEAL_PREMIUM)
 
-        effective_budget = min(budget, float(os.getenv("MAX_TRADE_USD", "500")))
+        effective_budget, _, _ = _effective_budget(budget)
         affordable = int(effective_budget / premium) if premium > 0 else 0
 
         delta_distance = abs(delta - self.target_delta)
@@ -1286,11 +1382,15 @@ class APContractSelectionEngine:
             except Exception:
                 dte = 0
 
-            premium_per_share    = mid
-            premium_per_contract = mid * 100
-            MAX_TRADE_USD        = float(os.getenv("MAX_TRADE_USD", "500"))
-            effective_budget     = min(budget, MAX_TRADE_USD)
-            affordable           = int(effective_budget / premium_per_contract) if premium_per_contract > 0 else 0
+            # Keep ranking/scoring on mid, but live affordability and order cost must use
+            # the executable buy-side price. This prevents a contract from fitting
+            # at mid while the submitted ask-limit order exceeds the authorized budget.
+            scoring_price_per_share   = mid
+            execution_price_per_share = ask
+            premium_per_share         = execution_price_per_share
+            premium_per_contract      = execution_price_per_share * 100
+            effective_budget, MAX_TRADE_USD, budget_clipped = _effective_budget(budget)
+            affordable                = int(effective_budget / premium_per_contract) if premium_per_contract > 0 else 0
 
             return SelectedContract(
                 contract_symbol      = opt.get("symbol", ""),
@@ -1317,6 +1417,10 @@ class APContractSelectionEngine:
                 ),
                 selection_score      = score,
                 dte                  = dte,
+                scoring_price_per_share   = scoring_price_per_share,
+                execution_price_per_share = execution_price_per_share,
+                effective_budget          = effective_budget,
+                budget_clipped            = budget_clipped,
             )
         except Exception as e:
             log.error("_build_selected failed: %s", e)
