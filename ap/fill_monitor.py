@@ -61,6 +61,15 @@ ALLOW_LEGACY_FILL_MONITOR = (
     in {"1", "true", "yes", "on"}
 )
 
+AP_ENV = os.getenv("AP_ENV", os.getenv("ENV", "production")).strip().lower()
+PRODUCTION_MODE = AP_ENV in {"prod", "production", "live"} or os.getenv("AP_LIVE_TRADING", "0").strip().lower() in {"1", "true", "yes", "on"}
+
+if PRODUCTION_MODE and ALLOW_LEGACY_FILL_MONITOR:
+    raise RuntimeError(
+        "ALLOW_LEGACY_FILL_MONITOR=1 is forbidden in production/live mode; "
+        "fill_monitor must use OSM/PM as the source-of-truth path."
+    )
+
 ACTIVE_BROKER_STATUSES = {
     "OPEN",
     "PENDING",
@@ -120,6 +129,16 @@ def audit(client_id: str, level: str, event: str, payload: dict):
             exc,
         )
 
+
+
+def _safe_alert(alert_fn, msg: str) -> None:
+    """Best-effort operator alert. Never block reconciliation."""
+    if not alert_fn:
+        return
+    try:
+        alert_fn(msg)
+    except Exception as exc:
+        log.debug("Fill monitor alert_fn failed non-critical: %s", exc)
 
 def emit_fill_event(
     order: dict,
@@ -348,7 +367,7 @@ def _release_entry_guards(order: dict):
 # PAIR MANAGER HELPER — BROKER CANCEL FIRST
 # =============================================================================
 
-def _cancel_pair_opposite(order: dict, broker: BrokerAdapter, osm) -> None:
+def _cancel_pair_opposite(order: dict, broker: BrokerAdapter, osm, alert_fn=None) -> None:
     """
     On ENTRY fill: cancel the opposite side of a 1-1 pair.
 
@@ -389,11 +408,32 @@ def _cancel_pair_opposite(order: dict, broker: BrokerAdapter, osm) -> None:
             log.warning("[%s] Could not resolve opposite broker id: %s", ticker, exc)
 
         if not resolved_broker_id:
-            log.warning(
-                "[%s] Pair cancel skipped — no broker_order_id for local_order_id=%s",
-                ticker,
-                cancel_local_id,
+            msg = f"PAIR_CANCEL_SKIPPED_NO_BROKER_ID | {ticker} | opposite_local={cancel_local_id} | filled_local={filled_local_id}"
+            log.warning("[%s] %s", ticker, msg)
+            audit(
+                str(order.get("client_id") or "default"),
+                "CRITICAL",
+                "PAIR_CANCEL_SKIPPED_NO_BROKER_ID",
+                {
+                    "filled_local_order_id": filled_local_id,
+                    "opposite_local_order_id": cancel_local_id,
+                    "symbol": ticker,
+                    "side": side,
+                    "reason": "opposite order has no broker_order_id",
+                },
             )
+            emit_fill_event(
+                order,
+                decision="ERROR",
+                reason_code="PAIR_CANCEL_SKIPPED_NO_BROKER_ID",
+                explanation=msg,
+                result={},
+                extra_context={
+                    "filled_local_order_id": filled_local_id,
+                    "opposite_local_order_id": cancel_local_id,
+                },
+            )
+            _safe_alert(alert_fn, f"[fill_monitor:{order.get('client_id')}] {msg}")
             return
 
         try:
@@ -402,13 +442,37 @@ def _cancel_pair_opposite(order: dict, broker: BrokerAdapter, osm) -> None:
             else:
                 _cancel_with_session(broker, resolved_broker_id)
         except Exception as exc:
-            log.warning(
-                "[%s] Broker pair cancel failed | local=%s broker=%s error=%s",
-                ticker,
-                cancel_local_id,
-                resolved_broker_id,
-                exc,
+            msg = (
+                f"PAIR_CANCEL_BROKER_FAILED | {ticker} | opposite_local={cancel_local_id} "
+                f"broker={resolved_broker_id} error={exc}"
             )
+            log.warning("[%s] %s", ticker, msg)
+            audit(
+                str(order.get("client_id") or "default"),
+                "CRITICAL",
+                "PAIR_CANCEL_BROKER_FAILED",
+                {
+                    "filled_local_order_id": filled_local_id,
+                    "opposite_local_order_id": cancel_local_id,
+                    "opposite_broker_order_id": resolved_broker_id,
+                    "symbol": ticker,
+                    "side": side,
+                    "error": str(exc),
+                },
+            )
+            emit_fill_event(
+                order,
+                decision="ERROR",
+                reason_code="PAIR_CANCEL_BROKER_FAILED",
+                explanation=msg,
+                result={},
+                extra_context={
+                    "filled_local_order_id": filled_local_id,
+                    "opposite_local_order_id": cancel_local_id,
+                    "opposite_broker_order_id": resolved_broker_id,
+                },
+            )
+            _safe_alert(alert_fn, f"[fill_monitor:{order.get('client_id')}] {msg}")
             return
 
         ok = osm.transition(
@@ -424,11 +488,36 @@ def _cancel_pair_opposite(order: dict, broker: BrokerAdapter, osm) -> None:
                 cancel_local_id,
                 resolved_broker_id,
             )
+            audit(
+                str(order.get("client_id") or "default"),
+                "INFO",
+                "PAIR_CANCEL_CONFIRMED",
+                {
+                    "filled_local_order_id": filled_local_id,
+                    "opposite_local_order_id": cancel_local_id,
+                    "opposite_broker_order_id": resolved_broker_id,
+                    "symbol": ticker,
+                    "side": side,
+                },
+            )
 
     except ImportError:
         pass
     except Exception as exc:
-        log.debug("Pair manager cancel failed (non-critical): %s", exc)
+        msg = f"PAIR_CANCEL_MANAGER_FAILED | {order.get('symbol','?')} | local={order.get('local_order_id')} error={exc}"
+        log.warning(msg)
+        audit(
+            str(order.get("client_id") or "default"),
+            "WARNING",
+            "PAIR_CANCEL_MANAGER_FAILED",
+            {
+                "local_order_id": order.get("local_order_id"),
+                "broker_order_id": order.get("broker_order_id"),
+                "symbol": order.get("symbol"),
+                "error": str(exc),
+            },
+        )
+        _safe_alert(alert_fn, f"[fill_monitor:{order.get('client_id')}] {msg}")
 
 
 def _cancel_with_session(broker: BrokerAdapter, broker_order_id: str):
@@ -531,8 +620,28 @@ def _place_standing_stop_best_effort(
         ticker = (order.get("symbol") or "").upper()
 
         if hasattr(broker, "place_stop_order"):
-            broker.place_stop_order(symbol=contract, qty=qty, stop_price=stop_px)
-            log.info("[%s] Standing stop placed via broker helper @ $%.2f", ticker, stop_px)
+            stop_resp = broker.place_stop_order(symbol=contract, qty=qty, stop_price=stop_px)
+            stop_id = None
+            stop_stat = "unknown"
+            if isinstance(stop_resp, dict):
+                stop_id = stop_resp.get("id") or stop_resp.get("order_id") or stop_resp.get("broker_order_id")
+                stop_stat = str(stop_resp.get("status") or stop_resp.get("state") or "unknown")
+            log.info("[%s] Standing stop placed via broker helper @ $%.2f | broker_stop=%s status=%s", ticker, stop_px, stop_id or "?", stop_stat)
+            audit(
+                order["client_id"],
+                "INFO",
+                "STOP_ORDER_PLACED",
+                {
+                    "local_order_id": order.get("local_order_id"),
+                    "ticker": ticker,
+                    "contract": contract,
+                    "qty": int(qty),
+                    "stop_px": stop_px,
+                    "broker_stop_order_id": stop_id,
+                    "broker_stop_status": stop_stat,
+                    "source": "broker_helper",
+                },
+            )
             return
 
         base_url = (
@@ -575,6 +684,21 @@ def _place_standing_stop_best_effort(
                 stop_px,
                 stop_id,
                 stop_stat,
+            )
+            audit(
+                order["client_id"],
+                "INFO",
+                "STOP_ORDER_PLACED",
+                {
+                    "local_order_id": order.get("local_order_id"),
+                    "ticker": ticker,
+                    "contract": contract,
+                    "qty": int(qty),
+                    "stop_px": stop_px,
+                    "broker_stop_order_id": stop_id,
+                    "broker_stop_status": stop_stat,
+                    "source": "rest",
+                },
             )
         else:
             err_body = getattr(resp, "text", "")[:200]
@@ -817,7 +941,10 @@ def process_pending_order(
     osm=None,
     pm=None,
     exit_engine=None,
+    alert_fn=None,
 ):
+    if PRODUCTION_MODE and ALLOW_LEGACY_FILL_MONITOR:
+        raise RuntimeError("ALLOW_LEGACY_FILL_MONITOR=1 is forbidden in production/live mode")
     if osm is None and not ALLOW_LEGACY_FILL_MONITOR:
         raise RuntimeError("fill_monitor requires OSM unless ALLOW_LEGACY_FILL_MONITOR=1")
 
@@ -911,7 +1038,7 @@ def process_pending_order(
                 )
 
                 # Pair cancel is broker-first/local-second.
-                _cancel_pair_opposite(order, broker, osm)
+                _cancel_pair_opposite(order, broker, osm, alert_fn=alert_fn)
 
                 # Persist local position BEFORE placing optional standing stop.
                 position_id = _open_position_safe(
@@ -1132,6 +1259,10 @@ def process_pending_order(
                     "anomaly_status": FILL_ANOMALY_STATUS,
                 },
             )
+            _safe_alert(
+                alert_fn,
+                f"[fill_monitor:{client_id}] BROKER_FILL_ANOMALY_ESCALATED | order={local_id} broker={broker_id} status={mapped} count={anomaly_count} reason={result.get('reason')}",
+            )
             _mark_broker_fill_anomaly(osm, order, reason=reason, mapped=mapped)
 
         return
@@ -1203,8 +1334,11 @@ def fill_monitor_loop(
     exit_engine=None,
     stop_event=None,
     client_id: str | None = None,
+    alert_fn=None,
 ):
     """Fill monitor must never pause on kill switch — it reconciles reality."""
+    if PRODUCTION_MODE and ALLOW_LEGACY_FILL_MONITOR:
+        raise RuntimeError("ALLOW_LEGACY_FILL_MONITOR=1 is forbidden in production/live mode")
     if osm is None and not ALLOW_LEGACY_FILL_MONITOR:
         raise RuntimeError("fill_monitor_loop requires OSM unless ALLOW_LEGACY_FILL_MONITOR=1")
 
@@ -1232,6 +1366,7 @@ def fill_monitor_loop(
                         osm=osm,
                         pm=pm,
                         exit_engine=exit_engine,
+                        alert_fn=alert_fn,
                     )
                 except Exception as exc:
                     log.exception("Failed to process order %s: %s", order.get("local_order_id"), exc)
