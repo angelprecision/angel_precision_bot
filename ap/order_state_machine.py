@@ -13,6 +13,7 @@
 # whether the requested lifecycle move is legal.
 # =============================================================================
 
+# CONTRACT: Any caller that passes filled_qty MUST pass the broker cumulative filled quantity for that order, not an incremental fill delta.
 from __future__ import annotations
 
 import logging
@@ -405,9 +406,33 @@ class APOrderStateMachine:
         old_status = current.get("status", "")
         kind = current.get("kind", "")
 
+        prev_filled = self._safe_int(current.get("filled_qty"), 0)
+        same_state_fill_update = False
+
+        # filled_qty contract: broker cumulative quantity only, never incremental.
+        if filled_qty is not None:
+            incoming_filled = self._safe_int(filled_qty, None)
+            if incoming_filled is None:
+                log.critical("[%s] INVALID FILL QTY | order=%s filled_qty=%r", self.client_id, local_order_id, filled_qty)
+                return False
+            if incoming_filled < prev_filled:
+                log.critical("[%s] INVALID CUMULATIVE FILL REGRESSION | order=%s new=%s prev=%s", self.client_id, local_order_id, incoming_filled, prev_filled)
+                self._emit_transition_event(
+                    local_order_id=local_order_id, old_status=old_status, new_status=new_status,
+                    order=current, decision="REJECT", reason_code="FILL_QTY_REGRESSION",
+                    explanation=f"filled_qty must be cumulative: new={incoming_filled} prev={prev_filled}",
+                    broker_order_id=broker_order_id, filled_qty=filled_qty, fill_price=fill_price, last_error=last_error,
+                )
+                return False
+
         if old_status == new_status:
-            log.debug("[%s] %s already %s — no-op", self.client_id, local_order_id, new_status)
-            return True
+            # Same-state fill updates are not no-ops.
+            # Brokers can report EXIT_PARTIAL_FILL cum=1 then EXIT_PARTIAL_FILL cum=2.
+            if new_status in (OrderStatus.PARTIAL_FILL, OrderStatus.EXIT_PARTIAL_FILL):
+                same_state_fill_update = True
+            else:
+                log.debug("[%s] %s already %s — no-op", self.client_id, local_order_id, new_status)
+                return True
 
         if OrderStatus.is_terminal(old_status):
             reason = f"terminal_transition_blocked:{old_status}->{new_status}"
@@ -431,7 +456,7 @@ class APOrderStateMachine:
             )
             return False
 
-        if not OrderStatus.can_transition(old_status, new_status):
+        if not same_state_fill_update and not OrderStatus.can_transition(old_status, new_status):
             reason = f"illegal_transition:{old_status}->{new_status}"
             log.critical(
                 "[%s] ILLEGAL TRANSITION — %s: %s -> %s | kind=%s broker=%s filled=%s price=%s",
@@ -538,12 +563,36 @@ class APOrderStateMachine:
             new_status=new_status,
             position_id=position_id,
             filled_qty=filled_qty,
+            fill_price=fill_price,
+            broker_order_id=broker_order_id or current.get("broker_order_id"),
+            local_order_id=local_order_id,
         )
 
         return True
 
-    def _handle_exit_engine_hooks(self, *, current: dict, new_status: str, position_id=None, filled_qty=None) -> None:
+    def _handle_exit_engine_hooks(
+        self,
+        *,
+        current: dict,
+        new_status: str,
+        position_id=None,
+        filled_qty=None,
+        fill_price=None,
+        broker_order_id=None,
+        local_order_id=None,
+    ) -> None:
+        """Coordinate broker-confirmed EXIT events with the exit engine.
+
+        Critical invariant:
+            EXIT_FILLED means "this EXIT order fully filled".
+            It does NOT always mean "the whole position is flat".
+
+        Therefore, when a scale-out order reaches EXIT_FILLED, we must apply
+        only that order's filled quantity to the ManagedPosition and keep the
+        runner alive unless quantity_remaining reaches zero.
+        """
         if new_status not in (
+            OrderStatus.EXIT_SUBMITTED,
             OrderStatus.EXIT_FILLED,
             OrderStatus.EXIT_PARTIAL_FILL,
             OrderStatus.CANCELED,
@@ -553,28 +602,151 @@ class APOrderStateMachine:
             return
 
         _pos_id = position_id or current.get("position_id")
-        _kind = current.get("kind", "ENTRY")
+        _kind = str(current.get("kind") or "ENTRY").upper()
         if not _pos_id or _kind != "EXIT":
             return
 
         try:
             _ee = _get_exit_engine_for_client(self.client_id)
             if not _ee:
+                log.warning(
+                    "[%s] EXIT hook skipped — no exit engine registered | order=%s pos=%s status=%s",
+                    self.client_id, local_order_id or current.get("local_order_id"), _pos_id, new_status,
+                )
+                return
+
+            _local_id = local_order_id or current.get("local_order_id")
+            _broker_id = broker_order_id or current.get("broker_order_id")
+            _order_qty = self._safe_int(current.get("qty"), 0)
+            _prev_filled = self._safe_int(current.get("filled_qty"), 0)
+            _cum_filled = self._safe_int(filled_qty, None)
+
+            if _cum_filled is not None and _cum_filled < _prev_filled:
+                log.critical(
+                    "[%s] INVALID EXIT CUMULATIVE FILL | order=%s pos=%s new=%s prev=%s",
+                    self.client_id, _local_id, _pos_id, _cum_filled, _prev_filled,
+                )
+                return
+
+            if new_status == OrderStatus.EXIT_SUBMITTED:
+                if not _broker_id:
+                    log.critical(
+                        "[%s] EXIT_SUBMITTED hook missing broker_order_id | order=%s pos=%s",
+                        self.client_id, _local_id, _pos_id,
+                    )
+                    return
+                self._call_exit_engine(
+                    _ee,
+                    "set_pending_exit_order",
+                    _pos_id,
+                    local_order_id=_local_id,
+                    broker_order_id=_broker_id,
+                    qty=_order_qty,
+                    reason=str(current.get("last_error") or ""),
+                )
+                return
+
+            if new_status == OrderStatus.EXIT_PARTIAL_FILL:
+                if _cum_filled is None:
+                    log.warning(
+                        "[%s] EXIT_PARTIAL_FILL missing filled_qty | order=%s pos=%s — not applying engine fill",
+                        self.client_id, _local_id, _pos_id,
+                    )
+                    return
+                _delta = max(0, _cum_filled - _prev_filled)
+                if _delta > 0:
+                    self._call_exit_engine(
+                        _ee,
+                        "note_partial_exit_fill",
+                        _pos_id,
+                        _delta,
+                        fill_price=fill_price,
+                        local_order_id=_local_id,
+                        broker_order_id=_broker_id,
+                        cumulative_filled=_cum_filled,
+                    )
                 return
 
             if new_status == OrderStatus.EXIT_FILLED:
-                _ee.mark_position_closed(_pos_id, reason="EXIT_FILLED")
-                return
+                # For a fully-filled EXIT order, apply only the unaccounted delta.
+                # If broker did not provide cumulative filled_qty, the order is fully
+                # filled, so use order qty as the cumulative amount for this order.
+                if _cum_filled is None or _cum_filled <= 0:
+                    _cum_filled = _order_qty
+                _delta = max(0, _cum_filled - _prev_filled)
 
-            if new_status == OrderStatus.EXIT_PARTIAL_FILL and filled_qty is not None:
-                prev_filled_qty = int(current.get("filled_qty") or 0)
-                delta = max(0, int(filled_qty) - prev_filled_qty)
-                if delta > 0:
-                    _ee.note_partial_exit_fill(_pos_id, delta)
+                # Determine whether this filled EXIT order flattens the whole position.
+                _pos = self._get_exit_engine_position(_ee, _pos_id)
+                _remaining_before = self._safe_int(getattr(_pos, "quantity_remaining", None), None) if _pos else None
+                if _remaining_before is None:
+                    _remaining_before = self._get_position_remaining_from_db(_pos_id)
+
+                if _delta <= 0:
+                    log.info(
+                        "[%s] EXIT_FILLED hook no-op — no new filled qty | order=%s pos=%s prev=%s cum=%s",
+                        self.client_id, _local_id, _pos_id, _prev_filled, _cum_filled,
+                    )
+                    self._call_exit_engine(
+                        _ee,
+                        "clear_exit_in_flight",
+                        _pos_id,
+                        local_order_id=_local_id,
+                        broker_order_id=_broker_id,
+                    )
+                    return
+
+                # If this exit order sold less than the current remaining position,
+                # it is a completed scale-out order, not a full close.
+                if _remaining_before is not None and _delta < int(_remaining_before):
+                    log.info(
+                        "[%s] EXIT_FILLED treated as completed scale-out | order=%s pos=%s delta=%s remaining_before=%s",
+                        self.client_id, _local_id, _pos_id, _delta, _remaining_before,
+                    )
+                    self._call_exit_engine(
+                        _ee,
+                        "note_partial_exit_fill",
+                        _pos_id,
+                        _delta,
+                        fill_price=fill_price,
+                        local_order_id=_local_id,
+                        broker_order_id=_broker_id,
+                        cumulative_filled=_cum_filled,
+                    )
+                    return
+
+                # Full flatten: order fill quantity equals/exceeds remaining size.
+                log.info(
+                    "[%s] EXIT_FILLED treated as full close | order=%s pos=%s delta=%s remaining_before=%s",
+                    self.client_id, _local_id, _pos_id, _delta, _remaining_before,
+                )
+                self._call_exit_engine(
+                    _ee,
+                    "mark_position_closed",
+                    _pos_id,
+                    reason="EXIT_FILLED",
+                    qty_filled=_delta,
+                    fill_price=fill_price,
+                    local_order_id=_local_id,
+                    broker_order_id=_broker_id,
+                    cumulative_filled=_cum_filled,
+                )
                 return
 
             if new_status in (OrderStatus.CANCELED, OrderStatus.EXPIRED, OrderStatus.REJECTED):
-                _ee.clear_exit_in_flight(_pos_id)
+                if hasattr(_ee, "on_exit_failure"):
+                    _ee.on_exit_failure(
+                        _pos_id,
+                        local_order_id=_local_id,
+                        broker_order_id=_broker_id,
+                        status=new_status,
+                    )
+                elif hasattr(_ee, "clear_exit_in_flight"):
+                    _ee.clear_exit_in_flight(_pos_id)
+                else:
+                    log.critical(
+                        "[%s] Exit failure hook missing on exit engine | order=%s pos=%s status=%s",
+                        self.client_id, _local_id, _pos_id, new_status,
+                    )
                 if new_status == OrderStatus.REJECTED:
                     try:
                         import time as _time
@@ -591,7 +763,115 @@ class APOrderStateMachine:
                     except Exception:
                         pass
         except Exception as _ee_err:
-            log.debug("[%s] exit_eng hook (non-critical): %s", self.client_id, _ee_err)
+            log.exception("[%s] exit_eng hook failed: %s", self.client_id, _ee_err)
+
+    @staticmethod
+    def _safe_int(value, default=0):
+        try:
+            if value is None:
+                return default
+            return int(value)
+        except Exception:
+            return default
+
+    @staticmethod
+    def _call_exit_engine(exit_engine, method_name: str, *args, **kwargs):
+        """Strictly call an exit-engine hook.
+
+        Do not filter kwargs or fall back to positional-only calls. Signature
+        mismatches must surface because they can hide lost order identity or
+        lost cumulative-fill attribution.
+        """
+        method = getattr(exit_engine, method_name, None)
+        if not method:
+            return None
+        return method(*args, **kwargs)
+
+    @staticmethod
+    def _get_exit_engine_position(exit_engine, position_id: str):
+        if not exit_engine or not position_id:
+            return None
+        getter = getattr(exit_engine, "get_position", None)
+        if callable(getter):
+            try:
+                return getter(position_id)
+            except Exception:
+                pass
+        for pos in getattr(exit_engine, "_positions", []) or []:
+            if str(getattr(pos, "position_id", "")) == str(position_id):
+                return pos
+        return None
+
+    def _get_position_remaining_from_db(self, position_id: str):
+        """Best-effort fallback when exit engine is not seeded.
+
+        Supports both older schema (qty only) and hardened schema
+        (quantity_remaining). Returns None if unavailable.
+        """
+        if not position_id:
+            return None
+        try:
+            def _fn():
+                with conn() as c:
+                    c.execute(
+                        "SELECT * FROM positions WHERE client_id=%s AND id=%s LIMIT 1",
+                        (self.client_id, position_id),
+                    )
+                    return c.fetchone()
+            row = run_with_retry(_fn) or {}
+            if not row:
+                return None
+            if row.get("quantity_remaining") is not None:
+                return int(row.get("quantity_remaining") or 0)
+            return int(row.get("qty") or 0)
+        except Exception:
+            return None
+
+    def apply_fill_update(
+        self,
+        local_order_id: str,
+        *,
+        cumulative_filled: int,
+        fill_price=None,
+        broker_order_id=None,
+    ) -> bool:
+        """Apply a broker cumulative fill update without requiring a state change.
+
+        Use this when an order is already PARTIAL_FILL / EXIT_PARTIAL_FILL and
+        the broker reports a larger cumulative filled quantity for the same
+        lifecycle state. The cumulative_filled value MUST be broker cumulative
+        quantity for this order, not an incremental delta.
+        """
+        order = self._get_order(local_order_id)
+        if not order:
+            log.error("[%s] apply_fill_update: order %s not found", self.client_id, local_order_id)
+            return False
+
+        order = dict(order)
+        status = str(order.get("status") or "")
+        kind = str(order.get("kind") or "").upper()
+
+        if status not in (OrderStatus.PARTIAL_FILL, OrderStatus.EXIT_PARTIAL_FILL):
+            log.warning(
+                "[%s] apply_fill_update blocked — order=%s status=%s is not partial-fill",
+                self.client_id, local_order_id, status,
+            )
+            return False
+
+        if status == OrderStatus.EXIT_PARTIAL_FILL and kind != "EXIT":
+            log.critical(
+                "[%s] apply_fill_update blocked — EXIT_PARTIAL_FILL on non-EXIT order=%s kind=%s",
+                self.client_id, local_order_id, kind,
+            )
+            return False
+
+        return self.transition(
+            local_order_id,
+            status,
+            broker_order_id=broker_order_id or order.get("broker_order_id"),
+            filled_qty=cumulative_filled,
+            fill_price=fill_price,
+        )
 
     # ---------------------------------------------------------------------
     # Public readers / mutators
@@ -770,9 +1050,12 @@ class APOrderStateMachine:
             status = (order.get("status") or "").lower()
             broker_order_id = order.get("id") or order.get("order_id")
             if status in ("ok", "pending", "open", "accepted", "filled") and broker_order_id:
-                self.transition(local_id, OrderStatus.SUBMITTED, broker_order_id=broker_order_id, submitted_ts=now_utc_iso())
-                return {"ok": True, "local_order_id": local_id, "broker_order_id": broker_order_id, "status": OrderStatus.SUBMITTED, "error": None}
-            error_msg = f"broker_status:{status or 'unknown'} broker_order_id_missing:{not bool(broker_order_id)}"
+                ok = self.transition(local_id, OrderStatus.SUBMITTED, broker_order_id=broker_order_id, submitted_ts=now_utc_iso())
+                if ok:
+                    return {"ok": True, "local_order_id": local_id, "broker_order_id": broker_order_id, "status": OrderStatus.SUBMITTED, "error": None}
+                error_msg = "submitted_transition_failed_after_broker_accept"
+            else:
+                error_msg = f"broker_status:{status or 'unknown'} broker_order_id_missing:{not bool(broker_order_id)}"
         except Exception as e:
             error_msg = f"broker_error:{e}"
 
@@ -832,10 +1115,13 @@ class APOrderStateMachine:
             order = (resp.json() or {}).get("order") or {}
             status = (order.get("status") or "").lower()
             broker_order_id = order.get("id") or order.get("order_id")
-            if status in ("ok", "pending", "open", "accepted"):
-                self.transition(local_id, OrderStatus.EXIT_SUBMITTED, broker_order_id=broker_order_id, submitted_ts=now_utc_iso())
-                return {"ok": True, "local_order_id": local_id, "broker_order_id": broker_order_id, "status": OrderStatus.EXIT_SUBMITTED, "error": None}
-            error_msg = f"broker_status:{status or 'unknown'}"
+            if status in ("ok", "pending", "open", "accepted", "filled") and broker_order_id:
+                ok = self.transition(local_id, OrderStatus.EXIT_SUBMITTED, broker_order_id=broker_order_id, submitted_ts=now_utc_iso())
+                if ok:
+                    return {"ok": True, "local_order_id": local_id, "broker_order_id": broker_order_id, "status": OrderStatus.EXIT_SUBMITTED, "error": None}
+                error_msg = "exit_submitted_transition_failed_after_broker_accept"
+            else:
+                error_msg = f"broker_status:{status or 'unknown'} broker_order_id_missing:{not bool(broker_order_id)}"
         except Exception as e:
             error_msg = f"broker_error:{e}"
 
@@ -852,10 +1138,10 @@ class APOrderStateMachine:
         # OCC style option symbols start with underlying letters before YYMMDD.
         import re
 
-        m = re.match(r"^([A-Z]{1,6})\d{6}[CP]", raw_contract or raw_symbol)
+        m = re.match(r"^([A-Z]{1,10})\d{6}[CP]", raw_contract or raw_symbol)
         if m:
             return m.group(1)
-        return raw_symbol[:6] if raw_symbol else raw_contract[:6]
+        return raw_symbol if raw_symbol else raw_contract
 
     # ---------------------------------------------------------------------
     # Internal DB helpers
@@ -876,7 +1162,9 @@ class APOrderStateMachine:
         def _fn():
             with conn() as c:
                 c.execute(
-                    "SELECT * FROM orders WHERE client_id=%s AND plan_id=%s AND kind=%s LIMIT 1",
+                    "SELECT * FROM orders WHERE client_id=%s AND plan_id=%s AND kind=%s "
+                    "AND status NOT IN ( 'FILLED', 'EXIT_FILLED', 'REJECTED', 'CANCELED', 'EXPIRED', 'ERROR' ) "
+                    "ORDER BY created_ts DESC LIMIT 1",
                     (self.client_id, plan_id, kind),
                 )
                 return c.fetchone()
@@ -888,7 +1176,8 @@ class APOrderStateMachine:
             with conn() as c:
                 c.execute(
                     "SELECT * FROM orders WHERE client_id=%s AND position_id=%s AND kind='EXIT' "
-                    "AND status NOT IN ('EXIT_FILLED','REJECTED','CANCELED','EXPIRED','ERROR') LIMIT 1",
+                    "AND status NOT IN ('EXIT_FILLED', 'REJECTED', 'CANCELED', 'EXPIRED', 'ERROR') "
+                    "ORDER BY created_ts DESC LIMIT 1",
                     (self.client_id, position_id),
                 )
                 return c.fetchone()
