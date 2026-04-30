@@ -591,6 +591,23 @@ def _is_protective_exit(reason: str) -> bool:
     ))
 
 
+
+def _is_runner_protective_reason(reason: str) -> bool:
+    """Narrow runner-protective classification for emergency override decisions."""
+    r = (reason or "").upper()
+    return (
+        "RUNNER TRAIL" in r
+        or "RUNNER EMERGENCY" in r
+        or "SENTINEL MISSED TP" in r
+        or "MISSED TP" in r
+    )
+
+
+def _is_same_or_equivalent_runner_protection(pending_reason: str, new_reason: str) -> bool:
+    """True when both pending and new exits are already runner/profit-protection closes."""
+    return _is_runner_protective_reason(pending_reason) and _is_runner_protective_reason(new_reason)
+
+
 class APExitEngine:
     """
     Manages all open positions with time-aware exit logic.
@@ -715,509 +732,125 @@ class APExitEngine:
         if pos.pending_exit_qty > 0 and pos.pending_exit_filled_qty > pos.pending_exit_qty:
             raise RuntimeError(f"position invariant failed {context}: pending_exit_filled_qty={pos.pending_exit_filled_qty} > pending_exit_qty={pos.pending_exit_qty} pos_id={pos.position_id}")
 
-    def _can_submit_exit(self, pos: ManagedPosition, now_utc: datetime, *, reason: str = "") -> bool:
+    def _can_submit_exit(
+        self,
+        pos: ManagedPosition,
+        now_utc: datetime,
+        *,
+        reason: str = "",
+        allow_inflight_override: bool = False,
+    ) -> bool:
+        """Centralized gate for every path that can submit an exit order.
+
+        Normal rule:
+            exit_in_flight=True blocks new exits.
+
+        Emergency override rule:
+            allow_inflight_override=True may bypass in-flight only when:
+            - existing in-flight order is stale for >= 20 seconds, OR
+            - the new reason is runner-protective/emergency AND the pending
+              reason is not already an equivalent runner-protective close.
+
+        This prevents duplicate normal exits while allowing true runner rescue.
+        """
         if pos.closed or int(pos.quantity_remaining or 0) <= 0:
             return False
-        if pos.exit_in_flight:
-            self._emit_exit_event(pos, "HOLD", "EXIT_SIGNAL_BLOCKED_IN_FLIGHT", f"Exit suppressed because exit already in flight: {reason or pos.pending_exit_reason}", extra_inputs={"pending_exit_reason": pos.pending_exit_reason, "pending_exit_qty": pos.pending_exit_qty, "pending_exit_filled_qty": pos.pending_exit_filled_qty, "last_exit_signal_ts": str(pos.last_exit_signal_ts or "")})
+
+        if pos.exit_in_flight and not allow_inflight_override:
+            self._emit_exit_event(
+                pos,
+                "HOLD",
+                "EXIT_SIGNAL_BLOCKED_IN_FLIGHT",
+                f"Exit suppressed because exit already in flight: {reason or pos.pending_exit_reason}",
+                extra_inputs={
+                    "pending_exit_reason": pos.pending_exit_reason,
+                    "pending_exit_qty": pos.pending_exit_qty,
+                    "pending_exit_filled_qty": pos.pending_exit_filled_qty,
+                    "last_exit_signal_ts": str(pos.last_exit_signal_ts or ""),
+                },
+            )
             return False
+
+        if pos.exit_in_flight and allow_inflight_override:
+            flight_sec = 0.0
+            if pos.last_exit_signal_ts:
+                flight_sec = (now_utc - pos.last_exit_signal_ts).total_seconds()
+
+            stale_enough = flight_sec >= 20.0
+            emergency_reason = _is_runner_protective_reason(reason)
+            already_same_runner_protection = _is_same_or_equivalent_runner_protection(
+                pos.pending_exit_reason,
+                reason,
+            )
+
+            if already_same_runner_protection and not stale_enough:
+                self._emit_exit_event(
+                    pos,
+                    "HOLD",
+                    "EXIT_OVERRIDE_DENIED_EQUIVALENT_PENDING",
+                    (
+                        "Inflight override denied; pending exit is already an equivalent "
+                        f"runner-protective close and is not stale ({flight_sec:.1f}s)"
+                    ),
+                    extra_inputs={
+                        "flight_sec": flight_sec,
+                        "pending_exit_reason": pos.pending_exit_reason,
+                        "override_reason": reason,
+                    },
+                )
+                return False
+
+            if not stale_enough and not emergency_reason:
+                self._emit_exit_event(
+                    pos,
+                    "HOLD",
+                    "EXIT_OVERRIDE_DENIED",
+                    f"Inflight override denied; existing exit not stale enough: {flight_sec:.1f}s",
+                    extra_inputs={
+                        "flight_sec": flight_sec,
+                        "pending_exit_reason": pos.pending_exit_reason,
+                        "override_reason": reason,
+                    },
+                )
+                return False
+
+            self._emit_exit_event(
+                pos,
+                "ALERT",
+                "EXIT_INFLIGHT_OVERRIDE_ALLOWED",
+                f"Inflight override allowed for emergency exit: {reason}",
+                extra_inputs={
+                    "flight_sec": flight_sec,
+                    "pending_exit_reason": pos.pending_exit_reason,
+                    "pending_exit_qty": pos.pending_exit_qty,
+                    "pending_exit_filled_qty": pos.pending_exit_filled_qty,
+                    "stale_enough": stale_enough,
+                    "emergency_reason": emergency_reason,
+                },
+            )
+            log.warning(
+                "[%s] EXIT IN-FLIGHT OVERRIDE allowed | flight=%.1fs new=%s pending=%s",
+                pos.ticker,
+                flight_sec,
+                reason,
+                pos.pending_exit_reason,
+            )
+
         if pos.last_rejection_ts is not None:
             elapsed = time.time() - pos.last_rejection_ts
             if elapsed < 30:
-                self._emit_exit_event(pos, "HOLD", "EXIT_REJECTION_COOLDOWN", f"Exit suppressed during rejection cooldown: {elapsed:.0f}s", extra_inputs={"cooldown_elapsed_sec": elapsed})
+                self._emit_exit_event(
+                    pos,
+                    "HOLD",
+                    "EXIT_REJECTION_COOLDOWN",
+                    f"Exit suppressed during rejection cooldown: {elapsed:.0f}s",
+                    extra_inputs={"cooldown_elapsed_sec": elapsed},
+                )
                 return False
             pos.last_rejection_ts = None
             pos.last_exit_rejected = False
+
         return True
-
-    def _mark_exit_submitted(self, pos: ManagedPosition, decision: ExitDecision) -> None:
-        pos.exit_in_flight = True
-        pos.pending_exit_reason = decision.reason
-        pos.pending_exit_qty = int(decision.quantity or 0)
-        pos.pending_exit_filled_qty = 0
-        pos.pending_scale_counted = False
-        pos.last_exit_signal_ts = datetime.now(timezone.utc)
-        pos._exit_stuck_count = 0
-
-    def add_position(self, pos: ManagedPosition):
-        with self._lock:
-            for existing in self._positions:
-                same_id  = bool(pos.position_id and existing.position_id == pos.position_id)
-                same_sym = (existing.ticker == pos.ticker and
-                            existing.option_symbol == pos.option_symbol and
-                            not existing.closed)
-                if same_id or same_sym:
-                    log.debug("[%s] Exit engine already tracking %s | pos_id=%s",
-                              self._email or pos.ticker, pos.option_symbol, pos.position_id or "n/a")
-                    return
-            self._positions.append(pos)
-        log.info(
-            f"[{pos.ticker}] Position added to exit engine | "
-            f"{pos.side} {pos.quantity}x {pos.option_symbol} "
-            f"@ ${pos.entry_price:.2f} | "
-            f"target=${pos.underlying_target} stop=${pos.underlying_stop} "
-            f"| pos_id={pos.position_id or 'n/a'}"
-        )
-
-    def start(self):
-        if self._thread and self._thread.is_alive():
-            log.debug("APExitEngine already running [%s]", self._email or "default")
-            return
-        self._running = True
-        # Thread name must match self_healing's components dict:
-        # "exit_engine": (f"ap-exit-engine-{email}", ...)
-        thread_name = f"ap-exit-engine-{self._email}" if self._email else "ap-exit-engine"
-        self._thread  = threading.Thread(
-            target=self._exit_loop,
-            daemon=True,
-            name=thread_name
-        )
-        self._thread.start()
-        log.info(f"APExitEngine started [{thread_name}]")
-
-    def stop(self):
-        self._running = False
-
-    def active_positions(self) -> list[ManagedPosition]:
-        with self._lock:
-            return [p for p in self._positions if not p.closed]
-
-    def get_position(self, position_id: str) -> Optional[ManagedPosition]:
-        """Return the in-memory managed position, if currently tracked."""
-        if not position_id:
-            return None
-        with self._lock:
-            for pos in self._positions:
-                if str(pos.position_id) == str(position_id) and not pos.closed:
-                    return pos
-        return None
-
-    def set_pending_exit_order(
-        self,
-        position_id: str,
-        *,
-        local_order_id: str = "",
-        broker_order_id: str = "",
-        qty: int = 0,
-        reason: str = "",
-    ) -> bool:
-        """Bind the currently in-flight exit to the exact local/broker order.
-
-        Called by OSM only after the broker accepted the exit order. This is the
-        handshake that makes later fill/reject/cancel callbacks attributable.
-        """
-        if not position_id:
-            return False
-        with self._lock:
-            for pos in self._positions:
-                if str(pos.position_id) != str(position_id) or pos.closed:
-                    continue
-                if local_order_id:
-                    pos.pending_exit_local_order_id = str(local_order_id)
-                if broker_order_id:
-                    pos.pending_exit_broker_order_id = str(broker_order_id)
-                if qty:
-                    pos.pending_exit_qty = int(qty)
-                if reason:
-                    pos.pending_exit_reason = reason
-                pos.exit_in_flight = True
-                pos.pending_exit_filled_qty = 0
-                pos.pending_scale_counted = False
-                pos.last_applied_exit_cum_fill = 0
-                self._assert_position_invariants(pos, "set_pending_exit_order")
-                log.info(
-                    "[exit_eng] Pending exit identity set | pos_id=%s local=%s broker=%s qty=%s",
-                    position_id, local_order_id or "?", broker_order_id or "?", qty or pos.pending_exit_qty,
-                )
-                return True
-        return False
-
-    @staticmethod
-    def _same_nonempty(a, b) -> bool:
-        return bool(a) and bool(b) and str(a) == str(b)
-
-    def _exit_event_is_allowed(
-        self,
-        pos: ManagedPosition,
-        *,
-        local_order_id: str = "",
-        broker_order_id: str = "",
-        cumulative_filled: int | None = None,
-    ) -> bool:
-        """Validate that a broker event belongs to this position's pending exit.
-
-        Also rejects replayed cumulative fill events for the same local/broker
-        order. This is intentionally strict when a pending order id is known and
-        permissive only for legacy paths where OSM cannot supply identity.
-        """
-        local_order_id = str(local_order_id or "")
-        broker_order_id = str(broker_order_id or "")
-        pending_local = str(getattr(pos, "pending_exit_local_order_id", "") or "")
-        pending_broker = str(getattr(pos, "pending_exit_broker_order_id", "") or "")
-
-        if pending_local and local_order_id and pending_local != local_order_id:
-            log.warning(
-                "[exit_eng] Ignoring exit event for non-pending local order | pos_id=%s pending=%s event=%s",
-                pos.position_id, pending_local, local_order_id,
-            )
-            return False
-        if pending_broker and broker_order_id and pending_broker != broker_order_id:
-            log.warning(
-                "[exit_eng] Ignoring exit event for non-pending broker order | pos_id=%s pending=%s event=%s",
-                pos.position_id, pending_broker, broker_order_id,
-            )
-            return False
-
-        # Replay guard after a final/partial callback already advanced state.
-        same_local = self._same_nonempty(local_order_id, getattr(pos, "last_applied_exit_local_order_id", ""))
-        same_broker = self._same_nonempty(broker_order_id, getattr(pos, "last_applied_exit_broker_order_id", ""))
-        if (same_local or same_broker) and cumulative_filled is not None:
-            last_cum = int(getattr(pos, "last_applied_exit_cum_fill", 0) or 0)
-            if int(cumulative_filled) <= last_cum:
-                log.info(
-                    "[exit_eng] Duplicate exit fill event ignored | pos_id=%s local=%s broker=%s cum=%s last=%s",
-                    pos.position_id, local_order_id, broker_order_id, cumulative_filled, last_cum,
-                )
-                return False
-        return True
-
-    def _record_applied_exit_event(
-        self,
-        pos: ManagedPosition,
-        *,
-        local_order_id: str = "",
-        broker_order_id: str = "",
-        cumulative_filled: int | None = None,
-    ) -> None:
-        if local_order_id:
-            pos.last_applied_exit_local_order_id = str(local_order_id)
-        if broker_order_id:
-            pos.last_applied_exit_broker_order_id = str(broker_order_id)
-        if cumulative_filled is not None:
-            prior = int(getattr(pos, "last_applied_exit_cum_fill", 0) or 0)
-            if int(cumulative_filled) < prior:
-                raise RuntimeError(
-                    f"exit cumulative fill decreased: cum={cumulative_filled} prior={prior} pos_id={pos.position_id}"
-                )
-            pos.last_applied_exit_cum_fill = max(prior, int(cumulative_filled))
-
-    def _clear_pending_exit_identity(self, pos: ManagedPosition) -> None:
-        pos.pending_exit_local_order_id = ""
-        pos.pending_exit_broker_order_id = ""
-
-    # ── BROKER RECONCILIATION HOOKS ──────────────────────────────────────────
-    # Called by APOrderMonitor / APBrokerReconciler after confirming broker truth.
-
-    def mark_position_closed(
-        self,
-        position_id: str,
-        reason: str = "",
-        qty_filled: int | None = None,
-        *,
-        fill_price: float | None = None,
-        local_order_id: str = "",
-        broker_order_id: str = "",
-        cumulative_filled: int | None = None,
-    ):
-        """Called after broker confirms an EXIT order fill.
-
-        EXIT_FILLED means the exit order filled, not always that the entire
-        position is gone. If the filled order was a scale-out, reduce
-        quantity_remaining and keep the runner alive. Only remove from memory
-        when the confirmed fill closes the remaining quantity.
-        """
-        if not position_id:
-            return
-
-        closed_now = False
-        with self._lock:
-            for pos in self._positions:
-                if pos.position_id != position_id:
-                    continue
-                if not self._exit_event_is_allowed(
-                    pos,
-                    local_order_id=local_order_id,
-                    broker_order_id=broker_order_id,
-                    cumulative_filled=cumulative_filled,
-                ):
-                    return
-
-                remaining_before = int(getattr(pos, "quantity_remaining", 0) or 0)
-                pending_qty = int(getattr(pos, "pending_exit_qty", 0) or 0)
-                fill_qty = int(qty_filled or pending_qty or remaining_before or 0)
-                fill_qty = max(0, min(fill_qty, remaining_before))
-                self._record_applied_exit_event(
-                    pos,
-                    local_order_id=local_order_id,
-                    broker_order_id=broker_order_id,
-                    cumulative_filled=cumulative_filled if cumulative_filled is not None else fill_qty,
-                )
-
-                if fill_qty > 0 and fill_qty < remaining_before:
-                    pos.quantity_remaining = remaining_before - fill_qty
-                    exit_reason = (getattr(pos, "pending_exit_reason", "") or reason or "").upper()
-                    is_scale_action = (
-                        "SCALE" in exit_reason
-                        or "PARTIAL" in exit_reason
-                        or "IMMEDIATE TP (PARTIAL)" in exit_reason
-                        or "PROFIT PROTECT" in exit_reason
-                    )
-                    if is_scale_action and not getattr(pos, "pending_scale_counted", False):
-                        pos.scale_outs_done += 1
-                        pos.pending_scale_counted = True
-
-                    pos.exit_in_flight = False
-                    pos.pending_exit_reason = ""
-                    pos.pending_exit_qty = 0
-                    pos.pending_exit_filled_qty = 0
-                    pos.pending_scale_counted = False
-                    self._clear_pending_exit_identity(pos)
-                    pos.last_exit_signal_ts = None
-                    self._assert_position_invariants(pos, "mark_position_closed_scale_out")
-                    self._emit_exit_event(
-                        pos,
-                        decision="APPLY",
-                        reason_code="EXIT_SCALE_COMPLETED",
-                        explanation="Exit order filled as scale-out; runner remains open",
-                        stage="exit_reconciliation",
-                        extra_inputs={
-                            "filled_qty": fill_qty,
-                            "remaining_before": remaining_before,
-                            "remaining_after": pos.quantity_remaining,
-                        },
-                    )
-                    log.info(
-                        "[exit_eng] Exit order filled as scale-out | pos_id=%s qty=%s remaining=%s reason=%s",
-                        position_id, fill_qty, pos.quantity_remaining, reason,
-                    )
-                    # CRITICAL: scale-out EXIT_FILLED must not fall through into full close.
-                    return
-
-                self._clear_pending_exit_identity(pos)
-                pos.quantity_remaining = 0
-                pos.closed = True
-                pos.close_reason = reason or pos.close_reason
-                self._assert_position_invariants(pos, "mark_position_closed_full")
-                self._emit_exit_event(
-                    pos,
-                    decision="APPLY",
-                    reason_code="EXIT_FULL_CLOSE_APPLIED",
-                    explanation="Broker-confirmed exit fill closed the full remaining position",
-                    stage="exit_reconciliation",
-                    extra_inputs={
-                        "filled_qty": fill_qty,
-                        "remaining_before": remaining_before,
-                        "remaining_after": 0,
-                    },
-                )
-                closed_now = True
-                break
-
-            self._positions = [p for p in self._positions if not p.closed]
-
-        if closed_now:
-            log.info("[exit_eng] Closed (broker-confirmed) | pos_id=%s reason=%s", position_id, reason)
-
-    def clear_exit_in_flight(self, position_id: str):
-        """Called when exit order is canceled/rejected/expired — engine may retry."""
-        if not position_id:
-            return
-        with self._lock:
-            for pos in self._positions:
-                if pos.position_id == position_id:
-                    pos.exit_in_flight      = False
-                    pos.pending_exit_reason = ""
-                    pos.pending_exit_qty    = 0
-                    pos.pending_exit_filled_qty = 0
-                    pos.pending_scale_counted = False
-                    self._clear_pending_exit_identity(pos)
-                    pos.last_exit_signal_ts = None
-                    self._assert_position_invariants(pos, "clear_exit_in_flight")
-        log.info("[exit_eng] Exit in-flight cleared | pos_id=%s", position_id)
-
-    def on_exit_failure(
-        self,
-        position_id: str,
-        *,
-        local_order_id: str = "",
-        broker_order_id: str = "",
-        status: str = "",
-    ):
-        """Broker-confirmed exit rejection/cancel/expiry. Clears in-flight state.
-        Scale state is based only on confirmed fills, so there is no submit-time rollback.
-        """
-        if not position_id:
-            return
-        with self._lock:
-            for pos in self._positions:
-                if str(pos.position_id) == str(position_id):
-                    if not self._exit_event_is_allowed(pos, local_order_id=local_order_id, broker_order_id=broker_order_id):
-                        return
-                    pos.exit_in_flight = False
-                    pos.pending_exit_reason = ""
-                    pos.pending_exit_qty = 0
-                    pos.pending_exit_filled_qty = 0
-                    pos.pending_scale_counted = False
-                    self._clear_pending_exit_identity(pos)
-                    pos.last_exit_signal_ts = None
-                    pos.last_exit_rejected = True
-                    pos.last_rejection_ts = time.time()
-                    self._assert_position_invariants(pos, "on_exit_failure")
-                    self._emit_exit_event(
-                        pos,
-                        decision="APPLY",
-                        reason_code="EXIT_FAILURE_HANDLED",
-                        explanation=f"Exit failure handled: {status or 'unknown'}",
-                        stage="exit_reconciliation",
-                        extra_inputs={"status": status, "local_order_id": local_order_id, "broker_order_id": broker_order_id},
-                    )
-                    break
-        log.info("[exit_eng] Exit failure handled | pos_id=%s status=%s", position_id, status or "?")
-
-    def note_partial_exit_fill(
-        self,
-        position_id: str,
-        qty_filled: int,
-        *,
-        fill_price: float | None = None,
-        local_order_id: str = "",
-        broker_order_id: str = "",
-        cumulative_filled: int | None = None,
-    ):
-        """
-        Called when broker confirms an exit fill smaller than the original position.
-
-        One scale-out order can fill in multiple broker executions. We only
-        increment scale_outs_done once the intended pending scale quantity is
-        completely filled, not on every partial execution callback.
-        """
-        if not position_id or qty_filled <= 0:
-            return
-        qty_filled = int(qty_filled)
-        with self._lock:
-            for pos in self._positions:
-                if pos.position_id != position_id:
-                    continue
-                if not self._exit_event_is_allowed(
-                    pos,
-                    local_order_id=local_order_id,
-                    broker_order_id=broker_order_id,
-                    cumulative_filled=cumulative_filled,
-                ):
-                    return
-
-                remaining_before = int(pos.quantity_remaining or 0)
-                if qty_filled > remaining_before:
-                    self._emit_exit_event(
-                        pos,
-                        decision="REJECT",
-                        reason_code="EXIT_PARTIAL_FILL_OVER_REMAINING",
-                        explanation=f"Rejected partial fill qty={qty_filled} > remaining={remaining_before}",
-                        stage="exit_reconciliation",
-                        extra_inputs={
-                            "qty_filled": qty_filled,
-                            "quantity_remaining": remaining_before,
-                            "pending_exit_qty": pos.pending_exit_qty,
-                            "pending_exit_filled_qty": pos.pending_exit_filled_qty,
-                        },
-                    )
-                    log.error(
-                        "[exit_eng] Partial fill rejected: qty_filled=%s > remaining=%s | pos_id=%s",
-                        qty_filled, remaining_before, position_id,
-                    )
-                    return
-
-                pending_qty = int(getattr(pos, "pending_exit_qty", 0) or 0)
-                pending_filled_before = int(getattr(pos, "pending_exit_filled_qty", 0) or 0)
-                if pending_qty > 0 and pending_filled_before + qty_filled > pending_qty:
-                    self._emit_exit_event(
-                        pos,
-                        decision="REJECT",
-                        reason_code="EXIT_PARTIAL_FILL_OVER_PENDING",
-                        explanation=(
-                            f"Rejected partial fill cumulative pending={pending_filled_before + qty_filled} > pending_exit_qty={pending_qty}"
-                        ),
-                        stage="exit_reconciliation",
-                        extra_inputs={
-                            "qty_filled": qty_filled,
-                            "pending_exit_qty": pending_qty,
-                            "pending_exit_filled_qty": pending_filled_before,
-                        },
-                    )
-                    log.error(
-                        "[exit_eng] Partial fill rejected: pending filled would exceed pending qty | pos_id=%s",
-                        position_id,
-                    )
-                    return
-
-                pos.quantity_remaining = remaining_before - qty_filled
-                pos.pending_exit_filled_qty = pending_filled_before + qty_filled
-                self._record_applied_exit_event(
-                    pos,
-                    local_order_id=local_order_id,
-                    broker_order_id=broker_order_id,
-                    cumulative_filled=cumulative_filled if cumulative_filled is not None else pos.pending_exit_filled_qty,
-                )
-
-                reason = (getattr(pos, "pending_exit_reason", "") or "").upper()
-                is_scale_action = (
-                    "SCALE" in reason
-                    or "PARTIAL" in reason
-                    or "IMMEDIATE TP (PARTIAL)" in reason
-                    or "PROFIT PROTECT" in reason
-                )
-                pending_complete = pending_qty <= 0 or pos.pending_exit_filled_qty >= pending_qty
-
-                if is_scale_action and pending_complete and not getattr(pos, "pending_scale_counted", False):
-                    pos.scale_outs_done += 1
-                    pos.pending_scale_counted = True
-
-                if pending_complete or pos.quantity_remaining == 0:
-                    pos.exit_in_flight = False
-                    pos.pending_exit_reason = ""
-                    pos.pending_exit_qty = 0
-                    pos.pending_exit_filled_qty = 0
-                    pos.pending_scale_counted = False
-                    self._clear_pending_exit_identity(pos)
-                    pos.last_exit_signal_ts = None
-
-                if pos.quantity_remaining == 0:
-                    pos.closed = True
-                self._assert_position_invariants(pos, "note_partial_exit_fill")
-                break
-
-            self._positions = [p for p in self._positions if not p.closed]
-        log.info("[exit_eng] Partial fill noted | pos_id=%s qty_filled=%d", position_id, qty_filled)
-
-    def _run_sentinels(self):
-        """Safety sentinels. Every action path uses _can_submit_exit."""
-        now = datetime.now(timezone.utc)
-        for pos in list(self._positions):
-            age_min = (now - pos.opened_at).total_seconds() / 60 if pos.opened_at else 0
-            pnl = pos.option_pnl_pct
-            peak = pos.peak_pnl_pct
-            hard_stop, immediate_tp, _ = _effective_thresholds(pos)
-            if peak >= immediate_tp and age_min > 1 and pnl > 0 and self._can_submit_exit(pos, now, reason="sentinel_missed_tp"):
-                self._submit_exit_decision(pos, ExitDecision("CLOSE_ALL", pos.quantity_remaining, f"SENTINEL MISSED TP -- peak +{peak*100:.0f}% current +{pnl*100:.0f}%", "HIGH", pnl), from_sentinel=True)
-            if pnl <= hard_stop and age_min > 1 and self._can_submit_exit(pos, now, reason="sentinel_missed_stop"):
-                self._submit_exit_decision(pos, ExitDecision("CLOSE_ALL", pos.quantity_remaining, f"SENTINEL FORCED EXIT -- {pnl*100:.0f}% breached profile stop {hard_stop*100:.0f}%", "IMMEDIATE", pnl), from_sentinel=True)
-            if pos.exit_in_flight and pos.last_exit_signal_ts:
-                flight_sec = (now - pos.last_exit_signal_ts).total_seconds()
-                if flight_sec > 300:
-                    pos._exit_stuck_count += 1
-                    log.warning("[SENTINEL] %s | EXIT STUCK -- %.0fs in-flight | pos=%s count=%s", pos.ticker, flight_sec, pos.position_id, pos._exit_stuck_count)
-                    self._emit_exit_event(pos, "ALERT", "EXIT_STUCK_IN_FLIGHT", f"Exit stuck in flight for {flight_sec:.0f}s; waiting for broker/OSM reconciliation", stage="system_alert", extra_inputs={"flight_sec": flight_sec, "stuck_count": pos._exit_stuck_count})
-            if age_min >= 45 and -0.08 <= pnl <= 0.05 and pos.max_profit_seen < 0.05 and self._can_submit_exit(pos, now, reason="sentinel_dead_trade"):
-                entry_u, target_u, curr_u = pos.underlying_entry, pos.underlying_target, pos.current_underlying
-                progress = 0.0
-                if entry_u and target_u and curr_u and abs(target_u - entry_u) > 0:
-                    progress = abs(curr_u - entry_u) / abs(target_u - entry_u)
-                if progress < 0.30:
-                    self._submit_exit_decision(pos, ExitDecision("CLOSE_ALL", pos.quantity_remaining, f"TIME STOP -- thesis not confirmed after {age_min:.0f}min pnl={pnl*100:.1f}% progress={progress*100:.0f}% toward target", "HIGH", pnl), from_sentinel=True)
-
-    def _eligible_for_new_exit(self, pos: ManagedPosition, now_utc: datetime) -> bool:
-        """Compatibility wrapper. Centralized gate; never clears in-flight exits by timeout."""
-        return self._can_submit_exit(pos, now_utc, reason="eligibility_check")
 
     def seed_from_db(self, position_manager):
         """
@@ -1397,13 +1030,15 @@ class APExitEngine:
                             _runner_drop_now*100, _emergency_trail*100,
                         )
 
-                if _force_runner_check and pos.exit_in_flight:
+                if _force_runner_check:
                     log.warning(
-                        "[%s] RUNNER EMERGENCY suppressed — exit already in flight | %s | reason=%s",
-                        pos.ticker, pos.option_symbol, pos.pending_exit_reason
+                        "[%s] RUNNER EMERGENCY active — bypassing normal eligibility gate | %s | in_flight=%s reason=%s",
+                        pos.ticker,
+                        pos.option_symbol,
+                        pos.exit_in_flight,
+                        pos.pending_exit_reason,
                     )
-                    continue
-                if not _force_runner_check and not self._eligible_for_new_exit(pos, now_utc):
+                elif not self._eligible_for_new_exit(pos, now_utc):
                     continue
 
                 # Evaluate exit
@@ -1430,7 +1065,7 @@ class APExitEngine:
                                 "suggested_limit": decision.suggested_limit,
                             },
                         )
-                        actions_to_take.append((pos, decision))
+                        actions_to_take.append((pos, decision, bool(_force_runner_check)))
 
         # ── Kill check post-fetch, pre-execute ───────────────────────────────
         # Default policy: kill switch DOES NOT block exits. Exits reduce risk.
@@ -1472,8 +1107,19 @@ class APExitEngine:
         # Execute actions through one centralized, gated submit path.
         # This preserves the full strategy logic above while avoiding direct
         # on_exit/on_scale calls and avoiding callback execution under lock.
-        for pos, decision in actions_to_take:
-            self._submit_exit_decision(pos, decision, from_sentinel=False, kill_active=kill_active)
+        for _action_item in actions_to_take:
+            if len(_action_item) == 3:
+                pos, decision, _force_runner_submit = _action_item
+            else:
+                pos, decision = _action_item
+                _force_runner_submit = False
+            self._submit_exit_decision(
+                pos,
+                decision,
+                from_sentinel=False,
+                kill_active=kill_active,
+                allow_inflight_override=bool(_force_runner_submit),
+            )
 
     def _submit_exit_decision(
         self,
@@ -1482,6 +1128,7 @@ class APExitEngine:
         *,
         from_sentinel: bool = False,
         kill_active: bool = False,
+        allow_inflight_override: bool = False,
     ) -> bool:
         """Single submit path for normal, scale, sentinel, and emergency exits.
 
@@ -1494,7 +1141,12 @@ class APExitEngine:
 
         # 1) Short critical section: validate and capture submit snapshot.
         with self._lock:
-            if not self._can_submit_exit(pos, now_utc, reason=decision.reason):
+            if not self._can_submit_exit(
+                pos,
+                now_utc,
+                reason=decision.reason,
+                allow_inflight_override=allow_inflight_override,
+            ):
                 return False
 
             if kill_active and KILL_BLOCKS_NON_PROTECTIVE_EXITS and not _is_protective_exit(decision.reason or ""):
