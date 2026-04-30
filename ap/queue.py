@@ -172,6 +172,18 @@ def enqueue_signal(
 # JOB MANAGEMENT
 # =============================================================================
 
+_TERMINAL_QUEUE_STATUSES = {
+    "REJECTED",
+    "ERROR",
+    "SUBMITTED",
+    "FILLED",
+    "CANCELED",
+    "CANCELLED",
+    "EXPIRED",
+    "DONE",
+}
+
+
 def _mark_job(
     job_id: int,
     status: str,
@@ -179,19 +191,29 @@ def _mark_job(
     result: dict | None = None,
     error: str | None = None,
 ):
+    """
+    Update a queue job without falsely finishing non-terminal states.
+
+    WATCHING is intentionally non-terminal: the entry watcher owns the trigger
+    and later broker submission path. Marking finished_ts on WATCHING can make
+    a live watched job look complete before any broker order fires.
+    """
+    terminal = str(status).upper() in _TERMINAL_QUEUE_STATUSES
+
     def _fn():
         with _conn()() as c:
             c.execute(
                 """
                 UPDATE trade_queue
                 SET status=%s,
-                    finished_ts=NOW(),
+                    finished_ts=CASE WHEN %s THEN NOW() ELSE finished_ts END,
                     result_json=%s,
                     last_error=%s
                 WHERE id=%s
                 """,
                 (
                     status,
+                    terminal,
                     _json_dumps(result) if result is not None else None,
                     error,
                     job_id,
@@ -538,30 +560,62 @@ def _dispatch(
 
     if trigger_type == "breach":
         try:
-            # Register with watcher — no broker submit yet
-            entry_watcher.watch(plan=plan, local_order_id=local_order_id)
+            # Move the local ENTRY order into explicit watcher-owned state before
+            # arming. This proves the queue/OSM contract early and prevents a
+            # fake WATCHING job when the OSM cannot represent PENDING_TRIGGER.
+            try:
+                if hasattr(order_state_machine, "mark_entry_pending_trigger"):
+                    pending_ok = bool(order_state_machine.mark_entry_pending_trigger(local_order_id))
+                else:
+                    pending_ok = bool(order_state_machine.transition(
+                        local_order_id, "PENDING_TRIGGER", submitted_ts=None,
+                    ))
+            except Exception as _st:
+                log.error(
+                    "[%s] PENDING_TRIGGER transition failed before watcher arm: %s",
+                    ticker, _st, exc_info=True,
+                )
+                pending_ok = False
+
+            if not pending_ok:
+                log.critical(
+                    "[%s] WATCH_ARM_ABORTED — could not mark order PENDING_TRIGGER | local=%s",
+                    ticker, local_order_id,
+                )
+                _mark_job(job_id, "ERROR", error="pending_trigger_transition_failed")
+                return
+
+            # Register with watcher — no broker submit yet. The watcher returns
+            # False for stale signals, dedup blocks, opposite-side conflicts,
+            # and failed OSM local-order validation. Do not mark WATCHING unless
+            # this returns True.
+            armed = bool(entry_watcher.watch(plan=plan, local_order_id=local_order_id))
+            if not armed:
+                log.warning(
+                    "[%s] WATCH_ARM_FAILED — watcher refused signal | local=%s",
+                    ticker, local_order_id,
+                )
+                try:
+                    if hasattr(order_state_machine, "expire_pending_entry"):
+                        order_state_machine.expire_pending_entry(local_order_id, reason="watch_arm_failed")
+                    elif hasattr(order_state_machine, "cancel_pending_entry"):
+                        order_state_machine.cancel_pending_entry(local_order_id, reason="watch_arm_failed")
+                    else:
+                        order_state_machine.transition(local_order_id, "EXPIRED", last_error="watch_arm_failed")
+                except Exception as _cleanup_exc:
+                    log.error(
+                        "[%s] Failed to cleanup unarmed pending entry %s: %s",
+                        ticker, local_order_id, _cleanup_exc, exc_info=True,
+                    )
+                _mark_job(job_id, "REJECTED", error="watch_arm_failed")
+                return
+
             log.info(
                 f"[{ticker}] Handed to entry watcher | "
                 f"trigger=${getattr(plan, 'trigger_price', '?')}"
             )
 
-            # Transition to PENDING_TRIGGER — truthfully reflects
-            # "watching for breach" not "order at broker".
-            # SUBMITTED is only set by entry_watcher when broker.place_order() succeeds.
-            try:
-                order_state_machine.transition(
-                    local_order_id, "PENDING_TRIGGER",
-                    submitted_ts=None,
-                )
-            except Exception as _st:
-                # PENDING_TRIGGER may not exist in older OSM schemas —
-                # fall back to leaving order at CREATED (still truthful)
-                log.warning(
-                    "[%s] PENDING_TRIGGER transition failed — order stays CREATED: %s",
-                    ticker, _st,
-                )
-
-            # Queue job = WATCHING (correct at queue level)
+            # Queue job = WATCHING only after watcher arm succeeded.
             _mark_job(job_id, "WATCHING",
                       result={"plan_id": plan.plan_id,
                               "local_order_id": local_order_id,
@@ -570,7 +624,16 @@ def _dispatch(
                               "trigger_type": "breach",
                               "needs_contract_selection": bool(getattr(plan, "_needs_contract_selection", False))})
         except Exception as e:
-            log.error(f"[{ticker}] entry_watcher.watch() failed: {e}")
+            log.error(f"[{ticker}] entry_watcher.watch() failed: {e}", exc_info=True)
+            try:
+                if hasattr(order_state_machine, "expire_pending_entry"):
+                    order_state_machine.expire_pending_entry(local_order_id, reason=f"watcher_error:{e}")
+                elif hasattr(order_state_machine, "cancel_pending_entry"):
+                    order_state_machine.cancel_pending_entry(local_order_id, reason=f"watcher_error:{e}")
+                else:
+                    order_state_machine.transition(local_order_id, "ERROR", last_error=f"watcher_error:{e}")
+            except Exception:
+                pass
             _mark_job(job_id, "ERROR", error=f"watcher_error: {e}")
     else:
         log.warning(
