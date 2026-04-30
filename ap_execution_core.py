@@ -5,8 +5,8 @@
 #
 # Signal flow:
 #   receive_signal()
-#     -> score gate (85 live / 75 paper)
-#     -> context hard block (context < 12/20 live / 8/20 paper -> reject)
+#     -> score gate (75 live / 45 paper)
+#     -> context hard block (context < 10 live / 0 paper -> reject)
 #     -> tier classify (A+/A/B)
 #     -> B tier -> shadow tracker (paper only)
 #     -> A/A+ -> RankingQueue (signals compete by score)
@@ -72,7 +72,7 @@ ET  = ZoneInfo("America/New_York")
 
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
 BOT_MODE            = (os.getenv("AP_MODE") or os.getenv("BOT_MODE") or "PAPER").upper()
-ENABLE_LEGACY_EXECUTION_CORE = os.getenv("ENABLE_LEGACY_EXECUTION_CORE", "0").strip().lower() in {"1", "true", "yes", "on"}
+ENABLE_LEGACY_EXECUTION_CORE = False  # pure production: legacy ExecutionCore path is permanently disabled
 MAX_POSITIONS       = int(os.getenv("MAX_POSITIONS", "7"))
 
 # ── Paper-mode gate thresholds ────────────────────────────────────────────────
@@ -216,7 +216,7 @@ class APExecutionCore:
         self.tracker = APSignalTracker(supabase_client, store=self.store)
 
         # Core modules
-        self.entry_watcher = APEntryWatcher(broker)
+        self.entry_watcher = APEntryWatcher(broker, order_state_machine=self.order_state_machine)
         self.exit_eng    = APExitEngine(broker, email=email,
                                            data_broker=data_broker)
         self.feedback    = APFeedbackLoop(supabase_client, DISCORD_WEBHOOK_URL, signal_store=self.store)
@@ -282,6 +282,14 @@ class APExecutionCore:
                 self.proof.mode = "paper" if self.paper else "live"
         else:
             self._max_positions = MAX_POSITIONS
+
+        # Production safety: legacy direct-ranking/receive_signal path may exist
+        # for paper/dev fallback, but LIVE must remain queue/OSM authority only.
+        if ENABLE_LEGACY_EXECUTION_CORE and self.mode == "LIVE":
+            raise RuntimeError(
+                f"[{email}] ENABLE_LEGACY_EXECUTION_CORE must be off in LIVE mode; "
+                "production execution must stay queue-driven through trade_queue/worker_loop/OSM."
+            )
 
         # Wire watcher callbacks
         self.entry_watcher.on_trigger    = self._on_entry_trigger
@@ -408,7 +416,7 @@ class APExecutionCore:
                 tier=str(sig.get("grade") or sig.get("tier") or "B"),
                 score=float(sig.get("score") or 0),
                 trigger_type="breach",
-                trigger_price=watched.entry_trigger,
+                trigger_price=getattr(watched, "entry_trigger", watched.trigger_price),
                 stop_underlying=watched.stop_level,
                 target_underlying=watched.target_price,
                 contract_symbol=str(order.get("contract") or sig.get("contract_symbol") or ""),
@@ -550,22 +558,37 @@ class APExecutionCore:
         return True
 
     def start(self):
-        """Start all background threads.
+        """Start production orchestration threads only.
 
-        Production mode keeps ExecutionCore as an orchestration shell:
-        watcher + exit engine + tracker. The legacy receive_signal/ranking
-        path is disabled unless ENABLE_LEGACY_EXECUTION_CORE=1.
+        Pure production contract:
+          - Queue/worker owns signal evaluation and plan creation.
+          - OSM owns order lifecycle.
+          - EntryWatcher only waits for breach and calls this core back.
+          - Legacy ranking/direct execution is never started.
         """
+        problems = []
+        if self.master_control is None:
+            problems.append("master_control_missing")
+        if self.order_state_machine is None:
+            problems.append("order_state_machine_missing")
+        if self.entry_watcher is None:
+            problems.append("entry_watcher_missing")
+        if getattr(self.entry_watcher, "on_trigger", None) != self._on_entry_trigger:
+            problems.append("entry_watcher_on_trigger_not_wired")
+        if getattr(self.entry_watcher, "order_state_machine", None) is not self.order_state_machine:
+            problems.append("entry_watcher_osm_not_wired")
+        if self.exit_eng is None:
+            problems.append("exit_engine_missing")
+        if self.tracker is None:
+            problems.append("tracker_missing")
+        if problems:
+            raise RuntimeError(f"[{self.email}] APExecutionCore production startup validation failed: {','.join(problems)}")
+
         self.entry_watcher.start()
         self.exit_eng.start()
         self.tracker.start()
-        if ENABLE_LEGACY_EXECUTION_CORE:
-            self._start_ranking_processor()
-            _legacy_note = " + legacy ranking queue"
-        else:
-            self._rq_running = False
-            _legacy_note = " (legacy ranking disabled; queue is entry authority)"
-        log.info(f"[{self.email}] Execution core started (watcher + exit engine + tracker{_legacy_note})")
+        self._rq_running = False
+        log.info(f"[{self.email}] Execution core started (PURE_PRODUCTION: watcher + exit engine + tracker; queue is entry authority)")
 
     def stop(self):
         self.entry_watcher.stop()
@@ -617,212 +640,40 @@ class APExecutionCore:
     # ── PUBLIC: receive incoming scanner signal ───────────────────────────────
 
     def receive_signal(self, signal: dict, score_result=None):
+        """Compatibility shim only.
+
+        Pure production does not evaluate, rank, or submit entries inside
+        APExecutionCore. Incoming scanner signals are routed to the unified
+        Postgres queue, where worker_loop + master_control + contract_selector
+        + OSM own the entry lifecycle.
         """
-        Entry point for all scanner signals.
-        Routes through APMasterControl -- the single decision authority.
-        Master control handles: gates, intelligence, tier, sizing, plan creation.
-        Execution core only dispatches the approved plan.
-        """
-        if not ENABLE_LEGACY_EXECUTION_CORE:
-            # Production decommission path: ExecutionCore no longer owns initial
-            # signal evaluation/ranking. Route to the unified Postgres queue,
-            # where master_control + contract_selector + OSM are the authority.
-            try:
-                from ap.queue import enqueue_signal
-                signal_id = str(signal.get("signal_id") or uuid.uuid4())
-                signal["signal_id"] = signal_id
-                ok = enqueue_signal(
-                    signal,
-                    client_id=self.email or "default",
-                    idempotency_key=f"{signal_id}:{self.email or 'default'}",
-                )
-                log.warning(
-                    "[%s] receive_signal legacy path disabled — routed to queue | inserted=%s",
-                    signal.get("ticker") or signal.get("symbol") or "?", ok,
-                )
-            except Exception as exc:
-                log.critical(
-                    "[%s] receive_signal legacy path disabled and queue route failed: %s",
-                    signal.get("ticker") or signal.get("symbol") or "?", exc,
-                )
-            return
-
-        ticker = signal.get("ticker", "")
-        score  = float(signal.get("score", 0) or 0)
-
-        # Assign signal_id immediately
-        signal_id = str(signal.get("signal_id") or uuid.uuid4())
-        signal["signal_id"] = signal_id
-
-        log.info(
-            f"[{ticker}] Signal received | "
-            f"{signal.get('pattern')} {signal.get('side')} [{signal.get('timeframe')}] | "
-            f"Score={score:.1f}"
-        )
-
-        funnel.inc("signals_received")
-
-        # ── LEGACY FALLBACK ───────────────────────────────────────────────────
-        # Old scanners send symbol/direction/pattern_id but no score or ev_score.
-        # Route to legacy queue. Insert ap_signals row so traffic is visible.
-        # Master control does NOT run on legacy signals.
-        is_legacy = (
-            score == 0 and (
-                signal.get("signal_id")
-                or signal.get("symbol")
-                or signal.get("pattern_id")
-            ) and not signal.get("ev_score")
-        )
-        if is_legacy:
-            legacy_ticker = signal.get("symbol") or signal.get("ticker", "?")
-            log.info(f"[{legacy_ticker}] LEGACY SIGNAL -- routing to legacy queue (no score)")
-            self.store.insert_signal(signal_id, signal, decision_status="legacy_routed")
-            try:
-                from ap.queue import enqueue_signal
-                from ap.models import Signal
-                legacy_sig = Signal(
-                    signal_id      = signal.get("signal_id", str(uuid.uuid4())),
-                    symbol         = signal.get("symbol", signal.get("ticker", "")),
-                    direction      = signal.get("direction", signal.get("side", "CALL")),
-                    pattern_id     = signal.get("pattern_id", "SCANNER_V1"),
-                    confidence_tag = signal.get("confidence_tag", "standard_pool"),
-                    timestamp_iso  = signal.get("timestamp_iso", datetime.now(timezone.utc).isoformat()),
-                    trigger        = signal.get("trigger", signal),
-                )
-                enqueue_signal(legacy_sig, client_id="default")
-                log.info(f"[{legacy_ticker}] Legacy signal queued successfully")
-            except Exception as e:
-                log.warning(f"[{legacy_ticker}] Legacy queue failed: {e} -- signal dropped")
-            return
-
-        # Apply paper exec fallbacks before master control evaluates
-        signal    = self._apply_paper_exec_fallbacks(signal)
-        score     = float(signal.get("score", 0) or 0)
-        signal_id = str(signal.get("signal_id", signal_id))  # preserve after deepcopy
-
-        # Insert into ap_signals immediately so every signal is visible
-        self.store.insert_signal(signal_id, signal, decision_status="received")
-
-        # ── MASTER CONTROL -- single decision authority ────────────────────────
-        decision = self.master_control.evaluate(signal, client_id=self.email or "default")
-
-        if not decision.ok:
-            if decision.stage == "shadow":
-                if score_result:
-                    td = self.tier_engine.classify(score_result)
-                    self.shadow.log_shadow(signal, td)
-                funnel.inc("shadow_tracked")
-                log.info(f"[{ticker}] SHADOW-TIER | score={score:.1f}")
-            else:
-                funnel.inc("rejected_score")
-            return
-
-        # Plan approved -- attach approved execution plan and dispatch to ranking queue.
-        # IMPORTANT: _breach_risk_check() uses this exact plan for lightweight
-        # exposure revalidation at breach time. Do not drop it before watcher handoff.
-        plan = decision.plan
-        signal["_approved_plan"] = plan
-        signal["tier"]         = plan.tier
-        signal["auto_execute"] = (plan.tier == "A+")
-        funnel.inc("passed_score")
-        funnel.inc("passed_context")
-        self.rank_queue.add(signal)
-        self.store.update_status(signal_id, "queued", timestamp_flag="queued_at")
-        log.info(
-            f"[{ticker}] {plan.tier}-TIER queued | score={score:.1f} "
-            f"contracts={plan.contracts} | "
-            f"{'1 contract probation' if plan.tier == 'B' else 'full execution'}"
-        )
+        try:
+            from ap.queue import enqueue_signal
+            signal_id = str(signal.get("signal_id") or uuid.uuid4())
+            signal["signal_id"] = signal_id
+            ok = enqueue_signal(
+                signal,
+                client_id=self.email or "default",
+                idempotency_key=f"{signal_id}:{self.email or 'default'}",
+            )
+            log.info(
+                "[%s] receive_signal routed to production queue | inserted=%s",
+                signal.get("ticker") or signal.get("symbol") or "?",
+                ok,
+            )
+        except Exception as exc:
+            log.critical(
+                "[%s] receive_signal queue route failed: %s",
+                signal.get("ticker") or signal.get("symbol") or "?",
+                exc,
+            )
         return
 
     def _start_ranking_processor(self):
-        """Background thread: drains legacy ranking queue into watcher every 5 seconds."""
-        if not ENABLE_LEGACY_EXECUTION_CORE:
-            self._rq_running = False
-            log.info("[%s] RankingQueueProcessor not started — legacy ExecutionCore entries disabled", self.email)
-            return
-        self._rq_running = True
-
-        def _loop():
-            while self._rq_running:
-                try:
-                    slots = self._available_position_slots()
-                    if slots > 0 and self.rank_queue.size() > 0:
-                        signals = self.rank_queue.drain(slots)
-                        for sig in signals:
-                            tkr       = sig.get("ticker", "")
-                            score     = float(sig.get("score", 0))
-                            signal_id = str(sig.get("signal_id", ""))
-
-                            if slots <= 0:
-                                log.info(f"[{tkr}] No slots left -- re-queuing remaining signals")
-                                self.rank_queue.add(sig)
-                                continue
-                            slots -= 1
-
-                            # Sector correlation cap
-                            sector = sig.get("correlation_bucket", "OTHER")
-                            with self._sector_lock:
-                                sector_count = self._sector_counts.get(sector, 0)
-                            # FIX: raised OTHER cap to 7 -- all scanner tickers land in OTHER
-                            SECTOR_MAX = {"SEMI": 3, "MEGACAP": 3, "INDEX": 3,
-                                          "FINANCIAL": 3, "BIO": 2, "CLOUD": 3}.get(sector, 7)
-                            if sector_count >= SECTOR_MAX:
-                                log.info(
-                                    f"[{tkr}] SECTOR CAP -- {sector} already has "
-                                    f"{sector_count}/{SECTOR_MAX} active. Skipping."
-                                )
-                                funnel.inc("sector_capped")
-                                if signal_id:
-                                    self.store.update_signal_fields(signal_id, {
-                                        "decision_status": "dropped",
-                                        "context_notes":   f"sector_cap: {sector} at {sector_count}/{SECTOR_MAX}",
-                                    })
-                                continue
-
-                            # Re-check context before dispatching to watcher.
-                            # Signal may have sat in queue for up to 120s.
-                            # Only re-check if real_time_ctx is actually present.
-                            stale_breakdown = sig.get("score_breakdown")
-                            if stale_breakdown and "real_time_ctx" in stale_breakdown:
-                                stale_ctx = float(stale_breakdown.get("real_time_ctx", 0) or 0)
-                                if stale_ctx < self._context_floor and stale_ctx > 0:
-                                    log.info(
-                                        f"[{tkr}] Context re-check failed after queue wait "
-                                        f"(ctx={stale_ctx:.1f} < floor={self._context_floor}) -- skipping"
-                                    )
-                                    if signal_id:
-                                        self.store.update_signal_fields(signal_id, {
-                                            "decision_status": "dropped",
-                                            "context_notes":   f"context_recheck_fail: ctx={stale_ctx:.1f} floor={self._context_floor}",
-                                        })
-                                    continue
-
-                            added = self.entry_watcher.add_signal(sig)
-                            if added:
-                                funnel.inc("watcher_sent")
-                                self.store.update_status(
-                                    signal_id, "watching",
-                                    timestamp_flag="watcher_started_at",
-                                )
-                                with self._sector_lock:
-                                    self._sector_counts[sector] = self._sector_counts.get(sector, 0) + 1
-                                log.info(
-                                    f"[{tkr}] Dispatched from ranking queue -> watcher | "
-                                    f"score={score:.1f} [{sig.get('grade')}] | "
-                                    f"sector={sector} ({sector_count+1}/{SECTOR_MAX}) | "
-                                    f"slots left: {slots}"
-                                )
-                            else:
-                                slots += 1
-                                log.info(f"[{tkr}] Watcher rejected (EOD or duplicate) -- slot returned")
-                except Exception as e:
-                    log.error(f"Ranking queue processor error: {e}")
-                time.sleep(5)
-
-        t = threading.Thread(target=_loop, daemon=True, name=f"rq-processor-{self.email}")
-        t.start()
-        log.info(f"[{self.email}] RankingQueueProcessor started (5s interval)")
+        """Disabled in pure production. Queue/worker is the only entry authority."""
+        self._rq_running = False
+        log.warning("[%s] Legacy RankingQueueProcessor is disabled in pure production", self.email)
+        return
 
     # ── CALLBACK: Breach Confirmed -> Execute ─────────────────────────────────
 
@@ -952,206 +803,118 @@ class APExecutionCore:
             f"[{decision.grade}] [{setup_status}]"
         )
 
-        # ── ENTRY SUBMISSION ─────────────────────────────────────────────────
-        # Primary path: route through OSM. This creates DB row + transitions
-        # lifecycle. We do NOT mint a position here on success; that belongs
-        # to the FILLED transition path via fill monitor / reconciler.
+        # ── ENTRY SUBMISSION — PURE PRODUCTION QUEUE/OSM PATH ───────────────
+        # Queue/worker must have already created an ENTRY order and armed the
+        # watcher with local_order_id. This core never creates a fresh entry
+        # order at breach time and never creates synthetic in-memory positions.
 
-        if self.order_state_machine:
-            plan = ApprovedExecutionPlan(
-                plan_id           = signal_id,
-                signal_id         = signal_id,
-                client_id         = self.email,
-                ticker            = ticker,
-                side              = side.upper(),
-                direction         = side.upper(),
-                pattern           = str(sig.get("pattern", "") or ""),
-                timeframe         = str(sig.get("timeframe", "1d") or "1d"),
-                contracts         = contracts,
-                limit_price       = decision.mid_price,
-                max_position_usd  = float(decision.mid_price * contracts * 100),
-                contract_symbol   = decision.symbol,
-                tier              = str(tier or sig.get("tier", "B")),
-                score             = float(sig.get("score", 0) or 0),
-                intel_score       = float(sig.get("intel_score", 0) or 0),
-                confidence_bucket = str(decision.grade or sig.get("confidence_tag", "B")),
-                trigger_type      = "breach",
-                trigger_price     = watched.trigger_price,
-                stop_underlying   = watched.stop_level,
-                target_underlying = watched.target_price,
-                mode              = "live" if not self.paper else "paper",
-            )
-
-            log.info(
-                f"[{ticker}] {'PAPER' if self.paper else 'LIVE'} -- "
-                f"submitting entry via OSM @ ${decision.mid_price:.2f} x{contracts}"
-            )
-            queue_local_order_id = str(sig.get("local_order_id") or "")
-            if queue_local_order_id and hasattr(self.order_state_machine, "submit_existing_entry"):
-                # Queue-created watcher order path.
-                # Money-safe rule: broker accepts first, then OSM transitions the
-                # EXISTING PENDING_TRIGGER order to SUBMITTED with broker_order_id.
-                submit_res = self.order_state_machine.submit_existing_entry(
-                    local_order_id = queue_local_order_id,
-                    broker         = self.broker,
-                    plan           = plan,
-                    limit_price    = decision.mid_price,
-                )
-            else:
-                # Legacy/dev path only. Creates a new entry order then submits it.
-                # submit_entry itself is money-safe: it transitions to SUBMITTED
-                # only after broker accepts and returns a broker_order_id.
-                submit_res = self.order_state_machine.submit_entry(
-                    broker      = self.broker,
-                    plan        = plan,
-                    limit_price = decision.mid_price,
-                )
-
-            if submit_res["ok"]:
-                local_order_id  = submit_res["local_order_id"]
-                broker_order_id = submit_res["broker_order_id"]
-
-                if signal_id:
-                    self.store.update_signal_fields(signal_id, {
-                        "decision_status": "submitted",
-                        "context_notes": (
-                            f"entry_submitted local={local_order_id} "
-                            f"broker={broker_order_id}"
-                        ),
-                    })
-
-                log.info(
-                    f"[{ticker}] Entry submitted via OSM | "
-                    f"local={local_order_id} broker={broker_order_id} "
-                    f"{contracts}x {decision.symbol} @ ${decision.mid_price:.2f}"
-                )
-                # Do NOT create ManagedPosition here; wait for FILLED.
-                return
-
-            # OSM / broker submission failed
-            if self.paper:
-                # Paper continuity only. This intentionally bypasses DB/OSM truth,
-                # so the log must be loud and searchable.
-                log.critical(
-                    f"[{ticker}] SYNTHETIC_ONLY_NO_DB_POSITION — OSM/sandbox order failed; "
-                    f"creating in-memory paper position only @ ${decision.mid_price:.2f} | "
-                    f"error={submit_res['error']}"
-                )
-                fill_price      = decision.mid_price
-                local_order_id  = submit_res.get("local_order_id")
-                broker_order_id = submit_res.get("broker_order_id")
-                synthetic       = True
-            else:
-                log.error(
-                    f"[{ticker}] Entry submit failed via OSM | "
-                    f"order={submit_res['local_order_id']} error={submit_res['error']}"
-                )
-                funnel.inc("order_failed")
-                return
-        else:
-            # Legacy path (no OSM wired) — paper keeps sandbox continuity
-            log.info(
-                f"[{ticker}] {'PAPER' if self.paper else 'LIVE'} -- "
-                f"submitting entry (legacy) @ ${decision.mid_price:.2f}"
-            )
-            fill_price = self._place_option_order(
-                symbol      = decision.symbol,
-                contracts   = contracts,
-                side        = "buy_to_open",
-                limit_price = decision.mid_price,
-            )
-            synthetic       = False
-            local_order_id  = None
-            broker_order_id = None
-
-            if not fill_price:
-                if self.paper:
-                    log.critical(
-                        f"[{ticker}] SYNTHETIC_ONLY_NO_DB_POSITION — legacy sandbox order failed; "
-                        f"creating in-memory paper position only @ ${decision.mid_price:.2f}"
-                    )
-                    fill_price = decision.mid_price
-                    synthetic  = True
-                else:
-                    log.error(f"[{ticker}] Order failed -- no fill price returned")
-                    funnel.inc("order_failed")
-                    return
-
-        # If we reach here, we are in a simulated or legacy fill path only.
-        if not fill_price:
-            log.error(f"[{ticker}] Order failed -- no fill price")
+        if self.order_state_machine is None:
+            log.critical("[%s] PRODUCTION_ENTRY_BLOCK — order_state_machine missing at breach", ticker)
             funnel.inc("order_failed")
+            if signal_id:
+                self.store.update_signal_fields(signal_id, {
+                    "decision_status": "blocked_at_breach",
+                    "context_notes": "order_state_machine_missing_at_breach",
+                })
             return
 
-        # Register with exit engine using simulated/legacy fill
-        pos = ManagedPosition(
+        queue_local_order_id = str(sig.get("local_order_id") or "")
+        if not queue_local_order_id:
+            log.critical("[%s] PRODUCTION_ENTRY_BLOCK — local_order_id missing from watcher signal", ticker)
+            funnel.inc("order_failed")
+            if signal_id:
+                self.store.update_signal_fields(signal_id, {
+                    "decision_status": "blocked_at_breach",
+                    "context_notes": "local_order_id_missing_at_breach",
+                })
+            return
+
+        if not hasattr(self.order_state_machine, "submit_existing_entry"):
+            log.critical("[%s] PRODUCTION_ENTRY_BLOCK — OSM missing submit_existing_entry", ticker)
+            funnel.inc("order_failed")
+            if signal_id:
+                self.store.update_signal_fields(signal_id, {
+                    "decision_status": "blocked_at_breach",
+                    "context_notes": "osm_missing_submit_existing_entry",
+                })
+            return
+
+        plan = ApprovedExecutionPlan(
+            plan_id           = str(sig.get("plan_id") or signal_id or queue_local_order_id),
+            signal_id         = signal_id or str(sig.get("signal_id") or queue_local_order_id),
+            client_id         = self.email,
             ticker            = ticker,
-            option_symbol     = decision.symbol,
-            side              = side,
-            quantity          = contracts,
-            entry_price       = fill_price,
-            underlying_entry  = watched.trigger_price,
-            underlying_target = watched.target_price,
-            underlying_stop   = watched.stop_level,
-            is_trend_day      = bool(sig.get("is_trend_day", False)),
-            trend_direction   = sig.get("spy_trend", "neutral"),
+            side              = side.upper(),
+            direction         = side.upper(),
+            pattern           = str(sig.get("pattern", "") or ""),
+            timeframe         = str(sig.get("timeframe", "1d") or "1d"),
+            contracts         = contracts,
+            limit_price       = decision.mid_price,
+            max_position_usd  = float(decision.mid_price * contracts * 100),
+            contract_symbol   = decision.symbol,
+            tier              = str(tier or sig.get("tier", "B")),
+            score             = float(sig.get("score", 0) or 0),
+            intel_score       = float(sig.get("intel_score", 0) or 0),
+            confidence_bucket = str(decision.grade or sig.get("confidence_tag", "B")),
+            trigger_type      = "breach",
+            trigger_price     = watched.trigger_price,
+            stop_underlying   = watched.stop_level,
+            target_underlying = watched.target_price,
+            mode              = "live" if not self.paper else "paper",
         )
-        pos.current_option_price = fill_price
-        pos.current_underlying   = watched.trigger_price
-        pos.signal               = sig  # type: ignore[attr-defined]
-        pos.synthetic_entry      = synthetic  # type: ignore[attr-defined]
-        if local_order_id:
-            pos.local_order_id  = local_order_id   # type: ignore[attr-defined]
-        if broker_order_id:
-            pos.broker_order_id = broker_order_id  # type: ignore[attr-defined]
-
-        self.exit_eng.add_position(pos)
-
-        with self._pos_lock:
-            self._position_count += 1
-
-        if signal_id:
-            _status = "executed_synthetic" if synthetic else "executed"
-            self.store.update_status(signal_id, _status, timestamp_flag="executed_at")
-
-        self.proof.log_position_opened(
-            ticker          = ticker,
-            side            = side,
-            tier            = sig.get("tier", "A"),
-            score           = watched.score,
-            contracts       = contracts,
-            synthetic_entry = bool(getattr(pos, "synthetic_entry", False)),
-        )
-
-        # ── SLIPPAGE TRACKER ────────────────────────────────────────
-        # Compare actual fill to the mid we expected. Log once per entry
-        # for later bucket analysis (slippage vs spread_pct vs ticker tier).
-        # Not logged for synthetic fills (those ARE the mid by construction).
-        try:
-            _quote_mid    = float(getattr(decision, "mid_price", 0) or 0)
-            _quote_spread = float(getattr(decision, "spread_pct", 0) or 0)
-            if _quote_mid > 0 and fill_price and not synthetic:
-                # BUY slippage: positive = paid above mid (bad for us)
-                _slip_vs_mid = fill_price - _quote_mid
-                _slip_bps    = (_slip_vs_mid / _quote_mid) * 10_000
-                log.info(
-                    f"[SLIPPAGE] {ticker} {decision.symbol} side=BUY qty={contracts} "
-                    f"mid={_quote_mid:.2f} fill={fill_price:.2f} "
-                    f"spread_pct={_quote_spread:.3f} "
-                    f"slip_vs_mid=${_slip_vs_mid:+.2f} slip_bps={_slip_bps:+.0f} "
-                    f"pro_tier={sig.get('_pro_tier', '?')}"
-                )
-        except Exception as _e:
-            log.debug(f"[{ticker}] slippage log failed: {_e}")
 
         log.info(
-            f"[{ticker}] {'PAPER' if self.paper else 'LIVE'} OPEN "
-            f"(synthetic={synthetic}) | "
-            f"{contracts}x {decision.symbol} @ ${fill_price:.2f} | "
-            f"target=${watched.target_price} stop=${watched.stop_level} | "
-            f"tier={tier} score={watched.score:.0f}"
-            + (f" | local={local_order_id} broker={broker_order_id}" if local_order_id else "")
+            "[%s] %s — submitting EXISTING queue order via OSM | local=%s @ $%.2f x%s",
+            ticker,
+            "PAPER" if self.paper else "LIVE",
+            queue_local_order_id,
+            decision.mid_price,
+            contracts,
         )
+        submit_res = self.order_state_machine.submit_existing_entry(
+            local_order_id = queue_local_order_id,
+            broker         = self.broker,
+            plan           = plan,
+            limit_price    = decision.mid_price,
+        )
+
+        if submit_res.get("ok"):
+            local_order_id  = submit_res.get("local_order_id")
+            broker_order_id = submit_res.get("broker_order_id")
+            if signal_id:
+                self.store.update_signal_fields(signal_id, {
+                    "decision_status": "submitted",
+                    "context_notes": (
+                        f"entry_submitted local={local_order_id} "
+                        f"broker={broker_order_id}"
+                    ),
+                })
+            log.info(
+                "[%s] Entry submitted via OSM | local=%s broker=%s %sx %s @ $%.2f",
+                ticker,
+                local_order_id,
+                broker_order_id,
+                contracts,
+                decision.symbol,
+                decision.mid_price,
+            )
+            # Do NOT create ManagedPosition here; fill_monitor/OSM/position_manager
+            # create DB truth after broker fill.
+            return
+
+        log.error(
+            "[%s] Entry submit failed via OSM | local=%s error=%s",
+            ticker,
+            submit_res.get("local_order_id") or queue_local_order_id,
+            submit_res.get("error"),
+        )
+        funnel.inc("order_failed")
+        if signal_id:
+            self.store.update_signal_fields(signal_id, {
+                "decision_status": "submit_failed",
+                "context_notes": f"osm_submit_existing_entry_failed={submit_res.get('error')}",
+            })
+        return
 
     # ── CALLBACK: Position Closed ─────────────────────────────────────────────
 
@@ -1352,10 +1115,58 @@ class APExecutionCore:
 
     # ── CALLBACKS: Expire / Invalidate ────────────────────────────────────────
 
+    def _cleanup_pending_entry_order(self, watched: WatchedSignal, *, action: str, reason: str) -> None:
+        """Best-effort OSM cleanup for watcher terminal outcomes.
+
+        The queue creates an ENTRY order before arming the watcher. If the
+        watcher later expires or invalidates before broker submission, that
+        order must not remain as a ghost CREATED/PENDING_TRIGGER row.
+        """
+        sig = getattr(watched, "signal", {}) or {}
+        local_order_id = str(sig.get("local_order_id") or "").strip()
+        if not local_order_id or self.order_state_machine is None:
+            return
+
+        try:
+            if action == "expire" and hasattr(self.order_state_machine, "expire_pending_entry"):
+                ok = self.order_state_machine.expire_pending_entry(local_order_id, reason=reason)
+                if not ok:
+                    log.warning(
+                        "[%s] OSM expire_pending_entry returned false | order=%s reason=%s",
+                        watched.ticker, local_order_id, reason,
+                    )
+                return
+
+            if action == "cancel" and hasattr(self.order_state_machine, "cancel_pending_entry"):
+                ok = self.order_state_machine.cancel_pending_entry(local_order_id, reason=reason)
+                if not ok:
+                    log.warning(
+                        "[%s] OSM cancel_pending_entry returned false | order=%s reason=%s",
+                        watched.ticker, local_order_id, reason,
+                    )
+                return
+
+            # Compatibility fallback for older OSM versions that do not expose
+            # helper methods yet. Only legal CREATED/PENDING_TRIGGER orders will
+            # transition; illegal/terminal states are blocked by OSM.transition().
+            fallback_status = "EXPIRED" if action == "expire" else "CANCELED"
+            if hasattr(self.order_state_machine, "transition"):
+                self.order_state_machine.transition(
+                    local_order_id,
+                    fallback_status,
+                    last_error=reason,
+                )
+        except Exception as exc:
+            log.error(
+                "[%s] OSM pending-entry cleanup failed | order=%s action=%s reason=%s error=%s",
+                watched.ticker, local_order_id, action, reason, exc, exc_info=True,
+            )
+
     def _on_signal_expire(self, watched: WatchedSignal):
         signal_id = str(watched.signal.get("signal_id", ""))
         if signal_id:
             self.store.update_status(signal_id, "expired", timestamp_flag="expired_at")
+        self._cleanup_pending_entry_order(watched, action="expire", reason="watcher_expired")
         funnel.inc("watcher_expired")
         log.info(f"[{watched.ticker}] Signal expired -- no breach")
 
@@ -1363,6 +1174,7 @@ class APExecutionCore:
         signal_id = str(watched.signal.get("signal_id", ""))
         if signal_id:
             self.store.update_status(signal_id, "invalidated", timestamp_flag="invalidated_at")
+        self._cleanup_pending_entry_order(watched, action="cancel", reason="watcher_invalidated")
         funnel.inc("watcher_invalidated")
         log.info(f"[{watched.ticker}] Signal invalidated -- wrong direction")
 
@@ -1443,7 +1255,7 @@ class APExecutionCore:
             resp = self.broker.session.get(
                 f"{base_url}/v1/markets/options/chains",
                 params  = {"symbol": ticker, "expiration": expiry, "greeks": "true"},
-                headers = {"Accept": "application/json"},
+                headers = headers,
                 timeout = 10,
             )
             raw     = resp.json() or {}
@@ -1464,7 +1276,7 @@ class APExecutionCore:
             exp_resp = self.broker.session.get(
                 f"{base_url}/v1/markets/options/expirations",
                 params  = {"symbol": ticker, "includeAllRoots": "true"},
-                headers = {"Accept": "application/json"},
+                headers = headers,
                 timeout = 10,
             )
             exp_data = exp_resp.json() or {}
@@ -1527,7 +1339,7 @@ class APExecutionCore:
         per_contract  = option_price * 100          # e.g. $1.50 mid → $150/contract
         raw_qty       = int(budget // per_contract) if per_contract > 0 else 0
         tier_cap      = self._max_contracts_for_tier(tier)
-        return max(1, min(raw_qty, tier_cap))       # always at least 1 if we get here
+        return max(0, min(raw_qty, tier_cap))       # strict production sizing: 0 if budget cannot afford 1 contract
 
     def _get_base_contracts(self, score: float) -> int:
         if score >= 95: return 4
@@ -1551,7 +1363,7 @@ class APExecutionCore:
                     "price":         round(limit_price, 2),
                     "duration":      "day",
                 },
-                headers = {"Accept": "application/json"},
+                headers = headers,
                 timeout = 10,
             )
             order  = resp.json().get("order", {})
