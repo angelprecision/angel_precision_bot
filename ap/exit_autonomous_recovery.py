@@ -6,7 +6,7 @@ Conservative autonomous recovery helper for APExitEngine quarantine/stale in-fli
 Safety rules
 ------------
 1. Never clear an exit quarantine by time alone.
-2. Never authorize replacement if a matching live broker exit order is found.
+2. Never authorize replacement if ANY matching live broker exit order is found.
 3. Prefer fill/close truth when broker/DB evidence exists.
 4. On ambiguous matching live exits, try broker cancel first and only unlock after
    cancel proof or terminal broker confirmation.
@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -29,6 +30,8 @@ OPEN_BROKER_STATUSES = {"open", "pending", "accepted", "submitted", "queued", "w
 TERMINAL_BROKER_STATUSES = {"filled", "canceled", "cancelled", "rejected", "expired"}
 CANCEL_CONFIRMED_STATUSES = {"canceled", "cancelled", "rejected", "expired"}
 QUOTE_STALE_WARN_SEC = int(os.getenv("EXIT_RECOVERY_QUOTE_STALE_SEC", "30"))
+CANCEL_PROOF_RETRIES = int(os.getenv("EXIT_RECOVERY_CANCEL_RETRIES", "3"))
+CANCEL_PROOF_DELAY_SEC = float(os.getenv("EXIT_RECOVERY_CANCEL_DELAY_SEC", "1.0"))
 
 
 def _now() -> datetime:
@@ -98,6 +101,7 @@ def _list_open_orders(broker: Any) -> list[dict]:
             except TypeError:
                 result = method()
             if result is None:
+                log.warning("broker.%s returned None during autonomous recovery", method_name)
                 continue
             if isinstance(result, dict):
                 for key in ("orders", "data", "results", "items"):
@@ -107,7 +111,7 @@ def _list_open_orders(broker: Any) -> list[dict]:
             if isinstance(result, list):
                 return [dict(x) for x in result if isinstance(x, dict)]
         except Exception as exc:
-            log.debug("broker.%s failed during autonomous recovery: %s", method_name, exc)
+            log.warning("broker.%s failed during autonomous recovery: %s", method_name, exc)
     return []
 
 
@@ -116,39 +120,76 @@ def _get_order(broker: Any, broker_order_id: str) -> Optional[dict]:
         return None
     method = getattr(broker, "get_order", None)
     if not callable(method):
+        log.warning("broker.get_order missing during autonomous recovery")
         return None
     try:
         raw = method(broker_order_id)
-        return dict(raw) if isinstance(raw, dict) else None
+        if isinstance(raw, dict):
+            return dict(raw)
+        log.warning("broker.get_order(%s) returned non-dict payload: %r", broker_order_id, raw)
+        return None
     except Exception as exc:
-        log.debug("broker.get_order(%s) failed: %s", broker_order_id, exc)
+        log.warning("broker.get_order(%s) failed: %s", broker_order_id, exc)
         return None
 
 
-def _cancel_order_with_proof(broker: Any, broker_order_id: str) -> tuple[bool, dict]:
-    """Attempt broker cancel and verify terminal/canceled status."""
+def _matching_open_exit_orders(broker: Any, contract: str, *, exclude_broker_id: str = "") -> list[tuple[str, dict]]:
+    matches: list[tuple[str, dict]] = []
+    for raw in _list_open_orders(broker):
+        if contract and _contract(raw) != contract:
+            continue
+        if not _is_exit_like(raw):
+            continue
+        st = _status(raw)
+        if st and st not in OPEN_BROKER_STATUSES:
+            continue
+        bid = _broker_order_id(raw)
+        if not bid or (exclude_broker_id and bid == exclude_broker_id):
+            continue
+        matches.append((bid, raw))
+    return matches
+
+
+def _cancel_order_with_proof(
+    broker: Any,
+    broker_order_id: str,
+    *,
+    max_retries: int = CANCEL_PROOF_RETRIES,
+    retry_delay: float = CANCEL_PROOF_DELAY_SEC,
+) -> tuple[bool, dict]:
+    """Attempt broker cancel and wait briefly for terminal/canceled proof."""
     if not broker_order_id:
         return False, {"error": "missing_broker_order_id"}
     cancel = getattr(broker, "cancel_order", None)
     if not callable(cancel):
-        return False, {"error": "broker_cancel_order_missing"}
+        return False, {"error": "broker_cancel_order_missing", "broker_order_id": broker_order_id}
     try:
         raw = cancel(broker_order_id)
         raw = dict(raw) if isinstance(raw, dict) else {"raw": raw}
     except Exception as exc:
         return False, {"error": str(exc), "broker_order_id": broker_order_id}
 
-    status = _status(raw)
+    status_val = _status(raw)
     ok_flag = bool(raw.get("ok"))
-    confirmed = _get_order(broker, broker_order_id)
-    confirmed_status = _status(confirmed or {}) if confirmed else status
-    if ok_flag and (not confirmed_status or confirmed_status in CANCEL_CONFIRMED_STATUSES):
-        raw["confirmed_status"] = confirmed_status
-        return True, raw
-    if confirmed_status in CANCEL_CONFIRMED_STATUSES:
-        raw["confirmed_status"] = confirmed_status
-        return True, raw
+    confirmed_status = status_val
+    confirmed_payload: Optional[dict] = None
+
+    for attempt in range(max(1, int(max_retries))):
+        confirmed = _get_order(broker, broker_order_id)
+        confirmed_payload = confirmed
+        confirmed_status = _status(confirmed or {}) if confirmed else status_val
+        if confirmed_status in CANCEL_CONFIRMED_STATUSES:
+            raw["confirmed_status"] = confirmed_status
+            raw["confirmation_attempts"] = attempt + 1
+            return True, raw
+        if attempt < max_retries - 1:
+            time.sleep(max(0.0, float(retry_delay)))
+
+    # If broker accepted cancel but status has not propagated, do NOT unlock.
     raw["confirmed_status"] = confirmed_status
+    raw["confirmation_attempts"] = max_retries
+    raw["confirmed_payload"] = confirmed_payload
+    raw["ok_flag"] = ok_flag
     return False, raw
 
 
@@ -189,6 +230,28 @@ class RecoveryAction:
     local_order_id: str = ""
     broker_order_id: str = ""
     details: dict = field(default_factory=dict)
+
+
+def _mark_replacement_safe(exit_engine: Any, pid: str, *, reason: str, local_id: str, broker_id: str, details: dict) -> RecoveryAction:
+    if exit_engine and hasattr(exit_engine, "mark_exit_replacement_safe"):
+        exit_engine.mark_exit_replacement_safe(
+            pid,
+            reason=reason,
+            local_order_id=local_id,
+            broker_order_id=broker_id,
+            reconciled=True,
+        )
+        return RecoveryAction("REPLACEMENT_SAFE", reason, pid, local_id, broker_id, details)
+    if exit_engine and hasattr(exit_engine, "clear_exit_in_flight"):
+        exit_engine.clear_exit_in_flight(
+            pid,
+            reason=reason,
+            local_order_id=local_id,
+            broker_order_id=broker_id,
+            reconciled=True,
+        )
+        return RecoveryAction("CLEARED_IN_FLIGHT", reason, pid, local_id, broker_id, details)
+    return RecoveryAction("NOOP", "no_replacement_or_clear_hook_available", pid, local_id, broker_id, details)
 
 
 def recover_exit_position(pos: Any, *, broker: Any, exit_engine: Any = None, osm: Any = None) -> RecoveryAction:
@@ -238,39 +301,34 @@ def recover_exit_position(pos: Any, *, broker: Any, exit_engine: Any = None, osm
                     )
                 return RecoveryAction("MARKED_CLOSED", "broker_order_filled", pid, local_id, pending_broker_id, {"status": st, "filled_qty": filled_qty, "quote_health": qh})
             if st in TERMINAL_BROKER_STATUSES:
-                if exit_engine and hasattr(exit_engine, "mark_exit_replacement_safe"):
-                    exit_engine.mark_exit_replacement_safe(
-                        pid,
-                        reason=f"autonomous_recovery_broker_terminal_{st}",
-                        local_order_id=local_id,
-                        broker_order_id=pending_broker_id,
-                        reconciled=True,
-                    )
-                elif exit_engine and hasattr(exit_engine, "clear_exit_in_flight"):
-                    exit_engine.clear_exit_in_flight(
-                        pid,
-                        reason=f"autonomous_recovery_broker_terminal_{st}",
-                        local_order_id=local_id,
-                        broker_order_id=pending_broker_id,
-                        reconciled=True,
-                    )
-                return RecoveryAction("REPLACEMENT_SAFE", "broker_order_terminal", pid, local_id, pending_broker_id, {"status": st, "quote_health": qh})
+                # CRITICAL safety: terminal status for the old pending id is NOT enough.
+                # Scan broker for a different live exit on the same contract before allowing replacement.
+                other_matches = _matching_open_exit_orders(broker, contract, exclude_broker_id=pending_broker_id)
+                if len(other_matches) == 1:
+                    other_bid, other_raw = other_matches[0]
+                    if exit_engine and hasattr(exit_engine, "set_pending_exit_order"):
+                        exit_engine.set_pending_exit_order(
+                            pid,
+                            local_order_id=local_id,
+                            broker_order_id=other_bid,
+                            qty=int(_qty(other_raw) or getattr(pos, "pending_exit_qty", 0) or 0),
+                            reason="autonomous_recovery_found_different_open_exit",
+                        )
+                    return RecoveryAction("CONFIRMED_OPEN", "different_broker_exit_still_open", pid, local_id, other_bid, {"old_status": st, "contract": contract, "quote_health": qh})
+                if len(other_matches) > 1:
+                    return RecoveryAction("NOOP", "multiple_different_open_exits_block_replacement", pid, local_id, pending_broker_id, {"old_status": st, "matches": [m[0] for m in other_matches], "quote_health": qh})
+                return _mark_replacement_safe(
+                    exit_engine,
+                    pid,
+                    reason=f"autonomous_recovery_broker_terminal_{st}",
+                    local_id=local_id,
+                    broker_id=pending_broker_id,
+                    details={"status": st, "quote_health": qh},
+                )
             return RecoveryAction("NOOP", "broker_order_ambiguous_status", pid, local_id, pending_broker_id, {"status": st, "quote_health": qh})
 
     # Missing broker id: scan open orders for matching exit order.
-    open_orders = _list_open_orders(broker)
-    matches = []
-    for raw in open_orders:
-        if contract and _contract(raw) != contract:
-            continue
-        if not _is_exit_like(raw):
-            continue
-        st = _status(raw)
-        if st and st not in OPEN_BROKER_STATUSES:
-            continue
-        bid = _broker_order_id(raw)
-        if bid:
-            matches.append((bid, raw))
+    matches = _matching_open_exit_orders(broker, contract)
 
     if len(matches) == 1:
         recovered_broker_id, raw = matches[0]
@@ -292,29 +350,26 @@ def recover_exit_position(pos: Any, *, broker: Any, exit_engine: Any = None, osm
             cancel_results.append({"broker_order_id": bid, "ok": ok, "proof": proof})
             if not ok:
                 all_canceled = False
-        if all_canceled and exit_engine and hasattr(exit_engine, "mark_exit_replacement_safe"):
-            exit_engine.mark_exit_replacement_safe(
+        if all_canceled:
+            return _mark_replacement_safe(
+                exit_engine,
                 pid,
                 reason="autonomous_recovery_multiple_live_exit_orders_canceled",
-                local_order_id=local_id,
-                broker_order_id="",
-                reconciled=True,
+                local_id=local_id,
+                broker_id="",
+                details={"match_count": len(matches), "cancel_results": cancel_results, "quote_health": qh},
             )
-            return RecoveryAction("REPLACEMENT_SAFE", "multiple_live_exit_orders_canceled_with_proof", pid, local_id, "", {"match_count": len(matches), "cancel_results": cancel_results, "quote_health": qh})
         return RecoveryAction("NOOP", "multiple_live_exit_orders_cancel_not_proven", pid, local_id, "", {"match_count": len(matches), "cancel_results": cancel_results, "quote_health": qh})
 
     # Negative proof: no matching open sell-to-close order currently at broker.
-    if exit_engine and hasattr(exit_engine, "mark_exit_replacement_safe"):
-        exit_engine.mark_exit_replacement_safe(
-            pid,
-            reason="autonomous_recovery_no_matching_live_exit_order",
-            local_order_id=local_id,
-            broker_order_id="",
-            reconciled=True,
-        )
-        return RecoveryAction("REPLACEMENT_SAFE", "no_matching_live_exit_order", pid, local_id, "", {"contract": contract, "quote_health": qh})
-
-    return RecoveryAction("NOOP", "no_replacement_hook_available", pid, local_id, "", {"contract": contract, "quote_health": qh})
+    return _mark_replacement_safe(
+        exit_engine,
+        pid,
+        reason="autonomous_recovery_no_matching_live_exit_order",
+        local_id=local_id,
+        broker_id="",
+        details={"contract": contract, "quote_health": qh},
+    )
 
 
 def recover_exit_engine(exit_engine: Any, *, broker: Any, osm: Any = None, max_positions: int = 10) -> list[RecoveryAction]:
@@ -341,7 +396,6 @@ def recover_exit_engine(exit_engine: Any, *, broker: Any, osm: Any = None, max_p
 
 
 def scan_quote_staleness(exit_engine: Any, *, stale_sec: int = QUOTE_STALE_WARN_SEC) -> list[dict]:
-    """Return active positions whose option/underlying quote health is stale."""
     out = []
     if exit_engine is None:
         return out
