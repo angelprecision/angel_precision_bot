@@ -1,4 +1,5 @@
 # ap/contract_selector.py
+# PATCH: capital alignment — scoring stays midpoint; affordability/reserved risk uses ask execution basis.
 #
 # ══════════════════════════════════════════════════════════════════════════════
 # CANONICAL QUALITY GATE INVARIANT (do not remove)
@@ -1013,24 +1014,24 @@ class APContractSelectionEngine:
         # ── F. UPDATE PLAN IN-PLACE ───────────────────────────────────────────
         if isinstance(plan, dict):
             plan["contract_symbol"] = selected.contract_symbol
-            plan["limit_price"]     = selected.ask
+            plan["limit_price"]     = selected.execution_price_per_share
             plan["contracts"]       = selected.affordable_contracts
             plan["max_position_usd"] = plan["contracts"] * selected.premium_per_contract
             plan["selector_effective_budget"] = selected.effective_budget
             plan["selector_budget_clipped"] = selected.budget_clipped
             plan["selector_scoring_price"] = selected.scoring_price_per_share
             plan["selector_execution_price"] = selected.execution_price_per_share
-            plan["selector_pricing_basis"] = "ASK_EXECUTION"
+            plan["selector_pricing_basis"] = "ASK_EXECUTION" if str(self.mode).upper() == "LIVE" else "MID_SIMULATION"
         else:
             plan.contract_symbol  = selected.contract_symbol
-            plan.limit_price      = selected.ask
+            plan.limit_price      = selected.execution_price_per_share
             plan.contracts        = selected.affordable_contracts
             plan.max_position_usd = plan.contracts * selected.premium_per_contract
             plan.selector_effective_budget = selected.effective_budget
             plan.selector_budget_clipped = selected.budget_clipped
             plan.selector_scoring_price = selected.scoring_price_per_share
             plan.selector_execution_price = selected.execution_price_per_share
-            plan.selector_pricing_basis = "ASK_EXECUTION"
+            plan.selector_pricing_basis = "ASK_EXECUTION" if str(self.mode).upper() == "LIVE" else "MID_SIMULATION"
         if _wick_confidence and not getattr(plan, "wick_confidence", None):
             try:
                 plan.wick_confidence = _wick_confidence
@@ -1054,7 +1055,7 @@ class APContractSelectionEngine:
                 "execution_price_per_share": selected.execution_price_per_share,
                 "effective_budget": selected.effective_budget,
                 "budget_clipped": selected.budget_clipped,
-                "pricing_basis": "ASK_EXECUTION",
+                "pricing_basis": "ASK_EXECUTION" if str(self.mode).upper() == "LIVE" else "MID_SIMULATION",
                 "spread_pct":           selected.spread_pct,
                 "oi":                   selected.open_interest,
                 "volume":               selected.volume,
@@ -1382,11 +1383,14 @@ class APContractSelectionEngine:
             except Exception:
                 dte = 0
 
-            # Keep ranking/scoring on mid, but live affordability and order cost must use
-            # the executable buy-side price. This prevents a contract from fitting
-            # at mid while the submitted ask-limit order exceeds the authorized budget.
+            # Keep ranking/scoring on mid. Use ask for LIVE money truth, but keep
+            # paper/research simulation on mid if that is the configured mode.
+            # This prevents LIVE from approving a contract that only fits at mid,
+            # while preserving less restrictive paper iteration when not live.
+            is_live = str(getattr(self, "mode", "paper")).upper() == "LIVE"
             scoring_price_per_share   = mid
-            execution_price_per_share = ask
+            execution_price_per_share = ask if is_live else mid
+            pricing_basis             = "ASK_EXECUTION" if is_live else "MID_SIMULATION"
             premium_per_share         = execution_price_per_share
             premium_per_contract      = execution_price_per_share * 100
             effective_budget, MAX_TRADE_USD, budget_clipped = _effective_budget(budget)
