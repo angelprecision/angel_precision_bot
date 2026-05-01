@@ -7,114 +7,79 @@
 #   CALL signal: invalidated when session_low_so_far < prior_day_low
 #                Rationale: if the market already broke the prior-day low
 #                before our entry, the bullish structure is compromised.
-#                The daily candle is no longer "waiting to go up" —
-#                it already showed downside follow-through.
 #
 #   PUT signal:  invalidated when session_high_so_far > prior_day_high
 #                Rationale: if the market already broke the prior-day high
 #                before our entry, the bearish structure is compromised.
-#                The daily candle is no longer "waiting to go down" —
-#                it already showed upside follow-through.
 #
-# DATA NOTE — Tradier quote fields used:
-#   "high" = session high so far (regular + any premarket if extended enabled)
-#   "low"  = session low so far
-#   These are labeled session_high_so_far / session_low_so_far here to make
-#   explicit they may not be pure extended-hours-only values. Verify field
-#   behavior in your Tradier account settings if results seem off.
+# CLIENT-MONEY POLICY:
+#   Default is FAIL-CLOSED. Missing prior levels or missing snapshot means the
+#   overnight daily signal is invalidated, not allowed through. Set
+#   OVERNIGHT_DAILY_FAIL_OPEN=1 only for emergency/paper transitional testing.
 #
-# FAIL OPEN policy:
-#   - If snapshot unavailable → log WARNING, keep signal valid
-#   - If prior levels missing → log WARNING, keep signal valid for NOW
-#     (once signal creation reliably stores prior levels, change to expire)
-#
-# Integration:
-#   1. ap/queue.py       — attach prior_day_high, prior_day_low, timeframe,
-#                          strategy_type to the plan before handing to watcher
-#   2. ap_entry_watcher.py — call recheck_overnight_daily() in _check_all()
-#                            for overnight signals where _is_daily_signal(w)
+# IMPORTANT PROFITABILITY NOTE:
+#   This file validates daily structure. It does not, by itself, prove that the
+#   candle on the selected timeframe has CLOSED directional. That requires a bar
+#   history / candle-close data source. The watcher currently confirms breach
+#   momentum over multiple quote polls, not a completed candle close.
 # =============================================================================
 
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
 
 log = logging.getLogger("ap.overnight_daily_validator")
 
+OVERNIGHT_DAILY_FAIL_OPEN = os.getenv("OVERNIGHT_DAILY_FAIL_OPEN", "0").strip().lower() in {"1", "true", "yes", "on"}
 
-# =============================================================================
-# INVALIDATION REASON CODES
-# =============================================================================
 
 class InvalidationReason:
     PRIOR_HIGH_BREACHED = "INVALIDATED_PRIOR_HIGH_BREACHED"
-    PRIOR_LOW_BREACHED  = "INVALIDATED_PRIOR_LOW_BREACHED"
+    PRIOR_LOW_BREACHED = "INVALIDATED_PRIOR_LOW_BREACHED"
     BOTH_SIDES_BREACHED = "INVALIDATED_BOTH_SIDES_BREACHED"
-    EXPIRED_NO_TRIGGER  = "INVALIDATED_EXPIRED_NO_TRIGGER"
-    INVALID_SIDE        = "INVALID_SIDE"
+    EXPIRED_NO_TRIGGER = "INVALIDATED_EXPIRED_NO_TRIGGER"
+    INVALID_SIDE = "INVALID_SIDE"
+    MISSING_PRIOR_LEVELS = "INVALIDATED_MISSING_PRIOR_LEVELS"
+    SNAPSHOT_UNAVAILABLE = "INVALIDATED_SNAPSHOT_UNAVAILABLE"
 
 
 class OvernightWatchState:
-    """
-    Dedicated state enum for overnight daily signals.
-    These states are stored in w.signal["queue_status"] and are separate
-    from WatchState (PENDING/TRIGGERED/EXPIRED/INVALIDATED) which lives
-    on the WatchedSignal object itself.
-    Use these in dashboard queries and observability.
-    """
-    OVERNIGHT_QUEUED      = "OVERNIGHT_QUEUED"
-    OPEN_RECHECK_PENDING  = "OPEN_RECHECK_PENDING"
-    VALID_AWAITING_BREACH = "VALID_AWAITING_BREACH"   # ← explicit armed state
-    INVALIDATED           = "INVALIDATED"
-    ENTRY_SUBMITTED       = "ENTRY_SUBMITTED"
-    ENTERED               = "ENTERED"
-    EXPIRED_NO_TRIGGER    = "EXPIRED_NO_TRIGGER"
+    OVERNIGHT_QUEUED = "OVERNIGHT_QUEUED"
+    OPEN_RECHECK_PENDING = "OPEN_RECHECK_PENDING"
+    VALID_AWAITING_BREACH = "VALID_AWAITING_BREACH"
+    INVALIDATED = "INVALIDATED"
+    ENTRY_SUBMITTED = "ENTRY_SUBMITTED"
+    ENTERED = "ENTERED"
+    EXPIRED_NO_TRIGGER = "EXPIRED_NO_TRIGGER"
 
-
-# =============================================================================
-# RESULT
-# =============================================================================
 
 @dataclass
 class ValidationResult:
-    valid:             bool
-    reason_code:       str
-    reason_text:       str
-    prior_high:        Optional[float] = None
-    prior_low:         Optional[float] = None
-    session_high:      Optional[float] = None   # session_high_so_far
-    session_low:       Optional[float] = None   # session_low_so_far
-    side:              Optional[str]   = None
+    valid: bool
+    reason_code: str
+    reason_text: str
+    prior_high: Optional[float] = None
+    prior_low: Optional[float] = None
+    session_high: Optional[float] = None
+    session_low: Optional[float] = None
+    side: Optional[str] = None
 
-
-# =============================================================================
-# MARKET SNAPSHOT
-# =============================================================================
 
 @dataclass
 class MarketSnapshot:
-    """
-    Session price data for overnight validity check.
-    session_high_so_far / session_low_so_far come from Tradier quote
-    fields "high" and "low" which represent the session range so far.
-    These include premarket when Tradier extended-hours data is enabled.
-    Verify in your account that these reflect the full overnight range.
-    """
-    ticker:                str
-    session_high_so_far:   float
-    session_low_so_far:    float
-    last_price:            float
-    fetched_at:            str
+    ticker: str
+    session_high_so_far: float
+    session_low_so_far: float
+    last_price: float
+    fetched_at: str
 
 
 def fetch_market_snapshot(ticker: str, broker) -> Optional[MarketSnapshot]:
-    """
-    Fetch session high/low + last from Tradier.
-    Returns None on any failure — caller fails open.
-    """
+    """Fetch session high/low + last from Tradier. Returns None on failure."""
     try:
         base_url = (
             getattr(broker, "base_url", None)
@@ -133,13 +98,15 @@ def fetch_market_snapshot(ticker: str, broker) -> Optional[MarketSnapshot]:
 
         raw = resp.json().get("quotes", {}).get("quote", {})
         quote = raw[0] if isinstance(raw, list) and raw else raw
+        if not isinstance(quote, dict):
+            return None
 
         session_high = float(quote.get("high") or 0)
-        session_low  = float(quote.get("low")  or 0)
-        last         = float(quote.get("last") or quote.get("bid") or 0)
+        session_low = float(quote.get("low") or 0)
+        last = float(quote.get("last") or quote.get("bid") or quote.get("ask") or 0)
 
         if not session_high or not session_low:
-            log.warning("[%s] Snapshot missing high/low — fail open", ticker)
+            log.warning("[%s] Snapshot missing high/low", ticker)
             return None
 
         return MarketSnapshot(
@@ -150,201 +117,85 @@ def fetch_market_snapshot(ticker: str, broker) -> Optional[MarketSnapshot]:
             fetched_at=datetime.now(timezone.utc).isoformat(),
         )
     except Exception as e:
-        log.warning("[%s] Snapshot fetch failed (%s) — fail open", ticker, e)
+        log.warning("[%s] Snapshot fetch failed (%s)", ticker, e)
         return None
 
 
-# =============================================================================
-# CORE VALIDATOR
-# =============================================================================
+def _missing_data_result(*, ticker: str, side: str, prior_day_high: Optional[float], prior_day_low: Optional[float], snapshot_missing: bool) -> ValidationResult:
+    if OVERNIGHT_DAILY_FAIL_OPEN:
+        reason_code = "VALID_MISSING_DATA_FAIL_OPEN"
+        reason_text = "Missing overnight daily validation data — fail-open override enabled"
+        log.warning("[%s] OVERNIGHT_DAILY_FAIL_OPEN | side=%s prior_high=%s prior_low=%s snapshot_missing=%s", ticker, side, prior_day_high, prior_day_low, snapshot_missing)
+        return ValidationResult(True, reason_code, reason_text, prior_day_high, prior_day_low, side=side)
+
+    if not prior_day_high or not prior_day_low:
+        reason_code = InvalidationReason.MISSING_PRIOR_LEVELS
+        reason_text = "Prior-day high/low missing — fail-closed for client-money safety"
+    else:
+        reason_code = InvalidationReason.SNAPSHOT_UNAVAILABLE
+        reason_text = "Market snapshot unavailable — fail-closed for client-money safety"
+
+    log.error("[%s] OVERNIGHT_DAILY_INVALIDATED | %s | side=%s prior_high=%s prior_low=%s snapshot_missing=%s", ticker, reason_code, side, prior_day_high, prior_day_low, snapshot_missing)
+    return ValidationResult(False, reason_code, reason_text, prior_day_high, prior_day_low, side=side)
+
 
 def validate_overnight_daily_signal(
     *,
-    ticker:         str,
-    side:           str,
+    ticker: str,
+    side: str,
     prior_day_high: Optional[float],
-    prior_day_low:  Optional[float],
-    snapshot:       Optional[MarketSnapshot],
+    prior_day_low: Optional[float],
+    snapshot: Optional[MarketSnapshot],
 ) -> ValidationResult:
-    """
-    The Strat overnight daily structural validity check.
-
-    See module docstring for exact directional definitions.
-    Fails OPEN on missing data to preserve signal rather than silently kill it.
-    """
     side = (side or "").upper()
 
-    # ── Missing prior levels ──────────────────────────────────────────────────
-    # Log as WARNING — once signal creation reliably stores these fields,
-    # consider changing to expire instead of fail open.
-    if not prior_day_high or not prior_day_low:
-        log.warning(
-            "[%s] OVERNIGHT_DAILY_RECHECK | prior levels not stored — fail open "
-            "| prior_high=%s prior_low=%s | side=%s",
-            ticker, prior_day_high, prior_day_low, side,
-        )
-        # TODO: once signal creation reliably stores prior_day_high/low,
-        # change this to return valid=False with reason_code=InvalidationReason.EXPIRED_NO_TRIGGER
-        # For now, fail open to avoid silently killing signals during transition period.
-        return ValidationResult(
-            valid=True,
-            reason_code="VALID_MISSING_LEVELS_FAIL_OPEN",
-            reason_text="Prior-day levels not stored — failing open (fix signal creation, then harden)",
-            prior_high=prior_day_high,
-            prior_low=prior_day_low,
-            side=side,
-        )
+    if side not in {"CALL", "PUT"}:
+        return ValidationResult(False, InvalidationReason.INVALID_SIDE, f"Unknown side '{side}' — must be CALL or PUT", side=side)
 
-    # ── No snapshot ───────────────────────────────────────────────────────────
-    if snapshot is None:
-        log.warning(
-            "[%s] OVERNIGHT_DAILY_RECHECK | snapshot unavailable — fail open "
-            "| prior_high=%.2f prior_low=%.2f | side=%s",
-            ticker, prior_day_high, prior_day_low, side,
-        )
-        return ValidationResult(
-            valid=True,
-            reason_code="VALID_SNAPSHOT_UNAVAILABLE_FAIL_OPEN",
-            reason_text="Session data unavailable — failing open to preserve signal",
-            prior_high=prior_day_high,
-            prior_low=prior_day_low,
+    if not prior_day_high or not prior_day_low or snapshot is None:
+        return _missing_data_result(
+            ticker=ticker,
             side=side,
+            prior_day_high=prior_day_high,
+            prior_day_low=prior_day_low,
+            snapshot_missing=snapshot is None,
         )
 
     sh = snapshot.session_high_so_far
     sl = snapshot.session_low_so_far
-
     high_breached = sh > prior_day_high
-    low_breached  = sl < prior_day_low
+    low_breached = sl < prior_day_low
 
-    # ── Both sides breached ───────────────────────────────────────────────────
     if high_breached and low_breached:
-        log.info(
-            "[%s] OVERNIGHT_DAILY_INVALIDATED | BOTH_SIDES_BREACHED | side=%s "
-            "| prior_high=%.2f session_high=%.2f | prior_low=%.2f session_low=%.2f",
-            ticker, side, prior_day_high, sh, prior_day_low, sl,
-        )
-        return ValidationResult(
-            valid=False,
-            reason_code=InvalidationReason.BOTH_SIDES_BREACHED,
-            reason_text=(
-                f"Both prior-day boundaries breached: "
-                f"session_high {sh:.2f} > prior_high {prior_day_high:.2f} AND "
-                f"session_low {sl:.2f} < prior_low {prior_day_low:.2f}"
-            ),
-            prior_high=prior_day_high, prior_low=prior_day_low,
-            session_high=sh, session_low=sl, side=side,
-        )
+        log.info("[%s] OVERNIGHT_DAILY_INVALIDATED | BOTH_SIDES_BREACHED | side=%s | prior_high=%.2f session_high=%.2f | prior_low=%.2f session_low=%.2f", ticker, side, prior_day_high, sh, prior_day_low, sl)
+        return ValidationResult(False, InvalidationReason.BOTH_SIDES_BREACHED, f"Both prior-day boundaries breached: session_high {sh:.2f} > prior_high {prior_day_high:.2f} AND session_low {sl:.2f} < prior_low {prior_day_low:.2f}", prior_day_high, prior_day_low, sh, sl, side)
 
-    # ── CALL: invalid if session low breached prior-day low ───────────────────
     if side == "CALL":
         if low_breached:
-            log.info(
-                "[%s] OVERNIGHT_DAILY_INVALIDATED | PRIOR_LOW_BREACHED | side=CALL "
-                "| session_low=%.2f < prior_low=%.2f — bullish structure compromised",
-                ticker, sl, prior_day_low,
-            )
-            return ValidationResult(
-                valid=False,
-                reason_code=InvalidationReason.PRIOR_LOW_BREACHED,
-                reason_text=(
-                    f"Session low {sl:.2f} breached prior-day low {prior_day_low:.2f} "
-                    f"— CALL setup invalidated (daily already showed downside)"
-                ),
-                prior_high=prior_day_high, prior_low=prior_day_low,
-                session_high=sh, session_low=sl, side=side,
-            )
-        log.info(
-            "[%s] OVERNIGHT_DAILY_VALID | side=CALL | prior_low=%.2f session_low=%.2f OK "
-            "| prior_high=%.2f session_high=%.2f | arming for breach",
-            ticker, prior_day_low, sl, prior_day_high, sh,
-        )
-        return ValidationResult(
-            valid=True, reason_code="VALID",
-            reason_text="CALL valid — prior-day low intact, arming for upside breach",
-            prior_high=prior_day_high, prior_low=prior_day_low,
-            session_high=sh, session_low=sl, side=side,
-        )
+            log.info("[%s] OVERNIGHT_DAILY_INVALIDATED | PRIOR_LOW_BREACHED | side=CALL | session_low=%.2f < prior_low=%.2f", ticker, sl, prior_day_low)
+            return ValidationResult(False, InvalidationReason.PRIOR_LOW_BREACHED, f"Session low {sl:.2f} breached prior-day low {prior_day_low:.2f} — CALL setup invalidated", prior_day_high, prior_day_low, sh, sl, side)
+        log.info("[%s] OVERNIGHT_DAILY_VALID | side=CALL | prior_low=%.2f session_low=%.2f OK | prior_high=%.2f session_high=%.2f", ticker, prior_day_low, sl, prior_day_high, sh)
+        return ValidationResult(True, "VALID", "CALL valid — prior-day low intact, arming for upside breach", prior_day_high, prior_day_low, sh, sl, side)
 
-    # ── PUT: invalid if session high breached prior-day high ──────────────────
-    if side == "PUT":
-        if high_breached:
-            log.info(
-                "[%s] OVERNIGHT_DAILY_INVALIDATED | PRIOR_HIGH_BREACHED | side=PUT "
-                "| session_high=%.2f > prior_high=%.2f — bearish structure compromised",
-                ticker, sh, prior_day_high,
-            )
-            return ValidationResult(
-                valid=False,
-                reason_code=InvalidationReason.PRIOR_HIGH_BREACHED,
-                reason_text=(
-                    f"Session high {sh:.2f} breached prior-day high {prior_day_high:.2f} "
-                    f"— PUT setup invalidated (daily already showed upside)"
-                ),
-                prior_high=prior_day_high, prior_low=prior_day_low,
-                session_high=sh, session_low=sl, side=side,
-            )
-        log.info(
-            "[%s] OVERNIGHT_DAILY_VALID | side=PUT | prior_high=%.2f session_high=%.2f OK "
-            "| prior_low=%.2f session_low=%.2f | arming for breach",
-            ticker, prior_day_high, sh, prior_day_low, sl,
-        )
-        return ValidationResult(
-            valid=True, reason_code="VALID",
-            reason_text="PUT valid — prior-day high intact, arming for downside breach",
-            prior_high=prior_day_high, prior_low=prior_day_low,
-            session_high=sh, session_low=sl, side=side,
-        )
+    if high_breached:
+        log.info("[%s] OVERNIGHT_DAILY_INVALIDATED | PRIOR_HIGH_BREACHED | side=PUT | session_high=%.2f > prior_high=%.2f", ticker, sh, prior_day_high)
+        return ValidationResult(False, InvalidationReason.PRIOR_HIGH_BREACHED, f"Session high {sh:.2f} breached prior-day high {prior_day_high:.2f} — PUT setup invalidated", prior_day_high, prior_day_low, sh, sl, side)
 
-    return ValidationResult(
-        valid=False,
-        reason_code=InvalidationReason.INVALID_SIDE,
-        reason_text=f"Unknown side '{side}' — must be CALL or PUT",
-        side=side,
-    )
+    log.info("[%s] OVERNIGHT_DAILY_VALID | side=PUT | prior_high=%.2f session_high=%.2f OK | prior_low=%.2f session_low=%.2f", ticker, prior_day_high, sh, prior_day_low, sl)
+    return ValidationResult(True, "VALID", "PUT valid — prior-day high intact, arming for downside breach", prior_day_high, prior_day_low, sh, sl, side)
 
-
-# =============================================================================
-# WATCHER INTEGRATION
-# =============================================================================
 
 def recheck_overnight_daily(watched, broker) -> ValidationResult:
-    """
-    Called from APEntryWatcher._check_all() for overnight daily signals.
-    Fetches live snapshot and runs structural validity check.
-
-    EXACT WIRING in _check_all() overnight revalidation loop:
-
-        from ap.overnight_daily_validator import recheck_overnight_daily, _is_daily_signal
-
-        for w in overnight_active:
-            if _is_daily_signal(w):
-                result = recheck_overnight_daily(w, self.broker)
-                if not result.valid:
-                    w.state = WatchState.INVALIDATED
-                    _to_expire_overnight.append(w)
-                else:
-                    # Set explicit armed state — do NOT just flip w.overnight=False
-                    # This keeps the queue inspectable and truthful
-                    w.overnight = False          # promote to same-day active watcher
-                    # Use explicit state constant — easier to grep and dashboard-query
-                    w.signal["queue_status"] = OvernightWatchState.VALID_AWAITING_BREACH
-                    log.info("[%s] OVERNIGHT_DAILY_ARMED | side=%s | queue_status=%s | %s",
-                             w.ticker, w.side,
-                             OvernightWatchState.VALID_AWAITING_BREACH,
-                             result.reason_text)
-                    # TODO tomorrow morning: grep logs for OVERNIGHT_DAILY_VALID and verify
-                    # that session_high/session_low values match what you see on your chart.
-                    # Tradier "high"/"low" quote fields should reflect premarket range if
-                    # extended hours are enabled on your account. Confirm once before trusting.
-                continue  # skip generic stale/drift check below
-
-            # existing generic intraday stale check continues here...
-    """
-    signal         = getattr(watched, "signal", {}) or {}
-    prior_day_high = float(signal.get("prior_day_high") or 0) or None
-    prior_day_low  = float(signal.get("prior_day_low")  or 0) or None
-    snapshot       = fetch_market_snapshot(watched.ticker, broker)
+    signal = getattr(watched, "signal", {}) or {}
+    try:
+        prior_day_high = float(signal.get("prior_day_high") or 0) or None
+    except Exception:
+        prior_day_high = None
+    try:
+        prior_day_low = float(signal.get("prior_day_low") or 0) or None
+    except Exception:
+        prior_day_low = None
+    snapshot = fetch_market_snapshot(watched.ticker, broker)
 
     return validate_overnight_daily_signal(
         ticker=watched.ticker,
@@ -356,8 +207,9 @@ def recheck_overnight_daily(watched, broker) -> ValidationResult:
 
 
 def _is_daily_signal(watched) -> bool:
-    """Returns True if this is a daily timeframe overnight signal."""
-    signal = getattr(watched, "signal", {}) or {}
+    signal = getattr(watched, "signal", {}) or watched or {}
+    if not isinstance(signal, dict):
+        signal = getattr(watched, "signal", {}) or {}
     tf = (signal.get("timeframe") or "").upper()
     st = (signal.get("strategy_type") or "").upper()
     return tf in ("1D", "DAILY", "D") or st == "OVERNIGHT_DAILY"
