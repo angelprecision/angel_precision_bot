@@ -706,17 +706,34 @@ class APOrderStateMachine:
                 if _cum_filled is None or _cum_filled <= 0:
                     _cum_filled = _order_qty
                 _delta = max(0, _cum_filled - _prev_filled)
-                _pos = self._get_exit_engine_position(_ee, _pos_id)
-                _remaining_before = self._safe_int(getattr(_pos, "quantity_remaining", None), None) if _pos else None
+                # Prefer DB-backed remaining quantity for classification because in-memory
+                # exit-engine state can lag under callback/reconciler timing. Only fall back
+                # to engine memory if DB cannot answer. If both are unavailable, treat the
+                # order fill as a conservative partial/accounted fill and alert instead of
+                # incorrectly full-closing a runner.
+                _remaining_before = self._get_position_remaining_from_db(_pos_id)
                 if _remaining_before is None:
-                    _remaining_before = self._get_position_remaining_from_db(_pos_id)
+                    _pos = self._get_exit_engine_position(_ee, _pos_id)
+                    _remaining_before = self._safe_int(getattr(_pos, "quantity_remaining", None), None) if _pos else None
 
                 if _delta <= 0:
                     log.info("[%s] EXIT_FILLED hook no-op — no new filled qty | order=%s pos=%s prev=%s cum=%s", self.client_id, _local_id, _pos_id, _prev_filled, _cum_filled)
                     self._call_exit_engine(_ee, "clear_exit_in_flight", _pos_id, local_order_id=_local_id, broker_order_id=_broker_id)
                     return
 
-                if _remaining_before is not None and _delta < int(_remaining_before):
+                if _remaining_before is None:
+                    log.critical(
+                        "[%s] EXIT_FILLED remaining size unknown — conservative partial handling | order=%s pos=%s delta=%s",
+                        self.client_id, _local_id, _pos_id, _delta,
+                    )
+                    self._call_exit_engine(
+                        _ee, "note_partial_exit_fill", _pos_id, _delta,
+                        fill_price=fill_price, local_order_id=_local_id,
+                        broker_order_id=_broker_id, cumulative_filled=_cum_filled,
+                    )
+                    return
+
+                if _delta < int(_remaining_before):
                     log.info("[%s] EXIT_FILLED treated as completed scale-out | order=%s pos=%s delta=%s remaining_before=%s", self.client_id, _local_id, _pos_id, _delta, _remaining_before)
                     self._call_exit_engine(_ee, "note_partial_exit_fill", _pos_id, _delta, fill_price=fill_price, local_order_id=_local_id, broker_order_id=_broker_id, cumulative_filled=_cum_filled)
                     return
@@ -938,6 +955,33 @@ class APOrderStateMachine:
         return {"ok": False, "local_order_id": local_id, "broker_order_id": broker_order_id, "status": OrderStatus.ERROR, "error": error_msg}
 
     def submit_exit(self, *, broker, position_id, contract, symbol, direction, qty, limit_price, plan_id=None, signal_id=None) -> dict:
+        """Submit an EXIT order through OSM only.
+
+        Hard safety rules:
+        - If any active EXIT order already exists for the position, do NOT post
+          another broker order from this path. The prior order must be reconciled
+          to EXIT_FILLED/CANCELED/EXPIRED/REJECTED/ERROR first.
+        - If broker appears to accept the order but returns no broker_order_id,
+          park the local order in active EXIT_SUBMITTED quarantine instead of
+          ERROR. That blocks duplicate exits until broker reconciliation/manual
+          identity recovery resolves truth.
+        """
+        existing = self._get_active_exit_order(position_id)
+        if existing:
+            existing = dict(existing)
+            error_msg = f"active_exit_already_exists:{existing.get('local_order_id')}:{existing.get('status')}"
+            log.critical(
+                "[%s] submit_exit BLOCKED — active exit already exists | pos=%s existing=%s status=%s broker=%s",
+                self.client_id, position_id, existing.get('local_order_id'), existing.get('status'), existing.get('broker_order_id'),
+            )
+            return {
+                "ok": False,
+                "local_order_id": existing.get("local_order_id"),
+                "broker_order_id": existing.get("broker_order_id"),
+                "status": existing.get("status"),
+                "error": error_msg,
+            }
+
         local_id = self.create_exit_order(position_id=position_id, contract=contract, symbol=symbol, direction=direction, qty=qty, plan_id=plan_id, signal_id=signal_id, limit_price=limit_price)
         lp = float(limit_price or 0)
         if lp <= 0:
@@ -964,6 +1008,24 @@ class APOrderStateMachine:
                 if ok:
                     return {"ok": True, "local_order_id": local_id, "broker_order_id": broker_order_id, "status": OrderStatus.EXIT_SUBMITTED, "error": None}
                 error_msg = "exit_submitted_transition_failed_after_broker_accept"
+            elif self._is_broker_accept_status(status) and not broker_order_id:
+                # Broker may have accepted a live order but failed to return identity.
+                # Keep the local order ACTIVE so no second exit can be submitted.
+                error_msg = f"broker_accepted_missing_order_id_quarantine:status={status or 'unknown'}"
+                ok = self.transition(
+                    local_id,
+                    OrderStatus.EXIT_SUBMITTED,
+                    submitted_ts=now_utc_iso(),
+                    last_error=error_msg,
+                )
+                return {
+                    "ok": False,
+                    "local_order_id": local_id,
+                    "broker_order_id": None,
+                    "status": OrderStatus.EXIT_SUBMITTED if ok else OrderStatus.ERROR,
+                    "error": error_msg,
+                    "identity_quarantine": True,
+                }
             else:
                 error_msg = f"broker_status:{status or 'unknown'} broker_order_id_missing:{not bool(broker_order_id)}"
         except Exception as e:
