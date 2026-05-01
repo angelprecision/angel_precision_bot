@@ -494,8 +494,9 @@ class APContractSelectionEngine:
             entry_approx = getattr(plan, "trigger_price", pt1) or pt1
             _expected_move_pct = abs(pt1 - entry_approx) / entry_approx * 100 if entry_approx else 0
 
+        _plan_tier = _safe_plan_attr(plan, "tier", "B") or "B"
         log.info("[%s] ContractSelector | direction=%s budget=$%.0f tier=%s pt1=%s",
-                 ticker, direction, budget, plan.tier, pt1)
+                 ticker, direction, budget, _plan_tier, pt1)
 
         # ── GATE 1: EARNINGS BLACKOUT ─────────────────────────────────────────
         if self.earnings_guard is not None:
@@ -1087,9 +1088,12 @@ class APContractSelectionEngine:
                 ticker, selected.contract_symbol,
             )
 
-        if _wick_confidence and not getattr(plan, "wick_confidence", None):
+        if self.mutate_plan and _wick_confidence and not _safe_plan_attr(plan, "wick_confidence", None):
             try:
-                plan.wick_confidence = _wick_confidence
+                if isinstance(plan, dict):
+                    plan["wick_confidence"] = _wick_confidence
+                else:
+                    plan.wick_confidence = _wick_confidence
             except Exception:
                 pass
 
@@ -1127,6 +1131,7 @@ class APContractSelectionEngine:
                 "is_etf":              _is_etf,
                 "selection_reason":    selected.selection_reason,
                 "mode":                self.mode,
+                "pricing_basis":       selected.pricing_basis,
                 "simulation_override": "[forced_1]" in (selected.selection_reason or ""),
                 "quality_rules_version": _QUALITY_RULES_VERSION,
                 "budget_clipped":       _budget_was_clipped,
@@ -1218,13 +1223,13 @@ class APContractSelectionEngine:
 
         options = chain_resp.json().get("options", {}).get("option", []) or []
 
-        # 5. Inject underlying price AND ticker into every option dict
-        # CRITICAL: both injections must be INSIDE the for loop so every
-        # option gets them — not just the last one
-        if underlying_price:
-            for o in options:
+        # 5. Inject ticker into every option dict regardless of quote availability.
+        # _quality_filter() uses _ticker for per-ticker premium caps, so this must
+        # not depend on underlying_price being present. Inject underlying only when available.
+        for o in options:
+            o["_ticker"] = ticker
+            if underlying_price:
                 o["_underlying_price"] = underlying_price
-                o["_ticker"] = ticker          # ← INSIDE loop (was outside = bug)
 
         filtered = [o for o in options if o.get("option_type", "").lower() == option_type]
         return filtered, underlying_price
