@@ -60,25 +60,26 @@ _PRIORITY_TICKERS = {"SPY", "QQQ", "IWM", "SPX", "NDX", "DIA"}
 _PRIORITY_FLOOR = 40.0
 _INDEX_TO_ETF = {"^GSPC": "SPY", "^NDX": "QQQ", "^RUT": "IWM", "^DJI": "DIA"}
 
-# Entry order states that can reserve capital or represent exposure truth-lag
-# between master-control approval, OSM creation, watcher arming, broker ack,
-# and fill reconciliation. Keep this broad and conservative for LIVE gates.
-_ENTRY_CAPITAL_RESERVED_STATUSES = {
-    "CREATED",
-    "PENDING",
-    "PENDING_TRIGGER",
-    "WATCHING",
-    "TRIGGERED",
-    "QUEUED",
-    "SUBMITTING",
-    "SUBMITTED",
-    "ACK",
-    "ACKED",
-    "ACCEPTED",
-    "OPEN",
-    "PARTIAL",
-    "PARTIALLY_FILLED",
-}
+# Canonical active ENTRY order states that reserve capital / represent pending exposure.
+# Keep this aligned with APOrderStateMachine.PENDING_ENTRY_STATUSES and
+# APPositionManager._PENDING_ENTRY_STATUSES. Master Control prefers
+# position_manager.snapshot()["pending_entry_capital"], but this fallback must
+# use the same canonical lifecycle so fallback risk math cannot drift.
+try:
+    from ap.order_state_machine import PENDING_ENTRY_STATUSES as _OSM_PENDING_ENTRY_STATUSES
+except Exception:
+    _OSM_PENDING_ENTRY_STATUSES = None
+
+_ENTRY_CAPITAL_RESERVED_STATUSES = tuple(
+    str(s).upper().strip()
+    for s in (_OSM_PENDING_ENTRY_STATUSES or (
+        "CREATED",
+        "PENDING_TRIGGER",
+        "SUBMITTED",
+        "ACKNOWLEDGED",
+        "PARTIAL_FILL",
+    ))
+)
 
 
 def _estimate_premium(ticker: str) -> float:
@@ -488,6 +489,50 @@ class APMasterControl:
                 self.account_equity * self.max_sector_pct,
             )
 
+    @staticmethod
+    def _position_price_for_exposure(pos: dict) -> float:
+        """Best available option premium per share for an active position.
+
+        Keep this aligned with APPositionManager._active_position_capital_sql():
+        avg_fill first, then entry/import/reconstruction price fields. This
+        prevents sector/ticker exposure gates from undercounting partially healed
+        live rows that do not yet have avg_fill populated.
+        """
+        for key in (
+            "avg_fill",
+            "entry_price",
+            "entry_option_price",
+            "premium_per_share",
+            "limit_price",
+        ):
+            try:
+                value = pos.get(key)
+                if value is not None and float(value) > 0:
+                    return float(value)
+            except Exception:
+                continue
+        return 0.0
+
+    @staticmethod
+    def _position_qty_for_exposure(pos: dict) -> int:
+        """Best available active/remaining contract quantity for exposure.
+
+        quantity_remaining is preferred when available so partial exits reduce
+        risk exposure; qty/contracts remain backward-compatible fallbacks.
+        """
+        for key in ("quantity_remaining", "qty", "contracts"):
+            try:
+                value = pos.get(key)
+                if value is not None and int(value) > 0:
+                    return int(value)
+            except Exception:
+                continue
+        return 0
+
+    @classmethod
+    def _position_capital_for_exposure(cls, pos: dict) -> float:
+        return cls._position_price_for_exposure(pos) * cls._position_qty_for_exposure(pos) * 100
+
     def _sector_capital_deployed(self, positions: list, sector: str) -> float:
         total = 0.0
         for pos in positions:
@@ -495,9 +540,7 @@ class APMasterControl:
             pos_sector = self.SECTOR_MAP.get(ticker_in_pos.upper(), "other")
             if pos_sector == sector:
                 try:
-                    fill = float(pos.get("avg_fill") or 0)
-                    qty = int(pos.get("qty") or 0)
-                    total += fill * qty * 100
+                    total += self._position_capital_for_exposure(pos)
                 except Exception:
                     pass
         return total
@@ -507,9 +550,9 @@ class APMasterControl:
         Sum capital reserved by entry orders that may still become exposure.
 
         LIVE policy: if this query fails, callers can fail closed because pending
-        capital is part of the hard capital gate. The status list is deliberately
-        broad so OSM/queue/broker handoff states do not undercount risk during
-        approval-time truth lag.
+        capital is part of the hard capital gate. The status list is intentionally
+        canonical and aligned with OSM/PositionManager so fallback risk math cannot
+        drift from the snapshot truth path.
         """
         try:
             from ap.db import conn, run_with_retry
@@ -521,11 +564,14 @@ class APMasterControl:
                     c.execute(
                         """
                         SELECT COALESCE(SUM(
-                            CASE
-                                WHEN reserved_cost IS NOT NULL AND reserved_cost > 0 THEN reserved_cost
-                                WHEN limit_price IS NOT NULL AND limit_price > 0 THEN limit_price * qty * 100
-                                ELSE qty * 100 * 5.0
-                            END
+                            COALESCE(
+                                NULLIF(reserved_cost, 0),
+                                CASE
+                                    WHEN limit_price IS NOT NULL AND limit_price > 0
+                                    THEN limit_price * qty * 100
+                                    ELSE 0
+                                END
+                            )
                         ), 0) AS pending_capital
                         FROM orders
                         WHERE client_id = %s
@@ -536,7 +582,32 @@ class APMasterControl:
                         (client_id, list(statuses)),
                     )
                     row = c.fetchone()
-                    return float((row or {}).get("pending_capital") or 0)
+                    pending_capital = float((row or {}).get("pending_capital") or 0)
+
+                    # LIVE integrity guard: an active ENTRY order with neither
+                    # reserved_cost nor limit_price has unknown dollar exposure.
+                    # Do not silently count it as $0 in live capital gates.
+                    if self._is_live_mode() and self.pending_capital_fail_closed_live:
+                        c.execute(
+                            """
+                            SELECT COUNT(*) AS missing_cost
+                            FROM orders
+                            WHERE client_id = %s
+                              AND kind = 'ENTRY'
+                              AND UPPER(COALESCE(status, '')) = ANY(%s)
+                              AND UPPER(COALESCE(status, '')) NOT IN ('CANCELLED', 'CANCELED', 'REJECTED', 'ERROR', 'FAILED', 'FILLED', 'CLOSED')
+                              AND (reserved_cost IS NULL OR reserved_cost <= 0)
+                              AND (limit_price IS NULL OR limit_price <= 0)
+                            """,
+                            (client_id, list(statuses)),
+                        )
+                        missing = int((c.fetchone() or {}).get("missing_cost") or 0)
+                        if missing > 0:
+                            raise RuntimeError(
+                                f"pending_capital_integrity_failure: {missing} active ENTRY order(s) missing reserved_cost and limit_price"
+                            )
+
+                    return pending_capital
 
             return run_with_retry(_fn)
         except Exception as e:
@@ -577,9 +648,7 @@ class APMasterControl:
             t = str(pos.get("underlying") or pos.get("ticker") or "")
             if t.upper() == ticker.upper():
                 try:
-                    fill = float(pos.get("avg_fill") or 0)
-                    qty = int(pos.get("qty") or 0)
-                    total += fill * qty * 100
+                    total += self._position_capital_for_exposure(pos)
                 except Exception:
                     pass
         return total
@@ -590,9 +659,7 @@ class APMasterControl:
             ticker_in_pos = str(pos.get("underlying") or pos.get("ticker") or "")
             sector = self.SECTOR_MAP.get(ticker_in_pos.upper(), "other")
             try:
-                fill = float(pos.get("avg_fill") or 0)
-                qty = int(pos.get("qty") or 0)
-                exposure[sector] = exposure.get(sector, 0.0) + fill * qty * 100
+                exposure[sector] = exposure.get(sector, 0.0) + self._position_capital_for_exposure(pos)
             except Exception:
                 pass
         return exposure
