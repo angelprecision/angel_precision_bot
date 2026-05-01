@@ -13,6 +13,7 @@
 #   - Hard stop: DTE/instrument-adjusted; default -30%, tighter on 0DTE index
 #
 # Money-safety invariant:
+#   - v9: missing callback identity is a visible safe-lock, not a silent deadlock.
 #   - Submitting an exit order is NOT a fill.
 #   - scale_outs_done increments only after broker-confirmed exit fill.
 #   - Every exit path, including sentinels, must respect exit_in_flight gating.
@@ -195,10 +196,29 @@ class ManagedPosition:
     pending_exit_broker_order_id: str = ""
     last_applied_exit_local_order_id: str = ""
     last_applied_exit_broker_order_id: str = ""
+    # Backward-compatible aggregate watermark; per-order map below is authoritative.
     last_applied_exit_cum_fill: int = 0
+    last_applied_exit_cum_fill_by_order: dict[str, int] = field(default_factory=dict)
     last_exit_signal_ts:  Optional[datetime] = None
     last_callback_identity_missing: bool = False
     last_callback_identity_missing_ts: Optional[datetime] = None
+    # v7 order-safety quarantine/replacement controls. Missing identity does
+    # NOT auto-release because a broker order may still be live even when the
+    # callback failed to return IDs. Replacement requires explicit external
+    # cancel/reconcile proof via mark_exit_replacement_safe().
+    exit_identity_quarantine: bool = False
+    pending_exit_replace_allowed: bool = False
+    pending_exit_replace_reason: str = ""
+    pending_exit_replace_allowed_ts: Optional[datetime] = None
+    # Quarantine escalation telemetry. Quarantine itself blocks duplicate exits;
+    # these fields make safe-lock visible until reconciler/OSM resolves it.
+    exit_identity_quarantine_alert_count: int = 0
+    last_exit_identity_quarantine_alert_ts: Optional[datetime] = None
+    last_exit_clear_reason: str = ""
+    last_exit_clear_local_order_id: str = ""
+    last_exit_clear_broker_order_id: str = ""
+    last_exit_identity_quarantine_resolved_ts: Optional[datetime] = None
+    last_exit_identity_reject_ts: Optional[datetime] = None
 
     # Quote-health fields are explicit dataclass state so dashboard/watchdog code
     # does not depend on dynamic attributes being added during polling.
@@ -625,7 +645,15 @@ LOWEST_EXIT_PRIORITY = len(EXIT_RULE_PRIORITY) + 100
 # Quote and identity safety contract. Normal exits require fresh option marks.
 # Only broker-independent/forced-risk exits may proceed in degraded quote mode.
 STALE_OPTION_QUOTE_MAX_AGE_SEC = int(os.getenv("EXIT_ENGINE_STALE_OPTION_QUOTE_SEC", "20"))
-FORCED_RISK_EXIT_CODES = {"EOD_FORCE_CLOSE", "STOP_HIT", "SENTINEL_FORCED_EXIT"}
+FORCED_RISK_EXIT_CODES = {
+    "EOD_FORCE_CLOSE",
+    "STOP_HIT",
+    "SENTINEL_FORCED_EXIT",
+    "HARD_STOP",
+    "NEVER_GREEN_STOP",
+    "THETA_STOP",
+    "TIME_STOP",
+}
 
 
 def _classify_exit_decision(decision: "ExitDecision") -> str:
@@ -834,50 +862,246 @@ class APExitEngine:
         with self._lock:
             return [p for p in self._positions if not p.closed and int(p.quantity_remaining or 0) > 0]
 
+    def set_pending_exit_order(
+        self,
+        position_id: str,
+        *,
+        local_order_id: str = "",
+        broker_order_id: str = "",
+        qty: int = 0,
+        reason: str = "",
+        **kwargs,
+    ) -> None:
+        """OSM v3-compatible hook for pending/working exit order state.
+
+        OSM may call this after it has created/submitted a broker-side exit
+        order. Keep the live ManagedPosition aligned with OSM identity without
+        forcing callers to match an older/narrower APExitEngine signature.
+        """
+        if not position_id:
+            return
+        try:
+            qty_i = max(0, int(qty or 0))
+        except Exception:
+            qty_i = 0
+        local_order_id = str(local_order_id or "")
+        broker_order_id = str(broker_order_id or "")
+        reason = str(reason or "")
+
+        with self._lock:
+            for pos in self._positions:
+                if str(pos.position_id or "") != str(position_id or ""):
+                    continue
+                if pos.closed or int(pos.quantity_remaining or 0) <= 0:
+                    return
+
+                pos.exit_in_flight = True
+                pos.pending_exit_reason = reason or pos.pending_exit_reason or "osm_pending_exit_order"
+                if qty_i > 0:
+                    pos.pending_exit_qty = qty_i
+                elif int(pos.pending_exit_qty or 0) <= 0:
+                    pos.pending_exit_qty = int(pos.quantity_remaining or 0)
+                pos.pending_exit_local_order_id = local_order_id or pos.pending_exit_local_order_id or ""
+                pos.pending_exit_broker_order_id = broker_order_id or pos.pending_exit_broker_order_id or ""
+                pos.last_exit_signal_ts = datetime.now(timezone.utc)
+                pos.last_exit_rejected = False
+                pos._exit_stuck_count = 0
+
+                if local_order_id or broker_order_id:
+                    pos.last_callback_identity_missing = False
+                    pos.last_callback_identity_missing_ts = None
+                    pos.exit_identity_quarantine = False
+                    pos.exit_identity_quarantine_alert_count = 0
+                    pos.last_exit_identity_quarantine_alert_ts = None
+
+                self._assert_position_invariants(pos, "set_pending_exit_order")
+                self._emit_exit_event(
+                    pos,
+                    decision="SUBMITTED",
+                    reason_code="OSM_PENDING_EXIT_ORDER_SET",
+                    explanation="OSM reported pending exit order identity to exit engine.",
+                    stage="exit_reconciliation",
+                    extra_inputs={
+                        "local_order_id": local_order_id,
+                        "broker_order_id": broker_order_id,
+                        "qty": qty_i,
+                        "reason": reason,
+                    },
+                )
+                log.info(
+                    "[exit_eng] OSM pending exit set | pos_id=%s local=%s broker=%s qty=%s reason=%s",
+                    position_id,
+                    local_order_id or "?",
+                    broker_order_id or "?",
+                    qty_i,
+                    reason or "?",
+                )
+                return
+
+        log.warning(
+            "[exit_eng] OSM pending exit for unknown position | pos_id=%s local=%s broker=%s qty=%s reason=%s",
+            position_id,
+            local_order_id or "?",
+            broker_order_id or "?",
+            qty_i,
+            reason or "?",
+        )
+
     # ── BROKER / OSM RECONCILIATION HOOKS ───────────────────────────────────
     # These methods are intentionally backward compatible with older callers
     # while supporting exact OSM/local/broker order identity when supplied.
+
+    def _pending_exit_has_identity(self, pos: ManagedPosition) -> bool:
+        """True when current pending exit generation has local/broker identity."""
+        return bool(
+            getattr(pos, "pending_exit_local_order_id", "")
+            or getattr(pos, "pending_exit_broker_order_id", "")
+        )
+
+    def _exit_identity_matches(
+        self,
+        pos: ManagedPosition,
+        *,
+        local_order_id: str = "",
+        broker_order_id: str = "",
+        allow_missing_when_no_pending_identity: bool = True,
+    ) -> bool:
+        """Validate an OSM/reconciler hook against the current pending exit generation."""
+        local_order_id = str(local_order_id or "")
+        broker_order_id = str(broker_order_id or "")
+        pending_local = str(getattr(pos, "pending_exit_local_order_id", "") or "")
+        pending_broker = str(getattr(pos, "pending_exit_broker_order_id", "") or "")
+        supplied_identity = bool(local_order_id or broker_order_id)
+        pending_identity = bool(pending_local or pending_broker)
+        if not supplied_identity:
+            return bool(allow_missing_when_no_pending_identity and not pending_identity)
+        if local_order_id and pending_local and local_order_id != pending_local:
+            return False
+        if broker_order_id and pending_broker and broker_order_id != pending_broker:
+            return False
+        return True
+
+    def _reject_stale_exit_hook(
+        self,
+        pos: ManagedPosition,
+        *,
+        hook_name: str,
+        local_order_id: str = "",
+        broker_order_id: str = "",
+        reason: str = "",
+    ) -> None:
+        """Emit a loud event when a hook tries to mutate a different exit generation."""
+        try:
+            pos.last_exit_identity_reject_ts = datetime.now(timezone.utc)
+            log.error(
+                "[%s] STALE_EXIT_HOOK_REJECTED | hook=%s pos=%s got_local=%s got_broker=%s pending_local=%s pending_broker=%s reason=%s",
+                getattr(pos, "ticker", "?"), hook_name, getattr(pos, "position_id", "?"),
+                local_order_id or "?", broker_order_id or "?",
+                getattr(pos, "pending_exit_local_order_id", "") or "?",
+                getattr(pos, "pending_exit_broker_order_id", "") or "?",
+                reason or "?",
+            )
+            self._emit_exit_event(
+                pos,
+                decision="REJECT",
+                reason_code="STALE_EXIT_HOOK_REJECTED",
+                explanation=f"Rejected {hook_name}; supplied identity does not match current pending exit generation.",
+                stage="exit_reconciliation",
+                extra_inputs={
+                    "hook_name": hook_name,
+                    "supplied_local_order_id": local_order_id,
+                    "supplied_broker_order_id": broker_order_id,
+                    "pending_exit_local_order_id": getattr(pos, "pending_exit_local_order_id", ""),
+                    "pending_exit_broker_order_id": getattr(pos, "pending_exit_broker_order_id", ""),
+                    "reason": reason,
+                },
+            )
+        except Exception:
+            pass
 
     def mark_position_closed(
         self,
         position_id: str,
         reason: str = "",
         *,
+        qty_filled: Optional[int] = None,
+        fill_price: Optional[float] = None,
         local_order_id: str = "",
         broker_order_id: str = "",
+        cumulative_filled: Optional[int] = None,
+        cumulative_filled_qty: Optional[int] = None,
+        force: bool = False,
+        reconciled: bool = False,
+        **kwargs,
     ):
-        """Called after broker + DB confirm the position is fully closed."""
+        """Called after broker + DB confirm the position is fully closed.
+
+        v11: close hooks are identity-bound. If the engine has a current pending
+        exit identity, a close for a different/no identity is rejected unless the
+        caller explicitly marks the close as force/reconciled. This prevents stale
+        close callbacks from mutating a newer live exit generation.
+        """
         if not position_id:
             return
+        reason_s = str(reason or "")
+        local_order_id = str(local_order_id or "")
+        broker_order_id = str(broker_order_id or "")
+        force = bool(force or reconciled or kwargs.get("force") or kwargs.get("reconciled"))
+        if "RECONCILER" in reason_s.upper():
+            force = True
+
         with self._lock:
             for pos in self._positions:
-                if pos.position_id == position_id:
-                    pos.closed = True
-                    pos.close_reason = reason or pos.close_reason or "broker_confirmed_closed"
-                    pos.quantity_remaining = 0
-                    pos.exit_in_flight = False
-                    pos.pending_exit_reason = ""
-                    pos.pending_exit_action = ""
-                    pos.pending_exit_qty = 0
-                    pos.pending_exit_filled_qty = 0
-                    pos.pending_scale_counted = False
-                    pos.last_applied_exit_local_order_id = local_order_id or pos.pending_exit_local_order_id or pos.last_applied_exit_local_order_id
-                    pos.last_applied_exit_broker_order_id = broker_order_id or pos.pending_exit_broker_order_id or pos.last_applied_exit_broker_order_id
-                    pos.last_exit_signal_ts = None
-                    pos.last_callback_identity_missing = False
-                    pos.last_callback_identity_missing_ts = None
-                    self._emit_exit_event(
+                if str(pos.position_id or "") != str(position_id or ""):
+                    continue
+                if not force and not self._exit_identity_matches(
+                    pos,
+                    local_order_id=local_order_id,
+                    broker_order_id=broker_order_id,
+                    allow_missing_when_no_pending_identity=True,
+                ):
+                    self._reject_stale_exit_hook(
                         pos,
-                        decision="CLOSED",
-                        reason_code="BROKER_CONFIRMED_CLOSED",
-                        explanation=pos.close_reason,
-                        stage="exit_reconciliation",
-                        extra_inputs={
-                            "local_order_id": local_order_id,
-                            "broker_order_id": broker_order_id,
-                        },
+                        hook_name="mark_position_closed",
+                        local_order_id=local_order_id,
+                        broker_order_id=broker_order_id,
+                        reason=reason_s,
                     )
-            self._positions = [p for p in self._positions if not p.closed]
+                    return
+                pos.closed = True
+                pos.close_reason = reason_s or pos.close_reason or "broker_confirmed_closed"
+                pos.quantity_remaining = 0
+                try:
+                    if fill_price is not None:
+                        pos.current_option_price = float(fill_price)
+                except Exception:
+                    pass
+                pos.exit_in_flight = False
+                pos.pending_exit_reason = ""
+                pos.pending_exit_action = ""
+                pos.pending_exit_qty = 0
+                pos.pending_exit_filled_qty = 0
+                pos.pending_scale_counted = False
+                pos.last_applied_exit_local_order_id = local_order_id or pos.pending_exit_local_order_id or pos.last_applied_exit_local_order_id
+                pos.last_applied_exit_broker_order_id = broker_order_id or pos.pending_exit_broker_order_id or pos.last_applied_exit_broker_order_id
+                pos.last_exit_signal_ts = None
+                pos.last_callback_identity_missing = False
+                pos.last_callback_identity_missing_ts = None
+                pos.exit_identity_quarantine = False
+                pos.last_exit_identity_quarantine_resolved_ts = datetime.now(timezone.utc)
+                pos.exit_identity_quarantine_alert_count = getattr(pos, "exit_identity_quarantine_alert_count", 0)
+                pos.last_exit_identity_quarantine_alert_ts = getattr(pos, "last_exit_identity_quarantine_alert_ts", None)
+                pos.pending_exit_replace_allowed = False
+                pos.pending_exit_replace_reason = ""
+                pos.pending_exit_replace_allowed_ts = None
+                self._emit_exit_event(
+                    pos,
+                    decision="CLOSED",
+                    reason_code="BROKER_CONFIRMED_CLOSED",
+                    explanation=pos.close_reason,
+                    stage="exit_reconciliation",
+                    extra_inputs={"local_order_id": local_order_id, "broker_order_id": broker_order_id, "force": force},
+                )
         log.info("[exit_eng] Closed (broker-confirmed) | pos_id=%s reason=%s", position_id, reason)
 
     def clear_exit_in_flight(
@@ -888,57 +1112,132 @@ class APExitEngine:
         local_order_id: str = "",
         broker_order_id: str = "",
         rejected: bool = False,
+        force: bool = False,
+        reconciled: bool = False,
+        **kwargs,
     ):
-        """Called when exit order is canceled/rejected/expired so the engine may retry."""
+        """Called when exit order is canceled/rejected/expired so the engine may retry.
+
+        v11: clearing is identity-bound. A stale position-only clear cannot reopen
+        submit eligibility or erase fill watermarks for a different pending exit
+        generation. Use force=True/reconciled=True only after authoritative broker
+        proof that no pending exit can still fill.
+        """
         if not position_id:
             return
+        reason_s = str(reason or "")
+        local_order_id = str(local_order_id or "")
+        broker_order_id = str(broker_order_id or "")
+        force = bool(force or reconciled or kwargs.get("force") or kwargs.get("reconciled"))
+        if "RECONCILER" in reason_s.upper() or "NEGATIVE_BROKER_CHECK" in reason_s.upper():
+            force = True
         with self._lock:
             for pos in self._positions:
-                if pos.position_id == position_id:
-                    pos.exit_in_flight = False
-                    pos.pending_exit_reason = ""
-                    pos.pending_exit_action = ""
-                    pos.pending_exit_qty = 0
-                    pos.pending_exit_filled_qty = 0
-                    pos.pending_scale_counted = False
-                    pos.pending_exit_local_order_id = ""
-                    pos.pending_exit_broker_order_id = ""
-                    pos.last_exit_signal_ts = None
-                    pos.last_exit_rejected = bool(rejected)
-                    pos.last_rejection_ts = time.time() if rejected else None
-                    pos.last_callback_identity_missing = False
-                    pos.last_callback_identity_missing_ts = None
-                    self._assert_position_invariants(pos, "clear_exit_in_flight")
-                    self._emit_exit_event(
+                if str(pos.position_id or "") != str(position_id or ""):
+                    continue
+                if not force and not self._exit_identity_matches(
+                    pos,
+                    local_order_id=local_order_id,
+                    broker_order_id=broker_order_id,
+                    allow_missing_when_no_pending_identity=True,
+                ):
+                    self._reject_stale_exit_hook(
                         pos,
-                        decision="ALERT" if rejected else "CLEARED",
-                        reason_code="EXIT_REJECTED" if rejected else "EXIT_IN_FLIGHT_CLEARED",
-                        explanation=reason or ("Exit order rejected/cleared" if rejected else "Exit in-flight cleared"),
-                        stage="exit_reconciliation",
-                        extra_inputs={
-                            "local_order_id": local_order_id,
-                            "broker_order_id": broker_order_id,
-                            "rejected": rejected,
-                        },
+                        hook_name="clear_exit_in_flight",
+                        local_order_id=local_order_id,
+                        broker_order_id=broker_order_id,
+                        reason=reason_s,
                     )
+                    return
+                pos.exit_in_flight = False
+                pos.pending_exit_reason = ""
+                pos.pending_exit_action = ""
+                pos.pending_exit_qty = 0
+                pos.pending_exit_filled_qty = 0
+                pos.pending_scale_counted = False
+                pos.last_exit_clear_reason = reason_s
+                pos.last_exit_clear_local_order_id = local_order_id
+                pos.last_exit_clear_broker_order_id = broker_order_id
+                pos.pending_exit_local_order_id = ""
+                pos.pending_exit_broker_order_id = ""
+                # Do not wipe last_applied_exit_cum_fill_by_order here. Late callbacks
+                # for the just-cleared order may still arrive; new order submission resets it.
+                pos.last_exit_signal_ts = None
+                pos.last_exit_rejected = bool(rejected)
+                pos.last_rejection_ts = time.time() if rejected else None
+                pos.last_callback_identity_missing = False
+                pos.last_callback_identity_missing_ts = None
+                pos.exit_identity_quarantine = False
+                pos.last_exit_identity_quarantine_resolved_ts = datetime.now(timezone.utc)
+                pos.pending_exit_replace_allowed = False
+                pos.pending_exit_replace_reason = ""
+                pos.pending_exit_replace_allowed_ts = None
+                self._assert_position_invariants(pos, "clear_exit_in_flight")
+                self._emit_exit_event(
+                    pos,
+                    decision="ALERT" if rejected else "CLEARED",
+                    reason_code="EXIT_REJECTED" if rejected else "EXIT_IN_FLIGHT_CLEARED",
+                    explanation=reason_s or ("Exit order rejected/cleared" if rejected else "Exit in-flight cleared"),
+                    stage="exit_reconciliation",
+                    extra_inputs={"local_order_id": local_order_id, "broker_order_id": broker_order_id, "rejected": rejected, "force": force},
+                )
         log.info("[exit_eng] Exit in-flight cleared | pos_id=%s rejected=%s reason=%s", position_id, rejected, reason)
+
+    def on_exit_failure(
+
+        self,
+        position_id: str,
+        *,
+        reason: str = "",
+        local_order_id: str = "",
+        broker_order_id: str = "",
+        **kwargs,
+    ) -> None:
+        """OSM v3-compatible hook for exit failure/rejection.
+
+        Normalize failure into the same cleared/rejected state used by normal
+        cancel/reject reconciliation. This prevents TypeError when OSM supplies
+        keyword identity fields.
+        """
+        self.clear_exit_in_flight(
+            position_id,
+            reason=reason or "exit_failure",
+            local_order_id=local_order_id,
+            broker_order_id=broker_order_id,
+            rejected=True,
+            **kwargs,
+        )
 
     def note_partial_exit_fill(
         self,
         position_id: str,
-        qty_filled: int,
+        qty_filled: int = 0,
         *,
+        fill_price: Optional[float] = None,
         local_order_id: str = "",
         broker_order_id: str = "",
+        cumulative_filled: Optional[int] = None,
         cumulative_filled_qty: Optional[int] = None,
+        **kwargs,
     ):
         """Called when broker confirms an exit fill.
 
         qty_filled is treated as a delta by default. If cumulative_filled_qty is
-        supplied by OSM/reconciler, this method computes an idempotent delta.
+        supplied by OSM/reconciler, it is treated as cumulative for the CURRENT
+        exit order identity only. This prevents one order's fill watermark from
+        corrupting the next order's fill math.
         """
         if not position_id:
             return
+        if cumulative_filled_qty is None and cumulative_filled is not None:
+            cumulative_filled_qty = cumulative_filled
+        try:
+            if fill_price is not None:
+                fill_price = float(fill_price)
+        except Exception:
+            fill_price = None
+
+        applied_delta = 0
         with self._lock:
             for pos in self._positions:
                 if pos.position_id != position_id:
@@ -957,12 +1256,30 @@ class APExitEngine:
                     )
                     return
 
+                # Prefer exact broker identity, then local identity, then the
+                # current pending identity. Fall back to a synthetic key only for
+                # legacy/no-identity callbacks so cumulative fills remain scoped
+                # to this pending exit generation instead of the position lifetime.
+                order_key = (
+                    broker_order_id
+                    or local_order_id
+                    or pos.pending_exit_broker_order_id
+                    or pos.pending_exit_local_order_id
+                    or f"pending:{pos.position_id}:{pos.last_exit_signal_ts.isoformat() if pos.last_exit_signal_ts else 'unknown'}"
+                )
+
                 if cumulative_filled_qty is not None:
                     cum = max(0, int(cumulative_filled_qty or 0))
-                    delta = max(0, cum - int(pos.last_applied_exit_cum_fill or 0))
+                    prev = int(pos.last_applied_exit_cum_fill_by_order.get(order_key, 0) or 0)
+                    delta = max(0, cum - prev)
+                    pos.last_applied_exit_cum_fill_by_order[order_key] = max(prev, cum)
+                    # Keep aggregate field for old diagnostics only; it is not
+                    # used for delta calculation anymore.
                     pos.last_applied_exit_cum_fill = max(int(pos.last_applied_exit_cum_fill or 0), cum)
                 else:
                     delta = max(0, int(qty_filled or 0))
+                    prev = int(pos.last_applied_exit_cum_fill_by_order.get(order_key, 0) or 0)
+                    pos.last_applied_exit_cum_fill_by_order[order_key] = prev + delta
                     pos.last_applied_exit_cum_fill += delta
 
                 if delta <= 0:
@@ -970,11 +1287,20 @@ class APExitEngine:
                         pos,
                         decision="HOLD",
                         reason_code="DUPLICATE_EXIT_FILL_IGNORED",
-                        explanation="Duplicate or zero-delta exit fill ignored",
+                        explanation="Duplicate or zero-delta exit fill ignored for current exit order identity",
                         stage="exit_reconciliation",
+                        extra_inputs={
+                            "order_key": order_key,
+                            "cumulative_filled_qty": cumulative_filled_qty,
+                            "local_order_id": local_order_id,
+                            "broker_order_id": broker_order_id,
+                        },
                     )
                     return
 
+                applied_delta = delta
+                if fill_price is not None:
+                    pos.current_option_price = float(fill_price)
                 pos.pending_exit_filled_qty += delta
                 pos.quantity_remaining = max(0, int(pos.quantity_remaining or 0) - delta)
                 pos.last_applied_exit_local_order_id = local_order_id or pos.pending_exit_local_order_id or pos.last_applied_exit_local_order_id
@@ -982,31 +1308,46 @@ class APExitEngine:
                 if local_order_id or broker_order_id or pos.pending_exit_local_order_id or pos.pending_exit_broker_order_id:
                     pos.last_callback_identity_missing = False
                     pos.last_callback_identity_missing_ts = None
+                    pos.exit_identity_quarantine = False
+                    pos.exit_identity_quarantine_alert_count = 0
+                    pos.last_exit_identity_quarantine_alert_ts = None
+                    pos.pending_exit_replace_allowed = False
+                    pos.pending_exit_replace_reason = ""
+                    pos.pending_exit_replace_allowed_ts = None
 
-                # Count scale-out only after broker-confirmed fill, never on submit.
+                # Count scale-out only after a meaningful confirmed tranche fill.
+                # A tiny 1-contract partial on a large intended scale should not
+                # immediately convert the strategy into runner mode. For small
+                # tranches, one filled contract is necessarily meaningful.
                 if (
                     (pos.pending_exit_action or "").upper() == "SCALE_OUT"
                     and pos.pending_exit_qty > 0
                     and not pos.pending_scale_counted
                     and pos.quantity_remaining > 0
                 ):
-                    pos.scale_outs_done += 1
-                    pos.pending_scale_counted = True
-                    try:
-                        from ap.db import conn, run_with_retry as _rwr_s
-                        _sd = pos.scale_outs_done
-                        _qr = pos.quantity_remaining
-                        _pi = pos.position_id
-                        if _pi:
-                            def _save_scale():
-                                with conn() as _c:
-                                    _c.execute(
-                                        "UPDATE positions SET scale_outs_done=%s, quantity_remaining=%s WHERE id=%s",
-                                        (_sd, _qr, _pi),
-                                    )
-                            _rwr_s(_save_scale)
-                    except Exception as _se:
-                        log.debug("[%s] scale/qty persist failed (non-critical): %s", pos.ticker, _se)
+                    # v7: do not advance runner/scale state until the intended
+                    # scale tranche is fully broker-confirmed. Earlier v6 used
+                    # a 50% meaningful-fill policy, but that can switch strategy
+                    # state while the original scale order is still partially live.
+                    fully_confirmed_scale = pos.pending_exit_filled_qty >= pos.pending_exit_qty
+                    if fully_confirmed_scale:
+                        pos.scale_outs_done += 1
+                        pos.pending_scale_counted = True
+                        try:
+                            from ap.db import conn, run_with_retry as _rwr_s
+                            _sd = pos.scale_outs_done
+                            _qr = pos.quantity_remaining
+                            _pi = pos.position_id
+                            if _pi:
+                                def _save_scale():
+                                    with conn() as _c:
+                                        _c.execute(
+                                            "UPDATE positions SET scale_outs_done=%s, quantity_remaining=%s WHERE id=%s",
+                                            (_sd, _qr, _pi),
+                                        )
+                                _rwr_s(_save_scale)
+                        except Exception as _se:
+                            log.debug("[%s] scale/qty persist failed (non-critical): %s", pos.ticker, _se)
 
                 fully_filled_pending = (
                     pos.pending_exit_qty > 0
@@ -1024,6 +1365,8 @@ class APExitEngine:
                     pos.pending_scale_counted = False
                     pos.pending_exit_local_order_id = ""
                     pos.pending_exit_broker_order_id = ""
+                    pos.last_applied_exit_cum_fill_by_order = {}
+                    pos.last_applied_exit_cum_fill = 0
                     pos.last_exit_signal_ts = None
                     pos._exit_stuck_count = 0
 
@@ -1037,13 +1380,16 @@ class APExitEngine:
                     extra_inputs={
                         "delta_qty": delta,
                         "cumulative_filled_qty": cumulative_filled_qty,
+                        "order_key": order_key,
                         "local_order_id": local_order_id,
                         "broker_order_id": broker_order_id,
+                        "scale_counted": pos.pending_scale_counted,
                     },
                 )
                 break
-            self._positions = [p for p in self._positions if not p.closed]
-        log.info("[exit_eng] Exit fill noted | pos_id=%s qty_delta=%d", position_id, int(qty_filled or 0))
+            # Keep closed position object in memory for late broker callbacks and diagnostics.
+            # active_positions() filters closed positions, so this does not affect trading decisions.
+        log.info("[exit_eng] Exit fill noted | pos_id=%s qty_delta=%d", position_id, int(applied_delta or qty_filled or 0))
 
     def _mark_exit_submitted(
         self,
@@ -1062,9 +1408,87 @@ class APExitEngine:
         pos.pending_scale_counted = False
         pos.pending_exit_local_order_id = local_order_id or pos.pending_exit_local_order_id or ""
         pos.pending_exit_broker_order_id = broker_order_id or pos.pending_exit_broker_order_id or ""
+        # New pending order generation: per-order cumulative fill watermarks
+        # must not inherit the prior order's cumulative semantics.
+        pos.last_applied_exit_cum_fill_by_order = {}
+        pos.last_applied_exit_cum_fill = 0
         pos.last_exit_signal_ts = datetime.now(timezone.utc)
         pos.last_exit_rejected = False
         pos._exit_stuck_count = 0
+        pos.exit_identity_quarantine = bool(pos.last_callback_identity_missing)
+        pos.pending_exit_replace_allowed = False
+        pos.pending_exit_replace_reason = ""
+        pos.pending_exit_replace_allowed_ts = None
+
+    def mark_exit_replacement_safe(
+        self,
+        position_id: str,
+        reason: str = "",
+        *,
+        local_order_id: str = "",
+        broker_order_id: str = "",
+        force: bool = False,
+        reconciled: bool = False,
+        **kwargs,
+    ) -> None:
+        """Allow exactly one replacement exit after external cancel/reconcile proof.
+
+        v11: replacement proof is bound to the current pending exit generation.
+        A misplaced reconciler call cannot authorize replacement against the wrong
+        still-live pending exit unless it passes force=True/reconciled=True after
+        authoritative broker proof.
+        """
+        if not position_id:
+            return
+        reason_s = str(reason or "")
+        local_order_id = str(local_order_id or "")
+        broker_order_id = str(broker_order_id or "")
+        force = bool(force or reconciled or kwargs.get("force") or kwargs.get("reconciled"))
+        if "NEGATIVE_BROKER_CHECK" in reason_s.upper() or "RECONCILER" in reason_s.upper():
+            force = force or not bool(local_order_id or broker_order_id)
+        with self._lock:
+            for pos in self._positions:
+                if str(pos.position_id or "") == str(position_id or "") and not pos.closed:
+                    if not force and not self._exit_identity_matches(
+                        pos,
+                        local_order_id=local_order_id,
+                        broker_order_id=broker_order_id,
+                        allow_missing_when_no_pending_identity=False,
+                    ):
+                        self._reject_stale_exit_hook(
+                            pos,
+                            hook_name="mark_exit_replacement_safe",
+                            local_order_id=local_order_id,
+                            broker_order_id=broker_order_id,
+                            reason=reason_s,
+                        )
+                        return
+                    pos.pending_exit_replace_allowed = True
+                    pos.pending_exit_replace_reason = reason_s or "external_cancel_or_reconcile_proof"
+                    pos.pending_exit_replace_allowed_ts = datetime.now(timezone.utc)
+                    pos.exit_identity_quarantine = False
+                    pos.last_exit_identity_quarantine_resolved_ts = datetime.now(timezone.utc)
+                    self._emit_exit_event(
+                        pos,
+                        "ALERT",
+                        "EXIT_REPLACEMENT_MARKED_SAFE",
+                        "External OSM/reconciler proof marked pending exit safe to replace once.",
+                        stage="exit_reconciliation",
+                        extra_inputs={
+                            "reason": pos.pending_exit_replace_reason,
+                            "proof_local_order_id": local_order_id,
+                            "proof_broker_order_id": broker_order_id,
+                            "force": force,
+                            "pending_exit_reason": pos.pending_exit_reason,
+                            "pending_exit_local_order_id": pos.pending_exit_local_order_id,
+                            "pending_exit_broker_order_id": pos.pending_exit_broker_order_id,
+                        },
+                    )
+                    log.critical(
+                        "[%s] EXIT REPLACEMENT MARKED SAFE | pos=%s proof_local=%s proof_broker=%s reason=%s force=%s",
+                        pos.ticker, position_id, local_order_id or "?", broker_order_id or "?", pos.pending_exit_replace_reason, force,
+                    )
+                    return
 
     def _eligible_for_new_exit(self, pos: ManagedPosition, now_utc: datetime) -> bool:
         """Compatibility wrapper around centralized submit gate."""
@@ -1083,6 +1507,65 @@ class APExitEngine:
             age_min = (now - pos.opened_at).total_seconds() / 60 if pos.opened_at else 0
             pnl = pos.option_pnl_pct
             peak = pos.peak_pnl_pct
+
+            # Quarantine sentinel: missing callback identity is intentionally safe-locking.
+            # Do not auto-clear it here; make it loud and repeated until one recovery
+            # hook resolves truth: set_pending_exit_order(), note_partial_exit_fill(),
+            # mark_position_closed(), clear_exit_in_flight(), or mark_exit_replacement_safe().
+            if (
+                pos.exit_in_flight
+                and getattr(pos, "last_callback_identity_missing", False)
+                and getattr(pos, "exit_identity_quarantine", False)
+                and not getattr(pos, "pending_exit_replace_allowed", False)
+            ):
+                identity_started = pos.last_callback_identity_missing_ts or pos.last_exit_signal_ts or now
+                try:
+                    quarantine_age_sec = max(0.0, (now - identity_started).total_seconds())
+                except Exception:
+                    quarantine_age_sec = 0.0
+                last_alert_ts = getattr(pos, "last_exit_identity_quarantine_alert_ts", None)
+                should_alert = quarantine_age_sec >= 30.0 and (
+                    last_alert_ts is None
+                    or (now - last_alert_ts).total_seconds() >= 30.0
+                )
+                if should_alert:
+                    pos.exit_identity_quarantine_alert_count = int(
+                        getattr(pos, "exit_identity_quarantine_alert_count", 0) or 0
+                    ) + 1
+                    pos.last_exit_identity_quarantine_alert_ts = now
+                    log.error(
+                        "[%s] EXIT IDENTITY QUARANTINE ACTIVE %.1fs x%d — duplicate exits blocked; "
+                        "reconciler/OSM must resolve | pos_id=%s action=%s qty=%s local=%s broker=%s reason=%s",
+                        pos.ticker,
+                        quarantine_age_sec,
+                        pos.exit_identity_quarantine_alert_count,
+                        pos.position_id or "?",
+                        pos.pending_exit_action or "?",
+                        pos.pending_exit_qty,
+                        pos.pending_exit_local_order_id or "?",
+                        pos.pending_exit_broker_order_id or "?",
+                        pos.pending_exit_reason or "?",
+                    )
+                    self._emit_exit_event(
+                        pos,
+                        decision="ALERT",
+                        reason_code="EXIT_IDENTITY_QUARANTINE_NEEDS_RECONCILE",
+                        explanation=(
+                            "Accepted exit callback returned no local/broker order identity. "
+                            "Duplicate exits are blocked until OSM/reconciler proves fill, cancel, reject, "
+                            "broker order identity, or safe replacement."
+                        ),
+                        stage="system_alert",
+                        extra_inputs={
+                            "quarantine_age_sec": quarantine_age_sec,
+                            "alert_count": pos.exit_identity_quarantine_alert_count,
+                            "pending_exit_action": pos.pending_exit_action,
+                            "pending_exit_qty": pos.pending_exit_qty,
+                            "pending_exit_reason": pos.pending_exit_reason,
+                            "pending_exit_local_order_id": pos.pending_exit_local_order_id,
+                            "pending_exit_broker_order_id": pos.pending_exit_broker_order_id,
+                        },
+                    )
 
             if peak >= IMMEDIATE_TP_PCT and not pos.exit_in_flight and age_min > 1:
                 log.error(
@@ -1238,19 +1721,57 @@ class APExitEngine:
         if pos.closed or int(pos.quantity_remaining or 0) <= 0:
             return False
 
-        if pos.exit_in_flight and getattr(pos, "last_callback_identity_missing", False):
+        if (
+            pos.exit_in_flight
+            and getattr(pos, "last_callback_identity_missing", False)
+            and not getattr(pos, "pending_exit_replace_allowed", False)
+        ):
+            identity_age = 0.0
+            if pos.last_callback_identity_missing_ts:
+                try:
+                    identity_age = (now_utc - pos.last_callback_identity_missing_ts).total_seconds()
+                except Exception:
+                    identity_age = 0.0
+            elif pos.last_exit_signal_ts:
+                try:
+                    identity_age = (now_utc - pos.last_exit_signal_ts).total_seconds()
+                except Exception:
+                    identity_age = 0.0
+
+            # v7: never auto-clear missing-identity quarantine. If the callback
+            # placed a live broker order but returned no IDs, clearing in-flight
+            # locally can create a duplicate exit. Only reconciler/OSM truth may
+            # clear this via mark_position_closed(), clear_exit_in_flight(),
+            # note_partial_exit_fill(), or mark_exit_replacement_safe().
+            pos.exit_identity_quarantine = True
+            severity = "ERROR" if identity_age >= 20.0 else "HOLD"
+            reason_code = (
+                "EXIT_IDENTITY_QUARANTINE_STALE_NEEDS_RECONCILE"
+                if identity_age >= 20.0
+                else "EXIT_IDENTITY_QUARANTINE_BLOCK"
+            )
+            if identity_age >= 20.0:
+                log.error(
+                    "[%s] EXIT IDENTITY QUARANTINE %.1fs — duplicate submits blocked; reconciler/OSM must resolve | pos_id=%s pending=%s",
+                    pos.ticker, identity_age, pos.position_id, pos.pending_exit_reason,
+                )
             self._emit_exit_event(
                 pos,
-                "HOLD",
-                "EXIT_IDENTITY_QUARANTINE_BLOCK",
+                severity,
+                reason_code,
                 (
                     "Exit suppressed because the prior accepted callback returned no "
-                    "local/broker order identity. Reconciler must clear, reject, or fill it first."
+                    "local/broker order identity. Duplicate submissions remain blocked "
+                    "until broker/OSM reconciliation confirms fill, rejection, cancel, or replacement safety."
                 ),
+                stage="exit_submission",
                 extra_inputs={
+                    "identity_age_sec": identity_age,
                     "pending_exit_reason": pos.pending_exit_reason,
                     "pending_exit_action": pos.pending_exit_action,
                     "pending_exit_qty": pos.pending_exit_qty,
+                    "pending_exit_local_order_id": pos.pending_exit_local_order_id,
+                    "pending_exit_broker_order_id": pos.pending_exit_broker_order_id,
                     "last_callback_identity_missing_ts": str(pos.last_callback_identity_missing_ts or ""),
                 },
             )
@@ -1276,6 +1797,37 @@ class APExitEngine:
             if pos.last_exit_signal_ts:
                 flight_sec = (now_utc - pos.last_exit_signal_ts).total_seconds()
 
+            # v7: replacement/runner emergency override cannot submit a second
+            # real-world exit unless an external broker/OSM path has explicitly
+            # proven the prior working exit is canceled, rejected, or otherwise
+            # safe to replace. Staleness or higher priority alone is not cancel proof.
+            if not getattr(pos, "pending_exit_replace_allowed", False):
+                self._emit_exit_event(
+                    pos,
+                    "HOLD",
+                    "EXIT_OVERRIDE_NEEDS_CANCEL_OR_RECONCILE_PROOF",
+                    (
+                        "Inflight override denied. Pending exit may still be live at broker; "
+                        "replacement requires mark_exit_replacement_safe() after cancel/reconcile proof."
+                    ),
+                    extra_inputs={
+                        "flight_sec": flight_sec,
+                        "pending_exit_reason": pos.pending_exit_reason,
+                        "override_reason": reason,
+                        "pending_exit_local_order_id": pos.pending_exit_local_order_id,
+                        "pending_exit_broker_order_id": pos.pending_exit_broker_order_id,
+                    },
+                )
+                return False
+
+            # Consume one-shot replacement authorization. Once broker/OSM has
+            # proven the older order cannot still fill, precedence should not
+            # re-block the replacement solely because it has the same class.
+            replacement_proof = True
+            pos.pending_exit_replace_allowed = False
+            pos.pending_exit_replace_reason = ""
+            pos.pending_exit_replace_allowed_ts = None
+
             # Executable precedence guard:
             # do not allow a lower/equal priority exit to override a fresh higher/equal pending exit.
             # Stale pending exits may still be overridden so the system can rescue stuck risk.
@@ -1284,7 +1836,7 @@ class APExitEngine:
             pending_code = _classify_exit_decision(ExitDecision(pos.pending_exit_action or "CLOSE_ALL", 0, pos.pending_exit_reason or "", "IMMEDIATE"))
             new_pri = _exit_priority(new_code)
             pending_pri = _exit_priority(pending_code)
-            if not stale_enough and pending_code != "UNKNOWN_EXIT" and new_pri >= pending_pri:
+            if (not replacement_proof) and not stale_enough and pending_code != "UNKNOWN_EXIT" and new_pri >= pending_pri:
                 self._emit_exit_event(
                     pos,
                     "HOLD",
@@ -1312,7 +1864,7 @@ class APExitEngine:
                 reason,
             )
 
-            if already_same_runner_protection and not stale_enough and not higher_priority_override:
+            if (not replacement_proof) and already_same_runner_protection and not stale_enough and not higher_priority_override:
                 self._emit_exit_event(
                     pos,
                     "HOLD",
@@ -1329,7 +1881,7 @@ class APExitEngine:
                 )
                 return False
 
-            if not stale_enough and not emergency_reason and not higher_priority_override:
+            if (not replacement_proof) and not stale_enough and not emergency_reason and not higher_priority_override:
                 self._emit_exit_event(
                     pos,
                     "HOLD",
@@ -1404,11 +1956,12 @@ class APExitEngine:
             seeded = 0
             for row in rows:
                 try:
+                    original_qty = int(row.get("qty", 1) or 1)
                     mp = ManagedPosition(
                         ticker=row.get("underlying", "") or row.get("symbol", ""),
                         option_symbol=row.get("contract", ""),
                         side=row.get("direction", "CALL"),
-                        quantity=int(row.get("qty", 1) or 1),
+                        quantity=original_qty,
                         entry_price=float(row.get("avg_fill", 0) or 0),
                         underlying_entry=float(row.get("underlying_entry", 0) or 0),
                         underlying_target=float(row.get("target_underlying") or 0),
@@ -1418,20 +1971,21 @@ class APExitEngine:
                         signal_id=str(row.get("signal_id") or ""),
                     )
                     mp.current_option_price = float(row.get("avg_fill", 0) or 0)
-                    # Restore runner state from DB so restarts pick up mid-trade correctly
-                    mp.scale_outs_done    = int(row.get("scale_outs_done", 0) or 0)
-                    # Bug fix: use quantity_remaining if stored, else fall back to original qty
-                    # quantity_remaining reflects partial closes/scale-outs; qty is the original fill
+                    # Restore runner state from DB so restarts pick up mid-trade correctly.
+                    mp.scale_outs_done = int(row.get("scale_outs_done", 0) or 0)
+
+                    # Preserve original filled size in mp.quantity. Only restore
+                    # quantity_remaining from DB so restart does not turn a 4-lot
+                    # with 1 runner left into a fake original 1-lot.
                     _qty_remaining = int(row.get("quantity_remaining", 0) or 0)
-                    _db_qty        = int(row.get("qty", 0) or 0)
-                    _resolved_qty  = _qty_remaining if _qty_remaining > 0 else _db_qty
-                    if _resolved_qty > 0:
-                        mp.quantity          = _resolved_qty   # update base qty to remaining
-                        mp.quantity_remaining = _resolved_qty
-                        log.debug(
-                            "seed_from_db: %s qty_remaining=%d (db_qty=%d scale_outs=%d)",
-                            mp.ticker, _resolved_qty, _db_qty, mp.scale_outs_done
-                        )
+                    if _qty_remaining > 0:
+                        mp.quantity_remaining = min(_qty_remaining, mp.quantity) if mp.quantity > 0 else _qty_remaining
+                    else:
+                        mp.quantity_remaining = mp.quantity
+                    log.debug(
+                        "seed_from_db: %s original_qty=%d qty_remaining=%d scale_outs=%d",
+                        mp.ticker, mp.quantity, mp.quantity_remaining, mp.scale_outs_done,
+                    )
                     mp.current_underlying = float(row.get("underlying_entry", 0) or 0)
                     self.add_position(mp)
                     seeded += 1
@@ -1766,7 +2320,14 @@ class APExitEngine:
             identity["raw_status"] = str(status)
 
         accepted = _get(callback_result, "accepted", "ok", "success")
-        if accepted is False:
+        # OSM submit_exit may intentionally return ok=False while parking the
+        # order in EXIT_SUBMITTED identity quarantine (broker accepted but did
+        # not return broker_order_id). That is not a callback failure from the
+        # exit engine's perspective: it is an active local OSM order that must
+        # block duplicates until reconciler resolves it.
+        identity_quarantine = bool(_get(callback_result, "identity_quarantine"))
+        status_norm = str(identity.get("raw_status") or "").upper()
+        if accepted is False and not (identity_quarantine or status_norm == "EXIT_SUBMITTED"):
             identity["accepted"] = False
 
         local_id = _get(
@@ -1858,6 +2419,18 @@ class APExitEngine:
                     "last_option_quote_update_ts": pos.last_option_quote_update_ts.isoformat() if pos.last_option_quote_update_ts else "",
                     "last_option_quote_missing_ts": pos.last_option_quote_missing_ts.isoformat() if pos.last_option_quote_missing_ts else "",
                     "last_callback_identity_missing": getattr(pos, "last_callback_identity_missing", False),
+                    "exit_identity_quarantine": getattr(pos, "exit_identity_quarantine", False),
+                    "exit_identity_quarantine_alert_count": getattr(pos, "exit_identity_quarantine_alert_count", 0),
+                    "last_exit_identity_quarantine_alert_ts": (
+                        pos.last_exit_identity_quarantine_alert_ts.isoformat()
+                        if getattr(pos, "last_exit_identity_quarantine_alert_ts", None) else ""
+                    ),
+                    "pending_exit_replace_allowed": getattr(pos, "pending_exit_replace_allowed", False),
+                    "pending_exit_replace_reason": getattr(pos, "pending_exit_replace_reason", ""),
+                    "pending_exit_replace_allowed_ts": (
+                        pos.pending_exit_replace_allowed_ts.isoformat()
+                        if getattr(pos, "pending_exit_replace_allowed_ts", None) else ""
+                    ),
                     "last_callback_identity_missing_ts": (
                         pos.last_callback_identity_missing_ts.isoformat()
                         if pos.last_callback_identity_missing_ts else ""
@@ -2081,9 +2654,32 @@ class APExitEngine:
                 local_order_id=callback_identity.get("local_order_id", ""),
                 broker_order_id=callback_identity.get("broker_order_id", ""),
             )
+            if callback_identity.get("raw_status", "").upper() == "EXIT_SUBMITTED" and callback_identity.get("local_order_id") and not callback_identity.get("broker_order_id"):
+                # OSM has an active local EXIT order but broker identity is quarantined.
+                # Keep duplicate suppression active and surface as quarantine until reconciler
+                # backfills broker id, confirms fill, terminal-clears, or marks replacement safe.
+                current_pos.last_callback_identity_missing = True
+                current_pos.last_callback_identity_missing_ts = datetime.now(timezone.utc)
+                current_pos.exit_identity_quarantine = True
+                current_pos.exit_identity_quarantine_alert_count = 0
+                current_pos.last_exit_identity_quarantine_alert_ts = None
+                self._emit_exit_event(
+                    current_pos,
+                    decision="ALERT",
+                    reason_code="EXIT_SUBMITTED_BROKER_ID_QUARANTINE",
+                    explanation="OSM parked exit as submitted without broker_order_id; reconciler must resolve identity.",
+                    stage="exit_submission",
+                    extra_inputs={
+                        "pending_exit_local_order_id": current_pos.pending_exit_local_order_id,
+                        "pending_exit_broker_order_id": current_pos.pending_exit_broker_order_id,
+                    },
+                )
             if not current_pos.pending_exit_local_order_id and not current_pos.pending_exit_broker_order_id:
                 current_pos.last_callback_identity_missing = True
                 current_pos.last_callback_identity_missing_ts = datetime.now(timezone.utc)
+                current_pos.exit_identity_quarantine = True
+                current_pos.exit_identity_quarantine_alert_count = 0
+                current_pos.last_exit_identity_quarantine_alert_ts = None
                 log.error(
                     "[%s] EXIT SUBMITTED WITHOUT ORDER ID | pos_id=%s sym=%s action=%s qty=%s status=%s",
                     ticker,
