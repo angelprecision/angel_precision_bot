@@ -1,23 +1,25 @@
 """
 order_state_machine_exit_quarantine_patch.py
 ===========================================
-Runtime safety patch for APOrderStateMachine -> APExitEngine exit hooks.
+Runtime safety patch installer for APOrderStateMachine, APBrokerReconciler, and APExitEngine.
 
-Fixes two production-risk gaps:
-1. EXIT_SUBMITTED with missing broker_order_id is bridged into the exit engine
-   as identity_quarantine=True instead of being silently skipped.
-2. EXIT_FILLED classification is made more conservative and identity-aware so a
-   completed scale-out is not misclassified as a full position close when
-   remaining-size context is missing/stale.
+This file is intentionally used as the single installer because client_runner.py already calls:
 
-Install before APOrderStateMachine instances are used:
-    from order_state_machine_exit_quarantine_patch import install_exit_quarantine_patch
     install_exit_quarantine_patch(APOrderStateMachine)
+
+Installed protections
+---------------------
+1. OSM EXIT_SUBMITTED with missing broker_order_id -> APExitEngine quarantine.
+2. OSM EXIT_FILLED scale-out/full-close classification is conservative and cumulative-fill aware.
+3. APBrokerReconciler.run_once() is idempotent/throttled and locked to prevent double transitions.
+4. APExitEngine.mark_position_closed() records trade outcomes into ap.performance_tracker.
 """
 
 from __future__ import annotations
 
 import logging
+import threading
+import time
 from functools import wraps
 from typing import Any
 
@@ -25,6 +27,10 @@ log = logging.getLogger("ap.order_state_machine.exit_quarantine_patch")
 
 _PATCH_FLAG = "__ap_exit_quarantine_patch_installed__"
 _ORIGINAL_ATTR = "__ap_exit_quarantine_original_handle_hooks__"
+_RECONCILER_PATCH_FLAG = "__ap_reconciler_idempotency_patch_installed__"
+_RECONCILER_ORIGINAL_ATTR = "__ap_reconciler_original_run_once__"
+_EXIT_PERF_PATCH_FLAG = "__ap_exit_performance_patch_installed__"
+_EXIT_PERF_ORIGINAL_ATTR = "__ap_exit_performance_original_mark_position_closed__"
 
 
 def _safe_int(value: Any, default: int | None = 0) -> int | None:
@@ -52,7 +58,6 @@ def _call_exit_engine(ee, name: str, *args, **kwargs) -> bool:
         fn(*args, **kwargs)
         return True
     except TypeError:
-        # Backward compatibility for older hooks: remove newer kwargs and retry once.
         filtered = dict(kwargs)
         for k in ("identity_quarantine", "reconciled", "status"):
             filtered.pop(k, None)
@@ -96,7 +101,6 @@ def _find_exit_engine_position(ee, position_id: str):
 
 
 def _position_qty_context(ee, position_id: str) -> tuple[int | None, int | None]:
-    """Return (original_qty, remaining_qty) from live exit-engine state if available."""
     pos = _find_exit_engine_position(ee, position_id)
     if pos is None:
         return None, None
@@ -105,8 +109,112 @@ def _position_qty_context(ee, position_id: str) -> tuple[int | None, int | None]
     return original, remaining
 
 
+def _install_reconciler_idempotency_patch() -> bool:
+    try:
+        from ap_reconciler import APBrokerReconciler
+    except Exception as exc:
+        log.warning("Reconciler idempotency patch skipped: %s", exc)
+        return False
+
+    if getattr(APBrokerReconciler, _RECONCILER_PATCH_FLAG, False):
+        return True
+
+    original = getattr(APBrokerReconciler, "run_once", None)
+    if not callable(original):
+        log.warning("Reconciler idempotency patch skipped: run_once missing")
+        return False
+
+    setattr(APBrokerReconciler, _RECONCILER_ORIGINAL_ATTR, original)
+
+    @wraps(original)
+    def run_once_guarded(self, *args, **kwargs):
+        now = time.time()
+        min_gap = float(getattr(self, "_run_once_min_gap_sec", 3.0))
+        lock = getattr(self, "_run_once_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            try:
+                setattr(self, "_run_once_lock", lock)
+            except Exception:
+                pass
+
+        if not lock.acquire(blocking=False):
+            log.debug("[%s] Reconciler run_once skipped: already running", getattr(self, "client_id", "?"))
+            return getattr(self, "_last_summary", {}) or {}
+
+        try:
+            last_ts = float(getattr(self, "_last_run_ts", 0.0) or 0.0)
+            if now - last_ts < min_gap:
+                log.debug("[%s] Reconciler run_once skipped: called too soon", getattr(self, "client_id", "?"))
+                return getattr(self, "_last_summary", {}) or {}
+            setattr(self, "_last_run_ts", now)
+            summary = original(self, *args, **kwargs)
+            try:
+                setattr(self, "_last_summary", summary or {})
+            except Exception:
+                pass
+            return summary
+        finally:
+            try:
+                lock.release()
+            except Exception:
+                pass
+
+    setattr(APBrokerReconciler, "run_once", run_once_guarded)
+    setattr(APBrokerReconciler, _RECONCILER_PATCH_FLAG, True)
+    log.info("APBrokerReconciler run_once idempotency patch installed")
+    return True
+
+
+def _install_exit_performance_patch() -> bool:
+    try:
+        from ap_exit_engine import APExitEngine
+    except Exception as exc:
+        log.warning("Exit performance patch skipped: %s", exc)
+        return False
+
+    if getattr(APExitEngine, _EXIT_PERF_PATCH_FLAG, False):
+        return True
+
+    original = getattr(APExitEngine, "mark_position_closed", None)
+    if not callable(original):
+        log.warning("Exit performance patch skipped: mark_position_closed missing")
+        return False
+
+    setattr(APExitEngine, _EXIT_PERF_ORIGINAL_ATTR, original)
+
+    @wraps(original)
+    def mark_position_closed_with_perf(self, position_id, *args, **kwargs):
+        result = original(self, position_id, *args, **kwargs)
+        try:
+            pos = _find_exit_engine_position(self, str(position_id))
+            if pos is not None:
+                fill_price = kwargs.get("fill_price")
+                qty_filled = kwargs.get("qty_filled") or kwargs.get("cumulative_filled")
+                reason = kwargs.get("reason") or (args[0] if args else "") or "position_closed"
+                from ap.performance_tracker import record_trade_outcome_from_position
+                record_trade_outcome_from_position(
+                    pos,
+                    qty_filled=qty_filled,
+                    fill_price=fill_price,
+                    reason=str(reason),
+                    supabase_client=getattr(self, "sb", None) or getattr(self, "supabase", None),
+                )
+        except Exception as exc:
+            log.debug("performance outcome hook failed: %s", exc)
+        return result
+
+    setattr(APExitEngine, "mark_position_closed", mark_position_closed_with_perf)
+    setattr(APExitEngine, _EXIT_PERF_PATCH_FLAG, True)
+    log.info("APExitEngine performance outcome patch installed")
+    return True
+
+
 def install_exit_quarantine_patch(osm_cls):
-    """Install OSM exit-hook safety patch."""
+    """Install OSM exit-hook safety plus companion runtime patches."""
+    _install_reconciler_idempotency_patch()
+    _install_exit_performance_patch()
+
     if getattr(osm_cls, _PATCH_FLAG, False):
         return osm_cls
 
@@ -138,7 +246,6 @@ def install_exit_quarantine_patch(osm_cls):
         prev_filled = _safe_int(current.get("filled_qty"), 0) or 0
         cum_filled = _safe_int(filled_qty, None)
 
-        # Native bridge for accepted-but-missing-identity exits.
         if new_status == "EXIT_SUBMITTED" and not broker_order_id:
             _call_exit_engine(
                 ee,
@@ -156,11 +263,8 @@ def install_exit_quarantine_patch(osm_cls):
                 local_order_id or "?",
                 position_id,
             )
-            # Do not call original; native original returns early after logging anyway.
             return None
 
-        # Safer EXIT_FILLED classification. If this order's cumulative fill is
-        # less than original position size, it cannot be a full position close.
         if new_status == "EXIT_FILLED":
             if cum_filled is None or cum_filled <= 0:
                 cum_filled = order_qty
@@ -251,6 +355,7 @@ def install_exit_quarantine_patch(osm_cls):
 
     setattr(osm_cls, "_handle_exit_engine_hooks", patched)
     setattr(osm_cls, _PATCH_FLAG, True)
+    log.info("APOrderStateMachine exit quarantine/fill-classification patch installed")
     return osm_cls
 
 
