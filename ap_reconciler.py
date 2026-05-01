@@ -1,7 +1,7 @@
 """
 ap_reconciler.py — Broker-vs-DB Truth Reconciliation
 =====================================================
-Runs every RECONCILE_INTERVAL_SEC (default 180s = 3 min) per client.
+Runs every RECONCILE_INTERVAL_SEC (default 15s) per client during live market protection.
 
 Truth policy:
   - Broker wins on order status.
@@ -57,7 +57,7 @@ from typing import Optional
 
 log = logging.getLogger("ap.reconciler")
 
-RECONCILE_INTERVAL_SEC = int(os.getenv("RECONCILE_INTERVAL_SEC", "60"))
+RECONCILE_INTERVAL_SEC = int(os.getenv("RECONCILE_INTERVAL_SEC", "15"))
 IMPORT_MISSING_BROKER_POSITIONS = (
     os.getenv("RECONCILER_IMPORT_MISSING_BROKER_POSITIONS", "1")
     .strip()
@@ -88,19 +88,20 @@ BROKER_TO_OSM = {
 }
 
 
-def _market_hours_interval() -> int:
-    """60s during session, 180s outside — reduces broker API calls after close."""
+def _market_hours_interval(configured_interval: int = RECONCILE_INTERVAL_SEC) -> int:
+    """
+    15s market-hours reconciler safety net. Dedicated fill monitor should still
+    forward incremental broker fills to OSM in under 10 seconds.
+    """
     try:
         from zoneinfo import ZoneInfo
         from datetime import datetime as _dt, time as _time
-
         et = _dt.now(ZoneInfo("America/New_York"))
         if _time(9, 25) <= et.time() <= _time(16, 5):
-            return 60
+            return max(5, min(int(configured_interval or 15), 15))
     except Exception:
         pass
-    return 180
-
+    return max(15, int(configured_interval or 60))
 
 class APBrokerReconciler:
     """
@@ -128,6 +129,11 @@ class APBrokerReconciler:
         self._run_count  = 0
         self.exit_engine = None      # wired by client_runner after construction
         self._ghost_tracker: dict[str, bool] = {}  # two-pass ghost detection per contract
+        self.fill_monitor = None      # optional fill_monitor_final_hardened-7.py instance
+        self.require_fill_monitor = (
+            os.getenv("RECONCILER_REQUIRE_FILL_MONITOR", "0").strip().lower()
+            in {"1", "true", "yes", "on"}
+        )
 
     # ──────────────────────────────────────────────────────────────────────────
     # Lifecycle
@@ -143,8 +149,9 @@ class APBrokerReconciler:
             name=f"reconciler-{self.client_id}",
         )
         self._thread.start()
+        self._verify_fill_monitor_or_alert()
         log.info(
-            "[%s] Reconciler started (interval=%ds import_missing_broker_positions=%s)",
+            "[%s] Reconciler started (interval=%ds market_hours_effective<=15s import_missing_broker_positions=%s)",
             self.client_id,
             self._interval,
             IMPORT_MISSING_BROKER_POSITIONS,
@@ -165,7 +172,7 @@ class APBrokerReconciler:
     def _loop(self):
         # Stagger startup to avoid hammering broker on restart.
         time.sleep(min(30, max(1, self._interval // 4)))
-        while not self._stop.wait(_market_hours_interval()):
+        while not self._stop.wait(_market_hours_interval(self._interval)):
             try:
                 self.run_once()
             except Exception as e:
@@ -220,6 +227,96 @@ class APBrokerReconciler:
             len(summary["errors"]),
         )
         return summary
+
+    def _verify_fill_monitor_or_alert(self) -> bool:
+        """Confirm the dedicated fill monitor is wired/alive when exposed."""
+        fm = getattr(self, "fill_monitor", None) or getattr(self, "fill_mon", None)
+        alive = False
+        if fm is not None:
+            try:
+                if hasattr(fm, "is_alive") and callable(fm.is_alive):
+                    alive = bool(fm.is_alive())
+                elif hasattr(fm, "_thread"):
+                    alive = bool(getattr(fm, "_thread") and fm._thread.is_alive())
+                elif hasattr(fm, "running"):
+                    alive = bool(getattr(fm, "running"))
+            except Exception:
+                alive = False
+        if not alive:
+            msg = (
+                "FILL_MONITOR_NOT_CONFIRMED | fill_monitor_final_hardened-7.py "
+                "not wired/alive from reconciler view; using tightened reconciler "
+                f"interval={self._interval}s as safety net."
+            )
+            if self.require_fill_monitor:
+                raise RuntimeError(msg)
+            self._alert(msg)
+            return False
+        return True
+
+    def _extract_explicit_cumulative_fill_qty(self, broker_raw: dict) -> Optional[int]:
+        """Require normalized broker cumulative fill quantity; never invent qty=0."""
+        for key in (
+            "filled_qty", "filled_quantity", "cumulative_filled_qty",
+            "cumulative_filled_quantity", "exec_quantity",
+            "executed_quantity", "filled",
+        ):
+            if key not in broker_raw:
+                continue
+            val = broker_raw.get(key)
+            if val is None or val == "":
+                continue
+            try:
+                qty = int(float(val))
+                if qty >= 0:
+                    return qty
+            except Exception:
+                continue
+        return None
+
+    def _extract_avg_fill_price(self, broker_raw: dict) -> Optional[float]:
+        for key in (
+            "avg_fill_price", "average_fill_price", "fill_price",
+            "filled_avg_price", "avg_price", "price",
+        ):
+            if key not in broker_raw:
+                continue
+            val = broker_raw.get(key)
+            if val is None or val == "":
+                continue
+            try:
+                px = float(val)
+                if px > 0:
+                    return px
+            except Exception:
+                continue
+        return None
+
+    def _db_order_filled_qty(self, order: dict) -> int:
+        for key in ("filled_qty", "filled_quantity", "exec_quantity", "quantity_filled"):
+            try:
+                val = order.get(key)
+                if val is not None and val != "":
+                    return max(0, int(float(val)))
+            except Exception:
+                pass
+        return 0
+
+    def _db_order_requested_qty(self, order: dict) -> int:
+        for key in ("qty", "quantity", "contracts", "order_qty"):
+            try:
+                val = order.get(key)
+                if val is not None and val != "":
+                    return max(0, int(float(val)))
+            except Exception:
+                pass
+        return 0
+
+    def _apply_osm_fill_update(self, local_id: str, status: str, filled_qty: int, fill_price: float) -> bool:
+        apply_fn = getattr(self.osm, "apply_fill_update", None)
+        if callable(apply_fn):
+            return bool(apply_fn(local_id, filled_qty=filled_qty, fill_price=fill_price, status=status))
+        return bool(self.osm.transition(local_id, status, filled_qty=filled_qty, fill_price=fill_price))
 
     # ──────────────────────────────────────────────────────────────────────────
     # Order reconciliation
@@ -327,18 +424,42 @@ class APBrokerReconciler:
         if broker_status == "partially_filled":
             new_status = "PARTIAL_FILL" if kind == "ENTRY" else "EXIT_PARTIAL_FILL"
 
-        filled_qty = int(
-            broker_raw.get("exec_quantity")
-            or broker_raw.get("filled_quantity")
-            or broker_raw.get("quantity")
-            or 0
-        )
-        avg_fill = float(
-            broker_raw.get("avg_fill_price")
-            or broker_raw.get("fill_price")
-            or broker_raw.get("price")
-            or 0.0
-        )
+        filled_qty = self._extract_explicit_cumulative_fill_qty(broker_raw)
+        avg_fill = self._extract_avg_fill_price(broker_raw)
+        if filled_qty is None:
+            self._alert(
+                f"BROKER_FILL_QTY_NOT_NORMALIZED | {contract} | {local_id} | "
+                "broker returned filled/partial status without explicit cumulative fill qty; "
+                "skipping OSM correction until broker adapter normalizes this field"
+            )
+            summary["orders_alerted"] += 1
+            return
+        if avg_fill is None:
+            self._alert(
+                f"BROKER_FILL_PRICE_NOT_NORMALIZED | {contract} | {local_id} | "
+                "broker returned filled/partial status without explicit avg fill price; "
+                "skipping OSM correction until broker adapter normalizes this field"
+            )
+            summary["orders_alerted"] += 1
+            return
+
+        requested_qty = self._db_order_requested_qty(order)
+        db_filled_before = self._db_order_filled_qty(order)
+        if (
+            requested_qty > 0
+            and db_filled_before > 0
+            and db_filled_before < requested_qty
+            and filled_qty >= requested_qty
+        ):
+            partial_status = "PARTIAL_FILL" if kind == "ENTRY" else "EXIT_PARTIAL_FILL"
+            try:
+                self._apply_osm_fill_update(local_id, partial_status, db_filled_before, avg_fill)
+                log.warning(
+                    "[%s] RECONCILE_INTERMEDIATE_FILL_UPDATE | %s | %s | qty=%s before terminal qty=%s",
+                    self.client_id, contract, local_id, db_filled_before, filled_qty,
+                )
+            except Exception as ie:
+                log.error("[%s] Intermediate fill update failed for %s: %s", self.client_id, local_id, ie)
 
         log.warning(
             "[%s] RECONCILE_CORRECT: %s | %s | DB=%s broker=%s → advancing to %s",
@@ -346,7 +467,7 @@ class APBrokerReconciler:
         )
 
         try:
-            ok = self.osm.transition(
+            ok = self._apply_osm_fill_update(
                 local_id,
                 new_status,
                 filled_qty=filled_qty,
