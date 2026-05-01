@@ -7,11 +7,15 @@
 #   - get_healer()
 #   - APSelfHealingSystem.register/unregister/heartbeat/get_health_summary
 #
-# Added production guard:
-#   - Exit quarantine watchdog. If exit engine reports missing identity / quarantine
-#     / stale in-flight state, self-healing now attempts to kick the broker
-#     reconciler path and escalates loudly instead of letting a safe-lock sit
-#     invisible. It does NOT guess broker truth or clear quarantine by itself.
+# Production guards:
+#   - Thread liveness/stall checks
+#   - Fast stuck-CLOSING alert loop
+#   - Exit quarantine watchdog
+#   - Autonomous broker-truth exit recovery fallback
+#
+# Money-safety rule:
+#   Self-healing may query broker truth and call identity-bound recovery hooks,
+#   but it must never blindly clear quarantine or blindly submit duplicate exits.
 # =============================================================================
 
 from __future__ import annotations
@@ -128,8 +132,16 @@ class APSelfHealingSystem:
         self._reconcile_thread: Optional[threading.Thread] = None
 
     def start(self):
-        self._health_thread = threading.Thread(target=self._health_loop, daemon=True, name="self-heal-health")
-        self._reconcile_thread = threading.Thread(target=self._reconcile_loop, daemon=True, name="self-heal-reconcile")
+        self._health_thread = threading.Thread(
+            target=self._health_loop,
+            daemon=True,
+            name="self-heal-health",
+        )
+        self._reconcile_thread = threading.Thread(
+            target=self._reconcile_loop,
+            daemon=True,
+            name="self-heal-reconcile",
+        )
         self._health_thread.start()
         self._reconcile_thread.start()
         log.info("APSelfHealingSystem started (health=%ss reconcile=%ss)", HEALTH_POLL_SEC, RECONCILE_POLL_SEC)
@@ -338,29 +350,64 @@ class APSelfHealingSystem:
         try:
             for row in run_with_retry(_get_stuck_closing) or []:
                 age = _age_seconds(row.get("updated_at")) if hasattr(row, "get") else 9999
-                self._alert(email, "reconcile", HealthState.CRITICAL, f"STUCK CLOSING pos={row.get('id')} age={age:.0f}s exit={row.get('broker_order_id','none')}", None)
+                self._alert(
+                    email,
+                    "reconcile",
+                    HealthState.CRITICAL,
+                    f"STUCK CLOSING pos={row.get('id')} age={age:.0f}s exit={row.get('broker_order_id','none')}",
+                    None,
+                )
         except Exception as e:
             log.debug("[%s] Stuck closing check failed: %s", email, e)
+
+    def _run_autonomous_exit_recovery(self, email: str, runner, health: ComponentHealth) -> list:
+        """Run direct broker-truth recovery as a fallback to reconciler.
+
+        The helper itself enforces the safety rule: no blind clear, no blind duplicate submit.
+        """
+        actions = []
+        try:
+            core = getattr(runner, "core", None)
+            exit_eng = getattr(core, "exit_eng", None)
+            broker = getattr(core, "broker", None)
+            osm = getattr(runner, "order_state_machine", None)
+            if not (exit_eng and broker):
+                health.record_error("autonomous recovery skipped: missing exit_eng or broker")
+                return actions
+
+            from ap.exit_autonomous_recovery import recover_exit_engine
+
+            actions = recover_exit_engine(exit_engine=exit_eng, broker=broker, osm=osm)
+            if actions:
+                summary = ", ".join(f"{getattr(a, 'position_id', '?')}:{getattr(a, 'action', '?')}" for a in actions[:8])
+                health.record_error(f"autonomous recovery actions: {summary}")
+                log.warning("[%s] autonomous exit recovery actions: %s", email, summary)
+        except Exception as e:
+            health.record_error(f"autonomous recovery failed: {e}")
+            log.error("[%s] autonomous exit recovery failed: %s", email, e, exc_info=True)
+        return actions
 
     def _check_exit_quarantine_watchdog(self, email: str, runner) -> None:
         """Self-heal watchdog for quarantined/stale exit states.
 
-        This does not clear/replace orders by guessing. It makes the safe-lock
-        operational: start/restart reconciler when available, run one reconcile
-        pass when possible, block new entries, and escalate loudly.
+        Recovery order:
+          1. Block new entries / mark degraded.
+          2. Try to start/restart reconciler and run one pass.
+          3. Run autonomous direct broker-truth recovery fallback.
+          4. Alert/dashboard with action details.
         """
         exit_eng = getattr(getattr(runner, "core", None), "exit_eng", None)
         if exit_eng is None:
             return
 
         problematic = []
-        now = _now()
         try:
-            positions = []
             if hasattr(exit_eng, "active_positions"):
                 positions = list(exit_eng.active_positions())
             elif hasattr(exit_eng, "_positions"):
                 positions = [p for p in getattr(exit_eng, "_positions", []) if not getattr(p, "closed", False)]
+            else:
+                positions = []
 
             for pos in positions:
                 in_flight = bool(getattr(pos, "exit_in_flight", False))
@@ -408,6 +455,8 @@ class APSelfHealingSystem:
         except Exception as e:
             health.record_error(f"reconciler run_once failed: {e}")
 
+        autonomous_actions = self._run_autonomous_exit_recovery(email, runner, health)
+
         if health.cooldown_ok():
             details = []
             for pos, age, q, s in problematic[:5]:
@@ -417,11 +466,18 @@ class APSelfHealingSystem:
                     f"local={getattr(pos, 'pending_exit_local_order_id', '') or '?'} "
                     f"broker={getattr(pos, 'pending_exit_broker_order_id', '') or '?'}"
                 )
+            action_summary = ""
+            if autonomous_actions:
+                action_summary = " | autonomous=" + ", ".join(
+                    f"{getattr(a, 'position_id', '?')}:{getattr(a, 'action', '?')}" for a in autonomous_actions[:8]
+                )
             self._alert(
                 email,
                 "exit_quarantine",
                 health.state,
-                "Exit quarantine/stale in-flight detected. Entries blocked; self-healing attempted reconciler start/run. " + " | ".join(details),
+                "Exit quarantine/stale in-flight detected. Entries blocked; reconciler kicked; autonomous broker-truth recovery attempted. "
+                + " | ".join(details)
+                + action_summary,
                 health,
             )
 
