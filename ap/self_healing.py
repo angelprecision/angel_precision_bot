@@ -2,20 +2,13 @@
 # =============================================================================
 # Self-healing layer for Angel Precision Bot.
 #
-# Preserves the existing public API:
-#   - init_self_healing(...)
-#   - get_healer()
-#   - APSelfHealingSystem.register/unregister/heartbeat/get_health_summary
-#
 # Production guards:
 #   - Thread liveness/stall checks
 #   - Fast stuck-CLOSING alert loop
 #   - Exit quarantine watchdog
 #   - Autonomous broker-truth exit recovery fallback
-#
-# Money-safety rule:
-#   Self-healing may query broker truth and call identity-bound recovery hooks,
-#   but it must never blindly clear quarantine or blindly submit duplicate exits.
+#   - Quote-staleness watchdog
+#   - Best-effort recovery action audit persistence
 # =============================================================================
 
 from __future__ import annotations
@@ -43,6 +36,8 @@ ALERT_COOLDOWN_SEC = int(os.getenv("HEAL_ALERT_COOLDOWN", "300"))
 EXIT_QUARANTINE_WARN_SEC = int(os.getenv("EXIT_QUARANTINE_WARN_SEC", "30"))
 EXIT_QUARANTINE_CRITICAL_SEC = int(os.getenv("EXIT_QUARANTINE_CRITICAL_SEC", "60"))
 EXIT_INFLIGHT_WARN_SEC = int(os.getenv("EXIT_INFLIGHT_WARN_SEC", "45"))
+RECONCILER_SETTLE_SEC = float(os.getenv("SELF_HEAL_RECONCILER_SETTLE_SEC", "3.0"))
+QUOTE_STALE_WARN_SEC = int(os.getenv("EXIT_RECOVERY_QUOTE_STALE_SEC", "30"))
 
 
 def _now() -> datetime:
@@ -95,10 +90,7 @@ class ComponentHealth:
         return time.time() - self.last_alert > ALERT_COOLDOWN_SEC
 
     def restart_allowed(self) -> bool:
-        return (
-            self.restart_count < MAX_RESTART_ATTEMPTS
-            and (time.time() - self.last_restart.timestamp()) > RESTART_COOLDOWN_SEC
-        )
+        return self.restart_count < MAX_RESTART_ATTEMPTS and (time.time() - self.last_restart.timestamp()) > RESTART_COOLDOWN_SEC
 
 
 RestartFn = Callable[[], bool]
@@ -132,16 +124,8 @@ class APSelfHealingSystem:
         self._reconcile_thread: Optional[threading.Thread] = None
 
     def start(self):
-        self._health_thread = threading.Thread(
-            target=self._health_loop,
-            daemon=True,
-            name="self-heal-health",
-        )
-        self._reconcile_thread = threading.Thread(
-            target=self._reconcile_loop,
-            daemon=True,
-            name="self-heal-reconcile",
-        )
+        self._health_thread = threading.Thread(target=self._health_loop, daemon=True, name="self-heal-health")
+        self._reconcile_thread = threading.Thread(target=self._reconcile_loop, daemon=True, name="self-heal-reconcile")
         self._health_thread.start()
         self._reconcile_thread.start()
         log.info("APSelfHealingSystem started (health=%ss reconcile=%ss)", HEALTH_POLL_SEC, RECONCILE_POLL_SEC)
@@ -166,7 +150,6 @@ class APSelfHealingSystem:
 
         def restart_worker():
             try:
-                log.warning("[%s] AUTO-RESTART: worker thread", email)
                 broker = getattr(runner, "_broker_ref", None) or getattr(getattr(runner, "core", None), "broker", None)
                 runner._start_worker_thread(broker)
                 return True
@@ -176,7 +159,6 @@ class APSelfHealingSystem:
 
         def restart_order_monitor():
             try:
-                log.warning("[%s] AUTO-RESTART: order monitor", email)
                 if getattr(runner, "order_monitor", None):
                     runner.order_monitor.stop()
                 from ap.order_monitor import APOrderMonitor
@@ -198,7 +180,6 @@ class APSelfHealingSystem:
 
         def restart_equity_refresh():
             try:
-                log.warning("[%s] AUTO-RESTART: equity refresh", email)
                 broker = getattr(getattr(runner, "core", None), "broker", None)
                 if broker:
                     runner._start_equity_refresh(broker)
@@ -209,7 +190,6 @@ class APSelfHealingSystem:
 
         def restart_or_start_reconciler():
             try:
-                log.warning("[%s] AUTO-START/RESTART: broker reconciler", email)
                 broker = getattr(getattr(runner, "core", None), "broker", None)
                 exit_eng = getattr(getattr(runner, "core", None), "exit_eng", None)
                 if getattr(runner, "reconciler", None):
@@ -273,6 +253,7 @@ class APSelfHealingSystem:
                 self._handle_dead_component(email, runner, comp, health, auto_restart, dead_severity, components)
 
         self._check_exit_quarantine_watchdog(email, runner)
+        self._check_quote_staleness(email, runner)
 
         exit_health = self._get_health(email, "exit_engine")
         mc = getattr(runner, "master_control", None)
@@ -326,12 +307,12 @@ class APSelfHealingSystem:
                 if pm and osm:
                     self._reconcile_client(email, pm, osm)
                 self._check_exit_quarantine_watchdog(email, runner)
+                self._check_quote_staleness(email, runner)
             except Exception as e:
                 log.debug("[%s] Reconcile error: %s", email, e)
 
     def _reconcile_client(self, email: str, pm, osm):
         from ap.db import conn, run_with_retry
-
         def _get_stuck_closing():
             with conn() as c:
                 c.execute(
@@ -346,25 +327,48 @@ class APSelfHealingSystem:
                     (email,),
                 )
                 return c.fetchall()
-
         try:
             for row in run_with_retry(_get_stuck_closing) or []:
                 age = _age_seconds(row.get("updated_at")) if hasattr(row, "get") else 9999
-                self._alert(
-                    email,
-                    "reconcile",
-                    HealthState.CRITICAL,
-                    f"STUCK CLOSING pos={row.get('id')} age={age:.0f}s exit={row.get('broker_order_id','none')}",
-                    None,
-                )
+                self._alert(email, "reconcile", HealthState.CRITICAL, f"STUCK CLOSING pos={row.get('id')} age={age:.0f}s exit={row.get('broker_order_id','none')}", None)
         except Exception as e:
             log.debug("[%s] Stuck closing check failed: %s", email, e)
 
-    def _run_autonomous_exit_recovery(self, email: str, runner, health: ComponentHealth) -> list:
-        """Run direct broker-truth recovery as a fallback to reconciler.
+    def _persist_recovery_actions(self, email: str, actions: list) -> None:
+        if not actions:
+            return
+        for action in actions:
+            payload = {
+                "client_id": email,
+                "position_id": getattr(action, "position_id", "") or None,
+                "action": getattr(action, "action", ""),
+                "reason": getattr(action, "reason", ""),
+                "local_order_id": getattr(action, "local_order_id", ""),
+                "broker_order_id": getattr(action, "broker_order_id", ""),
+                "details": getattr(action, "details", {}) or {},
+                "created_at": _now_iso(),
+            }
+            try:
+                from ap.db import conn, run_with_retry
+                def _insert():
+                    with conn() as c:
+                        c.execute(
+                            """
+                            INSERT INTO client_recovery_log
+                                (client_id, position_id, action, reason, local_order_id, broker_order_id, details, created_at)
+                            VALUES (%s,%s,%s,%s,%s,%s,%s::jsonb,%s)
+                            """,
+                            (payload["client_id"], payload["position_id"], payload["action"], payload["reason"], payload["local_order_id"], payload["broker_order_id"], __import__('json').dumps(payload["details"]), payload["created_at"]),
+                        )
+                run_with_retry(_insert)
+            except Exception:
+                if self.sb:
+                    try:
+                        self.sb.table("client_recovery_log").insert(payload).execute()
+                    except Exception as e:
+                        log.debug("Recovery action DB write failed: %s", e)
 
-        The helper itself enforces the safety rule: no blind clear, no blind duplicate submit.
-        """
+    def _run_autonomous_exit_recovery(self, email: str, runner, health: ComponentHealth) -> list:
         actions = []
         try:
             core = getattr(runner, "core", None)
@@ -374,32 +378,49 @@ class APSelfHealingSystem:
             if not (exit_eng and broker):
                 health.record_error("autonomous recovery skipped: missing exit_eng or broker")
                 return actions
-
             from ap.exit_autonomous_recovery import recover_exit_engine
-
             actions = recover_exit_engine(exit_engine=exit_eng, broker=broker, osm=osm)
             if actions:
                 summary = ", ".join(f"{getattr(a, 'position_id', '?')}:{getattr(a, 'action', '?')}" for a in actions[:8])
                 health.record_error(f"autonomous recovery actions: {summary}")
                 log.warning("[%s] autonomous exit recovery actions: %s", email, summary)
+                self._persist_recovery_actions(email, actions)
         except Exception as e:
             health.record_error(f"autonomous recovery failed: {e}")
             log.error("[%s] autonomous exit recovery failed: %s", email, e, exc_info=True)
         return actions
 
-    def _check_exit_quarantine_watchdog(self, email: str, runner) -> None:
-        """Self-heal watchdog for quarantined/stale exit states.
+    def _check_quote_staleness(self, email: str, runner) -> None:
+        try:
+            exit_eng = getattr(getattr(runner, "core", None), "exit_eng", None)
+            if exit_eng is None:
+                return
+            from ap.exit_autonomous_recovery import scan_quote_staleness
+            stale = scan_quote_staleness(exit_eng, stale_sec=QUOTE_STALE_WARN_SEC)
+            if not stale:
+                return
+            health = self._get_health(email, "quote_staleness")
+            health.state = HealthState.WARNING
+            health.record_error(f"stale_quotes_count={len(stale)}")
+            try:
+                if hasattr(runner, "entries_allowed"):
+                    runner.entries_allowed.clear()
+                if hasattr(runner, "degraded"):
+                    runner.degraded.set()
+                if hasattr(runner, "degraded_reasons"):
+                    runner.degraded_reasons.add(f"quote_staleness:{len(stale)}")
+            except Exception:
+                pass
+            if health.cooldown_ok():
+                summary = ", ".join(f"{s.get('ticker','?')}:{s.get('contract','?')} opt_age={s.get('option_quote_age_sec')}" for s in stale[:5])
+                self._alert(email, "quote_staleness", HealthState.WARNING, f"Stale quotes detected; entries blocked/degraded. {summary}", health)
+        except Exception as e:
+            log.debug("[%s] quote staleness watchdog failed: %s", email, e)
 
-        Recovery order:
-          1. Block new entries / mark degraded.
-          2. Try to start/restart reconciler and run one pass.
-          3. Run autonomous direct broker-truth recovery fallback.
-          4. Alert/dashboard with action details.
-        """
+    def _check_exit_quarantine_watchdog(self, email: str, runner) -> None:
         exit_eng = getattr(getattr(runner, "core", None), "exit_eng", None)
         if exit_eng is None:
             return
-
         problematic = []
         try:
             if hasattr(exit_eng, "active_positions"):
@@ -408,7 +429,6 @@ class APSelfHealingSystem:
                 positions = [p for p in getattr(exit_eng, "_positions", []) if not getattr(p, "closed", False)]
             else:
                 positions = []
-
             for pos in positions:
                 in_flight = bool(getattr(pos, "exit_in_flight", False))
                 quarantine = bool(getattr(pos, "exit_identity_quarantine", False) or getattr(pos, "last_callback_identity_missing", False))
@@ -421,15 +441,12 @@ class APSelfHealingSystem:
         except Exception as e:
             log.debug("[%s] exit quarantine watchdog scan failed: %s", email, e)
             return
-
         if not problematic:
             return
-
         health = self._get_health(email, "exit_quarantine")
         worst_age = max(age for _, age, _, _ in problematic)
         health.state = HealthState.CRITICAL if worst_age >= EXIT_QUARANTINE_CRITICAL_SEC else HealthState.WARNING
         health.record_error(f"exit quarantine/stale inflight count={len(problematic)} worst_age={worst_age:.0f}s")
-
         try:
             if hasattr(runner, "entries_allowed"):
                 runner.entries_allowed.clear()
@@ -439,7 +456,6 @@ class APSelfHealingSystem:
                 runner.degraded_reasons.add(f"exit_quarantine:{len(problematic)}")
         except Exception:
             pass
-
         reconciler = getattr(runner, "reconciler", None)
         rec_alive = bool(reconciler and (not hasattr(reconciler, "is_alive") or reconciler.is_alive()))
         if not rec_alive:
@@ -447,39 +463,22 @@ class APSelfHealingSystem:
             if rec_health.restart_allowed():
                 self._handle_dead_component(email, runner, "reconciler", rec_health, True, HealthState.CRITICAL, {})
                 reconciler = getattr(runner, "reconciler", None)
-
         try:
             reconciler = getattr(runner, "reconciler", None)
             if reconciler and hasattr(reconciler, "run_once"):
                 reconciler.run_once()
+                time.sleep(max(0.0, RECONCILER_SETTLE_SEC))
         except Exception as e:
             health.record_error(f"reconciler run_once failed: {e}")
-
         autonomous_actions = self._run_autonomous_exit_recovery(email, runner, health)
-
         if health.cooldown_ok():
             details = []
             for pos, age, q, s in problematic[:5]:
-                details.append(
-                    f"{getattr(pos, 'ticker', '?')} pos={getattr(pos, 'position_id', '?')} "
-                    f"age={age:.0f}s q={q} stale_inflight={s} "
-                    f"local={getattr(pos, 'pending_exit_local_order_id', '') or '?'} "
-                    f"broker={getattr(pos, 'pending_exit_broker_order_id', '') or '?'}"
-                )
+                details.append(f"{getattr(pos, 'ticker', '?')} pos={getattr(pos, 'position_id', '?')} age={age:.0f}s q={q} stale_inflight={s} local={getattr(pos, 'pending_exit_local_order_id', '') or '?'} broker={getattr(pos, 'pending_exit_broker_order_id', '') or '?'}")
             action_summary = ""
             if autonomous_actions:
-                action_summary = " | autonomous=" + ", ".join(
-                    f"{getattr(a, 'position_id', '?')}:{getattr(a, 'action', '?')}" for a in autonomous_actions[:8]
-                )
-            self._alert(
-                email,
-                "exit_quarantine",
-                health.state,
-                "Exit quarantine/stale in-flight detected. Entries blocked; reconciler kicked; autonomous broker-truth recovery attempted. "
-                + " | ".join(details)
-                + action_summary,
-                health,
-            )
+                action_summary = " | autonomous=" + ", ".join(f"{getattr(a, 'position_id', '?')}:{getattr(a, 'action', '?')}" for a in autonomous_actions[:8])
+            self._alert(email, "exit_quarantine", health.state, "Exit quarantine/stale in-flight detected. Entries blocked; reconciler kicked/settled; autonomous broker-truth recovery attempted. " + " | ".join(details) + action_summary, health)
 
     def _get_health(self, email: str, component: str) -> ComponentHealth:
         key = (email, component)
@@ -493,12 +492,7 @@ class APSelfHealingSystem:
         icon = {"OK": "✅", "WARNING": "⚠️", "CRITICAL": "🔴", "FATAL": "🚨"}.get(state, "❓")
         restarts = f" | restarts={health.restart_count}/{MAX_RESTART_ATTEMPTS}" if health else ""
         log.error("%s SELF-HEAL [%s] [%s] [%s]: %s%s", icon, state, email, component, message, restarts)
-        full_msg = (
-            f"{icon} **ANGEL PRECISION — SELF-HEAL {state}**\n"
-            f"**Client:** `{email}`\n**Component:** `{component}`\n**State:** `{state}`\n"
-            f"**Time:** `{_now_iso()}`\n**Message:** {message}"
-            + (f"\n**Restart attempts:** {health.restart_count}/{MAX_RESTART_ATTEMPTS}" if health else "")
-        )
+        full_msg = f"{icon} **ANGEL PRECISION — SELF-HEAL {state}**\n**Client:** `{email}`\n**Component:** `{component}`\n**State:** `{state}`\n**Time:** `{_now_iso()}`\n**Message:** {message}" + (f"\n**Restart attempts:** {health.restart_count}/{MAX_RESTART_ATTEMPTS}" if health else "")
         self._send_discord(full_msg)
         self._write_dashboard(email, component, state, message, health)
 
@@ -516,16 +510,7 @@ class APSelfHealingSystem:
         if not self.sb:
             return
         try:
-            self.sb.table("client_health").upsert({
-                "client_id": email,
-                "component": component,
-                "status": state,
-                "alert_type": f"self_heal_{component}",
-                "restart_count": health.restart_count if health else 0,
-                "message": message[:500],
-                "alerted_at": _now_iso(),
-                "updated_at": _now_iso(),
-            }, on_conflict="client_id,component").execute()
+            self.sb.table("client_health").upsert({"client_id": email, "component": component, "status": state, "alert_type": f"self_heal_{component}", "restart_count": health.restart_count if health else 0, "message": message[:500], "alerted_at": _now_iso(), "updated_at": _now_iso()}, on_conflict="client_id,component").execute()
         except Exception as e:
             log.debug("Dashboard write failed: %s", e)
 
@@ -537,16 +522,7 @@ class APSelfHealingSystem:
 
     def get_health_summary(self) -> list[dict]:
         with self._lock:
-            return [
-                {
-                    "client_id": h.client_id,
-                    "component": h.component,
-                    "state": h.state,
-                    "restart_count": h.restart_count,
-                    "last_seen": h.last_seen.isoformat(),
-                }
-                for h in self._health.values()
-            ]
+            return [{"client_id": h.client_id, "component": h.component, "state": h.state, "restart_count": h.restart_count, "last_seen": h.last_seen.isoformat()} for h in self._health.values()]
 
 
 _healer: Optional[APSelfHealingSystem] = None
