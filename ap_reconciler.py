@@ -426,6 +426,137 @@ class APBrokerReconciler:
 
         self._check_ghost_fills(summary)
 
+    def _resolve_missing_id_exit_truth(self, order: dict, summary: dict, *, reason: str = "") -> bool:
+        """Resolve an EXIT order that has no broker_order_id into exactly one safe endpoint.
+
+        Endpoints:
+          - broker open exit confidently recovered -> OSM EXIT_ACKNOWLEDGED + exit_engine.set_pending_exit_order
+          - recent fill exists -> OSM EXIT_FILLED + exit_engine mark/partial hooks through OSM
+          - no broker order/fill after repeated proof -> mark replacement safe and terminal-cancel local order
+          - ambiguous/unknown -> alert and keep quarantine
+        """
+        local_id = str(order.get("local_order_id") or order.get("id") or "")
+        pos_id = str(order.get("position_id") or order.get("positionId") or "").strip()
+        contract = self._norm_contract(order.get("contract") or order.get("symbol") or "")
+        underlying = self._norm_underlying(order.get("underlying") or order.get("ticker") or contract[:6])
+        requested_qty = self._db_order_requested_qty(order)
+
+        if not local_id or not pos_id:
+            self._alert(
+                f"MISSING_ID_EXIT_RESOLVE_BLOCKED | {contract or '?'} | {local_id or '?'} | "
+                "missing local_id or position_id; manual review required"
+            )
+            summary["orders_alerted"] += 1
+            return False
+
+        # Endpoint 1: recover an active broker order identity if possible.
+        try:
+            if self._recover_missing_broker_id_exit(order, summary):
+                broker_oid = None
+                try:
+                    refreshed = self.osm.get_order(local_id) if hasattr(self.osm, "get_order") else None
+                    broker_oid = refreshed.get("broker_order_id") if refreshed else None
+                except Exception:
+                    broker_oid = None
+                if self.exit_engine and broker_oid:
+                    try:
+                        self.exit_engine.set_pending_exit_order(
+                            pos_id,
+                            local_order_id=local_id,
+                            broker_order_id=str(broker_oid),
+                            qty=requested_qty,
+                            reason="missing_id_exit_recovered_by_reconciler",
+                        )
+                    except Exception as exc:
+                        log.warning("[%s] exit_engine set_pending after missing-id recovery failed: %s", self.client_id, exc)
+                return True
+        except Exception as exc:
+            log.warning("[%s] missing-id broker recovery errored for %s: %s", self.client_id, local_id, exc)
+
+        # Endpoint 2: recent fill evidence. Prefer to advance OSM so OSM owns hooks.
+        recent_fill = self._get_recent_exit_fill(contract, underlying)
+        if recent_fill:
+            fill_qty = self._safe_int(recent_fill.get("filled_qty"), requested_qty or 0)
+            fill_px = self._safe_float(recent_fill.get("fill_price"), 0.0)
+            if fill_qty > 0 and fill_px > 0:
+                try:
+                    self.osm.transition(
+                        local_id,
+                        "EXIT_FILLED",
+                        filled_qty=fill_qty,
+                        fill_price=fill_px,
+                        last_error="reconciler_missing_id_recent_exit_fill_resolved",
+                    )
+                    self._alert(
+                        f"MISSING_ID_EXIT_RESOLVED_BY_RECENT_FILL | {contract or '?'} | {local_id} | "
+                        f"pos={pos_id} qty={fill_qty} price={fill_px:.4f}"
+                    )
+                    summary["orders_corrected"] += 1
+                    return True
+                except Exception as exc:
+                    self._alert(
+                        f"MISSING_ID_EXIT_RECENT_FILL_OSM_FAILED | {contract or '?'} | {local_id} | {exc}"
+                    )
+                    summary["orders_alerted"] += 1
+                    return False
+            self._alert(
+                f"MISSING_ID_EXIT_RECENT_FILL_INCOMPLETE | {contract or '?'} | {local_id} | "
+                "recent fill found but qty/price missing; keeping quarantine"
+            )
+            summary["orders_alerted"] += 1
+            return False
+
+        # Endpoint 3: negative proof after recovery passes. No broker order and no recent fill.
+        # Mark replacement safe BEFORE terminalizing local order so the engine can allow one
+        # future protective replacement path if needed. OSM terminal transition will also clear
+        # in-flight via on_exit_failure/clear_exit_in_flight hooks.
+        if self.exit_engine:
+            try:
+                if hasattr(self.exit_engine, "mark_exit_replacement_safe"):
+                    self.exit_engine.mark_exit_replacement_safe(
+                        pos_id,
+                        reason=reason or "missing_id_exit_negative_broker_checks",
+                        local_order_id=local_id,
+                        broker_order_id="",
+                        reconciled=True,
+                    )
+                elif hasattr(self.exit_engine, "clear_exit_in_flight"):
+                    self.exit_engine.clear_exit_in_flight(
+                        pos_id,
+                        reason=reason or "missing_id_exit_negative_broker_checks",
+                        local_order_id=local_id,
+                        broker_order_id="",
+                        rejected=False,
+                        reconciled=True,
+                    )
+            except Exception as exc:
+                log.error("[%s] exit_engine quarantine release failed pos=%s order=%s: %s", self.client_id, pos_id, local_id, exc)
+
+        try:
+            ok = self.osm.transition(
+                local_id,
+                "CANCELED",
+                last_error=reason or "reconciler_missing_id_exit_negative_broker_checks_replacement_safe",
+            )
+            if ok:
+                self._alert(
+                    f"MISSING_ID_EXIT_RESOLVED_REPLACEMENT_SAFE | {contract or '?'} | {local_id} | "
+                    f"pos={pos_id}; no broker open order/recent fill after repeated checks"
+                )
+                summary["orders_corrected"] += 1
+                self._missing_id_exit_tracker.pop(str(local_id), None)
+                return True
+        except Exception as exc:
+            log.error("[%s] failed to terminal-cancel missing-id exit %s: %s", self.client_id, local_id, exc)
+
+        # Endpoint 4: unresolved, visible quarantine.
+        self._alert(
+            f"MISSING_ID_EXIT_UNRESOLVED_QUARANTINE | {contract or '?'} | {local_id} | "
+            f"pos={pos_id}; manual review required"
+        )
+        summary["orders_alerted"] += 1
+        return False
+
     def _handle_order_without_broker_id(self, order: dict, summary: dict) -> None:
         local_id   = order.get("local_order_id") or order.get("id")
         contract   = self._norm_contract(order.get("contract") or order.get("symbol") or "?")
@@ -474,8 +605,18 @@ class APBrokerReconciler:
                 )
                 summary["orders_alerted"] += 1
                 return
-            # After repeated negative broker-open-order and recent-fill checks,
-            # fall through to ordinary phantom cancel safety window.
+
+            # Full recovery contract for v8/v9 exit-engine quarantine:
+            # after repeated negative broker-open-order and recent-fill checks,
+            # resolve the exit into exactly one endpoint instead of falling into
+            # generic phantom-cancel logic and leaving the exit engine locked.
+            if self._resolve_missing_id_exit_truth(
+                order,
+                summary,
+                reason="reconciler_missing_id_exit_after_two_negative_passes",
+            ):
+                return
+            return
 
         if created_ts:
             try:
