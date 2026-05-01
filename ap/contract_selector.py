@@ -104,7 +104,11 @@ def _normalize_reason_code(raw_reason: str) -> str:
     for key, code in _REASON_CODE_MAP.items():
         if key in r:
             return code
-    return raw_reason.upper()
+    code = raw_reason.upper()
+    if code not in _UNKNOWN_SELECTOR_REASONS_SEEN:
+        _UNKNOWN_SELECTOR_REASONS_SEEN.add(code)
+        log.warning("Unmapped selector rejection reason observed: %s", code)
+    return code
 
 
 def _safe_float(val, default: float = 0.0) -> float:
@@ -143,8 +147,16 @@ _PRO_QUALITY_ENABLED = os.getenv("PRO_CONTRACT_QUALITY", "true").lower() != "fal
 # Safety defaults:
 # - Guard subsystem errors fail closed unless explicitly overridden.
 # - Budget clipping is explicit and observable so upstream sizing does not silently disagree.
-_SELECTOR_FAIL_OPEN_GUARD_ERRORS = os.getenv("SELECTOR_FAIL_OPEN_GUARD_ERRORS", "0") == "1"
+_RAW_SELECTOR_FAIL_OPEN_GUARD_ERRORS = os.getenv("SELECTOR_FAIL_OPEN_GUARD_ERRORS", "").strip().upper()
+_SELECTOR_FAIL_OPEN_GUARD_ERRORS = (_RAW_SELECTOR_FAIL_OPEN_GUARD_ERRORS == "I_UNDERSTAND_THIS_IS_UNSAFE")
 _QUALITY_RULES_VERSION = os.getenv("CONTRACT_QUALITY_RULES_VERSION", "contract_selector_v1")
+_UNKNOWN_SELECTOR_REASONS_SEEN: set[str] = set()
+
+if _SELECTOR_FAIL_OPEN_GUARD_ERRORS:
+    log.critical(
+        "SELECTOR_FAIL_OPEN_GUARD_ERRORS OVERRIDE ENABLED — guard exceptions will FAIL-OPEN. "
+        "This is unsafe for production and should not be enabled for live trading."
+    )
 
 def _max_trade_usd() -> float:
     try:
@@ -160,6 +172,11 @@ def _effective_budget(raw_budget: float) -> tuple[float, float, bool]:
         budget = 0.0
     eff = min(budget, cap)
     return eff, cap, bool(budget > cap)
+
+def _pricing_basis_for_mode(mode: str) -> tuple[bool, str]:
+    """Return (is_live, pricing_basis) for selector capital math."""
+    is_live = str(mode or "paper").upper() == "LIVE"
+    return is_live, "ASK_EXECUTION" if is_live else "MID_SIMULATION"
 
 _PRO_TIER1_TICKERS = {
     "SPY", "QQQ", "IWM", "DIA",
@@ -259,6 +276,7 @@ class SelectedContract:
     execution_price_per_share: float = 0.0
     effective_budget: float = 0.0
     budget_clipped: bool = False
+    pricing_basis: str = ""
 
     def to_dict(self) -> dict:
         return {
@@ -283,6 +301,7 @@ class SelectedContract:
             "execution_price_per_share": self.execution_price_per_share,
             "effective_budget": self.effective_budget,
             "budget_clipped": self.budget_clipped,
+            "pricing_basis": self.pricing_basis,
         }
 
 
@@ -310,6 +329,7 @@ class APContractSelectionEngine:
         prefer_weekly:  bool  = True,
         earnings_guard=None,
         iv_filter=None,
+        mutate_plan: bool = True,
     ):
         self.broker         = broker
         self.data_broker    = data_broker if data_broker is not None else broker
@@ -326,6 +346,7 @@ class APContractSelectionEngine:
         self.prefer_weekly  = prefer_weekly
         self.earnings_guard = earnings_guard
         self.iv_filter      = iv_filter
+        self.mutate_plan    = bool(mutate_plan)
 
         self.strategy_version = os.getenv("AP_STRATEGY_VERSION", "ap_live_beta")
         self.git_commit       = get_git_commit()
@@ -344,6 +365,7 @@ class APContractSelectionEngine:
             "pro_quality_enabled":    _PRO_QUALITY_ENABLED,
             "guard_error_fail_open":   _SELECTOR_FAIL_OPEN_GUARD_ERRORS,
             "quality_rules_version":   _QUALITY_RULES_VERSION,
+            "mutate_plan":             self.mutate_plan,
             "pro_min_bid":            _PRO_MIN_BID,
             "pro_min_bid_size_hard":  _PRO_MIN_BID_SIZE_HARD,
             "pro_t1_spread_hard_max": _PRO_T1_SPREAD_HARD_MAX,
@@ -904,6 +926,7 @@ class APContractSelectionEngine:
                     execution_price_per_share = selected.execution_price_per_share,
                     effective_budget          = selected.effective_budget,
                     budget_clipped            = selected.budget_clipped,
+                    pricing_basis             = selected.pricing_basis,
                     selection_reason     = selected.selection_reason + " [forced_1]",
                     selection_score      = selected.selection_score,
                     dte                  = selected.dte,
@@ -1012,26 +1035,58 @@ class APContractSelectionEngine:
             return None
 
         # ── F. UPDATE PLAN IN-PLACE ───────────────────────────────────────────
-        if isinstance(plan, dict):
-            plan["contract_symbol"] = selected.contract_symbol
-            plan["limit_price"]     = selected.execution_price_per_share
-            plan["contracts"]       = selected.affordable_contracts
-            plan["max_position_usd"] = plan["contracts"] * selected.premium_per_contract
-            plan["selector_effective_budget"] = selected.effective_budget
-            plan["selector_budget_clipped"] = selected.budget_clipped
-            plan["selector_scoring_price"] = selected.scoring_price_per_share
-            plan["selector_execution_price"] = selected.execution_price_per_share
-            plan["selector_pricing_basis"] = "ASK_EXECUTION" if str(self.mode).upper() == "LIVE" else "MID_SIMULATION"
+        # Default behavior remains mutation because downstream execution expects
+        # the selected contract fields on the plan. Set mutate_plan=False only
+        # for audit/replay callers that explicitly consume SelectedContract.
+        if self.mutate_plan:
+            if isinstance(plan, dict):
+                plan["contract_symbol"] = selected.contract_symbol
+                plan["limit_price"]     = selected.execution_price_per_share
+                plan["contracts"]       = selected.affordable_contracts
+                plan["max_position_usd"] = plan["contracts"] * selected.premium_per_contract
+                plan["selector_effective_budget"] = selected.effective_budget
+                plan["selector_budget_clipped"] = selected.budget_clipped
+                plan["selector_scoring_price"] = selected.scoring_price_per_share
+                plan["selector_execution_price"] = selected.execution_price_per_share
+                plan["selector_pricing_basis"] = selected.pricing_basis
+                plan.setdefault("selector_metadata", {})
+                plan["selector_metadata"].update({
+                    "contract_symbol": selected.contract_symbol,
+                    "pricing_basis": selected.pricing_basis,
+                    "premium_per_contract": selected.premium_per_contract,
+                    "affordable_contracts": selected.affordable_contracts,
+                    "effective_budget": selected.effective_budget,
+                    "budget_clipped": selected.budget_clipped,
+                })
+            else:
+                plan.contract_symbol  = selected.contract_symbol
+                plan.limit_price      = selected.execution_price_per_share
+                plan.contracts        = selected.affordable_contracts
+                plan.max_position_usd = plan.contracts * selected.premium_per_contract
+                plan.selector_effective_budget = selected.effective_budget
+                plan.selector_budget_clipped = selected.budget_clipped
+                plan.selector_scoring_price = selected.scoring_price_per_share
+                plan.selector_execution_price = selected.execution_price_per_share
+                plan.selector_pricing_basis = selected.pricing_basis
+                try:
+                    meta = getattr(plan, "selector_metadata", None) or {}
+                    meta.update({
+                        "contract_symbol": selected.contract_symbol,
+                        "pricing_basis": selected.pricing_basis,
+                        "premium_per_contract": selected.premium_per_contract,
+                        "affordable_contracts": selected.affordable_contracts,
+                        "effective_budget": selected.effective_budget,
+                        "budget_clipped": selected.budget_clipped,
+                    })
+                    plan.selector_metadata = meta
+                except Exception:
+                    pass
         else:
-            plan.contract_symbol  = selected.contract_symbol
-            plan.limit_price      = selected.execution_price_per_share
-            plan.contracts        = selected.affordable_contracts
-            plan.max_position_usd = plan.contracts * selected.premium_per_contract
-            plan.selector_effective_budget = selected.effective_budget
-            plan.selector_budget_clipped = selected.budget_clipped
-            plan.selector_scoring_price = selected.scoring_price_per_share
-            plan.selector_execution_price = selected.execution_price_per_share
-            plan.selector_pricing_basis = "ASK_EXECUTION" if str(self.mode).upper() == "LIVE" else "MID_SIMULATION"
+            log.info(
+                "[%s] Selector mutate_plan=False — returning SelectedContract without mutating plan | %s",
+                ticker, selected.contract_symbol,
+            )
+
         if _wick_confidence and not getattr(plan, "wick_confidence", None):
             try:
                 plan.wick_confidence = _wick_confidence
@@ -1055,7 +1110,7 @@ class APContractSelectionEngine:
                 "execution_price_per_share": selected.execution_price_per_share,
                 "effective_budget": selected.effective_budget,
                 "budget_clipped": selected.budget_clipped,
-                "pricing_basis": "ASK_EXECUTION" if str(self.mode).upper() == "LIVE" else "MID_SIMULATION",
+                "pricing_basis": selected.pricing_basis,
                 "spread_pct":           selected.spread_pct,
                 "oi":                   selected.open_interest,
                 "volume":               selected.volume,
@@ -1309,7 +1364,13 @@ class APContractSelectionEngine:
             return -9999.0
 
         spread_pct = (ask - bid) / mid
-        premium    = mid * 100
+        # Ranking still scores value/liquidity from midpoint, but affordability
+        # must use the same capital basis as _build_selected(): ask in LIVE, mid
+        # in paper/research. This prevents a contract from ranking highly only
+        # because it fits at mid while failing live affordability at ask.
+        is_live, _pricing_basis = _pricing_basis_for_mode(getattr(self, "mode", "paper"))
+        execution_price = ask if is_live else mid
+        execution_premium = execution_price * 100
 
         greeks = opt.get("greeks") or {}
         try:
@@ -1321,7 +1382,9 @@ class APContractSelectionEngine:
         premium_penalty   = max(0.0, mid - MAX_IDEAL_PREMIUM)
 
         effective_budget, _, _ = _effective_budget(budget)
-        affordable = int(effective_budget / premium) if premium > 0 else 0
+        affordable = int(effective_budget / execution_premium) if execution_premium > 0 else 0
+        affordability_ratio = min(1.0, effective_budget / execution_premium) if execution_premium > 0 else 0.0
+        unaffordable_penalty = -500.0 if affordable < 1 else 0.0
 
         delta_distance = abs(delta - self.target_delta)
 
@@ -1354,6 +1417,8 @@ class APContractSelectionEngine:
             (math.log(oi+1)  * 12)             +
             (math.log(vol+1) *  6)             +
             (premium_penalty * premium_weight) +
+            (affordability_ratio * 10)       +
+            unaffordable_penalty             +
             (otm_bias        *  6)
         )
 
@@ -1387,10 +1452,9 @@ class APContractSelectionEngine:
             # paper/research simulation on mid if that is the configured mode.
             # This prevents LIVE from approving a contract that only fits at mid,
             # while preserving less restrictive paper iteration when not live.
-            is_live = str(getattr(self, "mode", "paper")).upper() == "LIVE"
+            is_live, pricing_basis = _pricing_basis_for_mode(getattr(self, "mode", "paper"))
             scoring_price_per_share   = mid
             execution_price_per_share = ask if is_live else mid
-            pricing_basis             = "ASK_EXECUTION" if is_live else "MID_SIMULATION"
             premium_per_share         = execution_price_per_share
             premium_per_contract      = execution_price_per_share * 100
             effective_budget, MAX_TRADE_USD, budget_clipped = _effective_budget(budget)
@@ -1425,6 +1489,7 @@ class APContractSelectionEngine:
                 execution_price_per_share = execution_price_per_share,
                 effective_budget          = effective_budget,
                 budget_clipped            = budget_clipped,
+                pricing_basis             = pricing_basis,
             )
         except Exception as e:
             log.error("_build_selected failed: %s", e)
