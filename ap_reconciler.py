@@ -128,7 +128,8 @@ class APBrokerReconciler:
         self._thread: Optional[threading.Thread] = None
         self._run_count  = 0
         self.exit_engine = None      # wired by client_runner after construction
-        self._ghost_tracker: dict[str, bool] = {}  # two-pass ghost detection per contract
+        self._ghost_tracker: dict[str, int] = {}  # ghost detection count per contract
+        self._missing_id_exit_tracker: dict[str, int] = {}  # missing broker-id EXIT recovery pass count
         self.fill_monitor = None      # optional fill_monitor_final_hardened-7.py instance
         self.require_fill_monitor = (
             os.getenv("RECONCILER_REQUIRE_FILL_MONITOR", "0").strip().lower()
@@ -312,11 +313,70 @@ class APBrokerReconciler:
                 pass
         return 0
 
-    def _apply_osm_fill_update(self, local_id: str, status: str, filled_qty: int, fill_price: float) -> bool:
+
+    def _order_family_from_kind_and_status(self, order: dict, db_status: str = "") -> str | None:
+        """
+        Return ENTRY or EXIT only when kind/status agree enough for safe state mapping.
+
+        Reconciler must not push an ENTRY status onto an EXIT order or vice versa if
+        orders.kind is dirty. EXIT status-family wins only when kind is EXIT or the
+        DB status is explicitly exit-prefixed. Generic SUBMITTED/ACKNOWLEDGED states
+        require a trustworthy kind. Ambiguous rows are skipped and alerted.
+        """
+        kind = str(order.get("kind") or "").strip().upper()
+        status = str(db_status or order.get("status") or "").strip().upper()
+
+        exit_statuses = {
+            "EXIT_REQUESTED", "EXIT_SUBMITTED", "EXIT_ACKNOWLEDGED",
+            "EXIT_PARTIAL_FILL", "EXIT_FILLED", "PENDING_CANCEL",
+        }
+        entry_statuses = {
+            "PENDING_TRIGGER", "CREATED", "SUBMITTED", "ACKNOWLEDGED",
+            "PARTIAL_FILL", "FILLED",
+        }
+
+        if kind == "EXIT":
+            return "EXIT"
+        if kind == "ENTRY":
+            if status in exit_statuses:
+                return None
+            return "ENTRY"
+        if status in exit_statuses or status.startswith("EXIT_"):
+            return "EXIT"
+        if status in entry_statuses:
+            return "ENTRY"
+        return None
+
+    def _apply_osm_fill_update(
+        self,
+        local_id: str,
+        status: str,
+        filled_qty: int,
+        fill_price: float,
+        broker_order_id: str | None = None,
+    ) -> bool:
+        """Compatibility bridge for OSM v3 apply_fill_update()."""
+        status_u = str(status or "").upper()
         apply_fn = getattr(self.osm, "apply_fill_update", None)
-        if callable(apply_fn):
-            return bool(apply_fn(local_id, filled_qty=filled_qty, fill_price=fill_price, status=status))
-        return bool(self.osm.transition(local_id, status, filled_qty=filled_qty, fill_price=fill_price))
+        if callable(apply_fn) and status_u in {"PARTIAL_FILL", "EXIT_PARTIAL_FILL"}:
+            try:
+                return bool(apply_fn(
+                    local_id,
+                    cumulative_filled=int(filled_qty),
+                    fill_price=float(fill_price) if fill_price is not None else None,
+                    broker_order_id=broker_order_id,
+                ))
+            except TypeError as te:
+                log.warning(
+                    "[%s] OSM apply_fill_update signature mismatch for %s; falling back to transition(): %s",
+                    self.client_id, local_id, te,
+                )
+        return bool(self.osm.transition(
+            local_id,
+            status_u,
+            filled_qty=int(filled_qty),
+            fill_price=float(fill_price) if fill_price is not None else None,
+        ))
 
     # ──────────────────────────────────────────────────────────────────────────
     # Order reconciliation
@@ -368,8 +428,9 @@ class APBrokerReconciler:
 
     def _handle_order_without_broker_id(self, order: dict, summary: dict) -> None:
         local_id   = order.get("local_order_id") or order.get("id")
-        contract   = order.get("contract") or order.get("symbol") or "?"
+        contract   = self._norm_contract(order.get("contract") or order.get("symbol") or "?")
         kind       = (order.get("kind") or "ENTRY").upper()
+        db_status  = (order.get("status") or "").upper()
         created_ts = order.get("created_ts")
 
         # Deferred overnight/watcher entries may intentionally not have broker ids yet.
@@ -385,6 +446,37 @@ class APBrokerReconciler:
             except Exception:
                 pass
 
+        # Missing-ID protective exits are special. Do not phantom-cancel on age alone:
+        # first attempt broker identity recovery by contract/qty/sell-to-close evidence.
+        if kind == "EXIT" and db_status in {"EXIT_REQUESTED", "EXIT_SUBMITTED", "EXIT_ACKNOWLEDGED", "EXIT_PARTIAL_FILL", "SUBMITTED", "ACKNOWLEDGED", "PARTIAL_FILL"}:
+            if self._recover_missing_broker_id_exit(order, summary):
+                self._missing_id_exit_tracker.pop(str(local_id), None)
+                return
+
+            recent_fill = self._get_recent_exit_fill(
+                contract,
+                self._norm_underlying(order.get("underlying") or order.get("ticker") or contract[:6]),
+            )
+            if recent_fill:
+                self._alert(
+                    f"MISSING_ID_EXIT_RECENT_FILL_FOUND | {contract} | {local_id} | "
+                    "not phantom-canceling; waiting for fill/OSM convergence"
+                )
+                summary["orders_alerted"] += 1
+                return
+
+            passes = self._missing_id_exit_tracker.get(str(local_id), 0) + 1
+            self._missing_id_exit_tracker[str(local_id)] = passes
+            if passes < 2:
+                self._alert(
+                    f"MISSING_ID_EXIT_RECOVERY_PASS_{passes} | {contract} | {local_id} | "
+                    "broker_id missing; no broker match yet; refusing age-only phantom cancel"
+                )
+                summary["orders_alerted"] += 1
+                return
+            # After repeated negative broker-open-order and recent-fill checks,
+            # fall through to ordinary phantom cancel safety window.
+
         if created_ts:
             try:
                 created = datetime.fromisoformat(str(created_ts).replace("Z", "+00:00"))
@@ -394,11 +486,10 @@ class APBrokerReconciler:
                         self.osm.transition(
                             local_id,
                             "CANCELED",
-                            last_error="reconciler_phantom_cancel_no_broker_id",
+                            last_error="reconciler_phantom_cancel_no_broker_id_after_negative_broker_checks",
                         )
                         log.warning(
-                            "[%s] RECONCILE_AUTO_CANCEL phantom | %s | %s | "
-                            "age=%.0fs no broker_id",
+                            "[%s] RECONCILE_AUTO_CANCEL phantom | %s | %s | age=%.0fs no broker_id",
                             self.client_id, contract, local_id, age
                         )
                         summary["orders_corrected"] += 1
@@ -407,6 +498,350 @@ class APBrokerReconciler:
                                   self.client_id, local_id, _ce)
             except Exception:
                 pass
+
+    def _safe_get_broker_open_orders(self) -> list[dict]:
+        """Best-effort broker open-order fetch across adapter method names."""
+        for method_name in ("list_open_orders", "get_open_orders", "list_orders", "orders"):
+            method = getattr(self.broker, method_name, None)
+            if not callable(method):
+                continue
+            try:
+                try:
+                    result = method(status="open")
+                except TypeError:
+                    result = method()
+                if result is None:
+                    continue
+                if isinstance(result, dict):
+                    for key in ("orders", "data", "results"):
+                        if isinstance(result.get(key), list):
+                            return [dict(x) for x in result.get(key) if isinstance(x, dict)]
+                    return [result]
+                if isinstance(result, list):
+                    return [dict(x) for x in result if isinstance(x, dict)]
+            except Exception as exc:
+                log.debug("[%s] broker %s failed during missing-id recovery: %s", self.client_id, method_name, exc)
+        return []
+
+    def _broker_order_id_from_raw(self, raw: dict) -> str:
+        return str(raw.get("broker_order_id") or raw.get("order_id") or raw.get("id") or raw.get("orderId") or "").strip()
+
+    def _broker_order_contract_from_raw(self, raw: dict) -> str:
+        return self._norm_contract(raw.get("contract") or raw.get("option_symbol") or raw.get("symbol") or raw.get("instrument") or "")
+
+    def _broker_order_qty_from_raw(self, raw: dict) -> int:
+        for key in ("quantity", "qty", "order_qty", "remaining_quantity", "remaining_qty"):
+            try:
+                val = raw.get(key)
+                if val is not None and val != "":
+                    return abs(int(float(val)))
+            except Exception:
+                pass
+        return 0
+
+    def _broker_order_side_action_from_raw(self, raw: dict) -> str:
+        """
+        Normalize broker order side/action/instruction.
+
+        Strong matches are explicit sell-to-close variants. A plain "sell" is only a
+        weak fallback because some broker payloads are sparse, but it should not be
+        allowed to win recovery unless contract/qty/freshness also line up.
+        """
+        fields = (
+            "side",
+            "action",
+            "instruction",
+            "order_action",
+            "transaction_type",
+            "trade_action",
+            "type",
+            "order_type",
+        )
+        text = " ".join(str(raw.get(k) or "") for k in fields).strip().lower()
+        compact = text.replace("_", "").replace("-", "").replace(" ", "")
+        if compact in {"selltoclose", "stc"} or "sell to close" in text or "sell_to_close" in text:
+            return "SELL_TO_CLOSE"
+        if compact in {"buytoclose", "btc"} or "buy to close" in text or "buy_to_close" in text:
+            return "BUY_TO_CLOSE"
+        if "sell" in text:
+            return "SELL"
+        if "buy" in text:
+            return "BUY"
+        return ""
+
+    def _broker_order_is_exit_like(self, raw: dict) -> bool:
+        action = self._broker_order_side_action_from_raw(raw)
+        if action in {"SELL_TO_CLOSE", "SELL"}:
+            return True
+        # Some adapters put option closing intent in nested/extra metadata.
+        extra_text = " ".join(
+            str(raw.get(k) or "")
+            for k in ("description", "tag", "client_order_id", "client_tag", "memo", "notes")
+        ).lower()
+        compact = extra_text.replace("_", "").replace("-", "").replace(" ", "")
+        return "selltoclose" in compact or "stc" == compact
+
+    def _raw_identity_values(self, raw: dict) -> set[str]:
+        vals: set[str] = set()
+        for key in (
+            "position_id",
+            "positionId",
+            "ap_position_id",
+            "local_position_id",
+            "client_position_id",
+            "related_position_id",
+            "parent_position_id",
+            "client_tag",
+            "client_order_id",
+            "clientOrderId",
+            "tag",
+            "memo",
+            "notes",
+            "strategy_id",
+        ):
+            val = raw.get(key)
+            if val is None:
+                continue
+            sval = str(val).strip()
+            if sval:
+                vals.add(sval)
+        return vals
+
+    def _order_identity_values(self, order: dict) -> set[str]:
+        vals: set[str] = set()
+        for key in (
+            "position_id",
+            "positionId",
+            "ap_position_id",
+            "local_position_id",
+            "client_position_id",
+            "related_position_id",
+            "parent_position_id",
+            "client_tag",
+            "client_order_id",
+            "tag",
+            "signal_id",
+            "plan_id",
+        ):
+            val = order.get(key)
+            if val is None:
+                continue
+            sval = str(val).strip()
+            if sval:
+                vals.add(sval)
+        return vals
+
+    def _parse_broker_order_time(self, raw: dict) -> Optional[datetime]:
+        for key in (
+            "created_ts",
+            "created_at",
+            "submitted_at",
+            "transaction_date",
+            "timestamp",
+            "time",
+            "date",
+            "updated_at",
+        ):
+            val = raw.get(key)
+            if not val:
+                continue
+            try:
+                if isinstance(val, datetime):
+                    dt = val
+                else:
+                    txt = str(val).strip().replace("Z", "+00:00")
+                    dt = datetime.fromisoformat(txt)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                return dt.astimezone(timezone.utc)
+            except Exception:
+                continue
+        return None
+
+    def _parse_db_order_time(self, order: dict) -> Optional[datetime]:
+        for key in ("created_ts", "submitted_ts", "updated_ts"):
+            val = order.get(key)
+            if not val:
+                continue
+            try:
+                if isinstance(val, datetime):
+                    dt = val
+                else:
+                    dt = datetime.fromisoformat(str(val).replace("Z", "+00:00"))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                return dt.astimezone(timezone.utc)
+            except Exception:
+                continue
+        return None
+
+    def _score_missing_id_exit_candidate(self, order: dict, raw: dict) -> tuple[int, list[str]]:
+        """
+        Score a broker open order as a recovery candidate for a missing-ID EXIT.
+
+        Hard filters happen in _recover_missing_broker_id_exit(); this score ranks
+        remaining matches. It favors explicit identity metadata, sell-to-close
+        semantics, exact qty, and submit-time proximity. Loose text-only exit
+        evidence is deliberately low value.
+        """
+        score = 0
+        reasons: list[str] = []
+
+        order_ids = self._order_identity_values(order)
+        raw_ids = self._raw_identity_values(raw)
+        if order_ids and raw_ids and (order_ids & raw_ids):
+            score += 100
+            reasons.append("identity")
+
+        action = self._broker_order_side_action_from_raw(raw)
+        if action == "SELL_TO_CLOSE":
+            score += 40
+            reasons.append("explicit_stc")
+        elif action == "SELL":
+            score += 15
+            reasons.append("sell_fallback")
+        else:
+            # Not exit-like enough to recover unless identity is perfect.
+            reasons.append("no_exit_action")
+
+        requested_qty = self._db_order_requested_qty(order)
+        broker_qty = self._broker_order_qty_from_raw(raw)
+        if requested_qty > 0 and broker_qty > 0:
+            if requested_qty == broker_qty:
+                score += 25
+                reasons.append("qty_exact")
+            else:
+                score -= 100
+                reasons.append("qty_mismatch")
+
+        db_ts = self._parse_db_order_time(order)
+        broker_ts = self._parse_broker_order_time(raw)
+        if db_ts and broker_ts:
+            delta = abs((broker_ts - db_ts).total_seconds())
+            if delta <= 30:
+                score += 35
+                reasons.append("time_30s")
+            elif delta <= 120:
+                score += 25
+                reasons.append("time_120s")
+            elif delta <= 300:
+                score += 10
+                reasons.append("time_300s")
+            else:
+                score -= 50
+                reasons.append("stale_time")
+        else:
+            reasons.append("time_unknown")
+
+        return score, reasons
+
+    def _recover_missing_broker_id_exit(self, order: dict, summary: dict) -> bool:
+        local_id = str(order.get("local_order_id") or order.get("id") or "")
+        contract = self._norm_contract(order.get("contract") or order.get("symbol") or "")
+        requested_qty = self._db_order_requested_qty(order)
+        db_ts = self._parse_db_order_time(order)
+        position_id = str(order.get("position_id") or order.get("positionId") or "").strip()
+
+        scored: list[tuple[int, str, dict, list[str]]] = []
+        rejected_count = 0
+
+        for raw in self._safe_get_broker_open_orders():
+            status = str(raw.get("status") or raw.get("Status") or "").lower().strip()
+            if status and status in BROKER_TERMINAL:
+                continue
+
+            broker_contract = self._broker_order_contract_from_raw(raw)
+            if contract and broker_contract and broker_contract != contract:
+                continue
+            if contract and not broker_contract:
+                rejected_count += 1
+                continue
+
+            bqty = self._broker_order_qty_from_raw(raw)
+            if requested_qty > 0 and bqty > 0 and bqty != requested_qty:
+                continue
+
+            action = self._broker_order_side_action_from_raw(raw)
+            raw_ids = self._raw_identity_values(raw)
+            has_identity = bool(position_id and position_id in raw_ids)
+            if action not in {"SELL_TO_CLOSE", "SELL"} and not has_identity:
+                continue
+
+            # Freshness guard: if broker exposes timestamps, stale old replacement
+            # orders should not be allowed to win missing-ID recovery.
+            broker_ts = self._parse_broker_order_time(raw)
+            if db_ts and broker_ts:
+                delta = abs((broker_ts - db_ts).total_seconds())
+                if delta > 300 and not has_identity:
+                    continue
+
+            broker_oid = self._broker_order_id_from_raw(raw)
+            if not broker_oid:
+                continue
+
+            score, reasons = self._score_missing_id_exit_candidate(order, raw)
+            if score < 40:
+                rejected_count += 1
+                continue
+            scored.append((score, broker_oid, raw, reasons))
+
+        if not scored:
+            return False
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        top_score, broker_oid, raw, reasons = scored[0]
+        tied = [x for x in scored if x[0] == top_score]
+        if len(tied) > 1:
+            self._alert(
+                f"MISSING_ID_EXIT_AMBIGUOUS | {contract or '?'} | {local_id} | "
+                f"{len(tied)} tied broker candidates score={top_score}; manual review required"
+            )
+            summary["orders_alerted"] += 1
+            return False
+
+        if len(scored) > 1 and (top_score - scored[1][0]) < 25:
+            self._alert(
+                f"MISSING_ID_EXIT_AMBIGUOUS_CLOSE_SCORE | {contract or '?'} | {local_id} | "
+                f"top={top_score} second={scored[1][0]} reasons={','.join(reasons)}; manual review required"
+            )
+            summary["orders_alerted"] += 1
+            return False
+
+        try:
+            self._backfill_order_broker_id(local_id, broker_oid)
+        except Exception as exc:
+            log.warning("[%s] broker id DB backfill failed for %s -> %s: %s", self.client_id, local_id, broker_oid, exc)
+
+        try:
+            self.osm.transition(local_id, "EXIT_ACKNOWLEDGED", broker_order_id=broker_oid, last_error=None)
+        except TypeError:
+            self.osm.transition(local_id, "EXIT_ACKNOWLEDGED", broker_order_id=broker_oid)
+        except Exception as exc:
+            log.warning("[%s] OSM ack refresh failed after broker-id recovery for %s: %s", self.client_id, local_id, exc)
+
+        self._alert(
+            f"MISSING_ID_EXIT_RECOVERED | {contract or '?'} | {local_id} | "
+            f"broker_order_id={broker_oid} score={top_score} reasons={','.join(reasons)}"
+        )
+        summary["orders_corrected"] += 1
+        return True
+
+    def _backfill_order_broker_id(self, local_id: str, broker_order_id: str) -> None:
+        if not local_id or not broker_order_id:
+            return
+        from ap.db import conn, run_with_retry
+
+        def _update():
+            with conn() as c:
+                c.execute(
+                    """
+                    UPDATE orders
+                    SET broker_order_id=%s, updated_ts=NOW()
+                    WHERE client_id=%s AND local_order_id=%s
+                    """,
+                    (broker_order_id, self.client_id, local_id),
+                )
+        run_with_retry(_update)
 
     def _advance_order_to_broker_fill(
         self,
@@ -418,11 +853,20 @@ class APBrokerReconciler:
         local_id  = order.get("local_order_id") or order.get("id")
         contract  = order.get("contract") or order.get("symbol") or "?"
         db_status = (order.get("status") or "").upper()
-        kind      = (order.get("kind") or "ENTRY").upper()
+        family    = self._order_family_from_kind_and_status(order, db_status)
+        if family not in {"ENTRY", "EXIT"}:
+            self._alert(
+                f"RECONCILE_ORDER_FAMILY_AMBIGUOUS | {contract} | {local_id} | "
+                f"kind={order.get('kind')} status={db_status} broker={broker_status}; "
+                "skipping fill correction to avoid wrong ENTRY/EXIT state-family transition"
+            )
+            summary["orders_alerted"] += 1
+            return
+        kind      = family
 
-        new_status = "FILLED" if kind == "ENTRY" else "EXIT_FILLED"
+        new_status = "FILLED" if family == "ENTRY" else "EXIT_FILLED"
         if broker_status == "partially_filled":
-            new_status = "PARTIAL_FILL" if kind == "ENTRY" else "EXIT_PARTIAL_FILL"
+            new_status = "PARTIAL_FILL" if family == "ENTRY" else "EXIT_PARTIAL_FILL"
 
         filled_qty = self._extract_explicit_cumulative_fill_qty(broker_raw)
         avg_fill = self._extract_avg_fill_price(broker_raw)
@@ -451,7 +895,7 @@ class APBrokerReconciler:
             and db_filled_before < requested_qty
             and filled_qty >= requested_qty
         ):
-            partial_status = "PARTIAL_FILL" if kind == "ENTRY" else "EXIT_PARTIAL_FILL"
+            partial_status = "PARTIAL_FILL" if family == "ENTRY" else "EXIT_PARTIAL_FILL"
             try:
                 self._apply_osm_fill_update(local_id, partial_status, db_filled_before, avg_fill)
                 log.warning(
@@ -472,6 +916,12 @@ class APBrokerReconciler:
                 new_status,
                 filled_qty=filled_qty,
                 fill_price=avg_fill,
+                broker_order_id=str(
+                    broker_raw.get("id")
+                    or broker_raw.get("order_id")
+                    or broker_raw.get("broker_order_id")
+                    or ""
+                ) or None,
             )
             if not ok:
                 log.error("[%s] OSM transition failed for %s → %s",
@@ -485,7 +935,7 @@ class APBrokerReconciler:
                 f"(qty={filled_qty} avg={avg_fill:.2f})"
             )
 
-            if kind == "ENTRY" and new_status == "FILLED" and self.pm:
+            if family == "ENTRY" and new_status == "FILLED" and self.pm:
                 self._ensure_position_for_filled_entry(order, filled_qty, avg_fill, summary)
         except Exception as e:
             log.error("[%s] Reconcile transition error: %s", self.client_id, e)
@@ -787,15 +1237,13 @@ class APBrokerReconciler:
             return None
 
     def _mark_ghost_seen(self, contract: str) -> bool:
-        """
-        Two-pass ghost detection.
-        First call → False (wait one pass).
-        Second consecutive call → True (confirmed gone).
-        """
-        if contract in self._ghost_tracker:
-            del self._ghost_tracker[contract]
+        """Three-pass ghost detection to reduce false closes from broker API gaps."""
+        key = self._norm_contract(contract)
+        count = int(self._ghost_tracker.get(key, 0)) + 1
+        self._ghost_tracker[key] = count
+        if count >= 3:
+            del self._ghost_tracker[key]
             return True
-        self._ghost_tracker[contract] = True
         return False
 
     def _reconcile_positions(self, summary: dict):
@@ -912,17 +1360,30 @@ class APBrokerReconciler:
                 self.client_id, contract, exit_px
             )
         else:
+            pos_id_str = str(pos_id or "")
+            active_exit = self._active_exit_order_exists(position_id=pos_id_str) if pos_id_str else None
+            broker_open_exit = self._broker_open_exit_exists_for_contract(contract)
+            if active_exit or broker_open_exit:
+                self._ghost_tracker.pop(contract, None)
+                self._alert(
+                    f"GHOST_CLOSE_BLOCKED_ACTIVE_EXIT | {contract} | pos={pos_id_str or '?'} | "
+                    "broker position missing but active local/broker exit evidence exists; keeping DB OPEN"
+                )
+                summary["positions_alerted"] += 1
+                return
+
+            pass_count = int(self._ghost_tracker.get(self._norm_contract(contract), 0)) + 1
             if not self._mark_ghost_seen(contract):
                 log.warning(
-                    "[%s] GHOST_PASS_1 | %s | broker has no position — waiting one pass",
-                    self.client_id, contract
+                    "[%s] GHOST_PASS_%d | %s | broker has no position — waiting for stronger evidence",
+                    self.client_id, pass_count, contract
                 )
                 summary["positions_alerted"] += 1
                 return
             exit_px = entry_px
-            close_confidence = "MEDIUM"
+            close_confidence = "MEDIUM_THREE_PASS_NO_EXIT_EVIDENCE"
             log.warning(
-                "[%s] GHOST_PASS_2 | %s | confirmed gone from broker — auto-closing with entry price",
+                "[%s] GHOST_PASS_3 | %s | no broker position, no active exit, no broker open exit — auto-closing with entry price",
                 self.client_id, contract
             )
 
@@ -1580,6 +2041,21 @@ class APBrokerReconciler:
         except Exception as e:
             log.warning("[%s] Broker list_positions error: %s", self.client_id, e)
             return []
+
+    def _broker_open_exit_exists_for_contract(self, contract: str) -> bool:
+        """Return True when broker still shows an open sell-to-close order for contract."""
+        contract = self._norm_contract(contract)
+        if not contract:
+            return False
+        for raw in self._safe_get_broker_open_orders():
+            status = str(raw.get("status") or raw.get("Status") or "").lower().strip()
+            if status in BROKER_TERMINAL:
+                continue
+            if self._broker_order_contract_from_raw(raw) != contract:
+                continue
+            if self._broker_order_is_exit_like(raw):
+                return True
+        return False
 
     # ──────────────────────────────────────────────────────────────────────────
     # Duplicate position check
