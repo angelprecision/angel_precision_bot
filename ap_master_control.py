@@ -549,6 +549,28 @@ class APMasterControl:
             )
             return None
 
+    def _pending_capital_from_snapshot_or_db(self, snap: dict[str, Any], client_id: str) -> Optional[float]:
+        """Return pending ENTRY dollar exposure using the strongest available source.
+
+        Prefer APPositionManager.snapshot()["pending_entry_capital"] because it is
+        computed from the same active entry lifecycle states as pending_entries
+        in one consistent snapshot read. Fall back to the local DB query only for
+        older position-manager versions that do not expose that field.
+        """
+        if isinstance(snap, dict) and snap.get("pending_entry_capital") is not None:
+            try:
+                return float(snap.get("pending_entry_capital") or 0.0)
+            except Exception as e:
+                self._alert_degraded(
+                    "SNAPSHOT_PENDING_ENTRY_CAPITAL_INVALID",
+                    severity="CRITICAL" if self._is_live_mode() else "WARNING",
+                    client_id=client_id,
+                    details={"value": repr(snap.get("pending_entry_capital")), "error": str(e)},
+                )
+                if self._is_live_mode() and self.pending_capital_fail_closed_live:
+                    return None
+        return self._pending_orders_capital(client_id)
+
     def _ticker_capital_deployed(self, positions: list, ticker: str) -> float:
         total = 0.0
         for pos in positions:
@@ -648,7 +670,7 @@ class APMasterControl:
 
         estimated_contracts_pre = max(1, self._base_contracts(score))
         estimated_new_cost_pre = estimated_contracts_pre * 100 * _estimate_premium(ticker)
-        pending_capital_real = self._pending_orders_capital(client_id)
+        pending_capital_real = self._pending_capital_from_snapshot_or_db(snap, client_id)
         if pending_capital_real is None:
             if current_mode == "LIVE" and self.pending_capital_fail_closed_live:
                 return self._block(
@@ -1075,7 +1097,7 @@ class APMasterControl:
         if self._kill_switch_fn and self._kill_switch_fn():
             return self._block(signal_id, ticker, client_id, "blocked_system", "kill_switch_active_post_snapshot")
 
-        pending_cap = self._pending_orders_capital(client_id)
+        pending_cap = self._pending_capital_from_snapshot_or_db(snap, client_id)
         if pending_cap is None:
             if self._is_live_mode() and self.pending_capital_fail_closed_live:
                 return self._block(
