@@ -498,6 +498,7 @@ class ClientRunner(threading.Thread):
             from ap_master_control import APMasterControl
             from ap.position_manager import APPositionManager
             from ap.order_state_machine import APOrderStateMachine
+            from order_state_machine_exit_quarantine_patch import install_exit_quarantine_patch
             from ap.contract_selector import APContractSelectionEngine
         except Exception as exc:
             self._mark_failed(f"import_failed:{exc}")
@@ -561,6 +562,9 @@ class ClientRunner(threading.Thread):
             position_sizer=position_sizer,
             supabase_client=sb,
         )
+
+        install_exit_quarantine_patch(APOrderStateMachine)
+        logger.info("[%s] Exit quarantine patch installed on APOrderStateMachine", self.email)
 
         self.order_state_machine = APOrderStateMachine(client_id=self.email)
 
