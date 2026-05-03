@@ -422,18 +422,17 @@ def update_client_state(client_id: str = "default", updates: dict | None = None)
                 """,
                 (client_id, client_id, 'tradier', '', '',
                  'https://sandbox.tradier.com',
-                 float(os.getenv("INITIAL_EQUITY", "25000")), 'ACTIVE',
+                 0.0, 'ACTIVE',
                  now_utc_iso(), 10, 7, 0.05, 0.10),
             )
-            _default_eq = float(os.getenv("INITIAL_EQUITY", "25000"))
             c.execute(
                 """
                 INSERT INTO client_state (client_id, current_equity, starting_equity_today,
                     realized_pnl_today, trades_taken_today, mode, updated_at)
-                VALUES (%s, %s, %s, 0, 0, 'PAPER', NOW())
+                VALUES (%s, 0, 0, 0, 0, 'PAPER', NOW())
                 ON CONFLICT (client_id) DO NOTHING
                 """,
-                (client_id, _default_eq, _default_eq),
+                (client_id,),
             )
             # Apply the actual updates
             c.execute(

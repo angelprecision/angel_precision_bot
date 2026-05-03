@@ -344,7 +344,7 @@ def create_app() -> Flask:
             broker_account_id=os.getenv("TRADIER_ACCOUNT_ID", ""),
             broker_token=os.getenv("TRADIER_ACCESS_TOKEN", ""),
             broker_base_url=os.getenv("TRADIER_BASE_URL", "https://sandbox.tradier.com"),
-            initial_equity=float(os.getenv("INITIAL_EQUITY", "25000.0")),
+            initial_equity=_fetch_broker_equity() or 0.0,
         )
         log.info("✅ Default client created")
     else:
