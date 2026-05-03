@@ -281,7 +281,7 @@ class APMasterControl:
 
         self._kill_switch_fn = None
         self._mode_fn = None
-        self._seen_signals: set[str] = set()
+        self._seen_signals: dict[str, float] = {}  # key -> inserted_ts, expires after 1800s
         self._trade_cooldowns: dict[str, float] = {}
         self._seed_dedup_from_db(client_id=getattr(self, "_client_id", "default"))
         log.info(
@@ -702,17 +702,22 @@ class APMasterControl:
         if current_mode == "READ_ONLY":
             return self._block(signal_id, ticker, client_id, "blocked_system", "mode_read_only")
         if current_mode == "LIVE":
-            ev_score = signal.get("ev_score")
-            if not ev_score or float(ev_score or 0) <= 0:
+            ev_score = float(signal.get("ev_score") or 0)
+            if ev_score <= 0:
                 return self._block(signal_id, ticker, client_id, "blocked_system", "live_mode_requires_ev_score")
+        # In LIVE mode, use ev_score (backtested EV) as the authoritative gate score.
+        effective_score = float(signal.get("ev_score") or score) if current_mode == "LIVE" else score
 
         direction_raw = norm_side
         timeframe_raw = signal.get("timeframe", "1d")
         setup_key = f"{client_id}:{ticker.upper()}:{direction_raw}:{timeframe_raw}"
         signal_key = f"sig:{signal_id}:{client_id}"
+        _now_ts = time.time()
+        if len(self._seen_signals) > 500:
+            self._seen_signals = {k: v for k, v in self._seen_signals.items() if _now_ts - v < 1800}
         if signal_key in self._seen_signals:
             return self._block(signal_id, ticker, client_id, "blocked_system", "duplicate_signal_id")
-        if setup_key in self._seen_signals:
+        if setup_key in self._seen_signals and (_now_ts - self._seen_signals[setup_key]) < 1800:
             return self._block(signal_id, ticker, client_id, "blocked_system", f"duplicate_setup ({ticker} {direction_raw} {timeframe_raw})")
 
         snap = self._get_snapshot(client_id, ticker=ticker, signal_id=signal_id)
@@ -735,7 +740,7 @@ class APMasterControl:
         if effective_count >= self.max_positions:
             return self._block(signal_id, ticker, client_id, "blocked_risk", f"max_positions_with_pending ({effective_count}/{self.max_positions})")
 
-        estimated_contracts_pre = max(1, self._base_contracts(score))
+        estimated_contracts_pre = max(1, self._base_contracts(effective_score))
         estimated_new_cost_pre = estimated_contracts_pre * 100 * _estimate_premium(ticker)
         pending_capital_real = self._pending_capital_from_snapshot_or_db(snap, client_id)
         if pending_capital_real is None:
@@ -756,7 +761,7 @@ class APMasterControl:
 
         sector = self.SECTOR_MAP.get(ticker.upper(), "other")
         sector_deployed = self._sector_capital_deployed(snap["open_positions"] + snap["closing_positions"], sector)
-        estimated_contracts = max(1, self._base_contracts(score))
+        estimated_contracts = max(1, self._base_contracts(effective_score))
         estimated_new_cost = estimated_contracts * 100 * _estimate_premium(ticker)
         projected_sector = sector_deployed + estimated_new_cost
         effective_equity = self.account_equity
@@ -779,7 +784,8 @@ class APMasterControl:
             return self._block(signal_id, ticker, client_id, "blocked_risk", f"max_trades_today ({snap['trades_today']}/{self.max_trades_today})")
         if snap["realized_pnl_today"] <= self.max_daily_loss:
             return self._block(signal_id, ticker, client_id, "blocked_risk", f"daily_loss_limit (${snap['realized_pnl_today']:.2f} <= ${self.max_daily_loss:.2f})")
-        if snap["open_tickers"] and ticker.upper() in snap["open_tickers"]:
+        _open_only_tickers = {str(p.get("underlying") or p.get("ticker") or "").upper() for p in snap["open_positions"]}
+        if _open_only_tickers and ticker.upper() in _open_only_tickers:
             return self._block(signal_id, ticker, client_id, "blocked_risk", f"ticker_already_active ({ticker})")
 
         cooldown_key = f"{ticker.upper()}:{direction_raw}:cooldown"
@@ -796,13 +802,13 @@ class APMasterControl:
                 log.warning("[%s] has_pending_entry check failed: %s", ticker, e)
 
         if ticker.upper() in _PRIORITY_TICKERS:
-            if score < _PRIORITY_FLOOR:
+            if effective_score < _PRIORITY_FLOOR:
                 self._store_update(signal_id, "rejected", f"priority score {score:.1f} < floor {_PRIORITY_FLOOR}")
                 return self._block(signal_id, ticker, client_id, "blocked_score", f"score_below_priority_floor ({score:.1f}<{_PRIORITY_FLOOR})")
         else:
-            if score < self.score_floor:
-                self._store_update(signal_id, "rejected", f"score {score:.1f} < floor {self.score_floor}")
-                return self._block(signal_id, ticker, client_id, "blocked_score", f"score_below_floor ({score:.1f}<{self.score_floor})")
+            if effective_score < self.score_floor:
+                self._store_update(signal_id, "rejected", f"score {effective_score:.1f} < floor {self.score_floor}")
+                return self._block(signal_id, ticker, client_id, "blocked_score", f"score_below_floor ({effective_score:.1f}<{self.score_floor})")
 
         score_breakdown = signal.get("score_breakdown") or {}
         if "real_time_ctx" in score_breakdown:
@@ -886,13 +892,13 @@ class APMasterControl:
                     contracts = min(contracts, intel_contracts)
             except Exception as e:
                 log.warning("[%s] Sizer failed (%s) -- falling back to tier", ticker, e)
-                contracts = self._base_contracts(score)
+                contracts = self._base_contracts(effective_score)
         else:
             if str(tier).upper() == "B":
                 contracts = 1
             else:
                 tier_mult = 1.0 if str(tier).upper() == "A+" else 0.6
-                base = self._base_contracts(score)
+                base = self._base_contracts(effective_score)
                 contracts = max(1, round(base * feedback_mod * tier_mult))
                 if intel_avail and intel_contracts > 0:
                     contracts = min(contracts, intel_contracts)
@@ -959,8 +965,8 @@ class APMasterControl:
 
         # Persist dedup first. Only then add in-memory keys and mark queued.
         self._persist_dedup(signal_id, ticker, direction_raw, timeframe_raw, client_id)
-        self._seen_signals.add(signal_key)
-        self._seen_signals.add(setup_key)
+        self._seen_signals[signal_key] = time.time()
+        self._seen_signals[setup_key] = time.time()
         self._store_update(signal_id, "queued", timestamp_flag="queued_at")
 
         try:
@@ -1419,7 +1425,7 @@ class APMasterControl:
     def reset_session(self, client_id: str = ""):
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         client_prefix = client_id or (self.pm.client_id if hasattr(self.pm, "client_id") else "")
-        self._seen_signals.clear()
+        self._seen_signals.clear()  # dict.clear() — same interface
         try:
             from ap.db import conn, run_with_retry
 
@@ -1493,7 +1499,7 @@ class APMasterControl:
                         SELECT DISTINCT underlying, direction
                         FROM positions
                         WHERE client_id = %s
-                          AND status IN ('OPEN', 'CLOSING')
+                          AND status = 'OPEN'
                           AND entry_ts::date = %s::date
                         """,
                         (client_id, today),
@@ -1505,7 +1511,7 @@ class APMasterControl:
                 underlying = str(row.get("underlying") or row.get("ticker") or "")
                 direction = str(row.get("direction") or "CALL").upper()
                 for tf in ("1d", "60m", "30m", "15m"):
-                    self._seen_signals.add(f"{client_id}:{underlying.upper()}:{direction}:{tf}")
+                    self._seen_signals[f"{client_id}:{underlying.upper()}:{direction}:{tf}"] = time.time()
         except Exception as e:
             log.debug("Dedup seed failed (non-critical): %s", e)
             self._alert_degraded(
