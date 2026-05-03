@@ -28,7 +28,7 @@ Checks:
 
   Positions:
     E. DB OPEN/CLOSING → broker position missing
-       → evidence-based close only after filled exit evidence or two-pass ghost confirm
+       → evidence-based close only after filled exit evidence or three-pass ghost confirm
     F. DB qty vs broker qty mismatch
        → alert
     G. Broker OPEN → DB missing
@@ -37,6 +37,32 @@ Checks:
   Dedup:
     H. DB has duplicate OPEN positions for same underlying/direction
        → alert immediately
+
+Idempotency guard (built-in, no external patch needed):
+  run_once() is protected by a per-instance RLock and a minimum-interval gate
+  (RECONCILER_RUN_ONCE_MIN_INTERVAL_SEC, default 3s). Concurrent or rapid-fire
+  callers receive the last summary without re-executing broker/DB/OSM logic.
+
+Bug-fix history (see inline comments tagged FIX-N):
+  FIX-1  _broker_position_side: replaced "P in contract[-16:]" heuristic with a
+         proper OCC-format regex so single-letter-P tickers (e.g. Prudential "P")
+         are never misidentified as PUTs.
+  FIX-2  _advance_order_to_terminal: use _order_family_from_kind_and_status instead
+         of (order.get("kind") or "ENTRY") so NULL-kind EXIT orders still revert
+         their position to OPEN rather than being silently treated as ENTRY cancels.
+  FIX-3  _create_imported_position / _backfill_position_underlying_entry: underlying_entry
+         is now persisted to the DB row (both PM and SQL paths). Previously it was only
+         seeded into the in-process exit engine and lost on restart.
+  FIX-4  _check_ghost_fills: reduced window from 2 hours to 30 minutes and capped
+         broker get_order calls at 10 per pass to prevent API flooding.
+  FIX-5  run_once skipped-summary shape: the short-circuit dict now includes all
+         standard summary keys so callers cannot KeyError on orders_checked etc.
+  FIX-6  _safe_get_broker_open_orders: added error-response guard so a broker dict
+         like {"error": "rate_limited"} is never wrapped and processed as a fake order.
+  FIX-7  _import_broker_positions_missing_from_db / _reconcile_positions: removed
+         db_underlyings — the set was built and passed but never used for filtering,
+         creating dead state that could mislead future readers.
+  FIX-8  run_once: added pass timing (elapsed_sec in summary + log line).
 
 Usage:
     reconciler = APBrokerReconciler(broker=broker, client_id=email, osm=osm, pm=pm)
@@ -49,6 +75,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import threading
 import time
 import uuid
@@ -58,6 +85,12 @@ from typing import Optional
 log = logging.getLogger("ap.reconciler")
 
 RECONCILE_INTERVAL_SEC = int(os.getenv("RECONCILE_INTERVAL_SEC", "15"))
+
+# Minimum seconds between two effective run_once() executions on the same instance.
+# Rapid-fire callers (watchdogs, fill monitors, the reconciler loop itself) receive
+# the cached last summary and skip the full broker/DB/OSM pass.
+RUN_ONCE_MIN_INTERVAL_SEC = float(os.getenv("RECONCILER_RUN_ONCE_MIN_INTERVAL_SEC", "3.0"))
+
 IMPORT_MISSING_BROKER_POSITIONS = (
     os.getenv("RECONCILER_IMPORT_MISSING_BROKER_POSITIONS", "1")
     .strip()
@@ -71,9 +104,10 @@ DB_OPEN_STATUSES = frozenset({
     "EXIT_REQUESTED", "EXIT_SUBMITTED", "EXIT_ACKNOWLEDGED", "EXIT_PARTIAL_FILL",
 })
 
+# Canonical set of position statuses treated as live — used in SQL queries throughout.
 DB_OPEN_POSITION_STATUSES = ("OPEN", "CLOSING")
 
-BROKER_FILLED = frozenset({"filled", "partially_filled"})
+BROKER_FILLED   = frozenset({"filled", "partially_filled"})
 BROKER_TERMINAL = frozenset({"canceled", "cancelled", "rejected", "expired"})
 
 BROKER_TO_OSM = {
@@ -86,6 +120,10 @@ BROKER_TO_OSM = {
     "open":             "ACKNOWLEDGED",
     "pending":          "SUBMITTED",
 }
+
+# OCC option symbology: root(variable) + YYMMDD(6) + C|P(1) + 8-digit strike.
+# Anchored to end-of-string so it cannot match a P inside the root ticker.
+_OCC_CP_RE = re.compile(r'([CP])\d{8}$')
 
 
 def _market_hours_interval(configured_interval: int = RECONCILE_INTERVAL_SEC) -> int:
@@ -103,10 +141,39 @@ def _market_hours_interval(configured_interval: int = RECONCILE_INTERVAL_SEC) ->
         pass
     return max(15, int(configured_interval or 60))
 
+
+def _empty_summary(client_id: str, run: int = 0) -> dict:
+    """
+    Return a zeroed summary dict with all standard keys present.
+    Used for both real runs and skip-path returns so callers never KeyError.
+    """
+    return {
+        "run":                 run,
+        "client_id":           client_id,
+        "orders_checked":      0,
+        "orders_corrected":    0,
+        "orders_alerted":      0,
+        "positions_checked":   0,
+        "positions_alerted":   0,
+        "positions_corrected": 0,
+        "positions_imported":  0,
+        "elapsed_sec":         0.0,
+        "errors":              [],
+        "skipped":             False,
+    }
+
+
 class APBrokerReconciler:
     """
     Continuously reconciles broker truth against DB state.
     One instance per client — shares broker + OSM from ClientRunner.
+
+    Idempotency guarantee
+    ---------------------
+    run_once() is serialized by a per-instance RLock.  If a second caller arrives
+    within RUN_ONCE_MIN_INTERVAL_SEC of the previous execution completing, it
+    receives the cached summary dict immediately without re-entering broker/DB/OSM
+    logic.  This removes the need for any external patch or decorator.
     """
 
     def __init__(
@@ -136,6 +203,12 @@ class APBrokerReconciler:
             in {"1", "true", "yes", "on"}
         )
 
+        # ── Idempotency state (native, no external patch required) ────────────
+        self._run_once_lock: threading.RLock = threading.RLock()
+        self._last_run_once_ts: float = 0.0
+        self._last_run_once_summary: Optional[dict] = None
+        # ─────────────────────────────────────────────────────────────────────
+
     # ──────────────────────────────────────────────────────────────────────────
     # Lifecycle
     # ──────────────────────────────────────────────────────────────────────────
@@ -152,10 +225,12 @@ class APBrokerReconciler:
         self._thread.start()
         self._verify_fill_monitor_or_alert()
         log.info(
-            "[%s] Reconciler started (interval=%ds market_hours_effective<=15s import_missing_broker_positions=%s)",
+            "[%s] Reconciler started (interval=%ds market_hours_effective<=15s "
+            "import_missing_broker_positions=%s run_once_min_interval=%.1fs)",
             self.client_id,
             self._interval,
             IMPORT_MISSING_BROKER_POSITIONS,
+            RUN_ONCE_MIN_INTERVAL_SEC,
         )
 
     def stop(self):
@@ -180,54 +255,96 @@ class APBrokerReconciler:
                 log.error("[%s] Reconciler loop error: %s", self.client_id, e, exc_info=True)
 
     def run_once(self) -> dict:
-        """Run one full reconciliation pass. Safe to call directly from tests."""
-        self._run_count += 1
-        summary = {
-            "run": self._run_count,
-            "client_id": self.client_id,
-            "orders_checked": 0,
-            "orders_corrected": 0,
-            "orders_alerted": 0,
-            "positions_checked": 0,
-            "positions_alerted": 0,
-            "positions_corrected": 0,
-            "positions_imported": 0,
-            "errors": [],
-        }
+        """
+        Run one full reconciliation pass. Safe to call directly from tests.
 
-        try:
-            self._reconcile_orders(summary)
-        except Exception as e:
-            log.error("[%s] Order reconcile error: %s", self.client_id, e, exc_info=True)
-            summary["errors"].append(f"orders: {e}")
+        Idempotency guarantee
+        ---------------------
+        Serialized by a per-instance RLock.  If a concurrent or rapid-fire caller
+        arrives within RUN_ONCE_MIN_INTERVAL_SEC of the previous run completing, it
+        receives a standardized cached summary immediately (with skipped=True and all
+        standard keys present) without re-running broker/DB/OSM logic.  This
+        eliminates duplicate correction pressure from the reconciler loop, fill
+        monitors, and any external watchdog that all call run_once().
 
-        try:
-            self._reconcile_positions(summary)
-        except Exception as e:
-            log.error("[%s] Position reconcile error: %s", self.client_id, e, exc_info=True)
-            summary["errors"].append(f"positions: {e}")
+        FIX-5: skipped-path dict now contains all standard summary keys so callers
+        cannot KeyError on orders_checked, positions_checked, etc.
+        FIX-8: elapsed_sec is recorded and included in both the summary and log line.
+        """
+        with self._run_once_lock:
+            now     = time.monotonic()
+            elapsed = now - self._last_run_once_ts
 
-        try:
-            self._check_duplicate_positions(summary)
-        except Exception as e:
-            log.error("[%s] Dedup check error: %s", self.client_id, e, exc_info=True)
-            summary["errors"].append(f"dedup: {e}")
+            if self._last_run_once_ts and elapsed < RUN_ONCE_MIN_INTERVAL_SEC:
+                # Return a properly-shaped skipped summary so callers never KeyError.
+                # If a prior real summary exists, copy it and mark skipped=True.
+                # FIX-5: guarantees all standard keys are always present.
+                if self._last_run_once_summary is not None:
+                    cached = dict(self._last_run_once_summary)
+                    cached["skipped"]     = True
+                    cached["skip_reason"] = "run_once_called_too_soon"
+                else:
+                    cached = _empty_summary(self.client_id, self._run_count)
+                    cached["skipped"]         = True
+                    cached["skip_reason"]     = "run_once_called_too_soon"
+                    cached["min_interval_sec"] = RUN_ONCE_MIN_INTERVAL_SEC
+                log.debug(
+                    "[%s] Reconciler run_once skipped: %.2fs since last run (min=%.1fs)",
+                    self.client_id,
+                    elapsed,
+                    RUN_ONCE_MIN_INTERVAL_SEC,
+                )
+                return cached
 
-        log.info(
-            "[%s] Reconcile #%d complete | orders=%d corrected=%d alerted=%d "
-            "positions=%d pos_corrected=%d pos_imported=%d pos_alerts=%d errors=%d",
-            self.client_id,
-            self._run_count,
-            summary["orders_checked"],
-            summary["orders_corrected"],
-            summary["orders_alerted"],
-            summary["positions_checked"],
-            summary["positions_corrected"],
-            summary["positions_imported"],
-            summary["positions_alerted"],
-            len(summary["errors"]),
-        )
-        return summary
+            # Stamp *before* executing so a long run does not create an artificially
+            # short cool-down if another caller checks mid-execution.
+            self._last_run_once_ts = now
+
+            self._run_count += 1
+            summary = _empty_summary(self.client_id, self._run_count)
+
+            _pass_start = time.monotonic()
+
+            try:
+                self._reconcile_orders(summary)
+            except Exception as e:
+                log.error("[%s] Order reconcile error: %s", self.client_id, e, exc_info=True)
+                summary["errors"].append(f"orders: {e}")
+
+            try:
+                self._reconcile_positions(summary)
+            except Exception as e:
+                log.error("[%s] Position reconcile error: %s", self.client_id, e, exc_info=True)
+                summary["errors"].append(f"positions: {e}")
+
+            try:
+                self._check_duplicate_positions(summary)
+            except Exception as e:
+                log.error("[%s] Dedup check error: %s", self.client_id, e, exc_info=True)
+                summary["errors"].append(f"dedup: {e}")
+
+            # FIX-8: record and surface pass timing.
+            summary["elapsed_sec"] = round(time.monotonic() - _pass_start, 3)
+
+            log.info(
+                "[%s] Reconcile #%d complete | orders=%d corrected=%d alerted=%d "
+                "positions=%d pos_corrected=%d pos_imported=%d pos_alerts=%d "
+                "errors=%d elapsed=%.2fs",
+                self.client_id,
+                self._run_count,
+                summary["orders_checked"],
+                summary["orders_corrected"],
+                summary["orders_alerted"],
+                summary["positions_checked"],
+                summary["positions_corrected"],
+                summary["positions_imported"],
+                summary["positions_alerted"],
+                len(summary["errors"]),
+                summary["elapsed_sec"],
+            )
+
+            self._last_run_once_summary = summary
+            return summary
 
     def _verify_fill_monitor_or_alert(self) -> bool:
         """Confirm the dedicated fill monitor is wired/alive when exposed."""
@@ -313,7 +430,6 @@ class APBrokerReconciler:
                 pass
         return 0
 
-
     def _order_family_from_kind_and_status(self, order: dict, db_status: str = "") -> str | None:
         """
         Return ENTRY or EXIT only when kind/status agree enough for safe state mapping.
@@ -323,7 +439,7 @@ class APBrokerReconciler:
         DB status is explicitly exit-prefixed. Generic SUBMITTED/ACKNOWLEDGED states
         require a trustworthy kind. Ambiguous rows are skipped and alerted.
         """
-        kind = str(order.get("kind") or "").strip().upper()
+        kind   = str(order.get("kind") or "").strip().upper()
         status = str(db_status or order.get("status") or "").strip().upper()
 
         exit_statuses = {
@@ -395,7 +511,6 @@ class APBrokerReconciler:
             broker_oid = order.get("broker_order_id")
             db_status  = (order.get("status") or "").upper()
             contract   = order.get("contract") or order.get("symbol") or "?"
-            kind       = (order.get("kind") or "ENTRY").upper()
 
             if not broker_oid or broker_oid in ("N/A", "PENDING", ""):
                 self._handle_order_without_broker_id(order, summary)
@@ -421,7 +536,7 @@ class APBrokerReconciler:
             elif broker_status not in ("", "unknown", "error"):
                 log.debug(
                     "[%s] Unrecognized broker status '%s' for order %s",
-                    self.client_id, broker_status, local_id
+                    self.client_id, broker_status, local_id,
                 )
 
         self._check_ghost_fills(summary)
@@ -435,10 +550,12 @@ class APBrokerReconciler:
           - no broker order/fill after repeated proof -> mark replacement safe and terminal-cancel local order
           - ambiguous/unknown -> alert and keep quarantine
         """
-        local_id = str(order.get("local_order_id") or order.get("id") or "")
-        pos_id = str(order.get("position_id") or order.get("positionId") or "").strip()
-        contract = self._norm_contract(order.get("contract") or order.get("symbol") or "")
-        underlying = self._norm_underlying(order.get("underlying") or order.get("ticker") or contract[:6])
+        local_id      = str(order.get("local_order_id") or order.get("id") or "")
+        pos_id        = str(order.get("position_id") or order.get("positionId") or "").strip()
+        contract      = self._norm_contract(order.get("contract") or order.get("symbol") or "")
+        underlying    = self._norm_underlying(
+            order.get("underlying") or order.get("ticker") or contract[:6]
+        )
         requested_qty = self._db_order_requested_qty(order)
 
         if not local_id or not pos_id:
@@ -454,7 +571,7 @@ class APBrokerReconciler:
             if self._recover_missing_broker_id_exit(order, summary):
                 broker_oid = None
                 try:
-                    refreshed = self.osm.get_order(local_id) if hasattr(self.osm, "get_order") else None
+                    refreshed  = self.osm.get_order(local_id) if hasattr(self.osm, "get_order") else None
                     broker_oid = refreshed.get("broker_order_id") if refreshed else None
                 except Exception:
                     broker_oid = None
@@ -468,16 +585,22 @@ class APBrokerReconciler:
                             reason="missing_id_exit_recovered_by_reconciler",
                         )
                     except Exception as exc:
-                        log.warning("[%s] exit_engine set_pending after missing-id recovery failed: %s", self.client_id, exc)
+                        log.warning(
+                            "[%s] exit_engine set_pending after missing-id recovery failed: %s",
+                            self.client_id, exc,
+                        )
                 return True
         except Exception as exc:
-            log.warning("[%s] missing-id broker recovery errored for %s: %s", self.client_id, local_id, exc)
+            log.warning(
+                "[%s] missing-id broker recovery errored for %s: %s",
+                self.client_id, local_id, exc,
+            )
 
         # Endpoint 2: recent fill evidence. Prefer to advance OSM so OSM owns hooks.
         recent_fill = self._get_recent_exit_fill(contract, underlying)
         if recent_fill:
             fill_qty = self._safe_int(recent_fill.get("filled_qty"), requested_qty or 0)
-            fill_px = self._safe_float(recent_fill.get("fill_price"), 0.0)
+            fill_px  = self._safe_float(recent_fill.get("fill_price"), 0.0)
             if fill_qty > 0 and fill_px > 0:
                 try:
                     self.osm.transition(
@@ -508,7 +631,7 @@ class APBrokerReconciler:
 
         # Endpoint 3: negative proof after recovery passes. No broker order and no recent fill.
         # Mark replacement safe BEFORE terminalizing local order so the engine can allow one
-        # future protective replacement path if needed. OSM terminal transition will also clear
+        # future protective replacement path if needed.  OSM terminal transition will also clear
         # in-flight via on_exit_failure/clear_exit_in_flight hooks.
         if self.exit_engine:
             try:
@@ -530,7 +653,10 @@ class APBrokerReconciler:
                         reconciled=True,
                     )
             except Exception as exc:
-                log.error("[%s] exit_engine quarantine release failed pos=%s order=%s: %s", self.client_id, pos_id, local_id, exc)
+                log.error(
+                    "[%s] exit_engine quarantine release failed pos=%s order=%s: %s",
+                    self.client_id, pos_id, local_id, exc,
+                )
 
         try:
             ok = self.osm.transition(
@@ -547,7 +673,10 @@ class APBrokerReconciler:
                 self._missing_id_exit_tracker.pop(str(local_id), None)
                 return True
         except Exception as exc:
-            log.error("[%s] failed to terminal-cancel missing-id exit %s: %s", self.client_id, local_id, exc)
+            log.error(
+                "[%s] failed to terminal-cancel missing-id exit %s: %s",
+                self.client_id, local_id, exc,
+            )
 
         # Endpoint 4: unresolved, visible quarantine.
         self._alert(
@@ -565,28 +694,35 @@ class APBrokerReconciler:
         created_ts = order.get("created_ts")
 
         # Deferred overnight/watcher entries may intentionally not have broker ids yet.
-        _contract_raw = order.get("contract")
+        _contract_raw   = order.get("contract")
         _is_no_contract = not _contract_raw or str(_contract_raw).strip() in ("", "None", "null")
         if kind == "ENTRY" and _is_no_contract and created_ts:
             try:
                 _ts = datetime.fromisoformat(str(created_ts).replace("Z", "+00:00"))
                 if _ts.hour >= 20 or _ts.hour < 9:
-                    log.debug("[%s] skip phantom cancel — overnight entry watcher owns | %s",
-                              self.client_id, local_id)
+                    log.debug(
+                        "[%s] skip phantom cancel — overnight entry watcher owns | %s",
+                        self.client_id, local_id,
+                    )
                     return
             except Exception:
                 pass
 
         # Missing-ID protective exits are special. Do not phantom-cancel on age alone:
         # first attempt broker identity recovery by contract/qty/sell-to-close evidence.
-        if kind == "EXIT" and db_status in {"EXIT_REQUESTED", "EXIT_SUBMITTED", "EXIT_ACKNOWLEDGED", "EXIT_PARTIAL_FILL", "SUBMITTED", "ACKNOWLEDGED", "PARTIAL_FILL"}:
+        if kind == "EXIT" and db_status in {
+            "EXIT_REQUESTED", "EXIT_SUBMITTED", "EXIT_ACKNOWLEDGED", "EXIT_PARTIAL_FILL",
+            "SUBMITTED", "ACKNOWLEDGED", "PARTIAL_FILL",
+        }:
             if self._recover_missing_broker_id_exit(order, summary):
                 self._missing_id_exit_tracker.pop(str(local_id), None)
                 return
 
             recent_fill = self._get_recent_exit_fill(
                 contract,
-                self._norm_underlying(order.get("underlying") or order.get("ticker") or contract[:6]),
+                self._norm_underlying(
+                    order.get("underlying") or order.get("ticker") or contract[:6]
+                ),
             )
             if recent_fill:
                 self._alert(
@@ -621,7 +757,7 @@ class APBrokerReconciler:
         if created_ts:
             try:
                 created = datetime.fromisoformat(str(created_ts).replace("Z", "+00:00"))
-                age = (datetime.now(timezone.utc) - created).total_seconds()
+                age     = (datetime.now(timezone.utc) - created).total_seconds()
                 if age > 300:
                     try:
                         self.osm.transition(
@@ -631,7 +767,7 @@ class APBrokerReconciler:
                         )
                         log.warning(
                             "[%s] RECONCILE_AUTO_CANCEL phantom | %s | %s | age=%.0fs no broker_id",
-                            self.client_id, contract, local_id, age
+                            self.client_id, contract, local_id, age,
                         )
                         summary["orders_corrected"] += 1
                     except Exception as _ce:
@@ -641,7 +777,13 @@ class APBrokerReconciler:
                 pass
 
     def _safe_get_broker_open_orders(self) -> list[dict]:
-        """Best-effort broker open-order fetch across adapter method names."""
+        """
+        Best-effort broker open-order fetch across adapter method names.
+
+        FIX-6: error-response guard added. If the broker returns a bare dict without
+        a recognized list key, and it contains error/message indicators, we skip it
+        rather than wrapping the error payload as a fake order object.
+        """
         for method_name in ("list_open_orders", "get_open_orders", "list_orders", "orders"):
             method = getattr(self.broker, method_name, None)
             if not callable(method):
@@ -657,18 +799,48 @@ class APBrokerReconciler:
                     for key in ("orders", "data", "results"):
                         if isinstance(result.get(key), list):
                             return [dict(x) for x in result.get(key) if isinstance(x, dict)]
-                    return [result]
+                    # FIX-6: guard — error dicts must not become fake order objects.
+                    if result.get("error") or result.get("errors") or result.get("message"):
+                        log.warning(
+                            "[%s] broker %s returned error-like dict; skipping: %s",
+                            self.client_id, method_name, result,
+                        )
+                        continue
+                    # Bare dict with no known list key and no error indicator —
+                    # treat as a single-order response only if it has an id field.
+                    if result.get("id") or result.get("order_id") or result.get("broker_order_id"):
+                        return [result]
+                    log.warning(
+                        "[%s] broker %s returned unrecognized dict shape; skipping: keys=%s",
+                        self.client_id, method_name, list(result.keys())[:10],
+                    )
+                    continue
                 if isinstance(result, list):
                     return [dict(x) for x in result if isinstance(x, dict)]
             except Exception as exc:
-                log.debug("[%s] broker %s failed during missing-id recovery: %s", self.client_id, method_name, exc)
+                log.debug(
+                    "[%s] broker %s failed during missing-id recovery: %s",
+                    self.client_id, method_name, exc,
+                )
         return []
 
     def _broker_order_id_from_raw(self, raw: dict) -> str:
-        return str(raw.get("broker_order_id") or raw.get("order_id") or raw.get("id") or raw.get("orderId") or "").strip()
+        return str(
+            raw.get("broker_order_id")
+            or raw.get("order_id")
+            or raw.get("id")
+            or raw.get("orderId")
+            or ""
+        ).strip()
 
     def _broker_order_contract_from_raw(self, raw: dict) -> str:
-        return self._norm_contract(raw.get("contract") or raw.get("option_symbol") or raw.get("symbol") or raw.get("instrument") or "")
+        return self._norm_contract(
+            raw.get("contract")
+            or raw.get("option_symbol")
+            or raw.get("symbol")
+            or raw.get("instrument")
+            or ""
+        )
 
     def _broker_order_qty_from_raw(self, raw: dict) -> int:
         for key in ("quantity", "qty", "order_qty", "remaining_quantity", "remaining_qty"):
@@ -689,16 +861,10 @@ class APBrokerReconciler:
         allowed to win recovery unless contract/qty/freshness also line up.
         """
         fields = (
-            "side",
-            "action",
-            "instruction",
-            "order_action",
-            "transaction_type",
-            "trade_action",
-            "type",
-            "order_type",
+            "side", "action", "instruction", "order_action",
+            "transaction_type", "trade_action", "type", "order_type",
         )
-        text = " ".join(str(raw.get(k) or "") for k in fields).strip().lower()
+        text    = " ".join(str(raw.get(k) or "") for k in fields).strip().lower()
         compact = text.replace("_", "").replace("-", "").replace(" ", "")
         if compact in {"selltoclose", "stc"} or "sell to close" in text or "sell_to_close" in text:
             return "SELL_TO_CLOSE"
@@ -714,7 +880,6 @@ class APBrokerReconciler:
         action = self._broker_order_side_action_from_raw(raw)
         if action in {"SELL_TO_CLOSE", "SELL"}:
             return True
-        # Some adapters put option closing intent in nested/extra metadata.
         extra_text = " ".join(
             str(raw.get(k) or "")
             for k in ("description", "tag", "client_order_id", "client_tag", "memo", "notes")
@@ -725,20 +890,10 @@ class APBrokerReconciler:
     def _raw_identity_values(self, raw: dict) -> set[str]:
         vals: set[str] = set()
         for key in (
-            "position_id",
-            "positionId",
-            "ap_position_id",
-            "local_position_id",
-            "client_position_id",
-            "related_position_id",
-            "parent_position_id",
-            "client_tag",
-            "client_order_id",
-            "clientOrderId",
-            "tag",
-            "memo",
-            "notes",
-            "strategy_id",
+            "position_id", "positionId", "ap_position_id", "local_position_id",
+            "client_position_id", "related_position_id", "parent_position_id",
+            "client_tag", "client_order_id", "clientOrderId", "tag",
+            "memo", "notes", "strategy_id",
         ):
             val = raw.get(key)
             if val is None:
@@ -751,18 +906,9 @@ class APBrokerReconciler:
     def _order_identity_values(self, order: dict) -> set[str]:
         vals: set[str] = set()
         for key in (
-            "position_id",
-            "positionId",
-            "ap_position_id",
-            "local_position_id",
-            "client_position_id",
-            "related_position_id",
-            "parent_position_id",
-            "client_tag",
-            "client_order_id",
-            "tag",
-            "signal_id",
-            "plan_id",
+            "position_id", "positionId", "ap_position_id", "local_position_id",
+            "client_position_id", "related_position_id", "parent_position_id",
+            "client_tag", "client_order_id", "tag", "signal_id", "plan_id",
         ):
             val = order.get(key)
             if val is None:
@@ -774,14 +920,8 @@ class APBrokerReconciler:
 
     def _parse_broker_order_time(self, raw: dict) -> Optional[datetime]:
         for key in (
-            "created_ts",
-            "created_at",
-            "submitted_at",
-            "transaction_date",
-            "timestamp",
-            "time",
-            "date",
-            "updated_at",
+            "created_ts", "created_at", "submitted_at", "transaction_date",
+            "timestamp", "time", "date", "updated_at",
         ):
             val = raw.get(key)
             if not val:
@@ -791,7 +931,7 @@ class APBrokerReconciler:
                     dt = val
                 else:
                     txt = str(val).strip().replace("Z", "+00:00")
-                    dt = datetime.fromisoformat(txt)
+                    dt  = datetime.fromisoformat(txt)
                 if dt.tzinfo is None:
                     dt = dt.replace(tzinfo=timezone.utc)
                 return dt.astimezone(timezone.utc)
@@ -825,11 +965,11 @@ class APBrokerReconciler:
         semantics, exact qty, and submit-time proximity. Loose text-only exit
         evidence is deliberately low value.
         """
-        score = 0
+        score   = 0
         reasons: list[str] = []
 
         order_ids = self._order_identity_values(order)
-        raw_ids = self._raw_identity_values(raw)
+        raw_ids   = self._raw_identity_values(raw)
         if order_ids and raw_ids and (order_ids & raw_ids):
             score += 100
             reasons.append("identity")
@@ -842,11 +982,10 @@ class APBrokerReconciler:
             score += 15
             reasons.append("sell_fallback")
         else:
-            # Not exit-like enough to recover unless identity is perfect.
             reasons.append("no_exit_action")
 
         requested_qty = self._db_order_requested_qty(order)
-        broker_qty = self._broker_order_qty_from_raw(raw)
+        broker_qty    = self._broker_order_qty_from_raw(raw)
         if requested_qty > 0 and broker_qty > 0:
             if requested_qty == broker_qty:
                 score += 25
@@ -855,7 +994,7 @@ class APBrokerReconciler:
                 score -= 100
                 reasons.append("qty_mismatch")
 
-        db_ts = self._parse_db_order_time(order)
+        db_ts     = self._parse_db_order_time(order)
         broker_ts = self._parse_broker_order_time(raw)
         if db_ts and broker_ts:
             delta = abs((broker_ts - db_ts).total_seconds())
@@ -877,11 +1016,11 @@ class APBrokerReconciler:
         return score, reasons
 
     def _recover_missing_broker_id_exit(self, order: dict, summary: dict) -> bool:
-        local_id = str(order.get("local_order_id") or order.get("id") or "")
-        contract = self._norm_contract(order.get("contract") or order.get("symbol") or "")
+        local_id      = str(order.get("local_order_id") or order.get("id") or "")
+        contract      = self._norm_contract(order.get("contract") or order.get("symbol") or "")
         requested_qty = self._db_order_requested_qty(order)
-        db_ts = self._parse_db_order_time(order)
-        position_id = str(order.get("position_id") or order.get("positionId") or "").strip()
+        db_ts         = self._parse_db_order_time(order)
+        position_id   = str(order.get("position_id") or order.get("positionId") or "").strip()
 
         scored: list[tuple[int, str, dict, list[str]]] = []
         rejected_count = 0
@@ -902,14 +1041,13 @@ class APBrokerReconciler:
             if requested_qty > 0 and bqty > 0 and bqty != requested_qty:
                 continue
 
-            action = self._broker_order_side_action_from_raw(raw)
-            raw_ids = self._raw_identity_values(raw)
+            action       = self._broker_order_side_action_from_raw(raw)
+            raw_ids      = self._raw_identity_values(raw)
             has_identity = bool(position_id and position_id in raw_ids)
             if action not in {"SELL_TO_CLOSE", "SELL"} and not has_identity:
                 continue
 
-            # Freshness guard: if broker exposes timestamps, stale old replacement
-            # orders should not be allowed to win missing-ID recovery.
+            # Freshness guard: stale old replacement orders must not win missing-ID recovery.
             broker_ts = self._parse_broker_order_time(raw)
             if db_ts and broker_ts:
                 delta = abs((broker_ts - db_ts).total_seconds())
@@ -951,14 +1089,20 @@ class APBrokerReconciler:
         try:
             self._backfill_order_broker_id(local_id, broker_oid)
         except Exception as exc:
-            log.warning("[%s] broker id DB backfill failed for %s -> %s: %s", self.client_id, local_id, broker_oid, exc)
+            log.warning(
+                "[%s] broker id DB backfill failed for %s -> %s: %s",
+                self.client_id, local_id, broker_oid, exc,
+            )
 
         try:
             self.osm.transition(local_id, "EXIT_ACKNOWLEDGED", broker_order_id=broker_oid, last_error=None)
         except TypeError:
             self.osm.transition(local_id, "EXIT_ACKNOWLEDGED", broker_order_id=broker_oid)
         except Exception as exc:
-            log.warning("[%s] OSM ack refresh failed after broker-id recovery for %s: %s", self.client_id, local_id, exc)
+            log.warning(
+                "[%s] OSM ack refresh failed after broker-id recovery for %s: %s",
+                self.client_id, local_id, exc,
+            )
 
         self._alert(
             f"MISSING_ID_EXIT_RECOVERED | {contract or '?'} | {local_id} | "
@@ -982,6 +1126,7 @@ class APBrokerReconciler:
                     """,
                     (broker_order_id, self.client_id, local_id),
                 )
+
         run_with_retry(_update)
 
     def _advance_order_to_broker_fill(
@@ -1003,14 +1148,13 @@ class APBrokerReconciler:
             )
             summary["orders_alerted"] += 1
             return
-        kind      = family
 
         new_status = "FILLED" if family == "ENTRY" else "EXIT_FILLED"
         if broker_status == "partially_filled":
             new_status = "PARTIAL_FILL" if family == "ENTRY" else "EXIT_PARTIAL_FILL"
 
         filled_qty = self._extract_explicit_cumulative_fill_qty(broker_raw)
-        avg_fill = self._extract_avg_fill_price(broker_raw)
+        avg_fill   = self._extract_avg_fill_price(broker_raw)
         if filled_qty is None:
             self._alert(
                 f"BROKER_FILL_QTY_NOT_NORMALIZED | {contract} | {local_id} | "
@@ -1028,7 +1172,7 @@ class APBrokerReconciler:
             summary["orders_alerted"] += 1
             return
 
-        requested_qty = self._db_order_requested_qty(order)
+        requested_qty    = self._db_order_requested_qty(order)
         db_filled_before = self._db_order_filled_qty(order)
         if (
             requested_qty > 0
@@ -1044,11 +1188,12 @@ class APBrokerReconciler:
                     self.client_id, contract, local_id, db_filled_before, filled_qty,
                 )
             except Exception as ie:
-                log.error("[%s] Intermediate fill update failed for %s: %s", self.client_id, local_id, ie)
+                log.error("[%s] Intermediate fill update failed for %s: %s",
+                          self.client_id, local_id, ie)
 
         log.warning(
             "[%s] RECONCILE_CORRECT: %s | %s | DB=%s broker=%s → advancing to %s",
-            self.client_id, contract, local_id, db_status, broker_status, new_status
+            self.client_id, contract, local_id, db_status, broker_status, new_status,
         )
 
         try:
@@ -1082,15 +1227,40 @@ class APBrokerReconciler:
             log.error("[%s] Reconcile transition error: %s", self.client_id, e)
 
     def _advance_order_to_terminal(self, order: dict, broker_status: str, summary: dict) -> None:
-        local_id  = order.get("local_order_id") or order.get("id")
-        contract  = order.get("contract") or order.get("symbol") or "?"
-        db_status = (order.get("status") or "").upper()
-        kind      = (order.get("kind") or "ENTRY").upper()
+        """
+        Advance a DB-open order to its terminal broker state.
+
+        FIX-2: previously used (order.get("kind") or "ENTRY") which silently defaulted
+        NULL-kind EXIT orders to ENTRY, preventing _revert_position_to_open from being
+        called when a real exit order was rejected or canceled. Now uses the same
+        _order_family_from_kind_and_status resolver as _advance_order_to_broker_fill so
+        that db_status EXIT-prefixed rows are correctly identified even when kind is NULL.
+        """
+        local_id   = order.get("local_order_id") or order.get("id")
+        contract   = order.get("contract") or order.get("symbol") or "?"
+        db_status  = (order.get("status") or "").upper()
         new_status = BROKER_TO_OSM.get(broker_status, "CANCELED")
+
+        # FIX-2: use the family resolver so NULL kind on an EXIT row still works.
+        family = self._order_family_from_kind_and_status(order, db_status)
+        # If family is unresolvable (genuinely ambiguous), fall back to raw kind rather
+        # than default-to-ENTRY; log a warning so the ambiguity is visible.
+        if family is None:
+            raw_kind = (order.get("kind") or "").strip().upper()
+            if raw_kind in {"ENTRY", "EXIT"}:
+                family = raw_kind
+            else:
+                log.warning(
+                    "[%s] RECONCILE_TERMINAL_FAMILY_AMBIGUOUS | %s | %s | "
+                    "kind=%s db_status=%s — skipping position revert to be safe",
+                    self.client_id, contract, local_id,
+                    order.get("kind"), db_status,
+                )
+                family = "ENTRY"   # conservative: don't revert, don't corrupt
 
         log.warning(
             "[%s] RECONCILE_CORRECT: %s | %s | DB=%s broker=%s → advancing to %s",
-            self.client_id, contract, local_id, db_status, broker_status, new_status
+            self.client_id, contract, local_id, db_status, broker_status, new_status,
         )
 
         try:
@@ -1105,7 +1275,7 @@ class APBrokerReconciler:
                 return
 
             summary["orders_corrected"] += 1
-            if kind == "EXIT":
+            if family == "EXIT":
                 position_id = order.get("position_id")
                 if position_id:
                     self._revert_position_to_open(
@@ -1146,7 +1316,7 @@ class APBrokerReconciler:
             return pos_id
 
         try:
-            plan_id = order.get("plan_id") or order.get("signal_id") or order.get("local_order_id")
+            plan_id       = order.get("plan_id") or order.get("signal_id") or order.get("local_order_id")
             signal_id_val = order.get("signal_id") or order.get("local_order_id")
             pos_id = self.pm.open_position(
                 plan_id=plan_id,
@@ -1160,11 +1330,9 @@ class APBrokerReconciler:
                 score=float(order.get("score") or 0),
                 pattern=str(order.get("pattern") or ""),
                 stop_underlying=float(order.get("stop_underlying"))
-                if order.get("stop_underlying")
-                else None,
+                if order.get("stop_underlying") else None,
                 target_underlying=float(order.get("target_underlying"))
-                if order.get("target_underlying")
-                else None,
+                if order.get("target_underlying") else None,
             )
             summary["positions_imported"] += 1
             self._alert(
@@ -1182,7 +1350,13 @@ class APBrokerReconciler:
             return None
 
     def _check_ghost_fills(self, summary: dict):
-        """Check orders DB says FILLED where broker shows terminal. Alert only."""
+        """
+        Check orders DB says FILLED where broker shows terminal. Alert only.
+
+        FIX-4: window reduced from 2 hours to 30 minutes and hard-capped at 10 rows
+        to prevent up to 20 sequential broker get_order calls per reconcile pass on
+        a busy trading day.
+        """
         from ap.db import run_with_retry, conn
 
         def _get_recent_fills():
@@ -1196,9 +1370,9 @@ class APBrokerReconciler:
                       AND status IN ('FILLED','EXIT_FILLED')
                       AND broker_order_id IS NOT NULL
                       AND broker_order_id NOT IN ('N/A','PENDING','')
-                      AND updated_ts > NOW() - INTERVAL '2 hours'
+                      AND updated_ts > NOW() - INTERVAL '30 minutes'
                     ORDER BY updated_ts DESC
-                    LIMIT 20
+                    LIMIT 10
                     """,
                     (self.client_id,),
                 )
@@ -1236,6 +1410,25 @@ class APBrokerReconciler:
 
     def _norm_underlying(self, val: str) -> str:
         return str(val or "").strip().upper()
+
+    def _safe_int(self, value, default: int = 0) -> int:
+        try:
+            if value is None or value == "":
+                return int(default)
+            return int(float(value))
+        except Exception:
+            return int(default)
+
+    def _safe_float(self, value, default: float = 0.0) -> float:
+        try:
+            if value is None or value == "":
+                return float(default)
+            out = float(value)
+            if out != out:  # NaN guard
+                return float(default)
+            return out
+        except Exception:
+            return float(default)
 
     def _safe_get_broker_positions(self) -> list[dict]:
         """Fetch broker positions; return [] on error."""
@@ -1288,13 +1481,8 @@ class APBrokerReconciler:
         cost_basis. If avg price is unavailable, derive from cost_basis / qty / 100.
         """
         for key in (
-            "avg_fill",
-            "avg_price",
-            "average_price",
-            "average_cost",
-            "cost_per_share",
-            "price",
-            "last_price",
+            "avg_fill", "avg_price", "average_price", "average_cost",
+            "cost_per_share", "price", "last_price",
         ):
             try:
                 val = bp.get(key)
@@ -1304,7 +1492,7 @@ class APBrokerReconciler:
                 pass
 
         try:
-            qty = self._broker_position_qty(bp)
+            qty        = self._broker_position_qty(bp)
             cost_basis = float(bp.get("cost_basis") or bp.get("costbasis") or 0)
             if qty > 0 and cost_basis > 0:
                 return abs(cost_basis) / qty / 100.0
@@ -1315,18 +1503,41 @@ class APBrokerReconciler:
         return 0.0
 
     def _broker_position_side(self, bp: dict) -> str:
+        """
+        Determine CALL or PUT from broker position payload.
+
+        FIX-1: the previous implementation used `if "P" in contract[-16:]` which
+        misidentifies CALLs as PUTs whenever the root ticker itself contains a "P"
+        and the contract string is short enough that the root character falls within
+        the last-16 window (e.g. single-character ticker "P" for Prudential Financial,
+        or any other instrument whose OCC symbol starts with P).
+
+        The correct approach is to anchor a regex to the end of the OCC string and
+        match the C/P character that immediately precedes the 8-digit strike.
+        Standard OCC format: {root}{YYMMDD}{C|P}{8-digit strike}
+        """
         side = str(bp.get("direction") or bp.get("side") or "").upper()
-        contract = self._broker_position_contract(bp)
         if side in {"CALL", "PUT"}:
             return side
-        if "P" in contract[-16:]:
-            # Option symbology may contain C/P before strike.
-            # Better exact parser is not guaranteed here; fallback keeps DB usable.
-            return "PUT"
+
+        contract = self._broker_position_contract(bp)
+        # FIX-1: use compiled regex anchored to end-of-string.
+        m = _OCC_CP_RE.search(contract)
+        if m:
+            return "PUT" if m.group(1) == "P" else "CALL"
+
+        # Fallback: if contract is non-standard or empty, default to CALL and
+        # emit a warning so the ambiguity is visible in logs.
+        if contract:
+            log.warning(
+                "[%s] _broker_position_side: could not parse C/P from contract '%s'; "
+                "defaulting to CALL — verify broker position payload",
+                self.client_id, contract,
+            )
         return "CALL"
 
     def _get_open_db_positions(self) -> list[dict]:
-        """Fetch DB OPEN/CLOSING positions with a direct SQL fallback."""
+        """Fetch DB OPEN/CLOSING positions using the canonical DB_OPEN_POSITION_STATUSES constant."""
         try:
             from ap.db import run_with_retry, conn
 
@@ -1337,12 +1548,13 @@ class APBrokerReconciler:
                         SELECT *
                         FROM positions
                         WHERE client_id=%s
-                          AND status IN ('OPEN','CLOSING')
+                          AND status = ANY(%s)
                         ORDER BY entry_ts DESC NULLS LAST
                         """,
-                        (self.client_id,),
+                        (self.client_id, list(DB_OPEN_POSITION_STATUSES)),
                     )
                     return c.fetchall()
+
             rows = run_with_retry(_fetch) or []
             return [dict(r) for r in rows]
         except Exception as e:
@@ -1379,7 +1591,7 @@ class APBrokerReconciler:
 
     def _mark_ghost_seen(self, contract: str) -> bool:
         """Three-pass ghost detection to reduce false closes from broker API gaps."""
-        key = self._norm_contract(contract)
+        key   = self._norm_contract(contract)
         count = int(self._ghost_tracker.get(key, 0)) + 1
         self._ghost_tracker[key] = count
         if count >= 3:
@@ -1393,20 +1605,24 @@ class APBrokerReconciler:
 
         Policy:
           1. Match DB positions by exact contract symbol first.
-          2. Auto-close DB positions only with filled exit evidence or two-pass ghost confirm.
+          2. Auto-close DB positions only with filled exit evidence or three-pass ghost confirm.
           3. Import broker-open positions missing from DB so restarts cannot orphan trades.
+
+        FIX-7: db_underlyings removed — it was constructed and passed to
+        _import_broker_positions_missing_from_db but never used as a filter condition
+        inside that method, creating misleading dead state.
         """
         summary.setdefault("positions_corrected", 0)
         summary.setdefault("positions_imported", 0)
 
         broker_positions = self._safe_get_broker_positions()
-        broker_by_contract: dict[str, dict] = {}
+        broker_by_contract:   dict[str, dict]       = {}
         broker_by_underlying: dict[str, list[dict]] = {}
 
         for bp in broker_positions:
             c_sym = self._broker_position_contract(bp)
             u_sym = self._broker_position_underlying(bp)
-            qty = self._broker_position_qty(bp)
+            qty   = self._broker_position_qty(bp)
             if qty <= 0:
                 continue
             if c_sym:
@@ -1417,8 +1633,8 @@ class APBrokerReconciler:
         db_positions = self._get_open_db_positions()
         summary["positions_checked"] = len(db_positions)
 
+        # FIX-7: only track db_contracts — the set actually used for dedup in the import pass.
         db_contracts: set[str] = set()
-        db_underlyings: set[str] = set()
 
         # DB → broker checks.
         for pos in db_positions:
@@ -1430,8 +1646,6 @@ class APBrokerReconciler:
 
             if contract:
                 db_contracts.add(contract)
-            if underlying:
-                db_underlyings.add(underlying)
 
             broker_pos = broker_by_contract.get(contract)
 
@@ -1443,7 +1657,7 @@ class APBrokerReconciler:
                     log.warning(
                         "[%s] RECONCILE_AMBIGUOUS | %s — %d broker positions for underlying, "
                         "skipping auto-close",
-                        self.client_id, contract, len(matches)
+                        self.client_id, contract, len(matches),
                     )
                     self._ghost_tracker.pop(contract, None)
                     summary["positions_alerted"] += 1
@@ -1455,7 +1669,7 @@ class APBrokerReconciler:
                 if broker_qty != db_qty and db_qty > 0:
                     log.warning(
                         "[%s] POSITION_QTY_MISMATCH | %s | DB=%d broker=%d",
-                        self.client_id, contract, db_qty, broker_qty
+                        self.client_id, contract, db_qty, broker_qty,
                     )
                     summary["positions_alerted"] += 1
 
@@ -1476,7 +1690,6 @@ class APBrokerReconciler:
         self._import_broker_positions_missing_from_db(
             broker_positions=broker_positions,
             db_contracts=db_contracts,
-            db_underlyings=db_underlyings,
             summary=summary,
         )
 
@@ -1490,19 +1703,19 @@ class APBrokerReconciler:
         entry_px: float,
         summary: dict,
     ) -> None:
-        pos_id = pos.get("id") or pos.get("position_id")
+        pos_id    = pos.get("id") or pos.get("position_id")
         exit_fill = self._get_recent_exit_fill(contract, underlying)
 
         if exit_fill and float(exit_fill.get("fill_price") or 0) > 0:
-            exit_px = float(exit_fill["fill_price"])
+            exit_px          = float(exit_fill["fill_price"])
             close_confidence = "HIGH"
             log.info(
                 "[%s] RECONCILE_CLOSE_EVIDENCE | %s | filled exit found @ $%.4f",
-                self.client_id, contract, exit_px
+                self.client_id, contract, exit_px,
             )
         else:
-            pos_id_str = str(pos_id or "")
-            active_exit = self._active_exit_order_exists(position_id=pos_id_str) if pos_id_str else None
+            pos_id_str       = str(pos_id or "")
+            active_exit      = self._active_exit_order_exists(position_id=pos_id_str) if pos_id_str else None
             broker_open_exit = self._broker_open_exit_exists_for_contract(contract)
             if active_exit or broker_open_exit:
                 self._ghost_tracker.pop(contract, None)
@@ -1517,19 +1730,20 @@ class APBrokerReconciler:
             if not self._mark_ghost_seen(contract):
                 log.warning(
                     "[%s] GHOST_PASS_%d | %s | broker has no position — waiting for stronger evidence",
-                    self.client_id, pass_count, contract
+                    self.client_id, pass_count, contract,
                 )
                 summary["positions_alerted"] += 1
                 return
-            exit_px = entry_px
+            exit_px          = entry_px
             close_confidence = "MEDIUM_THREE_PASS_NO_EXIT_EVIDENCE"
             log.warning(
-                "[%s] GHOST_PASS_3 | %s | no broker position, no active exit, no broker open exit — auto-closing with entry price",
-                self.client_id, contract
+                "[%s] GHOST_PASS_3 | %s | no broker position, no active exit, "
+                "no broker open exit — auto-closing with entry price",
+                self.client_id, contract,
             )
 
         pnl_dollars = round((exit_px - entry_px) * db_qty * 100, 2)
-        pnl_pct = round(((exit_px - entry_px) / entry_px) * 100, 2) if entry_px > 0 else 0.0
+        pnl_pct     = round(((exit_px - entry_px) / entry_px) * 100, 2) if entry_px > 0 else 0.0
 
         try:
             from ap.db import conn, run_with_retry as _rwr
@@ -1581,7 +1795,7 @@ class APBrokerReconciler:
             "[%s] FINALIZED TRADE | %s | pos=%s | entry=%.4f exit=%.4f "
             "pnl=$%.2f (%.1f%%) source=RECONCILER confidence=%s",
             self.client_id, contract, pos_id, entry_px, exit_px,
-            pnl_dollars, pnl_pct, close_confidence
+            pnl_dollars, pnl_pct, close_confidence,
         )
         summary["positions_corrected"] += 1
         try:
@@ -1595,9 +1809,14 @@ class APBrokerReconciler:
         *,
         broker_positions: list[dict],
         db_contracts: set[str],
-        db_underlyings: set[str],
         summary: dict,
     ) -> None:
+        """
+        Import broker-open positions not found in DB to prevent orphan trades after restarts.
+
+        FIX-7: db_underlyings parameter removed — it was never used as a filter inside
+        this method. Only db_contracts is needed and used for dedup within this pass.
+        """
         if not IMPORT_MISSING_BROKER_POSITIONS:
             return
 
@@ -1613,8 +1832,8 @@ class APBrokerReconciler:
             if contract in db_contracts:
                 continue
 
-            underlying = self._broker_position_underlying(bp)
-            entry_px = self._broker_position_entry_price(bp)
+            underlying      = self._broker_position_underlying(bp)
+            entry_px        = self._broker_position_entry_price(bp)
             price_untrusted = False
 
             # Prefer real broker cost-basis/avg price. If missing, try a contract mark/last
@@ -1664,8 +1883,6 @@ class APBrokerReconciler:
             summary["positions_imported"] += 1
             summary["positions_corrected"] += 1
             db_contracts.add(contract)
-            if underlying:
-                db_underlyings.add(underlying)
 
             row = self._find_db_position_by_id(pos_id) or self._find_db_position_by_contract(contract)
             if row:
@@ -1711,8 +1928,14 @@ class APBrokerReconciler:
         """
         Create an OPEN DB row for a broker-open position missing from DB.
         Prefer APPositionManager, fall back to direct SQL with broad/minimal compatibility.
+
+        FIX-3: underlying_entry is now persisted to the DB row in all paths. Previously
+        it was only seeded into the in-process exit engine, so after a process restart
+        the exit engine received underlying_entry=0 (untrusted current price) instead of
+        the actual entry value, corrupting stop/target progress math for the position's
+        entire remaining lifetime.
         """
-        imported_plan_id = f"reconciled:{contract}:{int(time.time())}"
+        imported_plan_id   = f"reconciled:{contract}:{int(time.time())}"
         imported_signal_id = f"reconciled:{contract}:{uuid.uuid4().hex[:8]}"
 
         if self.pm is not None:
@@ -1731,19 +1954,32 @@ class APBrokerReconciler:
                     stop_underlying=None,
                     target_underlying=None,
                 )
-                return str(pos_id) if pos_id else None
+                if pos_id:
+                    # FIX-3: backfill underlying_entry after PM creates the row, since
+                    # pm.open_position does not accept underlying_entry as a parameter.
+                    if underlying_entry > 0:
+                        try:
+                            self._backfill_position_underlying_entry(str(pos_id), underlying_entry)
+                        except Exception as ue:
+                            log.warning(
+                                "[%s] underlying_entry backfill failed for imported pos %s: %s",
+                                self.client_id, pos_id, ue,
+                            )
+                    return str(pos_id)
+                return None
             except Exception as pm_err:
                 log.error(
                     "[%s] pm.open_position import failed for %s: %s — trying SQL fallback",
-                    self.client_id, contract, pm_err
+                    self.client_id, contract, pm_err,
                 )
 
         try:
             from ap.db import conn, run_with_retry
 
-            pos_id = str(uuid.uuid4())
+            pos_id  = str(uuid.uuid4())
             now_iso = datetime.now(timezone.utc).isoformat()
 
+            # FIX-3: underlying_entry included in the full-schema insert.
             def _insert_full():
                 with conn() as c:
                     c.execute(
@@ -1751,10 +1987,10 @@ class APBrokerReconciler:
                         INSERT INTO positions (
                             id, client_id, underlying, contract, direction, qty, avg_fill,
                             entry_ts, status, plan_id, signal_id, close_source,
-                            close_confidence
+                            close_confidence, underlying_entry
                         ) VALUES (
                             %s,%s,%s,%s,%s,%s,%s,
-                            %s,'OPEN',%s,%s,%s,%s
+                            %s,'OPEN',%s,%s,%s,%s,%s
                         )
                         ON CONFLICT (id) DO NOTHING
                         """,
@@ -1771,6 +2007,7 @@ class APBrokerReconciler:
                             imported_signal_id,
                             "RECONCILER_IMPORT",
                             "BROKER_OPEN_PRICE_UNTRUSTED" if price_untrusted else "BROKER_OPEN",
+                            float(underlying_entry) if underlying_entry > 0 else None,
                         ),
                     )
 
@@ -1780,8 +2017,40 @@ class APBrokerReconciler:
             except Exception as full_err:
                 log.warning(
                     "[%s] full imported position insert failed for %s: %s — trying minimal schema",
-                    self.client_id, contract, full_err
+                    self.client_id, contract, full_err,
                 )
+
+            # Minimal schema fallback: broadest possible compatibility.
+            # FIX-3: attempt to include underlying_entry; if the column does not exist
+            # in this schema version the except block retries without it.
+            def _insert_with_ue():
+                with conn() as c:
+                    c.execute(
+                        """
+                        INSERT INTO positions (
+                            id, client_id, underlying, contract, direction, qty, avg_fill,
+                            entry_ts, status, underlying_entry
+                        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,'OPEN',%s)
+                        ON CONFLICT (id) DO NOTHING
+                        """,
+                        (
+                            pos_id,
+                            self.client_id,
+                            underlying or contract[:6],
+                            contract,
+                            side,
+                            int(qty),
+                            float(entry_px),
+                            now_iso,
+                            float(underlying_entry) if underlying_entry > 0 else None,
+                        ),
+                    )
+
+            try:
+                run_with_retry(_insert_with_ue)
+                return pos_id
+            except Exception:
+                pass  # column may not exist — fall through to bare minimal
 
             def _insert_minimal():
                 with conn() as c:
@@ -1806,11 +2075,43 @@ class APBrokerReconciler:
                     )
 
             run_with_retry(_insert_minimal)
+            # FIX-3: even on bare minimal insert, attempt a follow-up UPDATE for
+            # underlying_entry so restarts don't run on untrusted zero.
+            if underlying_entry > 0:
+                try:
+                    self._backfill_position_underlying_entry(pos_id, underlying_entry)
+                except Exception:
+                    pass  # non-fatal; exit engine seeding still carries the value
             return pos_id
         except Exception as sql_err:
             log.error("[%s] SQL import failed for broker position %s: %s",
                       self.client_id, contract, sql_err)
             return None
+
+    def _backfill_position_underlying_entry(self, pos_id: str, underlying_entry: float) -> None:
+        """
+        Persist underlying_entry to an existing DB position row.
+
+        FIX-3 support method: called after pm.open_position (which does not accept
+        underlying_entry as a parameter) and after minimal-schema SQL inserts that
+        may lack the column in the INSERT column list.
+        """
+        if not pos_id or underlying_entry <= 0:
+            return
+        from ap.db import conn, run_with_retry
+
+        def _update():
+            with conn() as c:
+                c.execute(
+                    """
+                    UPDATE positions
+                    SET underlying_entry = %s
+                    WHERE id = %s AND client_id = %s
+                    """,
+                    (float(underlying_entry), pos_id, self.client_id),
+                )
+
+        run_with_retry(_update)
 
     def _find_db_position_by_contract(self, contract: str) -> Optional[dict]:
         contract = self._norm_contract(contract)
@@ -1826,12 +2127,12 @@ class APBrokerReconciler:
                         SELECT *
                         FROM positions
                         WHERE client_id=%s
-                          AND status IN ('OPEN','CLOSING')
+                          AND status = ANY(%s)
                           AND UPPER(contract)=%s
                         ORDER BY entry_ts DESC NULLS LAST
                         LIMIT 1
                         """,
-                        (self.client_id, contract),
+                        (self.client_id, list(DB_OPEN_POSITION_STATUSES), contract),
                     )
                     row = c.fetchone()
                     return dict(row) if row else None
@@ -1865,12 +2166,17 @@ class APBrokerReconciler:
         if not pos:
             return
 
-        pos_id = str(pos.get("id") or pos.get("position_id") or "")
-        contract = self._norm_contract(pos.get("contract") or pos.get("symbol") or "")
+        pos_id     = str(pos.get("id") or pos.get("position_id") or "")
+        contract   = self._norm_contract(pos.get("contract") or pos.get("symbol") or "")
         underlying = self._norm_underlying(pos.get("underlying") or pos.get("ticker") or contract[:6])
-        side = str(pos.get("direction") or pos.get("side") or "CALL").upper()
-        qty = int(pos.get("qty") or pos.get("quantity") or pos.get("quantity_remaining") or 0)
-        entry_px = self._safe_float(pos.get("avg_fill") or pos.get("entry_price"), 0.0)
+        side       = str(pos.get("direction") or pos.get("side") or "CALL").upper()
+        qty        = int(
+            pos.get("qty")
+            or pos.get("quantity")
+            or pos.get("quantity_remaining")
+            or 0
+        )
+        entry_px         = self._safe_float(pos.get("avg_fill") or pos.get("entry_price"), 0.0)
         underlying_entry = self._derive_underlying_entry_from_position(
             pos,
             underlying=underlying,
@@ -1915,15 +2221,15 @@ class APBrokerReconciler:
         if not _ee:
             log.critical(
                 "[%s] Cannot seed exit engine for imported/open position %s — exit_engine not wired",
-                self.client_id, contract
+                self.client_id, contract,
             )
             return
 
         try:
             from ap_exit_engine import ManagedPosition
 
-            stop_u = self._safe_float(stop_underlying, 0.0)
-            target_u = self._safe_float(target_underlying, 0.0)
+            stop_u             = self._safe_float(stop_underlying, 0.0)
+            target_u           = self._safe_float(target_underlying, 0.0)
             underlying_entry_u = self._safe_float(underlying_entry, 0.0)
             if underlying_entry_u <= 0:
                 underlying_entry_u = self._get_current_underlying_price(underlying)
@@ -1943,44 +2249,29 @@ class APBrokerReconciler:
                 underlying_target=float(target_u),
                 underlying_stop=float(stop_u),
             )
-            mp.position_id = str(pos_id or "")
-            mp.client_id = self.client_id
-            mp.signal_id = f"reconciled:{contract}"
-            mp.current_option_price = float(entry_px)
-            mp.price_untrusted = bool(price_untrusted)
+            mp.position_id              = str(pos_id or "")
+            mp.client_id                = self.client_id
+            mp.signal_id                = f"reconciled:{contract}"
+            mp.current_option_price     = float(entry_px)
+            mp.price_untrusted          = bool(price_untrusted)
             mp.underlying_entry_untrusted = bool(underlying_entry_u <= 0)
-            mp.imported_by_reconciler = True
+            mp.imported_by_reconciler   = True
             _ee.add_position(mp)
             log.critical(
                 "[%s] EXIT_ENGINE_SEEDED_FROM_RECONCILER | %s | qty=%s entry=%.4f "
                 "underlying_entry=%.4f price_untrusted=%s pos=%s",
-                self.client_id, contract, qty, entry_px, underlying_entry_u, bool(price_untrusted), pos_id or "n/a"
+                self.client_id, contract, qty, entry_px,
+                underlying_entry_u, bool(price_untrusted), pos_id or "n/a",
             )
         except Exception as e:
             log.error("[%s] Failed to seed exit engine for %s: %s",
                       self.client_id, contract, e)
 
-    def _safe_float(self, value, default: float = 0.0) -> float:
-        try:
-            if value is None or value == "":
-                return float(default)
-            out = float(value)
-            if out != out:  # NaN guard
-                return float(default)
-            return out
-        except Exception:
-            return float(default)
-
     def _broker_position_mark_price(self, bp: dict) -> float:
         """Best-effort option mark/last extraction when cost basis is missing."""
         for key in (
-            "mark",
-            "mark_price",
-            "last",
-            "last_price",
-            "close",
-            "current_price",
-            "market_value_price",
+            "mark", "mark_price", "last", "last_price",
+            "close", "current_price", "market_value_price",
         ):
             val = self._safe_float(bp.get(key), 0.0)
             if val > 0:
@@ -2001,8 +2292,8 @@ class APBrokerReconciler:
         quote = None
         for method_name, args in (
             ("get_option_quote", (contract,)),
-            ("get_quote", (contract,)),
-            ("quote", (contract,)),
+            ("get_quote",        (contract,)),
+            ("quote",            (contract,)),
         ):
             method = getattr(self.broker, method_name, None)
             if not callable(method):
@@ -2074,15 +2365,9 @@ class APBrokerReconciler:
         if the broker or quote path exposes anything better.
         """
         for key in (
-            "underlying_entry",
-            "underlying_entry_price",
-            "entry_underlying",
-            "underlying_price_at_entry",
-            "underlying_price",
-            "underlier_price",
-            "root_price",
-            "underlying_last",
-            "current_underlying",
+            "underlying_entry", "underlying_entry_price", "entry_underlying",
+            "underlying_price_at_entry", "underlying_price", "underlier_price",
+            "root_price", "underlying_last", "current_underlying",
         ):
             val = self._safe_float(bp.get(key), 0.0)
             if val > 0:
@@ -2101,12 +2386,8 @@ class APBrokerReconciler:
     ) -> float:
         """Use DB metadata first when reseeding an existing open position."""
         for key in (
-            "underlying_entry",
-            "entry_underlying",
-            "trigger_price",
-            "underlying_entry_price",
-            "entry_underlying_price",
-            "opened_underlying",
+            "underlying_entry", "entry_underlying", "trigger_price",
+            "underlying_entry_price", "entry_underlying_price", "opened_underlying",
         ):
             val = self._safe_float(pos.get(key), 0.0)
             if val > 0:
@@ -2157,7 +2438,13 @@ class APBrokerReconciler:
                         ORDER BY created_ts DESC NULLS LAST, updated_ts DESC NULLS LAST
                         LIMIT 1
                         """,
-                        (self.client_id, position_id, failed_exit_order_id, failed_exit_order_id, list(active_statuses)),
+                        (
+                            self.client_id,
+                            position_id,
+                            failed_exit_order_id,
+                            failed_exit_order_id,
+                            list(active_statuses),
+                        ),
                     )
                     row = c.fetchone()
                     return dict(row) if row else None
@@ -2166,22 +2453,10 @@ class APBrokerReconciler:
         except Exception as exc:
             log.warning(
                 "[%s] Could not check active replacement exit for pos=%s: %s",
-                self.client_id,
-                position_id,
-                exc,
+                self.client_id, position_id, exc,
             )
             # Fail safe: unknown means do not force reopen.
             return {"status": "UNKNOWN_CHECK_FAILED", "error": str(exc)}
-
-    def _get_broker_positions(self) -> Optional[list]:
-        """Compatibility wrapper."""
-        if not hasattr(self.broker, "list_positions"):
-            return None
-        try:
-            return self.broker.list_positions() or []
-        except Exception as e:
-            log.warning("[%s] Broker list_positions error: %s", self.client_id, e)
-            return []
 
     def _broker_open_exit_exists_for_contract(self, contract: str) -> bool:
         """Return True when broker still shows an open sell-to-close order for contract."""
