@@ -458,6 +458,14 @@ class APEntryWatcher:
                             watched.side,
                             watched.score,
                         )
+                        _local_oid = w.signal.get("local_order_id")
+                        if _local_oid and self.order_state_machine and hasattr(self.order_state_machine, "cancel_pending_entry"):
+                            try:
+                                self.order_state_machine.cancel_pending_entry(
+                                    _local_oid, reason="direction_flip_watcher_cancel"
+                                )
+                            except Exception as _exc:
+                                log.warning("[%s] OSM cancel failed for direction_flip: %s", w.ticker, _exc)
                     self._pending = [w for w in self._pending if w not in opposite_side]
                 else:
                     log.info(
@@ -486,6 +494,14 @@ class APEntryWatcher:
                             w.score,
                             watched.score,
                         )
+                        _local_oid = w.signal.get("local_order_id")
+                        if _local_oid and self.order_state_machine and hasattr(self.order_state_machine, "cancel_pending_entry"):
+                            try:
+                                self.order_state_machine.cancel_pending_entry(
+                                    _local_oid, reason="same_side_replace_watcher_cancel"
+                                )
+                            except Exception as _exc:
+                                log.warning("[%s] OSM cancel failed for same_side_replace: %s", w.ticker, _exc)
                     self._pending = [w for w in self._pending if w not in same_side]
                 else:
                     log.info(
@@ -687,7 +703,7 @@ class APEntryWatcher:
         )
 
         # EOD force-expire same-day signals only. Overnight setups survive.
-        if now_et.hour >= 16:
+        if now_et.hour > EOD_CUTOFF_HOUR or (now_et.hour == EOD_CUTOFF_HOUR and now_et.minute >= EOD_CUTOFF_MIN):
             with self._lock:
                 expired = []
                 surviving = []
@@ -706,6 +722,12 @@ class APEntryWatcher:
                         len(expired),
                         len(surviving),
                     )
+            for w in expired:
+                if self.on_expire:
+                    try:
+                        self.on_expire(w)
+                    except Exception as _exc:
+                        log.error("[%s] on_expire callback failed on EOD expire: %s", w.ticker, _exc)
             return
 
         # Pre-market hold — no regular trigger polling before 9:30 ET.
