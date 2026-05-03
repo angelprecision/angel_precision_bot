@@ -707,13 +707,22 @@ class APExecutionCore:
         # ── EXIT SUBMISSION ─────────────────────────────────────────────────
         sig = getattr(pos, "signal", {})
         _sig_id = str(sig.get("signal_id", ""))
-        # Use bid for exit limit price — guarantees fill vs mid which often misses.
-        # If bid is not populated yet, fall back to mid.
-        _exit_limit = (
-            pos.current_bid
-            if getattr(pos, "current_bid", 0) > 0
-            else pos.current_option_price
-        )
+        # Use bid for exit limit price — bid guarantees fill vs mid which often misses.
+        # Fall back to mid-0.01 (slight aggressor below mid) if bid is zero/stale.
+        # Block entirely if neither bid nor mid is available — a zero-price exit
+        # order is worse than no exit order.
+        _bid = getattr(pos, "current_bid", 0) or 0
+        _mid = getattr(pos, "current_option_price", 0) or 0
+        if _bid > 0:
+            _exit_limit = _bid
+        elif _mid > 0:
+            _exit_limit = max(round(_mid - 0.01, 2), 0.01)
+        else:
+            log.critical(
+                "[%s] CLOSE BLOCKED — no valid bid or mid price for exit | %s",
+                pos.ticker, decision.reason,
+            )
+            return
         exit_price = _exit_limit
 
         if self.order_state_machine and pos.position_id:
