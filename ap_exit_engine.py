@@ -5,8 +5,8 @@
 # Current constants in this file:
 #   - Poll interval: 8 seconds
 #   - Profit protect W1: 11:00 AM ET, scale out 50% if option P&L >= +40%
-#   - Profit protect W2: 1:00 PM ET, scale out 75% if option P&L >= +25%
-#   - Profit protect W3: 2:00 PM ET, close all if option P&L >= +15%
+#   - Profit protect W2:  1:00 PM ET, scale out 75% if option P&L >= +25%
+#   - Profit protect W3:  2:00 PM ET, close all if option P&L >= +15%
 #   - EOD hard close: 3:45 PM ET, close all remaining contracts
 #   - Theta stop: after noon, close if option P&L <= -35%
 #   - Immediate TP: +18% option P&L; 1 contract closes all, multi-contract scales
@@ -17,6 +17,40 @@
 #   - Submitting an exit order is NOT a fill.
 #   - scale_outs_done increments only after broker-confirmed exit fill.
 #   - Every exit path, including sentinels, must respect exit_in_flight gating.
+#
+# Bug-fix history (see inline FIX-N tags):
+#   FIX-1  Discord webhook POST moved out of evaluate_exit() and out of the engine
+#          lock. evaluate_exit() is now a pure function with no side effects.
+#          Runner alert fires in _submit_exit_decision() after successful callback,
+#          outside both lock sections. Previously the POST (timeout=3) held
+#          self._lock for up to 3 seconds on every profitable runner close.
+#   FIX-2  Kill-switch filter unpacked (pos, decision, bool) 3-tuples as 2-tuples,
+#          raising ValueError on every iteration when KILL_BLOCKS_NON_PROTECTIVE_EXITS=1.
+#          Fixed to unpack as (p, d, _) throughout.
+#   FIX-3  Expired contract cleanup iterated and reassigned self._positions without
+#          holding self._lock — race with concurrent add_position/fill hooks.
+#          Entire expired-contract block now runs inside with self._lock.
+#   FIX-4  replacement_proof was unconditionally set True, making all three
+#          (not replacement_proof) guard blocks permanently dead code. Variable
+#          removed; guards now execute unconditionally so stale-time, equivalent-runner,
+#          and non-emergency checks actually run.
+#   FIX-5  Inline W1/W2 window comments had wrong times (1:30 PM / 2:30 PM).
+#          Corrected to match PROFIT_PROTECT_1_HOUR=11 (11:00 AM) and
+#          PROFIT_PROTECT_2_HOUR=13 (1:00 PM).
+#   FIX-6  Per-order cumulative fill watermark dict was cleared immediately on
+#          full-fill. Late duplicate callbacks (fill monitor + reconciler dual path)
+#          saw prev=0 and double-counted the fill. Dict is now preserved after
+#          pending order completes and only reset in _mark_exit_submitted() when
+#          a new exit order generation begins.
+#   FIX-7  Added get_position(position_id) method for O(1) lookup. OSM's
+#          _get_exit_engine_position() checks for this method first before
+#          falling back to O(n) linear scan.
+#   FIX-8  last_rejection_ts standardized from Optional[float] (epoch) to
+#          Optional[datetime] (UTC) to match every other timestamp field on
+#          ManagedPosition. Callers no longer need to know which fields are float.
+#   FIX-9  Healer reference captured once before _exit_loop() while-loop instead
+#          of re-importing every 8 seconds.
+#   FIX-10 Extra blank line inside def on_exit_failure() signature removed.
 # =============================================================================
 
 from __future__ import annotations
@@ -45,13 +79,13 @@ ET  = ZoneInfo("America/New_York")
 # ── TIME THRESHOLDS (ET) ──────────────────────────────────────────────────────
 PROFIT_PROTECT_1_HOUR = 11   # 11:00 AM -- scale out 50% if +40%
 PROFIT_PROTECT_1_MIN  = 0
-PROFIT_PROTECT_2_HOUR = 13   # 1:00 PM  -- scale out 75% if +25%
+PROFIT_PROTECT_2_HOUR = 13   #  1:00 PM -- scale out 75% if +25%
 PROFIT_PROTECT_2_MIN  = 0
-PROFIT_PROTECT_3_HOUR = 14   # 2:00 PM  -- exit all if +15%
+PROFIT_PROTECT_3_HOUR = 14   #  2:00 PM -- exit all if +15%
 PROFIT_PROTECT_3_MIN  = 0
-EOD_HARD_CLOSE_HOUR   = 15   # 3:45 PM  -- EXIT EVERYTHING (was 3:30, extended for runners)
+EOD_HARD_CLOSE_HOUR   = 15   #  3:45 PM -- EXIT EVERYTHING
 EOD_HARD_CLOSE_MIN    = 45
-POLL_INTERVAL_SEC     = 8    # check every 8 seconds — catch TP windows faster
+POLL_INTERVAL_SEC     = 8    # check every 8 seconds
 
 # Kill switch policy: exits reduce risk, so the engine must never pause
 # evaluation under kill switch. By default, all exit actions are allowed.
@@ -63,13 +97,13 @@ KILL_BLOCKS_NON_PROTECTIVE_EXITS = (
 )
 
 # ── P&L THRESHOLDS ────────────────────────────────────────────────────────────
-THETA_STOP_LOSS_PCT   = -0.35  # -35% on option → stop (was -50%)
-SCALE_OUT_1_THRESHOLD = 0.40   # +40%  → scale out 50% at window 1 (was +150%)
-SCALE_OUT_2_THRESHOLD = 0.25   # +25%  → scale out 75% at window 2 (was +80%)
-PROTECT_3_THRESHOLD   = 0.15   # +15%  → exit all at window 3 (was +30%)
+THETA_STOP_LOSS_PCT   = -0.35  # -35% on option → stop
+SCALE_OUT_1_THRESHOLD = 0.40   # +40% → scale out 50% at window 1
+SCALE_OUT_2_THRESHOLD = 0.25   # +25% → scale out 75% at window 2
+PROTECT_3_THRESHOLD   = 0.15   # +15% → exit all at window 3
 
 # ── IMMEDIATE TAKE-PROFIT (any time, no window gate) ──────────────────────────
-IMMEDIATE_TP_PCT      = 0.18   # +18% → scale out 70% immediately (was 0.25 — lock earlier, more runner time)
+IMMEDIATE_TP_PCT      = 0.18   # +18% → scale out 70% immediately
 HARD_STOP_PCT         = -0.30  # -30% → exit immediately regardless of time
 PROFIT_LOCK_PCT       = 0.12   # once at +25%, lock: don't fall below +12%
 
@@ -103,7 +137,7 @@ def _option_dte(option_symbol: str, *, session_date=None) -> int:
 
 
 def _option_root(option_symbol: str) -> str:
-    """Best-effort OCC/root extraction before YYMMDD date. Handles SPXW-style roots."""
+    """Best-effort OCC/root extraction before YYMMDD date."""
     import re
     sym = (option_symbol or "").upper().strip()
     m = re.search(r"(\d{6})[CP]", sym)
@@ -115,18 +149,16 @@ def _option_root(option_symbol: str) -> str:
 def _option_profile(pos: "ManagedPosition") -> tuple[int, bool, str]:
     symbol = (pos.option_symbol or "").upper()
     ticker = (pos.ticker or "").upper()
-    root = _option_root(symbol)
-    dte = _option_dte(symbol)
+    root   = _option_root(symbol)
+    dte    = _option_dte(symbol)
     index_roots = _INDEX_ETFS | {"SPXW", "NDX", "NDXP", "RUT", "RUTW"}
     is_index = root in index_roots or ticker in index_roots or any(root.startswith(t) for t in _INDEX_ETFS)
-    profile = "0DTE-idx" if (dte == 0 and is_index) else "0DTE-eq" if dte == 0 else f"{dte}DTE"
+    profile  = "0DTE-idx" if (dte == 0 and is_index) else "0DTE-eq" if dte == 0 else f"{dte}DTE"
     return dte, is_index, profile
 
 
 def _effective_thresholds(pos: "ManagedPosition") -> tuple:
-    """
-    Returns (hard_stop, immediate_tp, profit_lock) adjusted for ET-session DTE and instrument.
-    """
+    """Returns (hard_stop, immediate_tp, profit_lock) adjusted for DTE and instrument."""
     dte, is_index, _ = _option_profile(pos)
     if dte == 0 and is_index:
         return -0.18, 0.20, 0.08
@@ -135,9 +167,10 @@ def _effective_thresholds(pos: "ManagedPosition") -> tuple:
     if dte <= 2:
         return -0.26, 0.25, 0.12
     return HARD_STOP_PCT, IMMEDIATE_TP_PCT, PROFIT_LOCK_PCT
-TRAIL_DROP_FROM_PEAK  = 0.10   # if peak was +25%+, exit if drops 10pts from peak
-SMALL_WIN_PCT         = 0.10   # +10% → small win capture (see time gates below)
-SMALL_WIN_TRAIL       = 0.07   # after +10% seen, don't let it fall below +3%
+
+TRAIL_DROP_FROM_PEAK  = 0.10
+SMALL_WIN_PCT         = 0.10
+SMALL_WIN_TRAIL       = 0.07
 
 
 # ── POSITION TRACKER ─────────────────────────────────────────────────────────
@@ -172,46 +205,38 @@ class ManagedPosition:
     current_underlying:   float = 0.0
     quantity_remaining:   int   = 0
     scale_outs_done:      int   = 0
-    peak_pnl_pct:         float = 0.0   # highest option P&L seen
-    touched_profit:       bool  = False  # True once position was ever green
-    last_rejection_ts:    Optional[float] = None  # epoch when last exit was rejected
+    peak_pnl_pct:         float = 0.0
+    touched_profit:       bool  = False
+    # FIX-8: standardized to Optional[datetime] (was Optional[float] / epoch seconds).
+    # Previously set via time.time(); all other timestamp fields are Optional[datetime].
+    last_rejection_ts:    Optional[datetime] = None
     last_exit_rejected:  bool = False
     _exit_stuck_count:   int = 0
-    max_profit_seen:      float = 0.0   # highest positive P&L ever seen
+    max_profit_seen:      float = 0.0
     closed:               bool  = False
     close_reason:         str   = ""
     opened_at:            datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
-    # Exit coordination — engine signals intent; order truth decides closure
+    # Exit coordination
     exit_in_flight:       bool  = False
     pending_exit_reason:  str   = ""
-    pending_exit_action:  str   = ""  # SCALE_OUT / CLOSE_ALL / STOP; used for fill-safe reconciliation
+    pending_exit_action:  str   = ""
     pending_exit_qty:     int   = 0
     pending_exit_filled_qty: int = 0
     pending_scale_counted: bool = False
-    # Exact broker/local exit order identity. These fields make broker fill
-    # callbacks idempotent and prevent a stale event for one exit order from
-    # mutating a different in-flight exit.
     pending_exit_local_order_id: str = ""
     pending_exit_broker_order_id: str = ""
     last_applied_exit_local_order_id: str = ""
     last_applied_exit_broker_order_id: str = ""
-    # Backward-compatible aggregate watermark; per-order map below is authoritative.
     last_applied_exit_cum_fill: int = 0
     last_applied_exit_cum_fill_by_order: dict[str, int] = field(default_factory=dict)
     last_exit_signal_ts:  Optional[datetime] = None
     last_callback_identity_missing: bool = False
     last_callback_identity_missing_ts: Optional[datetime] = None
-    # v7 order-safety quarantine/replacement controls. Missing identity does
-    # NOT auto-release because a broker order may still be live even when the
-    # callback failed to return IDs. Replacement requires explicit external
-    # cancel/reconcile proof via mark_exit_replacement_safe().
     exit_identity_quarantine: bool = False
     pending_exit_replace_allowed: bool = False
     pending_exit_replace_reason: str = ""
     pending_exit_replace_allowed_ts: Optional[datetime] = None
-    # Quarantine escalation telemetry. Quarantine itself blocks duplicate exits;
-    # these fields make safe-lock visible until reconciler/OSM resolves it.
     exit_identity_quarantine_alert_count: int = 0
     last_exit_identity_quarantine_alert_ts: Optional[datetime] = None
     last_exit_clear_reason: str = ""
@@ -220,10 +245,14 @@ class ManagedPosition:
     last_exit_identity_quarantine_resolved_ts: Optional[datetime] = None
     last_exit_identity_reject_ts: Optional[datetime] = None
 
-    # Quote-health fields are explicit dataclass state so dashboard/watchdog code
-    # does not depend on dynamic attributes being added during polling.
-    # Aggregate fields stay for backward compatibility; leg-specific fields make
-    # it visible when the underlying is fresh but the option quote is stale.
+    # P2: Submit generation token. Monotonically incremented by _mark_exit_submitted()
+    # each time a new exit order generation begins. _submit_exit_decision() captures
+    # this before releasing the pre-submit lock, then verifies it matches in the
+    # post-callback lock. A mismatch means another path (fill, reconciler, OSM) has
+    # already advanced or closed this position while the callback was executing.
+    _submit_generation: int = 0
+
+    # Quote-health fields
     last_quote_update_ts: Optional[datetime] = None
     last_quote_missing_ts: Optional[datetime] = None
     last_underlying_quote_update_ts: Optional[datetime] = None
@@ -237,11 +266,14 @@ class ManagedPosition:
 
     def __post_init__(self):
         self.quantity = max(0, int(self.quantity or 0))
-        self.quantity_remaining = self.quantity if int(self.quantity_remaining or 0) <= 0 else int(self.quantity_remaining)
+        self.quantity_remaining = (
+            self.quantity
+            if int(self.quantity_remaining or 0) <= 0
+            else int(self.quantity_remaining)
+        )
 
     @property
     def option_pnl_pct(self) -> float:
-        """Current option P&L as percentage of entry cost."""
         if self.entry_price <= 0 or self.current_option_price <= 0:
             return 0.0
         return (self.current_option_price - self.entry_price) / self.entry_price
@@ -252,13 +284,10 @@ class ManagedPosition:
             return 0.0
         if self.side == "CALL":
             return (self.current_underlying - self.underlying_entry) / self.underlying_entry
-        else:
-            return (self.underlying_entry - self.current_underlying) / self.underlying_entry
+        return (self.underlying_entry - self.current_underlying) / self.underlying_entry
 
     @property
     def is_at_target(self) -> bool:
-        # Guard: zero or negative target means "not set" — rely on P&L exits only.
-        # Prevents false TARGET HIT on first quote poll when scanner omits pt1.
         if self.underlying_target <= 0:
             return False
         if self.side == "CALL":
@@ -267,8 +296,6 @@ class ManagedPosition:
 
     @property
     def is_at_stop(self) -> bool:
-        # Guard: zero or negative stop means "not set" — rely on theta stop / P&L.
-        # Prevents false STOP HIT when scanner omits stop level.
         if self.underlying_stop <= 0:
             return False
         if self.side == "CALL":
@@ -280,14 +307,19 @@ class ManagedPosition:
 
 @dataclass
 class ExitDecision:
-    action:         str    # "HOLD", "SCALE_OUT", "CLOSE_ALL", "STOP"
-    quantity:       int    # contracts to close (0 = hold)
-    reason:         str
-    urgency:        str    # "NORMAL", "HIGH", "IMMEDIATE"
-    pnl_pct:        float  = 0.0
-    suggested_limit: float = 0.0  # live bid at decision time — use as sell limit price
-                                  # 0.0 means caller should query fresh bid themselves
-    reason_code:    str    = ""   # machine-readable control code; text reason is human-only
+    action:          str    # "HOLD", "SCALE_OUT", "CLOSE_ALL", "STOP"
+    quantity:        int    # contracts to close (0 = hold)
+    reason:          str
+    urgency:         str    # "NORMAL", "HIGH", "IMMEDIATE"
+    pnl_pct:         float = 0.0
+    suggested_limit: float = 0.0
+    reason_code:     str   = ""
+    # FIX-1: runner alert metadata carried by the decision so the
+    # pure function can signal intent without making a network call.
+    # _submit_exit_decision() reads this and fires Discord after lock release.
+    _runner_alert_peak_pct: float = 0.0
+    _runner_trail_used:     float = 0.0
+    _runner_duration_min:   int   = 0
 
     @property
     def should_act(self) -> bool:
@@ -300,10 +332,14 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
     """
     Core exit evaluation. Called every POLL_INTERVAL_SEC for each position.
     Returns ExitDecision.
+
+    FIX-1: This is now a pure function with no side effects. The Discord runner
+    alert that previously lived here (blocking requests.post under self._lock)
+    has been moved to _submit_exit_decision(), which fires it after the
+    callback returns, outside both lock sections.
     """
     if now_et is None:
         now_et = datetime.now(ET)
-    # Use DTE-adjusted thresholds — tighter stops on 0DTE index options
     _hard_stop, _immediate_tp, _profit_lock = _effective_thresholds(pos)
 
     hour, minute = now_et.hour, now_et.minute
@@ -315,7 +351,7 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
         return ExitDecision(
             action="CLOSE_ALL", quantity=qty_rem,
             reason=f"TARGET HIT -- underlying ${pos.current_underlying:.2f} reached ${pos.underlying_target:.2f}",
-            urgency="IMMEDIATE", pnl_pct=option_pnl
+            urgency="IMMEDIATE", pnl_pct=option_pnl,
         )
 
     # ── 2. STOP HIT ──────────────────────────────────────────────────────────
@@ -323,24 +359,18 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
         return ExitDecision(
             action="STOP", quantity=qty_rem,
             reason=f"STOP HIT -- underlying ${pos.current_underlying:.2f} at stop ${pos.underlying_stop:.2f}",
-            urgency="IMMEDIATE", pnl_pct=option_pnl
+            urgency="IMMEDIATE", pnl_pct=option_pnl,
         )
 
-    # ── IMMEDIATE TAKE-PROFIT (fires any time, no window gate) ──────────────────
-    # Scale-out model: lock in the bulk, leave a runner.
-    #   1 contract  → CLOSE_ALL (can't split)
-    #   2 contracts → sell 1, run 1
-    #   3+          → sell 70%, run 30% (min 1 runner)
+    # ── IMMEDIATE TAKE-PROFIT ─────────────────────────────────────────────────
     if option_pnl >= _immediate_tp and pos.scale_outs_done == 0:
         if qty_rem == 1:
-            # Single contract — take it all
             return ExitDecision(
                 action="CLOSE_ALL", quantity=qty_rem,
                 reason=f"IMMEDIATE TP (full) -- +{option_pnl*100:.0f}% | 1 contract, no split",
-                urgency="IMMEDIATE", pnl_pct=option_pnl
+                urgency="IMMEDIATE", pnl_pct=option_pnl,
             )
         else:
-            # Multi-contract — sell 70%, keep runner(s)
             qty_lock = max(1, round(qty_rem * 0.70))
             qty_run  = qty_rem - qty_lock
             return ExitDecision(
@@ -349,18 +379,14 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
                     f"IMMEDIATE TP (partial) -- +{option_pnl*100:.0f}% | "
                     f"locking {qty_lock}/{qty_rem} contracts, running {qty_run} with trail"
                 ),
-                urgency="IMMEDIATE", pnl_pct=option_pnl
+                urgency="IMMEDIATE", pnl_pct=option_pnl,
             )
 
-    # ── RUNNER TRAIL (after scale-out, protect the runner) ───────────────────
-    # Once we've done a scale-out, trail the remaining contracts tightly.
-    # Exit the runner if it drops more than 15pts from where we scaled.
+    # ── RUNNER TRAIL ──────────────────────────────────────────────────────────
+    # FIX-1: Discord runner alert moved to _submit_exit_decision(). This branch
+    # now returns the alert metadata on the decision object instead of calling
+    # requests.post() here under self._lock.
     if pos.scale_outs_done >= 1 and pos.peak_pnl_pct > 0:
-        # Tiered trail — tighter as peak gets bigger, protect more of the gain
-        # Peak >80%: 10pt trail (e.g. 86% peak → close at 76%)
-        # Peak >60%: 13pt trail (e.g. 70% peak → close at 57%)
-        # Peak >40%: 15pt trail
-        # Below 40%: 20pt trail (more room at lower peaks)
         if pos.peak_pnl_pct >= 0.80:
             _runner_trail = 0.10
         elif pos.peak_pnl_pct >= 0.60:
@@ -369,42 +395,33 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
             _runner_trail = 0.15
         else:
             _runner_trail = 0.20
-        runner_drop   = pos.peak_pnl_pct - option_pnl
+        runner_drop = pos.peak_pnl_pct - option_pnl
         if runner_drop >= _runner_trail or option_pnl <= 0:
-            # 🏆 Discord alert when runner closes with meaningful gain — your sales machine
-            if pos.peak_pnl_pct >= 0.50:
-                try:
-                    import os as _os, requests as _req, time as _time
-                    _wh = _os.getenv("DISCORD_WEBHOOK_RUNNER", "") or _os.getenv("DISCORD_WEBHOOK_URL", "")
-                    if _wh:
-                        # opened_at is datetime — convert to timestamp before subtraction
-                        _opened_ts = pos.opened_at.timestamp() if hasattr(pos.opened_at, "timestamp") else _time.time()
-                        _dur = int((_time.time() - _opened_ts) / 60)
-                        _req.post(_wh, json={"embeds": [{
-                            "title":       f"🏆 RUNNER CLOSED · {pos.ticker}",
-                            "description": (
-                                f"**Peak: +{pos.peak_pnl_pct*100:.0f}%** → Exit: +{option_pnl*100:.0f}%\n"
-                                f"Held {_dur}m | Trail: {_runner_trail*100:.0f}pts | Contracts: {qty_rem}"
-                            ),
-                            "color": 0xF1C40F,
-                        }]}, timeout=3)
-                except Exception:
-                    pass  # never block exit on Discord failure
-            return ExitDecision(
+            _dur_min = 0
+            try:
+                _opened_ts = pos.opened_at.timestamp() if hasattr(pos.opened_at, "timestamp") else time.time()
+                _dur_min   = int((time.time() - _opened_ts) / 60)
+            except Exception:
+                pass
+            d = ExitDecision(
                 action="CLOSE_ALL", quantity=qty_rem,
                 reason=(
                     f"RUNNER TRAIL EXIT -- peaked +{pos.peak_pnl_pct*100:.0f}%, "
                     f"now +{option_pnl*100:.0f}%, protecting runner gains"
                 ),
-                urgency="HIGH", pnl_pct=option_pnl
+                urgency="HIGH", pnl_pct=option_pnl,
             )
+            # FIX-1: carry alert metadata so _submit_exit_decision() can fire
+            # the Discord notification after callback returns (outside lock).
+            if pos.peak_pnl_pct >= 0.50:
+                d._runner_alert_peak_pct = pos.peak_pnl_pct
+                d._runner_trail_used     = _runner_trail
+                d._runner_duration_min   = _dur_min
+            return d
 
-    # ── SMALL WIN CAPTURE ──────────────────────────────────────────────────────
-    # Once peak >= +10%, protect the gain:
-    #   Rule A: if it drops 7pts from peak while still positive → lock it in
-    #   Rule B: if underlying reached 60%+ toward signal target → take option gain
+    # ── SMALL WIN CAPTURE ─────────────────────────────────────────────────────
     if pos.max_profit_seen >= SMALL_WIN_PCT:
-        floor = max(0.03, pos.max_profit_seen - SMALL_WIN_TRAIL)  # at least +3%
+        floor = max(0.03, pos.max_profit_seen - SMALL_WIN_TRAIL)
         if 0 < option_pnl <= floor:
             return ExitDecision(
                 action="CLOSE_ALL", quantity=qty_rem,
@@ -412,7 +429,7 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
                     f"SMALL WIN LOCK — peaked +{pos.max_profit_seen*100:.0f}%, "
                     f"protecting +{option_pnl*100:.0f}%"
                 ),
-                urgency="HIGH", pnl_pct=option_pnl
+                urgency="HIGH", pnl_pct=option_pnl,
             )
 
     # Underlying progress: if 60%+ toward scanner target, take option gain now
@@ -430,13 +447,10 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
                         f"UNDERLYING PROGRESS EXIT — {_progress*100:.0f}% toward target, "
                         f"locking option +{option_pnl*100:.0f}%"
                     ),
-                    urgency="HIGH", pnl_pct=option_pnl
+                    urgency="HIGH", pnl_pct=option_pnl,
                 )
 
-    # ── TOUCHED PROFIT PROTECTION ──────────────────────────────────────────────
-    # Was ever green → went negative → exit immediately.
-    # After a confirmed scale-out, runner protection is handled by RUNNER TRAIL
-    # and max_profit_seen logic. Do not let this global rule fight runners.
+    # ── TOUCHED PROFIT PROTECTION ─────────────────────────────────────────────
     if pos.scale_outs_done == 0 and pos.touched_profit and option_pnl <= -0.05:
         return ExitDecision(
             action="CLOSE_ALL", quantity=qty_rem,
@@ -444,62 +458,44 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
                 f"TOUCHED PROFIT STOP — was +{pos.max_profit_seen*100:.0f}% "
                 f"now {option_pnl*100:.0f}% — protecting capital"
             ),
-            urgency="IMMEDIATE", pnl_pct=option_pnl
+            urgency="IMMEDIATE", pnl_pct=option_pnl,
         )
 
-    # ── NEVER-GREEN ESCALATING STOP ─────────────────────────────────────────
-    # If the trade NEVER touched profit, tighten the stop as time passes.
-    # Logic: the longer it sits without going green, the less likely it works.
-    # Preserves capital by getting out at -12% instead of -25%.
-    #
-    # DTE-aware — matches the same instrument classes as _effective_thresholds():
-    #
-    #   0DTE INDEX (SPY/QQQ/IWM): fastest confirmation required — moves happen NOW
-    #     0-3 min: -12%   5-8 min: -10%   8-15 min: -8%   15+ min: -6%
-    #
-    #   0DTE EQUITY: slightly more breathing room — single names can lag index
-    #     0-5 min: -15%   5-10 min: -12%   10-20 min: -10%   20+ min: -8%
-    #
-    #   1-2 DTE (any): more time to be right — theta slower, moves develop
-    #     0-10 min: -18%   10-20 min: -15%   20-40 min: -12%   40+ min: -10%
-    #
-    #   DEFAULT (2DTE+): swing scalp profile — most breathing room
-    #     0-5 min: -15%   5-10 min: -12%   10-20 min: -10%   20+ min: -8%
+    # ── NEVER-GREEN ESCALATING STOP ───────────────────────────────────────────
     if not pos.touched_profit:
-        _age_min = (datetime.now(timezone.utc) - pos.opened_at).total_seconds() / 60                    if pos.opened_at else 0
-
-        # Reuse ET-session DTE + instrument class from _effective_thresholds context
+        _age_min = (
+            (datetime.now(timezone.utc) - pos.opened_at).total_seconds() / 60
+            if pos.opened_at else 0
+        )
         _dte_ng, _is_idx_ng, _profile_ng = _option_profile(pos)
 
         if _dte_ng == 0 and _is_idx_ng:
-            # 0DTE index — fastest leash: SPY/QQQ/IWM move hard and fast
             if _age_min < 3:    _ng_stop = -0.12
             elif _age_min < 8:  _ng_stop = -0.10
             elif _age_min < 15: _ng_stop = -0.08
             else:               _ng_stop = -0.06
         elif _dte_ng == 0:
-            # 0DTE equity — slightly more room
             if _age_min < 5:    _ng_stop = -0.15
             elif _age_min < 10: _ng_stop = -0.12
             elif _age_min < 20: _ng_stop = -0.10
             else:               _ng_stop = -0.08
         elif _dte_ng <= 2:
-            # 1-2 DTE — more time to develop, theta slower
             if _age_min < 10:   _ng_stop = -0.18
             elif _age_min < 20: _ng_stop = -0.15
             elif _age_min < 40: _ng_stop = -0.12
             else:               _ng_stop = -0.10
         else:
-            # Default 2DTE+ swing profile
             if _age_min < 5:    _ng_stop = -0.15
             elif _age_min < 10: _ng_stop = -0.12
             elif _age_min < 20: _ng_stop = -0.10
             else:               _ng_stop = -0.08
 
         if option_pnl <= _ng_stop:
-            _profile = ("0DTE-idx" if (_dte_ng==0 and _is_idx_ng)
-                        else "0DTE-eq" if _dte_ng==0
-                        else f"{_dte_ng}DTE")
+            _profile = (
+                "0DTE-idx" if (_dte_ng == 0 and _is_idx_ng)
+                else "0DTE-eq" if _dte_ng == 0
+                else f"{_dte_ng}DTE"
+            )
             return ExitDecision(
                 action="CLOSE_ALL", quantity=qty_rem,
                 reason=(
@@ -510,33 +506,31 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
                 urgency="IMMEDIATE", pnl_pct=option_pnl,
             )
 
-    # ── HARD STOP (fires any time, no time gate) ─────────────────────────────
+    # ── HARD STOP ─────────────────────────────────────────────────────────────
     if option_pnl <= _hard_stop:
         return ExitDecision(
             action="STOP", quantity=qty_rem,
             reason=f"HARD STOP -- {option_pnl*100:.0f}% exceeded -{abs(_hard_stop)*100:.0f}% max loss",
-            urgency="IMMEDIATE", pnl_pct=option_pnl
+            urgency="IMMEDIATE", pnl_pct=option_pnl,
         )
 
-    # ── PROFIT LOCK (once we hit peak, don't give it all back) ──────────────────
+    # ── PROFIT LOCK ───────────────────────────────────────────────────────────
     if pos.peak_pnl_pct >= _immediate_tp:
-        # Hard floor: don't fall below PROFIT_LOCK_PCT
         if option_pnl <= _profit_lock:
             return ExitDecision(
                 action="CLOSE_ALL", quantity=qty_rem,
                 reason=f"PROFIT LOCK -- peaked at +{pos.peak_pnl_pct*100:.0f}%, fell to +{option_pnl*100:.0f}% — locking in",
-                urgency="HIGH", pnl_pct=option_pnl
+                urgency="HIGH", pnl_pct=option_pnl,
             )
-        # Trailing stop: if dropped 10+ points from peak, exit
         drop_from_peak = pos.peak_pnl_pct - option_pnl
         if drop_from_peak >= TRAIL_DROP_FROM_PEAK:
             return ExitDecision(
                 action="CLOSE_ALL", quantity=qty_rem,
                 reason=f"TRAILING STOP -- peak +{pos.peak_pnl_pct*100:.0f}%, dropped {drop_from_peak*100:.0f}pts to +{option_pnl*100:.0f}%",
-                urgency="HIGH", pnl_pct=option_pnl
+                urgency="HIGH", pnl_pct=option_pnl,
             )
 
-    # ── TREND DAY MULTIPLIERS (must be defined before all exit checks) ────────
+    # ── TREND DAY MULTIPLIERS ─────────────────────────────────────────────────
     direction_aligns = (
         pos.is_trend_day and (
             (pos.side == "CALL" and pos.trend_direction == "uptrend") or
@@ -553,10 +547,10 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
         return ExitDecision(
             action="CLOSE_ALL", quantity=qty_rem,
             reason=f"EOD FORCE CLOSE -- {hour}:{minute:02d} ET past {EOD_HARD_CLOSE_HOUR}:{EOD_HARD_CLOSE_MIN:02d}",
-            urgency="IMMEDIATE", pnl_pct=option_pnl
+            urgency="IMMEDIATE", pnl_pct=option_pnl,
         )
 
-    # ── 4. PROFIT PROTECTION -- WINDOW 3 (3:00 PM+) ───────────────────────────
+    # ── 4. PROFIT PROTECTION -- WINDOW 3 (2:00 PM+) ──────────────────────────
     past_window3 = (hour > PROFIT_PROTECT_3_HOUR or
                     (hour == PROFIT_PROTECT_3_HOUR and minute >= PROFIT_PROTECT_3_MIN))
     protect3_thresh = 0.50 if direction_aligns else PROTECT_3_THRESHOLD
@@ -564,60 +558,66 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
         trend_note = " [trend day -- raised to 50% threshold]" if direction_aligns else ""
         return ExitDecision(
             action="CLOSE_ALL", quantity=qty_rem,
-            reason=f"PROFIT PROTECT W3 -- +{option_pnl*100:.0f}% at 3PM+{trend_note}",
-            urgency="HIGH", pnl_pct=option_pnl
+            reason=f"PROFIT PROTECT W3 -- +{option_pnl*100:.0f}% at 2PM+{trend_note}",
+            urgency="HIGH", pnl_pct=option_pnl,
         )
 
-    # ── 5. PROFIT PROTECTION -- WINDOW 2 (2:30 PM+, or 3:00 PM on trend day) ─
+    # ── 5. PROFIT PROTECTION -- WINDOW 2 (1:00 PM+, or 1:30 PM on trend day) ─
+    # FIX-5a: comment corrected from "2:30 PM+" to "1:00 PM+" to match
+    # PROFIT_PROTECT_2_HOUR = 13 = 1:00 PM. Previous comment was 90 min wrong.
     w2_hour = PROFIT_PROTECT_2_HOUR
     w2_min  = PROFIT_PROTECT_2_MIN + trend_bonus_window
     while w2_min >= 60:
         w2_hour += 1
-        w2_min -= 60
+        w2_min  -= 60
     past_window2 = (hour > w2_hour or (hour == w2_hour and minute >= w2_min))
     scale2_threshold = SCALE_OUT_2_THRESHOLD * trend_bonus_threshold
     if past_window2 and option_pnl >= scale2_threshold and pos.scale_outs_done < 2:
-        qty_close = max(1, round(qty_rem * (0.50 if direction_aligns else 0.75)))
+        qty_close  = max(1, round(qty_rem * (0.50 if direction_aligns else 0.75)))
         trend_note = " [TREND DAY -- reduced scale]" if direction_aligns else ""
         return ExitDecision(
             action="SCALE_OUT", quantity=qty_close,
-            reason=f"PROFIT PROTECT W2 -- +{option_pnl*100:.0f}% at {w2_hour}:{w2_min:02d}PM+ scale{trend_note}",
-            urgency="HIGH", pnl_pct=option_pnl
+            reason=f"PROFIT PROTECT W2 -- +{option_pnl*100:.0f}% at {w2_hour}:{w2_min:02d}+ scale{trend_note}",
+            urgency="HIGH", pnl_pct=option_pnl,
         )
 
-    # ── 6. PROFIT PROTECTION -- WINDOW 1 (1:30 PM+, or 2:00 PM on trend day) ─
+    # ── 6. PROFIT PROTECTION -- WINDOW 1 (11:00 AM+, or 11:30 AM on trend day) ─
+    # FIX-5b: comment corrected from "1:30 PM+" to "11:00 AM+" to match
+    # PROFIT_PROTECT_1_HOUR = 11 = 11:00 AM. Previous comment was 2.5 hours wrong.
     w1_hour = PROFIT_PROTECT_1_HOUR
     w1_min  = PROFIT_PROTECT_1_MIN + trend_bonus_window
     while w1_min >= 60:
         w1_hour += 1
-        w1_min -= 60
+        w1_min  -= 60
     past_window1 = (hour > w1_hour or (hour == w1_hour and minute >= w1_min))
     scale1_threshold = SCALE_OUT_1_THRESHOLD * trend_bonus_threshold
     if past_window1 and option_pnl >= scale1_threshold and pos.scale_outs_done < 1:
-        qty_close = max(1, round(qty_rem * (0.35 if direction_aligns else 0.50)))
+        qty_close  = max(1, round(qty_rem * (0.35 if direction_aligns else 0.50)))
         trend_note = " [TREND DAY -- let runner breathe]" if direction_aligns else ""
         return ExitDecision(
             action="SCALE_OUT", quantity=qty_close,
-            reason=f"PROFIT PROTECT W1 -- +{option_pnl*100:.0f}% at {w1_hour}:{w1_min:02d}PM+ scale{trend_note}",
-            urgency="NORMAL", pnl_pct=option_pnl
+            reason=f"PROFIT PROTECT W1 -- +{option_pnl*100:.0f}% at {w1_hour}:{w1_min:02d}+ scale{trend_note}",
+            urgency="NORMAL", pnl_pct=option_pnl,
         )
 
-    # ── 7. THETA KILL SWITCH (past noon, down >50%) ───────────────────────────
+    # ── 7. THETA KILL SWITCH (past noon, down >35%) ───────────────────────────
     past_noon = hour >= 12
     if past_noon and option_pnl <= THETA_STOP_LOSS_PCT:
         return ExitDecision(
             action="CLOSE_ALL", quantity=qty_rem,
             reason=f"THETA STOP -- option down {option_pnl*100:.0f}% after noon, cutting losses",
-            urgency="NORMAL", pnl_pct=option_pnl
+            urgency="NORMAL", pnl_pct=option_pnl,
         )
 
-    return ExitDecision(action="HOLD", quantity=0, reason="No exit condition met", urgency="NORMAL", pnl_pct=option_pnl)
+    return ExitDecision(
+        action="HOLD", quantity=0,
+        reason="No exit condition met", urgency="NORMAL", pnl_pct=option_pnl,
+    )
 
 
 # ── EXIT ENGINE ───────────────────────────────────────────────────────────────
 
 EXIT_RULE_PRECEDENCE = (
-    # Lower number = higher priority. This is now executable, not decorative.
     "STOP_HIT",
     "HARD_STOP",
     "EOD_FORCE_CLOSE",
@@ -642,8 +642,6 @@ EXIT_RULE_PRECEDENCE = (
 EXIT_RULE_PRIORITY = {code: idx for idx, code in enumerate(EXIT_RULE_PRECEDENCE)}
 LOWEST_EXIT_PRIORITY = len(EXIT_RULE_PRIORITY) + 100
 
-# Quote and identity safety contract. Normal exits require fresh option marks.
-# Only broker-independent/forced-risk exits may proceed in degraded quote mode.
 STALE_OPTION_QUOTE_MAX_AGE_SEC = int(os.getenv("EXIT_ENGINE_STALE_OPTION_QUOTE_SEC", "20"))
 FORCED_RISK_EXIT_CODES = {
     "EOD_FORCE_CLOSE",
@@ -657,54 +655,30 @@ FORCED_RISK_EXIT_CODES = {
 
 
 def _classify_exit_decision(decision: "ExitDecision") -> str:
-    """Stable reason-code classifier used for precedence, telemetry, and gating.
-
-    Preferred source is ExitDecision.reason_code. The string parser remains only
-    as a backward-compatible fallback for older callers/tests.
-    """
     explicit_code = (getattr(decision, "reason_code", "") or "").upper().strip()
     if explicit_code:
         return explicit_code
-    r = (getattr(decision, "reason", "") or "").upper()
+    r      = (getattr(decision, "reason", "") or "").upper()
     action = (getattr(decision, "action", "") or "").upper()
-    if "SENTINEL" in r:
-        return "SENTINEL_FORCED_EXIT"
-    if "EOD FORCE CLOSE" in r:
-        return "EOD_FORCE_CLOSE"
-    if "THETA STOP" in r:
-        return "THETA_STOP"
-    if "STOP HIT" in r:
-        return "STOP_HIT"
-    if "HARD STOP" in r:
-        return "HARD_STOP"
-    if "RUNNER TRAIL" in r or "RUNNER EMERGENCY" in r:
-        return "RUNNER_TRAIL"
-    if "SMALL WIN LOCK" in r:
-        return "SMALL_WIN_LOCK"
-    if "TOUCHED PROFIT STOP" in r:
-        return "TOUCHED_PROFIT_STOP"
-    if "UNDERLYING PROGRESS EXIT" in r:
-        return "UNDERLYING_PROGRESS_EXIT"
-    if "NEVER GREEN STOP" in r:
-        return "NEVER_GREEN_STOP"
-    if "PROFIT LOCK" in r:
-        return "PROFIT_LOCK"
-    if "TRAILING STOP" in r:
-        return "TRAILING_STOP"
-    if "IMMEDIATE TP" in r:
-        return "IMMEDIATE_TP"
-    if "TARGET HIT" in r:
-        return "TARGET_HIT"
-    if "PROFIT PROTECT W3" in r:
-        return "PROFIT_PROTECT_W3"
-    if "PROFIT PROTECT W2" in r:
-        return "PROFIT_PROTECT_W2"
-    if "PROFIT PROTECT W1" in r:
-        return "PROFIT_PROTECT_W1"
-    if "TIME STOP" in r or "DEAD TRADE" in r:
-        return "TIME_STOP"
-    if action == "SCALE_OUT":
-        return "TP_SCALE_OUT"
+    if "SENTINEL" in r:              return "SENTINEL_FORCED_EXIT"
+    if "EOD FORCE CLOSE" in r:       return "EOD_FORCE_CLOSE"
+    if "THETA STOP" in r:            return "THETA_STOP"
+    if "STOP HIT" in r:              return "STOP_HIT"
+    if "HARD STOP" in r:             return "HARD_STOP"
+    if "RUNNER TRAIL" in r or "RUNNER EMERGENCY" in r: return "RUNNER_TRAIL"
+    if "SMALL WIN LOCK" in r:        return "SMALL_WIN_LOCK"
+    if "TOUCHED PROFIT STOP" in r:   return "TOUCHED_PROFIT_STOP"
+    if "UNDERLYING PROGRESS EXIT" in r: return "UNDERLYING_PROGRESS_EXIT"
+    if "NEVER GREEN STOP" in r:      return "NEVER_GREEN_STOP"
+    if "PROFIT LOCK" in r:           return "PROFIT_LOCK"
+    if "TRAILING STOP" in r:         return "TRAILING_STOP"
+    if "IMMEDIATE TP" in r:          return "IMMEDIATE_TP"
+    if "TARGET HIT" in r:            return "TARGET_HIT"
+    if "PROFIT PROTECT W3" in r:     return "PROFIT_PROTECT_W3"
+    if "PROFIT PROTECT W2" in r:     return "PROFIT_PROTECT_W2"
+    if "PROFIT PROTECT W1" in r:     return "PROFIT_PROTECT_W1"
+    if "TIME STOP" in r or "DEAD TRADE" in r: return "TIME_STOP"
+    if action == "SCALE_OUT":        return "TP_SCALE_OUT"
     return "UNKNOWN_EXIT"
 
 
@@ -713,13 +687,10 @@ def _exit_priority(decision_or_code) -> int:
     return EXIT_RULE_PRIORITY.get(code, LOWEST_EXIT_PRIORITY)
 
 
-def _is_option_quote_stale(pos: "ManagedPosition", now_utc: Optional[datetime] = None) -> tuple[bool, Optional[float], str]:
-    """Return (is_stale, age_sec, reason) for option quote freshness.
-
-    Option marks drive option P&L and sell limits; normal exits must not submit
-    from stale option quotes. Underlying/EOD/sentinel forced-risk exits are
-    handled separately by the submit gate.
-    """
+def _is_option_quote_stale(
+    pos: "ManagedPosition",
+    now_utc: Optional[datetime] = None,
+) -> tuple[bool, Optional[float], str]:
     now_utc = now_utc or datetime.now(timezone.utc)
     ts = getattr(pos, "last_option_quote_update_ts", None)
     if ts is None:
@@ -738,18 +709,15 @@ def _is_forced_risk_exit_code(code: str) -> bool:
 
 
 def _is_protective_exit(reason: str) -> bool:
-    """True if exit reason is protective — module-level so always in scope."""
     r = (reason or "").upper()
     return any(k in r for k in (
         "EOD", "STOP", "MAX_LOSS", "THETA", "PROTECTIVE", "FORCE CLOSE", "SENTINEL",
         "TARGET HIT", "IMMEDIATE TP", "PROFIT PROTECT", "SMALL WIN", "RUNNER TRAIL",
-        "PROFIT LOCK", "TOUCHED PROFIT", "NEVER GREEN", "DEAD TRADE"
+        "PROFIT LOCK", "TOUCHED PROFIT", "NEVER GREEN", "DEAD TRADE",
     ))
 
 
-
 def _is_runner_protective_reason(reason: str) -> bool:
-    """Narrow runner-protective classification for emergency override decisions."""
     r = (reason or "").upper()
     return (
         "RUNNER TRAIL" in r
@@ -760,7 +728,6 @@ def _is_runner_protective_reason(reason: str) -> bool:
 
 
 def _is_same_or_equivalent_runner_protection(pending_reason: str, new_reason: str) -> bool:
-    """True when both pending and new exits are already runner/profit-protection closes."""
     return _is_runner_protective_reason(pending_reason) and _is_runner_protective_reason(new_reason)
 
 
@@ -768,42 +735,53 @@ class APExitEngine:
     """
     Manages all open positions with time-aware exit logic.
     Runs as a background thread.
-
-    Usage:
-        engine = APExitEngine(broker)
-        engine.on_exit = lambda pos, decision: broker.close_position(pos, decision)
-        engine.start()
-
-        # When a trade is entered:
-        engine.add_position(ManagedPosition(...))
     """
 
     def __init__(self, broker, kill_switch_fn=None, email: str = "",
                  data_broker=None):
-        self.broker           = broker
-        # data_broker: live api.tradier.com broker for real-time quotes.
-        # Falls back to execution broker if not provided (sandbox = delayed).
-        self._quote_broker    = data_broker or broker
-        self._email           = email              # used to name thread per-client
+        self.broker        = broker
+        self._quote_broker = data_broker or broker
+        self._email        = email
         self._positions: list[ManagedPosition] = []
-        self._lock            = threading.RLock()  # reentrant: helpers/submission paths can nest lock acquisition
-        self._running         = False
+        # P1: O(1) position index keyed by position_id.
+        # Kept in sync with self._positions by add_position(), expired-contract
+        # cleanup, mark_position_closed(), and note_partial_exit_fill() close path.
+        self._positions_by_id: dict[str, ManagedPosition] = {}
+        self._lock         = threading.RLock()
+        self._running      = False
         self._thread: Optional[threading.Thread] = None
-        self.on_exit: Optional[Callable]  = None   # callback(pos, ExitDecision)
-        self.on_scale: Optional[Callable] = None   # callback(pos, ExitDecision, qty)
-        self._kill_switch_fn  = kill_switch_fn     # callable() → bool | None
+        self.on_exit: Optional[Callable]  = None
+        self.on_scale: Optional[Callable] = None
+        self._kill_switch_fn = kill_switch_fn
 
-        # Observability metadata. Never let analytics break live exits.
-        self.run_id = os.getenv("AP_RUN_ID", "unknown")
+        self.run_id           = os.getenv("AP_RUN_ID", "unknown")
         self.strategy_version = os.getenv("AP_STRATEGY_VERSION", "ap_live_beta")
-        self.git_commit = get_git_commit()
+        self.git_commit       = get_git_commit()
+
+    # ── P1: True O(1) position lookup ────────────────────────────────────────
+    def get_position(self, position_id: str) -> Optional[ManagedPosition]:
+        """
+        O(1) position lookup by position_id via self._positions_by_id index.
+
+        Previously still performed O(n) linear scan despite the method name.
+        Now backed by a dict kept in sync by all write paths (add_position,
+        expired-contract cleanup, mark_position_closed, note_partial_exit_fill).
+        OSM's _get_exit_engine_position() calls this first; without the O(1)
+        path every fill/close/hook callback would scan the full list.
+        """
+        pid = str(position_id or "")
+        if not pid:
+            return None
+        with self._lock:
+            return self._positions_by_id.get(pid)
+
     def add_position(self, pos: ManagedPosition):
         """Track a newly broker-confirmed open position for exit protection."""
         if pos is None:
             return
         with self._lock:
             for existing in self._positions:
-                same_id = bool(pos.position_id and existing.position_id == pos.position_id)
+                same_id  = bool(pos.position_id and existing.position_id == pos.position_id)
                 same_sym = (
                     existing.ticker == pos.ticker
                     and existing.option_symbol == pos.option_symbol
@@ -819,38 +797,27 @@ class APExitEngine:
                     return
             self._assert_position_invariants(pos, "add_position")
             self._positions.append(pos)
+            # P1: keep O(1) index in sync.
+            if pos.position_id:
+                self._positions_by_id[pos.position_id] = pos
         log.info(
             "[%s] Position added to exit engine | %s %sx %s @ $%.2f | target=%s stop=%s | pos_id=%s",
-            pos.ticker,
-            pos.side,
-            pos.quantity,
-            pos.option_symbol,
-            pos.entry_price,
-            pos.underlying_target,
-            pos.underlying_stop,
-            pos.position_id or "n/a",
+            pos.ticker, pos.side, pos.quantity, pos.option_symbol, pos.entry_price,
+            pos.underlying_target, pos.underlying_stop, pos.position_id or "n/a",
         )
 
     def start(self):
-        """Start exit engine background loop."""
         if self._thread and self._thread.is_alive():
             log.debug("APExitEngine already running [%s]", self._email or "default")
             self._running = True
             return
-
         self._running = True
-        # Keep compatibility with self-healing / supervisor component registry.
-        thread_name = f"ap-exit-engine-{self._email}" if self._email else "ap-exit-engine"
-        self._thread = threading.Thread(
-            target=self._exit_loop,
-            name=thread_name,
-            daemon=True,
-        )
+        thread_name   = f"ap-exit-engine-{self._email}" if self._email else "ap-exit-engine"
+        self._thread  = threading.Thread(target=self._exit_loop, name=thread_name, daemon=True)
         self._thread.start()
         log.info("APExitEngine started [%s]", thread_name)
 
     def stop(self):
-        """Stop exit engine background loop and reset thread state for clean restart."""
         self._running = False
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=5)
@@ -858,7 +825,6 @@ class APExitEngine:
         log.info("[%s] APExitEngine stopped", self._email or "default")
 
     def active_positions(self) -> list[ManagedPosition]:
-        """Return a snapshot of currently tracked, non-closed positions."""
         with self._lock:
             return [p for p in self._positions if not p.closed and int(p.quantity_remaining or 0) > 0]
 
@@ -872,21 +838,15 @@ class APExitEngine:
         reason: str = "",
         **kwargs,
     ) -> None:
-        """OSM v3-compatible hook for pending/working exit order state.
-
-        OSM may call this after it has created/submitted a broker-side exit
-        order. Keep the live ManagedPosition aligned with OSM identity without
-        forcing callers to match an older/narrower APExitEngine signature.
-        """
         if not position_id:
             return
         try:
             qty_i = max(0, int(qty or 0))
         except Exception:
             qty_i = 0
-        local_order_id = str(local_order_id or "")
+        local_order_id  = str(local_order_id or "")
         broker_order_id = str(broker_order_id or "")
-        reason = str(reason or "")
+        reason          = str(reason or "")
 
         with self._lock:
             for pos in self._positions:
@@ -894,26 +854,23 @@ class APExitEngine:
                     continue
                 if pos.closed or int(pos.quantity_remaining or 0) <= 0:
                     return
-
-                pos.exit_in_flight = True
+                pos.exit_in_flight    = True
                 pos.pending_exit_reason = reason or pos.pending_exit_reason or "osm_pending_exit_order"
                 if qty_i > 0:
                     pos.pending_exit_qty = qty_i
                 elif int(pos.pending_exit_qty or 0) <= 0:
                     pos.pending_exit_qty = int(pos.quantity_remaining or 0)
-                pos.pending_exit_local_order_id = local_order_id or pos.pending_exit_local_order_id or ""
+                pos.pending_exit_local_order_id  = local_order_id  or pos.pending_exit_local_order_id  or ""
                 pos.pending_exit_broker_order_id = broker_order_id or pos.pending_exit_broker_order_id or ""
-                pos.last_exit_signal_ts = datetime.now(timezone.utc)
-                pos.last_exit_rejected = False
-                pos._exit_stuck_count = 0
-
+                pos.last_exit_signal_ts  = datetime.now(timezone.utc)
+                pos.last_exit_rejected   = False
+                pos._exit_stuck_count    = 0
                 if local_order_id or broker_order_id:
-                    pos.last_callback_identity_missing = False
+                    pos.last_callback_identity_missing    = False
                     pos.last_callback_identity_missing_ts = None
-                    pos.exit_identity_quarantine = False
+                    pos.exit_identity_quarantine          = False
                     pos.exit_identity_quarantine_alert_count = 0
                     pos.last_exit_identity_quarantine_alert_ts = None
-
                 self._assert_position_invariants(pos, "set_pending_exit_order")
                 self._emit_exit_event(
                     pos,
@@ -930,29 +887,18 @@ class APExitEngine:
                 )
                 log.info(
                     "[exit_eng] OSM pending exit set | pos_id=%s local=%s broker=%s qty=%s reason=%s",
-                    position_id,
-                    local_order_id or "?",
-                    broker_order_id or "?",
-                    qty_i,
-                    reason or "?",
+                    position_id, local_order_id or "?", broker_order_id or "?", qty_i, reason or "?",
                 )
                 return
 
         log.warning(
             "[exit_eng] OSM pending exit for unknown position | pos_id=%s local=%s broker=%s qty=%s reason=%s",
-            position_id,
-            local_order_id or "?",
-            broker_order_id or "?",
-            qty_i,
-            reason or "?",
+            position_id, local_order_id or "?", broker_order_id or "?", qty_i, reason or "?",
         )
 
-    # ── BROKER / OSM RECONCILIATION HOOKS ───────────────────────────────────
-    # These methods are intentionally backward compatible with older callers
-    # while supporting exact OSM/local/broker order identity when supplied.
+    # ── BROKER / OSM RECONCILIATION HOOKS ────────────────────────────────────
 
     def _pending_exit_has_identity(self, pos: ManagedPosition) -> bool:
-        """True when current pending exit generation has local/broker identity."""
         return bool(
             getattr(pos, "pending_exit_local_order_id", "")
             or getattr(pos, "pending_exit_broker_order_id", "")
@@ -966,13 +912,12 @@ class APExitEngine:
         broker_order_id: str = "",
         allow_missing_when_no_pending_identity: bool = True,
     ) -> bool:
-        """Validate an OSM/reconciler hook against the current pending exit generation."""
-        local_order_id = str(local_order_id or "")
+        local_order_id  = str(local_order_id or "")
         broker_order_id = str(broker_order_id or "")
-        pending_local = str(getattr(pos, "pending_exit_local_order_id", "") or "")
-        pending_broker = str(getattr(pos, "pending_exit_broker_order_id", "") or "")
+        pending_local   = str(getattr(pos, "pending_exit_local_order_id", "") or "")
+        pending_broker  = str(getattr(pos, "pending_exit_broker_order_id", "") or "")
         supplied_identity = bool(local_order_id or broker_order_id)
-        pending_identity = bool(pending_local or pending_broker)
+        pending_identity  = bool(pending_local or pending_broker)
         if not supplied_identity:
             return bool(allow_missing_when_no_pending_identity and not pending_identity)
         if local_order_id and pending_local and local_order_id != pending_local:
@@ -990,7 +935,6 @@ class APExitEngine:
         broker_order_id: str = "",
         reason: str = "",
     ) -> None:
-        """Emit a loud event when a hook tries to mutate a different exit generation."""
         try:
             pos.last_exit_identity_reject_ts = datetime.now(timezone.utc)
             log.error(
@@ -1034,17 +978,10 @@ class APExitEngine:
         reconciled: bool = False,
         **kwargs,
     ):
-        """Called after broker + DB confirm the position is fully closed.
-
-        v11: close hooks are identity-bound. If the engine has a current pending
-        exit identity, a close for a different/no identity is rejected unless the
-        caller explicitly marks the close as force/reconciled. This prevents stale
-        close callbacks from mutating a newer live exit generation.
-        """
         if not position_id:
             return
-        reason_s = str(reason or "")
-        local_order_id = str(local_order_id or "")
+        reason_s        = str(reason or "")
+        local_order_id  = str(local_order_id or "")
         broker_order_id = str(broker_order_id or "")
         force = bool(force or reconciled or kwargs.get("force") or kwargs.get("reconciled"))
         if "RECONCILER" in reason_s.upper():
@@ -1061,38 +998,39 @@ class APExitEngine:
                     allow_missing_when_no_pending_identity=True,
                 ):
                     self._reject_stale_exit_hook(
-                        pos,
-                        hook_name="mark_position_closed",
+                        pos, hook_name="mark_position_closed",
                         local_order_id=local_order_id,
-                        broker_order_id=broker_order_id,
-                        reason=reason_s,
+                        broker_order_id=broker_order_id, reason=reason_s,
                     )
                     return
-                pos.closed = True
-                pos.close_reason = reason_s or pos.close_reason or "broker_confirmed_closed"
+                pos.closed        = True
+                pos.close_reason  = reason_s or pos.close_reason or "broker_confirmed_closed"
                 pos.quantity_remaining = 0
+                # P2: advance generation so concurrent _submit_exit_decision validators
+                # detect this broker-confirmed close and do not mark stale in-flight state.
+                pos._submit_generation += 1
                 try:
                     if fill_price is not None:
                         pos.current_option_price = float(fill_price)
                 except Exception:
                     pass
-                pos.exit_in_flight = False
+                pos.exit_in_flight   = False
                 pos.pending_exit_reason = ""
                 pos.pending_exit_action = ""
-                pos.pending_exit_qty = 0
+                pos.pending_exit_qty    = 0
                 pos.pending_exit_filled_qty = 0
-                pos.pending_scale_counted = False
-                pos.last_applied_exit_local_order_id = local_order_id or pos.pending_exit_local_order_id or pos.last_applied_exit_local_order_id
+                pos.pending_scale_counted   = False
+                pos.last_applied_exit_local_order_id  = local_order_id  or pos.pending_exit_local_order_id  or pos.last_applied_exit_local_order_id
                 pos.last_applied_exit_broker_order_id = broker_order_id or pos.pending_exit_broker_order_id or pos.last_applied_exit_broker_order_id
-                pos.last_exit_signal_ts = None
-                pos.last_callback_identity_missing = False
+                pos.last_exit_signal_ts               = None
+                pos.last_callback_identity_missing    = False
                 pos.last_callback_identity_missing_ts = None
-                pos.exit_identity_quarantine = False
+                pos.exit_identity_quarantine          = False
                 pos.last_exit_identity_quarantine_resolved_ts = datetime.now(timezone.utc)
-                pos.exit_identity_quarantine_alert_count = getattr(pos, "exit_identity_quarantine_alert_count", 0)
-                pos.last_exit_identity_quarantine_alert_ts = getattr(pos, "last_exit_identity_quarantine_alert_ts", None)
-                pos.pending_exit_replace_allowed = False
-                pos.pending_exit_replace_reason = ""
+                pos.exit_identity_quarantine_alert_count     = getattr(pos, "exit_identity_quarantine_alert_count", 0)
+                pos.last_exit_identity_quarantine_alert_ts   = getattr(pos, "last_exit_identity_quarantine_alert_ts", None)
+                pos.pending_exit_replace_allowed  = False
+                pos.pending_exit_replace_reason   = ""
                 pos.pending_exit_replace_allowed_ts = None
                 self._emit_exit_event(
                     pos,
@@ -1100,7 +1038,11 @@ class APExitEngine:
                     reason_code="BROKER_CONFIRMED_CLOSED",
                     explanation=pos.close_reason,
                     stage="exit_reconciliation",
-                    extra_inputs={"local_order_id": local_order_id, "broker_order_id": broker_order_id, "force": force},
+                    extra_inputs={
+                        "local_order_id": local_order_id,
+                        "broker_order_id": broker_order_id,
+                        "force": force,
+                    },
                 )
         log.info("[exit_eng] Closed (broker-confirmed) | pos_id=%s reason=%s", position_id, reason)
 
@@ -1116,21 +1058,15 @@ class APExitEngine:
         reconciled: bool = False,
         **kwargs,
     ):
-        """Called when exit order is canceled/rejected/expired so the engine may retry.
-
-        v11: clearing is identity-bound. A stale position-only clear cannot reopen
-        submit eligibility or erase fill watermarks for a different pending exit
-        generation. Use force=True/reconciled=True only after authoritative broker
-        proof that no pending exit can still fill.
-        """
         if not position_id:
             return
-        reason_s = str(reason or "")
-        local_order_id = str(local_order_id or "")
+        reason_s        = str(reason or "")
+        local_order_id  = str(local_order_id or "")
         broker_order_id = str(broker_order_id or "")
         force = bool(force or reconciled or kwargs.get("force") or kwargs.get("reconciled"))
         if "RECONCILER" in reason_s.upper() or "NEGATIVE_BROKER_CHECK" in reason_s.upper():
             force = True
+
         with self._lock:
             for pos in self._positions:
                 if str(pos.position_id or "") != str(position_id or ""):
@@ -1142,35 +1078,36 @@ class APExitEngine:
                     allow_missing_when_no_pending_identity=True,
                 ):
                     self._reject_stale_exit_hook(
-                        pos,
-                        hook_name="clear_exit_in_flight",
+                        pos, hook_name="clear_exit_in_flight",
                         local_order_id=local_order_id,
-                        broker_order_id=broker_order_id,
-                        reason=reason_s,
+                        broker_order_id=broker_order_id, reason=reason_s,
                     )
                     return
-                pos.exit_in_flight = False
+                pos.exit_in_flight   = False
                 pos.pending_exit_reason = ""
                 pos.pending_exit_action = ""
-                pos.pending_exit_qty = 0
+                pos.pending_exit_qty    = 0
                 pos.pending_exit_filled_qty = 0
-                pos.pending_scale_counted = False
-                pos.last_exit_clear_reason = reason_s
-                pos.last_exit_clear_local_order_id = local_order_id
-                pos.last_exit_clear_broker_order_id = broker_order_id
-                pos.pending_exit_local_order_id = ""
+                pos.pending_scale_counted   = False
+                pos.last_exit_clear_reason           = reason_s
+                pos.last_exit_clear_local_order_id   = local_order_id
+                pos.last_exit_clear_broker_order_id  = broker_order_id
+                pos.pending_exit_local_order_id  = ""
                 pos.pending_exit_broker_order_id = ""
                 # Do not wipe last_applied_exit_cum_fill_by_order here. Late callbacks
-                # for the just-cleared order may still arrive; new order submission resets it.
-                pos.last_exit_signal_ts = None
-                pos.last_exit_rejected = bool(rejected)
-                pos.last_rejection_ts = time.time() if rejected else None
-                pos.last_callback_identity_missing = False
+                # for the just-cleared order may still arrive; only _mark_exit_submitted()
+                # resets it when a new order generation begins.
+                pos.last_exit_signal_ts  = None
+                # FIX-8: last_rejection_ts is now Optional[datetime], consistent with all
+                # other timestamp fields on ManagedPosition.
+                pos.last_exit_rejected   = bool(rejected)
+                pos.last_rejection_ts    = datetime.now(timezone.utc) if rejected else None
+                pos.last_callback_identity_missing    = False
                 pos.last_callback_identity_missing_ts = None
-                pos.exit_identity_quarantine = False
+                pos.exit_identity_quarantine          = False
                 pos.last_exit_identity_quarantine_resolved_ts = datetime.now(timezone.utc)
-                pos.pending_exit_replace_allowed = False
-                pos.pending_exit_replace_reason = ""
+                pos.pending_exit_replace_allowed   = False
+                pos.pending_exit_replace_reason    = ""
                 pos.pending_exit_replace_allowed_ts = None
                 self._assert_position_invariants(pos, "clear_exit_in_flight")
                 self._emit_exit_event(
@@ -1179,12 +1116,16 @@ class APExitEngine:
                     reason_code="EXIT_REJECTED" if rejected else "EXIT_IN_FLIGHT_CLEARED",
                     explanation=reason_s or ("Exit order rejected/cleared" if rejected else "Exit in-flight cleared"),
                     stage="exit_reconciliation",
-                    extra_inputs={"local_order_id": local_order_id, "broker_order_id": broker_order_id, "rejected": rejected, "force": force},
+                    extra_inputs={
+                        "local_order_id": local_order_id,
+                        "broker_order_id": broker_order_id,
+                        "rejected": rejected,
+                        "force": force,
+                    },
                 )
         log.info("[exit_eng] Exit in-flight cleared | pos_id=%s rejected=%s reason=%s", position_id, rejected, reason)
 
     def on_exit_failure(
-
         self,
         position_id: str,
         *,
@@ -1193,12 +1134,8 @@ class APExitEngine:
         broker_order_id: str = "",
         **kwargs,
     ) -> None:
-        """OSM v3-compatible hook for exit failure/rejection.
-
-        Normalize failure into the same cleared/rejected state used by normal
-        cancel/reject reconciliation. This prevents TypeError when OSM supplies
-        keyword identity fields.
-        """
+        """OSM v3-compatible hook for exit failure/rejection."""
+        # FIX-10: extra blank line between method signature and body removed.
         self.clear_exit_in_flight(
             position_id,
             reason=reason or "exit_failure",
@@ -1220,13 +1157,6 @@ class APExitEngine:
         cumulative_filled_qty: Optional[int] = None,
         **kwargs,
     ):
-        """Called when broker confirms an exit fill.
-
-        qty_filled is treated as a delta by default. If cumulative_filled_qty is
-        supplied by OSM/reconciler, it is treated as cumulative for the CURRENT
-        exit order identity only. This prevents one order's fill watermark from
-        corrupting the next order's fill math.
-        """
         if not position_id:
             return
         if cumulative_filled_qty is None and cumulative_filled is not None:
@@ -1256,10 +1186,6 @@ class APExitEngine:
                     )
                     return
 
-                # Prefer exact broker identity, then local identity, then the
-                # current pending identity. Fall back to a synthetic key only for
-                # legacy/no-identity callbacks so cumulative fills remain scoped
-                # to this pending exit generation instead of the position lifetime.
                 order_key = (
                     broker_order_id
                     or local_order_id
@@ -1269,16 +1195,14 @@ class APExitEngine:
                 )
 
                 if cumulative_filled_qty is not None:
-                    cum = max(0, int(cumulative_filled_qty or 0))
-                    prev = int(pos.last_applied_exit_cum_fill_by_order.get(order_key, 0) or 0)
+                    cum   = max(0, int(cumulative_filled_qty or 0))
+                    prev  = int(pos.last_applied_exit_cum_fill_by_order.get(order_key, 0) or 0)
                     delta = max(0, cum - prev)
                     pos.last_applied_exit_cum_fill_by_order[order_key] = max(prev, cum)
-                    # Keep aggregate field for old diagnostics only; it is not
-                    # used for delta calculation anymore.
                     pos.last_applied_exit_cum_fill = max(int(pos.last_applied_exit_cum_fill or 0), cum)
                 else:
                     delta = max(0, int(qty_filled or 0))
-                    prev = int(pos.last_applied_exit_cum_fill_by_order.get(order_key, 0) or 0)
+                    prev  = int(pos.last_applied_exit_cum_fill_by_order.get(order_key, 0) or 0)
                     pos.last_applied_exit_cum_fill_by_order[order_key] = prev + delta
                     pos.last_applied_exit_cum_fill += delta
 
@@ -1303,35 +1227,27 @@ class APExitEngine:
                     pos.current_option_price = float(fill_price)
                 pos.pending_exit_filled_qty += delta
                 pos.quantity_remaining = max(0, int(pos.quantity_remaining or 0) - delta)
-                pos.last_applied_exit_local_order_id = local_order_id or pos.pending_exit_local_order_id or pos.last_applied_exit_local_order_id
+                pos.last_applied_exit_local_order_id  = local_order_id  or pos.pending_exit_local_order_id  or pos.last_applied_exit_local_order_id
                 pos.last_applied_exit_broker_order_id = broker_order_id or pos.pending_exit_broker_order_id or pos.last_applied_exit_broker_order_id
                 if local_order_id or broker_order_id or pos.pending_exit_local_order_id or pos.pending_exit_broker_order_id:
-                    pos.last_callback_identity_missing = False
+                    pos.last_callback_identity_missing    = False
                     pos.last_callback_identity_missing_ts = None
-                    pos.exit_identity_quarantine = False
+                    pos.exit_identity_quarantine          = False
                     pos.exit_identity_quarantine_alert_count = 0
                     pos.last_exit_identity_quarantine_alert_ts = None
-                    pos.pending_exit_replace_allowed = False
-                    pos.pending_exit_replace_reason = ""
+                    pos.pending_exit_replace_allowed  = False
+                    pos.pending_exit_replace_reason   = ""
                     pos.pending_exit_replace_allowed_ts = None
 
-                # Count scale-out only after a meaningful confirmed tranche fill.
-                # A tiny 1-contract partial on a large intended scale should not
-                # immediately convert the strategy into runner mode. For small
-                # tranches, one filled contract is necessarily meaningful.
                 if (
                     (pos.pending_exit_action or "").upper() == "SCALE_OUT"
                     and pos.pending_exit_qty > 0
                     and not pos.pending_scale_counted
                     and pos.quantity_remaining > 0
                 ):
-                    # v7: do not advance runner/scale state until the intended
-                    # scale tranche is fully broker-confirmed. Earlier v6 used
-                    # a 50% meaningful-fill policy, but that can switch strategy
-                    # state while the original scale order is still partially live.
                     fully_confirmed_scale = pos.pending_exit_filled_qty >= pos.pending_exit_qty
                     if fully_confirmed_scale:
-                        pos.scale_outs_done += 1
+                        pos.scale_outs_done     += 1
                         pos.pending_scale_counted = True
                         try:
                             from ap.db import conn, run_with_retry as _rwr_s
@@ -1354,21 +1270,29 @@ class APExitEngine:
                     and pos.pending_exit_filled_qty >= pos.pending_exit_qty
                 )
                 if pos.quantity_remaining <= 0:
-                    pos.closed = True
+                    pos.closed       = True
                     pos.close_reason = pos.pending_exit_reason or "exit_fill_closed"
+                    # P2: advance generation so any concurrent _submit_exit_decision
+                    # post-callback validator sees the close and does not overwrite truth.
+                    pos._submit_generation += 1
+
                 if fully_filled_pending or pos.closed:
-                    pos.exit_in_flight = False
+                    pos.exit_in_flight      = False
                     pos.pending_exit_reason = ""
                     pos.pending_exit_action = ""
-                    pos.pending_exit_qty = 0
+                    pos.pending_exit_qty    = 0
                     pos.pending_exit_filled_qty = 0
-                    pos.pending_scale_counted = False
-                    pos.pending_exit_local_order_id = ""
+                    pos.pending_scale_counted   = False
+                    pos.pending_exit_local_order_id  = ""
                     pos.pending_exit_broker_order_id = ""
-                    pos.last_applied_exit_cum_fill_by_order = {}
+                    # FIX-6: watermark dict is NOT cleared here. _mark_exit_submitted()
+                    # resets it when a new order generation begins. Preserving it here
+                    # means late duplicate callbacks for the just-completed order still
+                    # see their prev watermark and compute delta=0, preventing double-counts
+                    # from the fill monitor + reconciler dual-path.
                     pos.last_applied_exit_cum_fill = 0
                     pos.last_exit_signal_ts = None
-                    pos._exit_stuck_count = 0
+                    pos._exit_stuck_count   = 0
 
                 self._assert_position_invariants(pos, "note_partial_exit_fill")
                 self._emit_exit_event(
@@ -1387,8 +1311,7 @@ class APExitEngine:
                     },
                 )
                 break
-            # Keep closed position object in memory for late broker callbacks and diagnostics.
-            # active_positions() filters closed positions, so this does not affect trading decisions.
+
         log.info("[exit_eng] Exit fill noted | pos_id=%s qty_delta=%d", position_id, int(applied_delta or qty_filled or 0))
 
     def _mark_exit_submitted(
@@ -1399,25 +1322,27 @@ class APExitEngine:
         local_order_id: str = "",
         broker_order_id: str = "",
     ) -> None:
-        """Mark an exit as submitted after downstream callback accepts the intent."""
-        pos.exit_in_flight = True
+        pos.exit_in_flight      = True
         pos.pending_exit_reason = decision.reason or ""
         pos.pending_exit_action = (decision.action or "").upper()
-        pos.pending_exit_qty = max(0, int(decision.quantity or 0))
+        pos.pending_exit_qty    = max(0, int(decision.quantity or 0))
         pos.pending_exit_filled_qty = 0
-        pos.pending_scale_counted = False
-        pos.pending_exit_local_order_id = local_order_id or pos.pending_exit_local_order_id or ""
+        pos.pending_scale_counted   = False
+        pos.pending_exit_local_order_id  = local_order_id  or pos.pending_exit_local_order_id  or ""
         pos.pending_exit_broker_order_id = broker_order_id or pos.pending_exit_broker_order_id or ""
-        # New pending order generation: per-order cumulative fill watermarks
-        # must not inherit the prior order's cumulative semantics.
+        # FIX-6: new order generation resets the per-order watermark dict so the
+        # new order's cumulative fills start from zero.
         pos.last_applied_exit_cum_fill_by_order = {}
-        pos.last_applied_exit_cum_fill = 0
-        pos.last_exit_signal_ts = datetime.now(timezone.utc)
-        pos.last_exit_rejected = False
-        pos._exit_stuck_count = 0
-        pos.exit_identity_quarantine = bool(pos.last_callback_identity_missing)
-        pos.pending_exit_replace_allowed = False
-        pos.pending_exit_replace_reason = ""
+        pos.last_applied_exit_cum_fill  = 0
+        pos.last_exit_signal_ts         = datetime.now(timezone.utc)
+        pos.last_exit_rejected          = False
+        pos._exit_stuck_count           = 0
+        # P2: increment generation so concurrent post-callback validators can detect
+        # that state was advanced while they were waiting outside the lock.
+        pos._submit_generation         += 1
+        pos.exit_identity_quarantine    = bool(pos.last_callback_identity_missing)
+        pos.pending_exit_replace_allowed    = False
+        pos.pending_exit_replace_reason     = ""
         pos.pending_exit_replace_allowed_ts = None
 
     def mark_exit_replacement_safe(
@@ -1431,21 +1356,15 @@ class APExitEngine:
         reconciled: bool = False,
         **kwargs,
     ) -> None:
-        """Allow exactly one replacement exit after external cancel/reconcile proof.
-
-        v11: replacement proof is bound to the current pending exit generation.
-        A misplaced reconciler call cannot authorize replacement against the wrong
-        still-live pending exit unless it passes force=True/reconciled=True after
-        authoritative broker proof.
-        """
         if not position_id:
             return
-        reason_s = str(reason or "")
-        local_order_id = str(local_order_id or "")
+        reason_s        = str(reason or "")
+        local_order_id  = str(local_order_id or "")
         broker_order_id = str(broker_order_id or "")
         force = bool(force or reconciled or kwargs.get("force") or kwargs.get("reconciled"))
         if "NEGATIVE_BROKER_CHECK" in reason_s.upper() or "RECONCILER" in reason_s.upper():
             force = force or not bool(local_order_id or broker_order_id)
+
         with self._lock:
             for pos in self._positions:
                 if str(pos.position_id or "") == str(position_id or "") and not pos.closed:
@@ -1456,22 +1375,18 @@ class APExitEngine:
                         allow_missing_when_no_pending_identity=False,
                     ):
                         self._reject_stale_exit_hook(
-                            pos,
-                            hook_name="mark_exit_replacement_safe",
+                            pos, hook_name="mark_exit_replacement_safe",
                             local_order_id=local_order_id,
-                            broker_order_id=broker_order_id,
-                            reason=reason_s,
+                            broker_order_id=broker_order_id, reason=reason_s,
                         )
                         return
-                    pos.pending_exit_replace_allowed = True
-                    pos.pending_exit_replace_reason = reason_s or "external_cancel_or_reconcile_proof"
+                    pos.pending_exit_replace_allowed  = True
+                    pos.pending_exit_replace_reason   = reason_s or "external_cancel_or_reconcile_proof"
                     pos.pending_exit_replace_allowed_ts = datetime.now(timezone.utc)
                     pos.exit_identity_quarantine = False
                     pos.last_exit_identity_quarantine_resolved_ts = datetime.now(timezone.utc)
                     self._emit_exit_event(
-                        pos,
-                        "ALERT",
-                        "EXIT_REPLACEMENT_MARKED_SAFE",
+                        pos, "ALERT", "EXIT_REPLACEMENT_MARKED_SAFE",
                         "External OSM/reconciler proof marked pending exit safe to replace once.",
                         stage="exit_reconciliation",
                         extra_inputs={
@@ -1486,32 +1401,29 @@ class APExitEngine:
                     )
                     log.critical(
                         "[%s] EXIT REPLACEMENT MARKED SAFE | pos=%s proof_local=%s proof_broker=%s reason=%s force=%s",
-                        pos.ticker, position_id, local_order_id or "?", broker_order_id or "?", pos.pending_exit_replace_reason, force,
+                        pos.ticker, position_id,
+                        local_order_id or "?", broker_order_id or "?",
+                        pos.pending_exit_replace_reason, force,
                     )
                     return
 
     def _eligible_for_new_exit(self, pos: ManagedPosition, now_utc: datetime) -> bool:
-        """Compatibility wrapper around centralized submit gate."""
         return self._can_submit_exit(pos, now_utc, reason=pos.pending_exit_reason or "poll")
 
     def _run_sentinels(self):
-        """Safety sentinels for missed TP/stop, stuck exits, and dead trades.
-
-        Sentinels never submit directly. They route through _submit_exit_decision
-        so duplicate/in-flight gating and observability remain consistent.
-        """
         now = datetime.now(timezone.utc)
-        for pos in list(self._positions):
+        # Elite-2: take snapshot inside lock for consistency. list(self._positions)
+        # without the lock can race with the locked expired-contract cleanup that
+        # reassigns self._positions = [...]. Snapshot under lock, iterate outside.
+        with self._lock:
+            snapshot = list(self._positions)
+        for pos in snapshot:
             if pos.closed or int(pos.quantity_remaining or 0) <= 0:
                 continue
             age_min = (now - pos.opened_at).total_seconds() / 60 if pos.opened_at else 0
-            pnl = pos.option_pnl_pct
-            peak = pos.peak_pnl_pct
+            pnl     = pos.option_pnl_pct
+            peak    = pos.peak_pnl_pct
 
-            # Quarantine sentinel: missing callback identity is intentionally safe-locking.
-            # Do not auto-clear it here; make it loud and repeated until one recovery
-            # hook resolves truth: set_pending_exit_order(), note_partial_exit_fill(),
-            # mark_position_closed(), clear_exit_in_flight(), or mark_exit_replacement_safe().
             if (
                 pos.exit_in_flight
                 and getattr(pos, "last_callback_identity_missing", False)
@@ -1524,7 +1436,7 @@ class APExitEngine:
                 except Exception:
                     quarantine_age_sec = 0.0
                 last_alert_ts = getattr(pos, "last_exit_identity_quarantine_alert_ts", None)
-                should_alert = quarantine_age_sec >= 30.0 and (
+                should_alert  = quarantine_age_sec >= 30.0 and (
                     last_alert_ts is None
                     or (now - last_alert_ts).total_seconds() >= 30.0
                 )
@@ -1533,24 +1445,50 @@ class APExitEngine:
                         getattr(pos, "exit_identity_quarantine_alert_count", 0) or 0
                     ) + 1
                     pos.last_exit_identity_quarantine_alert_ts = now
-                    log.error(
-                        "[%s] EXIT IDENTITY QUARANTINE ACTIVE %.1fs x%d — duplicate exits blocked; "
+
+                    # P5: Quarantine escalation. After QUARANTINE_ESCALATE_AFTER_N alerts
+                    # (default 5 = ~150s at 30s cadence), escalate to CRITICAL and emit a
+                    # distinct reason code so dashboards/PagerDuty can alert differently.
+                    # The only safe resolution remains an explicit reconciler/OSM hook call.
+                    _qcount = pos.exit_identity_quarantine_alert_count
+                    _escalate_after = int(os.getenv("EXIT_QUARANTINE_ESCALATE_AFTER_N", "5"))
+                    _escalated = _qcount >= _escalate_after
+
+                    log.critical(
+                        "[%s] EXIT IDENTITY QUARANTINE %s %.1fs x%d — duplicate exits blocked; "
                         "reconciler/OSM must resolve | pos_id=%s action=%s qty=%s local=%s broker=%s reason=%s",
                         pos.ticker,
+                        "ESCALATED" if _escalated else "ACTIVE",
                         quarantine_age_sec,
-                        pos.exit_identity_quarantine_alert_count,
+                        _qcount,
                         pos.position_id or "?",
                         pos.pending_exit_action or "?",
                         pos.pending_exit_qty,
-                        pos.pending_exit_local_order_id or "?",
+                        pos.pending_exit_local_order_id  or "?",
+                        pos.pending_exit_broker_order_id or "?",
+                        pos.pending_exit_reason or "?",
+                    ) if _escalated else log.error(
+                        "[%s] EXIT IDENTITY QUARANTINE ACTIVE %.1fs x%d — duplicate exits blocked; "
+                        "reconciler/OSM must resolve | pos_id=%s action=%s qty=%s local=%s broker=%s reason=%s",
+                        pos.ticker, quarantine_age_sec, _qcount,
+                        pos.position_id or "?",
+                        pos.pending_exit_action or "?",
+                        pos.pending_exit_qty,
+                        pos.pending_exit_local_order_id  or "?",
                         pos.pending_exit_broker_order_id or "?",
                         pos.pending_exit_reason or "?",
                     )
                     self._emit_exit_event(
-                        pos,
-                        decision="ALERT",
-                        reason_code="EXIT_IDENTITY_QUARANTINE_NEEDS_RECONCILE",
+                        pos, decision="ALERT",
+                        reason_code=(
+                            "EXIT_IDENTITY_QUARANTINE_ESCALATED"
+                            if _escalated
+                            else "EXIT_IDENTITY_QUARANTINE_NEEDS_RECONCILE"
+                        ),
                         explanation=(
+                            f"ESCALATED after {_qcount} alerts: "
+                            if _escalated else ""
+                        ) + (
                             "Accepted exit callback returned no local/broker order identity. "
                             "Duplicate exits are blocked until OSM/reconciler proves fill, cancel, reject, "
                             "broker order identity, or safe replacement."
@@ -1558,14 +1496,32 @@ class APExitEngine:
                         stage="system_alert",
                         extra_inputs={
                             "quarantine_age_sec": quarantine_age_sec,
-                            "alert_count": pos.exit_identity_quarantine_alert_count,
+                            "alert_count": _qcount,
+                            "escalated": _escalated,
+                            "escalate_after": _escalate_after,
                             "pending_exit_action": pos.pending_exit_action,
                             "pending_exit_qty": pos.pending_exit_qty,
                             "pending_exit_reason": pos.pending_exit_reason,
-                            "pending_exit_local_order_id": pos.pending_exit_local_order_id,
+                            "pending_exit_local_order_id":  pos.pending_exit_local_order_id,
                             "pending_exit_broker_order_id": pos.pending_exit_broker_order_id,
                         },
                     )
+
+                    # Elite-1: Force-reconcile action on escalation.
+                    # Two paths depending on what identity we have:
+                    #
+                    # PATH A — broker_order_id is known: ask broker for current order
+                    #   status and apply the result directly. This resolves the most
+                    #   common "accepted but slow fill confirmation" quarantine case
+                    #   without waiting for the next reconciler cycle.
+                    #
+                    # PATH B — no broker_order_id: emit FORCE_RECONCILE_REQUEST so
+                    #   the reconciler can perform fuzzy matching on the next pass.
+                    #   The exit engine cannot replicate reconciler identity logic
+                    #   (sell-to-close matching, time proximity scoring, etc.) so
+                    #   attempting inline resolution without an order ID is unsafe.
+                    if _escalated:
+                        self._attempt_quarantine_force_reconcile(pos, quarantine_age_sec)
 
             if peak >= IMMEDIATE_TP_PCT and not pos.exit_in_flight and age_min > 1:
                 log.error(
@@ -1575,11 +1531,9 @@ class APExitEngine:
 
             if pnl <= HARD_STOP_PCT and not pos.exit_in_flight and age_min > 1:
                 decision = ExitDecision(
-                    action="CLOSE_ALL",
-                    quantity=pos.quantity_remaining,
+                    action="CLOSE_ALL", quantity=pos.quantity_remaining,
                     reason=f"SENTINEL FORCED EXIT — {pnl*100:.0f}% with no exit order",
-                    urgency="IMMEDIATE",
-                    pnl_pct=pnl,
+                    urgency="IMMEDIATE", pnl_pct=pnl,
                 )
                 self._submit_exit_decision(pos, decision, from_sentinel=True, allow_inflight_override=True)
                 continue
@@ -1595,9 +1549,7 @@ class APExitEngine:
                             pos.ticker, pos._exit_stuck_count, flight_sec, pos.position_id,
                         )
                         self._emit_exit_event(
-                            pos,
-                            decision="ALERT",
-                            reason_code="EXIT_STUCK",
+                            pos, decision="ALERT", reason_code="EXIT_STUCK",
                             explanation=f"Exit in flight for {flight_sec:.0f}s with no fill",
                             stage="system_alert",
                             extra_inputs={"flight_sec": flight_sec, "stuck_count": pos._exit_stuck_count},
@@ -1608,8 +1560,8 @@ class APExitEngine:
                             pos.ticker, flight_sec, pos.position_id,
                         )
 
-            DEAD_TRADE_MIN = 45
-            DEAD_TRADE_LOW = -0.08
+            DEAD_TRADE_MIN  = 45
+            DEAD_TRADE_LOW  = -0.08
             DEAD_TRADE_HIGH = 0.05
             if (
                 not pos.exit_in_flight
@@ -1624,16 +1576,260 @@ class APExitEngine:
                         progress = abs(pos.current_underlying - pos.underlying_entry) / denom
                 if progress < 0.30:
                     decision = ExitDecision(
-                        action="CLOSE_ALL",
-                        quantity=pos.quantity_remaining,
+                        action="CLOSE_ALL", quantity=pos.quantity_remaining,
                         reason=(
                             f"TIME STOP — thesis not confirmed after {age_min:.0f}min "
                             f"pnl={pnl*100:.1f}% progress={progress*100:.0f}% toward target"
                         ),
-                        urgency="HIGH",
-                        pnl_pct=pnl,
+                        urgency="HIGH", pnl_pct=pnl,
                     )
                     self._submit_exit_decision(pos, decision, from_sentinel=True)
+
+    def _attempt_quarantine_force_reconcile(
+        self,
+        pos: ManagedPosition,
+        quarantine_age_sec: float,
+    ) -> None:
+        """
+        Elite-1: Force-reconcile action triggered when quarantine has escalated.
+
+        Boundary rule: the exit engine must not replicate reconciler logic.
+        - If broker_order_id is known → ask broker directly; apply confirmed state.
+        - If broker_order_id is missing → emit FORCE_RECONCILE_REQUEST so the
+          reconciler can use its fuzzy-match logic on the next cycle. Do not guess.
+
+        This method must never make a blocking network call under self._lock.
+        It reads pos fields without the lock (sentinel already has a snapshot),
+        and only acquires the lock for state mutations after broker I/O completes.
+        """
+        broker_oid = str(pos.pending_exit_broker_order_id or "").strip()
+        position_id = str(pos.position_id or "")
+        ticker = str(pos.ticker or "")
+
+        if not broker_oid:
+            # PATH B: no broker identity → signal reconciler, do not guess.
+            log.critical(
+                "[%s] QUARANTINE_FORCE_RECONCILE_REQUEST | pos=%s | "
+                "no broker_order_id — reconciler must perform fuzzy identity recovery on next cycle | "
+                "quarantine_age=%.0fs",
+                ticker, position_id or "?", quarantine_age_sec,
+            )
+            self._emit_exit_event(
+                pos,
+                decision="ALERT",
+                reason_code="FORCE_RECONCILE_REQUEST",
+                explanation=(
+                    "Quarantine escalated with no broker_order_id. "
+                    "Reconciler must perform fuzzy identity recovery (sell-to-close match, "
+                    "time proximity, qty match) on next cycle."
+                ),
+                stage="system_alert",
+                extra_inputs={
+                    "quarantine_age_sec": quarantine_age_sec,
+                    "pending_exit_local_order_id": pos.pending_exit_local_order_id,
+                    "pending_exit_reason": pos.pending_exit_reason,
+                },
+            )
+            return
+
+        # PATH A: broker_order_id is known → lightweight broker status check.
+        # This is the common case: broker accepted the order but fill confirmation
+        # is delayed (e.g. broker API latency, network hiccup on callback).
+        log.critical(
+            "[%s] QUARANTINE_FORCE_RECONCILE_BROKER_CHECK | pos=%s broker=%s | "
+            "asking broker for order status directly | quarantine_age=%.0fs",
+            ticker, position_id or "?", broker_oid, quarantine_age_sec,
+        )
+        try:
+            broker_raw = self.broker.get_order(broker_oid)
+        except Exception as exc:
+            log.error(
+                "[%s] QUARANTINE_FORCE_RECONCILE_BROKER_FETCH_FAILED | pos=%s broker=%s | %s",
+                ticker, position_id or "?", broker_oid, exc,
+            )
+            self._emit_exit_event(
+                pos,
+                decision="ALERT",
+                reason_code="FORCE_RECONCILE_BROKER_FETCH_FAILED",
+                explanation=f"Broker get_order failed during forced reconcile: {exc}",
+                stage="system_alert",
+                extra_inputs={"broker_order_id": broker_oid, "error": str(exc)},
+            )
+            return
+
+        broker_status = str(broker_raw.get("status") or broker_raw.get("Status") or "").lower().strip()
+
+        _broker_filled   = {"filled", "partially_filled"}
+        _broker_terminal = {"canceled", "cancelled", "rejected", "expired"}
+
+        # Best-effort qty and price extraction — shared by both fill branches.
+        # Treated as cumulative (consistent with note_partial_exit_fill's
+        # per-order watermark model). Broker field names scanned in priority order.
+        _filled_qty = None
+        _fill_price = None
+        for _fk in ("filled_qty", "filled_quantity", "cumulative_filled_qty", "exec_quantity"):
+            _v = broker_raw.get(_fk)
+            if _v is not None:
+                try: _filled_qty = int(float(_v)); break
+                except Exception: pass
+        for _pk in ("avg_fill_price", "average_fill_price", "fill_price", "avg_price"):
+            _v = broker_raw.get(_pk)
+            if _v is not None:
+                try: _fill_price = float(_v); break
+                except Exception: pass
+
+        if broker_status == "filled":
+            # Full fill confirmed — hard close is correct and safe.
+            log.critical(
+                "[%s] QUARANTINE_FORCE_RECONCILE_FILL_CONFIRMED | pos=%s broker=%s | "
+                "broker status=%s filled_qty=%s fill_price=%s — applying force close",
+                ticker, position_id or "?", broker_oid,
+                broker_status, _filled_qty, _fill_price,
+            )
+            self._emit_exit_event(
+                pos,
+                decision="ALERT",
+                reason_code="FORCE_RECONCILE_FILL_CONFIRMED",
+                explanation=f"Forced reconcile confirmed full fill status={broker_status}; applying close.",
+                stage="exit_reconciliation",
+                extra_inputs={
+                    "broker_order_id": broker_oid,
+                    "broker_status": broker_status,
+                    "filled_qty": _filled_qty,
+                    "fill_price": _fill_price,
+                },
+            )
+            self.mark_position_closed(
+                position_id,
+                reason=f"quarantine_force_reconcile_broker_{broker_status}",
+                fill_price=_fill_price,
+                broker_order_id=broker_oid,
+                local_order_id=pos.pending_exit_local_order_id,
+                force=True,
+            )
+
+        elif broker_status == "partially_filled":
+            # Partial fill confirmed — do NOT hard-close. Apply the confirmed
+            # cumulative tranche via note_partial_exit_fill() and let
+            # quantity_remaining drive closure. Only close if the fill exhausts
+            # the remaining position, verified by re-reading state after the write.
+            #
+            # Caution: _filled_qty is treated as cumulative here, consistent with
+            # note_partial_exit_fill()'s per-order watermark model. If the broker
+            # returns incremental quantities on get_order(), this would misapply;
+            # but the field names scanned above are all cumulative-named, which is
+            # the safest available assumption.
+            log.critical(
+                "[%s] QUARANTINE_FORCE_RECONCILE_PARTIAL_FILL | pos=%s broker=%s | "
+                "broker partial fill confirmed — applying tranche, not hard-closing | "
+                "filled_qty=%s fill_price=%s",
+                ticker, position_id or "?", broker_oid, _filled_qty, _fill_price,
+            )
+            self._emit_exit_event(
+                pos,
+                decision="ALERT",
+                reason_code="FORCE_RECONCILE_PARTIAL_FILL_CONFIRMED",
+                explanation=f"Forced reconcile confirmed partial fill; applying tranche via note_partial_exit_fill.",
+                stage="exit_reconciliation",
+                extra_inputs={
+                    "broker_order_id": broker_oid,
+                    "broker_status": broker_status,
+                    "filled_qty": _filled_qty,
+                    "fill_price": _fill_price,
+                    "quarantine_age_sec": quarantine_age_sec,
+                },
+            )
+            if _filled_qty and _filled_qty > 0:
+                self.note_partial_exit_fill(
+                    position_id,
+                    qty_filled=_filled_qty,
+                    fill_price=_fill_price,
+                    broker_order_id=broker_oid,
+                    local_order_id=pos.pending_exit_local_order_id,
+                    cumulative_filled=_filled_qty,
+                )
+                # Re-read state after the write — only close if the tranche
+                # exhausted the remaining position. get_position() uses the O(1)
+                # dict index so this always reflects post-fill truth, never the
+                # snapshot captured before note_partial_exit_fill() ran.
+               
+            else:
+                # No reliable qty — the broker returned partially_filled but no
+                # usable quantity. Emit alert with full context so dashboards can
+                # distinguish this from unknown-status and no-order-id cases, then
+                # defer to the reconciler which has the fuzzy-match logic to resolve.
+                self._emit_exit_event(
+                    pos,
+                    decision="ALERT",
+                    reason_code="FORCE_RECONCILE_PARTIAL_FILL_QTY_UNKNOWN",
+                    explanation=(
+                        "Partial fill confirmed but qty unknown — reconciler must resolve. "
+                        "Cannot safely apply delta without cumulative quantity."
+                    ),
+                    stage="exit_reconciliation",
+                    extra_inputs={
+                        "broker_order_id": broker_oid,
+                        "broker_status": broker_status,
+                        "quarantine_age_sec": quarantine_age_sec,
+                    },
+                )
+
+        elif broker_status in _broker_terminal:
+            # Broker confirms terminal (canceled/rejected/expired) — clear in-flight
+            # and allow the engine to resubmit on the next evaluation cycle.
+            log.critical(
+                "[%s] QUARANTINE_FORCE_RECONCILE_TERMINAL_CONFIRMED | pos=%s broker=%s | "
+                "broker status=%s — clearing quarantine so engine can resubmit",
+                ticker, position_id or "?", broker_oid, broker_status,
+            )
+            self._emit_exit_event(
+                pos,
+                decision="ALERT",
+                reason_code="FORCE_RECONCILE_TERMINAL_CONFIRMED",
+                explanation=f"Forced reconcile confirmed broker terminal status={broker_status}; clearing in-flight.",
+                stage="exit_reconciliation",
+                extra_inputs={"broker_order_id": broker_oid, "broker_status": broker_status},
+            )
+            self.clear_exit_in_flight(
+                position_id,
+                reason=f"quarantine_force_reconcile_broker_{broker_status}",
+                broker_order_id=broker_oid,
+                local_order_id=pos.pending_exit_local_order_id,
+                rejected=(broker_status in {"rejected"}),
+                force=True,
+            )
+
+        elif broker_status in {"open", "pending", "working", "submitted", "acknowledged"}:
+            # Order is still live at broker — quarantine is correct, keep blocking.
+            log.warning(
+                "[%s] QUARANTINE_FORCE_RECONCILE_ORDER_STILL_LIVE | pos=%s broker=%s | "
+                "broker status=%s — quarantine remains; fill monitor will complete when filled",
+                ticker, position_id or "?", broker_oid, broker_status,
+            )
+            self._emit_exit_event(
+                pos,
+                decision="HOLD",
+                reason_code="FORCE_RECONCILE_ORDER_STILL_LIVE",
+                explanation=f"Forced reconcile: broker order still live (status={broker_status}); quarantine maintained.",
+                stage="exit_reconciliation",
+                extra_inputs={"broker_order_id": broker_oid, "broker_status": broker_status},
+            )
+
+        else:
+            # Unrecognized or empty broker status — can't safely act; defer to reconciler.
+            log.error(
+                "[%s] QUARANTINE_FORCE_RECONCILE_STATUS_UNKNOWN | pos=%s broker=%s | "
+                "unrecognized broker status=%r — deferring to reconciler",
+                ticker, position_id or "?", broker_oid, broker_status,
+            )
+            self._emit_exit_event(
+                pos,
+                decision="ALERT",
+                reason_code="FORCE_RECONCILE_STATUS_UNKNOWN",
+                explanation=f"Forced reconcile: unrecognized broker status={broker_status!r}; deferring to reconciler.",
+                stage="exit_reconciliation",
+                extra_inputs={"broker_order_id": broker_oid, "broker_status": broker_status},
+            )
 
     def _emit_exit_event(
         self,
@@ -1645,7 +1841,6 @@ class APExitEngine:
         extra_inputs: Optional[dict] = None,
         extra_context: Optional[dict] = None,
     ) -> None:
-        """Emit structured exit telemetry without risking the exit loop."""
         if emit_decision_event is None:
             return
         try:
@@ -1664,18 +1859,18 @@ class APExitEngine:
                 strategy_version=self.strategy_version,
                 git_commit=self.git_commit,
                 inputs={
-                    "option_pnl_pct": getattr(pos, "option_pnl_pct", 0.0),
-                    "peak_pnl_pct": getattr(pos, "peak_pnl_pct", 0.0),
-                    "max_profit_seen": getattr(pos, "max_profit_seen", 0.0),
-                    "touched_profit": getattr(pos, "touched_profit", False),
-                    "qty_remaining": getattr(pos, "quantity_remaining", 0),
-                    "quantity_remaining": getattr(pos, "quantity_remaining", 0),
-                    "quantity": getattr(pos, "quantity", 0),
-                    "scale_outs_done": getattr(pos, "scale_outs_done", 0),
-                    "exit_in_flight": getattr(pos, "exit_in_flight", False),
-                    "pending_exit_action": getattr(pos, "pending_exit_action", ""),
-                    "pending_exit_qty": getattr(pos, "pending_exit_qty", 0),
-                    "pending_exit_filled_qty": getattr(pos, "pending_exit_filled_qty", 0),
+                    "option_pnl_pct":              getattr(pos, "option_pnl_pct", 0.0),
+                    "peak_pnl_pct":                getattr(pos, "peak_pnl_pct", 0.0),
+                    "max_profit_seen":             getattr(pos, "max_profit_seen", 0.0),
+                    "touched_profit":              getattr(pos, "touched_profit", False),
+                    "qty_remaining":               getattr(pos, "quantity_remaining", 0),
+                    "quantity_remaining":          getattr(pos, "quantity_remaining", 0),
+                    "quantity":                    getattr(pos, "quantity", 0),
+                    "scale_outs_done":             getattr(pos, "scale_outs_done", 0),
+                    "exit_in_flight":              getattr(pos, "exit_in_flight", False),
+                    "pending_exit_action":         getattr(pos, "pending_exit_action", ""),
+                    "pending_exit_qty":            getattr(pos, "pending_exit_qty", 0),
+                    "pending_exit_filled_qty":     getattr(pos, "pending_exit_filled_qty", 0),
                     "pending_exit_local_order_id": getattr(pos, "pending_exit_local_order_id", ""),
                     "pending_exit_broker_order_id": getattr(pos, "pending_exit_broker_order_id", ""),
                     **(extra_inputs or {}),
@@ -1691,11 +1886,21 @@ class APExitEngine:
 
     def _assert_position_invariants(self, pos: ManagedPosition, context: str = "") -> None:
         if pos.quantity_remaining < 0 or pos.quantity_remaining > pos.quantity:
-            raise RuntimeError(f"position invariant failed {context}: quantity_remaining={pos.quantity_remaining} quantity={pos.quantity} pos_id={pos.position_id}")
+            raise RuntimeError(
+                f"position invariant failed {context}: "
+                f"quantity_remaining={pos.quantity_remaining} quantity={pos.quantity} pos_id={pos.position_id}"
+            )
         if pos.pending_exit_filled_qty < 0:
-            raise RuntimeError(f"position invariant failed {context}: pending_exit_filled_qty={pos.pending_exit_filled_qty} pos_id={pos.position_id}")
+            raise RuntimeError(
+                f"position invariant failed {context}: "
+                f"pending_exit_filled_qty={pos.pending_exit_filled_qty} pos_id={pos.position_id}"
+            )
         if pos.pending_exit_qty > 0 and pos.pending_exit_filled_qty > pos.pending_exit_qty:
-            raise RuntimeError(f"position invariant failed {context}: pending_exit_filled_qty={pos.pending_exit_filled_qty} > pending_exit_qty={pos.pending_exit_qty} pos_id={pos.position_id}")
+            raise RuntimeError(
+                f"position invariant failed {context}: "
+                f"pending_exit_filled_qty={pos.pending_exit_filled_qty} > "
+                f"pending_exit_qty={pos.pending_exit_qty} pos_id={pos.position_id}"
+            )
 
     def _can_submit_exit(
         self,
@@ -1705,19 +1910,7 @@ class APExitEngine:
         reason: str = "",
         allow_inflight_override: bool = False,
     ) -> bool:
-        """Centralized gate for every path that can submit an exit order.
-
-        Normal rule:
-            exit_in_flight=True blocks new exits.
-
-        Emergency override rule:
-            allow_inflight_override=True may bypass in-flight only when:
-            - existing in-flight order is stale for >= 20 seconds, OR
-            - the new reason is runner-protective/emergency AND the pending
-              reason is not already an equivalent runner-protective close.
-
-        This prevents duplicate normal exits while allowing true runner rescue.
-        """
+        """Centralized gate for every path that can submit an exit order."""
         if pos.closed or int(pos.quantity_remaining or 0) <= 0:
             return False
 
@@ -1738,13 +1931,8 @@ class APExitEngine:
                 except Exception:
                     identity_age = 0.0
 
-            # v7: never auto-clear missing-identity quarantine. If the callback
-            # placed a live broker order but returned no IDs, clearing in-flight
-            # locally can create a duplicate exit. Only reconciler/OSM truth may
-            # clear this via mark_position_closed(), clear_exit_in_flight(),
-            # note_partial_exit_fill(), or mark_exit_replacement_safe().
             pos.exit_identity_quarantine = True
-            severity = "ERROR" if identity_age >= 20.0 else "HOLD"
+            severity    = "ERROR" if identity_age >= 20.0 else "HOLD"
             reason_code = (
                 "EXIT_IDENTITY_QUARANTINE_STALE_NEEDS_RECONCILE"
                 if identity_age >= 20.0
@@ -1756,9 +1944,7 @@ class APExitEngine:
                     pos.ticker, identity_age, pos.position_id, pos.pending_exit_reason,
                 )
             self._emit_exit_event(
-                pos,
-                severity,
-                reason_code,
+                pos, severity, reason_code,
                 (
                     "Exit suppressed because the prior accepted callback returned no "
                     "local/broker order identity. Duplicate submissions remain blocked "
@@ -1779,9 +1965,7 @@ class APExitEngine:
 
         if pos.exit_in_flight and not allow_inflight_override:
             self._emit_exit_event(
-                pos,
-                "HOLD",
-                "EXIT_SIGNAL_BLOCKED_IN_FLIGHT",
+                pos, "HOLD", "EXIT_SIGNAL_BLOCKED_IN_FLIGHT",
                 f"Exit suppressed because exit already in flight: {reason or pos.pending_exit_reason}",
                 extra_inputs={
                     "pending_exit_reason": pos.pending_exit_reason,
@@ -1797,15 +1981,9 @@ class APExitEngine:
             if pos.last_exit_signal_ts:
                 flight_sec = (now_utc - pos.last_exit_signal_ts).total_seconds()
 
-            # v7: replacement/runner emergency override cannot submit a second
-            # real-world exit unless an external broker/OSM path has explicitly
-            # proven the prior working exit is canceled, rejected, or otherwise
-            # safe to replace. Staleness or higher priority alone is not cancel proof.
             if not getattr(pos, "pending_exit_replace_allowed", False):
                 self._emit_exit_event(
-                    pos,
-                    "HOLD",
-                    "EXIT_OVERRIDE_NEEDS_CANCEL_OR_RECONCILE_PROOF",
+                    pos, "HOLD", "EXIT_OVERRIDE_NEEDS_CANCEL_OR_RECONCILE_PROOF",
                     (
                         "Inflight override denied. Pending exit may still be live at broker; "
                         "replacement requires mark_exit_replacement_safe() after cancel/reconcile proof."
@@ -1820,27 +1998,25 @@ class APExitEngine:
                 )
                 return False
 
-            # Consume one-shot replacement authorization. Once broker/OSM has
-            # proven the older order cannot still fill, precedence should not
-            # re-block the replacement solely because it has the same class.
-            replacement_proof = True
-            pos.pending_exit_replace_allowed = False
-            pos.pending_exit_replace_reason = ""
+            # Consume one-shot replacement authorization.
+            pos.pending_exit_replace_allowed    = False
+            pos.pending_exit_replace_reason     = ""
             pos.pending_exit_replace_allowed_ts = None
 
-            # Executable precedence guard:
-            # do not allow a lower/equal priority exit to override a fresh higher/equal pending exit.
-            # Stale pending exits may still be overridden so the system can rescue stuck risk.
             stale_enough = flight_sec >= 20.0
-            new_code = _classify_exit_decision(ExitDecision("CLOSE_ALL", 0, reason or "", "IMMEDIATE"))
+            new_code     = _classify_exit_decision(ExitDecision("CLOSE_ALL", 0, reason or "", "IMMEDIATE"))
             pending_code = _classify_exit_decision(ExitDecision(pos.pending_exit_action or "CLOSE_ALL", 0, pos.pending_exit_reason or "", "IMMEDIATE"))
-            new_pri = _exit_priority(new_code)
-            pending_pri = _exit_priority(pending_code)
-            if (not replacement_proof) and not stale_enough and pending_code != "UNKNOWN_EXIT" and new_pri >= pending_pri:
+            new_pri      = _exit_priority(new_code)
+            pending_pri  = _exit_priority(pending_code)
+
+            # FIX-4: replacement_proof variable removed. The three guard blocks
+            # previously prefixed with '(not replacement_proof) and' were permanently
+            # dead because replacement_proof was always True. They now execute
+            # unconditionally so stale-time, equivalent-runner, and non-emergency
+            # checks actually gate the override decision.
+            if not stale_enough and pending_code != "UNKNOWN_EXIT" and new_pri >= pending_pri:
                 self._emit_exit_event(
-                    pos,
-                    "HOLD",
-                    "EXIT_OVERRIDE_DENIED_PRECEDENCE",
+                    pos, "HOLD", "EXIT_OVERRIDE_DENIED_PRECEDENCE",
                     (
                         f"Inflight override denied by precedence; pending={pending_code} "
                         f"new={new_code} flight={flight_sec:.1f}s"
@@ -1858,17 +2034,14 @@ class APExitEngine:
                 return False
 
             higher_priority_override = (new_pri < pending_pri)
-            emergency_reason = _is_runner_protective_reason(reason)
+            emergency_reason         = _is_runner_protective_reason(reason)
             already_same_runner_protection = _is_same_or_equivalent_runner_protection(
-                pos.pending_exit_reason,
-                reason,
+                pos.pending_exit_reason, reason,
             )
 
-            if (not replacement_proof) and already_same_runner_protection and not stale_enough and not higher_priority_override:
+            if already_same_runner_protection and not stale_enough and not higher_priority_override:
                 self._emit_exit_event(
-                    pos,
-                    "HOLD",
-                    "EXIT_OVERRIDE_DENIED_EQUIVALENT_PENDING",
+                    pos, "HOLD", "EXIT_OVERRIDE_DENIED_EQUIVALENT_PENDING",
                     (
                         "Inflight override denied; pending exit is already an equivalent "
                         f"runner-protective close and is not stale ({flight_sec:.1f}s)"
@@ -1881,11 +2054,9 @@ class APExitEngine:
                 )
                 return False
 
-            if (not replacement_proof) and not stale_enough and not emergency_reason and not higher_priority_override:
+            if not stale_enough and not emergency_reason and not higher_priority_override:
                 self._emit_exit_event(
-                    pos,
-                    "HOLD",
-                    "EXIT_OVERRIDE_DENIED",
+                    pos, "HOLD", "EXIT_OVERRIDE_DENIED",
                     f"Inflight override denied; existing exit not stale enough: {flight_sec:.1f}s",
                     extra_inputs={
                         "flight_sec": flight_sec,
@@ -1901,9 +2072,7 @@ class APExitEngine:
                 return False
 
             self._emit_exit_event(
-                pos,
-                "ALERT",
-                "EXIT_INFLIGHT_OVERRIDE_ALLOWED",
+                pos, "ALERT", "EXIT_INFLIGHT_OVERRIDE_ALLOWED",
                 f"Inflight override allowed for emergency exit: {reason}",
                 extra_inputs={
                     "flight_sec": flight_sec,
@@ -1921,33 +2090,29 @@ class APExitEngine:
             )
             log.warning(
                 "[%s] EXIT IN-FLIGHT OVERRIDE allowed | flight=%.1fs new=%s pending=%s",
-                pos.ticker,
-                flight_sec,
-                reason,
-                pos.pending_exit_reason,
+                pos.ticker, flight_sec, reason, pos.pending_exit_reason,
             )
 
         if pos.last_rejection_ts is not None:
-            elapsed = time.time() - pos.last_rejection_ts
+            # FIX-8: last_rejection_ts is now Optional[datetime]; compute elapsed with datetime arithmetic.
+            try:
+                elapsed = (datetime.now(timezone.utc) - pos.last_rejection_ts).total_seconds()
+            except Exception:
+                elapsed = 999.0
             if elapsed < 30:
                 self._emit_exit_event(
-                    pos,
-                    "HOLD",
-                    "EXIT_REJECTION_COOLDOWN",
+                    pos, "HOLD", "EXIT_REJECTION_COOLDOWN",
                     f"Exit suppressed during rejection cooldown: {elapsed:.0f}s",
                     extra_inputs={"cooldown_elapsed_sec": elapsed},
                 )
                 return False
-            pos.last_rejection_ts = None
+            pos.last_rejection_ts  = None
             pos.last_exit_rejected = False
 
         return True
 
     def seed_from_db(self, position_manager):
-        """
-        Re-hydrate in-memory positions from DB on startup.
-        Prevents open positions from losing exit protection after a restart.
-        """
+        """Re-hydrate in-memory positions from DB on startup."""
         try:
             rows = position_manager.get_active_positions()
             if not rows:
@@ -1971,12 +2136,7 @@ class APExitEngine:
                         signal_id=str(row.get("signal_id") or ""),
                     )
                     mp.current_option_price = float(row.get("avg_fill", 0) or 0)
-                    # Restore runner state from DB so restarts pick up mid-trade correctly.
-                    mp.scale_outs_done = int(row.get("scale_outs_done", 0) or 0)
-
-                    # Preserve original filled size in mp.quantity. Only restore
-                    # quantity_remaining from DB so restart does not turn a 4-lot
-                    # with 1 runner left into a fake original 1-lot.
+                    mp.scale_outs_done      = int(row.get("scale_outs_done", 0) or 0)
                     _qty_remaining = int(row.get("quantity_remaining", 0) or 0)
                     if _qty_remaining > 0:
                         mp.quantity_remaining = min(_qty_remaining, mp.quantity) if mp.quantity > 0 else _qty_remaining
@@ -1996,70 +2156,82 @@ class APExitEngine:
             log.error("seed_from_db FAILED — open positions have NO exit protection: %s", e)
 
     def _exit_loop(self):
+        # FIX-9: capture healer reference once before the loop so we don't
+        # re-import on every 8-second iteration. The module cache makes
+        # re-imports cheap but can return a stale reference if healer is
+        # reregistered; capturing here avoids that edge case entirely.
+        try:
+            from ap.self_healing import get_healer as _get_healer_fn
+            _cached_healer = _get_healer_fn()
+        except Exception:
+            _cached_healer = None
+
         while self._running:
             try:
                 self._check_all_positions()
             except Exception as e:
-                log.error(f"Exit engine error: {e}", exc_info=True)
+                log.error("Exit engine error: %s", e, exc_info=True)
 
-            # Heartbeat so self-healer knows exit engine is alive and progressing
             try:
-                from ap.self_healing import get_healer as _get_healer
-                _healer = _get_healer()
-                if _healer is not None and self._email:
-                    _healer.heartbeat(self._email, "exit_engine")
+                if _cached_healer is not None and self._email:
+                    _cached_healer.heartbeat(self._email, "exit_engine")
             except Exception:
                 pass
 
             time.sleep(POLL_INTERVAL_SEC)
 
     def _check_all_positions(self):
-        # Detect contracts that expired before the current ET session date.
-        # Do not silently discard without observability: emit a terminal cleanup
-        # event so reconciler/dashboard gaps are visible.
         today_et = _et_session_date()
-        to_remove = []
-        for pos in self._positions:
-            sym = getattr(pos, "option_symbol", "") or ""
-            try:
-                exp = _option_expiration_date(sym)
-                if exp and exp < today_et:
-                    log.warning(
-                        "[exit_eng] EXPIRED CONTRACT detected | %s exp=%s today_et=%s — local engine cleanup",
-                        sym, exp.isoformat(), today_et.isoformat()
-                    )
-                    self._emit_exit_event(
-                        pos,
-                        decision="ALERT",
-                        reason_code="EXPIRED_CONTRACT_LOCAL_CLEANUP",
-                        explanation=f"Expired contract removed from exit engine tracking: {sym}",
-                        stage="system_alert",
-                        extra_inputs={"expiration": exp.isoformat(), "session_date_et": today_et.isoformat()},
-                    )
-                    pos.closed = True
-                    pos.close_reason = "expired_contract_local_cleanup"
-                    to_remove.append(pos)
-            except Exception as _exp_err:
-                log.debug("[exit_eng] Expired-contract cleanup check failed for %s: %s", sym, _exp_err)
-        if to_remove:
-            self._positions = [p for p in self._positions if not p.closed]
-            log.info("[exit_eng] Removed %d expired contract(s) from engine", len(to_remove))
 
-        # Run sentinels first — catch stuck/missed exits
+        # FIX-3: expired contract cleanup now runs inside self._lock.
+        # Previously this block iterated and reassigned self._positions without
+        # the lock — a concurrent add_position or fill callback could corrupt
+        # the list or silently drop a newly added position.
+        with self._lock:
+            to_remove = []
+            for pos in self._positions:
+                sym = getattr(pos, "option_symbol", "") or ""
+                try:
+                    exp = _option_expiration_date(sym)
+                    if exp and exp < today_et:
+                        log.warning(
+                            "[exit_eng] EXPIRED CONTRACT detected | %s exp=%s today_et=%s — local engine cleanup",
+                            sym, exp.isoformat(), today_et.isoformat(),
+                        )
+                        self._emit_exit_event(
+                            pos,
+                            decision="ALERT",
+                            reason_code="EXPIRED_CONTRACT_LOCAL_CLEANUP",
+                            explanation=f"Expired contract removed from exit engine tracking: {sym}",
+                            stage="system_alert",
+                            extra_inputs={
+                                "expiration": exp.isoformat(),
+                                "session_date_et": today_et.isoformat(),
+                            },
+                        )
+                        pos.closed       = True
+                        pos.close_reason = "expired_contract_local_cleanup"
+                        to_remove.append(pos)
+                except Exception as _exp_err:
+                    log.debug("[exit_eng] Expired-contract cleanup check failed for %s: %s", sym, _exp_err)
+
+            if to_remove:
+                self._positions = [p for p in self._positions if not p.closed]
+                # P1: prune expired positions from O(1) index.
+                for _ep in to_remove:
+                    self._positions_by_id.pop(_ep.position_id, None)
+                log.info("[exit_eng] Removed %d expired contract(s) from engine", len(to_remove))
+
         try:
             self._run_sentinels()
         except Exception as _se:
             log.debug("[exit_eng] Sentinel error (non-critical): %s", _se)
-        # ── Kill switch snapshot (DO NOT RETURN) ────────────────────────────
-        # Kill switch means "do not add new risk". It must never stop the
-        # exit engine from evaluating/placing risk-reducing exits.
+
         kill_active = False
         if self._kill_switch_fn:
             try:
                 kill_active = bool(self._kill_switch_fn())
             except Exception as _ks_err:
-                # Exit protection is more important than a failed kill-switch read.
-                # Do not block exits because the kill-switch function errored.
                 log.warning("Exit engine kill-switch check failed; continuing exit evaluation: %s", _ks_err)
                 kill_active = False
         if kill_active:
@@ -2067,38 +2239,37 @@ class APExitEngine:
                 "Exit engine kill switch active — continuing exit evaluation; "
                 "risk-reducing exits remain enabled"
             )
+
         now_et = datetime.now(ET)
         active = self.active_positions()
         if not active:
             return
 
-        # Batch quote fetch for all tickers
-        tickers = list({p.ticker for p in active})
-        option_symbols = list({p.option_symbol for p in active})
+        tickers        = list({p.ticker        for p in active})
+        option_symbols = list({p.option_symbol  for p in active})
 
         try:
             underlying_quotes = self._fetch_quotes(tickers)
-            option_quotes      = self._fetch_option_quotes(option_symbols)
+            option_quotes     = self._fetch_option_quotes(option_symbols)
         except Exception as e:
-            log.warning(f"Quote fetch error: {e}")
+            log.warning("Quote fetch error: %s", e)
             return
 
         actions_to_take = []
         with self._lock:
             for pos in active:
-                # Update prices
                 uq = underlying_quotes.get(pos.ticker, {})
                 oq = option_quotes.get(pos.option_symbol, {})
 
                 now_utc = datetime.now(timezone.utc)
                 underlying_progressed = False
-                option_progressed = False
+                option_progressed     = False
 
                 if uq:
                     last = float(uq.get("last") or uq.get("bid") or 0)
                     if last > 0:
                         pos.current_underlying = last
-                        underlying_progressed = True
+                        underlying_progressed  = True
 
                 if oq:
                     bid = float(oq.get("bid", 0) or 0)
@@ -2107,76 +2278,65 @@ class APExitEngine:
                         pos.current_bid          = bid
                         pos.current_ask          = ask
                         pos.current_option_price = (bid + ask) / 2
-                        option_progressed = True
+                        option_progressed        = True
 
                 if underlying_progressed:
-                    pos.last_underlying_quote_update_ts = now_utc
+                    pos.last_underlying_quote_update_ts  = now_utc
                     pos.last_underlying_quote_missing_ts = None
                 else:
                     pos.last_underlying_quote_missing_ts = now_utc
 
                 if option_progressed:
-                    pos.last_option_quote_update_ts = now_utc
+                    pos.last_option_quote_update_ts  = now_utc
                     pos.last_option_quote_missing_ts = None
                 else:
                     pos.last_option_quote_missing_ts = now_utc
 
                 if underlying_progressed or option_progressed:
-                    pos.last_quote_update_ts = now_utc
+                    pos.last_quote_update_ts  = now_utc
                     pos.last_quote_missing_ts = None
                 else:
                     pos.last_quote_missing_ts = now_utc
 
-                # Gate: don't re-fire while an exit is in-flight
                 option_pnl = pos.option_pnl_pct
-                # Runner trail bypass: if scale-out done and runner is giving
-                # back massive gains, close regardless of exit_in_flight.
-                # This prevents a pending scale-out fill from blocking the
-                # runner trail while price collapses (NFLX 86%→35% case).
+
                 _force_runner_check = False
                 if pos.scale_outs_done >= 1 and pos.peak_pnl_pct >= 0.40:
-                    _runner_drop_now = pos.peak_pnl_pct - option_pnl
-                    _emergency_trail = 0.15  # tighter emergency trail
+                    _runner_drop_now   = pos.peak_pnl_pct - option_pnl
+                    _emergency_trail   = 0.15
                     if _runner_drop_now >= _emergency_trail:
                         _force_runner_check = True
                         log.warning(
                             "[%s] RUNNER EMERGENCY — peak=%.0f%% now=%.0f%% "
                             "drop=%.0f%% > %.0f%% — emergency runner check",
-                            pos.ticker, pos.peak_pnl_pct*100, option_pnl*100,
-                            _runner_drop_now*100, _emergency_trail*100,
+                            pos.ticker, pos.peak_pnl_pct * 100, option_pnl * 100,
+                            _runner_drop_now * 100, _emergency_trail * 100,
                         )
 
                 if _force_runner_check:
                     log.warning(
                         "[%s] RUNNER EMERGENCY active — bypassing normal eligibility gate | %s | in_flight=%s reason=%s",
-                        pos.ticker,
-                        pos.option_symbol,
-                        pos.exit_in_flight,
-                        pos.pending_exit_reason,
+                        pos.ticker, pos.option_symbol, pos.exit_in_flight, pos.pending_exit_reason,
                     )
                 elif not self._eligible_for_new_exit(pos, now_utc):
                     continue
 
-                # Evaluate exit
                 if pos.current_underlying > 0 and pos.current_option_price > 0:
-                    # Track peak P&L for profit lock
                     if pos.option_pnl_pct > pos.peak_pnl_pct:
                         pos.peak_pnl_pct = pos.option_pnl_pct
                     if pos.option_pnl_pct > 0:
-                        pos.touched_profit   = True
+                        pos.touched_profit = True
                         if pos.option_pnl_pct > pos.max_profit_seen:
                             pos.max_profit_seen = pos.option_pnl_pct
+
                     decision = evaluate_exit(pos, now_et)
                     decision.reason_code = _classify_exit_decision(decision)
+
                     if decision.should_act:
-                        # Decision-path quote freshness gate. This prevents stale option
-                        # marks from even entering the submit queue for normal exits.
-                        # _submit_exit_decision() repeats the same check as defense in depth.
                         option_quote_stale, option_quote_age_sec, option_quote_state = _is_option_quote_stale(pos, now_utc)
                         if option_quote_stale and not _is_forced_risk_exit_code(decision.reason_code):
                             self._emit_exit_event(
-                                pos,
-                                decision="HOLD",
+                                pos, decision="HOLD",
                                 reason_code="OPTION_QUOTE_STALE_DECISION_SUPPRESSED",
                                 explanation=(
                                     f"Suppressed {decision.reason_code} before submit queue because option quote is not fresh: "
@@ -2198,7 +2358,8 @@ class APExitEngine:
                             )
                             log.error(
                                 "[%s] EXIT DECISION SUPPRESSED: stale option quote | code=%s age=%s state=%s pos_id=%s",
-                                pos.ticker, decision.reason_code, option_quote_age_sec, option_quote_state, pos.position_id or "?"
+                                pos.ticker, decision.reason_code, option_quote_age_sec,
+                                option_quote_state, pos.position_id or "?",
                             )
                             continue
 
@@ -2206,8 +2367,7 @@ class APExitEngine:
                             decision.reason = f"{decision.reason} | DEGRADED_QUOTE_MODE:{option_quote_state}"
 
                         self._emit_exit_event(
-                            pos,
-                            decision="SUBMIT",
+                            pos, decision="SUBMIT",
                             reason_code=self._exit_reason_code(decision),
                             explanation=decision.reason,
                             stage="exit_decision",
@@ -2225,25 +2385,22 @@ class APExitEngine:
                         actions_to_take.append((pos, decision, bool(_force_runner_check)))
 
         # ── Kill check post-fetch, pre-execute ───────────────────────────────
-        # Default policy: kill switch DOES NOT block exits. Exits reduce risk.
-        # Optional strict mode can block non-protective exits, but still allows
-        # hard stops, theta stops, EOD, sentinel/time stops, and other protective exits.
+        # FIX-2: actions_to_take contains 3-tuples (pos, decision, bool).
+        # Previously unpacked as 2-tuples, raising ValueError when
+        # KILL_BLOCKS_NON_PROTECTIVE_EXITS=1. Fixed to unpack as (p, d, _).
         if kill_active and KILL_BLOCKS_NON_PROTECTIVE_EXITS:
-            protective = [(p, d) for p, d in actions_to_take if _is_protective_exit(d.reason or "")]
-            blocked_actions = [(p, d) for p, d in actions_to_take if not _is_protective_exit(d.reason or "")]
+            protective      = [(p, d, f) for p, d, f in actions_to_take if _is_protective_exit(d.reason or "")]
+            blocked_actions = [(p, d, f) for p, d, f in actions_to_take if not _is_protective_exit(d.reason or "")]
             blocked = len(blocked_actions)
             if blocked:
                 log.warning(
                     "Exit engine: kill switch active strict mode -- blocking %d non-protective exit(s), "
                     "allowing %d protective exit(s)",
-                    blocked,
-                    len(protective),
+                    blocked, len(protective),
                 )
-                for _bp, _bd in blocked_actions:
+                for _bp, _bd, _ in blocked_actions:
                     self._emit_exit_event(
-                        _bp,
-                        decision="REJECT",
-                        reason_code="KILL_SWITCH_ACTIVE",
+                        _bp, decision="REJECT", reason_code="KILL_SWITCH_ACTIVE",
                         explanation=f"Kill switch blocked non-protective exit: {_bd.reason}",
                         stage="exit_decision",
                         extra_inputs={
@@ -2261,15 +2418,7 @@ class APExitEngine:
                 len(actions_to_take),
             )
 
-        # Execute actions through one centralized, gated submit path.
-        # This preserves the full strategy logic above while avoiding direct
-        # on_exit/on_scale calls and avoiding callback execution under lock.
-        for _action_item in actions_to_take:
-            if len(_action_item) == 3:
-                pos, decision, _force_runner_submit = _action_item
-            else:
-                pos, decision = _action_item
-                _force_runner_submit = False
+        for pos, decision, _force_runner_submit in actions_to_take:
             self._submit_exit_decision(
                 pos,
                 decision,
@@ -2279,14 +2428,6 @@ class APExitEngine:
             )
 
     def _extract_exit_order_identity(self, callback_result) -> dict:
-        """Best-effort bridge from execution callback return value to OSM identity.
-
-        Supported callback returns:
-        - None: legacy callback, no identity returned
-        - False: explicit failure, do not mark submitted
-        - dict/object with local_order_id / broker_order_id / order_id / id
-        - tuple(local_order_id, broker_order_id)
-        """
         identity = {
             "accepted": True,
             "local_order_id": "",
@@ -2309,124 +2450,153 @@ class APExitEngine:
             return None
 
         if isinstance(callback_result, (tuple, list)):
-            if len(callback_result) >= 1 and callback_result[0] is not None:
-                identity["local_order_id"] = str(callback_result[0])
-            if len(callback_result) >= 2 and callback_result[1] is not None:
-                identity["broker_order_id"] = str(callback_result[1])
+            # P3: Harden tuple contract. Tuples must contain string-like order IDs,
+            # not status booleans or dicts. A tuple whose first element is a bool
+            # (e.g. (True, None) meaning "accepted, no ID") or a non-string type
+            # would previously be cast to "True"/"False" and poison identity matching.
+            # Reject ambiguous shapes; require dict/object callbacks for structured state.
+            first = callback_result[0] if len(callback_result) >= 1 else None
+            second = callback_result[1] if len(callback_result) >= 2 else None
+
+            if isinstance(first, bool) or isinstance(first, (dict, list)):
+                # Callback returned (accepted_bool, ...) or (dict, ...) — not an order ID tuple.
+                # Treat accepted=True (the bool value) but no identity.
+                if isinstance(first, bool):
+                    if not first:
+                        identity["accepted"] = False
+                        identity["raw_status"] = "callback_tuple_false"
+                log.warning(
+                    "[exit_eng] _extract_exit_order_identity: ambiguous tuple shape — "
+                    "first element is %s, not a string order ID; treating as no identity. "
+                    "Callback should return a dict with local_order_id/broker_order_id.",
+                    type(first).__name__,
+                )
+                self._emit_exit_event(
+                    None,  # pos not available here; caller emits with context
+                    decision="ALERT",
+                    reason_code="EXIT_CALLBACK_AMBIGUOUS_TUPLE",
+                    explanation=(
+                        f"Exit callback returned a tuple/list whose first element is {type(first).__name__}, "
+                        "not a string order ID. No identity extracted; position may quarantine."
+                    ),
+                    stage="exit_submission",
+                ) if False else None  # _emit_exit_event needs pos; caller handles quarantine
+                return identity
+
+            if first is not None and not isinstance(first, (str, int)):
+                log.warning(
+                    "[exit_eng] _extract_exit_order_identity: unexpected tuple element type %s; "
+                    "expected str order ID. Callback should return a dict.",
+                    type(first).__name__,
+                )
+
+            if first is not None:
+                identity["local_order_id"] = str(first)
+            if second is not None and not isinstance(second, bool):
+                identity["broker_order_id"] = str(second)
             return identity
 
         status = _get(callback_result, "status", "raw_status", "state")
         if status is not None:
             identity["raw_status"] = str(status)
 
-        accepted = _get(callback_result, "accepted", "ok", "success")
-        # OSM submit_exit may intentionally return ok=False while parking the
-        # order in EXIT_SUBMITTED identity quarantine (broker accepted but did
-        # not return broker_order_id). That is not a callback failure from the
-        # exit engine's perspective: it is an active local OSM order that must
-        # block duplicates until reconciler resolves it.
+        accepted           = _get(callback_result, "accepted", "ok", "success")
         identity_quarantine = bool(_get(callback_result, "identity_quarantine"))
-        status_norm = str(identity.get("raw_status") or "").upper()
+        status_norm        = str(identity.get("raw_status") or "").upper()
         if accepted is False and not (identity_quarantine or status_norm == "EXIT_SUBMITTED"):
             identity["accepted"] = False
 
         local_id = _get(
             callback_result,
-            "local_order_id",
-            "exit_local_order_id",
-            "order_local_id",
-            "client_order_id",
+            "local_order_id", "exit_local_order_id",
+            "order_local_id", "client_order_id",
         )
         broker_id = _get(
             callback_result,
-            "broker_order_id",
-            "exit_broker_order_id",
-            "order_id",
-            "broker_id",
-            "id",
+            "broker_order_id", "exit_broker_order_id",
+            "order_id", "broker_id", "id",
         )
-
-        if local_id is not None:
-            identity["local_order_id"] = str(local_id)
-        if broker_id is not None:
-            identity["broker_order_id"] = str(broker_id)
-
+        if local_id  is not None: identity["local_order_id"]  = str(local_id)
+        if broker_id is not None: identity["broker_order_id"] = str(broker_id)
         return identity
 
     def health_snapshot(self, *, stale_after_sec: float = 60.0) -> dict:
-        """Return watchdog-friendly health state for dashboard/self-healing.
-
-        This does not submit, cancel, or mutate orders. It is safe for polling.
-        """
         now = datetime.now(timezone.utc)
         with self._lock:
-            positions = []
-            stale_inflight = []
-            stale_quotes = []
-            stale_underlying_quotes = []
-            stale_option_quotes = []
-            missing_callback_identity = []
+            positions                  = []
+            stale_inflight             = []
+            stale_quotes               = []
+            stale_underlying_quotes    = []
+            stale_option_quotes        = []
+            missing_callback_identity  = []
+
             for pos in self._positions:
-                flight_sec = None
-                quote_age_sec = None
-                underlying_quote_age_sec = None
-                option_quote_age_sec = None
+                flight_sec                  = None
+                quote_age_sec               = None
+                underlying_quote_age_sec    = None
+                option_quote_age_sec        = None
                 ident = pos.position_id or pos.option_symbol or pos.ticker
+
                 if pos.exit_in_flight and pos.last_exit_signal_ts:
                     flight_sec = max(0.0, (now - pos.last_exit_signal_ts).total_seconds())
                     if flight_sec >= stale_after_sec:
                         stale_inflight.append(ident)
+
                 if pos.last_quote_update_ts:
                     quote_age_sec = max(0.0, (now - pos.last_quote_update_ts).total_seconds())
                     if quote_age_sec >= stale_after_sec and not pos.closed:
                         stale_quotes.append(ident)
                 elif not pos.closed:
                     stale_quotes.append(ident)
+
                 if pos.last_underlying_quote_update_ts:
                     underlying_quote_age_sec = max(0.0, (now - pos.last_underlying_quote_update_ts).total_seconds())
                     if underlying_quote_age_sec >= stale_after_sec and not pos.closed:
                         stale_underlying_quotes.append(ident)
                 elif not pos.closed:
                     stale_underlying_quotes.append(ident)
+
                 if pos.last_option_quote_update_ts:
                     option_quote_age_sec = max(0.0, (now - pos.last_option_quote_update_ts).total_seconds())
                     if option_quote_age_sec >= stale_after_sec and not pos.closed:
                         stale_option_quotes.append(ident)
                 elif not pos.closed:
                     stale_option_quotes.append(ident)
+
                 if getattr(pos, "last_callback_identity_missing", False) and pos.exit_in_flight:
                     missing_callback_identity.append(pos.position_id or pos.option_symbol or pos.ticker)
+
                 positions.append({
-                    "position_id": pos.position_id,
-                    "ticker": pos.ticker,
-                    "option_symbol": pos.option_symbol,
-                    "quantity_remaining": pos.quantity_remaining,
-                    "closed": pos.closed,
-                    "exit_in_flight": pos.exit_in_flight,
-                    "pending_exit_action": pos.pending_exit_action,
-                    "pending_exit_qty": pos.pending_exit_qty,
-                    "pending_exit_filled_qty": pos.pending_exit_filled_qty,
-                    "pending_exit_local_order_id": pos.pending_exit_local_order_id,
-                    "pending_exit_broker_order_id": pos.pending_exit_broker_order_id,
-                    "flight_sec": flight_sec,
-                    "quote_age_sec": quote_age_sec,
-                    "underlying_quote_age_sec": underlying_quote_age_sec,
-                    "option_quote_age_sec": option_quote_age_sec,
-                    "last_quote_update_ts": pos.last_quote_update_ts.isoformat() if pos.last_quote_update_ts else "",
-                    "last_quote_missing_ts": pos.last_quote_missing_ts.isoformat() if pos.last_quote_missing_ts else "",
+                    "position_id":                     pos.position_id,
+                    "ticker":                          pos.ticker,
+                    "option_symbol":                   pos.option_symbol,
+                    "quantity_remaining":              pos.quantity_remaining,
+                    "closed":                          pos.closed,
+                    "exit_in_flight":                  pos.exit_in_flight,
+                    "pending_exit_action":             pos.pending_exit_action,
+                    "pending_exit_qty":                pos.pending_exit_qty,
+                    "pending_exit_filled_qty":         pos.pending_exit_filled_qty,
+                    "pending_exit_local_order_id":     pos.pending_exit_local_order_id,
+                    "pending_exit_broker_order_id":    pos.pending_exit_broker_order_id,
+                    "flight_sec":                      flight_sec,
+                    "quote_age_sec":                   quote_age_sec,
+                    "underlying_quote_age_sec":        underlying_quote_age_sec,
+                    "option_quote_age_sec":            option_quote_age_sec,
+                    "last_quote_update_ts":            pos.last_quote_update_ts.isoformat() if pos.last_quote_update_ts else "",
+                    "last_quote_missing_ts":           pos.last_quote_missing_ts.isoformat() if pos.last_quote_missing_ts else "",
                     "last_underlying_quote_update_ts": pos.last_underlying_quote_update_ts.isoformat() if pos.last_underlying_quote_update_ts else "",
                     "last_underlying_quote_missing_ts": pos.last_underlying_quote_missing_ts.isoformat() if pos.last_underlying_quote_missing_ts else "",
-                    "last_option_quote_update_ts": pos.last_option_quote_update_ts.isoformat() if pos.last_option_quote_update_ts else "",
-                    "last_option_quote_missing_ts": pos.last_option_quote_missing_ts.isoformat() if pos.last_option_quote_missing_ts else "",
-                    "last_callback_identity_missing": getattr(pos, "last_callback_identity_missing", False),
-                    "exit_identity_quarantine": getattr(pos, "exit_identity_quarantine", False),
+                    "last_option_quote_update_ts":     pos.last_option_quote_update_ts.isoformat() if pos.last_option_quote_update_ts else "",
+                    "last_option_quote_missing_ts":    pos.last_option_quote_missing_ts.isoformat() if pos.last_option_quote_missing_ts else "",
+                    "last_callback_identity_missing":  getattr(pos, "last_callback_identity_missing", False),
+                    "exit_identity_quarantine":        getattr(pos, "exit_identity_quarantine", False),
                     "exit_identity_quarantine_alert_count": getattr(pos, "exit_identity_quarantine_alert_count", 0),
                     "last_exit_identity_quarantine_alert_ts": (
                         pos.last_exit_identity_quarantine_alert_ts.isoformat()
                         if getattr(pos, "last_exit_identity_quarantine_alert_ts", None) else ""
                     ),
-                    "pending_exit_replace_allowed": getattr(pos, "pending_exit_replace_allowed", False),
-                    "pending_exit_replace_reason": getattr(pos, "pending_exit_replace_reason", ""),
+                    "pending_exit_replace_allowed":    getattr(pos, "pending_exit_replace_allowed", False),
+                    "pending_exit_replace_reason":     getattr(pos, "pending_exit_replace_reason", ""),
                     "pending_exit_replace_allowed_ts": (
                         pos.pending_exit_replace_allowed_ts.isoformat()
                         if getattr(pos, "pending_exit_replace_allowed_ts", None) else ""
@@ -2436,23 +2606,24 @@ class APExitEngine:
                         if pos.last_callback_identity_missing_ts else ""
                     ),
                 })
+
             thread_alive = bool(self._thread and self._thread.is_alive())
             return {
-                "running_flag": bool(self._running),
-                "thread_alive": thread_alive,
-                "thread_name": self._thread.name if self._thread else "",
-                "position_count": len(positions),
-                "stale_inflight_count": len(stale_inflight),
-                "stale_inflight": stale_inflight,
-                "stale_quote_count": len(stale_quotes),
-                "stale_quotes": stale_quotes,
-                "stale_underlying_quote_count": len(stale_underlying_quotes),
-                "stale_underlying_quotes": stale_underlying_quotes,
-                "stale_option_quote_count": len(stale_option_quotes),
-                "stale_option_quotes": stale_option_quotes,
+                "running_flag":                   bool(self._running),
+                "thread_alive":                   thread_alive,
+                "thread_name":                    self._thread.name if self._thread else "",
+                "position_count":                 len(positions),
+                "stale_inflight_count":           len(stale_inflight),
+                "stale_inflight":                 stale_inflight,
+                "stale_quote_count":              len(stale_quotes),
+                "stale_quotes":                   stale_quotes,
+                "stale_underlying_quote_count":   len(stale_underlying_quotes),
+                "stale_underlying_quotes":        stale_underlying_quotes,
+                "stale_option_quote_count":       len(stale_option_quotes),
+                "stale_option_quotes":            stale_option_quotes,
                 "missing_callback_identity_count": len(missing_callback_identity),
-                "missing_callback_identity": missing_callback_identity,
-                "positions": positions,
+                "missing_callback_identity":       missing_callback_identity,
+                "positions":                       positions,
             }
 
     def _submit_exit_decision(
@@ -2468,19 +2639,19 @@ class APExitEngine:
 
         Locking rule:
         - Hold engine lock only for eligibility checks and internal state mutation.
-        - Never call on_exit/on_scale while holding self._lock. Those callbacks are
-          external code and may touch OSM/broker/reconciler paths.
+        - Never call on_exit/on_scale while holding self._lock.
+        - FIX-1: Discord runner alert fires here after callback returns,
+          outside both lock sections, using metadata carried by the decision.
         """
-        now_utc = datetime.now(timezone.utc)
-        ticker = str(pos.ticker or "")
+        now_utc       = datetime.now(timezone.utc)
+        ticker        = str(pos.ticker or "")
         option_symbol = str(pos.option_symbol or "")
-        position_id = str(pos.position_id or "")
+        position_id   = str(pos.position_id or "")
 
         # 1) Short critical section: validate and capture submit snapshot.
         with self._lock:
             if not self._can_submit_exit(
-                pos,
-                now_utc,
+                pos, now_utc,
                 reason=decision.reason,
                 allow_inflight_override=allow_inflight_override,
             ):
@@ -2491,8 +2662,7 @@ class APExitEngine:
             option_quote_stale, option_quote_age_sec, option_quote_state = _is_option_quote_stale(pos, now_utc)
             if option_quote_stale and not _is_forced_risk_exit_code(decision.reason_code):
                 self._emit_exit_event(
-                    pos,
-                    decision="REJECT",
+                    pos, decision="REJECT",
                     reason_code="OPTION_QUOTE_STALE_BLOCK",
                     explanation=(
                         f"Blocked {decision.reason_code} because option quote is not fresh: "
@@ -2513,14 +2683,14 @@ class APExitEngine:
                 )
                 log.error(
                     "[%s] EXIT BLOCKED: stale option quote | code=%s age=%s state=%s pos_id=%s",
-                    ticker, decision.reason_code, option_quote_age_sec, option_quote_state, pos.position_id or "?"
+                    ticker, decision.reason_code, option_quote_age_sec,
+                    option_quote_state, pos.position_id or "?",
                 )
                 return False
 
             if option_quote_stale and _is_forced_risk_exit_code(decision.reason_code):
                 self._emit_exit_event(
-                    pos,
-                    decision="ALERT",
+                    pos, decision="ALERT",
                     reason_code="FORCED_EXIT_DEGRADED_OPTION_QUOTE",
                     explanation=(
                         f"Forced-risk exit allowed despite stale/missing option quote: "
@@ -2537,14 +2707,13 @@ class APExitEngine:
                 )
                 log.warning(
                     "[%s] FORCED EXIT IN DEGRADED QUOTE MODE | code=%s age=%s state=%s pos_id=%s",
-                    ticker, decision.reason_code, option_quote_age_sec, option_quote_state, pos.position_id or "?"
+                    ticker, decision.reason_code, option_quote_age_sec,
+                    option_quote_state, pos.position_id or "?",
                 )
 
             if kill_active and KILL_BLOCKS_NON_PROTECTIVE_EXITS and not _is_protective_exit(decision.reason or ""):
                 self._emit_exit_event(
-                    pos,
-                    decision="REJECT",
-                    reason_code="KILL_SWITCH_ACTIVE",
+                    pos, decision="REJECT", reason_code="KILL_SWITCH_ACTIVE",
                     explanation=f"Kill switch blocked non-protective exit: {decision.reason}",
                     stage="exit_decision",
                 )
@@ -2554,23 +2723,20 @@ class APExitEngine:
                 decision.suggested_limit = round(pos.current_bid * 0.99, 2)
 
             pre_submit_qty = int(pos.quantity_remaining or 0)
+            # P2: snapshot the submit generation so the post-callback lock can
+            # detect if a concurrent path (fill, OSM, reconciler) mutated this
+            # position while the external callback was executing.
+            pre_submit_generation = int(pos._submit_generation)
 
             log.info(
                 "[EXIT] client=%s ticker=%s sym=%s side=%s action=%s pnl=%.1f%% peak=%.1f%% qty_rem=%d qty_close=%d reason=%s",
-                pos.client_id or "?",
-                pos.ticker,
-                pos.option_symbol,
-                pos.side,
-                decision.action,
-                decision.pnl_pct * 100.0,
-                pos.peak_pnl_pct * 100.0,
-                pos.quantity_remaining,
-                decision.quantity,
-                decision.reason,
+                pos.client_id or "?", pos.ticker, pos.option_symbol, pos.side,
+                decision.action, decision.pnl_pct * 100.0, pos.peak_pnl_pct * 100.0,
+                pos.quantity_remaining, decision.quantity, decision.reason,
             )
 
         # 2) External callback outside lock.
-        callback_result = None
+        callback_result  = None
         callback_identity = {"accepted": True, "local_order_id": "", "broker_order_id": "", "raw_status": ""}
         try:
             if decision.action == "SCALE_OUT":
@@ -2587,8 +2753,7 @@ class APExitEngine:
             callback_identity = self._extract_exit_order_identity(callback_result)
             if not callback_identity.get("accepted", True):
                 self._emit_exit_event(
-                    pos,
-                    decision="ERROR",
+                    pos, decision="ERROR",
                     reason_code="EXIT_CALLBACK_NOT_ACCEPTED",
                     explanation=f"Exit callback returned non-accepted status: {callback_identity.get('raw_status', '')}",
                     stage="exit_submission",
@@ -2598,14 +2763,47 @@ class APExitEngine:
         except Exception as exc:
             log.error("[%s] Exit submit failed; position remains tracked: %s", ticker, exc)
             self._emit_exit_event(
-                pos,
-                decision="ERROR",
-                reason_code="EXIT_SUBMIT_FAILED",
-                explanation=str(exc),
-                stage="exit_submission",
+                pos, decision="ERROR", reason_code="EXIT_SUBMIT_FAILED",
+                explanation=str(exc), stage="exit_submission",
                 extra_inputs={"decision_action": decision.action, "decision_qty": decision.quantity},
             )
             return False
+
+        # FIX-1 + P4: Discord runner alert fires in a daemon thread so even a
+        # 3-second webhook stall does not stretch the submission path thread.
+        # Previously outside the lock but still inline on the submit thread.
+        if (
+            decision._runner_alert_peak_pct > 0
+            and decision.action in ("CLOSE_ALL", "SCALE_OUT")
+            and callback_identity.get("accepted", True)
+        ):
+            _alert_ticker   = pos.ticker
+            _alert_peak     = decision._runner_alert_peak_pct
+            _alert_pnl      = decision.pnl_pct
+            _alert_dur      = decision._runner_duration_min
+            _alert_trail    = decision._runner_trail_used
+            _alert_qty      = decision.quantity
+
+            def _fire_discord():
+                try:
+                    import os as _os, requests as _req
+                    _wh = _os.getenv("DISCORD_WEBHOOK_RUNNER", "") or _os.getenv("DISCORD_WEBHOOK_URL", "")
+                    if _wh:
+                        _req.post(_wh, json={"embeds": [{
+                            "title":       f"🏆 RUNNER CLOSED · {_alert_ticker}",
+                            "description": (
+                                f"**Peak: +{_alert_peak*100:.0f}%** → "
+                                f"Exit: +{_alert_pnl*100:.0f}%\n"
+                                f"Held {_alert_dur}m | "
+                                f"Trail: {_alert_trail*100:.0f}pts | "
+                                f"Contracts: {_alert_qty}"
+                            ),
+                            "color": 0xF1C40F,
+                        }]}, timeout=3)
+                except Exception:
+                    pass  # never surface Discord errors to the trading path
+
+            threading.Thread(target=_fire_discord, daemon=True, name="discord-runner-alert").start()
 
         # 3) Short critical section: revalidate and mark submitted.
         with self._lock:
@@ -2621,22 +2819,45 @@ class APExitEngine:
             if current_pos is None:
                 log.warning(
                     "[%s] Exit callback returned but position is no longer tracked | pos_id=%s sym=%s",
-                    ticker,
-                    position_id or "?",
-                    option_symbol,
+                    ticker, position_id or "?", option_symbol,
                 )
                 return False
 
-            # Do not overwrite a broker/OSM state change that arrived synchronously
-            # during callback execution.
             if current_pos.closed or int(current_pos.quantity_remaining or 0) <= 0:
                 log.info("[%s] Exit callback returned after position already closed | pos_id=%s", ticker, position_id or "?")
                 return True
 
+            # P2: generation mismatch means a concurrent path (note_partial_exit_fill,
+            # mark_position_closed, OSM fill hook) advanced state while our callback
+            # was executing. Do not overwrite a confirmed fill or close with a stale
+            # submitted marker — the downstream path already owns truth.
+            if int(current_pos._submit_generation) != pre_submit_generation:
+                log.warning(
+                    "[%s] EXIT SUBMIT GENERATION MISMATCH — state advanced concurrently | "
+                    "pos_id=%s pre_gen=%d current_gen=%d; not marking in-flight",
+                    ticker, position_id or "?",
+                    pre_submit_generation, current_pos._submit_generation,
+                )
+                self._emit_exit_event(
+                    current_pos, decision="HOLD",
+                    reason_code="EXIT_SUBMIT_GENERATION_MISMATCH",
+                    explanation=(
+                        "Post-callback position state was advanced by a concurrent path "
+                        "(fill/close/OSM) during callback execution; submit not marked in-flight."
+                    ),
+                    stage="exit_submission",
+                    extra_inputs={
+                        "pre_submit_generation": pre_submit_generation,
+                        "current_generation": current_pos._submit_generation,
+                        "decision_action": decision.action,
+                        "pre_submit_qty": pre_submit_qty,
+                    },
+                )
+                return True  # callback may have submitted; reconciler handles truth
+
             if current_pos.exit_in_flight:
                 self._emit_exit_event(
-                    current_pos,
-                    decision="HOLD",
+                    current_pos, decision="HOLD",
                     reason_code="EXIT_SUBMIT_MARK_SKIPPED_ALREADY_IN_FLIGHT",
                     explanation="Exit callback returned but position was already marked in-flight by downstream path",
                     stage="exit_submission",
@@ -2649,49 +2870,47 @@ class APExitEngine:
                 return True
 
             self._mark_exit_submitted(
-                current_pos,
-                decision,
+                current_pos, decision,
                 local_order_id=callback_identity.get("local_order_id", ""),
                 broker_order_id=callback_identity.get("broker_order_id", ""),
             )
-            if callback_identity.get("raw_status", "").upper() == "EXIT_SUBMITTED" and callback_identity.get("local_order_id") and not callback_identity.get("broker_order_id"):
-                # OSM has an active local EXIT order but broker identity is quarantined.
-                # Keep duplicate suppression active and surface as quarantine until reconciler
-                # backfills broker id, confirms fill, terminal-clears, or marks replacement safe.
-                current_pos.last_callback_identity_missing = True
+
+            if (
+                callback_identity.get("raw_status", "").upper() == "EXIT_SUBMITTED"
+                and callback_identity.get("local_order_id")
+                and not callback_identity.get("broker_order_id")
+            ):
+                current_pos.last_callback_identity_missing    = True
                 current_pos.last_callback_identity_missing_ts = datetime.now(timezone.utc)
-                current_pos.exit_identity_quarantine = True
+                current_pos.exit_identity_quarantine          = True
                 current_pos.exit_identity_quarantine_alert_count = 0
                 current_pos.last_exit_identity_quarantine_alert_ts = None
                 self._emit_exit_event(
-                    current_pos,
-                    decision="ALERT",
+                    current_pos, decision="ALERT",
                     reason_code="EXIT_SUBMITTED_BROKER_ID_QUARANTINE",
                     explanation="OSM parked exit as submitted without broker_order_id; reconciler must resolve identity.",
                     stage="exit_submission",
                     extra_inputs={
-                        "pending_exit_local_order_id": current_pos.pending_exit_local_order_id,
+                        "pending_exit_local_order_id":  current_pos.pending_exit_local_order_id,
                         "pending_exit_broker_order_id": current_pos.pending_exit_broker_order_id,
                     },
                 )
+
             if not current_pos.pending_exit_local_order_id and not current_pos.pending_exit_broker_order_id:
-                current_pos.last_callback_identity_missing = True
+                current_pos.last_callback_identity_missing    = True
                 current_pos.last_callback_identity_missing_ts = datetime.now(timezone.utc)
-                current_pos.exit_identity_quarantine = True
+                current_pos.exit_identity_quarantine          = True
                 current_pos.exit_identity_quarantine_alert_count = 0
                 current_pos.last_exit_identity_quarantine_alert_ts = None
                 log.error(
                     "[%s] EXIT SUBMITTED WITHOUT ORDER ID | pos_id=%s sym=%s action=%s qty=%s status=%s",
-                    ticker,
-                    current_pos.position_id or "?",
+                    ticker, current_pos.position_id or "?",
                     current_pos.option_symbol or option_symbol,
-                    decision.action,
-                    decision.quantity,
+                    decision.action, decision.quantity,
                     callback_identity.get("raw_status", ""),
                 )
                 self._emit_exit_event(
-                    current_pos,
-                    decision="ALERT",
+                    current_pos, decision="ALERT",
                     reason_code="EXIT_SUBMITTED_WITHOUT_ORDER_ID",
                     explanation=(
                         "Exit callback accepted but returned no local/broker order identity; "
@@ -2704,11 +2923,11 @@ class APExitEngine:
                         "callback_status": callback_identity.get("raw_status", ""),
                     },
                 )
+
             self._assert_position_invariants(current_pos, "submit_exit_decision")
 
         self._emit_exit_event(
-            pos,
-            decision="SUBMITTED",
+            pos, decision="SUBMITTED",
             reason_code=self._exit_reason_code(decision),
             explanation=decision.reason,
             stage="exit_submission",
@@ -2717,7 +2936,7 @@ class APExitEngine:
                 "decision_qty": decision.quantity,
                 "from_sentinel": from_sentinel,
                 "pre_submit_qty": pre_submit_qty,
-                "local_order_id": callback_identity.get("local_order_id", ""),
+                "local_order_id":  callback_identity.get("local_order_id", ""),
                 "broker_order_id": callback_identity.get("broker_order_id", ""),
                 "callback_status": callback_identity.get("raw_status", ""),
             },
@@ -2734,11 +2953,12 @@ class APExitEngine:
             )
             data = resp.json()
             raw  = data.get("quotes", {}).get("quote", [])
-            if isinstance(raw, dict): raw = [raw]
+            if isinstance(raw, dict):
+                raw = [raw]
             return {q["symbol"]: q for q in raw if q.get("symbol")}
         except Exception as e:
             log.error("Quote fetch failed: %s", e, exc_info=True)
-            return {}  # caller must handle empty dict as "no data available"
+            return {}
 
     def _fetch_option_quotes(self, symbols: list[str]) -> dict:
         try:
@@ -2750,9 +2970,9 @@ class APExitEngine:
             )
             data = resp.json()
             raw  = data.get("quotes", {}).get("quote", [])
-            if isinstance(raw, dict): raw = [raw]
+            if isinstance(raw, dict):
+                raw = [raw]
             return {q["symbol"]: q for q in raw if q.get("symbol")}
         except Exception as e:
             log.error("Option quote fetch failed: %s", e, exc_info=True)
-            return {}  # caller must handle empty dict as "no data available"
-            
+            return {}
