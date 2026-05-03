@@ -1421,6 +1421,16 @@ class APOrderStateMachine:
             error_msg = f"broker_error:{e}"
 
         self.transition(local_id, OrderStatus.ERROR, last_error=error_msg or "unknown_error")
+        self._emit_transition_event(
+            local_order_id=local_id,
+            old_status=OrderStatus.EXIT_REQUESTED,
+            new_status=OrderStatus.ERROR,
+            decision="ERROR",
+            reason_code="BROKER_REJECTED_EXIT",
+            explanation=error_msg or "unknown_error",
+            broker_order_id=broker_order_id,
+            extra_inputs={"broker_rejection_reason": error_msg or "unknown_error"},
+        )
         return {"ok": False, "local_order_id": local_id, "broker_order_id": broker_order_id,
                 "status": OrderStatus.ERROR, "error": error_msg}
 
@@ -1518,6 +1528,10 @@ class APOrderStateMachine:
                 return None
             if row.get("quantity_remaining") is not None:
                 return int(row.get("quantity_remaining") or 0)
+            # Fallback to qty (total contracted) — only correct if quantity_remaining
+            # is being decremented on note_partial_exit_fill (confirmed in ap_exit_engine.py).
+            # If scale-outs are not updating quantity_remaining in DB, this will
+            # return full size and cause a partial-close to be treated as full close.
             return int(row.get("qty") or 0)
         except Exception:
             return None
