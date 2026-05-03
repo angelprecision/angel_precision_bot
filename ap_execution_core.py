@@ -94,6 +94,11 @@ class APExecutionCore:
             client_email=email,
             mode="paper" if self.paper else "live",
         )
+        try:
+            from ap_edge_intelligence import APTradeLogger as _ATL
+            self._edge_logger = _ATL()
+        except Exception:
+            self._edge_logger = None
 
         # ── MASTER CONTROL -- single production decision authority ─────────────
         if master_control is None:
@@ -316,8 +321,6 @@ class APExecutionCore:
                     ),
                 })
             _sector = sig.get("sector") or sig.get("correlation_bucket") or ticker
-            with self._sector_lock:
-                self._sector_counts[_sector] = max(0, self._sector_counts.get(_sector, 0) - 1)
             try:
                 self._cleanup_pending_entry_order(watched, action="cancel", reason="positions_full_at_breach")
             except Exception:
@@ -338,8 +341,6 @@ class APExecutionCore:
                         "context_notes": msg,
                     })
                 _sector = sig.get("sector") or sig.get("correlation_bucket") or ticker
-                with self._sector_lock:
-                    self._sector_counts[_sector] = max(0, self._sector_counts.get(_sector, 0) - 1)
                 return False
 
             log.critical(
@@ -366,8 +367,6 @@ class APExecutionCore:
                             "context_notes": f"exposure_revalidation={reason}",
                         })
                     _sector = sig.get("sector") or sig.get("correlation_bucket") or ticker
-                    with self._sector_lock:
-                        self._sector_counts[_sector] = max(0, self._sector_counts.get(_sector, 0) - 1)
                     return False
             except Exception as exc:
                 if self.mode == "LIVE":
@@ -381,8 +380,6 @@ class APExecutionCore:
                             "context_notes": f"exposure_revalidation_error={exc}",
                         })
                     _sector = sig.get("sector") or sig.get("correlation_bucket") or ticker
-                    with self._sector_lock:
-                        self._sector_counts[_sector] = max(0, self._sector_counts.get(_sector, 0) - 1)
                     return False
                 log.warning("[%s] PAPER breach exposure revalidation failed open: %s", ticker, exc)
 
@@ -753,7 +750,7 @@ class APExecutionCore:
             )
             return
 
-        opt_pnl = (exit_price - pos.entry_price) / pos.entry_price * 100 if pos.entry_price else 0
+        opt_pnl = (exit_price - pos.entry_price) / pos.entry_price * 100 if pos.entry_price else 0  # percent (e.g. 15.3), NOT decimal ratio
         win     = opt_pnl > 0
         tier    = sig.get("tier", "A+")
 
@@ -835,27 +832,27 @@ class APExecutionCore:
 
         self.shadow.record_live_outcome(tier, opt_pnl)
 
-        # Log trade to edge intelligence
+        # Log trade to edge intelligence (logger instantiated once in __init__ to avoid resource leaks)
         try:
-            from ap_edge_intelligence import APTradeLogger
-            _edge_logger = APTradeLogger()
-            _edge_logger.log_trade(
-                position={
-                    **(pos.__dict__ if hasattr(pos, "__dict__") else {}),
-                    "signal": sig,
-                    "ticker": pos.ticker,
-                    "direction": pos.side,
-                    "timeframe": sig.get("timeframe", "1d"),
-                    "synthetic_entry": bool(getattr(pos, "synthetic_entry", False)),
-                },
-                exit_info={
-                    "exit_price": exit_price,
-                    "exit_reason": decision.reason,
-                    "exit_ts": datetime.now(timezone.utc).isoformat(),
-                    "underlying_exit": pos.current_underlying,
-                },
-                client_id=self.email,
-            )
+            _edge_logger = self._edge_logger
+            if _edge_logger:
+                _edge_logger.log_trade(
+                    position={
+                        **(pos.__dict__ if hasattr(pos, "__dict__") else {}),
+                        "signal": sig,
+                        "ticker": pos.ticker,
+                        "direction": pos.side,
+                        "timeframe": sig.get("timeframe", "1d"),
+                        "synthetic_entry": bool(getattr(pos, "synthetic_entry", False)),
+                    },
+                    exit_info={
+                        "exit_price": exit_price,
+                        "exit_reason": decision.reason,
+                        "exit_ts": datetime.now(timezone.utc).isoformat(),
+                        "underlying_exit": pos.current_underlying,
+                    },
+                    client_id=self.email,
+                )
         except Exception as _e:
             log.debug(f"Trade logger error (non-critical): {_e}")
 
