@@ -1518,7 +1518,7 @@ def start_multi_client_supervisor():
             # Inner loop checks runner liveness every 15s and breaks early to call
             # _sync_runners immediately when any runner dies. Full member-list refresh
             # from Supabase still happens on the 300s outer cadence.
-            _sync_interval = int(os.getenv("SUPERVISOR_SYNC_SEC", "300"))
+            _sync_interval = int(os.getenv("SUPERVISOR_SYNC_SEC", "60"))
             _check_interval = int(os.getenv("SUPERVISOR_LIVENESS_CHECK_SEC", "15"))
             _checks = max(1, _sync_interval // _check_interval)
             for _ in range(_checks):

@@ -31,6 +31,10 @@ except Exception:
 
 log = logging.getLogger("ap.master_control")
 
+# QUARTERLY REVIEW REQUIRED: These estimates are used for capital gate projections
+# before real contract pricing is known. If ATM premiums diverge significantly
+# (e.g. NVDA drops from 9.50 to 4.00 in low-vol regime), the capital gate will
+# over-block valid signals. Update before each live trading quarter.
 _PREMIUM_ESTIMATES: dict[str, float] = {
     "NVDA": 9.50,
     "TSLA": 7.00,

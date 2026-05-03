@@ -2976,3 +2976,56 @@ class APExitEngine:
         except Exception as e:
             log.error("Option quote fetch failed: %s", e, exc_info=True)
             return {}
+
+    def _refresh_quotes(self) -> None:
+        """
+        Immediately refresh current_underlying and option prices for all active
+        positions. Called after seed_from_db() on restart so exit logic does not
+        fire on stale entry-time underlying prices during the first poll window.
+
+        Mirrors the quote-fetch logic in _exit_loop but runs once synchronously.
+        Fails silently — the first regular poll cycle (8s) corrects any miss.
+        """
+        active = self.active_positions()
+        if not active:
+            log.debug("_refresh_quotes: no active positions to refresh")
+            return
+
+        tickers        = list({p.ticker       for p in active})
+        option_symbols = list({p.option_symbol for p in active})
+
+        try:
+            underlying_quotes = self._fetch_quotes(tickers)
+            option_quotes     = self._fetch_option_quotes(option_symbols)
+        except Exception as e:
+            log.warning("_refresh_quotes: quote fetch failed — first poll cycle will correct: %s", e)
+            return
+
+        now_utc = datetime.now(timezone.utc)
+        with self._lock:
+            for pos in active:
+                uq = underlying_quotes.get(pos.ticker, {})
+                oq = option_quotes.get(pos.option_symbol, {})
+
+                if uq:
+                    last = float(uq.get("last") or uq.get("bid") or 0)
+                    if last > 0:
+                        pos.current_underlying = last
+                        pos.last_underlying_quote_update_ts = now_utc
+                        log.info(
+                            "[%s] _refresh_quotes: current_underlying refreshed $%.2f -> $%.2f",
+                            pos.ticker,
+                            pos.underlying_entry,
+                            last,
+                        )
+
+                if oq:
+                    bid = float(oq.get("bid", 0) or 0)
+                    ask = float(oq.get("ask", 0) or 0)
+                    if bid > 0 and ask > 0:
+                        pos.current_bid          = bid
+                        pos.current_ask          = ask
+                        pos.current_option_price = (bid + ask) / 2
+                        pos.last_option_quote_update_ts = now_utc
+
+        log.info("_refresh_quotes: refreshed %d position(s) with live quotes", len(active))
