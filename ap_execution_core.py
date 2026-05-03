@@ -940,6 +940,9 @@ class APExecutionCore:
         _sig_id = str(getattr(pos, "signal", {}).get("signal_id", "") or "")
 
         if self.order_state_machine and pos.position_id:
+            _scale_bid   = getattr(pos, "current_bid", 0) or 0
+            _scale_mid   = getattr(pos, "current_option_price", 0) or 0
+            _scale_limit = _scale_bid if _scale_bid > 0 else max(round(_scale_mid - 0.01, 2), 0.01)
             scale_res = self.order_state_machine.submit_exit(
                 broker      = self.broker,
                 position_id = str(pos.position_id),
@@ -947,14 +950,14 @@ class APExecutionCore:
                 symbol      = pos.ticker,
                 direction   = pos.side,
                 qty         = decision.quantity,
-                limit_price = pos.current_option_price,
+                limit_price = _scale_limit,
                 signal_id   = _sig_id or None,
             )
             if scale_res["ok"]:
                 log.info(
                     f"[{pos.ticker}] Scale exit submitted | "
                     f"local={scale_res['local_order_id']} broker={scale_res['broker_order_id']} "
-                    f"qty={decision.quantity} @ ${pos.current_option_price:.2f}"
+                    f"qty={decision.quantity} @ ${_scale_limit:.2f}"
                 )
             else:
                 log.error(
