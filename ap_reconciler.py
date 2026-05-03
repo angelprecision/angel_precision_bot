@@ -699,7 +699,9 @@ class APBrokerReconciler:
         if kind == "ENTRY" and _is_no_contract and created_ts:
             try:
                 _ts = datetime.fromisoformat(str(created_ts).replace("Z", "+00:00"))
-                if _ts.hour >= 20 or _ts.hour < 9:
+                from zoneinfo import ZoneInfo as _ZI
+                _ts_et = _ts.astimezone(_ZI("America/New_York"))
+                if _ts_et.hour >= 20 or _ts_et.hour < 9:
                     log.debug(
                         "[%s] skip phantom cancel — overnight entry watcher owns | %s",
                         self.client_id, local_id,
@@ -1437,7 +1439,18 @@ class APBrokerReconciler:
             if result is None:
                 return []
             if isinstance(result, list):
-                return result
+                return [dict(x) for x in result if isinstance(x, dict)]
+            if isinstance(result, dict):
+                # Tradier: {"positions": {"position": [...]}} or {"positions": []}
+                inner = result.get("positions") or result.get("data") or result.get("results")
+                if isinstance(inner, list):
+                    return [dict(x) for x in inner if isinstance(x, dict)]
+                if isinstance(inner, dict):
+                    pos = inner.get("position")
+                    if isinstance(pos, list):
+                        return [dict(x) for x in pos if isinstance(x, dict)]
+                    if isinstance(pos, dict):
+                        return [pos]
             return []
         except Exception as e:
             log.error("[%s] Broker list_positions failed: %s", self.client_id, e)
@@ -2486,11 +2499,11 @@ class APBrokerReconciler:
                     """
                     SELECT underlying, direction, COUNT(*) as cnt
                     FROM positions
-                    WHERE client_id=%s AND status='OPEN'
+                    WHERE client_id=%s AND status = ANY(%s)
                     GROUP BY underlying, direction
                     HAVING COUNT(*) > 1
                     """,
-                    (self.client_id,),
+                    (self.client_id, list(DB_OPEN_POSITION_STATUSES)),
                 )
                 return c.fetchall()
 
@@ -2551,6 +2564,17 @@ class APBrokerReconciler:
                     "[%s] RECONCILE: reverted pos %s to OPEN after terminal exit order | %s",
                     self.client_id, position_id, contract,
                 )
+                if self.exit_engine:
+                    try:
+                        self.exit_engine.clear_exit_in_flight(
+                            position_id,
+                            reason="reconciler_revert_position_to_open",
+                        )
+                    except Exception as ee_err:
+                        log.warning(
+                            "[%s] clear_exit_in_flight failed on revert for pos=%s: %s",
+                            self.client_id, position_id, ee_err,
+                        )
             else:
                 log.info(
                     "[%s] RECONCILE: no OPEN revert needed for pos %s | %s "
