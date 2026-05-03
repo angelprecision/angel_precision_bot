@@ -112,15 +112,15 @@ def _increment_broker_anomaly_count(client_id: str, local_order_id: str, broker_
 
 def audit(client_id: str, level: str, event: str, payload: dict):
     """Best-effort audit write. Audit failures must never block reconciliation."""
-    try:
+    def _fn():
         with conn() as c:
-            run_with_retry(
-                lambda: c.execute(
-                    "INSERT INTO audit_log (ts, level, event, payload, client_id) "
-                    "VALUES (%s,%s,%s,%s,%s)",
-                    (now_utc_iso(), level, event, json_dumps(payload), client_id),
-                )
+            c.execute(
+                "INSERT INTO audit_log (ts, level, event, payload, client_id) "
+                "VALUES (%s,%s,%s,%s,%s)",
+                (now_utc_iso(), level, event, json_dumps(payload), client_id),
             )
+    try:
+        run_with_retry(_fn)
     except Exception as exc:
         log.warning(
             "Audit write failed non-fatal | client=%s event=%s error=%s",
@@ -200,9 +200,9 @@ def get_pending_orders(client_id: str) -> list[dict]:
     if not client_id:
         raise ValueError("get_pending_orders requires client_id")
 
-    with conn() as c:
-        rows = run_with_retry(
-            lambda: c.execute(
+    def _fn():
+        with conn() as c:
+            rows = c.execute(
                 """
                 SELECT
                     client_id,
@@ -247,8 +247,8 @@ def get_pending_orders(client_id: str) -> list[dict]:
                 """,
                 (client_id,),
             ).fetchall()
-        )
-    return [dict(r) for r in rows]
+            return [dict(r) for r in rows]
+    return run_with_retry(_fn)
 
 
 # =============================================================================
@@ -358,9 +358,14 @@ def _release_entry_guards(order: dict):
             * OPT_MULTIPLIER
         )
 
-    if cost and cost > 0:
-        release_equity(client_id, cost)
-        release_symbol_lock(client_id, symbol)
+    if not cost or cost <= 0:
+        log.warning(
+            "[%s] _release_entry_guards: cost is zero for order=%s — equity may not be fully released",
+            order.get("client_id"), order.get("local_order_id"),
+        )
+        return
+    release_equity(client_id, cost)
+    release_symbol_lock(client_id, symbol)
 
 
 # =============================================================================
@@ -1398,18 +1403,20 @@ def _legacy_update_order_status(
     if not ALLOW_LEGACY_FILL_MONITOR:
         raise RuntimeError("legacy fill monitor path disabled")
 
-    with conn() as c:
-        updates = ["status=%s", "updated_ts=%s"]
-        params = [status, now_utc_iso()]
-        if filled_qty is not None:
-            updates.append("filled_qty=%s")
-            params.append(int(filled_qty))
-        if error is not None:
-            updates.append("last_error=%s")
-            params.append(error)
-        params.append(local_order_id)
-        sql = f"UPDATE orders SET {', '.join(updates)} WHERE local_order_id=%s"
-        run_with_retry(lambda: c.execute(sql, params))
+    updates = ["status=%s", "updated_ts=%s"]
+    params = [status, now_utc_iso()]
+    if filled_qty is not None:
+        updates.append("filled_qty=%s")
+        params.append(int(filled_qty))
+    if error is not None:
+        updates.append("last_error=%s")
+        params.append(error)
+    params.append(local_order_id)
+    sql = f"UPDATE orders SET {', '.join(updates)} WHERE local_order_id=%s"
+    def _fn():
+        with conn() as c:
+            c.execute(sql, params)
+    run_with_retry(_fn)
 
 
 def _legacy_create_position_from_fill(order: dict, avg_fill_price: float, filled_qty: int):
@@ -1423,9 +1430,9 @@ def _legacy_create_position_from_fill(order: dict, avg_fill_price: float, filled
     client_id = order["client_id"]
     direction = (order.get("direction") or "CALL").upper()
 
-    with conn() as c:
-        run_with_retry(
-            lambda: c.execute(
+    def _insert_pos():
+        with conn() as c:
+            c.execute(
                 """
                 INSERT INTO positions (
                     id, client_id, underlying, contract, direction, qty, avg_fill,
@@ -1446,15 +1453,15 @@ def _legacy_create_position_from_fill(order: dict, avg_fill_price: float, filled
                     "OPEN",
                 ),
             )
-        )
+    run_with_retry(_insert_pos)
 
-    with conn() as c:
-        run_with_retry(
-            lambda: c.execute(
+    def _link_order():
+        with conn() as c:
+            c.execute(
                 "UPDATE orders SET position_id=%s WHERE local_order_id=%s",
                 (pos_id, order["local_order_id"]),
             )
-        )
+    run_with_retry(_link_order)
 
     audit(
         client_id,
@@ -1483,13 +1490,13 @@ def _legacy_close_position_from_exit_fill(order: dict, avg_fill_price: float):
         log.error("Exit order has no position_id: %s", order.get("local_order_id"))
         return
 
-    with conn() as c:
-        pos_row = run_with_retry(
-            lambda: c.execute(
+    def _fetch_pos():
+        with conn() as c:
+            return c.execute(
                 "SELECT * FROM positions WHERE id=%s AND client_id=%s",
                 (position_id, client_id),
             ).fetchone()
-        )
+    pos_row = run_with_retry(_fetch_pos)
 
     if not pos_row:
         log.error("Position not found: %s", position_id)
@@ -1502,9 +1509,9 @@ def _legacy_close_position_from_exit_fill(order: dict, avg_fill_price: float):
     realized_pnl = (exit_px - entry_price) * qty * OPT_MULTIPLIER
     realized_pnl_pct = round(((exit_px - entry_price) / entry_price) * 100, 2) if entry_price > 0 else 0.0
 
-    with conn() as c:
-        run_with_retry(
-            lambda: c.execute(
+    def _close_pos():
+        with conn() as c:
+            c.execute(
                 """
                 UPDATE positions
                 SET status='CLOSED', exit_ts=%s, exit_price=%s,
@@ -1523,17 +1530,17 @@ def _legacy_close_position_from_exit_fill(order: dict, avg_fill_price: float):
                     client_id,
                 ),
             )
-        )
+    run_with_retry(_close_pos)
 
-    with conn() as c:
-        run_with_retry(
-            lambda: c.execute(
+    def _update_pnl():
+        with conn() as c:
+            c.execute(
                 "UPDATE client_state "
                 "SET realized_pnl_today = COALESCE(realized_pnl_today, 0.0) + %s "
                 "WHERE client_id=%s",
                 (float(realized_pnl), client_id),
             )
-        )
+    run_with_retry(_update_pnl)
 
     audit(
         client_id,
