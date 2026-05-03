@@ -21,6 +21,19 @@
 # 33. Degraded-mode state freezes new entries without losing shutdown/exit visibility.
 # 34. Startup manifest + control-stack validation required before initialized=True.
 # 35. Runtime health loop continuously verifies worker/fill-monitor/core integrity.
+#
+# Wiring additions (see inline WIRE-N tags):
+# WIRE-1  probe_db_rowcount() called once at supervisor startup. If the DB driver
+#         returns None for rowcount and OSM_ROWCOUNT_NONE_IS_FATAL=1 (default),
+#         the supervisor raises RuntimeError before spawning any runner thread.
+# WIRE-2  get_split_brain_orders() audited per-client after OSM construction.
+#         If leftover split-brain orders exist from a prior session, runner enters
+#         degraded mode immediately, blocking new entries until reconciler recovers.
+# WIRE-3  _on_split_brain_detected() callback passed to worker_loop so that any
+#         submit that returns {"split_brain": True} at runtime freezes the client
+#         immediately without waiting for the health loop.
+# WIRE-4  install_exit_quarantine_patch imported from ap.order_state_machine
+#         (now a no-op shim there) instead of the old standalone patch file.
 # =============================================================================
 
 from __future__ import annotations
@@ -53,6 +66,17 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
 )
+
+# COHESION-2 FIX: apply the (now no-op) shim once at module import time, not
+# per-runner startup. A real class-level patch should only run once per process,
+# not once per client thread restart. Keeping it here so if the shim is ever
+# un-shimmed, it won't silently apply N times.
+try:
+    from ap.order_state_machine import install_exit_quarantine_patch, APOrderStateMachine as _OSM_CLASS
+    install_exit_quarantine_patch(_OSM_CLASS)
+    logger.debug("Exit quarantine shim confirmed (all protections native in APOrderStateMachine)")
+except Exception as _patch_exc:
+    logger.warning("Could not apply exit quarantine shim at import: %s", _patch_exc)
 
 _ET = ZoneInfo("America/New_York")
 _time_module: object = time
@@ -177,10 +201,125 @@ class ClientRunner(threading.Thread):
         if stop_runner:
             self.stopped.set()
 
+    # WIRE-3 (support method) ─────────────────────────────────────────────────
+    def _on_split_brain_detected(
+        self,
+        local_order_id: str = "",
+        broker_order_id: str = "",
+    ) -> None:
+        """
+        Callback passed to worker_loop. Called when any submit returns
+        {"split_brain": True} — broker accepted but OSM DB transition failed.
+
+        Freezes new entries immediately while keeping the runner alive so the
+        fill monitor and reconciler can advance the flagged order(s) to SUBMITTED
+        and clear the split-brain state from the DB.
+
+        worker_loop must call this as:
+            if res.get("split_brain"):
+                on_split_brain(
+                    local_order_id=res.get("local_order_id", ""),
+                    broker_order_id=res.get("broker_order_id", ""),
+                )
+
+        Note: _enter_degraded_mode already clears entries_allowed internally.
+        """
+        # Include the order ID in the reason key so the log and dashboard show
+        # which exact order triggered the freeze. _reason_key() splits on ':'
+        # so "split_brain_detected" is still the prefix for clearing logic.
+        reason = f"split_brain_detected:{local_order_id or 'unknown'}"
+
+        logger.critical(
+            "[%s] SPLIT-BRAIN DETECTED at runtime | local=%s broker=%s — "
+            "freezing entries until reconciler recovers",
+            self.email,
+            local_order_id or "?",
+            broker_order_id or "?",
+        )
+
+        # Enter degraded mode (also clears entries_allowed internally).
+        self._enter_degraded_mode(reason, stop_runner=False)
+
+        # Notify the healer so self-healing infrastructure has full visibility
+        # and can take any configured action (alert, escalation, etc.).
+        healer = get_healer()
+        if healer is not None:
+            try:
+                healer.request_action(
+                    self.email,
+                    "split_brain",
+                    reason=reason,
+                    local_order_id=str(local_order_id or ""),
+                    broker_order_id=str(broker_order_id or ""),
+                )
+            except Exception:
+                logger.debug(
+                    "[%s] healer request_action failed for split-brain event",
+                    self.email,
+                    exc_info=True,
+                )
+
+    def _check_split_brain_recovery(self) -> bool:
+        """
+        BUG-5 FIX: poll get_split_brain_orders() and clear split-brain degraded
+        reasons when the reconciler has resolved all flagged orders.
+
+        Previously split_brain_residue and split_brain_detected were permanently
+        sticky — the runner stayed degraded after a split-brain event even after
+        the reconciler had advanced the flagged orders, until the runner was
+        manually restarted.
+
+        Called from both the main runner loop (60s cadence) and the health loop
+        (RUNNER_HEALTH_CHECK_SEC cadence). Returns True if split-brain reasons
+        were cleared.
+        """
+        has_sb_reason = any(
+            self._reason_key(r) in {"split_brain_residue", "split_brain_detected"}
+            for r in self.degraded_reasons
+        )
+        if not has_sb_reason:
+            return False
+
+        if self.order_state_machine is None:
+            return False
+
+        try:
+            remaining = self.order_state_machine.get_split_brain_orders()
+        except Exception as exc:
+            logger.warning("[%s] split-brain recovery check failed: %s", self.email, exc)
+            return False
+
+        if remaining:
+            # Still outstanding — keep degraded.
+            logger.debug(
+                "[%s] split-brain recovery check: %d order(s) still unresolved",
+                self.email, len(remaining),
+            )
+            return False
+
+        # All split-brain orders resolved by reconciler.
+        logger.warning(
+            "[%s] SPLIT-BRAIN RECOVERED — all flagged orders resolved by reconciler; "
+            "clearing degraded reasons and re-evaluating entry permission",
+            self.email,
+        )
+        self._clear_degraded_reason_key("split_brain_residue")
+        self._clear_degraded_reason_key("split_brain_detected")
+        return True
+    # ─────────────────────────────────────────────────────────────────────────
+
     def _reason_key(self, reason: str) -> str:
         return str(reason or "").split(":", 1)[0]
 
     def _clear_degraded_reason_key(self, key: str):
+        """
+        Remove all degraded reasons matching the given key prefix.
+
+        COHESION-1 FIX: if removing the reason empties the set, proactively
+        clear degraded.set() and re-evaluate entry permission. Previously there
+        was a window where degraded_reasons was empty but degraded.is_set() was
+        still True, until _try_recover_degraded_mode ran on the next health tick.
+        """
         key = str(key or "")
         if not key:
             return
@@ -188,6 +327,13 @@ class ClientRunner(threading.Thread):
             r for r in self.degraded_reasons
             if self._reason_key(r) != key
         }
+        # If the set is now empty and we're not in a hard-failed / stopping state,
+        # clear the degraded flag immediately rather than waiting for the health loop.
+        if not self.degraded_reasons and not self.failed.is_set() and not self.stopping.is_set():
+            if self.degraded.is_set():
+                logger.warning("[%s] RECOVERED (reason cleared, no remaining degraded reasons)", self.email)
+            self.degraded.clear()
+            self._set_entry_permission()
 
     def _try_recover_degraded_mode(self):
         """
@@ -195,6 +341,10 @@ class ClientRunner(threading.Thread):
 
         Critical startup/control-stack failures remain sticky. Runtime worker/fill
         monitor failures are recoverable because those loops are self-restarting.
+
+        split_brain_detected and split_brain_residue are also sticky — they must
+        be cleared by the reconciler recovering the flagged orders, not by this
+        method.
         """
         if self.failed.is_set() or self.stopping.is_set() or self.stopped.is_set():
             return False
@@ -215,6 +365,8 @@ class ClientRunner(threading.Thread):
             "fill_monitor_loop_crashed",
             "fill_monitor_loop_returned",
         }
+        # split_brain reasons are NOT in recoverable — they are sticky until the
+        # reconciler explicitly clears them by advancing flagged orders.
 
         remaining = {
             r for r in self.degraded_reasons
@@ -377,6 +529,7 @@ class ClientRunner(threading.Thread):
                     self._clear_degraded_reason_key("worker_dead")
 
                 self._try_recover_degraded_mode()
+                self._check_split_brain_recovery()   # BUG-5 FIX: poll for reconciler resolution
                 self._set_entry_permission()
 
                 try:
@@ -471,18 +624,27 @@ class ClientRunner(threading.Thread):
             self._mark_failed("no_token")
             return
 
+        # FIX-1: URL is the authoritative source of mode truth.
+        # Previous logic: sandbox→PAPER, else defer to AP_MODE env (default paper).
+        # Bug: api.tradier.com URL + missing AP_MODE → mode="PAPER" while routing
+        # real orders to production — capital gates in APMasterControl behave as
+        # paper while actual money is at risk.
+        # Fix: production URL always forces LIVE regardless of AP_MODE.
         if "sandbox" in self.base_url.lower():
             self.mode = "PAPER"
-        elif os.getenv("AP_MODE", "paper").upper() == "LIVE":
+        elif "api.tradier.com" in self.base_url.lower():
             self.mode = "LIVE"
+            logger.warning(
+                "[%s] Forcing LIVE mode from base_url=%s — AP_MODE env is ignored when URL is production",
+                self.email, self.base_url,
+            )
         else:
-            self.mode = "PAPER"
-        logger.info("[%s] Client mode: %s (from tradier_base_url)", self.email, self.mode)
+            self.mode = os.getenv("AP_MODE", "PAPER").upper()
+        logger.info("[%s] Client mode: %s (base_url=%s)", self.email, self.mode, self.base_url)
 
         if self.mode == "LIVE":
             missing = []
-            if not token:
-                missing.append("member.tradier_access_token")
+            # Note: token is guaranteed non-None here — checked and early-returned above.
             if not str(self.account_id or "").strip():
                 missing.append("member.tradier_account_id")
             if not os.getenv("DATABASE_URL", "").strip():
@@ -498,7 +660,6 @@ class ClientRunner(threading.Thread):
             from ap_master_control import APMasterControl
             from ap.position_manager import APPositionManager
             from ap.order_state_machine import APOrderStateMachine
-            from order_state_machine_exit_quarantine_patch import install_exit_quarantine_patch
             from ap.contract_selector import APContractSelectionEngine
         except Exception as exc:
             self._mark_failed(f"import_failed:{exc}")
@@ -516,7 +677,9 @@ class ClientRunner(threading.Thread):
         broker = TradierBroker(broker_cfg)
 
         self._clear_old_phantom_orders()
-        sb = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY) if SUPABASE_URL else None
+        # BUG-3 FIX: guard both URL and key — an empty service key produces a
+        # confusing auth error inside Supabase rather than a clear None here.
+        sb = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY) if (SUPABASE_URL and SUPABASE_SERVICE_KEY) else None
 
         self.position_manager = APPositionManager(client_id=self.email)
 
@@ -563,10 +726,30 @@ class ClientRunner(threading.Thread):
             supabase_client=sb,
         )
 
-        install_exit_quarantine_patch(APOrderStateMachine)
-        logger.info("[%s] Exit quarantine patch installed on APOrderStateMachine", self.email)
-
         self.order_state_machine = APOrderStateMachine(client_id=self.email)
+
+        # WIRE-2: split-brain startup audit ───────────────────────────────────
+        # Orders from a prior session where the broker accepted a submission but
+        # the DB transition failed are flagged with SPLIT_BRAIN: in last_error.
+        # Start in degraded mode if any exist — entries are blocked until the
+        # reconciler advances the flagged orders on its next pass.
+        try:
+            split_brain_orders = self.order_state_machine.get_split_brain_orders()
+        except Exception as _sb_exc:
+            logger.error("[%s] Split-brain startup audit failed: %s", self.email, _sb_exc)
+            split_brain_orders = []
+
+        if split_brain_orders:
+            _sb_reason = f"split_brain_residue:{len(split_brain_orders)}"
+            self._enter_degraded_mode(_sb_reason, stop_runner=False)
+            logger.critical(
+                "[%s] Starting DEGRADED — %d split-brain order(s) from prior session; "
+                "broker_order_ids: %s | reconciler must recover before entries resume",
+                self.email,
+                len(split_brain_orders),
+                [o.get("broker_order_id") for o in split_brain_orders],
+            )
+        # ─────────────────────────────────────────────────────────────────────
 
         data_token = os.getenv("TRADIER_DATA_TOKEN", "").strip()
         data_base_url = os.getenv("TRADIER_DATA_BASE_URL", "https://api.tradier.com").strip()
@@ -685,6 +868,7 @@ class ClientRunner(threading.Thread):
                     healer_ref.heartbeat(self.email, "runner")
             except Exception:
                 pass
+            self._check_split_brain_recovery()   # BUG-5 FIX: clear sticky reasons when resolved
             self._try_recover_degraded_mode()
             self._set_entry_permission()
 
@@ -752,10 +936,29 @@ class ClientRunner(threading.Thread):
     def _clear_old_phantom_orders(self):
         try:
             from ap.db import conn as _conn
+
+            # FIX-2: In LIVE mode, SUBMITTED/ACKNOWLEDGED orders without a broker_order_id
+            # can be genuine split-brain events (broker accepted but DB write of broker_order_id
+            # failed). Cancelling them at startup would discard the only local record of a real
+            # live order, leaving an open position at Tradier with no tracking in DB.
+            #
+            # Two-tier defence:
+            #   Tier A (safe): CREATED/PENDING_TRIGGER with no broker ID — these were
+            #     never submitted. Age gate: PHANTOM_ORDER_MIN_AGE_MINUTES (default 5).
+            #   Tier B (guarded): SUBMITTED/ACKNOWLEDGED with no broker ID — only cancel
+            #     if last_error indicates a known pre-submission state (never reached broker)
+            #     OR age exceeds PHANTOM_SUBMITTED_MIN_AGE_MINUTES (default 30 in LIVE,
+            #     5 in PAPER). Any split-brain order with a real last_error should be left
+            #     for the reconciler to resolve on the next pass.
             min_age = int(os.getenv("PHANTOM_ORDER_MIN_AGE_MINUTES", "5"))
+            submitted_min_age = int(os.getenv(
+                "PHANTOM_SUBMITTED_MIN_AGE_MINUTES",
+                "30" if self.mode == "LIVE" else "5",
+            ))
 
             def _clear_phantoms():
                 with _conn() as c:
+                    # Tier A: pre-submission states — safe to cancel by age alone.
                     c.execute(
                         """
                         UPDATE orders
@@ -763,7 +966,7 @@ class ClientRunner(threading.Thread):
                             last_error = %s,
                             updated_ts = NOW()
                         WHERE client_id = %s
-                          AND status IN ('CREATED', 'SUBMITTED', 'ACKNOWLEDGED')
+                          AND status IN ('CREATED', 'PENDING_TRIGGER')
                           AND created_ts < NOW() - (%s || ' minutes')::interval
                           AND (
                                 broker_order_id IS NULL
@@ -771,13 +974,56 @@ class ClientRunner(threading.Thread):
                              OR UPPER(TRIM(COALESCE(broker_order_id, ''))) IN ('N/A', 'NA', 'NONE', 'NULL')
                           )
                         """,
-                        ("CANCELED", "startup_phantom_clear", self.email, str(min_age)),
+                        ("CANCELED", "startup_phantom_clear_pre_submit", self.email, str(min_age)),
                     )
-                    return c.rowcount
+                    tier_a = c.rowcount or 0
 
-            n = run_with_retry(_clear_phantoms)
-            if n:
-                logger.info("[%s] Startup: cleared %s old phantom orders", self.email, n)
+                    # Tier B: submitted/acknowledged with no broker ID — only cancel if
+                    # last_error signals a known never-reached-broker state, OR age exceeds
+                    # the longer submitted threshold. Log at CRITICAL when this path fires
+                    # in LIVE mode so any residual split-brain is immediately visible.
+                    c.execute(
+                        """
+                        UPDATE orders
+                        SET status = %s,
+                            last_error = %s,
+                            updated_ts = NOW()
+                        WHERE client_id = %s
+                          AND status IN ('SUBMITTED', 'ACKNOWLEDGED')
+                          AND created_ts < NOW() - (%s || ' minutes')::interval
+                          AND (
+                                broker_order_id IS NULL
+                             OR TRIM(COALESCE(broker_order_id, '')) = ''
+                             OR UPPER(TRIM(COALESCE(broker_order_id, ''))) IN ('N/A', 'NA', 'NONE', 'NULL')
+                          )
+                          AND (
+                                COALESCE(last_error, '') IN (
+                                    'startup_phantom', 'never_submitted', 'pre_submit_canceled',
+                                    'invalid_entry_limit_price', 'invalid_existing_entry_qty',
+                                    'missing_existing_entry_contract', 'invalid_exit_limit_price'
+                                )
+                             OR created_ts < NOW() - (%s || ' minutes')::interval
+                          )
+                        """,
+                        (
+                            "CANCELED", "startup_phantom_clear_submitted",
+                            self.email, str(min_age),
+                            str(submitted_min_age),
+                        ),
+                    )
+                    tier_b = c.rowcount or 0
+                    return tier_a, tier_b
+
+            tier_a, tier_b = run_with_retry(_clear_phantoms)
+            if tier_a:
+                logger.info("[%s] Startup: cleared %s pre-submit phantom orders", self.email, tier_a)
+            if tier_b:
+                log_fn = logger.critical if self.mode == "LIVE" else logger.warning
+                log_fn(
+                    "[%s] Startup: cleared %s submitted/acknowledged phantom orders (mode=%s) "
+                    "— verify no live Tradier positions are orphaned",
+                    self.email, tier_b, self.mode,
+                )
         except Exception as exc:
             logger.warning("[%s] Startup phantom clear: %s", self.email, exc)
 
@@ -820,6 +1066,15 @@ class ClientRunner(threading.Thread):
             )
         except Exception as exc:
             logger.error("[%s] Startup recovery error: %s", self.email, exc)
+            # FIX-6: in LIVE mode a failed recovery means open positions from a prior
+            # session may not be reseeded to the exit engine, leaving live contracts
+            # with no exit protection. Enter degraded mode to block new entries while
+            # the existing positions remain tracked. Do not stop the runner — fill
+            # monitor and exit engine can still protect positions already in memory.
+            if self.mode == "LIVE":
+                self._enter_degraded_mode(
+                    f"startup_recovery_failed:{exc}", stop_runner=False
+                )
 
     def _register_exit_engine(self, exit_eng):
         try:
@@ -830,6 +1085,21 @@ class ClientRunner(threading.Thread):
             logger.warning("[%s] Exit engine registration error: %s", self.email, exc)
 
     def _seed_exit_engine_from_db(self, exit_eng):
+        # FIX-3: seed_from_db() sets current_underlying = underlying_entry on restart,
+        # not a fresh live quote. In LIVE mode this means the exit engine's underlying
+        # price is stale from entry time until the first 8-second poll cycle refreshes it.
+        # The first quote fetch after startup corrects this, but any exit logic that fires
+        # during that first poll window (especially EOD/sentinel checks) will use entry
+        # price as current underlying. This is a known issue in seed_from_db() itself
+        # that must be fixed there before relying on seeding for live positions.
+        # Until fixed: log a visible warning in LIVE mode so the gap is not invisible.
+        if self.mode == "LIVE":
+            logger.warning(
+                "[%s] _seed_exit_engine_from_db: seed_from_db sets current_underlying=underlying_entry "
+                "not a live quote — exit engine may use stale underlying price until first poll cycle (~8s). "
+                "Fix seed_from_db() to fetch live quotes before relying on seeding in LIVE mode.",
+                self.email,
+            )
         try:
             if exit_eng and hasattr(exit_eng, "seed_from_db"):
                 exit_eng.seed_from_db(self.position_manager)
@@ -920,12 +1190,36 @@ class ClientRunner(threading.Thread):
             logger.warning("[%s] Equity sync failed: %s -- using default", self.email, exc)
 
     def _start_equity_refresh(self, broker):
-        reset_done_for_date = ""
+        # FIX-5: if the process starts after 9:30 AM ET the 900s equity thread loop
+        # never fires reset_session() for that day because at_open only matches
+        # 9:30–10:59 AM. Seed dedup state from DB reflects prior-session signals, so
+        # a mid-morning restart blocks same-day signals that haven't been traded yet.
+        # Run reset_session() once on startup if market is already open for the day.
+        try:
+            _now_et = datetime.now(_ET)
+            _market_open = (
+                (_now_et.hour == 9 and _now_et.minute >= 30)
+                or _now_et.hour >= 10
+            )
+            if _market_open and self.master_control and hasattr(self.master_control, "reset_session"):
+                self.master_control.reset_session(client_id=self.email)
+                logger.info(
+                    "[%s] Startup-time session reset — market already open at %s ET",
+                    self.email, _now_et.strftime("%H:%M"),
+                )
+        except Exception as exc:
+            logger.warning("[%s] Startup-time session reset failed: %s", self.email, exc)
+
+        reset_done_for_date = datetime.now(_ET).strftime("%Y-%m-%d") if (
+            datetime.now(_ET).hour >= 10
+            or (datetime.now(_ET).hour == 9 and datetime.now(_ET).minute >= 30)
+        ) else ""
 
         def _refresh_loop():
             nonlocal reset_done_for_date
             healer_ref = get_healer()
-            while not self.stopped.wait(900):
+            _refresh_interval = int(os.getenv("EQUITY_REFRESH_INTERVAL_SEC", "900"))
+            while not self.stopped.wait(_refresh_interval):
                 self._sync_account_equity(broker)
                 self.last_equity_heartbeat_ts = time.time()
                 try:
@@ -958,6 +1252,12 @@ class ClientRunner(threading.Thread):
 
         is_live = self.mode == "LIVE"
 
+        # WIRE-3: capture the callback reference once here so the closure is
+        # stable across worker restarts. worker_loop must call this with
+        # on_split_brain(local_order_id=..., broker_order_id=...) when it sees
+        # res.get("split_brain") == True from submit_existing_entry/submit_exit.
+        _split_brain_cb = self._on_split_brain_detected
+
         def _run_worker():
             restart_sleep = float(os.getenv("WORKER_RESTART_SLEEP_SEC", "2"))
             while not self.stopped.is_set():
@@ -973,6 +1273,10 @@ class ClientRunner(threading.Thread):
                         stop_event=self.stopped,
                         live_mode=is_live,
                         exit_eng=getattr(self.core, "exit_eng", None),
+                        # WIRE-3: freeze callback for split-brain runtime detection.
+                        # worker_loop must accept and call this when it sees
+                        # res.get("split_brain") from any submit result.
+                        on_split_brain=_split_brain_cb,
                     )
                     if self.stopped.is_set():
                         break
@@ -1037,11 +1341,21 @@ def route_signal_to_all_clients(signal: dict):
                 ticker,
             )
             try:
-                sb = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
-                members = _fetch_active_members(sb)
-                active_emails = [m["email"] for m in members if m.get("email")]
-                with _registry_lock:
-                    _members_cache["emails"] = (active_emails, now + 60.0)
+                if not (SUPABASE_URL and SUPABASE_SERVICE_KEY):
+                    # Consistent with BUG-3 fix: both credentials required before
+                    # attempting create_client. An empty service key produces a
+                    # confusing Supabase auth error rather than a clean empty list.
+                    logger.error(
+                        "Signal %s [%s] -- Supabase fallback requested but credentials incomplete; dropping",
+                        signal_id, ticker,
+                    )
+                    active_emails = []
+                else:
+                    sb = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+                    members = _fetch_active_members(sb)
+                    active_emails = [m["email"] for m in members if m.get("email")]
+                    with _registry_lock:
+                        _members_cache["emails"] = (active_emails, now + 60.0)
             except Exception as exc:
                 logger.error("Supabase members fallback failed: %s", exc)
                 active_emails = []
@@ -1130,9 +1444,41 @@ def _sync_runners(sb: Client):
 
 
 def start_multi_client_supervisor():
+    # BUG-1 FIX: Supabase credential check runs FIRST. If this process is not
+    # the multi-client supervisor (no Supabase), we return immediately without
+    # probing DB rowcount — the probe is only meaningful when the supervisor is
+    # actually going to start and spawn runner threads.
     if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
         logger.warning("No Supabase credentials -- multi-client supervisor not starting")
         return
+
+    # WIRE-1: DB rowcount probe — process-level, runs once before any runner
+    # thread or APOrderStateMachine is created. If the active DB driver returns
+    # None for rowcount and OSM_ROWCOUNT_NONE_IS_FATAL=1 (the default), every
+    # call to transition() will refuse to advance state, stalling all order
+    # lifecycle updates system-wide. Fail hard here so the problem surfaces at
+    # startup rather than silently during live trading.
+    try:
+        from ap.order_state_machine import probe_db_rowcount, _ROWCOUNT_NONE_IS_FATAL
+        _rowcount_result = probe_db_rowcount()
+        if _rowcount_result is None and _ROWCOUNT_NONE_IS_FATAL:
+            raise RuntimeError(
+                "DB driver does not expose rowcount and OSM_ROWCOUNT_NONE_IS_FATAL=1 — "
+                "all OSM transitions will stall; fix the DB wrapper or set "
+                "OSM_ROWCOUNT_NONE_IS_FATAL=0 only after proving writes cannot silently fail"
+            )
+        logger.info(
+            "DB rowcount probe: %s — OSM transition safety confirmed",
+            repr(_rowcount_result),
+        )
+    except RuntimeError:
+        raise  # propagate the hard-fail; do not swallow
+    except Exception as _probe_exc:
+        # Any other exception from probe_db_rowcount (DB not up, import error, etc.)
+        # is also fatal — we cannot start trading without knowing DB truth behavior.
+        raise RuntimeError(
+            f"DB rowcount probe failed at supervisor startup: {_probe_exc}"
+        ) from _probe_exc
 
     sb = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
     init_monitor(supabase_client=sb)
@@ -1147,7 +1493,23 @@ def start_multi_client_supervisor():
                 _sync_runners(sb)
             except Exception as exc:
                 logger.error("Supervisor sync error: %s", exc)
-            time.sleep(300)
+            # FIX-4: 300s full-sync cadence is too slow for dead-runner detection.
+            # Inner loop checks runner liveness every 15s and breaks early to call
+            # _sync_runners immediately when any runner dies. Full member-list refresh
+            # from Supabase still happens on the 300s outer cadence.
+            _sync_interval = int(os.getenv("SUPERVISOR_SYNC_SEC", "300"))
+            _check_interval = int(os.getenv("SUPERVISOR_LIVENESS_CHECK_SEC", "15"))
+            _checks = max(1, _sync_interval // _check_interval)
+            for _ in range(_checks):
+                time.sleep(_check_interval)
+                with _registry_lock:
+                    any_dead = any(
+                        not r.is_alive()
+                        for r in _active_runners.values()
+                    )
+                if any_dead:
+                    logger.warning("Supervisor: dead runner detected — triggering early sync")
+                    break
 
     thread = threading.Thread(target=_supervisor, daemon=True, name="client-supervisor")
     thread.start()
@@ -1178,8 +1540,18 @@ def get_runner_status() -> list[dict]:
                 "position_mgr": r.position_manager is not None,
                 "order_osm": r.order_state_machine is not None,
                 "contract_sel": r.contract_selector is not None,
-                "earnings_guard": r.contract_selector is not None,
-                "iv_filter": r.contract_selector is not None,
+                # FIX-11: previously both fields reported contract_selector is not None,
+                # which is always True whenever the selector is initialized. Now reports
+                # whether the underlying guard/filter object is actually wired into the
+                # selector by checking the canonical attribute names.
+                "earnings_guard": (
+                    getattr(r.contract_selector, "earnings_guard", None) is not None
+                    if r.contract_selector else False
+                ),
+                "iv_filter": (
+                    getattr(r.contract_selector, "iv_filter", None) is not None
+                    if r.contract_selector else False
+                ),
                 "order_monitor": r.order_monitor is not None,
                 "worker_alive": getattr(r, "worker_thread", None) is not None and r.worker_thread.is_alive(),
                 "fill_monitor_alive": getattr(r, "fill_monitor_thread", None) is not None and r.fill_monitor_thread.is_alive(),
