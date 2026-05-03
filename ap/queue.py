@@ -656,6 +656,16 @@ def _dispatch(
                 limit_price=getattr(plan, "limit_price", None),
             )
 
+            # WIRE-3: split-brain — broker accepted but OSM DB transition failed
+            if submit_res.get("split_brain") and callable(on_split_brain):
+                try:
+                    on_split_brain(
+                        local_order_id=submit_res.get("local_order_id", ""),
+                        broker_order_id=submit_res.get("broker_order_id", ""),
+                    )
+                except Exception as _sb_err:
+                    log.error("[%s] split_brain callback failed: %s", ticker, _sb_err)
+
             if not submit_res.get("ok"):
                 log.error(
                     "[%s] Immediate submit failed safely | local=%s error=%s",
@@ -699,11 +709,14 @@ def worker_loop(
     client_id: str = "default",
     stop_event=None,
     live_mode: bool = False,
+    on_split_brain=None,
 ):
     """
     Main queue worker.
     stop_event: threading.Event — set by ClientRunner.stop() to cleanly exit.
     live_mode:  if True, legacy process_signal() fallback is disabled entirely.
+    on_split_brain: optional callback(local_order_id, broker_order_id) fired when
+                    a submit returns split_brain=True (broker accepted, OSM DB failed).
     """
     _init_db()()
     mode_label = "control" if master_control else ("LIVE-NO-FALLBACK" if live_mode else "legacy")
