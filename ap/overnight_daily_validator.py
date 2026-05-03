@@ -80,6 +80,13 @@ class MarketSnapshot:
 
 def fetch_market_snapshot(ticker: str, broker) -> Optional[MarketSnapshot]:
     """Fetch session high/low + last from Tradier. Returns None on failure."""
+    # Guard: OCC option symbols contain digits after position 4 (e.g. TSLA260516C00180000)
+    if len(ticker) > 6 and any(c.isdigit() for c in ticker[4:]):
+        log.error(
+            "[%s] fetch_market_snapshot called with option symbol — must be underlying equity symbol",
+            ticker,
+        )
+        return None
     try:
         base_url = (
             getattr(broker, "base_url", None)
@@ -152,12 +159,22 @@ def validate_overnight_daily_signal(
     if side not in {"CALL", "PUT"}:
         return ValidationResult(False, InvalidationReason.INVALID_SIDE, f"Unknown side '{side}' — must be CALL or PUT", side=side)
 
-    if not prior_day_high or not prior_day_low or snapshot is None:
+    # Sanity check: prior levels must be real prices, not stubs/zeroes
+    _MIN_VALID_PRICE = 0.50
+    prior_high_valid = bool(prior_day_high and float(prior_day_high) >= _MIN_VALID_PRICE)
+    prior_low_valid  = bool(prior_day_low  and float(prior_day_low)  >= _MIN_VALID_PRICE)
+    levels_sane = (
+        prior_high_valid
+        and prior_low_valid
+        and float(prior_day_high) > float(prior_day_low)
+    )
+
+    if not levels_sane or snapshot is None:
         return _missing_data_result(
             ticker=ticker,
             side=side,
-            prior_day_high=prior_day_high,
-            prior_day_low=prior_day_low,
+            prior_day_high=prior_day_high if prior_high_valid else None,
+            prior_day_low=prior_day_low if prior_low_valid else None,
             snapshot_missing=snapshot is None,
         )
 

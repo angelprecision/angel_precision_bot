@@ -271,8 +271,11 @@ class APSelfHealingSystem:
         if auto_restart and health.restart_allowed():
             fn = restart_registry.get(email, comp)
             if fn:
-                health.restart_count += 1
-                health.last_restart = _now()
+                with self._lock:
+                    if not health.restart_allowed():
+                        return
+                    health.restart_count += 1
+                    health.last_restart = _now()
                 health.state = HealthState.CRITICAL
                 health.record_error(f"Dead — restart attempt {health.restart_count}")
                 success = fn()
@@ -306,8 +309,6 @@ class APSelfHealingSystem:
                 osm = getattr(runner, "order_state_machine", None)
                 if pm and osm:
                     self._reconcile_client(email, pm, osm)
-                self._check_exit_quarantine_watchdog(email, runner)
-                self._check_quote_staleness(email, runner)
             except Exception as e:
                 log.debug("[%s] Reconcile error: %s", email, e)
 
@@ -482,9 +483,10 @@ class APSelfHealingSystem:
 
     def _get_health(self, email: str, component: str) -> ComponentHealth:
         key = (email, component)
-        if key not in self._health:
-            self._health[key] = ComponentHealth(client_id=email, component=component)
-        return self._health[key]
+        with self._lock:
+            if key not in self._health:
+                self._health[key] = ComponentHealth(client_id=email, component=component)
+            return self._health[key]
 
     def _alert(self, email: str, component: str, state: str, message: str, health: Optional[ComponentHealth]):
         if health:
@@ -499,6 +501,14 @@ class APSelfHealingSystem:
     def _send_discord(self, message: str):
         if not DISCORD_WEBHOOK_URL:
             return
+        threading.Thread(
+            target=self._send_discord_sync,
+            args=(message,),
+            daemon=True,
+            name="discord-alert",
+        ).start()
+
+    def _send_discord_sync(self, message: str):
         try:
             resp = requests.post(DISCORD_WEBHOOK_URL, json={"content": message[:1900]}, timeout=8)
             if resp.status_code not in (200, 204):

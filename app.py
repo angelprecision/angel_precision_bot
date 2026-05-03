@@ -76,6 +76,7 @@ RATE_LIMIT_PER_MIN = int(os.getenv("RATE_LIMIT_PER_MIN", "60"))
 
 # Idempotency cache (per worker - upgrade to Redis later)
 _IDEMP = {}
+_IDEMP_LAST_CLEANUP: float = 0.0
 IDEMP_TTL_SECONDS = int(os.getenv("IDEMP_TTL_SECONDS", "300"))
 
 # HMAC time drift (seconds)
@@ -110,7 +111,11 @@ def _rate_limited(bucket: str) -> bool:
 
 
 def _idem_cleanup():
+    global _IDEMP_LAST_CLEANUP
     now = time.time()
+    if now - _IDEMP_LAST_CLEANUP < 1.0:
+        return
+    _IDEMP_LAST_CLEANUP = now
     dead = [k for k, (ts, _) in _IDEMP.items() if now - ts > IDEMP_TTL_SECONDS]
     for k in dead:
         _IDEMP.pop(k, None)
@@ -171,17 +176,17 @@ def _verify_hmac(req) -> bool:
             ts_i = None
 
         if ts_i is not None:
-            # Anti-replay / drift window
+            # Anti-replay / drift window — hard reject, no Scheme B fallthrough
             if abs(int(time.time()) - ts_i) > HMAC_MAX_SKEW_SECONDS:
-                log.warning(f"Timestamp out of range: {ts_i}")
-            else:
-                msg = str(ts_i).encode("utf-8") + b"." + raw
-                expected = _hmac_hex(SIGNING_SECRET, msg)
-                if hmac.compare_digest(expected, sig):
-                    log.debug("✅ HMAC verified (timestamped scheme)")
-                    return True
-                else:
-                    log.warning("HMAC timestamped scheme failed (signature mismatch)")
+                log.warning(f"Timestamp out of range: {ts_i} — rejecting, not falling through to Scheme B")
+                return False
+            msg = str(ts_i).encode("utf-8") + b"." + raw
+            expected = _hmac_hex(SIGNING_SECRET, msg)
+            if hmac.compare_digest(expected, sig):
+                log.debug("✅ HMAC verified (timestamped scheme)")
+                return True
+            log.warning("HMAC timestamped scheme failed (signature mismatch)")
+            return False  # Scheme A headers present but wrong sig — never try Scheme B
 
     # -----------------------------
     # Scheme B: Simple body-only HMAC
@@ -304,6 +309,12 @@ def start_background_threads_once(broker):
 # APP FACTORY (gunicorn safe)
 # ============================================================
 
+
+def _discord_signal_id(symbol: str, direction: str, strike, content_hash: str) -> str:
+    """Deterministic signal_id so Discord webhook retries don't create duplicate queue entries."""
+    raw = f"{symbol}:{direction}:{strike}:{content_hash}"
+    return hashlib.sha256(raw.encode()).hexdigest()[:32]
+
 def create_app() -> Flask:
     app = Flask(__name__)
     app.config["MAX_CONTENT_LENGTH"] = MAX_CONTENT_LENGTH
@@ -333,7 +344,7 @@ def create_app() -> Flask:
             broker_account_id=os.getenv("TRADIER_ACCOUNT_ID", ""),
             broker_token=os.getenv("TRADIER_ACCESS_TOKEN", ""),
             broker_base_url=os.getenv("TRADIER_BASE_URL", "https://sandbox.tradier.com"),
-            initial_equity=100000.0,
+            initial_equity=float(os.getenv("INITIAL_EQUITY", "25000.0")),
         )
         log.info("✅ Default client created")
     else:
@@ -343,7 +354,10 @@ def create_app() -> Flask:
     # =============================================
 
     @app.get("/debug/threads")
+    @require_hmac
     def debug_threads():
+        if APP_ENV == "prod":
+            return jsonify({"ok": False, "error": "disabled_in_prod"}), 403
         import threading
         threads = []
         for t in threading.enumerate():
@@ -355,6 +369,7 @@ def create_app() -> Flask:
         return jsonify({"ok": True, "threads": threads})
 
     @app.get("/debug/queue_counts")
+    @require_hmac
     def debug_queue_counts():
         try:
             from ap.db import run_with_retry
@@ -517,6 +532,9 @@ def create_app() -> Flask:
     def kill_on():
         log.warning("🔴 KILL SWITCH ENABLED")
         update_state({"kill_switch": True, "mode": "READ_ONLY"}, client_id=DEFAULT_CLIENT_ID)
+        with _SIGNAL_CACHE_LOCK:
+            _kill_switch_cache.clear()
+            _client_status_cache.clear()
         return jsonify({"ok": True, "kill_switch": True})
 
     @app.post("/kill_switch/off")
@@ -524,6 +542,8 @@ def create_app() -> Flask:
     def kill_off():
         log.info("🟢 KILL SWITCH DISABLED")
         update_state({"kill_switch": False}, client_id=DEFAULT_CLIENT_ID)
+        with _SIGNAL_CACHE_LOCK:
+            _kill_switch_cache.clear()
         return jsonify({"ok": True, "kill_switch": False})
 
     @app.post("/mode")
@@ -643,8 +663,9 @@ def create_app() -> Flask:
 
             for msg in parsed:
                 if msg.calls and msg.calls.strike:
+                    _chash = hashlib.sha256(text.encode()).hexdigest()[:16]
                     sig = Signal(
-                        signal_id=str(uuid.uuid4()),
+                        signal_id=_discord_signal_id(msg.symbol, "CALL", msg.calls.strike, _chash),
                         symbol=msg.symbol,
                         direction="CALL",
                         pattern_id="SCANNER_V1",
@@ -665,8 +686,9 @@ def create_app() -> Flask:
                     queued += 1
 
                 if msg.puts and msg.puts.strike:
+                    _phash = hashlib.sha256(text.encode()).hexdigest()[:16]
                     sig = Signal(
-                        signal_id=str(uuid.uuid4()),
+                        signal_id=_discord_signal_id(msg.symbol, "PUT", msg.puts.strike, _phash),
                         symbol=msg.symbol,
                         direction="PUT",
                         pattern_id="SCANNER_V1",

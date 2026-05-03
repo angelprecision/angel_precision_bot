@@ -24,7 +24,7 @@ from typing import Optional
 log = logging.getLogger("intelligence_bridge")
 
 _BOT_ROOT  = os.path.dirname(os.path.abspath(__file__))
-_INTEL_DIR = os.path.join(_BOT_ROOT, "ap_intelligence-3")
+_INTEL_DIR = os.path.join(_BOT_ROOT, "ap_intelligence")
 
 if _BOT_ROOT not in sys.path:
     sys.path.insert(0, _BOT_ROOT)
@@ -101,6 +101,13 @@ _AUDIT_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
 )
 atexit.register(lambda: _AUDIT_EXECUTOR.shutdown(wait=False, cancel_futures=True))
 
+# FIX 19: Module-level executor for intel checks — never spawn per-signal
+_INTEL_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=int(os.getenv("INTEL_WORKERS", "2")),
+    thread_name_prefix="intel-run",
+)
+atexit.register(lambda: _INTEL_EXECUTOR.shutdown(wait=False, cancel_futures=True))
+
 def _data_collection_allowed() -> bool:
     return _INTEL_DATA_COLLECTION_OVERRIDE or not _INTEL_IS_LIVE
 
@@ -119,7 +126,7 @@ def _block_gate(*, status: str, score: float, reasoning: str, risk_detail=None, 
 def _collect_gate(*, status: str, score: float, reasoning: str, risk_detail=None, price_data_stub: bool = False) -> dict:
     return {
         "approved": True,
-        "score": max(round(float(score or 0), 1), 50.0),
+        "score": round(float(score or 0), 1),  # honest raw score — 1-contract cap is the real guard
         "contracts": 1,
         "reasoning": reasoning,
         "intel_status": status,
@@ -204,18 +211,21 @@ def _get_pipeline(client_id: str = "default"):
 
 
 _audit_log = None
+_audit_log_lock = threading.Lock()
 
 def _get_audit_log():
     global _audit_log
     if _audit_log is not None:
         return _audit_log
-    try:
-        from ap_intelligence.ap_audit_log import APAuditLog
-        _audit_log = APAuditLog()
+    with _audit_log_lock:
+        if _audit_log is not None:
+            return _audit_log
+        try:
+            from ap_intelligence.ap_audit_log import APAuditLog
+            _audit_log = APAuditLog()
+        except Exception as e:
+            log.debug(f"intelligence_bridge: audit log unavailable ({e})")
         return _audit_log
-    except Exception as e:
-        log.debug(f"intelligence_bridge: audit log unavailable ({e})")
-        return None
 
 
 def _signal_to_direction(signal: dict) -> str:
@@ -413,9 +423,8 @@ def run_intelligence_check(signal: dict, underlying_price: float,
         )
 
     try:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-            future = ex.submit(_run)
-            result = future.result(timeout=INTEL_TIMEOUT_SECONDS)
+        future = _INTEL_EXECUTOR.submit(_run)
+        result = future.result(timeout=INTEL_TIMEOUT_SECONDS)
 
         gate = _map_result(result, score_in)
 

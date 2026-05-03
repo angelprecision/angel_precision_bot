@@ -145,6 +145,7 @@ def conn():
         # Both attempts failed -- raise so run_with_retry can handle it
         raise psycopg2.OperationalError("Could not obtain a live DB connection after pool rebuild")
 
+    cursor = None
     try:
         db_conn.autocommit = False
         cursor = db_conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
@@ -158,10 +159,11 @@ def conn():
             pass
         raise
     finally:
-        try:
-            cursor.close()
-        except Exception:
-            pass
+        if cursor is not None:
+            try:
+                cursor.close()
+            except Exception:
+                pass
         try:
             pool.putconn(db_conn)
         except Exception:
@@ -419,17 +421,19 @@ def update_client_state(client_id: str = "default", updates: dict | None = None)
                 ON CONFLICT (client_id) DO NOTHING
                 """,
                 (client_id, client_id, 'tradier', '', '',
-                 'https://sandbox.tradier.com', 25000.0, 'ACTIVE',
+                 'https://sandbox.tradier.com',
+                 float(os.getenv("INITIAL_EQUITY", "25000")), 'ACTIVE',
                  now_utc_iso(), 10, 7, 0.05, 0.10),
             )
+            _default_eq = float(os.getenv("INITIAL_EQUITY", "25000"))
             c.execute(
                 """
                 INSERT INTO client_state (client_id, current_equity, starting_equity_today,
                     realized_pnl_today, trades_taken_today, mode, updated_at)
-                VALUES (%s, 25000, 25000, 0, 0, 'PAPER', NOW())
+                VALUES (%s, %s, %s, 0, 0, 'PAPER', NOW())
                 ON CONFLICT (client_id) DO NOTHING
                 """,
-                (client_id,),
+                (client_id, _default_eq, _default_eq),
             )
             # Apply the actual updates
             c.execute(
@@ -544,7 +548,12 @@ def update_client(client_id: str, **kwargs) -> dict:
     return get_client(client_id)
 
 
-def delete_client(client_id: str):
+def delete_client(client_id: str, *, confirm: bool = False):
+    if not confirm:
+        raise ValueError(
+            "delete_client requires confirm=True. "
+            "This permanently deletes ALL positions, orders, and audit history for this client."
+        )
     def _fn():
         with conn() as c:
             for table in ["audit_log", "trade_queue", "orders", "positions", "client_state", "clients"]:

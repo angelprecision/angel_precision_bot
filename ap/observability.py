@@ -147,12 +147,21 @@ def new_candidate_id() -> str:
     return uuid.uuid4().hex
 
 
+_GIT_COMMIT_CACHE: Optional[str] = None
+
 def get_git_commit(default: str = "unknown") -> str:
+    global _GIT_COMMIT_CACHE
+    if _GIT_COMMIT_CACHE is not None:
+        return _GIT_COMMIT_CACHE
     try:
-        out = subprocess.check_output(["git", "rev-parse", "--short", "HEAD"], stderr=subprocess.DEVNULL)
-        return out.decode().strip() or default
+        out = subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            stderr=subprocess.DEVNULL,
+        )
+        _GIT_COMMIT_CACHE = out.decode().strip() or default
     except Exception:
-        return default
+        _GIT_COMMIT_CACHE = default
+    return _GIT_COMMIT_CACHE
 
 
 def make_config_hash(config: dict[str, Any]) -> str:
@@ -335,7 +344,7 @@ def upsert_rejected_counterfactual(payload: dict[str, Any]) -> None:
                 """,
                 (
                     payload.get("candidate_id"), payload.get("run_id"), payload.get("client_id"), payload.get("symbol"), payload.get("contract"), payload.get("setup_type"), payload.get("timeframe"),
-                    payload.get("reject_ts"), payload.get("reject_stage"), payload.get("reject_reason_code"), payload.get("reject_explanation"),
+                    payload.get("reject_ts") or utc_now_iso(), payload.get("reject_stage"), payload.get("reject_reason_code"), payload.get("reject_explanation"),
                     payload.get("hypothetical_entry_price"), payload.get("hypothetical_stop_price"), payload.get("hypothetical_target_price"),
                     payload.get("max_favorable_pct"), payload.get("max_adverse_pct"), payload.get("result_15m_pct"), payload.get("result_30m_pct"), payload.get("result_eod_pct"),
                     payload.get("would_hit_stop"), payload.get("would_hit_target"), payload.get("would_be_profitable"),
