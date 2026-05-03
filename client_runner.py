@@ -1104,6 +1104,17 @@ class ClientRunner(threading.Thread):
             if exit_eng and hasattr(exit_eng, "seed_from_db"):
                 exit_eng.seed_from_db(self.position_manager)
                 logger.info("[%s] Exit engine reseeded from DB", self.email)
+                # Immediately refresh underlying prices after seed so exit logic
+                # does not fire on stale entry-time prices during first poll window.
+                if self.mode == "LIVE" and hasattr(exit_eng, "_refresh_quotes"):
+                    try:
+                        exit_eng._refresh_quotes()
+                        logger.info("[%s] Post-seed quote refresh complete", self.email)
+                    except Exception as qe:
+                        logger.warning(
+                            "[%s] Post-seed quote refresh failed: %s — first poll cycle will correct",
+                            self.email, qe,
+                        )
         except Exception as exc:
             logger.warning("[%s] Exit engine DB seed error: %s", self.email, exc)
 
@@ -1321,11 +1332,21 @@ def route_signal_to_all_clients(signal: dict):
 
     if not active_emails:
         if not ALLOW_SUPABASE_FANOUT_FALLBACK:
-            logger.warning(
-                "Signal %s [%s] -- no local entries-allowed runners and Supabase fallback disabled; dropping",
-                signal_id,
-                ticker,
-            )
+            with _registry_lock:
+                degraded_count = sum(
+                    1 for r in _active_runners.values()
+                    if r.degraded.is_set() and not r.stopping.is_set()
+                )
+            if degraded_count:
+                logger.critical(
+                    "Signal %s [%s] — %d runner(s) DEGRADED, 0 entries-allowed. "                    "Signal DROPPED. Check degraded_reasons via /admin/runner_status",
+                    signal_id, ticker, degraded_count,
+                )
+            else:
+                logger.warning(
+                    "Signal %s [%s] -- no local entries-allowed runners and Supabase fallback disabled; dropping",
+                    signal_id, ticker,
+                )
             return 0
 
         now = _time_module.monotonic()
