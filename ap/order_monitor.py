@@ -980,7 +980,7 @@ class APOrderMonitor:
                     """
                     SELECT local_order_id, broker_order_id, status, symbol,
                            contract, position_id, created_ts, submitted_ts,
-                           limit_price
+                           limit_price, price
                     FROM orders
                     WHERE client_id=%s
                       AND kind='ENTRY'
@@ -1002,7 +1002,8 @@ class APOrderMonitor:
                 c.execute(
                     """
                     SELECT local_order_id, broker_order_id, status, symbol,
-                           contract, position_id, created_ts, submitted_ts
+                           contract, position_id, created_ts, submitted_ts,
+                           avg_fill, fill_price, entry_price, ticker
                     FROM orders
                     WHERE client_id=%s
                       AND kind='EXIT'
@@ -1052,7 +1053,7 @@ class APOrderMonitor:
                 resp = _req.get(
                     f"{base}/v1/markets/quotes",
                     params={"symbols": symbol, "greeks": "false"},
-                    headers=headers, timeout=5,
+                    headers=headers, timeout=(3.05, 5),
                 )
                 if resp.status_code == 200:
                     q = resp.json().get("quotes", {}).get("quote", {})
