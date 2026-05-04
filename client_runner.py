@@ -518,14 +518,21 @@ class ClientRunner(threading.Thread):
                 if not exit_present:
                     self._enter_degraded_mode("exit_engine_missing_runtime", stop_runner=True)
                     break
-                if not fill_alive:
+                # Grace period: fill_monitor self-restarts after crashes.
+                # Only degrade after 2 consecutive missed checks (~40s) to
+                # avoid false positives during brief restart windows.
+                _fm_grace = float(os.getenv("FILL_MONITOR_DEAD_GRACE_SEC", "45"))
+                _fm_last = self.last_fill_monitor_heartbeat_ts or now
+                if not fill_alive and (now - _fm_last) > _fm_grace:
                     self._enter_degraded_mode("fill_monitor_dead", stop_runner=False)
-                else:
+                elif fill_alive:
                     self._clear_degraded_reason_key("fill_monitor_dead")
 
-                if not worker_alive:
+                _wk_grace = float(os.getenv("WORKER_DEAD_GRACE_SEC", "45"))
+                _wk_last = self.last_worker_heartbeat_ts or now
+                if not worker_alive and (now - _wk_last) > _wk_grace:
                     self._enter_degraded_mode("worker_dead", stop_runner=False)
-                else:
+                elif worker_alive:
                     self._clear_degraded_reason_key("worker_dead")
 
                 self._try_recover_degraded_mode()
