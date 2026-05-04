@@ -154,11 +154,12 @@ class APPositionSizer:
 
         if stop_threshold > throttle_threshold:
             log.warning(
-                "Sizer thresholds misordered; correcting | throttle=%.2f stop=%.2f",
+                "Sizer thresholds misordered (stop less negative than throttle); "
+                "swapping to preserve user intent | throttle=%.2f stop=%.2f",
                 throttle_threshold,
                 stop_threshold,
             )
-            stop_threshold = min(stop_threshold, throttle_threshold * 2.5)
+            stop_threshold, throttle_threshold = throttle_threshold, stop_threshold
 
         if drawdown <= stop_threshold:
             log.warning(
@@ -348,12 +349,22 @@ class APPositionSizer:
             return 0, "tier_fallback", 0.0, 0.0
 
         win_rate = len(wins) / n
+        # Normalize P&L by historical qty so avg_win/avg_loss are per-contract values.
+        # Without this, multi-contract historical trades inflate the ratio vs current
+        # single-contract premium, causing Kelly to over-size when history had large
+        # positions and under-size when history had small ones.
         avg_win = (
-            sum(float(r.get("realized_pnl") or 0.0) for r in wins) / len(wins)
+            sum(
+                float(r.get("realized_pnl") or 0.0) / max(1, int(r.get("qty") or 1))
+                for r in wins
+            ) / len(wins)
             if wins else 0.0
         )
         avg_loss = (
-            sum(abs(float(r.get("realized_pnl") or 0.0)) for r in losses) / len(losses)
+            sum(
+                abs(float(r.get("realized_pnl") or 0.0)) / max(1, int(r.get("qty") or 1))
+                for r in losses
+            ) / len(losses)
             if losses else 0.0
         )
 
