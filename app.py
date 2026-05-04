@@ -742,6 +742,17 @@ def create_app() -> Flask:
     # BROKER TEST
     # =============================================
 
+    @app.get("/admin/runner_status")
+    @require_hmac
+    def admin_runner_status():
+        try:
+            from client_runner import get_runner_status
+            runners = get_runner_status()
+            return jsonify({"ok": True, "runners": runners, "count": len(runners)})
+        except Exception as e:
+            log.error(f"Runner status failed: {e}")
+            return jsonify({"ok": False, "error": str(e)}), 500
+
     @app.get("/tradier/test")
     @require_hmac
     def tradier_test():

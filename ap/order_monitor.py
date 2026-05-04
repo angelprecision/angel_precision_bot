@@ -980,7 +980,9 @@ class APOrderMonitor:
                     """
                     SELECT local_order_id, broker_order_id, status, symbol,
                            contract, position_id, created_ts, submitted_ts,
-                           limit_price, price
+                           limit_price,
+                           limit_price AS price,
+                           fill_price
                     FROM orders
                     WHERE client_id=%s
                       AND kind='ENTRY'
@@ -1003,7 +1005,10 @@ class APOrderMonitor:
                     """
                     SELECT local_order_id, broker_order_id, status, symbol,
                            contract, position_id, created_ts, submitted_ts,
-                           avg_fill, fill_price, entry_price, ticker
+                           fill_price,
+                           fill_price AS avg_fill,
+                           limit_price AS entry_price,
+                           symbol AS ticker
                     FROM orders
                     WHERE client_id=%s
                       AND kind='EXIT'
