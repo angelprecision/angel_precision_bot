@@ -454,14 +454,22 @@ class ClientRunner(threading.Thread):
         if ready:
             self.entries_allowed.set()
         else:
+            if not self.is_alive():
+                logger.warning("[%s] entries_allowed BLOCKED: runner thread not alive", self.email)
+            if not self.initialized.is_set():
+                logger.warning("[%s] entries_allowed BLOCKED: not initialized", self.email)
+            if not _core_ok:
+                logger.warning("[%s] entries_allowed BLOCKED: core/exit_eng missing", self.email)
             if not _worker_ok:
                 logger.warning("[%s] entries_allowed BLOCKED: worker_thread dead", self.email)
             if not _fill_ok_for_entries:
-                logger.warning("[%s] entries_allowed BLOCKED: fill_monitor dead >120s", self.email)
+                logger.warning("[%s] entries_allowed BLOCKED: fill_monitor dead >120s (actual=%s)", self.email, _fill_ok)
             if _degraded:
                 logger.warning("[%s] entries_allowed BLOCKED: degraded reasons=%s", self.email, list(getattr(self, "degraded_reasons", {}).keys()))
             if _failed:
                 logger.warning("[%s] entries_allowed BLOCKED: failed", self.email)
+            if self.stopping.is_set():
+                logger.warning("[%s] entries_allowed BLOCKED: stopping", self.email)
             self.entries_allowed.clear()
         return ready
 
