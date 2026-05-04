@@ -554,20 +554,6 @@ def create_app() -> Flask:
     @app.post("/kill_switch/on")
     @require_hmac
     def kill_on():
-        from datetime import datetime
-        from zoneinfo import ZoneInfo
-        _et = datetime.now(ZoneInfo("America/New_York"))
-        _market_open = (
-            _et.weekday() < 5 and
-            (_et.hour > 9 or (_et.hour == 9 and _et.minute >= 30)) and
-            _et.hour < 16
-        )
-        _force = (request.get_json() or {}).get("force", False)
-        if _market_open and not _force:
-            log.warning("🟡 KILL SWITCH BLOCKED — market open, automated call rejected (force=true to override)")
-            return jsonify({"ok": False, "blocked": True,
-                            "error": "market_open_kill_switch_blocked",
-                            "hint": "Pass {force:true} to override during market hours"}), 403
         log.warning("🔴 KILL SWITCH ENABLED")
         update_state({"kill_switch": True, "mode": "READ_ONLY"}, client_id=DEFAULT_CLIENT_ID)
         with _SIGNAL_CACHE_LOCK:
