@@ -796,9 +796,22 @@ class APEntryWatcher:
                 bid = ask = last
 
             if not (bid or ask) or not w.entry_trigger:
-                # Fail open for quote outage: arm watcher rather than delete setup.
-                w.overnight = False
-                log.warning("[%s] Overnight recheck quote unavailable — arming fail-open", w.ticker)
+                # Mode-aware failure policy:
+                # LIVE: quote outage = invalidate. Never arm with stale/zero quotes.
+                #       Premium clients cannot have positions opened without verified price.
+                # PAPER: fail open (arm watcher) — sandbox is for learning, not money protection.
+                _is_live_watcher = str(getattr(self, "mode", "PAPER")).upper() == "LIVE"
+                if _is_live_watcher:
+                    w.state = WatchState.INVALIDATED
+                    w._release_dedup_key()
+                    log.warning(
+                        "[%s] LIVE overnight recheck: quote unavailable — INVALIDATING setup "
+                        "(fail closed). Will need fresh signal at market open.",
+                        w.ticker,
+                    )
+                else:
+                    w.overnight = False
+                    log.warning("[%s] PAPER overnight recheck: quote unavailable — arming fail-open", w.ticker)
                 continue
 
             mid = (bid + ask) / 2.0 if bid and ask else max(bid, ask)
