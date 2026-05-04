@@ -879,9 +879,10 @@ class APMasterControl:
             in_session = True
         pnl_today = raw_pnl if in_session else 0.0
 
+        _sizing = None
         if self.sizer and not bootstrap_mode:
             try:
-                sizing = self.sizer.compute(
+                _sizing = self.sizer.compute(
                     client_id=client_id,
                     tier=str(tier),
                     premium_per_contract=placeholder_premium,
@@ -889,9 +890,9 @@ class APMasterControl:
                     realized_pnl_today=pnl_today,
                     position_manager=self.pm,
                 )
-                contracts = sizing.contracts
+                contracts = _sizing.contracts
                 if contracts <= 0:
-                    return self._block(signal_id, ticker, client_id, "blocked_risk", f"sizer_blocked: {sizing.reason}")
+                    return self._block(signal_id, ticker, client_id, "blocked_risk", f"sizer_blocked: {_sizing.reason}")
                 if intel_avail and intel_contracts > 0:
                     contracts = min(contracts, intel_contracts)
             except Exception as e:
@@ -943,8 +944,8 @@ class APMasterControl:
             metadata={
                 "setup_status": setup_status,
                 "feedback_mod": feedback_mod,
-                "sizing_method": sizing.method if self.sizer and "sizing" in locals() else "tier_fallback",
-                "sizing_reason": sizing.reason if self.sizer and "sizing" in locals() else "",
+                "sizing_method": _sizing.method if _sizing is not None else "tier_fallback",
+                "sizing_reason": _sizing.reason if _sizing is not None else "",
                 "intel_result": intel,
                 "sector": self.SECTOR_MAP.get(ticker.upper(), "other"),
                 "snapshot_at_eval": {
@@ -968,7 +969,19 @@ class APMasterControl:
             return self._block(signal_id, ticker, client_id, "blocked_system", "kill_switch_active_pre_commit")
 
         # Persist dedup first. Only then add in-memory keys and mark queued.
-        self._persist_dedup(signal_id, ticker, direction_raw, timeframe_raw, client_id)
+        # In LIVE mode a dedup-persist failure blocks the signal (fail-closed).
+        # In paper mode a transient DB hiccup should not kill a valid signal.
+        try:
+            self._persist_dedup(signal_id, ticker, direction_raw, timeframe_raw, client_id)
+        except Exception as _dedup_err:
+            if self._is_live_mode():
+                return self._block(
+                    signal_id, ticker, client_id,
+                    "blocked_system",
+                    f"dedup_persist_failed_live: {_dedup_err}",
+                    reason_code="DEDUP_PERSIST_FAILED",
+                )
+            log.warning("[%s] Dedup persist failed in paper — proceeding: %s", ticker, _dedup_err)
         self._seen_signals[signal_key] = time.time()
         self._seen_signals[setup_key] = time.time()
         self._store_update(signal_id, "queued", timestamp_flag="queued_at")
