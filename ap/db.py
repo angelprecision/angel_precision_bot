@@ -118,25 +118,29 @@ def conn():
     """
     pool = _get_pool()
 
-    # Connection health check: use db_conn.closed (set by psycopg2 on detected
-    # broken connections) instead of a live SELECT 1 probe on every acquisition.
-    # SELECT 1 on every conn() doubles DB round-trips under burst load.
-    # Silent SSL EOF that slips through .closed will raise on first real query
-    # and be caught by run_with_retry which rebuilds the pool via OperationalError.
-    db_conn = pool.getconn()
-    if getattr(db_conn, "closed", 0):
-        log.warning("Stale connection detected (closed flag), discarding and rebuilding pool")
-        try:
-            pool.putconn(db_conn, close=True)
-        except Exception:
-            pass
-        global _pool
-        with _pool_lock:  # HIGH-010: thread-safe pool rebuild
-            _pool = None
-        pool = _get_pool()
+    # SELECT 1 probe on every acquisition — keeps connections alive and detects
+    # SSL EOF before the real query fires. Required for Supabase which kills
+    # idle connections after ~60s. Performance cost acceptable for correctness.
+    for _attempt in range(2):
         db_conn = pool.getconn()
-        if getattr(db_conn, "closed", 0):
-            raise psycopg2.OperationalError("Could not obtain a live DB connection after pool rebuild")
+        try:
+            _probe_cur = db_conn.cursor()
+            _probe_cur.execute("SELECT 1")
+            _probe_cur.close()
+            db_conn.rollback()
+            break
+        except Exception as _probe_err:
+            log.warning("Stale connection detected (%s), discarding and rebuilding pool", _probe_err)
+            try:
+                pool.putconn(db_conn, close=True)
+            except Exception:
+                pass
+            global _pool
+            with _pool_lock:
+                _pool = None
+            pool = _get_pool()
+    else:
+        raise psycopg2.OperationalError("Could not obtain a live DB connection after pool rebuild")
 
     cursor = None
     try:
