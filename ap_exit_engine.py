@@ -1044,6 +1044,10 @@ class APExitEngine:
                         "force": force,
                     },
                 )
+                # FIX-3: Remove from O(1) index on close to prevent memory leak
+                # and get_position() returning closed positions to callers.
+                if pos.position_id and pos.position_id in self._positions_by_id:
+                    del self._positions_by_id[pos.position_id]
         log.info("[exit_eng] Closed (broker-confirmed) | pos_id=%s reason=%s", position_id, reason)
 
     def clear_exit_in_flight(
@@ -1249,21 +1253,11 @@ class APExitEngine:
                     if fully_confirmed_scale:
                         pos.scale_outs_done     += 1
                         pos.pending_scale_counted = True
-                        try:
-                            from ap.db import conn, run_with_retry as _rwr_s
-                            _sd = pos.scale_outs_done
-                            _qr = pos.quantity_remaining
-                            _pi = pos.position_id
-                            if _pi:
-                                def _save_scale():
-                                    with conn() as _c:
-                                        _c.execute(
-                                            "UPDATE positions SET scale_outs_done=%s, quantity_remaining=%s WHERE id=%s",
-                                            (_sd, _qr, _pi),
-                                        )
-                                _rwr_s(_save_scale)
-                        except Exception as _se:
-                            log.debug("[%s] scale/qty persist failed (non-critical): %s", pos.ticker, _se)
+                        # Snapshot values under lock; persist AFTER lock releases
+                        # to avoid blocking add_position/fill hooks for DB latency.
+                        _scale_sd = pos.scale_outs_done
+                        _scale_qr = pos.quantity_remaining
+                        _scale_pi = pos.position_id
 
                 fully_filled_pending = (
                     pos.pending_exit_qty > 0
@@ -1275,6 +1269,10 @@ class APExitEngine:
                     # P2: advance generation so any concurrent _submit_exit_decision
                     # post-callback validator sees the close and does not overwrite truth.
                     pos._submit_generation += 1
+                    # FIX-3: Remove from O(1) index so get_position() does not
+                    # return this closed position to callers.
+                    if pos.position_id and pos.position_id in self._positions_by_id:
+                        del self._positions_by_id[pos.position_id]
 
                 if fully_filled_pending or pos.closed:
                     pos.exit_in_flight      = False
@@ -1312,6 +1310,21 @@ class APExitEngine:
                 )
                 break
 
+        # FIX-2: DB persist for scale fill snapshot moved OUTSIDE self._lock
+        # to prevent blocking exit loop for DB latency duration.
+        if "_scale_pi" in dir() and _scale_pi:
+            try:
+                from ap.db import conn, run_with_retry as _rwr_s
+                _sd_snap, _qr_snap, _pi_snap = _scale_sd, _scale_qr, _scale_pi
+                def _save_scale():
+                    with conn() as _c:
+                        _c.execute(
+                            "UPDATE positions SET scale_outs_done=%s, quantity_remaining=%s WHERE id=%s",
+                            (_sd_snap, _qr_snap, _pi_snap),
+                        )
+                _rwr_s(_save_scale)
+            except Exception as _se:
+                log.debug("[exit_eng] scale/qty persist failed (non-critical): %s", _se)
         log.info("[exit_eng] Exit fill noted | pos_id=%s qty_delta=%d", position_id, int(applied_delta or qty_filled or 0))
 
     def _mark_exit_submitted(
