@@ -764,6 +764,45 @@ def create_app() -> Flask:
             log.error(f"Runner failures failed: {e}")
             return jsonify({"ok": False, "error": str(e)}), 500
 
+    @app.post("/admin/force_start_runner")
+    @require_hmac
+    def admin_force_start_runner():
+        """Directly spawn a runner for a member — bypasses supervisor for emergency recovery."""
+        try:
+            from client_runner import _active_runners, _registry_lock, ClientRunner, _fetch_active_members
+            from supabase import create_client
+            import os
+
+            sb_url = os.getenv("SUPABASE_URL", "")
+            sb_key = os.getenv("SUPABASE_SERVICE_KEY", "")
+            if not sb_url or not sb_key:
+                return jsonify({"ok": False, "error": "SUPABASE_URL or SUPABASE_SERVICE_KEY not set"}), 500
+
+            sb = create_client(sb_url, sb_key)
+            members = _fetch_active_members(sb)
+
+            if not members:
+                return jsonify({"ok": False, "error": "No active members found in Supabase", "count": 0})
+
+            started = []
+            for member in members:
+                email = member["email"]
+                with _registry_lock:
+                    existing = _active_runners.get(email)
+                    if existing and existing.is_alive():
+                        started.append({"email": email, "status": "already_running"})
+                        continue
+                    runner = ClientRunner(member)
+                    _active_runners[email] = runner
+                    runner.start()
+                    started.append({"email": email, "status": "started"})
+                    log.info(f"force_start_runner: started runner for {email}")
+
+            return jsonify({"ok": True, "started": started})
+        except Exception as e:
+            log.error(f"force_start_runner failed: {e}", exc_info=True)
+            return jsonify({"ok": False, "error": str(e)}), 500
+
     @app.get("/admin/supervisor_state")
     @require_hmac
     def admin_supervisor_state():
