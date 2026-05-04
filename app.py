@@ -1002,6 +1002,171 @@ def create_app() -> Flask:
             log.error(f"Supervisor state failed: {e}")
             return jsonify({"ok": False, "error": str(e)}), 500
 
+    @app.get("/client/trades")
+    @require_hmac
+    def client_trades():
+        """Execution proof surface for clients and ops.
+        Returns every completed trade with: entry time, fill, exit time, fill, net P&L.
+        This is what a $3K/month client needs to see — not logs.
+        """
+        try:
+            from ap.db import run_with_retry
+            import psycopg2.extras
+
+            client_id = request.args.get("client_id", "tradefluencehq@gmail.com")
+            limit = min(int(request.args.get("limit", 50)), 200)
+            status = request.args.get("status", "ALL").upper()
+
+            def _fetch():
+                with __import__("ap.db", fromlist=["conn"]).conn() as c:
+                    psycopg2.extras.register_uuid()
+                    status_filter = ""
+                    params = [client_id]
+                    if status != "ALL":
+                        status_filter = "AND p.status = %s"
+                        params.append(status)
+                    c.execute(f"""
+                        SELECT
+                            p.position_id,
+                            p.underlying          AS ticker,
+                            p.side,
+                            p.option_symbol       AS contract,
+                            p.quantity,
+                            p.entry_price,
+                            p.entry_fill_price,
+                            p.entry_time,
+                            p.exit_price,
+                            p.exit_fill_price,
+                            p.exit_time,
+                            p.realized_pnl,
+                            p.status,
+                            p.exit_reason,
+                            p.created_at
+                        FROM positions p
+                        WHERE p.client_id = %s
+                        {status_filter}
+                        ORDER BY p.created_at DESC
+                        LIMIT %s
+                    """, params + [limit])
+                    cols = [d[0] for d in c.description]
+                    rows = c.fetchall()
+                    return [dict(zip(cols, row)) for row in rows]
+
+            trades = run_with_retry(_fetch)
+
+            # Compute summary stats
+            closed = [t for t in trades if t.get("status") in ("CLOSED", "FILLED")]
+            total_pnl = sum(float(t.get("realized_pnl") or 0) for t in closed)
+            wins = sum(1 for t in closed if float(t.get("realized_pnl") or 0) > 0)
+            losses = sum(1 for t in closed if float(t.get("realized_pnl") or 0) < 0)
+
+            # Serialize datetimes
+            import datetime
+            for t in trades:
+                for k, v in t.items():
+                    if isinstance(v, (datetime.datetime, datetime.date)):
+                        t[k] = v.isoformat()
+                    elif hasattr(v, "hex"):  # UUID
+                        t[k] = str(v)
+
+            return jsonify({
+                "ok": True,
+                "client_id": client_id,
+                "trades": trades,
+                "summary": {
+                    "total": len(trades),
+                    "closed": len(closed),
+                    "wins": wins,
+                    "losses": losses,
+                    "total_pnl": round(total_pnl, 2),
+                    "win_rate": round(wins / len(closed) * 100, 1) if closed else 0,
+                },
+            })
+        except Exception as e:
+            log.error(f"client_trades failed: {e}", exc_info=True)
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.get("/client/positions")
+    @require_hmac
+    def client_positions():
+        """Live open positions — what the client holds right now."""
+        try:
+            from ap.db import run_with_retry
+            import psycopg2.extras
+
+            client_id = request.args.get("client_id", "tradefluencehq@gmail.com")
+
+            def _fetch():
+                with __import__("ap.db", fromlist=["conn"]).conn() as c:
+                    c.execute("""
+                        SELECT
+                            p.position_id,
+                            p.underlying    AS ticker,
+                            p.side,
+                            p.option_symbol AS contract,
+                            p.quantity,
+                            p.entry_price,
+                            p.entry_fill_price,
+                            p.entry_time,
+                            p.status,
+                            p.realized_pnl,
+                            p.unrealized_pnl
+                        FROM positions p
+                        WHERE p.client_id = %s
+                          AND p.status IN ('OPEN', 'CLOSING')
+                        ORDER BY p.entry_time DESC
+                    """, (client_id,))
+                    cols = [d[0] for d in c.description]
+                    return [dict(zip(cols, row)) for row in c.fetchall()]
+
+            positions = run_with_retry(_fetch)
+
+            import datetime
+            for p in positions:
+                for k, v in p.items():
+                    if isinstance(v, (datetime.datetime, datetime.date)):
+                        p[k] = v.isoformat()
+                    elif hasattr(v, "hex"):
+                        p[k] = str(v)
+
+            return jsonify({
+                "ok": True,
+                "client_id": client_id,
+                "positions": positions,
+                "count": len(positions),
+            })
+        except Exception as e:
+            log.error(f"client_positions failed: {e}", exc_info=True)
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.get("/client/rejections")
+    @require_hmac
+    def client_rejections():
+        """Every signal rejection — queryable by client. No log-diving needed."""
+        try:
+            import os as _os
+            from supabase import create_client as _cc
+            client_id = request.args.get("client_id", "tradefluencehq@gmail.com")
+            limit = min(int(request.args.get("limit", 50)), 200)
+            _sb_url = _os.getenv("SUPABASE_URL", "")
+            _sb_key = _os.getenv("SUPABASE_SERVICE_KEY", "")
+            if not _sb_url or not _sb_key:
+                return jsonify({"ok": False, "error": "Supabase not configured"}), 500
+            sb = _cc(_sb_url, _sb_key)
+            result = (
+                sb.table("ap_signals")
+                .select("signal_id,ticker,side,score,decision_status,context_notes,created_at")
+                .eq("client_email", client_id)
+                .eq("decision_status", "rejected")
+                .order("created_at", desc=True)
+                .limit(limit)
+                .execute()
+            )
+            return jsonify({"ok": True, "client_id": client_id, "rejections": result.data or [], "count": len(result.data or [])})
+        except Exception as e:
+            log.error(f"client_rejections failed: {e}", exc_info=True)
+            return jsonify({"ok": False, "error": str(e)}), 500
+
     @app.get("/tradier/test")
     @require_hmac
     def tradier_test():
