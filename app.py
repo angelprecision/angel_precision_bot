@@ -175,8 +175,8 @@ def _verify_hmac(req) -> bool:
         try:
             ts_i = int(ts)
         except Exception:
-            log.warning(f"Invalid X-AP-Timestamp: {ts}")
-            ts_i = None
+            log.warning(f"Invalid X-AP-Timestamp: {ts!r} — rejecting, not falling through to Scheme B")
+            return False  # Scheme A headers present but ts unparseable — hard reject
 
         if ts_i is not None:
             # Anti-replay / drift window — hard reject, no Scheme B fallthrough
