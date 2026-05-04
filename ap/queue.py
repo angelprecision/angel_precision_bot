@@ -519,26 +519,23 @@ def _dispatch(
             # contract selection. Accept only when breach-time re-selection is
             # wired end-to-end; until then dropping is safer than a stale contract.
             log.info(
-                "[%s] Signal %s deferred to market open — no live quotes for contract selection after hours. "
-                "Will be requeued at 9:30 AM ET via overnight watcher.",
+                "[%s] Signal %s deferred — market closed, no live quotes for contract selection. "
+                "Marked WATCHING in queue. Scanner will send fresh signal IDs at next run; "
+                "this record is retained for audit and dashboard visibility.",
                 ticker, signal_id,
             )
-            # DEFER not REJECT: mark as WATCHING so it gets re-evaluated at open.
-            # The entry watcher overnight path will recheck this signal when market opens.
+            # Mark WATCHING (not REJECTED) so dashboard shows it as deferred, not failed.
+            # The scanner generates new signal IDs each session, so tomorrow's signals
+            # will route cleanly. This record stays queryable for client transparency.
             _mark_job(job_id, "WATCHING", error=None)
-            # Wire into entry_watcher overnight path if available
-            try:
-                if entry_watcher and hasattr(entry_watcher, "add"):
-                    import uuid as _uuid_mod
-                    from ap_entry_watcher import WatchEntry
-                    _w = WatchEntry(
-                        signal=payload,
-                        overnight=True,
-                    )
-                    entry_watcher.add(_w)
-                    log.info("[%s] Signal added to entry_watcher overnight queue", ticker)
-            except Exception as _ew_exc:
-                log.debug("[%s] Entry watcher overnight add failed (non-fatal): %s", ticker, _ew_exc)
+            # Log to ap_signals for permanent structured record
+            _log_rejection_to_db(
+                signal_id=signal_id, client_id=client_id, ticker=ticker,
+                side=payload.get("side", ""), score=float(payload.get("score") or 0),
+                stage="contract_selection", reason_code="market_closed_deferred",
+                human_reason="After market hours — deferred to next session. No action needed.",
+                payload=payload,
+            )
             return
     except Exception:
         pass
