@@ -113,25 +113,28 @@ def _rate_limited(bucket: str) -> bool:
 def _idem_cleanup():
     global _IDEMP_LAST_CLEANUP
     now = time.time()
-    if now - _IDEMP_LAST_CLEANUP < 1.0:
-        return
-    _IDEMP_LAST_CLEANUP = now
-    dead = [k for k, (ts, _) in _IDEMP.items() if now - ts > IDEMP_TTL_SECONDS]
-    for k in dead:
-        _IDEMP.pop(k, None)
+    with THREAD_LOCK:
+        if now - _IDEMP_LAST_CLEANUP < 1.0:
+            return
+        _IDEMP_LAST_CLEANUP = now
+        dead = [k for k, (ts, _) in _IDEMP.items() if now - ts > IDEMP_TTL_SECONDS]
+        for k in dead:
+            _IDEMP.pop(k, None)
 
 
 def _idem_get(key: str):
     if not key:
         return None
     _idem_cleanup()
-    hit = _IDEMP.get(key)
+    with THREAD_LOCK:
+        hit = _IDEMP.get(key)
     return hit[1] if hit else None
 
 
 def _idem_set(key: str, payload: dict):
     if key:
-        _IDEMP[key] = (time.time(), payload)
+        with THREAD_LOCK:
+            _IDEMP[key] = (time.time(), payload)
 
 
 def _hmac_hex(key: bytes, msg: bytes) -> str:
@@ -315,6 +318,28 @@ def _discord_signal_id(symbol: str, direction: str, strike, content_hash: str) -
     raw = f"{symbol}:{direction}:{strike}:{content_hash}"
     return hashlib.sha256(raw.encode()).hexdigest()[:32]
 
+def _fetch_broker_equity() -> float:
+    """Fetch live account equity at startup. Returns 0.0 on any failure —
+    client_runner._sync_account_equity() pulls the real balance after startup.
+    """
+    try:
+        broker = build_broker()
+        for method in ("get_account_equity", "get_account_balance"):
+            fn = getattr(broker, method, None)
+            if callable(fn):
+                val = fn()
+                if val and float(val) > 0:
+                    return float(val)
+        if hasattr(broker, "get_balances"):
+            b = broker.get_balances()
+            for k in ("equity", "total_equity", "net_liquidation", "cash"):
+                if b.get(k) and float(b[k]) > 0:
+                    return float(b[k])
+    except Exception as _e:
+        log.warning("_fetch_broker_equity failed at startup — defaulting to 0.0: %s", _e)
+    return 0.0
+
+
 def create_app() -> Flask:
     app = Flask(__name__)
     app.config["MAX_CONTENT_LENGTH"] = MAX_CONTENT_LENGTH
@@ -349,42 +374,41 @@ def create_app() -> Flask:
         log.info("✅ Default client created")
     else:
         log.info("✅ Default client exists")
-        # =============================================
-    # DEBUG (TEMP) - REMOVE LATER
-    # =============================================
 
-    @app.get("/debug/threads")
-    @require_hmac
-    def debug_threads():
-        if APP_ENV == "prod":
-            return jsonify({"ok": False, "error": "disabled_in_prod"}), 403
-        import threading
-        threads = []
-        for t in threading.enumerate():
-            threads.append({
-                "name": t.name,
-                "daemon": bool(getattr(t, "daemon", False)),
-                "alive": bool(t.is_alive()),
-            })
-        return jsonify({"ok": True, "threads": threads})
+    # Debug routes — only registered in non-prod environments.
+    # Conditional registration (not just conditional response) avoids
+    # exposing these endpoints as attack surface in production.
+    if APP_ENV != "prod":
+        @app.get("/debug/threads")
+        @require_hmac
+        def debug_threads():
+            import threading
+            threads = []
+            for t in threading.enumerate():
+                threads.append({
+                    "name": t.name,
+                    "daemon": bool(getattr(t, "daemon", False)),
+                    "alive": bool(t.is_alive()),
+                })
+            return jsonify({"ok": True, "threads": threads})
 
-    @app.get("/debug/queue_counts")
-    @require_hmac
-    def debug_queue_counts():
-        try:
-            from ap.db import run_with_retry
-            def _q():
-                with conn() as c:
-                    return {
-                        "new":  c.execute("SELECT COUNT(*) AS n FROM trade_queue WHERE status='NEW'").fetchone()["n"],
-                        "proc": c.execute("SELECT COUNT(*) AS n FROM trade_queue WHERE status='PROCESSING'").fetchone()["n"],
-                        "done": c.execute("SELECT COUNT(*) AS n FROM trade_queue WHERE status='DONE'").fetchone()["n"],
-                        "err":  c.execute("SELECT COUNT(*) AS n FROM trade_queue WHERE status='ERROR'").fetchone()["n"],
-                    }
-            counts = run_with_retry(_q)
-            return jsonify({"ok": True, "NEW": int(counts["new"]), "PROCESSING": int(counts["proc"]), "DONE": int(counts["done"]), "ERROR": int(counts["err"])})
-        except Exception as e:
-            return jsonify({"ok": False, "error": str(e)}), 500
+        @app.get("/debug/queue_counts")
+        @require_hmac
+        def debug_queue_counts():
+            try:
+                from ap.db import run_with_retry
+                def _q():
+                    with conn() as c:
+                        return {
+                            "new":  c.execute("SELECT COUNT(*) AS n FROM trade_queue WHERE status='NEW'").fetchone()["n"],
+                            "proc": c.execute("SELECT COUNT(*) AS n FROM trade_queue WHERE status='PROCESSING'").fetchone()["n"],
+                            "done": c.execute("SELECT COUNT(*) AS n FROM trade_queue WHERE status='DONE'").fetchone()["n"],
+                            "err":  c.execute("SELECT COUNT(*) AS n FROM trade_queue WHERE status='ERROR'").fetchone()["n"],
+                        }
+                counts = run_with_retry(_q)
+                return jsonify({"ok": True, "NEW": int(counts["new"]), "PROCESSING": int(counts["proc"]), "DONE": int(counts["done"]), "ERROR": int(counts["err"])})
+            except Exception as e:
+                return jsonify({"ok": False, "error": str(e)}), 500
 
     # ✅ Explicit default client state update (prevents FK issues & ambiguity)
     update_state({"mode": mode}, client_id=DEFAULT_CLIENT_ID)
