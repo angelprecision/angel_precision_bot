@@ -1473,20 +1473,22 @@ def route_signal_to_all_clients(signal: dict):
     if not active_emails:
         if not ALLOW_SUPABASE_FANOUT_FALLBACK:
             with _registry_lock:
-                degraded_count = sum(
-                    1 for r in _active_runners.values()
-                    if r.degraded.is_set() and not r.stopping.is_set()
-                )
-            if degraded_count:
-                logger.critical(
-                    "Signal %s [%s] — %d runner(s) DEGRADED, 0 entries-allowed. "                    "Signal DROPPED. Check degraded_reasons via /admin/runner_status",
-                    signal_id, ticker, degraded_count,
-                )
-            else:
-                logger.warning(
-                    "Signal %s [%s] -- no local entries-allowed runners and Supabase fallback disabled; dropping",
-                    signal_id, ticker,
-                )
+                for _email, _r in _active_runners.items():
+                    _alive = _r.is_alive()
+                    _init = _r.initialized.is_set()
+                    _stop = _r.stopping.is_set()
+                    _fail = _r.failed.is_set()
+                    _deg  = _r.degraded.is_set()
+                    _ea   = _r.entries_allowed.is_set()
+                    logger.warning(
+                        "ROUTE_BLOCK [%s]: alive=%s init=%s stop=%s fail=%s degraded=%s entries_allowed=%s reasons=%s",
+                        _email, _alive, _init, _stop, _fail, _deg, _ea,
+                        list(getattr(_r, "degraded_reasons", {}).keys()) if _deg else []
+                    )
+            logger.warning(
+                "Signal %s [%s] -- no local entries-allowed runners and Supabase fallback disabled; dropping",
+                signal_id, ticker,
+            )
             return 0
 
         now = _time_module.monotonic()
