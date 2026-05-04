@@ -1473,6 +1473,16 @@ def start_multi_client_supervisor():
         logger.warning("No Supabase credentials -- multi-client supervisor not starting")
         return
 
+    # Validate ENCRYPTION_KEY before spawning any runner. Every ClientRunner calls
+    # _get_token() → decrypt_token() on startup. A missing key means every runner
+    # fails on first _get_token() with a RuntimeError — after appearing healthy.
+    # Fail here at supervisor startup so the problem is immediately visible.
+    if not _raw_key:
+        raise RuntimeError(
+            "ENCRYPTION_KEY env var is required for token decryption — "
+            "set it in Render env vars before starting the supervisor"
+        )
+
     # WIRE-1: DB rowcount probe — process-level, runs once before any runner
     # thread or APOrderStateMachine is created. If the active DB driver returns
     # None for rowcount and OSM_ROWCOUNT_NONE_IS_FATAL=1 (the default), every
