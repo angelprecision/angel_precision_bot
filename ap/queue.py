@@ -433,6 +433,15 @@ def _dispatch(
                     plan.metadata["contract_selection_deferred"] = "outside_regular_session"
             except Exception:
                 pass
+            # Reject immediately — market is closed, live quotes unavailable for
+            # contract selection. Accept only when breach-time re-selection is
+            # wired end-to-end; until then dropping is safer than a stale contract.
+            log.warning(
+                "[%s] Signal %s rejected — market closed, no live quotes for contract selection",
+                ticker, signal_id,
+            )
+            _mark_job(job_id, "REJECTED", error="market_closed_no_contract_selection")
+            return
     except Exception:
         pass
 

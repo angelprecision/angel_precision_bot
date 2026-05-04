@@ -652,6 +652,29 @@ class ClientRunner(threading.Thread):
             if missing:
                 self._mark_failed("LIVE startup missing: " + ", ".join(missing))
                 return
+            # LIVE safety config — hard block unsafe settings before any thread starts
+            try:
+                from ap.fill_monitor import ALLOW_LEGACY_FILL_MONITOR
+                if ALLOW_LEGACY_FILL_MONITOR:
+                    self._mark_failed("LIVE_STARTUP_FATAL: ALLOW_LEGACY_FILL_MONITOR=1 is forbidden in LIVE")
+                    return
+            except ImportError:
+                pass
+            _allow_imm = os.getenv("ALLOW_IMMEDIATE_EXECUTION", "0").strip().lower()
+            if _allow_imm in ("1", "true", "yes", "on"):
+                self._mark_failed("LIVE_STARTUP_FATAL: ALLOW_IMMEDIATE_EXECUTION=1 is forbidden in LIVE")
+                return
+            try:
+                from ap.order_state_machine import _ROWCOUNT_NONE_IS_FATAL
+                if not _ROWCOUNT_NONE_IS_FATAL:
+                    self._mark_failed("LIVE_STARTUP_FATAL: OSM_ROWCOUNT_NONE_IS_FATAL=0 in LIVE — unsafe")
+                    return
+            except ImportError:
+                pass
+            logger.critical(
+                "[%s] LIVE SAFETY CONFIG VERIFIED: legacy_fill_monitor=OFF immediate_execution=OFF rowcount_fatal=ON",
+                self.email,
+            )
             logger.info("[%s] LIVE mode assertions PASSED | account_id=%s base_url=%s", self.email, self.account_id, self.base_url)
 
         try:
@@ -1024,6 +1047,11 @@ class ClientRunner(threading.Thread):
                     "— verify no live Tradier positions are orphaned",
                     self.email, tier_b, self.mode,
                 )
+                if self.mode == "LIVE":
+                    self._enter_degraded_mode(
+                        f"startup_phantom_submitted_live:{tier_b}",
+                        stop_runner=False,
+                    )
         except Exception as exc:
             logger.warning("[%s] Startup phantom clear: %s", self.email, exc)
 

@@ -52,6 +52,10 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from ap.db import conn, run_with_retry
+try:
+    from psycopg2 import errors as pg_errors
+except ImportError:
+    pg_errors = None
 from ap.utils import now_utc_iso
 
 try:

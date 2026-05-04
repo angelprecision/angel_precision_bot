@@ -243,6 +243,7 @@ class APMasterControl:
         self.max_trades_today = max_trades_today
         self.max_daily_loss = max_daily_loss
         self.account_equity = account_equity
+        self._startup_equity = float(account_equity)  # used to scale max_daily_loss proportionally
         self.pm = position_manager
         self._client_id = client_id
         self.sizer = position_sizer
@@ -482,15 +483,22 @@ class APMasterControl:
     def set_account_equity(self, equity: float, client_id: str = ""):
         old = self.account_equity
         self.account_equity = float(equity)
+        # Recompute max_daily_loss proportionally to new equity.
+        # max_capital/sector/ticker pct gates recompute inline — no action needed.
+        # max_daily_loss is a fixed dollar set at startup; scale it with equity.
+        if self._startup_equity and self._startup_equity > 0:
+            loss_pct = abs(self.max_daily_loss / self._startup_equity)
+            self.max_daily_loss = -abs(self.account_equity * loss_pct)
         label = f"[{client_id}] " if client_id else ""
         if abs(old - self.account_equity) > 1:
             log.info(
-                "%sAccount equity updated: $%.0f -> $%.0f | max_capital=$%.0f max_sector=$%.0f",
+                "%sAccount equity updated: $%.0f -> $%.0f | max_capital=$%.0f max_sector=$%.0f max_daily_loss=$%.0f",
                 label,
                 old,
                 self.account_equity,
                 self.account_equity * self.max_capital_pct,
                 self.account_equity * self.max_sector_pct,
+                self.max_daily_loss,
             )
 
     @staticmethod
