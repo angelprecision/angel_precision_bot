@@ -1195,11 +1195,14 @@ class APContractSelectionEngine:
             pass
 
         # 2. Get expirations
-        exp_resp = requests.get(
-            f"{base_url}/v1/markets/options/expirations",
-            params={"symbol": ticker, "includeAllRoots": "true"},
-            headers=headers, timeout=10,
-        )
+        try:
+            exp_resp = requests.get(
+                f"{base_url}/v1/markets/options/expirations",
+                params={"symbol": ticker, "includeAllRoots": "true"},
+                headers=headers, timeout=10,
+            )
+        except requests.exceptions.RequestException as _e:
+            raise ValueError(f"Expirations fetch network error: {_e}") from _e
         if exp_resp.status_code != 200:
             raise ValueError(f"Expirations fetch failed: {exp_resp.status_code}")
 
@@ -1213,11 +1216,14 @@ class APContractSelectionEngine:
             return [], underlying_price
 
         # 4. Get chain with greeks
-        chain_resp = requests.get(
-            f"{base_url}/v1/markets/options/chains",
-            params={"symbol": ticker, "expiration": target_exp, "greeks": "true"},
-            headers=headers, timeout=10,
-        )
+        try:
+            chain_resp = requests.get(
+                f"{base_url}/v1/markets/options/chains",
+                params={"symbol": ticker, "expiration": target_exp, "greeks": "true"},
+                headers=headers, timeout=10,
+            )
+        except requests.exceptions.RequestException as _e:
+            raise ValueError(f"Chain fetch network error: {_e}") from _e
         if chain_resp.status_code != 200:
             raise ValueError(f"Chain fetch failed: {chain_resp.status_code}")
 
@@ -1274,6 +1280,13 @@ class APContractSelectionEngine:
     # =========================================================================
 
     def _synthetic_contract(self, ticker: str, direction: str, reason: str) -> "SelectedContract":
+        """Dead code — never called in production. Guard prevents accidental wiring in LIVE.
+        If this is ever needed, create a dedicated paper-only code path instead.
+        """
+        assert self.mode.upper() != "LIVE", (
+            "_synthetic_contract must never be called in LIVE mode — "
+            f"{ticker}_SIM is not a real option symbol and would be submitted to the broker"
+        )
         log.warning("[%s] SYNTHETIC CONTRACT -- %s", ticker, reason)
         return SelectedContract(
             contract_symbol=f"{ticker}_SIM", expiration="SIM", strike=0,
