@@ -34,7 +34,6 @@ import logging
 from ap.trace import trace_gate
 import os
 import time
-from datetime import datetime, timezone
 from typing import Any, Optional
 
 from ap.state import update_state
@@ -155,15 +154,21 @@ def enqueue_signal(
                 """,
                 (client_id, signal_id, _json_dumps(payload), idempotency_key),
             )
+            # rowcount is 0 when ON CONFLICT DO NOTHING fires (duplicate);
+            # 1 when the row was actually inserted.
+            return getattr(c, "rowcount", None)
 
     try:
-        _run_with_retry(_ins)
+        rowcount = _run_with_retry(_ins)
+        if rowcount == 0:
+            log.debug(f"Duplicate ignored: {signal_id}")
+            return False
         log.info(f"✅ Enqueued: {signal_id} client={client_id}")
         return True
     except Exception as e:
         msg = str(e).lower()
         if "unique" in msg or "conflict" in msg:
-            log.debug(f"Duplicate ignored: {signal_id}")
+            log.debug(f"Duplicate ignored (exception path): {signal_id}")
             return False
         raise
 
@@ -231,7 +236,7 @@ def _claim_one_job(client_id: str = "default") -> Optional[dict]:
     def _atomic_claim():
         with _conn()() as c:
             c.execute(
-                f"""
+                """
                 UPDATE trade_queue
                 SET status      = 'NEW',
                     started_ts  = NULL,
@@ -239,9 +244,9 @@ def _claim_one_job(client_id: str = "default") -> Optional[dict]:
                 WHERE status    = 'PROCESSING'
                   AND client_id = %s
                   AND started_ts IS NOT NULL
-                  AND started_ts < NOW() - INTERVAL '{PROCESSING_STALE_SECS} seconds'
+                  AND started_ts < NOW() - (%s || ' seconds')::interval
                 """,
-                (client_id,),
+                (client_id, str(PROCESSING_STALE_SECS)),
             )
             c.execute(
                 """
@@ -285,6 +290,7 @@ def _dispatch(
     position_manager=None,
     exit_eng=None,
     broker=None,
+    on_split_brain=None,
 ):
     """
     Unified control path:
@@ -778,6 +784,7 @@ def worker_loop(
                     position_manager=position_manager,
                     exit_eng=exit_eng,
                     broker=broker,
+                    on_split_brain=on_split_brain,
                 )
             else:
                 log.error(
