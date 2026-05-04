@@ -1633,7 +1633,8 @@ def start_multi_client_supervisor():
 
     def _supervisor():
         logger.info("Multi-client supervisor started")
-        while True:
+        try:
+          while True:
             try:
                 members = _fetch_active_members(sb)
                 _supervisor_state["last_member_count"] = len(members)
@@ -1661,6 +1662,9 @@ def start_multi_client_supervisor():
                 if any_dead:
                     logger.warning("Supervisor: dead runner detected — triggering early sync")
                     break
+        except BaseException as _fatal:
+            _supervisor_state["last_sync_error"] = f"FATAL_CRASH: {_fatal}"
+            logger.critical("Supervisor thread FATAL crash: %s", _fatal, exc_info=True)
 
     global _supervisor_thread
     _supervisor_thread = threading.Thread(target=_supervisor, daemon=True, name="client-supervisor")
