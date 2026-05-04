@@ -1022,25 +1022,32 @@ def create_app() -> Flask:
                     psycopg2.extras.register_uuid()
                     status_filter = ""
                     params = [client_id]
-                    if status != "ALL":
-                        status_filter = "AND p.status = %s"
-                        params.append(status)
+                    if status == "CLOSED":
+                        status_filter = "AND p.status IN ('closed', 'CLOSED')"
+                    elif status == "OPEN":
+                        status_filter = "AND p.status IN ('open', 'OPEN', 'closing', 'CLOSING')"
+                    elif status != "ALL":
+                        status_filter = "AND UPPER(p.status) = %s"
+                        params.append(status.upper())
                     c.execute(f"""
                         SELECT
-                            p.position_id,
+                            p.id                  AS trade_id,
                             p.underlying          AS ticker,
-                            p.side,
-                            p.option_symbol       AS contract,
-                            p.quantity,
-                            p.entry_price,
-                            p.entry_fill_price,
-                            p.entry_time,
+                            p.direction           AS side,
+                            p.contract,
+                            p.qty                 AS quantity,
+                            p.expected_entry      AS entry_price,
+                            p.avg_fill            AS fill_price,
+                            p.entry_ts            AS entry_time,
                             p.exit_price,
-                            p.exit_fill_price,
-                            p.exit_time,
+                            p.exit_ts             AS exit_time,
                             p.realized_pnl,
+                            p.realized_pnl_pct,
                             p.status,
                             p.exit_reason,
+                            p.score,
+                            p.tier,
+                            p.signal_id,
                             p.created_at
                         FROM positions p
                         WHERE p.client_id = %s
@@ -1100,21 +1107,22 @@ def create_app() -> Flask:
                 with __import__("ap.db", fromlist=["conn"]).conn() as c:
                     c.execute("""
                         SELECT
-                            p.position_id,
-                            p.underlying    AS ticker,
-                            p.side,
-                            p.option_symbol AS contract,
-                            p.quantity,
-                            p.entry_price,
-                            p.entry_fill_price,
-                            p.entry_time,
+                            p.id                AS trade_id,
+                            p.underlying        AS ticker,
+                            p.direction         AS side,
+                            p.contract,
+                            p.qty               AS quantity,
+                            p.expected_entry    AS entry_price,
+                            p.avg_fill          AS fill_price,
+                            p.entry_ts          AS entry_time,
                             p.status,
                             p.realized_pnl,
-                            p.unrealized_pnl
+                            p.score,
+                            p.signal_id
                         FROM positions p
                         WHERE p.client_id = %s
-                          AND p.status IN ('OPEN', 'CLOSING')
-                        ORDER BY p.entry_time DESC
+                          AND LOWER(p.status) IN ('open', 'closing')
+                        ORDER BY p.entry_ts DESC NULLS LAST
                     """, (client_id,))
                     cols = [d[0] for d in c.description]
                     return [dict(zip(cols, row)) for row in c.fetchall()]
