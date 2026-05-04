@@ -119,6 +119,28 @@ def get_runner_failure_log() -> list[dict]:
     with _failure_log_lock:
         return list(_runner_failure_log)
 
+
+# Supervisor state — updated by the supervisor loop so we can inspect it via API
+_supervisor_state: dict = {
+    "started": False,
+    "last_sync_ts": 0.0,
+    "last_member_count": 0,
+    "last_sync_error": "",
+    "sync_count": 0,
+    "thread_alive": False,
+}
+_supervisor_thread: threading.Thread | None = None
+
+
+def get_supervisor_state() -> dict:
+    import time as _time
+    return {
+        **_supervisor_state,
+        "thread_alive": _supervisor_thread.is_alive() if _supervisor_thread else False,
+        "active_runner_count": len(_active_runners),
+        "now_ts": _time.time(),
+    }
+
 # Broker reconciler is disabled by default because the rich fill monitor is
 # already the primary broker-order reconciliation path.
 ENABLE_BROKER_RECONCILER = _env_bool("ENABLE_BROKER_RECONCILER", "0")
@@ -1607,12 +1629,20 @@ def start_multi_client_supervisor():
     init_self_healing(supabase_client=sb)
     logger.info("Self-healing system initialized")
 
+    _supervisor_state["started"] = True
+
     def _supervisor():
         logger.info("Multi-client supervisor started")
         while True:
             try:
+                members = _fetch_active_members(sb)
+                _supervisor_state["last_member_count"] = len(members)
+                _supervisor_state["last_sync_error"] = ""
                 _sync_runners(sb)
+                _supervisor_state["sync_count"] += 1
+                _supervisor_state["last_sync_ts"] = time.time()
             except Exception as exc:
+                _supervisor_state["last_sync_error"] = str(exc)
                 logger.error("Supervisor sync error: %s", exc)
             # FIX-4: 300s full-sync cadence is too slow for dead-runner detection.
             # Inner loop checks runner liveness every 15s and breaks early to call
@@ -1632,8 +1662,9 @@ def start_multi_client_supervisor():
                     logger.warning("Supervisor: dead runner detected — triggering early sync")
                     break
 
-    thread = threading.Thread(target=_supervisor, daemon=True, name="client-supervisor")
-    thread.start()
+    global _supervisor_thread
+    _supervisor_thread = threading.Thread(target=_supervisor, daemon=True, name="client-supervisor")
+    _supervisor_thread.start()
     logger.info("Client supervisor thread launched")
 
 
