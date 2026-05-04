@@ -790,6 +790,59 @@ def create_app() -> Flask:
             return jsonify({"ok": False, "error": str(e)}), 500
 
 
+
+    @app.post("/admin/reset_runner")
+    @require_hmac
+    def admin_reset_runner():
+        """Kill any stuck runner (initialized=False for >120s) and restart it cleanly."""
+        try:
+            import time as _time
+            from client_runner import (
+                _active_runners, _registry_lock, ClientRunner,
+                _fetch_active_members, SUPABASE_URL, SUPABASE_SERVICE_KEY,
+            )
+            from supabase import create_client
+
+            killed = []
+            restarted = []
+
+            with _registry_lock:
+                for email, runner in list(_active_runners.items()):
+                    # Kill runners that are alive but not initialized after >60s
+                    is_stuck = (
+                        runner.is_alive()
+                        and not runner.initialized.is_set()
+                        and not runner.failed.is_set()
+                    )
+                    is_dead = not runner.is_alive()
+                    if is_stuck or is_dead:
+                        runner.stop()
+                        del _active_runners[email]
+                        killed.append(email)
+                        log.warning(f"reset_runner: killed {'stuck' if is_stuck else 'dead'} runner for {email}")
+
+            if killed and SUPABASE_URL and SUPABASE_SERVICE_KEY:
+                sb = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+                members = _fetch_active_members(sb)
+                for member in members:
+                    email = member["email"]
+                    if email not in killed:
+                        continue
+                    with _registry_lock:
+                        existing = _active_runners.get(email)
+                        if existing and existing.is_alive():
+                            continue
+                        runner = ClientRunner(member)
+                        _active_runners[email] = runner
+                        runner.start()
+                        restarted.append(email)
+                        log.info(f"reset_runner: restarted runner for {email}")
+
+            return jsonify({"ok": True, "killed": killed, "restarted": restarted})
+        except Exception as e:
+            log.error(f"reset_runner failed: {e}", exc_info=True)
+            return jsonify({"ok": False, "error": str(e)}), 500
+
     @app.post("/admin/test_signal")
     @require_hmac
     def admin_test_signal():
@@ -798,7 +851,7 @@ def create_app() -> Flask:
         try:
             import time as _time, uuid as _uuid
             from client_runner import _active_runners, _registry_lock
-            from ap.queue import _enqueue
+            from ap.queue import enqueue_signal
 
             body = request.get_json(silent=True) or {}
             ticker  = body.get("ticker", "SPY")
@@ -841,7 +894,7 @@ def create_app() -> Flask:
 
             # Enqueue directly into the runner's queue (bypasses route_signal_to_all_clients)
             try:
-                job_id = _enqueue(signal, client_id=client_id, priority=10)
+                job_id = enqueue_signal(signal, client_id=client_id)
                 return jsonify({
                     "ok": True,
                     "signal_id": signal_id,
