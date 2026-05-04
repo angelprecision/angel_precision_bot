@@ -289,7 +289,7 @@ def _log_rejection_to_db(
     payload: dict,
 ) -> None:
     """Write every signal rejection to ap_signals with a permanent queryable record.
-    Dashboard, clients, and ops can query this. Never rely on logs alone.
+    Uses exact ap_signals schema columns. Non-fatal — never blocks the trade path.
     """
     try:
         import os as _os, uuid as _uuid
@@ -315,7 +315,8 @@ def _log_rejection_to_db(
                 "stage": stage,
                 "reason_code": reason_code,
                 "human_reason": human_reason,
-                **{k: v for k, v in payload.items() if k not in ("raw_payload",)},
+                **{k: v for k, v in payload.items()
+                   if k not in ("raw_payload", "signal_payload") and not callable(v)},
             },
         }, on_conflict="signal_id").execute()
     except Exception as _rlog_exc:
