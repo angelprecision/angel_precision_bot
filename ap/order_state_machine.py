@@ -447,7 +447,16 @@ class APOrderStateMachine:
                     ),
                 )
 
-        run_with_retry(_fn)
+        try:
+            run_with_retry(_fn)
+        except Exception as _db_err:
+            if pg_errors and isinstance(_db_err, pg_errors.UniqueViolation):
+                log.critical(
+                    "[%s] DUPLICATE ORDER BLOCKED by DB constraint — ENTRY plan=%s",
+                    self.client_id, plan.plan_id,
+                )
+                return existing["local_order_id"] if existing else local_order_id
+            raise
         log.info(
             "[%s] ORDER CREATED (entry) | %s x%s | local_order_id=%s",
             self.client_id, contract, plan.contracts, local_order_id,
@@ -510,7 +519,16 @@ class APOrderStateMachine:
                     ),
                 )
 
-        run_with_retry(_fn)
+        try:
+            run_with_retry(_fn)
+        except Exception as _db_err:
+            if pg_errors and isinstance(_db_err, pg_errors.UniqueViolation):
+                log.critical(
+                    "[%s] DUPLICATE ORDER BLOCKED by DB constraint — EXIT pos=%s",
+                    self.client_id, position_id,
+                )
+                return existing["local_order_id"] if existing else local_id
+            raise
         log.info(
             "[%s] ORDER CREATED (exit) | %s x%s pos=%s | local_order_id=%s",
             self.client_id, contract, qty, position_id, local_id,
