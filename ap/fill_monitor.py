@@ -1310,25 +1310,91 @@ def _audit_long_pending(order: dict, kind: str, client_id: str, local_id: str, b
 
 
 def _sync_exit_price(order: dict, result: dict):
+    """
+    Update proof_trades with the REAL Tradier avg_fill price.
+    The execution core logs exit_option_price = limit_price at close time.
+    This corrects it to the actual broker fill price and recalculates PnL.
+    Runs directly against Supabase proof_trades — no dashboard API hop needed.
+    """
     try:
-        from ap.exit_price_sync import sync_exit_price_to_dashboard
+        pos_id      = order.get("position_id")
+        avg_fill    = result.get("avg_fill")
+        entry_price = float(order.get("entry_price") or order.get("fill_price") or 0)
+        client_id   = order.get("client_id", "")
+        ticker      = (order.get("symbol") or "").upper()
 
-        pos_id = order.get("position_id")
-        avg_fill = result.get("avg_fill")
-        entry_price = order.get("entry_price") or order.get("fill_price")
-        ticker = (order.get("symbol") or "").upper()
+        if not pos_id or avg_fill is None:
+            return
 
-        if pos_id and avg_fill is not None:
+        exit_px = float(avg_fill)
+
+        # Recalculate PnL from broker fill price
+        opt_pnl_pct = None
+        win = None
+        if entry_price > 0:
+            opt_pnl_pct = round((exit_px - entry_price) / entry_price * 100, 2)
+            win = opt_pnl_pct > 0
+
+        # 1. Update proof_trades directly in Supabase
+        try:
+            from ap.db import conn, run_with_retry
+            def _update_proof():
+                with conn() as c:
+                    params = [exit_px]
+                    set_clause = "exit_option_price = %s"
+                    if opt_pnl_pct is not None:
+                        set_clause += ", option_pnl_pct = %s, win = %s"
+                        params += [opt_pnl_pct, win]
+                    params += [str(pos_id)]
+                    c.execute(
+                        f"UPDATE proof_trades SET {set_clause} WHERE position_id = %s",
+                        params,
+                    )
+                    # Fallback: match by client_email + recent close time
+                    if getattr(c, "rowcount", 0) == 0 and client_id:
+                        params2 = [exit_px]
+                        set2 = "exit_option_price = %s"
+                        if opt_pnl_pct is not None:
+                            set2 += ", option_pnl_pct = %s, win = %s"
+                            params2 += [opt_pnl_pct, win]
+                        params2.append(client_id)
+                        c.execute(
+                            f"UPDATE proof_trades SET {set2} "
+                            "WHERE client_email = %s "
+                            "AND closed_at >= NOW() - INTERVAL '30 minutes' "
+                            "AND (exit_option_price IS NULL OR ABS(COALESCE(exit_option_price,0) - 0) < 0.001)",
+                            params2,
+                        )
+                    return getattr(c, "rowcount", 0)
+            updated = run_with_retry(_update_proof) or 0
+            if updated:
+                log.info(
+                    "[%s] EXIT PRICE SYNCED | %s broker_fill=$%.4f entry=$%.4f pnl=%.1f%% win=%s",
+                    client_id, ticker, exit_px, entry_price,
+                    opt_pnl_pct if opt_pnl_pct is not None else 0,
+                    win,
+                )
+            else:
+                log.warning("[%s] EXIT PRICE SYNC: proof_trades row not found for pos_id=%s", client_id, pos_id)
+        except Exception as db_exc:
+            log.debug("[%s] proof_trades exit sync DB error (non-critical): %s", client_id, db_exc)
+
+        # 2. Also notify dashboard API if configured (belt-and-suspenders)
+        try:
+            from ap.exit_price_sync import sync_exit_price_to_dashboard
             sync_exit_price_to_dashboard(
                 position_id=str(pos_id),
-                exit_avg_fill=float(avg_fill),
-                entry_price=float(entry_price) if entry_price else None,
+                exit_avg_fill=exit_px,
+                entry_price=entry_price if entry_price else None,
                 ticker=ticker,
             )
-    except ImportError:
-        pass
+        except ImportError:
+            pass
+        except Exception:
+            pass
+
     except Exception as exc:
-        log.debug("[%s] exit_price_sync failed (non-critical): %s", order.get("client_id"), exc)
+        log.debug("[%s] _sync_exit_price failed (non-critical): %s", order.get("client_id"), exc)
 
 
 # =============================================================================
