@@ -426,22 +426,32 @@ class ClientRunner(threading.Thread):
         return False
 
     def _set_entry_permission(self):
+        _worker_ok = self.worker_thread is not None and self.worker_thread.is_alive()
+        _fill_ok   = self.fill_monitor_thread is not None and self.fill_monitor_thread.is_alive()
+        _core_ok   = self.core is not None and getattr(self.core, "exit_eng", None) is not None
+        _degraded  = self.degraded.is_set()
+        _failed    = self.failed.is_set()
         ready = (
             self.is_alive()
             and self.initialized.is_set()
-            and not self.failed.is_set()
+            and not _failed
             and not self.stopping.is_set()
-            and not self.degraded.is_set()
-            and self.core is not None
-            and getattr(self.core, "exit_eng", None) is not None
-            and self.worker_thread is not None
-            and self.worker_thread.is_alive()
-            and self.fill_monitor_thread is not None
-            and self.fill_monitor_thread.is_alive()
+            and not _degraded
+            and _core_ok
+            and _worker_ok
+            and _fill_ok
         )
         if ready:
             self.entries_allowed.set()
         else:
+            if not _worker_ok:
+                logger.warning("[%s] entries_allowed BLOCKED: worker_thread dead", self.email)
+            if not _fill_ok:
+                logger.warning("[%s] entries_allowed BLOCKED: fill_monitor_thread dead", self.email)
+            if _degraded:
+                logger.warning("[%s] entries_allowed BLOCKED: degraded reasons=%s", self.email, list(getattr(self, "degraded_reasons", {}).keys()))
+            if _failed:
+                logger.warning("[%s] entries_allowed BLOCKED: failed", self.email)
             self.entries_allowed.clear()
         return ready
 
