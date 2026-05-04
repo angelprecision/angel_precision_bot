@@ -591,6 +591,31 @@ def create_app() -> Flask:
         # Guard: return 503 if worker not ready — scanner will retry instead of silently dropping
         if not THREADS_STARTED:
             return jsonify({"ok": False, "error": "worker_not_ready", "hint": "Bot is starting up — retry in 5s"}), 503
+        # Self-heal: if no runners alive after restart, spawn them now before routing.
+        try:
+            import os as _os2
+            from client_runner import (
+                _active_runners as _ar, _registry_lock as _rl,
+                ClientRunner as _CR, _fetch_active_members as _fam,
+                SUPABASE_URL as _su, SUPABASE_SERVICE_KEY as _sk,
+            )
+            if _os2.getenv("RUN_SUPERVISOR") == "1":
+                with _rl:
+                    _any_alive = any(r.is_alive() for r in _ar.values())
+                if not _any_alive and _su and _sk:
+                    from supabase import create_client as _cc2
+                    _members2 = _fam(_cc2(_su, _sk))
+                    for _m2 in _members2:
+                        _email2 = _m2["email"]
+                        with _rl:
+                            _ex2 = _ar.get(_email2)
+                            if not _ex2 or not _ex2.is_alive():
+                                _r2 = _CR(_m2)
+                                _ar[_email2] = _r2
+                                _r2.start()
+                                log.info(f"signal self-heal: started runner for {_email2}")
+        except Exception as _she:
+            log.warning(f"signal self-heal error (non-fatal): {_she}")
         ip = _client_ip()
         client_id = _require_client_id_header()
         if not client_id:
@@ -762,6 +787,75 @@ def create_app() -> Flask:
             return jsonify({"ok": True, "failures": failures, "count": len(failures)})
         except Exception as e:
             log.error(f"Runner failures failed: {e}")
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+
+    @app.post("/admin/test_signal")
+    @require_hmac
+    def admin_test_signal():
+        """Inject a test signal directly into the worker queue, bypassing market-hours
+        and quote checks. For after-hours testing only."""
+        try:
+            import time as _time, uuid as _uuid
+            from client_runner import _active_runners, _registry_lock
+            from ap.queue import _enqueue
+
+            body = request.get_json(silent=True) or {}
+            ticker  = body.get("ticker", "SPY")
+            side    = body.get("side", "CALL").upper()
+            score   = float(body.get("score", 75.0))
+            client_id = body.get("client_id", "tradefluencehq@gmail.com")
+
+            signal_id = body.get("signal_id") or f"TEST-{_uuid.uuid4().hex[:8]}"
+
+            signal = {
+                "signal_id": signal_id,
+                "ticker": ticker,
+                "side": side,
+                "score": score,
+                "strategy": body.get("strategy", "test"),
+                "timestamp": _time.time(),
+                "test_mode": True,
+                "bypass_market_hours": True,
+            }
+
+            # Check runner health first
+            with _registry_lock:
+                runner = _active_runners.get(client_id)
+
+            if not runner or not runner.is_alive():
+                return jsonify({
+                    "ok": False,
+                    "error": f"No alive runner for {client_id}. Hit /admin/force_start_runner first.",
+                    "runner_alive": False,
+                }), 503
+
+            if not runner.entries_allowed.is_set():
+                reasons = sorted(list(getattr(runner, "degraded_reasons", set())))
+                return jsonify({
+                    "ok": False,
+                    "error": "Runner alive but entries_allowed=False",
+                    "degraded": runner.degraded.is_set(),
+                    "degraded_reasons": reasons,
+                }), 503
+
+            # Enqueue directly into the runner's queue (bypasses route_signal_to_all_clients)
+            try:
+                job_id = _enqueue(signal, client_id=client_id, priority=10)
+                return jsonify({
+                    "ok": True,
+                    "signal_id": signal_id,
+                    "job_id": str(job_id),
+                    "ticker": ticker,
+                    "side": side,
+                    "score": score,
+                    "note": "Test signal enqueued — worker will process but market_closed_no_contract_selection rejection is expected after hours",
+                })
+            except Exception as eq_exc:
+                return jsonify({"ok": False, "error": f"enqueue failed: {eq_exc}"}), 500
+
+        except Exception as e:
+            log.error(f"test_signal failed: {e}", exc_info=True)
             return jsonify({"ok": False, "error": str(e)}), 500
 
     @app.post("/admin/force_start_runner")
