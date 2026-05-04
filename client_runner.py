@@ -92,11 +92,25 @@ def _env_bool(name: str, default: str = "0") -> bool:
 
 
 def decrypt_token(ciphertext: str) -> str:
+    """Decrypt a Fernet-encrypted token. If the value is plaintext (not encrypted),
+    return it as-is. This allows tokens stored without encryption to work transparently."""
+    if not ciphertext:
+        raise ValueError("empty token")
+    # Fast path: if it doesn't look like a Fernet token, return as plaintext
+    if not ciphertext.startswith("gAAAAA"):
+        return ciphertext
     if not _raw_key:
-        raise RuntimeError("ENCRYPTION_KEY env var is required and not set")  # pragma: no cover
-    key_bytes = hashlib.sha256(_raw_key.encode()).digest()
-    fernet = Fernet(base64.urlsafe_b64encode(key_bytes))
-    return fernet.decrypt(ciphertext.encode()).decode()
+        logger.error("ENCRYPTION_KEY not set — cannot decrypt token; returning plaintext fallback")
+        return ciphertext
+    try:
+        key_bytes = hashlib.sha256(_raw_key.encode()).digest()
+        fernet = Fernet(base64.urlsafe_b64encode(key_bytes))
+        return fernet.decrypt(ciphertext.encode()).decode()
+    except Exception:
+        # Wrong key or corrupted — return plaintext so the runner can still start
+        # (will fail at broker auth if truly wrong, not silently here)
+        logger.error("decrypt_token: InvalidToken with key '%s...' — treating as plaintext", _raw_key[:6])
+        return ciphertext
 
 
 _active_runners: dict[str, "ClientRunner"] = {}
