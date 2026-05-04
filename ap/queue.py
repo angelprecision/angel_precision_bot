@@ -277,6 +277,51 @@ def _claim_one_job(client_id: str = "default") -> Optional[dict]:
 # DISPATCH -- master control path
 # =============================================================================
 
+def _log_rejection_to_db(
+    signal_id: str,
+    client_id: str,
+    ticker: str,
+    side: str,
+    score: float,
+    stage: str,
+    reason_code: str,
+    human_reason: str,
+    payload: dict,
+) -> None:
+    """Write every signal rejection to ap_signals with a permanent queryable record.
+    Dashboard, clients, and ops can query this. Never rely on logs alone.
+    """
+    try:
+        import os as _os, uuid as _uuid
+        from supabase import create_client as _cc
+        _sb_url = _os.getenv("SUPABASE_URL", "")
+        _sb_key = _os.getenv("SUPABASE_SERVICE_KEY", "")
+        if not _sb_url or not _sb_key:
+            return
+        _sbc = _cc(_sb_url, _sb_key)
+        _sbc.table("ap_signals").upsert({
+            "signal_id":       str(signal_id or _uuid.uuid4()),
+            "client_email":    str(client_id),
+            "system_version":  "v2",
+            "ticker":          str(ticker),
+            "side":            str(side).upper(),
+            "score":           float(score or 0),
+            "tier":            str(payload.get("tier") or "B"),
+            "pattern":         str(payload.get("pattern") or ""),
+            "timeframe":       str(payload.get("timeframe") or "1d"),
+            "decision_status": "rejected",
+            "context_notes":   f"stage={stage} | code={reason_code} | {human_reason}",
+            "raw_payload":     {
+                "stage": stage,
+                "reason_code": reason_code,
+                "human_reason": human_reason,
+                **{k: v for k, v in payload.items() if k not in ("raw_payload",)},
+            },
+        }, on_conflict="signal_id").execute()
+    except Exception as _rlog_exc:
+        log.debug("_log_rejection_to_db failed (non-fatal): %s", _rlog_exc)
+
+
 def _dispatch(
     job_id: int,
     client_id: str,
@@ -328,6 +373,35 @@ def _dispatch(
     except ImportError:
         pass  # restart_guard not yet deployed — skip silently
 
+    # ── 0.5 BROKER EQUITY REFRESH — hard-fetch before every evaluation ─────────
+    # Premium clients pay for accurate position sizing. We do not use cached equity.
+    # LIVE mode: equity unavailable = trade rejected (fail closed).
+    # PAPER mode: equity unavailable = log warning, continue with last known value.
+    try:
+        if broker and hasattr(broker, "get_account_equity"):
+            _fresh_equity = broker.get_account_equity()
+            if _fresh_equity and float(_fresh_equity) > 0:
+                master_control.set_account_equity(float(_fresh_equity))
+                log.info("[%s] Equity refreshed before eval: $%.2f", ticker, float(_fresh_equity))
+            else:
+                if live_mode:
+                    log.error("[%s] LIVE: broker returned zero/null equity — rejecting signal (fail closed)", ticker)
+                    _mark_job(job_id, "REJECTED", error="live_equity_unavailable:broker_returned_zero")
+                    return
+                else:
+                    log.warning("[%s] PAPER: equity refresh returned zero — using last known value", ticker)
+        elif live_mode:
+            log.error("[%s] LIVE: broker has no get_account_equity() method — rejecting signal", ticker)
+            _mark_job(job_id, "REJECTED", error="live_equity_unavailable:no_broker_method")
+            return
+    except Exception as _eq_exc:
+        if live_mode:
+            log.error("[%s] LIVE: equity refresh raised %s — rejecting signal (fail closed)", ticker, _eq_exc)
+            _mark_job(job_id, "REJECTED", error=f"live_equity_unavailable:{_eq_exc}")
+            return
+        else:
+            log.warning("[%s] PAPER: equity refresh error %s — continuing with last known value", ticker, _eq_exc)
+
     # ── 1. MASTER CONTROL (initial gate, placeholder estimate) ────────────────
     try:
         decision = master_control.evaluate(payload, client_id=client_id)
@@ -342,6 +416,13 @@ def _dispatch(
                    reason=decision.reason, score=float(payload.get("score") or 0))
         _mark_job(job_id, "REJECTED",
                   result={"stage": decision.stage, "reason": decision.reason})
+        # Permanent structured rejection record — queryable by client/dashboard
+        _log_rejection_to_db(
+            signal_id=signal_id, client_id=client_id, ticker=ticker,
+            side=payload.get("side", ""), score=float(payload.get("score") or 0),
+            stage=decision.stage, reason_code=str(decision.reason or ""),
+            human_reason=str(decision.reason or ""), payload=payload,
+        )
 
         # Post rejection to Discord
         try:
@@ -437,11 +518,27 @@ def _dispatch(
             # Reject immediately — market is closed, live quotes unavailable for
             # contract selection. Accept only when breach-time re-selection is
             # wired end-to-end; until then dropping is safer than a stale contract.
-            log.warning(
-                "[%s] Signal %s rejected — market closed, no live quotes for contract selection",
+            log.info(
+                "[%s] Signal %s deferred to market open — no live quotes for contract selection after hours. "
+                "Will be requeued at 9:30 AM ET via overnight watcher.",
                 ticker, signal_id,
             )
-            _mark_job(job_id, "REJECTED", error="market_closed_no_contract_selection")
+            # DEFER not REJECT: mark as WATCHING so it gets re-evaluated at open.
+            # The entry watcher overnight path will recheck this signal when market opens.
+            _mark_job(job_id, "WATCHING", error=None)
+            # Wire into entry_watcher overnight path if available
+            try:
+                if entry_watcher and hasattr(entry_watcher, "add"):
+                    import uuid as _uuid_mod
+                    from ap_entry_watcher import WatchEntry
+                    _w = WatchEntry(
+                        signal=payload,
+                        overnight=True,
+                    )
+                    entry_watcher.add(_w)
+                    log.info("[%s] Signal added to entry_watcher overnight queue", ticker)
+            except Exception as _ew_exc:
+                log.debug("[%s] Entry watcher overnight add failed (non-fatal): %s", ticker, _ew_exc)
             return
     except Exception:
         pass
