@@ -416,7 +416,8 @@ def _dispatch(
     try:
         _now_et2 = _now_et()
         _in_mkt  = _is_regular_session_et(_now_et2)
-        if not _in_mkt and contract_selector:
+        _bypass_mkt = bool(payload.get("bypass_market_hours") or payload.get("test_mode"))
+        if not _in_mkt and contract_selector and not _bypass_mkt:
             _skip_contract_selection = True
             log.info(
                 f"[{ticker}] Post-market signal — skipping contract selection "
