@@ -1213,7 +1213,10 @@ class ClientRunner(threading.Thread):
                     # Transient DB errors (SSL EOF, connection reset): restart silently
                     # without degrading entries_allowed. Only degrade on sustained failures
                     # (3+ crashes within 5 minutes) or non-DB errors.
-                    if _is_db_transient and _fm_crash_count <= 3 and (_now - _fm_last_crash_ts) < 300:
+                    # Treat as transient if: DB error AND (first crash OR within 5min window)
+                    _is_first_crash = (_fm_last_crash_ts == 0.0)
+                    _is_within_window = (_now - _fm_last_crash_ts) < 300
+                    if _is_db_transient and _fm_crash_count <= 3 and (_is_first_crash or _is_within_window):
                         logger.warning("[%s] fill_monitor DB transient crash #%d (%s) -- restarting silently in %.1fs",
                                        self.email, _fm_crash_count, exc, restart_sleep)
                     else:
