@@ -755,17 +755,10 @@ class ClientRunner(threading.Thread):
     def _run_inner(self):
         logger.info("[%s] ClientRunner starting -- account %s @ %s", self.email, self.account_id, self.base_url)
 
-        token = self._get_token()
-        if not token:
-            self._mark_failed("no_token")
-            return
-
-        # FIX-1: URL is the authoritative source of mode truth.
-        # Previous logic: sandbox→PAPER, else defer to AP_MODE env (default paper).
-        # Bug: api.tradier.com URL + missing AP_MODE → mode="PAPER" while routing
-        # real orders to production — capital gates in APMasterControl behave as
-        # paper while actual money is at risk.
-        # Fix: production URL always forces LIVE regardless of AP_MODE.
+        # MODE DETECTION FIRST — must happen before _get_token() so decrypt_token()
+        # receives the correct mode and applies LIVE fail-closed policy.
+        # URL is the authoritative source of mode truth — never trust AP_MODE env
+        # when a production URL is present.
         if "sandbox" in self.base_url.lower():
             self.mode = "PAPER"
         elif "api.tradier.com" in self.base_url.lower():
@@ -777,6 +770,11 @@ class ClientRunner(threading.Thread):
         else:
             self.mode = os.getenv("AP_MODE", "PAPER").upper()
         logger.info("[%s] Client mode: %s (base_url=%s)", self.email, self.mode, self.base_url)
+
+        token = self._get_token()   # decrypt_token() now receives the correct mode
+        if not token:
+            self._mark_failed("no_token")
+            return
 
         if self.mode == "LIVE":
             missing = []
