@@ -1622,6 +1622,15 @@ def _sync_runners(sb: Client):
             email = member["email"]
             existing = _active_runners.get(email)
             if existing and existing.is_alive():
+                # Don't replace a runner that is alive — even if not yet initialized.
+                # Replacing an initializing runner causes double-spawn and the new
+                # runner overwrites the good one, leaving entries_allowed=False forever.
+                if not existing.initialized.is_set():
+                    logger.info(
+                        "Skipping spawn for %s — runner alive and still initializing "
+                        "(initialized=False). Will check again next sync cycle.",
+                        email
+                    )
                 continue
             logger.info("Starting runner for %s", email)
             runner = ClientRunner(member)
@@ -1696,6 +1705,11 @@ def start_multi_client_supervisor():
 
     def _supervisor():
         logger.info("Multi-client supervisor started")
+        # Wait for post_worker_init runners to register before first sync.
+        # Without this delay, supervisor and post_worker_init both spawn runners
+        # simultaneously, and the supervisor overwrites the initialized runner.
+        _initial_delay = float(os.getenv("SUPERVISOR_INITIAL_DELAY_SEC", "15"))
+        time.sleep(_initial_delay)
         while True:
             try:
                 members = _fetch_active_members(sb)
