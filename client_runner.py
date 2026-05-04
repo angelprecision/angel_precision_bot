@@ -1180,11 +1180,15 @@ class ClientRunner(threading.Thread):
 
         _fm_crash_count = 0
         _fm_last_crash_ts = 0.0
+        _fm_last_success_ts = 0.0
         _FM_DB_ERR_PHRASES = ("ssl", "eof", "connection", "socket", "timeout", "pool", "interface")
+        _FM_TRANSIENT_THRESHOLD = int(os.getenv("FILL_MONITOR_TRANSIENT_THRESHOLD", "5"))
+        _FM_CRASH_WINDOW = float(os.getenv("FILL_MONITOR_CRASH_WINDOW_SEC", "300"))
 
         def _run_fill_monitor():
-            nonlocal _fm_crash_count, _fm_last_crash_ts
+            nonlocal _fm_crash_count, _fm_last_crash_ts, _fm_last_success_ts
             while not self.stopped.is_set():
+                _loop_start = time.time()
                 try:
                     fill_monitor_loop(
                         broker=broker,
@@ -1197,9 +1201,13 @@ class ClientRunner(threading.Thread):
                     )
                     if self.stopped.is_set():
                         break
+                    # Reset crash count if the loop ran for a meaningful period
+                    if (time.time() - _loop_start) > 30:
+                        _fm_crash_count = 0
+                        _fm_last_success_ts = time.time()
                     # Unexpected clean return — only degrade if sustained
                     _fm_crash_count += 1
-                    if _fm_crash_count >= 3:
+                    if _fm_crash_count >= _FM_TRANSIENT_THRESHOLD:
                         self._enter_degraded_mode("fill_monitor_loop_returned", stop_runner=False)
                     logger.warning("[%s] fill_monitor_loop returned unexpectedly (crash #%d) -- restarting in %.1fs", self.email, _fm_crash_count, restart_sleep)
                     time.sleep(restart_sleep)
@@ -1208,15 +1216,19 @@ class ClientRunner(threading.Thread):
                         break
                     exc_str = str(exc).lower()
                     _is_db_transient = any(p in exc_str for p in _FM_DB_ERR_PHRASES)
-                    _fm_crash_count += 1
                     _now = time.time()
+                    # Reset crash count if last crash was outside the window
+                    # (independent transient events, not a sustained failure)
+                    if _fm_last_crash_ts > 0 and (_now - _fm_last_crash_ts) >= _FM_CRASH_WINDOW:
+                        _fm_crash_count = 0
+                    # Also reset if fill_monitor ran successfully for >30s since last crash
+                    if (_loop_start - _fm_last_crash_ts) > 30 and _fm_last_crash_ts > 0:
+                        _fm_crash_count = 0
+                    _fm_crash_count += 1
                     # Transient DB errors (SSL EOF, connection reset): restart silently
-                    # without degrading entries_allowed. Only degrade on sustained failures
-                    # (3+ crashes within 5 minutes) or non-DB errors.
-                    # Treat as transient if: DB error AND (first crash OR within 5min window)
-                    _is_first_crash = (_fm_last_crash_ts == 0.0)
-                    _is_within_window = (_now - _fm_last_crash_ts) < 300
-                    if _is_db_transient and _fm_crash_count <= 3 and (_is_first_crash or _is_within_window):
+                    # without degrading entries_allowed. Only degrade after N rapid
+                    # crashes within the window, or for non-DB errors.
+                    if _is_db_transient and _fm_crash_count <= _FM_TRANSIENT_THRESHOLD:
                         logger.warning("[%s] fill_monitor DB transient crash #%d (%s) -- restarting silently in %.1fs",
                                        self.email, _fm_crash_count, exc, restart_sleep)
                     else:
