@@ -86,30 +86,71 @@ SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY", "")
 _raw_key = os.getenv("ENCRYPTION_KEY", "angel-precision-encrypt-2026").strip()
 
+# Validate the key is usable as a Fernet key at import time — surfaces misconfiguration early
+try:
+    _key_bytes = hashlib.sha256(_raw_key.encode()).digest()
+    _fernet_test = Fernet(base64.urlsafe_b64encode(_key_bytes))
+    del _fernet_test, _key_bytes
+    logger.debug("ENCRYPTION_KEY validated (Fernet-capable)")
+except Exception as _key_err:
+    logger.critical("ENCRYPTION_KEY is invalid or Fernet import failed: %s", _key_err)
+
 
 def _env_bool(name: str, default: str = "0") -> bool:
     return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
 
 
-def decrypt_token(ciphertext: str) -> str:
-    """Decrypt a Fernet-encrypted token. If the value is plaintext (not encrypted),
-    return it as-is. This allows tokens stored without encryption to work transparently."""
+def decrypt_token(ciphertext: str, mode: str = "PAPER") -> str:
+    """Decrypt a Fernet-encrypted token.
+
+    PAPER mode: falls back to plaintext if value looks unencrypted or key is wrong.
+                This allows dev/sandbox setups to work without ENCRYPTION_KEY.
+    LIVE mode:  any decrypt failure is fatal — raises RuntimeError.
+                Plaintext tokens are never accepted in LIVE mode.
+                No trade should execute with an unverified broker credential.
+    """
     if not ciphertext:
         raise ValueError("empty token")
-    # Fast path: if it doesn't look like a Fernet token, return as plaintext
-    if not ciphertext.startswith("gAAAAA"):
+
+    is_live = str(mode).upper() == "LIVE"
+
+    # Fernet tokens always start with "gAAAAA"
+    looks_encrypted = ciphertext.startswith("gAAAAA")
+
+    if not looks_encrypted:
+        if is_live:
+            raise RuntimeError(
+                "LIVE mode requires an encrypted Tradier token (gAAAAA... prefix). "
+                "Plaintext tokens are not permitted in LIVE mode — re-encrypt via dashboard."
+            )
+        # PAPER: plaintext is acceptable
         return ciphertext
+
     if not _raw_key:
-        logger.error("ENCRYPTION_KEY not set — cannot decrypt token; returning plaintext fallback")
+        if is_live:
+            raise RuntimeError(
+                "LIVE mode requires ENCRYPTION_KEY env var to decrypt the Tradier token. "
+                "Set ENCRYPTION_KEY in Render environment variables."
+            )
+        logger.error("ENCRYPTION_KEY not set — cannot decrypt Fernet token; PAPER fallback to ciphertext as plaintext")
         return ciphertext
+
     try:
         key_bytes = hashlib.sha256(_raw_key.encode()).digest()
         fernet = Fernet(base64.urlsafe_b64encode(key_bytes))
         return fernet.decrypt(ciphertext.encode()).decode()
-    except Exception:
-        # Wrong key or corrupted — return plaintext so the runner can still start
-        # (will fail at broker auth if truly wrong, not silently here)
-        logger.error("decrypt_token: InvalidToken with key '%s...' — treating as plaintext", _raw_key[:6])
+    except Exception as _dec_err:
+        if is_live:
+            raise RuntimeError(
+                f"LIVE mode token decryption failed — wrong ENCRYPTION_KEY or corrupted token. "
+                f"Detail: {_dec_err}. Fix ENCRYPTION_KEY in Render env vars."
+            ) from _dec_err
+        # PAPER: log loudly but continue with sandbox
+        logger.error(
+            "decrypt_token: Fernet decrypt failed (key='%s...') — PAPER mode, returning raw value. "
+            "This will fail at Tradier auth if the token is actually encrypted.",
+            _raw_key[:6],
+        )
         return ciphertext
 
 
@@ -216,7 +257,11 @@ class ClientRunner(threading.Thread):
             raw = self.member.get("tradier_access_token", "")
             if not raw:
                 return None
-            return decrypt_token(raw)
+            return decrypt_token(raw, mode=self.mode)
+        except RuntimeError as exc:
+            # LIVE mode: decrypt failure is fatal — block runner startup
+            logger.critical("[%s] FATAL token decrypt error: %s", self.email, exc)
+            return None
         except Exception as exc:
             logger.error("[%s] Token decrypt failed: %s", self.email, exc)
             return None
@@ -798,7 +843,25 @@ class ClientRunner(threading.Thread):
         self.position_manager = APPositionManager(client_id=self.email)
 
         client_cfg = self._load_client_config()
-        equity = float(client_cfg.get("initial_equity", os.getenv("ACCOUNT_EQUITY", "25000")) or 25000)
+        # Equity truth: fetch from Tradier FIRST before creating master_control.
+        # This ensures capital gates are always calibrated to the client's actual
+        # account balance — not a hardcoded default. $25K default is last resort only.
+        _default_equity = float(client_cfg.get("initial_equity", os.getenv("ACCOUNT_EQUITY", "25000")) or 25000)
+        try:
+            if hasattr(broker, "get_account_equity"):
+                _live_eq = broker.get_account_equity()
+                if _live_eq and float(_live_eq) > 0:
+                    equity = float(_live_eq)
+                    logger.info("[%s] Startup equity from Tradier: $%.2f", self.email, equity)
+                else:
+                    equity = _default_equity
+                    logger.warning("[%s] Tradier returned zero equity — using default $%.2f", self.email, equity)
+            else:
+                equity = _default_equity
+                logger.warning("[%s] Broker has no get_account_equity — using default $%.2f", self.email, equity)
+        except Exception as _eq_startup_exc:
+            equity = _default_equity
+            logger.warning("[%s] Equity fetch at startup failed: %s — using default $%.2f", self.email, _eq_startup_exc, equity)
         max_trades = int(client_cfg.get("max_trades_per_day", os.getenv("MAX_TRADES_TODAY", "10")) or 10)
         max_pos = int(client_cfg.get("max_concurrent_positions", os.getenv("MAX_POSITIONS", "10")) or 10)
         loss_pct = float(client_cfg.get("daily_max_loss_pct", 0.06) or 0.06)
