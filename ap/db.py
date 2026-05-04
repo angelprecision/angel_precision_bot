@@ -118,32 +118,25 @@ def conn():
     """
     pool = _get_pool()
 
-    # Ping-validate: get a connection and probe it with SELECT 1.
-    # SSL EOF from the server side is only detectable via an actual query --
-    # psycopg2's status flags won't catch it until after the error.
-    # If the probe fails, close the bad conn, nuke the pool, and open fresh.
-    for _attempt in range(2):
-        db_conn = pool.getconn()
+    # Connection health check: use db_conn.closed (set by psycopg2 on detected
+    # broken connections) instead of a live SELECT 1 probe on every acquisition.
+    # SELECT 1 on every conn() doubles DB round-trips under burst load.
+    # Silent SSL EOF that slips through .closed will raise on first real query
+    # and be caught by run_with_retry which rebuilds the pool via OperationalError.
+    db_conn = pool.getconn()
+    if getattr(db_conn, "closed", 0):
+        log.warning("Stale connection detected (closed flag), discarding and rebuilding pool")
         try:
-            _probe_cur = db_conn.cursor()
-            _probe_cur.execute("SELECT 1")
-            _probe_cur.close()
-            db_conn.rollback()  # reset txn state after probe
-            break  # connection is alive
-        except Exception as _probe_err:
-            log.warning(f"Stale connection detected ({_probe_err}), discarding and rebuilding pool")
-            try:
-                pool.putconn(db_conn, close=True)
-            except Exception:
-                pass
-            global _pool
-            with _pool_lock:  # HIGH-010: thread-safe pool rebuild
-                _pool = None
-            pool = _get_pool()
-            # loop back to get a fresh connection from the new pool
-    else:
-        # Both attempts failed -- raise so run_with_retry can handle it
-        raise psycopg2.OperationalError("Could not obtain a live DB connection after pool rebuild")
+            pool.putconn(db_conn, close=True)
+        except Exception:
+            pass
+        global _pool
+        with _pool_lock:  # HIGH-010: thread-safe pool rebuild
+            _pool = None
+        pool = _get_pool()
+        db_conn = pool.getconn()
+        if getattr(db_conn, "closed", 0):
+            raise psycopg2.OperationalError("Could not obtain a live DB connection after pool rebuild")
 
     cursor = None
     try:
@@ -499,22 +492,27 @@ def upsert_client(client_id: str, **kwargs):
 
     def _fn():
         with conn() as c:
-            c.execute("SELECT client_id FROM clients WHERE client_id=%s", (client_id,))
-            existing = c.fetchone()
             now = now_utc_iso()
-            if existing:
-                updates = []; params = []
-                for k, v in kwargs.items():
-                    updates.append(f"{k}=%s"); params.append(v)
-                params.append(client_id)
-                c.execute(f"UPDATE clients SET {', '.join(updates)} WHERE client_id=%s", params)
+            insert_kwargs = dict(kwargs)
+            insert_kwargs.setdefault("status", "ACTIVE")
+            insert_kwargs.setdefault("created_at", now)
+            insert_kwargs["client_id"] = client_id
+            cols    = ", ".join(insert_kwargs.keys())
+            phs     = ", ".join(["%s"] * len(insert_kwargs))
+            updates = [f"{k}=%s" for k in kwargs.keys()]
+            # ON CONFLICT DO UPDATE is atomic — no SELECT-then-branch race condition.
+            # Only update keys explicitly passed; client_id/created_at are stable.
+            if updates:
+                c.execute(
+                    f"INSERT INTO clients ({cols}) VALUES ({phs}) "
+                    f"ON CONFLICT (client_id) DO UPDATE SET {', '.join(updates)}",
+                    list(insert_kwargs.values()) + list(kwargs.values()),
+                )
             else:
-                kwargs.setdefault("status", "ACTIVE")
-                kwargs.setdefault("created_at", now)
-                kwargs["client_id"] = client_id
-                cols = ", ".join(kwargs.keys())
-                phs  = ", ".join(["%s"] * len(kwargs))
-                c.execute(f"INSERT INTO clients ({cols}) VALUES ({phs})", list(kwargs.values()))
+                c.execute(
+                    f"INSERT INTO clients ({cols}) VALUES ({phs}) ON CONFLICT (client_id) DO NOTHING",
+                    list(insert_kwargs.values()),
+                )
     return run_with_retry(_fn)
 
 
