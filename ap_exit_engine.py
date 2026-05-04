@@ -1454,10 +1454,17 @@ class APExitEngine:
                     or (now - last_alert_ts).total_seconds() >= 30.0
                 )
                 if should_alert:
-                    pos.exit_identity_quarantine_alert_count = int(
-                        getattr(pos, "exit_identity_quarantine_alert_count", 0) or 0
-                    ) + 1
-                    pos.last_exit_identity_quarantine_alert_ts = now
+                    # Re-fetch live ref under lock before writing — position may
+                    # have been closed/removed between snapshot and now.
+                    with self._lock:
+                        _live_q = self._positions_by_id.get(pos.position_id)
+                        if not _live_q or _live_q.closed or int(_live_q.quantity_remaining or 0) <= 0:
+                            continue
+                        _live_q.exit_identity_quarantine_alert_count = int(
+                            getattr(_live_q, "exit_identity_quarantine_alert_count", 0) or 0
+                        ) + 1
+                        _live_q.last_exit_identity_quarantine_alert_ts = now
+                    pos = _live_q  # use live ref for remainder of this iteration
 
                     # P5: Quarantine escalation. After QUARANTINE_ESCALATE_AFTER_N alerts
                     # (default 5 = ~150s at 30s cadence), escalate to CRITICAL and emit a
@@ -1554,18 +1561,25 @@ class APExitEngine:
             if pos.exit_in_flight and pos.last_exit_signal_ts:
                 flight_sec = (now - pos.last_exit_signal_ts).total_seconds()
                 if flight_sec > 300:
-                    pos._exit_stuck_count = int(getattr(pos, "_exit_stuck_count", 0) or 0) + 1
-                    if pos._exit_stuck_count >= 2:
-                        pos.last_exit_rejected = True
+                    # Re-fetch live ref under lock before writing state.
+                    with self._lock:
+                        _live_s = self._positions_by_id.get(pos.position_id)
+                        if not _live_s or _live_s.closed or int(_live_s.quantity_remaining or 0) <= 0:
+                            continue
+                        _live_s._exit_stuck_count = int(getattr(_live_s, "_exit_stuck_count", 0) or 0) + 1
+                        if _live_s._exit_stuck_count >= 2:
+                            _live_s.last_exit_rejected = True
+                        _stuck_count = _live_s._exit_stuck_count
+                    if _stuck_count >= 2:
                         log.error(
                             "[SENTINEL] %s | EXIT STUCK x%d — %.0fs in-flight, no fill | pos=%s",
-                            pos.ticker, pos._exit_stuck_count, flight_sec, pos.position_id,
+                            pos.ticker, _stuck_count, flight_sec, pos.position_id,
                         )
                         self._emit_exit_event(
                             pos, decision="ALERT", reason_code="EXIT_STUCK",
                             explanation=f"Exit in flight for {flight_sec:.0f}s with no fill",
                             stage="system_alert",
-                            extra_inputs={"flight_sec": flight_sec, "stuck_count": pos._exit_stuck_count},
+                            extra_inputs={"flight_sec": flight_sec, "stuck_count": _stuck_count},
                         )
                     else:
                         log.warning(
