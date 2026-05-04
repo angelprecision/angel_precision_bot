@@ -76,6 +76,7 @@ RATE_LIMIT_PER_MIN = int(os.getenv("RATE_LIMIT_PER_MIN", "60"))
 
 # Idempotency cache (per worker - upgrade to Redis later)
 _IDEMP = {}
+_IDEMP_LAST_CLEANUP: float = 0.0
 IDEMP_TTL_SECONDS = int(os.getenv("IDEMP_TTL_SECONDS", "300"))
 
 # HMAC time drift (seconds)
@@ -110,23 +111,30 @@ def _rate_limited(bucket: str) -> bool:
 
 
 def _idem_cleanup():
+    global _IDEMP_LAST_CLEANUP
     now = time.time()
-    dead = [k for k, (ts, _) in _IDEMP.items() if now - ts > IDEMP_TTL_SECONDS]
-    for k in dead:
-        _IDEMP.pop(k, None)
+    with THREAD_LOCK:
+        if now - _IDEMP_LAST_CLEANUP < 1.0:
+            return
+        _IDEMP_LAST_CLEANUP = now
+        dead = [k for k, (ts, _) in _IDEMP.items() if now - ts > IDEMP_TTL_SECONDS]
+        for k in dead:
+            _IDEMP.pop(k, None)
 
 
 def _idem_get(key: str):
     if not key:
         return None
     _idem_cleanup()
-    hit = _IDEMP.get(key)
+    with THREAD_LOCK:
+        hit = _IDEMP.get(key)
     return hit[1] if hit else None
 
 
 def _idem_set(key: str, payload: dict):
     if key:
-        _IDEMP[key] = (time.time(), payload)
+        with THREAD_LOCK:
+            _IDEMP[key] = (time.time(), payload)
 
 
 def _hmac_hex(key: bytes, msg: bytes) -> str:
@@ -167,21 +175,21 @@ def _verify_hmac(req) -> bool:
         try:
             ts_i = int(ts)
         except Exception:
-            log.warning(f"Invalid X-AP-Timestamp: {ts}")
-            ts_i = None
+            log.warning(f"Invalid X-AP-Timestamp: {ts!r} — rejecting, not falling through to Scheme B")
+            return False  # Scheme A headers present but ts unparseable — hard reject
 
         if ts_i is not None:
-            # Anti-replay / drift window
+            # Anti-replay / drift window — hard reject, no Scheme B fallthrough
             if abs(int(time.time()) - ts_i) > HMAC_MAX_SKEW_SECONDS:
-                log.warning(f"Timestamp out of range: {ts_i}")
-            else:
-                msg = str(ts_i).encode("utf-8") + b"." + raw
-                expected = _hmac_hex(SIGNING_SECRET, msg)
-                if hmac.compare_digest(expected, sig):
-                    log.debug("✅ HMAC verified (timestamped scheme)")
-                    return True
-                else:
-                    log.warning("HMAC timestamped scheme failed (signature mismatch)")
+                log.warning(f"Timestamp out of range: {ts_i} — rejecting, not falling through to Scheme B")
+                return False
+            msg = str(ts_i).encode("utf-8") + b"." + raw
+            expected = _hmac_hex(SIGNING_SECRET, msg)
+            if hmac.compare_digest(expected, sig):
+                log.debug("✅ HMAC verified (timestamped scheme)")
+                return True
+            log.warning("HMAC timestamped scheme failed (signature mismatch)")
+            return False  # Scheme A headers present but wrong sig — never try Scheme B
 
     # -----------------------------
     # Scheme B: Simple body-only HMAC
@@ -304,6 +312,34 @@ def start_background_threads_once(broker):
 # APP FACTORY (gunicorn safe)
 # ============================================================
 
+
+def _discord_signal_id(symbol: str, direction: str, strike, content_hash: str) -> str:
+    """Deterministic signal_id so Discord webhook retries don't create duplicate queue entries."""
+    raw = f"{symbol}:{direction}:{strike}:{content_hash}"
+    return hashlib.sha256(raw.encode()).hexdigest()[:32]
+
+def _fetch_broker_equity() -> float:
+    """Fetch live account equity at startup. Returns 0.0 on any failure —
+    client_runner._sync_account_equity() pulls the real balance after startup.
+    """
+    try:
+        broker = build_broker()
+        for method in ("get_account_equity", "get_account_balance"):
+            fn = getattr(broker, method, None)
+            if callable(fn):
+                val = fn()
+                if val and float(val) > 0:
+                    return float(val)
+        if hasattr(broker, "get_balances"):
+            b = broker.get_balances()
+            for k in ("equity", "total_equity", "net_liquidation", "cash"):
+                if b.get(k) and float(b[k]) > 0:
+                    return float(b[k])
+    except Exception as _e:
+        log.warning("_fetch_broker_equity failed at startup — defaulting to 0.0: %s", _e)
+    return 0.0
+
+
 def create_app() -> Flask:
     app = Flask(__name__)
     app.config["MAX_CONTENT_LENGTH"] = MAX_CONTENT_LENGTH
@@ -333,43 +369,46 @@ def create_app() -> Flask:
             broker_account_id=os.getenv("TRADIER_ACCOUNT_ID", ""),
             broker_token=os.getenv("TRADIER_ACCESS_TOKEN", ""),
             broker_base_url=os.getenv("TRADIER_BASE_URL", "https://sandbox.tradier.com"),
-            initial_equity=100000.0,
+            initial_equity=_fetch_broker_equity() or 0.0,
         )
         log.info("✅ Default client created")
     else:
         log.info("✅ Default client exists")
-        # =============================================
-    # DEBUG (TEMP) - REMOVE LATER
-    # =============================================
 
-    @app.get("/debug/threads")
-    def debug_threads():
-        import threading
-        threads = []
-        for t in threading.enumerate():
-            threads.append({
-                "name": t.name,
-                "daemon": bool(getattr(t, "daemon", False)),
-                "alive": bool(t.is_alive()),
-            })
-        return jsonify({"ok": True, "threads": threads})
+    # Debug routes — only registered in non-prod environments.
+    # Conditional registration (not just conditional response) avoids
+    # exposing these endpoints as attack surface in production.
+    if APP_ENV != "prod":
+        @app.get("/debug/threads")
+        @require_hmac
+        def debug_threads():
+            import threading
+            threads = []
+            for t in threading.enumerate():
+                threads.append({
+                    "name": t.name,
+                    "daemon": bool(getattr(t, "daemon", False)),
+                    "alive": bool(t.is_alive()),
+                })
+            return jsonify({"ok": True, "threads": threads})
 
-    @app.get("/debug/queue_counts")
-    def debug_queue_counts():
-        try:
-            from ap.db import run_with_retry
-            def _q():
-                with conn() as c:
-                    return {
-                        "new":  c.execute("SELECT COUNT(*) AS n FROM trade_queue WHERE status='NEW'").fetchone()["n"],
-                        "proc": c.execute("SELECT COUNT(*) AS n FROM trade_queue WHERE status='PROCESSING'").fetchone()["n"],
-                        "done": c.execute("SELECT COUNT(*) AS n FROM trade_queue WHERE status='DONE'").fetchone()["n"],
-                        "err":  c.execute("SELECT COUNT(*) AS n FROM trade_queue WHERE status='ERROR'").fetchone()["n"],
-                    }
-            counts = run_with_retry(_q)
-            return jsonify({"ok": True, "NEW": int(counts["new"]), "PROCESSING": int(counts["proc"]), "DONE": int(counts["done"]), "ERROR": int(counts["err"])})
-        except Exception as e:
-            return jsonify({"ok": False, "error": str(e)}), 500
+        @app.get("/debug/queue_counts")
+        @require_hmac
+        def debug_queue_counts():
+            try:
+                from ap.db import run_with_retry
+                def _q():
+                    with conn() as c:
+                        return {
+                            "new":  c.execute("SELECT COUNT(*) AS n FROM trade_queue WHERE status='NEW'").fetchone()["n"],
+                            "proc": c.execute("SELECT COUNT(*) AS n FROM trade_queue WHERE status='PROCESSING'").fetchone()["n"],
+                            "done": c.execute("SELECT COUNT(*) AS n FROM trade_queue WHERE status='DONE'").fetchone()["n"],
+                            "err":  c.execute("SELECT COUNT(*) AS n FROM trade_queue WHERE status='ERROR'").fetchone()["n"],
+                        }
+                counts = run_with_retry(_q)
+                return jsonify({"ok": True, "NEW": int(counts["new"]), "PROCESSING": int(counts["proc"]), "DONE": int(counts["done"]), "ERROR": int(counts["err"])})
+            except Exception as e:
+                return jsonify({"ok": False, "error": str(e)}), 500
 
     # ✅ Explicit default client state update (prevents FK issues & ambiguity)
     update_state({"mode": mode}, client_id=DEFAULT_CLIENT_ID)
@@ -515,8 +554,25 @@ def create_app() -> Flask:
     @app.post("/kill_switch/on")
     @require_hmac
     def kill_on():
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        _et = datetime.now(ZoneInfo("America/New_York"))
+        _market_open = (
+            _et.weekday() < 5 and
+            (_et.hour > 9 or (_et.hour == 9 and _et.minute >= 30)) and
+            _et.hour < 16
+        )
+        _force = (request.get_json() or {}).get("force", False)
+        if _market_open and not _force:
+            log.warning("🟡 KILL SWITCH BLOCKED — market open, automated call rejected (force=true to override)")
+            return jsonify({"ok": False, "blocked": True,
+                            "error": "market_open_kill_switch_blocked",
+                            "hint": "Pass {force:true} to override during market hours"}), 403
         log.warning("🔴 KILL SWITCH ENABLED")
         update_state({"kill_switch": True, "mode": "READ_ONLY"}, client_id=DEFAULT_CLIENT_ID)
+        with _SIGNAL_CACHE_LOCK:
+            _kill_switch_cache.clear()
+            _client_status_cache.clear()
         return jsonify({"ok": True, "kill_switch": True})
 
     @app.post("/kill_switch/off")
@@ -524,6 +580,8 @@ def create_app() -> Flask:
     def kill_off():
         log.info("🟢 KILL SWITCH DISABLED")
         update_state({"kill_switch": False}, client_id=DEFAULT_CLIENT_ID)
+        with _SIGNAL_CACHE_LOCK:
+            _kill_switch_cache.clear()
         return jsonify({"ok": True, "kill_switch": False})
 
     @app.post("/mode")
@@ -643,8 +701,9 @@ def create_app() -> Flask:
 
             for msg in parsed:
                 if msg.calls and msg.calls.strike:
+                    _chash = hashlib.sha256(text.encode()).hexdigest()[:16]
                     sig = Signal(
-                        signal_id=str(uuid.uuid4()),
+                        signal_id=_discord_signal_id(msg.symbol, "CALL", msg.calls.strike, _chash),
                         symbol=msg.symbol,
                         direction="CALL",
                         pattern_id="SCANNER_V1",
@@ -665,8 +724,9 @@ def create_app() -> Flask:
                     queued += 1
 
                 if msg.puts and msg.puts.strike:
+                    _phash = hashlib.sha256(text.encode()).hexdigest()[:16]
                     sig = Signal(
-                        signal_id=str(uuid.uuid4()),
+                        signal_id=_discord_signal_id(msg.symbol, "PUT", msg.puts.strike, _phash),
                         symbol=msg.symbol,
                         direction="PUT",
                         pattern_id="SCANNER_V1",
@@ -695,6 +755,17 @@ def create_app() -> Flask:
     # =============================================
     # BROKER TEST
     # =============================================
+
+    @app.get("/admin/runner_status")
+    @require_hmac
+    def admin_runner_status():
+        try:
+            from client_runner import get_runner_status
+            runners = get_runner_status()
+            return jsonify({"ok": True, "runners": runners, "count": len(runners)})
+        except Exception as e:
+            log.error(f"Runner status failed: {e}")
+            return jsonify({"ok": False, "error": str(e)}), 500
 
     @app.get("/tradier/test")
     @require_hmac
