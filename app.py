@@ -791,6 +791,48 @@ def create_app() -> Flask:
 
 
 
+
+    @app.post("/admin/force_initialize")
+    @require_hmac
+    def admin_force_initialize():
+        """EMERGENCY: Force initialized.set() + entries_allowed.set() on a stuck runner.
+        Use only when runner is alive but stuck in startup (initialized=False for >60s).
+        """
+        try:
+            import time as _t
+            from client_runner import _active_runners, _registry_lock
+
+            forced = []
+            with _registry_lock:
+                for email, runner in list(_active_runners.items()):
+                    if runner.is_alive() and not runner.initialized.is_set() and not runner.failed.is_set():
+                        # Force the initialization flags
+                        runner.initialized.set()
+                        # Set sub-thread placeholders so _set_entry_permission() passes
+                        import threading as _th
+                        if runner.fill_monitor_thread is None or not runner.fill_monitor_thread.is_alive():
+                            runner._fill_dead_since = None  # reset grace period
+                        if runner.worker_thread is None:
+                            # Create a dummy placeholder — actual worker won't start but entries can flow
+                            log.warning(f"force_initialize: {email} worker_thread is None — runner may not process signals")
+                        runner._set_entry_permission()
+                        forced.append({
+                            "email": email,
+                            "initialized_set": runner.initialized.is_set(),
+                            "entries_allowed": runner.entries_allowed.is_set(),
+                            "fill_alive": runner.fill_monitor_thread.is_alive() if runner.fill_monitor_thread else False,
+                            "worker_alive": runner.worker_thread.is_alive() if runner.worker_thread else False,
+                        })
+                        log.warning(f"force_initialize: forced initialized=True for {email}")
+
+            if not forced:
+                return jsonify({"ok": False, "error": "No stuck runners found (already initialized or failed)"})
+
+            return jsonify({"ok": True, "forced": forced})
+        except Exception as e:
+            log.error(f"force_initialize failed: {e}", exc_info=True)
+            return jsonify({"ok": False, "error": str(e)}), 500
+
     @app.post("/admin/reset_runner")
     @require_hmac
     def admin_reset_runner():
