@@ -348,6 +348,10 @@ def _dispatch(
     """
     ticker = payload.get("ticker") or payload.get("symbol", "?")
 
+    # live_mode must be defined locally — it is NOT passed as a parameter.
+    # Derive from master_control.mode so LIVE fail-closed logic is always correct.
+    live_mode: bool = str(getattr(master_control, "mode", "PAPER")).upper() == "LIVE"
+
     # ── 0. RESTART GUARD ─────────────────────────────────────────────────────
     # Blocks overnight (previous-day) signals during market hours.
     # Prevents 47-signal mass re-fire when bot restarts mid-session.
@@ -373,34 +377,43 @@ def _dispatch(
     except ImportError:
         pass  # restart_guard not yet deployed — skip silently
 
-    # ── 0.5 BROKER EQUITY REFRESH — hard-fetch before every evaluation ─────────
-    # Premium clients pay for accurate position sizing. We do not use cached equity.
-    # LIVE mode: equity unavailable = trade rejected (fail closed).
-    # PAPER mode: equity unavailable = log warning, continue with last known value.
-    try:
-        if broker and hasattr(broker, "get_account_equity"):
-            _fresh_equity = broker.get_account_equity()
-            if _fresh_equity and float(_fresh_equity) > 0:
-                master_control.set_account_equity(float(_fresh_equity))
-                log.info("[%s] Equity refreshed before eval: $%.2f", ticker, float(_fresh_equity))
+    # ── 0.5 BROKER EQUITY REFRESH — cached 30s, fail-closed in LIVE ─────────────
+    # Equity gates must reflect real account balance — not startup defaults.
+    # Cache: 30s per client avoids blocking signal pipeline on multi-client setups.
+    # LIVE: stale or unavailable equity = signal rejected (fail closed, no exceptions).
+    # PAPER: stale/missing equity = log warning, continue with last known value.
+    _EQ_CACHE_TTL = 30.0
+    _eq_cache_key = f"_eq_cache:{client_id}"
+    _eq_last_ts = getattr(master_control, "_equity_cache_ts", 0.0)
+    _eq_stale = (time.time() - _eq_last_ts) > _EQ_CACHE_TTL
+
+    if _eq_stale:
+        try:
+            if broker and hasattr(broker, "get_account_equity"):
+                _fresh_equity = broker.get_account_equity()
+                if _fresh_equity and float(_fresh_equity) > 0:
+                    master_control.set_account_equity(float(_fresh_equity))
+                    master_control._equity_cache_ts = time.time()
+                    log.info("[%s] Equity refreshed: $%.2f (cache valid 30s)", ticker, float(_fresh_equity))
+                else:
+                    if live_mode:
+                        log.error("[%s] LIVE: broker returned zero/null equity — rejecting (fail closed)", ticker)
+                        _mark_job(job_id, "REJECTED", error="live_equity_unavailable:broker_returned_zero")
+                        return
+                    log.warning("[%s] PAPER: equity refresh returned zero — using last known value", ticker)
             else:
                 if live_mode:
-                    log.error("[%s] LIVE: broker returned zero/null equity — rejecting signal (fail closed)", ticker)
-                    _mark_job(job_id, "REJECTED", error="live_equity_unavailable:broker_returned_zero")
+                    log.error("[%s] LIVE: no broker equity method — rejecting (fail closed)", ticker)
+                    _mark_job(job_id, "REJECTED", error="live_equity_unavailable:no_broker_method")
                     return
-                else:
-                    log.warning("[%s] PAPER: equity refresh returned zero — using last known value", ticker)
-        elif live_mode:
-            log.error("[%s] LIVE: broker has no get_account_equity() method — rejecting signal", ticker)
-            _mark_job(job_id, "REJECTED", error="live_equity_unavailable:no_broker_method")
-            return
-    except Exception as _eq_exc:
-        if live_mode:
-            log.error("[%s] LIVE: equity refresh raised %s — rejecting signal (fail closed)", ticker, _eq_exc)
-            _mark_job(job_id, "REJECTED", error=f"live_equity_unavailable:{_eq_exc}")
-            return
-        else:
-            log.warning("[%s] PAPER: equity refresh error %s — continuing with last known value", ticker, _eq_exc)
+        except Exception as _eq_exc:
+            if live_mode:
+                log.error("[%s] LIVE: equity refresh error %s — rejecting (fail closed)", ticker, _eq_exc)
+                _mark_job(job_id, "REJECTED", error=f"live_equity_unavailable:{_eq_exc}")
+                return
+            log.warning("[%s] PAPER: equity refresh error %s — continuing with cached value", ticker, _eq_exc)
+    else:
+        log.debug("[%s] Equity cache fresh (%.0fs old) — skipping broker call", ticker, time.time() - _eq_last_ts)
 
     # ── 1. MASTER CONTROL (initial gate, placeholder estimate) ────────────────
     try:
@@ -519,15 +532,16 @@ def _dispatch(
             # contract selection. Accept only when breach-time re-selection is
             # wired end-to-end; until then dropping is safer than a stale contract.
             log.info(
-                "[%s] Signal %s deferred — market closed, no live quotes for contract selection. "
-                "Marked WATCHING in queue. Scanner will send fresh signal IDs at next run; "
-                "this record is retained for audit and dashboard visibility.",
+                "[%s] Signal %s after-hours — market closed, contract selection deferred. "
+                "Recording for audit. Scanner sends fresh IDs at next session; "
+                "this record is informational only (not in execution pipeline).",
                 ticker, signal_id,
             )
-            # Mark WATCHING (not REJECTED) so dashboard shows it as deferred, not failed.
-            # The scanner generates new signal IDs each session, so tomorrow's signals
-            # will route cleanly. This record stays queryable for client transparency.
-            _mark_job(job_id, "WATCHING", error=None)
+            # Status: WATCHING is the closest available status for "deferred/informational".
+            # CONTRACT SELECTION DID NOT RUN. This record is audit-only.
+            # It is NOT in the execution pipeline — no watcher is armed, no order created.
+            # Tomorrow's scanner generates new signal_ids → fresh jobs → full execution path.
+            _mark_job(job_id, "WATCHING", error="after_hours_deferred:audit_only")
             # Log to ap_signals for permanent structured record
             _log_rejection_to_db(
                 signal_id=signal_id, client_id=client_id, ticker=ticker,
