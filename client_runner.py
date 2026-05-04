@@ -1178,7 +1178,12 @@ class ClientRunner(threading.Thread):
 
         restart_sleep = float(os.getenv("FILL_MONITOR_RESTART_SLEEP_SEC", "2"))
 
+        _fm_crash_count = 0
+        _fm_last_crash_ts = 0.0
+        _FM_DB_ERR_PHRASES = ("ssl", "eof", "connection", "socket", "timeout", "pool", "interface")
+
         def _run_fill_monitor():
+            nonlocal _fm_crash_count, _fm_last_crash_ts
             while not self.stopped.is_set():
                 try:
                     fill_monitor_loop(
@@ -1192,14 +1197,29 @@ class ClientRunner(threading.Thread):
                     )
                     if self.stopped.is_set():
                         break
-                    self._enter_degraded_mode("fill_monitor_loop_returned", stop_runner=False)
-                    logger.warning("[%s] fill_monitor_loop returned unexpectedly -- restarting in %.1fs", self.email, restart_sleep)
+                    # Unexpected clean return — only degrade if sustained
+                    _fm_crash_count += 1
+                    if _fm_crash_count >= 3:
+                        self._enter_degraded_mode("fill_monitor_loop_returned", stop_runner=False)
+                    logger.warning("[%s] fill_monitor_loop returned unexpectedly (crash #%d) -- restarting in %.1fs", self.email, _fm_crash_count, restart_sleep)
                     time.sleep(restart_sleep)
                 except Exception as exc:
                     if self.stopped.is_set():
                         break
-                    self._enter_degraded_mode(f"fill_monitor_loop_crashed:{exc}", stop_runner=False)
-                    logger.error("[%s] fill_monitor_loop crashed: %s -- restarting in %.1fs", self.email, exc, restart_sleep, exc_info=True)
+                    exc_str = str(exc).lower()
+                    _is_db_transient = any(p in exc_str for p in _FM_DB_ERR_PHRASES)
+                    _fm_crash_count += 1
+                    _now = time.time()
+                    # Transient DB errors (SSL EOF, connection reset): restart silently
+                    # without degrading entries_allowed. Only degrade on sustained failures
+                    # (3+ crashes within 5 minutes) or non-DB errors.
+                    if _is_db_transient and _fm_crash_count <= 3 and (_now - _fm_last_crash_ts) < 300:
+                        logger.warning("[%s] fill_monitor DB transient crash #%d (%s) -- restarting silently in %.1fs",
+                                       self.email, _fm_crash_count, exc, restart_sleep)
+                    else:
+                        self._enter_degraded_mode(f"fill_monitor_loop_crashed:{exc}", stop_runner=False)
+                        logger.error("[%s] fill_monitor_loop crashed: %s -- restarting in %.1fs", self.email, exc, restart_sleep, exc_info=True)
+                    _fm_last_crash_ts = _now
                     time.sleep(restart_sleep)
 
         self.fill_monitor_thread = threading.Thread(
