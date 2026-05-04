@@ -764,6 +764,16 @@ def create_app() -> Flask:
             log.error(f"Runner failures failed: {e}")
             return jsonify({"ok": False, "error": str(e)}), 500
 
+    @app.get("/admin/supervisor_state")
+    @require_hmac
+    def admin_supervisor_state():
+        try:
+            from client_runner import get_supervisor_state
+            return jsonify({"ok": True, **get_supervisor_state()})
+        except Exception as e:
+            log.error(f"Supervisor state failed: {e}")
+            return jsonify({"ok": False, "error": str(e)}), 500
+
     @app.get("/tradier/test")
     @require_hmac
     def tradier_test():
