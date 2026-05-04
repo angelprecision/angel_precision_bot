@@ -504,8 +504,15 @@ class APPositionManager:
         does not yet have local_order_id/broker_order_id unique indexes.
         pg_advisory_xact_lock is transaction-scoped and releases automatically
         when conn() commits or rolls back.
+
+        Uses md5-based 64-bit key to eliminate the 32-bit hashtext() collision
+        space risk. hashtext() collisions across different client/order keys
+        would cause false lock contention in multi-client production.
         """
-        c.execute("SELECT pg_advisory_xact_lock(hashtext(%s)::bigint)", (key,))
+        c.execute(
+            "SELECT pg_advisory_xact_lock(('x' || md5(%s))::bit(64)::bigint)",
+            (key,),
+        )
 
     # ------------------------------------------------------------------
     # Writes
