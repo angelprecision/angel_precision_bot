@@ -129,14 +129,14 @@ _supervisor_state: dict = {
     "sync_count": 0,
     "thread_alive": False,
 }
-_supervisor_thread: threading.Thread | None = None
+_supervisor_ref: dict = {"thread": None}  # mutable container to avoid global reassignment scope issues
 
 
 def get_supervisor_state() -> dict:
     import time as _time
     return {
         **_supervisor_state,
-        "thread_alive": _supervisor_thread.is_alive() if _supervisor_thread else False,
+        "thread_alive": _supervisor_ref["thread"].is_alive() if _supervisor_ref["thread"] else False,
         "active_runner_count": len(_active_runners),
         "now_ts": _time.time(),
     }
@@ -1662,9 +1662,8 @@ def start_multi_client_supervisor():
                     logger.warning("Supervisor: dead runner detected — triggering early sync")
                     break
 
-    global _supervisor_thread
-    _supervisor_thread = threading.Thread(target=_supervisor, daemon=True, name="client-supervisor")
-    _supervisor_thread.start()
+    _supervisor_ref["thread"] = threading.Thread(target=_supervisor, daemon=True, name="client-supervisor")
+    _supervisor_ref["thread"].start()
     logger.info("Client supervisor thread launched")
 
 
