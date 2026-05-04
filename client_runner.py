@@ -431,6 +431,16 @@ class ClientRunner(threading.Thread):
         _core_ok   = self.core is not None and getattr(self.core, "exit_eng", None) is not None
         _degraded  = self.degraded.is_set()
         _failed    = self.failed.is_set()
+        # Fill monitor self-restarts after SSL crashes. Give it 120s grace before
+        # blocking entries — prevents brief restart windows from killing signal flow.
+        _fill_dead_since = getattr(self, "_fill_dead_since", None)
+        if not _fill_ok:
+            if _fill_dead_since is None:
+                self._fill_dead_since = time.time()
+            _fill_ok_for_entries = (time.time() - self._fill_dead_since) < 120
+        else:
+            self._fill_dead_since = None
+            _fill_ok_for_entries = True
         ready = (
             self.is_alive()
             and self.initialized.is_set()
@@ -439,15 +449,15 @@ class ClientRunner(threading.Thread):
             and not _degraded
             and _core_ok
             and _worker_ok
-            and _fill_ok
+            and _fill_ok_for_entries
         )
         if ready:
             self.entries_allowed.set()
         else:
             if not _worker_ok:
                 logger.warning("[%s] entries_allowed BLOCKED: worker_thread dead", self.email)
-            if not _fill_ok:
-                logger.warning("[%s] entries_allowed BLOCKED: fill_monitor_thread dead", self.email)
+            if not _fill_ok_for_entries:
+                logger.warning("[%s] entries_allowed BLOCKED: fill_monitor dead >120s", self.email)
             if _degraded:
                 logger.warning("[%s] entries_allowed BLOCKED: degraded reasons=%s", self.email, list(getattr(self, "degraded_reasons", {}).keys()))
             if _failed:
