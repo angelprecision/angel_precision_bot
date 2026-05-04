@@ -1071,7 +1071,11 @@ def process_pending_order(
         elif ok and kind == "EXIT":
             _sync_exit_price(order, result)
 
-        if kind == "ENTRY":
+        # Release equity/symbol lock only after OSM confirmed the fill.
+        # If ok=False (OSM transition failed), position is not confirmed —
+        # releasing equity here would let a new trade consume capital that
+        # is still reserved for this unresolved fill.
+        if ok and kind == "ENTRY":
             _release_entry_guards(order)
 
         audit(
