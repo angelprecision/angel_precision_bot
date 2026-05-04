@@ -34,6 +34,7 @@ import logging
 from ap.trace import trace_gate
 import os
 import time
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 from ap.state import update_state
@@ -69,7 +70,6 @@ def _is_regular_session_et(dt=None) -> bool:
 
 POLL_INTERVAL         = float(os.getenv("QUEUE_POLL_INTERVAL", "1.0"))
 PROCESSING_STALE_SECS = int(os.getenv("PROCESSING_STALE_SECS", "120"))
-ALLOW_IMMEDIATE_EXECUTION = os.getenv("ALLOW_IMMEDIATE_EXECUTION", "0").lower() in {"1", "true", "yes", "on"}
 
 
 # =============================================================================
@@ -154,21 +154,15 @@ def enqueue_signal(
                 """,
                 (client_id, signal_id, _json_dumps(payload), idempotency_key),
             )
-            # rowcount is 0 when ON CONFLICT DO NOTHING fires (duplicate);
-            # 1 when the row was actually inserted.
-            return getattr(c, "rowcount", None)
 
     try:
-        rowcount = _run_with_retry(_ins)
-        if rowcount == 0:
-            log.debug(f"Duplicate ignored: {signal_id}")
-            return False
+        _run_with_retry(_ins)
         log.info(f"✅ Enqueued: {signal_id} client={client_id}")
         return True
     except Exception as e:
         msg = str(e).lower()
         if "unique" in msg or "conflict" in msg:
-            log.debug(f"Duplicate ignored (exception path): {signal_id}")
+            log.debug(f"Duplicate ignored: {signal_id}")
             return False
         raise
 
@@ -177,18 +171,6 @@ def enqueue_signal(
 # JOB MANAGEMENT
 # =============================================================================
 
-_TERMINAL_QUEUE_STATUSES = {
-    "REJECTED",
-    "ERROR",
-    "SUBMITTED",
-    "FILLED",
-    "CANCELED",
-    "CANCELLED",
-    "EXPIRED",
-    "DONE",
-}
-
-
 def _mark_job(
     job_id: int,
     status: str,
@@ -196,29 +178,19 @@ def _mark_job(
     result: dict | None = None,
     error: str | None = None,
 ):
-    """
-    Update a queue job without falsely finishing non-terminal states.
-
-    WATCHING is intentionally non-terminal: the entry watcher owns the trigger
-    and later broker submission path. Marking finished_ts on WATCHING can make
-    a live watched job look complete before any broker order fires.
-    """
-    terminal = str(status).upper() in _TERMINAL_QUEUE_STATUSES
-
     def _fn():
         with _conn()() as c:
             c.execute(
                 """
                 UPDATE trade_queue
                 SET status=%s,
-                    finished_ts=CASE WHEN %s THEN NOW() ELSE finished_ts END,
+                    finished_ts=NOW(),
                     result_json=%s,
                     last_error=%s
                 WHERE id=%s
                 """,
                 (
                     status,
-                    terminal,
                     _json_dumps(result) if result is not None else None,
                     error,
                     job_id,
@@ -236,7 +208,7 @@ def _claim_one_job(client_id: str = "default") -> Optional[dict]:
     def _atomic_claim():
         with _conn()() as c:
             c.execute(
-                """
+                f"""
                 UPDATE trade_queue
                 SET status      = 'NEW',
                     started_ts  = NULL,
@@ -244,9 +216,9 @@ def _claim_one_job(client_id: str = "default") -> Optional[dict]:
                 WHERE status    = 'PROCESSING'
                   AND client_id = %s
                   AND started_ts IS NOT NULL
-                  AND started_ts < NOW() - (%s || ' seconds')::interval
+                  AND started_ts < NOW() - INTERVAL '{PROCESSING_STALE_SECS} seconds'
                 """,
-                (client_id, str(PROCESSING_STALE_SECS)),
+                (client_id,),
             )
             c.execute(
                 """
@@ -290,7 +262,6 @@ def _dispatch(
     position_manager=None,
     exit_eng=None,
     broker=None,
-    on_split_brain=None,
 ):
     """
     Unified control path:
@@ -422,26 +393,6 @@ def _dispatch(
                 f"[{ticker}] Post-market signal — skipping contract selection "
                 f"(stale quotes). Will select at breach time with live quotes."
             )
-            # Explicitly mark this plan as watcher/breach-time contract selection.
-            # Prevents downstream confusion: no broker order should be submitted
-            # until live quotes are available at breach.
-            try:
-                plan.contract_symbol = None
-                setattr(plan, "_needs_contract_selection", True)
-                if hasattr(plan, "metadata") and isinstance(plan.metadata, dict):
-                    plan.metadata["needs_contract_selection"] = True
-                    plan.metadata["contract_selection_deferred"] = "outside_regular_session"
-            except Exception:
-                pass
-            # Reject immediately — market is closed, live quotes unavailable for
-            # contract selection. Accept only when breach-time re-selection is
-            # wired end-to-end; until then dropping is safer than a stale contract.
-            log.warning(
-                "[%s] Signal %s rejected — market closed, no live quotes for contract selection",
-                ticker, signal_id,
-            )
-            _mark_job(job_id, "REJECTED", error="market_closed_no_contract_selection")
-            return
     except Exception:
         pass
 
@@ -525,39 +476,8 @@ def _dispatch(
             _mark_job(job_id, "REJECTED", error="overnight_signal_no_watcher")
             return
 
-    # Breach-first policy:
-    #   - forced_breach is sticky
-    #   - immediate execution is disabled by default
-    #   - set ALLOW_IMMEDIATE_EXECUTION=1 only for controlled internal testing
-    raw_trigger_type = str(getattr(plan, "trigger_type", "breach") or "breach").lower()
-    if forced_breach:
-        trigger_type = "breach"
-    elif raw_trigger_type == "immediate" and ALLOW_IMMEDIATE_EXECUTION:
-        trigger_type = "immediate"
-    else:
-        if raw_trigger_type == "immediate" and not ALLOW_IMMEDIATE_EXECUTION:
-            log.warning(
-                "[%s] Immediate execution requested but disabled — forcing breach/watch path",
-                ticker,
-            )
-        trigger_type = "breach"
-
-    if trigger_type == "breach" and not entry_watcher:
-        log.critical("[%s] ENTRY WATCHER MISSING — cannot arm breach entry", ticker)
-        _mark_job(job_id, "REJECTED", error="entry_watcher_missing")
-        try:
-            from ap.rejection_feed import post_master_control_block
-            post_master_control_block(
-                ticker=ticker,
-                side=payload.get("side", ""),
-                stage="entry_watcher",
-                reason="entry_watcher_missing",
-                score=float(payload.get("score") or 0),
-                pattern=payload.get("pattern_id") or payload.get("pattern", ""),
-            )
-        except Exception:
-            pass
-        return
+    # forced_breach is sticky — getattr cannot override it
+    trigger_type = "breach" if forced_breach else getattr(plan, "trigger_type", "immediate")
 
     # Block entries after 3:15 PM ET during market hours (weekdays only)
     _now_et_cut  = _now_et()
@@ -573,137 +493,170 @@ def _dispatch(
         _mark_job(job_id, "REJECTED", error="entry_cutoff: too_late_in_session")
         return
 
-    if trigger_type == "breach":
+    if trigger_type == "breach" and entry_watcher:
         try:
-            # Move the local ENTRY order into explicit watcher-owned state before
-            # arming. This proves the queue/OSM contract early and prevents a
-            # fake WATCHING job when the OSM cannot represent PENDING_TRIGGER.
-            try:
-                if hasattr(order_state_machine, "mark_entry_pending_trigger"):
-                    pending_ok = bool(order_state_machine.mark_entry_pending_trigger(local_order_id))
-                else:
-                    pending_ok = bool(order_state_machine.transition(
-                        local_order_id, "PENDING_TRIGGER", submitted_ts=None,
-                    ))
-            except Exception as _st:
-                log.error(
-                    "[%s] PENDING_TRIGGER transition failed before watcher arm: %s",
-                    ticker, _st, exc_info=True,
-                )
-                pending_ok = False
-
-            if not pending_ok:
-                log.critical(
-                    "[%s] WATCH_ARM_ABORTED — could not mark order PENDING_TRIGGER | local=%s",
-                    ticker, local_order_id,
-                )
-                _mark_job(job_id, "ERROR", error="pending_trigger_transition_failed")
-                return
-
-            # Register with watcher — no broker submit yet. The watcher returns
-            # False for stale signals, dedup blocks, opposite-side conflicts,
-            # and failed OSM local-order validation. Do not mark WATCHING unless
-            # this returns True.
-            armed = bool(entry_watcher.watch(plan=plan, local_order_id=local_order_id))
-            if not armed:
-                log.warning(
-                    "[%s] WATCH_ARM_FAILED — watcher refused signal | local=%s",
-                    ticker, local_order_id,
-                )
-                try:
-                    if hasattr(order_state_machine, "expire_pending_entry"):
-                        order_state_machine.expire_pending_entry(local_order_id, reason="watch_arm_failed")
-                    elif hasattr(order_state_machine, "cancel_pending_entry"):
-                        order_state_machine.cancel_pending_entry(local_order_id, reason="watch_arm_failed")
-                    else:
-                        order_state_machine.transition(local_order_id, "EXPIRED", last_error="watch_arm_failed")
-                except Exception as _cleanup_exc:
-                    log.error(
-                        "[%s] Failed to cleanup unarmed pending entry %s: %s",
-                        ticker, local_order_id, _cleanup_exc, exc_info=True,
-                    )
-                _mark_job(job_id, "REJECTED", error="watch_arm_failed")
-                return
-
+            # Register with watcher — no broker submit yet
+            entry_watcher.watch(plan=plan, local_order_id=local_order_id)
             log.info(
                 f"[{ticker}] Handed to entry watcher | "
                 f"trigger=${getattr(plan, 'trigger_price', '?')}"
             )
 
-            # Queue job = WATCHING only after watcher arm succeeded.
+            # Transition to PENDING_TRIGGER — truthfully reflects
+            # "watching for breach" not "order at broker".
+            # SUBMITTED is only set by entry_watcher when broker.place_order() succeeds.
+            try:
+                order_state_machine.transition(
+                    local_order_id, "PENDING_TRIGGER",
+                    submitted_ts=None,
+                )
+            except Exception as _st:
+                # PENDING_TRIGGER may not exist in older OSM schemas —
+                # fall back to leaving order at CREATED (still truthful)
+                log.warning(
+                    "[%s] PENDING_TRIGGER transition failed — order stays CREATED: %s",
+                    ticker, _st,
+                )
+
+            # Queue job = WATCHING (correct at queue level)
             _mark_job(job_id, "WATCHING",
                       result={"plan_id": plan.plan_id,
                               "local_order_id": local_order_id,
                               "contract": getattr(plan, "contract_symbol", ""),
                               "real_cost": plan.max_position_usd,
-                              "trigger_type": "breach",
-                              "needs_contract_selection": bool(getattr(plan, "_needs_contract_selection", False))})
+                              "trigger_type": "breach"})
         except Exception as e:
-            log.error(f"[{ticker}] entry_watcher.watch() failed: {e}", exc_info=True)
-            try:
-                if hasattr(order_state_machine, "expire_pending_entry"):
-                    order_state_machine.expire_pending_entry(local_order_id, reason=f"watcher_error:{e}")
-                elif hasattr(order_state_machine, "cancel_pending_entry"):
-                    order_state_machine.cancel_pending_entry(local_order_id, reason=f"watcher_error:{e}")
-                else:
-                    order_state_machine.transition(local_order_id, "ERROR", last_error=f"watcher_error:{e}")
-            except Exception:
-                pass
+            log.error(f"[{ticker}] entry_watcher.watch() failed: {e}")
             _mark_job(job_id, "ERROR", error=f"watcher_error: {e}")
     else:
-        log.warning(
-            "[%s] IMMEDIATE EXECUTION PATH ENABLED — this should only run when ALLOW_IMMEDIATE_EXECUTION=1",
-            ticker,
-        )
-
-        # Money-safe immediate path:
-        # Never mark SUBMITTED before broker acceptance. We submit the existing
-        # CREATED order through OSM, and OSM transitions to SUBMITTED only after
-        # broker accepts and returns broker_order_id.
         try:
-            if not hasattr(order_state_machine, "submit_existing_entry"):
-                raise RuntimeError("order_state_machine_missing_submit_existing_entry")
+            order_state_machine.transition(local_order_id, "SUBMITTED",
+                                           submitted_ts=now_utc_iso())
+            log.info(f"[{ticker}] Order submitted immediately: {local_order_id}")
 
-            submit_res = order_state_machine.submit_existing_entry(
-                local_order_id=local_order_id,
-                broker=broker,
-                plan=plan,
-                limit_price=getattr(plan, "limit_price", None),
-            )
+            import os as _os
+            _bot_mode = (_os.getenv("AP_MODE") or _os.getenv("BOT_MODE") or "PAPER").upper()
+            if _bot_mode != "LIVE":
+                fill_price = getattr(plan, "limit_price", None)
+                if fill_price:
+                    try:
+                        _submitted_to_broker = False
+                        if broker is not None:
+                            try:
+                                _resp = broker.place_order(
+                                    symbol=ticker,
+                                    contract=getattr(plan, "contract_symbol", ""),
+                                    qty=getattr(plan, "contracts", 1),
+                                    limit_price=fill_price,
+                                    side="buy_to_open",
+                                )
+                                _submitted_to_broker = True
+                                _raw_broker_id = (
+                                    getattr(_resp, "broker_order_id", None)
+                                    or getattr(_resp, "order_id", None)
+                                    or ""
+                                )
+                                _broker_order_id = str(_raw_broker_id) if _raw_broker_id and str(_raw_broker_id) not in ("", "N/A", "None") else ""
+                                log.info(
+                                    f"[{ticker}] SANDBOX ORDER SUBMITTED | "
+                                    f"broker_id={_broker_order_id or 'REJECTED'} "
+                                    f"status={getattr(_resp, 'status', '?')}"
+                                )
+                                if _broker_order_id:
+                                    from ap.db import update_order as _upd_order
+                                    _upd_order(local_order_id,
+                                               broker_order_id=_broker_order_id)
+                            except Exception as _be:
+                                log.warning(f"[{ticker}] Sandbox order failed ({_be}) -- continuing with local paper fill")
+                                _broker_order_id = ""
 
-            # WIRE-3: split-brain — broker accepted but OSM DB transition failed
-            if submit_res.get("split_brain") and callable(on_split_brain):
-                try:
-                    on_split_brain(
-                        local_order_id=submit_res.get("local_order_id", ""),
-                        broker_order_id=submit_res.get("broker_order_id", ""),
-                    )
-                except Exception as _sb_err:
-                    log.error("[%s] split_brain callback failed: %s", ticker, _sb_err)
+                        order_state_machine.transition(
+                            local_order_id, "FILLED",
+                            fill_price=fill_price,
+                            filled_qty=getattr(plan, "contracts", 1),
+                            filled_ts=now_utc_iso(),
+                        )
+                        log.info(
+                            f"[{ticker}] PAPER FILL | {getattr(plan, 'contract_symbol', '?')} "
+                            f"@ ${fill_price:.2f} x{getattr(plan, 'contracts', 1)}"
+                        )
 
-            if not submit_res.get("ok"):
-                log.error(
-                    "[%s] Immediate submit failed safely | local=%s error=%s",
-                    ticker, local_order_id, submit_res.get("error"),
-                )
-                _mark_job(job_id, "ERROR", error=f"submit_error:{submit_res.get('error')}")
-                return
+                        _pos_id = None
+                        if position_manager is not None:
+                            try:
+                                _pos_id = position_manager.open_position(
+                                    plan_id=plan.plan_id,
+                                    signal_id=signal_id,
+                                    ticker=ticker,
+                                    contract=getattr(plan, "contract_symbol", ""),
+                                    side=getattr(plan, "side", "CALL"),
+                                    qty=getattr(plan, "contracts", 1),
+                                    entry_price=fill_price,
+                                    tier=str(getattr(plan, "tier", "B")),
+                                    score=float(getattr(plan, "score", 0.0) or 0),
+                                    pattern=str(getattr(plan, "pattern", "") or ""),
+                                    tp_pct=float(getattr(plan, "tp_pct", 0.20) or 0.20),
+                                    sl_pct=float(getattr(plan, "sl_pct", 0.25) or 0.25),
+                                    stop_underlying=getattr(plan, "stop_price", None),
+                                    target_underlying=getattr(plan, "target_underlying", None),
+                                )
+                                order_state_machine.transition(
+                                    local_order_id, "FILLED",
+                                    position_id=_pos_id,
+                                )
+                                log.info(f"[{ticker}] POSITION CREATED | id={_pos_id}")
 
-            log.info(
-                "[%s] Order submitted immediately after broker acceptance | local=%s broker=%s",
-                ticker, local_order_id, submit_res.get("broker_order_id"),
-            )
+                                if exit_eng is not None:
+                                    try:
+                                        from ap_exit_engine import ManagedPosition
+                                        mp = ManagedPosition(
+                                            ticker=ticker,
+                                            option_symbol=getattr(plan, "contract_symbol", ""),
+                                            side=getattr(plan, "side", "CALL"),
+                                            quantity=getattr(plan, "contracts", 1),
+                                            entry_price=fill_price,
+                                            underlying_entry=getattr(plan, "trigger_price", 0.0) or 0.0,
+                                            underlying_target=float(
+                                                getattr(plan, "target_underlying", None)
+                                                or (float("inf") if getattr(plan, "side", "CALL") == "CALL"
+                                                    else 0.0)
+                                            ),
+                                            underlying_stop=float(
+                                                getattr(plan, "stop_underlying", None) or 0.0
+                                            ),
+                                        )
+                                        mp.current_option_price = fill_price
+                                        exit_eng.add_position(mp)
+                                        log.info("[%s] Registered with exit engine | %s", ticker, getattr(plan, 'contract_symbol', ''))
+                                    except Exception as e:
+                                        log.error("[%s] EXIT ENGINE REGISTRATION FAILED — position has NO stop loss: %s", ticker, e)
+                                else:
+                                    log.error("[%s] exit_eng not injected — position has NO stop loss protection", ticker)
+                            except Exception as ope:
+                                log.warning(f"[{ticker}] open_position failed: {ope}")
+                        else:
+                            log.warning(f"[{ticker}] position_manager not injected -- position not tracked")
+
+                        _mark_job(job_id, "COMPLETED",
+                                  result={"plan_id": plan.plan_id,
+                                          "local_order_id": local_order_id,
+                                          "contract": getattr(plan, "contract_symbol", ""),
+                                          "fill_price": fill_price,
+                                          "real_cost": plan.max_position_usd,
+                                          "position_id": _pos_id,
+                                          "trigger_type": "immediate_paper_fill"})
+                        return
+                    except Exception as pe:
+                        log.warning(f"[{ticker}] Paper fill transition failed: {pe}")
 
             _mark_job(job_id, "SUBMITTED",
                       result={"plan_id": plan.plan_id,
                               "local_order_id": local_order_id,
-                              "broker_order_id": submit_res.get("broker_order_id"),
                               "contract": getattr(plan, "contract_symbol", ""),
                               "real_cost": plan.max_position_usd,
                               "trigger_type": "immediate"})
-            return
         except Exception as e:
-            log.error(f"[{ticker}] immediate submit failed: {e}", exc_info=True)
+            log.error(f"[{ticker}] immediate submit failed: {e}")
             _mark_job(job_id, "ERROR", error=f"submit_error: {e}")
 
 
@@ -724,14 +677,11 @@ def worker_loop(
     client_id: str = "default",
     stop_event=None,
     live_mode: bool = False,
-    on_split_brain=None,
 ):
     """
     Main queue worker.
     stop_event: threading.Event — set by ClientRunner.stop() to cleanly exit.
     live_mode:  if True, legacy process_signal() fallback is disabled entirely.
-    on_split_brain: optional callback(local_order_id, broker_order_id) fired when
-                    a submit returns split_brain=True (broker accepted, OSM DB failed).
     """
     _init_db()()
     mode_label = "control" if master_control else ("LIVE-NO-FALLBACK" if live_mode else "legacy")
@@ -793,7 +743,6 @@ def worker_loop(
                     position_manager=position_manager,
                     exit_eng=exit_eng,
                     broker=broker,
-                    on_split_brain=on_split_brain,
                 )
             else:
                 log.error(

@@ -118,31 +118,33 @@ def conn():
     """
     pool = _get_pool()
 
-    # SELECT 1 probe on every acquisition — keeps connections alive and detects
-    # SSL EOF before the real query fires. Required for Supabase which kills
-    # idle connections after ~60s. Performance cost acceptable for correctness.
+    # Ping-validate: get a connection and probe it with SELECT 1.
+    # SSL EOF from the server side is only detectable via an actual query --
+    # psycopg2's status flags won't catch it until after the error.
+    # If the probe fails, close the bad conn, nuke the pool, and open fresh.
     for _attempt in range(2):
         db_conn = pool.getconn()
         try:
             _probe_cur = db_conn.cursor()
             _probe_cur.execute("SELECT 1")
             _probe_cur.close()
-            db_conn.rollback()
-            break
+            db_conn.rollback()  # reset txn state after probe
+            break  # connection is alive
         except Exception as _probe_err:
-            log.warning("Stale connection detected (%s), discarding and rebuilding pool", _probe_err)
+            log.warning(f"Stale connection detected ({_probe_err}), discarding and rebuilding pool")
             try:
                 pool.putconn(db_conn, close=True)
             except Exception:
                 pass
             global _pool
-            with _pool_lock:
+            with _pool_lock:  # HIGH-010: thread-safe pool rebuild
                 _pool = None
             pool = _get_pool()
+            # loop back to get a fresh connection from the new pool
     else:
+        # Both attempts failed -- raise so run_with_retry can handle it
         raise psycopg2.OperationalError("Could not obtain a live DB connection after pool rebuild")
 
-    cursor = None
     try:
         db_conn.autocommit = False
         cursor = db_conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
@@ -156,11 +158,10 @@ def conn():
             pass
         raise
     finally:
-        if cursor is not None:
-            try:
-                cursor.close()
-            except Exception:
-                pass
+        try:
+            cursor.close()
+        except Exception:
+            pass
         try:
             pool.putconn(db_conn)
         except Exception:
@@ -418,15 +419,14 @@ def update_client_state(client_id: str = "default", updates: dict | None = None)
                 ON CONFLICT (client_id) DO NOTHING
                 """,
                 (client_id, client_id, 'tradier', '', '',
-                 'https://sandbox.tradier.com',
-                 0.0, 'ACTIVE',
+                 'https://sandbox.tradier.com', 25000.0, 'ACTIVE',
                  now_utc_iso(), 10, 7, 0.05, 0.10),
             )
             c.execute(
                 """
                 INSERT INTO client_state (client_id, current_equity, starting_equity_today,
                     realized_pnl_today, trades_taken_today, mode, updated_at)
-                VALUES (%s, 0, 0, 0, 0, 'PAPER', NOW())
+                VALUES (%s, 25000, 25000, 0, 0, 'PAPER', NOW())
                 ON CONFLICT (client_id) DO NOTHING
                 """,
                 (client_id,),
@@ -496,27 +496,22 @@ def upsert_client(client_id: str, **kwargs):
 
     def _fn():
         with conn() as c:
+            c.execute("SELECT client_id FROM clients WHERE client_id=%s", (client_id,))
+            existing = c.fetchone()
             now = now_utc_iso()
-            insert_kwargs = dict(kwargs)
-            insert_kwargs.setdefault("status", "ACTIVE")
-            insert_kwargs.setdefault("created_at", now)
-            insert_kwargs["client_id"] = client_id
-            cols    = ", ".join(insert_kwargs.keys())
-            phs     = ", ".join(["%s"] * len(insert_kwargs))
-            updates = [f"{k}=%s" for k in kwargs.keys()]
-            # ON CONFLICT DO UPDATE is atomic — no SELECT-then-branch race condition.
-            # Only update keys explicitly passed; client_id/created_at are stable.
-            if updates:
-                c.execute(
-                    f"INSERT INTO clients ({cols}) VALUES ({phs}) "
-                    f"ON CONFLICT (client_id) DO UPDATE SET {', '.join(updates)}",
-                    list(insert_kwargs.values()) + list(kwargs.values()),
-                )
+            if existing:
+                updates = []; params = []
+                for k, v in kwargs.items():
+                    updates.append(f"{k}=%s"); params.append(v)
+                params.append(client_id)
+                c.execute(f"UPDATE clients SET {', '.join(updates)} WHERE client_id=%s", params)
             else:
-                c.execute(
-                    f"INSERT INTO clients ({cols}) VALUES ({phs}) ON CONFLICT (client_id) DO NOTHING",
-                    list(insert_kwargs.values()),
-                )
+                kwargs.setdefault("status", "ACTIVE")
+                kwargs.setdefault("created_at", now)
+                kwargs["client_id"] = client_id
+                cols = ", ".join(kwargs.keys())
+                phs  = ", ".join(["%s"] * len(kwargs))
+                c.execute(f"INSERT INTO clients ({cols}) VALUES ({phs})", list(kwargs.values()))
     return run_with_retry(_fn)
 
 
@@ -549,12 +544,7 @@ def update_client(client_id: str, **kwargs) -> dict:
     return get_client(client_id)
 
 
-def delete_client(client_id: str, *, confirm: bool = False):
-    if not confirm:
-        raise ValueError(
-            "delete_client requires confirm=True. "
-            "This permanently deletes ALL positions, orders, and audit history for this client."
-        )
+def delete_client(client_id: str):
     def _fn():
         with conn() as c:
             for table in ["audit_log", "trade_queue", "orders", "positions", "client_state", "clients"]:

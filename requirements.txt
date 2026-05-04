@@ -27,4 +27,4 @@ pydantic>=2.0.0,<3.0.0
 # MED-020: previously missing dependencies
 reportlab>=4.0.0
 discord.py>=2.3.0
-pytz>=2023.3
+# deploy 1776700532

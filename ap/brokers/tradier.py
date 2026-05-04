@@ -159,18 +159,23 @@ class TradierBroker(BrokerAdapter):
         if limit_price is not None:
             data["price"] = f"{float(limit_price):.2f}"
 
-        if os.getenv("TRADIER_DEBUG_ORDERS", "0") == "1":
-            log.info(
-                f"TRADIER_ORDER_PAYLOAD | symbol={symbol} contract={contract} "
-                f"side={side} qty={qty} price={data.get('price', 'market')} "
-                f"full_payload={data}"
-            )
+        # -------------------------------------------------------
+        # DEBUG: Log exact payload hitting Tradier API
+        # Remove once Short bug is confirmed fixed
+        # -------------------------------------------------------
+        log.info(
+            f"TRADIER_ORDER_PAYLOAD | symbol={symbol} contract={contract} "
+            f"side={side} qty={qty} price={data.get('price', 'market')} "
+            f"full_payload={data}"
+        )
 
         try:
             j = self._post(f"/v1/accounts/{self.cfg.account_id}/orders", data=data)
 
-            if os.getenv("TRADIER_DEBUG_ORDERS", "0") == "1":
-                log.info(f"TRADIER_ORDER_RESPONSE | {j}")
+            # -------------------------------------------------------
+            # DEBUG: Log raw Tradier response
+            # -------------------------------------------------------
+            log.info(f"TRADIER_ORDER_RESPONSE | {j}")
 
             # Tradier returns {"order":{"id": "...", "status":"ok"}} or similar
             order = j.get("order") or {}
@@ -271,7 +276,6 @@ class TradierBroker(BrokerAdapter):
             resp = self.session.delete(
                 f"{self.cfg.base_url}/v1/accounts/{self.cfg.account_id}/orders/{broker_order_id}",
                 headers={"Accept": "application/json"},
-                timeout=(3.05, 10),
             )
             raw = resp.json() if resp.content else {}
             status = str((raw.get("order") or raw).get("status", "")).lower()
@@ -312,11 +316,7 @@ class TradierBroker(BrokerAdapter):
                     "symbol":     p.get("symbol", ""),
                     "quantity":   float(p.get("quantity", 0)),
                     "cost_basis": float(p.get("cost_basis", 0)),
-                    "side":       (lambda sym: (
-                        "CALL" if (len(sym) >= 15 and sym[-9] == "C") else
-                        "PUT"  if (len(sym) >= 15 and sym[-9] == "P") else
-                        "CALL" if "C" in sym else "PUT"
-                    ))(str(p.get("symbol", ""))),
+                    "side":       "CALL" if "C" in str(p.get("symbol","")) else "PUT",
                     "raw":        p,
                 })
             return result
