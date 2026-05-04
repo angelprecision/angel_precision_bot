@@ -1165,7 +1165,13 @@ class ClientRunner(threading.Thread):
             return {}
 
     def _run_startup_recovery(self, broker, exit_eng):
-        try:
+        """Run startup recovery with a hard timeout to prevent blocking initialization.
+        Recovery is best-effort — a timeout logs a warning but never blocks entries.
+        """
+        import concurrent.futures as _cf
+        _RECOVERY_TIMEOUT = float(os.getenv("STARTUP_RECOVERY_TIMEOUT_SEC", "25"))
+
+        def _do_recovery():
             recovery = APStartupRecovery(
                 client_id=self.email,
                 broker=broker,
@@ -1174,15 +1180,28 @@ class ClientRunner(threading.Thread):
                 master_control=self.master_control,
                 exit_engine=exit_eng,
             )
-            rec_result = recovery.run()
-            logger.info(
-                "[%s] Startup recovery complete: positions=%s entries_corrected=%s exits=%s dedup=%s",
-                self.email,
-                rec_result.get("positions_recovered"),
-                rec_result.get("entries_corrected"),
-                rec_result.get("exits_reattached"),
-                rec_result.get("dedup_seeded"),
-            )
+            return recovery.run()
+
+        try:
+            with _cf.ThreadPoolExecutor(max_workers=1) as _ex:
+                _fut = _ex.submit(_do_recovery)
+                try:
+                    rec_result = _fut.result(timeout=_RECOVERY_TIMEOUT)
+                    logger.info(
+                        "[%s] Startup recovery complete: positions=%s entries_corrected=%s exits=%s dedup=%s",
+                        self.email,
+                        rec_result.get("positions_recovered"),
+                        rec_result.get("entries_corrected"),
+                        rec_result.get("exits_reattached"),
+                        rec_result.get("dedup_seeded"),
+                    )
+                except _cf.TimeoutError:
+                    logger.warning(
+                        "[%s] Startup recovery timed out after %.0fs — continuing without full recovery. "
+                        "Open positions may not be reseeded until next restart.",
+                        self.email, _RECOVERY_TIMEOUT,
+                    )
+                    _fut.cancel()
         except Exception as exc:
             logger.error("[%s] Startup recovery error: %s", self.email, exc)
             # FIX-6: in LIVE mode a failed recovery means open positions from a prior
