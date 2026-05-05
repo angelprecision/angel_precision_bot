@@ -1216,7 +1216,8 @@ def create_app() -> Flask:
                     results[email] = result
                     log.info(f"overnight_reeval [{email}]: {result}")
                 except Exception as e:
-                    results[email] = {"error": str(e)}
+                    import traceback as _tb
+                    results[email] = {"error": str(e), "traceback": _tb.format_exc()[-2000:]}
                     log.error(f"overnight_reeval [{email}] failed: {e}", exc_info=True)
 
             total_armed = sum(r.get("armed", 0) for r in results.values() if isinstance(r, dict))
