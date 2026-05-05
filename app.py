@@ -1204,10 +1204,10 @@ def create_app() -> Flask:
                         client_id=email,
                         broker=getattr(_core, "broker", None) if _core else None,
                         master_control=runner.master_control,
-                        contract_selector=getattr(_core, "contract_selector", None) if _core else None,
+                        contract_selector=runner.contract_selector,
                         order_state_machine=runner.order_state_machine,
                         entry_watcher=getattr(_core, "entry_watcher", None) if _core else None,
-                        position_manager=getattr(runner, "position_manager", None),
+                        position_manager=runner.position_manager,
                         exit_eng=getattr(_core, "exit_eng", None) if _core else None,
                         force=force,
                     )
