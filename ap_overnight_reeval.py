@@ -58,7 +58,9 @@ def _is_trading_day(dt: datetime) -> bool:
 
 
 def _signal_date(signal: dict) -> Optional[date]:
-    """Extract the date the signal was generated (not when we process it)."""
+    """Extract the date the signal was generated (not when we process it).
+    Falls back to parsing the signal_id itself (format: YYYY-MM-DD:...).
+    """
     for key in ("created_at", "signal_date", "date", "timestamp_iso"):
         val = signal.get(key, "")
         if val and len(str(val)) >= 10:
@@ -66,6 +68,13 @@ def _signal_date(signal: dict) -> Optional[date]:
                 return date.fromisoformat(str(val)[:10])
             except ValueError:
                 continue
+    # Try parsing from signal_id: "2026-05-05:1-1:AAPL:Weekly:CALL"
+    signal_id = signal.get("signal_id", "")
+    if signal_id and len(signal_id) >= 10:
+        try:
+            return date.fromisoformat(str(signal_id)[:10])
+        except ValueError:
+            pass
     return None
 
 
