@@ -951,6 +951,9 @@ class APExecutionCore:
         if self.order_state_machine and pos.position_id:
             _scale_bid   = getattr(pos, "current_bid", 0) or 0
             _scale_mid   = getattr(pos, "current_option_price", 0) or 0
+        if  _scale_bid  <= 0 and _scale_mid <= 0:
+            log.critical("[%s] SCALE BLOCKED — no valid bid or mid for scale-out", pos.ticker)
+            return
             _scale_limit = _scale_bid if _scale_bid > 0 else max(round(_scale_mid - 0.01, 2), 0.01)
             scale_res = self.order_state_machine.submit_exit(
                 broker      = self.broker,
