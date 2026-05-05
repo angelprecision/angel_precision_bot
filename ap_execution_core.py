@@ -707,23 +707,39 @@ class APExecutionCore:
         # ── EXIT SUBMISSION ─────────────────────────────────────────────────
         sig = getattr(pos, "signal", {})
         _sig_id = str(sig.get("signal_id", ""))
-        # Use bid for exit limit price — bid guarantees fill vs mid which often misses.
-        # Fall back to mid-0.01 (slight aggressor below mid) if bid is zero/stale.
-        # Block entirely if neither bid nor mid is available — a zero-price exit
-        # order is worse than no exit order.
+        _urgency = str(getattr(decision, "urgency", "") or "").upper()
         _bid = getattr(pos, "current_bid", 0) or 0
+        _ask = getattr(pos, "current_ask", 0) or 0
         _mid = getattr(pos, "current_option_price", 0) or 0
-        if _bid > 0:
-            _exit_limit = _bid
+
+        # EXIT PRICING POLICY:
+        # IMMEDIATE urgency (hard stop, never green, EOD) → market order.
+        #   Guarantee the fill. We'd rather fill at market than loop 10 rejected limits.
+        # HIGH urgency (profit lock, trailing stop, touched-profit) → mid price.
+        #   Options trade closer to mid in practice. Mid fills better than bid.
+        # Normal → mid price with slight discount.
+        # If neither bid nor mid available → block (zero-price exit is catastrophic).
+
+        _use_market = _urgency == "IMMEDIATE"
+
+        if _use_market:
+            # Market order — no limit_price. Tradier will fill at NBBO.
+            _exit_limit = None
+            exit_price = _mid if _mid > 0 else _bid  # for P&L logging only
+            log.info("[%s] MARKET EXIT — urgency=IMMEDIATE reason=%s", pos.ticker, decision.reason)
         elif _mid > 0:
-            _exit_limit = max(round(_mid - 0.01, 2), 0.01)
+            # Mid price — slightly below mid to get fills without racing to the bottom
+            _exit_limit = max(round(_mid * 0.98, 2), 0.01)  # 2% below mid
+            exit_price = _exit_limit
+        elif _bid > 0:
+            _exit_limit = _bid
+            exit_price = _exit_limit
         else:
             log.critical(
                 "[%s] CLOSE BLOCKED — no valid bid or mid price for exit | %s",
                 pos.ticker, decision.reason,
             )
             return
-        exit_price = _exit_limit
 
         if self.order_state_machine and pos.position_id:
             log.info(
@@ -737,8 +753,9 @@ class APExecutionCore:
                 symbol      = pos.ticker,
                 direction   = pos.side,
                 qty         = pos.quantity_remaining,
-                limit_price = _exit_limit,
+                limit_price = _exit_limit,  # None = market order for IMMEDIATE exits
                 signal_id   = _sig_id or None,
+                order_type  = "market" if _exit_limit is None else "limit",
             )
             if exit_res["ok"]:
                 log.info(
