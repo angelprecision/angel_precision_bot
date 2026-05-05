@@ -2,7 +2,7 @@ name: Overnight Reeval
 
 on:
   schedule:
-    - cron: "5 13 * * 1-5"
+    - cron: "5 13 * * 1-5"  # 6:05 AM PT
   workflow_dispatch:
 
 jobs:
@@ -10,10 +10,14 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Trigger overnight reeval
+      - name: Trigger overnight reeval (HMAC)
         run: |
+          BODY='{"force": true}'
+          TS=$(date +%s)
+          SIG=$(printf "%s.%s" "$TS" "$BODY" | openssl dgst -sha256 -hmac "${{ secrets.AP_SIGNING_SECRET }}" -hex | sed 's/^.* //')
+
           curl -f -sS --max-time 15 -X POST "${{ secrets.AP_BOT_URL }}/admin/overnight_reeval" \
             -H "Content-Type: application/json" \
-            -H "X-Admin-Key: ${{ secrets.AP_ADMIN_KEY }}" \
-            -d '{"force": true}'
-
+            -H "X-AP-Timestamp: $TS" \
+            -H "X-AP-Signature: $SIG" \
+            -d "$BODY"
