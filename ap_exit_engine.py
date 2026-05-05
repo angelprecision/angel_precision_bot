@@ -98,14 +98,23 @@ KILL_BLOCKS_NON_PROTECTIVE_EXITS = (
 
 # ── P&L THRESHOLDS ────────────────────────────────────────────────────────────
 THETA_STOP_LOSS_PCT   = -0.35  # -35% on option → stop
-SCALE_OUT_1_THRESHOLD = 0.40   # +40% → scale out 50% at window 1
-SCALE_OUT_2_THRESHOLD = 0.20   # +20% → scale out 75% at window 2
-PROTECT_3_THRESHOLD   = 0.12   # +12% → exit all at window 3
+# ── SCALE-OUT LADDER (33/33/34 split) ───────────────────────────────────────
+# Target: avg win 20-25% | let runners reach 30%+
+# Scale 1: take first third at +10% → reduces risk, banks a guaranteed win
+# Scale 2: take second third at +20% → locks in strong gain
+# Scale 3: hold final third with trailing stop until 30%+ or trail fires
+SCALE_OUT_1_THRESHOLD = 0.15   # +15% → sell 33% (first lock — lets small moves pass)
+SCALE_OUT_2_THRESHOLD = 0.25   # +25% → sell another 33% (strong winner)
+SCALE_OUT_3_THRESHOLD = 0.40   # +40% → close remainder (let runner go far)
+PROTECT_3_THRESHOLD   = 0.15   # +15% → EOD protection if past 2:00 PM
 
 # ── IMMEDIATE TAKE-PROFIT (any time, no window gate) ──────────────────────────
-IMMEDIATE_TP_PCT      = 0.15   # +15% → scale out 70% immediately (lowered from 18%)
+# IMMEDIATE_TP is now the trailing-stop ACTIVATION point, not a hard sell
+# Once peak >= 15%, the trailing stop engine kicks in at TRAIL_DROP_FROM_PEAK
+# We do NOT sell everything at 15% — we let it run to 20%, 30%+ with trail
+IMMEDIATE_TP_PCT      = 0.15   # +15% → ACTIVATES trailing stop (does NOT auto-sell)
 HARD_STOP_PCT         = -0.30  # -30% → exit immediately regardless of time
-PROFIT_LOCK_PCT       = 0.08   # once at +15%, lock: don't fall below +8% (was +12%)
+PROFIT_LOCK_PCT       = 0.12   # once past 15%, don't fall below +12% (protects a real gain)
 
 _INDEX_ETFS = {"QQQ", "SPY", "IWM", "DIA", "SPX"}
 
@@ -168,9 +177,11 @@ def _effective_thresholds(pos: "ManagedPosition") -> tuple:
         return -0.26, 0.25, 0.12
     return HARD_STOP_PCT, IMMEDIATE_TP_PCT, PROFIT_LOCK_PCT
 
-TRAIL_DROP_FROM_PEAK  = 0.06   # tightened: 6pt drop from peak triggers exit (was 10pt)
-SMALL_WIN_PCT         = 0.08   # trail kicks in once we've seen +8% (was 10%)
-SMALL_WIN_TRAIL       = 0.05   # floor 5pt below peak-win (was 7pt)
+# TRAILING STOP — fires when position drops N points from its peak
+# Wide enough to let winners run to 25-30%, tight enough to protect gains
+TRAIL_DROP_FROM_PEAK  = 0.10   # 10pt drop from peak fires exit (e.g. +30% → exits at +20%)
+SMALL_WIN_PCT         = 0.12   # trail kicks in once we've seen +12%
+SMALL_WIN_TRAIL       = 0.08   # floor 8pt below peak (seen +20% → floor at +12%)
 
 
 # ── POSITION TRACKER ─────────────────────────────────────────────────────────
@@ -362,25 +373,51 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
             urgency="IMMEDIATE", pnl_pct=option_pnl,
         )
 
-    # ── IMMEDIATE TAKE-PROFIT ─────────────────────────────────────────────────
-    if option_pnl >= _immediate_tp and pos.scale_outs_done == 0:
-        if qty_rem == 1:
-            return ExitDecision(
-                action="CLOSE_ALL", quantity=qty_rem,
-                reason=f"IMMEDIATE TP (full) -- +{option_pnl*100:.0f}% | 1 contract, no split",
-                urgency="IMMEDIATE", pnl_pct=option_pnl,
-            )
+    # ── 33/33/34 SCALE-OUT LADDER ────────────────────────────────────────────
+    # Targets: +10% → sell 33% | +20% → sell 33% | +30% → sell remainder
+    # Do NOT close everything at 15% — let winners run to 25-30%+ with trail.
+    # Single-contract positions: hold until trail fires or 30%+ hit.
+
+    # Scale 1: first +10% hit → sell first third
+    if option_pnl >= SCALE_OUT_1_THRESHOLD and pos.scale_outs_done == 0:
+        if qty_rem <= 1:
+            # 1 contract — do NOT sell here, let it run to trail
+            pass  # fall through to trail/profit-lock checks
         else:
-            qty_lock = max(1, round(qty_rem * 0.70))
-            qty_run  = qty_rem - qty_lock
+            qty_s1 = max(1, round(qty_rem / 3))
             return ExitDecision(
-                action="SCALE_OUT", quantity=qty_lock,
-                reason=(
-                    f"IMMEDIATE TP (partial) -- +{option_pnl*100:.0f}% | "
-                    f"locking {qty_lock}/{qty_rem} contracts, running {qty_run} with trail"
-                ),
-                urgency="IMMEDIATE", pnl_pct=option_pnl,
+                action="SCALE_OUT", quantity=qty_s1,
+                reason=f"SCALE_1 (+10%) -- selling {qty_s1}/{qty_rem} | running {qty_rem-qty_s1} to +20%",
+                urgency="HIGH", pnl_pct=option_pnl,
             )
+
+    # Scale 2: +20% hit → sell second third
+    if option_pnl >= SCALE_OUT_2_THRESHOLD and pos.scale_outs_done == 1:
+        if qty_rem <= 1:
+            pass  # 1 contract runner — let it run to +30% or trail
+        else:
+            qty_s2 = max(1, round(qty_rem / 2))  # half of what's left ≈ second third of original
+            return ExitDecision(
+                action="SCALE_OUT", quantity=qty_s2,
+                reason=f"SCALE_2 (+20%) -- selling {qty_s2}/{qty_rem} runner | targeting +30%",
+                urgency="HIGH", pnl_pct=option_pnl,
+            )
+
+    # Scale 3: +30% → close remainder (full exit for final runner)
+    if option_pnl >= SCALE_OUT_3_THRESHOLD and pos.scale_outs_done >= 2:
+        return ExitDecision(
+            action="CLOSE_ALL", quantity=qty_rem,
+            reason=f"SCALE_3 (+30%) -- runner target reached, full exit",
+            urgency="HIGH", pnl_pct=option_pnl,
+        )
+
+    # For single contracts or runners at +30%+: close at +30%
+    if option_pnl >= SCALE_OUT_3_THRESHOLD and pos.scale_outs_done == 0 and qty_rem == 1:  # +40% single-contract close
+        return ExitDecision(
+            action="CLOSE_ALL", quantity=qty_rem,
+            reason=f"SINGLE_CONTRACT_TP (+30%) -- {option_pnl*100:.0f}% target hit",
+            urgency="HIGH", pnl_pct=option_pnl,
+        )
 
     # ── RUNNER TRAIL ──────────────────────────────────────────────────────────
     # FIX-1: Discord runner alert moved to _submit_exit_decision(). This branch
