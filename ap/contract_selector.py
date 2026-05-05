@@ -159,10 +159,12 @@ if _SELECTOR_FAIL_OPEN_GUARD_ERRORS:
     )
 
 def _max_trade_usd() -> float:
+    # 10% of account per trade. At $17,767 equity = $1,776 max.
+    # Env var MAX_TRADE_USD overrides (set in Render for live clients).
     try:
-        return float(os.getenv("MAX_TRADE_USD", "500"))
+        return float(os.getenv("MAX_TRADE_USD", "1800"))
     except Exception:
-        return 500.0
+        return 1800.0
 
 def _effective_budget(raw_budget: float) -> tuple[float, float, bool]:
     cap = _max_trade_usd()
