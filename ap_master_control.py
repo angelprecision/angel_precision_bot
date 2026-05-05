@@ -908,9 +908,9 @@ class APMasterControl:
                 contracts = self._base_contracts(effective_score)
         else:
             if str(tier).upper() == "B":
-                # Allow 2 contracts on B-tier if score justifies it
+                # B-tier: score-driven, cap at 4 (budget gate handles the real ceiling)
                 contracts = self._base_contracts(effective_score)
-                contracts = min(contracts, 2)  # Cap B-tier at 2
+                contracts = min(contracts, 4)  # B-tier cap
             else:
                 tier_mult = 1.0 if str(tier).upper() == "A+" else 0.6
                 base = self._base_contracts(effective_score)
@@ -1163,20 +1163,17 @@ class APMasterControl:
         return "REJECT"
 
     def _base_contracts(self, score: float) -> int:
-        """Returns base contract count from score.
-        Daily scanner signals score 65-70 — those get 2 contracts for meaningful position size.
-        Higher scores scale up. Always min 1, max capped by capital gates.
+        """Contract count from signal score.
+        Budget is 10% of account ($1800) — actual contracts depend on premium.
+        At $1.06 premium: $1800 / $106 = ~16 raw, capped at 5 by capital gates.
+        At $4.30 premium: $1800 / $430 = ~4 contracts.
+        Higher scores get more. Capital gate is the real ceiling, not this function.
         """
-        if score >= 95:
-            return 4
-        if score >= 90:
-            return 3
-        if score >= 85:
-            return 2
-        if score >= 75:
-            return 2
-        if score >= 60:
-            return 2  # Daily scanner range — 2 contracts for $100-150 positions
+        if score >= 95: return 5
+        if score >= 90: return 4
+        if score >= 85: return 3
+        if score >= 75: return 3
+        if score >= 60: return 2   # daily scanner range
         return 1
 
     def revalidate_exposure(self, plan, client_id: str = "default") -> ControlDecision:
