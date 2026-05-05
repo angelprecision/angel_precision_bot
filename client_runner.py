@@ -619,6 +619,10 @@ class ClientRunner(threading.Thread):
             self.stopped.set()
             raise RuntimeError(f"[{self.email}] worker_thread failed to start")
 
+    def _get_broker(self):
+        """Broker lives inside self.core — resolve it safely."""
+        return getattr(self.core, "broker", None) if self.core else None
+
     def _run_overnight_reeval_if_due(self) -> None:
         """Fire overnight signal re-evaluation at 9:00-9:45 AM ET on trading days.
         Runs once per calendar day. Processes WATCHING signals, fetches prior-day
@@ -645,16 +649,20 @@ class ClientRunner(threading.Thread):
             logger.info("[%s] 🌅 Overnight daily signal reeval — %02d:%02d ET | checking WATCHING queue",
                         self.email, now_et.hour, now_et.minute)
 
+            broker = self._get_broker()
+            entry_watcher = getattr(self.core, "entry_watcher", None) if self.core else None
+            contract_selector = getattr(self.core, "contract_selector", None) if self.core else None
+
             from ap_overnight_reeval import run_overnight_reeval
             result = run_overnight_reeval(
                 client_id=self.email,
-                broker=self.broker,
+                broker=broker,
                 master_control=self.master_control,
-                contract_selector=self.contract_selector,
+                contract_selector=contract_selector,
                 order_state_machine=self.order_state_machine,
-                entry_watcher=self.entry_watcher,
+                entry_watcher=entry_watcher,
                 position_manager=getattr(self, "position_manager", None),
-                exit_eng=getattr(self, "exit_eng", None),
+                exit_eng=getattr(self.core, "exit_eng", None) if self.core else None,
                 force=False,
             )
             logger.info(
