@@ -1175,6 +1175,63 @@ def create_app() -> Flask:
             log.error(f"client_rejections failed: {e}", exc_info=True)
             return jsonify({"ok": False, "error": str(e)}), 500
 
+    @app.post("/admin/overnight_reeval")
+    @require_hmac
+    def admin_overnight_reeval():
+        """Manually trigger overnight daily signal reeval for all active runners.
+        Normally fires automatically at 9:00-9:45 AM ET.
+        Use this to trigger it manually (e.g. after a late deploy or for testing).
+        Pass {"force": true} to bypass the time-of-day guard.
+        """
+        try:
+            from client_runner import _active_runners, _registry_lock
+            from ap_overnight_reeval import run_overnight_reeval
+
+            body = request.get_json(silent=True) or {}
+            force = bool(body.get("force", True))  # default force=True for manual calls
+
+            results = {}
+            with _registry_lock:
+                runners = list(_active_runners.items())
+
+            for email, runner in runners:
+                if not runner.is_alive():
+                    results[email] = {"error": "runner not alive"}
+                    continue
+                try:
+                    result = run_overnight_reeval(
+                        client_id=email,
+                        broker=runner.broker,
+                        master_control=runner.master_control,
+                        contract_selector=runner.contract_selector,
+                        order_state_machine=runner.order_state_machine,
+                        entry_watcher=runner.entry_watcher,
+                        position_manager=getattr(runner, "position_manager", None),
+                        exit_eng=getattr(runner, "exit_eng", None),
+                        force=force,
+                    )
+                    # Reset the daily gate so auto-run fires again tomorrow
+                    runner._last_overnight_reeval_date = None
+                    results[email] = result
+                    log.info(f"overnight_reeval [{email}]: {result}")
+                except Exception as e:
+                    results[email] = {"error": str(e)}
+                    log.error(f"overnight_reeval [{email}] failed: {e}", exc_info=True)
+
+            total_armed = sum(r.get("armed", 0) for r in results.values() if isinstance(r, dict))
+            total_rejected = sum(r.get("rejected", 0) for r in results.values() if isinstance(r, dict))
+            return jsonify({
+                "ok": True,
+                "force": force,
+                "runners": len(runners),
+                "total_armed": total_armed,
+                "total_rejected": total_rejected,
+                "results": results,
+            })
+        except Exception as e:
+            log.error(f"overnight_reeval endpoint failed: {e}", exc_info=True)
+            return jsonify({"ok": False, "error": str(e)}), 500
+
     @app.get("/tradier/test")
     @require_hmac
     def tradier_test():
