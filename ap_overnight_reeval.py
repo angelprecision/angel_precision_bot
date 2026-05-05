@@ -283,11 +283,19 @@ def run_overnight_reeval(
 def _fetch_watching_signals(client_id: str) -> list:
     """Fetch WATCHING jobs from local trade_queue for this client."""
     try:
-        from ap.db import run_with_retry
-        def _q():
-            from ap.db import conn as _conn
-            with _conn() as c:
-                c.execute("""
+        import psycopg2, os
+        DATABASE_URL = os.getenv("DATABASE_URL", "")
+        if not DATABASE_URL:
+            log.error("_fetch_watching_signals: DATABASE_URL not set")
+            return []
+        dsn = DATABASE_URL
+        if "sslmode" not in dsn:
+            dsn += ("?sslmode=require" if "?" not in dsn else "&sslmode=require")
+        conn = psycopg2.connect(dsn, connect_timeout=10)
+        conn.autocommit = True
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
                     SELECT id, signal_id, payload, created_ts
                     FROM trade_queue
                     WHERE client_id = %s
@@ -295,9 +303,22 @@ def _fetch_watching_signals(client_id: str) -> list:
                     ORDER BY created_ts DESC
                     LIMIT 100
                 """, (client_id,))
-                cols = [d[0] for d in c.description]
-                return [dict(zip(cols, row)) for row in c.fetchall()]
-        return run_with_retry(_q)
+                cols = [d[0] for d in cur.description]
+                rows = cur.fetchall()
+                result = []
+                for row in rows:
+                    d = dict(zip(cols, row))
+                    # payload may be stored as JSON string or dict
+                    if isinstance(d.get("payload"), str):
+                        import json as _j
+                        try:
+                            d["payload"] = _j.loads(d["payload"])
+                        except Exception:
+                            pass
+                    result.append(d)
+                return result
+        finally:
+            conn.close()
     except Exception as e:
         log.error("_fetch_watching_signals failed: %s", e)
         return []
@@ -305,19 +326,24 @@ def _fetch_watching_signals(client_id: str) -> list:
 
 def _mark_job_rejected(job_id: int, client_id: str, reason: str) -> None:
     try:
-        from ap.db import run_with_retry
-        from datetime import datetime, timezone
-        def _u():
-            from ap.db import conn as _conn
-            with _conn() as c:
-                c.execute("""
+        import psycopg2, os
+        DATABASE_URL = os.getenv("DATABASE_URL", "")
+        if not DATABASE_URL:
+            return
+        dsn = DATABASE_URL + ("?sslmode=require" if "?" not in DATABASE_URL else "&sslmode=require")
+        conn = psycopg2.connect(dsn, connect_timeout=10)
+        conn.autocommit = True
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
                     UPDATE trade_queue
                     SET status = 'REJECTED',
                         last_error = %s,
                         finished_ts = NOW()
                     WHERE id = %s AND client_id = %s
-                """, (reason, job_id, client_id))
-        run_with_retry(_u)
+                """, (reason[:500], job_id, client_id))
+        finally:
+            conn.close()
     except Exception as e:
         log.debug("_mark_job_rejected failed (non-fatal): %s", e)
 
@@ -325,17 +351,23 @@ def _mark_job_rejected(job_id: int, client_id: str, reason: str) -> None:
 def _mark_job_watching_armed(job_id: int, client_id: str, contract: str) -> None:
     """Update the WATCHING job to record that it has been armed in the watcher."""
     try:
-        from ap.db import run_with_retry
-        def _u():
-            from ap.db import conn as _conn
-            with _conn() as c:
-                c.execute("""
+        import psycopg2, os
+        DATABASE_URL = os.getenv("DATABASE_URL", "")
+        if not DATABASE_URL:
+            return
+        dsn = DATABASE_URL + ("?sslmode=require" if "?" not in DATABASE_URL else "&sslmode=require")
+        conn = psycopg2.connect(dsn, connect_timeout=10)
+        conn.autocommit = True
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
                     UPDATE trade_queue
                     SET last_error = %s,
                         started_ts = COALESCE(started_ts, NOW())
                     WHERE id = %s AND client_id = %s
-                """, (f"armed:contract={contract}", job_id, client_id))
-        run_with_retry(_u)
+                """, (f"armed:contract={contract}"[:500], job_id, client_id))
+        finally:
+            conn.close()
     except Exception as e:
         log.debug("_mark_job_watching_armed failed (non-fatal): %s", e)
 
