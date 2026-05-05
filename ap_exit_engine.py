@@ -83,8 +83,8 @@ PROFIT_PROTECT_2_HOUR = 13   #  1:00 PM -- scale out 75% if +25%
 PROFIT_PROTECT_2_MIN  = 0
 PROFIT_PROTECT_3_HOUR = 14   #  2:00 PM -- exit all if +15%
 PROFIT_PROTECT_3_MIN  = 0
-EOD_HARD_CLOSE_HOUR   = 15   #  3:45 PM -- EXIT EVERYTHING
-EOD_HARD_CLOSE_MIN    = 45
+EOD_HARD_CLOSE_HOUR   = 15   #  3:50 PM -- EXIT EVERYTHING before close
+EOD_HARD_CLOSE_MIN    = 50   # Changed from 3:45 to give more time for fills
 POLL_INTERVAL_SEC     = 8    # check every 8 seconds
 
 # Kill switch policy: exits reduce risk, so the engine must never pause
@@ -541,12 +541,17 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
     trend_bonus_window    = 30   if direction_aligns else 0
 
     # ── 3. EOD HARD CLOSE ────────────────────────────────────────────────────
+    # EOD close: fires at 3:50 PM ET OR any time market is closed (stale quotes)
+    # The stale-quote check ensures positions don't survive overnight if the
+    # exit engine missed the 3:50 window due to quote feed stopping at 4 PM.
     past_eod = (hour > EOD_HARD_CLOSE_HOUR or
                 (hour == EOD_HARD_CLOSE_HOUR and minute >= EOD_HARD_CLOSE_MIN))
-    if past_eod:
+    # Also force-close if market is clearly closed (hour > 16 ET or < 9:30 ET next day)
+    market_clearly_closed = (hour >= 16) or (hour < 9) or (hour == 9 and minute < 30)
+    if past_eod or (market_clearly_closed and not getattr(pos, "overnight_hold_approved", False)):
         return ExitDecision(
             action="CLOSE_ALL", quantity=qty_rem,
-            reason=f"EOD FORCE CLOSE -- {hour}:{minute:02d} ET past {EOD_HARD_CLOSE_HOUR}:{EOD_HARD_CLOSE_MIN:02d}",
+            reason=f"EOD FORCE CLOSE -- {hour}:{minute:02d} ET {'(market closed)' if market_clearly_closed else f'past {EOD_HARD_CLOSE_HOUR}:{EOD_HARD_CLOSE_MIN:02d}'}",
             urgency="IMMEDIATE", pnl_pct=option_pnl,
         )
 
