@@ -305,14 +305,37 @@ class APSignalTracker:
 
             for t in ticker_list:
                 try:
-                    col_df = df if len(ticker_list) == 1 else (
-                        df[t] if t in df.columns.get_level_values(0) else None
-                    )
-                    if col_df is None or col_df.empty:
+                    # yfinance >= 0.2.x with multiple tickers returns MultiIndex columns
+                    # (ticker, field) or (field, ticker) depending on group_by.
+                    # Handle both formats defensively.
+                    col_df = None
+                    if len(ticker_list) == 1:
+                        col_df = df
+                    elif hasattr(df.columns, "levels"):
+                        # MultiIndex: try (ticker, field) — group_by="ticker"
+                        lvl0 = df.columns.get_level_values(0)
+                        lvl1 = df.columns.get_level_values(1)
+                        if t in lvl0:
+                            col_df = df[t]  # group_by="ticker"
+                        elif t in lvl1:
+                            col_df = df.xs(t, axis=1, level=1)  # group_by="column"
+                    else:
+                        col_df = df.get(t)
+
+                    if col_df is None or (hasattr(col_df, "empty") and col_df.empty):
                         continue
-                    close = col_df["Close"].dropna()
-                    if not close.empty:
-                        prices[t] = round(float(close.iloc[-1]), 4)
+
+                    # Try "Close" then "close" (yfinance column name varies by version)
+                    close_series = None
+                    for col_name in ("Close", "close", "Adj Close", "adj close"):
+                        if col_name in col_df.columns:
+                            close_series = col_df[col_name].dropna()
+                            break
+
+                    if close_series is None or close_series.empty:
+                        continue
+
+                    prices[t] = round(float(close_series.iloc[-1]), 4)
                 except Exception as e:
                     log.warning("Price parse failed for %s: %s", t, e)  # MED-014
             return prices
