@@ -128,11 +128,21 @@ def fetch_market_snapshot(ticker: str, broker) -> Optional[MarketSnapshot]:
         return None
 
 
-def _missing_data_result(*, ticker: str, side: str, prior_day_high: Optional[float], prior_day_low: Optional[float], snapshot_missing: bool) -> ValidationResult:
+def _missing_data_result(
+    *,
+    ticker: str,
+    side: str,
+    prior_day_high: Optional[float],
+    prior_day_low: Optional[float],
+    snapshot_missing: bool,
+) -> ValidationResult:
     if OVERNIGHT_DAILY_FAIL_OPEN:
         reason_code = "VALID_MISSING_DATA_FAIL_OPEN"
         reason_text = "Missing overnight daily validation data — fail-open override enabled"
-        log.warning("[%s] OVERNIGHT_DAILY_FAIL_OPEN | side=%s prior_high=%s prior_low=%s snapshot_missing=%s", ticker, side, prior_day_high, prior_day_low, snapshot_missing)
+        log.warning(
+            "[%s] OVERNIGHT_DAILY_FAIL_OPEN | side=%s prior_high=%s prior_low=%s snapshot_missing=%s",
+            ticker, side, prior_day_high, prior_day_low, snapshot_missing,
+        )
         return ValidationResult(True, reason_code, reason_text, prior_day_high, prior_day_low, side=side)
 
     if not prior_day_high or not prior_day_low:
@@ -142,7 +152,10 @@ def _missing_data_result(*, ticker: str, side: str, prior_day_high: Optional[flo
         reason_code = InvalidationReason.SNAPSHOT_UNAVAILABLE
         reason_text = "Market snapshot unavailable — fail-closed for client-money safety"
 
-    log.error("[%s] OVERNIGHT_DAILY_INVALIDATED | %s | side=%s prior_high=%s prior_low=%s snapshot_missing=%s", ticker, reason_code, side, prior_day_high, prior_day_low, snapshot_missing)
+    log.error(
+        "[%s] OVERNIGHT_DAILY_INVALIDATED | %s | side=%s prior_high=%s prior_low=%s snapshot_missing=%s",
+        ticker, reason_code, side, prior_day_high, prior_day_low, snapshot_missing,
+    )
     return ValidationResult(False, reason_code, reason_text, prior_day_high, prior_day_low, side=side)
 
 
@@ -157,42 +170,47 @@ def validate_overnight_daily_signal(
     side = (side or "").upper()
 
     if side not in {"CALL", "PUT"}:
-        return ValidationResult(False, InvalidationReason.INVALID_SIDE, f"Unknown side '{side}' — must be CALL or PUT", side=side)
+        return ValidationResult(
+            False,
+            InvalidationReason.INVALID_SIDE,
+            f"Unknown side '{side}' — must be CALL or PUT",
+            side=side,
+        )
 
     # Sanity check: prior levels must be real prices, not stubs/zeroes
     _MIN_VALID_PRICE = 0.50
     prior_high_valid = bool(prior_day_high and float(prior_day_high) >= _MIN_VALID_PRICE)
-    prior_low_valid  = bool(prior_day_low  and float(prior_day_low)  >= _MIN_VALID_PRICE)
+    prior_low_valid = bool(prior_day_low and float(prior_day_low) >= _MIN_VALID_PRICE)
     levels_sane = (
         prior_high_valid
         and prior_low_valid
         and float(prior_day_high) > float(prior_day_low)
     )
 
-   if not levels_sane:
-    return _missing_data_result(
-        ticker=ticker,
-        side=side,
-        prior_day_high=prior_day_high if prior_high_valid else None,
-        prior_day_low=prior_day_low if prior_low_valid else None,
-        snapshot_missing=False,
-    )
+    if not levels_sane:
+        return _missing_data_result(
+            ticker=ticker,
+            side=side,
+            prior_day_high=prior_day_high if prior_high_valid else None,
+            prior_day_low=prior_day_low if prior_low_valid else None,
+            snapshot_missing=False,
+        )
 
-   if snapshot is None:
-    log.warning(
-        "[%s] OVERNIGHT_DAILY_SNAPSHOT_UNAVAILABLE — allowing PAPER setup through using prior-day levels only",
-        ticker,
-    )
-    return ValidationResult(
-        True,
-        "SNAPSHOT_UNAVAILABLE_FAIL_OPEN_PAPER",
-        "Snapshot unavailable; allowing PAPER setup through using prior-day levels only.",
-        prior_day_high,
-        prior_day_low,
-        None,
-        None,
-        side,
-    )
+    if snapshot is None:
+        log.warning(
+            "[%s] OVERNIGHT_DAILY_SNAPSHOT_UNAVAILABLE — allowing PAPER setup through using prior-day levels only",
+            ticker,
+        )
+        return ValidationResult(
+            True,
+            "SNAPSHOT_UNAVAILABLE_FAIL_OPEN_PAPER",
+            "Snapshot unavailable; allowing PAPER setup through using prior-day levels only.",
+            prior_day_high,
+            prior_day_low,
+            None,
+            None,
+            side,
+        )
 
     sh = snapshot.session_high_so_far
     sl = snapshot.session_low_so_far
@@ -200,22 +218,69 @@ def validate_overnight_daily_signal(
     low_breached = sl < prior_day_low
 
     if high_breached and low_breached:
-        log.info("[%s] OVERNIGHT_DAILY_INVALIDATED | BOTH_SIDES_BREACHED | side=%s | prior_high=%.2f session_high=%.2f | prior_low=%.2f session_low=%.2f", ticker, side, prior_day_high, sh, prior_day_low, sl)
-        return ValidationResult(False, InvalidationReason.BOTH_SIDES_BREACHED, f"Both prior-day boundaries breached: session_high {sh:.2f} > prior_high {prior_day_high:.2f} AND session_low {sl:.2f} < prior_low {prior_day_low:.2f}", prior_day_high, prior_day_low, sh, sl, side)
+        log.info(
+            "[%s] OVERNIGHT_DAILY_INVALIDATED | BOTH_SIDES_BREACHED | side=%s | "
+            "prior_high=%.2f session_high=%.2f | prior_low=%.2f session_low=%.2f",
+            ticker, side, prior_day_high, sh, prior_day_low, sl,
+        )
+        return ValidationResult(
+            False,
+            InvalidationReason.BOTH_SIDES_BREACHED,
+            f"Both prior-day boundaries breached: session_high {sh:.2f} > prior_high {prior_day_high:.2f} "
+            f"AND session_low {sl:.2f} < prior_low {prior_day_low:.2f}",
+            prior_day_high, prior_day_low, sh, sl, side,
+        )
 
     if side == "CALL":
         if low_breached:
-            log.info("[%s] OVERNIGHT_DAILY_INVALIDATED | PRIOR_LOW_BREACHED | side=CALL | session_low=%.2f < prior_low=%.2f", ticker, sl, prior_day_low)
-            return ValidationResult(False, InvalidationReason.PRIOR_LOW_BREACHED, f"Session low {sl:.2f} breached prior-day low {prior_day_low:.2f} — CALL setup invalidated", prior_day_high, prior_day_low, sh, sl, side)
-        log.info("[%s] OVERNIGHT_DAILY_VALID | side=CALL | prior_low=%.2f session_low=%.2f OK | prior_high=%.2f session_high=%.2f", ticker, prior_day_low, sl, prior_day_high, sh)
-        return ValidationResult(True, "VALID", "CALL valid — prior-day low intact, arming for upside breach", prior_day_high, prior_day_low, sh, sl, side)
+            log.info(
+                "[%s] OVERNIGHT_DAILY_INVALIDATED | PRIOR_LOW_BREACHED | side=CALL | "
+                "session_low=%.2f < prior_low=%.2f",
+                ticker, sl, prior_day_low,
+            )
+            return ValidationResult(
+                False,
+                InvalidationReason.PRIOR_LOW_BREACHED,
+                f"Session low {sl:.2f} breached prior-day low {prior_day_low:.2f} — CALL setup invalidated",
+                prior_day_high, prior_day_low, sh, sl, side,
+            )
+        log.info(
+            "[%s] OVERNIGHT_DAILY_VALID | side=CALL | prior_low=%.2f session_low=%.2f OK | "
+            "prior_high=%.2f session_high=%.2f",
+            ticker, prior_day_low, sl, prior_day_high, sh,
+        )
+        return ValidationResult(
+            True,
+            "VALID",
+            "CALL valid — prior-day low intact, arming for upside breach",
+            prior_day_high, prior_day_low, sh, sl, side,
+        )
 
+    # PUT path
     if high_breached:
-        log.info("[%s] OVERNIGHT_DAILY_INVALIDATED | PRIOR_HIGH_BREACHED | side=PUT | session_high=%.2f > prior_high=%.2f", ticker, sh, prior_day_high)
-        return ValidationResult(False, InvalidationReason.PRIOR_HIGH_BREACHED, f"Session high {sh:.2f} breached prior-day high {prior_day_high:.2f} — PUT setup invalidated", prior_day_high, prior_day_low, sh, sl, side)
+        log.info(
+            "[%s] OVERNIGHT_DAILY_INVALIDATED | PRIOR_HIGH_BREACHED | side=PUT | "
+            "session_high=%.2f > prior_high=%.2f",
+            ticker, sh, prior_day_high,
+        )
+        return ValidationResult(
+            False,
+            InvalidationReason.PRIOR_HIGH_BREACHED,
+            f"Session high {sh:.2f} breached prior-day high {prior_day_high:.2f} — PUT setup invalidated",
+            prior_day_high, prior_day_low, sh, sl, side,
+        )
 
-    log.info("[%s] OVERNIGHT_DAILY_VALID | side=PUT | prior_high=%.2f session_high=%.2f OK | prior_low=%.2f session_low=%.2f", ticker, prior_day_high, sh, prior_day_low, sl)
-    return ValidationResult(True, "VALID", "PUT valid — prior-day high intact, arming for downside breach", prior_day_high, prior_day_low, sh, sl, side)
+    log.info(
+        "[%s] OVERNIGHT_DAILY_VALID | side=PUT | prior_high=%.2f session_high=%.2f OK | "
+        "prior_low=%.2f session_low=%.2f",
+        ticker, prior_day_high, sh, prior_day_low, sl,
+    )
+    return ValidationResult(
+        True,
+        "VALID",
+        "PUT valid — prior-day high intact, arming for downside breach",
+        prior_day_high, prior_day_low, sh, sl, side,
+    )
 
 
 def recheck_overnight_daily(watched, broker) -> ValidationResult:
