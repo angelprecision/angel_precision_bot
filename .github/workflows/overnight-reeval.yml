@@ -2,27 +2,57 @@ name: Overnight Reeval
 
 on:
   schedule:
-    - cron: "5 13 * * 1-5"  # 6:05 AM PT (weekdays)
+    # Run at 9:00 AM ET (13:00 UTC) on weekdays — primary trigger
+    - cron: "0 13 * * 1-5"
+    # Backup run at 9:10 AM ET (13:10 UTC) in case runner was busy
+    - cron: "10 13 * * 1-5"
   workflow_dispatch:
+    inputs:
+      force:
+        description: 'Force reeval regardless of time'
+        required: false
+        default: 'true'
 
 jobs:
   trigger-overnight-reeval:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
 
     steps:
-      - name: Trigger overnight reeval (HMAC)
+      - name: Trigger overnight reeval (HMAC signed)
         run: |
           BODY='{"force": true}'
           TS=$(date +%s)
+          BOT_URL="${{ secrets.AP_BOT_URL }}"
+          SIGNING_SECRET="${{ secrets.AP_SIGNING_SECRET }}"
 
-          SIG=$(printf "%s.%s" "$TS" "$BODY" | openssl dgst -sha256 -hmac "${{ secrets.AP_SIGNING_SECRET }}" -hex | sed 's/^.* //')
+          # Compute HMAC: SHA256(timestamp.body)
+          SIG=$(printf "%s.%s" "$TS" "$BODY" | \
+            openssl dgst -sha256 -hmac "$SIGNING_SECRET" -hex | \
+            sed 's/^.* //')
 
-          curl -i -sS \
+          echo "Triggering overnight reeval at $(date -u) | bot=$BOT_URL"
+
+          HTTP_CODE=$(curl -s -o /tmp/response.txt -w "%{http_code}" \
             --retry 3 \
-            --retry-delay 5 \
-            --max-time 60 \
-            -X POST "${{ secrets.AP_BOT_URL }}/admin/overnight_reeval" \
+            --retry-delay 10 \
+            --retry-all-errors \
+            --max-time 90 \
+            -X POST "${BOT_URL}/admin/overnight_reeval" \
             -H "Content-Type: application/json" \
             -H "X-AP-Timestamp: $TS" \
             -H "X-AP-Signature: $SIG" \
-            -d "$BODY"
+            -d "$BODY")
+
+          echo "HTTP $HTTP_CODE"
+          cat /tmp/response.txt
+          echo ""
+
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "::error::Overnight reeval returned HTTP $HTTP_CODE"
+            exit 1
+          fi
+
+          # Check how many setups were armed
+          ARMED=$(cat /tmp/response.txt | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('total_armed',0))" 2>/dev/null || echo "?")
+          echo "✅ Overnight reeval complete — $ARMED setups armed for today"
