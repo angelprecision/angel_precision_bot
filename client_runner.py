@@ -650,8 +650,10 @@ class ClientRunner(threading.Thread):
                         self.email, now_et.hour, now_et.minute)
 
             broker = self._get_broker()
+            # All of these are stored directly on the runner (not on self.core)
             entry_watcher = getattr(self.core, "entry_watcher", None) if self.core else None
-            contract_selector = getattr(self.core, "contract_selector", None) if self.core else None
+            contract_selector = self.contract_selector
+            exit_eng = getattr(self.core, "exit_eng", None) if self.core else None
 
             from ap_overnight_reeval import run_overnight_reeval
             result = run_overnight_reeval(
@@ -661,8 +663,8 @@ class ClientRunner(threading.Thread):
                 contract_selector=contract_selector,
                 order_state_machine=self.order_state_machine,
                 entry_watcher=entry_watcher,
-                position_manager=getattr(self, "position_manager", None),
-                exit_eng=getattr(self.core, "exit_eng", None) if self.core else None,
+                position_manager=self.position_manager,
+                exit_eng=exit_eng,
                 force=False,
             )
             logger.info(
