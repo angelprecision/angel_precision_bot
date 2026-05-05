@@ -103,6 +103,48 @@ class TradierBroker(BrokerAdapter):
     # -------------------------
     # Options
     # -------------------------
+    def get_prior_day_levels(self, symbol: str) -> dict:
+        """Fetch prior trading day OHLC from Tradier history endpoint.
+        Returns {"prior_day_high": float, "prior_day_low": float, "prior_day_close": float}
+        or empty dict on failure.
+
+        Used by the overnight reeval loop at 9:15 AM ET to validate daily setups
+        before arming the entry watcher.
+        """
+        from datetime import datetime, timedelta, timezone
+        try:
+            # Fetch 5 days of daily history — take the most recent completed day
+            # (not today, since today's bar is still open)
+            j = self._get("/v1/markets/history", params={
+                "symbol": symbol,
+                "interval": "daily",
+                "start": (datetime.now(timezone.utc) - timedelta(days=7)).strftime("%Y-%m-%d"),
+                "end": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+            })
+            days = (j.get("history") or {}).get("day") or []
+            if not isinstance(days, list):
+                days = [days] if days else []
+
+            # Sort by date descending, skip today's partial bar if present
+            today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            completed = [d for d in days if isinstance(d, dict) and d.get("date", "") < today_str]
+            completed.sort(key=lambda d: d.get("date", ""), reverse=True)
+
+            if not completed:
+                return {}
+
+            prior = completed[0]
+            return {
+                "prior_day_high":  float(prior.get("high")  or 0) or None,
+                "prior_day_low":   float(prior.get("low")   or 0) or None,
+                "prior_day_close": float(prior.get("close") or 0) or None,
+                "prior_day_date":  prior.get("date"),
+            }
+        except Exception as e:
+            import logging
+            logging.getLogger("ap.broker").warning("[%s] get_prior_day_levels failed: %s", symbol, e)
+            return {}
+
     def get_option_expirations(self, symbol: str) -> List[str]:
         j = self._get("/v1/markets/options/expirations", params={
             "symbol": symbol,
