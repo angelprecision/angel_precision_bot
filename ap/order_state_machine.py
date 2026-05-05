@@ -1365,6 +1365,7 @@ class APOrderStateMachine:
         limit_price,
         plan_id=None,
         signal_id=None,
+        order_type: str = "limit",
     ) -> dict:
         existing = self._get_active_exit_order(position_id)
         if existing:
@@ -1388,7 +1389,8 @@ class APOrderStateMachine:
             limit_price=limit_price,
         )
         lp = float(limit_price or 0)
-        if lp <= 0:
+        _is_market_order = (order_type == "market") or (lp <= 0 and order_type != "limit")
+        if lp <= 0 and not _is_market_order:
             error_msg = "invalid_exit_limit_price"
             self.transition(local_id, OrderStatus.ERROR, last_error=error_msg)
             return {"ok": False, "local_order_id": local_id, "broker_order_id": None,
@@ -1403,13 +1405,18 @@ class APOrderStateMachine:
         underlying    = self._resolve_underlying_symbol(symbol=symbol, contract=contract)
         error_msg     = broker_order_id = None
         try:
+            _is_market = (order_type == "market") or (lp <= 0)
+            _order_data = {
+                "class": "option", "symbol": underlying, "option_symbol": contract,
+                "side": "sell_to_close", "quantity": int(qty),
+                "type": "market" if _is_market else "limit",
+                "duration": "day",
+            }
+            if not _is_market:
+                _order_data["price"] = round(lp, 2)
             resp = broker.session.post(
                 f"{base_url}/v1/accounts/{account_id}/orders",
-                data={
-                    "class": "option", "symbol": underlying, "option_symbol": contract,
-                    "side": "sell_to_close", "quantity": int(qty),
-                    "type": "limit", "price": round(lp, 2), "duration": "day",
-                },
+                data=_order_data,
                 headers={"Accept": "application/json"},
                 timeout=10,
             )
