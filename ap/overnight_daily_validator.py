@@ -169,13 +169,29 @@ def validate_overnight_daily_signal(
         and float(prior_day_high) > float(prior_day_low)
     )
 
-    if not levels_sane or snapshot is None:
+   if not levels_sane:
     return _missing_data_result(
         ticker=ticker,
         side=side,
         prior_day_high=prior_day_high if prior_high_valid else None,
         prior_day_low=prior_day_low if prior_low_valid else None,
-        snapshot_missing=snapshot is None,
+        snapshot_missing=False,
+    )
+
+   if snapshot is None:
+    log.warning(
+        "[%s] OVERNIGHT_DAILY_SNAPSHOT_UNAVAILABLE — allowing PAPER setup through using prior-day levels only",
+        ticker,
+    )
+    return ValidationResult(
+        True,
+        "SNAPSHOT_UNAVAILABLE_FAIL_OPEN_PAPER",
+        "Snapshot unavailable; allowing PAPER setup through using prior-day levels only.",
+        prior_day_high,
+        prior_day_low,
+        None,
+        None,
+        side,
     )
 
     sh = snapshot.session_high_so_far
