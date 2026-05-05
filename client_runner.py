@@ -619,6 +619,52 @@ class ClientRunner(threading.Thread):
             self.stopped.set()
             raise RuntimeError(f"[{self.email}] worker_thread failed to start")
 
+    def _run_overnight_reeval_if_due(self) -> None:
+        """Fire overnight signal re-evaluation at 9:00-9:45 AM ET on trading days.
+        Runs once per calendar day. Processes WATCHING signals, fetches prior-day
+        levels, validates directional structure, selects contracts, arms watcher.
+        """
+        try:
+            from zoneinfo import ZoneInfo
+            import datetime as _dt
+            now_et = _dt.datetime.now(ZoneInfo("America/New_York"))
+            today = now_et.date()
+
+            # Only Mon-Fri, 9:00-9:45 AM ET
+            if now_et.weekday() >= 5:
+                return
+            if not (now_et.hour == 9 and 0 <= now_et.minute <= 45):
+                return
+
+            # Only once per day
+            last_ran = getattr(self, "_last_overnight_reeval_date", None)
+            if last_ran == today:
+                return
+
+            self._last_overnight_reeval_date = today
+            logger.info("[%s] 🌅 Overnight daily signal reeval — %02d:%02d ET | checking WATCHING queue",
+                        self.email, now_et.hour, now_et.minute)
+
+            from ap_overnight_reeval import run_overnight_reeval
+            result = run_overnight_reeval(
+                client_id=self.email,
+                broker=self.broker,
+                master_control=self.master_control,
+                contract_selector=self.contract_selector,
+                order_state_machine=self.order_state_machine,
+                entry_watcher=self.entry_watcher,
+                position_manager=getattr(self, "position_manager", None),
+                exit_eng=getattr(self, "exit_eng", None),
+                force=False,
+            )
+            logger.info(
+                "[%s] Overnight reeval complete: armed=%d rejected=%d processed=%d errors=%d",
+                self.email, result["armed"], result["rejected"],
+                result["processed"], result["errors"],
+            )
+        except Exception as exc:
+            logger.error("[%s] Overnight reeval error (non-fatal): %s", self.email, exc, exc_info=True)
+
     def _start_runtime_health_loop(self):
         interval = float(os.getenv("RUNNER_HEALTH_CHECK_SEC", "20"))
 
@@ -666,6 +712,7 @@ class ClientRunner(threading.Thread):
 
                 self._try_recover_degraded_mode()
                 self._check_split_brain_recovery()   # BUG-5 FIX: poll for reconciler resolution
+                self._run_overnight_reeval_if_due()  # Arm WATCHING signals at 9:00-9:45 AM ET
                 self._set_entry_permission()
 
                 try:
