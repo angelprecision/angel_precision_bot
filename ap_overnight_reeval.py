@@ -242,7 +242,7 @@ def run_overnight_reeval(
 
             # Step 5: Contract selection
             try:
-                plan = contract_selector.select(signal, decision)
+                plan = contract_selector.select(signal)
             except Exception as cs_exc:
                 log.error("[%s] overnight_reeval: contract_selector.select failed: %s", ticker, cs_exc)
                 _mark_job_rejected(job_id, client_id, f"contract_selection_failed:{cs_exc}")
