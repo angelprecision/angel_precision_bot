@@ -203,8 +203,24 @@ def run_overnight_reeval(
                      ticker, signal_id, entry_trigger or 0)
 
             # Step 4: Master control pre-check (score gates, capital, etc.)
+            # Use a fresh REEVAL: signal_id so master_control dedup doesn't block it.
+            # The original signal was already deduped when it first arrived — overnight
+            # reeval is a legitimate second evaluation of the same setup.
             try:
-                decision = master_control.evaluate(signal, client_id=client_id)
+                import uuid as _uuid2
+                reeval_signal = {**signal, "signal_id": f"REEVAL:{signal_id}:{_uuid2.uuid4().hex[:6]}"}
+                # Clear this ticker/side from dedup cache if possible
+                try:
+                    direction = signal.get("side", "").upper()
+                    timeframe = signal.get("timeframe", "1d")
+                    setup_key = f"{client_id}:{ticker.upper()}:{direction}:{timeframe}"
+                    orig_key = f"sig:{signal_id}:{client_id}"
+                    mc_seen = getattr(master_control, "_seen_signals", {})
+                    mc_seen.pop(orig_key, None)
+                    mc_seen.pop(setup_key, None)
+                except Exception:
+                    pass
+                decision = master_control.evaluate(reeval_signal, client_id=client_id)
                 if not decision.ok:
                     log.info("[%s] overnight_reeval: MC blocked %s — %s", ticker, signal_id, decision.reason)
                     _mark_job_rejected(job_id, client_id, f"mc_blocked:{decision.reason}")
