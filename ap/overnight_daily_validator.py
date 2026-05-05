@@ -170,13 +170,13 @@ def validate_overnight_daily_signal(
     )
 
     if not levels_sane or snapshot is None:
-        return _missing_data_result(
-            ticker=ticker,
-            side=side,
-            prior_day_high=prior_day_high if prior_high_valid else None,
-            prior_day_low=prior_day_low if prior_low_valid else None,
-            snapshot_missing=snapshot is None,
-        )
+    return _missing_data_result(
+        ticker=ticker,
+        side=side,
+        prior_day_high=prior_day_high if prior_high_valid else None,
+        prior_day_low=prior_day_low if prior_low_valid else None,
+        snapshot_missing=snapshot is None,
+    )
 
     sh = snapshot.session_high_so_far
     sl = snapshot.session_low_so_far
