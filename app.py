@@ -1199,15 +1199,16 @@ def create_app() -> Flask:
                     results[email] = {"error": "runner not alive"}
                     continue
                 try:
+                    _core = runner.core
                     result = run_overnight_reeval(
                         client_id=email,
-                        broker=runner.broker,
+                        broker=getattr(_core, "broker", None) if _core else None,
                         master_control=runner.master_control,
-                        contract_selector=runner.contract_selector,
+                        contract_selector=getattr(_core, "contract_selector", None) if _core else None,
                         order_state_machine=runner.order_state_machine,
-                        entry_watcher=runner.entry_watcher,
+                        entry_watcher=getattr(_core, "entry_watcher", None) if _core else None,
                         position_manager=getattr(runner, "position_manager", None),
-                        exit_eng=getattr(runner, "exit_eng", None),
+                        exit_eng=getattr(_core, "exit_eng", None) if _core else None,
                         force=force,
                     )
                     # Reset the daily gate so auto-run fires again tomorrow
