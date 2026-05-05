@@ -1065,8 +1065,19 @@ def process_pending_order(
 
                 _seed_exit_engine(exit_engine, position_id, order, result, signal_id)
 
+                if not position_id:
+                    log.critical(
+                        "[%s] CRITICAL: _open_position_safe returned None for %s %s "
+                        "(fill confirmed but no position record created — exit engine BLIND to this position)",
+                        client_id, order.get("symbol"), local_id,
+                    )
+
             except Exception as exc:
-                log.error("[%s] ENTRY fill side-effects failed for %s: %s", client_id, local_id, exc)
+                log.critical(
+                    "[%s] ENTRY fill side-effects FAILED for %s — position NOT created, "
+                    "exit engine BLIND to this position. Error: %s",
+                    client_id, local_id, exc, exc_info=True,
+                )
 
         elif ok and kind == "EXIT":
             _sync_exit_price(order, result)
