@@ -1,0 +1,19 @@
+name: Overnight Reeval
+
+on:
+  schedule:
+    - cron: "5 13 * * 1-5"
+  workflow_dispatch:
+
+jobs:
+  trigger-overnight-reeval:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Trigger overnight reeval
+        run: |
+          curl -f -sS --max-time 15 -X POST "${{ secrets.AP_BOT_URL }}/admin/overnight_reeval" \
+            -H "Content-Type: application/json" \
+            -H "X-Admin-Key: ${{ secrets.AP_ADMIN_KEY }}" \
+            -d '{"force": true}'
+
