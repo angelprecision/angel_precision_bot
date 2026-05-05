@@ -99,13 +99,13 @@ KILL_BLOCKS_NON_PROTECTIVE_EXITS = (
 # ── P&L THRESHOLDS ────────────────────────────────────────────────────────────
 THETA_STOP_LOSS_PCT   = -0.35  # -35% on option → stop
 SCALE_OUT_1_THRESHOLD = 0.40   # +40% → scale out 50% at window 1
-SCALE_OUT_2_THRESHOLD = 0.25   # +25% → scale out 75% at window 2
-PROTECT_3_THRESHOLD   = 0.15   # +15% → exit all at window 3
+SCALE_OUT_2_THRESHOLD = 0.20   # +20% → scale out 75% at window 2
+PROTECT_3_THRESHOLD   = 0.12   # +12% → exit all at window 3
 
 # ── IMMEDIATE TAKE-PROFIT (any time, no window gate) ──────────────────────────
-IMMEDIATE_TP_PCT      = 0.18   # +18% → scale out 70% immediately
+IMMEDIATE_TP_PCT      = 0.15   # +15% → scale out 70% immediately (lowered from 18%)
 HARD_STOP_PCT         = -0.30  # -30% → exit immediately regardless of time
-PROFIT_LOCK_PCT       = 0.12   # once at +25%, lock: don't fall below +12%
+PROFIT_LOCK_PCT       = 0.08   # once at +15%, lock: don't fall below +8% (was +12%)
 
 _INDEX_ETFS = {"QQQ", "SPY", "IWM", "DIA", "SPX"}
 
@@ -168,9 +168,9 @@ def _effective_thresholds(pos: "ManagedPosition") -> tuple:
         return -0.26, 0.25, 0.12
     return HARD_STOP_PCT, IMMEDIATE_TP_PCT, PROFIT_LOCK_PCT
 
-TRAIL_DROP_FROM_PEAK  = 0.10
-SMALL_WIN_PCT         = 0.10
-SMALL_WIN_TRAIL       = 0.07
+TRAIL_DROP_FROM_PEAK  = 0.06   # tightened: 6pt drop from peak triggers exit (was 10pt)
+SMALL_WIN_PCT         = 0.08   # trail kicks in once we've seen +8% (was 10%)
+SMALL_WIN_TRAIL       = 0.05   # floor 5pt below peak-win (was 7pt)
 
 
 # ── POSITION TRACKER ─────────────────────────────────────────────────────────
