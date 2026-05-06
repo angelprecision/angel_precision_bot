@@ -413,14 +413,41 @@ def run_intelligence_check(signal: dict, underlying_price: float,
         return _unavailable_gate("UNAVAILABLE", "intel_unavailable")
 
     def _run():
-        return pipeline.run_quick(
-            ticker             = ticker,
-            scanner_signal     = direction,
-            scanner_confidence = score_in,
-            underlying_price   = float(underlying_price),
-            dte                = int(signal.get("dte") or 1),
-            allow_0dte         = True,
-        )
+        # Pass live chain data from signal if available.
+        # If None, pipeline.run() uses estimates — same as before.
+        _atr       = signal.get("atr_value")
+        _delta     = signal.get("option_delta")
+        _spread    = signal.get("spread_pct")
+        _oi        = signal.get("open_interest") or signal.get("option_open_interest")
+        _vol_opts  = signal.get("option_volume")
+        _prem      = signal.get("option_bid") or signal.get("option_ask")
+
+        if any(x is not None for x in [_atr, _delta, _spread]):
+            # Full call with live data — risk manager gets real inputs
+            return pipeline.run(
+                ticker               = ticker,
+                scanner_signal       = direction,
+                scanner_confidence   = score_in,
+                underlying_price     = float(underlying_price),
+                dte                  = int(signal.get("dte") or 1),
+                allow_0dte           = True,
+                atr_value            = float(_atr) if _atr else None,
+                option_delta         = float(_delta) if _delta else None,
+                bid_ask_spread_pct   = float(_spread) if _spread else None,
+                open_interest        = int(_oi) if _oi else None,
+                daily_volume_options = int(_vol_opts) if _vol_opts else None,
+                option_premium       = float(_prem) if _prem else None,
+            )
+        else:
+            # Fallback: estimates only (chain data not available)
+            return pipeline.run_quick(
+                ticker             = ticker,
+                scanner_signal     = direction,
+                scanner_confidence = score_in,
+                underlying_price   = float(underlying_price),
+                dte                = int(signal.get("dte") or 1),
+                allow_0dte         = True,
+            )
 
     try:
         future = _INTEL_EXECUTOR.submit(_run)
