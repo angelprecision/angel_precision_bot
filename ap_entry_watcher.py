@@ -334,6 +334,7 @@ class APEntryWatcher:
 
         self._open_trigger_count = 0
         self._open_protect_date = None
+        self._open_trigger_tickers: set = set()   # per-ticker open protection
 
         # Real watcher-level duplicate barrier. Cleanup alone is not enough;
         # the key must be initialized and enforced before a signal is armed.
@@ -420,6 +421,11 @@ class APEntryWatcher:
             return False
 
         dedup_key = self._dedup_key_for_signal(watched.signal)
+        if not dedup_key:
+            log.warning(
+                "[%s] add_signal: signal_id missing — dedup disabled for this signal. "
+                "Duplicate arms possible.", watched.ticker
+            )
 
         with self._lock:
             if dedup_key and dedup_key in self._dedup_set:
@@ -590,8 +596,8 @@ class APEntryWatcher:
                 mid = (bid + ask) / 2 if bid > 0 and ask > 0 else max(bid, ask)
                 if mid > 0:
                     pct_from_trigger = (mid - trigger) / trigger
-                    stale = (side == "CALL" and pct_from_trigger > 0.030) or (
-                        side == "PUT" and pct_from_trigger < -0.030
+                    stale = (side == "CALL" and pct_from_trigger > MAX_INTRADAY_DRIFT_PCT) or (
+                        side == "PUT" and pct_from_trigger < -MAX_INTRADAY_DRIFT_PCT
                     )
                     if stop and stop > 0:
                         if side == "CALL" and mid < stop:
@@ -697,6 +703,7 @@ class APEntryWatcher:
         if self._open_protect_date != today_et:
             self._open_protect_date = today_et
             self._open_trigger_count = 0
+            self._open_trigger_tickers = set()
 
         open_protect_active = (
             now_et.hour == 9 and 30 <= now_et.minute < 30 + OPEN_PROTECT_MINUTES
@@ -861,6 +868,21 @@ class APEntryWatcher:
                     w.entry_trigger,
                 )
 
+        # Fire expire/invalidate callbacks BEFORE removing from pending.
+        # Without this, OSM orders for rejected overnight signals stay as
+        # phantom PENDING_TRIGGER orders until the next startup cleanup.
+        for w in to_remove:
+            if w.state == WatchState.INVALIDATED and self.on_invalidate:
+                try:
+                    self.on_invalidate(w)
+                except Exception as _exc:
+                    log.error("[%s] on_invalidate failed during overnight revalidation: %s", w.ticker, _exc)
+            elif w.state == WatchState.EXPIRED and self.on_expire:
+                try:
+                    self.on_expire(w)
+                except Exception as _exc:
+                    log.error("[%s] on_expire failed during overnight revalidation: %s", w.ticker, _exc)
+
         if to_remove:
             with self._lock:
                 remove_ids = {id(w) for w in to_remove}
@@ -896,18 +918,21 @@ class APEntryWatcher:
 
                 new_state = w.check(bid, ask)
                 if new_state == WatchState.TRIGGERED:
-                    if open_protect_active and self._open_trigger_count >= MAX_OPEN_TRIGGERS:
+                    if open_protect_active and w.ticker in self._open_trigger_tickers:
+                        # Per-ticker open protection: this ticker already triggered once
+                        # at open. Block duplicate triggers for the same ticker within
+                        # the open protection window (first 5 minutes).
                         w.state = WatchState.EXPIRED
                         w._release_dedup_key()
                         completed.append(("done", w))
                         log.info(
-                            "[%s] OPEN_PROTECTION_BLOCK — max open triggers reached (%s/%s)",
+                            "[%s] OPEN_PROTECTION_BLOCK — ticker already triggered at open",
                             w.ticker,
-                            self._open_trigger_count,
-                            MAX_OPEN_TRIGGERS,
                         )
                     else:
                         self._open_trigger_count += 1
+                        if open_protect_active:
+                            self._open_trigger_tickers.add(w.ticker)
                         completed.append(("trigger", w))
                 elif new_state in (WatchState.EXPIRED, WatchState.INVALIDATED):
                     completed.append(("done", w))
