@@ -524,7 +524,7 @@ class ClientRunner(threading.Thread):
             if not _fill_ok_for_entries:
                 logger.warning("[%s] entries_allowed BLOCKED: fill_monitor dead >120s (actual=%s)", self.email, _fill_ok)
             if _degraded:
-                logger.warning("[%s] entries_allowed BLOCKED: degraded reasons=%s", self.email, list(getattr(self, "degraded_reasons", {}).keys()))
+                logger.warning("[%s] entries_allowed BLOCKED: degraded reasons=%s", self.email, sorted(getattr(self, "degraded_reasons", set())))
             if _failed:
                 logger.warning("[%s] entries_allowed BLOCKED: failed", self.email)
             if self.stopping.is_set():
@@ -1634,7 +1634,7 @@ def route_signal_to_all_clients(signal: dict):
                     logger.warning(
                         "ROUTE_BLOCK [%s]: alive=%s init=%s stop=%s fail=%s degraded=%s entries_allowed=%s reasons=%s",
                         _email, _alive, _init, _stop, _fail, _deg, _ea,
-                        list(getattr(_r, "degraded_reasons", {}).keys()) if _deg else []
+                        sorted(getattr(_r, "degraded_reasons", set())) if _deg else []
                     )
             logger.warning(
                 "Signal %s [%s] -- no local entries-allowed runners and Supabase fallback disabled; dropping",
@@ -1840,6 +1840,23 @@ def start_multi_client_supervisor():
                 except Exception as exc:
                     _supervisor_state["last_sync_error"] = str(exc)
                     logger.error("Supervisor sync error: %s", exc)
+
+                # Liveness check: sleep in short intervals between full syncs.
+                # Breaks early to trigger an immediate re-sync if any runner dies.
+                _sync_interval = int(os.getenv("SUPERVISOR_SYNC_SEC", "60"))
+                _check_interval = int(os.getenv("SUPERVISOR_LIVENESS_CHECK_SEC", "15"))
+                _elapsed = 0
+                while _elapsed < _sync_interval:
+                    time.sleep(_check_interval)
+                    _elapsed += _check_interval
+                    with _registry_lock:
+                        any_dead = any(
+                            not r.is_alive()
+                            for r in _active_runners.values()
+                        )
+                    if any_dead:
+                        logger.warning("Supervisor: dead runner detected — triggering early sync")
+                        break
         except BaseException as fatal:
             # Thread is about to die — log it so we can see why
             _supervisor_state["last_sync_error"] = f"FATAL:{fatal}"
@@ -1848,23 +1865,6 @@ def start_multi_client_supervisor():
                 "Bot will rely on post_worker_init hook for runner spawning. "
                 "Error: %s", fatal, exc_info=True
             )
-            # FIX-4: 300s full-sync cadence is too slow for dead-runner detection.
-            # Inner loop checks runner liveness every 15s and breaks early to call
-            # _sync_runners immediately when any runner dies. Full member-list refresh
-            # from Supabase still happens on the 300s outer cadence.
-            _sync_interval = int(os.getenv("SUPERVISOR_SYNC_SEC", "60"))
-            _check_interval = int(os.getenv("SUPERVISOR_LIVENESS_CHECK_SEC", "15"))
-            _checks = max(1, _sync_interval // _check_interval)
-            for _ in range(_checks):
-                time.sleep(_check_interval)
-                with _registry_lock:
-                    any_dead = any(
-                        not r.is_alive()
-                        for r in _active_runners.values()
-                    )
-                if any_dead:
-                    logger.warning("Supervisor: dead runner detected — triggering early sync")
-                    break
 
     _supervisor_ref["thread"] = threading.Thread(target=_supervisor, daemon=True, name="client-supervisor")
     _supervisor_ref["thread"].start()

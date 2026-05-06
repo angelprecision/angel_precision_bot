@@ -202,6 +202,10 @@ class OrderStatus:
         SUBMITTED:         {ACKNOWLEDGED, PARTIAL_FILL, FILLED, REJECTED, EXPIRED, ERROR, CANCELED},
         ACKNOWLEDGED:      {PARTIAL_FILL, FILLED, REJECTED, EXPIRED, ERROR, CANCELED},
         PARTIAL_FILL:      {FILLED, REJECTED, EXPIRED, ERROR, CANCELED},
+        # DESIGN: FILLED → EXIT_REQUESTED is allowed to support direct re-use of
+        # the entry order row. In practice, exit lifecycle uses a separate EXIT order
+        # row (kind='EXIT') starting at EXIT_REQUESTED — see create_exit_order().
+        # EXIT_FILLED is intentionally absent (terminal, no further transitions).
         FILLED:            {EXIT_REQUESTED},
         EXIT_REQUESTED:    {EXIT_SUBMITTED, REJECTED, CANCELED, EXPIRED, ERROR},
         EXIT_SUBMITTED:    {EXIT_ACKNOWLEDGED, EXIT_PARTIAL_FILL, EXIT_FILLED, REJECTED, EXPIRED, ERROR, CANCELED},
@@ -456,6 +460,10 @@ class APOrderStateMachine:
                     "[%s] DUPLICATE ORDER BLOCKED by DB constraint — ENTRY plan=%s",
                     self.client_id, plan.plan_id,
                 )
+                # Re-fetch: another thread may have inserted between our check and INSERT
+                refetched = self._get_order_by_plan(plan.plan_id, kind="ENTRY")
+                if refetched:
+                    return refetched["local_order_id"]
                 return existing["local_order_id"] if existing else local_order_id
             raise
         log.info(
@@ -528,6 +536,10 @@ class APOrderStateMachine:
                     "[%s] DUPLICATE ORDER BLOCKED by DB constraint — EXIT pos=%s",
                     self.client_id, position_id,
                 )
+                # Re-fetch: another thread may have inserted between our check and INSERT
+                refetched = self._get_order_by_plan(position_id, kind="EXIT")
+                if refetched:
+                    return refetched["local_order_id"]
                 return existing["local_order_id"] if existing else local_id
             raise
         log.info(
@@ -1390,8 +1402,8 @@ class APOrderStateMachine:
             limit_price=limit_price,
         )
         lp = float(limit_price or 0)
-        _is_market_order = (order_type == "market") or (lp <= 0 and order_type != "limit")
-        if lp <= 0 and not _is_market_order:
+        _is_market = (order_type == "market") or (lp <= 0 and order_type != "limit")
+        if lp <= 0 and not _is_market:
             error_msg = "invalid_exit_limit_price"
             self.transition(local_id, OrderStatus.ERROR, last_error=error_msg)
             return {"ok": False, "local_order_id": local_id, "broker_order_id": None,
@@ -1406,7 +1418,7 @@ class APOrderStateMachine:
         underlying    = self._resolve_underlying_symbol(symbol=symbol, contract=contract)
         error_msg     = broker_order_id = None
         try:
-            _is_market = (order_type == "market") or (lp <= 0)
+            _is_market = (order_type == "market") or (lp <= 0 and order_type != "limit")
             _order_data = {
                 "class": "option", "symbol": underlying, "option_symbol": contract,
                 "side": "sell_to_close", "quantity": int(qty),
@@ -1558,10 +1570,16 @@ class APOrderStateMachine:
                 return None
             if row.get("quantity_remaining") is not None:
                 return int(row.get("quantity_remaining") or 0)
-            # Fallback to qty (total contracted) — only correct if quantity_remaining
-            # is being decremented on note_partial_exit_fill (confirmed in ap_exit_engine.py).
-            # If scale-outs are not updating quantity_remaining in DB, this will
-            # return full size and cause a partial-close to be treated as full close.
+            # Fallback: quantity_remaining is NULL in DB.
+            # This is correct on first fill (before any scale-out), but if it fires
+            # after a scale-out it means DB is not being updated — partial close will
+            # be silently treated as full close on the next fill.
+            log.critical(
+                "[%s] _get_position_remaining_from_db: quantity_remaining is NULL for pos=%s "
+                "falling back to qty=%s — if this fires after a scale-out, "
+                "quantity_remaining is not being updated in DB",
+                self.client_id, position_id, row.get("qty"),
+            )
             return int(row.get("qty") or 0)
         except Exception:
             return None
