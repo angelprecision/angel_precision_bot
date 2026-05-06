@@ -679,105 +679,100 @@ class APContractSelectionEngine:
             return None
 
         # ── B. HARD QUALITY FILTER ────────────────────────────────────────────
-        _orig_spread        = self.max_spread_pct
-        _orig_oi            = self.min_oi
-        _orig_vol           = self.min_volume
-        try:
-            self.max_spread_pct = _eff_max_spread
-            self.min_oi         = _eff_min_oi
-            self.min_volume     = _eff_min_volume
+        # No self-mutation: effective thresholds passed directly to _quality_filter.
+        # This is thread-safe when worker_loop and entry_watcher breach both call
+        # select() on the same instance simultaneously.
+        today      = date.today()
+        survivors  = []
+        _rejections: dict = {}
+        _pro_tiers:  dict = {"A": 0, "B": 0}
 
-            today      = date.today()
-            survivors  = []
-            _rejections: dict = {}
-            _pro_tiers:  dict = {"A": 0, "B": 0}
-
-            for opt in chain:
-                if _PRO_QUALITY_ENABLED:
-                    exp_str = opt.get("expiration_date", "")
-                    _dte = 0
-                    if exp_str:
-                        try:
-                            _dte = (date.fromisoformat(exp_str) - today).days
-                        except Exception:
-                            _dte = 0
-                    pro_tier, pro_reason = _pro_contract_quality(opt, ticker, _dte)
-                    if pro_tier == "REJECT":
-                        _rejections[pro_reason] = _rejections.get(pro_reason, 0) + 1
-                        try:
-                            self._emit_selector_event(
-                                plan,
-                                stage="quality_filter",
-                                decision="REJECT",
-                                reason_code=_normalize_reason_code(pro_reason),
-                                explanation=pro_reason,
-                                contract=opt.get("symbol"),
-                                inputs={
-                                    "bid":        _safe_float(opt.get("bid")),
-                                    "ask":        _safe_float(opt.get("ask")),
-                                    "volume":     int(opt.get("volume") or 0),
-                                    "oi":         int(opt.get("open_interest") or 0),
-                                    "dte":        _dte,
-                                    "spread_pct": round(
-                                        ((_safe_float(opt.get("ask")) - _safe_float(opt.get("bid")))
-                                         / max((_safe_float(opt.get("ask")) + _safe_float(opt.get("bid"))) / 2, 0.01)),
-                                        4
-                                    ),
-                                },
-                                thresholds={
-                                    "hard_spread": (
-                                        _PRO_T1_SPREAD_HARD_MAX
-                                        if (ticker.upper() in _PRO_TIER1_TICKERS)
-                                        else _PRO_T2_SPREAD_HARD_MAX
-                                    ),
-                                    "min_bid": _PRO_MIN_BID,
-                                    "min_bid_size": _PRO_MIN_BID_SIZE_HARD,
-                                },
-                            )
-                        except Exception:
-                            pass  # per-contract pro-quality emit — non-critical
-                        continue
-                    opt["_pro_tier"] = pro_tier
-                    _pro_tiers[pro_tier] = _pro_tiers.get(pro_tier, 0) + 1
-
-                result = self._quality_filter(opt, today)
-                if result is None:
-                    survivors.append(opt)
-                else:
-                    _rejections[result] = _rejections.get(result, 0) + 1
-                    log.debug("[%s] filtered: %s -- %s", ticker, opt.get("symbol", "?"), result)
+        for opt in chain:
+            if _PRO_QUALITY_ENABLED:
+                exp_str = opt.get("expiration_date", "")
+                _dte = 0
+                if exp_str:
+                    try:
+                        _dte = (date.fromisoformat(exp_str) - today).days
+                    except Exception:
+                        _dte = 0
+                pro_tier, pro_reason = _pro_contract_quality(opt, ticker, _dte)
+                if pro_tier == "REJECT":
+                    _rejections[pro_reason] = _rejections.get(pro_reason, 0) + 1
                     try:
                         self._emit_selector_event(
                             plan,
                             stage="quality_filter",
                             decision="REJECT",
-                            reason_code=_normalize_reason_code(result),
-                            explanation=result,
+                            reason_code=_normalize_reason_code(pro_reason),
+                            explanation=pro_reason,
                             contract=opt.get("symbol"),
                             inputs={
-                                "bid":     _safe_float(opt.get("bid")),
-                                "ask":     _safe_float(opt.get("ask")),
-                                "volume":  int(opt.get("volume") or 0),
-                                "oi":      int(opt.get("open_interest") or 0),
-                                "premium": round(
-                                            ((_safe_float(opt.get("bid")) + _safe_float(opt.get("ask"))) / 2) * 100,
-                                            2
-                                        ) if opt.get("bid") is not None and opt.get("ask") is not None else 0,
+                                "bid":        _safe_float(opt.get("bid")),
+                                "ask":        _safe_float(opt.get("ask")),
+                                "volume":     int(opt.get("volume") or 0),
+                                "oi":         int(opt.get("open_interest") or 0),
+                                "dte":        _dte,
+                                "spread_pct": round(
+                                    ((_safe_float(opt.get("ask")) - _safe_float(opt.get("bid")))
+                                     / max((_safe_float(opt.get("ask")) + _safe_float(opt.get("bid"))) / 2, 0.01)),
+                                    4
+                                ),
                             },
                             thresholds={
-                                "max_spread_pct": _safe_float(_eff_max_spread),
-                                "min_oi":         _safe_float(_eff_min_oi),
-                                "min_premium":    self.min_premium,
-                                "max_premium":    self.max_premium,
+                                "hard_spread": (
+                                    _PRO_T1_SPREAD_HARD_MAX
+                                    if (ticker.upper() in _PRO_TIER1_TICKERS)
+                                    else _PRO_T2_SPREAD_HARD_MAX
+                                ),
+                                "min_bid": _PRO_MIN_BID,
+                                "min_bid_size": _PRO_MIN_BID_SIZE_HARD,
                             },
                         )
                     except Exception:
-                        pass  # per-contract quality-filter emit — non-critical
+                        pass  # per-contract pro-quality emit — non-critical
+                    continue
+                opt["_pro_tier"] = pro_tier
+                _pro_tiers[pro_tier] = _pro_tiers.get(pro_tier, 0) + 1
 
-        finally:
-            self.max_spread_pct = _orig_spread
-            self.min_oi         = _orig_oi
-            self.min_volume     = _orig_vol
+            result = self._quality_filter(
+                opt, today,
+                max_spread_pct=_eff_max_spread,
+                min_oi=_eff_min_oi,
+                min_volume=_eff_min_volume,
+            )
+            if result is None:
+                survivors.append(opt)
+            else:
+                _rejections[result] = _rejections.get(result, 0) + 1
+                log.debug("[%s] filtered: %s -- %s", ticker, opt.get("symbol", "?"), result)
+                try:
+                    self._emit_selector_event(
+                        plan,
+                        stage="quality_filter",
+                        decision="REJECT",
+                        reason_code=_normalize_reason_code(result),
+                        explanation=result,
+                        contract=opt.get("symbol"),
+                        inputs={
+                            "bid":     _safe_float(opt.get("bid")),
+                            "ask":     _safe_float(opt.get("ask")),
+                            "volume":  int(opt.get("volume") or 0),
+                            "oi":      int(opt.get("open_interest") or 0),
+                            "premium": round(
+                                        ((_safe_float(opt.get("bid")) + _safe_float(opt.get("ask"))) / 2) * 100,
+                                        2
+                                    ) if opt.get("bid") is not None and opt.get("ask") is not None else 0,
+                        },
+                        thresholds={
+                            "max_spread_pct": _safe_float(_eff_max_spread),
+                            "min_oi":         _safe_float(_eff_min_oi),
+                            "min_premium":    self.min_premium,
+                            "max_premium":    self.max_premium,
+                        },
+                    )
+                except Exception:
+                    pass  # per-contract quality-filter emit — non-critical
 
         if not survivors:
             log.warning(
@@ -1169,6 +1164,9 @@ class APContractSelectionEngine:
     def _fetch_tradier_chain(self, ticker: str, option_type: str) -> tuple[list[dict], Optional[float]]:
         """Direct Tradier API call for option chain. Returns (chain, underlying_price)."""
         import requests
+        # Use broker's pooled session if available (connection reuse, keep-alive).
+        # Fall back to bare requests if broker has no session attribute.
+        _session = getattr(self.data_broker, "session", None) or requests
 
         cfg      = getattr(self.data_broker, "cfg", None)
         base_url = (getattr(cfg, "base_url", None)
@@ -1184,7 +1182,7 @@ class APContractSelectionEngine:
         # 1. Fetch underlying quote
         underlying_price = None
         try:
-            q_resp = requests.get(
+            q_resp = _session.get(
                 f"{base_url}/v1/markets/quotes",
                 params={"symbols": ticker, "greeks": "false"},
                 headers=headers, timeout=8,
@@ -1198,7 +1196,7 @@ class APContractSelectionEngine:
 
         # 2. Get expirations
         try:
-            exp_resp = requests.get(
+            exp_resp = _session.get(
                 f"{base_url}/v1/markets/options/expirations",
                 params={"symbol": ticker, "includeAllRoots": "true"},
                 headers=headers, timeout=10,
@@ -1219,7 +1217,7 @@ class APContractSelectionEngine:
 
         # 4. Get chain with greeks
         try:
-            chain_resp = requests.get(
+            chain_resp = _session.get(
                 f"{base_url}/v1/markets/options/chains",
                 params={"symbol": ticker, "expiration": target_exp, "greeks": "true"},
                 headers=headers, timeout=10,
@@ -1249,6 +1247,8 @@ class APContractSelectionEngine:
         for d_str in dates:
             try:
                 d = date.fromisoformat(d_str)
+                if d.weekday() >= 5:   # skip Saturday (5) and Sunday (6)
+                    continue
                 dte = (d - today).days
                 if self.min_dte <= dte <= self.max_dte:
                     valid.append((dte, d_str))
@@ -1259,6 +1259,8 @@ class APContractSelectionEngine:
             for d_str in dates:
                 try:
                     d = date.fromisoformat(d_str)
+                    if d.weekday() >= 5:   # skip Saturday/Sunday
+                        continue
                     dte = (d - today).days
                     if dte >= self.min_dte:
                         valid.append((dte, d_str))
@@ -1299,7 +1301,19 @@ class APContractSelectionEngine:
             selection_score=0, dte=0,
         )
 
-    def _quality_filter(self, opt: dict, today: date) -> Optional[str]:
+    def _quality_filter(
+        self,
+        opt: dict,
+        today: date,
+        *,
+        max_spread_pct: Optional[float] = None,
+        min_oi: Optional[int] = None,
+        min_volume: Optional[int] = None,
+    ) -> Optional[str]:
+        _max_spread = max_spread_pct if max_spread_pct is not None else self.max_spread_pct
+        _min_oi     = min_oi         if min_oi         is not None else self.min_oi
+        _min_volume = min_volume      if min_volume     is not None else self.min_volume
+
         bid = float(opt.get("bid") or 0)
         ask = float(opt.get("ask") or 0)
         oi  = int(opt.get("open_interest") or 0)
@@ -1314,12 +1328,12 @@ class APContractSelectionEngine:
         if mid <= 0:
             return "zero_mid"
         spread_pct = (ask - bid) / mid
-        if spread_pct > self.max_spread_pct:
+        if spread_pct > _max_spread:
             return "spread_too_wide_%.1f%%" % (spread_pct * 100)
 
-        if oi < self.min_oi:
+        if oi < _min_oi:
             return "low_oi_%d" % oi
-        if vol < self.min_volume:
+        if vol < _min_volume:
             return "low_volume_%d" % vol
 
         premium = mid * 100
