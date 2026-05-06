@@ -835,6 +835,8 @@ def _seed_exit_engine(exit_engine, position_id: str, order: dict, result: dict, 
             "quote_fresh": False,
             "seed_source": "fill_monitor",
         }
+        if not getattr(mp, "client_id", ""):
+            mp.client_id = getattr(exit_engine, "_email", "") or getattr(exit_engine, "client_id", "")
         exit_engine.add_position(mp)
 
         refresher = getattr(exit_engine, "request_quote_refresh", None)

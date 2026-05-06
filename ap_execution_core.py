@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import os
+import time
 import uuid
 import logging
 import threading
@@ -692,17 +693,17 @@ class APExecutionCore:
     # ── CALLBACK: Position Closed ─────────────────────────────────────────────
 
     def _on_position_close(self, pos: ManagedPosition, decision):
+        # ── IDEMPOTENCY: skip if position already marked closed ──────────────
+        if getattr(pos, "closed", False):
+            log.debug("[%s] _on_position_close called but pos.closed=True — skipping", pos.ticker)
+            return
+
         with self._pos_lock:
             self._position_count = max(0, self._position_count - 1)
 
         sector = getattr(pos, "signal", {}).get("correlation_bucket", "OTHER")
         with self._sector_lock:
             self._sector_counts[sector] = max(0, self._sector_counts.get(sector, 0) - 1)
-
-        # ── IDEMPOTENCY: skip if position already marked closed ──────────────
-        if getattr(pos, "closed", False):
-            log.debug("[%s] _on_position_close called but pos.closed=True — skipping", pos.ticker)
-            return
 
         # ── EXIT SUBMISSION ─────────────────────────────────────────────────
         sig = getattr(pos, "signal", {})
@@ -778,9 +779,10 @@ class APExecutionCore:
             return
 
         if self.order_state_machine and pos.position_id:
+            _price_str = f"${_exit_limit:.2f}" if _exit_limit is not None else "MARKET"
             log.info(
                 f"[{pos.ticker}] {'PAPER' if self.paper else 'LIVE'} CLOSE -- "
-                f"submitting sell_to_close via OSM @ ${_exit_limit:.2f} (bid) | {decision.reason}"
+                f"submitting sell_to_close via OSM @ {_price_str} | {decision.reason}"
             )
             exit_res = self.order_state_machine.submit_exit(
                 broker      = self.broker,
@@ -1004,9 +1006,9 @@ class APExecutionCore:
         if self.order_state_machine and pos.position_id:
             _scale_bid   = getattr(pos, "current_bid", 0) or 0
             _scale_mid   = getattr(pos, "current_option_price", 0) or 0
-        if  _scale_bid  <= 0 and _scale_mid <= 0:
-            log.critical("[%s] SCALE BLOCKED — no valid bid or mid for scale-out", pos.ticker)
-            return
+            if _scale_bid <= 0 and _scale_mid <= 0:
+                log.critical("[%s] SCALE BLOCKED — no valid bid or mid for scale-out", pos.ticker)
+                return
             _scale_limit = _scale_bid if _scale_bid > 0 else max(round(_scale_mid - 0.01, 2), 0.01)
             scale_res = self.order_state_machine.submit_exit(
                 broker      = self.broker,

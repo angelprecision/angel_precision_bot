@@ -257,6 +257,7 @@ class APMasterControl:
 
         # Optional callback wired by runner/ops layer. Signature is flexible:
         # alert_fn(event=str, severity=str, client_id=str, ticker=str, signal_id=str, details=dict)
+        self._equity_cache_ts: float = 0.0   # initialized here; set by _dispatch() after broker call
         self._alert_fn = None
         self._degraded_counts: dict[str, int] = {}
 

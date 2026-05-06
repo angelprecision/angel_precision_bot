@@ -417,13 +417,16 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
     # FIX-1: Discord runner alert moved to _submit_exit_decision(). This branch
     # now returns the alert metadata on the decision object instead of calling
     # requests.post() here under self._lock.
-    if pos.scale_outs_done >= 1 and pos.peak_pnl_pct > 0:
+    _single_contract = (qty_rem == 1 and pos.scale_outs_done == 0)
+    if (pos.scale_outs_done >= 1 or _single_contract) and pos.peak_pnl_pct >= IMMEDIATE_TP_PCT:
         if pos.peak_pnl_pct >= 0.80:
             _runner_trail = 0.10
         elif pos.peak_pnl_pct >= 0.60:
             _runner_trail = 0.13
         elif pos.peak_pnl_pct >= 0.40:
             _runner_trail = 0.15
+        elif _single_contract:
+            _runner_trail = 0.12   # tighter trail for single-contract positions
         else:
             _runner_trail = 0.20
         runner_drop = pos.peak_pnl_pct - option_pnl
@@ -578,7 +581,7 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
     past_eod = (hour > EOD_HARD_CLOSE_HOUR or
                 (hour == EOD_HARD_CLOSE_HOUR and minute >= EOD_HARD_CLOSE_MIN))
     # Also force-close if market is clearly closed (hour > 16 ET or < 9:30 ET next day)
-    market_clearly_closed = (hour >= 16) or (hour < 9) or (hour == 9 and minute < 30)
+    market_clearly_closed = (hour >= 16)
     if past_eod or (market_clearly_closed and not getattr(pos, "overnight_hold_approved", False)):
         return ExitDecision(
             action="CLOSE_ALL", quantity=qty_rem,

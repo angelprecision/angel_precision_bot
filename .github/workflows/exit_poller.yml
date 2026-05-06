@@ -1,11 +1,11 @@
 name: Exit Poller
 
 on:
-  schedule:
-    # Every 5 minutes, 9am–4pm ET (14:00–21:00 UTC), Mon–Fri
-    # GitHub Actions minimum is 5 min; this fires at :00 :05 :10 ... :55
-    - cron: '*/5 14-21 * * 1-5'
-  workflow_dispatch:  # Allow manual trigger from GitHub UI
+  # DISABLED: exit_poller.yml conflicts with APExitEngine DTE-aware thresholds.
+  # exit_poller uses -25%/+50% flat thresholds vs engine's dynamic system.
+  # APExitEngine (running in ClientRunner) is the sole exit authority.
+  # Re-enable ONLY as a manual fallback trigger.
+  workflow_dispatch:
 
 jobs:
   poll:

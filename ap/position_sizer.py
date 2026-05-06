@@ -126,6 +126,13 @@ class APPositionSizer:
 
         account_equity = float(account_equity or 0.0)
         premium_per_contract = float(premium_per_contract or 0.0)
+        # Guard: premium_per_contract must be TOTAL contract dollars (e.g., 950.0 for a $9.50 option).
+        # If caller passes per-share price (9.50), Kelly sizing produces ~100x too many contracts.
+        assert premium_per_contract == 0.0 or premium_per_contract >= 10.0, (
+            f"premium_per_contract={premium_per_contract:.4f} appears to be per-share, not per-contract. "
+            f"Must be total contract dollars (e.g., 950.0 for a $9.50 option × 100 shares). "
+            f"Pass 0.0 to skip sizing."
+        )
         drawdown = float(realized_pnl_today or 0.0)
         tier_upper = str(tier or "B").upper()
         max_positions = max(0, int(max_positions or 0))
