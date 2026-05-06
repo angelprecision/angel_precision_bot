@@ -705,6 +705,95 @@ class ClientRunner(threading.Thread):
         except Exception as _exc:
             logger.debug("[%s] exit_autonomous_recovery error (non-fatal): %s", self.email, _exc)
 
+    def _detect_manual_closes(self):
+        """
+        Detect positions that were manually closed at the broker but still show OPEN in DB.
+        Runs every 120s — checks broker positions list against DB open positions.
+        When a mismatch is found, marks the DB position as CLOSED with close_source='manual_client_close'.
+        This handles the case where a client manually closes a trade on the Tradier dashboard.
+        """
+        _now = time.time()
+        _last = getattr(self, "_last_manual_close_check_ts", 0.0)
+        if _now - _last < 120.0:
+            return
+        self._last_manual_close_check_ts = _now
+
+        try:
+            broker = getattr(self, "broker", None)
+            if not broker or not hasattr(broker, "list_positions"):
+                return
+
+            # Get live broker positions
+            broker_positions = broker.list_positions() or []
+            broker_contracts = {
+                str(p.get("symbol") or "").upper()
+                for p in broker_positions
+                if int(p.get("quantity") or 0) != 0
+            }
+
+            # Get DB open positions
+            from ap.db import conn, run_with_retry
+            def _get_open():
+                with conn() as c:
+                    c.execute(
+                        "SELECT id, contract, underlying, avg_fill, qty "
+                        "FROM positions WHERE client_id=%s AND status='OPEN'",
+                        (self.email,)
+                    )
+                    return c.fetchall()
+
+            open_positions = run_with_retry(_get_open) or []
+
+            for pos in open_positions:
+                pos_id = pos.get("id")
+                contract = str(pos.get("contract") or "").upper()
+                if not contract or not pos_id:
+                    continue
+
+                # If this contract is no longer at the broker, it was manually closed
+                if contract not in broker_contracts:
+                    logger.warning(
+                        "[%s] Manual close detected: %s not in broker positions — marking CLOSED",
+                        self.email, contract
+                    )
+                    try:
+                        from datetime import datetime, timezone
+                        now_iso = datetime.now(timezone.utc).isoformat()
+                        def _close(pid=pos_id, ts=now_iso):
+                            with conn() as c:
+                                c.execute(
+                                    """UPDATE positions
+                                       SET status='CLOSED',
+                                           exit_ts=%s,
+                                           exit_reason='MANUAL_CLIENT_CLOSE',
+                                           close_source='manual_client_close',
+                                           updated_at=%s
+                                       WHERE id=%s AND status='OPEN'""",
+                                    (ts, ts, pid)
+                                )
+                        run_with_retry(_close)
+
+                        # Also notify exit engine to remove this position
+                        core = getattr(self, "core", None)
+                        exit_eng = getattr(core, "exit_eng", None) if core else None
+                        if exit_eng and hasattr(exit_eng, "mark_position_closed"):
+                            try:
+                                exit_eng.mark_position_closed(pos_id)
+                            except Exception:
+                                pass
+
+                        logger.info(
+                            "[%s] Position %s marked CLOSED (manual client close) | contract=%s",
+                            self.email, pos_id, contract
+                        )
+                    except Exception as close_err:
+                        logger.error(
+                            "[%s] Failed to mark manual close for pos=%s: %s",
+                            self.email, pos_id, close_err
+                        )
+        except Exception as exc:
+            logger.debug("[%s] _detect_manual_closes error (non-fatal): %s", self.email, exc)
+
     def _start_runtime_health_loop(self):
         interval = float(os.getenv("RUNNER_HEALTH_CHECK_SEC", "20"))
 
@@ -754,6 +843,7 @@ class ClientRunner(threading.Thread):
                 self._check_split_brain_recovery()   # BUG-5 FIX: poll for reconciler resolution
                 self._run_overnight_reeval_if_due()  # Arm WATCHING signals at 9:00-9:45 AM ET
                 self._run_exit_autonomous_recovery() # Resolve CLOSING-forever positions every 60s
+                self._detect_manual_closes()         # Detect broker-closed positions not in DB
                 self._set_entry_permission()
 
                 try:

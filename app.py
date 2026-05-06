@@ -1252,6 +1252,37 @@ def create_app() -> Flask:
             log.error(f"overnight_reeval endpoint failed: {e}", exc_info=True)
             return jsonify({"ok": False, "error": str(e)}), 500
 
+    @app.post("/admin/reseed_exit_engine")
+    @require_hmac
+    def reseed_exit_engine():
+        """Force the exit engine to reseed from DB — picks up manually seeded positions."""
+        from client_runner import _active_runners, _registry_lock
+        results = {}
+        with _registry_lock:
+            runners = dict(_active_runners)
+        for email, runner in runners.items():
+            try:
+                core = getattr(runner, "core", None)
+                exit_eng = getattr(core, "exit_eng", None) if core else None
+                if exit_eng and hasattr(exit_eng, "seed_from_db"):
+                    exit_eng.seed_from_db()
+                    # Also refresh quotes so exit engine has current prices
+                    if hasattr(exit_eng, "_refresh_quotes"):
+                        import threading
+                        threading.Thread(
+                            target=exit_eng._refresh_quotes,
+                            daemon=True,
+                            name=f"reseed-quote-refresh-{email}",
+                        ).start()
+                    results[email] = {"ok": True, "reseeded": True}
+                    log.info("[%s] Exit engine reseeded via admin endpoint", email)
+                else:
+                    results[email] = {"ok": False, "error": "exit_engine_not_found"}
+            except Exception as e:
+                results[email] = {"ok": False, "error": str(e)}
+                log.error("reseed_exit_engine failed for %s: %s", email, e)
+        return jsonify({"ok": True, "results": results})
+
     @app.get("/tradier/test")
     @require_hmac
     def tradier_test():
