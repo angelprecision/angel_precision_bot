@@ -712,33 +712,44 @@ class APExecutionCore:
         _ask = getattr(pos, "current_ask", 0) or 0
         _mid = getattr(pos, "current_option_price", 0) or 0
 
-        # EXIT PRICING POLICY:
-        # IMMEDIATE urgency (hard stop, never green, EOD) → market order.
-        #   Guarantee the fill. We'd rather fill at market than loop 10 rejected limits.
-        # HIGH urgency (profit lock, trailing stop, touched-profit) → mid price.
-        #   Options trade closer to mid in practice. Mid fills better than bid.
-        # Normal → mid price with slight discount.
-        # If neither bid nor mid available → block (zero-price exit is catastrophic).
+        # EXIT PRICING POLICY
+        # ─────────────────────────────────────────────────────────────────
+        # IMMEDIATE urgency (hard stop -33%, never-green, EOD) → MARKET ORDER
+        #   Must fill. Hard stops and EOD closes cannot miss. No slippage risk.
+        #
+        # HIGH urgency (scale-out +15%/+25%, trailing stop) → LIMIT AT MID
+        #   Place limit at current mid price. You booked +15% → get the +15%.
+        #   If the limit misses (moves away) → order expires → trail catches it next cycle.
+        #   This prevents getting stopped out by a wide spread and locks in the gain you earned.
+        #   No "2% discount" — if you've earned +15%, take $4.31 not $4.22.
+        #
+        # No quote available for IMMEDIATE → BLOCK (never submit zero-price stop)
+        # No quote available for HIGH → retry on next quote cycle (not blocking)
 
         _use_market = _urgency == "IMMEDIATE"
 
         if _use_market:
-            # Market order — no limit_price. Tradier will fill at NBBO.
             _exit_limit = None
-            exit_price = _mid if _mid > 0 else _bid  # for P&L logging only
-            log.info("[%s] MARKET EXIT — urgency=IMMEDIATE reason=%s", pos.ticker, decision.reason)
+            exit_price = _mid if _mid > 0 else _bid
+            if exit_price <= 0:
+                log.critical("[%s] CLOSE BLOCKED — no quote for IMMEDIATE exit | %s", pos.ticker, decision.reason)
+                return
+            log.info("[%s] MARKET EXIT @ est.$%.2f | urgency=IMMEDIATE | %s", pos.ticker, exit_price, decision.reason)
         elif _mid > 0:
-            # Mid price — slightly below mid to get fills without racing to the bottom
-            _exit_limit = max(round(_mid * 0.98, 2), 0.01)  # 2% below mid
+            # Limit at mid — no discount, no slippage. You earned the gain, take it.
+            _exit_limit = round(_mid, 2)
             exit_price = _exit_limit
+            log.info("[%s] LIMIT EXIT @ $%.2f (mid) | urgency=HIGH | %s", pos.ticker, _exit_limit, decision.reason)
         elif _bid > 0:
-            _exit_limit = _bid
+            _exit_limit = round(_bid, 2)
             exit_price = _exit_limit
+            log.info("[%s] LIMIT EXIT @ $%.2f (bid) | urgency=HIGH | %s", pos.ticker, _exit_limit, decision.reason)
         else:
-            log.critical(
-                "[%s] CLOSE BLOCKED — no valid bid or mid price for exit | %s",
-                pos.ticker, decision.reason,
-            )
+            if _urgency == "IMMEDIATE":
+                log.critical("[%s] CLOSE BLOCKED — no quote for IMMEDIATE exit | %s", pos.ticker, decision.reason)
+                return
+            # HIGH urgency with no quote — skip this cycle, trail will catch on next quote
+            log.warning("[%s] Exit skipped — no quote | will retry on next cycle | %s", pos.ticker, decision.reason)
             return
 
         if self.order_state_machine and pos.position_id:
