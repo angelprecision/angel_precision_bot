@@ -214,8 +214,10 @@ def init_db():
     import os as _os_db
     _bot_mode = _os_db.getenv("BOT_MODE", _os_db.getenv("MODE", "PAPER")).upper()
     try:
-        with conn() as c:
-            c.execute("SELECT 1")
+        def _probe():
+            with conn() as c:
+                c.execute("SELECT 1")
+        run_with_retry(_probe)
         log.info("✅ Postgres connection verified")
     except Exception as e:
         log.error(f"❌ Postgres connection failed: {e}")
@@ -405,8 +407,9 @@ def update_client_state(client_id: str = "default", updates: dict | None = None)
     set_values = list(safe.values())
     def _fn():
         with conn() as c:
-            # Auto-provision client + state rows before writing
-            # Prevents ForeignKeyViolation when a new member email is added
+            # Auto-provision client + state rows before writing.
+            # SQL kept in sync with ensure_client_exists() — both use ON CONFLICT DO NOTHING.
+            _now = now_utc_iso()
             c.execute(
                 """
                 INSERT INTO clients (
@@ -417,19 +420,19 @@ def update_client_state(client_id: str = "default", updates: dict | None = None)
                 ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 ON CONFLICT (client_id) DO NOTHING
                 """,
-                (client_id, client_id, 'tradier', '', '',
-                 'https://sandbox.tradier.com',
-                 0.0, 'ACTIVE',
-                 now_utc_iso(), 10, 7, 0.05, 0.10),
+                (client_id, client_id, 'tradier', '', '', 'https://sandbox.tradier.com',
+                 25000.0, 'ACTIVE', _now, 10, 7, 0.05, 0.10),
             )
             c.execute(
                 """
-                INSERT INTO client_state (client_id, current_equity, starting_equity_today,
-                    realized_pnl_today, trades_taken_today, mode, updated_at)
-                VALUES (%s, 0, 0, 0, 0, 'PAPER', NOW())
+                INSERT INTO client_state (
+                    client_id, current_equity, starting_equity_today,
+                    realized_pnl_today, trades_taken_today, daily_stop_hit,
+                    kill_switch, mode, day_key, updated_at
+                ) VALUES (%s,%s,%s,0.0,0,0,False,'PAPER',NULL,%s)
                 ON CONFLICT (client_id) DO NOTHING
                 """,
-                (client_id,),
+                (client_id, 25000.0, 25000.0, _now),
             )
             # Apply the actual updates
             c.execute(
@@ -664,11 +667,17 @@ def get_open_orders_for_reconcile(client_id: str | None = None,
             if client_id:
                 c.execute(
                     "SELECT * FROM orders WHERE client_id=%s "
-                    "AND status IN ('CREATED','SUBMITTED','ACKNOWLEDGED','PARTIAL_FILL') "
+                    "AND status IN ("
+                    "  'CREATED','SUBMITTED','ACKNOWLEDGED','PARTIAL_FILL',"
+                    "  'EXIT_REQUESTED','EXIT_SUBMITTED','EXIT_ACKNOWLEDGED','EXIT_PARTIAL_FILL'"
+                    ") "
                     "ORDER BY created_ts DESC LIMIT %s", (client_id, limit))
             else:
                 c.execute(
-                    "SELECT * FROM orders WHERE status IN ('CREATED','SUBMITTED','ACKNOWLEDGED','PARTIAL_FILL') "
+                    "SELECT * FROM orders WHERE status IN ("
+                    "  'CREATED','SUBMITTED','ACKNOWLEDGED','PARTIAL_FILL',"
+                    "  'EXIT_REQUESTED','EXIT_SUBMITTED','EXIT_ACKNOWLEDGED','EXIT_PARTIAL_FILL'"
+                    ") "
                     "ORDER BY created_ts DESC LIMIT %s", (limit,))
             return c.fetchall()
     return run_with_retry(_fn)
