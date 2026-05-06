@@ -443,13 +443,23 @@ def create_app() -> Flask:
         "X-AP-Signature", "Idempotency-Key", "X-API-Key", "X-Admin-Key",
         "X-Signature",  # ✅ Added for simple HMAC scheme
     ]
+    _trusted_origins = [
+        "https://www.angelprecision.com",
+        "https://angelprecision.com",
+        "https://angel-precision-dashboard-backend.onrender.com",
+        "https://angel-precision-bot-official-1.onrender.com",
+        # Add client-specific origins here as they onboard
+    ]
+    # Public endpoints open to any origin (scanner POSTs use HMAC auth, not origin)
+    _open_origins = ["*"]
+
     CORS(app, resources={
-        r"/client/*": {"origins": ["*"], "methods": ["GET", "POST", "PATCH"], "allow_headers": allow_headers},
-        r"/admin/*": {"origins": ["*"], "methods": ["GET", "POST", "PATCH"], "allow_headers": allow_headers},
-        r"/signal": {"origins": ["*"], "methods": ["POST"], "allow_headers": allow_headers},
-        r"/scanner/*": {"origins": ["*"], "methods": ["POST"], "allow_headers": allow_headers},
-        r"/control/*": {"origins": ["*"], "methods": ["POST"], "allow_headers": allow_headers},
-        r"/rental/*": {"origins": ["*"], "methods": ["GET", "POST"], "allow_headers": allow_headers},
+        r"/client/*": {"origins": _trusted_origins, "methods": ["GET", "POST", "PATCH"], "allow_headers": allow_headers},
+        r"/admin/*":  {"origins": _trusted_origins, "methods": ["GET", "POST", "PATCH"], "allow_headers": allow_headers},
+        r"/signal":   {"origins": _open_origins,    "methods": ["POST"],                 "allow_headers": allow_headers},
+        r"/scanner/*":{"origins": _open_origins,    "methods": ["POST"],                 "allow_headers": allow_headers},
+        r"/control/*":{"origins": _open_origins,    "methods": ["POST"],                 "allow_headers": allow_headers},
+        r"/rental/*": {"origins": _trusted_origins, "methods": ["GET", "POST"],          "allow_headers": allow_headers},
     })
 
     # Security headers
