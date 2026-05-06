@@ -197,19 +197,12 @@ def validate_overnight_daily_signal(
         )
 
     if snapshot is None:
-        log.warning(
-            "[%s] OVERNIGHT_DAILY_SNAPSHOT_UNAVAILABLE — allowing PAPER setup through using prior-day levels only",
-            ticker,
-        )
-        return ValidationResult(
-            True,
-            "SNAPSHOT_UNAVAILABLE_FAIL_OPEN_PAPER",
-            "Snapshot unavailable; allowing PAPER setup through using prior-day levels only.",
-            prior_day_high,
-            prior_day_low,
-            None,
-            None,
-            side,
+        return _missing_data_result(
+            ticker=ticker,
+            side=side,
+            prior_day_high=prior_day_high,
+            prior_day_low=prior_day_low,
+            snapshot_missing=True,
         )
 
     sh = snapshot.session_high_so_far
@@ -293,10 +286,15 @@ def recheck_overnight_daily(watched, broker) -> ValidationResult:
         prior_day_low = float(signal.get("prior_day_low") or 0) or None
     except Exception:
         prior_day_low = None
-    snapshot = fetch_market_snapshot(watched.ticker, broker)
+    _underlying = (
+        getattr(watched, "underlying", None)
+        or getattr(watched, "symbol", None)
+        or watched.ticker
+    )
+    snapshot = fetch_market_snapshot(_underlying, broker)
 
     return validate_overnight_daily_signal(
-        ticker=watched.ticker,
+        ticker=_underlying,
         side=watched.side,
         prior_day_high=prior_day_high,
         prior_day_low=prior_day_low,
