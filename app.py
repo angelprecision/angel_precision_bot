@@ -45,9 +45,9 @@ _client_status_cache: dict = {}   # {client_id: (status, expires_ts)}
 _kill_switch_cache:   dict = {}   # {client_id: (kill_val, mode, expires_ts)}
 _CACHE_TTL = 30.0                 # seconds -- refresh every 30s
 
-# HIGH-007: gate supervisor behind env var -- do not start at import time
-if os.getenv("RUN_SUPERVISOR") == "1":
-    start_multi_client_supervisor()
+# HIGH-007: supervisor started in gunicorn post_worker_init hook ONLY.
+# Do NOT call start_multi_client_supervisor() here -- this is module import scope.
+# gunicorn.conf.py post_worker_init is the sole authoritative startup path.
 
 # ============================================================
 # GLOBALS (gunicorn safe - no threads at import time)
