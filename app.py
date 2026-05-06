@@ -1297,6 +1297,95 @@ def create_app() -> Flask:
                 log.error("reseed_exit_engine failed for %s: %s", email, e)
         return jsonify({"ok": True, "results": results})
 
+    @app.post("/admin/nightly_reconcile")
+    @require_hmac
+    def nightly_reconcile():
+        """
+        Nightly reconciliation: compare DB open positions against Tradier live positions.
+        Alerts on mismatches. Called by cron job after market close.
+        """
+        from client_runner import _active_runners, _registry_lock
+        results = {}
+        with _registry_lock:
+            runners = dict(_active_runners)
+
+        for email, runner in runners.items():
+            try:
+                broker = getattr(runner, "broker", None)
+                if not broker or not hasattr(broker, "list_positions"):
+                    results[email] = {"ok": False, "error": "no_broker"}
+                    continue
+
+                # Get broker positions
+                broker_positions = broker.list_positions() or []
+                broker_contracts = {
+                    str(p.get("symbol") or "").upper(): int(p.get("quantity") or 0)
+                    for p in broker_positions
+                    if int(p.get("quantity") or 0) != 0
+                }
+
+                # Get DB open positions
+                from ap.db import conn, run_with_retry
+                def _get_open(em=email):
+                    with conn() as c:
+                        c.execute(
+                            "SELECT id, contract, underlying, avg_fill, qty, status "
+                            "FROM positions WHERE client_id=%s AND status IN ('OPEN','CLOSING')",
+                            (em,)
+                        )
+                        return c.fetchall()
+
+                db_positions = run_with_retry(_get_open) or []
+                db_contracts = {
+                    str(p.get("contract") or "").upper(): p
+                    for p in db_positions
+                }
+
+                mismatches = []
+
+                # DB says open but broker doesn't have it
+                for contract, pos in db_contracts.items():
+                    if contract not in broker_contracts:
+                        mismatches.append({
+                            "type": "db_open_not_at_broker",
+                            "contract": contract,
+                            "position_id": pos.get("id"),
+                            "status": pos.get("status"),
+                        })
+
+                # Broker has it but DB doesn't
+                for contract, qty in broker_contracts.items():
+                    if contract not in db_contracts:
+                        mismatches.append({
+                            "type": "broker_position_missing_from_db",
+                            "contract": contract,
+                            "qty": qty,
+                        })
+
+                if mismatches:
+                    log.warning(
+                        "[%s] NIGHTLY_RECONCILE: %d mismatch(es) found: %s",
+                        email, len(mismatches), mismatches
+                    )
+
+                results[email] = {
+                    "ok": True,
+                    "db_open": len(db_positions),
+                    "broker_open": len(broker_contracts),
+                    "mismatches": mismatches,
+                    "mismatch_count": len(mismatches),
+                }
+            except Exception as e:
+                results[email] = {"ok": False, "error": str(e)}
+                log.error("nightly_reconcile failed for %s: %s", email, e)
+
+        total_mismatches = sum(r.get("mismatch_count", 0) for r in results.values() if isinstance(r, dict))
+        return jsonify({
+            "ok": True,
+            "results": results,
+            "total_mismatches": total_mismatches,
+        })
+
     @app.get("/tradier/test")
     @require_hmac
     def tradier_test():

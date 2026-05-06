@@ -1,0 +1,50 @@
+name: Nightly Position Reconciliation
+
+on:
+  schedule:
+    - cron: '30 21 * * 1-5'   # 5:30 PM ET (21:30 UTC) weekdays — after market close
+  workflow_dispatch:
+
+jobs:
+  reconcile:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Run nightly position reconciliation
+        env:
+          BOT_URL: ${{ secrets.BOT_URL }}
+          SIGNING_SECRET: ${{ secrets.SIGNING_SECRET }}
+        run: |
+          python3 -c "
+          import hmac, hashlib, time, json, urllib.request, os, sys
+
+          secret = os.environ['SIGNING_SECRET'].encode()
+          bot_url = os.environ.get('BOT_URL', 'https://angel-precision-bot-official-1.onrender.com')
+          body = b'{}'
+          ts = str(int(time.time()))
+          sig = hmac.new(secret, ts.encode() + b'.' + body, hashlib.sha256).hexdigest()
+
+          req = urllib.request.Request(
+              f'{bot_url}/admin/nightly_reconcile',
+              data=body,
+              headers={
+                  'Content-Type': 'application/json',
+                  'X-AP-Timestamp': ts,
+                  'X-AP-Signature': sig,
+                  'X-Client-Id': 'tradefluencehq@gmail.com',
+              },
+              method='POST'
+          )
+          try:
+              with urllib.request.urlopen(req, timeout=30) as r:
+                  data = json.loads(r.read())
+                  print(json.dumps(data, indent=2))
+                  mismatches = data.get('total_mismatches', 0)
+                  if mismatches > 0:
+                      print(f'WARNING: {mismatches} position mismatch(es) found — review required')
+                      sys.exit(1)
+                  else:
+                      print('All positions reconciled — no mismatches')
+          except Exception as e:
+              print(f'Reconciliation failed: {e}')
+              sys.exit(1)
+          "
