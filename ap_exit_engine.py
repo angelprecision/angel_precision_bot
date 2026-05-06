@@ -115,7 +115,7 @@ PROTECT_3_THRESHOLD   = 0.15   # +15% → EOD protection if past 2:00 PM
 # Once peak >= 15%, the trailing stop engine kicks in at TRAIL_DROP_FROM_PEAK
 # We do NOT sell everything at 15% — we let it run to 20%, 30%+ with trail
 IMMEDIATE_TP_PCT      = 0.15   # +15% → ACTIVATES trailing stop (does NOT auto-sell)
-HARD_STOP_PCT         = -0.30  # -30% → exit immediately regardless of time
+HARD_STOP_PCT         = -0.33  # -33% → hard stop (gives one recovery breath vs -30%)
 PROFIT_LOCK_PCT       = 0.12   # once past 15%, don't fall below +12% (protects a real gain)
 
 _INDEX_ETFS = {"QQQ", "SPY", "IWM", "DIA", "SPX"}
