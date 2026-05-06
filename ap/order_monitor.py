@@ -798,10 +798,11 @@ class APOrderMonitor:
             return dict(row) if row else None
         except Exception as e:
             log.error(
-                "[%s] Failed checking newer replacement exit | pos=%s old_exit=%s: %s",
+                "[%s] Failed checking newer replacement exit | pos=%s old_exit=%s: %s — "
+                "assuming no replacement; proceeding with position reopen",
                 self.client_id, position_id, canceled_exit_order_id, e,
             )
-            return {"local_order_id": "UNKNOWN_REPLACEMENT_CHECK_FAILED", "status": "UNKNOWN"}
+            return None  # safe: caller proceeds with position reopen on None
 
     def _query_broker_order(self, broker_order_id: Optional[str]) -> Optional[str]:
         if not broker_order_id or not self.broker:
@@ -965,6 +966,22 @@ class APOrderMonitor:
                         "[%s] clear_exit_in_flight failed for pos=%s status=%s: %s",
                         self.client_id, _pos_id, s, _e2,
                     )
+            # Revert position to OPEN so the exit engine can re-submit.
+            # Without this, the position stays CLOSING and the exit engine
+            # never re-submits even after clearing in-flight.
+            if _pos_id and self.pm:
+                try:
+                    self._guarded_revert_position_open_after_exit_cancel(
+                        position_id=_pos_id,
+                        canceled_exit_order_id=local_order_id,
+                        contract=contract,
+                        reason=f"broker_terminal_status={s}",
+                    )
+                except Exception as _e3:
+                    log.error(
+                        "[%s] _guarded_revert failed after broker terminal exit status=%s pos=%s: %s",
+                        self.client_id, s, _pos_id, _e3,
+                    )
 
     def _get_broker_order_id(self, local_order_id: str) -> Optional[str]:
         try:
@@ -1050,12 +1067,11 @@ class APOrderMonitor:
                     if bid > 0 and ask > 0:
                         return (bid + ask) / 2
             if hasattr(self.broker, "session") and hasattr(self.broker, "cfg"):
-                import requests as _req
                 cfg = self.broker.cfg
                 base = getattr(cfg, "base_url", "https://sandbox.tradier.com")
                 token = getattr(cfg, "access_token", None) or getattr(cfg, "token", "")
                 headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
-                resp = _req.get(
+                resp = self.broker.session.get(
                     f"{base}/v1/markets/quotes",
                     params={"symbols": symbol, "greeks": "false"},
                     headers=headers, timeout=(3.05, 5),
