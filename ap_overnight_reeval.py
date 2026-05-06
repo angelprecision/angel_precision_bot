@@ -112,13 +112,12 @@ def run_overnight_reeval(
             log.info("[%s] overnight_reeval: skipping — not a trading day", client_id)
             result["skipped"] = -1
             return result
-        if not (9 <= now_et.hour < 10 or (now_et.hour == 9 and now_et.minute <= 45)):
-            # Also allow 9:00-9:45
-            if not (now_et.hour == 9 and 0 <= now_et.minute <= 45):
-                log.info("[%s] overnight_reeval: skipping — outside 9:00-9:45 AM ET window (now=%02d:%02d)",
-                         client_id, now_et.hour, now_et.minute)
-                result["skipped"] = -1
-                return result
+        _in_window = (now_et.hour == 9 and 0 <= now_et.minute <= 45)
+        if not _in_window:
+            log.info("[%s] overnight_reeval: skipping — outside 9:00-9:45 AM ET window (now=%02d:%02d)",
+                     client_id, now_et.hour, now_et.minute)
+            result["skipped"] = -1
+            return result
 
     # Fetch WATCHING signals from trade_queue
     watching_signals = _fetch_watching_signals(client_id)
@@ -240,54 +239,60 @@ def run_overnight_reeval(
                 result["errors"] += 1
                 continue
 
-            # Step 5: Contract selection
+            # Step 5: Contract selection — pass decision.plan (ApprovedExecutionPlan),
+            # not the raw signal dict. select() mutates plan in-place (contract_symbol,
+            # limit_price, contracts, max_position_usd) and returns SelectedContract.
             try:
-                plan = contract_selector.select(signal)
+                selected = contract_selector.select(decision.plan)
             except Exception as cs_exc:
                 log.error("[%s] overnight_reeval: contract_selector.select failed: %s", ticker, cs_exc)
                 _mark_job_rejected(job_id, client_id, f"contract_selection_failed:{cs_exc}")
                 result["rejected"] += 1
                 continue
 
-            if not plan or not getattr(plan, "contract", None):
+            # After select() with mutate_plan=True (default), decision.plan.contract_symbol
+            # is populated. selected=None means no valid contract found.
+            if not selected or not getattr(decision.plan, "contract_symbol", None):
                 log.warning("[%s] overnight_reeval: no contract found for %s", ticker, signal_id)
                 _mark_job_rejected(job_id, client_id, "no_contract_selected")
                 result["rejected"] += 1
                 continue
 
-            # Ensure entry_trigger propagates to the plan
-            if entry_trigger and not getattr(plan, "entry_trigger", None):
+            # Propagate entry_trigger and overnight flag to the plan
+            if entry_trigger:
                 try:
-                    plan.entry_trigger = entry_trigger
-                    plan.trigger_type = "breach"
-                    plan.overnight = True
+                    decision.plan.trigger_price = float(entry_trigger)
+                    decision.plan.trigger_type  = "breach"
+                    decision.plan.metadata["overnight"] = True
                 except Exception:
                     pass
 
-            # Step 6: Create OSM entry order
+            # Step 6: Create OSM entry order — let OSM generate a fresh UUID.
+            # Do NOT pass local_order_id: static IDs cause OSM conflicts on retry.
             try:
-                local_order_id = f"{signal_id}:{client_id}"
-                osm_result = order_state_machine.create_entry_order(
-                    signal=signal,
-                    plan=plan,
-                    client_id=client_id,
-                    local_order_id=local_order_id,
-                )
+                local_order_id = order_state_machine.create_entry_order(decision.plan)
             except Exception as osm_exc:
                 log.error("[%s] overnight_reeval: OSM create_entry_order failed: %s", ticker, osm_exc)
                 result["errors"] += 1
                 continue
 
-            # Step 7: Arm entry watcher
+            if not local_order_id:
+                log.error("[%s] overnight_reeval: OSM returned no local_order_id for %s", ticker, signal_id)
+                result["errors"] += 1
+                continue
+
+            # Step 7: Arm entry watcher — pass plan (not signal) and the OSM order ID
+            _contract_sym = decision.plan.contract_symbol or ""
             try:
-                armed = entry_watcher.watch(plan, local_order_id)
+                armed = entry_watcher.watch(decision.plan, local_order_id)
                 if armed:
-                    _mark_job_watching_armed(job_id, client_id, plan.contract)
-                    log.info("[%s] ✅ ARMED for tomorrow — contract=%s entry_trigger=%.4f",
-                             ticker, plan.contract, entry_trigger or 0)
+                    _mark_job_watching_armed(job_id, client_id, _contract_sym)
+                    log.info("[%s] ✅ ARMED — contract=%s entry_trigger=%.4f",
+                             ticker, _contract_sym, entry_trigger or 0)
                     result["armed"] += 1
                 else:
-                    log.error("[%s] overnight_reeval: entry_watcher.watch() returned False", ticker)
+                    log.error("[%s] overnight_reeval: entry_watcher.watch() returned False | contract=%s",
+                              ticker, _contract_sym)
                     result["errors"] += 1
             except Exception as ew_exc:
                 log.error("[%s] overnight_reeval: entry_watcher.watch failed: %s", ticker, ew_exc)
@@ -308,19 +313,12 @@ def run_overnight_reeval(
 def _fetch_watching_signals(client_id: str) -> list:
     """Fetch WATCHING jobs from local trade_queue for this client."""
     try:
-        import psycopg2, os
-        DATABASE_URL = os.getenv("DATABASE_URL", "")
-        if not DATABASE_URL:
-            log.error("_fetch_watching_signals: DATABASE_URL not set")
-            return []
-        dsn = DATABASE_URL
-        if "sslmode" not in dsn:
-            dsn += ("?sslmode=require" if "?" not in dsn else "&sslmode=require")
-        conn = psycopg2.connect(dsn, connect_timeout=10)
-        conn.autocommit = True
-        try:
-            with conn.cursor() as cur:
-                cur.execute("""
+        from ap.db import conn, run_with_retry
+        import json as _j
+
+        def _fn():
+            with conn() as c:
+                c.execute("""
                     SELECT id, signal_id, payload, created_ts
                     FROM trade_queue
                     WHERE client_id = %s
@@ -328,22 +326,19 @@ def _fetch_watching_signals(client_id: str) -> list:
                     ORDER BY created_ts DESC
                     LIMIT 100
                 """, (client_id,))
-                cols = [d[0] for d in cur.description]
-                rows = cur.fetchall()
-                result = []
-                for row in rows:
-                    d = dict(zip(cols, row))
-                    # payload may be stored as JSON string or dict
-                    if isinstance(d.get("payload"), str):
-                        import json as _j
-                        try:
-                            d["payload"] = _j.loads(d["payload"])
-                        except Exception:
-                            pass
-                    result.append(d)
-                return result
-        finally:
-            conn.close()
+                return c.fetchall()
+
+        rows = run_with_retry(_fn) or []
+        result = []
+        for row in rows:
+            d = dict(row) if not isinstance(row, dict) else row
+            if isinstance(d.get("payload"), str):
+                try:
+                    d["payload"] = _j.loads(d["payload"])
+                except Exception:
+                    pass
+            result.append(d)
+        return result
     except Exception as e:
         log.error("_fetch_watching_signals failed: %s", e)
         return []
@@ -351,24 +346,19 @@ def _fetch_watching_signals(client_id: str) -> list:
 
 def _mark_job_rejected(job_id: int, client_id: str, reason: str) -> None:
     try:
-        import psycopg2, os
-        DATABASE_URL = os.getenv("DATABASE_URL", "")
-        if not DATABASE_URL:
-            return
-        dsn = DATABASE_URL + ("?sslmode=require" if "?" not in DATABASE_URL else "&sslmode=require")
-        conn = psycopg2.connect(dsn, connect_timeout=10)
-        conn.autocommit = True
-        try:
-            with conn.cursor() as cur:
-                cur.execute("""
+        from ap.db import conn, run_with_retry
+
+        def _fn():
+            with conn() as c:
+                c.execute("""
                     UPDATE trade_queue
                     SET status = 'REJECTED',
                         last_error = %s,
                         finished_ts = NOW()
                     WHERE id = %s AND client_id = %s
                 """, (reason[:500], job_id, client_id))
-        finally:
-            conn.close()
+
+        run_with_retry(_fn)
     except Exception as e:
         log.debug("_mark_job_rejected failed (non-fatal): %s", e)
 
@@ -376,23 +366,18 @@ def _mark_job_rejected(job_id: int, client_id: str, reason: str) -> None:
 def _mark_job_watching_armed(job_id: int, client_id: str, contract: str) -> None:
     """Update the WATCHING job to record that it has been armed in the watcher."""
     try:
-        import psycopg2, os
-        DATABASE_URL = os.getenv("DATABASE_URL", "")
-        if not DATABASE_URL:
-            return
-        dsn = DATABASE_URL + ("?sslmode=require" if "?" not in DATABASE_URL else "&sslmode=require")
-        conn = psycopg2.connect(dsn, connect_timeout=10)
-        conn.autocommit = True
-        try:
-            with conn.cursor() as cur:
-                cur.execute("""
+        from ap.db import conn, run_with_retry
+
+        def _fn():
+            with conn() as c:
+                c.execute("""
                     UPDATE trade_queue
                     SET last_error = %s,
                         started_ts = COALESCE(started_ts, NOW())
                     WHERE id = %s AND client_id = %s
                 """, (f"armed:contract={contract}"[:500], job_id, client_id))
-        finally:
-            conn.close()
+
+        run_with_retry(_fn)
     except Exception as e:
         log.debug("_mark_job_watching_armed failed (non-fatal): %s", e)
 
