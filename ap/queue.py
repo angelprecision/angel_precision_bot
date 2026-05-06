@@ -277,6 +277,25 @@ def _claim_one_job(client_id: str = "default") -> Optional[dict]:
 # DISPATCH -- master control path
 # =============================================================================
 
+# Module-level Supabase client singleton — initialized once, reused across all rejection logs.
+_sb_client_singleton = None
+
+def _get_sb_client():
+    """Lazy-init module-level Supabase client. Returns None if env vars not set."""
+    global _sb_client_singleton
+    if _sb_client_singleton is None:
+        try:
+            import os as _os
+            from supabase import create_client as _cc
+            _url = _os.getenv("SUPABASE_URL", "")
+            _key = _os.getenv("SUPABASE_SERVICE_KEY", "")
+            if _url and _key:
+                _sb_client_singleton = _cc(_url, _key)
+        except Exception:
+            pass
+    return _sb_client_singleton
+
+
 def _log_rejection_to_db(
     signal_id: str,
     client_id: str,
@@ -292,13 +311,10 @@ def _log_rejection_to_db(
     Uses exact ap_signals schema columns. Non-fatal — never blocks the trade path.
     """
     try:
-        import os as _os, uuid as _uuid
-        from supabase import create_client as _cc
-        _sb_url = _os.getenv("SUPABASE_URL", "")
-        _sb_key = _os.getenv("SUPABASE_SERVICE_KEY", "")
-        if not _sb_url or not _sb_key:
+        import uuid as _uuid
+        _sbc = _get_sb_client()
+        if _sbc is None:
             return
-        _sbc = _cc(_sb_url, _sb_key)
         _sbc.table("ap_signals").upsert({
             "signal_id":       str(signal_id or _uuid.uuid4()),
             "client_email":    str(client_id),
@@ -349,8 +365,10 @@ def _dispatch(
     """
     ticker = payload.get("ticker") or payload.get("symbol", "?")
 
-    # live_mode must be defined locally — it is NOT passed as a parameter.
-    # Derive from master_control.mode so LIVE fail-closed logic is always correct.
+    # live_mode is derived from master_control.mode — it is NOT passed as a parameter.
+    # master_control is the sole authority for LIVE vs PAPER mode in _dispatch.
+    # worker_loop's live_mode parameter is only used for the mode label log and
+    # legacy-fallback guard; it does not affect _dispatch fail-closed logic.
     live_mode: bool = str(getattr(master_control, "mode", "PAPER")).upper() == "LIVE"
 
     # ── 0. RESTART GUARD ─────────────────────────────────────────────────────
@@ -460,11 +478,7 @@ def _dispatch(
             _in_session = _is_regular_session_et(_now_et_def)
             if not _in_session and _is_deferrable:
                 import uuid as _uuid
-                import os as _os
-                from supabase import create_client as _create_client
-                _sb_url = _os.getenv("SUPABASE_URL", "")
-                _sb_key = _os.getenv("SUPABASE_SERVICE_KEY", "")
-                _sbc = _create_client(_sb_url, _sb_key) if _sb_url and _sb_key else None
+                _sbc = _get_sb_client()
                 if _sbc:
                     _sig_id = str(payload.get("signal_id") or _uuid.uuid4())
                     _sbc.table("ap_signals").upsert({
@@ -538,11 +552,11 @@ def _dispatch(
                 "this record is informational only (not in execution pipeline).",
                 ticker, signal_id,
             )
-            # Status: WATCHING is the closest available status for "deferred/informational".
-            # CONTRACT SELECTION DID NOT RUN. This record is audit-only.
-            # It is NOT in the execution pipeline — no watcher is armed, no order created.
+            # Status: EXPIRED — this record is audit-only. No watcher armed, no OSM order created.
+            # WATCHING is reserved for live breach-watch jobs (watcher armed + OSM order exists).
+            # After-hours records use EXPIRED so they are never reprocessed on restart.
             # Tomorrow's scanner generates new signal_ids → fresh jobs → full execution path.
-            _mark_job(job_id, "WATCHING", error="after_hours_deferred:audit_only")
+            _mark_job(job_id, "EXPIRED", error="after_hours_deferred:audit_only")
             # Log to ap_signals for permanent structured record
             _log_rejection_to_db(
                 signal_id=signal_id, client_id=client_id, ticker=ticker,
