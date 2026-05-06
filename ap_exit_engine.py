@@ -98,14 +98,16 @@ KILL_BLOCKS_NON_PROTECTIVE_EXITS = (
 
 # ── P&L THRESHOLDS ────────────────────────────────────────────────────────────
 THETA_STOP_LOSS_PCT   = -0.35  # -35% on option → stop
-# ── SCALE-OUT LADDER (33/33/34 split) ───────────────────────────────────────
-# Target: avg win 20-25% | let runners reach 30%+
-# Scale 1: take first third at +10% → reduces risk, banks a guaranteed win
-# Scale 2: take second third at +20% → locks in strong gain
-# Scale 3: hold final third with trailing stop until 30%+ or trail fires
-SCALE_OUT_1_THRESHOLD = 0.15   # +15% → sell 33% (first lock — lets small moves pass)
-SCALE_OUT_2_THRESHOLD = 0.25   # +25% → sell another 33% (strong winner)
-SCALE_OUT_3_THRESHOLD = 0.40   # +40% → close remainder (let runner go far)
+# ── SCALE-OUT LADDER (33/33/runner) ─────────────────────────────────────────
+# Strategy: bank gains in thirds, let the runner ride as far as it goes.
+# The TRAILING STOP (not a fixed cap) decides when the runner exits.
+# No ceiling — if a position goes 87% like last week, the trail catches it there.
+# Scale 1: +15% → sell 1/3  (first lock, still have 2/3 running)
+# Scale 2: +25% → sell 1/3  (second lock, 1/3 runner remains)
+# Runner:  trail exit at TRAIL_DROP_FROM_PEAK below peak — could be 30%, 50%, 87%
+SCALE_OUT_1_THRESHOLD = 0.15   # +15% → sell first third
+SCALE_OUT_2_THRESHOLD = 0.25   # +25% → sell second third
+# NO SCALE_OUT_3 — runner exits via trailing stop only, no fixed ceiling
 PROTECT_3_THRESHOLD   = 0.15   # +15% → EOD protection if past 2:00 PM
 
 # ── IMMEDIATE TAKE-PROFIT (any time, no window gate) ──────────────────────────
@@ -404,20 +406,12 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
             )
 
     # Scale 3: +30% → close remainder (full exit for final runner)
-    if option_pnl >= SCALE_OUT_3_THRESHOLD and pos.scale_outs_done >= 2:
-        return ExitDecision(
-            action="CLOSE_ALL", quantity=qty_rem,
-            reason=f"SCALE_3 (+30%) -- runner target reached, full exit",
-            urgency="HIGH", pnl_pct=option_pnl,
-        )
+    # Runner (scale_outs_done >= 2): exits via trail only — no fixed ceiling
+    # Could reach 30%, 50%, 87% — trail catches it wherever it peaks
 
     # For single contracts or runners at +30%+: close at +30%
-    if option_pnl >= SCALE_OUT_3_THRESHOLD and pos.scale_outs_done == 0 and qty_rem == 1:  # +40% single-contract close
-        return ExitDecision(
-            action="CLOSE_ALL", quantity=qty_rem,
-            reason=f"SINGLE_CONTRACT_TP (+30%) -- {option_pnl*100:.0f}% target hit",
-            urgency="HIGH", pnl_pct=option_pnl,
-        )
+    # Single contract: no fixed ceiling — trail exit only
+    # Let it go to 87%+ if the momentum is there
 
     # ── RUNNER TRAIL ──────────────────────────────────────────────────────────
     # FIX-1: Discord runner alert moved to _submit_exit_decision(). This branch
