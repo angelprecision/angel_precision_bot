@@ -57,7 +57,7 @@ cfg = Config()
 log = get_logger("app")
 log.info(f"CONFIG LOADED FROM: {__import__('ap.config').config.__file__}")
 
-APP_ENV = os.getenv("APP_ENV", "dev").lower().strip()
+APP_ENV = os.getenv("APP_ENV", "prod").lower().strip()
 SIGNING_SECRET = os.getenv("SIGNING_SECRET", "").encode()
 log.info("SIGNING_SECRET_SHA256_8=" + hashlib.sha256(SIGNING_SECRET).hexdigest()[:8])
 
@@ -77,6 +77,7 @@ RATE_LIMIT_PER_MIN = int(os.getenv("RATE_LIMIT_PER_MIN", "60"))
 # Idempotency cache (per worker - upgrade to Redis later)
 _IDEMP = {}
 _IDEMP_LAST_CLEANUP: float = 0.0
+_SELF_HEAL_IN_PROGRESS = threading.Event()
 IDEMP_TTL_SECONDS = int(os.getenv("IDEMP_TTL_SECONDS", "300"))
 
 # HMAC time drift (seconds)
@@ -85,6 +86,7 @@ HMAC_MAX_SKEW_SECONDS = int(os.getenv("HMAC_MAX_SKEW_SECONDS", "300"))  # ✅ 5 
 # Threads
 THREADS_STARTED = False
 THREAD_LOCK = threading.Lock()
+_IDEMP_LOCK = threading.Lock()
 
 MAX_CONTENT_LENGTH = int(os.getenv("MAX_CONTENT_LENGTH_BYTES", str(256 * 1024)))
 
@@ -113,7 +115,7 @@ def _rate_limited(bucket: str) -> bool:
 def _idem_cleanup():
     global _IDEMP_LAST_CLEANUP
     now = time.time()
-    with THREAD_LOCK:
+    with _IDEMP_LOCK:
         if now - _IDEMP_LAST_CLEANUP < 1.0:
             return
         _IDEMP_LAST_CLEANUP = now
@@ -126,14 +128,14 @@ def _idem_get(key: str):
     if not key:
         return None
     _idem_cleanup()
-    with THREAD_LOCK:
+    with _IDEMP_LOCK:
         hit = _IDEMP.get(key)
     return hit[1] if hit else None
 
 
 def _idem_set(key: str, payload: dict):
     if key:
-        with THREAD_LOCK:
+        with _IDEMP_LOCK:
             _IDEMP[key] = (time.time(), payload)
 
 
@@ -613,17 +615,23 @@ def create_app() -> Flask:
                 with _rl:
                     _any_alive = any(r.is_alive() for r in _ar.values())
                 if not _any_alive and _su and _sk:
-                    from supabase import create_client as _cc2
-                    _members2 = _fam(_cc2(_su, _sk))
-                    for _m2 in _members2:
-                        _email2 = _m2["email"]
-                        with _rl:
-                            _ex2 = _ar.get(_email2)
-                            if not _ex2 or not _ex2.is_alive():
-                                _r2 = _CR(_m2)
-                                _ar[_email2] = _r2
-                                _r2.start()
-                                log.info(f"signal self-heal: started runner for {_email2}")
+                    if not _SELF_HEAL_IN_PROGRESS.is_set():
+                        _SELF_HEAL_IN_PROGRESS.set()
+                        try:
+                            from supabase import create_client as _cc2
+                            _members2 = _fam(_cc2(_su, _sk))
+                            for _m2 in _members2:
+                                _email2 = _m2["email"]
+                                with _rl:
+                                    _ex2 = _ar.get(_email2)
+                                    if not _ex2 or not _ex2.is_alive():
+                                        _r2 = _CR(_m2)
+                                        _ar[_email2] = _r2
+                                        _r2.start()
+                                        log.info(f"signal self-heal: started runner for {_email2}")
+                        finally:
+                            _SELF_HEAL_IN_PROGRESS.clear()
+                    # else: another request is already healing — signals are enqueued durably
         except Exception as _she:
             log.warning(f"signal self-heal error (non-fatal): {_she}")
         ip = _client_ip()
