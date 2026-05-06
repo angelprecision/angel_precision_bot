@@ -728,28 +728,53 @@ class APExecutionCore:
 
         _use_market = _urgency == "IMMEDIATE"
 
+        # LIMIT-TO-MARKET ESCALATION for HIGH urgency exits:
+        # If a limit order was placed and hasn't filled within the escalation window,
+        # step down the price and eventually go market. Prevents sitting on a 22% gain
+        # while the price slides back. Tracked via pos._exit_submit_ts and _exit_attempts.
+        _exit_submit_ts = getattr(pos, "_exit_submit_ts", 0) or 0
+        _exit_attempts  = getattr(pos, "_exit_attempts",  0) or 0
+        _age_since_submit = time.time() - _exit_submit_ts if _exit_submit_ts else 999
+
+        # If HIGH urgency limit is in-flight > 90s → escalate to bid
+        # If HIGH urgency limit is in-flight > 150s → escalate to market
+        if not _use_market and _urgency == "HIGH" and getattr(pos, "exit_in_flight", False):
+            if _age_since_submit > 150:
+                _use_market = True
+                log.warning("[%s] EXIT ESCALATED TO MARKET — limit unfilled >150s | %s", pos.ticker, decision.reason)
+            elif _age_since_submit > 90 and _bid > 0:
+                # Step down to bid
+                _exit_limit = round(_bid, 2)
+                exit_price = _exit_limit
+                log.warning("[%s] EXIT STEPPED DOWN to bid $%.2f — limit unfilled >90s | %s", pos.ticker, _exit_limit, decision.reason)
+
         if _use_market:
             _exit_limit = None
             exit_price = _mid if _mid > 0 else _bid
             if exit_price <= 0:
                 log.critical("[%s] CLOSE BLOCKED — no quote for IMMEDIATE exit | %s", pos.ticker, decision.reason)
                 return
-            log.info("[%s] MARKET EXIT @ est.$%.2f | urgency=IMMEDIATE | %s", pos.ticker, exit_price, decision.reason)
+            log.info("[%s] MARKET EXIT @ est.$%.2f | urgency=%s | %s", pos.ticker, exit_price, _urgency, decision.reason)
         elif _mid > 0:
-            # Limit at mid — no discount, no slippage. You earned the gain, take it.
             _exit_limit = round(_mid, 2)
             exit_price = _exit_limit
-            log.info("[%s] LIMIT EXIT @ $%.2f (mid) | urgency=HIGH | %s", pos.ticker, _exit_limit, decision.reason)
+            # Track submission time for escalation
+            pos._exit_submit_ts = time.time()  # type: ignore[attr-defined]
+            pos._exit_attempts  = _exit_attempts + 1  # type: ignore[attr-defined]
+            log.info("[%s] LIMIT EXIT @ $%.2f (mid) attempt=%d | urgency=HIGH | %s",
+                     pos.ticker, _exit_limit, pos._exit_attempts, decision.reason)
         elif _bid > 0:
             _exit_limit = round(_bid, 2)
             exit_price = _exit_limit
-            log.info("[%s] LIMIT EXIT @ $%.2f (bid) | urgency=HIGH | %s", pos.ticker, _exit_limit, decision.reason)
+            pos._exit_submit_ts = time.time()  # type: ignore[attr-defined]
+            pos._exit_attempts  = _exit_attempts + 1  # type: ignore[attr-defined]
+            log.info("[%s] LIMIT EXIT @ $%.2f (bid) attempt=%d | urgency=HIGH | %s",
+                     pos.ticker, _exit_limit, pos._exit_attempts, decision.reason)
         else:
             if _urgency == "IMMEDIATE":
                 log.critical("[%s] CLOSE BLOCKED — no quote for IMMEDIATE exit | %s", pos.ticker, decision.reason)
                 return
-            # HIGH urgency with no quote — skip this cycle, trail will catch on next quote
-            log.warning("[%s] Exit skipped — no quote | will retry on next cycle | %s", pos.ticker, decision.reason)
+            log.warning("[%s] Exit skipped — no quote | will retry | %s", pos.ticker, decision.reason)
             return
 
         if self.order_state_machine and pos.position_id:
