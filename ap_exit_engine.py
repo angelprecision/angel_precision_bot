@@ -375,6 +375,17 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
             urgency="IMMEDIATE", pnl_pct=option_pnl,
         )
 
+    # ── TOUCHED PROFIT PROTECTION ─────────────────────────────────────────────
+    if pos.scale_outs_done == 0 and pos.touched_profit and option_pnl <= -0.05:
+        return ExitDecision(
+            action="CLOSE_ALL", quantity=qty_rem,
+            reason=(
+                f"TOUCHED PROFIT STOP — was +{pos.max_profit_seen*100:.0f}% "
+                f"now {option_pnl*100:.0f}% — protecting capital"
+            ),
+            urgency="IMMEDIATE", pnl_pct=option_pnl,
+        )
+
     # ── 33/33/34 SCALE-OUT LADDER ────────────────────────────────────────────
     # Targets: +10% → sell 33% | +20% → sell 33% | +30% → sell remainder
     # Do NOT close everything at 15% — let winners run to 25-30%+ with trail.
@@ -483,17 +494,6 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
                     ),
                     urgency="HIGH", pnl_pct=option_pnl,
                 )
-
-    # ── TOUCHED PROFIT PROTECTION ─────────────────────────────────────────────
-    if pos.scale_outs_done == 0 and pos.touched_profit and option_pnl <= -0.05:
-        return ExitDecision(
-            action="CLOSE_ALL", quantity=qty_rem,
-            reason=(
-                f"TOUCHED PROFIT STOP — was +{pos.max_profit_seen*100:.0f}% "
-                f"now {option_pnl*100:.0f}% — protecting capital"
-            ),
-            urgency="IMMEDIATE", pnl_pct=option_pnl,
-        )
 
     # ── NEVER-GREEN ESCALATING STOP ───────────────────────────────────────────
     if not pos.touched_profit:

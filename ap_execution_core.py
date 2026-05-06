@@ -833,7 +833,7 @@ class APExecutionCore:
             _checks = [
                 ("has_position_id",  bool(getattr(pos, "position_id", ""))),
                 ("exit_px_positive", exit_price > 0),
-                ("pnl_recorded",     abs(opt_pnl) >= 0),
+                ("pnl_recorded",     abs(opt_pnl) > 0.001),
             ]
             _pass = all(v for _, v in _checks)
             _str  = " ".join(f"{k}={'OK' if v else 'FAIL'}" for k, v in _checks)
@@ -867,7 +867,7 @@ class APExecutionCore:
             underlying_exit    = pos.current_underlying,
             contracts          = pos.quantity,
             exit_reason        = decision.reason,
-            option_pnl_pct     = opt_pnl,
+            option_pnl_pct     = opt_pnl / 100.0,
             underlying_pnl_pct = (pos.current_underlying - pos.underlying_entry) / pos.underlying_entry * 100
                                   if pos.underlying_entry else 0,
             win                = win,
@@ -894,7 +894,7 @@ class APExecutionCore:
         if signal_id:
             self.store.update_status(signal_id, "closed", timestamp_flag="closed_at")
 
-        self.shadow.record_live_outcome(tier, opt_pnl)
+        self.shadow.record_live_outcome(tier, opt_pnl / 100.0)
 
         # Log trade to edge intelligence (logger instantiated once in __init__ to avoid resource leaks)
         try:
