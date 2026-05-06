@@ -196,6 +196,7 @@ class APBrokerReconciler:
         self._run_count  = 0
         self.exit_engine = None      # wired by client_runner after construction
         self._ghost_tracker: dict[str, int] = {}  # ghost detection count per contract
+        self._ghost_fill_confirmed: set[str] = set()  # broker_oids already confirmed terminal — skip re-check
         self._missing_id_exit_tracker: dict[str, int] = {}  # missing broker-id EXIT recovery pass count
         self.fill_monitor = None      # optional fill_monitor_final_hardened-7.py instance
         self.require_fill_monitor = (
@@ -1390,6 +1391,8 @@ class APBrokerReconciler:
             broker_oid = f.get("broker_order_id")
             if not broker_oid:
                 continue
+            if broker_oid in self._ghost_fill_confirmed:
+                continue   # already confirmed as truly filled on a prior pass
             try:
                 broker_raw    = self.broker.get_order(broker_oid)
                 broker_status = str(broker_raw.get("status") or "").lower()
@@ -1400,6 +1403,9 @@ class APBrokerReconciler:
                         f"DB=FILLED but broker={broker_status} — MANUAL REVIEW REQUIRED"
                     )
                     summary["orders_alerted"] += 1
+                else:
+                    # Broker confirms it is still filled — cache so we skip next pass
+                    self._ghost_fill_confirmed.add(broker_oid)
             except Exception:
                 pass
 
@@ -1747,13 +1753,23 @@ class APBrokerReconciler:
                 )
                 summary["positions_alerted"] += 1
                 return
-            exit_px          = entry_px
-            close_confidence = "MEDIUM_THREE_PASS_NO_EXIT_EVIDENCE"
-            log.warning(
-                "[%s] GHOST_PASS_3 | %s | no broker position, no active exit, "
-                "no broker open exit — auto-closing with entry price",
-                self.client_id, contract,
-            )
+            _current_px = self._get_current_option_price(contract)
+            if _current_px > 0:
+                exit_px          = _current_px
+                close_confidence = "MEDIUM_THREE_PASS_CURRENT_MARK"
+                log.warning(
+                    "[%s] GHOST_PASS_3 | %s | no broker position, no active exit — "
+                    "auto-closing at current mark $%.4f",
+                    self.client_id, contract, _current_px,
+                )
+            else:
+                exit_px          = entry_px
+                close_confidence = "MEDIUM_THREE_PASS_NO_EXIT_EVIDENCE"
+                log.warning(
+                    "[%s] GHOST_PASS_3 | %s | no broker position, no active exit, "
+                    "no live quote — auto-closing at entry price (P&L = $0)",
+                    self.client_id, contract,
+                )
 
         pnl_dollars = round((exit_px - entry_px) * db_qty * 100, 2)
         pnl_pct     = round(((exit_px - entry_px) / entry_px) * 100, 2) if entry_px > 0 else 0.0
@@ -2564,17 +2580,25 @@ class APBrokerReconciler:
                     "[%s] RECONCILE: reverted pos %s to OPEN after terminal exit order | %s",
                     self.client_id, position_id, contract,
                 )
+                _ee_cleared = False
                 if self.exit_engine:
                     try:
                         self.exit_engine.clear_exit_in_flight(
                             position_id,
                             reason="reconciler_revert_position_to_open",
                         )
+                        _ee_cleared = True
                     except Exception as ee_err:
                         log.warning(
                             "[%s] clear_exit_in_flight failed on revert for pos=%s: %s",
                             self.client_id, position_id, ee_err,
                         )
+                if not _ee_cleared:
+                    self._alert(
+                        f"REVERT_EXIT_ENGINE_NOT_CLEARED | {contract} | pos={position_id} | "
+                        "position reverted to OPEN in DB but exit engine in-flight flag may be stale. "
+                        "Exit engine will not re-submit a protective exit without manual intervention."
+                    )
             else:
                 log.info(
                     "[%s] RECONCILE: no OPEN revert needed for pos %s | %s "
