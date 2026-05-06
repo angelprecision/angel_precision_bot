@@ -1823,22 +1823,31 @@ def start_multi_client_supervisor():
 
     def _supervisor():
         logger.info("Multi-client supervisor started")
-        # Wait for post_worker_init runners to register before first sync.
-        # Without this delay, supervisor and post_worker_init both spawn runners
-        # simultaneously, and the supervisor overwrites the initialized runner.
-        _initial_delay = float(os.getenv("SUPERVISOR_INITIAL_DELAY_SEC", "15"))
-        time.sleep(_initial_delay)
-        while True:
-            try:
-                members = _fetch_active_members(sb)
-                _supervisor_state["last_member_count"] = len(members)
-                _supervisor_state["last_sync_error"] = ""
-                _sync_runners(sb)
-                _supervisor_state["sync_count"] += 1
-                _supervisor_state["last_sync_ts"] = time.time()
-            except Exception as exc:
-                _supervisor_state["last_sync_error"] = str(exc)
-                logger.error("Supervisor sync error: %s", exc)
+        # Outer try/except catches ANY crash including import errors, network
+        # issues during first fetch, etc. Without this the thread dies silently.
+        try:
+            # Wait for post_worker_init runners to register before first sync.
+            _initial_delay = float(os.getenv("SUPERVISOR_INITIAL_DELAY_SEC", "15"))
+            time.sleep(_initial_delay)
+            while True:
+                try:
+                    members = _fetch_active_members(sb)
+                    _supervisor_state["last_member_count"] = len(members)
+                    _supervisor_state["last_sync_error"] = ""
+                    _sync_runners(sb)
+                    _supervisor_state["sync_count"] += 1
+                    _supervisor_state["last_sync_ts"] = time.time()
+                except Exception as exc:
+                    _supervisor_state["last_sync_error"] = str(exc)
+                    logger.error("Supervisor sync error: %s", exc)
+        except BaseException as fatal:
+            # Thread is about to die — log it so we can see why
+            _supervisor_state["last_sync_error"] = f"FATAL:{fatal}"
+            logger.critical(
+                "Supervisor thread FATAL crash — thread will die. "
+                "Bot will rely on post_worker_init hook for runner spawning. "
+                "Error: %s", fatal, exc_info=True
+            )
             # FIX-4: 300s full-sync cadence is too slow for dead-runner detection.
             # Inner loop checks runner liveness every 15s and breaks early to call
             # _sync_runners immediately when any runner dies. Full member-list refresh
