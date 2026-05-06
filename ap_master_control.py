@@ -42,7 +42,7 @@ _PREMIUM_ESTIMATES: dict[str, float] = {
     "NFLX": 8.00,
     "AMD": 4.50,
     "MSFT": 5.00,
-    "AAPL": 3.00,
+    "AAPL": 2.50,
     "SPY": 2.00,
     "QQQ": 3.50,
     "IWM": 1.50,
@@ -753,7 +753,7 @@ class APMasterControl:
         if effective_count >= self.max_positions:
             return self._block(signal_id, ticker, client_id, "blocked_risk", f"max_positions_with_pending ({effective_count}/{self.max_positions})")
 
-        estimated_contracts_pre = max(1, self._base_contracts(effective_score))
+        estimated_contracts_pre = max(1, self._base_contracts(effective_score, _estimate_premium(ticker)))
         estimated_new_cost_pre = estimated_contracts_pre * 100 * _estimate_premium(ticker)
         pending_capital_real = self._pending_capital_from_snapshot_or_db(snap, client_id)
         if pending_capital_real is None:
@@ -774,7 +774,7 @@ class APMasterControl:
 
         sector = self.SECTOR_MAP.get(ticker.upper(), "other")
         sector_deployed = self._sector_capital_deployed(snap["open_positions"] + snap["closing_positions"], sector)
-        estimated_contracts = max(1, self._base_contracts(effective_score))
+        estimated_contracts = max(1, self._base_contracts(effective_score, _estimate_premium(ticker)))
         estimated_new_cost = estimated_contracts * 100 * _estimate_premium(ticker)
         projected_sector = sector_deployed + estimated_new_cost
         effective_equity = self.account_equity
@@ -906,15 +906,15 @@ class APMasterControl:
                     contracts = min(contracts, intel_contracts)
             except Exception as e:
                 log.warning("[%s] Sizer failed (%s) -- falling back to tier", ticker, e)
-                contracts = self._base_contracts(effective_score)
+                contracts = self._base_contracts(effective_score, _estimate_premium(ticker))
         else:
             if str(tier).upper() == "B":
                 # B-tier: score-driven, cap at 4 (budget gate handles the real ceiling)
-                contracts = self._base_contracts(effective_score)
+                contracts = self._base_contracts(effective_score, _estimate_premium(ticker))
                 contracts = min(contracts, 4)  # B-tier cap
             else:
                 tier_mult = 1.0 if str(tier).upper() == "A+" else 0.6
-                base = self._base_contracts(effective_score)
+                base = self._base_contracts(effective_score, _estimate_premium(ticker))
                 contracts = max(1, round(base * feedback_mod * tier_mult))
                 if intel_avail and intel_contracts > 0:
                     contracts = min(contracts, intel_contracts)
@@ -938,7 +938,7 @@ class APMasterControl:
             pattern=signal.get("pattern", signal.get("pattern_id", "")),
             timeframe=signal.get("timeframe", "1d"),
             contracts=contracts,
-            max_position_usd=(1 if bootstrap_mode else contracts) * 100 * _estimate_premium(ticker),
+            max_position_usd=(1 * 100 * _estimate_premium(ticker)) if bootstrap_mode else float(os.getenv("MAX_TRADE_USD", "1800")),
             tier=str(tier),
             score=score,
             intel_score=intel_score,
@@ -1163,19 +1163,51 @@ class APMasterControl:
             return "C"
         return "REJECT"
 
-    def _base_contracts(self, score: float) -> int:
-        """Contract count from signal score.
-        Budget is 10% of account ($1800) — actual contracts depend on premium.
-        At $1.06 premium: $1800 / $106 = ~16 raw, capped at 5 by capital gates.
-        At $4.30 premium: $1800 / $430 = ~4 contracts.
-        Higher scores get more. Capital gate is the real ceiling, not this function.
+    def _base_contracts(self, score: float, premium_estimate: float = 0.0) -> int:
         """
-        if score >= 95: return 5
-        if score >= 90: return 4
-        if score >= 85: return 3
-        if score >= 75: return 3
-        if score >= 60: return 2   # daily scanner range
-        return 1
+        Contract count based on budget, not arbitrary score tiers.
+
+        Score controls what FRACTION of the budget to deploy:
+          score 85+  → 100% of budget
+          score 75-84 → 80% of budget
+          score 60-74 → 65% of budget
+          score < 60  → 50% of budget (shouldn't reach here normally)
+
+        Budget is MAX_TRADE_USD (default $1,800 = 10% of account).
+        Contracts = floor(budget_fraction × MAX_TRADE_USD / (premium × 100))
+
+        Minimum: 2 contracts (need at least 2 to scale out)
+        Maximum: 10 contracts (hard cap for risk control)
+        """
+        try:
+            max_usd = float(os.getenv("MAX_TRADE_USD", "1800"))
+        except Exception:
+            max_usd = 1800.0
+
+        # Score-based budget fraction
+        if score >= 85:
+            fraction = 1.00
+        elif score >= 75:
+            fraction = 0.80
+        elif score >= 60:
+            fraction = 0.65
+        else:
+            fraction = 0.50
+
+        effective_budget = max_usd * fraction
+
+        # If we have a premium estimate, use it for contract math
+        if premium_estimate and premium_estimate > 0:
+            raw = int(effective_budget / (premium_estimate * 100))
+        else:
+            # Fall back to score tiers as rough estimate when no premium known yet
+            if score >= 85: raw = 5
+            elif score >= 75: raw = 4
+            elif score >= 60: raw = 3
+            else: raw = 2
+
+        # Minimum 2 (need 2 to scale out at all), maximum 10
+        return max(2, min(10, raw))
 
     def revalidate_exposure(self, plan, client_id: str = "default") -> ControlDecision:
         """
