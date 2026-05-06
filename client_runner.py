@@ -675,6 +675,36 @@ class ClientRunner(threading.Thread):
         except Exception as exc:
             logger.error("[%s] Overnight reeval error (non-fatal): %s", self.email, exc, exc_info=True)
 
+    def _run_exit_autonomous_recovery(self):
+        """
+        Run exit engine recovery every ~60s to resolve CLOSING-forever positions.
+        Calls recover_exit_engine which scans tracked positions for stale in-flight
+        exits and resolves them via broker API — recovering from dropped fill callbacks,
+        split-brain exit orders, and Render restart gaps.
+        """
+        # Rate-limit to every 60s (health loop runs every 20s → run every 3rd tick)
+        _now = time.time()
+        _last = getattr(self, "_last_exit_recovery_ts", 0.0)
+        if _now - _last < 60.0:
+            return
+        self._last_exit_recovery_ts = _now
+
+        try:
+            from ap.exit_autonomous_recovery import recover_exit_engine
+            exit_eng = getattr(self.core, "exit_eng", None) if self.core else None
+            broker = getattr(self, "broker", None)
+            if exit_eng is None or broker is None:
+                return
+            actions = recover_exit_engine(exit_eng, broker=broker)
+            for action in (actions or []):
+                if action.action not in ("NOOP",):
+                    logger.info(
+                        "[%s] exit_autonomous_recovery: %s | %s | pos=%s",
+                        self.email, action.action, action.reason, action.position_id,
+                    )
+        except Exception as _exc:
+            logger.debug("[%s] exit_autonomous_recovery error (non-fatal): %s", self.email, _exc)
+
     def _start_runtime_health_loop(self):
         interval = float(os.getenv("RUNNER_HEALTH_CHECK_SEC", "20"))
 
@@ -723,6 +753,7 @@ class ClientRunner(threading.Thread):
                 self._try_recover_degraded_mode()
                 self._check_split_brain_recovery()   # BUG-5 FIX: poll for reconciler resolution
                 self._run_overnight_reeval_if_due()  # Arm WATCHING signals at 9:00-9:45 AM ET
+                self._run_exit_autonomous_recovery() # Resolve CLOSING-forever positions every 60s
                 self._set_entry_permission()
 
                 try:

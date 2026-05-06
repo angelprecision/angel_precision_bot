@@ -74,7 +74,7 @@ def _is_exit_like(raw: dict) -> bool:
         "side", "action", "instruction", "order_action", "transaction_type", "trade_action", "type", "description", "memo", "notes"
     )).lower()
     compact = text.replace("_", "").replace("-", "").replace(" ", "")
-    return "selltoclose" in compact or compact == "stc" or "sell to close" in text or "sell" in text
+    return "selltoclose" in compact or compact == "stc" or "sell to close" in text
 
 
 def _dt_age_seconds(dt: Any) -> Optional[float]:
@@ -362,6 +362,30 @@ def recover_exit_position(pos: Any, *, broker: Any, exit_engine: Any = None, osm
         return RecoveryAction("NOOP", "multiple_live_exit_orders_cancel_not_proven", pid, local_id, "", {"match_count": len(matches), "cancel_results": cancel_results, "quote_health": qh})
 
     # Negative proof: no matching open sell-to-close order currently at broker.
+    # Before marking replacement safe, verify the contract is still held.
+    # If position is flat at the broker (exit filled, callback dropped), close it
+    # instead of spawning a duplicate sell-to-close that Tradier will reject.
+    try:
+        _broker_positions = broker.list_positions() if hasattr(broker, "list_positions") else []
+        _contract_held = any(
+            str(p.get("symbol") or "").upper() == str(contract or "").upper()
+            for p in (_broker_positions or [])
+            if int(p.get("quantity") or 0) != 0
+        )
+        if not _contract_held and contract:
+            # Position is flat at broker — exit filled but callback was dropped.
+            # Mark position closed rather than allowing a duplicate exit submission.
+            if exit_engine and hasattr(exit_engine, "mark_position_closed"):
+                exit_engine.mark_position_closed(pid, exit_price=None, filled_qty=getattr(pos, "contracts", 0))
+            return RecoveryAction(
+                "MARKED_CLOSED",
+                "autonomous_recovery_contract_flat_at_broker",
+                pid, local_id, "",
+                {"contract": contract, "quote_health": qh, "source": "negative_proof_position_check"},
+            )
+    except Exception as _bp_exc:
+        log.debug("exit_autonomous_recovery: broker position check failed (non-fatal): %s", _bp_exc)
+
     return _mark_replacement_safe(
         exit_engine,
         pid,
