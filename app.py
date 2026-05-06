@@ -1265,12 +1265,26 @@ def create_app() -> Flask:
                 core = getattr(runner, "core", None)
                 exit_eng = getattr(core, "exit_eng", None) if core else None
                 if exit_eng and hasattr(exit_eng, "seed_from_db"):
-                    exit_eng.seed_from_db()
+                    # seed_from_db requires position_manager argument
+                    pm = getattr(runner, "pm", None)
+                    if pm is None:
+                        core = getattr(runner, "core", None)
+                        pm = getattr(core, "position_manager", None) if core else None
+                    if pm is None:
+                        # Try to get from master_control
+                        mc = getattr(core, "master_control", None) if core else None
+                        pm = getattr(mc, "pm", None) if mc else None
+                    try:
+                        exit_eng.seed_from_db(pm)
+                    except TypeError:
+                        # Some versions don't require pm
+                        exit_eng.seed_from_db()
                     # Also refresh quotes so exit engine has current prices
-                    if hasattr(exit_eng, "_refresh_quotes"):
+                    _refresh = getattr(exit_eng, "refresh_quotes", None) or getattr(exit_eng, "_refresh_quotes", None)
+                    if _refresh:
                         import threading
                         threading.Thread(
-                            target=exit_eng._refresh_quotes,
+                            target=_refresh,
                             daemon=True,
                             name=f"reseed-quote-refresh-{email}",
                         ).start()
