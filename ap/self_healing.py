@@ -308,30 +308,37 @@ class APSelfHealingSystem:
                 pm = getattr(runner, "position_manager", None)
                 osm = getattr(runner, "order_state_machine", None)
                 if pm and osm:
-                    self._reconcile_client(email, pm, osm)
+                    self._reconcile_client(email, pm, osm, runner=runner)
             except Exception as e:
                 log.debug("[%s] Reconcile error: %s", email, e)
 
-    def _reconcile_client(self, email: str, pm, osm):
+    def _reconcile_client(self, email: str, pm, osm, runner=None):
         from ap.db import conn, run_with_retry
         def _get_stuck_closing():
             with conn() as c:
                 c.execute(
-                    f"""
+                    """
                     SELECT p.id, p.underlying, p.updated_at, o.local_order_id,
                            o.status as order_status, o.broker_order_id
                     FROM positions p
                     LEFT JOIN orders o ON o.client_id=p.client_id AND o.position_id=p.id AND o.kind='EXIT'
                     WHERE p.client_id=%s AND p.status='CLOSING'
-                      AND p.updated_at < NOW() - INTERVAL '{CLOSING_TIMEOUT_SEC} seconds'
+                      AND p.updated_at < NOW() - (%s * INTERVAL '1 second')
                     """,
-                    (email,),
+                    (email, CLOSING_TIMEOUT_SEC),
                 )
                 return c.fetchall()
         try:
             for row in run_with_retry(_get_stuck_closing) or []:
                 age = _age_seconds(row.get("updated_at")) if hasattr(row, "get") else 9999
                 self._alert(email, "reconcile", HealthState.CRITICAL, f"STUCK CLOSING pos={row.get('id')} age={age:.0f}s exit={row.get('broker_order_id','none')}", None)
+                reconciler = getattr(runner, "reconciler", None) if runner else None
+                if reconciler and hasattr(reconciler, "run_once"):
+                    try:
+                        reconciler.run_once()
+                        log.info("[%s] Kicked reconciler for stuck-CLOSING pos=%s", email, row.get("id"))
+                    except Exception as re:
+                        log.debug("[%s] reconciler kick failed for stuck-CLOSING pos=%s: %s", email, row.get("id"), re)
         except Exception as e:
             log.debug("[%s] Stuck closing check failed: %s", email, e)
 
@@ -351,7 +358,7 @@ class APSelfHealingSystem:
             }
             try:
                 from ap.db import conn, run_with_retry
-                def _insert():
+                def _insert(payload=payload):
                     with conn() as c:
                         c.execute(
                             """
@@ -404,12 +411,13 @@ class APSelfHealingSystem:
             health.state = HealthState.WARNING
             health.record_error(f"stale_quotes_count={len(stale)}")
             try:
-                if hasattr(runner, "entries_allowed"):
-                    runner.entries_allowed.clear()
-                if hasattr(runner, "degraded"):
-                    runner.degraded.set()
-                if hasattr(runner, "degraded_reasons"):
-                    runner.degraded_reasons.add(f"quote_staleness:{len(stale)}")
+                if hasattr(runner, "_enter_degraded_mode"):
+                    runner._enter_degraded_mode("quote_staleness", stop_runner=False)
+                else:
+                    if hasattr(runner, "entries_allowed"):
+                        runner.entries_allowed.clear()
+                    if hasattr(runner, "degraded"):
+                        runner.degraded.set()
             except Exception:
                 pass
             if health.cooldown_ok():
@@ -449,12 +457,13 @@ class APSelfHealingSystem:
         health.state = HealthState.CRITICAL if worst_age >= EXIT_QUARANTINE_CRITICAL_SEC else HealthState.WARNING
         health.record_error(f"exit quarantine/stale inflight count={len(problematic)} worst_age={worst_age:.0f}s")
         try:
-            if hasattr(runner, "entries_allowed"):
-                runner.entries_allowed.clear()
-            if hasattr(runner, "degraded"):
-                runner.degraded.set()
-            if hasattr(runner, "degraded_reasons"):
-                runner.degraded_reasons.add(f"exit_quarantine:{len(problematic)}")
+            if hasattr(runner, "_enter_degraded_mode"):
+                runner._enter_degraded_mode("exit_quarantine_watchdog", stop_runner=False)
+            else:
+                if hasattr(runner, "entries_allowed"):
+                    runner.entries_allowed.clear()
+                if hasattr(runner, "degraded"):
+                    runner.degraded.set()
         except Exception:
             pass
         reconciler = getattr(runner, "reconciler", None)
