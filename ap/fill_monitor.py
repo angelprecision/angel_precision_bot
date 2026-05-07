@@ -1377,7 +1377,7 @@ def _sync_exit_price(order: dict, result: dict):
                             "WHERE client_email = %s "
                             "AND ticker = %s "
                             "AND closed_at >= NOW() - INTERVAL '60 minutes' "
-                            "AND win = FALSE",  -- only correct records that show as losses
+                            "AND win = FALSE",  # only correct records that show as losses
                             params2,
                         )
                     return getattr(c, "rowcount", 0)
