@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 
@@ -497,11 +498,13 @@ class APStartupRecovery:
             timeframe = str(row.get("timeframe") or "1d")
 
             # Re-add both the signal_id key and the setup key
+            # _seen_signals is a dict[str, float] — use direct assignment not .add()
+            _ts = time.time()
             if signal_id:
-                self.mc._seen_signals.add(f"sig:{signal_id}:{self.client_id}")
+                self.mc._seen_signals[f"sig:{signal_id}:{self.client_id}"] = _ts
             if ticker:
                 setup_key = f"{self.client_id}:{ticker}:{direction}:{timeframe}"
-                self.mc._seen_signals.add(setup_key)
+                self.mc._seen_signals[setup_key] = _ts
             count += 1
 
         result["dedup_seeded"] = count
