@@ -1193,6 +1193,29 @@ def create_app() -> Flask:
             log.error(f"client_rejections failed: {e}", exc_info=True)
             return jsonify({"ok": False, "error": str(e)}), 500
 
+
+    @app.post("/admin/reset_dedup")
+    @require_hmac
+    def reset_dedup():
+        """Force reset the master control dedup cache — clears stale signal blocks."""
+        from client_runner import _active_runners, _registry_lock
+        results = {}
+        with _registry_lock:
+            runners = dict(_active_runners)
+        for email, runner in runners.items():
+            try:
+                core = getattr(runner, "core", None)
+                mc = getattr(core, "master_control", None) if core else None
+                if mc and hasattr(mc, "reset_session"):
+                    mc.reset_session(client_id=email)
+                    results[email] = {"ok": True, "cleared": True}
+                    log.info("[%s] Dedup cache cleared via admin endpoint", email)
+                else:
+                    results[email] = {"ok": False, "error": "master_control_not_found"}
+            except Exception as e:
+                results[email] = {"ok": False, "error": str(e)}
+        return jsonify({"ok": True, "results": results})
+
     @app.post("/admin/overnight_reeval")
     @require_hmac
     def admin_overnight_reeval():
