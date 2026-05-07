@@ -1363,19 +1363,21 @@ def _sync_exit_price(order: dict, result: dict):
                         f"UPDATE proof_trades SET {set_clause} WHERE position_id = %s",
                         params,
                     )
-                    # Fallback: match by client_email + recent close time
-                    if getattr(c, "rowcount", 0) == 0 and client_id:
+                    # Fallback: match by ticker + client + recent close time
+                    # This catches manually-seeded positions where position_id is not in proof_trades
+                    if getattr(c, "rowcount", 0) == 0 and client_id and ticker:
                         params2 = [exit_px]
                         set2 = "exit_option_price = %s"
                         if opt_pnl_pct is not None:
                             set2 += ", option_pnl_pct = %s, win = %s"
                             params2 += [opt_pnl_pct, win]
-                        params2.append(client_id)
+                        params2 += [client_id, ticker]
                         c.execute(
                             f"UPDATE proof_trades SET {set2} "
                             "WHERE client_email = %s "
-                            "AND closed_at >= NOW() - INTERVAL '30 minutes' "
-                            "AND (exit_option_price IS NULL OR ABS(COALESCE(exit_option_price,0) - 0) < 0.001)",
+                            "AND ticker = %s "
+                            "AND closed_at >= NOW() - INTERVAL '60 minutes' "
+                            "AND win = FALSE",  -- only correct records that show as losses
                             params2,
                         )
                     return getattr(c, "rowcount", 0)
