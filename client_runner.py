@@ -1654,7 +1654,7 @@ class ClientRunner(threading.Thread):
                 try:
                     now_et = datetime.now(_ET)
                     today_str = now_et.strftime("%Y-%m-%d")
-                    at_open = (now_et.hour == 9 and now_et.minute >= 30) or now_et.hour == 10
+                    at_open = (now_et.hour == 9 and now_et.minute >= 15) or now_et.hour == 10  # 9:15 AM — before signals hit the queue at open
                     if at_open and reset_done_for_date != today_str:
                         if self.master_control and hasattr(self.master_control, "reset_session"):
                             self.master_control.reset_session(client_id=self.email)
