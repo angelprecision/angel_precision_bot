@@ -552,11 +552,12 @@ def _dispatch(
                 "this record is informational only (not in execution pipeline).",
                 ticker, signal_id,
             )
-            # Status: EXPIRED — this record is audit-only. No watcher armed, no OSM order created.
-            # WATCHING is reserved for live breach-watch jobs (watcher armed + OSM order exists).
-            # After-hours records use EXPIRED so they are never reprocessed on restart.
-            # Tomorrow's scanner generates new signal_ids → fresh jobs → full execution path.
-            _mark_job(job_id, "EXPIRED", error="after_hours_deferred:audit_only")
+            # Status: WATCHING — signal is valid, awaiting 9 AM overnight reeval to arm.
+            # The overnight reeval queries WHERE status='WATCHING' to find these signals.
+            # WATCHING here means: master control approved, contract selection deferred to breach.
+            # The overnight reeval at 9 AM will run contract selection with live quotes and
+            # arm the entry watcher. This is the correct overnight pipeline for daily scanner signals.
+            _mark_job(job_id, "WATCHING", error="after_hours_deferred:awaiting_overnight_reeval")
             # Log to ap_signals for permanent structured record
             _log_rejection_to_db(
                 signal_id=signal_id, client_id=client_id, ticker=ticker,
