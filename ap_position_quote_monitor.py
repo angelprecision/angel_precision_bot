@@ -57,6 +57,17 @@ def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _get_attr(obj, *names, default=None):
+    for name in names:
+        try:
+            v = getattr(obj, name, None)
+            if v not in (None, ""):
+                return v
+        except Exception:
+            pass
+    return default
+
+
 class APPositionQuoteMonitor:
     def __init__(
         self,
@@ -213,11 +224,11 @@ class APPositionQuoteMonitor:
         contracts_set: set[str] = set()
 
         for p in positions:
-            pid = getattr(p, "position_id", "") or ""
+            pid = str(_get_attr(p, "positionid", "position_id", default="") or "")
             if pid:
                 active_ids.add(pid)
-            t = (getattr(p, "ticker", "") or "").upper()
-            c = (getattr(p, "option_symbol", "") or "").upper()
+            t = str(_get_attr(p, "ticker", "underlying", default="") or "").upper()
+            c = str(_get_attr(p, "optionsymbol", "option_symbol", "contract", default="") or "").upper()
             if t:
                 underlyings_set.add(t)
             if c:
@@ -239,9 +250,9 @@ class APPositionQuoteMonitor:
 
         with lock_ctx:
             for pos in positions:
-                pid = getattr(pos, "position_id", "") or ""
-                t = (getattr(pos, "ticker", "") or "").upper()
-                c = (getattr(pos, "option_symbol", "") or "").upper()
+                pid = str(_get_attr(pos, "positionid", "position_id", default="") or "")
+                t = str(_get_attr(pos, "ticker", "underlying", default="") or "").upper()
+                c = str(_get_attr(pos, "optionsymbol", "option_symbol", "contract", default="") or "").upper()
 
                 uq = und_quotes.get(t) or {}
                 oq = opt_quotes.get(c) or {}
@@ -252,64 +263,96 @@ class APPositionQuoteMonitor:
                 opt_price, price_source = self._extract_option_price(oq, bid, ask)
 
                 if und_last > 0:
+                    self._write_field(pos, "currentunderlying", und_last)
                     self._write_field(pos, "current_underlying", und_last)
+                    self._write_field(pos, "lastunderlyingquoteupdatets", now_utc)
                     self._write_field(pos, "last_underlying_quote_update_ts", now_utc)
-                    if hasattr(pos, "last_underlying_quote_missing_ts"):
-                        self._write_field(pos, "last_underlying_quote_missing_ts", None)
-                elif hasattr(pos, "last_underlying_quote_missing_ts"):
+                    self._write_field(pos, "lastunderlyingquotemissingts", None)
+                    self._write_field(pos, "last_underlying_quote_missing_ts", None)
+                else:
+                    self._write_field(pos, "lastunderlyingquotemissingts", now_utc)
                     self._write_field(pos, "last_underlying_quote_missing_ts", now_utc)
 
                 if opt_price > 0:
+                    self._write_field(pos, "currentoptionprice", opt_price)
                     self._write_field(pos, "current_option_price", opt_price)
                     if bid > 0:
+                        self._write_field(pos, "currentbid", bid)
                         self._write_field(pos, "current_bid", bid)
                     if ask > 0:
+                        self._write_field(pos, "currentask", ask)
                         self._write_field(pos, "current_ask", ask)
+                    self._write_field(pos, "lastoptionquoteupdatets", now_utc)
                     self._write_field(pos, "last_option_quote_update_ts", now_utc)
+                    self._write_field(pos, "lastquoteupdatets", now_utc)
                     self._write_field(pos, "last_option_price_source", price_source)
-                    if hasattr(pos, "last_option_quote_missing_ts"):
-                        self._write_field(pos, "last_option_quote_missing_ts", None)
+                    self._write_field(pos, "lastoptionpricesource", price_source)
+                    self._write_field(pos, "lastoptionquotemissingts", None)
+                    self._write_field(pos, "last_option_quote_missing_ts", None)
 
                     if self._should_wake(c, opt_price):
                         wake_engine = True
                     self._last_push_price[c] = opt_price
-                elif hasattr(pos, "last_option_quote_missing_ts"):
+                else:
+                    self._write_field(pos, "lastoptionquotemissingts", now_utc)
                     self._write_field(pos, "last_option_quote_missing_ts", now_utc)
 
                 cost_basis = (
-                    _safe_float(getattr(pos, "avg_fill_price", None), 0.0)
-                    or _safe_float(getattr(pos, "entry_fill_price", None), 0.0)
-                    or _safe_float(getattr(pos, "avgfill", None), 0.0)
-                    or _safe_float(getattr(pos, "entry_price", None), 0.0)
+                    _safe_float(_get_attr(pos, "entryprice", "entry_price", default=None), 0.0)
+                    or _safe_float(_get_attr(pos, "avgfill", "avg_fill_price", default=None), 0.0)
+                    or _safe_float(_get_attr(pos, "entry_fill_price", default=None), 0.0)
                 )
-                if cost_basis > 0 and _safe_float(getattr(pos, "current_option_price", None), 0.0) > 0:
-                    pnl_pct = (pos.current_option_price - cost_basis) / cost_basis
+                cur_opt = _safe_float(_get_attr(pos, "currentoptionprice", "current_option_price", default=None), 0.0)
+                if cost_basis > 0 and cur_opt > 0:
+                    pnl_pct = (cur_opt - cost_basis) / cost_basis
                     peak = max(
                         pnl_pct,
-                        _safe_float(getattr(pos, "peak_pnl_pct", None), float("-inf")),
-                        _safe_float(getattr(pos, "max_profit_seen", None), float("-inf")),
+                        _safe_float(_get_attr(pos, "peakpnlpct", "peak_pnl_pct", default=None), float("-inf")),
+                        _safe_float(_get_attr(pos, "maxprofitseen", "max_profit_seen", default=None), float("-inf")),
                     )
+                    self._write_field(pos, "peakpnlpct", peak)
                     self._write_field(pos, "peak_pnl_pct", peak)
+                    self._write_field(pos, "maxprofitseen", peak)
                     self._write_field(pos, "max_profit_seen", peak)
                     if pnl_pct >= 0.05:
+                        self._write_field(pos, "touchedprofit", True)
                         self._write_field(pos, "touched_profit", True)
 
+                cur_underlying = _safe_float(_get_attr(pos, "currentunderlying", "current_underlying", default=None), 0.0)
+                cur_option = _safe_float(_get_attr(pos, "currentoptionprice", "current_option_price", default=None), 0.0)
+                cur_bid = _safe_float(_get_attr(pos, "currentbid", "current_bid", default=None), 0.0)
+                cur_ask = _safe_float(_get_attr(pos, "currentask", "current_ask", default=None), 0.0)
+                und_ts = _get_attr(pos, "lastunderlyingquoteupdatets", "last_underlying_quote_update_ts", default=None)
+                opt_ts = _get_attr(pos, "lastoptionquoteupdatets", "last_option_quote_update_ts", default=None)
+
                 snapshots.append({
+                    "positionid": pid,
                     "position_id": pid,
                     "ticker": t,
+                    "optionsymbol": c,
                     "option_symbol": c,
-                    "current_underlying": _safe_float(getattr(pos, "current_underlying", None), 0.0),
-                    "current_option_price": _safe_float(getattr(pos, "current_option_price", None), 0.0),
-                    "current_bid": _safe_float(getattr(pos, "current_bid", None), 0.0),
-                    "current_ask": _safe_float(getattr(pos, "current_ask", None), 0.0),
+                    "currentunderlying": cur_underlying,
+                    "current_underlying": cur_underlying,
+                    "currentoptionprice": cur_option,
+                    "current_option_price": cur_option,
+                    "currentbid": cur_bid,
+                    "current_bid": cur_bid,
+                    "currentask": cur_ask,
+                    "current_ask": cur_ask,
+                    "pricesource": price_source,
                     "price_source": price_source,
-                    "last_underlying_quote_update_ts": getattr(pos, "last_underlying_quote_update_ts", None),
-                    "last_option_quote_update_ts": getattr(pos, "last_option_quote_update_ts", None),
+                    "lastunderlyingquoteupdatets": und_ts,
+                    "last_underlying_quote_update_ts": und_ts,
+                    "lastoptionquoteupdatets": opt_ts,
+                    "last_option_quote_update_ts": opt_ts,
                 })
 
                 self._classify_health(pid, c, t, pos)
 
-        applier = getattr(self.exit_engine, "apply_quote_snapshots", None)
+        applier = (
+            getattr(self.exit_engine, "applyquotesnapshots", None)
+            or getattr(self.exit_engine, "apply_quote_snapshots", None)
+        )
         if callable(applier):
             try:
                 applier(snapshots)
@@ -319,9 +362,16 @@ class APPositionQuoteMonitor:
         self._prune_closed(active_ids, active_contracts)
 
         if wake_engine:
-            waker = getattr(self.exit_engine, "_quote_arrived_event", None)
+            waker = (
+                getattr(self.exit_engine, "quotearrivedevent", None)
+                or getattr(self.exit_engine, "_quote_arrived_event", None)
+                or getattr(self.exit_engine, "quote_arrived_event", None)
+            )
             if waker is not None:
-                waker.set()
+                try:
+                    waker.set()
+                except Exception:
+                    pass
 
     # ── Wake gating (price threshold + cooldown) ────────────────────────────
     def _should_wake(self, contract: str, opt_price: float) -> bool:
@@ -533,8 +583,9 @@ class APPositionQuoteMonitor:
     # ── Health classification (always sets quote_state on pos) ──────────────
     def _classify_health(self, pid: str, contract: str, underlying: str, pos):
         now = _utc_now()
-        opt_ts = getattr(pos, "last_option_quote_update_ts", None)
-        und_ts = getattr(pos, "last_underlying_quote_update_ts", None)
+        opt_ts = _get_attr(pos, "lastoptionquoteupdatets", "last_option_quote_update_ts", default=None)
+        und_ts = _get_attr(pos, "lastunderlyingquoteupdatets", "last_underlying_quote_update_ts", default=None)
+        last_price = _safe_float(_get_attr(pos, "currentoptionprice", "current_option_price", default=None), 0.0)
         opt_age = (now - opt_ts).total_seconds() if opt_ts else 999.0
         und_age = (now - und_ts).total_seconds() if und_ts else 999.0
 
@@ -554,7 +605,7 @@ class APPositionQuoteMonitor:
             entry = {
                 "contract": contract,
                 "underlying": underlying,
-                "last_price": _safe_float(getattr(pos, "current_option_price", None), 0.0),
+                "last_price": last_price,
                 "blind_cycles": blind_cycles,
                 "last_option_quote_update_ts": opt_ts,
                 "last_underlying_quote_update_ts": und_ts,
@@ -582,8 +633,11 @@ class APPositionQuoteMonitor:
         # Always propagate quote state onto the position, even when direct writes are off.
         # Exit engine *must* see this, so it bypasses the feature flag.
         try:
+            setattr(pos, "quotestate", state)
             setattr(pos, "quote_state", state)
+            setattr(pos, "quoteoptagesec", opt_age)
             setattr(pos, "quote_opt_age_sec", opt_age)
+            setattr(pos, "quoteundagesec", und_age)
             setattr(pos, "quote_und_age_sec", und_age)
         except Exception:
             pass
