@@ -787,6 +787,15 @@ class APExitEngine:
         # cleanup, mark_position_closed(), and note_partial_exit_fill() close path.
         self._positions_by_id: dict[str, ManagedPosition] = {}
         self._lock         = threading.RLock()
+
+        # QPM/admin safety controls:
+        # - _flattening prevents duplicate manual flatten loops inside this engine.
+        # - _quote_arrived_event lets the PositionQuoteMonitor wake the exit loop immediately.
+        # - quote_monitor is wired by the runner for metrics/observability.
+        self._flattening   = threading.Event()
+        self._quote_arrived_event = threading.Event()
+        self.quote_monitor = None
+
         self._running      = False
         self._thread: Optional[threading.Thread] = None
         self.on_exit: Optional[Callable]  = None
@@ -866,6 +875,146 @@ class APExitEngine:
     def active_positions(self) -> list[ManagedPosition]:
         with self._lock:
             return [p for p in self._positions if not p.closed and int(p.quantity_remaining or 0) > 0]
+
+    def attach_quote_monitor(self, monitor) -> None:
+        """Wire the PositionQuoteMonitor for observability and wake-driven exits."""
+        self.quote_monitor = monitor
+
+    def apply_quote_snapshots(self, snapshots: list[dict]) -> None:
+        """
+        Stable quote-monitor -> exit-engine state update contract.
+
+        The PositionQuoteMonitor can push quote snapshots here instead of relying
+        only on arbitrary object mutation. This keeps the exit engine as the
+        canonical owner of its ManagedPosition state while still allowing the
+        monitor to hydrate prices at high frequency.
+        """
+        if not snapshots:
+            return
+
+        by_id = {
+            str(s.get("position_id") or ""): s
+            for s in snapshots
+            if s.get("position_id")
+        }
+        if not by_id:
+            return
+
+        with self._lock:
+            for pos in self._positions:
+                if getattr(pos, "closed", False):
+                    continue
+
+                pid = str(getattr(pos, "position_id", "") or "")
+                snap = by_id.get(pid)
+                if not snap:
+                    continue
+
+                try:
+                    current_underlying = float(snap.get("current_underlying") or 0.0)
+                    current_option_price = float(snap.get("current_option_price") or 0.0)
+                    current_bid = float(snap.get("current_bid") or 0.0)
+                    current_ask = float(snap.get("current_ask") or 0.0)
+
+                    if current_underlying > 0:
+                        pos.current_underlying = current_underlying
+                    if current_option_price > 0:
+                        pos.current_option_price = current_option_price
+                    if current_bid > 0:
+                        pos.current_bid = current_bid
+                    if current_ask > 0:
+                        pos.current_ask = current_ask
+
+                    if snap.get("last_underlying_quote_update_ts") is not None:
+                        pos.last_underlying_quote_update_ts = snap.get("last_underlying_quote_update_ts")
+                    if snap.get("last_option_quote_update_ts") is not None:
+                        pos.last_option_quote_update_ts = snap.get("last_option_quote_update_ts")
+
+                    if snap.get("price_source"):
+                        setattr(pos, "last_option_price_source", snap.get("price_source"))
+
+                except Exception as exc:
+                    log.debug(
+                        "apply_quote_snapshots failed pos_id=%s err=%s",
+                        pid or "?",
+                        exc,
+                    )
+
+    def emergency_flatten(
+        self,
+        reason: str = "manual_flatten",
+        force: bool = True,
+        bypass_quote_gate: bool = True,
+    ) -> int:
+        """
+        Manual admin flatten path.
+
+        Reuses the normal exit submission pipeline and marks the decision as
+        forced-risk so stale/blind quote gates do not block emergency liquidation.
+        This keeps fills, OSM state, reconciler state, and audit trails coherent.
+        """
+        if self._flattening.is_set():
+            log.warning("emergency_flatten already running")
+            return 0
+
+        self._flattening.set()
+
+        try:
+            submitted = 0
+
+            with self._lock:
+                snapshot = [
+                    p for p in self._positions
+                    if not getattr(p, "closed", False)
+                    and int(getattr(p, "quantity_remaining", 0) or 0) > 0
+                ]
+
+            for pos in snapshot:
+                try:
+                    qty = int(getattr(pos, "quantity_remaining", 0) or 0)
+                    if qty <= 0:
+                        continue
+
+                    decision = ExitDecision(
+                        action="CLOSE_ALL",
+                        quantity=qty,
+                        reason=f"SENTINEL FORCED EXIT -- {reason}",
+                        urgency="IMMEDIATE",
+                        pnl_pct=float(getattr(pos, "option_pnl_pct", 0.0) or 0.0),
+                        reason_code="SENTINEL_FORCED_EXIT",
+                    )
+
+                    ok = self._submit_exit_decision(
+                        pos,
+                        decision,
+                        from_sentinel=True,
+                        allow_inflight_override=bool(force),
+                    )
+
+                    if ok:
+                        submitted += 1
+
+                except Exception as e:
+                    log.error(
+                        "emergency_flatten failed pos_id=%s symbol=%s err=%s",
+                        getattr(pos, "position_id", "?"),
+                        getattr(pos, "option_symbol", "?"),
+                        e,
+                        exc_info=True,
+                    )
+
+            log.critical(
+                "EMERGENCY_FLATTEN submitted=%d reason=%s force=%s bypass_quote_gate=%s",
+                submitted,
+                reason,
+                force,
+                bypass_quote_gate,
+            )
+
+            return submitted
+
+        finally:
+            self._flattening.clear()
 
     def set_pending_exit_order(
         self,
@@ -2244,7 +2393,11 @@ class APExitEngine:
             except Exception:
                 pass
 
-            time.sleep(POLL_INTERVAL_SEC)
+            # QPM: PositionQuoteMonitor can wake the exit loop immediately
+            # when a material quote move arrives; otherwise this still behaves
+            # like the original 8-second polling safety net.
+            self._quote_arrived_event.wait(timeout=POLL_INTERVAL_SEC)
+            self._quote_arrived_event.clear()
 
     def _check_all_positions(self):
         today_et = _et_session_date()
@@ -2427,6 +2580,13 @@ class APExitEngine:
                                 pos.ticker, decision.reason_code, option_quote_age_sec,
                                 option_quote_state, pos.position_id or "?",
                             )
+                            qm = getattr(self, "quote_monitor", None)
+                            if qm is not None:
+                                qpm_state = getattr(pos, "quote_state", "")
+                                if qpm_state == "blind" and hasattr(qm, "note_exit_gated_blind"):
+                                    qm.note_exit_gated_blind()
+                                elif hasattr(qm, "note_exit_gated_stale"):
+                                    qm.note_exit_gated_stale()
                             continue
 
                         if option_quote_stale and _is_forced_risk_exit_code(decision.reason_code):
