@@ -1430,6 +1430,324 @@ def create_app() -> Flask:
 # Gunicorn entrypoint
 app = create_app()
 
+# =========================================================================
+# DEBUG + ADMIN: quote monitor observability + manual flatten
+# =========================================================================
+# These routes are registered after create_app() so the existing stable app body
+# remains untouched while still exposing fleet-level quote-monitor telemetry and
+# manual emergency flatten controls.
+import os as _os_admin
+import hmac as _hmac_admin
+import logging as _logging_admin
+from functools import wraps as _admin_wraps
+
+admin_log = _logging_admin.getLogger("admin.controls")
+
+ADMIN_API_KEY = _os_admin.getenv("ADMIN_API_KEY", "")
+ALLOWED_ADMIN_IPS = {
+    ip.strip()
+    for ip in _os_admin.getenv("ALLOWED_ADMIN_IPS", "").split(",")
+    if ip.strip()
+}
+
+
+def _admin_client_ip() -> str:
+    return request.headers.get(
+        "X-Forwarded-For",
+        request.remote_addr or "",
+    ).split(",")[0].strip()
+
+
+def _require_admin(fn):
+    @_admin_wraps(fn)
+    def _wrap(*a, **kw):
+        if not ADMIN_API_KEY:
+            return jsonify({"ok": False, "error": "ADMIN_API_KEY not configured"}), 503
+
+        ip = _admin_client_ip()
+
+        if ALLOWED_ADMIN_IPS and ip not in ALLOWED_ADMIN_IPS:
+            admin_log.critical("ADMIN_DENIED_IP path=%s ip=%s", request.path, ip)
+            return jsonify({"ok": False, "error": "forbidden_ip"}), 403
+
+        supplied = request.headers.get("X-Admin-Key", "")
+
+        if not _hmac_admin.compare_digest(supplied, ADMIN_API_KEY):
+            admin_log.critical("ADMIN_AUTH_FAIL path=%s ip=%s", request.path, ip)
+            return jsonify({"ok": False, "error": "unauthorized"}), 401
+
+        return fn(*a, **kw)
+
+    return _wrap
+
+
+def _iter_client_runners():
+    """
+    Yield (client_id, runner) for every active client runner.
+
+    Supports both registry styles used across this codebase:
+      - CLIENT_RUNNERS: dict[str, Runner]
+      - _active_runners + _registry_lock: dict[str, Runner]
+    """
+    # Preferred explicit registry if present.
+    try:
+        from client_runner import CLIENT_RUNNERS  # type: ignore
+        for cid, runner in list(CLIENT_RUNNERS.items()):
+            yield cid, runner
+        return
+    except Exception as e:
+        admin_log.debug("CLIENT_RUNERS unavailable; falling back to _active_runners: %s", e)
+
+    # Current runner registry used by this app's existing admin routes.
+    try:
+        from client_runner import _active_runners, _registry_lock
+        with _registry_lock:
+            runners = list(_active_runners.items())
+        for cid, runner in runners:
+            yield cid, runner
+        return
+    except Exception as e:
+        admin_log.error("runner registry unavailable: %s", e)
+        return
+
+
+def _get_quote_monitor(runner):
+    # Monitors may be hung directly off the runner.
+    qm = getattr(runner, "quote_monitor", None)
+    if qm is not None:
+        return qm
+
+    # Or hung off the exit engine.
+    ee = _get_exit_engine(runner)
+    if ee is not None:
+        return getattr(ee, "quote_monitor", None) or getattr(ee, "_quote_monitor", None)
+
+    return None
+
+
+def _get_exit_engine(runner):
+    # Direct runner attribute.
+    ee = getattr(runner, "exit_engine", None)
+    if ee is not None:
+        return ee
+
+    # Core-owned engine variants used elsewhere in this app.
+    core = getattr(runner, "core", None)
+    if core is not None:
+        for name in ("exit_eng", "exit_engine", "exiteng"):
+            ee = getattr(core, name, None)
+            if ee is not None:
+                return ee
+
+    # Last-resort common aliases.
+    for name in ("exit_eng", "exiteng"):
+        ee = getattr(runner, name, None)
+        if ee is not None:
+            return ee
+
+    return None
+
+
+def _call_flatten(ee, reason: str, force: bool = True):
+    """
+    Attempts common flatten method names.
+    force=True is important so manual flatten can bypass quote gates.
+    """
+    for name in ("emergency_flatten", "flatten_all", "close_all_positions", "flatten"):
+        fn = getattr(ee, name, None)
+        if not callable(fn):
+            continue
+
+        try:
+            varnames = getattr(getattr(fn, "__code__", None), "co_varnames", ())
+            kwargs = {}
+
+            if "reason" in varnames:
+                kwargs["reason"] = reason
+            if "force" in varnames:
+                kwargs["force"] = force
+            if "bypass_quote_gate" in varnames:
+                kwargs["bypass_quote_gate"] = force
+            if "emergency_override_quote_gate" in varnames:
+                kwargs["emergency_override_quote_gate"] = force
+
+            result = fn(**kwargs) if kwargs else fn()
+
+            return True, name, None, result
+
+        except Exception as e:
+            return False, name, str(e), None
+
+    return False, None, "no flatten method on exit_engine", None
+
+
+@app.get("/debug/quote_metrics")
+@_require_admin
+def debug_quote_metrics():
+    target = request.args.get("client_id")
+    out = {}
+
+    for cid, runner in _iter_client_runners():
+        if target and cid != target:
+            continue
+
+        qm = _get_quote_monitor(runner)
+        if qm is None:
+            out[cid] = {"ok": False, "error": "no quote_monitor"}
+            continue
+
+        try:
+            out[cid] = {
+                "ok": True,
+                "alive": qm.is_alive() if hasattr(qm, "is_alive") else None,
+                "healthy": qm.is_healthy() if hasattr(qm, "is_healthy") else None,
+                "metrics": qm.metrics_snapshot() if hasattr(qm, "metrics_snapshot") else {},
+                "health": qm.health_snapshot() if hasattr(qm, "health_snapshot") else [],
+            }
+        except Exception as e:
+            out[cid] = {"ok": False, "error": str(e)}
+
+    return jsonify({"ok": True, "clients": out})
+
+
+@app.get("/debug/quote_health")
+@_require_admin
+def debug_quote_health():
+    order = {"fresh": 0, "degraded": 1, "stale": 2, "blind": 3}
+    result = []
+
+    for cid, runner in _iter_client_runners():
+        qm = _get_quote_monitor(runner)
+
+        if qm is None:
+            result.append({"client_id": cid, "ok": False, "error": "no quote_monitor"})
+            continue
+
+        try:
+            health = qm.health_snapshot() if hasattr(qm, "health_snapshot") else []
+            worst = "fresh"
+
+            for h in health:
+                state = h.get("state", "fresh")
+                if order.get(state, 0) > order.get(worst, 0):
+                    worst = state
+
+            result.append({
+                "client_id": cid,
+                "ok": True,
+                "alive": qm.is_alive() if hasattr(qm, "is_alive") else None,
+                "healthy": qm.is_healthy() if hasattr(qm, "is_healthy") else None,
+                "last_cycle_age_sec": round(qm.last_cycle_age_sec(), 2) if hasattr(qm, "last_cycle_age_sec") else None,
+                "position_count": len(health),
+                "worst_state": worst,
+            })
+
+        except Exception as e:
+            result.append({"client_id": cid, "ok": False, "error": str(e)})
+
+    return jsonify({"ok": True, "clients": result})
+
+
+@app.post("/admin/flatten_client")
+@_require_admin
+def admin_flatten_client():
+    data = request.get_json(silent=True) or {}
+    cid = (data.get("client_id") or data.get("email") or "").strip()
+    reason = data.get("reason") or "manual_flatten"
+    force = bool(data.get("force", True))
+
+    if not cid:
+        return jsonify({"ok": False, "error": "client_id required"}), 400
+
+    for run_cid, runner in _iter_client_runners():
+        if run_cid != cid:
+            continue
+
+        ee = _get_exit_engine(runner)
+        if ee is None:
+            return jsonify({"ok": False, "error": "no exit_engine for client"}), 500
+
+        ok, method, err, result = _call_flatten(ee, reason=reason, force=force)
+
+        if ok:
+            admin_log.critical(
+                "MANUAL_FLATTEN_CLIENT client=%s method=%s reason=%s force=%s result=%s ip=%s",
+                cid,
+                method,
+                reason,
+                force,
+                result,
+                _admin_client_ip(),
+            )
+            return jsonify({
+                "ok": True,
+                "client_id": cid,
+                "method": method,
+                "reason": reason,
+                "force": force,
+                "result": result,
+            })
+
+        return jsonify({"ok": False, "error": err, "method": method}), 500
+
+    return jsonify({"ok": False, "error": f"client {cid} not found"}), 404
+
+
+@app.post("/admin/flatten_all")
+@_require_admin
+def admin_flatten_all():
+    data = request.get_json(silent=True) or {}
+    reason = data.get("reason") or "manual_flatten_all"
+    confirm = data.get("confirm")
+
+    if confirm != "FLATTEN_ALL":
+        return jsonify({
+            "ok": False,
+            "error": "confirmation required",
+            "required_confirm": "FLATTEN_ALL",
+        }), 400
+
+    force = bool(data.get("force", True))
+
+    admin_log.critical(
+        "GLOBAL_FLATTEN_REQUEST reason=%s force=%s ip=%s",
+        reason,
+        force,
+        _admin_client_ip(),
+    )
+
+    results = {}
+
+    for cid, runner in _iter_client_runners():
+        ee = _get_exit_engine(runner)
+
+        if ee is None:
+            results[cid] = {"ok": False, "error": "no exit_engine"}
+            continue
+
+        ok, method, err, result = _call_flatten(ee, reason=reason, force=force)
+
+        if ok:
+            results[cid] = {"ok": True, "method": method, "force": force, "result": result}
+            admin_log.critical(
+                "GLOBAL_FLATTEN_CLIENT client=%s method=%s reason=%s force=%s result=%s",
+                cid,
+                method,
+                reason,
+                force,
+                result,
+            )
+        else:
+            results[cid] = {"ok": False, "method": method, "error": err}
+
+    return jsonify({
+        "ok": True,
+        "reason": reason,
+        "force": force,
+        "clients": results,
+    })
+
+
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "5000"))
     log.info(f"Starting on port {port}")
