@@ -61,11 +61,23 @@ from ap_reconciler import APBrokerReconciler
 from ap_recovery import APStartupRecovery
 from ap.self_healing import get_healer, init_self_healing
 
+try:
+    from ap.position_quote_monitor import APPositionQuoteMonitor
+except Exception as _qpm_import_exc:
+    APPositionQuoteMonitor = None
+    # logger is defined just below; warning is emitted after logger initialization.
+
 logger = logging.getLogger("client_runner")
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
 )
+
+if APPositionQuoteMonitor is None:
+    try:
+        logger.warning("APPositionQuoteMonitor import failed: %s", _qpm_import_exc)
+    except Exception:
+        pass
 
 # COHESION-2 FIX: apply the (now no-op) shim once at module import time, not
 # per-runner startup. A real class-level patch should only run once per process,
@@ -245,6 +257,11 @@ class ClientRunner(threading.Thread):
         self.order_state_machine = None
         self.contract_selector = None
         self.order_monitor = None
+        self.quotemonitor = None
+        self.quote_monitor = None
+        self.broker = None
+        self.data_broker = None
+        self.databroker = None
         self.fill_monitor_thread = None
         self.worker_thread = None
         self.equity_thread = None
@@ -484,12 +501,124 @@ class ClientRunner(threading.Thread):
 
         return False
 
+    def _quote_monitor_healthy(self) -> bool:
+        """Return True when the per-client quote monitor is alive and heartbeating."""
+        qm = getattr(self, "quotemonitor", None) or getattr(self, "quote_monitor", None)
+        if qm is None:
+            return False
+        try:
+            return bool(qm.is_healthy())
+        except Exception:
+            return False
+
+    def _start_position_quote_monitor(self, broker=None, exit_eng=None) -> None:
+        """
+        Start the per-client APPositionQuoteMonitor once broker + exit engine exist.
+
+        Ownership:
+          - ClientRunner owns monitor lifecycle.
+          - ExitEngine owns position state and exit decisions.
+          - QuoteMonitor hydrates quotes into ExitEngine and wakes the exit loop.
+          - app.py only observes health/metrics through runner.quotemonitor/quote_monitor.
+        """
+        if APPositionQuoteMonitor is None:
+            logger.warning("[%s] PositionQuoteMonitor unavailable: import failed", self.email)
+            return
+
+        existing = getattr(self, "quotemonitor", None) or getattr(self, "quote_monitor", None)
+        if existing is not None:
+            try:
+                if existing.is_alive():
+                    return
+            except Exception:
+                pass
+
+        core = getattr(self, "core", None)
+        broker = (
+            broker
+            or getattr(self, "data_broker", None)
+            or getattr(self, "databroker", None)
+            or getattr(self, "broker", None)
+            or getattr(core, "data_broker", None)
+            or getattr(core, "databroker", None)
+            or getattr(core, "broker", None)
+        )
+        exit_eng = (
+            exit_eng
+            or getattr(self, "exit_eng", None)
+            or getattr(self, "exiteng", None)
+            or getattr(self, "exit_engine", None)
+            or getattr(core, "exit_eng", None)
+            or getattr(core, "exiteng", None)
+            or getattr(core, "exit_engine", None)
+        )
+
+        if broker is None:
+            logger.error("[%s] PositionQuoteMonitor not started: broker missing", self.email)
+            return
+        if exit_eng is None:
+            logger.error("[%s] PositionQuoteMonitor not started: exit engine missing", self.email)
+            return
+
+        def _qpm_alert(msg: str) -> None:
+            try:
+                logger.warning("[%s] %s", self.email, msg)
+                health_mon = get_monitor()
+                if health_mon and hasattr(health_mon, "raise_dashboard_alert"):
+                    health_mon.raise_dashboard_alert(self.email, msg)
+            except Exception:
+                pass
+
+        qm = APPositionQuoteMonitor(
+            broker=broker,
+            client_id=self.email,
+            exit_engine=exit_eng,
+            alert_fn=_qpm_alert,
+        )
+
+        attach = (
+            getattr(exit_eng, "attach_quote_monitor", None)
+            or getattr(exit_eng, "attachquotemonitor", None)
+        )
+        if callable(attach):
+            attach(qm)
+        else:
+            try:
+                setattr(exit_eng, "quote_monitor", qm)
+                setattr(exit_eng, "quotemonitor", qm)
+            except Exception:
+                pass
+
+        self.quote_monitor = qm
+        self.quotemonitor = qm
+        try:
+            setattr(exit_eng, "quote_monitor", qm)
+            setattr(exit_eng, "quotemonitor", qm)
+        except Exception:
+            pass
+
+        qm.start()
+        logger.info("[%s] PositionQuoteMonitor started and attached to exit engine", self.email)
+
     def _set_entry_permission(self):
         _worker_ok = self.worker_thread is not None and self.worker_thread.is_alive()
         _fill_ok   = self.fill_monitor_thread is not None and self.fill_monitor_thread.is_alive()
         _core_ok   = self.core is not None and getattr(self.core, "exit_eng", None) is not None
-        _degraded  = self.degraded.is_set()
         _failed    = self.failed.is_set()
+
+        _require_qpm = os.getenv("REQUIRE_QUOTE_MONITOR_FOR_ENTRIES", "1").strip().lower() in {"1", "true", "yes", "on"}
+        _quote_ok = self._quote_monitor_healthy() if _require_qpm else True
+        if _require_qpm and self.initialized.is_set() and not self.stopping.is_set() and not _failed:
+            if _quote_ok:
+                if "quote_monitor_unhealthy" in self.degraded_reasons:
+                    self.degraded_reasons.discard("quote_monitor_unhealthy")
+                    if not self.degraded_reasons:
+                        self.degraded.clear()
+            else:
+                self.degraded.set()
+                self.degraded_reasons.add("quote_monitor_unhealthy")
+
+        _degraded  = self.degraded.is_set()
         # Fill monitor self-restarts after SSL crashes. Give it 120s grace before
         # blocking entries — prevents brief restart windows from killing signal flow.
         _fill_dead_since = getattr(self, "_fill_dead_since", None)
@@ -509,6 +638,7 @@ class ClientRunner(threading.Thread):
             and _core_ok
             and _worker_ok
             and _fill_ok_for_entries
+            and _quote_ok
         )
         if ready:
             self.entries_allowed.set()
@@ -523,6 +653,8 @@ class ClientRunner(threading.Thread):
                 logger.warning("[%s] entries_allowed BLOCKED: worker_thread dead", self.email)
             if not _fill_ok_for_entries:
                 logger.warning("[%s] entries_allowed BLOCKED: fill_monitor dead >120s (actual=%s)", self.email, _fill_ok)
+            if _require_qpm and not _quote_ok:
+                logger.warning("[%s] entries_allowed BLOCKED: quote_monitor unhealthy/missing", self.email)
             if _degraded:
                 logger.warning("[%s] entries_allowed BLOCKED: degraded reasons=%s", self.email, sorted(getattr(self, "degraded_reasons", set())))
             if _failed:
@@ -556,6 +688,8 @@ class ClientRunner(threading.Thread):
             "order_state_machine_present": self.order_state_machine is not None,
             "contract_selector_present": self.contract_selector is not None,
             "order_monitor_present": self.order_monitor is not None,
+            "quote_monitor_present": self.quotemonitor is not None or self.quote_monitor is not None,
+            "quote_monitor_alive": bool((self.quotemonitor or self.quote_monitor) and (self.quotemonitor or self.quote_monitor).is_alive()),
             "fill_monitor_alive": bool(self.fill_monitor_thread and self.fill_monitor_thread.is_alive()),
             "worker_alive": bool(self.worker_thread and self.worker_thread.is_alive()),
             "equity_alive": bool(self.equity_thread and self.equity_thread.is_alive()),
@@ -1010,6 +1144,7 @@ class ClientRunner(threading.Thread):
 
         broker_cfg = TradierConfig(base_url=self.base_url, access_token=token, account_id=self.account_id)
         broker = TradierBroker(broker_cfg)
+        self.broker = broker
 
         self._clear_old_phantom_orders()
         # BUG-3 FIX: guard both URL and key — an empty service key produces a
@@ -1114,6 +1249,9 @@ class ClientRunner(threading.Thread):
             data_broker = broker
             logger.warning("[%s] TRADIER_DATA_TOKEN not set -- using execution broker for data", self.email)
 
+        self.data_broker = data_broker
+        self.databroker = data_broker
+
         earnings_guard = APEarningsGuard(
             broker=data_broker,
             blackout_days=int(os.getenv("EARNINGS_BLACKOUT_DAYS", "3")),
@@ -1164,6 +1302,7 @@ class ClientRunner(threading.Thread):
         self._register_exit_engine(exit_eng)
         self._run_startup_recovery(broker, exit_eng)
         self._seed_exit_engine_from_db(exit_eng)
+        self._start_position_quote_monitor(data_broker if data_token else broker, exit_eng)
         self._start_reconciler(broker, exit_eng)
         self._sync_account_equity(broker)
 
@@ -1233,6 +1372,17 @@ class ClientRunner(threading.Thread):
     def _cleanup(self):
         self.entries_allowed.clear()
         self.degraded.set()
+
+        qm = getattr(self, "quotemonitor", None) or getattr(self, "quote_monitor", None)
+        if qm is not None:
+            try:
+                qm.stop()
+                logger.info("[%s] PositionQuoteMonitor stopped", self.email)
+            except Exception as exc:
+                logger.warning("[%s] PositionQuoteMonitor stop failed: %s", self.email, exc)
+            finally:
+                self.quotemonitor = None
+                self.quote_monitor = None
 
         if self.order_monitor:
             try:
@@ -2030,6 +2180,12 @@ def get_runner_status() -> list[dict]:
                     if r.contract_selector else False
                 ),
                 "order_monitor": r.order_monitor is not None,
+                "quote_monitor": (getattr(r, "quotemonitor", None) is not None or getattr(r, "quote_monitor", None) is not None),
+                "quote_monitor_alive": (
+                    bool((getattr(r, "quotemonitor", None) or getattr(r, "quote_monitor", None))
+                         and (getattr(r, "quotemonitor", None) or getattr(r, "quote_monitor", None)).is_alive())
+                ),
+                "quote_monitor_healthy": r._quote_monitor_healthy() if hasattr(r, "_quote_monitor_healthy") else False,
                 "worker_alive": getattr(r, "worker_thread", None) is not None and r.worker_thread.is_alive(),
                 "fill_monitor_alive": getattr(r, "fill_monitor_thread", None) is not None and r.fill_monitor_thread.is_alive(),
                 "equity_alive": getattr(r, "equity_thread", None) is not None and r.equity_thread.is_alive(),
