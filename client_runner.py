@@ -501,6 +501,16 @@ class ClientRunner(threading.Thread):
 
         return False
 
+    def _is_market_hours_now(self) -> bool:
+        """True only during NYSE market hours Mon–Fri 9:25–16:05 ET."""
+        try:
+            from zoneinfo import ZoneInfo
+            from datetime import datetime as _dt, time as _t
+            et = _dt.now(ZoneInfo("America/New_York"))
+            return _t(9, 25) <= et.time() <= _t(16, 5) and et.weekday() < 5
+        except Exception:
+            return True   # fail open — don't block entries on tz error
+
     def _quote_monitor_healthy(self) -> bool:
         """Return True when the per-client quote monitor is alive and heartbeating."""
         qm = getattr(self, "quotemonitor", None) or getattr(self, "quote_monitor", None)
@@ -607,16 +617,33 @@ class ClientRunner(threading.Thread):
         _failed    = self.failed.is_set()
 
         _require_qpm = os.getenv("REQUIRE_QUOTE_MONITOR_FOR_ENTRIES", "1").strip().lower() in {"1", "true", "yes", "on"}
-        _quote_ok = self._quote_monitor_healthy() if _require_qpm else True
-        if _require_qpm and self.initialized.is_set() and not self.stopping.is_set() and not _failed:
+
+        # QPM is a real-time trading monitor — only required during market hours.
+        # Off-hours (nights, weekends): QPM cycles slowly and monitors no positions.
+        # Requiring it off-hours creates false degraded state that persists into open.
+        _market_open = self._is_market_hours_now()
+        _quote_ok = (self._quote_monitor_healthy() if (_require_qpm and _market_open) else True)
+
+        if _require_qpm and _market_open and self.initialized.is_set() and not self.stopping.is_set() and not _failed:
+            _was_degraded_qpm = "quote_monitor_unhealthy" in getattr(self, "degraded_reasons", set())
             if _quote_ok:
-                if "quote_monitor_unhealthy" in self.degraded_reasons:
+                if _was_degraded_qpm:
                     self.degraded_reasons.discard("quote_monitor_unhealthy")
                     if not self.degraded_reasons:
                         self.degraded.clear()
+                    # QPM just recovered during market hours — fire entries_allowed
+                    # immediately rather than waiting for the next 20s health loop tick.
+                    logger.info("[%s] QPM recovered — entries_allowed unlocked immediately", self.email)
             else:
                 self.degraded.set()
                 self.degraded_reasons.add("quote_monitor_unhealthy")
+        elif not _market_open:
+            # Off-hours: clear any stale QPM degraded reason so it doesn't block
+            # market-open entries when QPM hasn't had a chance to recover yet.
+            if "quote_monitor_unhealthy" in getattr(self, "degraded_reasons", set()):
+                self.degraded_reasons.discard("quote_monitor_unhealthy")
+                if not self.degraded_reasons:
+                    self.degraded.clear()
 
         _degraded  = self.degraded.is_set()
         # Fill monitor self-restarts after SSL crashes. Give it 120s grace before
