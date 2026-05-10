@@ -284,38 +284,51 @@ def run_overnight_reeval(
                 result["errors"] += 1
                 continue
 
-            # Step 5: Contract selection — pass decision.plan (ApprovedExecutionPlan),
-            # not the raw signal dict. select() mutates plan in-place (contract_symbol,
-            # limit_price, contracts, max_position_usd) and returns SelectedContract.
+            # Step 5: Contract selection — best-effort only.
+            # Pre-market option chains have zero bids (options don't trade before
+            # 9:30 AM ET). If selection fails here, we arm the watcher with
+            # contract_deferred=True so the execution core selects the contract
+            # at breach time when live quotes are available.
+            # NEVER permanently reject a valid signal because of pre-market chain data.
+            contract_deferred = False
             try:
                 selected = contract_selector.select(decision.plan)
             except Exception as cs_exc:
-                log.error("[%s] overnight_reeval: contract_selector.select failed: %s", ticker, cs_exc)
-                _mark_job_rejected(job_id, client_id, f"contract_selection_failed:{cs_exc}")
-                if _lifecycle_ok:
-                    try:
-                        _sig_rejected(signal_id, ticker, _LO.OVERNIGHT_EVAL,
-                                      f"contract_selection_failed: {cs_exc}",
-                                      _RC.EXECUTION, "CONTRACT_SELECTION_FAILED", _RS.WARNING)
-                    except Exception:
-                        pass
-                result["rejected"] += 1
-                continue
+                log.warning(
+                    "[%s] overnight_reeval: contract selection failed pre-market (%s) "
+                    "— deferring to breach time with live quotes",
+                    ticker, cs_exc,
+                )
+                selected = None
 
-            # After select() with mutate_plan=True (default), decision.plan.contract_symbol
-            # is populated. selected=None means no valid contract found.
-            if not selected or not getattr(decision.plan, "contract_symbol", None):
-                log.warning("[%s] overnight_reeval: no contract found for %s", ticker, signal_id)
-                _mark_job_rejected(job_id, client_id, "no_contract_selected")
+            if not selected or not str(getattr(decision.plan, "contract_symbol", "") or "").strip():
+                contract_deferred = True
+                log.info(
+                    "[%s] overnight_reeval: no pre-market contract available "
+                    "(zero bids expected before 9:30 AM ET) — "
+                    "arming watcher with contract_deferred=True | trigger=%.4f",
+                    ticker, entry_trigger or 0,
+                )
+                # Execution core will select the live contract at breach time.
+                # Set a placeholder limit so the plan passes downstream validation,
+                # and mark contracts=1 as the minimum safe default.
+                try:
+                    decision.plan.limit_price = 0.01   # overwritten at breach by live quote
+                    if not getattr(decision.plan, "contracts", None):
+                        decision.plan.contracts = 1
+                    if not hasattr(decision.plan, "metadata") or decision.plan.metadata is None:
+                        decision.plan.metadata = {}
+                    decision.plan.metadata["contract_deferred"] = True
+                except Exception:
+                    pass
                 if _lifecycle_ok:
                     try:
-                        _sig_rejected(signal_id, ticker, _LO.OVERNIGHT_EVAL,
-                                      "no_contract_selected",
-                                      _RC.EXECUTION, "NO_CONTRACT_SELECTED", _RS.INFO)
+                        from ap_lifecycle import LEDGER as _L
+                        _L.log_event(signal_id, "contract_deferred",
+                                     owner="overnight_reeval",
+                                     reason="pre_market_zero_bids_deferred_to_breach")
                     except Exception:
                         pass
-                result["rejected"] += 1
-                continue
 
             # Propagate entry_trigger and overnight flag to the plan
             if entry_trigger:
@@ -341,13 +354,16 @@ def run_overnight_reeval(
                 continue
 
             # Step 7: Arm entry watcher — pass plan (not signal) and the OSM order ID
-            _contract_sym = decision.plan.contract_symbol or ""
+            _contract_sym = str(getattr(decision.plan, "contract_symbol", "") or "")
+            _arm_label    = _contract_sym if _contract_sym else "DEFERRED_AT_BREACH"
             try:
                 armed = entry_watcher.watch(decision.plan, local_order_id)
                 if armed:
-                    _mark_job_watching_armed(job_id, client_id, _contract_sym)
-                    log.info("[%s] ✅ ARMED — contract=%s entry_trigger=%.4f",
-                             ticker, _contract_sym, entry_trigger or 0)
+                    _mark_job_watching_armed(job_id, client_id, _arm_label)
+                    log.info(
+                        "[%s] ✅ ARMED — contract=%s entry_trigger=%.4f contract_deferred=%s",
+                        ticker, _arm_label, entry_trigger or 0, contract_deferred,
+                    )
                     # ── THE BUG TRAP: signal is now WATCHING in the watcher ──
                     # If this signal disappears before market open, grep:
                     # [SIGNAL_TRACE] id=<signal_id>
@@ -356,12 +372,13 @@ def run_overnight_reeval(
                         try:
                             signal_armed(signal_id, ticker, _LO.OVERNIGHT_EVAL,
                                          "armed_in_entry_watcher",
-                                         contract=_contract_sym,
+                                         contract=_arm_label,
                                          local_order_id=str(local_order_id),
-                                         entry_trigger=str(entry_trigger or 0))
+                                         entry_trigger=str(entry_trigger or 0),
+                                         contract_deferred=str(contract_deferred))
                             signal_watching(signal_id, ticker, _LO.WATCHER,
                                             "watching_for_trigger_breach",
-                                            contract=_contract_sym,
+                                            contract=_arm_label,
                                             entry_trigger=str(entry_trigger or 0))
                         except Exception:
                             pass

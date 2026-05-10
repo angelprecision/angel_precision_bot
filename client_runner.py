@@ -1311,6 +1311,7 @@ class ClientRunner(threading.Thread):
             order_state_machine=self.order_state_machine,
             data_broker=data_broker,
             master_control=self.master_control,
+            contract_selector=self.contract_selector,
         )
         self.core.start()
         self._validate_execution_core_started()

@@ -62,8 +62,9 @@ class APExecutionCore:
     already-created entry orders, exit-engine callbacks, and signal logging.
     """
 
-    def __init__(self, broker, supabase_client=None, email: str = "", position_manager=None, order_state_machine=None, data_broker=None, master_control=None):
-        self.broker    = broker
+    def __init__(self, broker, supabase_client=None, email: str = "", position_manager=None, order_state_machine=None, data_broker=None, master_control=None, contract_selector=None):
+        self.broker            = broker
+        self.contract_selector = contract_selector  # wired for breach-time selection of deferred overnight signals
         self.email              = email
         self.position_manager   = position_manager
         self.order_state_machine = order_state_machine
@@ -586,6 +587,75 @@ class APExecutionCore:
                     "context_notes": "approved_plan_missing_after_revalidation",
                 })
             return
+
+        # 3b) Breach-time contract selection for overnight deferred signals.
+        # Pre-market option chains have zero bids — overnight_reeval cannot select
+        # contracts before 9:30 AM ET. Those signals are armed with
+        # contract_deferred=True. Here at breach (market open, live quotes) we
+        # select the contract before the limit_price and contract_symbol checks.
+        _sig_meta   = getattr(approved_plan, "metadata", {}) or {}
+        _sig_dict   = sig or {}
+        _deferred   = (
+            bool(_sig_meta.get("contract_deferred"))
+            or bool(_sig_dict.get("contract_deferred"))
+            or not str(getattr(approved_plan, "contract_symbol", "") or "").strip()
+        )
+        if _deferred:
+            if self.contract_selector is None:
+                log.critical(
+                    "[%s] PRODUCTION_ENTRY_BLOCK — contract_deferred=True but no "
+                    "contract_selector wired into execution core",
+                    ticker,
+                )
+                funnel.inc("order_failed")
+                if signal_id:
+                    self.store.update_signal_fields(signal_id, {
+                        "decision_status": "blocked_at_breach",
+                        "context_notes": "contract_deferred_no_selector",
+                    })
+                return
+            try:
+                log.info(
+                    "[%s] Overnight deferred signal — selecting contract at breach "
+                    "with live quotes (trigger=%.4f side=%s)",
+                    ticker,
+                    float(getattr(approved_plan, "trigger_price", 0) or 0),
+                    getattr(approved_plan, "side", "?"),
+                )
+                _sel = self.contract_selector.select(approved_plan)
+                _live_contract = str(getattr(approved_plan, "contract_symbol", "") or "").strip()
+                if not _sel or not _live_contract:
+                    log.critical(
+                        "[%s] PRODUCTION_ENTRY_BLOCK — breach-time contract selection "
+                        "returned no contract",
+                        ticker,
+                    )
+                    funnel.inc("order_failed")
+                    if signal_id:
+                        self.store.update_signal_fields(signal_id, {
+                            "decision_status": "blocked_at_breach",
+                            "context_notes": "breach_time_contract_selection_no_result",
+                        })
+                    return
+                log.info(
+                    "[%s] Breach-time contract selected: %s @ $%.2f x%s",
+                    ticker, _live_contract,
+                    float(getattr(approved_plan, "limit_price", 0) or 0),
+                    int(getattr(approved_plan, "contracts", 1) or 1),
+                )
+            except Exception as _cs_err:
+                log.critical(
+                    "[%s] PRODUCTION_ENTRY_BLOCK — breach-time contract selection "
+                    "error: %s",
+                    ticker, _cs_err,
+                )
+                funnel.inc("order_failed")
+                if signal_id:
+                    self.store.update_signal_fields(signal_id, {
+                        "decision_status": "blocked_at_breach",
+                        "context_notes": f"breach_time_contract_selection_error:{_cs_err}",
+                    })
+                return
 
         # 4) Require the approved plan to carry a valid limit price.
         submit_limit = getattr(approved_plan, "limit_price", None)

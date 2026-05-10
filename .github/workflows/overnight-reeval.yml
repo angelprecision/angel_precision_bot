@@ -2,16 +2,16 @@ name: Overnight Reeval
 
 on:
   schedule:
-    # Run at 9:00 AM ET (13:00 UTC) on weekdays — primary trigger
+    # Primary: 9:00 AM ET (13:00 UTC) — validation + watcher arming
     - cron: "0 13 * * 1-5"
-    # Backup run at 9:10 AM ET (13:10 UTC) in case runner was busy
+    # Backup: 9:10 AM ET (13:10 UTC) — catches missed primary runs
     - cron: "10 13 * * 1-5"
   workflow_dispatch:
     inputs:
       force:
-        description: 'Force reeval regardless of time'
+        description: 'Force reeval regardless of time/day (true/false)'
         required: false
-        default: 'true'
+        default: 'false'
 
 jobs:
   trigger-overnight-reeval:
@@ -21,7 +21,13 @@ jobs:
     steps:
       - name: Trigger overnight reeval (HMAC signed)
         run: |
-          BODY='{"force": true}'
+          # Scheduled runs never force — they run in the 9:00-9:45 AM ET window
+          # where the time guard is already satisfied.
+          # Manual dispatch uses the input; default is false to prevent
+          # accidentally consuming WATCHING signals outside trading hours.
+          FORCE_FLAG="${{ github.event.inputs.force || 'false' }}"
+          BODY="{\"force\": ${FORCE_FLAG}}"
+
           TS=$(date +%s)
           BOT_URL="${{ secrets.AP_BOT_URL }}"
           SIGNING_SECRET="${{ secrets.AP_SIGNING_SECRET }}"
@@ -31,7 +37,7 @@ jobs:
             openssl dgst -sha256 -hmac "$SIGNING_SECRET" -hex | \
             sed 's/^.* //')
 
-          echo "Triggering overnight reeval at $(date -u) | bot=$BOT_URL"
+          echo "Triggering overnight reeval at $(date -u) | bot=$BOT_URL | force=$FORCE_FLAG"
 
           HTTP_CODE=$(curl -s -o /tmp/response.txt -w "%{http_code}" \
             --retry 3 \
@@ -53,6 +59,10 @@ jobs:
             exit 1
           fi
 
-          # Check how many setups were armed
-          ARMED=$(cat /tmp/response.txt | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('total_armed',0))" 2>/dev/null || echo "?")
-          echo "✅ Overnight reeval complete — $ARMED setups armed for today"
+          ARMED=$(cat /tmp/response.txt | python3 -c \
+            "import sys,json; d=json.load(sys.stdin); print(d.get('armed', d.get('total_armed', 0)))" \
+            2>/dev/null || echo "?")
+          DEFERRED=$(cat /tmp/response.txt | python3 -c \
+            "import sys,json; d=json.load(sys.stdin); print(d.get('deferred_contract',0))" \
+            2>/dev/null || echo "0")
+          echo "✅ Overnight reeval complete — $ARMED watcher(s) armed | $DEFERRED contract(s) deferred to breach"
