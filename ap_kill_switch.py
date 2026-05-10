@@ -34,6 +34,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
+import time
 
 log = logging.getLogger("ap.kill")
 
@@ -50,21 +51,30 @@ class KillSwitch:
     def __init__(self, flag_path: str = _DEFAULT_FLAG_PATH):
         self._armed     = False
         self._reason    = ""
+        self._armed_at  = 0.0
         self._lock      = threading.Lock()
         self._flag_path = flag_path
-        # On startup: if flag file exists from a prior crash, arm immediately.
+        # On startup: if flag file exists from a prior run, log loudly but do NOT
+        # auto-arm. The flag persists on disk (Render persistent disk) and could
+        # have been written during a startup race in a previous deploy. Require an
+        # explicit operator call to arm via the API, or let the health sweep arm
+        # it after the startup grace period if a real organ failure is detected.
         if os.path.exists(self._flag_path):
             try:
                 with open(self._flag_path) as f:
                     prior_reason = f.read().strip()
             except Exception:
-                prior_reason = "flag_file_existed_on_startup"
-            self._armed  = True
-            self._reason = prior_reason
-            log.critical(
-                "[KILL_SWITCH] ARMED ON STARTUP — prior flag file found: %s",
+                prior_reason = "unknown"
+            log.warning(
+                "[KILL_SWITCH] Stale flag file found from prior run: %s — "
+                "removing it to allow clean startup. "
+                "Kill switch will re-arm if a critical organ fails after startup grace period.",
                 prior_reason,
             )
+            try:
+                os.remove(self._flag_path)
+            except Exception:
+                pass
 
     def is_killed(self) -> bool:
         """Zero-latency check. Always prefer in-memory flag over file I/O."""
@@ -75,8 +85,9 @@ class KillSwitch:
         with self._lock:
             if self._armed:
                 return
-            self._armed  = True
-            self._reason = reason
+            self._armed    = True
+            self._reason   = reason
+            self._armed_at = time.time()
             log.critical("[KILL_SWITCH] SYSTEM HALT: %s", reason)
             try:
                 os.makedirs(os.path.dirname(self._flag_path) or "logs", exist_ok=True)
