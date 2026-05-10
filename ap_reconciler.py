@@ -84,6 +84,33 @@ from typing import Optional
 
 log = logging.getLogger("ap.reconciler")
 
+# ── Optional observability hooks ─────────────────────────────────────────────
+# These imports are deliberately defensive so the reconciler can still run in
+# isolation/tests before ap_lifecycle.py or ap_health_registry.py are deployed.
+try:
+    from ap_lifecycle import (
+        signal_recovered_position,
+        signal_position_reseeded,
+        signal_rejected,
+        RejectionCategory,
+        RejectionSeverity,
+        LifecycleOwner,
+    )
+except Exception:  # pragma: no cover - runtime safety for partial deployments
+    signal_recovered_position = None
+    signal_position_reseeded = None
+    signal_rejected = None
+    RejectionCategory = None
+    RejectionSeverity = None
+    LifecycleOwner = None
+
+try:
+    from ap_health_registry import HEALTH, Criticality
+except Exception:  # pragma: no cover - runtime safety for partial deployments
+    HEALTH = None
+    Criticality = None
+# ─────────────────────────────────────────────────────────────────────────────
+
 RECONCILE_INTERVAL_SEC = int(os.getenv("RECONCILE_INTERVAL_SEC", "15"))
 
 # Minimum seconds between two effective run_once() executions on the same instance.
@@ -208,6 +235,10 @@ class APBrokerReconciler:
         self._run_once_lock: threading.RLock = threading.RLock()
         self._last_run_once_ts: float = 0.0
         self._last_run_once_summary: Optional[dict] = None
+
+        # ── Observability identity ───────────────────────────────────────────
+        self._health_name = f"ap_reconciler:{self.client_id}"
+        self._register_health()
         # ─────────────────────────────────────────────────────────────────────
 
     # ──────────────────────────────────────────────────────────────────────────
@@ -225,6 +256,7 @@ class APBrokerReconciler:
         )
         self._thread.start()
         self._verify_fill_monitor_or_alert()
+        self._heartbeat("started", thread_alive=True)
         log.info(
             "[%s] Reconciler started (interval=%ds market_hours_effective<=15s "
             "import_missing_broker_positions=%s run_once_min_interval=%.1fs)",
@@ -238,6 +270,7 @@ class APBrokerReconciler:
         self._stop.set()
         if self._thread:
             self._thread.join(timeout=10)
+        self._heartbeat("stopped", thread_alive=False)
 
     def is_alive(self) -> bool:
         return bool(self._thread and self._thread.is_alive())
@@ -254,6 +287,7 @@ class APBrokerReconciler:
                 self.run_once()
             except Exception as e:
                 log.error("[%s] Reconciler loop error: %s", self.client_id, e, exc_info=True)
+                self._report_health_error(f"loop_error: {e}", fatal=False)
 
     def run_once(self) -> dict:
         """
@@ -311,21 +345,38 @@ class APBrokerReconciler:
             except Exception as e:
                 log.error("[%s] Order reconcile error: %s", self.client_id, e, exc_info=True)
                 summary["errors"].append(f"orders: {e}")
+                self._report_health_error(f"orders_reconcile_error: {e}", fatal=False)
 
             try:
                 self._reconcile_positions(summary)
             except Exception as e:
                 log.error("[%s] Position reconcile error: %s", self.client_id, e, exc_info=True)
                 summary["errors"].append(f"positions: {e}")
+                self._report_health_error(f"positions_reconcile_error: {e}", fatal=False)
 
             try:
                 self._check_duplicate_positions(summary)
             except Exception as e:
                 log.error("[%s] Dedup check error: %s", self.client_id, e, exc_info=True)
                 summary["errors"].append(f"dedup: {e}")
+                self._report_health_error(f"dedup_reconcile_error: {e}", fatal=False)
 
             # FIX-8: record and surface pass timing.
             summary["elapsed_sec"] = round(time.monotonic() - _pass_start, 3)
+
+            self._heartbeat(
+                "run_once_complete",
+                run=self._run_count,
+                orders_checked=summary.get("orders_checked", 0),
+                orders_corrected=summary.get("orders_corrected", 0),
+                orders_alerted=summary.get("orders_alerted", 0),
+                positions_checked=summary.get("positions_checked", 0),
+                positions_corrected=summary.get("positions_corrected", 0),
+                positions_imported=summary.get("positions_imported", 0),
+                positions_alerted=summary.get("positions_alerted", 0),
+                errors=len(summary.get("errors", [])),
+                elapsed_sec=summary.get("elapsed_sec", 0.0),
+            )
 
             log.info(
                 "[%s] Reconcile #%d complete | orders=%d corrected=%d alerted=%d "
@@ -1771,6 +1822,25 @@ class APBrokerReconciler:
                     self.client_id, contract,
                 )
 
+        # Lifecycle visibility: ghost/autoclose is a major data-correction event.
+        # Record it before the DB row is changed so a future trace can explain
+        # exactly why the reconciler decided broker truth required closing DB truth.
+        self._record_reconciler_rejection(
+            signal_id=str(pos_id or f"ghost:{contract}"),
+            ticker=underlying or contract[:6],
+            category_name="DATA",
+            severity_name="WARNING",
+            reason_code="BROKER_POSITION_MISSING_THREE_PASS_CONFIRM",
+            human_reason="broker position missing after three-pass confirmation; reconciler auto-closing DB position",
+            contract=contract,
+            pos_id=pos_id,
+            db_qty=db_qty,
+            entry_px=entry_px,
+            exit_px=exit_px,
+            close_confidence=close_confidence,
+            client_id=self.client_id,
+        )
+
         pnl_dollars = round((exit_px - entry_px) * db_qty * 100, 2)
         pnl_pct     = round(((exit_px - entry_px) / entry_px) * 100, 2) if entry_px > 0 else 0.0
 
@@ -1907,7 +1977,35 @@ class APBrokerReconciler:
 
             if not pos_id:
                 summary["positions_alerted"] += 1
+                self._record_reconciler_rejection(
+                    signal_id=f"reconciled:{contract}",
+                    ticker=underlying or contract[:6],
+                    category_name="DATA",
+                    severity_name="WARNING",
+                    reason_code="BROKER_POSITION_IMPORT_FAILED",
+                    human_reason="broker had open option position but DB import returned no position id",
+                    contract=contract,
+                    qty=qty,
+                    entry_px=entry_px,
+                    price_untrusted=price_untrusted,
+                    underlying_entry=underlying_entry,
+                )
                 continue
+
+            self._record_recovered_position(
+                signal_id=str(pos_id or f"reconciled:{contract}"),
+                ticker=underlying or contract[:6],
+                reason="broker_open_position_missing_from_db_imported",
+                contract=contract,
+                qty=qty,
+                side=side,
+                entry_px=entry_px,
+                price_untrusted=price_untrusted,
+                underlying_entry=underlying_entry,
+                client_id=self.client_id,
+                broker_position=bp,
+                db_position_missing=True,
+            )
 
             summary["positions_imported"] += 1
             summary["positions_corrected"] += 1
@@ -2252,6 +2350,20 @@ class APBrokerReconciler:
                 "[%s] Cannot seed exit engine for imported/open position %s — exit_engine not wired",
                 self.client_id, contract,
             )
+            self._record_reconciler_rejection(
+                signal_id=str(pos_id or f"reconciled:{contract}"),
+                ticker=underlying or contract[:6],
+                category_name="HEALTH",
+                severity_name="CRITICAL",
+                reason_code="EXIT_ENGINE_NOT_WIRED",
+                human_reason="reconciler could not seed imported/open position because exit_engine is not wired",
+                contract=contract,
+                pos_id=pos_id,
+                qty=qty,
+                entry_px=entry_px,
+                price_untrusted=price_untrusted,
+                underlying_entry=underlying_entry,
+            )
             return
 
         try:
@@ -2292,9 +2404,49 @@ class APBrokerReconciler:
                 self.client_id, contract, qty, entry_px,
                 underlying_entry_u, bool(price_untrusted), pos_id or "n/a",
             )
+            self._record_position_reseeded(
+                signal_id=str(pos_id or f"reconciled:{contract}"),
+                ticker=underlying or contract[:6],
+                reason="position_seeded_into_exit_engine_by_reconciler",
+                contract=contract,
+                pos_id=pos_id,
+                qty=qty,
+                side=side,
+                entry_px=entry_px,
+                underlying_entry=underlying_entry_u,
+                price_untrusted=price_untrusted,
+                exit_engine_seeded=True,
+                quote_monitor_attached=False,
+                client_id=self.client_id,
+            )
+            self._heartbeat(
+                "exit_engine_seed",
+                contract=contract,
+                position_id=str(pos_id or ""),
+                qty=qty,
+                entry_px=entry_px,
+                underlying_entry=underlying_entry_u,
+                price_untrusted=bool(price_untrusted),
+            )
         except Exception as e:
             log.error("[%s] Failed to seed exit engine for %s: %s",
                       self.client_id, contract, e)
+            self._record_reconciler_rejection(
+                signal_id=str(pos_id or f"reconciled:{contract}"),
+                ticker=underlying or contract[:6],
+                category_name="EXECUTION",
+                severity_name="CRITICAL",
+                reason_code="EXIT_ENGINE_SEED_FAILED",
+                human_reason=f"failed to seed exit engine from reconciler: {e}",
+                contract=contract,
+                pos_id=pos_id,
+                qty=qty,
+                side=side,
+                entry_px=entry_px,
+                underlying_entry=underlying_entry,
+                price_untrusted=price_untrusted,
+            )
+            self._report_health_error(f"exit_engine_seed_failed: {e}", fatal=False)
 
     def _broker_position_mark_price(self, bp: dict) -> float:
         """Best-effort option mark/last extraction when cost basis is missing."""
@@ -2608,6 +2760,127 @@ class APBrokerReconciler:
         except Exception as e:
             log.error("[%s] Failed to revert position %s: %s",
                       self.client_id, position_id, e)
+
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Observability helpers: lifecycle + health
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def _owner(self):
+        """Return LifecycleOwner.RECONCILER when available, else a safe string."""
+        try:
+            return LifecycleOwner.RECONCILER if LifecycleOwner is not None else "RECONCILER"
+        except Exception:
+            return "RECONCILER"
+
+    def _enum_value(self, enum_cls, name: str, fallback: str):
+        """Resolve optional enum values without hard-failing older lifecycle files."""
+        try:
+            if enum_cls is not None and hasattr(enum_cls, name):
+                return getattr(enum_cls, name)
+        except Exception:
+            pass
+        return fallback
+
+    def _register_health(self) -> None:
+        if HEALTH is None or Criticality is None:
+            return
+        try:
+            HEALTH.register(self._health_name, Criticality.HIGH, stale_after_s=max(45.0, float(self._interval) * 4.0))
+        except Exception as exc:
+            log.debug("[%s] health register failed: %s", self.client_id, exc)
+
+    def _heartbeat(self, event: str = "heartbeat", **metrics) -> None:
+        if HEALTH is None:
+            return
+        try:
+            clean_metrics = {"event": event}
+            for k, v in metrics.items():
+                if isinstance(v, (int, float, bool)):
+                    clean_metrics[k] = float(v) if isinstance(v, bool) else v
+                elif v is not None:
+                    clean_metrics[k] = str(v)[:120]
+            HEALTH.heartbeat(self._health_name, metrics=clean_metrics)
+        except Exception as exc:
+            log.debug("[%s] health heartbeat failed: %s", self.client_id, exc)
+
+    def _report_health_error(self, error: str, fatal: bool = False) -> None:
+        if HEALTH is None:
+            return
+        try:
+            HEALTH.report_error(self._health_name, str(error), fatal=fatal)
+        except Exception as exc:
+            log.debug("[%s] health report failed: %s", self.client_id, exc)
+
+    def _record_recovered_position(self, *, signal_id: str, ticker: str, reason: str, **meta) -> None:
+        if signal_recovered_position is None:
+            log.warning(
+                "[%s] RECOVERED_POSITION | %s | %s | %s",
+                self.client_id, ticker, signal_id, reason,
+            )
+            return
+        try:
+            signal_recovered_position(
+                signal_id=str(signal_id),
+                ticker=str(ticker or "?").upper(),
+                owner=self._owner(),
+                reason=reason,
+                **meta,
+            )
+        except Exception as exc:
+            log.error("[%s] lifecycle RECOVERED_POSITION write failed: %s", self.client_id, exc)
+
+    def _record_position_reseeded(self, *, signal_id: str, ticker: str, reason: str, **meta) -> None:
+        if signal_position_reseeded is None:
+            log.warning(
+                "[%s] POSITION_RESEEDED | %s | %s | %s",
+                self.client_id, ticker, signal_id, reason,
+            )
+            return
+        try:
+            signal_position_reseeded(
+                signal_id=str(signal_id),
+                ticker=str(ticker or "?").upper(),
+                owner=self._owner(),
+                reason=reason,
+                **meta,
+            )
+        except Exception as exc:
+            log.error("[%s] lifecycle POSITION_RESEEDED write failed: %s", self.client_id, exc)
+
+    def _record_reconciler_rejection(
+        self,
+        *,
+        signal_id: str,
+        ticker: str,
+        category_name: str,
+        severity_name: str,
+        reason_code: str,
+        human_reason: str,
+        **meta,
+    ) -> None:
+        if signal_rejected is None:
+            log.warning(
+                "[%s] RECONCILER_REJECTION | %s | %s | %s | %s",
+                self.client_id, ticker, signal_id, reason_code, human_reason,
+            )
+            return
+        try:
+            category = self._enum_value(RejectionCategory, category_name, category_name)
+            severity = self._enum_value(RejectionSeverity, severity_name, severity_name)
+            signal_rejected(
+                signal_id=str(signal_id),
+                ticker=str(ticker or "?").upper(),
+                owner=self._owner(),
+                category=category,
+                reason_code=reason_code,
+                severity=severity,
+                reason=human_reason,
+                client_id=self.client_id,
+                **meta,
+            )
+        except Exception as exc:
+            log.error("[%s] lifecycle rejection write failed: %s", self.client_id, exc)
 
     def _alert(self, msg: str):
         log.warning("[%s] RECONCILER: %s", self.client_id, msg)
