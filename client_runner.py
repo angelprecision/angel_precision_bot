@@ -795,10 +795,10 @@ class ClientRunner(threading.Thread):
             now_et = _dt.datetime.now(ZoneInfo("America/New_York"))
             today = now_et.date()
 
-            # Only Mon-Fri, 9:00-9:45 AM ET
+            # Only Mon-Fri, 9:00-9:25 AM ET — must arm watcher before 9:30 open
             if now_et.weekday() >= 5:
                 return
-            if not (now_et.hour == 9 and 0 <= now_et.minute <= 45):
+            if not (now_et.hour == 9 and 0 <= now_et.minute <= 25):
                 return
 
             # Only once per day

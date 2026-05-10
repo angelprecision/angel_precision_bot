@@ -2,10 +2,13 @@ name: Overnight Reeval
 
 on:
   schedule:
-    # Primary: 9:00 AM ET (13:00 UTC) — validation + watcher arming
-    - cron: "0 13 * * 1-5"
-    # Backup: 9:10 AM ET (13:10 UTC) — catches missed primary runs
-    - cron: "10 13 * * 1-5"
+    # 9:03 AM ET (13:03 UTC) — primary. Avoids :00 high-load minute on GitHub.
+    # Bot-side health loop also fires within 20s of 9:00 AM ET independently.
+    - cron: "3 13 * * 1-5"
+    # 9:11 AM ET (13:11 UTC) — backup in case primary runner was queued/delayed.
+    - cron: "11 13 * * 1-5"
+    # 9:19 AM ET (13:19 UTC) — final safety net. Still inside 9:00-9:25 window.
+    - cron: "19 13 * * 1-5"
   workflow_dispatch:
     inputs:
       force:
