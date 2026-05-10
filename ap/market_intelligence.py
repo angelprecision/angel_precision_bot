@@ -384,19 +384,31 @@ class APIVRankFilter:
     def __init__(self, broker, max_iv_rank: float = 70.0, hard_cap: float = None, mode: str = "RESEARCH") -> None:
         self.broker      = broker
         self.mode        = (mode or "RESEARCH").upper()
-        # Zone thresholds vary by mode
-        # PAPER/RESEARCH: soft=100, hard=150, extreme=180
-        # LIVE/PROD:      soft=100, hard=120, extreme=140
+        # Zone thresholds by mode:
+        #
+        # PAPER/RESEARCH:
+        #   Zone 1 (normal):     IV rank ≤ max_iv_rank (105 from env) → free pass
+        #   Zone 2 (exceeding):  max_iv_rank < IV rank ≤ hard_cap (150) → requires momentum score≥65
+        #   Zone 3 (extreme):    IV rank > 150 → hard block
+        #
+        # LIVE/PROD (tighter):
+        #   Zone 1 (normal):     IV rank ≤ min(max_iv_rank, 100) → free pass
+        #   Zone 2 (soft):       100 < IV rank ≤ 120 → requires momentum score≥65
+        #   Zone 3 (hard):       120 < IV rank ≤ 140 → requires strong momentum score≥72
+        #   Zone 4 (extreme):    IV rank > 140 → hard block
         if self.mode in ("LIVE", "PROD"):
-            self.soft_cap    = 100.0
             self.max_iv_rank = min(float(max_iv_rank), 100.0)
+            self.soft_cap    = self.max_iv_rank   # env var respected in live too
             self.hard_cap    = hard_cap if hard_cap is not None else 120.0
             self.extreme_cap = 140.0
         else:
-            self.soft_cap    = 100.0
-            self.max_iv_rank = float(max_iv_rank)   # env override respected
+            self.max_iv_rank = float(max_iv_rank)
+            # Wire env var to soft_cap so MAX_IV_RANK=105 actually gates zone 1
+            self.soft_cap    = self.max_iv_rank
             self.hard_cap    = hard_cap if hard_cap is not None else 150.0
-            self.extreme_cap = 180.0
+            # Ceiling: anything above hard_cap (150) is blocked immediately
+            # extreme_cap = hard_cap + 1 collapses zones 3+4 → one hard block above ceiling
+            self.extreme_cap = self.hard_cap + 1.0  # e.g. 151 when hard_cap=150
         # Cache: {ticker: (fetched_at_epoch, result_dict)}
         self._cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
         log.info(

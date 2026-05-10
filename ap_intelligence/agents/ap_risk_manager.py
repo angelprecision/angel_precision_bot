@@ -90,11 +90,11 @@ MAX_SAME_SECTOR_POSITIONS = 2
 
 # Contract quality hard gates
 CONTRACT_FILTERS = {
-    "max_spread_pct":   0.25,    # was 0.10 — 10% was too tight; daily options often 15-25%
-    "min_open_interest":100,     # was 500 — too strict for non-mega-cap names
-    "min_daily_volume": 30,      # was 100
-    "min_delta":        0.20,    # was 0.25 — allow slightly more OTM
-    "max_delta":        0.75,    # was 0.70 — allow slightly more ITM
+    "max_spread_pct":   0.14,    # 14% — risk manager veto (per spec: 10%→14%)
+    "min_open_interest":100,     # loosened from 500 — further gated in contract_selector
+    "min_daily_volume": 30,      # loosened — further gated in contract_selector
+    "min_delta":        0.20,    # allow slightly more OTM
+    "max_delta":        0.75,    # allow slightly more ITM
     "min_dte":          1,
     "max_dte_0dte":     1,
 }

@@ -189,13 +189,13 @@ _PRO_TIER1_TICKERS = {
 _PRO_MIN_BID            = 0.10
 _PRO_MIN_BID_SIZE_HARD  = 3
 
-_PRO_T1_SPREAD_HARD_MAX = 0.15   # was 0.06 — 6% too tight for daily options, now 15%
-_PRO_T1_SPREAD_A_TIER   = 0.06   # was 0.03
-_PRO_T1_SIZE_MIN        = 5      # was 10
+_PRO_T1_SPREAD_HARD_MAX = 0.10   # 10% — T1 tickers (AAPL/NVDA/TSLA/etc)
+_PRO_T1_SPREAD_A_TIER   = 0.05   # 5%  — A-tier quality threshold
+_PRO_T1_SIZE_MIN        = 5
 
-_PRO_T2_SPREAD_HARD_MAX = 0.22   # was 0.08 — 8% killed most mid-caps, now 22%
-_PRO_T2_SPREAD_A_TIER   = 0.10   # was 0.04
-_PRO_T2_SIZE_MIN        = 3      # was 5
+_PRO_T2_SPREAD_HARD_MAX = 0.12   # 12% — T2 tickers (everything else)
+_PRO_T2_SPREAD_A_TIER   = 0.06   # 6%  — A-tier quality threshold
+_PRO_T2_SIZE_MIN        = 3
 
 
 def _pro_contract_quality(opt: dict, ticker: str, dte: int) -> tuple[str, str]:
@@ -232,11 +232,11 @@ def _pro_contract_quality(opt: dict, ticker: str, dte: int) -> tuple[str, str]:
             return "REJECT", f"size_too_thin_bid{bid_size}_ask{ask_size}"
 
     if dte <= 1:
-        min_vol, min_oi = 50,  200    # was 100 / 500
+        min_vol, min_oi = 50,  500    # 0–1 DTE: OI=500 (user spec)
     elif dte <= 7:
-        min_vol, min_oi = 100, 300    # was 200 / 1000
+        min_vol, min_oi = 100, 500    # 2–7 DTE: OI 1000→500, vol 200→100
     else:
-        min_vol, min_oi = 150, 500    # was 500 / 2000
+        min_vol, min_oi = 150, 1000   # 8+ DTE: OI 2000→1000
 
     if vol < min_vol and oi < min_oi:
         return "REJECT", f"illiquid_vol{vol}_oi{oi}_need_v{min_vol}_or_oi{min_oi}"
