@@ -26,7 +26,9 @@ RATE_LIMIT_BACKOFF_BASE_SEC = float(os.getenv("QUOTE_429_BACKOFF_BASE_SEC", "1.0
 RATE_LIMIT_BACKOFF_MAX_SEC  = float(os.getenv("QUOTE_429_BACKOFF_MAX_SEC", "8.0"))
 MAX_SPREAD_PCT              = float(os.getenv("MAX_OPTION_SPREAD_PCT", "0.18"))
 MAX_SPREAD_ABS              = float(os.getenv("MAX_OPTION_SPREAD_ABS", "0.15"))
-HEARTBEAT_DEGRADED_SEC      = float(os.getenv("QUOTE_HEARTBEAT_DEGRADED_SEC", "10.0"))
+HEARTBEAT_DEGRADED_SEC      = float(os.getenv("QUOTE_HEARTBEAT_DEGRADED_SEC", "45.0"))
+HEARTBEAT_GRACE_SEC         = float(os.getenv("QUOTE_HEARTBEAT_GRACE_SEC", "8.0"))
+ENGINE_LOCK_TIMEOUT_SEC     = float(os.getenv("QUOTE_ENGINE_LOCK_TIMEOUT_SEC", "2.0"))
 
 # Feature flag: migrate to snapshots-only ownership later by setting this to "0".
 DIRECT_POSITION_WRITES      = os.getenv("QUOTE_MONITOR_DIRECT_WRITES", "1") == "1"
@@ -97,7 +99,11 @@ class APPositionQuoteMonitor:
         self._cycles = 0
         self._consecutive_failures = 0
         self._rate_limit_backoff_sec = RATE_LIMIT_BACKOFF_BASE_SEC
-        self._last_cycle_ts = time.time()
+        now = time.time()
+        self._last_cycle_ts = now
+        self._last_cycle_started_ts = 0.0
+        self._last_cycle_completed_ts = now
+        self._refresh_in_progress = False
 
         self._metrics = {
             "cycles": 0,
@@ -112,6 +118,7 @@ class APPositionQuoteMonitor:
             "wakes_suppressed": 0,
             "exits_gated_blind": 0,    # bumped by exit engine when it gates
             "exits_gated_stale": 0,    # bumped by exit engine when it gates
+            "engine_lock_timeouts": 0,
         }
 
     # ── Lifecycle ────────────────────────────────────────────────────────────
@@ -144,12 +151,34 @@ class APPositionQuoteMonitor:
     def last_cycle_age_sec(self) -> float:
         return time.time() - self._last_cycle_ts
 
+    def _healthy_window_sec(self) -> float:
+        """
+        Health window must be longer than the monitor sleep interval.
+
+        The old default was QUOTE_HEARTBEAT_DEGRADED_SEC=10 while off-hours
+        polling sleeps 15s. That made the runner mark the quote monitor unhealthy
+        during normal after-hours operation. This window keeps safety strict during
+        market hours while preventing false degradation between off-hours polls.
+        """
+        interval = self._interval if _is_market_hours() else POLL_OFFHOURS_SEC
+        return max(HEARTBEAT_DEGRADED_SEC, interval + HEARTBEAT_GRACE_SEC + HTTP_TIMEOUT)
+
     def is_healthy(self) -> bool:
-        return self.is_alive() and self.last_cycle_age_sec() <= HEARTBEAT_DEGRADED_SEC
+        if not self.is_alive():
+            return False
+        now = time.time()
+        window = self._healthy_window_sec()
+        if self._refresh_in_progress:
+            started = self._last_cycle_started_ts or self._last_cycle_ts
+            return (now - started) <= window
+        return (now - self._last_cycle_completed_ts) <= window
 
     def metrics_snapshot(self) -> dict:
         m = dict(self._metrics)
         m["last_cycle_age_sec"] = round(self.last_cycle_age_sec(), 2)
+        m["last_cycle_completed_age_sec"] = round(time.time() - self._last_cycle_completed_ts, 2)
+        m["refresh_in_progress"] = bool(self._refresh_in_progress)
+        m["healthy_window_sec"] = round(self._healthy_window_sec(), 2)
         m["consecutive_failures"] = self._consecutive_failures
         m["direct_writes"] = DIRECT_POSITION_WRITES
         return m
@@ -193,6 +222,8 @@ class APPositionQuoteMonitor:
         while not self._stop.is_set():
             interval = self._interval if _is_market_hours() else POLL_OFFHOURS_SEC
             try:
+                self._refresh_in_progress = True
+                self._last_cycle_started_ts = time.time()
                 self._refresh_once()
                 self._consecutive_failures = 0
             except Exception as e:
@@ -200,6 +231,10 @@ class APPositionQuoteMonitor:
                 log.error("[%s] QuoteMonitor cycle error (%d): %s",
                           self.client_id, self._consecutive_failures, e,
                           exc_info=self._consecutive_failures <= 3)
+            finally:
+                self._refresh_in_progress = False
+                self._last_cycle_ts = time.time()
+                self._last_cycle_completed_ts = self._last_cycle_ts
 
             triggered = self._kick.wait(timeout=interval)
             if triggered:
@@ -246,9 +281,14 @@ class APPositionQuoteMonitor:
         snapshots = []
 
         engine_lock = getattr(self.exit_engine, "_lock", None)
-        lock_ctx = engine_lock if engine_lock is not None else _NullCtx()
+        lock_ctx = _TimedLockCtx(engine_lock, ENGINE_LOCK_TIMEOUT_SEC, self.client_id)
 
-        with lock_ctx:
+        with lock_ctx as locked:
+            if not locked:
+                self._metrics["engine_lock_timeouts"] = self._metrics.get("engine_lock_timeouts", 0) + 1
+                log.warning("[%s] QuoteMonitor skipped cycle: exit engine lock timeout after %.1fs",
+                            self.client_id, ENGINE_LOCK_TIMEOUT_SEC)
+                return
             for pos in positions:
                 pid = str(_get_attr(pos, "positionid", "position_id", default="") or "")
                 t = str(_get_attr(pos, "ticker", "underlying", default="") or "").upper()
