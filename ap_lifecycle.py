@@ -8,6 +8,7 @@ RULE: If it is not in this ledger, it did not happen.
 This module records:
 - every signal state transition
 - every explicit trade rejection
+- every recovered/reseeded broker position after restart/reconciliation
 - every illegal transition attempt
 - every suspicious/invariant-breaking movement
 
@@ -72,6 +73,7 @@ log = logging.getLogger("ap.lifecycle")
 
 class SignalState(str, Enum):
     CREATED             = "CREATED"
+    ADOPTED             = "ADOPTED"             # existing signal adopted after restart/recovery
     PERSISTED           = "PERSISTED"
     LOADED_BY_OSM       = "LOADED_BY_OSM"
     EVALUATING          = "EVALUATING"
@@ -81,6 +83,8 @@ class SignalState(str, Enum):
     TRIGGER_READY       = "TRIGGER_READY"
     ENTRY_SUBMITTED     = "ENTRY_SUBMITTED"
     POSITION_OPENED     = "POSITION_OPENED"
+    RECOVERED_POSITION  = "RECOVERED_POSITION"   # broker/db recovery imported an existing open position
+    POSITION_RESEEDED   = "POSITION_RESEEDED"    # exit engine/QPM/watchers reseeded for recovered position
     INVALIDATED         = "INVALIDATED"
     REJECTED            = "REJECTED"
     EXPIRED             = "EXPIRED"
@@ -102,6 +106,7 @@ class LifecycleOwner(str, Enum):
     QUOTE_MONITOR   = "QUOTE_MONITOR"
     EXIT_ENGINE     = "EXIT_ENGINE"
     FILL_MONITOR    = "FILL_MONITOR"
+    POSITION_STORE  = "POSITION_STORE"
     BROKER          = "BROKER"
     RECONCILER      = "RECONCILER"
     RECOVERY        = "RECOVERY"
@@ -141,9 +146,17 @@ OwnerLike = Union[str, LifecycleOwner]
 # ---------------------------------------------------------------------------
 
 LEGAL_TRANSITIONS: Dict[Optional[SignalState], set] = {
-    None: {SignalState.CREATED},
+    # None means this process has no in-memory state yet.
+    # CREATED = brand-new signal. ADOPTED = existing persisted/watcher signal after restart.
+    None: {SignalState.CREATED, SignalState.ADOPTED, SignalState.RECOVERED_POSITION},
     SignalState.CREATED: {
         SignalState.PERSISTED, SignalState.REJECTED, SignalState.ERROR,
+    },
+    SignalState.ADOPTED: {
+        SignalState.WATCHING, SignalState.REVALIDATING,
+        SignalState.TRIGGER_READY, SignalState.INVALIDATED,
+        SignalState.REJECTED, SignalState.EXPIRED,
+        SignalState.RECOVERED_POSITION, SignalState.ERROR,
     },
     SignalState.PERSISTED: {
         SignalState.LOADED_BY_OSM, SignalState.WATCHING,
@@ -165,7 +178,7 @@ LEGAL_TRANSITIONS: Dict[Optional[SignalState], set] = {
         SignalState.REVALIDATING, SignalState.TRIGGER_READY,
         SignalState.INVALIDATED, SignalState.REJECTED,
         SignalState.EXPIRED, SignalState.CANCELLED,
-        SignalState.REMOVED, SignalState.ERROR,
+        SignalState.ERROR,
     },
     SignalState.REVALIDATING: {
         SignalState.WATCHING, SignalState.INVALIDATED,
@@ -178,6 +191,10 @@ LEGAL_TRANSITIONS: Dict[Optional[SignalState], set] = {
     SignalState.ENTRY_SUBMITTED: {
         SignalState.POSITION_OPENED, SignalState.REJECTED, SignalState.ERROR,
     },
+    SignalState.RECOVERED_POSITION: {
+        SignalState.POSITION_RESEEDED, SignalState.ERROR,
+    },
+    SignalState.POSITION_RESEEDED: set(),
     # Terminal-ish states
     SignalState.POSITION_OPENED: set(),
     SignalState.INVALIDATED:     {SignalState.REMOVED},
@@ -190,13 +207,20 @@ LEGAL_TRANSITIONS: Dict[Optional[SignalState], set] = {
 
 TERMINAL_STATES = {
     SignalState.POSITION_OPENED,
+    SignalState.POSITION_RESEEDED,
     SignalState.REMOVED,
 }
 
 SUSPICIOUS_TRANSITIONS = {
-    (SignalState.WATCHING, SignalState.REMOVED),
     (SignalState.WATCHING, SignalState.EXPIRED),
 }
+
+# Direct WATCHING -> REMOVED is intentionally NOT legal.
+# A watched signal must first explain why it is leaving active watch:
+# WATCHING -> INVALIDATED -> REMOVED
+# WATCHING -> EXPIRED -> REMOVED
+# WATCHING -> REJECTED -> REMOVED
+# WATCHING -> CANCELLED -> REMOVED
 
 
 # ---------------------------------------------------------------------------
@@ -610,6 +634,26 @@ def signal_created(signal_id: str, ticker: str, owner: OwnerLike = LifecycleOwne
     return LEDGER.transition(signal_id, ticker, SignalState.CREATED, owner, reason, metadata=meta or None)
 
 
+def signal_adopted(
+    signal_id: str,
+    ticker: str,
+    owner: OwnerLike = LifecycleOwner.RECOVERY,
+    reason: str = "adopted_existing_signal_after_restart",
+    **meta,
+) -> LedgerEntry:
+    """
+    Mark an already-existing signal as adopted after process restart/recovery.
+
+    Use this before restoring old overnight/watcher signals when _current_state
+    is empty but the signal already exists in DB/memory from a prior run.
+
+    Typical recovery flow:
+        signal_adopted(sig.id, sig.ticker, reason="restart_recovery_loaded_existing_signal")
+        signal_watching(sig.id, sig.ticker, owner=LifecycleOwner.WATCHER, reason="restored_to_watching_after_restart")
+    """
+    return LEDGER.transition(signal_id, ticker, SignalState.ADOPTED, owner, reason, metadata=meta or None)
+
+
 def signal_persisted(signal_id: str, ticker: str, owner: OwnerLike = LifecycleOwner.SIGNAL_STORE, reason: str = "signal_persisted", **meta) -> LedgerEntry:
     return LEDGER.transition(signal_id, ticker, SignalState.PERSISTED, owner, reason, metadata=meta or None)
 
@@ -644,6 +688,69 @@ def signal_entry_submitted(signal_id: str, ticker: str, owner: OwnerLike = Lifec
 
 def signal_position_opened(signal_id: str, ticker: str, owner: OwnerLike = LifecycleOwner.RECONCILER, reason: str = "position_opened", **meta) -> LedgerEntry:
     return LEDGER.transition(signal_id, ticker, SignalState.POSITION_OPENED, owner, reason, metadata=meta or None)
+
+
+def signal_recovered_position(
+    signal_id: str,
+    ticker: str,
+    owner: OwnerLike = LifecycleOwner.RECONCILER,
+    reason: str = "reconciler_recovered_existing_broker_position",
+    **meta,
+) -> LedgerEntry:
+    """
+    Record that recovery/reconciler found an already-open broker position.
+
+    Use this when broker reality says a position exists but local in-memory state
+    was empty after restart, DB position row was missing/stale, or the position
+    had to be imported back into system management.
+
+    Typical recovery flow:
+        signal_recovered_position(
+            signal_id=position_or_signal_id,
+            ticker=ticker,
+            broker_position_id=broker_pos_id,
+            option_symbol=option_symbol,
+            db_position_missing=True,
+        )
+        signal_position_reseeded(
+            signal_id=position_or_signal_id,
+            ticker=ticker,
+            exit_engine_seeded=True,
+            quote_monitor_attached=True,
+        )
+    """
+    return LEDGER.transition(
+        signal_id,
+        ticker,
+        SignalState.RECOVERED_POSITION,
+        owner,
+        reason,
+        metadata=meta or None,
+    )
+
+
+def signal_position_reseeded(
+    signal_id: str,
+    ticker: str,
+    owner: OwnerLike = LifecycleOwner.RECONCILER,
+    reason: str = "recovered_position_reseeded_into_exit_management",
+    **meta,
+) -> LedgerEntry:
+    """
+    Record that a recovered position has been reattached to management.
+
+    This should be called only after the needed organs have been reseeded or
+    attached, for example exit engine state, quote monitor subscription, DB row,
+    and any local active-position cache.
+    """
+    return LEDGER.transition(
+        signal_id,
+        ticker,
+        SignalState.POSITION_RESEEDED,
+        owner,
+        reason,
+        metadata=meta or None,
+    )
 
 
 def signal_invalidated(signal_id: str, ticker: str, owner: OwnerLike, reason: str, **meta) -> LedgerEntry:
