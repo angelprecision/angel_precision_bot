@@ -2459,63 +2459,59 @@ class APExitEngine:
                 "risk-reducing exits remain enabled"
             )
 
+        # ── Quote Authority: Exit Engine is a PURE CONSUMER ──────────────────
+        # QPM is the single authorized writer for all quote fields.
+        # Exit Engine NEVER fetches quotes independently — doing so caused a
+        # race condition where our stale fetch overwrote QPM's fresher data.
+        # We read from QUOTES (written by QPM) and from the QPM snapshot path
+        # (apply_quote_snapshots, called above). If QPM has no fresh snapshot
+        # for a position, we hold — we do not guess with stale broker data.
+        try:
+            from ap_quote_authority import QUOTES as _QUOTES
+            _quote_authority_available = True
+        except ImportError:
+            _QUOTES = None
+            _quote_authority_available = False
+
+        # Emit health heartbeat so the registry knows exit engine is alive.
+        try:
+            from ap_health_registry import HEALTH as _EE_HEALTH
+            _EE_HEALTH.heartbeat(
+                "ap_exit_engine",
+                metrics={"active_positions": len(self.active_positions())},
+            )
+        except Exception:
+            pass
+
         now_et = datetime.now(ET)
         active = self.active_positions()
         if not active:
             return
 
-        tickers        = list({p.ticker        for p in active})
-        option_symbols = list({p.option_symbol  for p in active})
-
-        try:
-            underlying_quotes = self._fetch_quotes(tickers)
-            option_quotes     = self._fetch_option_quotes(option_symbols)
-        except Exception as e:
-            log.warning("Quote fetch error: %s", e)
-            return
-
         actions_to_take = []
         with self._lock:
             for pos in active:
-                uq = underlying_quotes.get(pos.ticker, {})
-                oq = option_quotes.get(pos.option_symbol, {})
-
                 now_utc = datetime.now(timezone.utc)
-                underlying_progressed = False
-                option_progressed     = False
 
-                if uq:
-                    last = float(uq.get("last") or uq.get("bid") or 0)
-                    if last > 0:
-                        pos.current_underlying = last
-                        underlying_progressed  = True
-
-                if oq:
-                    bid = float(oq.get("bid", 0) or 0)
-                    ask = float(oq.get("ask", 0) or 0)
-                    if bid > 0 and ask > 0:
-                        pos.current_bid          = bid
-                        pos.current_ask          = ask
-                        pos.current_option_price = (bid + ask) / 2
-                        option_progressed        = True
-
-                if underlying_progressed:
-                    pos.last_underlying_quote_update_ts  = now_utc
-                    pos.last_underlying_quote_missing_ts = None
-                else:
-                    pos.last_underlying_quote_missing_ts = now_utc
-
-                if option_progressed:
-                    pos.last_option_quote_update_ts  = now_utc
-                    pos.last_option_quote_missing_ts = None
-                else:
-                    pos.last_option_quote_missing_ts = now_utc
-
-                if underlying_progressed or option_progressed:
-                    pos.last_quote_update_ts  = now_utc
-                    pos.last_quote_missing_ts = None
-                else:
-                    pos.last_quote_missing_ts = now_utc
+                # Enrich from QUOTES authority if available and QPM has a fresh snapshot.
+                # This supplements the apply_quote_snapshots() path (which QPM calls
+                # directly) — if both run, the most recent QPM data wins because QPM
+                # is always the last writer of record.
+                if _quote_authority_available and _QUOTES is not None:
+                    _snap = _QUOTES.get_fresh(pos.option_symbol, max_age_s=12)
+                    if _snap is not None:
+                        if _snap.bid > 0:
+                            pos.current_bid          = _snap.bid
+                            pos.current_ask          = _snap.ask
+                            pos.current_option_price = _snap.mid
+                            pos.last_option_quote_update_ts  = now_utc
+                            pos.last_option_quote_missing_ts = None
+                            pos.last_quote_update_ts  = now_utc
+                            pos.last_quote_missing_ts = None
+                        if _snap.underlying_price > 0:
+                            pos.current_underlying              = _snap.underlying_price
+                            pos.last_underlying_quote_update_ts  = now_utc
+                            pos.last_underlying_quote_missing_ts = None
 
                 option_pnl = pos.option_pnl_pct
 

@@ -28,6 +28,16 @@ from ap.logger import get_logger
 from ap.models import Signal
 from ap.queue import enqueue_signal, worker_loop
 from ap.state import load_state, update_state
+
+# ── Angel Precision Intelligence infrastructure ───────────────────────────────
+try:
+    from ap_bootstrap import bootstrap as _ap_bootstrap
+    from ap_health_endpoints import health_bp as _health_bp
+    _AP_INFRA_AVAILABLE = True
+except Exception as _ap_infra_err:
+    _AP_INFRA_AVAILABLE = False
+    _ap_bootstrap = None
+    _health_bp = None
 from ap.broker import SimBroker
 
 from ap.parsers import parse_scanner_text
@@ -357,6 +367,29 @@ def create_app() -> Flask:
 
     init_db()
     log.info("✅ Database initialized")
+
+    # ── Bootstrap Angel Precision Intelligence infrastructure ─────────────────
+    # Registers all organs, wires kill switch into health registry,
+    # starts health sweep thread. Runs once — idempotent.
+    if _AP_INFRA_AVAILABLE and _ap_bootstrap:
+        try:
+            # Wire Discord alert function if available in this scope.
+            _discord_alert_fn = None
+            try:
+                from ap.notify import send_discord_alert as _discord_alert_fn
+            except Exception:
+                pass
+            _ap_bootstrap(alert_fn=_discord_alert_fn)
+            log.info("✅ AP Intelligence infrastructure bootstrapped")
+        except Exception as _boot_err:
+            log.error("AP bootstrap failed (non-fatal): %s", _boot_err)
+
+    if _AP_INFRA_AVAILABLE and _health_bp:
+        try:
+            app.register_blueprint(_health_bp)
+            log.info("✅ Health endpoints registered at /health/*")
+        except Exception as _bp_err:
+            log.error("Health blueprint registration failed (non-fatal): %s", _bp_err)
 
     # ✅ Ensure default client exists BEFORE any state write
     with conn() as c:

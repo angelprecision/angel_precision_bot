@@ -103,6 +103,29 @@ def run_overnight_reeval(
         InvalidationReason,
     )
 
+    # ── Lifecycle ledger + health registry ───────────────────────────────────
+    try:
+        from ap_lifecycle import (
+            LEDGER as _LEDGER,
+            SignalState as _SS,
+            LifecycleOwner as _LO,
+            signal_watching,
+            signal_invalidated,
+            signal_armed,
+            signal_rejected as _sig_rejected,
+            RejectionCategory as _RC,
+            RejectionSeverity as _RS,
+        )
+        _lifecycle_ok = True
+    except Exception:
+        _lifecycle_ok = False
+
+    try:
+        from ap_health_registry import HEALTH as _OR_HEALTH
+        _OR_HEALTH.heartbeat("ap_overnight_signal_manager")
+    except Exception:
+        pass
+
     result = {"processed": 0, "armed": 0, "rejected": 0, "skipped": 0, "errors": 0}
 
     # Guard: only run on trading days, 9:00-9:45 AM ET (unless force=True)
@@ -146,6 +169,14 @@ def run_overnight_reeval(
                 if age_days > OVERNIGHT_SIGNAL_MAX_AGE_DAYS:
                     log.info("[%s] overnight_reeval: skipping stale signal %s (age=%dd)", ticker, signal_id, age_days)
                     _mark_job_rejected(job_id, client_id, f"stale_signal:age={age_days}d")
+                    if _lifecycle_ok:
+                        try:
+                            _sig_rejected(signal_id, ticker, _LO.OVERNIGHT_EVAL,
+                                          f"stale_signal age={age_days}d",
+                                          _RC.VALIDATION, "STALE_SIGNAL", _RS.INFO,
+                                          age_days=age_days)
+                        except Exception:
+                            pass
                     result["rejected"] += 1
                     continue
 
@@ -204,6 +235,13 @@ def run_overnight_reeval(
                     human_reason=validation.reason_text,
                     payload=signal,
                 )
+                if _lifecycle_ok:
+                    try:
+                        _sig_rejected(signal_id, ticker, _LO.OVERNIGHT_EVAL,
+                                      f"overnight_invalidated: {validation.reason_text}",
+                                      _RC.VALIDATION, validation.reason_code, _RS.INFO)
+                    except Exception:
+                        pass
                 result["rejected"] += 1
                 continue
 
@@ -232,6 +270,13 @@ def run_overnight_reeval(
                 if not decision.ok:
                     log.info("[%s] overnight_reeval: MC blocked %s — %s", ticker, signal_id, decision.reason)
                     _mark_job_rejected(job_id, client_id, f"mc_blocked:{decision.reason}")
+                    if _lifecycle_ok:
+                        try:
+                            _sig_rejected(signal_id, ticker, _LO.MASTER_CONTROL,
+                                          f"mc_blocked: {decision.reason}",
+                                          _RC.RISK, "MC_BLOCKED", _RS.INFO)
+                        except Exception:
+                            pass
                     result["rejected"] += 1
                     continue
             except Exception as mc_exc:
@@ -247,6 +292,13 @@ def run_overnight_reeval(
             except Exception as cs_exc:
                 log.error("[%s] overnight_reeval: contract_selector.select failed: %s", ticker, cs_exc)
                 _mark_job_rejected(job_id, client_id, f"contract_selection_failed:{cs_exc}")
+                if _lifecycle_ok:
+                    try:
+                        _sig_rejected(signal_id, ticker, _LO.OVERNIGHT_EVAL,
+                                      f"contract_selection_failed: {cs_exc}",
+                                      _RC.EXECUTION, "CONTRACT_SELECTION_FAILED", _RS.WARNING)
+                    except Exception:
+                        pass
                 result["rejected"] += 1
                 continue
 
@@ -255,6 +307,13 @@ def run_overnight_reeval(
             if not selected or not getattr(decision.plan, "contract_symbol", None):
                 log.warning("[%s] overnight_reeval: no contract found for %s", ticker, signal_id)
                 _mark_job_rejected(job_id, client_id, "no_contract_selected")
+                if _lifecycle_ok:
+                    try:
+                        _sig_rejected(signal_id, ticker, _LO.OVERNIGHT_EVAL,
+                                      "no_contract_selected",
+                                      _RC.EXECUTION, "NO_CONTRACT_SELECTED", _RS.INFO)
+                    except Exception:
+                        pass
                 result["rejected"] += 1
                 continue
 
@@ -289,10 +348,35 @@ def run_overnight_reeval(
                     _mark_job_watching_armed(job_id, client_id, _contract_sym)
                     log.info("[%s] ✅ ARMED — contract=%s entry_trigger=%.4f",
                              ticker, _contract_sym, entry_trigger or 0)
+                    # ── THE BUG TRAP: signal is now WATCHING in the watcher ──
+                    # If this signal disappears before market open, grep:
+                    # [SIGNAL_TRACE] id=<signal_id>
+                    # The next state change from WATCHING will reveal the killer.
+                    if _lifecycle_ok:
+                        try:
+                            signal_armed(signal_id, ticker, _LO.OVERNIGHT_EVAL,
+                                         "armed_in_entry_watcher",
+                                         contract=_contract_sym,
+                                         local_order_id=str(local_order_id),
+                                         entry_trigger=str(entry_trigger or 0))
+                            signal_watching(signal_id, ticker, _LO.WATCHER,
+                                            "watching_for_trigger_breach",
+                                            contract=_contract_sym,
+                                            entry_trigger=str(entry_trigger or 0))
+                        except Exception:
+                            pass
                     result["armed"] += 1
                 else:
                     log.error("[%s] overnight_reeval: entry_watcher.watch() returned False | contract=%s",
                               ticker, _contract_sym)
+                    if _lifecycle_ok:
+                        try:
+                            _sig_rejected(signal_id, ticker, _LO.WATCHER,
+                                          "entry_watcher.watch() returned False",
+                                          _RC.EXECUTION, "WATCHER_ARM_FAILED", _RS.WARNING,
+                                          contract=_contract_sym)
+                        except Exception:
+                            pass
                     result["errors"] += 1
             except Exception as ew_exc:
                 log.error("[%s] overnight_reeval: entry_watcher.watch failed: %s", ticker, ew_exc)

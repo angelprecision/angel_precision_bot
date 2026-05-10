@@ -33,6 +33,40 @@ from datetime import datetime, timedelta, timezone
 from typing import Callable, Optional
 from zoneinfo import ZoneInfo
 
+# ── Lifecycle + health wiring (defensive — watcher runs standalone if missing) ──
+try:
+    from ap_lifecycle import (
+        LEDGER as _EW_LEDGER,
+        SignalState as _EW_SS,
+        LifecycleOwner as _EW_LO,
+        signal_watching,
+        signal_invalidated,
+        signal_cancelled,
+        signal_expired,
+        signal_triggered,
+    )
+    _EW_LIFECYCLE_OK = True
+except Exception:
+    _EW_LIFECYCLE_OK = False
+
+def _ew_record(signal_id: str, ticker: str, to_state_name: str, reason: str, **meta) -> None:
+    """Safe lifecycle wrapper — never raises, never blocks watcher logic."""
+    if not _EW_LIFECYCLE_OK:
+        return
+    try:
+        fn_map = {
+            "WATCHING":     signal_watching,
+            "INVALIDATED":  signal_invalidated,
+            "CANCELLED":    signal_cancelled,
+            "EXPIRED":      signal_expired,
+            "TRIGGER_READY": signal_triggered,
+        }
+        fn = fn_map.get(to_state_name)
+        if fn:
+            fn(signal_id, ticker, _EW_LO.WATCHER, reason, **meta)
+    except Exception:
+        pass
+
 log = logging.getLogger("ap.entry_watcher")
 ET = ZoneInfo("America/New_York")
 
@@ -689,9 +723,28 @@ class APEntryWatcher:
             ]
 
     def _poll_loop(self):
+        # Register with health registry once at thread start.
+        try:
+            from ap_health_registry import HEALTH as _WH, Criticality as _WC
+            _WH.ensure_registered("ap_entry_watcher", _WC.HIGH, stale_after_s=45.0)
+            _watcher_health_ok = True
+        except Exception:
+            _watcher_health_ok = False
+
         while self._running:
             try:
                 self._check_all()
+                if _watcher_health_ok:
+                    try:
+                        from ap_health_registry import HEALTH as _WH
+                        with self._lock:
+                            _watching_count = sum(1 for w in self._pending if w.is_active)
+                        _WH.heartbeat(
+                            "ap_entry_watcher",
+                            metrics={"watching": _watching_count},
+                        )
+                    except Exception:
+                        pass
             except Exception as exc:
                 log.error("Watcher poll error: %s", exc, exc_info=True)
             time.sleep(POLL_INTERVAL_SEC)
@@ -718,6 +771,15 @@ class APEntryWatcher:
                     if w.is_active and not w.overnight:
                         w.state = WatchState.EXPIRED
                         w._release_dedup_key()
+                        # BUG TRAP: WATCHING → EXPIRED logged here.
+                        # If signals vanish before market open, this log reveals if
+                        # the EOD cron is incorrectly expiring overnight signals.
+                        _ew_record(
+                            str(w.signal.get("signal_id", "")),
+                            w.ticker, "EXPIRED",
+                            "eod_force_expire_same_day_signal",
+                            overnight=False,
+                        )
                         expired.append(w)
                         log.info("[%s] Force-expired at market close (same-day signal)", w.ticker)
                     else:
@@ -872,6 +934,22 @@ class APEntryWatcher:
         # Without this, OSM orders for rejected overnight signals stay as
         # phantom PENDING_TRIGGER orders until the next startup cleanup.
         for w in to_remove:
+            # ── BUG TRAP: log the exact reason this signal left WATCHING ──────
+            # If a signal vanishes before market open, this log + SIGNAL_TRACE
+            # will show exactly which overnight revalidation branch killed it.
+            _sig_id = str(w.signal.get("signal_id", ""))
+            _ticker = str(w.ticker or "")
+            if _sig_id and _ticker:
+                _reason = (
+                    "overnight_revalidation_invalidated"
+                    if w.state == WatchState.INVALIDATED
+                    else "overnight_revalidation_expired"
+                )
+                _ew_record(_sig_id, _ticker,
+                           "INVALIDATED" if w.state == WatchState.INVALIDATED else "EXPIRED",
+                           _reason,
+                           queue_status=str(w.signal.get("queue_status", "")))
+
             if w.state == WatchState.INVALIDATED and self.on_invalidate:
                 try:
                     self.on_invalidate(w)
@@ -941,7 +1019,15 @@ class APEntryWatcher:
             self._pending = [w for w in self._pending if id(w) not in done_ids]
 
         for action, w in completed:
+            _sig_id = str(w.signal.get("signal_id", ""))
+            _ticker = str(w.ticker or "")
             if action == "trigger":
+                # Signal breached — record TRIGGER_READY before firing callback.
+                if _sig_id and _ticker:
+                    _ew_record(_sig_id, _ticker, "TRIGGER_READY",
+                               "trigger_breached_entry_submitted",
+                               contract=str(w.signal.get("contract_symbol", "")),
+                               entry_trigger=str(w.entry_trigger or ""))
                 if self.on_trigger:
                     try:
                         self.on_trigger(w)
@@ -952,16 +1038,26 @@ class APEntryWatcher:
                 else:
                     log.error("[%s] TRIGGERED but no on_trigger callback is wired", w.ticker)
                     w._release_dedup_key()
-            elif w.state == WatchState.EXPIRED and self.on_expire:
-                try:
-                    self.on_expire(w)
-                except Exception as exc:
-                    log.error("[%s] on_expire callback failed: %s", w.ticker, exc, exc_info=True)
-            elif w.state == WatchState.INVALIDATED and self.on_invalidate:
-                try:
-                    self.on_invalidate(w)
-                except Exception as exc:
-                    log.error("[%s] on_invalidate callback failed: %s", w.ticker, exc, exc_info=True)
+            elif w.state == WatchState.EXPIRED:
+                # BUG TRAP: log every expiry with the reason it was in.
+                if _sig_id and _ticker:
+                    _ew_record(_sig_id, _ticker, "EXPIRED",
+                               "signal_expired_in_poll_loop",
+                               minutes_watching=str(getattr(w, "minutes_watching", "?")))
+                if self.on_expire:
+                    try:
+                        self.on_expire(w)
+                    except Exception as exc:
+                        log.error("[%s] on_expire callback failed: %s", w.ticker, exc, exc_info=True)
+            elif w.state == WatchState.INVALIDATED:
+                if _sig_id and _ticker:
+                    _ew_record(_sig_id, _ticker, "INVALIDATED",
+                               "signal_invalidated_in_poll_loop")
+                if self.on_invalidate:
+                    try:
+                        self.on_invalidate(w)
+                    except Exception as exc:
+                        log.error("[%s] on_invalidate callback failed: %s", w.ticker, exc, exc_info=True)
 
     def _get_quote(self, ticker: str) -> dict:
         try:
