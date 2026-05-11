@@ -99,7 +99,12 @@ class APSignalPipeline:
         self.technical    = APTechnicalAgent()
         self.sentiment    = APSentimentAgent(openai_api_key=self.openai_api_key)
         self.fundamentals = APFundamentalsAgent()
-        self.risk_manager = APRiskManager(portfolio_value=portfolio_value)
+        self.risk_manager = APRiskManager(
+            portfolio_value=portfolio_value,
+            risk_pct_per_trade=float(os.getenv("RISK_PCT_PER_TRADE", "0.10")),  # 10% = aligns with MAX_TRADE_USD=1800
+            max_position_pct=float(os.getenv("MAX_POSITION_PCT", "0.10")),       # 10% hard position cap
+            max_contracts_hard_cap=int(os.getenv("MAX_CONTRACTS", "6")),          # mirrors contract_selector cap
+        )
         self.pm           = APPortfolioManager(
             openai_api_key=self.openai_api_key,
             use_llm=use_llm,

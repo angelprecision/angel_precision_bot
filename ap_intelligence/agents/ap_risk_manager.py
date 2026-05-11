@@ -152,18 +152,20 @@ class APRiskManager:
     def __init__(
         self,
         portfolio_value: float,
-        risk_pct_per_trade: float = 0.02,       # 2% account risk per trade — NEVER loosened
-        max_position_pct: float = 0.20,         # Hard cap: 20% in one position — NEVER loosened
-        daily_loss_limit_pct: float = -0.05,    # Kill switch at -5% day — NEVER loosened
+        risk_pct_per_trade: float = 0.10,       # 10% account risk per trade — aligns with MAX_TRADE_USD
+        max_position_pct: float = 0.10,         # 10% position cap — aligns with MAX_TRADE_USD
+        daily_loss_limit_pct: float = -0.05,    # Kill switch at -5% day
         allow_0dte: bool = True,
-        mode: str = None,                       # "production" | "research" | None (reads AP_MODE env)
+        mode: str = None,
+        max_contracts_hard_cap: int = 6,        # mirrors contract_selector MAX_CONTRACTS
     ):
-        self.portfolio_value      = portfolio_value
-        self.risk_pct_per_trade   = risk_pct_per_trade
-        self.max_position_pct     = max_position_pct
-        self.daily_loss_limit_pct = daily_loss_limit_pct
-        self.allow_0dte           = allow_0dte
-        self.mode_cfg             = APModeConfig(mode=mode)
+        self.portfolio_value        = portfolio_value
+        self.risk_pct_per_trade     = risk_pct_per_trade
+        self.max_position_pct       = max_position_pct
+        self.daily_loss_limit_pct   = daily_loss_limit_pct
+        self.allow_0dte             = allow_0dte
+        self.mode_cfg               = APModeConfig(mode=mode)
+        self.max_contracts_hard_cap = max_contracts_hard_cap
 
         # Exposure tracking
         self.open_positions: dict[str, dict] = {}
@@ -311,11 +313,12 @@ class APRiskManager:
         remaining = max(0.0, (self.portfolio_value * 0.80) - already_deployed)  # Keep 20% cash
         contracts_from_capital = int(remaining / cost_per_contract) if cost_per_contract > 0 else 0
 
-        # Final contracts = minimum of all constraints
+        # Final contracts = minimum of all constraints + hard cap
         max_contracts = max(0, min(
             contracts_from_risk,
             contracts_from_dollar_cap,
             contracts_from_capital,
+            self.max_contracts_hard_cap,   # hard ceiling — matches contract_selector MAX_CONTRACTS
         ))
         max_usd = max_contracts * cost_per_contract
 
