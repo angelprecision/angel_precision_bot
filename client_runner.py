@@ -1299,6 +1299,8 @@ class ClientRunner(threading.Thread):
             min_oi=int(os.getenv("MIN_OI", "1")),
             min_volume=int(os.getenv("MIN_VOLUME", "0")),
             max_dte=int(os.getenv("MAX_DTE", "21")),
+            min_premium=float(os.getenv("MIN_PREMIUM", "10.0")),
+            max_premium=float(os.getenv("MAX_PREMIUM", "350.0")),
             earnings_guard=earnings_guard,
             iv_filter=iv_filter,
         )

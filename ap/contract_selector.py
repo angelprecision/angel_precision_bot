@@ -1492,7 +1492,11 @@ class APContractSelectionEngine:
             premium_per_share         = execution_price_per_share
             premium_per_contract      = execution_price_per_share * 100
             effective_budget, MAX_TRADE_USD, budget_clipped = _effective_budget(budget)
-            affordable                = int(effective_budget / premium_per_contract) if premium_per_contract > 0 else 0
+            _raw_affordable           = int(effective_budget / premium_per_contract) if premium_per_contract > 0 else 0
+            # Hard cap: never exceed 6 contracts per position regardless of budget.
+            # Keeps max exposure at 6 × $350 = $2,100 worst-case on a single name.
+            _MAX_CONTRACTS_HARD_CAP   = int(os.getenv("MAX_CONTRACTS", "6"))
+            affordable                = min(_raw_affordable, _MAX_CONTRACTS_HARD_CAP)
 
             return SelectedContract(
                 contract_symbol      = opt.get("symbol", ""),
