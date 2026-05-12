@@ -296,6 +296,84 @@ def _get_sb_client():
     return _sb_client_singleton
 
 
+def _log_signal_to_db(
+    signal_id: str,
+    client_id: str,
+    ticker: str,
+    side: str,
+    score: float,
+    stage: str,
+    reason_code: str,
+    human_reason: str,
+    payload: dict,
+    *,
+    decision_status: str = "rejected",
+    queued_at: str | None = None,
+) -> None:
+    """
+    Write a structured signal decision to ap_signals.
+
+    - True rejections:  decision_status='rejected'  (default, backward-compatible)
+    - After-hours defer:decision_status='WATCHING'   so overnight_reeval can find them
+
+    This fixes the bug where market_closed_deferred signals were logged as rejected
+    making them invisible to overnight_reeval which queries ap_signals WHERE
+    decision_status='WATCHING'.
+    """
+    try:
+        import uuid as _uuid
+        _sbc = _get_sb_client()
+        if _sbc is None:
+            return
+
+        _status = str(decision_status or "rejected").strip() or "rejected"
+
+        _row: dict = {
+            "signal_id":       str(signal_id or _uuid.uuid4()),
+            "client_email":    str(client_id),
+            "system_version":  "v2",
+            "ticker":          str(ticker),
+            "side":            str(side or payload.get("side") or "CALL").upper(),
+            "score":           float(score or payload.get("score") or 0),
+            "tier":            str(payload.get("tier") or "B"),
+            "pattern":         str(payload.get("pattern") or ""),
+            "timeframe":       str(payload.get("timeframe") or "1d"),
+            "decision_status": _status,
+            "context_notes":   f"stage={stage} | code={reason_code} | {human_reason}",
+            "raw_payload": {
+                "stage": stage,
+                "reason_code": reason_code,
+                "human_reason": human_reason,
+                **{k: v for k, v in payload.items()
+                   if k not in ("raw_payload", "signal_payload") and not callable(v)},
+            },
+        }
+
+        # Preserve trigger/level data when present
+        for _src_key, _dst_key in (
+            ("entry_trigger",    "entry_trigger"),
+            ("entry_price",      "entry_trigger"),
+            ("stop_price",       "stop_price"),
+            ("stop_underlying",  "stop_price"),
+            ("target_price",     "target_price"),
+            ("underlying_at_signal", "underlying_at_signal"),
+            ("underlying_price", "underlying_at_signal"),
+        ):
+            try:
+                val = payload.get(_src_key)
+                if val is not None and float(val) > 0 and _dst_key not in _row:
+                    _row[_dst_key] = float(val)
+            except Exception:
+                pass
+
+        if queued_at:
+            _row["queued_at"] = queued_at
+
+        _sbc.table("ap_signals").upsert(_row, on_conflict="signal_id").execute()
+    except Exception as _rlog_exc:
+        log.debug("_log_signal_to_db failed (non-fatal): %s", _rlog_exc)
+
+
 def _log_rejection_to_db(
     signal_id: str,
     client_id: str,
@@ -307,36 +385,13 @@ def _log_rejection_to_db(
     human_reason: str,
     payload: dict,
 ) -> None:
-    """Write every signal rejection to ap_signals with a permanent queryable record.
-    Uses exact ap_signals schema columns. Non-fatal — never blocks the trade path.
-    """
-    try:
-        import uuid as _uuid
-        _sbc = _get_sb_client()
-        if _sbc is None:
-            return
-        _sbc.table("ap_signals").upsert({
-            "signal_id":       str(signal_id or _uuid.uuid4()),
-            "client_email":    str(client_id),
-            "system_version":  "v2",
-            "ticker":          str(ticker),
-            "side":            str(side).upper(),
-            "score":           float(score or 0),
-            "tier":            str(payload.get("tier") or "B"),
-            "pattern":         str(payload.get("pattern") or ""),
-            "timeframe":       str(payload.get("timeframe") or "1d"),
-            "decision_status": "rejected",
-            "context_notes":   f"stage={stage} | code={reason_code} | {human_reason}",
-            "raw_payload":     {
-                "stage": stage,
-                "reason_code": reason_code,
-                "human_reason": human_reason,
-                **{k: v for k, v in payload.items()
-                   if k not in ("raw_payload", "signal_payload") and not callable(v)},
-            },
-        }, on_conflict="signal_id").execute()
-    except Exception as _rlog_exc:
-        log.debug("_log_rejection_to_db failed (non-fatal): %s", _rlog_exc)
+    """Backward-compatible wrapper — all existing rejection calls unchanged."""
+    _log_signal_to_db(
+        signal_id=signal_id, client_id=client_id, ticker=ticker,
+        side=side, score=score, stage=stage,
+        reason_code=reason_code, human_reason=human_reason,
+        payload=payload, decision_status="rejected",
+    )
 
 
 def _dispatch(
@@ -558,13 +613,18 @@ def _dispatch(
             # The overnight reeval at 9 AM will run contract selection with live quotes and
             # arm the entry watcher. This is the correct overnight pipeline for daily scanner signals.
             _mark_job(job_id, "WATCHING", error="after_hours_deferred:awaiting_overnight_reeval")
-            # Log to ap_signals for permanent structured record
-            _log_rejection_to_db(
+            # Log to ap_signals as WATCHING — NOT rejected.
+            # overnight_reeval queries ap_signals WHERE decision_status='WATCHING'
+            # to find signals to arm at 9 AM ET. Writing 'rejected' here was the
+            # root cause of overnight signals never being processed.
+            _log_signal_to_db(
                 signal_id=signal_id, client_id=client_id, ticker=ticker,
                 side=payload.get("side", ""), score=float(payload.get("score") or 0),
                 stage="contract_selection", reason_code="market_closed_deferred",
                 human_reason="After market hours — deferred to next session. No action needed.",
                 payload=payload,
+                decision_status="WATCHING",
+                queued_at=datetime.now(timezone.utc).isoformat(),
             )
             return
     except Exception:
