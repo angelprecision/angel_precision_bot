@@ -1,35 +1,4 @@
-Angel
-atradesta
-Online
 
-Angel — 4/30/2026 9:47 PM
-CRITICAL (blockers for live money)
-1. Autonomous recovery DOES NOT check broker open orders before calling mark_exit_replacement_safe()
-
-Location: recover_exit_position() lines ~170-180 in exit_autonomous_recovery.py
-
-The problem:
-
-message.txt
-13 KB
-Mimi — 5/2/2026 11:50 AM
-https://github.com/TraderAlice/Auto-Quant
-GitHub
-GitHub - TraderAlice/Auto-Quant
-Contribute to TraderAlice/Auto-Quant development by creating an account on GitHub.
-
-Mimi — 5/2/2026 11:58 AM
-Forwarded
-quick market scan
-
-Mimi — Yesterday at 5:09 AM
-Image
-Mimi — Yesterday at 10:58 AM
-Image
-Mimi — Yesterday at 11:16 AM
-Image
-Mimi — 6:20 AM
-"""
 ap_overnight_reeval.py — Overnight Daily Signal Re-Evaluation Engine
 =====================================================================
 This is the missing piece of the full trading loop.
@@ -820,5 +789,4 @@ def _log_rejection_supabase(
         }, on_conflict="signal_id").execute()
     except Exception as e:
         log.debug("_log_rejection_supabase failed: %s", e)
-ap_overnight_reeval.py
-29 KB
+
