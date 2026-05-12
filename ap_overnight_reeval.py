@@ -1,3 +1,166 @@
+Angel
+atradesta
+Online
+
+Angel — 4/30/2026 9:47 PM
+CRITICAL (blockers for live money)
+1. Autonomous recovery DOES NOT check broker open orders before calling mark_exit_replacement_safe()
+
+Location: recover_exit_position() lines ~170-180 in exit_autonomous_recovery.py
+
+The problem:
+
+message.txt
+13 KB
+Mimi — 5/2/2026 11:50 AM
+https://github.com/TraderAlice/Auto-Quant
+GitHub
+GitHub - TraderAlice/Auto-Quant
+Contribute to TraderAlice/Auto-Quant development by creating an account on GitHub.
+
+Mimi — 5/2/2026 11:58 AM
+Forwarded
+quick market scan
+
+Mimi — Yesterday at 5:09 AM
+Image
+Mimi — Yesterday at 10:58 AM
+Image
+Mimi — Yesterday at 11:16 AM
+Image
+Mimi — 6:20 AM
+"""
+ap_overnight_reeval.py — Overnight Daily Signal Re-Evaluation Engine
+=====================================================================
+This is the missing piece of the full trading loop.
+
+FLOW:
+  1. Market close → scanner runs → signals arrive with timeframe=1d
+  2. Bot marks them WATCHING (audit record, not yet armed)
+  3. *** THIS MODULE *** runs at 9:15 AM ET (15 min before open)
+  4. For each WATCHING signal:
+     a. Fetch prior-day high/low from Tradier history
+     b. Run overnight_daily_validator (directional invalidation check)
+     c. If VALID: select contract, create OSM entry order, arm entry_watcher
+     d. If INVALID: mark REJECTED with reason code, log to ap_signals
+  5. At 9:30 AM ET open: entry_watcher polls quotes, waits for breach
+  6. On breach: on_trigger fires → OSM submits entry → fill monitor takes over
+
+WHEN IT RUNS:
+  - Called by client_runner's health loop at ~9:15 AM ET on trading days
+  - Also callable via /admin/overnight_reeval for manual trigger
+  - ONLY processes signals with date == yesterday (no stale signals)
+
+ENTRY TRIGGER LOGIC:
+  - If scanner provides entry_trigger: use it directly
+  - If not: use prior_day_high (CALL) or prior_day_low (PUT) as the breach level
+    This matches The Strat: we enter on prior-day boundary breach
+
+FAIL-CLOSED:
+  - Missing prior levels → REJECTED
+  - Broker unavailable → skip (will retry on next poll)
+  - No contract found → REJECTED with reason
+"""
+from __future__ import annotations
+
+import logging
+import os
+import time
+from datetime import date, datetime, timezone, timedelta
+from typing import TYPE_CHECKING, Optional
+
+log = logging.getLogger("ap.overnight_reeval")
+
+if TYPE_CHECKING:
+    pass
+
+# How many calendar days back a signal is still considered "fresh"
+# e.g. a Friday signal is valid Monday morning = 3 days
+OVERNIGHT_SIGNAL_MAX_AGE_DAYS = int(os.getenv("OVERNIGHT_SIGNAL_MAX_AGE_DAYS", "4"))
+
+
+def _et_now() -> datetime:
+    from zoneinfo import ZoneInfo
+    return datetime.now(ZoneInfo("America/New_York"))
+
+
+def _is_trading_day(dt: datetime) -> bool:
+    return dt.weekday() < 5  # Mon-Fri
+
+
+def _signal_date(signal: dict) -> Optional[date]:
+    """Extract the date the signal was generated (not when we process it).
+    Falls back to parsing the signal_id itself (format: YYYY-MM-DD:...).
+    """
+    for key in ("created_at", "signal_date", "date", "timestamp_iso"):
+        val = signal.get(key, "")
+        if val and len(str(val)) >= 10:
+            try:
+                return date.fromisoformat(str(val)[:10])
+            except ValueError:
+                continue
+    # Try parsing from signal_id: "2026-05-05:1-1:AAPL:Weekly:CALL"
+    signal_id = signal.get("signal_id", "")
+    if signal_id and len(signal_id) >= 10:
+        try:
+            return date.fromisoformat(str(signal_id)[:10])
+        except ValueError:
+            pass
+    return None
+
+
+def run_overnight_reeval(
+    *,
+    client_id: str,
+    broker,
+    master_control,
+    contract_selector,
+    order_state_machine,
+    entry_watcher,
+    position_manager=None,
+    exit_eng=None,
+    on_split_brain=None,
+    force: bool = False,
+) -> dict:
+    """
+    Re-evaluate all WATCHING signals for client_id.
+    Called at ~9:15 AM ET before market open.
+
+    Returns summary dict: {processed, armed, rejected, skipped, errors}
+    """
+    from ap.overnight_daily_validator import (
+... (559 lines left)
+
+ap_overnight_reeval.py
+29 KB
+# ap_exit_engine.py -- Angel Precision Time-Aware Exit Engine
+# =============================================================================
+# 0DTE / short-dated option exit protection.
+#
+# Current constants in this file:
+#   - Poll interval: 8 seconds... (117 KB left)
+
+ap_exit_engine.py
+167 KB
+# ap/fill_monitor.py — Fill Monitor (OSM-routed, rich final)
+"""
+Fill Monitor — broker reconciliation poller + side-effect orchestrator.
+
+This file preserves the production behaviors from the larger legacy monitor:
+- audit_log writes... (15 KB left)
+
+fill_monitor.py
+65 KB
+# ap/position_manager.py — APPositionManager
+# =============================================================================
+# Client-relative position truth backed by Supabase Postgres.
+#
+# Money-safety fixes:
+# - Dedup guards only block ACTIVE positions (OPEN/CLOSING), not historical CLOSED rows.
+
+position_manager.py
+38 KB
+﻿
 """
 ap_overnight_reeval.py — Overnight Daily Signal Re-Evaluation Engine
 =====================================================================
@@ -412,7 +575,21 @@ def run_overnight_reeval(
 
 
 def _fetch_watching_signals(client_id: str) -> list:
-    """Fetch WATCHING jobs from local trade_queue for this client."""
+    """
+    Fetch WATCHING signals from both sources of truth.
+
+    1. trade_queue.status='WATCHING' for locally queued in-session jobs.
+    2. ap_signals.decision_status='WATCHING' for scanner/audit signals written
+       by APSignalStore.
+
+    This fixes the production bug where the overnight reeval ran correctly but
+    saw zero jobs because it only queried trade_queue while the scanner stored
+    WATCHING state in Supabase ap_signals.decision_status.
+    """
+    results: list[dict] = []
+    seen_signal_ids: set[str] = set()
+
+    # Source 1: local Postgres trade_queue.
     try:
         from ap.db import conn, run_with_retry
         import json as _j
@@ -430,7 +607,6 @@ def _fetch_watching_signals(client_id: str) -> list:
                 return c.fetchall()
 
         rows = run_with_retry(_fn) or []
-        result = []
         for row in rows:
             d = dict(row) if not isinstance(row, dict) else row
             if isinstance(d.get("payload"), str):
@@ -438,14 +614,122 @@ def _fetch_watching_signals(client_id: str) -> list:
                     d["payload"] = _j.loads(d["payload"])
                 except Exception:
                     pass
-            result.append(d)
-        return result
+            d["_source"] = "trade_queue"
+            results.append(d)
+            if d.get("signal_id"):
+                seen_signal_ids.add(str(d["signal_id"]))
     except Exception as e:
-        log.error("_fetch_watching_signals failed: %s", e)
-        return []
+        log.error("_fetch_watching_signals[trade_queue] failed: %s", e)
+
+    # Source 2: Supabase ap_signals.
+    try:
+        import json as _j2
+        from supabase import create_client as _cc
+
+        sb_url = os.getenv("SUPABASE_URL", "")
+        sb_key = (
+            os.getenv("SUPABASE_SERVICE_KEY", "")
+            or os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
+            or os.getenv("SUPABASE_ANON_KEY", "")
+        )
+        if not sb_url or not sb_key:
+            log.warning("_fetch_watching_signals[ap_signals]: missing Supabase credentials")
+        else:
+            cutoff = (
+                datetime.now(timezone.utc)
+                - timedelta(days=OVERNIGHT_SIGNAL_MAX_AGE_DAYS + 1)
+            ).isoformat()
+            sb = _cc(sb_url, sb_key)
+            res = (
+                sb.table("ap_signals")
+                .select(
+                    "signal_id, signal_payload, raw_payload, created_at, ticker, "
+                    "side, score, timeframe, pattern, tier, decision_status, "
+                    "entry_trigger, stop_price, target_price, underlying_at_signal"
+                )
+                .eq("client_email", client_id)
+                .eq("decision_status", "WATCHING")
+                .gte("created_at", cutoff)
+                .order("created_at", desc=True)
+                .limit(100)
+                .execute()
+            )
+
+            for row in (res.data or []):
+                sid = str(row.get("signal_id") or "")
+                if not sid or sid in seen_signal_ids:
+                    continue
+
+                payload = row.get("signal_payload") or row.get("raw_payload") or {}
+                if isinstance(payload, str):
+                    try:
+                        payload = _j2.loads(payload)
+                    except Exception:
+                        payload = {}
+                if not isinstance(payload, dict):
+                    payload = {}
+
+                # Hydrate required downstream fields from columns if the JSON
+                # payload is sparse.
+                for key in ("ticker", "side", "score", "timeframe", "pattern", "tier"):
+                    if not payload.get(key) and row.get(key) is not None:
+                        payload[key] = row.get(key)
+                if not payload.get("symbol") and row.get("ticker"):
+                    payload["symbol"] = row.get("ticker")
+                if not payload.get("signal_id"):
+                    payload["signal_id"] = sid
+                if not payload.get("created_at") and row.get("created_at"):
+                    payload["created_at"] = row.get("created_at")
+                if not payload.get("entry_trigger") and row.get("entry_trigger") is not None:
+                    payload["entry_trigger"] = row.get("entry_trigger")
+                if not payload.get("stop_price") and row.get("stop_price") is not None:
+                    payload["stop_price"] = row.get("stop_price")
+                if not payload.get("target_price") and row.get("target_price") is not None:
+                    payload["target_price"] = row.get("target_price")
+                if not payload.get("underlying_price") and row.get("underlying_at_signal") is not None:
+                    payload["underlying_price"] = row.get("underlying_at_signal")
+
+                results.append({
+                    "id": f"sup:{sid}",
+                    "signal_id": sid,
+                    "payload": payload,
+                    "created_ts": row.get("created_at"),
+                    "_source": "ap_signals",
+                })
+                seen_signal_ids.add(sid)
+    except Exception as e:
+        log.error("_fetch_watching_signals[ap_signals] failed: %s", e)
+
+    tq_count = sum(1 for r in results if r.get("_source") == "trade_queue")
+    sup_count = sum(1 for r in results if r.get("_source") == "ap_signals")
+    log.info(
+        "[%s] _fetch_watching_signals: total=%d trade_queue=%d ap_signals=%d",
+        client_id, len(results), tq_count, sup_count,
+    )
+    return results
 
 
-def _mark_job_rejected(job_id: int, client_id: str, reason: str) -> None:
+def _mark_job_rejected(job_id, client_id: str, reason: str) -> None:
+    """Mark a WATCHING job rejected in its original source table."""
+    job_id_str = str(job_id)
+    if job_id_str.startswith("sup:"):
+        signal_id = job_id_str[4:]
+        try:
+            from supabase import create_client as _cc
+            sb = _cc(
+                os.getenv("SUPABASE_URL", ""),
+                os.getenv("SUPABASE_SERVICE_KEY", "")
+                or os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
+                or os.getenv("SUPABASE_ANON_KEY", ""),
+            )
+            sb.table("ap_signals").update({
+                "decision_status": "rejected",
+                "context_notes": reason[:500],
+            }).eq("signal_id", signal_id).eq("client_email", client_id).execute()
+        except Exception as e:
+            log.debug("_mark_job_rejected[ap_signals] failed non-fatal: %s", e)
+        return
+
     try:
         from ap.db import conn, run_with_retry
 
@@ -458,14 +742,34 @@ def _mark_job_rejected(job_id: int, client_id: str, reason: str) -> None:
                         finished_ts = NOW()
                     WHERE id = %s AND client_id = %s
                 """, (reason[:500], job_id, client_id))
-
         run_with_retry(_fn)
     except Exception as e:
-        log.debug("_mark_job_rejected failed (non-fatal): %s", e)
+        log.debug("_mark_job_rejected[trade_queue] failed non-fatal: %s", e)
 
 
-def _mark_job_watching_armed(job_id: int, client_id: str, contract: str) -> None:
-    """Update the WATCHING job to record that it has been armed in the watcher."""
+def _mark_job_watching_armed(job_id, client_id: str, contract: str) -> None:
+    """Record that a WATCHING job has been armed in the entry watcher."""
+    job_id_str = str(job_id)
+    label = f"armed:contract={contract}"[:500]
+    if job_id_str.startswith("sup:"):
+        signal_id = job_id_str[4:]
+        try:
+            from supabase import create_client as _cc
+            sb = _cc(
+                os.getenv("SUPABASE_URL", ""),
+                os.getenv("SUPABASE_SERVICE_KEY", "")
+                or os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
+                or os.getenv("SUPABASE_ANON_KEY", ""),
+            )
+            sb.table("ap_signals").update({
+                "decision_status": "armed",
+                "context_notes": label,
+                "watcher_started_at": datetime.now(timezone.utc).isoformat(),
+            }).eq("signal_id", signal_id).eq("client_email", client_id).execute()
+        except Exception as e:
+            log.debug("_mark_job_watching_armed[ap_signals] failed non-fatal: %s", e)
+        return
+
     try:
         from ap.db import conn, run_with_retry
 
@@ -476,11 +780,10 @@ def _mark_job_watching_armed(job_id: int, client_id: str, contract: str) -> None
                     SET last_error = %s,
                         started_ts = COALESCE(started_ts, NOW())
                     WHERE id = %s AND client_id = %s
-                """, (f"armed:contract={contract}"[:500], job_id, client_id))
-
+                """, (label, job_id, client_id))
         run_with_retry(_fn)
     except Exception as e:
-        log.debug("_mark_job_watching_armed failed (non-fatal): %s", e)
+        log.debug("_mark_job_watching_armed[trade_queue] failed non-fatal: %s", e)
 
 
 def _log_rejection_supabase(
@@ -517,3 +820,5 @@ def _log_rejection_supabase(
         }, on_conflict="signal_id").execute()
     except Exception as e:
         log.debug("_log_rejection_supabase failed: %s", e)
+ap_overnight_reeval.py
+29 KB
