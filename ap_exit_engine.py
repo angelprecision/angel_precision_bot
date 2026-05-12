@@ -157,6 +157,33 @@ def _option_root(option_symbol: str) -> str:
     return sym[:m.start()].strip()
 
 
+def _normalize_ticker(ticker: str, option_symbol: str = "") -> str:
+    """
+    Normalize a stored underlying ticker against an OCC option symbol.
+
+    This prevents the fill-monitor / restart bug where an OCC symbol such as
+    META260515C00615000 is accidentally sliced into META26. If the stored
+    ticker ends with a digit, it is almost certainly not a valid equity root
+    for this bot's universe, so the root is recovered from the contract.
+    """
+    import re as _re
+
+    t = str(ticker or "").strip().upper()
+    root = _option_root(option_symbol or "").strip().upper()
+
+    if not t and root:
+        return root
+
+    if t and _re.search(r"\d$", t) and root and not _re.search(r"\d$", root):
+        log.warning(
+            "TICKER NORMALIZED: '%s' -> '%s' from contract '%s'",
+            t, root, option_symbol or "",
+        )
+        return root
+
+    return t
+
+
 def _option_profile(pos: "ManagedPosition") -> tuple[int, bool, str]:
     symbol = (pos.option_symbol or "").upper()
     ticker = (pos.ticker or "").upper()
@@ -690,6 +717,17 @@ FORCED_RISK_EXIT_CODES = {
     "NEVER_GREEN_STOP",
     "THETA_STOP",
     "TIME_STOP",
+    # Winner-protection exits must be allowed through degraded quote mode.
+    # If a position has already established a profit peak, a QPM gap should not
+    # trap it and allow a winner to become a loser.
+    "RUNNER_TRAIL",
+    "PROFIT_LOCK",
+    "TRAILING_STOP",
+    "TOUCHED_PROFIT_STOP",
+    "SMALL_WIN_LOCK",
+    "PROFIT_PROTECT_W3",
+    "PROFIT_PROTECT_W2",
+    "PROFIT_PROTECT_W1",
 }
 
 
@@ -827,6 +865,18 @@ class APExitEngine:
         """Track a newly broker-confirmed open position for exit protection."""
         if pos is None:
             return
+
+        # Normalize before duplicate checks and before QPM sees the position.
+        # A corrupted ticker like META26 makes quote fetches fail and blinds exits.
+        _raw_ticker = str(pos.ticker or "")
+        _fixed_ticker = _normalize_ticker(_raw_ticker, pos.option_symbol or "")
+        if _fixed_ticker != _raw_ticker:
+            log.warning(
+                "[exit_eng] add_position: ticker normalized '%s' -> '%s' | contract=%s | pos_id=%s",
+                _raw_ticker, _fixed_ticker, pos.option_symbol or "?", pos.position_id or "?",
+            )
+            pos.ticker = _fixed_ticker
+
         with self._lock:
             for existing in self._positions:
                 same_id  = bool(pos.position_id and existing.position_id == pos.position_id)
@@ -2337,13 +2387,23 @@ class APExitEngine:
             for row in rows:
                 try:
                     original_qty = int(row.get("qty", 1) or 1)
+                    _raw_ticker = str(row.get("underlying", "") or row.get("symbol", "") or "")
+                    _contract_sym = str(row.get("contract", "") or "")
+                    _ticker = _normalize_ticker(_raw_ticker, _contract_sym)
+                    if _ticker != _raw_ticker:
+                        log.warning(
+                            "seed_from_db: ticker normalized '%s' -> '%s' | contract=%s | pos_id=%s",
+                            _raw_ticker, _ticker, _contract_sym, row.get("id"),
+                        )
+                    _underlying_entry = float(row.get("underlying_entry", 0) or 0)
+
                     mp = ManagedPosition(
-                        ticker=row.get("underlying", "") or row.get("symbol", ""),
-                        option_symbol=row.get("contract", ""),
+                        ticker=_ticker,
+                        option_symbol=_contract_sym,
                         side=row.get("direction", "CALL"),
                         quantity=original_qty,
                         entry_price=float(row.get("avg_fill", 0) or 0),
-                        underlying_entry=float(row.get("underlying_entry", 0) or 0),
+                        underlying_entry=_underlying_entry,
                         underlying_target=float(row.get("target_underlying") or 0),
                         underlying_stop=float(row.get("stop_underlying") or 0),
                         position_id=str(row.get("id") or ""),
@@ -2515,6 +2575,43 @@ class APExitEngine:
 
                 option_pnl = pos.option_pnl_pct
 
+                # EOD PRE-GATE: this must run before any quote/eligibility gate.
+                # After 3:50 PM ET or after market close, a zero/stale option quote
+                # must never prevent risk-reducing liquidation.
+                _eg_h = now_et.hour
+                _eg_m = now_et.minute
+                _eg_past_eod = (
+                    _eg_h > EOD_HARD_CLOSE_HOUR
+                    or (_eg_h == EOD_HARD_CLOSE_HOUR and _eg_m >= EOD_HARD_CLOSE_MIN)
+                )
+                _eg_market_closed = (_eg_h >= 16)
+                if (
+                    (_eg_past_eod or _eg_market_closed)
+                    and not getattr(pos, "overnight_hold_approved", False)
+                    and not pos.exit_in_flight
+                    and not pos.closed
+                    and int(pos.quantity_remaining or 0) > 0
+                ):
+                    _eod_qty = int(pos.quantity_remaining)
+                    _eod_decision = ExitDecision(
+                        action="CLOSE_ALL",
+                        quantity=_eod_qty,
+                        reason=(
+                            f"EOD FORCE CLOSE -- {_eg_h}:{_eg_m:02d} ET "
+                            + ("(market closed)" if _eg_market_closed else f"past {EOD_HARD_CLOSE_HOUR}:{EOD_HARD_CLOSE_MIN:02d}")
+                            + " | quote_gate_bypassed=True"
+                        ),
+                        urgency="IMMEDIATE",
+                        pnl_pct=option_pnl,
+                        reason_code="EOD_FORCE_CLOSE",
+                    )
+                    log.warning(
+                        "[%s] EOD PRE-GATE EXIT | pos_id=%s | %d:%02d ET | qty=%d | option_pnl=%.1f%% | bypassing quote gate",
+                        pos.ticker, pos.position_id or "?", _eg_h, _eg_m, _eod_qty, option_pnl * 100,
+                    )
+                    actions_to_take.append((pos, _eod_decision, False))
+                    continue
+
                 _force_runner_check = False
                 if pos.scale_outs_done >= 1 and pos.peak_pnl_pct >= 0.40:
                     _runner_drop_now   = pos.peak_pnl_pct - option_pnl
@@ -2536,13 +2633,24 @@ class APExitEngine:
                 elif not self._eligible_for_new_exit(pos, now_utc):
                     continue
 
-                if pos.current_underlying > 0 and pos.current_option_price > 0:
-                    if pos.option_pnl_pct > pos.peak_pnl_pct:
-                        pos.peak_pnl_pct = pos.option_pnl_pct
-                    if pos.option_pnl_pct > 0:
-                        pos.touched_profit = True
-                        if pos.option_pnl_pct > pos.max_profit_seen:
-                            pos.max_profit_seen = pos.option_pnl_pct
+                _has_live_quotes = (
+                    pos.current_underlying > 0 and pos.current_option_price > 0
+                )
+                _has_peak_to_protect = (
+                    pos.peak_pnl_pct >= IMMEDIATE_TP_PCT
+                    and int(pos.quantity_remaining or 0) > 0
+                )
+
+                if _has_live_quotes or _has_peak_to_protect:
+                    # Only advance peak state from live quotes. A stale zero quote
+                    # may trigger protection, but must never erase the real peak.
+                    if _has_live_quotes:
+                        if pos.option_pnl_pct > pos.peak_pnl_pct:
+                            pos.peak_pnl_pct = pos.option_pnl_pct
+                        if pos.option_pnl_pct > 0:
+                            pos.touched_profit = True
+                            if pos.option_pnl_pct > pos.max_profit_seen:
+                                pos.max_profit_seen = pos.option_pnl_pct
 
                     decision = evaluate_exit(pos, now_et)
                     decision.reason_code = _classify_exit_decision(decision)
