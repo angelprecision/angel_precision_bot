@@ -528,6 +528,7 @@ class APPositionManager:
         side: str,
         qty: int,
         entry_price: float,
+        underlying_entry: Optional[float] = None,
         tier: str = "B",
         score: float = 0.0,
         pattern: str = "",
@@ -557,6 +558,7 @@ class APPositionManager:
 
         has_local_col = self._has_position_column("local_order_id")
         has_broker_col = self._has_position_column("broker_order_id")
+        has_underlying_entry_col = self._has_position_column("underlying_entry")
 
         position_id = str(uuid.uuid4())
         ts = now_utc_iso()
@@ -582,6 +584,10 @@ class APPositionManager:
             self._nullable_float(target_underlying),
             PositionStatus.OPEN, ts, ts, ts,
         ]
+
+        if has_underlying_entry_col:
+            columns.append("underlying_entry")
+            values.append(self._nullable_float(underlying_entry))
 
         if local_order_id and has_local_col:
             columns.append("local_order_id")
@@ -695,9 +701,9 @@ class APPositionManager:
         final_id, inserted = run_with_retry(_fn)
         if inserted:
             log.info(
-                "[%s] POSITION OPENED | %s %s x%s @ $%.2f | id=%s tier=%s local_order=%s broker_order=%s",
+                "[%s] POSITION OPENED | %s %s x%s @ $%.2f | id=%s tier=%s underlying_entry=%s local_order=%s broker_order=%s",
                 self.client_id, ticker, contract, qty, entry_price, final_id, tier,
-                local_order_id or "", broker_order_id or "",
+                underlying_entry if underlying_entry is not None else "", local_order_id or "", broker_order_id or "",
             )
         else:
             log.warning(
