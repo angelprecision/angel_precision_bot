@@ -293,7 +293,10 @@ class APRiskManager:
         if expected_loss_per_contract > 0:
             contracts_from_risk = int(risk_dollars / expected_loss_per_contract)
         else:
-            contracts_from_risk = 1
+            # Risk math failed (zero denominator) — floor at 2 so accounts
+            # that can afford 2+ contracts don't get capped to 1 on a data gap.
+            # Capital and dollar caps downstream will constrain if budget is tight.
+            contracts_from_risk = 2
 
         # ── 7. Apply all caps ──────────────────────────────────
         # Cap 1: Vol + sector + correlation adjusted position cap

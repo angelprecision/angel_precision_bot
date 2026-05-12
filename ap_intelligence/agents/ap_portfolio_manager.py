@@ -158,7 +158,11 @@ class APPortfolioManager:
         raw_contracts = risk.get("max_contracts", 0)
         raw_usd       = risk.get("max_position_usd", 0.0)
 
-        final_contracts = max(1, int(raw_contracts * size_mult))
+        # Minimum 2 contracts when the risk manager approved 2 or more.
+        # If risk manager only approved 1 (tight budget / low equity), respect that.
+        # Rule: never force 2 contracts on an account that can only afford 1.
+        _min_floor      = 2 if raw_contracts >= 2 else 1
+        final_contracts = max(_min_floor, int(raw_contracts * size_mult))
         final_usd       = round(raw_usd * size_mult, 2)
 
         # ── REASONING ─────────────────────────────────────────
