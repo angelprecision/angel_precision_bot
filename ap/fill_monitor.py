@@ -552,6 +552,128 @@ def _cancel_with_session(broker: BrokerAdapter, broker_order_id: str):
 # SAFE HELPERS
 # =============================================================================
 
+
+def _extract_underlying_from_contract(contract: str, fallback: str = "") -> str:
+    """
+    Extract the underlying root from an OCC option symbol.
+
+    Example:
+        META260515C00615000 -> META
+
+    This prevents the corrupted ticker bug where slicing an OCC symbol produced
+    invalid underlyings such as META26, causing quote monitors to fetch a ticker
+    that does not exist.
+    """
+    import re as _re
+    sym = str(contract or "").upper().strip()
+    fallback = str(fallback or "").upper().strip()
+    if sym:
+        m = _re.search(r"\d{6}[CP]", sym)
+        if m:
+            root = sym[:m.start()].strip()
+            if root:
+                return root
+        root = _re.sub(r"\d+$", "", sym).strip()
+        if root:
+            return root
+    return fallback
+
+
+def _get_underlying_price_at_fill(broker: BrokerAdapter, ticker: str) -> float:
+    """
+    Capture underlying price at the moment an entry fill is confirmed.
+
+    FIX: the original implementation only tried abstract method names that
+    TradierBroker does not expose, silently returning 0.0 every time.
+    This caused underlying_entry = NULL in the positions table, disabling
+    all underlying-based exit logic (stop_hit, target_hit, progress exit).
+
+    Strategy (in priority order):
+      1. Abstract broker helper methods (forwards-compatible with any broker)
+      2. Tradier REST API via broker.session (guaranteed path for TradierBroker)
+      3. Hard fallback: 0.0 — now logged as WARNING so failures are never silent
+    """
+    if not broker or not ticker:
+        return 0.0
+
+    ticker = str(ticker).upper().strip()
+
+    # ── 1. Abstract broker helpers ────────────────────────────────────────────
+    for method_name in ("get_quote", "get_underlying_price", "get_last_price", "quote"):
+        method = getattr(broker, method_name, None)
+        if not callable(method):
+            continue
+        try:
+            result = method(ticker)
+            if isinstance(result, (int, float)) and float(result) > 0:
+                return float(result)
+            if isinstance(result, dict):
+                for key in ("last", "last_price", "price", "mark", "bid", "close"):
+                    val = result.get(key)
+                    if val is not None:
+                        try:
+                            fv = float(val)
+                            if fv > 0:
+                                return fv
+                        except Exception:
+                            pass
+        except Exception:
+            continue
+
+    # ── 2. Tradier REST API via broker session (primary path for TradierBroker) ─
+    # TradierBroker exposes .session (requests.Session) and .cfg.base_url.
+    # Using the broker's existing authenticated session avoids credential duplication.
+    try:
+        session = getattr(broker, "session", None)
+        cfg = getattr(broker, "cfg", None)
+        base_url = (
+            getattr(cfg, "base_url", None)
+            or getattr(cfg, "baseurl", None)
+            or getattr(broker, "base_url", None)
+            or getattr(broker, "_base_url", None)
+        )
+        if session and base_url:
+            resp = session.get(
+                f"{base_url}/v1/markets/quotes",
+                params={"symbols": ticker, "greeks": "false"},
+                headers={"Accept": "application/json"},
+                timeout=4,
+            )
+            if getattr(resp, "status_code", 500) < 300:
+                data = resp.json() or {}
+                raw = data.get("quotes", {}).get("quote", {})
+                if isinstance(raw, list):
+                    raw = raw[0] if raw else {}
+                if isinstance(raw, dict):
+                    for key in ("last", "ask", "bid", "close", "prevclose"):
+                        val = raw.get(key)
+                        if val is not None:
+                            try:
+                                fv = float(val)
+                                if fv > 0:
+                                    log.debug(
+                                        "[fill_monitor] underlying_entry=%s for %s "
+                                        "via Tradier REST (%s)",
+                                        fv, ticker, key,
+                                    )
+                                    return fv
+                            except Exception:
+                                pass
+    except Exception as exc:
+        log.debug(
+            "[fill_monitor] Tradier REST underlying price fetch failed for %s: %s",
+            ticker, exc,
+        )
+
+    # ── 3. Hard fallback ───────────────────────────────────────────────────────
+    log.warning(
+        "[fill_monitor] _get_underlying_price_at_fill: could not fetch price for '%s' "
+        "— underlying_entry will be NULL. "
+        "Check broker session/base_url are accessible at fill time.",
+        ticker,
+    )
+    return 0.0
+
 def _call_with_supported_kwargs(fn, **kwargs):
     """Call a function with only supported keyword args for compatibility."""
     sig = inspect.signature(fn)
@@ -577,20 +699,33 @@ def _get_existing_position_by_order(pm, local_order_id: str, broker_order_id: Op
     return None
 
 
-def _open_position_safe(pm, *, order: dict, result: dict, plan_id: str, signal_id: str, local_id: str) -> Optional[str]:
+def _open_position_safe(pm, *, order: dict, result: dict, plan_id: str, signal_id: str, local_id: str, broker: BrokerAdapter = None) -> Optional[str]:
     """Open position with idempotency keys when the PM supports them."""
     existing = _get_existing_position_by_order(pm, local_id, order.get("broker_order_id"))
     if existing:
         return existing.get("id") or existing.get("position_id")
 
+    contract = order.get("contract") or order.get("symbol") or ""
+    ticker = _extract_underlying_from_contract(contract, fallback=order.get("symbol") or "")
+    underlying_entry = _safe_float(
+        order.get("underlying_entry")
+        or order.get("entry_underlying")
+        or order.get("last_underlying_price")
+        or order.get("trigger_price")
+        or 0.0
+    )
+    if underlying_entry <= 0:
+        underlying_entry = _get_underlying_price_at_fill(broker, ticker)
+
     kwargs = {
         "plan_id": plan_id,
         "signal_id": signal_id,
-        "ticker": (order.get("symbol") or "").upper(),
-        "contract": order.get("contract") or order.get("symbol") or "",
+        "ticker": ticker,
+        "contract": contract,
         "side": (order.get("direction") or "CALL").upper(),
         "qty": int(result.get("filled_qty") or order.get("qty") or 0),
         "entry_price": float(result.get("avg_fill") or 0.0),
+        "underlying_entry": underlying_entry if underlying_entry > 0 else None,
         "tier": str(order.get("tier") or "B"),
         "score": float(order.get("score") or 0),
         "pattern": str(order.get("pattern") or ""),
@@ -603,7 +738,7 @@ def _open_position_safe(pm, *, order: dict, result: dict, plan_id: str, signal_i
     try:
         return pm.open_position(**kwargs)
     except TypeError:
-        # Compatibility with older PM signature that does not yet accept local/broker order ids.
+        # Compatibility with older PM signature that does not yet accept every field.
         return _call_with_supported_kwargs(pm.open_position, **kwargs)
 
 
@@ -787,18 +922,20 @@ def _seed_exit_engine(exit_engine, position_id: str, order: dict, result: dict, 
 
     try:
         _MP = _load_managed_position_class()
-
+        contract = order.get("contract") or order.get("symbol") or ""
+        ticker = _extract_underlying_from_contract(contract, fallback=order.get("symbol") or "")
         underlying_entry = _safe_float(
-            order.get("trigger_price")
-            or order.get("underlying_entry")
+            order.get("underlying_entry")
             or order.get("entry_underlying")
+            or order.get("last_underlying_price")
+            or order.get("trigger_price")
             or 0.0
         )
         entry_option_price = _safe_float(result.get("avg_fill") or order.get("fill_price") or 0.0)
 
         mp = _MP(
-            ticker=(order.get("symbol") or "").upper(),
-            option_symbol=order.get("contract") or order.get("symbol") or "",
+            ticker=ticker,
+            option_symbol=contract,
             side=(order.get("direction") or "CALL").upper(),
             quantity=int(result.get("filled_qty") or order.get("qty") or 0),
             entry_price=entry_option_price,
@@ -810,8 +947,6 @@ def _seed_exit_engine(exit_engine, position_id: str, order: dict, result: dict, 
         mp.client_id = str(order.get("client_id") or "")
         mp.signal_id = signal_id
 
-        # Do not replay entry underlying as current underlying. Current quote fields are
-        # deliberately unknown/provisional until the exit engine hydrates live quotes.
         try:
             mp.current_underlying = _safe_float(order.get("last_underlying_price") or 0.0)
             mp.current_option_price = entry_option_price
@@ -847,9 +982,10 @@ def _seed_exit_engine(exit_engine, position_id: str, order: dict, result: dict, 
                 log.debug("[%s] exit_engine.request_quote_refresh failed non-critical for %s: %s", order.get("client_id"), position_id, exc)
 
         log.info(
-            "[%s] Exit engine seeded for pos=%s quote_fresh=False current_underlying=%s",
+            "[%s] Exit engine seeded for pos=%s ticker=%s quote_fresh=False current_underlying=%s",
             order.get("client_id"),
             position_id,
+            ticker,
             getattr(mp, "current_underlying", None),
         )
     except Exception as exc:
@@ -1055,6 +1191,7 @@ def process_pending_order(
                     plan_id=plan_id,
                     signal_id=signal_id,
                     local_id=local_id,
+                    broker=broker,
                 )
 
                 # Secondary broker-side stop is best-effort only.
