@@ -1,3 +1,231 @@
+
+
+
+ap_overnight_reeval.py — Overnight Daily Signal Re-Evaluation Engine
+=====================================================================
+This is the missing piece of the full trading loop.
+
+FLOW:
+  1. Market close → scanner runs → signals arrive with timeframe=1d
+  2. Bot marks them WATCHING (audit record, not yet armed)
+  3. *** THIS MODULE *** runs at 9:15 AM ET (15 min before open)
+  4. For each WATCHING signal:
+     a. Fetch prior-day high/low from Tradier history
+     b. Run overnight_daily_validator (directional invalidation check)
+     c. If VALID: select contract, create OSM entry order, arm entry_watcher
+     d. If INVALID: mark REJECTED with reason code, log to ap_signals
+  5. At 9:30 AM ET open: entry_watcher polls quotes, waits for breach
+  6. On breach: on_trigger fires → OSM submits entry → fill monitor takes over
+
+WHEN IT RUNS:
+  - Called by client_runner's health loop at ~9:15 AM ET on trading days
+  - Also callable via /admin/overnight_reeval for manual trigger
+  - ONLY processes signals with date == yesterday (no stale signals)
+
+ENTRY TRIGGER LOGIC:
+  - If scanner provides entry_trigger: use it directly
+  - If not: use prior_day_high (CALL) or prior_day_low (PUT) as the breach level
+    This matches The Strat: we enter on prior-day boundary breach
+
+FAIL-CLOSED:
+  - Missing prior levels → REJECTED
+  - Broker unavailable → skip (will retry on next poll)
+  - No contract found → REJECTED with reason
+"""
+from __future__ import annotations
+
+import logging
+import os
+import time
+from datetime import date, datetime, timezone, timedelta
+from typing import TYPE_CHECKING, Optional
+
+log = logging.getLogger("ap.overnight_reeval")
+
+if TYPE_CHECKING:
+    pass
+
+# How many calendar days back a signal is still considered "fresh"
+# e.g. a Friday signal is valid Monday morning = 3 days
+OVERNIGHT_SIGNAL_MAX_AGE_DAYS = int(os.getenv("OVERNIGHT_SIGNAL_MAX_AGE_DAYS", "4"))
+
+
+def _et_now() -> datetime:
+    from zoneinfo import ZoneInfo
+    return datetime.now(ZoneInfo("America/New_York"))
+
+
+def _is_trading_day(dt: datetime) -> bool:
+    return dt.weekday() < 5  # Mon-Fri
+
+
+def _signal_date(signal: dict) -> Optional[date]:
+    """Extract the date the signal was generated (not when we process it).
+    Falls back to parsing the signal_id itself (format: YYYY-MM-DD:...).
+    """
+    for key in ("created_at", "signal_date", "date", "timestamp_iso"):
+        val = signal.get(key, "")
+        if val and len(str(val)) >= 10:
+            try:
+                return date.fromisoformat(str(val)[:10])
+            except ValueError:
+                continue
+    # Try parsing from signal_id: "2026-05-05:1-1:AAPL:Weekly:CALL"
+    signal_id = signal.get("signal_id", "")
+    if signal_id and len(signal_id) >= 10:
+        try:
+            return date.fromisoformat(str(signal_id)[:10])
+        except ValueError:
+            pass
+    return None
+
+
+def run_overnight_reeval(
+    *,
+    client_id: str,
+    broker,
+    master_control,
+    contract_selector,
+    order_state_machine,
+    entry_watcher,
+    position_manager=None,
+    exit_eng=None,
+    on_split_brain=None,
+    force: bool = False,
+) -> dict:
+    """
+    Re-evaluate all WATCHING signals for client_id.
+    Called at ~9:15 AM ET before market open.
+
+    Returns summary dict: {processed, armed, rejected, skipped, errors}
+    """
+    from ap.overnight_daily_validator import (
+... (559 lines left)
+
+ap_overnight_reeval.py
+29 KB
+# ap_exit_engine.py -- Angel Precision Time-Aware Exit Engine
+# =============================================================================
+# 0DTE / short-dated option exit protection.
+#
+# Current constants in this file:
+#   - Poll interval: 8 seconds
+#   - Profit protect W1: 11:00 AM ET, scale out 50% if option P&L >= +40%
+#   - Profit protect W2:  1:00 PM ET, scale out 75% if option P&L >= +25%
+#   - Profit protect W3:  2:00 PM ET, close all if option P&L >= +15%
+#   - EOD hard close: 3:45 PM ET, close all remaining contracts
+#   - Theta stop: after noon, close if option P&L <= -35%
+#   - Immediate TP: +18% option P&L; 1 contract closes all, multi-contract scales
+#   - Hard stop: DTE/instrument-adjusted; default -30%, tighter on 0DTE index
+#
+# Money-safety invariant:
+#   - v9: missing callback identity is a visible safe-lock, not a silent deadlock.
+#   - Submitting an exit order is NOT a fill.
+#   - scale_outs_done increments only after broker-confirmed exit fill.
+#   - Every exit path, including sentinels, must respect exit_in_flight gating.
+#
+# Bug-fix history (see inline FIX-N tags):
+#   FIX-1  Discord webhook POST moved out of evaluate_exit() and out of the engine
+#          lock. evaluate_exit() is now a pure function with no side effects.
+#          Runner alert fires in _submit_exit_decision() after successful callback,
+#          outside both lock sections. Previously the POST (timeout=3) held
+#          self._lock for up to 3 seconds on every profitable runner close.
+#   FIX-2  Kill-switch filter unpacked (pos, decision, bool) 3-tuples as 2-tuples,
+#          raising ValueError on every iteration when KILL_BLOCKS_NON_PROTECTIVE_EXITS=1.
+#          Fixed to unpack as (p, d, _) throughout.
+#   FIX-3  Expired contract cleanup iterated and reassigned self._positions without
+#          holding self._lock — race with concurrent add_position/fill hooks.
+#          Entire expired-contract block now runs inside with self._lock.
+#   FIX-4  replacement_proof was unconditionally set True, making all three
+#          (not replacement_proof) guard blocks permanently dead code. Variable
+#          removed; guards now execute unconditionally so stale-time, equivalent-runner,
+#          and non-emergency checks actually run.
+#   FIX-5  Inline W1/W2 window comments had wrong times (1:30 PM / 2:30 PM).
+#          Corrected to match PROFIT_PROTECT_1_HOUR=11 (11:00 AM) and
+#          PROFIT_PROTECT_2_HOUR=13 (1:00 PM).
+#   FIX-6  Per-order cumulative fill watermark dict was cleared immediately on
+#          full-fill. Late duplicate callbacks (fill monitor + reconciler dual path)
+#          saw prev=0 and double-counted the fill. Dict is now preserved after
+#          pending order completes and only reset in _mark_exit_submitted() when
+#          a new exit order generation begins.
+#   FIX-7  Added get_position(position_id) method for O(1) lookup. OSM's
+#          _get_exit_engine_position() checks for this method first before
+#          falling back to O(n) linear scan.
+#   FIX-8  last_rejection_ts standardized from Optional[float] (epoch) to
+#          Optional[datetime] (UTC) to match every other timestamp field on
+#          ManagedPosition. Callers no longer need to know which fields are float.
+#   FIX-9  Healer reference captured once before _exit_loop() while-loop instead
+#          of re-importing every 8 seconds.
+#   FIX-10 Extra blank line inside def on_exit_failure() signature removed.
+# =============================================================================
+
+from __future__ import annotations
+
+import os
+import time
+import threading
+import logging
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Optional, Callable
+from zoneinfo import ZoneInfo
+
+
+try:
+    from ap.observability import emit_decision_event, get_git_commit
+except Exception:
+    emit_decision_event = None
+
+    def get_git_commit(default: str = "unknown") -> str:
+        return default
+
+log = logging.getLogger("ap.exit_engine")
+ET  = ZoneInfo("America/New_York")
+
+# ── TIME THRESHOLDS (ET) ──────────────────────────────────────────────────────
+PROFIT_PROTECT_1_HOUR = 11   # 11:00 AM -- scale out 50% if +40%
+PROFIT_PROTECT_1_MIN  = 0
+PROFIT_PROTECT_2_HOUR = 13   #  1:00 PM -- scale out 75% if +25%
+PROFIT_PROTECT_2_MIN  = 0
+PROFIT_PROTECT_3_HOUR = 14   #  2:00 PM -- exit all if +15%
+PROFIT_PROTECT_3_MIN  = 0
+EOD_HARD_CLOSE_HOUR   = 15   #  3:50 PM -- EXIT EVERYTHING before close
+EOD_HARD_CLOSE_MIN    = 50   # Changed from 3:45 to give more time for fills
+POLL_INTERVAL_SEC     = 8    # check every 8 seconds
+
+# Kill switch policy: exits reduce risk, so the engine must never pause
+# evaluation under kill switch. By default, all exit actions are allowed.
+# Set EXIT_ENGINE_KILL_BLOCKS_NON_PROTECTIVE=1 only if you explicitly want
+# kill switch to block non-protective exits while still allowing stops/EOD/theta.
+KILL_BLOCKS_NON_PROTECTIVE_EXITS = (
+    os.getenv("EXIT_ENGINE_KILL_BLOCKS_NON_PROTECTIVE", "0").strip().lower()
+    in {"1", "true", "yes", "on"}
+)
+
+# ── P&L THRESHOLDS ────────────────────────────────────────────────────────────
+THETA_STOP_LOSS_PCT   = -0.35  # -35% on option → stop... (117 KB left)
+
+ap_exit_engine.py
+167 KB
+# ap/fill_monitor.py — Fill Monitor (OSM-routed, rich final)
+"""
+Fill Monitor — broker reconciliation poller + side-effect orchestrator.
+
+This file preserves the production behaviors from the larger legacy monitor:
+- audit_log writes... (15 KB left)
+
+fill_monitor.py
+65 KB
+# ap/position_manager.py — APPositionManager
+# =============================================================================
+# Client-relative position truth backed by Supabase Postgres.
+#
+# Money-safety fixes:
+# - Dedup guards only block ACTIVE positions (OPEN/CLOSING), not historical CLOSED rows.
+
+position_manager.py
+38 KB
+﻿
 # ap/fill_monitor.py — Fill Monitor (OSM-routed, rich final)
 """
 Fill Monitor — broker reconciliation poller + side-effect orchestrator.
@@ -552,6 +780,54 @@ def _cancel_with_session(broker: BrokerAdapter, broker_order_id: str):
 # SAFE HELPERS
 # =============================================================================
 
+
+def _extract_underlying_from_contract(contract: str, fallback: str = "") -> str:
+    """
+    Extract the underlying root from an OCC option symbol.
+
+    Example:
+        META260515C00615000 -> META
+
+    This prevents the corrupted ticker bug where slicing an OCC symbol produced
+    invalid underlyings such as META26, causing quote monitors to fetch a ticker
+    that does not exist.
+    """
+    import re as _re
+    sym = str(contract or "").upper().strip()
+    fallback = str(fallback or "").upper().strip()
+    if sym:
+        m = _re.search(r"\d{6}[CP]", sym)
+        if m:
+            root = sym[:m.start()].strip()
+            if root:
+                return root
+        root = _re.sub(r"\d+$", "", sym).strip()
+        if root:
+            return root
+    return fallback
+
+
+def _get_underlying_price_at_fill(broker: BrokerAdapter, ticker: str) -> float:
+    """Best-effort capture of underlying price at the moment an entry fill is confirmed."""
+    if not broker or not ticker:
+        return 0.0
+    for method_name in ("get_quote", "get_underlying_price", "get_last_price", "quote"):
+        method = getattr(broker, method_name, None)
+        if not callable(method):
+            continue
+        try:
+            result = method(ticker)
+            if isinstance(result, (int, float)) and float(result) > 0:
+                return float(result)
+            if isinstance(result, dict):
+                for key in ("last", "last_price", "price", "mark", "bid", "close"):
+                    val = result.get(key)
+                    if val is not None and float(val) > 0:
+                        return float(val)
+        except Exception:
+            continue
+    return 0.0
+
 def _call_with_supported_kwargs(fn, **kwargs):
     """Call a function with only supported keyword args for compatibility."""
     sig = inspect.signature(fn)
@@ -577,20 +853,33 @@ def _get_existing_position_by_order(pm, local_order_id: str, broker_order_id: Op
     return None
 
 
-def _open_position_safe(pm, *, order: dict, result: dict, plan_id: str, signal_id: str, local_id: str) -> Optional[str]:
+def _open_position_safe(pm, *, order: dict, result: dict, plan_id: str, signal_id: str, local_id: str, broker: BrokerAdapter = None) -> Optional[str]:
     """Open position with idempotency keys when the PM supports them."""
     existing = _get_existing_position_by_order(pm, local_id, order.get("broker_order_id"))
     if existing:
         return existing.get("id") or existing.get("position_id")
 
+    contract = order.get("contract") or order.get("symbol") or ""
+    ticker = _extract_underlying_from_contract(contract, fallback=order.get("symbol") or "")
+    underlying_entry = _safe_float(
+        order.get("underlying_entry")
+        or order.get("entry_underlying")
+        or order.get("last_underlying_price")
+        or order.get("trigger_price")
+        or 0.0
+    )
+    if underlying_entry <= 0:
+        underlying_entry = _get_underlying_price_at_fill(broker, ticker)
+
     kwargs = {
         "plan_id": plan_id,
         "signal_id": signal_id,
-        "ticker": (order.get("symbol") or "").upper(),
-        "contract": order.get("contract") or order.get("symbol") or "",
+        "ticker": ticker,
+        "contract": contract,
         "side": (order.get("direction") or "CALL").upper(),
         "qty": int(result.get("filled_qty") or order.get("qty") or 0),
         "entry_price": float(result.get("avg_fill") or 0.0),
+        "underlying_entry": underlying_entry if underlying_entry > 0 else None,
         "tier": str(order.get("tier") or "B"),
         "score": float(order.get("score") or 0),
         "pattern": str(order.get("pattern") or ""),
@@ -603,7 +892,7 @@ def _open_position_safe(pm, *, order: dict, result: dict, plan_id: str, signal_i
     try:
         return pm.open_position(**kwargs)
     except TypeError:
-        # Compatibility with older PM signature that does not yet accept local/broker order ids.
+        # Compatibility with older PM signature that does not yet accept every field.
         return _call_with_supported_kwargs(pm.open_position, **kwargs)
 
 
@@ -787,18 +1076,20 @@ def _seed_exit_engine(exit_engine, position_id: str, order: dict, result: dict, 
 
     try:
         _MP = _load_managed_position_class()
-
+        contract = order.get("contract") or order.get("symbol") or ""
+        ticker = _extract_underlying_from_contract(contract, fallback=order.get("symbol") or "")
         underlying_entry = _safe_float(
-            order.get("trigger_price")
-            or order.get("underlying_entry")
+            order.get("underlying_entry")
             or order.get("entry_underlying")
+            or order.get("last_underlying_price")
+            or order.get("trigger_price")
             or 0.0
         )
         entry_option_price = _safe_float(result.get("avg_fill") or order.get("fill_price") or 0.0)
 
         mp = _MP(
-            ticker=(order.get("symbol") or "").upper(),
-            option_symbol=order.get("contract") or order.get("symbol") or "",
+            ticker=ticker,
+            option_symbol=contract,
             side=(order.get("direction") or "CALL").upper(),
             quantity=int(result.get("filled_qty") or order.get("qty") or 0),
             entry_price=entry_option_price,
@@ -810,8 +1101,6 @@ def _seed_exit_engine(exit_engine, position_id: str, order: dict, result: dict, 
         mp.client_id = str(order.get("client_id") or "")
         mp.signal_id = signal_id
 
-        # Do not replay entry underlying as current underlying. Current quote fields are
-        # deliberately unknown/provisional until the exit engine hydrates live quotes.
         try:
             mp.current_underlying = _safe_float(order.get("last_underlying_price") or 0.0)
             mp.current_option_price = entry_option_price
@@ -847,9 +1136,10 @@ def _seed_exit_engine(exit_engine, position_id: str, order: dict, result: dict, 
                 log.debug("[%s] exit_engine.request_quote_refresh failed non-critical for %s: %s", order.get("client_id"), position_id, exc)
 
         log.info(
-            "[%s] Exit engine seeded for pos=%s quote_fresh=False current_underlying=%s",
+            "[%s] Exit engine seeded for pos=%s ticker=%s quote_fresh=False current_underlying=%s",
             order.get("client_id"),
             position_id,
+            ticker,
             getattr(mp, "current_underlying", None),
         )
     except Exception as exc:
@@ -1055,6 +1345,7 @@ def process_pending_order(
                     plan_id=plan_id,
                     signal_id=signal_id,
                     local_id=local_id,
+                    broker=broker,
                 )
 
                 # Secondary broker-side stop is best-effort only.
@@ -1283,391 +1574,4 @@ def process_pending_order(
             )
             _safe_alert(
                 alert_fn,
-                f"[fill_monitor:{client_id}] BROKER_FILL_ANOMALY_ESCALATED | order={local_id} broker={broker_id} status={mapped} count={anomaly_count} reason={result.get('reason')}",
-            )
-            _mark_broker_fill_anomaly(osm, order, reason=reason, mapped=mapped)
-
-        return
-
-    # Fallback guard
-    log.warning(
-        "[%s] Unhandled broker mapped status | order=%s broker=%s mapped=%s",
-        client_id,
-        local_id,
-        broker_id,
-        mapped,
-    )
-    if osm:
-        osm.increment_retry(local_id)
-
-
-def _audit_long_pending(order: dict, kind: str, client_id: str, local_id: str, broker_id: str):
-    try:
-        created_raw = order.get("created_ts")
-        if isinstance(created_raw, str):
-            created = datetime.fromisoformat(created_raw)
-        else:
-            created = created_raw
-        if not created:
-            return
-        age = (datetime.now(timezone.utc) - created).total_seconds()
-        if age > 300:
-            audit(
-                client_id,
-                "WARNING",
-                "ORDER_PENDING_LONG",
-                {"local_order_id": local_id, "broker_order_id": broker_id, "kind": kind, "age_seconds": age},
-            )
-    except Exception:
-        pass
-
-
-def _sync_exit_price(order: dict, result: dict):
-    """
-    Update proof_trades with the REAL Tradier avg_fill price.
-    The execution core logs exit_option_price = limit_price at close time.
-    This corrects it to the actual broker fill price and recalculates PnL.
-    Runs directly against Supabase proof_trades — no dashboard API hop needed.
-    """
-    try:
-        pos_id      = order.get("position_id")
-        avg_fill    = result.get("avg_fill")
-        entry_price = float(order.get("entry_price") or order.get("fill_price") or 0)
-        client_id   = order.get("client_id", "")
-        ticker      = (order.get("symbol") or "").upper()
-
-        if not pos_id or avg_fill is None:
-            return
-
-        exit_px = float(avg_fill)
-
-        # Recalculate PnL from broker fill price
-        opt_pnl_pct = None
-        win = None
-        if entry_price > 0:
-            opt_pnl_pct = round((exit_px - entry_price) / entry_price * 100, 2)
-            win = opt_pnl_pct > 0
-
-        # 1. Update proof_trades directly in Supabase
-        try:
-            from ap.db import conn, run_with_retry
-            def _update_proof():
-                with conn() as c:
-                    params = [exit_px]
-                    set_clause = "exit_option_price = %s"
-                    if opt_pnl_pct is not None:
-                        set_clause += ", option_pnl_pct = %s, win = %s"
-                        params += [opt_pnl_pct, win]
-                    params += [str(pos_id)]
-                    c.execute(
-                        f"UPDATE proof_trades SET {set_clause} WHERE position_id = %s",
-                        params,
-                    )
-                    # Fallback: match by ticker + client + recent close time
-                    # This catches manually-seeded positions where position_id is not in proof_trades
-                    if getattr(c, "rowcount", 0) == 0 and client_id and ticker:
-                        params2 = [exit_px]
-                        set2 = "exit_option_price = %s"
-                        if opt_pnl_pct is not None:
-                            set2 += ", option_pnl_pct = %s, win = %s"
-                            params2 += [opt_pnl_pct, win]
-                        params2 += [client_id, ticker]
-                        c.execute(
-                            f"UPDATE proof_trades SET {set2} "
-                            "WHERE client_email = %s "
-                            "AND ticker = %s "
-                            "AND closed_at >= NOW() - INTERVAL '60 minutes' "
-                            "AND win = FALSE",  # only correct records that show as losses
-                            params2,
-                        )
-                    return getattr(c, "rowcount", 0)
-            updated = run_with_retry(_update_proof) or 0
-            if updated:
-                log.info(
-                    "[%s] EXIT PRICE SYNCED | %s broker_fill=$%.4f entry=$%.4f pnl=%.1f%% win=%s",
-                    client_id, ticker, exit_px, entry_price,
-                    opt_pnl_pct if opt_pnl_pct is not None else 0,
-                    win,
-                )
-            else:
-                log.warning("[%s] EXIT PRICE SYNC: proof_trades row not found for pos_id=%s", client_id, pos_id)
-        except Exception as db_exc:
-            log.debug("[%s] proof_trades exit sync DB error (non-critical): %s", client_id, db_exc)
-
-        # 2. Also notify dashboard API if configured (belt-and-suspenders)
-        try:
-            from ap.exit_price_sync import sync_exit_price_to_dashboard
-            sync_exit_price_to_dashboard(
-                position_id=str(pos_id),
-                exit_avg_fill=exit_px,
-                entry_price=entry_price if entry_price else None,
-                ticker=ticker,
-            )
-        except ImportError:
-            pass
-        except Exception:
-            pass
-
-    except Exception as exc:
-        log.debug("[%s] _sync_exit_price failed (non-critical): %s", order.get("client_id"), exc)
-
-
-# =============================================================================
-# MAIN LOOP — STOP-EVENT SAFE
-# =============================================================================
-
-def fill_monitor_loop(
-    broker: BrokerAdapter,
-    poll_seconds: float = 10.0,
-    osm=None,
-    pm=None,
-    exit_engine=None,
-    stop_event=None,
-    client_id: str | None = None,
-    alert_fn=None,
-):
-    """Fill monitor must never pause on kill switch — it reconciles reality."""
-    if PRODUCTION_MODE and ALLOW_LEGACY_FILL_MONITOR:
-        raise RuntimeError("ALLOW_LEGACY_FILL_MONITOR=1 is forbidden in production/live mode")
-    if osm is None and not ALLOW_LEGACY_FILL_MONITOR:
-        raise RuntimeError("fill_monitor_loop requires OSM unless ALLOW_LEGACY_FILL_MONITOR=1")
-
-    if not client_id:
-        client_id = getattr(osm, "client_id", None) or getattr(pm, "client_id", None)
-    if not client_id:
-        raise ValueError("fill_monitor_loop requires client_id or osm/pm with client_id")
-
-    log.info(
-        "Fill monitor started | client_id=%s osm=%s pm=%s ee=%s",
-        client_id,
-        "wired" if osm else "legacy-fallback",
-        "wired" if pm else "none",
-        "wired" if exit_engine else "none",
-    )
-
-    while not (stop_event and stop_event.is_set()):
-        try:
-            pending = get_pending_orders(client_id)
-            for order in pending:
-                try:
-                    process_pending_order(
-                        broker,
-                        order,
-                        osm=osm,
-                        pm=pm,
-                        exit_engine=exit_engine,
-                        alert_fn=alert_fn,
-                    )
-                except Exception as exc:
-                    log.exception("Failed to process order %s: %s", order.get("local_order_id"), exc)
-
-            if stop_event:
-                stop_event.wait(poll_seconds)
-            else:
-                time.sleep(poll_seconds)
-
-        except Exception as exc:
-            log.exception("Fill monitor loop error: %s", exc)
-            if stop_event:
-                stop_event.wait(poll_seconds * 2)
-            else:
-                time.sleep(poll_seconds * 2)
-
-
-# =============================================================================
-# LEGACY FALLBACK HELPERS (deprecated — used only when ALLOW_LEGACY_FILL_MONITOR=1)
-# =============================================================================
-
-def _legacy_update_order_status(
-    local_order_id: str,
-    status: str,
-    filled_qty: int | None = None,
-    error: str | None = None,
-):
-    """DEPRECATED: Direct DB write. Use osm.transition() instead."""
-    if not ALLOW_LEGACY_FILL_MONITOR:
-        raise RuntimeError("legacy fill monitor path disabled")
-
-    updates = ["status=%s", "updated_ts=%s"]
-    params = [status, now_utc_iso()]
-    if filled_qty is not None:
-        updates.append("filled_qty=%s")
-        params.append(int(filled_qty))
-    if error is not None:
-        updates.append("last_error=%s")
-        params.append(error)
-    params.append(local_order_id)
-    sql = f"UPDATE orders SET {', '.join(updates)} WHERE local_order_id=%s"
-    def _fn():
-        with conn() as c:
-            c.execute(sql, params)
-    run_with_retry(_fn)
-
-
-def _legacy_create_position_from_fill(order: dict, avg_fill_price: float, filled_qty: int):
-    """DEPRECATED: Direct DB write. OSM/PM path should handle position opening."""
-    if not ALLOW_LEGACY_FILL_MONITOR:
-        raise RuntimeError("legacy fill monitor path disabled")
-
-    import uuid
-
-    pos_id = str(uuid.uuid4())
-    client_id = order["client_id"]
-    direction = (order.get("direction") or "CALL").upper()
-
-    def _insert_pos():
-        with conn() as c:
-            c.execute(
-                """
-                INSERT INTO positions (
-                    id, client_id, underlying, contract, direction, qty, avg_fill,
-                    entry_ts, tp_pct, sl_pct, status
-                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                """,
-                (
-                    pos_id,
-                    client_id,
-                    order["symbol"],
-                    order["contract"],
-                    direction,
-                    int(filled_qty),
-                    float(avg_fill_price),
-                    now_utc_iso(),
-                    float(cfg.TAKE_PROFIT_PCT),
-                    float(cfg.STOP_LOSS_PCT),
-                    "OPEN",
-                ),
-            )
-    run_with_retry(_insert_pos)
-
-    def _link_order():
-        with conn() as c:
-            c.execute(
-                "UPDATE orders SET position_id=%s WHERE local_order_id=%s",
-                (pos_id, order["local_order_id"]),
-            )
-    run_with_retry(_link_order)
-
-    audit(
-        client_id,
-        "INFO",
-        "POSITION_CREATED_FROM_FILL_LEGACY",
-        {
-            "position_id": pos_id,
-            "local_order_id": order["local_order_id"],
-            "contract": order["contract"],
-            "qty": int(filled_qty),
-            "avg_fill": float(avg_fill_price),
-        },
-    )
-    return pos_id
-
-
-def _legacy_close_position_from_exit_fill(order: dict, avg_fill_price: float):
-    """DEPRECATED: Direct DB write. OSM.transition(EXIT_FILLED) via exit engine should handle this."""
-    if not ALLOW_LEGACY_FILL_MONITOR:
-        raise RuntimeError("legacy fill monitor path disabled")
-
-    client_id = order["client_id"]
-    position_id = order.get("position_id")
-
-    if not position_id:
-        log.error("Exit order has no position_id: %s", order.get("local_order_id"))
-        return
-
-    def _fetch_pos():
-        with conn() as c:
-            return c.execute(
-                "SELECT * FROM positions WHERE id=%s AND client_id=%s",
-                (position_id, client_id),
-            ).fetchone()
-    pos_row = run_with_retry(_fetch_pos)
-
-    if not pos_row:
-        log.error("Position not found: %s", position_id)
-        return
-
-    pos = dict(pos_row)
-    entry_price = float(pos["avg_fill"])
-    qty = int(pos["qty"])
-    exit_px = float(avg_fill_price)
-    realized_pnl = (exit_px - entry_price) * qty * OPT_MULTIPLIER
-    realized_pnl_pct = round(((exit_px - entry_price) / entry_price) * 100, 2) if entry_price > 0 else 0.0
-
-    def _close_pos():
-        with conn() as c:
-            c.execute(
-                """
-                UPDATE positions
-                SET status='CLOSED', exit_ts=%s, exit_price=%s,
-                    realized_pnl=%s, realized_pnl_pct=%s,
-                    close_source=%s, close_confidence=%s
-                WHERE id=%s AND client_id=%s
-                """,
-                (
-                    now_utc_iso(),
-                    exit_px,
-                    float(realized_pnl),
-                    realized_pnl_pct,
-                    "FILL_MONITOR",
-                    "HIGH",
-                    position_id,
-                    client_id,
-                ),
-            )
-    run_with_retry(_close_pos)
-
-    def _update_pnl():
-        with conn() as c:
-            c.execute(
-                "UPDATE client_state "
-                "SET realized_pnl_today = COALESCE(realized_pnl_today, 0.0) + %s "
-                "WHERE client_id=%s",
-                (float(realized_pnl), client_id),
-            )
-    run_with_retry(_update_pnl)
-
-    audit(
-        client_id,
-        "INFO",
-        "FINALIZED_TRADE_FROM_FILL_MONITOR",
-        {
-            "position_id": position_id,
-            "contract": pos["contract"],
-            "entry_price": entry_price,
-            "exit_price": exit_px,
-            "qty": qty,
-            "realized_pnl": float(realized_pnl),
-            "realized_pnl_pct": realized_pnl_pct,
-            "close_source": "FILL_MONITOR",
-            "close_confidence": "HIGH",
-        },
-    )
-
-    try:
-        epx = exit_px
-        pct = realized_pnl_pct
-        win = realized_pnl_pct > 0
-        cid = client_id
-
-        def _update_proof():
-            with conn() as c2:
-                c2.execute(
-                    """
-                    UPDATE proof_trades
-                    SET exit_option_price = %s,
-                        option_pnl_pct    = %s,
-                        win               = %s
-                    WHERE client_email = %s
-                      AND closed_at >= NOW() - INTERVAL '4 hours'
-                      AND ABS(COALESCE(exit_option_price,0) - %s) > 0.05
-                    """,
-                    (epx, pct, win, cid, epx),
-                )
-                return c2.rowcount
-
-        updated = run_with_retry(_update_proof) or 0
-        if updated:
-            log.info("[%s] proof_trades corrected with actual fill $%.4f pnl=%.1f%%", client_id, exit_px, realized_pnl_pct)
-    except Exception as exc:
-        log.debug("[%s] proof_trades correction (non-critical): %s", client_id, exc)
+         ... (15 KB left)
