@@ -110,11 +110,22 @@ SCALE_OUT_2_THRESHOLD = 0.25   # +25% → sell second third
 # NO SCALE_OUT_3 — runner exits via trailing stop only, no fixed ceiling
 PROTECT_3_THRESHOLD   = 0.15   # +15% → EOD protection if past 2:00 PM
 
+# ── PROFIT FLOORS — absolute guarantees regardless of trail/QPM state ─────────
+# Once peak_pnl_pct crosses these, we never let the position exit below the floor.
+# Fires BEFORE trail math — trail is reactive, floors are absolute.
+# This is the primary fix for "went +22% then went red" — floor at +25% peak
+# means worst case we exit at +10%, not at a loss.
+PROFIT_FLOOR = {
+    0.15: 0.04,   # touched +15% → minimum exit at +4%  (don't give it all back)
+    0.25: 0.10,   # touched +25% → minimum exit at +10%
+    0.40: 0.20,   # touched +40% → minimum exit at +20%
+    0.60: 0.30,   # touched +60% → minimum exit at +30%
+}
+
 # ── IMMEDIATE TAKE-PROFIT (any time, no window gate) ──────────────────────────
-# IMMEDIATE_TP is now the trailing-stop ACTIVATION point, not a hard sell
-# Once peak >= 15%, the trailing stop engine kicks in at TRAIL_DROP_FROM_PEAK
-# We do NOT sell everything at 15% — we let it run to 20%, 30%+ with trail
-IMMEDIATE_TP_PCT      = 0.15   # +15% → ACTIVATES trailing stop (does NOT auto-sell)
+# Lowered from 15% to 12% — arms trail sooner, less chance of giving back gains
+# if QPM has a gap at peak.
+IMMEDIATE_TP_PCT      = 0.12   # +12% → ACTIVATES trailing stop (was 15%)
 HARD_STOP_PCT         = -0.33  # -33% → hard stop (gives one recovery breath vs -30%)
 PROFIT_LOCK_PCT       = 0.12   # once past 15%, don't fall below +12% (protects a real gain)
 
@@ -457,16 +468,41 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
     # requests.post() here under self._lock.
     _single_contract = (qty_rem == 1 and pos.scale_outs_done == 0)
     if (pos.scale_outs_done >= 1 or _single_contract) and pos.peak_pnl_pct >= IMMEDIATE_TP_PCT:
+
+        # ── PROFIT FLOOR CHECK — fires before trail math ──────────────────────
+        # If peak crossed a floor threshold and current P&L is below that floor,
+        # sell immediately. This protects against QPM gaps missing the peak.
+        # Example: peaked at +25% (floor=10%), now at +7% → EXIT at +7%.
+        _applicable_floor = 0.0
+        for _floor_trigger, _floor_min in sorted(PROFIT_FLOOR.items(), reverse=True):
+            if pos.peak_pnl_pct >= _floor_trigger:
+                _applicable_floor = _floor_min
+                break
+        if _applicable_floor > 0 and 0 < option_pnl < _applicable_floor:
+            return ExitDecision(
+                action="CLOSE_ALL", quantity=qty_rem,
+                reason=(
+                    f"PROFIT LOCK — peaked +{pos.peak_pnl_pct*100:.0f}%, "
+                    f"now +{option_pnl*100:.0f}% below floor +{_applicable_floor*100:.0f}%"
+                ),
+                urgency="IMMEDIATE",
+                pnl_pct=option_pnl,
+                reason_code="PROFIT_LOCK",
+            )
+        # ─────────────────────────────────────────────────────────────────────
+
+        # Tightened trail thresholds — was 12-20%, now 8-15%
+        # Tighter trail = less giveback on winners, especially for single contracts
         if pos.peak_pnl_pct >= 0.80:
-            _runner_trail = 0.10
+            _runner_trail = 0.08   # gave back 8% from 80%+ peak → sell
         elif pos.peak_pnl_pct >= 0.60:
-            _runner_trail = 0.13
+            _runner_trail = 0.10
         elif pos.peak_pnl_pct >= 0.40:
-            _runner_trail = 0.15
+            _runner_trail = 0.12
         elif _single_contract:
-            _runner_trail = 0.12   # tighter trail for single-contract positions
+            _runner_trail = 0.08   # single contracts: tight 8% trail (was 12%)
         else:
-            _runner_trail = 0.20
+            _runner_trail = 0.15   # multi-contract runner: 15% trail (was 20%)
         runner_drop = pos.peak_pnl_pct - option_pnl
         if runner_drop >= _runner_trail or option_pnl <= 0:
             _dur_min = 0
