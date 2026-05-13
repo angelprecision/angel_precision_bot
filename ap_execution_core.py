@@ -804,8 +804,19 @@ class APExecutionCore:
             "SMALL_WIN_LOCK", "EOD_FORCE_CLOSE", "HARD_STOP", "STOP_HIT",
             "SENTINEL_FORCED_EXIT", "NEVER_GREEN_STOP", "THETA_STOP", "TIME_STOP",
         }
-        _reason_code    = str(getattr(decision, "reason_code", "") or "").upper()
-        _is_protective  = _reason_code in _PROTECTIVE_EXIT_CODES
+        _reason_code = str(getattr(decision, "reason_code", "") or "").upper()
+        _reason_text = str(getattr(decision, "reason", "") or "").upper()
+
+        _PROTECTIVE_REASON_TEXT_MARKERS = {
+            "RUNNER TRAIL", "TRAILING STOP", "PROFIT LOCK", "TOUCHED PROFIT",
+            "SMALL WIN", "EOD FORCE CLOSE", "HARD STOP", "STOP HIT",
+            "NEVER GREEN", "THETA", "TIME STOP", "SENTINEL",
+        }
+
+        _is_protective = (
+            _reason_code in _PROTECTIVE_EXIT_CODES
+            or any(marker in _reason_text for marker in _PROTECTIVE_REASON_TEXT_MARKERS)
+        )
 
         _use_market = _urgency == "IMMEDIATE"
 
