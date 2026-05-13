@@ -347,6 +347,15 @@ class APBrokerReconciler:
                 summary["errors"].append(f"orders: {e}")
                 self._report_health_error(f"orders_reconcile_error: {e}", fatal=False)
 
+            # Check for stale acknowledged exits before position heal.
+            # An acknowledged exit with filled_qty=0 sitting too long means
+            # broker truth has not been reflected — resolve or alert.
+            try:
+                self._handle_stale_acknowledged_exits(summary)
+            except Exception as e:
+                log.error("[%s] Stale ack exit handler error: %s", self.client_id, e, exc_info=True)
+                summary["errors"].append(f"stale_ack_exits: {e}")
+
             # Backup fill-truth heal: must run after orders, before positions.
             # Catches any EXIT_FILLED order whose linked position wasn't finalized
             # (manual exits, restart gaps, fill monitor delays, OSM misses).
@@ -554,6 +563,140 @@ class APBrokerReconciler:
             filled_qty=int(filled_qty),
             fill_price=float(fill_price) if fill_price is not None else None,
         ))
+
+    def _handle_stale_acknowledged_exits(self, summary: dict) -> None:
+        """
+        Find EXIT orders stuck in EXIT_SUBMITTED / EXIT_ACKNOWLEDGED with zero fill
+        and verify broker truth. Acts on what broker reports:
+          - broker filled   → advance OSM to EXIT_FILLED
+          - broker terminal → advance OSM to CANCELED/REJECTED/EXPIRED
+          - broker pending  → alert for manual review / cancel-replace
+
+        Prevents profitable exits from sitting silently while price moves away.
+        Threshold controlled by EXIT_ACK_STALE_SEC env var (default 20s).
+        """
+        try:
+            import os as _os
+            max_age_sec = int(_os.getenv("EXIT_ACK_STALE_SEC", "20"))
+
+            def _fn():
+                with conn() as c:
+                    c.execute(
+                        """
+                        SELECT
+                            local_order_id, broker_order_id, position_id,
+                            contract, symbol, status, qty, filled_qty,
+                            submitted_ts, updated_ts,
+                            EXTRACT(EPOCH FROM (
+                                NOW() - COALESCE(submitted_ts, updated_ts, created_ts)
+                            )) AS age_sec
+                        FROM orders
+                        WHERE client_id = %s
+                          AND kind = 'EXIT'
+                          AND status IN ('EXIT_SUBMITTED', 'EXIT_ACKNOWLEDGED')
+                          AND COALESCE(filled_qty, 0) = 0
+                          AND broker_order_id IS NOT NULL
+                          AND broker_order_id <> ''
+                          AND EXTRACT(EPOCH FROM (
+                              NOW() - COALESCE(submitted_ts, updated_ts, created_ts)
+                          )) >= %s
+                        ORDER BY submitted_ts ASC NULLS LAST
+                        LIMIT 25
+                        """,
+                        (self.client_id, max_age_sec),
+                    )
+                    return c.fetchall()
+
+            rows = run_with_retry(_fn) or []
+            if not rows:
+                return
+
+            for row in rows:
+                row = dict(row)
+                local_id  = str(row.get("local_order_id")  or "")
+                broker_id = str(row.get("broker_order_id") or "")
+                contract  = str(row.get("contract") or row.get("symbol") or "")
+                age_sec   = float(row.get("age_sec") or 0)
+                db_status = str(row.get("status") or "")
+
+                broker_raw = {}
+                try:
+                    broker_raw = self.broker.get_order(broker_id) or {}
+                except Exception as exc:
+                    log.warning(
+                        "[%s] stale_ack_exit broker.get_order failed | "
+                        "order=%s broker=%s age=%.1fs err=%s",
+                        self.client_id, local_id, broker_id, age_sec, exc,
+                    )
+                    continue
+
+                broker_status = str(
+                    broker_raw.get("status") or broker_raw.get("Status") or ""
+                ).lower().strip()
+
+                fill_qty = self._extract_explicit_cumulative_fill_qty(broker_raw)
+                fill_px  = self._extract_avg_fill_price(broker_raw)
+
+                if broker_status in BROKER_FILLED and fill_qty and fill_px:
+                    family     = self._order_family_from_kind_and_status(row, db_status)
+                    new_status = "EXIT_FILLED" if family == "EXIT" else "FILLED"
+                    try:
+                        self.osm.transition(
+                            local_id, new_status,
+                            broker_order_id=broker_id,
+                            filled_qty=int(fill_qty),
+                            fill_price=float(fill_px),
+                            last_error="stale_ack_exit_broker_filled",
+                        )
+                        summary["orders_corrected"] = int(summary.get("orders_corrected", 0)) + 1
+                        log.warning(
+                            "[%s] STALE_EXIT_RESOLVED FILLED | %s | local=%s broker=%s age=%.1fs",
+                            self.client_id, contract, local_id, broker_id, age_sec,
+                        )
+                    except Exception as exc:
+                        log.error("[%s] stale_ack_exit OSM transition failed: %s", self.client_id, exc)
+                    continue
+
+                if broker_status in BROKER_TERMINAL:
+                    mapped = BROKER_TO_OSM.get(broker_status, "CANCELED")
+                    try:
+                        self.osm.transition(
+                            local_id, mapped,
+                            broker_order_id=broker_id,
+                            last_error=f"stale_ack_exit_broker_terminal:{broker_status}",
+                        )
+                        summary["orders_corrected"] = int(summary.get("orders_corrected", 0)) + 1
+                        log.warning(
+                            "[%s] STALE_EXIT_RESOLVED TERMINAL | %s | local=%s broker=%s "
+                            "broker_status=%s age=%.1fs",
+                            self.client_id, contract, local_id, broker_id, broker_status, age_sec,
+                        )
+                    except Exception as exc:
+                        log.error("[%s] stale_ack_exit OSM terminal transition failed: %s", self.client_id, exc)
+                    continue
+
+                # Still open at broker — alert for manual review
+                self._alert(
+                    f"STALE_EXIT_ACKNOWLEDGED | {contract} | local={local_id} "
+                    f"broker={broker_id} broker_status={broker_status} age={age_sec:.0f}s "
+                    f"| needs cancel/replace or manual review"
+                )
+                summary["orders_alerted"] = int(summary.get("orders_alerted", 0)) + 1
+                log.warning(
+                    "[%s] STALE_EXIT_ACKNOWLEDGED unresolved | %s | local=%s broker=%s "
+                    "broker_status=%s age=%.1fs",
+                    self.client_id, contract, local_id, broker_id, broker_status, age_sec,
+                )
+
+        except Exception as exc:
+            log.error(
+                "[%s] _handle_stale_acknowledged_exits failed: %s",
+                self.client_id, exc, exc_info=True,
+            )
+            try:
+                summary.setdefault("errors", []).append(f"stale_ack_exits: {exc}")
+            except Exception:
+                pass
 
     # ──────────────────────────────────────────────────────────────────────────
     # Exit-fill position heal (backup truth repair)

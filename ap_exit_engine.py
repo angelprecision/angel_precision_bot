@@ -2394,6 +2394,74 @@ class APExitEngine:
 
         return True
 
+    def hydrate_pending_exit_identity_from_db(self, pos: ManagedPosition) -> bool:
+        """
+        Reattach an active EXIT order from DB to the in-memory ManagedPosition.
+
+        Fixes restart/reseed cases where:
+          pos.exit_in_flight = True
+          pos.pending_exit_local_order_id  = ""   ← blank
+          pos.pending_exit_broker_order_id = ""   ← blank
+        but the DB has a real EXIT_SUBMITTED / EXIT_ACKNOWLEDGED order.
+
+        Without this, the engine cannot monitor, cancel, replace, or avoid
+        resubmitting a broker order it has forgotten about.
+        """
+        if not pos or not getattr(pos, "position_id", ""):
+            return False
+        try:
+            from ap.db import conn, run_with_retry
+
+            def _fn():
+                with conn() as c:
+                    c.execute(
+                        """
+                        SELECT local_order_id, broker_order_id, status,
+                               qty, filled_qty, created_ts, submitted_ts, updated_ts
+                        FROM orders
+                        WHERE client_id = %s
+                          AND position_id = %s
+                          AND kind = 'EXIT'
+                          AND status IN (
+                              'EXIT_REQUESTED','EXIT_SUBMITTED',
+                              'EXIT_ACKNOWLEDGED','EXIT_PARTIAL_FILL'
+                          )
+                        ORDER BY updated_ts DESC NULLS LAST,
+                                 created_ts DESC NULLS LAST
+                        LIMIT 1
+                        """,
+                        (getattr(pos, "client_id", None) or self._email or "", pos.position_id),
+                    )
+                    return c.fetchone()
+
+            row = run_with_retry(_fn)
+            if not row:
+                return False
+
+            row = dict(row)
+            local_id  = str(row.get("local_order_id")  or "")
+            broker_id = str(row.get("broker_order_id") or "")
+            status    = str(row.get("status")           or "")
+
+            pos.exit_in_flight                = True
+            pos.pending_exit_local_order_id   = local_id
+            pos.pending_exit_broker_order_id  = broker_id
+            pos.pending_exit_qty              = int(row.get("qty")        or getattr(pos, "quantity_remaining", 0) or 0)
+            pos.pending_exit_filled_qty       = int(row.get("filled_qty") or 0)
+
+            log.warning(
+                "[%s] HYDRATED ACTIVE EXIT IDENTITY | pos=%s local=%s broker=%s status=%s",
+                pos.ticker, pos.position_id, local_id, broker_id, status,
+            )
+            return True
+        except Exception as exc:
+            log.error(
+                "[%s] hydrate_pending_exit_identity_from_db failed | pos=%s | %s",
+                getattr(pos, "ticker", "?"), getattr(pos, "position_id", "?"),
+                exc, exc_info=True,
+            )
+            return False
+
     def seed_from_db(self, position_manager):
         """Re-hydrate in-memory positions from DB on startup."""
         try:
@@ -2441,6 +2509,9 @@ class APExitEngine:
                     )
                     mp.current_underlying = float(row.get("underlying_entry", 0) or 0)
                     self.add_position(mp)
+                    # Reattach any active broker exit order so engine can
+                    # monitor/cancel/replace without resubmitting blindly.
+                    self.hydrate_pending_exit_identity_from_db(mp)
                     seeded += 1
                 except Exception as e:
                     log.warning("seed_from_db: skipping row %s: %s", row.get("id"), e)
@@ -3004,6 +3075,12 @@ class APExitEngine:
         # Skipped for kill_active (emergency) and allow_inflight_override paths.
         if not kill_active and not allow_inflight_override:
             try:
+                # If in-flight but identity is blank (restart/reseed gap), hydrate
+                # from DB first so the guard can compare real order status.
+                if (getattr(pos, "exit_in_flight", False)
+                        and not getattr(pos, "pending_exit_local_order_id", "")):
+                    self.hydrate_pending_exit_identity_from_db(pos)
+
                 _osm = getattr(self, "order_state_machine", None) or getattr(self, "osm", None)
                 _active_exit = None
                 if _osm is not None:
@@ -3020,9 +3097,9 @@ class APExitEngine:
                         _active_exit.get("broker_order_id"),
                     )
                     try:
-                        pos.exit_in_flight            = True
-                        pos.pending_exit_order_id     = _active_exit.get("local_order_id")
-                        pos.pending_exit_broker_order_id = _active_exit.get("broker_order_id")
+                        pos.exit_in_flight                = True
+                        pos.pending_exit_local_order_id   = _active_exit.get("local_order_id") or pos.pending_exit_local_order_id
+                        pos.pending_exit_broker_order_id  = _active_exit.get("broker_order_id") or pos.pending_exit_broker_order_id
                     except Exception:
                         pass
                     return False
