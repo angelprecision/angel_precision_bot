@@ -221,6 +221,70 @@ ENABLE_BROKER_RECONCILER = _env_bool("ENABLE_BROKER_RECONCILER", "0")
 ALLOW_SUPABASE_FANOUT_FALLBACK = _env_bool("ALLOW_SUPABASE_FANOUT_FALLBACK", "0")
 
 
+def resolve_tradier_credentials(member: dict) -> dict:
+    """
+    Resolve Tradier credentials for this Render service's mode.
+
+    BOT_MODE=PAPER (default):
+        Uses tradier_paper_account_id / tradier_paper_access_token.
+        Falls back to tradier_account_id / tradier_access_token if paper-specific
+        columns are empty (backward compat for existing rows).
+        base_url always sandbox.tradier.com regardless of member row.
+
+    BOT_MODE=LIVE:
+        Requires tradier_live_account_id and tradier_live_access_token.
+        Does NOT fall back to active/paper columns — fails closed if missing.
+        Also requires AP_LIVE_TRADING=1 to be explicitly set on the service.
+
+    This is the single source of truth for credential resolution.
+    Call once in ClientRunner.__init__ and store results on self.
+    """
+    bot_mode     = os.getenv("BOT_MODE", os.getenv("MODE", "PAPER")).strip().upper()
+    live_enabled = os.getenv("AP_LIVE_TRADING", "0").strip().lower() in {"1", "true", "yes", "on"}
+    email        = member.get("email", "?")
+
+    if bot_mode == "LIVE":
+        if not live_enabled:
+            raise RuntimeError(
+                f"[{email}] BOT_MODE=LIVE but AP_LIVE_TRADING is not enabled — "
+                "set AP_LIVE_TRADING=1 on the live Render service"
+            )
+        account_id = member.get("tradier_live_account_id")
+        token      = member.get("tradier_live_access_token")
+        if not account_id or not token:
+            raise RuntimeError(
+                f"[{email}] LIVE startup missing tradier_live_account_id or "
+                "tradier_live_access_token — live mode fails closed"
+            )
+        return {
+            "mode":         "LIVE",
+            "account_id":   account_id,
+            "access_token": token,
+            "base_url":     "https://api.tradier.com",
+        }
+
+    # PAPER — use paper-specific columns, fall back to active columns
+    account_id = (
+        member.get("tradier_paper_account_id")
+        or member.get("tradier_account_id")
+    )
+    token = (
+        member.get("tradier_paper_access_token")
+        or member.get("tradier_access_token")
+    )
+    if not account_id or not token:
+        raise RuntimeError(
+            f"[{email}] PAPER startup missing tradier_paper_account_id or "
+            "tradier_paper_access_token (and no fallback tradier_account_id/token)"
+        )
+    return {
+        "mode":         "PAPER",
+        "account_id":   account_id,
+        "access_token": token,
+        "base_url":     "https://sandbox.tradier.com",
+    }
+
+
 class ClientRunner(threading.Thread):
     """
     One daemon thread per client. The runner owns all per-client subsystems and
@@ -231,9 +295,15 @@ class ClientRunner(threading.Thread):
     def __init__(self, member: dict):
         super().__init__(daemon=True, name=f"runner-{member['email']}")
         self.member = member
-        self.email = member["email"]
-        self.account_id = member["tradier_account_id"]
-        self.base_url = member.get("tradier_base_url", "https://sandbox.tradier.com")
+        self.email  = member["email"]
+
+        # Resolve credentials once at construction — single source of truth.
+        # Raises RuntimeError if credentials are missing or mode is misconfigured.
+        _resolved                    = resolve_tradier_credentials(member)
+        self.mode                    = _resolved["mode"]
+        self.account_id              = _resolved["account_id"]
+        self.base_url                = _resolved["base_url"]
+        self._resolved_tradier_token = _resolved["access_token"]
 
         self.stopped = threading.Event()
         self.initialized = threading.Event()
@@ -266,12 +336,11 @@ class ClientRunner(threading.Thread):
         self.worker_thread = None
         self.equity_thread = None
         self.health_thread = None
-        self.mode = "PAPER"
         self.failure_reason: str = ""
 
     def _get_token(self) -> str | None:
         try:
-            raw = self.member.get("tradier_access_token", "")
+            raw = getattr(self, "_resolved_tradier_token", None) or self.member.get("tradier_access_token", "")
             if not raw:
                 return None
             return decrypt_token(raw, mode=self.mode)
@@ -1997,20 +2066,33 @@ def route_signal_to_all_clients(signal: dict):
 
 def _fetch_active_members(sb: Client) -> list[dict]:
     try:
+        # Each Render service only picks up members matching its own mode.
+        # Paper service (BOT_MODE=paper): only tradier_account_mode=paper members.
+        # Live service  (BOT_MODE=live):  only tradier_account_mode=live members.
+        # Critical safety gate — prevents two services from running the same client.
+        _bot_mode = os.getenv("BOT_MODE", os.getenv("MODE", "paper")).strip().lower()
+
         res = (
             sb.table("members")
             .select(
-                "id,email,name,tradier_account_id,"
-                "tradier_access_token,tradier_base_url,"
+                "id,email,name,tier,"
+                "tradier_account_mode,"
+                "tradier_account_id,tradier_access_token,tradier_base_url,"
+                "tradier_paper_account_id,tradier_paper_access_token,"
+                "tradier_live_account_id,tradier_live_access_token,"
                 "subscription_active,approved"
             )
             .eq("approved", True)
             .eq("subscription_active", True)
-            .not_.is_("tradier_account_id", "null")
-            .not_.is_("tradier_access_token", "null")
+            .eq("tradier_account_mode", _bot_mode)
             .execute()
         )
-        return res.data or []
+        members = res.data or []
+        logger.info(
+            "_fetch_active_members: BOT_MODE=%s → %d active member(s)",
+            _bot_mode, len(members),
+        )
+        return members
     except Exception as exc:
         logger.error("Supabase fetch failed: %s", exc)
         return []
