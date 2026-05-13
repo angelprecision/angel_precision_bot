@@ -2766,17 +2766,31 @@ class APExitEngine:
                     and int(pos.quantity_remaining or 0) > 0
                 )
 
-                if _has_live_quotes or _has_peak_to_protect:
-                    # Only advance peak state from live quotes. A stale zero quote
-                    # may trigger protection, but must never erase the real peak.
-                    if _has_live_quotes:
-                        if pos.option_pnl_pct > pos.peak_pnl_pct:
-                            pos.peak_pnl_pct = pos.option_pnl_pct
-                        if pos.option_pnl_pct > 0:
-                            pos.touched_profit = True
-                            if pos.option_pnl_pct > pos.max_profit_seen:
-                                pos.max_profit_seen = pos.option_pnl_pct
+                # ── PEAK TRACKING — runs BEFORE quote gate, always ────────────
+                # The quote gate exists to prevent false exits on stale prices.
+                # It must NOT prevent recording a new high-water mark.
+                # If QPM has a gap exactly at peak, peak_pnl_pct never updates
+                # and trail/profit-floor logic fires based on a false 0% peak.
+                # Fix: advance peak from ANY non-zero option price, stale or not.
+                # Never allow a QPM gap to erase a real peak.
+                if pos.current_option_price > 0 and pos.entry_price > 0:
+                    _raw_pnl = (pos.current_option_price - pos.entry_price) / pos.entry_price
+                    if _raw_pnl > pos.peak_pnl_pct:
+                        pos.peak_pnl_pct = _raw_pnl
+                        log.debug(
+                            "[%s] PEAK UPDATE (pre-gate) | peak=%.1f%% | option=$%.2f entry=$%.2f",
+                            pos.ticker, _raw_pnl * 100,
+                            pos.current_option_price, pos.entry_price,
+                        )
+                    if _raw_pnl > 0:
+                        pos.touched_profit = True
+                        if _raw_pnl > pos.max_profit_seen:
+                            pos.max_profit_seen = _raw_pnl
+                # ─────────────────────────────────────────────────────────────
 
+                if _has_live_quotes or _has_peak_to_protect:
+                    # Duplicate peak advance removed — handled above pre-gate.
+                    # Gate now only controls whether evaluate_exit() is called.
                     decision = evaluate_exit(pos, now_et)
                     decision.reason_code = _classify_exit_decision(decision)
 
