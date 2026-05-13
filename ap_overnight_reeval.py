@@ -311,11 +311,11 @@ def run_overnight_reeval(
                 )
                 # Execution core will select the live contract at breach time.
                 # Set a placeholder limit so the plan passes downstream validation,
-                # and mark contracts=1 as the minimum safe default.
+                # and mark contracts with MIN_CONTRACTS_PER_POSITION as the minimum configured default.
                 try:
                     decision.plan.limit_price = 0.01   # overwritten at breach by live quote
                     if not getattr(decision.plan, "contracts", None):
-                        decision.plan.contracts = 1
+                        decision.plan.contracts = int(os.getenv("MIN_CONTRACTS_PER_POSITION", "2"))
                     if not hasattr(decision.plan, "metadata") or decision.plan.metadata is None:
                         decision.plan.metadata = {}
                     decision.plan.metadata["contract_deferred"] = True

@@ -31,6 +31,8 @@ except Exception:
 
 log = logging.getLogger("ap.master_control")
 
+MIN_CONTRACTS_PER_POSITION = int(os.getenv("MIN_CONTRACTS_PER_POSITION", "2"))
+
 # QUARTERLY REVIEW REQUIRED: These estimates are used for capital gate projections
 # before real contract pricing is known. If ATM premiums diverge significantly
 # (e.g. NVDA drops from 9.50 to 4.00 in low-vol regime), the capital gate will
@@ -753,7 +755,7 @@ class APMasterControl:
         if effective_count >= self.max_positions:
             return self._block(signal_id, ticker, client_id, "blocked_risk", f"max_positions_with_pending ({effective_count}/{self.max_positions})")
 
-        estimated_contracts_pre = max(1, self._base_contracts(effective_score, _estimate_premium(ticker)))
+        estimated_contracts_pre = max(MIN_CONTRACTS_PER_POSITION, self._base_contracts(effective_score, _estimate_premium(ticker)))
         estimated_new_cost_pre = estimated_contracts_pre * 100 * _estimate_premium(ticker)
         pending_capital_real = self._pending_capital_from_snapshot_or_db(snap, client_id)
         if pending_capital_real is None:
@@ -774,7 +776,7 @@ class APMasterControl:
 
         sector = self.SECTOR_MAP.get(ticker.upper(), "other")
         sector_deployed = self._sector_capital_deployed(snap["open_positions"] + snap["closing_positions"], sector)
-        estimated_contracts = max(1, self._base_contracts(effective_score, _estimate_premium(ticker)))
+        estimated_contracts = max(MIN_CONTRACTS_PER_POSITION, self._base_contracts(effective_score, _estimate_premium(ticker)))
         estimated_new_cost = estimated_contracts * 100 * _estimate_premium(ticker)
         projected_sector = sector_deployed + estimated_new_cost
         effective_equity = self.account_equity
