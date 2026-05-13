@@ -1052,8 +1052,22 @@ def _mark_broker_fill_anomaly(osm, order: dict, *, reason: str, mapped: str | No
     if not osm:
         return False
 
-    local_id = order.get("local_order_id")
+    local_id  = order.get("local_order_id")
     broker_id = order.get("broker_order_id")
+    client_id = order.get("client_id", "?")
+
+    # BROKER_FILL_ANOMALY is a diagnostic alert condition, not a legal OSM
+    # lifecycle state. Attempting to transition to it always produces:
+    #   CRITICAL: ILLEGAL TRANSITION -- EXIT_ACKNOWLEDGED -> BROKER_FILL_ANOMALY
+    # Guard here so the alert fires but OSM is never touched.
+    if FILL_ANOMALY_STATUS == "BROKER_FILL_ANOMALY":
+        log.critical(
+            "[%s] Broker fill anomaly retained as alert only | order=%s broker=%s reason=%s "
+            "| NOT transitioning OSM — BROKER_FILL_ANOMALY is not a legal lifecycle state",
+            client_id, local_id, broker_id, reason,
+        )
+        return False
+
     try:
         return bool(
             osm.transition(
@@ -1066,11 +1080,7 @@ def _mark_broker_fill_anomaly(osm, order: dict, *, reason: str, mapped: str | No
     except Exception as exc:
         log.error(
             "[%s] OSM anomaly transition failed | order=%s status=%s mapped=%s error=%s",
-            order.get("client_id"),
-            local_id,
-            FILL_ANOMALY_STATUS,
-            mapped,
-            exc,
+            client_id, local_id, FILL_ANOMALY_STATUS, mapped, exc,
         )
         return False
 

@@ -577,6 +577,7 @@ class APBrokerReconciler:
         """
         try:
             import os as _os
+            from ap.db import conn, run_with_retry
             max_age_sec = int(_os.getenv("EXIT_ACK_STALE_SEC", "20"))
 
             def _fn():
@@ -806,6 +807,7 @@ class APBrokerReconciler:
                          dashboard reads positions only after broker truth is copied.
         """
         try:
+            from ap.db import conn, run_with_retry
             from ap.position_manager import APPositionManager
 
             def _fn():
