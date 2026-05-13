@@ -301,7 +301,7 @@ class APSignalPipeline:
             "contracts":       decision.contracts,
             "max_usd":         decision.max_usd,
             "confidence":      decision.confidence,
-            "score":           getattr(decision, "score", None),
+            "score":           getattr(decision, "score", None) or float(signal_data.get("score") or signal_data.get("ev_score") or 0),
             "mode":            self.mode_cfg.mode,
             "reasoning":       decision.reasoning,
             "signal_breakdown":decision.signal_breakdown,
