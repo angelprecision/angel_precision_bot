@@ -788,14 +788,24 @@ class APExecutionCore:
         # IMMEDIATE urgency (hard stop -33%, never-green, EOD) → MARKET ORDER
         #   Must fill. Hard stops and EOD closes cannot miss. No slippage risk.
         #
-        # HIGH urgency (scale-out +15%/+25%, trailing stop) → LIMIT AT MID
-        #   Place limit at current mid price. You booked +15% → get the +15%.
-        #   If the limit misses (moves away) → order expires → trail catches it next cycle.
-        #   This prevents getting stopped out by a wide spread and locks in the gain you earned.
-        #   No "2% discount" — if you've earned +15%, take $4.31 not $4.22.
+        # HIGH urgency — PROTECTIVE exits (RUNNER_TRAIL, PROFIT_LOCK, etc.) → BID
+        #   Start at bid immediately. These exits protect earned profit; sitting at
+        #   mid while price slides back costs more than the bid/mid spread.
+        #
+        # HIGH urgency — SCALE exits (scale-out W1/W2/W3) → MID
+        #   Scale-outs are non-urgent partial closes; mid pricing is fine.
+        #   Still escalates to bid at 90s and market at 150s if unfilled.
         #
         # No quote available for IMMEDIATE → BLOCK (never submit zero-price stop)
         # No quote available for HIGH → retry on next quote cycle (not blocking)
+
+        _PROTECTIVE_EXIT_CODES = {
+            "RUNNER_TRAIL", "TRAILING_STOP", "PROFIT_LOCK", "TOUCHED_PROFIT_STOP",
+            "SMALL_WIN_LOCK", "EOD_FORCE_CLOSE", "HARD_STOP", "STOP_HIT",
+            "SENTINEL_FORCED_EXIT", "NEVER_GREEN_STOP", "THETA_STOP", "TIME_STOP",
+        }
+        _reason_code    = str(getattr(decision, "reason_code", "") or "").upper()
+        _is_protective  = _reason_code in _PROTECTIVE_EXIT_CODES
 
         _use_market = _urgency == "IMMEDIATE"
 
@@ -826,6 +836,15 @@ class APExecutionCore:
                 log.critical("[%s] CLOSE BLOCKED — no quote for IMMEDIATE exit | %s", pos.ticker, decision.reason)
                 return
             log.info("[%s] MARKET EXIT @ est.$%.2f | urgency=%s | %s", pos.ticker, exit_price, _urgency, decision.reason)
+        elif _is_protective and _bid > 0:
+            # Protective exits: start at bid immediately.
+            # Sitting at mid while profit erodes costs more than the spread.
+            _exit_limit = round(_bid, 2)
+            exit_price  = _exit_limit
+            pos._exit_submit_ts = time.time()  # type: ignore[attr-defined]
+            pos._exit_attempts  = _exit_attempts + 1  # type: ignore[attr-defined]
+            log.info("[%s] PROTECTIVE EXIT @ $%.2f (bid) attempt=%d | %s | %s",
+                     pos.ticker, _exit_limit, pos._exit_attempts, _reason_code, decision.reason)
         elif _mid > 0:
             _exit_limit = round(_mid, 2)
             exit_price = _exit_limit
