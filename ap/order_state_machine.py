@@ -985,6 +985,10 @@ class APOrderStateMachine:
                     broker_order_id=str(_broker_id or ""),
                     cumulative_filled=_cum_filled,
                 )
+                # Finalize position row from confirmed broker fill truth.
+                # This is the canonical write path: orders → positions → dashboard.
+                # Runs after mark_position_closed so exit engine state is updated first.
+                self._finalize_position_from_exit_order(str(_local_id or ""), fill_price=fill_price, filled_qty=_delta)
                 return
 
             # ── CANCELED / EXPIRED / REJECTED ───────────────────────────────
@@ -1594,6 +1598,60 @@ class APOrderStateMachine:
         if m:
             return m.group(1)
         return raw_symbol if raw_symbol else raw_contract
+
+    def _finalize_position_from_exit_order(
+        self,
+        local_order_id: str,
+        fill_price: float | None = None,
+        filled_qty: int | None = None,
+    ) -> None:
+        """
+        Copy confirmed broker fill truth from orders → positions after EXIT_FILLED.
+
+        Production rule: broker fill > order row > position row > dashboard.
+        Called immediately after mark_position_closed so the position row is
+        finalized with real fill price, P&L, and close metadata.
+        Non-fatal — any error is logged and swallowed; it never blocks the exit path.
+        """
+        try:
+            order = self._get_order(local_order_id)
+            if not order:
+                log.warning("[%s] _finalize_position_from_exit_order: order not found %s",
+                            self.client_id, local_order_id)
+                return
+
+            position_id    = str(order.get("position_id") or "")
+            _fill_price    = fill_price if fill_price is not None else order.get("fill_price")
+            _filled_qty    = filled_qty if filled_qty is not None else order.get("filled_qty")
+            _filled_ts     = order.get("filled_ts")
+            _broker_id     = str(order.get("broker_order_id") or "")
+
+            if not position_id or _fill_price is None or int(_filled_qty or 0) <= 0:
+                log.warning(
+                    "[%s] _finalize_position_from_exit_order skipped — incomplete fill data | "
+                    "order=%s pos=%s price=%r qty=%r",
+                    self.client_id, local_order_id, position_id, _fill_price, _filled_qty,
+                )
+                return
+
+            from ap.position_manager import APPositionManager
+            pm = APPositionManager(self.client_id)
+            pm.close_position_from_exit_fill(
+                position_id=position_id,
+                exit_price=float(_fill_price),
+                filled_qty=int(_filled_qty),
+                filled_ts=str(_filled_ts) if _filled_ts else now_utc_iso(),
+                local_order_id=local_order_id,
+                broker_order_id=_broker_id,
+                close_source="broker_exit_fill",
+                close_confidence="HIGH",
+                exit_reason="exit_filled",
+            )
+        except Exception as exc:
+            log.error(
+                "[%s] _finalize_position_from_exit_order failed | order=%s | %s",
+                self.client_id, local_order_id, exc, exc_info=True,
+            )
 
     def _get_order(self, local_order_id: str):
         def _fn():

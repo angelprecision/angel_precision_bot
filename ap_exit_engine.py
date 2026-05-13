@@ -731,6 +731,24 @@ FORCED_RISK_EXIT_CODES = {
 }
 
 
+def _active_exit_blocks_resubmit(order: dict | None) -> bool:
+    """
+    Return True if an in-flight exit order exists that must block resubmission.
+    Prevents the PLTR-class bug: EXIT_ACKNOWLEDGED → EXIT_SUBMITTED illegal transition.
+    The OSM correctly blocks the state machine transition; this guard stops the
+    exit engine from even attempting to create a duplicate exit order.
+    """
+    if not order:
+        return False
+    status = str(order.get("status") or "").upper()
+    return status in {
+        "EXIT_REQUESTED",
+        "EXIT_SUBMITTED",
+        "EXIT_ACKNOWLEDGED",
+        "EXIT_PARTIAL_FILL",
+    }
+
+
 def _classify_exit_decision(decision: "ExitDecision") -> str:
     explicit_code = (getattr(decision, "reason_code", "") or "").upper().strip()
     if explicit_code:
@@ -2977,6 +2995,40 @@ class APExitEngine:
         ticker        = str(pos.ticker or "")
         option_symbol = str(pos.option_symbol or "")
         position_id   = str(pos.position_id or "")
+
+        # ── RESUBMIT GUARD ────────────────────────────────────────────────────
+        # Block duplicate exit submission when an active exit order already exists
+        # in the DB (EXIT_REQUESTED / EXIT_SUBMITTED / EXIT_ACKNOWLEDGED / PARTIAL).
+        # The OSM correctly rejects the illegal state transition; this guard stops
+        # the exit engine from even creating a duplicate order (PLTR-class bug).
+        # Skipped for kill_active (emergency) and allow_inflight_override paths.
+        if not kill_active and not allow_inflight_override:
+            try:
+                _osm = getattr(self, "order_state_machine", None) or getattr(self, "osm", None)
+                _active_exit = None
+                if _osm is not None:
+                    if hasattr(_osm, "_get_active_exit_order"):
+                        _active_exit = _osm._get_active_exit_order(position_id)
+                    elif hasattr(_osm, "get_active_exit_order"):
+                        _active_exit = _osm.get_active_exit_order(position_id)
+                if _active_exit_blocks_resubmit(_active_exit):
+                    log.warning(
+                        "[%s] EXIT RESUBMIT BLOCKED | pos=%s | existing_order=%s | status=%s | broker=%s",
+                        ticker, position_id,
+                        _active_exit.get("local_order_id"),
+                        _active_exit.get("status"),
+                        _active_exit.get("broker_order_id"),
+                    )
+                    try:
+                        pos.exit_in_flight            = True
+                        pos.pending_exit_order_id     = _active_exit.get("local_order_id")
+                        pos.pending_exit_broker_order_id = _active_exit.get("broker_order_id")
+                    except Exception:
+                        pass
+                    return False
+            except Exception as _rsg_err:
+                log.debug("[%s] resubmit guard lookup failed (non-fatal): %s", ticker, _rsg_err)
+        # ─────────────────────────────────────────────────────────────────────
 
         # 1) Short critical section: validate and capture submit snapshot.
         with self._lock:

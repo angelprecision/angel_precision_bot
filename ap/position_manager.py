@@ -811,6 +811,135 @@ class APPositionManager:
             self.client_id, position_id, exit_price, realized_pnl, close_reason, final_status,
         )
 
+    def close_position_from_exit_fill(
+        self,
+        *,
+        position_id: str,
+        exit_price: float,
+        filled_qty: int,
+        filled_ts: Optional[str] = None,
+        local_order_id: str = "",
+        broker_order_id: str = "",
+        close_source: str = "broker_exit_fill",
+        close_confidence: str = "HIGH",
+        exit_reason: str = "exit_filled",
+    ) -> bool:
+        """
+        Canonical broker-truth position finalizer.
+
+        The ONLY clean path to finalize a position from a confirmed exit fill.
+        Uses confirmed broker/order fill data only — never quote, mid, bid, mark,
+        chart price, or estimated option price.
+
+        Writes: exit_price, realized_pnl, realized_pnl_pct, quantity_remaining,
+                exit_ts, close_source, close_confidence, status (CLOSED when full).
+
+        Called by:
+          - APOrderStateMachine.transition() when EXIT_FILLED succeeds
+          - APBrokerReconciler._heal_exit_filled_positions_from_orders() as backup
+        """
+        try:
+            exit_px  = float(exit_price or 0)
+            fill_qty = int(filled_qty or 0)
+        except Exception:
+            log.error(
+                "[%s] close_position_from_exit_fill invalid inputs | pos=%s exit_price=%r filled_qty=%r",
+                self.client_id, position_id, exit_price, filled_qty,
+            )
+            return False
+
+        if not position_id or exit_px <= 0 or fill_qty <= 0:
+            log.warning(
+                "[%s] close_position_from_exit_fill blocked | pos=%s exit_price=%s filled_qty=%s",
+                self.client_id, position_id, exit_px, fill_qty,
+            )
+            return False
+
+        ts = filled_ts or now_utc_iso()
+
+        def _fn():
+            with conn() as c:
+                c.execute(
+                    "SELECT * FROM positions WHERE id=%s AND client_id=%s FOR UPDATE",
+                    (position_id, self.client_id),
+                )
+                pos = c.fetchone()
+                if not pos:
+                    return False, "position_not_found"
+
+                avg_fill = float(pos.get("avg_fill") or pos.get("entry_price") or 0)
+                qty      = int(pos.get("qty") or 0)
+                current_remaining = pos.get("quantity_remaining")
+                if current_remaining is None:
+                    current_remaining = qty
+                current_remaining = int(current_remaining or 0)
+
+                if avg_fill <= 0 or qty <= 0:
+                    return False, "invalid_position_cost_basis"
+
+                close_qty    = min(fill_qty, current_remaining if current_remaining > 0 else fill_qty)
+                new_remaining = max(current_remaining - close_qty, 0)
+
+                realized_pnl     = round((exit_px - avg_fill) * close_qty * 100, 2)
+                realized_pnl_pct = round(((exit_px - avg_fill) / avg_fill) * 100, 2) if avg_fill else 0.0
+
+                new_status = PositionStatus.CLOSED if new_remaining <= 0 else PositionStatus.CLOSING
+
+                # Build update dynamically so missing columns don't crash
+                has = self._has_position_column
+                sets, vals = ["updated_at=NOW()"], []
+
+                def _add(col, val):
+                    if has(col):
+                        sets.append(f"{col}=%s")
+                        vals.append(val)
+
+                _add("exit_price",         exit_px)
+                _add("realized_pnl",       realized_pnl)
+                _add("realized_pnl_pct",   realized_pnl_pct)
+                _add("quantity_remaining", new_remaining)
+                _add("exit_ts",            ts)
+                _add("exit_reason",        exit_reason)
+                _add("close_source",       close_source)
+                _add("close_confidence",   close_confidence)
+                sets.append("status=%s"); vals.append(new_status)
+                if local_order_id and has("local_order_id"):
+                    sets.append("local_order_id=COALESCE(local_order_id,%s)"); vals.append(local_order_id)
+                if broker_order_id and has("broker_order_id"):
+                    sets.append("broker_order_id=COALESCE(broker_order_id,%s)"); vals.append(str(broker_order_id))
+
+                vals.extend([position_id, self.client_id])
+                c.execute(
+                    f"UPDATE positions SET {', '.join(sets)} "
+                    f"WHERE id=%s AND client_id=%s RETURNING id, status",
+                    tuple(vals),
+                )
+                row = c.fetchone()
+                if not row:
+                    return False, "update_no_row"
+                return True, {
+                    "status": row.get("status"), "exit_price": exit_px,
+                    "filled_qty": close_qty, "remaining": new_remaining,
+                    "realized_pnl": realized_pnl, "realized_pnl_pct": realized_pnl_pct,
+                }
+
+        ok, detail = run_with_retry(_fn)
+        if ok:
+            log.info(
+                "[%s] POSITION FINALIZED FROM EXIT FILL | pos=%s exit=$%.2f qty=%s "
+                "pnl=$%+.2f (%.1f%%) source=%s broker=%s",
+                self.client_id, position_id, exit_px, fill_qty,
+                detail.get("realized_pnl", 0), detail.get("realized_pnl_pct", 0),
+                close_source, broker_order_id or "",
+            )
+            return True
+
+        log.warning(
+            "[%s] close_position_from_exit_fill failed | pos=%s reason=%s",
+            self.client_id, position_id, detail,
+        )
+        return False
+
     def mark_closing(self, position_id: str):
         current = self.get_position(position_id)
         if not current or PositionStatus.is_terminal(current.get("status", "")):

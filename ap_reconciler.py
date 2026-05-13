@@ -347,6 +347,15 @@ class APBrokerReconciler:
                 summary["errors"].append(f"orders: {e}")
                 self._report_health_error(f"orders_reconcile_error: {e}", fatal=False)
 
+            # Backup fill-truth heal: must run after orders, before positions.
+            # Catches any EXIT_FILLED order whose linked position wasn't finalized
+            # (manual exits, restart gaps, fill monitor delays, OSM misses).
+            try:
+                self._heal_exit_filled_positions_from_orders(summary)
+            except Exception as e:
+                log.error("[%s] Exit-filled position heal error: %s", self.client_id, e, exc_info=True)
+                summary["errors"].append(f"exit_fill_heal: {e}")
+
             try:
                 self._reconcile_positions(summary)
             except Exception as e:
@@ -545,6 +554,95 @@ class APBrokerReconciler:
             filled_qty=int(filled_qty),
             fill_price=float(fill_price) if fill_price is not None else None,
         ))
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Exit-fill position heal (backup truth repair)
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def _heal_exit_filled_positions_from_orders(self, summary: dict) -> None:
+        """
+        Backup fill-truth repair. If any EXIT order is EXIT_FILLED with a confirmed
+        fill_price, but the linked position is still missing exit_price / realized_pnl
+        / realized_pnl_pct, finalize the position from the order row.
+
+        Catches: manual exits, restart gaps, fill monitor delays, OSM misses.
+        Production rule: orders table receives broker truth first.
+                         positions table is finalized from orders table.
+                         dashboard reads positions only after broker truth is copied.
+        """
+        try:
+            from ap.position_manager import APPositionManager
+
+            def _fn():
+                with conn() as c:
+                    c.execute(
+                        """
+                        SELECT
+                            o.local_order_id,
+                            o.position_id,
+                            o.fill_price,
+                            o.filled_qty,
+                            o.filled_ts,
+                            o.broker_order_id
+                        FROM orders o
+                        JOIN positions p ON p.id = o.position_id AND p.client_id = o.client_id
+                        WHERE o.client_id = %s
+                          AND o.kind = 'EXIT'
+                          AND o.status = 'EXIT_FILLED'
+                          AND o.fill_price IS NOT NULL
+                          AND COALESCE(o.filled_qty, 0) > 0
+                          AND p.avg_fill IS NOT NULL
+                          AND p.avg_fill > 0
+                          AND (
+                              p.exit_price IS NULL
+                              OR p.realized_pnl IS NULL
+                              OR p.realized_pnl_pct IS NULL
+                              OR p.quantity_remaining IS NULL
+                          )
+                        ORDER BY o.filled_ts DESC
+                        LIMIT 50
+                        """,
+                        (self.client_id,),
+                    )
+                    return c.fetchall()
+
+            rows = run_with_retry(_fn) or []
+            if not rows:
+                return
+
+            pm = APPositionManager(self.client_id)
+            healed = 0
+            for row in rows:
+                row = dict(row) if not isinstance(row, dict) else row
+                ok = pm.close_position_from_exit_fill(
+                    position_id=str(row["position_id"]),
+                    exit_price=float(row["fill_price"]),
+                    filled_qty=int(row["filled_qty"]),
+                    filled_ts=str(row["filled_ts"]) if row.get("filled_ts") else None,
+                    local_order_id=str(row.get("local_order_id") or ""),
+                    broker_order_id=str(row.get("broker_order_id") or ""),
+                    close_source="reconciler_broker_exit_fill",
+                    close_confidence="HIGH",
+                )
+                if ok:
+                    healed += 1
+
+            if healed:
+                summary["positions_corrected"] = int(summary.get("positions_corrected") or 0) + healed
+                log.warning(
+                    "[%s] Reconciler healed %d EXIT_FILLED position finalization gap(s)",
+                    self.client_id, healed,
+                )
+
+        except Exception as exc:
+            log.error(
+                "[%s] _heal_exit_filled_positions_from_orders failed: %s",
+                self.client_id, exc, exc_info=True,
+            )
+            try:
+                summary.setdefault("errors", []).append(f"exit_fill_heal: {exc}")
+            except Exception:
+                pass
 
     # ──────────────────────────────────────────────────────────────────────────
     # Order reconciliation
