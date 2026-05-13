@@ -228,74 +228,12 @@ class ClientRunner(threading.Thread):
     from _active_runners is runner-owned to avoid cleanup-order races.
     """
 
-def resolve_tradier_credentials(member: dict) -> dict:
-    """
-    Resolve the correct Tradier credentials for this Render service's mode.
-
-    BOT_MODE=PAPER (default) → uses tradier_paper_* columns, falls back to tradier_*
-    BOT_MODE=LIVE            → uses tradier_live_* columns, requires AP_LIVE_TRADING=1
-
-    This is the single source of truth for credential resolution.
-    Both Render services use the same Supabase members table but each
-    only picks up credentials matching its own mode.
-    """
-    bot_mode      = os.getenv("BOT_MODE", os.getenv("MODE", "PAPER")).strip().upper()
-    live_enabled  = os.getenv("AP_LIVE_TRADING", "0").strip().lower() in {"1", "true", "yes", "on"}
-    email         = member.get("email", "?")
-
-    if bot_mode == "LIVE":
-        if not live_enabled:
-            raise RuntimeError(
-                f"[{email}] BOT_MODE=LIVE but AP_LIVE_TRADING is not enabled — "
-                "set AP_LIVE_TRADING=1 on the live Render service to allow real-money trading"
-            )
-        account_id = member.get("tradier_live_account_id") or member.get("tradier_account_id")
-        token      = member.get("tradier_live_access_token") or member.get("tradier_access_token")
-        base_url   = "https://api.tradier.com"
-
-        if not account_id or not token:
-            raise RuntimeError(f"[{email}] LIVE startup missing live Tradier credentials")
-
-        return {
-            "mode":         "LIVE",
-            "account_id":   account_id,
-            "access_token": token,
-            "base_url":     base_url,
-        }
-
-    # PAPER (default)
-    account_id = (
-        member.get("tradier_paper_account_id")
-        or member.get("tradier_account_id")
-    )
-    token = (
-        member.get("tradier_paper_access_token")
-        or member.get("tradier_access_token")
-    )
-    base_url = "https://sandbox.tradier.com"
-
-    if not account_id or not token:
-        raise RuntimeError(f"[{email}] PAPER startup missing paper Tradier credentials")
-
-    return {
-        "mode":         "PAPER",
-        "account_id":   account_id,
-        "access_token": token,
-        "base_url":     base_url,
-    }
-
-
     def __init__(self, member: dict):
         super().__init__(daemon=True, name=f"runner-{member['email']}")
         self.member = member
-        self.email  = member["email"]
-
-        # Resolve credentials for this service's mode (PAPER or LIVE)
-        _resolved = resolve_tradier_credentials(member)
-        self.mode                    = _resolved["mode"]
-        self.account_id              = _resolved["account_id"]
-        self.base_url                = _resolved["base_url"]
-        self._resolved_tradier_token = _resolved["access_token"]
+        self.email = member["email"]
+        self.account_id = member["tradier_account_id"]
+        self.base_url = member.get("tradier_base_url", "https://sandbox.tradier.com")
 
         self.stopped = threading.Event()
         self.initialized = threading.Event()
@@ -333,7 +271,7 @@ def resolve_tradier_credentials(member: dict) -> dict:
 
     def _get_token(self) -> str | None:
         try:
-            raw = getattr(self, "_resolved_tradier_token", None) or self.member.get("tradier_access_token", "")
+            raw = self.member.get("tradier_access_token", "")
             if not raw:
                 return None
             return decrypt_token(raw, mode=self.mode)
@@ -2059,29 +1997,20 @@ def route_signal_to_all_clients(signal: dict):
 
 def _fetch_active_members(sb: Client) -> list[dict]:
     try:
-        # Each Render service only picks up members matching its own mode.
-        # Paper service: BOT_MODE=paper → only paper members
-        # Live service:  BOT_MODE=live  → only live members
-        # Prevents two Render services from running the same client.
-        _bot_mode = os.getenv("BOT_MODE", os.getenv("MODE", "paper")).strip().lower()
-
         res = (
             sb.table("members")
             .select(
-                "id,email,name,tier,"
-                "tradier_account_id,tradier_access_token,tradier_base_url,"
-                "tradier_paper_account_id,tradier_paper_access_token,"
-                "tradier_live_account_id,tradier_live_access_token,"
-                "tradier_account_mode,subscription_active,approved"
+                "id,email,name,tradier_account_id,"
+                "tradier_access_token,tradier_base_url,"
+                "subscription_active,approved"
             )
             .eq("approved", True)
             .eq("subscription_active", True)
-            .eq("tradier_account_mode", _bot_mode)
+            .not_.is_("tradier_account_id", "null")
+            .not_.is_("tradier_access_token", "null")
             .execute()
         )
-        members = res.data or []
-        logger.info("_fetch_active_members: BOT_MODE=%s found %d member(s)", _bot_mode, len(members))
-        return members
+        return res.data or []
     except Exception as exc:
         logger.error("Supabase fetch failed: %s", exc)
         return []
