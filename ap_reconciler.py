@@ -675,18 +675,110 @@ class APBrokerReconciler:
                         log.error("[%s] stale_ack_exit OSM terminal transition failed: %s", self.client_id, exc)
                     continue
 
-                # Still open at broker — alert for manual review
-                self._alert(
-                    f"STALE_EXIT_ACKNOWLEDGED | {contract} | local={local_id} "
-                    f"broker={broker_id} broker_status={broker_status} age={age_sec:.0f}s "
-                    f"| needs cancel/replace or manual review"
+                # Still open at broker — auto-cancel if flag enabled, otherwise alert
+                _auto_cancel = (
+                    _os.getenv("EXIT_AUTO_CANCEL_STALE_ACK", "0").strip().lower()
+                    in {"1", "true", "yes", "on"}
                 )
-                summary["orders_alerted"] = int(summary.get("orders_alerted", 0)) + 1
-                log.warning(
-                    "[%s] STALE_EXIT_ACKNOWLEDGED unresolved | %s | local=%s broker=%s "
-                    "broker_status=%s age=%.1fs",
-                    self.client_id, contract, local_id, broker_id, broker_status, age_sec,
-                )
+
+                if not _auto_cancel:
+                    self._alert(
+                        f"STALE_EXIT_ACKNOWLEDGED | {contract} | local={local_id} "
+                        f"broker={broker_id} broker_status={broker_status} age={age_sec:.0f}s "
+                        f"| needs cancel/replace or manual review"
+                    )
+                    summary["orders_alerted"] = int(summary.get("orders_alerted", 0)) + 1
+                    log.warning(
+                        "[%s] STALE_EXIT_ACKNOWLEDGED unresolved | %s | local=%s broker=%s "
+                        "broker_status=%s age=%.1fs | EXIT_AUTO_CANCEL_STALE_ACK=0 (alert only)",
+                        self.client_id, contract, local_id, broker_id, broker_status, age_sec,
+                    )
+                    continue
+
+                # Auto-cancel path — only runs when EXIT_AUTO_CANCEL_STALE_ACK=1
+                cancel_fn = getattr(self.broker, "cancel_order", None)
+                if not callable(cancel_fn):
+                    self._alert(
+                        f"STALE_EXIT_CANCEL_UNAVAILABLE | {contract} | local={local_id} "
+                        f"broker={broker_id} | broker.cancel_order not found"
+                    )
+                    summary["orders_alerted"] = int(summary.get("orders_alerted", 0)) + 1
+                    continue
+
+                try:
+                    cancel_res    = cancel_fn(broker_id) or {}
+                    cancel_ok     = bool(cancel_res.get("ok"))
+                    cancel_status = str(cancel_res.get("status") or "").lower().strip()
+                except Exception as _cex:
+                    log.error(
+                        "[%s] stale_ack_exit cancel_order exception | local=%s broker=%s | %s",
+                        self.client_id, local_id, broker_id, _cex,
+                    )
+                    self._alert(
+                        f"STALE_EXIT_CANCEL_ERROR | {contract} | local={local_id} "
+                        f"broker={broker_id} | err={_cex}"
+                    )
+                    summary["orders_alerted"] = int(summary.get("orders_alerted", 0)) + 1
+                    continue
+
+                if cancel_ok or cancel_status in {"canceled", "cancelled", "ok"}:
+                    try:
+                        self.osm.transition(
+                            local_id,
+                            "CANCELED",
+                            broker_order_id=broker_id,
+                            last_error="stale_exit_ack_auto_cancelled_for_fresh_resubmit",
+                        )
+                    except Exception as _tex:
+                        log.error(
+                            "[%s] stale_ack_exit OSM CANCELED transition failed | local=%s | %s",
+                            self.client_id, local_id, _tex,
+                        )
+
+                    # Clear exit identity so exit engine can submit a fresh order next cycle
+                    _pos_id = str(row.get("position_id") or "")
+                    if _pos_id:
+                        try:
+                            _ee = getattr(self, "exit_engine", None)
+                            if _ee and hasattr(_ee, "clear_pending_exit_order"):
+                                _ee.clear_pending_exit_order(
+                                    _pos_id,
+                                    reason="stale_ack_exit_cancelled_for_fresh_resubmit",
+                                    local_order_id=local_id,
+                                    broker_order_id=broker_id,
+                                )
+                            elif _ee and hasattr(_ee, "clear_exit_in_flight"):
+                                _ee.clear_exit_in_flight(
+                                    _pos_id,
+                                    local_order_id=local_id,
+                                    broker_order_id=broker_id,
+                                )
+                        except Exception as _eex:
+                            log.debug(
+                                "[%s] exit engine clear after cancel failed (non-fatal): %s",
+                                self.client_id, _eex,
+                            )
+
+                    summary["orders_corrected"] = int(summary.get("orders_corrected", 0)) + 1
+                    self._alert(
+                        f"STALE_EXIT_AUTO_CANCELED | {contract} | local={local_id} "
+                        f"broker={broker_id} age={age_sec:.0f}s | fresh exit allowed next cycle"
+                    )
+                    log.warning(
+                        "[%s] STALE_EXIT_AUTO_CANCELED | %s | local=%s broker=%s age=%.1fs",
+                        self.client_id, contract, local_id, broker_id, age_sec,
+                    )
+                else:
+                    self._alert(
+                        f"STALE_EXIT_CANCEL_FAILED | {contract} | local={local_id} "
+                        f"broker={broker_id} cancel_status={cancel_status} "
+                        f"error={cancel_res.get('error')}"
+                    )
+                    summary["orders_alerted"] = int(summary.get("orders_alerted", 0)) + 1
+                    log.error(
+                        "[%s] STALE_EXIT_CANCEL_FAILED | %s | local=%s broker=%s status=%s",
+                        self.client_id, contract, local_id, broker_id, cancel_status,
+                    )
 
         except Exception as exc:
             log.error(
