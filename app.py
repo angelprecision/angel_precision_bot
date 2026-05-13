@@ -1781,6 +1781,100 @@ def admin_flatten_all():
     })
 
 
+@app.post("/admin/position/force_exit/<position_id>")
+@_require_admin
+def admin_force_exit_position(position_id: str):
+    """
+    Force-close a specific open position from the admin dashboard.
+    Submits IMMEDIATE exit to the exit engine. Also writes proof_trades
+    so the close appears in the ledger.
+    """
+    data      = request.get_json(silent=True) or {}
+    client_id = data.get("client_id", "").strip()
+    reason    = data.get("reason", "admin_dashboard_force_exit")
+
+    admin_log.warning(
+        "FORCE_EXIT_POSITION pos=%s client=%s reason=%s ip=%s",
+        position_id, client_id, reason, _admin_client_ip(),
+    )
+
+    # Find the right runner
+    target_runner = None
+    for cid, runner in _iter_client_runners():
+        if client_id and cid != client_id:
+            continue
+        target_runner = runner
+        if client_id:
+            break
+
+    if not target_runner:
+        return jsonify({"ok": False, "error": f"No active runner for {client_id}"}), 404
+
+    ee = _get_exit_engine(target_runner)
+    if not ee:
+        return jsonify({"ok": False, "error": "Exit engine not available"}), 503
+
+    # Find position in exit engine
+    pos = None
+    try:
+        for p in ee.active_positions():
+            if str(getattr(p, "position_id", "")) == position_id:
+                pos = p
+                break
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"Position lookup failed: {e}"}), 500
+
+    if pos is None:
+        # Not in exit engine — close directly via position manager
+        try:
+            from ap.position_manager import APPositionManager
+            from ap.db import conn, run_with_retry
+            def _get_pos():
+                with conn() as c:
+                    c.execute("SELECT * FROM positions WHERE id=%s AND client_id=%s",
+                              (position_id, target_runner.email))
+                    return c.fetchone()
+            row = run_with_retry(_get_pos)
+            if not row:
+                return jsonify({"ok": False, "error": "Position not found"}), 404
+            row = dict(row)
+            entry_px = float(row.get("avg_fill") or row.get("entry_price") or 0)
+            pm = APPositionManager(target_runner.email)
+            pm.close_position_from_exit_fill(
+                position_id=position_id, exit_price=entry_px,
+                filled_qty=int(row.get("qty") or 1),
+                close_source="admin_force_exit", close_confidence="LOW",
+                exit_reason=reason,
+            )
+            return jsonify({"ok": True, "position_id": position_id,
+                            "method": "position_manager_direct",
+                            "warning": "Closed at entry price — update exit_option_price in proof_trades manually."})
+        except Exception as e:
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    # Submit immediate exit decision
+    try:
+        from ap_exit_engine import ExitDecision
+        qty = int(getattr(pos, "quantity_remaining", 0) or getattr(pos, "quantity", 1))
+        decision = ExitDecision(
+            action="CLOSE_ALL", quantity=qty,
+            reason=f"ADMIN FORCE EXIT — {reason}",
+            urgency="IMMEDIATE",
+            pnl_pct=getattr(pos, "option_pnl_pct", 0.0),
+            reason_code="ADMIN_FORCE_EXIT",
+        )
+        submitted = ee._submit_exit_decision(pos, decision, kill_active=True)
+        return jsonify({
+            "ok": True, "position_id": position_id,
+            "ticker": getattr(pos, "ticker", "?"),
+            "method": "exit_engine_immediate",
+            "submitted": bool(submitted),
+            "current_pnl_pct": round(getattr(pos, "option_pnl_pct", 0.0) * 100, 1),
+        })
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "5000"))
     log.info(f"Starting on port {port}")

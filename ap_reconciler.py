@@ -2232,6 +2232,45 @@ class APBrokerReconciler:
             pnl_dollars, pnl_pct, close_confidence,
         )
         summary["positions_corrected"] += 1
+
+        # ── Auto-log to proof_trades so manual/reconciler closes appear in ledger ──
+        # Without this, any position closed outside the exit engine (manual broker
+        # close, overnight expiry, emergency flatten) is invisible in the trade ledger.
+        try:
+            from ap_proof_logger import APProofLogger as _APProofLogger
+            _proof = _APProofLogger(client_id=self.client_id)
+            _proof.log_trade(
+                ticker             = underlying or contract[:6],
+                pattern            = "",
+                side               = side or "CALL",
+                timeframe          = "1d",
+                score              = 0,
+                tier               = "A",
+                context_score      = 0,
+                setup_status       = "reconciler_auto_close",
+                entry_trigger      = entry_px,
+                entry_option_price = entry_px,
+                exit_option_price  = exit_px,
+                underlying_entry   = 0.0,
+                underlying_exit    = 0.0,
+                contracts          = db_qty or 1,
+                exit_reason        = f"RECONCILER_AUTO_CLOSE | {close_confidence} | broker_position_missing",
+                option_pnl_pct     = pnl_pct / 100.0,
+                underlying_pnl_pct = 0.0,
+                win                = exit_px > entry_px,
+                spread_pct         = 0.0,
+                chain_grade        = "",
+                synthetic_entry    = False,
+            )
+            log.info(
+                "[%s] proof_trade logged for reconciler auto-close | %s | pnl=%.1f%%",
+                self.client_id, contract, pnl_pct,
+            )
+        except Exception as _proof_err:
+            log.warning(
+                "[%s] proof_trade log failed for reconciler close (non-fatal): %s",
+                self.client_id, _proof_err,
+            )
         try:
             from ap_proof_logger import funnel as _funnel_r
             _funnel_r.inc("reconciler_corrections")
