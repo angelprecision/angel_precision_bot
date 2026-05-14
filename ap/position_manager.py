@@ -956,16 +956,20 @@ class APPositionManager:
                                    exit_reason       = CASE
                                      WHEN exit_reason IS NULL OR exit_reason = ''
                                      THEN %s ELSE exit_reason END
-                               WHERE position_id = %s
-                                 AND client_id   = %s
-                                 AND system_version = 'v2'
-                                 AND synthetic_entry = FALSE""",
+                               WHERE id = (
+                                 SELECT id FROM proof_trades
+                                 WHERE client_email   = %s
+                                   AND system_version = 'v2'
+                                   AND synthetic_entry = FALSE
+                                   AND closed_at >= NOW() - INTERVAL '2 hours'
+                                 ORDER BY closed_at DESC
+                                 LIMIT 1
+                               )""",
                             (
                                 round(exit_px, 4),
                                 round(pnl_pct, 2),
                                 is_win,
                                 exit_reason,
-                                position_id,
                                 self.client_id,
                             ),
                         )
