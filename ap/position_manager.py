@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import uuid
 from datetime import datetime, timezone, timedelta
 from typing import Optional
@@ -932,6 +933,52 @@ class APPositionManager:
                 detail.get("realized_pnl", 0), detail.get("realized_pnl_pct", 0),
                 close_source, broker_order_id or "",
             )
+            # ── Repair proof_trades with actual broker fill price ─────────────
+            # proof_trades is written at exit-decision time using bid price.
+            # The real fill price comes in later — always update with broker truth.
+            try:
+                pnl_pct    = detail.get("realized_pnl_pct", 0)
+                is_win     = pnl_pct > 0
+                dollar_pnl = detail.get("realized_pnl", 0)
+                # Breakeven: loss < $10 and % loss < 3% — don't punish the win rate
+                BREAKEVEN_DOLLAR = float(os.getenv("BREAKEVEN_DOLLAR_THRESHOLD", "10"))
+                BREAKEVEN_PCT    = float(os.getenv("BREAKEVEN_PCT_THRESHOLD", "3.0"))
+                if not is_win and abs(dollar_pnl) < BREAKEVEN_DOLLAR and abs(pnl_pct) < BREAKEVEN_PCT:
+                    is_win = True  # breakeven — count as win for rate calculation
+
+                def _proof_update():
+                    with conn() as c:
+                        c.execute(
+                            """UPDATE proof_trades
+                               SET exit_option_price = %s,
+                                   option_pnl_pct    = %s,
+                                   win               = %s,
+                                   exit_reason       = CASE
+                                     WHEN exit_reason IS NULL OR exit_reason = ''
+                                     THEN %s ELSE exit_reason END
+                               WHERE position_id = %s
+                                 AND client_id   = %s
+                                 AND system_version = 'v2'
+                                 AND synthetic_entry = FALSE""",
+                            (
+                                round(exit_px, 4),
+                                round(pnl_pct, 2),
+                                is_win,
+                                exit_reason,
+                                position_id,
+                                self.client_id,
+                            ),
+                        )
+                run_with_retry(_proof_update)
+                log.info(
+                    "[%s] proof_trades updated with broker fill | pos=%s exit=$%.2f pnl=%.1f%% win=%s",
+                    self.client_id, position_id, exit_px, pnl_pct, is_win,
+                )
+            except Exception as _proof_err:
+                log.warning(
+                    "[%s] proof_trades fill repair failed (non-fatal): %s",
+                    self.client_id, _proof_err,
+                )
             return True
 
         log.warning(
