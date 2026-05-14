@@ -435,14 +435,26 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
         )
 
     # ── TOUCHED PROFIT PROTECTION ─────────────────────────────────────────────
-    if pos.scale_outs_done == 0 and pos.touched_profit and option_pnl <= -0.05:
-        return ExitDecision(
-            action="CLOSE_ALL", quantity=qty_rem,
-            reason=(
-                f"TOUCHED PROFIT STOP — was +{pos.max_profit_seen*100:.0f}% "
-                f"now {option_pnl*100:.0f}% — protecting capital"
-            ),
-            urgency="IMMEDIATE", pnl_pct=option_pnl,
+    # If position ever went green, we never let it close worse than:
+    #   peak >= 10%  → floor at -3% (tiny loss acceptable)
+    #   peak >= 5%   → floor at -5% (original threshold)
+    #   any green    → floor at -8% (loose catch-all)
+    if pos.scale_outs_done == 0 and pos.touched_profit:
+        _max = pos.max_profit_seen or 0
+        _floor = -0.08  # catch-all default
+        if _max >= 0.10:
+            _floor = -0.03   # peaked 10%+ — exit at -3% max
+        elif _max >= 0.05:
+            _floor = -0.05   # peaked 5-10% — exit at -5% max
+
+        if option_pnl <= _floor:
+            return ExitDecision(
+                action="CLOSE_ALL", quantity=qty_rem,
+                reason=(
+                    f"TOUCHED PROFIT STOP — peaked +{_max*100:.0f}% "
+                    f"now {option_pnl*100:.0f}% — floor={_floor*100:.0f}%"
+                ),
+                urgency="IMMEDIATE", pnl_pct=option_pnl,
         )
 
     # ── 33/33/34 SCALE-OUT LADDER ────────────────────────────────────────────
