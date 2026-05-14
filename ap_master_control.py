@@ -38,27 +38,36 @@ MIN_CONTRACTS_PER_POSITION = int(os.getenv("MIN_CONTRACTS_PER_POSITION", "2"))
 # (e.g. NVDA drops from 9.50 to 4.00 in low-vol regime), the capital gate will
 # over-block valid signals. Update before each live trading quarter.
 _PREMIUM_ESTIMATES: dict[str, float] = {
-    "NVDA": 9.50,
-    "TSLA": 7.00,
-    "META": 6.00,
-    "NFLX": 8.00,
-    "AMD": 4.50,
-    "MSFT": 5.00,
-    "AAPL": 2.50,
-    "SPY": 2.00,
-    "QQQ": 3.50,
-    "IWM": 1.50,
-    "DIA": 2.50,
-    "COIN": 5.00,
-    "PLTR": 1.50,
-    "MSTR": 18.00,
-    "AMZN": 4.50,
-    "GOOG": 4.00,
-    "GOOGL": 4.00,
-    "GS": 4.00,
-    "ORCL": 3.00,
-    "WFC": 2.50,
-    "MS": 3.50,
+    # Calibrated to typical 2-4% OTM options, 2-5 DTE
+    # These drive contract sizing in pre-selection gates only.
+    # Once a real contract is selected, its limit_price overrides these.
+    "NVDA":  4.50,
+    "TSLA":  3.50,
+    "META":  3.50,
+    "NFLX":  4.00,
+    "AMD":   2.00,
+    "MSFT":  2.50,
+    "AAPL":  1.50,
+    "SPY":   1.50,
+    "QQQ":   2.00,
+    "IWM":   1.00,
+    "DIA":   1.50,
+    "COIN":  3.00,
+    "PLTR":  1.00,
+    "MSTR":  8.00,
+    "AMZN":  2.50,
+    "GOOG":  2.50,
+    "GOOGL": 2.50,
+    "GS":    2.50,
+    "JPM":   2.00,
+    "ORCL":  1.50,
+    "WFC":   1.50,
+    "MS":    2.00,
+    "AVGO":  3.00,
+    "CRM":   2.00,
+    "PYPL":  1.50,
+    "ORLY":  4.00,
+    "AEP":   1.00,
 }
 _DEFAULT_PREMIUM_FALLBACK = 3.50
 
@@ -879,6 +888,12 @@ class APMasterControl:
                 log.warning("[%s] Feedback modifier failed: %s", ticker, e)
 
         placeholder_premium = 100 * _estimate_premium(ticker)
+        # Use actual contract limit_price if the signal already has one selected
+        # This gives accurate contract sizing instead of falling back to estimates
+        _actual_limit = float(signal.get("limit_price") or signal.get("contract_premium") or 0)
+        if _actual_limit > 0:
+            placeholder_premium = _actual_limit * 100
+            log.debug("[%s] Using actual contract premium $%.2f for sizing", ticker, _actual_limit)
         raw_pnl = snap.get("realized_pnl_today", 0.0)
         in_session = True
         try:
