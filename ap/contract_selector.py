@@ -238,7 +238,12 @@ def _pro_contract_quality(opt: dict, ticker: str, dte: int) -> tuple[str, str]:
     else:
         min_vol, min_oi = 150, 1000   # 8+ DTE: OI 2000→1000
 
-    if vol < min_vol and oi < min_oi:
+    # Tradier sandbox always returns OI=0 and volume=0 — liquidity check
+    # would block every paper trade. Skip OI/volume gate in paper/sandbox mode.
+    _is_paper = str(os.getenv("BOT_MODE", "paper")).upper() != "LIVE"
+    if _is_paper and vol == 0 and oi == 0:
+        pass  # sandbox data — skip liquidity gate, proceed to spread/bid checks
+    elif vol < min_vol and oi < min_oi:
         return "REJECT", f"illiquid_vol{vol}_oi{oi}_need_v{min_vol}_or_oi{min_oi}"
 
     size_ok_A = (bid_size >= _PRO_T1_SIZE_MIN and ask_size >= _PRO_T1_SIZE_MIN) if is_t1                 else (bid_size >= _PRO_T2_SIZE_MIN and ask_size >= _PRO_T2_SIZE_MIN)
