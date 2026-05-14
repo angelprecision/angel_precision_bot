@@ -76,6 +76,27 @@ except Exception:
 log = logging.getLogger("ap.exit_engine")
 ET  = ZoneInfo("America/New_York")
 
+# ── EXIT DECISION LEDGER — best-effort audit; never blocks live exits ─────────
+try:
+    from ap.exit_decision_ledger import record_exit_decision as _ledger_record
+except Exception:
+    _ledger_record = None  # type: ignore[assignment]
+
+
+def _ledger_exit_decision(pos, decision, *, client_id: str = "") -> None:
+    """Non-fatal wrapper — logs every exit decision cycle when position is green."""
+    try:
+        if _ledger_record is None:
+            return
+        _ledger_record(
+            pos, decision,
+            client_id=client_id or str(getattr(pos, "client_id", "") or ""),
+            metadata={"event_context": "exit_loop"},
+        )
+    except Exception:
+        pass
+# ─────────────────────────────────────────────────────────────────────────────
+
 # ── TIME THRESHOLDS (ET) ──────────────────────────────────────────────────────
 PROFIT_PROTECT_1_HOUR = 11   # 11:00 AM -- scale out 50% if +40%
 PROFIT_PROTECT_1_MIN  = 0
@@ -2792,6 +2813,7 @@ class APExitEngine:
                     # Duplicate peak advance removed — handled above pre-gate.
                     # Gate now only controls whether evaluate_exit() is called.
                     decision = evaluate_exit(pos, now_et)
+                    _ledger_exit_decision(pos, decision, client_id=self.client_id)
                     decision.reason_code = _classify_exit_decision(decision)
 
                     if decision.should_act:
