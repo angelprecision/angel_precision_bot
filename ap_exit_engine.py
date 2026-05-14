@@ -2813,8 +2813,8 @@ class APExitEngine:
                     # Duplicate peak advance removed — handled above pre-gate.
                     # Gate now only controls whether evaluate_exit() is called.
                     decision = evaluate_exit(pos, now_et)
-                    _ledger_exit_decision(pos, decision, client_id=self.client_id)
                     decision.reason_code = _classify_exit_decision(decision)
+                    _ledger_exit_decision(pos, decision, client_id=self.client_id)
 
                     if decision.should_act:
                         option_quote_stale, option_quote_age_sec, option_quote_state = _is_option_quote_stale(pos, now_utc)

@@ -679,6 +679,21 @@ class ClientRunner(threading.Thread):
         qm.start()
         logger.info("[%s] PositionQuoteMonitor started and attached to exit engine", self.email)
 
+        # ── Start ExitReliabilityMonitor alongside QPM ────────────────────────
+        # Checks every 60s for: GREEN_NO_DECISION, DECISION_NO_ORDER, STALE_EXIT_ORDER
+        try:
+            from ap.exit_reliability_monitor import ExitReliabilityMonitor
+            erm = ExitReliabilityMonitor(
+                client_id=self.email,
+                exit_engine=exit_eng,
+                supabase_client=getattr(self, "supabase", None),
+            )
+            erm.start()
+            self.exit_reliability_monitor = erm
+            logger.info("[%s] ExitReliabilityMonitor started", self.email)
+        except Exception as _erm_err:
+            logger.warning("[%s] ExitReliabilityMonitor failed to start (non-fatal): %s", self.email, _erm_err)
+
     def _set_entry_permission(self):
         _worker_ok = self.worker_thread is not None and self.worker_thread.is_alive()
         _fill_ok   = self.fill_monitor_thread is not None and self.fill_monitor_thread.is_alive()
@@ -1482,6 +1497,15 @@ class ClientRunner(threading.Thread):
             finally:
                 self.quotemonitor = None
                 self.quote_monitor = None
+
+        if getattr(self, "exit_reliability_monitor", None):
+            try:
+                self.exit_reliability_monitor.stop()
+                logger.info("[%s] ExitReliabilityMonitor stopped", self.email)
+            except Exception:
+                pass
+            finally:
+                self.exit_reliability_monitor = None
 
         if self.order_monitor:
             try:

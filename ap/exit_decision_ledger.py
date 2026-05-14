@@ -50,6 +50,13 @@ def _write(row: dict) -> bool:
     """Insert one row into exit_decision_ledger. Returns True on success."""
     try:
         from ap.db import conn, run_with_retry
+        from psycopg2.extras import Json
+
+        row = dict(row)
+        if isinstance(row.get("metadata"), dict):
+            row["metadata"] = Json(row["metadata"])
+        if isinstance(row.get("payload"), dict):
+            row["payload"] = Json(row["payload"])
 
         cols = list(row.keys())
         vals = list(row.values())

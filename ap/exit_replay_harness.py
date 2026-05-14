@@ -41,9 +41,9 @@ class _StubPosition:
         self,
         entry_price: float,
         qty: int,
-        ticker: str = "REPLAY",
+        ticker: str = "SPY",
         side: str = "CALL",
-        contract: str = "REPLAY_CONTRACT",
+        contract: str = "SPY260515C00500000",
     ) -> None:
         self.position_id          = "replay-0001"
         self.signal_id            = "replay-signal"
@@ -64,6 +64,8 @@ class _StubPosition:
         self.current_ask          = float(entry_price) * 1.03
         self.current_underlying   = 100.0
         self.underlying_entry     = 100.0
+        self.underlying_target    = 999999.0   # never trigger target
+        self.underlying_stop      = 0.0        # never trigger stop
         self.option_pnl_pct       = 0.0
         self.underlying_pnl_pct   = 0.0
         self.peak_pnl_pct         = 0.0
@@ -76,9 +78,18 @@ class _StubPosition:
         self.last_option_quote_ts = datetime.now(timezone.utc)
         self.last_und_quote_ts    = datetime.now(timezone.utc)
         self.opened_at            = datetime.now(timezone.utc)
+        self.entry_ts             = datetime.now(timezone.utc)
         self.scale_out_orders     = []
         self.pending_exit_action  = None
         self.pending_exit_local_order_id = None
+
+    @property
+    def is_at_target(self) -> bool:
+        return False
+
+    @property
+    def is_at_stop(self) -> bool:
+        return False
 
     def update_price(self, price: float) -> None:
         self.current_option_price = price
