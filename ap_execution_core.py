@@ -914,9 +914,22 @@ class APExecutionCore:
             )
             return
 
-        opt_pnl = (exit_price - pos.entry_price) / pos.entry_price * 100 if pos.entry_price else 0  # percent (e.g. 15.3), NOT decimal ratio
-        win     = opt_pnl > 0
-        tier    = sig.get("tier", "A+")
+        # Always compute option P&L from option prices — never from pos.entry_price
+        # which can be seeded from avg_fill (which sometimes stored underlying price).
+        _entry_opt = float(pos.entry_price or 0)
+        _exit_opt  = float(exit_price or 0)
+        if _entry_opt > 0 and _exit_opt > 0:
+            opt_pnl = (_exit_opt - _entry_opt) / _entry_opt * 100  # e.g. 15.3 = 15.3%
+        else:
+            opt_pnl = 0.0
+        win  = opt_pnl > 0
+        tier = sig.get("tier", "A+")
+
+        if _entry_opt > 0:
+            log.info(
+                "[%s] P&L CALC | entry=$%.4f exit=$%.4f → option_pnl=%.1f%% win=%s",
+                pos.ticker, _entry_opt, _exit_opt, opt_pnl, win,
+            )
 
         # Set 30-min same-direction cooldown on master_control
         try:
