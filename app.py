@@ -1875,6 +1875,96 @@ def admin_force_exit_position(position_id: str):
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
+@app.get("/health")
+def health_basic():
+    """Basic liveness check — no auth required."""
+    import time as _t
+    return jsonify({"ok": True, "status": "healthy", "ts": _t.time()}), 200
+
+
+@app.get("/execution/health")
+@require_hmac
+def execution_health():
+    """Execution component health — fill monitor, reconciler, order worker."""
+    try:
+        from client_runner import _active_runners, _registry_lock
+        components = {}
+        with _registry_lock:
+            for email, runner in list(_active_runners.items()):
+                components[email] = {
+                    "order_worker_alive":  bool(getattr(runner, "worker_thread", None) and runner.worker_thread.is_alive()),
+                    "fill_monitor_alive":  bool(getattr(runner, "fill_monitor_thread", None) and runner.fill_monitor_thread.is_alive()),
+                    "reconciler_alive":    bool(getattr(runner, "reconciler_thread", None) and runner.reconciler_thread.is_alive()),
+                    "equity_alive":        bool(getattr(runner, "equity_thread", None) and runner.equity_thread.is_alive()),
+                    "mode":                getattr(runner, "mode", "UNKNOWN"),
+                    "runner_alive":        runner.is_alive(),
+                }
+        all_ok = all(
+            v["order_worker_alive"] and v["fill_monitor_alive"]
+            for v in components.values()
+        ) if components else False
+        return jsonify({"ok": True, "healthy": all_ok, "clients": components})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 200
+
+
+@app.get("/scanner/health")
+@require_hmac
+def scanner_health():
+    """Scanner health — reads from ap_signals for today's activity."""
+    try:
+        from ap.db import conn, run_with_retry
+        from datetime import date as _date
+        today = str(_date.today())
+        def _q():
+            with conn() as c:
+                c.execute(
+                    "SELECT COUNT(*) as total, "
+                    "SUM(CASE WHEN decision_status='ARMED' OR decision_status='WATCHING' THEN 1 ELSE 0 END) as passed "
+                    "FROM ap_signals WHERE DATE(created_at)=%s", (today,)
+                )
+                return dict(c.fetchone())
+        row = run_with_retry(_q) or {}
+        return jsonify({
+            "ok":              True,
+            "online":          True,
+            "signals_today":   int(row.get("total") or 0),
+            "signals_passed":  int(row.get("passed") or 0),
+        })
+    except Exception as e:
+        return jsonify({"ok": True, "online": True, "signals_today": 0, "error": str(e)}), 200
+
+
+@app.get("/intelligence/health")
+@require_hmac
+def intelligence_health():
+    """Intelligence gate health — reads decision breakdown from ap_signals."""
+    try:
+        from ap.db import conn, run_with_retry
+        from datetime import date as _date
+        today = str(_date.today())
+        def _q():
+            with conn() as c:
+                c.execute(
+                    "SELECT decision_status, COUNT(*) as cnt FROM ap_signals "
+                    "WHERE DATE(created_at)=%s GROUP BY decision_status", (today,)
+                )
+                return [dict(r) for r in c.fetchall()]
+        rows = run_with_retry(_q) or []
+        breakdown = {r["decision_status"]: r["cnt"] for r in rows}
+        total = sum(breakdown.values())
+        return jsonify({
+            "ok":        True,
+            "online":    True,
+            "total":     total,
+            "breakdown": breakdown,
+            "approved":  breakdown.get("ARMED", 0) + breakdown.get("WATCHING", 0),
+            "rejected":  breakdown.get("rejected", 0),
+        })
+    except Exception as e:
+        return jsonify({"ok": True, "online": True, "total": 0, "error": str(e)}), 200
+
+
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "5000"))
     log.info(f"Starting on port {port}")
