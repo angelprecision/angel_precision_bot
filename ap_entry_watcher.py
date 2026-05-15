@@ -614,7 +614,16 @@ class APEntryWatcher:
 
         # Queue-time staleness check is skipped for outside-session setups.
         # Those are revalidated at the regular-session open instead.
-        if post_session or pre_market:
+        # Also skip for overnight/daily signals — their trigger is a prior-day
+        # level, not a same-day intraday price. A 1.5% move from a prior-day
+        # high/low is normal and should not invalidate the signal at arm time.
+        _is_overnight_signal = bool(
+            signal_dict.get("prior_day_high") or
+            signal_dict.get("prior_day_low") or
+            str(signal_dict.get("timeframe", "")).lower() in ("1d", "daily", "overnight")
+        )
+
+        if post_session or pre_market or _is_overnight_signal:
             log.info(
                 "[%s] Outside-session queue — skipping queue-time staleness check "
                 "(trigger=$%.2f side=%s)",
