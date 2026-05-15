@@ -941,7 +941,7 @@ class APBrokerReconciler:
         pos_id        = str(order.get("position_id") or order.get("positionId") or "").strip()
         contract      = self._norm_contract(order.get("contract") or order.get("symbol") or "")
         underlying    = self._norm_underlying(
-            order.get("underlying") or order.get("ticker") or contract[:6]
+            order.get("underlying") or order.get("ticker") or self._norm_underlying(contract)
         )
         requested_qty = self._db_order_requested_qty(order)
 
@@ -1110,7 +1110,7 @@ class APBrokerReconciler:
             recent_fill = self._get_recent_exit_fill(
                 contract,
                 self._norm_underlying(
-                    order.get("underlying") or order.get("ticker") or contract[:6]
+                    order.get("underlying") or order.get("ticker") or self._norm_underlying(contract)
                 ),
             )
             if recent_fill:
@@ -1803,7 +1803,22 @@ class APBrokerReconciler:
         return str(val or "").strip().upper()
 
     def _norm_underlying(self, val: str) -> str:
-        return str(val or "").strip().upper()
+        """
+        Normalize a ticker/underlying value.
+        Handles OCC contract symbols like TSLA260515C00452500 → TSLA.
+        OCC format: <TICKER><6-digit-date><C|P><8-digit-strike>
+        Ticker is 1-6 alpha chars at the start.
+        """
+        s = str(val or "").strip().upper()
+        if not s:
+            return s
+        # If it looks like an OCC symbol (contains digits after letters), extract ticker
+        import re as _re
+        m = _re.match(r'^([A-Z]{1,6})\d{6}[CP]\d+$', s)
+        if m:
+            return m.group(1)
+        # Plain ticker — return as-is
+        return s
 
     def _safe_int(self, value, default: int = 0) -> int:
         try:
@@ -2045,7 +2060,7 @@ class APBrokerReconciler:
         for pos in db_positions:
             pos_id     = pos.get("id") or pos.get("position_id")
             contract   = self._norm_contract(pos.get("contract") or pos.get("symbol") or "")
-            underlying = self._norm_underlying(pos.get("underlying") or pos.get("ticker") or contract[:6])
+            underlying = self._norm_underlying(pos.get("underlying") or pos.get("ticker") or self._norm_underlying(contract))
             db_qty     = int(pos.get("qty") or pos.get("quantity") or 0)
             entry_px   = float(pos.get("avg_fill") or pos.get("entry_price") or 0.0)
 
@@ -2162,7 +2177,7 @@ class APBrokerReconciler:
         # exactly why the reconciler decided broker truth required closing DB truth.
         self._record_reconciler_rejection(
             signal_id=str(pos_id or f"ghost:{contract}"),
-            ticker=underlying or contract[:6],
+            ticker=self._norm_underlying(underlying or contract),
             category_name="DATA",
             severity_name="WARNING",
             reason_code="BROKER_POSITION_MISSING_THREE_PASS_CONFIRM",
@@ -2240,7 +2255,7 @@ class APBrokerReconciler:
             from ap_proof_logger import APProofLogger as _APProofLogger
             _proof = _APProofLogger(client_id=self.client_id)
             _proof.log_trade(
-                ticker             = underlying or contract[:6],
+                ticker             = self._norm_underlying(underlying or contract),
                 pattern            = "",
                 side               = side or "CALL",
                 timeframe          = "1d",
@@ -2353,7 +2368,7 @@ class APBrokerReconciler:
                 summary["positions_alerted"] += 1
                 self._record_reconciler_rejection(
                     signal_id=f"reconciled:{contract}",
-                    ticker=underlying or contract[:6],
+                    ticker=self._norm_underlying(underlying or contract),
                     category_name="DATA",
                     severity_name="WARNING",
                     reason_code="BROKER_POSITION_IMPORT_FAILED",
@@ -2368,7 +2383,7 @@ class APBrokerReconciler:
 
             self._record_recovered_position(
                 signal_id=str(pos_id or f"reconciled:{contract}"),
-                ticker=underlying or contract[:6],
+                ticker=self._norm_underlying(underlying or contract),
                 reason="broker_open_position_missing_from_db_imported",
                 contract=contract,
                 qty=qty,
@@ -2444,7 +2459,7 @@ class APBrokerReconciler:
                 pos_id = self.pm.open_position(
                     plan_id=imported_plan_id,
                     signal_id=imported_signal_id,
-                    ticker=underlying or contract[:6],
+                    ticker=self._norm_underlying(underlying or contract),
                     contract=contract,
                     side=side,
                     qty=qty,
@@ -2498,7 +2513,7 @@ class APBrokerReconciler:
                         (
                             pos_id,
                             self.client_id,
-                            underlying or contract[:6],
+                            self._norm_underlying(underlying or contract),
                             contract,
                             side,
                             int(qty),
@@ -2537,7 +2552,7 @@ class APBrokerReconciler:
                         (
                             pos_id,
                             self.client_id,
-                            underlying or contract[:6],
+                            self._norm_underlying(underlying or contract),
                             contract,
                             side,
                             int(qty),
@@ -2566,7 +2581,7 @@ class APBrokerReconciler:
                         (
                             pos_id,
                             self.client_id,
-                            underlying or contract[:6],
+                            self._norm_underlying(underlying or contract),
                             contract,
                             side,
                             int(qty),
@@ -2669,7 +2684,7 @@ class APBrokerReconciler:
 
         pos_id     = str(pos.get("id") or pos.get("position_id") or "")
         contract   = self._norm_contract(pos.get("contract") or pos.get("symbol") or "")
-        underlying = self._norm_underlying(pos.get("underlying") or pos.get("ticker") or contract[:6])
+        underlying = self._norm_underlying(pos.get("underlying") or pos.get("ticker") or self._norm_underlying(contract))
         side       = str(pos.get("direction") or pos.get("side") or "CALL").upper()
         qty        = int(
             pos.get("qty")
@@ -2726,7 +2741,7 @@ class APBrokerReconciler:
             )
             self._record_reconciler_rejection(
                 signal_id=str(pos_id or f"reconciled:{contract}"),
-                ticker=underlying or contract[:6],
+                ticker=self._norm_underlying(underlying or contract),
                 category_name="HEALTH",
                 severity_name="CRITICAL",
                 reason_code="EXIT_ENGINE_NOT_WIRED",
@@ -2755,7 +2770,7 @@ class APBrokerReconciler:
                 )
 
             mp = ManagedPosition(
-                ticker=underlying or contract[:6],
+                ticker=self._norm_underlying(underlying or contract),
                 option_symbol=contract,
                 side=side,
                 quantity=int(qty),
@@ -2780,7 +2795,7 @@ class APBrokerReconciler:
             )
             self._record_position_reseeded(
                 signal_id=str(pos_id or f"reconciled:{contract}"),
-                ticker=underlying or contract[:6],
+                ticker=self._norm_underlying(underlying or contract),
                 reason="position_seeded_into_exit_engine_by_reconciler",
                 contract=contract,
                 pos_id=pos_id,
@@ -2807,7 +2822,7 @@ class APBrokerReconciler:
                       self.client_id, contract, e)
             self._record_reconciler_rejection(
                 signal_id=str(pos_id or f"reconciled:{contract}"),
-                ticker=underlying or contract[:6],
+                ticker=self._norm_underlying(underlying or contract),
                 category_name="EXECUTION",
                 severity_name="CRITICAL",
                 reason_code="EXIT_ENGINE_SEED_FAILED",
@@ -2930,7 +2945,7 @@ class APBrokerReconciler:
 
         # Last resort: current underlying is safer than hardcoded zero, but still
         # treated as approximate by the exit engine via underlying_entry_untrusted.
-        return self._get_current_underlying_price(underlying or contract[:6])
+        return self._get_current_underlying_price(self._norm_underlying(underlying or contract))
 
     def _derive_underlying_entry_from_position(
         self,
@@ -2949,7 +2964,7 @@ class APBrokerReconciler:
                 return val
 
         # Do NOT infer entry from stop/target; that corrupts progress math.
-        return self._get_current_underlying_price(underlying or contract[:6])
+        return self._get_current_underlying_price(self._norm_underlying(underlying or contract))
 
     def _active_exit_order_exists(
         self,
