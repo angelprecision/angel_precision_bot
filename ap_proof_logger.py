@@ -257,6 +257,8 @@ class APProofLogger:
         opened_at:           Optional[datetime] = None,
         closed_at:           Optional[datetime] = None,
         synthetic_entry:     bool = False,
+        position_id:         str  = "",
+        local_order_id:      str  = "",
     ) -> dict:
         now = datetime.now(timezone.utc)
         row = {
@@ -286,6 +288,8 @@ class APProofLogger:
             "spread_pct":         round(spread_pct, 4),
             "chain_grade":        chain_grade,
             "synthetic_entry":    bool(synthetic_entry),
+            "position_id":        position_id or None,
+            "local_order_id":     local_order_id or None,
         }
 
         # Cache for convenience — not source of truth

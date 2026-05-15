@@ -958,10 +958,16 @@ class APPositionManager:
                                      THEN %s ELSE exit_reason END
                                WHERE id = (
                                  SELECT id FROM proof_trades
-                                 WHERE client_email   = %s
+                                 WHERE client_email  = %s
                                    AND system_version = 'v2'
                                    AND synthetic_entry = FALSE
-                                   AND closed_at >= NOW() - INTERVAL '2 hours'
+                                   AND (
+                                     (position_id = %s AND %s IS NOT NULL AND %s != '')
+                                     OR (
+                                       position_id IS NULL
+                                       AND closed_at >= NOW() - INTERVAL '2 hours'
+                                     )
+                                   )
                                  ORDER BY closed_at DESC
                                  LIMIT 1
                                )""",
@@ -971,6 +977,7 @@ class APPositionManager:
                                 is_win,
                                 exit_reason,
                                 self.client_id,
+                                position_id, position_id, position_id,
                             ),
                         )
                 run_with_retry(_proof_update)

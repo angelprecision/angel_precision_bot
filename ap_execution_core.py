@@ -988,6 +988,8 @@ class APExecutionCore:
             chain_grade        = sig.get("chain_grade", ""),
             opened_at          = pos.opened_at if hasattr(pos, "opened_at") else None,
             synthetic_entry    = bool(getattr(pos, "synthetic_entry", False)),
+            position_id        = str(getattr(pos, "position_id", "") or ""),
+            local_order_id     = str(getattr(pos, "local_order_id", "") or ""),
         )
 
         self.feedback.record_outcome(
