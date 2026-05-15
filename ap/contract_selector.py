@@ -119,6 +119,31 @@ def _safe_float(val, default: float = 0.0) -> float:
         return default
 
 
+def _extract_abs_delta(opt: dict) -> tuple[Optional[float], str]:
+    """
+    Safely extract absolute delta from Tradier greeks dict.
+
+    CRITICAL: Missing/dirty Greeks must NEVER fall back to target_delta.
+    That silent fallback is what allowed the $0.11 far-OTM contract to score
+    as well as a $0.50 contract with real Greeks (bug root cause).
+
+    Returns (abs_delta, reason).  abs_delta is None when unavailable/corrupt.
+    """
+    greeks = opt.get("greeks")
+    if not greeks or not isinstance(greeks, dict):
+        return None, "missing_dirty_greeks_not_dict"
+    raw = greeks.get("delta")
+    if raw is None or raw == "":
+        return None, "missing_delta"
+    try:
+        d = abs(float(raw))
+    except Exception:
+        return None, f"dirty_delta_{raw}"
+    if d <= 0 or d > 1.0:
+        return None, f"delta_out_of_valid_range_{d:.4f}"
+    return d, "ok"
+
+
 def _safe_plan_attr(plan, attr: str, default=None):
     """Get attribute from plan whether it is an object or dict."""
     try:
@@ -831,7 +856,102 @@ class APContractSelectionEngine:
         scored.sort(key=lambda x: x[0], reverse=True)
         best_score, best = scored[0]
 
-        # ── D. BUILD SELECTED CONTRACT ────────────────────────────────────────
+        # ── CANDIDATE AUDIT — log why every contract won or lost ──────────────
+        # This is how you answer "why did we pick $0.11 instead of $0.50?"
+        try:
+            _audit_top = scored[:int(os.getenv("CONTRACT_CANDIDATE_AUDIT_TOP_N", "10"))]
+            for _rank, (_s, _c) in enumerate(_audit_top):
+                _ab, _ar = _extract_abs_delta(_c)
+                _bid = _safe_float(_c.get("bid"))
+                _ask = _safe_float(_c.get("ask"))
+                _prem = ((_bid + _ask) / 2) * 100
+                log.info(
+                    "[%s] CANDIDATE #%d | %s | $%.2f prem=$%.0f delta=%s score=%.1f",
+                    ticker, _rank + 1,
+                    _c.get("symbol", "?"),
+                    (_bid + _ask) / 2,
+                    _prem,
+                    f"{_ab:.3f}" if _ab is not None else f"MISSING({_ar})",
+                    _s,
+                )
+        except Exception:
+            pass
+
+        # ── CHEAP CONTRACT UPGRADE PASS ───────────────────────────────────────
+        # If selected contract is below MIN_ACCEPTABLE_PREMIUM, look for a
+        # better-priced contract in the $50–$350 range.
+        # Cheap contracts ($0.10–$0.49) are fragile: 1 cent move = -10% loss,
+        # fills are hard, and exits fail repeatedly (as seen with NVDA $0.11).
+        _MIN_ACCEPTABLE_PREMIUM = float(os.getenv("MIN_ACCEPTABLE_PREMIUM_PER_CONTRACT", "50"))
+        _MAX_UPGRADE_PREMIUM    = float(os.getenv("MAX_IDEAL_PREMIUM_PER_CONTRACT", "350"))
+
+        is_live_upgrade, _ = _pricing_basis_for_mode(getattr(self, "mode", "paper"))
+
+        def _exec_premium(opt: dict) -> float:
+            b = _safe_float(opt.get("bid"))
+            a = _safe_float(opt.get("ask"))
+            ep = a if is_live_upgrade else (b + a) / 2
+            return ep * 100
+
+        best_exec_prem = _exec_premium(best)
+
+        if best_exec_prem < _MIN_ACCEPTABLE_PREMIUM:
+            upgrade_pool = []
+            for _s, _c in scored[1:]:  # already sorted best-first
+                _prem = _exec_premium(_c)
+                if _MIN_ACCEPTABLE_PREMIUM <= _prem <= _MAX_UPGRADE_PREMIUM:
+                    _delta_val, _ = _extract_abs_delta(_c)
+                    if _delta_val is not None:  # require real Greeks on upgrade
+                        upgrade_pool.append((_s, _c, _prem))
+
+            if upgrade_pool:
+                upgrade_pool.sort(key=lambda x: x[0], reverse=True)
+                old_sym   = best.get("symbol")
+                old_prem  = best_exec_prem
+                best_score, best, new_prem = upgrade_pool[0]
+                log.warning(
+                    "[%s] CONTRACT_UPGRADE | %s ($%.0f) → %s ($%.0f) | reason=cheap_contract_upgrade",
+                    ticker, old_sym, old_prem, best.get("symbol"), new_prem,
+                )
+                self._emit_selector_event(
+                    plan, stage="contract_upgrade", decision="ALLOW",
+                    reason_code="CHEAP_CONTRACT_UPGRADED",
+                    explanation=(
+                        f"Selected {old_sym} premium ${old_prem:.0f} below minimum "
+                        f"${_MIN_ACCEPTABLE_PREMIUM:.0f}; upgraded to "
+                        f"{best.get('symbol')} premium ${new_prem:.0f}"
+                    ),
+                    contract=best.get("symbol"),
+                    inputs={"old_contract": old_sym, "old_premium": round(old_prem, 2),
+                            "new_contract": best.get("symbol"), "new_premium": round(new_prem, 2)},
+                    thresholds={"min_acceptable_premium": _MIN_ACCEPTABLE_PREMIUM,
+                                "max_upgrade_premium": _MAX_UPGRADE_PREMIUM},
+                )
+            else:
+                _allow_cheap = os.getenv("ALLOW_CHEAP_CONTRACT_IF_ONLY_CHOICE", "false").lower() == "true"
+                log.warning(
+                    "[%s] CHEAP_CONTRACT_%s | %s premium=$%.0f below min=$%.0f — no upgrade found",
+                    ticker,
+                    "ALLOWED" if _allow_cheap else "BLOCKED",
+                    best.get("symbol"), best_exec_prem, _MIN_ACCEPTABLE_PREMIUM,
+                )
+                self._emit_selector_event(
+                    plan, stage="cheap_contract_gate",
+                    decision="ALLOW" if _allow_cheap else "REJECT",
+                    reason_code="CHEAP_CONTRACT_NO_UPGRADE" if not _allow_cheap else "CHEAP_CONTRACT_ONLY_CHOICE",
+                    explanation=(
+                        f"{best.get('symbol')} premium ${best_exec_prem:.0f} below "
+                        f"${_MIN_ACCEPTABLE_PREMIUM:.0f} and no upgrade available. "
+                        f"{'Allowed by ALLOW_CHEAP_CONTRACT_IF_ONLY_CHOICE.' if _allow_cheap else 'Blocked.'}"
+                    ),
+                    contract=best.get("symbol"),
+                    inputs={"selected_contract": best.get("symbol"),
+                            "selected_premium": round(best_exec_prem, 2)},
+                    thresholds={"min_acceptable_premium": _MIN_ACCEPTABLE_PREMIUM,
+                                "allow_cheap_if_only_choice": _allow_cheap},
+                )
+                if not _allow_cheap:
+                    return None
         selected = self._build_selected(best, best_score, budget, today)
         if selected is None:
             return None
@@ -1358,17 +1478,17 @@ class APContractSelectionEngine:
                 return "invalid_expiration"
 
         greeks = opt.get("greeks") or {}
-        delta  = greeks.get("delta")
-        if delta is not None:
-            try:
-                delta = abs(float(delta))
-                min_d = max(0.05, self.target_delta - self.delta_band)
-                max_d = min(0.95, self.target_delta + self.delta_band)
-                if delta < min_d or delta > max_d:
-                    return "delta_out_of_band_%.2f" % delta
-            except Exception:
-                pass
-        else:
+        delta, delta_reason = _extract_abs_delta(opt)
+
+        _REQUIRE_REAL_GREEKS = os.getenv("REQUIRE_REAL_GREEKS", "true").lower() != "false"
+
+        if delta is None:
+            # Missing/dirty Greeks: use moneyness as fallback if Greeks are not required.
+            # When REQUIRE_REAL_GREEKS=true (default), reject the contract outright.
+            # This prevents far-OTM $0.11 contracts from passing quality as if delta=target.
+            if _REQUIRE_REAL_GREEKS:
+                return delta_reason  # e.g. "missing_delta", "dirty_delta_..."
+            # Fallback: use moneyness when Greeks are explicitly disabled
             underlying_price = opt.get("_underlying_price")
             strike = float(opt.get("strike") or 0)
             if underlying_price and strike:
@@ -1378,6 +1498,13 @@ class APContractSelectionEngine:
                     return "moneyness_out_of_range_%.3f" % moneyness
                 if option_type == "put" and not (0.88 <= moneyness <= 1.07):
                     return "moneyness_out_of_range_%.3f" % moneyness
+            else:
+                return delta_reason
+        else:
+            min_d = max(0.05, self.target_delta - self.delta_band)
+            max_d = min(0.95, self.target_delta + self.delta_band)
+            if delta < min_d or delta > max_d:
+                return "delta_out_of_band_%.2f" % delta
 
         return None
 
@@ -1407,13 +1534,24 @@ class APContractSelectionEngine:
         execution_premium = execution_price * 100
 
         greeks = opt.get("greeks") or {}
-        try:
-            delta = abs(float(greeks.get("delta") or self.target_delta))
-        except Exception:
-            delta = self.target_delta
+        delta, delta_reason = _extract_abs_delta(opt)
+        if delta is None:
+            # Missing Greeks: assign worst possible delta + heavy penalty.
+            # NEVER use target_delta as fallback — that silently makes
+            # a $0.11 far-OTM contract score like it has perfect delta.
+            delta = 0.01
+            missing_greeks_penalty = -300.0
+        else:
+            missing_greeks_penalty = 0.0
 
-        MAX_IDEAL_PREMIUM = float(os.getenv("MAX_IDEAL_PREMIUM", "3.50"))
-        premium_penalty   = max(0.0, mid - MAX_IDEAL_PREMIUM)
+        # Premium quality penalties — punish both extremes.
+        # MIN_IDEAL: $75/contract — below this fills are fragile (1 penny = -9% loss).
+        # MAX_IDEAL: $350/contract — above this uses too much capital.
+        MIN_IDEAL_PREMIUM = float(os.getenv("MIN_IDEAL_PREMIUM_PER_CONTRACT", "75"))  / 100.0
+        MAX_IDEAL_PREMIUM = float(os.getenv("MAX_IDEAL_PREMIUM_PER_CONTRACT", "350")) / 100.0
+        too_cheap_penalty     = max(0.0, MIN_IDEAL_PREMIUM - execution_price) * 150.0
+        too_expensive_penalty = max(0.0, execution_price - MAX_IDEAL_PREMIUM) * 25.0
+        premium_penalty       = too_cheap_penalty + too_expensive_penalty
 
         effective_budget, _, _ = _effective_budget(budget)
         affordable = int(effective_budget / execution_premium) if execution_premium > 0 else 0
@@ -1450,9 +1588,10 @@ class APContractSelectionEngine:
             (spread_pct      * spread_weight)  +
             (math.log(oi+1)  * 12)             +
             (math.log(vol+1) *  6)             +
-            (premium_penalty * premium_weight) +
-            (affordability_ratio * 10)       +
-            unaffordable_penalty             +
+            - premium_penalty                  +
+            (affordability_ratio * 10)         +
+            unaffordable_penalty               +
+            missing_greeks_penalty             +
             (otm_bias        *  6)
         )
 

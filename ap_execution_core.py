@@ -820,6 +820,25 @@ class APExecutionCore:
 
         _use_market = _urgency == "IMMEDIATE"
 
+        # CHEAP CONTRACT MARKET EXIT:
+        # If option is worth < $0.25/share, limit orders will not fill reliably.
+        # The spread is typically $0.01–$0.05 wide which means limit orders at
+        # $0.12, $0.13, $0.14 etc. bounce around without filling, causing the
+        # cascade of canceled exits seen with NVDA $0.11 contract.
+        # Go straight to market — the slippage on a $0.10 fill vs $0.11 is $0.01/share
+        # ($1/contract), which is far less damage than 15 failed limit attempts.
+        _CHEAP_EXIT_MARKET_THRESHOLD = float(
+            os.getenv("CHEAP_EXIT_MARKET_THRESHOLD", "0.25")
+        )
+        _current_opt_price = float(getattr(pos, "current_option_price", 0) or _mid or _bid)
+        if not _use_market and _current_opt_price > 0 and _current_opt_price < _CHEAP_EXIT_MARKET_THRESHOLD:
+            _use_market = True
+            log.warning(
+                "[%s] CHEAP_CONTRACT_MARKET_EXIT — option price $%.2f < threshold $%.2f "
+                "— using market order to avoid limit cascade | %s",
+                pos.ticker, _current_opt_price, _CHEAP_EXIT_MARKET_THRESHOLD, decision.reason,
+            )
+
         # LIMIT-TO-MARKET ESCALATION for HIGH urgency exits:
         # If a limit order was placed and hasn't filled within the escalation window,
         # step down the price and eventually go market. Prevents sitting on a 22% gain
