@@ -359,6 +359,49 @@ def run_overnight_reeval(
             try:
                 armed = entry_watcher.watch(decision.plan, local_order_id)
                 if armed:
+                    # Overnight reeval creates a LOCAL entry order before broker
+                    # submission. That order waits for APEntryWatcher to see the
+                    # breach. It MUST NOT remain in CREATED status, because
+                    # APOrderMonitor treats CREATED/no broker_order_id as
+                    # "never submitted" and cancels it after ORDER_TIMEOUT_CREATED.
+                    #
+                    # Correct overnight lifecycle:
+                    #   CREATED          → immediately after local order creation
+                    #   PENDING_TRIGGER  → after watcher arms (this block)
+                    #   SUBMITTED        → after breach via
+                    #                      APExecutionCore._on_entry_trigger()
+                    #                      → APOrderStateMachine.submit_existing_entry()
+                    #
+                    # DO NOT submit to Tradier here. Submitting before breach
+                    # would bypass the trigger-breach rule and enter prematurely.
+                    try:
+                        if hasattr(order_state_machine, "mark_entry_pending_trigger"):
+                            _pending_ok = order_state_machine.mark_entry_pending_trigger(local_order_id)
+                            if _pending_ok:
+                                log.info(
+                                    "[%s] OVERNIGHT_ENTRY_PENDING_TRIGGER | local=%s contract=%s "
+                                    "trigger=%.4f deferred=%s",
+                                    ticker, local_order_id, _arm_label,
+                                    entry_trigger or 0, contract_deferred,
+                                )
+                            else:
+                                log.error(
+                                    "[%s] OVERNIGHT_ENTRY_PENDING_TRIGGER_FAILED | "
+                                    "local=%s contract=%s — order monitor may cancel this order",
+                                    ticker, local_order_id, _arm_label,
+                                )
+                        else:
+                            log.error(
+                                "[%s] OVERNIGHT_ENTRY_PENDING_TRIGGER_FAILED | "
+                                "OSM missing mark_entry_pending_trigger | local=%s",
+                                ticker, local_order_id,
+                            )
+                    except Exception as _pt_err:
+                        log.error(
+                            "[%s] OVERNIGHT_ENTRY_PENDING_TRIGGER_ERROR | local=%s error=%s",
+                            ticker, local_order_id, _pt_err, exc_info=True,
+                        )
+
                     _mark_job_watching_armed(job_id, client_id, _arm_label)
                     log.info(
                         "[%s] ✅ ARMED — contract=%s entry_trigger=%.4f contract_deferred=%s",

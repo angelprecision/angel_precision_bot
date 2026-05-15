@@ -42,6 +42,7 @@ log = logging.getLogger("ap.order_monitor")
 
 # Timeout thresholds (seconds)
 TIMEOUT_CREATED       = int(os.getenv("ORDER_TIMEOUT_CREATED",       "120"))    # 2 min — CREATED = never reached broker
+TIMEOUT_CREATED_NO_BROKER_WARN = int(os.getenv("ORDER_TIMEOUT_CREATED_NO_BROKER_WARN", "10"))  # fast diagnostic — alert at 10s, cancel at 120s
 TIMEOUT_SUBMITTED     = int(os.getenv("ORDER_TIMEOUT_SUBMITTED",     "300"))   # 5 min
 TIMEOUT_ACKNOWLEDGED  = int(os.getenv("ORDER_TIMEOUT_ACKNOWLEDGED",  "600"))   # 10 min
 TIMEOUT_PARTIAL_FILL  = int(os.getenv("ORDER_TIMEOUT_PARTIAL_FILL",  "900"))   # 15 min
@@ -202,6 +203,44 @@ class APOrderMonitor:
             age_secs = (now - created_ts).total_seconds()
 
             if status == "CREATED":
+                # Fast diagnostic watchdog: surface CREATED/no broker_id early.
+                #
+                # Overnight watcher-held entries should move CREATED → PENDING_TRIGGER
+                # immediately after watcher arms (ap_overnight_reeval.py).
+                #
+                # Broker-submitted entries should move CREATED → SUBMITTED
+                # immediately after Tradier returns broker_order_id.
+                #
+                # If still CREATED after 10s with no broker_id, something is wrong.
+                # Log it fast — but keep the hard 120s cancel as final safety.
+                if not broker_oid and age_secs > TIMEOUT_CREATED_NO_BROKER_WARN:
+                    self._emit_order_event(
+                        local_order_id=local_id,
+                        stage="order_monitor",
+                        decision="ERROR",
+                        reason_code="CREATED_NO_BROKER_ID_WATCHDOG",
+                        explanation=(
+                            f"CREATED/no broker_order_id for {age_secs:.0f}s > "
+                            f"{TIMEOUT_CREATED_NO_BROKER_WARN}s — expected PENDING_TRIGGER "
+                            "if watcher-held, or SUBMITTED if broker-submitted"
+                        ),
+                        contract=contract,
+                        inputs={
+                            "status": status,
+                            "age_secs": age_secs,
+                            "broker_order_id": broker_oid,
+                        },
+                        thresholds={
+                            "created_no_broker_warn": TIMEOUT_CREATED_NO_BROKER_WARN,
+                            "timeout_created_cancel": TIMEOUT_CREATED,
+                        },
+                    )
+                    log.warning(
+                        "[%s] CREATED_NO_BROKER_ID_WATCHDOG | %s | %s | age=%.0fs — "
+                        "check overnight_reeval PENDING_TRIGGER or broker submit path",
+                        self.client_id, contract, local_id, age_secs,
+                    )
+
                 if age_secs > TIMEOUT_CREATED:
                     self._handle_stale_entry(
                         local_id, status, contract, age_secs,
