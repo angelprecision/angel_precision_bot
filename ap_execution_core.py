@@ -325,8 +325,8 @@ class APExecutionCore:
             _sector = sig.get("sector") or sig.get("correlation_bucket") or ticker
             try:
                 self._cleanup_pending_entry_order(watched, action="cancel", reason="positions_full_at_breach")
-            except Exception:
-                pass
+            except Exception as _clean_err:
+                log.error("[%s] Failed to cleanup pending entry order: %s", ticker, _clean_err)
             return False
 
         approved_plan = self._recover_plan_for_revalidation(watched)
@@ -1043,8 +1043,8 @@ class APExecutionCore:
                     signal_id = signal_id,        # already resolved two lines above
                     pnl_pct   = opt_pnl / 100.0,  # opt_pnl is %, convert to decimal
                 )
-            except Exception:
-                pass
+            except Exception as _alpha_err:
+                log.warning("Alpha tracker update failed: %s", _alpha_err)
 
     # ── CALLBACKS: Expire / Invalidate ────────────────────────────────────────
 

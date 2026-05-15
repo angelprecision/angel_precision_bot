@@ -176,8 +176,8 @@ class AP30TradeValidator:
                           .eq("kind", "ENTRY")
                           .limit(1).execute())
                     entry_order = (eo.data or [{}])[0]
-                except Exception:
-                    pass
+                except Exception as _eo_err:
+                    log.warning("Failed to fetch entry order for validation: %s", _eo_err)
 
             if pos_id:
                 try:
@@ -189,8 +189,8 @@ class AP30TradeValidator:
                           .eq("kind", "EXIT")
                           .limit(1).execute())
                     exit_order = (xo.data or [{}])[0]
-                except Exception:
-                    pass
+                except Exception as _xo_err:
+                    log.warning("Failed to fetch exit order for validation: %s", _xo_err)
 
             pos["_entry_order"] = entry_order or {}
             pos["_exit_order"]  = exit_order or {}

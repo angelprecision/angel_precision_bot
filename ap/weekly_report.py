@@ -693,14 +693,20 @@ class APWeeklyReporter:
     """Generate weekly PDF performance reports for Angel Precision clients."""
 
     TRADE_QUERY = """
-        SELECT underlying, direction, tier, score, avg_fill, exit_price,
-               realized_pnl, entry_ts, exit_ts, exit_reason, pattern,
-               EXTRACT(EPOCH FROM (exit_ts - entry_ts))/60 as hold_minutes
-        FROM positions
-        WHERE client_id = %s
-          AND status IN ('CLOSED','STOPPED','TAKEN_PROFIT','EXPIRED')
-          AND entry_ts >= %s AND entry_ts < %s
-        ORDER BY entry_ts ASC
+        SELECT ticker AS underlying, side AS direction, tier, score,
+               entry_option_price AS avg_fill,
+               exit_option_price AS exit_price,
+               option_pnl_pct AS realized_pnl_pct,
+               ROUND((entry_option_price * COALESCE(contracts, 1) * 100.0
+                      * option_pnl_pct / 100.0)::numeric, 2) AS realized_pnl,
+               opened_at AS entry_ts,
+               closed_at AS exit_ts,
+               exit_reason, pattern, hold_minutes
+        FROM proof_trades
+        WHERE client_email = %s
+          AND closed_at IS NOT NULL
+          AND opened_at >= %s AND opened_at < %s
+        ORDER BY opened_at ASC
     """
 
     def __init__(self, supabase_client: Any = None) -> None:

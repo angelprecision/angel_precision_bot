@@ -694,8 +694,8 @@ def _get_existing_position_by_order(pm, local_order_id: str, broker_order_id: Op
                 found = method(arg)
                 if found:
                     return found
-            except Exception:
-                pass
+            except Exception as _resolve_err:
+                log.debug("Method %s failed during resolution: %s", method.__name__ if hasattr(method, "__name__") else method, _resolve_err)
     return None
 
 
@@ -910,8 +910,8 @@ def _seed_exit_engine(exit_engine, position_id: str, order: dict, result: dict, 
         getter = getattr(exit_engine, "get_position", None)
         if callable(getter) and getter(position_id):
             return
-    except Exception:
-        pass
+    except Exception as _ee_err:
+        log.warning("Exit engine position check failed for %s: %s", position_id, _ee_err)
 
     try:
         if hasattr(exit_engine, "seed_position"):

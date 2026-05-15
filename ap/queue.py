@@ -627,8 +627,8 @@ def _dispatch(
                 queued_at=datetime.now(timezone.utc).isoformat(),
             )
             return
-    except Exception:
-        pass
+    except Exception as _mkt_err:
+        log.warning("[%s] Market hours check failed: %s — proceeding", ticker, _mkt_err)
 
     if contract_selector and not _skip_contract_selection:
         try:
@@ -832,8 +832,8 @@ def _dispatch(
                     order_state_machine.cancel_pending_entry(local_order_id, reason=f"watcher_error:{e}")
                 else:
                     order_state_machine.transition(local_order_id, "ERROR", last_error=f"watcher_error:{e}")
-            except Exception:
-                pass
+            except Exception as _cancel_err:
+                log.error("[%s] Failed to cancel/transition order after watcher error: %s", ticker, _cancel_err)
             _mark_job(job_id, "ERROR", error=f"watcher_error: {e}")
     else:
         log.warning(

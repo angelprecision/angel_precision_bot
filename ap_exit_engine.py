@@ -1337,8 +1337,8 @@ class APExitEngine:
                 try:
                     if fill_price is not None:
                         pos.current_option_price = float(fill_price)
-                except Exception:
-                    pass
+                except Exception as _fp_err:
+                    log.error("Failed to set fill_price on position: %s", _fp_err)
                 pos.exit_in_flight   = False
                 pos.pending_exit_reason = ""
                 pos.pending_exit_action = ""

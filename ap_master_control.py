@@ -684,8 +684,8 @@ class APMasterControl:
             sector = self.SECTOR_MAP.get(ticker_in_pos.upper(), "other")
             try:
                 exposure[sector] = exposure.get(sector, 0.0) + self._position_capital_for_exposure(pos)
-            except Exception:
-                pass
+            except Exception as _exp_err:
+                log.error("Failed to calculate exposure for sector %s: %s", sector, _exp_err)
         return exposure
 
     def evaluate(self, signal: dict, client_id: str = "default") -> ControlDecision:
