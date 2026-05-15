@@ -353,6 +353,26 @@ def run_overnight_reeval(
                 result["errors"] += 1
                 continue
 
+            # Step 6b: Mark order PENDING_TRIGGER so order_monitor does not
+            # cancel it as a stale CREATED order before the trigger breach fires.
+            # This mirrors the queue.py intraday path which does the same before arming.
+            try:
+                if hasattr(order_state_machine, "mark_entry_pending_trigger"):
+                    _pt_ok = order_state_machine.mark_entry_pending_trigger(local_order_id)
+                else:
+                    _pt_ok = order_state_machine.transition(
+                        local_order_id, "PENDING_TRIGGER", submitted_ts=None)
+                if not _pt_ok:
+                    log.error("[%s] overnight_reeval: could not mark PENDING_TRIGGER for %s — skipping arm",
+                              ticker, local_order_id)
+                    result["errors"] += 1
+                    continue
+            except Exception as _pt_exc:
+                log.error("[%s] overnight_reeval: PENDING_TRIGGER transition failed: %s — skipping arm",
+                          ticker, _pt_exc)
+                result["errors"] += 1
+                continue
+
             # Step 7: Arm entry watcher — pass plan (not signal) and the OSM order ID
             _contract_sym = str(getattr(decision.plan, "contract_symbol", "") or "")
             _arm_label    = _contract_sym if _contract_sym else "DEFERRED_AT_BREACH"
