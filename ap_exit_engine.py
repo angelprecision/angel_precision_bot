@@ -400,7 +400,54 @@ class ExitDecision:
 
 # ── EXIT LOGIC ────────────────────────────────────────────────────────────────
 
-def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> ExitDecision:
+def _underlying_still_confirming(pos: ManagedPosition) -> tuple[bool, str]:
+    """
+    Check if the underlying is still moving in our direction.
+    Used to give positions breathing room when option P&L dips but
+    the trade thesis (underlying momentum) is still intact.
+
+    Returns (confirming: bool, reason: str)
+    """
+    entry_u = getattr(pos, "underlying_entry", 0) or 0
+    curr_u  = getattr(pos, "current_underlying", 0) or 0
+    target_u = getattr(pos, "underlying_target", 0) or 0
+    stop_u  = getattr(pos, "underlying_stop", 0) or 0
+    side    = (getattr(pos, "side", "") or "").upper()
+
+    if not entry_u or not curr_u:
+        return False, "no_underlying_data"
+
+    move_pct = (curr_u - entry_u) / entry_u  # positive = underlying went up
+
+    if side == "CALL":
+        confirming = move_pct > -0.005  # underlying hasn't dropped >0.5% from entry
+        reason = f"underlying_move={move_pct*100:+.2f}%_from_entry"
+        # Also check: are we still above entry? If yes, thesis alive
+        if curr_u >= entry_u * 0.995:
+            return True, f"call_underlying_holding_above_entry_{reason}"
+        return False, f"call_underlying_broke_entry_{reason}"
+
+    elif side == "PUT":
+        confirming = move_pct < 0.005  # underlying hasn't risen >0.5% from entry
+        reason = f"underlying_move={move_pct*100:+.2f}%_from_entry"
+        if curr_u <= entry_u * 1.005:
+            return True, f"put_underlying_holding_below_entry_{reason}"
+        return False, f"put_underlying_broke_entry_{reason}"
+
+    return False, "unknown_side"
+
+
+def _position_age_minutes(pos: ManagedPosition) -> float:
+    """Return how many minutes old the position is."""
+    try:
+        if pos.opened_at:
+            return (datetime.now(timezone.utc) - pos.opened_at).total_seconds() / 60
+    except Exception:
+        pass
+    return 999.0  # unknown age — do not block exits
+
+
+
     """
     Core exit evaluation. Called every POLL_INTERVAL_SEC for each position.
     Returns ExitDecision.
@@ -448,14 +495,31 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
             _floor = -0.05   # peaked 5-10% — exit at -5% max
 
         if option_pnl <= _floor:
-            return ExitDecision(
-                action="CLOSE_ALL", quantity=qty_rem,
-                reason=(
-                    f"TOUCHED PROFIT STOP — peaked +{_max*100:.0f}% "
-                    f"now {option_pnl*100:.0f}% — floor={_floor*100:.0f}%"
-                ),
-                urgency="IMMEDIATE", pnl_pct=option_pnl,
-        )
+            # Before firing: check if underlying still confirming.
+            # A single penny drop on a cheap contract (-9%) is not a real signal
+            # if the underlying is still moving in our direction.
+            _age_min = _position_age_minutes(pos)
+            _confirming, _confirm_reason = _underlying_still_confirming(pos)
+            _MIN_HOLD_BEFORE_SOFT_EXIT = float(
+                os.getenv("MIN_HOLD_MINUTES_BEFORE_SOFT_EXIT", "3")
+            )
+            if _confirming and _age_min < _MIN_HOLD_BEFORE_SOFT_EXIT:
+                # Too early AND underlying still in our direction — breathe
+                log.info(
+                    "[%s] TOUCHED_PROFIT_STOP suppressed — underlying still confirming "
+                    "(%s) | age=%.1fmin < %.0fmin hold floor | pnl=%.1f%%",
+                    pos.ticker, _confirm_reason, _age_min,
+                    _MIN_HOLD_BEFORE_SOFT_EXIT, option_pnl * 100,
+                )
+            else:
+                return ExitDecision(
+                    action="CLOSE_ALL", quantity=qty_rem,
+                    reason=(
+                        f"TOUCHED PROFIT STOP — peaked +{_max*100:.0f}% "
+                        f"now {option_pnl*100:.0f}% — floor={_floor*100:.0f}%"
+                    ),
+                    urgency="IMMEDIATE", pnl_pct=option_pnl,
+                )
 
     # ── 33/33/34 SCALE-OUT LADDER ────────────────────────────────────────────
     # Targets: +10% → sell 33% | +20% → sell 33% | +30% → sell remainder
@@ -621,20 +685,37 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
             else:               _ng_stop = -0.08
 
         if option_pnl <= _ng_stop:
-            _profile = (
-                "0DTE-idx" if (_dte_ng == 0 and _is_idx_ng)
-                else "0DTE-eq" if _dte_ng == 0
-                else f"{_dte_ng}DTE"
-            )
-            return ExitDecision(
-                action="CLOSE_ALL", quantity=qty_rem,
-                reason=(
-                    f"NEVER GREEN STOP [{_profile}] — {option_pnl*100:.0f}% "
-                    f"at {_age_min:.0f}min | threshold={_ng_stop*100:.0f}% | "
-                    f"thesis never confirmed"
-                ),
-                urgency="IMMEDIATE", pnl_pct=option_pnl,
-            )
+            _ng_age_min = _position_age_minutes(pos)
+            _ng_confirming, _ng_confirm_reason = _underlying_still_confirming(pos)
+            _MIN_HOLD_NG = float(os.getenv("MIN_HOLD_MINUTES_BEFORE_SOFT_EXIT", "3"))
+
+            # Suppress never-green stop if:
+            # 1. Underlying is still confirming (thesis alive), AND
+            # 2. Position is young (< MIN_HOLD_MINUTES_BEFORE_SOFT_EXIT)
+            # This allows cheap fragile contracts to breathe through
+            # the initial spread/noise before the real move develops.
+            if _ng_confirming and _ng_age_min < _MIN_HOLD_NG:
+                log.info(
+                    "[%s] NEVER_GREEN_STOP suppressed — underlying still confirming "
+                    "(%s) | age=%.1fmin < %.0fmin hold floor | pnl=%.1f%%",
+                    pos.ticker, _ng_confirm_reason, _ng_age_min,
+                    _MIN_HOLD_NG, option_pnl * 100,
+                )
+            else:
+                _profile = (
+                    "0DTE-idx" if (_dte_ng == 0 and _is_idx_ng)
+                    else "0DTE-eq" if _dte_ng == 0
+                    else f"{_dte_ng}DTE"
+                )
+                return ExitDecision(
+                    action="CLOSE_ALL", quantity=qty_rem,
+                    reason=(
+                        f"NEVER GREEN STOP [{_profile}] — {option_pnl*100:.0f}% "
+                        f"at {_ng_age_min:.0f}min | threshold={_ng_stop*100:.0f}% | "
+                        f"thesis never confirmed | underlying:{_ng_confirm_reason}"
+                    ),
+                    urgency="IMMEDIATE", pnl_pct=option_pnl,
+                )
 
     # ── HARD STOP ─────────────────────────────────────────────────────────────
     if option_pnl <= _hard_stop:
