@@ -452,6 +452,7 @@ class APEntryWatcher:
                 watched.ticker,
                 local_order_id,
             )
+            self._last_reject_reason = "osm_validation_failed"
             return False
 
         dedup_key = self._dedup_key_for_signal(watched.signal)
@@ -468,6 +469,7 @@ class APEntryWatcher:
                     watched.ticker,
                     dedup_key,
                 )
+                self._last_reject_reason = "dedup_block"
                 return False
 
             same_side = [
@@ -508,6 +510,7 @@ class APEntryWatcher:
                                 log.warning("[%s] OSM cancel failed for direction_flip: %s", w.ticker, _exc)
                     self._pending = [w for w in self._pending if w not in opposite_side]
                 else:
+                    self._last_reject_reason = "opposite_side_conflict"
                     log.info(
                         "[%s] SAFE_MODE_BLOCK_OPPOSITE — keeping existing %s score=%.1f, "
                         "blocking new %s score=%.1f",
@@ -544,6 +547,7 @@ class APEntryWatcher:
                                 log.warning("[%s] OSM cancel failed for same_side_replace: %s", w.ticker, _exc)
                     self._pending = [w for w in self._pending if w not in same_side]
                 else:
+                    self._last_reject_reason = "same_side_block"
                     log.info(
                         "[%s] SAME_SIDE_BLOCK — keeping %s score=%.1f, "
                         "blocking weaker same-side score=%.1f",

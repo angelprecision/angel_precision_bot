@@ -792,7 +792,9 @@ def _dispatch(
             armed = bool(entry_watcher.watch(plan=plan, local_order_id=local_order_id))
             if not armed:
                 log.warning(
-                    "[%s] WATCH_ARM_FAILED — watcher refused signal | local=%s",
+                    "[%s] WATCH_ARM_FAILED — watcher refused signal | local=%s | "
+                    "check logs for: STALE SIGNAL / DEDUP_BLOCK / SAFE_MODE_BLOCK_OPPOSITE / "
+                    "SAME_SIDE_BLOCK / WATCH_ARM_BLOCKED (OSM validation failed)",
                     ticker, local_order_id,
                 )
                 try:
