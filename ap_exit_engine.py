@@ -447,7 +447,7 @@ def _position_age_minutes(pos: ManagedPosition) -> float:
     return 999.0  # unknown age — do not block exits
 
 
-
+def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> ExitDecision:
     """
     Core exit evaluation. Called every POLL_INTERVAL_SEC for each position.
     Returns ExitDecision.
@@ -498,25 +498,28 @@ def _position_age_minutes(pos: ManagedPosition) -> float:
             # Before firing: check if underlying still confirming.
             # A single penny drop on a cheap contract (-9%) is not a real signal
             # if the underlying is still moving in our direction.
+            # The thesis check applies regardless of age — if underlying
+            # is still holding, we do not punish the option for spread noise.
             _age_min = _position_age_minutes(pos)
             _confirming, _confirm_reason = _underlying_still_confirming(pos)
-            _MIN_HOLD_BEFORE_SOFT_EXIT = float(
-                os.getenv("MIN_HOLD_MINUTES_BEFORE_SOFT_EXIT", "3")
+            _MAX_THESIS_OVERRIDE = float(
+                os.getenv("MAX_HOLD_MINUTES_WHILE_RED", "5")
             )
-            if _confirming and _age_min < _MIN_HOLD_BEFORE_SOFT_EXIT:
-                # Too early AND underlying still in our direction — breathe
+            if _confirming and _age_min < _MAX_THESIS_OVERRIDE:
+                # Underlying still in our direction — hold, don't exit on noise
                 log.info(
                     "[%s] TOUCHED_PROFIT_STOP suppressed — underlying still confirming "
-                    "(%s) | age=%.1fmin < %.0fmin hold floor | pnl=%.1f%%",
+                    "(%s) | age=%.1fmin < %.0fmin thesis window | pnl=%.1f%%",
                     pos.ticker, _confirm_reason, _age_min,
-                    _MIN_HOLD_BEFORE_SOFT_EXIT, option_pnl * 100,
+                    _MAX_THESIS_OVERRIDE, option_pnl * 100,
                 )
             else:
                 return ExitDecision(
                     action="CLOSE_ALL", quantity=qty_rem,
                     reason=(
                         f"TOUCHED PROFIT STOP — peaked +{_max*100:.0f}% "
-                        f"now {option_pnl*100:.0f}% — floor={_floor*100:.0f}%"
+                        f"now {option_pnl*100:.0f}% — floor={_floor*100:.0f}% | "
+                        f"underlying={'confirming' if _confirming else 'not confirming'}"
                     ),
                     urgency="IMMEDIATE", pnl_pct=option_pnl,
                 )
@@ -535,7 +538,7 @@ def _position_age_minutes(pos: ManagedPosition) -> float:
             qty_s1 = max(1, round(qty_rem / 3))
             return ExitDecision(
                 action="SCALE_OUT", quantity=qty_s1,
-                reason=f"SCALE_1 (+10%) -- selling {qty_s1}/{qty_rem} | running {qty_rem-qty_s1} to +20%",
+                reason=f"SCALE_1 (+15%) -- selling {qty_s1}/{qty_rem} | running {qty_rem-qty_s1} to +25%",
                 urgency="HIGH", pnl_pct=option_pnl,
             )
 
@@ -547,7 +550,7 @@ def _position_age_minutes(pos: ManagedPosition) -> float:
             qty_s2 = max(1, round(qty_rem / 2))  # half of what's left ≈ second third of original
             return ExitDecision(
                 action="SCALE_OUT", quantity=qty_s2,
-                reason=f"SCALE_2 (+20%) -- selling {qty_s2}/{qty_rem} runner | targeting +30%",
+                reason=f"SCALE_2 (+25%) -- selling {qty_s2}/{qty_rem} runner | targeting +40%",
                 urgency="HIGH", pnl_pct=option_pnl,
             )
 
@@ -637,7 +640,10 @@ def _position_age_minutes(pos: ManagedPosition) -> float:
                 urgency="HIGH", pnl_pct=option_pnl,
             )
 
-    # Underlying progress: if 60%+ toward scanner target, take option gain now
+    # Underlying progress: if 60%+ toward scanner target, log but do NOT close.
+    # Closing the entire position at +5% because the underlying made partial
+    # progress is exactly how we miss +50%/+100% runners.
+    # Instead: log as a diagnostic signal only. Exits happen via trail/scale.
     _entry_u  = pos.underlying_entry
     _target_u = pos.underlying_target
     _curr_u   = pos.current_underlying
@@ -646,14 +652,70 @@ def _position_age_minutes(pos: ManagedPosition) -> float:
         if _range > 0:
             _progress = abs(_curr_u - _entry_u) / _range
             if _progress >= 0.60 and option_pnl >= 0.05:
-                return ExitDecision(
-                    action="CLOSE_ALL", quantity=qty_rem,
-                    reason=(
-                        f"UNDERLYING PROGRESS EXIT — {_progress*100:.0f}% toward target, "
-                        f"locking option +{option_pnl*100:.0f}%"
-                    ),
-                    urgency="HIGH", pnl_pct=option_pnl,
+                # Log only — DO NOT exit. Trail/scale-out handles actual exit.
+                log.debug(
+                    "[%s] UNDERLYING_PROGRESS_INFO — %.0f%% toward target, "
+                    "option +%.1f%% — holding for trail/scale",
+                    pos.ticker, _progress * 100, option_pnl * 100,
                 )
+
+    # ── SOFT LOSS STOP (-12%) — thesis-aware ─────────────────────────────────
+    # -33% = emergency hard stop (already above)
+    # -12% = soft stop: exit if thesis is broken, breathe if thesis alive
+    #
+    # This prevents red trades from bleeding to -33% while also giving
+    # young positions breathing room when the underlying still confirms.
+    #
+    # Rules:
+    #   1. If underlying broke against us → exit immediately
+    #   2. If young (< MIN_HOLD) AND underlying still confirming → hold
+    #   3. If old (>= MAX_HOLD_WHILE_RED) AND still red → exit regardless
+    #   4. Otherwise → hold and warn
+    _SOFT_LOSS_PCT      = float(os.getenv("SOFT_LOSS_STOP_PCT",           "-0.12"))
+    _MIN_HOLD_SOFT      = float(os.getenv("MIN_HOLD_MINUTES_BEFORE_SOFT_EXIT", "3"))
+    _MAX_HOLD_RED       = float(os.getenv("MAX_HOLD_MINUTES_WHILE_RED",        "5"))
+
+    if option_pnl <= _SOFT_LOSS_PCT and not pos.touched_profit:
+        _soft_age       = _position_age_minutes(pos)
+        _soft_confirm, _soft_reason = _underlying_still_confirming(pos)
+
+        if not _soft_confirm:
+            # Thesis broken — exit now, don't wait for -33%
+            return ExitDecision(
+                action="CLOSE_ALL", quantity=qty_rem,
+                reason=(
+                    f"THESIS_FAIL_SOFT_STOP — {option_pnl*100:.0f}% loss "
+                    f"and underlying not confirming ({_soft_reason}) | "
+                    f"age={_soft_age:.1f}min"
+                ),
+                urgency="IMMEDIATE", pnl_pct=option_pnl,
+            )
+        elif _soft_age < _MIN_HOLD_SOFT:
+            # Young position, thesis alive — breathe
+            log.info(
+                "[%s] SOFT_LOSS_STOP_SUPPRESSED — %.1f%% loss but underlying "
+                "confirming (%s) | age=%.1fmin < %.0fmin hold floor",
+                pos.ticker, option_pnl * 100, _soft_reason,
+                _soft_age, _MIN_HOLD_SOFT,
+            )
+        elif _soft_age >= _MAX_HOLD_RED:
+            # Been red too long — exit even if underlying barely holding
+            return ExitDecision(
+                action="CLOSE_ALL", quantity=qty_rem,
+                reason=(
+                    f"THESIS_STALE_SOFT_STOP — {option_pnl*100:.0f}% loss "
+                    f"after {_soft_age:.0f}min — thesis had time, no recovery"
+                ),
+                urgency="HIGH", pnl_pct=option_pnl,
+            )
+        else:
+            # In the hold window — log warning only
+            log.warning(
+                "[%s] SOFT_LOSS_WATCH — %.1f%% loss | underlying=%s | "
+                "age=%.1fmin | will exit at %.0fmin if no recovery",
+                pos.ticker, option_pnl * 100, _soft_reason,
+                _soft_age, _MAX_HOLD_RED,
+            )
 
     # ── NEVER-GREEN ESCALATING STOP ───────────────────────────────────────────
     if not pos.touched_profit:
