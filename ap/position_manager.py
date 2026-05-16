@@ -1143,6 +1143,9 @@ class APPositionManager:
                     "pending_exits": pending_exits,
                     "trades_today": int(summary.get("trades_today") or 0),
                     "realized_pnl_today": float(summary.get("realized_pnl_today") or 0),
+                    # Required by APMasterControl LIVE snapshot freshness check
+                    "snapshot_ts": __import__("datetime").datetime.now(
+                        __import__("datetime").timezone.utc).isoformat(),
                 }
 
         return run_with_retry(_fn)

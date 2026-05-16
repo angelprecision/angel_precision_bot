@@ -1184,9 +1184,20 @@ class APOrderStateMachine:
                     "status": status, "error": error_msg}
 
         lp       = float(limit_price or current.get("limit_price") or getattr(plan, "limit_price", 0) or 0)
-        contract = (current.get("contract") or getattr(plan, "contract_symbol", None)
-                    or current.get("symbol") or getattr(plan, "ticker", ""))
-        ticker   = current.get("symbol") or getattr(plan, "ticker", "")
+        # Resolve contract: prefer plan (updated at breach-time) over DB row
+        # if DB row has a DEFERRED: placeholder or bare ticker symbol.
+        _db_contract   = str(current.get("contract") or "").strip()
+        _plan_contract = str(getattr(plan, "contract_symbol", "") or "").strip()
+        _ticker_str    = str(current.get("symbol") or getattr(plan, "ticker", "") or "").strip()
+        _db_is_placeholder = (
+            not _db_contract
+            or _db_contract.upper().startswith("DEFERRED:")
+            or _db_contract.upper() == _ticker_str.upper()
+        )
+        contract = _plan_contract if _db_is_placeholder else _db_contract
+        if not contract:
+            contract = _plan_contract or _ticker_str  # last resort
+        ticker   = _ticker_str
         qty      = int(current.get("qty") or getattr(plan, "contracts", 0) or 0)
 
         if lp <= 0:
@@ -1201,8 +1212,10 @@ class APOrderStateMachine:
             return {"ok": False, "local_order_id": local_order_id,
                     "broker_order_id": current.get("broker_order_id"),
                     "status": OrderStatus.ERROR, "error": error_msg}
-        if not contract:
-            error_msg = "missing_existing_entry_contract"
+        if not contract or contract.upper().startswith("DEFERRED:"):
+            error_msg = f"deferred_placeholder_at_broker_submit:{contract}"
+            log.critical("[%s] PRODUCTION_ENTRY_BLOCK — attempted to submit placeholder contract %s to broker",
+                         self.client_id, contract)
             self.transition(local_order_id, OrderStatus.ERROR, last_error=error_msg)
             return {"ok": False, "local_order_id": local_order_id,
                     "broker_order_id": current.get("broker_order_id"),
