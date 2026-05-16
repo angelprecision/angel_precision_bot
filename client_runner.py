@@ -251,6 +251,8 @@ def resolve_tradier_credentials(member: dict) -> dict:
             )
         account_id = member.get("tradier_live_account_id")
         token      = member.get("tradier_live_access_token")
+        if account_id:
+            account_id = str(account_id).strip()
         if not account_id or not token:
             raise RuntimeError(
                 f"[{email}] LIVE startup missing tradier_live_account_id or "
@@ -272,6 +274,9 @@ def resolve_tradier_credentials(member: dict) -> dict:
         member.get("tradier_paper_access_token")
         or member.get("tradier_access_token")
     )
+    # Strip any trailing whitespace/newlines that may have been stored in DB
+    if account_id:
+        account_id = str(account_id).strip()
     if not account_id or not token:
         raise RuntimeError(
             f"[{email}] PAPER startup missing tradier_paper_account_id or "
