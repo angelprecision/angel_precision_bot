@@ -128,7 +128,7 @@ def run_overnight_reeval(
 
     result = {"processed": 0, "armed": 0, "rejected": 0, "skipped": 0, "errors": 0}
 
-    # Guard: only run on trading days, 9:00-9:25 AM ET window (unless force=True)
+    # Guard: only run on trading days, 9:00-9:29 AM ET window (unless force=True)
     now_et = _et_now()
     if not force:
         if not _is_trading_day(now_et):
@@ -137,7 +137,7 @@ def run_overnight_reeval(
             return result
         _in_window = (now_et.hour == 9 and 0 <= now_et.minute <= 29)
         if not _in_window:
-            log.info("[%s] overnight_reeval: skipping — outside 9:00-9:25 AM ET window (now=%02d:%02d)",
+            log.info("[%s] overnight_reeval: skipping — outside 9:00-9:29 AM ET window (now=%02d:%02d)",
                      client_id, now_et.hour, now_et.minute)
             result["skipped"] = -1
             return result
