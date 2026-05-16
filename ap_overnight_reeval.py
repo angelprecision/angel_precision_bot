@@ -135,7 +135,7 @@ def run_overnight_reeval(
             log.info("[%s] overnight_reeval: skipping — not a trading day", client_id)
             result["skipped"] = -1
             return result
-        _in_window = (now_et.hour == 9 and 0 <= now_et.minute <= 25)
+        _in_window = (now_et.hour == 9 and 0 <= now_et.minute <= 29)
         if not _in_window:
             log.info("[%s] overnight_reeval: skipping — outside 9:00-9:45 AM ET window (now=%02d:%02d)",
                      client_id, now_et.hour, now_et.minute)
