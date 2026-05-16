@@ -1184,9 +1184,55 @@ class APOrderStateMachine:
                     "status": status, "error": error_msg}
 
         lp       = float(limit_price or current.get("limit_price") or getattr(plan, "limit_price", 0) or 0)
-        contract = (current.get("contract") or getattr(plan, "contract_symbol", None)
-                    or current.get("symbol") or getattr(plan, "ticker", ""))
-        ticker   = current.get("symbol") or getattr(plan, "ticker", "")
+        # ── CONTRACT RESOLUTION — prefer live plan over stale DB row ──────────
+        # DB order row may contain DEFERRED:TICKER (set during overnight premarket
+        # when no chain was available). At breach time, execution_core runs live
+        # contract selection and updates plan.contract_symbol with the real OCC symbol.
+        # We MUST use the plan's live contract, not the stale placeholder.
+        _db_contract   = str(current.get("contract") or "").strip()
+        _plan_contract = str(getattr(plan, "contract_symbol", "") or "").strip()
+        _ticker        = current.get("symbol") or getattr(plan, "ticker", "")
+
+        _db_is_deferred = (
+            not _db_contract
+            or _db_contract.upper().startswith("DEFERRED:")
+            or _db_contract.upper() == str(_ticker).upper()
+        )
+
+        if _db_is_deferred and _plan_contract and not _plan_contract.upper().startswith("DEFERRED:"):
+            # Use live plan contract — breach-time selection resolved it
+            contract = _plan_contract
+            log.info(
+                "[%s] CONTRACT_RESOLVED: DB had placeholder %r → using plan %r",
+                _ticker, _db_contract, contract,
+            )
+            # Update the order row so DB is consistent before broker POST
+            try:
+                self._db.table("orders").update({
+                    "contract":    contract,
+                    "limit_price": round(lp, 2),
+                    "qty":         int(getattr(plan, "contracts", 0) or current.get("qty") or 0),
+                    "updated_ts":  now_utc_iso(),
+                }).eq("local_order_id", local_order_id).execute()
+            except Exception as _upd_exc:
+                log.warning("[%s] Failed to update order contract pre-submit: %s", _ticker, _upd_exc)
+        else:
+            contract = _db_contract or _plan_contract or _ticker
+
+        # HARD BLOCK — never submit a DEFERRED placeholder to Tradier
+        if not contract or contract.upper().startswith("DEFERRED:") or contract.upper() == str(_ticker).upper():
+            error_msg = f"DEFERRED_CONTRACT_BLOCKED:{contract}"
+            log.critical(
+                "[%s] CRITICAL — submit_existing_entry blocked: contract=%r is still a placeholder. "
+                "Breach-time contract selection may have failed. Blocking broker POST.",
+                _ticker, contract,
+            )
+            self.transition(local_order_id, OrderStatus.ERROR, last_error=error_msg)
+            return {"ok": False, "local_order_id": local_order_id,
+                    "broker_order_id": current.get("broker_order_id"),
+                    "status": OrderStatus.ERROR, "error": error_msg}
+
+        ticker   = _ticker
         qty      = int(current.get("qty") or getattr(plan, "contracts", 0) or 0)
 
         if lp <= 0:

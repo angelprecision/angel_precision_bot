@@ -1130,18 +1130,20 @@ class APPositionManager:
                 closing = [p for p in active if p.get("status") == PositionStatus.CLOSING]
 
                 return {
-                    "open_positions": opens,
-                    "closing_positions": closing,
-                    "open_count": len(active),        # backward-compatible alias for active_count
-                    "active_count": len(active),
-                    "session_day": session_day,
-                    "open_tickers": {p["underlying"] for p in active},
-                    "calls_open": sum(1 for p in active if p.get("direction") == "CALL"),
-                    "puts_open": sum(1 for p in active if p.get("direction") == "PUT"),
-                    "capital_deployed": float(summary.get("capital_deployed") or 0),
-                    "pending_entries": pending_entries,
-                    "pending_exits": pending_exits,
-                    "trades_today": int(summary.get("trades_today") or 0),
+                    "snapshot_ts":        datetime.now(timezone.utc).isoformat(),
+                    "generated_at":       datetime.now(timezone.utc).isoformat(),
+                    "open_positions":     opens,
+                    "closing_positions":  closing,
+                    "open_count":         len(active),
+                    "active_count":       len(active),
+                    "session_day":        session_day,
+                    "open_tickers":       {p["underlying"] for p in active},
+                    "calls_open":         sum(1 for p in active if p.get("direction") == "CALL"),
+                    "puts_open":          sum(1 for p in active if p.get("direction") == "PUT"),
+                    "capital_deployed":   float(summary.get("capital_deployed") or 0),
+                    "pending_entries":    pending_entries,
+                    "pending_exits":      pending_exits,
+                    "trades_today":       int(summary.get("trades_today") or 0),
                     "realized_pnl_today": float(summary.get("realized_pnl_today") or 0),
                 }
 
