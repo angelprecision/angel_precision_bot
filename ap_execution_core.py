@@ -595,10 +595,12 @@ class APExecutionCore:
         # select the contract before the limit_price and contract_symbol checks.
         _sig_meta   = getattr(approved_plan, "metadata", {}) or {}
         _sig_dict   = sig or {}
+        _contract_sym_raw = str(getattr(approved_plan, "contract_symbol", "") or "").strip()
         _deferred   = (
             bool(_sig_meta.get("contract_deferred"))
             or bool(_sig_dict.get("contract_deferred"))
-            or not str(getattr(approved_plan, "contract_symbol", "") or "").strip()
+            or not _contract_sym_raw
+            or _contract_sym_raw.upper().startswith("DEFERRED:")  # safety: never submit placeholder
         )
         if _deferred:
             if self.contract_selector is None:
@@ -635,6 +637,18 @@ class APExecutionCore:
                         self.store.update_signal_fields(signal_id, {
                             "decision_status": "blocked_at_breach",
                             "context_notes": "breach_time_contract_selection_no_result",
+                        })
+                    return
+                if _live_contract.upper().startswith("DEFERRED:"):
+                    log.critical(
+                        "[%s] PRODUCTION_ENTRY_BLOCK — contract selector left placeholder unresolved: %s",
+                        ticker, _live_contract,
+                    )
+                    funnel.inc("order_failed")
+                    if signal_id:
+                        self.store.update_signal_fields(signal_id, {
+                            "decision_status": "blocked_at_breach",
+                            "context_notes": f"deferred_unresolved_at_breach:{_live_contract}",
                         })
                     return
                 log.info(
