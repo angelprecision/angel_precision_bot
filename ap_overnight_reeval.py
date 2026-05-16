@@ -341,6 +341,16 @@ def run_overnight_reeval(
 
             # Step 6: Create OSM entry order — let OSM generate a fresh UUID.
             # Do NOT pass local_order_id: static IDs cause OSM conflicts on retry.
+            # For deferred contracts: ensure contract_symbol is NOT set to the
+            # ticker symbol — store as DEFERRED so orders table is clean and
+            # the execution core knows to select live at breach time.
+            if contract_deferred:
+                try:
+                    if not getattr(decision.plan, "contract_symbol", None) or \
+                       decision.plan.contract_symbol == decision.plan.ticker:
+                        decision.plan.contract_symbol = f"DEFERRED:{ticker}"
+                except Exception:
+                    pass
             try:
                 local_order_id = order_state_machine.create_entry_order(decision.plan)
             except Exception as osm_exc:
