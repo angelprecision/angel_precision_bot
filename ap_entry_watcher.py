@@ -661,6 +661,7 @@ class APEntryWatcher:
                             trigger,
                             side,
                         )
+                        self._last_reject_reason = f"stale_price_{pct_from_trigger*100:+.1f}pct_from_trigger"
                         return False
                     log.debug(
                         "[%s] Price check OK — $%.2f vs trigger $%.2f (%.1f%%)",

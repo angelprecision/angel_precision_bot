@@ -791,25 +791,28 @@ def _dispatch(
             # this returns True.
             armed = bool(entry_watcher.watch(plan=plan, local_order_id=local_order_id))
             if not armed:
+                # Pull the specific reason the watcher set before returning False
+                _reject_reason = getattr(entry_watcher, "_last_reject_reason", None) or "unknown"
+                _full_error    = f"watch_arm_failed:{_reject_reason}"
+
                 log.warning(
-                    "[%s] WATCH_ARM_FAILED — watcher refused signal | local=%s | "
-                    "check logs for: STALE SIGNAL / DEDUP_BLOCK / SAFE_MODE_BLOCK_OPPOSITE / "
-                    "SAME_SIDE_BLOCK / WATCH_ARM_BLOCKED (OSM validation failed)",
-                    ticker, local_order_id,
+                    "[%s] WATCH_ARM_FAILED | local=%s | reason=%s",
+                    ticker, local_order_id, _reject_reason,
                 )
                 try:
+                    # Persist exact reason to orders.last_error so dashboard shows it
                     if hasattr(order_state_machine, "expire_pending_entry"):
-                        order_state_machine.expire_pending_entry(local_order_id, reason="watch_arm_failed")
+                        order_state_machine.expire_pending_entry(local_order_id, reason=_full_error)
                     elif hasattr(order_state_machine, "cancel_pending_entry"):
-                        order_state_machine.cancel_pending_entry(local_order_id, reason="watch_arm_failed")
+                        order_state_machine.cancel_pending_entry(local_order_id, reason=_full_error)
                     else:
-                        order_state_machine.transition(local_order_id, "EXPIRED", last_error="watch_arm_failed")
+                        order_state_machine.transition(local_order_id, "EXPIRED", last_error=_full_error)
                 except Exception as _cleanup_exc:
                     log.error(
                         "[%s] Failed to cleanup unarmed pending entry %s: %s",
                         ticker, local_order_id, _cleanup_exc, exc_info=True,
                     )
-                _mark_job(job_id, "REJECTED", error="watch_arm_failed")
+                _mark_job(job_id, "REJECTED", error=_full_error)
                 return
 
             log.info(
