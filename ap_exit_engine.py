@@ -482,17 +482,27 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
         )
 
     # ── TOUCHED PROFIT PROTECTION ─────────────────────────────────────────────
-    # If position ever went green, we never let it close worse than:
-    #   peak >= 10%  → floor at -3% (tiny loss acceptable)
-    #   peak >= 5%   → floor at -5% (original threshold)
-    #   any green    → floor at -8% (loose catch-all)
+    # Once green, we LOCK IN a minimum profit. Never let a green trade
+    # become a loss. Average winner target = 25%.
+    #
+    # Floor logic (option_pnl must stay ABOVE floor or we exit):
+    #   peak >= 25%  → floor +12%  (never give back more than 13pts of a big winner)
+    #   peak >= 15%  → floor +8%   (protect 8% minimum from a 15%+ trade)
+    #   peak >= 10%  → floor +5%   (protect 5% minimum from a 10%+ trade)
+    #   peak >= 5%   → floor +3%   (MINIMUM green — never turn a 5%+ win into a loss)
+    #   any green    → floor  0%   (breakeven floor — touched green = never go red)
     if pos.scale_outs_done == 0 and pos.touched_profit:
         _max = pos.max_profit_seen or 0
-        _floor = -0.08  # catch-all default
-        if _max >= 0.10:
-            _floor = -0.03   # peaked 10%+ — exit at -3% max
+        if _max >= 0.25:
+            _floor = 0.12   # secured 12% minimum
+        elif _max >= 0.15:
+            _floor = 0.08   # secured 8% minimum
+        elif _max >= 0.10:
+            _floor = 0.05   # secured 5% minimum
         elif _max >= 0.05:
-            _floor = -0.05   # peaked 5-10% — exit at -5% max
+            _floor = 0.03   # secured 3% minimum — goal is 25% avg winner
+        else:
+            _floor = 0.00   # any green: floor at breakeven
 
         if option_pnl <= _floor:
             # Before firing: check if underlying still confirming.
@@ -659,19 +669,20 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
                     pos.ticker, _progress * 100, option_pnl * 100,
                 )
 
-    # ── SOFT LOSS STOP (-12%) — thesis-aware ─────────────────────────────────
-    # -33% = emergency hard stop (already above)
-    # -12% = soft stop: exit if thesis is broken, breathe if thesis alive
+    # ── SOFT LOSS STOP — two-tier, thesis-aware ──────────────────────────────
+    # -33% = hard stop emergency airbag (unchanged)
+    # -12% = normal soft stop (underlying flat or holding)
+    # -20% = extended room ONLY when underlying actively moving our direction
     #
-    # This prevents red trades from bleeding to -33% while also giving
-    # young positions breathing room when the underlying still confirms.
+    # This handles "trades that go -20% before popping" — the underlying
+    # move is the real signal. The option price is noise on cheap contracts.
     #
-    # Rules:
-    #   1. If underlying broke against us → exit immediately
-    #   2. If young (< MIN_HOLD) AND underlying still confirming → hold
-    #   3. If old (>= MAX_HOLD_WHILE_RED) AND still red → exit regardless
-    #   4. Otherwise → hold and warn
+    # Tier A: underlying moved 0.5%+ in our direction → breathe to -20%
+    # Tier B: underlying flat/holding within 0.5% of entry → soft stop -12%
+    # Tier C: underlying broke against us → exit immediately
+    # Always: past -20% → exit regardless of confirmation
     _SOFT_LOSS_PCT      = float(os.getenv("SOFT_LOSS_STOP_PCT",           "-0.12"))
+    _SOFT_LOSS_DEEP_PCT = float(os.getenv("SOFT_LOSS_STOP_DEEP_PCT",      "-0.20"))
     _MIN_HOLD_SOFT      = float(os.getenv("MIN_HOLD_MINUTES_BEFORE_SOFT_EXIT", "3"))
     _MAX_HOLD_RED       = float(os.getenv("MAX_HOLD_MINUTES_WHILE_RED",        "5"))
 
@@ -679,8 +690,29 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
         _soft_age       = _position_age_minutes(pos)
         _soft_confirm, _soft_reason = _underlying_still_confirming(pos)
 
+        # Measure how strongly the underlying is moving in our direction
+        _entry_u = getattr(pos, "underlying_entry", 0) or 0
+        _curr_u  = getattr(pos, "current_underlying", 0) or 0
+        _side    = (getattr(pos, "side", "") or "").upper()
+        _u_move  = 0.0
+        if _entry_u > 0 and _curr_u > 0:
+            raw_move = (_curr_u - _entry_u) / _entry_u
+            _u_move  = raw_move if _side == "CALL" else -raw_move
+        _strong_confirm = _soft_confirm and _u_move >= 0.005  # 0.5%+ move our way
+
+        # Past -20% → always exit, no more breathing room
+        if option_pnl <= _SOFT_LOSS_DEEP_PCT:
+            return ExitDecision(
+                action="CLOSE_ALL", quantity=qty_rem,
+                reason=(
+                    f"DEEP_LOSS_STOP — {option_pnl*100:.0f}% exceeds deep floor "
+                    f"{_SOFT_LOSS_DEEP_PCT*100:.0f}% | underlying={_soft_reason}"
+                ),
+                urgency="IMMEDIATE", pnl_pct=option_pnl,
+            )
+
         if not _soft_confirm:
-            # Thesis broken — exit now, don't wait for -33%
+            # Thesis broken — exit at -12%, don't wait for -33%
             return ExitDecision(
                 action="CLOSE_ALL", quantity=qty_rem,
                 reason=(
@@ -690,8 +722,15 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
                 ),
                 urgency="IMMEDIATE", pnl_pct=option_pnl,
             )
-        elif _soft_age < _MIN_HOLD_SOFT:
-            # Young position, thesis alive — breathe
+        elif _strong_confirm and _soft_age < _MIN_HOLD_SOFT:
+            # Underlying actively moving our way + young — breathe to -20%
+            log.info(
+                "[%s] SOFT_LOSS_SUPPRESSED (strong confirm) — underlying moved "
+                "+%.2f%% our direction | option=%.1f%% | age=%.1fmin | room to -20%%",
+                pos.ticker, _u_move * 100, option_pnl * 100, _soft_age,
+            )
+        elif _soft_confirm and _soft_age < _MIN_HOLD_SOFT:
+            # Underlying flat/holding + young — breathe to -12%
             log.info(
                 "[%s] SOFT_LOSS_STOP_SUPPRESSED — %.1f%% loss but underlying "
                 "confirming (%s) | age=%.1fmin < %.0fmin hold floor",
@@ -699,7 +738,7 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
                 _soft_age, _MIN_HOLD_SOFT,
             )
         elif _soft_age >= _MAX_HOLD_RED:
-            # Been red too long — exit even if underlying barely holding
+            # Red too long — exit even if underlying barely holding
             return ExitDecision(
                 action="CLOSE_ALL", quantity=qty_rem,
                 reason=(
@@ -709,7 +748,6 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
                 urgency="HIGH", pnl_pct=option_pnl,
             )
         else:
-            # In the hold window — log warning only
             log.warning(
                 "[%s] SOFT_LOSS_WATCH — %.1f%% loss | underlying=%s | "
                 "age=%.1fmin | will exit at %.0fmin if no recovery",
