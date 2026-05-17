@@ -7,16 +7,15 @@
 # contract_selector is the sole contract-quality authority for the queue path:
 #   /signal → queue → worker_loop → master_control → contract_selector → watcher
 #
-# The breach path (_on_entry_trigger) uses evaluate_contract() from
-# ap_options_intelligence.py.  These two gates MUST remain equivalent or
-# contract_selector must be stricter.
-#
-# RULE: Any future change to evaluate_contract() quality thresholds (IV caps,
-# spread limits, liquidity floors, premium bounds) MUST be mirrored here, OR
-# both paths must import from a shared rules module.
-#
-# Reclassified Bug 8 (audit 2026-04-24) as architectural note — not a defect —
-# because contract_selector already enforces equivalent quality controls.
+# AUDIT 2026-05-17: The breach path (_on_entry_trigger in ap_execution_core.py)
+# was historically documented as using evaluate_contract() from
+# ap_options_intelligence.py. That is NO LONGER TRUE. The breach path calls
+# self.contract_selector.select() (ap_execution_core.py ~L627) — the SAME
+# engine as the queue path. evaluate_contract() is now dead code: it is not
+# imported or called anywhere in the live system. There is therefore a SINGLE
+# contract-quality gate (this file). No dual-gate equivalence burden remains.
+# If evaluate_contract() is ever revived, it MUST import the thresholds from
+# this module rather than redefining them.
 # ══════════════════════════════════════════════════════════════════════════════ -- APContractSelectionEngine
 # =============================================================================
 # Unified contract selection. Takes an ApprovedExecutionPlan, returns the

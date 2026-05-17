@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import json
 import logging
+import copy
 from ap.trace import trace_gate
 import os
 import time
@@ -106,8 +107,13 @@ def enqueue_signal(
     Push a signal into trade_queue.
     Returns True if inserted, False if duplicate (idempotency_key conflict).
     """
+    # H1: route_signal_to_all_clients passes the SAME signal dict to
+    # enqueue_signal once per client. Below we mutate `payload` in place
+    # (defaults for ticker/score/side, and future per-client fields). Binding
+    # payload = sig would leak one client's mutations into the next client's
+    # enqueue. Always work on a deep copy so each client's payload is isolated.
     if isinstance(sig, dict):
-        payload = sig
+        payload = copy.deepcopy(sig)
     elif hasattr(sig, "model_dump"):
         payload = sig.model_dump()
     elif hasattr(sig, "dict"):
