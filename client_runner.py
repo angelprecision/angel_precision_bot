@@ -1447,6 +1447,7 @@ class ClientRunner(threading.Thread):
         self.master_control.wire(
             kill_switch_fn=lambda: getattr(self.core, "_kill_switch", False),
             mode_fn=lambda: getattr(self.core, "mode", self.mode),
+            entries_paused_fn=self._read_entries_paused,
         )
 
         self._register_exit_engine(exit_eng)
@@ -1693,6 +1694,33 @@ class ClientRunner(threading.Thread):
                     )
         except Exception as exc:
             logger.warning("[%s] Startup phantom clear: %s", self.email, exc)
+
+    def _read_entries_paused(self) -> bool:
+        """H5: per-client entries pause flag from client_state.entries_paused.
+
+        Read fresh so an operator toggle in the admin dashboard takes effect
+        with no bot restart. Cached for a few seconds so a burst of signals
+        does not hammer the DB. Fail-open: a transient read error must not
+        halt a client's trading — the kill switch remains the hard safety
+        stop, this is an operator-convenience pause.
+        """
+        import time as _t
+        _now = _t.monotonic()
+        _cached = getattr(self, "_entries_paused_cache", None)
+        if _cached is not None and _cached[1] > _now:
+            return _cached[0]
+        paused = False
+        try:
+            from ap.state import load_state
+            st = load_state(client_id=self.email) or {}
+            paused = bool(st.get("entries_paused", False))
+        except Exception as exc:
+            logger.warning("[%s] entries_paused read failed (fail-open): %s",
+                            self.email, exc)
+            paused = False
+        ttl = float(os.getenv("ENTRIES_PAUSED_CACHE_TTL", "5.0"))
+        self._entries_paused_cache = (paused, _now + ttl)
+        return paused
 
     def _load_client_config(self) -> dict:
         """Load per-client risk profile from the clients table.

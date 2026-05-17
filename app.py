@@ -620,6 +620,51 @@ def create_app() -> Flask:
             _kill_switch_cache.clear()
         return jsonify({"ok": True, "kill_switch": False})
 
+    @app.post("/admin/client/<client_id>/pause_entries")
+    @require_hmac
+    def admin_client_pause_entries(client_id):
+        """H5: pause ONE client's new entries. Exits keep running. Other
+        clients unaffected (each runner has its own master_control). Operator
+        control surfaced in the admin dashboard client section."""
+        cid = (client_id or "").strip()
+        if not cid:
+            return jsonify({"ok": False, "error": "missing_client_id"}), 400
+        log.info("⏸️ CLIENT ENTRIES PAUSED | %s", cid)
+        update_state({"entries_paused": True}, client_id=cid)
+        return jsonify({"ok": True, "client_id": cid, "entries_paused": True})
+
+    @app.post("/admin/client/<client_id>/resume_entries")
+    @require_hmac
+    def admin_client_resume_entries(client_id):
+        """H5: resume a paused client's entries."""
+        cid = (client_id or "").strip()
+        if not cid:
+            return jsonify({"ok": False, "error": "missing_client_id"}), 400
+        log.info("▶️ CLIENT ENTRIES RESUMED | %s", cid)
+        update_state({"entries_paused": False}, client_id=cid)
+        return jsonify({"ok": True, "client_id": cid, "entries_paused": False})
+
+    @app.get("/admin/client/<client_id>/control_state")
+    @require_hmac
+    def admin_client_control_state(client_id):
+        """H5/H6: report a client's live control state for the dashboard."""
+        cid = (client_id or "").strip()
+        if not cid:
+            return jsonify({"ok": False, "error": "missing_client_id"}), 400
+        try:
+            st = load_state(client_id=cid) or {}
+        except Exception as e:
+            return jsonify({"ok": False, "error": f"state_read_failed:{e}"}), 500
+        return jsonify({
+            "ok": True,
+            "client_id": cid,
+            "entries_paused": bool(st.get("entries_paused", False)),
+            "kill_switch": bool(st.get("kill_switch", False)),
+            "mode": st.get("mode", "PAPER"),
+            "realized_pnl_today": float(st.get("realized_pnl_today", 0.0) or 0.0),
+            "trades_taken_today": int(st.get("trades_taken_today", 0) or 0),
+        })
+
     @app.post("/mode")
     @require_hmac
     def set_mode():

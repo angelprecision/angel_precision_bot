@@ -303,6 +303,13 @@ class APMasterControl:
         )
 
         self._kill_switch_fn = None
+        # H5: per-client entries pause. Distinct from kill switch:
+        #   kill switch  = full READ_ONLY (no entries, protective mode)
+        #   entries pause = THIS client's new entries off, exits keep running,
+        #                   other clients unaffected. Operator-toggled from the
+        #                   admin dashboard; read fresh each evaluate() so it
+        #                   takes effect with no bot restart.
+        self._entries_paused_fn = None
         self._mode_fn = None
         self._seen_signals: dict[str, float] = {}  # key -> inserted_ts, expires after 1800s
         self._trade_cooldowns: dict[str, float] = {}
@@ -322,9 +329,11 @@ class APMasterControl:
             self.max_daily_loss,
         )
 
-    def wire(self, *, kill_switch_fn=None, mode_fn=None, position_count_fn=None, alert_fn=None, **kwargs):
+    def wire(self, *, kill_switch_fn=None, mode_fn=None, position_count_fn=None, alert_fn=None, entries_paused_fn=None, **kwargs):
         if kill_switch_fn:
             self._kill_switch_fn = kill_switch_fn
+        if entries_paused_fn:
+            self._entries_paused_fn = entries_paused_fn
         if mode_fn:
             self._mode_fn = mode_fn
         if alert_fn:
@@ -727,6 +736,21 @@ class APMasterControl:
             return self._block(signal_id, ticker, client_id, "blocked_system", "exit_engine_down__protective_systems_unavailable")
         if self._kill_switch_fn and self._kill_switch_fn():
             return self._block(signal_id, ticker, client_id, "blocked_system", "kill_switch_active")
+        # H5: per-client entries pause. Only blocks NEW entries for THIS client
+        # — evaluate() never gates exits, and other clients' runners have their
+        # own master_control instance, so this is fully isolated.
+        if self._entries_paused_fn:
+            try:
+                if self._entries_paused_fn():
+                    return self._block(
+                        signal_id, ticker, client_id, "blocked_system",
+                        "client_entries_paused — operator paused this client; "
+                        "exits still active",
+                        reason_code="CLIENT_ENTRIES_PAUSED",
+                    )
+            except Exception as _ep_err:
+                log.warning("[%s] entries_paused check failed (fail-open): %s",
+                            ticker, _ep_err)
 
         current_mode = self._current_mode()
         if current_mode == "READ_ONLY":
