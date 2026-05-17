@@ -720,8 +720,21 @@ class APOrderStateMachine:
             updates.append("position_id=%s"); params.append(position_id)
         if new_status in (OrderStatus.FILLED, OrderStatus.EXIT_FILLED):
             updates.append("filled_ts=%s"); params.append(filled_ts or now_utc_iso())
-        params.extend([local_order_id, self.client_id])
-        sql = f"UPDATE orders SET {', '.join(updates)} WHERE local_order_id=%s AND client_id=%s"
+        # COMPARE-AND-SWAP: guard the UPDATE on the status we read above.
+        # Without this, two concurrent callers (fill_monitor / order_monitor /
+        # reconciler all run in separate threads) can both pass the Python-side
+        # can_transition() check and both UPDATE the row — the second silently
+        # overwriting the first's fill_qty/fill_price. The rowcount==1 check
+        # cannot detect that because both UPDATEs legitimately touch one row.
+        # With "AND status=<old_status>" the DB serializes concurrent writers:
+        # exactly one wins, the losers get rowcount=0 and are handled below.
+        # same_state_fill_update (PARTIAL_FILL->PARTIAL_FILL) is safe here too
+        # because old_status == new_status, so the guard still matches the row.
+        params.extend([local_order_id, self.client_id, old_status])
+        sql = (
+            f"UPDATE orders SET {', '.join(updates)} "
+            f"WHERE local_order_id=%s AND client_id=%s AND status=%s"
+        )
 
         def _fn():
             with conn() as c:
@@ -731,9 +744,33 @@ class APOrderStateMachine:
         rowcount = run_with_retry(_fn)
 
         if rowcount == 0:
-            reason = f"transition_update_no_rows:{old_status}->{new_status}"
-            log.critical("[%s] OSM UPDATE TOUCHED ZERO ROWS | %s | %s",
-                         self.client_id, local_order_id, reason)
+            # CAS miss. Re-read to determine WHY the guarded UPDATE matched no row:
+            #   (a) another thread already advanced it to new_status -> idempotent OK
+            #   (b) another thread moved it somewhere else            -> real conflict
+            #   (c) row genuinely missing                             -> real error
+            latest = self._get_order(local_order_id)
+            if latest:
+                latest_status = str(dict(latest).get("status") or "")
+                if latest_status == new_status:
+                    log.info(
+                        "[%s] transition CAS no-op -- %s already advanced to %s by "
+                        "a concurrent worker; treating as success",
+                        self.client_id, local_order_id, new_status,
+                    )
+                    return True
+                reason = (
+                    f"transition_cas_conflict:{old_status}->{new_status}"
+                    f" (actual_now={latest_status})"
+                )
+                log.critical(
+                    "[%s] OSM CAS CONFLICT | %s | expected_from=%s wanted=%s actual=%s "
+                    "-- concurrent writer changed status; refusing to overwrite",
+                    self.client_id, local_order_id, old_status, new_status, latest_status,
+                )
+            else:
+                reason = f"transition_update_no_rows:{old_status}->{new_status}"
+                log.critical("[%s] OSM UPDATE TOUCHED ZERO ROWS (row missing) | %s | %s",
+                             self.client_id, local_order_id, reason)
             self._record_error(local_order_id, reason)
             self._emit_transition_event(
                 local_order_id=local_order_id, old_status=old_status, new_status=new_status,

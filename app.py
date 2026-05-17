@@ -54,6 +54,11 @@ _SIGNAL_CACHE_LOCK   = threading.Lock()
 _client_status_cache: dict = {}   # {client_id: (status, expires_ts)}
 _kill_switch_cache:   dict = {}   # {client_id: (kill_val, mode, expires_ts)}
 _CACHE_TTL = 30.0                 # seconds -- refresh every 30s
+# C3: kill switch is a safety control and is frequently changed OUT OF BAND
+# (Supabase SQL, dashboard backend) without calling /kill_switch/off, so the
+# cache cannot be explicitly invalidated on those paths. Keep this short so a
+# lifted kill switch takes effect within seconds, not within _CACHE_TTL.
+_KILL_SWITCH_CACHE_TTL = float(os.getenv("KILL_SWITCH_CACHE_TTL", "3.0"))
 
 # HIGH-007: supervisor started in gunicorn post_worker_init hook ONLY.
 # Do NOT call start_multi_client_supervisor() here -- this is module import scope.
@@ -693,6 +698,11 @@ def create_app() -> Flask:
             return jsonify(cached), 200
 
         # HIGH-008: use per-client cache key instead of DEFAULT_CLIENT_ID
+        # C3: the kill switch is a SAFETY control. External state changes
+        # (Supabase SQL, dashboard backend writing client_state directly)
+        # do NOT call /kill_switch/off, so they cannot clear this cache.
+        # A 30s TTL means up to 30s of dropped signals after recovery.
+        # Use a short dedicated TTL so external clears take effect fast.
         _now = time.monotonic()
         with _SIGNAL_CACHE_LOCK:
             _ks_cached = _kill_switch_cache.get(client_id)
@@ -702,10 +712,15 @@ def create_app() -> Flask:
             _st = load_state(client_id=client_id)
             _ks, _mode = _st.get("kill_switch"), _st.get("mode")
             with _SIGNAL_CACHE_LOCK:
-                _kill_switch_cache[client_id] = (_ks, _mode, _now + _CACHE_TTL)
+                _kill_switch_cache[client_id] = (_ks, _mode, _now + _KILL_SWITCH_CACHE_TTL)
         if _ks or _mode == "READ_ONLY":
+            # C2: do NOT write this into the idempotency cache. bot_in_read_only
+            # is a RECOVERABLE rejection — the kill switch can be lifted seconds
+            # later. If we cache it under the signal_id, the scanner's retry of
+            # the SAME signal_id returns this stale 403 for IDEMP_TTL_SECONDS
+            # (300s) even though the bot is live again. Only terminal successes
+            # may be cached. Leave idem_key unset so retries are reprocessed.
             payload = {"ok": False, "error": "bot_in_read_only"}
-            _idem_set(idem_key, payload)
             return jsonify(payload), 403
 
         # Fix 4: synchronous durable enqueue — 202 only after queue write succeeds
