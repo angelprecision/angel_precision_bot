@@ -1311,19 +1311,50 @@ class ClientRunner(threading.Thread):
             self.email, equity, max_trades, max_pos, max_loss, throttle_threshold, stop_threshold,
         )
 
+        # H3: per-client risk caps. _cfg_or_env returns the client's column
+        # value when set, otherwise the exact global env default used before.
+        _mc_capital_pct = self._cfg_or_env(client_cfg, "max_capital_pct", "MAX_CAPITAL_PCT", "0.40", float)
+        _mc_sector_pct  = self._cfg_or_env(client_cfg, "max_sector_pct",  "MAX_SECTOR_PCT",  "0.25", float)
+        _mc_ticker_pct  = self._cfg_or_env(client_cfg, "max_ticker_pct",  "MAX_TICKER_PCT",  "0.10", float)
+        _mc_max_calls   = self._cfg_or_env(client_cfg, "max_calls",       "MAX_CALLS",       "10",   int)
+        _mc_max_puts    = self._cfg_or_env(client_cfg, "max_puts",        "MAX_PUTS",        "10",   int)
+        _mc_score_floor = self._cfg_or_env(client_cfg, "score_floor",     "SCORE_FLOOR",     "65",   float)
+        _mc_ctx_floor   = self._cfg_or_env(client_cfg, "context_floor",   "CONTEXT_FLOOR",   "0.0",  float)
+        # H8: daily profit target (USD). NULL/0 = disabled. Per-client only —
+        # no global env default, since a blanket target across all clients
+        # would be wrong (different account sizes/goals).
+        _mc_daily_target = client_cfg.get("daily_profit_target_usd")
+        try:
+            _mc_daily_target = float(_mc_daily_target) if _mc_daily_target is not None else 0.0
+        except (TypeError, ValueError):
+            _mc_daily_target = 0.0
+        logger.info(
+            "[%s] Risk profile | capital=%.0f%% sector=%.0f%% ticker=%.0f%% "
+            "calls=%s puts=%s score_floor=%s ctx_floor=%s%s",
+            self.email, _mc_capital_pct * 100, _mc_sector_pct * 100,
+            _mc_ticker_pct * 100, _mc_max_calls, _mc_max_puts,
+            _mc_score_floor, _mc_ctx_floor,
+            " (per-client override active)" if any(
+                client_cfg.get(k) is not None for k in
+                ("max_capital_pct", "max_sector_pct", "max_ticker_pct",
+                 "max_calls", "max_puts", "score_floor", "context_floor")
+            ) else " (global defaults)",
+        )
+
         self.master_control = APMasterControl(
             mode=self.mode.lower(),
             client_id=self.email,
-            score_floor=float(os.getenv("SCORE_FLOOR", "65")),
-            context_floor=float(os.getenv("CONTEXT_FLOOR", "0.0")),
+            score_floor=_mc_score_floor,
+            context_floor=_mc_ctx_floor,
             max_positions=max_pos,
-            max_capital_pct=float(os.getenv("MAX_CAPITAL_PCT", "0.40")),
-            max_sector_pct=float(os.getenv("MAX_SECTOR_PCT", "0.25")),
-            max_ticker_pct=float(os.getenv("MAX_TICKER_PCT", "0.10")),
-            max_calls=int(os.getenv("MAX_CALLS", "10")),
-            max_puts=int(os.getenv("MAX_PUTS", "10")),
+            max_capital_pct=_mc_capital_pct,
+            max_sector_pct=_mc_sector_pct,
+            max_ticker_pct=_mc_ticker_pct,
+            max_calls=_mc_max_calls,
+            max_puts=_mc_max_puts,
             max_trades_today=max_trades,
             max_daily_loss=max_loss,
+            daily_profit_target_usd=_mc_daily_target,
             account_equity=equity,
             position_manager=self.position_manager,
             position_sizer=position_sizer,
@@ -1664,13 +1695,26 @@ class ClientRunner(threading.Thread):
             logger.warning("[%s] Startup phantom clear: %s", self.email, exc)
 
     def _load_client_config(self) -> dict:
+        """Load per-client risk profile from the clients table.
+
+        H3: Risk caps were previously global env vars — every client shared
+        MAX_CAPITAL_PCT / MAX_SECTOR_PCT / MAX_TICKER_PCT / MAX_CALLS /
+        MAX_PUTS / SCORE_FLOOR. That cannot serve a $5K beta client and a
+        proven $35K client simultaneously. These columns are nullable: a NULL
+        means "use the global env default" so existing clients behave EXACTLY
+        as before until an operator sets an explicit per-client override.
+        """
         try:
             from ap.db import conn as _conn
 
             def _load_cfg():
                 with _conn() as c:
                     c.execute(
-                        "SELECT max_trades_per_day, max_concurrent_positions, daily_max_loss_pct, initial_equity "
+                        "SELECT max_trades_per_day, max_concurrent_positions, "
+                        "daily_max_loss_pct, initial_equity, "
+                        "max_capital_pct, max_sector_pct, max_ticker_pct, "
+                        "max_calls, max_puts, score_floor, context_floor, "
+                        "daily_profit_target_usd, entries_enabled "
                         "FROM clients WHERE client_id=%s",
                         (self.email,),
                     )
@@ -1680,6 +1724,20 @@ class ClientRunner(threading.Thread):
         except Exception as exc:
             logger.warning("[%s] Could not load client config: %s", self.email, exc)
             return {}
+
+    @staticmethod
+    def _cfg_or_env(cfg: dict, key: str, env_name: str, env_default: str, cast):
+        """Return per-client cfg[key] when set (non-None), else env fallback.
+
+        Preserves exact current behavior when the column is NULL/absent.
+        """
+        val = cfg.get(key) if isinstance(cfg, dict) else None
+        if val is None:
+            return cast(os.getenv(env_name, env_default))
+        try:
+            return cast(val)
+        except (TypeError, ValueError):
+            return cast(os.getenv(env_name, env_default))
 
     def _run_startup_recovery(self, broker, exit_eng):
         """Run startup recovery with a hard timeout to prevent blocking initialization.

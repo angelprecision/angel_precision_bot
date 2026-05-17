@@ -229,6 +229,7 @@ class APMasterControl:
         max_puts: int = 5,
         max_trades_today: int = 10,
         max_daily_loss: float = -500.0,
+        daily_profit_target_usd: float = 0.0,
         account_equity: float = 25000.0,
         position_manager=None,
         position_sizer=None,
@@ -253,6 +254,11 @@ class APMasterControl:
         self.max_puts = max_puts
         self.max_trades_today = max_trades_today
         self.max_daily_loss = max_daily_loss
+        # H8: once realized P&L for the session reaches this dollar target,
+        # block NEW entries for the rest of the day so the bot does not give
+        # back a green day chasing more trades. 0.0 = disabled (unlimited).
+        # Exits are unaffected — master_control only gates entries.
+        self.daily_profit_target_usd = float(daily_profit_target_usd or 0.0)
         self.account_equity = account_equity
         self._startup_equity = float(account_equity)  # used to scale max_daily_loss proportionally
         self.pm = position_manager
@@ -757,6 +763,21 @@ class APMasterControl:
 
         total_trades = int(snap.get("total_trades") or 0)
         bootstrap_mode = total_trades < 20
+
+        # H8: daily profit-target quota. Once the session's realized P&L hits
+        # the per-client target, stop opening NEW entries — protect the green
+        # day. Exits keep running (this function only gates entries). Disabled
+        # when target is 0.0. Uses realized_pnl_today from the snapshot truth.
+        if self.daily_profit_target_usd and self.daily_profit_target_usd > 0:
+            _pnl_today = float(snap.get("realized_pnl_today") or 0.0)
+            if _pnl_today >= self.daily_profit_target_usd:
+                return self._block(
+                    signal_id, ticker, client_id, "blocked_risk",
+                    f"daily_profit_target_reached "
+                    f"(${_pnl_today:.0f} >= ${self.daily_profit_target_usd:.0f}) "
+                    f"— protecting green day, exits still active",
+                    reason_code="DAILY_PROFIT_TARGET_REACHED",
+                )
 
         if snap["open_count"] >= self.max_positions:
             return self._block(signal_id, ticker, client_id, "blocked_risk", f"max_positions ({snap['open_count']}/{self.max_positions})")
