@@ -62,6 +62,17 @@ def post_worker_init(worker):
                     f"(missing credentials or config — disable member or add Tradier account)",
                     exc_info=False,
                 )
+                # Write to Supabase so operator dashboard shows this immediately
+                try:
+                    sb.table("ap_system_events").insert({
+                        "event_type":  "RUNNER_STARTUP_SKIPPED",
+                        "severity":    "CRITICAL",
+                        "client_id":   email,
+                        "message":     f"Runner skipped on startup: {str(client_exc)[:200]}",
+                        "created_at":  __import__("datetime").datetime.utcnow().isoformat(),
+                    }).execute()
+                except Exception:
+                    pass  # Never let event logging crash startup
 
         log.info(f"post_worker_init: done — started={started} skipped={skipped}")
     except Exception as exc:
