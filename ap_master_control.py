@@ -764,19 +764,25 @@ class APMasterControl:
         total_trades = int(snap.get("total_trades") or 0)
         bootstrap_mode = total_trades < 20
 
-        # H8: daily profit-target quota. Once the session's realized P&L hits
-        # the per-client target, stop opening NEW entries — protect the green
-        # day. Exits keep running (this function only gates entries). Disabled
-        # when target is 0.0. Uses realized_pnl_today from the snapshot truth.
+        # H8 (corrected): daily_profit_target_usd is a MINIMUM/milestone, NOT a
+        # stop. The business goal is to make clients money — once the floor is
+        # cleared the bot KEEPS taking quality setups to maximize the day. The
+        # only behavior change after clearing the floor is OPTIONAL extra
+        # selectivity (protect-profit score bump) so post-target trades have to
+        # be a bit cleaner — opportunity stays open, the green day is protected
+        # by quality, not by quitting. Disabled when target is 0.0.
+        _post_target_score_bump = 0.0
         if self.daily_profit_target_usd and self.daily_profit_target_usd > 0:
             _pnl_today = float(snap.get("realized_pnl_today") or 0.0)
             if _pnl_today >= self.daily_profit_target_usd:
-                return self._block(
-                    signal_id, ticker, client_id, "blocked_risk",
-                    f"daily_profit_target_reached "
-                    f"(${_pnl_today:.0f} >= ${self.daily_profit_target_usd:.0f}) "
-                    f"— protecting green day, exits still active",
-                    reason_code="DAILY_PROFIT_TARGET_REACHED",
+                _post_target_score_bump = float(
+                    os.getenv("POST_TARGET_SCORE_BUMP", "5.0")
+                )
+                log.info(
+                    "[%s] Daily floor cleared ($%.0f >= $%.0f) — continuing to "
+                    "trade with +%.0f selectivity bump to protect the day",
+                    ticker, _pnl_today, self.daily_profit_target_usd,
+                    _post_target_score_bump,
                 )
 
         if snap["open_count"] >= self.max_positions:
@@ -846,14 +852,20 @@ class APMasterControl:
             except Exception as e:
                 log.warning("[%s] has_pending_entry check failed: %s", ticker, e)
 
+        # H8: after the daily floor is cleared, require a slightly higher score
+        # so post-target trades are cleaner — keeps the bot in opportunity while
+        # protecting the green day with quality rather than by stopping.
+        _eff_priority_floor = _PRIORITY_FLOOR + _post_target_score_bump
+        _eff_score_floor    = self.score_floor + _post_target_score_bump
+
         if ticker.upper() in _PRIORITY_TICKERS:
-            if effective_score < _PRIORITY_FLOOR:
-                self._store_update(signal_id, "rejected", f"priority score {score:.1f} < floor {_PRIORITY_FLOOR}")
-                return self._block(signal_id, ticker, client_id, "blocked_score", f"score_below_priority_floor ({score:.1f}<{_PRIORITY_FLOOR})")
+            if effective_score < _eff_priority_floor:
+                self._store_update(signal_id, "rejected", f"priority score {score:.1f} < floor {_eff_priority_floor}")
+                return self._block(signal_id, ticker, client_id, "blocked_score", f"score_below_priority_floor ({score:.1f}<{_eff_priority_floor})")
         else:
-            if effective_score < self.score_floor:
-                self._store_update(signal_id, "rejected", f"score {effective_score:.1f} < floor {self.score_floor}")
-                return self._block(signal_id, ticker, client_id, "blocked_score", f"score_below_floor ({effective_score:.1f}<{self.score_floor})")
+            if effective_score < _eff_score_floor:
+                self._store_update(signal_id, "rejected", f"score {effective_score:.1f} < floor {_eff_score_floor}")
+                return self._block(signal_id, ticker, client_id, "blocked_score", f"score_below_floor ({effective_score:.1f}<{_eff_score_floor})")
 
         score_breakdown = signal.get("score_breakdown") or {}
         if "real_time_ctx" in score_breakdown:

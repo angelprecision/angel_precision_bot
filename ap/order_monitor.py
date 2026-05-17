@@ -46,10 +46,21 @@ TIMEOUT_CREATED_NO_BROKER_WARN = int(os.getenv("ORDER_TIMEOUT_CREATED_NO_BROKER_
 TIMEOUT_SUBMITTED     = int(os.getenv("ORDER_TIMEOUT_SUBMITTED",     "300"))   # 5 min
 TIMEOUT_ACKNOWLEDGED  = int(os.getenv("ORDER_TIMEOUT_ACKNOWLEDGED",  "600"))   # 10 min
 TIMEOUT_PARTIAL_FILL  = int(os.getenv("ORDER_TIMEOUT_PARTIAL_FILL",  "900"))   # 15 min
-TIMEOUT_EXIT_PENDING  = int(os.getenv("ORDER_TIMEOUT_EXIT_PENDING",  "300"))   # 5 min — stricter
-TIMEOUT_EXIT_ACK      = int(os.getenv("ORDER_TIMEOUT_EXIT_ACK",      "600"))   # 10 min
+# H4: exit reliability. An unfilled exit on a fast-moving option is direct
+# account risk — a +25% green trade can round-trip to breakeven or a loss
+# while a mispriced limit exit sits unfilled. 5 min was far too slow. At 45s
+# the existing safety path (broker-fill-check -> cancel -> clear_exit_in_flight
+# -> exit engine re-evaluates & re-prices within its 8s loop) becomes
+# genuinely protective. Mechanism is UNCHANGED; only the trigger is faster.
+# Broker status is always checked first, so an exit that is mid-fill is never
+# wrongly canceled. Env-tunable for per-deployment calibration.
+TIMEOUT_EXIT_PENDING  = int(os.getenv("ORDER_TIMEOUT_EXIT_PENDING",  "45"))    # 45s — exit = account risk
+TIMEOUT_EXIT_ACK      = int(os.getenv("ORDER_TIMEOUT_EXIT_ACK",      "90"))    # 90s — acked but no fill
 
-POLL_INTERVAL = int(os.getenv("ORDER_MONITOR_POLL", "60"))  # seconds
+POLL_INTERVAL = int(os.getenv("ORDER_MONITOR_POLL", "60"))  # seconds (entry checks)
+# H4: exits run on this faster cadence (account risk). Keep >= a few seconds
+# to avoid hammering the broker; 15s + 45s timeout => hung exit caught fast.
+EXIT_CHECK_INTERVAL = int(os.getenv("ORDER_MONITOR_EXIT_POLL", "15"))  # seconds
 
 # Watchdog ownership controls.
 # Default is intentionally passive: this monitor alerts only and does not become
@@ -171,12 +182,25 @@ class APOrderMonitor:
         log.info(f"[{self.client_id}] APOrderMonitor stopping")
 
     def _run(self):
-        while not self._stop_event.wait(POLL_INTERVAL):
+        # H4: exits are account risk and must be checked far more often than
+        # entries. Entry checks stay at POLL_INTERVAL (a stuck entry just
+        # doesn't fill — no open position bleeding). Exit checks run every
+        # EXIT_CHECK_INTERVAL so a hung exit is caught in seconds, not a full
+        # minute. This does NOT multiply entry/broker API load — only the
+        # cheaper exit query runs on the fast cadence.
+        _last_entry_check = 0.0
+        while not self._stop_event.wait(EXIT_CHECK_INTERVAL):
+            _now = time.monotonic()
             try:
-                self._check_entry_orders()
                 self._check_exit_orders()
             except Exception as e:
-                log.error(f"[{self.client_id}] OrderMonitor loop error: {e}")
+                log.error(f"[{self.client_id}] OrderMonitor exit-check error: {e}")
+            if _now - _last_entry_check >= POLL_INTERVAL:
+                _last_entry_check = _now
+                try:
+                    self._check_entry_orders()
+                except Exception as e:
+                    log.error(f"[{self.client_id}] OrderMonitor entry-check error: {e}")
             try:
                 from ap.self_healing import get_healer as _gh
                 _h = _gh()

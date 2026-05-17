@@ -19,7 +19,7 @@ ALTER TABLE clients
   ADD COLUMN IF NOT EXISTS max_puts                 integer,
   ADD COLUMN IF NOT EXISTS score_floor              double precision,
   ADD COLUMN IF NOT EXISTS context_floor            double precision,
-  ADD COLUMN IF NOT EXISTS daily_profit_target_usd  double precision,
+  ADD COLUMN IF NOT EXISTS daily_profit_target_usd  double precision,  -- FLOOR not a cap: success milestone, bot keeps trading after
   ADD COLUMN IF NOT EXISTS entries_enabled          boolean DEFAULT true;
 
 -- ----------------------------------------------------------------------------
@@ -36,7 +36,7 @@ ALTER TABLE clients
 --   max_calls               = 1,
 --   max_puts                = 1,
 --   score_floor             = 70,
---   daily_profit_target_usd = 225
+--   daily_profit_target_usd = 225   -- floor: clear $225 then keep going
 -- WHERE client_id = 'jose.vasquez4011@gmail.com';
 
 -- Verify
