@@ -32,6 +32,67 @@ ET  = ZoneInfo("America/New_York")
 SYSTEM_VERSION = "v2"   # bump this to reset client-facing performance history
 
 
+# H7 — Canonical exit classification.
+# The exit engine writes free-text reasons ("TARGET HIT -- ...", "HARD STOP
+# -- ...", "RUNNER TRAIL EXIT -- ..."). Proof metrics need clean buckets so
+# the 28/30-trade cycle can be measured as: win-rate, breakeven-rate, true
+# loss-rate, hard-stop count, average win, average loss. This is a PURE
+# function over (reason, pnl, win) — it changes no exit behavior, only adds
+# a derived label to the proof row.
+EXIT_BUCKETS = (
+    "WIN_BASE_HIT",     # target/scale/profit-lock win at/near base target
+    "WIN_RUNNER",       # runner trailed out above base — the big winners
+    "BREAKEVEN_SAVE",   # closed within +/-3% — no real gain or loss
+    "SOFT_LOSS",        # losing exit but not the hard stop (managed cut)
+    "HARD_STOP",        # hit the hard stop threshold
+    "EOD_CLOSE",        # forced flat at end of day
+    "MANUAL_EXIT",      # operator/admin force-exit
+    "RECONCILED_CLOSE", # reconciler/quarantine evidence-based close
+    "UNCLASSIFIED",     # fell through — should be ~0; investigate if not
+)
+
+
+def classify_exit(exit_reason: str, option_pnl_pct: float, win: bool) -> str:
+    """Map a raw exit reason + P&L into one canonical EXIT_BUCKETS value.
+
+    Order matters: explicit-cause reasons (manual, EOD, hard stop, reconcile)
+    take priority over P&L-shape inference (runner vs base vs breakeven).
+    """
+    r = (exit_reason or "").upper()
+    pnl = float(option_pnl_pct or 0.0)
+
+    # 1. Explicit operational causes — independent of P&L sign.
+    if "MANUAL" in r or "ADMIN_FORCE" in r or "ADMIN FORCE" in r or "FORCE_EXIT" in r:
+        return "MANUAL_EXIT"
+    if "QUARANTINE" in r or "RECONCIL" in r or "GHOST" in r:
+        return "RECONCILED_CLOSE"
+    if "EOD" in r or "FORCE CLOSE" in r or "MARKET CLOSED" in r:
+        return "EOD_CLOSE"
+    if "HARD STOP" in r or "HARD_STOP" in r:
+        return "HARD_STOP"
+
+    # 2. Breakeven band — within +/-3% is neither a real win nor loss.
+    if -3.0 <= pnl <= 3.0:
+        return "BREAKEVEN_SAVE"
+
+    # 3. Winners — split base vs runner.
+    if win or pnl > 3.0:
+        if "RUNNER" in r or "TRAIL" in r and pnl >= 25.0:
+            return "WIN_RUNNER"
+        if "RUNNER" in r:
+            return "WIN_RUNNER"
+        # Trailing/profit-lock that still captured a big move counts as runner.
+        if pnl >= 25.0:
+            return "WIN_RUNNER"
+        return "WIN_BASE_HIT"
+
+    # 4. Losers that are not the hard stop = managed soft loss.
+    if pnl < -3.0:
+        return "SOFT_LOSS"
+
+    return "UNCLASSIFIED"
+
+
 # =============================================================================
 # INTRADAY FUNNEL COUNTER
 # =============================================================================
@@ -282,6 +343,7 @@ class APProofLogger:
             "underlying_exit":    round(underlying_exit, 4),
             "contracts":          contracts,
             "exit_reason":        exit_reason,
+            "exit_bucket":        classify_exit(exit_reason, option_pnl_pct, win),
             "option_pnl_pct":     round(option_pnl_pct, 2),
             "underlying_pnl_pct": round(underlying_pnl_pct, 3),
             "win":                win,
@@ -308,7 +370,25 @@ class APProofLogger:
                 self.sb.table("proof_trades").insert(row).execute()
                 log.debug(f"[PROOF] {ticker} written to Supabase")
             except Exception as e:
-                log.error(f"[PROOF] Supabase write failed: {e}")
+                # H7: exit_bucket is a new column. If the migration has not
+                # been applied yet, the insert fails on unknown column. Proof
+                # logging is the source of truth and must NEVER be lost — retry
+                # once without the derived field. The bucket can be backfilled
+                # later from exit_reason since classify_exit is a pure function.
+                emsg = str(e).lower()
+                if "exit_bucket" in emsg or "column" in emsg or "schema" in emsg:
+                    try:
+                        _fallback = {k: v for k, v in row.items() if k != "exit_bucket"}
+                        self.sb.table("proof_trades").insert(_fallback).execute()
+                        log.warning(
+                            "[PROOF] %s written WITHOUT exit_bucket (column missing — "
+                            "run migrations/2026_05_17_proof_exit_bucket.sql to enable)",
+                            ticker,
+                        )
+                    except Exception as e2:
+                        log.error(f"[PROOF] Supabase write failed (fallback too): {e2}")
+                else:
+                    log.error(f"[PROOF] Supabase write failed: {e}")
 
         return row
 
