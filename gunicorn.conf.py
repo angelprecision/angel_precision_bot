@@ -41,21 +41,29 @@ def post_worker_init(worker):
         members = _fetch_active_members(sb)
         log.info(f"post_worker_init: found {len(members)} active members")
 
-        started = []
+        started = []; skipped = []
         for member in members:
             email = member["email"]
-            with _registry_lock:
-                existing = _active_runners.get(email)
-                if existing and existing.is_alive():
-                    log.info(f"post_worker_init: runner already alive for {email}")
-                    continue
-                runner = ClientRunner(member)
-                _active_runners[email] = runner
-                runner.start()
-                started.append(email)
-                log.info(f"post_worker_init: started runner for {email}")
+            try:
+                with _registry_lock:
+                    existing = _active_runners.get(email)
+                    if existing and existing.is_alive():
+                        log.info(f"post_worker_init: runner already alive for {email}")
+                        continue
+                    runner = ClientRunner(member)
+                    _active_runners[email] = runner
+                    runner.start()
+                    started.append(email)
+                    log.info(f"post_worker_init: started runner for {email}")
+            except Exception as client_exc:
+                skipped.append(email)
+                log.error(
+                    f"post_worker_init: SKIPPED {email} — {client_exc} "
+                    f"(missing credentials or config — disable member or add Tradier account)",
+                    exc_info=False,
+                )
 
-        log.info(f"post_worker_init: done — started={started}")
+        log.info(f"post_worker_init: done — started={started} skipped={skipped}")
     except Exception as exc:
         import logging
         logging.getLogger("gunicorn.error").error(f"post_worker_init runner start failed: {exc}", exc_info=True)
