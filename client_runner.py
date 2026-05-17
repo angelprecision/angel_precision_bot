@@ -1787,6 +1787,11 @@ class ClientRunner(threading.Thread):
                 pm=self.position_manager,
             )
             self.reconciler.exit_engine = exit_eng
+            # Wire fill_monitor so reconciler can confirm it's alive
+            # fill_monitor_thread is set by _start_fill_monitor() — pass it now
+            # if already running, or it will be set after _start_fill_monitor() runs
+            if hasattr(self, 'fill_monitor_thread') and self.fill_monitor_thread:
+                self.reconciler.fill_monitor = self.fill_monitor_thread
             self.reconciler.start()
             logger.info("[%s] Broker reconciler started", self.email)
         except Exception as exc:
@@ -1864,6 +1869,11 @@ class ClientRunner(threading.Thread):
         )
         self.fill_monitor_thread.start()
         logger.info("[%s] Fill monitor thread launched", self.email)
+
+        # Wire into reconciler now that thread exists — reconciler was started first
+        if self.reconciler is not None:
+            self.reconciler.fill_monitor = self.fill_monitor_thread
+            logger.info("[%s] fill_monitor wired into reconciler", self.email)
 
     def _assert_fill_monitor_alive(self):
         time.sleep(float(os.getenv("FILL_MONITOR_START_GRACE_SEC", "0.5")))
