@@ -578,7 +578,10 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
                 )
 
     # ── 33/33/34 SCALE-OUT LADDER ────────────────────────────────────────────
-    # Targets: +10% → sell 33% | +20% → sell 33% | +30% → sell remainder
+    # Scale-out ladder:
+    # +15% (SCALE_OUT_1_THRESHOLD) → sell first third  — lock base gain
+    # +25% (SCALE_OUT_2_THRESHOLD) → sell second third — lock extended gain
+    # Runner: trails with no fixed ceiling — let winners run
     # Do NOT close everything at 15% — let winners run to 25-30%+ with trail.
     # Single-contract positions: hold until trail fires or 30%+ hit.
 
@@ -761,7 +764,11 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
                 "will exit if breach holds >%.0fs | age=%.1fmin",
                 pos.ticker, option_pnl * 100, _soft_confirm, _STOP_CONFIRM_SEC, _soft_age,
             )
-            return None  # Wait for confirmation
+            return ExitDecision(
+                action="HOLD", quantity=0,
+                reason=f"STOP_BREACH_STARTED — {option_pnl*100:.1f}% loss | breach stamped, waiting for confirmation window",
+                urgency="NORMAL", pnl_pct=option_pnl, reason_code="STOP_BREACH_STARTED",
+            )
 
         _breach_age_sec = _now_ts - _breach_ts
 
@@ -779,7 +786,11 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
                     pos.ticker, _u_move * 100, option_pnl * 100,
                     _breach_age_sec, _STOP_CONFIRM_SEC,
                 )
-                return None
+                return ExitDecision(
+                    action="HOLD", quantity=0,
+                    reason=f"STOP_BREACH_RESET — underlying recovered {_u_move*100:.2f}%, wick not confirmed",
+                    urgency="NORMAL", pnl_pct=option_pnl, reason_code="STOP_BREACH_RESET",
+                )
             # Still in confirmation window — log and wait
             log.info(
                 "[%s] STOP_BREACH_CONFIRMING — %.1f%% loss | breach=%.0fs/%.0fs | "
@@ -787,7 +798,11 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
                 pos.ticker, option_pnl * 100, _breach_age_sec, _STOP_CONFIRM_SEC,
                 _soft_reason,
             )
-            return None
+            return ExitDecision(
+                action="HOLD", quantity=0,
+                reason=f"STOP_BREACH_CONFIRMING — {option_pnl*100:.1f}% loss | {_breach_age_sec:.0f}s/{_STOP_CONFIRM_SEC:.0f}s window | {_soft_reason}",
+                urgency="NORMAL", pnl_pct=option_pnl, reason_code="STOP_BREACH_CONFIRMING",
+            )
 
         # ── Breach confirmed (held past confirmation window) ──────────────────
         # Now evaluate whether to exit
@@ -815,7 +830,11 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
                 "hold floor | underlying=%s | giving thesis time to develop",
                 pos.ticker, option_pnl * 100, _soft_age, _MIN_HOLD_SOFT, _soft_reason,
             )
-            return None
+            return ExitDecision(
+                action="HOLD", quantity=0,
+                reason=f"SOFT_STOP_SUPPRESSED — age {_soft_age:.1f}min < {_MIN_HOLD_SOFT:.0f}min floor, underlying confirming",
+                urgency="NORMAL", pnl_pct=option_pnl, reason_code="SOFT_STOP_SUPPRESSED",
+            )
 
         if not _soft_confirm:
             # Thesis confirmed broken — underlying not holding, breach confirmed
@@ -840,7 +859,11 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
             pos.ticker, option_pnl * 100, _soft_reason,
             _soft_age, _breach_age_sec,
         )
-        return None
+        return ExitDecision(
+            action="HOLD", quantity=0,
+            reason=f"SOFT_LOSS_WATCH — {option_pnl*100:.1f}% loss | thesis holding, underlying={_soft_reason}",
+            urgency="NORMAL", pnl_pct=option_pnl, reason_code="SOFT_LOSS_WATCH",
+        )
 
     # ── NEVER-GREEN ESCALATING STOP ───────────────────────────────────────────
     if not pos.touched_profit:
@@ -1613,6 +1636,17 @@ class APExitEngine:
                         pos.current_option_price = float(fill_price)
                 except Exception as _fp_err:
                     log.error("Failed to set fill_price on position: %s", _fp_err)
+                # FIX 2: fire proof finalization with broker-confirmed fill price.
+                # This is the ONLY point where we have the real fill — submit_exit
+                # only knew the limit price. on_exit_fill_confirmed calls
+                # APExecutionCore._finalize_proof() which writes proof/P&L/feedback
+                # using actual fill_price, not the estimated bid/mid at submit.
+                try:
+                    _fill_cb = getattr(self, "on_exit_fill_confirmed", None)
+                    if _fill_cb is not None and callable(_fill_cb):
+                        _fill_cb(pos, float(fill_price) if fill_price is not None else 0.0)
+                except Exception as _cb_err:
+                    log.error("on_exit_fill_confirmed callback failed (non-fatal): %s", _cb_err)
                 pos.exit_in_flight   = False
                 pos.pending_exit_reason = ""
                 pos.pending_exit_action = ""

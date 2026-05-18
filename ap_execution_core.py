@@ -136,6 +136,8 @@ class APExecutionCore:
         # Wire exit callbacks
         self.exit_eng.on_exit  = self._on_position_close
         self.exit_eng.on_scale = self._on_position_scale
+        # FIX 2: broker-confirmed fill callback — writes proof with actual fill price
+        self.exit_eng.on_exit_fill_confirmed = self._finalize_proof
 
         log.info(
             f"APExecutionCore initialized for {email} | "
@@ -1075,38 +1077,52 @@ class APExecutionCore:
         if getattr(pos, "proof_logged", False):
             log.debug("[%s] proof.log_trade skipped — already logged for this position", pos.ticker)
             return
+
+        # ── FIX 2: STAGE proof data on position — DO NOT write proof yet ─────
+        # submit_exit() means the exit order was SUBMITTED, not FILLED.
+        # Proof / P&L / feedback must only be written after broker fill
+        # is confirmed through the fill_monitor → mark_position_closed path.
+        # Stage all the data now (while we have decision/sig context) and
+        # finalize it in _finalize_proof() called from mark_position_closed.
+        #
+        # exit_price here is the limit price we placed (estimated fill).
+        # The actual broker fill price overwrites it in _finalize_proof().
+        pos._proof_staged = {                                   # type: ignore[attr-defined]
+            "ticker":             pos.ticker,
+            "pattern":            sig.get("pattern", ""),
+            "side":               pos.side,
+            "timeframe":          sig.get("timeframe", "1d"),
+            "score":              float(sig.get("score", 0) or 0),
+            "tier":               tier,
+            "context_score":      float((sig.get("score_breakdown") or {}).get("real_time_ctx", 0) or 0),
+            "setup_status":       self.feedback.get_setup_status(
+                                      pos.ticker, sig.get("pattern", ""),
+                                      sig.get("timeframe", "1d"), pos.side),
+            "entry_trigger":      pos.underlying_entry,
+            "entry_option_price": pos.entry_price,
+            "exit_option_price":  exit_price,   # estimated; overwritten at fill
+            "underlying_entry":   pos.underlying_entry,
+            "underlying_exit":    pos.current_underlying,
+            "contracts":          pos.quantity,
+            "exit_reason":        decision.reason,
+            "opt_pnl":            opt_pnl,       # re-calculated at fill with actual fill price
+            "win":                win,
+            "spread_pct":         float(sig.get("spread_pct", 0) or 0),
+            "chain_grade":        sig.get("chain_grade", ""),
+            "opened_at":          pos.opened_at if hasattr(pos, "opened_at") else None,
+            "synthetic_entry":    bool(getattr(pos, "synthetic_entry", False)),
+            "position_id":        str(getattr(pos, "position_id", "") or ""),
+            "local_order_id":     str(getattr(pos, "local_order_id", "") or ""),
+            "signal":             sig,
+            "paper":              self.paper,
+        }
         pos.proof_logged = True  # type: ignore[attr-defined]
-
-        self.proof.log_trade(
-            ticker             = pos.ticker,
-            pattern            = sig.get("pattern", ""),
-            side               = pos.side,
-            timeframe          = sig.get("timeframe", "1d"),
-            score              = float(sig.get("score", 0) or 0),
-            tier               = tier,
-            context_score      = float((sig.get("score_breakdown") or {}).get("real_time_ctx", 0) or 0),
-            setup_status       = self.feedback.get_setup_status(
-                                     pos.ticker, sig.get("pattern", ""),
-                                     sig.get("timeframe", "1d"), pos.side),
-            entry_trigger      = pos.underlying_entry,
-            entry_option_price = pos.entry_price,
-            exit_option_price  = exit_price,
-            underlying_entry   = pos.underlying_entry,
-            underlying_exit    = pos.current_underlying,
-            contracts          = pos.quantity,
-            exit_reason        = decision.reason,
-            option_pnl_pct     = opt_pnl / 100.0,
-            underlying_pnl_pct = (pos.current_underlying - pos.underlying_entry) / pos.underlying_entry * 100
-                                  if pos.underlying_entry else 0,
-            win                = win,
-            spread_pct         = float(sig.get("spread_pct", 0) or 0),
-            chain_grade        = sig.get("chain_grade", ""),
-            opened_at          = pos.opened_at if hasattr(pos, "opened_at") else None,
-            synthetic_entry    = bool(getattr(pos, "synthetic_entry", False)),
-            position_id        = str(getattr(pos, "position_id", "") or ""),
-            local_order_id     = str(getattr(pos, "local_order_id", "") or ""),
+        log.info(
+            "[%s] Proof STAGED (pending fill confirmation) | est_exit=$%.2f pnl=%.1f%%",
+            pos.ticker, exit_price, opt_pnl,
         )
-
+        # Feedback, signal close, shadow — these are safe to log at submit
+        # (they don't show dollar P&L on client dashboard)
         self.feedback.record_outcome(
             signal             = sig,
             entry_option_price = pos.entry_price,
@@ -1225,6 +1241,119 @@ class APExecutionCore:
         self._cleanup_pending_entry_order(watched, action="cancel", reason="watcher_invalidated")
         funnel.inc("watcher_invalidated")
         log.info(f"[{watched.ticker}] Signal invalidated -- wrong direction")
+
+    def _finalize_proof(self, pos: "ManagedPosition", actual_fill_price: float = 0.0) -> None:
+        """Write proof/P&L/feedback using the ACTUAL broker fill price.
+
+        Called from mark_position_closed via the exit engine's
+        on_exit_fill_confirmed callback — the only point where we have
+        broker-confirmed fill data. Reads the staged proof dict written
+        at submit time in _on_position_close and finalises with real numbers.
+
+        If actual_fill_price is 0 or None (can happen in paper sandbox),
+        falls back to the estimated exit_price staged at submission.
+        """
+        staged = getattr(pos, "_proof_staged", None)
+        if not staged:
+            # Nothing staged — position was either never submitted, already
+            # finalized, or came from a reconcile path. Nothing to do.
+            return
+        if getattr(pos, "_proof_finalized", False):
+            log.debug("[%s] _finalize_proof skipped — already finalized", pos.ticker)
+            return
+        pos._proof_finalized = True  # type: ignore[attr-defined]
+
+        # Use actual fill price; fall back to estimated if broker returns 0/None
+        fill = float(actual_fill_price or 0)
+        est  = float(staged.get("exit_option_price") or 0)
+        final_exit_price = fill if fill > 0 else est
+
+        entry_px = float(staged.get("entry_option_price") or 0)
+        if entry_px > 0 and final_exit_price > 0:
+            opt_pnl_pct = (final_exit_price - entry_px) / entry_px
+        else:
+            opt_pnl_pct = staged.get("opt_pnl", 0.0) / 100.0
+
+        win = opt_pnl_pct > 0
+
+        slippage_vs_est = round(final_exit_price - est, 4) if est > 0 else None
+        if fill > 0 and est > 0:
+            log.info(
+                "[%s] PROOF FINALIZED | est_exit=$%.2f actual_fill=$%.2f "
+                "slip=%.4f pnl=%.1f%%",
+                staged["ticker"], est, fill, slippage_vs_est, opt_pnl_pct * 100,
+            )
+        else:
+            log.info(
+                "[%s] PROOF FINALIZED (no fill price from broker — using estimate) "
+                "| exit=$%.2f pnl=%.1f%%",
+                staged["ticker"], final_exit_price, opt_pnl_pct * 100,
+            )
+
+        underlying_entry = staged.get("underlying_entry") or 0
+        underlying_exit  = staged.get("underlying_exit")  or pos.current_underlying or 0
+        u_pnl_pct = (
+            (underlying_exit - underlying_entry) / underlying_entry * 100
+            if underlying_entry else 0
+        )
+
+        try:
+            self.proof.log_trade(
+                ticker             = staged["ticker"],
+                pattern            = staged.get("pattern", ""),
+                side               = staged.get("side", ""),
+                timeframe          = staged.get("timeframe", "1d"),
+                score              = staged.get("score", 0),
+                tier               = staged.get("tier", ""),
+                context_score      = staged.get("context_score", 0),
+                setup_status       = staged.get("setup_status", ""),
+                entry_trigger      = underlying_entry,
+                entry_option_price = entry_px,
+                exit_option_price  = final_exit_price,
+                underlying_entry   = underlying_entry,
+                underlying_exit    = underlying_exit,
+                contracts          = staged.get("contracts", 1),
+                exit_reason        = staged.get("exit_reason", ""),
+                option_pnl_pct     = opt_pnl_pct,
+                underlying_pnl_pct = u_pnl_pct,
+                win                = win,
+                spread_pct         = staged.get("spread_pct", 0),
+                chain_grade        = staged.get("chain_grade", ""),
+                opened_at          = staged.get("opened_at"),
+                synthetic_entry    = staged.get("synthetic_entry", False),
+                position_id        = staged.get("position_id", ""),
+                local_order_id     = staged.get("local_order_id", ""),
+                # Slippage vs staged estimate
+                exit_fill_price    = fill if fill > 0 else None,
+                exit_limit_placed  = est if est > 0 else None,
+                slippage_vs_bid    = slippage_vs_est,
+            )
+        except Exception as proof_err:
+            log.error("[%s] _finalize_proof: proof.log_trade failed: %s", staged["ticker"], proof_err)
+            return
+
+        # Feedback + shadow safe to finalize here with real P&L
+        try:
+            sig = staged.get("signal", {})
+            paper = staged.get("paper", True)
+            self.feedback.record_outcome(
+                signal             = sig,
+                entry_option_price = entry_px,
+                exit_option_price  = final_exit_price,
+                exit_reason        = staged.get("exit_reason", ""),
+                underlying_entry   = underlying_entry,
+                underlying_exit    = underlying_exit,
+                contracts          = staged.get("contracts", 1),
+                context_notes      = f"mode={'paper' if paper else 'live'} fill_confirmed=True",
+                synthetic_entry    = staged.get("synthetic_entry", False),
+            )
+        except Exception as fb_err:
+            log.error("[%s] _finalize_proof: feedback.record_outcome failed: %s", staged["ticker"], fb_err)
+
+        try:
+            self.shadow.record_live_outcome(staged.get("tier", ""), opt_pnl_pct)
+        except Exception:
+            pass
 
     def _on_position_scale(self, pos: ManagedPosition, decision):
         log.info(
