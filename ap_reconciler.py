@@ -111,7 +111,7 @@ except Exception:  # pragma: no cover - runtime safety for partial deployments
     Criticality = None
 # ─────────────────────────────────────────────────────────────────────────────
 
-RECONCILE_INTERVAL_SEC = int(os.getenv("RECONCILE_INTERVAL_SEC", "15"))
+RECONCILE_INTERVAL_SEC = int(os.getenv("RECONCILE_INTERVAL_SEC", "60"))  # was 15s — 10 clients × 4/min = 40 calls/min excess
 
 # Minimum seconds between two effective run_once() executions on the same instance.
 # Rapid-fire callers (watchdogs, fill monitors, the reconciler loop itself) receive

@@ -1608,10 +1608,15 @@ def fill_monitor_loop(
                 except Exception as exc:
                     log.exception("Failed to process order %s: %s", order.get("local_order_id"), exc)
 
+            # Idle gate: when no orders are in flight, poll slowly to reduce
+            # Tradier API calls across 10 concurrent clients. 10 clients × 6
+            # calls/min = 60 wasted calls/min hitting broker for nothing.
+            # When active orders exist, use the normal fast poll cadence.
+            _sleep = poll_seconds if pending else min(poll_seconds * 3, 30.0)
             if stop_event:
-                stop_event.wait(poll_seconds)
+                stop_event.wait(_sleep)
             else:
-                time.sleep(poll_seconds)
+                time.sleep(_sleep)
 
         except Exception as exc:
             log.exception("Fill monitor loop error: %s", exc)
