@@ -1620,13 +1620,16 @@ class APContractSelectionEngine:
             except Exception:
                 dte = 0
 
-            # Keep ranking/scoring on mid. Use ask for LIVE money truth, but keep
-            # paper/research simulation on mid if that is the configured mode.
-            # This prevents LIVE from approving a contract that only fits at mid,
-            # while preserving less restrictive paper iteration when not live.
+            # Entry pricing: always use ask for the execution price.
+            # Previous logic used mid for paper ("less restrictive iteration")
+            # but mid-priced entries do not fill in practice — SMCI $1.23 limit
+            # vs $1.56 ask, MSFT $2.09 vs $2.27, JPM $1.44 vs $1.46 all sat
+            # canceled because wide spreads never touch mid. Paper trading must
+            # simulate real fills, which means paying ask. Scoring/ranking
+            # still uses mid (cheaper estimate prevents over-selection).
             is_live, pricing_basis = _pricing_basis_for_mode(getattr(self, "mode", "paper"))
-            scoring_price_per_share   = mid
-            execution_price_per_share = ask if is_live else mid
+            scoring_price_per_share   = mid    # ranking stays on mid
+            execution_price_per_share = ask    # entry always executes at ask
             premium_per_share         = execution_price_per_share
             premium_per_contract      = execution_price_per_share * 100
             effective_budget, MAX_TRADE_USD, budget_clipped = _effective_budget(budget)
