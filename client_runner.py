@@ -2235,31 +2235,99 @@ def _fetch_active_members(sb: Client) -> list[dict]:
                 _sys.stdout.flush(); _sys.stderr.flush()
                 os._exit(4)
 
-        query = (
-            sb.table("members")
-            .select(
-                "id,email,name,tier,"
-                "tradier_account_mode,"
-                "tradier_account_id,tradier_access_token,tradier_base_url,"
-                "tradier_paper_account_id,tradier_paper_access_token,"
-                "tradier_live_account_id,tradier_live_access_token,"
-                "subscription_active,approved,allow_live_trading,execution_pod"
-            )
-            .eq("approved", True)
-            .eq("subscription_active", True)
-            .eq("tradier_account_mode", _bot_mode)
+        # ── SCHEMA-RESILIENT FETCH ────────────────────────────────────────
+        # A missing optional column (execution_pod, allow_live_trading) must
+        # NEVER zero out every runner and halt all trading. That exact
+        # failure happened on the pod-model deploy: execution_pod did not
+        # exist yet, the whole members fetch threw, found 0 active members,
+        # and BA/MS signals were dropped with 503. We try the full select
+        # first; on a column error we fall back to the guaranteed-present
+        # core columns and synthesize safe defaults.
+        _FULL_COLS = (
+            "id,email,name,tier,"
+            "tradier_account_mode,"
+            "tradier_account_id,tradier_access_token,tradier_base_url,"
+            "tradier_paper_account_id,tradier_paper_access_token,"
+            "tradier_live_account_id,tradier_live_access_token,"
+            "subscription_active,approved,allow_live_trading,execution_pod"
         )
+        _CORE_COLS = (
+            "id,email,name,tier,"
+            "tradier_account_mode,"
+            "tradier_account_id,tradier_access_token,tradier_base_url,"
+            "tradier_paper_account_id,tradier_paper_access_token,"
+            "tradier_live_account_id,tradier_live_access_token,"
+            "subscription_active,approved"
+        )
+
+        def _run_fetch(cols: str, with_pod_filter: bool):
+            q = (
+                sb.table("members")
+                .select(cols)
+                .eq("approved", True)
+                .eq("subscription_active", True)
+                .eq("tradier_account_mode", _bot_mode)
+            )
+            if _single:
+                q = q.eq("email", _single)
+            elif _pod_id and with_pod_filter:
+                q = q.eq("execution_pod", _pod_id)
+            return q.execute()
 
         mode_label = "SHARED"
         if _single:
-            query = query.eq("email", _single)
             mode_label = f"SINGLE_CLIENT={_single}"
         elif _pod_id:
-            query = query.eq("execution_pod", _pod_id)
             mode_label = f"POD={_pod_id}"
 
-        res     = query.execute()
-        members = res.data or []
+        _schema_degraded = False
+        try:
+            res = _run_fetch(_FULL_COLS, with_pod_filter=True)
+            members = res.data or []
+        except Exception as _full_exc:
+            _msg = str(_full_exc).lower()
+            if "execution_pod" in _msg or "allow_live_trading" in _msg or "column" in _msg:
+                _schema_degraded = True
+                logger.critical(
+                    "SCHEMA MISMATCH | members fetch with full columns failed "
+                    "(%s). Falling back to core columns so trading is NOT "
+                    "halted. RUN THE MIGRATION: "
+                    "ALTER TABLE members ADD COLUMN IF NOT EXISTS "
+                    "execution_pod text; "
+                    "ALTER TABLE members ADD COLUMN IF NOT EXISTS "
+                    "allow_live_trading boolean DEFAULT false;",
+                    _full_exc,
+                )
+                # Core-column fetch (no pod filter possible — column missing).
+                res = _run_fetch(_CORE_COLS, with_pod_filter=False)
+                members = res.data or []
+                for _m in members:
+                    _m.setdefault("execution_pod", None)
+                    # Missing allow_live_trading: default False = SAFE. A live
+                    # service then drops everyone (correct) until migrated.
+                    _m.setdefault("allow_live_trading", False)
+            else:
+                raise
+
+        # If schema is degraded AND a pod filter was requested, we could not
+        # filter by execution_pod in SQL. Without the column we cannot know
+        # pod membership — fail SAFE: a pod service must not load unfiltered
+        # clients. Hard-fail boot so the migration is run before trading.
+        if _schema_degraded and _pod_id and not _single:
+            try:
+                _any_active = len(_active_runners) > 0
+            except Exception:
+                _any_active = False
+            if not _any_active:
+                logger.critical(
+                    "POD MODE + MISSING execution_pod COLUMN | cannot determine "
+                    "pod membership. Refusing to start a pod service that would "
+                    "load clients it cannot pod-filter. RUN THE MIGRATION then "
+                    "redeploy. Hard-exit so Render shows a failed deploy."
+                )
+                import sys as _sys
+                _sys.stdout.flush(); _sys.stderr.flush()
+                os._exit(6)
 
         # LIVE guardrail: allow_live_trading must be true.
         if _is_live:

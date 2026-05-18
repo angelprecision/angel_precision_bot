@@ -816,13 +816,26 @@ def create_app() -> Flask:
 
         try:
             enqueued = route_signal_to_all_clients(body)
-            log.info(
-                f"Signal routed: {body.get('ticker')} {body.get('side')} "
-                f"score={body.get('score')} sig={_sig_id} enqueued={enqueued}"
-            )
             if not enqueued:
-                payload = {"ok": False, "error": "no_active_clients", "signal_id": _sig_id}
+                # NOT routed — dropped. Do not call this "routed" in logs.
+                # This is the exact symptom of the broken-deploy / zero-runners
+                # state. Log CRITICAL so it is impossible to miss.
+                log.critical(
+                    "SIGNAL DROPPED — NO ACTIVE RUNNERS | %s %s score=%s "
+                    "sig=%s enqueued=0. Trading is DOWN: approved members may "
+                    "exist but zero runners started (schema mismatch / boot "
+                    "failure). Check /execution/health and run migrations.",
+                    body.get("ticker"), body.get("side"),
+                    body.get("score"), _sig_id,
+                )
+                payload = {"ok": False, "error": "no_active_clients",
+                           "signal_id": _sig_id, "enqueued": 0}
                 return jsonify(payload), 503
+            log.info(
+                "Signal routed: %s %s score=%s sig=%s enqueued=%s",
+                body.get("ticker"), body.get("side"),
+                body.get("score"), _sig_id, enqueued,
+            )
             payload = {"ok": True, "queued": True, "signal_id": _sig_id, "enqueued": enqueued}
             _idem_set(idem_key, payload)
             return jsonify(payload), 202
@@ -1987,7 +2000,14 @@ def health_basic():
 @app.get("/execution/health")
 @require_hmac
 def execution_health():
-    """Execution component health — fill monitor, reconciler, order worker."""
+    """Execution component health — fill monitor, reconciler, order worker.
+
+    CRITICAL READINESS: if approved+subscribed members exist in the DB for
+    this service's mode but ZERO runners are active, the service is NOT
+    READY (returns ok=false, http 503). This is the exact failure that hid
+    the broken pod deploy: app reported live while no runners existed and
+    every signal was dropped. Health must scream when that happens.
+    """
     try:
         from client_runner import _active_runners, _registry_lock
         components = {}
@@ -2001,11 +2021,57 @@ def execution_health():
                     "mode":                getattr(runner, "mode", "UNKNOWN"),
                     "runner_alive":        runner.is_alive(),
                 }
+        runner_count = len(components)
+
+        # Probe how many members SHOULD be running for this service.
+        expected_members = None
+        try:
+            from client_runner import _fetch_active_members, SUPABASE_URL, SUPABASE_SERVICE_KEY
+            from ap.db import get_client as _gc
+            if SUPABASE_URL and SUPABASE_SERVICE_KEY:
+                from supabase import create_client as _ccx
+                _sbx = _ccx(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+                expected_members = len(_fetch_active_members(_sbx))
+        except Exception:
+            expected_members = None  # probe failed — don't block on it
+
+        # The dangerous state: members are configured but no runners started.
+        members_without_runners = (
+            expected_members is not None
+            and expected_members > 0
+            and runner_count == 0
+        )
+
         all_ok = all(
             v["order_worker_alive"] and v["fill_monitor_alive"]
             for v in components.values()
         ) if components else False
-        return jsonify({"ok": True, "healthy": all_ok, "clients": components})
+
+        if members_without_runners:
+            return jsonify({
+                "ok": False,
+                "healthy": False,
+                "ready": False,
+                "critical": "MEMBERS_CONFIGURED_BUT_ZERO_RUNNERS",
+                "detail": (
+                    f"{expected_members} approved/subscribed member(s) for this "
+                    f"mode but 0 active runners. Trading is DOWN. Likely a "
+                    f"schema mismatch or boot failure — check logs and run "
+                    f"pending migrations."
+                ),
+                "expected_members": expected_members,
+                "runner_count": 0,
+                "clients": components,
+            }), 503
+
+        return jsonify({
+            "ok": True,
+            "healthy": all_ok,
+            "ready": runner_count > 0 and all_ok,
+            "expected_members": expected_members,
+            "runner_count": runner_count,
+            "clients": components,
+        })
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 200
 
