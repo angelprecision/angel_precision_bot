@@ -835,7 +835,25 @@ class APExecutionCore:
             or any(marker in _reason_text for marker in _PROTECTIVE_REASON_TEXT_MARKERS)
         )
 
-        _use_market = _urgency == "IMMEDIATE"
+        # IMMEDIATE splits into two tiers:
+        #   TRUE EMERGENCY → market (HARD_STOP -33%, EOD, SENTINEL/kill-switch)
+        #   PROFIT EXIT → aggressive bid-limit, fast step-down (TARGET, TOUCHED
+        #     PROFIT, PROFIT LOCK, IMMEDIATE_TP) — never blind-market a winner
+        _reason_code_u = str(getattr(decision, "reason_code", "") or "").upper()
+        _reason_text_u = str(getattr(decision, "reason", "") or "").upper()
+        _TRUE_EMERGENCY_CODES = {
+            "HARD_STOP", "EOD_FORCE_CLOSE", "SENTINEL_FORCED_EXIT",
+        }
+        _TRUE_EMERGENCY_MARKERS = {
+            "HARD STOP", "EOD FORCE CLOSE", "EOD FORCED", "SENTINEL FORCED",
+            "KILL SWITCH", "EMERGENCY",
+        }
+        _is_true_emergency = (
+            _reason_code_u in _TRUE_EMERGENCY_CODES
+            or any(m in _reason_text_u for m in _TRUE_EMERGENCY_MARKERS)
+        )
+        _use_market = (_urgency == "IMMEDIATE") and _is_true_emergency
+        _is_fast_profit_exit = (_urgency == "IMMEDIATE") and not _is_true_emergency
 
         # CHEAP CONTRACT MARKET EXIT:
         # If option is worth < $0.25/share, limit orders will not fill reliably.
@@ -869,6 +887,7 @@ class APExecutionCore:
         _exit_submit_ts   = getattr(pos, "_exit_submit_ts", 0) or 0
         _exit_attempts    = getattr(pos, "_exit_attempts",  0) or 0
         _age_since_submit = time.time() - _exit_submit_ts if _exit_submit_ts else 0
+        _ladder_price_set = False  # True once a step-down price is locked in
 
         # In-flight escalation for HIGH urgency exits
         if not _use_market and _urgency == "HIGH" and getattr(pos, "exit_in_flight", False) and _exit_submit_ts > 0:
@@ -880,12 +899,33 @@ class APExecutionCore:
                 # 30–60s → bid - $0.02
                 _exit_limit = max(round(_bid - 0.02, 2), 0.01)
                 exit_price  = _exit_limit
+                _ladder_price_set = True
                 log.warning("[%s] EXIT STEP-DOWN bid-$0.02 = $%.2f — unfilled >30s | %s", pos.ticker, _exit_limit, decision.reason)
             elif _age_since_submit >= 15 and _bid > 0:
                 # 15–30s → bid - $0.01
                 _exit_limit = max(round(_bid - 0.01, 2), 0.01)
                 exit_price  = _exit_limit
+                _ladder_price_set = True
                 log.warning("[%s] EXIT STEP-DOWN bid-$0.01 = $%.2f — unfilled >15s | %s", pos.ticker, _exit_limit, decision.reason)
+
+        # FAST PROFIT-EXIT step-down — tighter than HIGH (profit exits want speed
+        # but should never blind-market and give away the spread on a winner).
+        # 0–10s: bid | 10–20s: bid-0.01 | 20–40s: bid-0.02 | 40s+: market (take it)
+        if not _use_market and _is_fast_profit_exit and getattr(pos, "exit_in_flight", False) and _exit_submit_ts > 0:
+            if _age_since_submit >= 40:
+                # 40s+ — profit exit truly stuck, take market to lock the gain
+                _use_market = True
+                log.warning("[%s] PROFIT EXIT → MARKET — bid-limit unfilled >40s, locking gain | %s", pos.ticker, decision.reason)
+            elif _age_since_submit >= 20 and _bid > 0:
+                _exit_limit = max(round(_bid - 0.02, 2), 0.01)
+                exit_price  = _exit_limit
+                _ladder_price_set = True
+                log.warning("[%s] PROFIT EXIT STEP-DOWN bid-$0.02 = $%.2f — unfilled >20s | %s", pos.ticker, _exit_limit, decision.reason)
+            elif _age_since_submit >= 10 and _bid > 0:
+                _exit_limit = max(round(_bid - 0.01, 2), 0.01)
+                exit_price  = _exit_limit
+                _ladder_price_set = True
+                log.warning("[%s] PROFIT EXIT STEP-DOWN bid-$0.01 = $%.2f — unfilled >10s | %s", pos.ticker, _exit_limit, decision.reason)
 
         if _use_market:
             _exit_limit = None
@@ -894,11 +934,18 @@ class APExecutionCore:
                 log.critical("[%s] CLOSE BLOCKED — no quote for IMMEDIATE exit | %s", pos.ticker, decision.reason)
                 return
             log.info("[%s] MARKET EXIT @ est.$%.2f (bid) | urgency=%s | %s", pos.ticker, exit_price, _urgency, decision.reason)
+        elif _ladder_price_set and _exit_limit is not None and _exit_limit > 0:
+            # Step-down already locked an aggressive price — DO NOT overwrite it
+            exit_price = _exit_limit
+            log.info("[%s] LADDER PRICE LOCKED @ $%.2f | %s", pos.ticker, _exit_limit, decision.reason)
         elif _bid > 0:
-            # All exits start at current bid — profit protection, stops, scale-outs
+            # First attempt — all exits start at current bid
             _exit_limit = round(_bid, 2)
             exit_price  = _exit_limit
-            pos._exit_submit_ts = time.time()  # type: ignore[attr-defined]
+            # Only stamp timer on FIRST submit — never reset while in-flight, or
+            # the step-down ladder never ages to 15s/30s/60s (reviewer bug #2)
+            if not getattr(pos, "exit_in_flight", False) or not _exit_submit_ts:
+                pos._exit_submit_ts = time.time()  # type: ignore[attr-defined]
             pos._exit_attempts  = _exit_attempts + 1  # type: ignore[attr-defined]
             log.info("[%s] LIMIT EXIT @ $%.2f (bid) attempt=%d | urgency=%s | %s",
                      pos.ticker, _exit_limit, pos._exit_attempts, _urgency, decision.reason)
@@ -906,7 +953,8 @@ class APExecutionCore:
             # Bid unavailable — use mid as fallback
             _exit_limit = round(_mid, 2)
             exit_price  = _exit_limit
-            pos._exit_submit_ts = time.time()  # type: ignore[attr-defined]
+            if not getattr(pos, "exit_in_flight", False) or not _exit_submit_ts:
+                pos._exit_submit_ts = time.time()  # type: ignore[attr-defined]
             pos._exit_attempts  = _exit_attempts + 1  # type: ignore[attr-defined]
             log.info("[%s] LIMIT EXIT @ $%.2f (mid fallback) attempt=%d | %s",
                      pos.ticker, _exit_limit, pos._exit_attempts, decision.reason)
