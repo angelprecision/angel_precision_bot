@@ -40,6 +40,42 @@ from ap.utils import now_utc_iso
 
 log = logging.getLogger("ap.order_monitor")
 
+# ── Shared broker order-status cache ─────────────────────────────────────────
+# fill_monitor and order_monitor both call broker.get_order(broker_order_id)
+# independently. With 10 clients and active orders both components fire
+# concurrently — same broker_order_id queried twice within seconds.
+# This module-level cache (shared across all client threads in one process)
+# deduplicates those calls. TTL=8s: short enough to not delay stale detection,
+# long enough to absorb fill_monitor + order_monitor firing in the same window.
+_BROKER_STATUS_CACHE: dict = {}       # broker_order_id -> (status_str, expires_ts)
+_BROKER_STATUS_CACHE_LOCK = threading.Lock()
+_BROKER_STATUS_CACHE_TTL  = float(os.getenv("BROKER_STATUS_CACHE_TTL", "8.0"))
+
+
+def _cached_broker_order_status(broker_order_id: str, fetch_fn) -> Optional[str]:
+    """Return cached broker status or call fetch_fn() and cache the result.
+
+    fetch_fn must be a zero-arg callable that returns the raw status string.
+    Returns None if fetch_fn returns None (query failed or order not found).
+    """
+    now = time.monotonic()
+    with _BROKER_STATUS_CACHE_LOCK:
+        entry = _BROKER_STATUS_CACHE.get(broker_order_id)
+        if entry and entry[1] > now:
+            return entry[0]
+    # Cache miss — call broker
+    status = fetch_fn()
+    if status is not None:
+        with _BROKER_STATUS_CACHE_LOCK:
+            _BROKER_STATUS_CACHE[broker_order_id] = (status, now + _BROKER_STATUS_CACHE_TTL)
+        # Prune stale entries (keep cache small)
+        if len(_BROKER_STATUS_CACHE) > 500:
+            with _BROKER_STATUS_CACHE_LOCK:
+                dead = [k for k, v in _BROKER_STATUS_CACHE.items() if v[1] <= now]
+                for k in dead:
+                    _BROKER_STATUS_CACHE.pop(k, None)
+    return status
+
 # Timeout thresholds (seconds)
 TIMEOUT_CREATED       = int(os.getenv("ORDER_TIMEOUT_CREATED",       "120"))    # 2 min — CREATED = never reached broker
 TIMEOUT_CREATED_NO_BROKER_WARN = int(os.getenv("ORDER_TIMEOUT_CREATED_NO_BROKER_WARN", "10"))  # fast diagnostic — alert at 10s, cancel at 120s
@@ -870,19 +906,21 @@ class APOrderMonitor:
     def _query_broker_order(self, broker_order_id: Optional[str]) -> Optional[str]:
         if not broker_order_id or not self.broker:
             return None
-        try:
-            if hasattr(self.broker, "get_order"):
-                result = self.broker.get_order(broker_order_id)
-                if isinstance(result, dict):
-                    return str(
-                        result.get("status") or result.get("order_status") or ""
-                    ).lower()
-            if hasattr(self.broker, "order_status"):
-                result = self.broker.order_status(broker_order_id)
-                return str(result).lower() if result else None
-        except Exception as e:
-            log.debug(f"[{self.client_id}] Broker order query failed: {e}")
-        return None
+        def _fetch():
+            try:
+                if hasattr(self.broker, "get_order"):
+                    result = self.broker.get_order(broker_order_id)
+                    if isinstance(result, dict):
+                        return str(
+                            result.get("status") or result.get("order_status") or ""
+                        ).lower()
+                if hasattr(self.broker, "order_status"):
+                    result = self.broker.order_status(broker_order_id)
+                    return str(result).lower() if result else None
+            except Exception as e:
+                log.debug(f"[{self.client_id}] Broker order query failed: {e}")
+            return None
+        return _cached_broker_order_status(broker_order_id, _fetch)
 
     def _cancel_broker_order(self, broker_order_id: Optional[str]):
         if not broker_order_id or not self.broker:
