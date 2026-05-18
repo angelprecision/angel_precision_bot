@@ -855,23 +855,54 @@ class APExecutionCore:
         _use_market = (_urgency == "IMMEDIATE") and _is_true_emergency
         _is_fast_profit_exit = (_urgency == "IMMEDIATE") and not _is_true_emergency
 
-        # CHEAP CONTRACT MARKET EXIT:
-        # If option is worth < $0.25/share, limit orders will not fill reliably.
-        # The spread is typically $0.01–$0.05 wide which means limit orders at
-        # $0.12, $0.13, $0.14 etc. bounce around without filling, causing the
-        # cascade of canceled exits seen with NVDA $0.11 contract.
-        # Go straight to market — the slippage on a $0.10 fill vs $0.11 is $0.01/share
-        # ($1/contract), which is far less damage than 15 failed limit attempts.
+        # Exit attempt tracking — needed by cheap-contract logic below
+        _exit_submit_ts   = getattr(pos, "_exit_submit_ts", 0) or 0
+        _exit_attempts    = getattr(pos, "_exit_attempts",  0) or 0
+        _age_since_submit = time.time() - _exit_submit_ts if _exit_submit_ts else 0
+        _ladder_price_set = False  # True once a step-down price is locked in
+
+        # CHEAP CONTRACT HANDLING:
+        # Sub-$0.25 options have wide relative spreads and limits can bounce.
+        # OLD behavior blind-marketed them on the FIRST exit attempt — that
+        # violates no-market-except-emergency and gave away the spread.
+        #
+        # NEW behavior: cheap contracts still use bid-limit FIRST. Only escalate
+        # to market after multiple failed attempts (the limit cascade is real,
+        # but one clean bid-limit attempt almost always fills). Default threshold
+        # is 0 (disabled) — cheap-market only kicks in if explicitly enabled AND
+        # the position has already failed 3+ exit attempts.
         _CHEAP_EXIT_MARKET_THRESHOLD = float(
-            os.getenv("CHEAP_EXIT_MARKET_THRESHOLD", "0.25")
+            os.getenv("CHEAP_EXIT_MARKET_THRESHOLD", "0")  # default OFF
+        )
+        _cheap_exit_min_attempts = int(
+            os.getenv("CHEAP_EXIT_MARKET_MIN_ATTEMPTS", "3")
         )
         _current_opt_price = float(getattr(pos, "current_option_price", 0) or _mid or _bid)
-        if not _use_market and _current_opt_price > 0 and _current_opt_price < _CHEAP_EXIT_MARKET_THRESHOLD:
+        if (
+            not _use_market
+            and _CHEAP_EXIT_MARKET_THRESHOLD > 0
+            and _current_opt_price > 0
+            and _current_opt_price < _CHEAP_EXIT_MARKET_THRESHOLD
+            and _exit_attempts >= _cheap_exit_min_attempts
+        ):
             _use_market = True
             log.warning(
-                "[%s] CHEAP_CONTRACT_MARKET_EXIT — option price $%.2f < threshold $%.2f "
-                "— using market order to avoid limit cascade | %s",
-                pos.ticker, _current_opt_price, _CHEAP_EXIT_MARKET_THRESHOLD, decision.reason,
+                "[%s] CHEAP_CONTRACT_MARKET_EXIT — $%.2f < $%.2f AND %d failed "
+                "limit attempts — escalating to market | %s",
+                pos.ticker, _current_opt_price, _CHEAP_EXIT_MARKET_THRESHOLD,
+                _exit_attempts, decision.reason,
+            )
+        elif (
+            _CHEAP_EXIT_MARKET_THRESHOLD > 0
+            and _current_opt_price > 0
+            and _current_opt_price < _CHEAP_EXIT_MARKET_THRESHOLD
+            and _exit_attempts < _cheap_exit_min_attempts
+        ):
+            log.info(
+                "[%s] CHEAP_CONTRACT_BID_LIMIT — $%.2f cheap but attempt %d < %d "
+                "— using bid-limit, not market yet | %s",
+                pos.ticker, _current_opt_price, _exit_attempts,
+                _cheap_exit_min_attempts, decision.reason,
             )
 
         # LIMIT-TO-MARKET ESCALATION for HIGH urgency exits:
@@ -884,10 +915,7 @@ class APExecutionCore:
         #   15–30s unfilled: current_bid - $0.01
         #   30–60s unfilled: current_bid - $0.02
         #   60s+ unfilled:  market ONLY for HARD_STOP / EOD, else hold at bid-0.02
-        _exit_submit_ts   = getattr(pos, "_exit_submit_ts", 0) or 0
-        _exit_attempts    = getattr(pos, "_exit_attempts",  0) or 0
-        _age_since_submit = time.time() - _exit_submit_ts if _exit_submit_ts else 0
-        _ladder_price_set = False  # True once a step-down price is locked in
+        # (_exit_submit_ts / _exit_attempts / _ladder_price_set defined above)
 
         # In-flight escalation for HIGH urgency exits
         if not _use_market and _urgency == "HIGH" and getattr(pos, "exit_in_flight", False) and _exit_submit_ts > 0:
