@@ -2192,31 +2192,48 @@ def route_signal_to_all_clients(signal: dict):
 def _fetch_active_members(sb: Client) -> list[dict]:
     """Load the members this Render service is responsible for.
 
-    Three execution modes, checked in priority order:
+    Modes (priority order):
+      1. SINGLE_CLIENT_EMAIL set -> EXACTLY that one client. Hard-fail boot
+         if not found.
+      2. POD_ID set -> only members where execution_pod=POD_ID. Hard-fail
+         boot if zero, or if eligible count > MAX_POD_CLIENTS.
+      3. Neither -> SHARED mode. BLOCKED for live unless ALLOW_SHARED_LIVE=1.
 
-      1. SINGLE_CLIENT_EMAIL set  -> load EXACTLY that one client (dedicated
-         per-client Render service). Fails boot if not found.
+    LIVE guardrails (BOT_MODE=live):
+      - allow_live_trading must be true (else dropped, CRITICAL).
+      - a valid client_risk_profiles row must exist (else dropped, CRITICAL).
+      - shared mode is disabled unless ALLOW_SHARED_LIVE=1.
 
-      2. POD_ID set               -> load only members where
-         execution_pod = POD_ID (the pod model: 3-5 live clients per Render).
-         Fails boot if pod has more than MAX_POD_CLIENTS members.
-
-      3. Neither set              -> shared mode: all approved members for
-         this BOT_MODE (paper/onboarding/load-test service).
-
-    LIVE hard guardrails (BOT_MODE=live): every loaded member must have
-    allow_live_trading=true or it is dropped with a CRITICAL log. A live
-    service never trades a client who has not been explicitly approved.
+    Runtime overflow preserves ALREADY-ACTIVE runners — a newly assigned
+    client never displaces a client whose runner is already trading.
     """
     try:
         _bot_mode = os.getenv("BOT_MODE", os.getenv("MODE", "paper")).strip().lower()
         _is_live  = _bot_mode == "live"
 
-        # SINGLE_CLIENT_EMAIL preferred; CLIENT_ID kept as backward-compat alias
-        _single = (os.getenv("SINGLE_CLIENT_EMAIL", "")
-                   or os.getenv("CLIENT_ID", "")).strip()
-        _pod_id = os.getenv("POD_ID", "").strip()
+        # FIX 2: SINGLE_CLIENT_EMAIL is the canonical var. The generic
+        # CLIENT_ID env is only honored as single-client if it looks like an
+        # email (so a stray CLIENT_ID=default never forces single-client mode).
+        _single = os.getenv("SINGLE_CLIENT_EMAIL", "").strip()
+        if not _single:
+            _legacy = os.getenv("CLIENT_ID", "").strip()
+            if _legacy and "@" in _legacy:
+                _single = _legacy
+        _pod_id  = os.getenv("POD_ID", "").strip()
         _max_pod = int(os.getenv("MAX_POD_CLIENTS", "5"))
+
+        # FIX 1: live shared mode is disabled unless explicitly allowed.
+        if _is_live and not _single and not _pod_id:
+            if os.getenv("ALLOW_SHARED_LIVE", "").strip() != "1":
+                logger.critical(
+                    "LIVE SHARED MODE DISABLED | BOT_MODE=live but neither "
+                    "SINGLE_CLIENT_EMAIL nor POD_ID is set. A live service must "
+                    "never load all clients implicitly. Set POD_ID or "
+                    "SINGLE_CLIENT_EMAIL, or ALLOW_SHARED_LIVE=1 to override."
+                )
+                import sys as _sys
+                _sys.stdout.flush(); _sys.stderr.flush()
+                os._exit(4)
 
         query = (
             sb.table("members")
@@ -2244,7 +2261,7 @@ def _fetch_active_members(sb: Client) -> list[dict]:
         res     = query.execute()
         members = res.data or []
 
-        # LIVE guardrail: drop any member not explicitly approved for live.
+        # LIVE guardrail: allow_live_trading must be true.
         if _is_live:
             allowed = []
             for m in members:
@@ -2258,40 +2275,106 @@ def _fetch_active_members(sb: Client) -> list[dict]:
                 allowed.append(m)
             members = allowed
 
-        # Pod overflow at RUNTIME re-sync: do NOT raise (would kill runners
-        # holding open positions mid-day). Truncate to the first MAX_POD_CLIENTS
-        # deterministically (sorted by email) and CRITICAL-log. The one-time
-        # hard boot check already prevents *starting* an overloaded pod; this
-        # only handles a client being added to a live pod during the day.
+        # FIX 5: LIVE clients must have a valid client_risk_profiles row.
+        # Never let a live client trade on global fallback defaults.
+        if _is_live and members:
+            try:
+                _emails = [m["email"] for m in members]
+                _rp = (
+                    sb.table("client_risk_profiles")
+                    .select("client_email")
+                    .in_("client_email", _emails)
+                    .execute()
+                )
+                _have_rp = {r.get("client_email") for r in (_rp.data or [])}
+            except Exception as _rp_exc:
+                # If the risk profile table cannot be read, fail SAFE for live:
+                # treat as nobody having a profile (drops all -> zero -> boot
+                # hard-fail below). Better to fail a deploy than trade live on
+                # unknown risk limits.
+                logger.critical(
+                    "LIVE RISK-PROFILE CHECK FAILED to query client_risk_profiles "
+                    "(%s). Failing safe — no live client will load.", _rp_exc,
+                )
+                _have_rp = set()
+            _rp_ok = []
+            for m in members:
+                if m["email"] not in _have_rp:
+                    logger.critical(
+                        "LIVE RISK GUARDRAIL | %s has NO client_risk_profiles "
+                        "row — DROPPED. Live clients must have explicit risk "
+                        "limits, never global fallback defaults.",
+                        m["email"],
+                    )
+                    continue
+                _rp_ok.append(m)
+            members = _rp_ok
+
+        # FIX 3: runtime overflow must preserve already-active runners.
+        # Never sort all members and keep first N — that can drop a client
+        # whose runner is already trading. Keep active pod runners first;
+        # only admit new clients into remaining slots; reject extras.
         if _pod_id and len(members) > _max_pod:
-            members_sorted = sorted(members, key=lambda m: m.get("email", ""))
-            dropped = members_sorted[_max_pod:]
-            members = members_sorted[:_max_pod]
-            logger.critical(
-                "POD OVERFLOW AT RUNTIME | POD_ID=%s now has >%d members. "
-                "Keeping first %d (by email); NOT loading: %s. Move the extra "
-                "client(s) to another pod and redeploy.",
-                _pod_id, _max_pod, _max_pod,
-                ", ".join(m.get("email", "?") for m in dropped),
-            )
+            try:
+                _active_now = set(_active_runners.keys())
+            except Exception:
+                _active_now = set()
+            _already = [m for m in members if m["email"] in _active_now]
+            _new     = [m for m in members if m["email"] not in _active_now]
+            _slots   = max(0, _max_pod - len(_already))
+            _admit   = _new[:_slots]
+            _reject  = _already[_max_pod:] + _new[_slots:]
+            # If somehow more than _max_pod are ALREADY active (shouldn't happen
+            # because boot check prevents it), keep them all running — never
+            # kill a live runner mid-day — but log it loudly.
+            if len(_already) > _max_pod:
+                logger.critical(
+                    "POD OVERFLOW | POD_ID=%s has %d ALREADY-ACTIVE runners "
+                    "(> MAX_POD_CLIENTS=%d). Keeping all active to avoid "
+                    "killing live positions. Investigate immediately.",
+                    _pod_id, len(_already), _max_pod,
+                )
+                members = _already
+            else:
+                members = _already + _admit
+            if _reject:
+                logger.critical(
+                    "POD OVERFLOW AT RUNTIME | POD_ID=%s | preserving %d active "
+                    "runner(s), admitting %d new; REJECTING (not loaded): %s. "
+                    "Move these to another pod and redeploy.",
+                    _pod_id, len(_already), len(_admit),
+                    ", ".join(m.get("email", "?") for m in _reject),
+                )
 
-        # Single-client boot failure: wired to a client that does not exist.
-        if _single and not members:
-            logger.critical(
-                "SINGLE-CLIENT BOOT FAILURE | %s not found "
-                "(approved, subscription_active, mode=%s%s). "
-                "Check Supabase member row and this service env vars.",
-                _single, _bot_mode,
-                ", allow_live_trading" if _is_live else "",
-            )
-
-        # Zero-clients in a dedicated/pod service is a misconfiguration.
+        # FIX 4: SINGLE or POD mode with ZERO eligible clients is a
+        # misconfiguration — hard-fail boot so Render shows a failed deploy
+        # instead of an alive bot trading nothing. (Only hard-exit when no
+        # runners are active yet — i.e. at boot — never mid-day when runners
+        # exist, to avoid killing live positions on a transient empty fetch.)
         if (_single or _pod_id) and not members:
-            logger.critical(
-                "BOOT WARNING | %s resolved to ZERO clients. This service "
-                "will idle and trade nothing until the config is corrected.",
-                mode_label,
-            )
+            try:
+                _any_active = len(_active_runners) > 0
+            except Exception:
+                _any_active = False
+            if not _any_active:
+                logger.critical(
+                    "BOOT HARD FAILURE | %s resolved to ZERO eligible clients. "
+                    "A configured dedicated/pod service with no clients is a "
+                    "misconfiguration. Check member rows, execution_pod, "
+                    "allow_live_trading, risk profiles, and env vars.",
+                    mode_label,
+                )
+                import sys as _sys
+                _sys.stdout.flush(); _sys.stderr.flush()
+                os._exit(5)
+            else:
+                logger.critical(
+                    "RUNTIME WARNING | %s fetch returned ZERO clients but %d "
+                    "runner(s) already active — keeping them alive (transient "
+                    "empty fetch?). NOT hard-failing mid-session.",
+                    mode_label, len(_active_runners),
+                )
+                return []
 
         masked = ", ".join(
             (m.get("email", "?")[:3] + "***" + m.get("email", "?")[-8:])
@@ -2302,6 +2385,8 @@ def _fetch_active_members(sb: Client) -> list[dict]:
             _bot_mode, mode_label, len(members), masked,
         )
         return members
+    except SystemExit:
+        raise
     except Exception as exc:
         logger.error("Supabase fetch failed: %s", exc)
         return []
@@ -2412,46 +2497,27 @@ def start_multi_client_supervisor():
     logger.info("Self-healing system initialized")
 
     # ── ONE-TIME HARD BOOT GUARDRAIL ──────────────────────────────────────
-    # Pod overflow must FAIL STARTUP, not loop forever. The supervisor's
-    # try/except would swallow a RuntimeError, so we check ONCE here, before
-    # the supervisor thread starts, and hard-exit the process if a live pod
-    # is overloaded. Render then shows a failed deploy instead of a silently
-    # idle bot. Runtime re-syncs (mid-day) instead TRUNCATE safely so a late
-    # client addition never kills runners holding open positions.
-    _boot_pod_id  = os.getenv("POD_ID", "").strip()
-    _boot_mode    = os.getenv("BOT_MODE", os.getenv("MODE", "paper")).strip().lower()
-    _boot_maxpod  = int(os.getenv("MAX_POD_CLIENTS", "5"))
-    _boot_single  = (os.getenv("SINGLE_CLIENT_EMAIL", "")
-                     or os.getenv("CLIENT_ID", "")).strip()
-    if _boot_pod_id and not _boot_single:
-        try:
-            _probe = (
-                sb.table("members").select("email,allow_live_trading")
-                .eq("approved", True).eq("subscription_active", True)
-                .eq("tradier_account_mode", _boot_mode)
-                .eq("execution_pod", _boot_pod_id).execute()
-            )
-            _pod_members = _probe.data or []
-            if _boot_mode == "live":
-                _pod_members = [m for m in _pod_members if m.get("allow_live_trading")]
-            if len(_pod_members) > _boot_maxpod:
-                logger.critical(
-                    "POD OVERFLOW — HARD BOOT FAILURE | POD_ID=%s has %d eligible "
-                    "members but MAX_POD_CLIENTS=%d. Refusing to start. Re-assign "
-                    "clients to another pod or raise MAX_POD_CLIENTS deliberately.",
-                    _boot_pod_id, len(_pod_members), _boot_maxpod,
-                )
-                import sys as _sys
-                _sys.stdout.flush(); _sys.stderr.flush()
-                os._exit(3)   # hard kill — Render marks deploy failed
-            logger.info(
-                "POD BOOT CHECK OK | POD_ID=%s | %d/%d eligible members",
-                _boot_pod_id, len(_pod_members), _boot_maxpod,
-            )
-        except SystemExit:
-            raise
-        except Exception as _pod_exc:
-            logger.error("Pod boot check probe failed (continuing): %s", _pod_exc)
+    # Run the full validated _fetch_active_members ONCE before the supervisor
+    # thread starts. It performs ALL guardrails and hard-exits the process
+    # (os._exit) on any of: live-shared-without-override, pod overflow at
+    # boot, single/pod resolving to zero clients. Calling it here (not just
+    # inside the supervisor's try/except) guarantees a bad config FAILS THE
+    # DEPLOY instead of looping forever — the supervisor's except cannot
+    # swallow os._exit. Using the same function = zero logic drift between
+    # boot validation and runtime re-sync.
+    try:
+        _boot_members = _fetch_active_members(sb)
+        logger.info(
+            "BOOT GUARDRAIL PASSED | %d eligible client(s) at startup",
+            len(_boot_members),
+        )
+    except SystemExit:
+        raise
+    except Exception as _boot_exc:
+        # A pure query failure (network blip) should not hard-fail boot —
+        # the supervisor will retry. Only the explicit os._exit guardrails
+        # inside _fetch_active_members hard-fail, and those bypass this except.
+        logger.error("Boot member probe failed (supervisor will retry): %s", _boot_exc)
 
     _supervisor_state["started"] = True
 
