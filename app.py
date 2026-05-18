@@ -107,6 +107,48 @@ MAX_CONTENT_LENGTH = int(os.getenv("MAX_CONTENT_LENGTH_BYTES", str(256 * 1024)))
 
 DEFAULT_CLIENT_ID = os.getenv("DEFAULT_CLIENT_ID", "default").strip() or "default"
 
+# ── Single-client execution worker mode ──────────────────────────────────────
+# When CLIENT_ID is set this process is a dedicated Render service for one
+# client only (the isolated-per-client architecture). All runner discovery,
+# order queries, state reads/writes are pre-filtered to this client.
+# If CLIENT_ID is not set, the service runs in multi-client (shared) mode.
+CLIENT_ID        = (os.getenv("SINGLE_CLIENT_EMAIL", "") or os.getenv("CLIENT_ID", "")).strip()
+POD_ID           = os.getenv("POD_ID", "").strip()
+MAX_POD_CLIENTS  = int(os.getenv("MAX_POD_CLIENTS", "5"))
+BOT_INSTANCE_ID  = os.getenv("BOT_INSTANCE_ID", CLIENT_ID or POD_ID or "shared").strip()
+_BOOT_MODE_LBL   = os.getenv("BOT_MODE", os.getenv("MODE", "paper")).upper()
+
+if CLIENT_ID:
+    DEFAULT_CLIENT_ID = CLIENT_ID
+    log.info(
+        "\n" + "=" * 70 + "\n"
+        "  ANGEL PRECISION — DEDICATED CLIENT EXECUTION WORKER\n"
+        "  SINGLE_CLIENT:   %s\n"
+        "  BOT_INSTANCE_ID: %s\n"
+        "  MODE:            %s\n"
+        "  Runs ONLY this client. All writes scoped to this client.\n"
+        + "=" * 70,
+        CLIENT_ID, BOT_INSTANCE_ID, _BOOT_MODE_LBL,
+    )
+elif POD_ID:
+    log.info(
+        "\n" + "=" * 70 + "\n"
+        "  ANGEL PRECISION — POD EXECUTION WORKER\n"
+        "  POD_ID:          %s\n"
+        "  MAX_POD_CLIENTS: %s\n"
+        "  BOT_INSTANCE_ID: %s\n"
+        "  MODE:            %s\n"
+        "  Runs ONLY clients where execution_pod=%s. Fails boot if pod\n"
+        "  exceeds MAX_POD_CLIENTS. Live clients require allow_live_trading.\n"
+        + "=" * 70,
+        POD_ID, MAX_POD_CLIENTS, BOT_INSTANCE_ID, _BOOT_MODE_LBL, POD_ID,
+    )
+else:
+    log.info(
+        "ANGEL PRECISION — SHARED MODE | mode=%s | all approved clients "
+        "(paper/onboarding/load-test service)", _BOOT_MODE_LBL,
+    )
+
 # ============================================================
 # SECURITY HELPERS (HMAC + Rate Limit + Idempotency)
 # ============================================================

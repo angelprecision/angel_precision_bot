@@ -2190,14 +2190,35 @@ def route_signal_to_all_clients(signal: dict):
 
 
 def _fetch_active_members(sb: Client) -> list[dict]:
-    try:
-        # Each Render service only picks up members matching its own mode.
-        # Paper service (BOT_MODE=paper): only tradier_account_mode=paper members.
-        # Live service  (BOT_MODE=live):  only tradier_account_mode=live members.
-        # Critical safety gate — prevents two services from running the same client.
-        _bot_mode = os.getenv("BOT_MODE", os.getenv("MODE", "paper")).strip().lower()
+    """Load the members this Render service is responsible for.
 
-        res = (
+    Three execution modes, checked in priority order:
+
+      1. SINGLE_CLIENT_EMAIL set  -> load EXACTLY that one client (dedicated
+         per-client Render service). Fails boot if not found.
+
+      2. POD_ID set               -> load only members where
+         execution_pod = POD_ID (the pod model: 3-5 live clients per Render).
+         Fails boot if pod has more than MAX_POD_CLIENTS members.
+
+      3. Neither set              -> shared mode: all approved members for
+         this BOT_MODE (paper/onboarding/load-test service).
+
+    LIVE hard guardrails (BOT_MODE=live): every loaded member must have
+    allow_live_trading=true or it is dropped with a CRITICAL log. A live
+    service never trades a client who has not been explicitly approved.
+    """
+    try:
+        _bot_mode = os.getenv("BOT_MODE", os.getenv("MODE", "paper")).strip().lower()
+        _is_live  = _bot_mode == "live"
+
+        # SINGLE_CLIENT_EMAIL preferred; CLIENT_ID kept as backward-compat alias
+        _single = (os.getenv("SINGLE_CLIENT_EMAIL", "")
+                   or os.getenv("CLIENT_ID", "")).strip()
+        _pod_id = os.getenv("POD_ID", "").strip()
+        _max_pod = int(os.getenv("MAX_POD_CLIENTS", "5"))
+
+        query = (
             sb.table("members")
             .select(
                 "id,email,name,tier,"
@@ -2205,17 +2226,80 @@ def _fetch_active_members(sb: Client) -> list[dict]:
                 "tradier_account_id,tradier_access_token,tradier_base_url,"
                 "tradier_paper_account_id,tradier_paper_access_token,"
                 "tradier_live_account_id,tradier_live_access_token,"
-                "subscription_active,approved"
+                "subscription_active,approved,allow_live_trading,execution_pod"
             )
             .eq("approved", True)
             .eq("subscription_active", True)
             .eq("tradier_account_mode", _bot_mode)
-            .execute()
         )
+
+        mode_label = "SHARED"
+        if _single:
+            query = query.eq("email", _single)
+            mode_label = f"SINGLE_CLIENT={_single}"
+        elif _pod_id:
+            query = query.eq("execution_pod", _pod_id)
+            mode_label = f"POD={_pod_id}"
+
+        res     = query.execute()
         members = res.data or []
+
+        # LIVE guardrail: drop any member not explicitly approved for live.
+        if _is_live:
+            allowed = []
+            for m in members:
+                if not m.get("allow_live_trading"):
+                    logger.critical(
+                        "LIVE GUARDRAIL | %s loaded but allow_live_trading is "
+                        "false — DROPPED. This client will NOT trade live.",
+                        m.get("email"),
+                    )
+                    continue
+                allowed.append(m)
+            members = allowed
+
+        # Pod overflow at RUNTIME re-sync: do NOT raise (would kill runners
+        # holding open positions mid-day). Truncate to the first MAX_POD_CLIENTS
+        # deterministically (sorted by email) and CRITICAL-log. The one-time
+        # hard boot check already prevents *starting* an overloaded pod; this
+        # only handles a client being added to a live pod during the day.
+        if _pod_id and len(members) > _max_pod:
+            members_sorted = sorted(members, key=lambda m: m.get("email", ""))
+            dropped = members_sorted[_max_pod:]
+            members = members_sorted[:_max_pod]
+            logger.critical(
+                "POD OVERFLOW AT RUNTIME | POD_ID=%s now has >%d members. "
+                "Keeping first %d (by email); NOT loading: %s. Move the extra "
+                "client(s) to another pod and redeploy.",
+                _pod_id, _max_pod, _max_pod,
+                ", ".join(m.get("email", "?") for m in dropped),
+            )
+
+        # Single-client boot failure: wired to a client that does not exist.
+        if _single and not members:
+            logger.critical(
+                "SINGLE-CLIENT BOOT FAILURE | %s not found "
+                "(approved, subscription_active, mode=%s%s). "
+                "Check Supabase member row and this service env vars.",
+                _single, _bot_mode,
+                ", allow_live_trading" if _is_live else "",
+            )
+
+        # Zero-clients in a dedicated/pod service is a misconfiguration.
+        if (_single or _pod_id) and not members:
+            logger.critical(
+                "BOOT WARNING | %s resolved to ZERO clients. This service "
+                "will idle and trade nothing until the config is corrected.",
+                mode_label,
+            )
+
+        masked = ", ".join(
+            (m.get("email", "?")[:3] + "***" + m.get("email", "?")[-8:])
+            for m in members
+        ) or "(none)"
         logger.info(
-            "_fetch_active_members: BOT_MODE=%s → %d active member(s)",
-            _bot_mode, len(members),
+            "_fetch_active_members: BOT_MODE=%s %s → %d member(s) [%s]",
+            _bot_mode, mode_label, len(members), masked,
         )
         return members
     except Exception as exc:
@@ -2326,6 +2410,48 @@ def start_multi_client_supervisor():
     logger.info("Worker health monitor initialized")
     init_self_healing(supabase_client=sb)
     logger.info("Self-healing system initialized")
+
+    # ── ONE-TIME HARD BOOT GUARDRAIL ──────────────────────────────────────
+    # Pod overflow must FAIL STARTUP, not loop forever. The supervisor's
+    # try/except would swallow a RuntimeError, so we check ONCE here, before
+    # the supervisor thread starts, and hard-exit the process if a live pod
+    # is overloaded. Render then shows a failed deploy instead of a silently
+    # idle bot. Runtime re-syncs (mid-day) instead TRUNCATE safely so a late
+    # client addition never kills runners holding open positions.
+    _boot_pod_id  = os.getenv("POD_ID", "").strip()
+    _boot_mode    = os.getenv("BOT_MODE", os.getenv("MODE", "paper")).strip().lower()
+    _boot_maxpod  = int(os.getenv("MAX_POD_CLIENTS", "5"))
+    _boot_single  = (os.getenv("SINGLE_CLIENT_EMAIL", "")
+                     or os.getenv("CLIENT_ID", "")).strip()
+    if _boot_pod_id and not _boot_single:
+        try:
+            _probe = (
+                sb.table("members").select("email,allow_live_trading")
+                .eq("approved", True).eq("subscription_active", True)
+                .eq("tradier_account_mode", _boot_mode)
+                .eq("execution_pod", _boot_pod_id).execute()
+            )
+            _pod_members = _probe.data or []
+            if _boot_mode == "live":
+                _pod_members = [m for m in _pod_members if m.get("allow_live_trading")]
+            if len(_pod_members) > _boot_maxpod:
+                logger.critical(
+                    "POD OVERFLOW — HARD BOOT FAILURE | POD_ID=%s has %d eligible "
+                    "members but MAX_POD_CLIENTS=%d. Refusing to start. Re-assign "
+                    "clients to another pod or raise MAX_POD_CLIENTS deliberately.",
+                    _boot_pod_id, len(_pod_members), _boot_maxpod,
+                )
+                import sys as _sys
+                _sys.stdout.flush(); _sys.stderr.flush()
+                os._exit(3)   # hard kill — Render marks deploy failed
+            logger.info(
+                "POD BOOT CHECK OK | POD_ID=%s | %d/%d eligible members",
+                _boot_pod_id, len(_pod_members), _boot_maxpod,
+            )
+        except SystemExit:
+            raise
+        except Exception as _pod_exc:
+            logger.error("Pod boot check probe failed (continuing): %s", _pod_exc)
 
     _supervisor_state["started"] = True
 
