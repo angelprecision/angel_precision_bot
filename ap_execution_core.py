@@ -857,55 +857,58 @@ class APExecutionCore:
             )
 
         # LIMIT-TO-MARKET ESCALATION for HIGH urgency exits:
-        # If a limit order was placed and hasn't filled within the escalation window,
-        # step down the price and eventually go market. Prevents sitting on a 22% gain
-        # while the price slides back. Tracked via pos._exit_submit_ts and _exit_attempts.
-        _exit_submit_ts = getattr(pos, "_exit_submit_ts", 0) or 0
-        _exit_attempts  = getattr(pos, "_exit_attempts",  0) or 0
-        _age_since_submit = time.time() - _exit_submit_ts if _exit_submit_ts else 999
+        # EXIT PRICING — step-down bid ladder. Never market except true emergency.
+        # Market orders on options fill at ASK. On an intraday dip this means
+        # selling at the absolute worst price (BA case: $0.44 worse than bid).
+        #
+        # Step-down ladder priced from LIVE BID:
+        #   First attempt:  current_bid
+        #   15–30s unfilled: current_bid - $0.01
+        #   30–60s unfilled: current_bid - $0.02
+        #   60s+ unfilled:  market ONLY for HARD_STOP / EOD, else hold at bid-0.02
+        _exit_submit_ts   = getattr(pos, "_exit_submit_ts", 0) or 0
+        _exit_attempts    = getattr(pos, "_exit_attempts",  0) or 0
+        _age_since_submit = time.time() - _exit_submit_ts if _exit_submit_ts else 0
 
-        # If HIGH urgency limit is in-flight > 90s → escalate to bid
-        # If HIGH urgency limit is in-flight > 150s → escalate to market
-        if not _use_market and _urgency == "HIGH" and getattr(pos, "exit_in_flight", False):
-            if _age_since_submit > 150:
+        # In-flight escalation for HIGH urgency exits
+        if not _use_market and _urgency == "HIGH" and getattr(pos, "exit_in_flight", False) and _exit_submit_ts > 0:
+            if _age_since_submit >= 60 and _is_protective:
+                # 60s+ unfilled on a hard stop/EOD → market (must exit)
                 _use_market = True
-                log.warning("[%s] EXIT ESCALATED TO MARKET — limit unfilled >150s | %s", pos.ticker, decision.reason)
-            elif _age_since_submit > 90 and _bid > 0:
-                # Step down to bid
-                _exit_limit = round(_bid, 2)
-                exit_price = _exit_limit
-                log.warning("[%s] EXIT STEPPED DOWN to bid $%.2f — limit unfilled >90s | %s", pos.ticker, _exit_limit, decision.reason)
+                log.warning("[%s] EXIT ESCALATED TO MARKET — bid-limit unfilled >60s | %s", pos.ticker, decision.reason)
+            elif _age_since_submit >= 30 and _bid > 0:
+                # 30–60s → bid - $0.02
+                _exit_limit = max(round(_bid - 0.02, 2), 0.01)
+                exit_price  = _exit_limit
+                log.warning("[%s] EXIT STEP-DOWN bid-$0.02 = $%.2f — unfilled >30s | %s", pos.ticker, _exit_limit, decision.reason)
+            elif _age_since_submit >= 15 and _bid > 0:
+                # 15–30s → bid - $0.01
+                _exit_limit = max(round(_bid - 0.01, 2), 0.01)
+                exit_price  = _exit_limit
+                log.warning("[%s] EXIT STEP-DOWN bid-$0.01 = $%.2f — unfilled >15s | %s", pos.ticker, _exit_limit, decision.reason)
 
         if _use_market:
             _exit_limit = None
-            exit_price = _mid if _mid > 0 else _bid
+            exit_price = _bid if _bid > 0 else _mid
             if exit_price <= 0:
                 log.critical("[%s] CLOSE BLOCKED — no quote for IMMEDIATE exit | %s", pos.ticker, decision.reason)
                 return
-            log.info("[%s] MARKET EXIT @ est.$%.2f | urgency=%s | %s", pos.ticker, exit_price, _urgency, decision.reason)
-        elif _is_protective and _bid > 0:
-            # Protective exits: start at bid immediately.
-            # Sitting at mid while profit erodes costs more than the spread.
+            log.info("[%s] MARKET EXIT @ est.$%.2f (bid) | urgency=%s | %s", pos.ticker, exit_price, _urgency, decision.reason)
+        elif _bid > 0:
+            # All exits start at current bid — profit protection, stops, scale-outs
             _exit_limit = round(_bid, 2)
             exit_price  = _exit_limit
             pos._exit_submit_ts = time.time()  # type: ignore[attr-defined]
             pos._exit_attempts  = _exit_attempts + 1  # type: ignore[attr-defined]
-            log.info("[%s] PROTECTIVE EXIT @ $%.2f (bid) attempt=%d | %s | %s",
-                     pos.ticker, _exit_limit, pos._exit_attempts, _reason_code, decision.reason)
+            log.info("[%s] LIMIT EXIT @ $%.2f (bid) attempt=%d | urgency=%s | %s",
+                     pos.ticker, _exit_limit, pos._exit_attempts, _urgency, decision.reason)
         elif _mid > 0:
+            # Bid unavailable — use mid as fallback
             _exit_limit = round(_mid, 2)
-            exit_price = _exit_limit
-            # Track submission time for escalation
+            exit_price  = _exit_limit
             pos._exit_submit_ts = time.time()  # type: ignore[attr-defined]
             pos._exit_attempts  = _exit_attempts + 1  # type: ignore[attr-defined]
-            log.info("[%s] LIMIT EXIT @ $%.2f (mid) attempt=%d | urgency=HIGH | %s",
-                     pos.ticker, _exit_limit, pos._exit_attempts, decision.reason)
-        elif _bid > 0:
-            _exit_limit = round(_bid, 2)
-            exit_price = _exit_limit
-            pos._exit_submit_ts = time.time()  # type: ignore[attr-defined]
-            pos._exit_attempts  = _exit_attempts + 1  # type: ignore[attr-defined]
-            log.info("[%s] LIMIT EXIT @ $%.2f (bid) attempt=%d | urgency=HIGH | %s",
+            log.info("[%s] LIMIT EXIT @ $%.2f (mid fallback) attempt=%d | %s",
                      pos.ticker, _exit_limit, pos._exit_attempts, decision.reason)
         else:
             if _urgency == "IMMEDIATE":

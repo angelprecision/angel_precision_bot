@@ -474,16 +474,55 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
         )
 
     # ── 2. STOP HIT ──────────────────────────────────────────────────────────
-    # HIGH urgency (not IMMEDIATE) so exit uses limit at bid, not market.
-    # Market orders on options fill at ask — on an intraday dip this means
-    # selling into the worst possible price. Using bid-limit still exits
-    # promptly but gets a real fill instead of ask-side slippage.
+    # Require 30s confirmation before exiting on underlying stop breach.
+    # A single candle wick that immediately recovers should NOT trigger exit.
+    # Uses HIGH urgency (bid-limit) not IMMEDIATE (market).
     if pos.is_at_stop:
-        return ExitDecision(
-            action="STOP", quantity=qty_rem,
-            reason=f"STOP HIT -- underlying ${pos.current_underlying:.2f} at stop ${pos.underlying_stop:.2f}",
-            urgency="HIGH", pnl_pct=option_pnl,
-        )
+        _now_ts = time.time()
+        _stop_ts = getattr(pos, "_underlying_stop_breach_ts", None)
+        _UNDERLYING_CONFIRM_SEC = float(os.getenv("UNDERLYING_STOP_CONFIRM_SECONDS", "30"))
+
+        if _stop_ts is None:
+            try:
+                pos._underlying_stop_breach_ts = _now_ts  # type: ignore[attr-defined]
+            except Exception:
+                pass
+            log.info(
+                "[%s] UNDERLYING_STOP_BREACH_STARTED — $%.2f at stop $%.2f "
+                "| will exit if holds >%.0fs",
+                pos.ticker, pos.current_underlying,
+                pos.underlying_stop, _UNDERLYING_CONFIRM_SEC,
+            )
+        elif (_now_ts - _stop_ts) >= _UNDERLYING_CONFIRM_SEC:
+            # Breach confirmed — exit with bid-limit
+            try:
+                pos._underlying_stop_breach_ts = None  # type: ignore[attr-defined]
+            except Exception:
+                pass
+            return ExitDecision(
+                action="STOP", quantity=qty_rem,
+                reason=(
+                    f"STOP HIT — underlying ${pos.current_underlying:.2f} "
+                    f"held below stop ${pos.underlying_stop:.2f} "
+                    f"for {_now_ts - _stop_ts:.0f}s"
+                ),
+                urgency="HIGH", pnl_pct=option_pnl,
+            )
+        else:
+            log.info(
+                "[%s] UNDERLYING_STOP_CONFIRMING — $%.2f below stop $%.2f "
+                "| breach=%.0fs/%.0fs",
+                pos.ticker, pos.current_underlying,
+                pos.underlying_stop, _now_ts - _stop_ts, _UNDERLYING_CONFIRM_SEC,
+            )
+    else:
+        # Underlying recovered above stop — reset confirmation timer
+        if getattr(pos, "_underlying_stop_breach_ts", None) is not None:
+            try:
+                pos._underlying_stop_breach_ts = None  # type: ignore[attr-defined]
+                log.info("[%s] UNDERLYING_STOP_RECOVERED — price reclaimed stop level", pos.ticker)
+            except Exception:
+                pass
 
     # ── TOUCHED PROFIT PROTECTION ─────────────────────────────────────────────
     # Once green, we LOCK IN a minimum profit. Never let a green trade
@@ -687,8 +726,11 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
     # Always: past -20% → exit regardless of confirmation
     _SOFT_LOSS_PCT      = float(os.getenv("SOFT_LOSS_STOP_PCT",           "-0.12"))
     _SOFT_LOSS_DEEP_PCT = float(os.getenv("SOFT_LOSS_STOP_DEEP_PCT",      "-0.20"))
-    _MIN_HOLD_SOFT      = float(os.getenv("MIN_HOLD_MINUTES_BEFORE_SOFT_EXIT", "3"))
-    _MAX_HOLD_RED       = float(os.getenv("MAX_HOLD_MINUTES_WHILE_RED",        "5"))
+    # Minimum minutes before any soft stop can fire — give the thesis time to develop
+    _MIN_HOLD_SOFT      = float(os.getenv("MIN_HOLD_MINUTES_BEFORE_SOFT_EXIT", "5"))
+    # Stop confirmation window: breach must hold this many seconds before exit fires
+    # Prevents exiting on intraday wicks that immediately recover
+    _STOP_CONFIRM_SEC   = float(os.getenv("STOP_BREACH_CONFIRM_SECONDS", "45"))
 
     if option_pnl <= _SOFT_LOSS_PCT and not pos.touched_profit:
         _soft_age       = _position_age_minutes(pos)
@@ -704,61 +746,101 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
             _u_move  = raw_move if _side == "CALL" else -raw_move
         _strong_confirm = _soft_confirm and _u_move >= 0.005  # 0.5%+ move our way
 
-        # Past -20% → always exit, no more breathing room
-        # HIGH urgency uses bid-limit pricing — gets real fill, not ask-side market slippage
+        # Stop confirmation: track when this stop level was first breached
+        # If stop just breached (< STOP_CONFIRM_SECONDS ago), give it time to recover
+        _now_ts = time.time()
+        _breach_ts = getattr(pos, "_stop_breach_ts", None)
+        if _breach_ts is None:
+            # First time we see this breach — stamp it, don't exit yet
+            try:
+                pos._stop_breach_ts = _now_ts  # type: ignore[attr-defined]
+            except Exception:
+                pass
+            log.info(
+                "[%s] STOP_BREACH_STARTED — %.1f%% loss | confirming=%s | "
+                "will exit if breach holds >%.0fs | age=%.1fmin",
+                pos.ticker, option_pnl * 100, _soft_confirm, _STOP_CONFIRM_SEC, _soft_age,
+            )
+            return None  # Wait for confirmation
+
+        _breach_age_sec = _now_ts - _breach_ts
+
+        # If breach lasted < confirmation window AND underlying is recovering → reset
+        if _breach_age_sec < _STOP_CONFIRM_SEC:
+            if _strong_confirm:
+                # Underlying moving our way — this looks like a wick, not a real break
+                try:
+                    pos._stop_breach_ts = None  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+                log.info(
+                    "[%s] STOP_BREACH_RESET — underlying recovered (%.2f%% move) "
+                    "| option=%.1f%% | breach lasted %.0fs < %.0fs confirm window",
+                    pos.ticker, _u_move * 100, option_pnl * 100,
+                    _breach_age_sec, _STOP_CONFIRM_SEC,
+                )
+                return None
+            # Still in confirmation window — log and wait
+            log.info(
+                "[%s] STOP_BREACH_CONFIRMING — %.1f%% loss | breach=%.0fs/%.0fs | "
+                "underlying=%s",
+                pos.ticker, option_pnl * 100, _breach_age_sec, _STOP_CONFIRM_SEC,
+                _soft_reason,
+            )
+            return None
+
+        # ── Breach confirmed (held past confirmation window) ──────────────────
+        # Now evaluate whether to exit
+
+        # Past -20% with confirmed breach → exit, bid-limit
         if option_pnl <= _SOFT_LOSS_DEEP_PCT:
+            try:
+                pos._stop_breach_ts = None  # type: ignore[attr-defined]
+            except Exception:
+                pass
             return ExitDecision(
                 action="CLOSE_ALL", quantity=qty_rem,
                 reason=(
                     f"DEEP_LOSS_STOP — {option_pnl*100:.0f}% exceeds deep floor "
-                    f"{_SOFT_LOSS_DEEP_PCT*100:.0f}% | underlying={_soft_reason}"
+                    f"{_SOFT_LOSS_DEEP_PCT*100:.0f}% | confirmed {_breach_age_sec:.0f}s | "
+                    f"underlying={_soft_reason}"
                 ),
                 urgency="HIGH", pnl_pct=option_pnl,
             )
 
+        # Young position with confirming underlying → suppress, give more time
+        if _soft_age < _MIN_HOLD_SOFT and (_soft_confirm or _strong_confirm):
+            log.info(
+                "[%s] SOFT_STOP_SUPPRESSED — %.1f%% loss but age=%.1fmin < %.0fmin "
+                "hold floor | underlying=%s | giving thesis time to develop",
+                pos.ticker, option_pnl * 100, _soft_age, _MIN_HOLD_SOFT, _soft_reason,
+            )
+            return None
+
         if not _soft_confirm:
-            # Thesis broken — exit at -12%, don't wait for -33%
+            # Thesis confirmed broken — underlying not holding, breach confirmed
+            try:
+                pos._stop_breach_ts = None  # type: ignore[attr-defined]
+            except Exception:
+                pass
             return ExitDecision(
                 action="CLOSE_ALL", quantity=qty_rem,
                 reason=(
                     f"THESIS_FAIL_SOFT_STOP — {option_pnl*100:.0f}% loss "
                     f"and underlying not confirming ({_soft_reason}) | "
-                    f"age={_soft_age:.1f}min"
+                    f"age={_soft_age:.1f}min | confirmed {_breach_age_sec:.0f}s"
                 ),
                 urgency="HIGH", pnl_pct=option_pnl,
             )
-        elif _strong_confirm and _soft_age < _MIN_HOLD_SOFT:
-            # Underlying actively moving our way + young — breathe to -20%
-            log.info(
-                "[%s] SOFT_LOSS_SUPPRESSED (strong confirm) — underlying moved "
-                "+%.2f%% our direction | option=%.1f%% | age=%.1fmin | room to -20%%",
-                pos.ticker, _u_move * 100, option_pnl * 100, _soft_age,
-            )
-        elif _soft_confirm and _soft_age < _MIN_HOLD_SOFT:
-            # Underlying flat/holding + young — breathe to -12%
-            log.info(
-                "[%s] SOFT_LOSS_STOP_SUPPRESSED — %.1f%% loss but underlying "
-                "confirming (%s) | age=%.1fmin < %.0fmin hold floor",
-                pos.ticker, option_pnl * 100, _soft_reason,
-                _soft_age, _MIN_HOLD_SOFT,
-            )
-        elif _soft_age >= _MAX_HOLD_RED:
-            # Red too long — exit even if underlying barely holding
-            return ExitDecision(
-                action="CLOSE_ALL", quantity=qty_rem,
-                reason=(
-                    f"THESIS_STALE_SOFT_STOP — {option_pnl*100:.0f}% loss "
-                    f"after {_soft_age:.0f}min — thesis had time, no recovery"
-                ),
-                urgency="HIGH", pnl_pct=option_pnl,
-            )
-        else:
-            log.warning(
-                "[%s] SOFT_LOSS_WATCH — %.1f%% loss | underlying=%s | "
-                "age=%.1fmin | will exit at %.0fmin if no recovery",
-                pos.ticker, option_pnl * 100, _soft_reason,
-                _soft_age, _MAX_HOLD_RED,
-            )
+
+        # Thesis still valid — watch, don't exit on time alone
+        log.warning(
+            "[%s] SOFT_LOSS_WATCH — %.1f%% loss | underlying=%s | "
+            "age=%.1fmin | breach confirmed %.0fs | waiting for thesis to break",
+            pos.ticker, option_pnl * 100, _soft_reason,
+            _soft_age, _breach_age_sec,
+        )
+        return None
 
     # ── NEVER-GREEN ESCALATING STOP ───────────────────────────────────────────
     if not pos.touched_profit:
