@@ -1620,16 +1620,45 @@ class APContractSelectionEngine:
             except Exception:
                 dte = 0
 
-            # Entry pricing: always use ask for the execution price.
-            # Previous logic used mid for paper ("less restrictive iteration")
-            # but mid-priced entries do not fill in practice — SMCI $1.23 limit
-            # vs $1.56 ask, MSFT $2.09 vs $2.27, JPM $1.44 vs $1.46 all sat
-            # canceled because wide spreads never touch mid. Paper trading must
-            # simulate real fills, which means paying ask. Scoring/ranking
-            # still uses mid (cheaper estimate prevents over-selection).
+            # ── SPREAD-ADAPTIVE ENTRY PRICING ────────────────────────────
+            # Goal: best possible fill price without missing the setup.
+            # Static mid = canceled orders on wide-spread names (SMCI, BA).
+            # Static ask = overpaying on liquid names (SPY, QQQ) every trade.
+            # Solution: price based on how wide the spread is right now.
+            #
+            # spread_pct = (ask - bid) / ask  (fraction of ask price)
+            #
+            #   TIGHT  < 8%  → mid        (SPY, QQQ, liquid names: fills fast)
+            #   NORMAL 8-20% → mid + 40%  (MSFT, BA: blend toward ask)
+            #   WIDE   > 20% → ask        (SMCI, small caps: go right to ask)
+            #
+            # Scoring/ranking always stays on mid (consistent across names).
+            # This is the STARTING limit. The order monitor's 180s timeout
+            # then cancels if unfilled — we don't chase after 3 minutes.
+            # ─────────────────────────────────────────────────────────────
             is_live, pricing_basis = _pricing_basis_for_mode(getattr(self, "mode", "paper"))
-            scoring_price_per_share   = mid    # ranking stays on mid
-            execution_price_per_share = ask    # entry always executes at ask
+            scoring_price_per_share = mid   # ranking always on mid
+
+            if ask <= 0:
+                execution_price_per_share = mid or bid or 0.01
+            elif spread_pct < 0.08:
+                # Tight spread — liquid option. Mid fills reliably.
+                execution_price_per_share = mid
+            elif spread_pct < 0.20:
+                # Normal spread — price 40% of the way from mid to ask.
+                # Better than mid (fills faster), cheaper than ask.
+                execution_price_per_share = round(mid + (ask - mid) * 0.40, 2)
+            else:
+                # Wide spread — illiquid. Go straight to ask; waiting at mid
+                # means a canceled order and a missed setup entirely.
+                execution_price_per_share = ask
+
+            # Floor: never price below bid (would be absurd) or above ask
+            execution_price_per_share = max(
+                min(execution_price_per_share, ask),
+                bid if bid > 0 else execution_price_per_share
+            )
+            execution_price_per_share = round(execution_price_per_share, 2)
             premium_per_share         = execution_price_per_share
             premium_per_contract      = execution_price_per_share * 100
             effective_budget, MAX_TRADE_USD, budget_clipped = _effective_budget(budget)
