@@ -901,7 +901,7 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
                         f"at {_ng_age_min:.0f}min | threshold={_ng_stop*100:.0f}% | "
                         f"thesis never confirmed | underlying:{_ng_confirm_reason}"
                     ),
-                    urgency="IMMEDIATE", pnl_pct=option_pnl,
+                    urgency="HIGH", pnl_pct=option_pnl,
                 )
 
     # ── HARD STOP ─────────────────────────────────────────────────────────────
