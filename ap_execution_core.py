@@ -1118,29 +1118,13 @@ class APExecutionCore:
         }
         pos.proof_logged = True  # type: ignore[attr-defined]
         log.info(
-            "[%s] Proof STAGED (pending fill confirmation) | est_exit=$%.2f pnl=%.1f%%",
+            "[EXIT_SUBMITTED_PROOF_STAGED] %s | est_exit=$%.2f pnl=%.1f%% | "
+            "proof HELD — will finalize at broker-confirmed fill",
             pos.ticker, exit_price, opt_pnl,
         )
-        # Feedback, signal close, shadow — these are safe to log at submit
-        # (they don't show dollar P&L on client dashboard)
-        self.feedback.record_outcome(
-            signal             = sig,
-            entry_option_price = pos.entry_price,
-            exit_option_price  = exit_price,
-            exit_reason        = decision.reason,
-            underlying_entry   = pos.underlying_entry,
-            underlying_exit    = pos.current_underlying,
-            contracts          = pos.quantity,
-            context_notes      = f"mode={'paper' if self.paper else 'live'}",
-            synthetic_entry    = bool(getattr(pos, "synthetic_entry", False)),
-        )
-
-        # Belt-and-suspenders: mark closed here in addition to feedback loop
-        signal_id = str(sig.get("signal_id", ""))
-        if signal_id:
-            self.store.update_status(signal_id, "closed", timestamp_flag="closed_at")
-
-        self.shadow.record_live_outcome(tier, opt_pnl / 100.0)
+        # All P&L-bearing records (proof, feedback, signal-closed, shadow)
+        # are deferred to _finalize_proof() called from mark_position_closed()
+        # after broker fill confirmation. Nothing is written here.
 
         # Log trade to edge intelligence (logger instantiated once in __init__ to avoid resource leaks)
         try:
@@ -1167,6 +1151,9 @@ class APExecutionCore:
             log.debug(f"Trade logger error (non-critical): {_e}")
 
         # Feed outcome back to intelligence audit log (builds learning dataset)
+        # signal_id resolved here for alpha tracker — store.update_status("closed")
+        # is deferred to _finalize_proof() after broker-confirmed fill.
+        signal_id = str(sig.get("signal_id", "") or "")
         if _record_intel_outcome:
             try:
                 _record_intel_outcome(
@@ -1255,11 +1242,13 @@ class APExecutionCore:
         """
         staged = getattr(pos, "_proof_staged", None)
         if not staged:
-            # Nothing staged — position was either never submitted, already
-            # finalized, or came from a reconcile path. Nothing to do.
             return
         if getattr(pos, "_proof_finalized", False):
-            log.debug("[%s] _finalize_proof skipped — already finalized", pos.ticker)
+            log.info(
+                "[EXIT_PROOF_FINALIZE_SKIPPED_ALREADY_LOGGED] %s | "
+                "position already finalized — skipping duplicate",
+                getattr(pos, "ticker", "?"),
+            )
             return
         pos._proof_finalized = True  # type: ignore[attr-defined]
 
@@ -1279,14 +1268,16 @@ class APExecutionCore:
         slippage_vs_est = round(final_exit_price - est, 4) if est > 0 else None
         if fill > 0 and est > 0:
             log.info(
-                "[%s] PROOF FINALIZED | est_exit=$%.2f actual_fill=$%.2f "
-                "slip=%.4f pnl=%.1f%%",
-                staged["ticker"], est, fill, slippage_vs_est, opt_pnl_pct * 100,
+                "[EXIT_FILL_CONFIRMED_PROOF_FINALIZED] %s | "
+                "est_exit=$%.2f actual_fill=$%.2f slip=%.4f pnl=%.1f%%",
+                staged["ticker"], est, fill,
+                slippage_vs_est if slippage_vs_est is not None else 0.0,
+                opt_pnl_pct * 100,
             )
         else:
             log.info(
-                "[%s] PROOF FINALIZED (no fill price from broker — using estimate) "
-                "| exit=$%.2f pnl=%.1f%%",
+                "[EXIT_FILL_CONFIRMED_PROOF_FINALIZED] %s | "
+                "no broker fill price — using staged estimate $%.2f pnl=%.1f%%",
                 staged["ticker"], final_exit_price, opt_pnl_pct * 100,
             )
 
@@ -1347,8 +1338,12 @@ class APExecutionCore:
                 context_notes      = f"mode={'paper' if paper else 'live'} fill_confirmed=True",
                 synthetic_entry    = staged.get("synthetic_entry", False),
             )
+            # Mark signal closed only after broker-confirmed fill
+            signal_id = str(sig.get("signal_id", "") or "")
+            if signal_id:
+                self.store.update_status(signal_id, "closed", timestamp_flag="closed_at")
         except Exception as fb_err:
-            log.error("[%s] _finalize_proof: feedback.record_outcome failed: %s", staged["ticker"], fb_err)
+            log.error("[%s] _finalize_proof: feedback/store failed: %s", staged["ticker"], fb_err)
 
         try:
             self.shadow.record_live_outcome(staged.get("tier", ""), opt_pnl_pct)
