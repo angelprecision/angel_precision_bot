@@ -231,14 +231,16 @@ def print_report(r: dict):
 def post_discord(r: dict):
     import urllib.request
     p = r["proof_trades"]; e = r["entries"]
+    manual_ok  = '✅ 0' if p['manual_exits'] == 0 else f"❌ {p['manual_exits']}"
+    stale_ok   = '✅ 0' if e['expired']      == 0 else f"❌ {e['expired']}"
     text = (
         f"**Angel Precision — {r['date']} ({r['mode']})**\n"
         f"Signals: {r['signals']['total']} | Entries: {e['filled']}/{e['attempted']} filled\n"
         f"Closed: {p['total_closed']} | {p['winners']}W/{p['losers']}L | "
         f"Win={p['win_rate_pct']}% | AvgW={p['avg_winner_pct']:+.1f}% AvgL={p['avg_loser_pct']:+.1f}%\n"
         f"Client sync: {'✅' if r['client_sync']['sync_ok'] else '❌'} | "
-        f"Manual exits: {'✅ 0' if p['manual_exits']==0 else f'❌ {p[\"manual_exits\"]}'} | "
-        f"Stale: {'✅ 0' if e['expired']==0 else f'❌ {e[\"expired\"]}'}"
+        f"Manual exits: {manual_ok} | "
+        f"Stale: {stale_ok}"
     )
     data = json.dumps({"content": text}).encode()
     req = urllib.request.Request(DISCORD_WEBHOOK, data=data,
