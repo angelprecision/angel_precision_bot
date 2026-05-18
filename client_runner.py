@@ -265,7 +265,10 @@ def resolve_tradier_credentials(member: dict) -> dict:
             "base_url":     "https://api.tradier.com",
         }
 
-    # PAPER — use paper-specific columns, fall back to active columns
+    # PAPER — use paper-specific columns, fall back to generic active columns.
+    # Priority: tradier_paper_access_token > tradier_access_token (generic).
+    # Handles early onboarding where paper-specific token not yet captured.
+    # base_url is always sandbox regardless of which token source is used.
     account_id = (
         member.get("tradier_paper_account_id")
         or member.get("tradier_account_id")
@@ -274,19 +277,37 @@ def resolve_tradier_credentials(member: dict) -> dict:
         member.get("tradier_paper_access_token")
         or member.get("tradier_access_token")
     )
-    # Strip any trailing whitespace/newlines that may have been stored in DB
     if account_id:
         account_id = str(account_id).strip()
+
+    # token_source logged so we can confirm in Render logs which path was taken
+    if member.get("tradier_paper_access_token"):
+        token_source = "paper_specific"
+    elif member.get("tradier_access_token"):
+        token_source = "generic_fallback"
+    else:
+        token_source = "missing"
+
     if not account_id or not token:
         raise RuntimeError(
-            f"[{email}] PAPER startup missing tradier_paper_account_id or "
-            "tradier_paper_access_token (and no fallback tradier_account_id/token)"
+            f"[{email}] PAPER startup: no usable Tradier credentials. "
+            f"paper_account_id={'set' if member.get('tradier_paper_account_id') else 'MISSING'} "
+            f"paper_token={'set' if member.get('tradier_paper_access_token') else 'MISSING'} "
+            f"generic_token(fallback)={'set' if member.get('tradier_access_token') else 'MISSING'}"
         )
+
+    logger.info(
+        "[%s] PAPER credentials resolved | account=%s token_source=%s | base=sandbox",
+        email,
+        (account_id or "")[:4] + "****",
+        token_source,
+    )
     return {
         "mode":         "PAPER",
         "account_id":   account_id,
         "access_token": token,
         "base_url":     "https://sandbox.tradier.com",
+        "token_source": token_source,
     }
 
 
