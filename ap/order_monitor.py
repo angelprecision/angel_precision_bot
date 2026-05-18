@@ -80,8 +80,15 @@ def _cached_broker_order_status(broker_order_id: str, fetch_fn) -> Optional[str]
 TIMEOUT_CREATED       = int(os.getenv("ORDER_TIMEOUT_CREATED",       "120"))    # 2 min — CREATED = never reached broker
 TIMEOUT_CREATED_NO_BROKER_WARN = int(os.getenv("ORDER_TIMEOUT_CREATED_NO_BROKER_WARN", "10"))  # fast diagnostic — alert at 10s, cancel at 120s
 TIMEOUT_SUBMITTED     = int(os.getenv("ORDER_TIMEOUT_SUBMITTED",     "300"))   # 5 min
-TIMEOUT_ACKNOWLEDGED  = int(os.getenv("ORDER_TIMEOUT_ACKNOWLEDGED",  "600"))   # 10 min
+# Entry ACKNOWLEDGED timeout: an options scalp limit that sits acknowledged-
+# unfilled for 10 minutes is a stale entry — the move already happened. If it
+# fills now we enter late into a weaker setup (the SMCI bug). 180s is the
+# correct ceiling for scalp entries. Exits are handled separately and faster.
+TIMEOUT_ACKNOWLEDGED  = int(os.getenv("ORDER_TIMEOUT_ACKNOWLEDGED",  "180"))   # 3 min — scalp entry ceiling
 TIMEOUT_PARTIAL_FILL  = int(os.getenv("ORDER_TIMEOUT_PARTIAL_FILL",  "900"))   # 15 min
+# Hard ceiling on ANY unfilled buy-to-open entry limit regardless of status.
+# If a scalp entry has not filled in this window, the setup is stale — cancel.
+ENTRY_LIMIT_MAX_AGE_SECONDS = int(os.getenv("ENTRY_LIMIT_MAX_AGE_SECONDS", "150"))  # 2.5 min
 # H4: exit reliability. An unfilled exit on a fast-moving option is direct
 # account risk — a +25% green trade can round-trip to breakeven or a loss
 # while a mispriced limit exit sits unfilled. 5 min was far too slow. At 45s
@@ -99,12 +106,20 @@ POLL_INTERVAL = int(os.getenv("ORDER_MONITOR_POLL", "60"))  # seconds (entry che
 EXIT_CHECK_INTERVAL = int(os.getenv("ORDER_MONITOR_EXIT_POLL", "15"))  # seconds
 
 # Watchdog ownership controls.
-# Default is intentionally passive: this monitor alerts only and does not become
-# a second lifecycle authority alongside fill monitor, reconciler, OSM, and exit engine.
+# Default is intentionally passive for POSITION lifecycle (that authority
+# belongs to fill monitor / reconciler / OSM / exit engine). BUT a stale
+# unfilled ENTRY is not position lifecycle — letting it fill late creates a
+# bad trade. Entry cancels are therefore always permitted (see _handle_stale_entry).
 ORDER_MONITOR_MODE = os.getenv("ORDER_MONITOR_MODE", "watchdog").strip().lower()
-ENABLE_MISSED_MOVE_CANCEL = os.getenv("ENABLE_MISSED_MOVE_CANCEL", "0").strip() == "1"
+# Missed-move cancel ENABLED by default. The whole point is to not chase a
+# setup after the move already happened. Disabling it (the old default) is
+# exactly why the SMCI stale entry came back.
+ENABLE_MISSED_MOVE_CANCEL = os.getenv("ENABLE_MISSED_MOVE_CANCEL", "1").strip() == "1"
 ALLOW_ORDER_MONITOR_POSITION_REOPEN = os.getenv("ALLOW_ORDER_MONITOR_POSITION_REOPEN", "0").strip() == "1"
 ORDER_MONITOR_CAN_ACT = ORDER_MONITOR_MODE in {"active", "actor", "enforce", "enforced"}
+# Stale ENTRY cancels are always allowed even in watchdog mode. An unfilled
+# buy-to-open is not a position — leaving it to fill late is the actual risk.
+ALLOW_ENTRY_CANCEL_IN_WATCHDOG = os.getenv("ALLOW_ENTRY_CANCEL_IN_WATCHDOG", "1").strip() == "1"
 
 
 
@@ -155,8 +170,10 @@ class APOrderMonitor:
             "order_monitor_mode":     ORDER_MONITOR_MODE,
             "enable_missed_move_cancel": ENABLE_MISSED_MOVE_CANCEL,
             "allow_position_reopen":  ALLOW_ORDER_MONITOR_POSITION_REOPEN,
-            "missed_move_min_secs":   int(os.getenv("MISSED_MOVE_MIN_SECS",    "600")),
-            "missed_move_price_mult": float(os.getenv("MISSED_MOVE_PRICE_MULT", "1.20")),
+            "missed_move_min_secs":   int(os.getenv("MISSED_MOVE_MIN_SECS",    "75")),
+            "missed_move_price_mult": float(os.getenv("MISSED_MOVE_PRICE_MULT", "1.07")),
+            "entry_limit_max_age_seconds": ENTRY_LIMIT_MAX_AGE_SECONDS,
+            "allow_entry_cancel_in_watchdog": ALLOW_ENTRY_CANCEL_IN_WATCHDOG,
         })
 
     def _emit_order_event(
@@ -312,46 +329,11 @@ class APOrderMonitor:
                 ref_ts = submitted_ts or created_ts
                 age_secs = (now - ref_ts).total_seconds()
 
-                # MISSED-MOVE CANCEL — strategy decision with documented tradeoff:
-                # RISK: Cancels valid trades in fast markets where price runs 20%+
-                #       then pulls back to our level — reduces win rate in volatile sessions.
-                # BENEFIT: Prevents chasing stale setups where the move already happened.
-                # TUNING: MISSED_MOVE_PRICE_MULT via env (default 1.20 = 20% above limit).
-                #         Increase to 1.30+ to reduce false cancels in high-volatility markets.
-                _MISSED_MOVE_MIN_SECS = int(os.getenv("MISSED_MOVE_MIN_SECS", "600"))
-                _MISSED_MOVE_PRICE_MULT = float(os.getenv("MISSED_MOVE_PRICE_MULT", "1.20"))
-                if ENABLE_MISSED_MOVE_CANCEL and broker_oid and age_secs >= _MISSED_MOVE_MIN_SECS and status == "SUBMITTED":
-                    try:
-                        _limit_price = (
-                            order.get("limit_price")
-                            or order.get("price")
-                            or (self.osm.get_order(local_id) or {}).get("limit_price")
-                            or (self.osm.get_order(local_id) or {}).get("price")
-                        )
-                        _sym = order.get("contract") or order.get("symbol", "")
-                        if _limit_price and float(_limit_price) > 0 and _sym:
-                            _current = self._get_option_price(_sym)
-                            if _current and _current > float(_limit_price) * _MISSED_MOVE_PRICE_MULT:
-                                log.warning(
-                                    "[%s] MISSED MOVE CANCEL | %s | limit=$%.2f current=$%.2f "
-                                    "(%.0f%% above limit) after %.0fs — move happened without us",
-                                    self.client_id, _sym,
-                                    float(_limit_price), _current,
-                                    (_current / float(_limit_price) - 1) * 100,
-                                    age_secs,
-                                )
-                                self._handle_stale_entry(
-                                    local_id, status, contract, age_secs,
-                                    action="cancel",
-                                    reason=(
-                                        f"MISSED_MOVE — limit=${float(_limit_price):.2f} "
-                                        f"current=${_current:.2f} ({(_current/float(_limit_price)-1)*100:.0f}% above) "
-                                        f"after {age_secs:.0f}s — canceling stale entry"
-                                    ),
-                                )
-                                continue
-                    except Exception as _mme:
-                        log.debug("[%s] Missed-move check failed (non-critical): %s", self.client_id, _mme)
+                # Missed-move + hard entry-age cancel (applies to SUBMITTED)
+                if self._check_stale_entry_cancel(
+                    order, local_id, status, contract, age_secs
+                ):
+                    continue
 
                 if age_secs > TIMEOUT_SUBMITTED:
                     if not broker_oid:
@@ -385,6 +367,16 @@ class APOrderMonitor:
             elif status == "ACKNOWLEDGED":
                 ref_ts = submitted_ts or created_ts
                 age_secs = (now - ref_ts).total_seconds()
+
+                # MISSED-MOVE + HARD ENTRY-AGE CANCEL — also applies to ACKNOWLEDGED.
+                # The SMCI bug: an acknowledged-unfilled buy-to-open sat for 1hr+
+                # because missed-move only checked SUBMITTED and the ACK timeout
+                # was 10min. Now the same stale-entry protection runs here.
+                if self._check_stale_entry_cancel(
+                    order, local_id, status, contract, age_secs
+                ):
+                    continue
+
                 if age_secs > TIMEOUT_ACKNOWLEDGED:
                     broker_status = self._query_broker_order(broker_oid)
                     if broker_status:
@@ -395,7 +387,7 @@ class APOrderMonitor:
                             action="alert_and_cancel",
                             reason=(
                                 f"ACKNOWLEDGED for {age_secs:.0f}s > {TIMEOUT_ACKNOWLEDGED}s "
-                                f"— no fill"
+                                f"— no fill, scalp entry stale"
                             ),
                         )
 
@@ -496,6 +488,138 @@ class APOrderMonitor:
                         f"| MANUAL INTERVENTION REQUIRED"
                     )
 
+    def _check_stale_entry_cancel(
+        self,
+        order: dict,
+        local_id: str,
+        status: str,
+        contract: str,
+        age_secs: float,
+    ) -> bool:
+        """Cancel a stale unfilled buy-to-open entry limit.
+
+        Returns True if the order was cancelled (caller should `continue`).
+
+        Two independent triggers, EITHER fires a cancel:
+          (a) MISSED MOVE: current option price has run far enough above the
+              limit that filling now means entering late into a setup the
+              move already left behind.
+          (b) HARD AGE: the entry limit has simply been unfilled too long for
+              a scalp entry, regardless of price.
+
+        Applies to SUBMITTED and ACKNOWLEDGED (the SMCI bug was an
+        ACKNOWLEDGED order the old SUBMITTED-only check never touched).
+        """
+        try:
+            broker_oid = self._get_broker_order_id(local_id)
+
+            # Tightened defaults — old 600s/1.20x was effectively "never" for
+            # a scalp. 75s / 1.07x catches a stale entry before it fills late.
+            _missed_min_secs  = int(os.getenv("MISSED_MOVE_MIN_SECS", "75"))
+            _missed_price_mult = float(os.getenv("MISSED_MOVE_PRICE_MULT", "1.07"))
+
+            _limit_price = (
+                order.get("limit_price")
+                or order.get("price")
+                or (self.osm.get_order(local_id) or {}).get("limit_price")
+                or (self.osm.get_order(local_id) or {}).get("price")
+            )
+            _sym = order.get("contract") or order.get("symbol", "") or contract
+
+            # ── Trigger (a): MISSED MOVE ──────────────────────────────────
+            if (
+                ENABLE_MISSED_MOVE_CANCEL
+                and broker_oid
+                and age_secs >= _missed_min_secs
+                and _limit_price
+                and float(_limit_price) > 0
+                and _sym
+            ):
+                _current = self._get_option_price(_sym)
+                if _current and _current > float(_limit_price) * _missed_price_mult:
+                    _pct_above = (_current / float(_limit_price) - 1) * 100
+                    log.warning(
+                        "[%s] MISSED_MOVE_CANCEL | %s | limit=$%.2f current=$%.2f "
+                        "(%.0f%% above) status=%s age=%.0fs — move happened without us",
+                        self.client_id, _sym, float(_limit_price), _current,
+                        _pct_above, status, age_secs,
+                    )
+                    self._emit_order_event(
+                        local_order_id=local_id,
+                        stage="order_monitor",
+                        decision="REJECT",
+                        reason_code="MISSED_MOVE_ENTRY_CANCEL",
+                        explanation=(
+                            f"Canceling stale entry — option ran {_pct_above:.0f}% "
+                            f"above limit before fill (status={status}, age={age_secs:.0f}s)"
+                        ),
+                        contract=contract,
+                        inputs={
+                            "limit_price": float(_limit_price),
+                            "current_option_price": _current,
+                            "percent_above_limit": round(_pct_above, 2),
+                            "age_secs": round(age_secs, 1),
+                            "broker_order_id": broker_oid,
+                            "status": status,
+                        },
+                    )
+                    self._handle_stale_entry(
+                        local_id, status, contract, age_secs,
+                        action="cancel",
+                        reason=(
+                            f"STALE_ENTRY_CANCEL MISSED_MOVE — limit=${float(_limit_price):.2f} "
+                            f"current=${_current:.2f} ({_pct_above:.0f}% above) "
+                            f"status={status} age={age_secs:.0f}s"
+                        ),
+                    )
+                    return True
+
+            # ── Trigger (b): HARD ENTRY AGE ───────────────────────────────
+            # A buy-to-open that has not filled within the hard ceiling is a
+            # stale scalp entry — cancel regardless of price.
+            if broker_oid and age_secs >= ENTRY_LIMIT_MAX_AGE_SECONDS:
+                log.warning(
+                    "[%s] ENTRY_ACK_TIMEOUT_CANCEL | %s | status=%s age=%.0fs "
+                    ">= %ds hard entry ceiling — scalp entry stale",
+                    self.client_id, _sym or contract, status, age_secs,
+                    ENTRY_LIMIT_MAX_AGE_SECONDS,
+                )
+                self._emit_order_event(
+                    local_order_id=local_id,
+                    stage="order_monitor",
+                    decision="REJECT",
+                    reason_code="MISSED_MOVE_ENTRY_CANCEL",
+                    explanation=(
+                        f"Canceling stale entry — unfilled {age_secs:.0f}s "
+                        f">= {ENTRY_LIMIT_MAX_AGE_SECONDS}s hard ceiling (status={status})"
+                    ),
+                    contract=contract,
+                    inputs={
+                        "limit_price": float(_limit_price) if _limit_price else 0.0,
+                        "current_option_price": 0.0,
+                        "percent_above_limit": 0.0,
+                        "age_secs": round(age_secs, 1),
+                        "broker_order_id": broker_oid,
+                        "status": status,
+                    },
+                )
+                self._handle_stale_entry(
+                    local_id, status, contract, age_secs,
+                    action="cancel",
+                    reason=(
+                        f"STALE_ENTRY_CANCEL ENTRY_ACK_TIMEOUT — unfilled {age_secs:.0f}s "
+                        f">= {ENTRY_LIMIT_MAX_AGE_SECONDS}s ceiling status={status}"
+                    ),
+                )
+                return True
+
+        except Exception as _se:
+            log.debug(
+                "[%s] _check_stale_entry_cancel non-fatal error: %s",
+                self.client_id, _se,
+            )
+        return False
+
     def _handle_stale_entry(
         self,
         local_order_id: str,
@@ -531,7 +655,18 @@ class APOrderMonitor:
                 f"| {local_order_id} | {reason}"
             )
 
-        if not ORDER_MONITOR_CAN_ACT:
+        # WATCHDOG GATE — with ENTRY exception.
+        # Position lifecycle authority stays with fill monitor/reconciler/OSM/
+        # exit engine, so watchdog mode normally suppresses action. BUT an
+        # unfilled buy-to-open ENTRY is NOT a position — leaving it to fill
+        # late is the actual risk (the SMCI bug). Entry cancels are therefore
+        # permitted even in watchdog mode.
+        _is_entry_cancel = ("cancel" in action) and status in (
+            "CREATED", "SUBMITTED", "ACKNOWLEDGED",
+        )
+        _entry_cancel_allowed = ALLOW_ENTRY_CANCEL_IN_WATCHDOG and _is_entry_cancel
+
+        if not ORDER_MONITOR_CAN_ACT and not _entry_cancel_allowed:
             self._alert(
                 f"[WATCHDOG ONLY] Stale entry detected; no cancel attempted | "
                 f"{self.client_id} | {contract} | {local_order_id} | {reason}"
@@ -541,6 +676,13 @@ class APOrderMonitor:
                 self.client_id, local_order_id, status, action,
             )
             return
+
+        if not ORDER_MONITOR_CAN_ACT and _entry_cancel_allowed:
+            log.warning(
+                "[%s] WATCHDOG MODE but ENTRY CANCEL PERMITTED — unfilled %s "
+                "entry is not position lifecycle | order=%s | %s",
+                self.client_id, status, local_order_id, reason,
+            )
 
         if "cancel" in action:
             broker_oid = self._get_broker_order_id(local_order_id)
