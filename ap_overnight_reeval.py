@@ -550,6 +550,24 @@ def _fetch_watching_signals(client_id: str) -> list:
                 - timedelta(days=OVERNIGHT_SIGNAL_MAX_AGE_DAYS + 1)
             ).isoformat()
             sb = _cc(sb_url, sb_key)
+            # ── MULTI-CLIENT FAN-OUT FIX ──────────────────────────────────
+            # Do NOT filter ap_signals by client_email here. WATCHING rows in
+            # ap_signals are SCANNER SETUPS (SMCI, BA, HOOD, SPY, ...), not
+            # per-client jobs. The scanner writes a setup once, tagged to
+            # whichever client_email it first ran for. Filtering by
+            # client_email meant each client's overnight reeval only saw the
+            # setups tagged to itself — so SMCI reached tradefluence but Jose's
+            # reeval queried client_email=jose, found nothing, and SILENTLY
+            # skipped SMCI entirely (no decision, no rejection, no trail).
+            #
+            # Every active client's reeval must see the SAME universe of
+            # setups. Each client then runs its OWN risk/decision path via
+            # master_control.evaluate(signal, client_id=client_id) downstream,
+            # which logs an APPROVE or REJECT decision event per client. Same
+            # setups for everyone; separate per-client execution decisions.
+            #
+            # (Source 1 trade_queue stays client-scoped — those are genuine
+            # per-client in-session jobs, not shared scanner setups.)
             res = (
                 sb.table("ap_signals")
                 .select(
@@ -557,11 +575,10 @@ def _fetch_watching_signals(client_id: str) -> list:
                     "side, score, timeframe, pattern, tier, decision_status, "
                     "entry_trigger, stop_price, target_price, underlying_at_signal"
                 )
-                .eq("client_email", client_id)
                 .eq("decision_status", "WATCHING")
                 .gte("created_at", cutoff)
                 .order("created_at", desc=True)
-                .limit(100)
+                .limit(300)
                 .execute()
             )
 
@@ -610,34 +627,73 @@ def _fetch_watching_signals(client_id: str) -> list:
     except Exception as e:
         log.error("_fetch_watching_signals[ap_signals] failed: %s", e)
 
+    # ── SETUP-IDENTITY DEDUP ──────────────────────────────────────────────
+    # Now that ap_signals is fetched WITHOUT a client_email filter, the same
+    # logical setup (e.g. SMCI PUT 1d) may appear multiple times if it was
+    # stored under more than one client_email. signal_id dedup (above) only
+    # catches identical signal_ids. Collapse to one row per unique setup
+    # identity (ticker|side|timeframe|entry_trigger) so each client's reeval
+    # evaluates each distinct setup exactly once. trade_queue rows are kept
+    # as-is (genuine per-client jobs, never deduped against scanner setups).
+    _deduped: list[dict] = []
+    _seen_setup_keys: set = set()
+    for r in results:
+        if r.get("_source") == "trade_queue":
+            _deduped.append(r)
+            continue
+        p = r.get("payload") or {}
+        _tkr = str(p.get("ticker") or p.get("symbol") or "").upper().strip()
+        _side = str(p.get("side") or "").upper().strip()
+        _tf = str(p.get("timeframe") or "").lower().strip()
+        _trig = p.get("entry_trigger")
+        try:
+            _trig_k = round(float(_trig), 4) if _trig is not None else None
+        except (TypeError, ValueError):
+            _trig_k = None
+        _key = (_tkr, _side, _tf, _trig_k)
+        if _tkr and _key in _seen_setup_keys:
+            log.info(
+                "[%s] dedup: skipping duplicate setup %s %s %s (already have one)",
+                client_id, _tkr, _side, _tf,
+            )
+            continue
+        if _tkr:
+            _seen_setup_keys.add(_key)
+        _deduped.append(r)
+    results = _deduped
+
     tq_count = sum(1 for r in results if r.get("_source") == "trade_queue")
     sup_count = sum(1 for r in results if r.get("_source") == "ap_signals")
     log.info(
-        "[%s] _fetch_watching_signals: total=%d trade_queue=%d ap_signals=%d",
+        "[%s] _fetch_watching_signals: total=%d trade_queue=%d ap_signals=%d "
+        "(fan-out: all clients see same scanner setups)",
         client_id, len(results), tq_count, sup_count,
     )
     return results
 
 
 def _mark_job_rejected(job_id, client_id: str, reason: str) -> None:
-    """Mark a WATCHING job rejected in its original source table."""
+    """Mark a WATCHING job rejected in its original source table.
+
+    MULTI-CLIENT NOTE: for ap_signals scanner setups (sup: prefix) we do NOT
+    flip the shared row's decision_status. That row is shared across all
+    clients now (fan-out fix) — if client A's reeval flipped it to 'rejected'
+    it would vanish from the WATCHING pool for clients B, C, ... before their
+    reevals ran, recreating the exact silent-skip bug we just fixed. The
+    per-client rejection is ALREADY recorded by master_control.evaluate's
+    DECISION_EVENT (client_id scoped) and there is no per-client column on
+    ap_signals. The shared scanner row ages out naturally via the created_at
+    cutoff. trade_queue rows ARE genuinely per-client and still update.
+    """
     job_id_str = str(job_id)
     if job_id_str.startswith("sup:"):
-        signal_id = job_id_str[4:]
-        try:
-            from supabase import create_client as _cc
-            sb = _cc(
-                os.getenv("SUPABASE_URL", ""),
-                os.getenv("SUPABASE_SERVICE_KEY", "")
-                or os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
-                or os.getenv("SUPABASE_ANON_KEY", ""),
-            )
-            sb.table("ap_signals").update({
-                "decision_status": "rejected",
-                "context_notes": reason[:500],
-            }).eq("signal_id", signal_id).eq("client_email", client_id).execute()
-        except Exception as e:
-            log.debug("_mark_job_rejected[ap_signals] failed non-fatal: %s", e)
+        # Per-client decision already logged via master_control DECISION_EVENT.
+        # Do not mutate the shared scanner signal row.
+        log.info(
+            "[%s] reeval rejected shared setup %s — per-client decision logged "
+            "(shared ap_signals row left WATCHING for other clients): %s",
+            client_id, job_id_str[4:], reason[:200],
+        )
         return
 
     try:
@@ -658,26 +714,24 @@ def _mark_job_rejected(job_id, client_id: str, reason: str) -> None:
 
 
 def _mark_job_watching_armed(job_id, client_id: str, contract: str) -> None:
-    """Record that a WATCHING job has been armed in the entry watcher."""
+    """Record that a WATCHING job has been armed in the entry watcher.
+
+    MULTI-CLIENT NOTE: same rule as _mark_job_rejected. For shared ap_signals
+    scanner setups (sup: prefix) we do NOT flip the shared row to 'armed'.
+    The arm is tracked per-client by the entry watcher (keyed by client_id)
+    and the per-client order/watcher rows. Flipping the shared row would hide
+    the setup from other clients' reevals. trade_queue rows are per-client
+    and still update normally.
+    """
     job_id_str = str(job_id)
     label = f"armed:contract={contract}"[:500]
     if job_id_str.startswith("sup:"):
-        signal_id = job_id_str[4:]
-        try:
-            from supabase import create_client as _cc
-            sb = _cc(
-                os.getenv("SUPABASE_URL", ""),
-                os.getenv("SUPABASE_SERVICE_KEY", "")
-                or os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
-                or os.getenv("SUPABASE_ANON_KEY", ""),
-            )
-            sb.table("ap_signals").update({
-                "decision_status": "armed",
-                "context_notes": label,
-                "watcher_started_at": datetime.now(timezone.utc).isoformat(),
-            }).eq("signal_id", signal_id).eq("client_email", client_id).execute()
-        except Exception as e:
-            log.debug("_mark_job_watching_armed[ap_signals] failed non-fatal: %s", e)
+        log.info(
+            "[%s] reeval armed shared setup %s for this client "
+            "(per-client watcher created; shared ap_signals row left WATCHING "
+            "for other clients) %s",
+            client_id, job_id_str[4:], label,
+        )
         return
 
     try:
