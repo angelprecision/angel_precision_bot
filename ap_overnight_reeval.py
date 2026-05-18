@@ -330,12 +330,23 @@ def run_overnight_reeval(
                     except Exception:
                         pass
 
-            # Propagate entry_trigger and overnight flag to the plan
+            # Propagate entry_trigger and overnight flag to the plan.
+            # CRITICAL: also propagate prior_day_high, prior_day_low, and
+            # timeframe so APEntryWatcher.watch() correctly identifies this
+            # as an overnight signal and SKIPS the intraday staleness check.
+            # Without these fields, _is_overnight_signal = False, and the
+            # 1.5% drift guard fires at 0.2% movement — killing valid setups.
+            # (GOOGL, JPM, AAPL all expired today with watch_arm_failed:
+            # stale_price because the plan didn't carry these fields forward.)
             if entry_trigger:
                 try:
-                    decision.plan.trigger_price = float(entry_trigger)
-                    decision.plan.trigger_type  = "breach"
+                    decision.plan.trigger_price  = float(entry_trigger)
+                    decision.plan.trigger_type   = "breach"
                     decision.plan.metadata["overnight"] = True
+                    # Overnight signal identification fields for entry watcher
+                    decision.plan.prior_day_high = prior_day_high or None
+                    decision.plan.prior_day_low  = prior_day_low  or None
+                    decision.plan.timeframe      = str(signal.get("timeframe") or "1d")
                 except Exception:
                     pass
 
