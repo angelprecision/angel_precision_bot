@@ -3444,7 +3444,35 @@ class APExitEngine:
                 return False
 
             if decision.suggested_limit == 0.0 and pos.current_bid > 0:
-                decision.suggested_limit = round(pos.current_bid * 0.99, 2)
+                # Exit pricing strategy: use the natural price (midpoint between
+                # bid and ask) rather than bid*0.99. The old approach gave away
+                # 1% below bid on every exit — on a $5 option that's $5/contract
+                # of unnecessary slippage per trade.
+                #
+                # Natural (mid) fills quickly on liquid options because market
+                # makers actively compete at or near mid. If the spread is very
+                # wide (illiquid), we fall back toward the bid to guarantee fill.
+                #
+                # Wide spread = (ask-bid)/bid > 15% → price at bid (safety)
+                # Normal spread → price at mid, rounded to nearest cent
+                _bid = pos.current_bid
+                _ask = pos.current_ask if pos.current_ask > _bid else 0.0
+                if _ask > 0:
+                    _spread_pct = (_ask - _bid) / _bid if _bid > 0 else 1.0
+                    if _spread_pct > 0.15:
+                        # Wide spread — illiquid, price at bid to guarantee fill
+                        decision.suggested_limit = round(_bid, 2)
+                        log.debug("[EXIT] %s wide spread %.0f%% — pricing at bid %.2f",
+                                  ticker, _spread_pct * 100, _bid)
+                    else:
+                        # Normal spread — price at natural (mid), faster fill
+                        _mid = round((_bid + _ask) / 2.0, 2)
+                        decision.suggested_limit = _mid
+                        log.debug("[EXIT] %s mid-price %.2f (bid=%.2f ask=%.2f spread=%.0f%%)",
+                                  ticker, _mid, _bid, _ask, _spread_pct * 100)
+                else:
+                    # No ask available — use bid as floor
+                    decision.suggested_limit = round(_bid, 2)
 
             pre_submit_qty = int(pos.quantity_remaining or 0)
             # P2: snapshot the submit generation so the post-callback lock can
