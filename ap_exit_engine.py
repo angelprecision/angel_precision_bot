@@ -474,11 +474,15 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
         )
 
     # ── 2. STOP HIT ──────────────────────────────────────────────────────────
+    # HIGH urgency (not IMMEDIATE) so exit uses limit at bid, not market.
+    # Market orders on options fill at ask — on an intraday dip this means
+    # selling into the worst possible price. Using bid-limit still exits
+    # promptly but gets a real fill instead of ask-side slippage.
     if pos.is_at_stop:
         return ExitDecision(
             action="STOP", quantity=qty_rem,
             reason=f"STOP HIT -- underlying ${pos.current_underlying:.2f} at stop ${pos.underlying_stop:.2f}",
-            urgency="IMMEDIATE", pnl_pct=option_pnl,
+            urgency="HIGH", pnl_pct=option_pnl,
         )
 
     # ── TOUCHED PROFIT PROTECTION ─────────────────────────────────────────────
@@ -701,6 +705,7 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
         _strong_confirm = _soft_confirm and _u_move >= 0.005  # 0.5%+ move our way
 
         # Past -20% → always exit, no more breathing room
+        # HIGH urgency uses bid-limit pricing — gets real fill, not ask-side market slippage
         if option_pnl <= _SOFT_LOSS_DEEP_PCT:
             return ExitDecision(
                 action="CLOSE_ALL", quantity=qty_rem,
@@ -708,7 +713,7 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
                     f"DEEP_LOSS_STOP — {option_pnl*100:.0f}% exceeds deep floor "
                     f"{_SOFT_LOSS_DEEP_PCT*100:.0f}% | underlying={_soft_reason}"
                 ),
-                urgency="IMMEDIATE", pnl_pct=option_pnl,
+                urgency="HIGH", pnl_pct=option_pnl,
             )
 
         if not _soft_confirm:
@@ -720,7 +725,7 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
                     f"and underlying not confirming ({_soft_reason}) | "
                     f"age={_soft_age:.1f}min"
                 ),
-                urgency="IMMEDIATE", pnl_pct=option_pnl,
+                urgency="HIGH", pnl_pct=option_pnl,
             )
         elif _strong_confirm and _soft_age < _MIN_HOLD_SOFT:
             # Underlying actively moving our way + young — breathe to -20%
