@@ -320,6 +320,17 @@ class APProofLogger:
         synthetic_entry:     bool = False,
         position_id:         str  = "",
         local_order_id:      str  = "",
+        # Adaptive exit pricing slippage fields (filled by exit engine)
+        exit_bid:            float = 0.0,
+        exit_ask:            float = 0.0,
+        exit_mid:            float = 0.0,
+        exit_limit_placed:   float = 0.0,
+        exit_fill_price:     float = 0.0,
+        slippage_vs_mid:     float = 0.0,
+        slippage_vs_bid:     float = 0.0,
+        exit_pricing_tier:   str  = "",
+        exit_attempt:        int  = 0,
+        seconds_to_fill:     float = 0.0,
     ) -> dict:
         now = datetime.now(timezone.utc)
         row = {
@@ -352,6 +363,17 @@ class APProofLogger:
             "synthetic_entry":    bool(synthetic_entry),
             "position_id":        position_id or None,
             "local_order_id":     local_order_id or None,
+            # Adaptive exit pricing — how we priced vs what we got
+            "exit_bid":           round(exit_bid, 4) if exit_bid else None,
+            "exit_ask":           round(exit_ask, 4) if exit_ask else None,
+            "exit_mid":           round(exit_mid, 4) if exit_mid else None,
+            "exit_limit_placed":  round(exit_limit_placed, 4) if exit_limit_placed else None,
+            "exit_fill_price":    round(exit_fill_price, 4) if exit_fill_price else None,
+            "slippage_vs_mid":    round(slippage_vs_mid, 4) if slippage_vs_mid else None,
+            "slippage_vs_bid":    round(slippage_vs_bid, 4) if slippage_vs_bid else None,
+            "exit_pricing_tier":  exit_pricing_tier or None,
+            "exit_attempt":       exit_attempt if exit_attempt else None,
+            "seconds_to_fill":    round(seconds_to_fill, 1) if seconds_to_fill else None,
         }
 
         # Cache for convenience — not source of truth

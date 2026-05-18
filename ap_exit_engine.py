@@ -3444,35 +3444,96 @@ class APExitEngine:
                 return False
 
             if decision.suggested_limit == 0.0 and pos.current_bid > 0:
-                # Exit pricing strategy: use the natural price (midpoint between
-                # bid and ask) rather than bid*0.99. The old approach gave away
-                # 1% below bid on every exit — on a $5 option that's $5/contract
-                # of unnecessary slippage per trade.
+                # ── ADAPTIVE EXIT PRICING ─────────────────────────────────────
+                # Static bid*0.99 gave away $1-5/contract per trade. Static mid
+                # is better but can fail to fill on fast moves. Real solution:
+                # urgency-based starting price + retry step-down toward bid.
                 #
-                # Natural (mid) fills quickly on liquid options because market
-                # makers actively compete at or near mid. If the spread is very
-                # wide (illiquid), we fall back toward the bid to guarantee fill.
+                # URGENCY TIERS (by exit reason code):
+                #   RISK   — hard stop / EOD / theta / sentinel / never-green:
+                #            fill speed > price → start at bid immediately
+                #   TRAIL  — runner trail / profit lock / trailing stop:
+                #            position may be reversing → start at (mid+bid)/2
+                #   PROFIT — scale-out / target-hit / protect:
+                #            time is on our side → start at mid
                 #
-                # Wide spread = (ask-bid)/bid > 15% → price at bid (safety)
-                # Normal spread → price at mid, rounded to nearest cent
-                _bid = pos.current_bid
-                _ask = pos.current_ask if pos.current_ask > _bid else 0.0
-                if _ask > 0:
-                    _spread_pct = (_ask - _bid) / _bid if _bid > 0 else 1.0
-                    if _spread_pct > 0.15:
-                        # Wide spread — illiquid, price at bid to guarantee fill
-                        decision.suggested_limit = round(_bid, 2)
-                        log.debug("[EXIT] %s wide spread %.0f%% — pricing at bid %.2f",
-                                  ticker, _spread_pct * 100, _bid)
-                    else:
-                        # Normal spread — price at natural (mid), faster fill
-                        _mid = round((_bid + _ask) / 2.0, 2)
-                        decision.suggested_limit = _mid
-                        log.debug("[EXIT] %s mid-price %.2f (bid=%.2f ask=%.2f spread=%.0f%%)",
-                                  ticker, _mid, _bid, _ask, _spread_pct * 100)
+                # RETRY STEP-DOWN (via _exit_stuck_count from order_monitor):
+                #   attempt 0: tier starting price (mid / between / bid)
+                #   attempt 1: step 33% toward bid from starting price
+                #   attempt 2: step 66% toward bid
+                #   attempt 3+: bid (guarantee fill)
+                #
+                # WIDE SPREAD OVERRIDE: spread > 20% → always start at bid
+                # regardless of tier (illiquid, don't chase mid on thin book).
+                # ─────────────────────────────────────────────────────────────
+                _bid  = pos.current_bid
+                _ask  = pos.current_ask if pos.current_ask > _bid else 0.0
+                _mid  = round((_bid + _ask) / 2.0, 2) if _ask > 0 else _bid
+                _spread_pct = ((_ask - _bid) / _bid) if (_ask > 0 and _bid > 0) else 1.0
+                _attempt    = int(getattr(pos, "_exit_stuck_count", 0))
+
+                # Classify urgency from the exit reason code
+                _code = _classify_exit_decision(decision)
+                _RISK_CODES = {
+                    "EOD_FORCE_CLOSE", "HARD_STOP", "STOP_HIT", "THETA_STOP",
+                    "SENTINEL_FORCED_EXIT", "NEVER_GREEN_STOP", "TIME_STOP",
+                }
+                _TRAIL_CODES = {
+                    "RUNNER_TRAIL", "TRAILING_STOP", "PROFIT_LOCK",
+                    "TOUCHED_PROFIT_STOP", "SMALL_WIN_LOCK",
+                }
+                _SOFT_CODES = {
+                    "NEVER_GREEN_STOP", "THESIS_FAIL_SOFT_STOP",
+                    "THESIS_STALE_SOFT_STOP", "UNDERLYING_PROGRESS_EXIT",
+                }
+
+                # Wide spread override — always bid on thin books
+                if _spread_pct > 0.20 or _ask == 0:
+                    _start_price = _bid
+                    _tier = "BID_FORCED_WIDE_SPREAD"
+                elif _code in _RISK_CODES or _code in _SOFT_CODES:
+                    # Risk/stop exits: fill speed matters most
+                    _start_price = _bid
+                    _tier = "RISK_BID"
+                elif _code in _TRAIL_CODES:
+                    # Trail exits: position may be reversing, don't chase mid
+                    _start_price = round((_mid + _bid) / 2.0, 2)
+                    _tier = "TRAIL_BETWEEN"
                 else:
-                    # No ask available — use bid as floor
-                    decision.suggested_limit = round(_bid, 2)
+                    # Profit-taking exits: start at mid, fill usually fast
+                    _start_price = _mid
+                    _tier = "PROFIT_MID"
+
+                # Retry step-down: each failed attempt steps toward bid
+                if _attempt == 0:
+                    _final_price = _start_price
+                elif _attempt == 1:
+                    _final_price = round(_start_price + (_bid - _start_price) * 0.33, 2)
+                elif _attempt == 2:
+                    _final_price = round(_start_price + (_bid - _start_price) * 0.66, 2)
+                else:
+                    _final_price = _bid   # attempt 3+: guarantee fill at bid
+
+                # Never go below bid (floor)
+                decision.suggested_limit = max(round(_final_price, 2), _bid)
+
+                # Slippage metadata — logged below + available for proof logger
+                decision._pricing_meta = {
+                    "bid": _bid, "ask": _ask, "mid": _mid,
+                    "spread_pct": round(_spread_pct * 100, 1),
+                    "tier": _tier, "attempt": _attempt,
+                    "suggested_limit": decision.suggested_limit,
+                    "slippage_vs_mid": round(decision.suggested_limit - _mid, 3),
+                    "slippage_vs_bid": round(decision.suggested_limit - _bid, 3),
+                }
+                log.info(
+                    "[EXIT PRICE] %s | tier=%s attempt=%d | bid=%.2f ask=%.2f mid=%.2f "
+                    "spread=%.0f%% → limit=%.2f | vs_mid=%+.3f vs_bid=%+.3f",
+                    ticker, _tier, _attempt, _bid, _ask if _ask else 0.0, _mid,
+                    _spread_pct * 100, decision.suggested_limit,
+                    decision.suggested_limit - _mid,
+                    decision.suggested_limit - _bid,
+                )
 
             pre_submit_qty = int(pos.quantity_remaining or 0)
             # P2: snapshot the submit generation so the post-callback lock can
