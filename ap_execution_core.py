@@ -825,6 +825,9 @@ class APExecutionCore:
             "RUNNER TRAIL", "TRAILING STOP", "PROFIT LOCK", "TOUCHED PROFIT",
             "SMALL WIN", "EOD FORCE CLOSE", "HARD STOP", "STOP HIT",
             "NEVER GREEN", "THETA", "TIME STOP", "SENTINEL",
+            # Soft stops — thesis failed or went stale. Must use bid, not mid.
+            # These were missing and would get mid pricing (wrong for a stop).
+            "THESIS_FAIL_SOFT_STOP", "THESIS_STALE_SOFT_STOP", "SOFT_STOP",
         }
 
         _is_protective = (
