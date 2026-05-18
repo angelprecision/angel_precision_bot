@@ -627,9 +627,61 @@ class APEntryWatcher:
             str(signal_dict.get("timeframe", "")).lower() in ("1d", "daily", "overnight")
         )
 
+        # ── OPTION PREMIUM STALENESS CHECK ────────────────────────────────
+        # Separate from the underlying check. Even if the underlying is at
+        # the trigger level, the option premium may have already moved 20-40%
+        # because other participants front-ran the entry. Entering now means
+        # overpaying on premium that already priced in the move — catching the
+        # reversal instead of the setup.
+        #
+        # Only runs when we have a reference option price from the signal and
+        # live option quotes are available. If quotes unavailable, pass through
+        # (fail open — a missed quote check is better than a missed trade).
+        #
+        # MAX_OPTION_PREMIUM_DRIFT: if option bid is already >25% above the
+        # signal's entry_option_price, the move happened without us.
+        _MAX_OPTION_PREMIUM_DRIFT = float(
+            os.getenv("MAX_OPTION_PREMIUM_DRIFT_PCT", "0.25")
+        )
+        _signal_option_price = float(
+            getattr(plan, "entry_option_price", 0)
+            or signal_dict.get("entry_option_price", 0)
+            or 0
+        )
+        if _signal_option_price > 0 and not post_session and not pre_market:
+            try:
+                _opt_quote = self._get_option_quote(
+                    str(signal_dict.get("contract_symbol", "")
+                    or getattr(plan, "contract_symbol", ""))
+                )
+                _opt_bid = float((_opt_quote or {}).get("bid", 0) or 0)
+                if _opt_bid > 0:
+                    _opt_drift = (_opt_bid - _signal_option_price) / _signal_option_price
+                    if _opt_drift > _MAX_OPTION_PREMIUM_DRIFT:
+                        log.warning(
+                            "[%s] OPTION_PREMIUM_STALE | signal_price=$%.2f "
+                            "current_bid=$%.2f drift=+%.1f%% > %.0f%% max | "
+                            "move already happened — rejecting late entry",
+                            ticker, _signal_option_price, _opt_bid,
+                            _opt_drift * 100, _MAX_OPTION_PREMIUM_DRIFT * 100,
+                        )
+                        self._last_reject_reason = (
+                            f"option_premium_stale_{_opt_drift*100:+.1f}pct_above_signal"
+                        )
+                        return False
+                    log.debug(
+                        "[%s] Option premium OK | signal=$%.2f bid=$%.2f drift=%.1f%%",
+                        ticker, _signal_option_price, _opt_bid, _opt_drift * 100,
+                    )
+            except Exception as _oq_exc:
+                log.debug(
+                    "[%s] Option premium check unavailable (non-blocking): %s",
+                    ticker, _oq_exc,
+                )
+
         if post_session or pre_market or _is_overnight_signal:
             log.info(
-                "[%s] Outside-session queue — skipping queue-time staleness check "
+                "[%s] Outside-session queue — skipping underlying staleness check "
                 "(trigger=$%.2f side=%s)",
                 ticker,
                 float(trigger or 0),
@@ -1077,6 +1129,18 @@ class APEntryWatcher:
         try:
             quotes = self._fetch_quotes([ticker])
             return quotes.get(str(ticker).upper(), {})
+        except Exception:
+            return {}
+
+    def _get_option_quote(self, option_symbol: str) -> dict:
+        """Fetch a single option contract quote (bid/ask/last).
+        Uses the same Tradier quotes endpoint as _get_quote.
+        Returns empty dict on any failure — caller treats as unavailable."""
+        if not option_symbol or not option_symbol.strip():
+            return {}
+        try:
+            quotes = self._fetch_quotes([option_symbol.strip().upper()])
+            return quotes.get(option_symbol.strip().upper(), {})
         except Exception:
             return {}
 
