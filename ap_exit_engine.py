@@ -1015,6 +1015,12 @@ def _classify_exit_decision(decision: "ExitDecision") -> str:
     if "TOUCHED PROFIT STOP" in r:   return "TOUCHED_PROFIT_STOP"
     if "UNDERLYING PROGRESS EXIT" in r: return "UNDERLYING_PROGRESS_EXIT"
     if "NEVER GREEN STOP" in r:      return "NEVER_GREEN_STOP"
+    # Soft stops — these were returning UNKNOWN_EXIT, causing them to be
+    # priced at mid (PROFIT_MID tier) instead of bid (RISK_BID). A position
+    # being stopped out at a loss must price at bid for guaranteed fill.
+    if "THESIS_FAIL_SOFT_STOP" in r: return "THESIS_FAIL_SOFT_STOP"
+    if "THESIS_STALE_SOFT_STOP" in r: return "THESIS_STALE_SOFT_STOP"
+    if "SOFT_STOP" in r or "SOFT STOP" in r: return "THESIS_FAIL_SOFT_STOP"
     if "PROFIT LOCK" in r:           return "PROFIT_LOCK"
     if "TRAILING STOP" in r:         return "TRAILING_STOP"
     if "IMMEDIATE TP" in r:          return "IMMEDIATE_TP"
@@ -3483,8 +3489,8 @@ class APExitEngine:
                     "TOUCHED_PROFIT_STOP", "SMALL_WIN_LOCK",
                 }
                 _SOFT_CODES = {
-                    "NEVER_GREEN_STOP", "THESIS_FAIL_SOFT_STOP",
-                    "THESIS_STALE_SOFT_STOP", "UNDERLYING_PROGRESS_EXIT",
+                    "THESIS_FAIL_SOFT_STOP", "THESIS_STALE_SOFT_STOP",
+                    "UNDERLYING_PROGRESS_EXIT",
                 }
 
                 # Wide spread override — always bid on thin books
@@ -3499,6 +3505,13 @@ class APExitEngine:
                     # Trail exits: position may be reversing, don't chase mid
                     _start_price = round((_mid + _bid) / 2.0, 2)
                     _tier = "TRAIL_BETWEEN"
+                elif _code == "UNKNOWN_EXIT":
+                    # Unclassified reason — safe default is bid, not mid.
+                    # Unknown exit type could be a stop; never assume it's safe
+                    # to be patient. Log it so we can add it to the classifier.
+                    log.warning("[EXIT PRICE] %s UNKNOWN_EXIT code — defaulting to bid for safety", ticker)
+                    _start_price = _bid
+                    _tier = "RISK_BID"
                 else:
                     # Profit-taking exits: start at mid, fill usually fast
                     _start_price = _mid
