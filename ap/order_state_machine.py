@@ -536,8 +536,11 @@ class APOrderStateMachine:
                     "[%s] DUPLICATE ORDER BLOCKED by DB constraint — EXIT pos=%s",
                     self.client_id, position_id,
                 )
-                # Re-fetch: another thread may have inserted between our check and INSERT
-                refetched = self._get_order_by_plan(position_id, kind="EXIT")
+                # Re-fetch using position_id identity (same as the pre-check above),
+                # NOT _get_order_by_plan which queries plan_id — a different column.
+                # Using the wrong identity here can return None or a wrong row when
+                # two threads race to create an exit for the same position.
+                refetched = self._get_active_exit_order(position_id)
                 if refetched:
                     return refetched["local_order_id"]
                 return existing["local_order_id"] if existing else local_id

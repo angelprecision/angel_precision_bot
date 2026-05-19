@@ -57,6 +57,11 @@ from datetime import datetime, timezone, time as dtime
 
 log = logging.getLogger("ap.queue")
 
+# Tracks consecutive worker claim failures per client.
+# Reset to 0 on any successful job claim.
+# Used to fire QUEUE_WORKER_DEGRADED alerts before the operator notices.
+_claim_fail_count: dict = {}
+
 ET = ZoneInfo("America/New_York")
 
 def _now_et() -> datetime:
@@ -996,6 +1001,9 @@ def worker_loop(
                 time.sleep(poll_seconds)
                 continue
 
+            # Successful claim — reset consecutive failure counter
+            _claim_fail_count[client_id] = 0
+
             job_id    = int(job["id"])
             job_cid   = job["client_id"]
             signal_id = job["signal_id"]
@@ -1032,6 +1040,30 @@ def worker_loop(
             if job_id is not None:
                 try:
                     _mark_job(job_id, "ERROR", error=str(e))
+                except Exception:
+                    pass
+            # ── CLAIM FAILURE ALERTING ────────────────────────────────────
+            # Track consecutive failures. If the worker fails repeatedly
+            # without claiming any job, surface it as a CRITICAL log and
+            # update the health registry so the dashboard shows it.
+            # This catches the JSONB ? bug class (or any future claim crash)
+            # within minutes instead of days.
+            _claim_fail_count[client_id] = _claim_fail_count.get(client_id, 0) + 1
+            _fail_count = _claim_fail_count[client_id]
+            if _fail_count in (3, 10, 25) or _fail_count % 50 == 0:
+                log.critical(
+                    "[QUEUE_WORKER_DEGRADED] client=%s consecutive_failures=%d "
+                    "last_error=%s — queue is NOT draining. "
+                    "Check Render logs immediately.",
+                    client_id, _fail_count, str(e)[:120],
+                )
+                try:
+                    h = health_registry.get(client_id)
+                    if h:
+                        h.mark_degraded(
+                            f"queue_worker_consecutive_failures:{_fail_count}",
+                            f"last_error={str(e)[:80]}",
+                        )
                 except Exception:
                     pass
             time.sleep(poll_seconds)
