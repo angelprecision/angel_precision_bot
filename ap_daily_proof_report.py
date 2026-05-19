@@ -78,8 +78,8 @@ def build_report(report_date, debug=False):
 
     winners  = [t for t in (proof or []) if t.get("win")]
     losers   = [t for t in (proof or []) if not t.get("win") and t.get("option_pnl_pct") is not None]
-    avg_win  = sum(float(t["option_pnl_pct"] or 0)*100 for t in winners)/len(winners) if winners else 0.0
-    avg_loss = sum(float(t["option_pnl_pct"] or 0)*100 for t in losers )/len(losers)  if losers  else 0.0
+    avg_win  = sum(float(t["option_pnl_pct"] or 0) for t in winners)/len(winners) if winners else 0.0
+    avg_loss = sum(float(t["option_pnl_pct"] or 0) for t in losers )/len(losers)  if losers  else 0.0
 
     buckets = {}
     for t in (proof or []):
@@ -141,7 +141,7 @@ def build_report(report_date, debug=False):
         },
         "trades": [
             {"ticker": t.get("ticker"), "side": t.get("side"),
-             "pnl_pct": round(float(t.get("option_pnl_pct") or 0)*100, 1),
+             "pnl_pct": round(float(t.get("option_pnl_pct") or 0), 1),
              "win": t.get("win"), "bucket": t.get("exit_bucket"),
              "reason": (t.get("exit_reason") or "")[:60],
              "client": (t.get("client_email") or "")[:20],
