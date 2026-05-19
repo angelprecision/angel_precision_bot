@@ -178,6 +178,10 @@ def _client_ip() -> str:
 
 # AUDIT P1-9: track last sweep so we can periodically drop empty buckets and
 # prevent _RATE dict from growing forever on long-tail client IDs / IPs.
+# AUDIT FOLLOWUP: needs a lock because we now iterate the dict during sweep.
+# Without the lock, gunicorn's 4 gthread workers can mutate the dict while
+# another thread iterates -> RuntimeError: dictionary changed size during iteration.
+_RATE_LOCK = threading.Lock()
 _RATE_LAST_SWEEP: float = 0.0
 _RATE_SWEEP_INTERVAL = 60.0  # seconds
 
@@ -185,18 +189,22 @@ _RATE_SWEEP_INTERVAL = 60.0  # seconds
 def _rate_limited(bucket: str) -> bool:
     global _RATE_LAST_SWEEP
     now = time.time()
-    q = _RATE[bucket]
-    while q and (now - q[0] > 60):
-        q.popleft()
-    # Periodically prune empty buckets so the dict can't leak unbounded keys.
-    if now - _RATE_LAST_SWEEP > _RATE_SWEEP_INTERVAL:
-        _RATE_LAST_SWEEP = now
-        empty = [k for k, dq in _RATE.items() if not dq]
-        for k in empty:
-            _RATE.pop(k, None)
-    if len(q) >= RATE_LIMIT_PER_MIN:
-        return True
-    q.append(now)
+    with _RATE_LOCK:
+        q = _RATE[bucket]
+        while q and (now - q[0] > 60):
+            q.popleft()
+        # Periodically prune empty buckets so the dict can't leak unbounded keys.
+        # Snapshot keys with list(...) BEFORE iterating to avoid "dict changed
+        # size during iteration" if a sibling thread were to mutate concurrently
+        # (we hold the lock, but list() is also cheap and bulletproof).
+        if now - _RATE_LAST_SWEEP > _RATE_SWEEP_INTERVAL:
+            _RATE_LAST_SWEEP = now
+            for k in list(_RATE.keys()):
+                if not _RATE[k]:
+                    _RATE.pop(k, None)
+        if len(q) >= RATE_LIMIT_PER_MIN:
+            return True
+        q.append(now)
     return False
 
 
