@@ -1293,6 +1293,10 @@ class APExecutionCore:
             if underlying_entry else 0
         )
 
+        # proof_trades.option_pnl_pct is stored as PERCENTAGE (e.g. -25.0 = -25%)
+        # not decimal (e.g. -0.25). Convert before passing to log_trade.
+        opt_pnl_pct_for_proof = round(opt_pnl_pct * 100, 2)
+
         try:
             self.proof.log_trade(
                 ticker             = staged["ticker"],
@@ -1310,7 +1314,7 @@ class APExecutionCore:
                 underlying_exit    = underlying_exit,
                 contracts          = staged.get("contracts", 1),
                 exit_reason        = staged.get("exit_reason", ""),
-                option_pnl_pct     = opt_pnl_pct,
+                option_pnl_pct     = opt_pnl_pct_for_proof,
                 underlying_pnl_pct = u_pnl_pct,
                 win                = win,
                 spread_pct         = staged.get("spread_pct", 0),
