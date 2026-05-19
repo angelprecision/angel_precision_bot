@@ -1039,7 +1039,11 @@ class APExecutionCore:
             opt_pnl = (_exit_opt - _entry_opt) / _entry_opt * 100  # e.g. 15.3 = 15.3%
         else:
             opt_pnl = 0.0
-        win  = opt_pnl > 0
+        # Breakeven band: trades within BREAKEVEN_BAND_PCT of entry count as
+        # breakeven wins — not losses. Prevents $1-$2 slippage from showing
+        # as a loss when the position was effectively flat.
+        _breakeven_band = float(os.getenv("BREAKEVEN_BAND_PCT", "-2.0"))
+        win  = opt_pnl >= _breakeven_band
         tier = sig.get("tier", "A+")
 
         if _entry_opt > 0:
@@ -1263,7 +1267,8 @@ class APExecutionCore:
         else:
             opt_pnl_pct = staged.get("opt_pnl", 0.0) / 100.0
 
-        win = opt_pnl_pct > 0
+        _breakeven_band_pct = float(os.getenv("BREAKEVEN_BAND_PCT", "-2.0")) / 100.0
+        win = opt_pnl_pct >= _breakeven_band_pct
 
         slippage_vs_est = round(final_exit_price - est, 4) if est > 0 else None
         if fill > 0 and est > 0:

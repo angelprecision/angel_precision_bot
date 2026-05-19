@@ -72,7 +72,12 @@ def classify_exit(exit_reason: str, option_pnl_pct: float, win: bool) -> str:
         return "HARD_STOP"
 
     # 2. Breakeven band — within +/-3% is neither a real win nor loss.
-    if -3.0 <= pnl <= 3.0:
+    # BREAKEVEN_BAND: matches BREAKEVEN_BAND_PCT env var in execution_core.
+    # Trades within this band of entry are classified as BREAKEVEN_SAVE,
+    # not SOFT_LOSS. Default -2.0% lower bound (so -1.9% = breakeven, not loss).
+    import os as _os
+    _band = float(_os.getenv("BREAKEVEN_BAND_PCT", "-2.0"))
+    if _band <= pnl <= 3.0:
         return "BREAKEVEN_SAVE"
 
     # 3. Winners — split base vs runner.
