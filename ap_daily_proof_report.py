@@ -13,9 +13,11 @@ DISCORD_WEBHOOK = os.getenv("DISCORD_PROOF_WEBHOOK", "")
 DEBUG = False
 
 def sb_get(table, filters, select, label=""):
-    params = {"select": select}
-    params.update(filters)
-    qs  = urllib.parse.urlencode(params)
+    # filters must be a list of (key, value) tuples to support duplicate
+    # column names (e.g. two created_at params: gte.X and lte.Y).
+    # A dict would deduplicate them — PostgREST requires both separately.
+    param_list = [("select", select)] + list(filters)
+    qs  = urllib.parse.urlencode(param_list)
     url = f"{SUPABASE_URL}/rest/v1/{table}?{qs}"
     if DEBUG:
         print(f"  [DEBUG] {label or table}", file=sys.stderr)
@@ -48,7 +50,9 @@ def build_report(report_date, debug=False):
 
     def fetch(table, col, select, label):
         try:
-            return sb_get(table, {col: f"gte.{s}", f"{col}.lte": e2}, select, label)
+            return sb_get(table,
+                [(col, f"gte.{s}"), (col, f"lte.{e2}")],
+                select, label)
         except RuntimeError as ex:
             errs.append(f"{table}: {ex}")
             return None
@@ -58,7 +62,8 @@ def build_report(report_date, debug=False):
     proof    = fetch("proof_trades",  "closed_at",  "ticker,side,option_pnl_pct,win,exit_reason,exit_bucket,client_email,seconds_to_fill,slippage_vs_mid,exit_pricing_tier", "proof_trades")
     try:
         rejs = sb_get("decision_events",
-            {"timestamp": f"gte.{s}", "timestamp.lte": e2, "decision": "eq.REJECT"},
+            [("timestamp", f"gte.{s}"), ("timestamp", f"lte.{e2}"),
+             ("decision", "eq.REJECT")],
             "client_id,symbol,reason_code,stage", "decision_events")
     except Exception:
         rejs = []
@@ -211,6 +216,7 @@ if __name__ == "__main__":
     p.add_argument("--date", default=str(date.today()))
     p.add_argument("--post-discord", action="store_true")
     p.add_argument("--json",  action="store_true")
+    p.add_argument("--debug", action="store_true", help="Print exact URLs and Supabase error bodies")
     p.add_argument("--debug", action="store_true")
     args = p.parse_args()
     if not SUPABASE_KEY:
