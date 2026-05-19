@@ -36,8 +36,12 @@ class Config:
     MAX_PREMIUM_PER_SHARE: float = float(os.getenv("MAX_PREMIUM_PER_SHARE", "10.00"))
 
     # ─── TRADE LIMITS ───────────────────────────────────────────────────────
-    MAX_CONCURRENT_POSITIONS: int = int(os.getenv("MAX_CONCURRENT_POSITIONS", "2"))
-    MAX_TRADES_PER_DAY: int = int(os.getenv("MAX_TRADES_PER_DAY", "5"))
+    MAX_CONCURRENT_POSITIONS: int = int(os.getenv("MAX_CONCURRENT_POSITIONS", "4"))
+    # AUDIT PHASE-2: raised 5 -> 12. With the slot-accounting bug fixed (canceled
+    # orders no longer burn slots), and with score-based admission ordering, the
+    # daily cap can be lifted so overnight + intraday signals fit in one session.
+    # 12 is intentionally roomy: best-12-by-score across the day, not first-12.
+    MAX_TRADES_PER_DAY: int = int(os.getenv("MAX_TRADES_PER_DAY", "12"))
 
     # ─── DAILY LOSS KILL SWITCH ──────────────────────────────────────────────
     # FIX: renamed from MAX_DAILY_LOSS_PCT -- execution.py now uses this name

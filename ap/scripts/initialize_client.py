@@ -49,8 +49,11 @@ def get_or_create_client(client_id: str = "default") -> dict:
         tradier_access_token=tradier_token,
         tradier_base_url=tradier_base_url,
         initial_equity=100000.0,
-        max_trades_per_day=5,
-        max_concurrent_positions=2,
+        # AUDIT PHASE-2: raised from 5 -> 12 and 2 -> 4. Slot-accounting bug fixed,
+        # admission now score-ranked, so the higher caps no longer let low-quality
+        # signals burn slots ahead of better setups.
+        max_trades_per_day=12,
+        max_concurrent_positions=4,
         daily_max_loss_pct=0.05,
         base_position_pct=0.15
     )

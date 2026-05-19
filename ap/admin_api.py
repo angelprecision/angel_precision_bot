@@ -123,8 +123,9 @@ def create_client_endpoint():
         "broker_token": "TRADIER_ACCESS_TOKEN",
         "broker_base_url": "https://sandbox.tradier.com",
         "initial_equity": 5000,
-        "max_trades_per_day": 5,
-        "max_concurrent_positions": 3,
+        # AUDIT PHASE-2: raised from 5 -> 12 and 3 -> 4.
+        "max_trades_per_day": 12,
+        "max_concurrent_positions": 4,
         "daily_max_loss_pct": 0.05,
         "base_position_pct": 0.10
     }
@@ -155,8 +156,9 @@ def create_client_endpoint():
         initial_equity = _as_float(body.get("initial_equity", 100000.0), 100000.0)
 
         # Risk knobs
-        max_trades_per_day = _as_int(body.get("max_trades_per_day", 5), 5)
-        max_concurrent_positions = _as_int(body.get("max_concurrent_positions", 3), 3)
+        # AUDIT PHASE-2: default raised from 5 -> 12 and 3 -> 4.
+        max_trades_per_day = _as_int(body.get("max_trades_per_day", 12), 12)
+        max_concurrent_positions = _as_int(body.get("max_concurrent_positions", 4), 4)
         daily_max_loss_pct = _as_float(body.get("daily_max_loss_pct", 0.05), 0.05)
         base_position_pct = _as_float(body.get("base_position_pct", 0.10), 0.10)
 

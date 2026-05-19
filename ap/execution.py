@@ -194,6 +194,141 @@ def _count_open_positions(client_id: str) -> int:
         return int(row["n"] or 0)
 
 
+# ============================================================
+# AUDIT PHASE-2 — slot accounting bug fix.
+# Previous behavior: client_state.trades_taken_today is incremented on broker
+# ACK and NEVER decremented when the order later cancels, rejects, or expires.
+# Result: every canceled order permanently burns a slot for the rest of the day.
+# With cap=5 and 5 canceled MSFT/UBER/NFLX/AMZN orders, the bot rejects all
+# subsequent signals (including overnight setups) as 'daily_trade_cap'.
+#
+# Fix: compute the count at READ time from the orders table, counting only
+# orders that actually consume capital — active or filled. Canceled / rejected
+# / expired orders auto-free their slot. No increment side-effect, no race,
+# no decrement bookkeeping. Idempotent by construction.
+#
+# Statuses considered "slot-consuming":
+#   ACK, PARTIAL_FILL, FILLED        (live or already entered)
+# Statuses considered "slot-free":
+#   CANCELED, REJECTED, EXPIRED, ERROR   (terminal non-fill)
+# Special-case: orders with kind='EXIT' do NOT consume an entry slot —
+#   they are closing existing positions.
+# ============================================================
+_SLOT_CONSUMING_STATUSES = (
+    "ACK", "ACKNOWLEDGED", "SUBMITTED", "PARTIAL_FILL", "FILLED",
+)
+
+def _count_active_entry_orders_today(client_id: str) -> int:
+    """Count of ENTRY orders submitted today (UTC) whose status still consumes
+    a slot (live or already filled). Canceled/rejected/expired do not count.
+
+    This is the authoritative "trades_today" for the daily cap gate. It
+    replaces the broken counter that lived in client_state.trades_taken_today.
+    """
+    with conn() as c:
+        row = run_with_retry(lambda: c.execute(
+            """
+            SELECT COUNT(*) AS n
+            FROM orders
+            WHERE client_id = %s
+              AND COALESCE(kind, 'ENTRY') = 'ENTRY'
+              AND created_ts >= date_trunc('day', NOW() AT TIME ZONE 'UTC')
+              AND status IN %s
+            """,
+            (client_id, _SLOT_CONSUMING_STATUSES),
+        ).fetchone())
+        return int(row["n"] or 0)
+
+
+# ============================================================
+# AUDIT PHASE-2 — score-based preemption (conservative).
+# When the daily cap is full but some slots are held by PRE-SUBMITTED entries
+# (status=CREATED or PENDING_TRIGGER, i.e. waiting for a price trigger that
+# hasn't hit), a higher-scored incoming signal may preempt the lowest-scored
+# pre-submitted entry IF the score delta is meaningful.
+#
+# Why this is safe:
+#   - CREATED / PENDING_TRIGGER orders have NOT been submitted to the broker.
+#     Canceling is a local DB transition only — no broker round-trip, no risk
+#     of canceling an order that filled in the last millisecond.
+#   - We leave SUBMITTED / ACK / PARTIAL_FILL orders alone. Those are live
+#     at the broker and racing a cancel against a fill is how you double-pay.
+#   - PREEMPT_SCORE_DELTA gate: only preempt if new signal beats the lowest
+#     pre-submitted by at least this many points (default 10). Prevents
+#     thrashing on near-tied scores.
+#   - Gated by PREEMPT_PRE_SUBMITTED_ORDERS env flag. Default OFF for the
+#     first rollout day; flip on once observed safe.
+# ============================================================
+_PREEMPT_PRE_SUBMITTED = (os.getenv("PREEMPT_PRE_SUBMITTED_ORDERS", "0").strip().lower()
+                         in ("1", "true", "yes", "on"))
+_PREEMPT_SCORE_DELTA = float(os.getenv("PREEMPT_SCORE_DELTA", "10"))
+
+def _find_preemptible_pre_submitted(client_id: str, min_score_to_beat: float) -> dict | None:
+    """Return the lowest-scored CREATED/PENDING_TRIGGER entry order for this
+    client whose score is at least PREEMPT_SCORE_DELTA below min_score_to_beat.
+    Returns the row dict, or None if no candidate qualifies.
+    """
+    threshold = float(min_score_to_beat) - _PREEMPT_SCORE_DELTA
+    with conn() as c:
+        row = run_with_retry(lambda: c.execute(
+            """
+            SELECT id AS local_order_id,
+                   broker_order_id,
+                   status,
+                   COALESCE(NULLIF(meta->>'score','')::numeric, 65) AS score
+            FROM   orders
+            WHERE  client_id = %s
+              AND  COALESCE(kind, 'ENTRY') = 'ENTRY'
+              AND  status IN ('CREATED', 'PENDING_TRIGGER')
+              AND  created_ts >= date_trunc('day', NOW() AT TIME ZONE 'UTC')
+              AND  COALESCE(NULLIF(meta->>'score','')::numeric, 65) <= %s
+            ORDER  BY COALESCE(NULLIF(meta->>'score','')::numeric, 65) ASC,
+                      created_ts ASC
+            LIMIT  1
+            """,
+            (client_id, threshold),
+        ).fetchone())
+    return dict(row) if row else None
+
+
+def _try_preempt_for_higher_score(client_id: str, incoming_score: float) -> dict:
+    """Attempt to free one slot for a higher-scored incoming signal by canceling
+    the lowest-scored pre-submitted entry. Returns:
+      {'ok': True, 'preempted': {...}}  on success
+      {'ok': False, 'reason': '...'}    when nothing was preempted
+    Caller should re-check the cap gate after success.
+    """
+    if not _PREEMPT_PRE_SUBMITTED:
+        return {"ok": False, "reason": "preemption_disabled"}
+
+    candidate = _find_preemptible_pre_submitted(client_id, incoming_score)
+    if not candidate:
+        return {"ok": False, "reason": "no_eligible_pre_submitted",
+                "incoming_score": incoming_score,
+                "delta_required": _PREEMPT_SCORE_DELTA}
+
+    # Cancel via OSM — single source of truth for status transitions.
+    try:
+        from ap.order_state_machine import APOrderStateMachine
+        osm = APOrderStateMachine(client_id)
+        ok = osm.cancel_pending_entry(
+            candidate["local_order_id"],
+            reason=f"preempted_by_score score={incoming_score} ousted={candidate['score']}",
+        )
+        if not ok:
+            return {"ok": False, "reason": "osm_cancel_refused", "candidate": candidate}
+        audit(client_id, "INFO", "SLOT_PREEMPTED", {
+            "ousted_order_id":     candidate["local_order_id"],
+            "ousted_score":        float(candidate["score"]),
+            "incoming_score":      float(incoming_score),
+            "score_delta":         float(incoming_score) - float(candidate["score"]),
+        })
+        return {"ok": True, "preempted": candidate}
+    except Exception as e:
+        log.warning("[%s] preemption failed: %s", client_id, e)
+        return {"ok": False, "reason": "preempt_exception", "error": str(e)}
+
+
 def _check_daily_loss_stop(client_id: str, st: dict) -> dict:
     starting = float(st.get("starting_equity_today") or 0.0) or 100000.0
     realized = float(st.get("realized_pnl_today") or 0.0)
@@ -362,9 +497,28 @@ def process_signal(broker, client_id: str, signal_payload: dict) -> dict:
             return loss_check
 
         max_trades = int(client.get("max_trades_per_day") or cfg.MAX_TRADES_PER_DAY)
-        trades_today = int(st.get("trades_taken_today") or 0)
+        # AUDIT PHASE-2: authoritative count is computed from the orders table
+        # (slot-consuming statuses only). client_state.trades_taken_today is
+        # kept in sync for backward-compat readers but is no longer the gate.
+        trades_today = _count_active_entry_orders_today(client_id)
         if trades_today >= max_trades:
-            return {"ok": False, "error": "daily_trade_cap", "trades_today": trades_today, "max_trades": max_trades}
+            # AUDIT PHASE-2: try to free a slot by preempting a lower-scored
+            # PRE-SUBMITTED entry (gated by PREEMPT_PRE_SUBMITTED_ORDERS env).
+            incoming_score = float(signal_payload.get("score") or signal_payload.get("ev_score") or 0)
+            preempt = _try_preempt_for_higher_score(client_id, incoming_score)
+            if preempt.get("ok"):
+                # Re-count after preemption — the canceled order is no longer slot-consuming.
+                trades_today = _count_active_entry_orders_today(client_id)
+                if trades_today >= max_trades:
+                    # Race: another thread admitted between cancel and re-count. Bail cleanly.
+                    return {"ok": False, "error": "daily_trade_cap_post_preempt",
+                            "trades_today": trades_today, "max_trades": max_trades,
+                            "preempted": preempt["preempted"]}
+                # else: slot is free, fall through to continue admission.
+            else:
+                return {"ok": False, "error": "daily_trade_cap",
+                        "trades_today": trades_today, "max_trades": max_trades,
+                        "preempt_attempt": preempt}
 
         max_open = int(client.get("max_concurrent_positions") or cfg.MAX_CONCURRENT_POSITIONS)
         open_positions = _count_open_positions(client_id)
@@ -453,6 +607,22 @@ def process_signal(broker, client_id: str, signal_payload: dict) -> dict:
         reserved_cost = float(total_cost)
 
         local_order_id = new_local_order_id()
+        # AUDIT PHASE-2: persist meta so admission ordering (score) and re-peg
+        # alignment gate (signal_entry_price) have what they need at decision time.
+        _meta = {
+            "score":              float(signal_payload.get("score") or signal_payload.get("ev_score") or 0),
+            "ticker":             symbol,
+            "signal_entry_price": float(
+                signal_payload.get("signal_entry_price")
+                or (signal_payload.get("trigger") or {}).get("underlying_price")
+                or (signal_payload.get("trigger") or {}).get("entry_price")
+                or 0
+            ),
+            "signal_id":          str(signal_payload.get("signal_id") or ""),
+            "source":             str(signal_payload.get("source") or ""),
+            "repeg_attempts":     0,
+            "last_repeg_ts":      0,
+        }
         insert_order(
             client_id=client_id,
             local_order_id=local_order_id,
@@ -465,6 +635,7 @@ def process_signal(broker, client_id: str, signal_payload: dict) -> dict:
             qty=qty,
             limit_price=float(premium),
             reserved_cost=float(reserved_cost),
+            meta=_meta,
         )
 
         st2 = get_client_state(client_id)

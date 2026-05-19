@@ -537,6 +537,14 @@ class APOrderMonitor:
             ):
                 _current = self._get_option_price(_sym)
                 if _current and _current > float(_limit_price) * _missed_price_mult:
+                    # AUDIT PHASE-2: before MISSED_MOVE_CANCEL, try an alignment-
+                    # gated re-peg. Three gates (time, proximity, underlying
+                    # alignment) must ALL pass. If alignment broke (the MSFT
+                    # 2026-05-19 case), this returns ok=False and we fall through
+                    # to the existing cancel — which is the correct behavior, the
+                    # cancel was right today, we just couldn't chase safely.
+                    if self._try_repeg(order, local_id, contract, _sym, float(_limit_price), _current, status, age_secs):
+                        return True  # re-peg applied; next tick will observe new limit
                     _pct_above = (_current / float(_limit_price) - 1) * 100
                     log.warning(
                         "[%s] MISSED_MOVE_CANCEL | %s | limit=$%.2f current=$%.2f "
@@ -1297,6 +1305,115 @@ class APOrderMonitor:
             return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
         except Exception:
             return None
+
+    def _get_underlying_symbol_from_contract(self, contract_symbol: str) -> Optional[str]:
+        """Extract the underlying ticker from an OCC option contract symbol.
+        e.g. 'MSFT260522C00427500' -> 'MSFT'.  Falls back to None on parse failure."""
+        if not contract_symbol:
+            return None
+        s = str(contract_symbol).strip().upper()
+        # OCC: <ROOT>[1-6 chars]<YYMMDD><C|P><STRIKE*1000 padded to 8>
+        # Strike block is 8 digits at the end. Date is the 6 digits before C/P.
+        # Simpler heuristic: take chars before the first digit.
+        out = []
+        for ch in s:
+            if ch.isdigit():
+                break
+            out.append(ch)
+        root = "".join(out)
+        return root or None
+
+    def _try_repeg(
+        self,
+        order: dict,
+        local_id: str,
+        contract: str,
+        sym: str,
+        limit_price: float,
+        current_option_price: float,
+        status: str,
+        age_secs: float,
+    ) -> bool:
+        """Attempt an alignment-aware re-peg before falling through to cancel.
+        Returns True iff the re-peg was applied (caller should exit early).
+
+        Three-gate decision in ap/retry_engine.decide_repeg:
+          1. TIME       — attempts cap + min interval between re-pegs
+          2. PROXIMITY  — option must be within REPEG_PROXIMITY_PCT of limit
+          3. ALIGNMENT  — underlying still in favor of the original thesis
+
+        If ANY gate fails, returns False and the caller proceeds with its
+        normal MISSED_MOVE_CANCEL path. We never re-peg into a broken thesis.
+        """
+        try:
+            from ap.retry_engine import decide_repeg, apply_repeg
+        except Exception as e:
+            log.debug("[%s] retry_engine unavailable: %s", self.client_id, e)
+            return False
+
+        # Resolve underlying spot price for alignment gate.
+        underlying = self._get_underlying_symbol_from_contract(sym) \
+                     or (order.get("underlying") or order.get("symbol"))
+        spot = None
+        if underlying:
+            try:
+                if hasattr(self.broker, "get_quote"):
+                    q = self.broker.get_quote(underlying)
+                    if isinstance(q, dict):
+                        last = q.get("last") or q.get("close") or q.get("price")
+                        if last:
+                            spot = float(last)
+                        else:
+                            bid = float(q.get("bid") or 0)
+                            ask = float(q.get("ask") or 0)
+                            if bid > 0 and ask > 0:
+                                spot = (bid + ask) / 2
+            except Exception as e:
+                log.debug("[%s] _try_repeg spot lookup failed: %s", self.client_id, e)
+
+        # Build the order_row the decision function needs.
+        meta = dict(order.get("meta") or {})
+        order_row = {
+            "id":                 local_id,
+            "broker_order_id":    order.get("broker_order_id") or self._get_broker_order_id(local_id),
+            "limit_price":        limit_price,
+            "direction":          (order.get("direction")
+                                   or order.get("side")
+                                   or meta.get("direction")),
+            "signal_entry_price": (order.get("signal_entry_price")
+                                   or meta.get("signal_entry_price")
+                                   or meta.get("entry_price")),
+            "repeg_attempts":     int(meta.get("repeg_attempts") or 0),
+            "last_repeg_ts":      float(meta.get("last_repeg_ts") or 0),
+            "meta":               meta,
+        }
+
+        decision = decide_repeg(
+            order_row=order_row,
+            current_option_price=current_option_price,
+            underlying_spot=spot,
+        )
+        if not decision.ok:
+            log.info(
+                "[%s] REPEG_DECLINED order=%s sym=%s reason=%s detail=%s",
+                self.client_id, local_id, sym, decision.reason, decision.detail,
+            )
+            return False
+
+        applied = apply_repeg(
+            broker=self.broker,
+            osm=self.osm,
+            order_row=order_row,
+            decision=decision,
+            client_id=self.client_id,
+        )
+        if applied:
+            log.info(
+                "[%s] REPEG_APPLIED order=%s sym=%s new_limit=%.2f attempt=%d",
+                self.client_id, local_id, sym, decision.new_limit_price,
+                decision.attempts_used,
+            )
+        return applied
 
     def _get_option_price(self, symbol: str) -> Optional[float]:
         if not symbol or not self.broker:

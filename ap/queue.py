@@ -254,6 +254,19 @@ def _claim_one_job(client_id: str = "default") -> Optional[dict]:
                 """,
                 (client_id, str(PROCESSING_STALE_SECS)),
             )
+            # AUDIT PHASE-2: score-based admission.
+            # Previously: ORDER BY created_ts ASC — strict FIFO. First-7-wins.
+            # A low-quality early signal (low-liquidity ticker, score 72) burned
+            # a slot that a higher-scored later signal (AAPL 92) needed.
+            #
+            # Now: ORDER BY score DESC, created_ts ASC. Best-by-score wins,
+            # with arrival time as the tiebreaker for fairness. Score lives in
+            # the JSONB payload (set by enqueue_signal; defaults to 65 if absent).
+            #
+            # COALESCE handles three edge cases:
+            #   1. Old rows without 'score' in payload — treated as score 65 (the default)
+            #   2. Non-numeric scores — cast fails, COALESCE gives 65
+            #   3. NULL payload — score 65
             c.execute(
                 """
                 WITH next_job AS (
@@ -261,7 +274,9 @@ def _claim_one_job(client_id: str = "default") -> Optional[dict]:
                     FROM   trade_queue
                     WHERE  status    = 'NEW'
                       AND  client_id = %s
-                    ORDER BY created_ts ASC
+                    ORDER BY
+                        COALESCE(NULLIF(payload->>'score','')::numeric, 65) DESC,
+                        created_ts ASC
                     LIMIT  1
                     FOR UPDATE SKIP LOCKED
                 )
