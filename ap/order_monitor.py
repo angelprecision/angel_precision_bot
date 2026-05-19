@@ -129,7 +129,7 @@ class APOrderMonitor:
 
     Usage:
         monitor = APOrderMonitor(
-            client_id="tradefluencehq@gmail.com",
+            client_id=member["email"],  # always pass the authenticated client_id
             broker=broker,
             order_state_machine=osm,
             position_manager=pm,

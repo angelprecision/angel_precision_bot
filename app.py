@@ -85,6 +85,24 @@ if APP_ENV == "prod" and not SIGNING_SECRET:
     log.error("=" * 70)
     raise RuntimeError("SIGNING_SECRET required in production")
 
+# AUDIT P1-6: log SHA8 fingerprints of every secret at startup. Never log values.
+# Lets you verify on Render that rotation actually took effect.
+def _fp(val: str | bytes) -> str:
+    if not val:
+        return "<missing>"
+    b = val.encode() if isinstance(val, str) else val
+    return hashlib.sha256(b).hexdigest()[:8]
+
+_SECRET_FP_SUMMARY = {
+    "SIGNING_SECRET":       _fp(SIGNING_SECRET),
+    "ADMIN_API_KEY":        _fp(os.getenv("ADMIN_API_KEY", "")),
+    "TRADIER_ACCESS_TOKEN": _fp(os.getenv("TRADIER_ACCESS_TOKEN", "")),
+    "SUPABASE_SERVICE_KEY": _fp(os.getenv("SUPABASE_SERVICE_KEY", "")),
+    "ENCRYPTION_KEY":       _fp(os.getenv("ENCRYPTION_KEY", "")),
+    "JWT_SECRET":           _fp(os.getenv("JWT_SECRET", "")),
+}
+log.info("SECRET_FINGERPRINTS_SHA8=%s", _SECRET_FP_SUMMARY)
+
 # Rate limiting (per worker - upgrade to Redis later)
 _RATE = defaultdict(lambda: deque())
 RATE_LIMIT_PER_MIN = int(os.getenv("RATE_LIMIT_PER_MIN", "60"))
@@ -158,11 +176,24 @@ def _client_ip() -> str:
     return (xff.split(",")[0].strip() if xff else request.remote_addr) or "unknown"
 
 
+# AUDIT P1-9: track last sweep so we can periodically drop empty buckets and
+# prevent _RATE dict from growing forever on long-tail client IDs / IPs.
+_RATE_LAST_SWEEP: float = 0.0
+_RATE_SWEEP_INTERVAL = 60.0  # seconds
+
+
 def _rate_limited(bucket: str) -> bool:
+    global _RATE_LAST_SWEEP
     now = time.time()
     q = _RATE[bucket]
     while q and (now - q[0] > 60):
         q.popleft()
+    # Periodically prune empty buckets so the dict can't leak unbounded keys.
+    if now - _RATE_LAST_SWEEP > _RATE_SWEEP_INTERVAL:
+        _RATE_LAST_SWEEP = now
+        empty = [k for k, dq in _RATE.items() if not dq]
+        for k in empty:
+            _RATE.pop(k, None)
     if len(q) >= RATE_LIMIT_PER_MIN:
         return True
     q.append(now)
@@ -192,6 +223,9 @@ def _idem_get(key: str):
 
 def _idem_set(key: str, payload: dict):
     if key:
+        # AUDIT P1-9: cleanup on writes too, so a write-heavy workload that never
+        # reads (signals never replayed) can't leak unbounded entries.
+        _idem_cleanup()
         with _IDEMP_LOCK:
             _IDEMP[key] = (time.time(), payload)
 
@@ -1065,7 +1099,15 @@ def create_app() -> Flask:
             ticker  = body.get("ticker", "SPY")
             side    = body.get("side", "CALL").upper()
             score   = float(body.get("score", 75.0))
-            client_id = body.get("client_id", "tradefluencehq@gmail.com")
+            # AUDIT P0-1: client_id must be explicit. NO hardcoded fallback.
+            # Previously defaulted to a specific client email which leaked their data
+            # when any caller forgot the param.
+            client_id = (body.get("client_id") or "").strip()
+            if not client_id:
+                return jsonify({
+                    "ok": False,
+                    "error": "client_id required in body (no default — per-client routing is explicit).",
+                }), 400
 
             signal_id = body.get("signal_id") or f"TEST-{_uuid.uuid4().hex[:8]}"
 
@@ -1179,7 +1221,13 @@ def create_app() -> Flask:
             from ap.db import run_with_retry
             import psycopg2.extras
 
-            client_id = request.args.get("client_id", "tradefluencehq@gmail.com")
+            # AUDIT P0-1: client_id must be explicit. No hardcoded default.
+            client_id = (request.args.get("client_id") or "").strip()
+            if not client_id:
+                return jsonify({
+                    "ok": False,
+                    "error": "client_id query parameter required",
+                }), 400
             limit = min(int(request.args.get("limit", 50)), 200)
             status = request.args.get("status", "ALL").upper()
 
@@ -1267,7 +1315,13 @@ def create_app() -> Flask:
             from ap.db import run_with_retry
             import psycopg2.extras
 
-            client_id = request.args.get("client_id", "tradefluencehq@gmail.com")
+            # AUDIT P0-1: client_id must be explicit. No hardcoded default.
+            client_id = (request.args.get("client_id") or "").strip()
+            if not client_id:
+                return jsonify({
+                    "ok": False,
+                    "error": "client_id query parameter required",
+                }), 400
 
             def _fetch():
                 with __import__("ap.db", fromlist=["conn"]).conn() as c:
@@ -1320,7 +1374,13 @@ def create_app() -> Flask:
         try:
             import os as _os
             from supabase import create_client as _cc
-            client_id = request.args.get("client_id", "tradefluencehq@gmail.com")
+            # AUDIT P0-1: client_id must be explicit. No hardcoded default.
+            client_id = (request.args.get("client_id") or "").strip()
+            if not client_id:
+                return jsonify({
+                    "ok": False,
+                    "error": "client_id query parameter required",
+                }), 400
             limit = min(int(request.args.get("limit", 50)), 200)
             _sb_url = _os.getenv("SUPABASE_URL", "")
             _sb_key = _os.getenv("SUPABASE_SERVICE_KEY", "")
@@ -1339,6 +1399,90 @@ def create_app() -> Flask:
             return jsonify({"ok": True, "client_id": client_id, "rejections": result.data or [], "count": len(result.data or [])})
         except Exception as e:
             log.error(f"client_rejections failed: {e}", exc_info=True)
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+
+    @app.get("/client/orders")
+    @require_hmac
+    def client_orders():
+        """Order lifecycle ledger for a client.
+
+        AUDIT P0-3: this endpoint was previously called as `/client/me/orders` by the
+        dashboard backend but did not exist on the bot — every call 404'd silently
+        and the dashboard ledger panel was permanently empty. Now implemented.
+
+        Returns: order_id, broker_order_id, symbol, contract, side, kind (ENTRY/EXIT),
+                 qty, filled_qty, avg_fill, status, created_ts, updated_ts.
+        Used by /api/trading/ledger on the dashboard backend.
+        """
+        try:
+            from ap.db import run_with_retry
+            import psycopg2.extras
+
+            client_id = (request.args.get("client_id") or "").strip()
+            if not client_id:
+                return jsonify({
+                    "ok": False,
+                    "error": "client_id query parameter required",
+                }), 400
+
+            limit = min(int(request.args.get("limit", 100)), 500)
+            status_filter_val = (request.args.get("status") or "").strip().upper()
+
+            def _fetch():
+                with __import__("ap.db", fromlist=["conn"]).conn() as c:
+                    psycopg2.extras.register_uuid()
+                    params = [client_id]
+                    extra_where = ""
+                    if status_filter_val:
+                        extra_where = "AND UPPER(status) = %s"
+                        params.append(status_filter_val)
+                    c.execute(
+                        f"""
+                        SELECT
+                            id                AS order_id,
+                            broker_order_id,
+                            symbol,
+                            contract,
+                            side,
+                            kind,
+                            qty,
+                            filled_qty,
+                            avg_fill,
+                            status,
+                            created_ts,
+                            updated_ts,
+                            position_id
+                        FROM orders
+                        WHERE client_id = %s
+                        {extra_where}
+                        ORDER BY created_ts DESC
+                        LIMIT %s
+                        """,
+                        params + [limit],
+                    )
+                    cols = [d[0] for d in c.description]
+                    return [dict(zip(cols, row)) for row in c.fetchall()]
+
+            orders = run_with_retry(_fetch)
+
+            # Serialize timestamps + UUIDs for JSON
+            import datetime
+            for o in orders:
+                for k, v in o.items():
+                    if isinstance(v, (datetime.datetime, datetime.date)):
+                        o[k] = v.isoformat()
+                    elif hasattr(v, "hex") and not isinstance(v, (bytes, bytearray)):
+                        o[k] = str(v)
+
+            return jsonify({
+                "ok": True,
+                "client_id": client_id,
+                "count":     len(orders),
+                "orders":    orders,
+            })
+        except Exception as e:
+            log.error(f"client_orders failed: {e}", exc_info=True)
             return jsonify({"ok": False, "error": str(e)}), 500
 
 

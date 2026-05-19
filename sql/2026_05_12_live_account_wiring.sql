@@ -25,7 +25,7 @@ ADD COLUMN IF NOT EXISTS tradier_base_url text DEFAULT 'https://sandbox.tradier.
 --   tradier_account_id = tradier_live_account_id,
 --   tradier_access_token = tradier_live_access_token,
 --   tradier_base_url = 'https://api.tradier.com'
--- WHERE email = 'tradefluencehq@gmail.com';
+-- WHERE email = '<client-email>';
 
 -- Optional helper: switch one member's active Tradier account back to PAPER/SANDBOX.
 -- UPDATE members
@@ -36,7 +36,7 @@ ADD COLUMN IF NOT EXISTS tradier_base_url text DEFAULT 'https://sandbox.tradier.
 --   tradier_account_id = tradier_paper_account_id,
 --   tradier_access_token = tradier_paper_access_token,
 --   tradier_base_url = 'https://sandbox.tradier.com'
--- WHERE email = 'tradefluencehq@gmail.com';
+-- WHERE email = '<client-email>';
 
 -- Verification query.
 -- SELECT
@@ -52,6 +52,6 @@ ADD COLUMN IF NOT EXISTS tradier_base_url text DEFAULT 'https://sandbox.tradier.
 --   tradier_paper_access_token IS NOT NULL AS has_paper_token,
 --   tradier_access_token IS NOT NULL AS has_active_token
 -- FROM members
--- WHERE email = 'tradefluencehq@gmail.com';
+-- WHERE email = '<client-email>';
 
 NOTIFY pgrst, 'reload schema';
