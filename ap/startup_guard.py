@@ -86,8 +86,10 @@ def _check_position_limit_consistency():
     The execution core reads MAX_POSITIONS; the risk gate reads MAX_CONCURRENT_POSITIONS.
     They MUST be the same number.
     """
-    risk_limit = int(os.getenv("MAX_CONCURRENT_POSITIONS", "2"))
-    exec_limit = int(os.getenv("MAX_POSITIONS", "7"))
+    # AUDIT PHASE-2: raised defaults from 2/7 -> 4/4 so the two caps default to
+    # the same value. They're meant to be synchronized; previous defaults diverged.
+    risk_limit = int(os.getenv("MAX_CONCURRENT_POSITIONS", "4"))
+    exec_limit = int(os.getenv("MAX_POSITIONS", "4"))
 
     if risk_limit != exec_limit:
         # Clamp to the lower (safer) value

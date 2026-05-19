@@ -254,14 +254,42 @@ def _claim_one_job(client_id: str = "default") -> Optional[dict]:
                 """,
                 (client_id, str(PROCESSING_STALE_SECS)),
             )
+            # AUDIT PHASE-2: score-based admission.
+            # Previously: ORDER BY created_ts ASC — strict FIFO. First-N-wins.
+            # A low-quality early signal (low-liquidity ticker, score 72) burned
+            # a slot that a higher-scored later signal (AAPL 92) needed.
+            #
+            # Now: ORDER BY score DESC, created_ts ASC. Best-by-score wins,
+            # with arrival time as the tiebreaker. Score lives in the JSONB
+            # payload (set by enqueue_signal; defaults to 65 if absent).
+            #
+            # BLOCKER-1 FIX (post-review): the previous
+            #   COALESCE(NULLIF(payload->>'score','')::numeric, 65)
+            # crashes Postgres on malformed scores like 'A+' because the cast
+            # runs BEFORE COALESCE sees the result. A single bad score from any
+            # scanner would kill the claim worker, which would hang the queue.
+            #
+            # Defensive: regex-guard the cast. The ~ operator returns false on
+            # non-numeric strings, so we route those to the default value (65)
+            # without ever attempting the cast.
+            #
+            # Regex: optional minus, digits, optional decimal fraction. No exponent,
+            # no whitespace — scores live in a 0-100 range so we don't need them.
             c.execute(
-                """
+                r"""
                 WITH next_job AS (
                     SELECT id
                     FROM   trade_queue
                     WHERE  status    = 'NEW'
                       AND  client_id = %s
-                    ORDER BY created_ts ASC
+                    ORDER BY
+                        CASE
+                            WHEN payload ? 'score'
+                             AND payload->>'score' ~ '^-?[0-9]+(\.[0-9]+)?$'
+                            THEN (payload->>'score')::numeric
+                            ELSE 65
+                        END DESC,
+                        created_ts ASC
                     LIMIT  1
                     FOR UPDATE SKIP LOCKED
                 )

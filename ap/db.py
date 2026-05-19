@@ -273,8 +273,13 @@ def insert_order(
     broker_order_id: str | None = None,
     direction: str | None = None,
     reserved_cost: float | None = None,
+    meta: dict | None = None,
 ):
+    """AUDIT PHASE-2: added `meta` JSONB for signal_entry_price, score,
+    and re-peg counters. See migrations/20260519_phase2_orders_meta.sql."""
     ts = now_utc_iso()
+    import json as _json
+    meta_json = _json.dumps(meta or {})
     def _fn():
         with conn() as c:
             c.execute(
@@ -283,13 +288,13 @@ def insert_order(
                     client_id, local_order_id, broker_order_id, position_id,
                     kind, status, symbol, contract, direction, reserved_cost,
                     qty, limit_price, filled_qty, retries, last_error,
-                    created_ts, updated_ts
-                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    created_ts, updated_ts, meta
+                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)
                 ON CONFLICT (local_order_id) DO NOTHING
                 """,
                 (client_id, local_order_id, broker_order_id, position_id,
                  kind, status, symbol, contract, direction, reserved_cost,
-                 int(qty), limit_price, 0, 0, None, ts, ts),
+                 int(qty), limit_price, 0, 0, None, ts, ts, meta_json),
             )
     return run_with_retry(_fn)
 
@@ -301,12 +306,19 @@ def update_order(
     broker_order_id: str | None = None,
     last_error: str | None = None,
     filled_qty: int | None = None,
+    limit_price: float | None = None,
+    meta: dict | None = None,
 ):
+    """AUDIT PHASE-2: added `limit_price` (for re-pegs) and `meta` (re-peg counters,
+    signal entry price, score). Both are optional and backward-compatible."""
+    import json as _json
     updates = []; params: list[Any] = []
     if status is not None:           updates.append("status=%s");           params.append(status)
     if broker_order_id is not None:  updates.append("broker_order_id=%s");  params.append(broker_order_id)
     if last_error is not None:       updates.append("last_error=%s");       params.append(last_error)
     if filled_qty is not None:       updates.append("filled_qty=%s");       params.append(int(filled_qty))
+    if limit_price is not None:      updates.append("limit_price=%s");      params.append(float(limit_price))
+    if meta is not None:             updates.append("meta=%s::jsonb");      params.append(_json.dumps(meta))
     updates.append("updated_ts=%s"); params.append(now_utc_iso())
     params.append(local_order_id)
     sql = f"UPDATE orders SET {', '.join(updates)} WHERE local_order_id=%s"
