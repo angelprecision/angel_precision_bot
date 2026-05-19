@@ -15,8 +15,10 @@ Exit codes:
   2 = warnings only (trade with caution)
 
 Usage:
-  python ap_premarket_invariants.py [--client-id tradefluencehq@gmail.com]
-  python ap_premarket_invariants.py --all-clients
+  python ap_premarket_invariants.py --client-id <email>     # check one client
+  python ap_premarket_invariants.py --all-clients           # check every active client
+
+No hardcoded default client — you must specify which client(s) to check.
 """
 import os, sys, json, logging, argparse
 from datetime import datetime, timezone, timedelta
@@ -294,9 +296,13 @@ def run_for_client(client_id: str) -> InvariantResult:
 
 def main():
     parser = argparse.ArgumentParser(description="Angel Precision pre-market invariant check")
-    parser.add_argument("--client-id", default=os.getenv("DEFAULT_CLIENT_ID", "tradefluencehq@gmail.com"))
+    # AUDIT P0-1: no hardcoded fallback. Operator must specify --client-id or --all-clients.
+    parser.add_argument("--client-id", default=os.getenv("DEFAULT_CLIENT_ID", ""))
     parser.add_argument("--all-clients", action="store_true")
     args = parser.parse_args()
+
+    if not args.all_clients and not args.client_id:
+        parser.error("must specify either --client-id <email> or --all-clients (no default).")
 
     if args.all_clients:
         # Fetch all active clients from Supabase

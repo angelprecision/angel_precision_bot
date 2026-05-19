@@ -4,47 +4,93 @@ on:
   schedule:
     - cron: '30 21 * * 1-5'   # 5:30 PM ET (21:30 UTC) weekdays — after market close
   workflow_dispatch:
+    inputs:
+      client_id:
+        description: 'Specific client email to reconcile (leave blank for ALL active clients)'
+        required: false
+        default: ''
 
 jobs:
   reconcile:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - name: Run nightly position reconciliation
+      - name: Install deps
+        run: pip install --quiet requests supabase==2.7.4 httpx==0.27.2
+
+      - name: Run nightly position reconciliation for every active client
         env:
-          BOT_URL: ${{ secrets.BOT_URL }}
-          SIGNING_SECRET: ${{ secrets.SIGNING_SECRET }}
+          BOT_URL:               ${{ secrets.BOT_URL }}
+          SIGNING_SECRET:        ${{ secrets.SIGNING_SECRET }}
+          SUPABASE_URL:          ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY:  ${{ secrets.SUPABASE_SERVICE_KEY }}
+          FORCE_CLIENT:          ${{ github.event.inputs.client_id }}
         run: |
-          python3 -c "
-          import hmac, hashlib, time, json, urllib.request, os, sys
+          python3 <<'PY'
+          # AUDIT P0-1 fix: loop over ALL active clients from Supabase.
+          # Previously hardcoded to one client_id — other clients were silently never reconciled.
+          import os, sys, time, hmac, hashlib, json, urllib.request
 
-          secret = os.environ['SIGNING_SECRET'].encode()
-          bot_url = os.environ.get('BOT_URL', 'https://angel-precision-bot-official-1.onrender.com')
-          body = b'{}'
-          ts = str(int(time.time()))
-          sig = hmac.new(secret, ts.encode() + b'.' + body, hashlib.sha256).hexdigest()
+          BOT_URL  = os.environ["BOT_URL"]
+          SECRET   = os.environ["SIGNING_SECRET"].encode()
+          FORCE    = os.environ.get("FORCE_CLIENT", "").strip()
 
-          req = urllib.request.Request(
-              f'{bot_url}/admin/nightly_reconcile',
-              data=body,
-              headers={
-                  'Content-Type': 'application/json',
-                  'X-AP-Timestamp': ts,
-                  'X-AP-Signature': sig,
-                  'X-Client-Id': 'tradefluencehq@gmail.com',
-              },
-              method='POST'
-          )
-          try:
-              with urllib.request.urlopen(req, timeout=30) as r:
-                  data = json.loads(r.read())
-                  print(json.dumps(data, indent=2))
-                  mismatches = data.get('total_mismatches', 0)
-                  if mismatches > 0:
-                      print(f'WARNING: {mismatches} position mismatch(es) found — review required')
-                      sys.exit(1)
-                  else:
-                      print('All positions reconciled — no mismatches')
-          except Exception as e:
-              print(f'Reconciliation failed: {e}')
+          def discover_clients():
+              if FORCE:
+                  print(f"[manual] reconciling only {FORCE}")
+                  return [FORCE]
+              from supabase import create_client
+              sb_url = os.environ["SUPABASE_URL"]
+              sb_key = os.environ["SUPABASE_SERVICE_KEY"]
+              sb = create_client(sb_url, sb_key)
+              res = (
+                  sb.table("members")
+                    .select("email")
+                    .eq("approved", True)
+                    .eq("subscription_active", True)
+                    .execute()
+              )
+              return [r["email"] for r in (res.data or []) if r.get("email")]
+
+          def reconcile_one(client_id):
+              body = b"{}"
+              ts = str(int(time.time()))
+              sig = hmac.new(SECRET, ts.encode() + b"." + body, hashlib.sha256).hexdigest()
+              req = urllib.request.Request(
+                  f"{BOT_URL}/admin/nightly_reconcile",
+                  data=body,
+                  headers={
+                      "Content-Type":   "application/json",
+                      "X-AP-Timestamp": ts,
+                      "X-AP-Signature": sig,
+                      "X-Client-Id":    client_id,
+                  },
+                  method="POST",
+              )
+              with urllib.request.urlopen(req, timeout=60) as r:
+                  return json.loads(r.read())
+
+          clients = discover_clients()
+          print(f"discovered {len(clients)} active client(s): {clients}")
+
+          total_mismatches = 0
+          failures = []
+          for cid in clients:
+              try:
+                  data = reconcile_one(cid)
+                  m = int(data.get("total_mismatches", 0))
+                  total_mismatches += m
+                  print(f"[{cid}] mismatches={m}")
+              except Exception as e:
+                  failures.append((cid, str(e)))
+                  print(f"[{cid}] FAILED: {e}")
+
+          print(f"\nDONE: total_mismatches={total_mismatches} failures={len(failures)}")
+          if failures:
+              print("Failure detail:")
+              for cid, err in failures:
+                  print(f"  - {cid}: {err}")
+              sys.exit(2)
+          if total_mismatches > 0:
               sys.exit(1)
-          "
+          PY
