@@ -179,8 +179,12 @@ class _ConnWrapper:
         self._cur  = cursor
 
     def execute(self, sql: str, params: tuple | list = ()):
-        pg_sql = sql.replace("?", "%s")
-        self._cur.execute(pg_sql, params)
+        # Do NOT replace ? with %s here. The queue SQL uses the Postgres
+        # JSONB key-existence operator (payload ? 'score') which the
+        # naive replacement converts to payload %s 'score', giving psycopg2
+        # a phantom bind placeholder and raising IndexError on every claim.
+        # All SQL in this codebase already uses %s placeholders natively.
+        self._cur.execute(sql, params)
         return self
 
     def fetchone(self):
