@@ -48,6 +48,20 @@ What this branch does NOT change:
 
 ---
 
+## Kill switches (in order from least to most disruptive)
+
+If anything looks wrong in production, use these env vars on Render (no code
+rollback needed):
+
+| To disable... | Set... | Effect |
+|---|---|---|
+| Just the re-peg ladder | `REPEG_ENABLED=0` | `decide_repeg()` returns ok=False with reason="repeg_disabled". `order_monitor` falls through to the existing MISSED_MOVE_CANCEL behavior. Slot accounting and score ordering still active. |
+| Score-based preemption | `PREEMPT_PRE_SUBMITTED_ORDERS=0` | No pre-broker entries get canceled when a higher-scored signal arrives. Already the default for the first rollout day. |
+| Lift back to legacy caps | `MAX_TRADES_PER_DAY=5`, `MAX_CONCURRENT_POSITIONS=2`, `MAX_POSITIONS=2` | Returns to pre-PHASE2 caps. Slot accounting (orders-table-truth) still active; the queue still orders by score — only the cap shrinks. |
+| Whole admission improvement | All three above | The bot reverts to behaving like the pre-PHASE2 build except slot accounting stays correct. Score ordering is automatic via the existing SQL and harmless if scores are missing. |
+
+For a deeper rollback, revert the merge commit on `main`.
+
 ## Environment variables (new + changed defaults)
 
 | Var | Default | Meaning |

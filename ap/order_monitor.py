@@ -1371,11 +1371,17 @@ class APOrderMonitor:
             except Exception as e:
                 log.debug("[%s] _try_repeg spot lookup failed: %s", self.client_id, e)
 
-        # Build the order_row the decision function needs.
+        # Build the order_row the decision + apply functions need.
+        # BLOCKER-2 FIX (post-review): apply_repeg actually re-submits to the
+        # broker, so it needs symbol, contract, and qty too. Without these the
+        # resubmit can't happen and the slot would die in CREATED forever.
         meta = dict(order.get("meta") or {})
         order_row = {
             "id":                 local_id,
             "broker_order_id":    order.get("broker_order_id") or self._get_broker_order_id(local_id),
+            "symbol":             order.get("symbol") or meta.get("ticker"),
+            "contract":            contract or order.get("contract"),
+            "qty":                 order.get("qty") or order.get("quantity"),
             "limit_price":        limit_price,
             "direction":          (order.get("direction")
                                    or order.get("side")

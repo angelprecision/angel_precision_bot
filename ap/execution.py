@@ -267,23 +267,36 @@ def _find_preemptible_pre_submitted(client_id: str, min_score_to_beat: float) ->
     """Return the lowest-scored CREATED/PENDING_TRIGGER entry order for this
     client whose score is at least PREEMPT_SCORE_DELTA below min_score_to_beat.
     Returns the row dict, or None if no candidate qualifies.
+
+    BLOCKER-1 FIX (post-review): regex-guard the meta->>'score' cast so a
+    malformed score string ('A+', 'high', '') cannot crash this query.
+    Same defensive pattern as the queue claim in ap/queue.py.
     """
     threshold = float(min_score_to_beat) - _PREEMPT_SCORE_DELTA
     with conn() as c:
         row = run_with_retry(lambda: c.execute(
-            """
-            SELECT id AS local_order_id,
-                   broker_order_id,
-                   status,
-                   COALESCE(NULLIF(meta->>'score','')::numeric, 65) AS score
-            FROM   orders
-            WHERE  client_id = %s
-              AND  COALESCE(kind, 'ENTRY') = 'ENTRY'
-              AND  status IN ('CREATED', 'PENDING_TRIGGER')
-              AND  created_ts >= date_trunc('day', NOW() AT TIME ZONE 'UTC')
-              AND  COALESCE(NULLIF(meta->>'score','')::numeric, 65) <= %s
-            ORDER  BY COALESCE(NULLIF(meta->>'score','')::numeric, 65) ASC,
-                      created_ts ASC
+            r"""
+            WITH scored AS (
+                SELECT id AS local_order_id,
+                       broker_order_id,
+                       status,
+                       created_ts,
+                       CASE
+                           WHEN meta ? 'score'
+                            AND meta->>'score' ~ '^-?[0-9]+(\.[0-9]+)?$'
+                           THEN (meta->>'score')::numeric
+                           ELSE 65
+                       END AS score
+                FROM   orders
+                WHERE  client_id = %s
+                  AND  COALESCE(kind, 'ENTRY') = 'ENTRY'
+                  AND  status IN ('CREATED', 'PENDING_TRIGGER')
+                  AND  created_ts >= date_trunc('day', NOW() AT TIME ZONE 'UTC')
+            )
+            SELECT local_order_id, broker_order_id, status, score
+            FROM   scored
+            WHERE  score <= %s
+            ORDER  BY score ASC, created_ts ASC
             LIMIT  1
             """,
             (client_id, threshold),

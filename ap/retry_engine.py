@@ -242,26 +242,50 @@ def apply_repeg(
     decision: RepegDecision,
     client_id: str,
 ) -> bool:
-    """Apply the re-peg by canceling the broker order and submitting a new one
-    at decision.new_limit_price. Records the attempt in the orders.meta JSON.
+    """Apply the re-peg by canceling the broker order and submitting a NEW
+    one at decision.new_limit_price. Records the attempt in orders.meta.
 
-    Returns True on success, False otherwise.
+    BLOCKER-2 FIX (post-review): the previous version canceled the broker
+    order, flipped local status to CREATED, and said "the next worker tick
+    will pick it up." Reality: nothing in the codebase re-submits CREATED
+    entries. They sit until the 2-minute stale-watchdog cancels them locally.
+    Result: a 'missed move' would have become 'cancel + dead local order, no
+    replacement at the broker.' Exactly the failure mode the reviewer caught.
 
-    Implementation note: Tradier does not support order modification; we have
-    to cancel+resubmit. This is a small window where we have zero working
-    orders \u2014 if the market fills before resubmit, we miss. Acceptable trade-off:
-    Gate 1's REPEG_INTERVAL_SECS=30 means we only do this when the order
-    hasn't been moving anyway.
+    Now: cancel at broker, then immediately call broker.place_order() with
+    the new limit. On submit success: local order -> SUBMITTED with the new
+    broker_order_id. On submit failure: local order -> CANCELED so the slot
+    is freed cleanly (never leave a stuck CREATED row).
+
+    Returns True iff a new broker order is now live.
     """
     broker_oid = order_row.get("broker_order_id")
     local_oid  = order_row.get("id") or order_row.get("local_order_id")
+    symbol     = order_row.get("symbol")
+    contract   = order_row.get("contract")
+    qty        = order_row.get("qty") or order_row.get("quantity")
     if not broker_oid or not local_oid:
         log.warning("apply_repeg: missing ids broker=%s local=%s", broker_oid, local_oid)
         return False
+    if not symbol or not contract or qty in (None, "", 0):
+        log.warning("apply_repeg: missing required fields local=%s sym=%s contract=%s qty=%s",
+                    local_oid, symbol, contract, qty)
+        return False
+    try:
+        qty = int(qty)
+    except (TypeError, ValueError):
+        log.warning("apply_repeg: bad qty local=%s qty=%r", local_oid, qty)
+        return False
+    if qty <= 0:
+        log.warning("apply_repeg: non-positive qty local=%s qty=%s", local_oid, qty)
+        return False
 
+    from ap.db import update_order
+
+    # Step 1: cancel the existing broker order.
     try:
         cancel_result = broker.cancel_order(broker_oid)
-        if not cancel_result or cancel_result.get("error"):
+        if not cancel_result or (isinstance(cancel_result, dict) and cancel_result.get("error")):
             log.warning("apply_repeg: cancel_order failed broker=%s err=%s",
                         broker_oid, cancel_result)
             return False
@@ -269,31 +293,93 @@ def apply_repeg(
         log.warning("apply_repeg: cancel exception broker=%s err=%s", broker_oid, e)
         return False
 
-    # Record attempt BEFORE resubmit so we never lose the count.
+    # Step 2: mark intent in DB BEFORE resubmit so a process crash mid-flow
+    # leaves a clear forensic record (CREATED with bumped repeg_attempts and
+    # the old broker_order_id stashed in meta).
+    meta = dict(order_row.get("meta") or {})
+    meta["repeg_attempts"]       = decision.attempts_used
+    meta["last_repeg_ts"]        = time.time()
+    meta["last_repeg_reason"]    = decision.reason
+    meta["prev_broker_order_id"] = broker_oid
     try:
-        from ap.db import update_order
-        meta = dict(order_row.get("meta") or {})
-        meta["repeg_attempts"] = decision.attempts_used
-        meta["last_repeg_ts"]  = time.time()
-        meta["last_repeg_reason"] = decision.reason
         update_order(
             local_oid,
+            status="CREATED",
             limit_price=decision.new_limit_price,
             meta=meta,
-            status="CREATED",
+            broker_order_id=None,  # old broker_oid is dead; clear it
         )
     except Exception as e:
-        log.error("apply_repeg: failed to record attempt id=%s err=%s", local_oid, e)
+        log.error("apply_repeg: meta update failed id=%s err=%s", local_oid, e)
         return False
 
-    # Resubmit at the new limit. The broker submit path lives in execution.py;
-    # rather than re-implementing here, we mark the local order ready for
-    # re-submission and let the next worker tick pick it up. This is safer
-    # than re-entering execution.process_signal mid-loop.
+    # Step 3: submit the NEW order at the new limit price.
+    try:
+        resp = broker.place_order(
+            symbol=symbol,
+            contract=contract,
+            qty=qty,
+            limit_price=decision.new_limit_price,
+            side="buy_to_open",
+        )
+    except Exception as e:
+        log.error("[%s] REPEG_RESUBMIT_FAILED local=%s err=%s", client_id, local_oid, e)
+        # Old broker order is gone, new submit failed. Free the slot by
+        # transitioning to CANCELED so the daily-cap gate counts it as free
+        # and the operator sees a clear forensic row.
+        try:
+            update_order(local_oid, status="CANCELED",
+                         last_error=f"repeg_resubmit_exception:{e}")
+        except Exception:
+            log.exception("[%s] apply_repeg: also failed to mark CANCELED after resubmit failure", client_id)
+        return False
+
+    # Parse broker response.
+    new_broker_oid = None
+    submit_error   = None
+    submit_status  = None
+    if isinstance(resp, dict):
+        new_broker_oid = resp.get("broker_order_id") or resp.get("order_id") or resp.get("id")
+        submit_status  = str(resp.get("status") or "").upper()
+        submit_error   = resp.get("error")
+    else:
+        new_broker_oid = getattr(resp, "broker_order_id", None) or getattr(resp, "order_id", None)
+        submit_status  = str(getattr(resp, "status", "") or "").upper()
+        submit_error   = getattr(resp, "error", None)
+
+    accepted = (not submit_error) and submit_status in (
+        "ACK", "ACKED", "FILLED", "SUBMITTED", "OK", "ACCEPTED", "PENDING", "OPEN",
+    )
+    if not accepted:
+        log.error("[%s] REPEG_RESUBMIT_REJECTED local=%s status=%s err=%s",
+                  client_id, local_oid, submit_status, submit_error)
+        try:
+            update_order(local_oid, status="REJECTED",
+                         last_error=f"repeg_resubmit_rejected:{submit_status}:{submit_error}")
+        except Exception:
+            log.exception("[%s] apply_repeg: failed to mark REJECTED after resubmit reject", client_id)
+        return False
+
+    # Success path: transition local to SUBMITTED with the new broker id.
+    try:
+        update_order(
+            local_oid,
+            status="SUBMITTED",
+            broker_order_id=new_broker_oid,
+        )
+    except Exception as e:
+        log.critical(
+            "[%s] REPEG_DB_DRIFT local=%s new_broker_oid=%s err=%s -- "
+            "broker has a live order at the new limit, DB does not. "
+            "Reconciler should resolve next tick.",
+            client_id, local_oid, new_broker_oid, e,
+        )
+        return False
+
     log.info(
-        "[%s] REPEG: order=%s broker_oid=%s prev_limit=%.2f new_limit=%.2f "
-        "attempt=%d/%d reason=%s",
-        client_id, local_oid, broker_oid,
+        "[%s] REPEG_APPLIED order=%s old_broker=%s new_broker=%s prev_limit=%.2f "
+        "new_limit=%.2f attempt=%d/%d reason=%s",
+        client_id, local_oid, broker_oid, new_broker_oid,
         decision.detail.get("prev_limit", 0.0),
         decision.new_limit_price,
         decision.attempts_used, REPEG_MAX_ATTEMPTS,
