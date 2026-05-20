@@ -180,6 +180,24 @@ def run_overnight_reeval(
                     result["rejected"] += 1
                     continue
 
+            # Timeframe guard: overnight reeval is DAILY signals only.
+            # 60m, 5m, 15m, 1h signals are intraday — by 9 AM the thesis
+            # is hours stale and the prior-day levels are meaningless.
+            # Only 1d / daily / overnight timeframes are valid here.
+            _OVERNIGHT_TIMEFRAMES = set(
+                os.getenv("OVERNIGHT_VALID_TIMEFRAMES", "1d,daily,overnight,weekly,1w").lower().split(",")
+            )
+            _sig_tf = str(signal.get("timeframe") or "1d").lower().strip()
+            if _sig_tf not in _OVERNIGHT_TIMEFRAMES:
+                log.info(
+                    "[%s] overnight_reeval: skipping intraday signal %s (timeframe=%s) — "
+                    "overnight reeval is daily signals only",
+                    ticker, signal_id, _sig_tf,
+                )
+                _mark_job_rejected(job_id, client_id, f"intraday_timeframe_rejected:{_sig_tf}")
+                result["rejected"] += 1
+                continue
+
             # Step 1: Fetch prior-day levels from broker
             prior_levels = {}
             if hasattr(broker, "get_prior_day_levels"):
