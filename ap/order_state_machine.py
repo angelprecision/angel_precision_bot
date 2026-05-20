@@ -1507,26 +1507,203 @@ class APOrderStateMachine:
                       or "")
         underlying    = self._resolve_underlying_symbol(symbol=symbol, contract=contract)
         error_msg     = broker_order_id = None
+        # ── Build order payload ONCE ──────────────────────────────────────────
+        _is_market_payload = (order_type == "market") or (lp <= 0 and order_type != "limit")
+        _order_data = {
+            "class": "option", "symbol": underlying, "option_symbol": contract,
+            "side": "sell_to_close", "quantity": int(qty),
+            "type": "market" if _is_market_payload else "limit",
+            "duration": "day",
+        }
+        if not _is_market_payload:
+            _order_data["price"] = round(lp, 2)
+        # Tradier accepts a 'tag' field — using local_id provides client-side
+        # idempotency. If we retry on ambiguous response, we can find this tag
+        # in /orders to confirm the order landed without double-submitting.
+        _order_data["tag"] = str(local_id)[:32]  # Tradier tag max 32 chars
+
+        # ── Retry-safe broker submission ──────────────────────────────────────
+        # Failure classes:
+        #   RETRYABLE_CONN  — connection failed before send (safe to retry)
+        #   RETRYABLE_5XX   — server error (safe to retry)
+        #   RETRYABLE_429   — rate limit (retry with backoff)
+        #   AMBIGUOUS       — read timeout / mid-response failure — order MAY
+        #                     have landed. Must query Tradier to confirm before
+        #                     retrying, or we risk a double exit.
+        #   PERMANENT_REJECT — 4xx (not 429) — broker rejected, do not retry
+        #   BROKER_REJECTED — Tradier returned rejected status, do not retry
         try:
-            _is_market = (order_type == "market") or (lp <= 0 and order_type != "limit")
-            _order_data = {
-                "class": "option", "symbol": underlying, "option_symbol": contract,
-                "side": "sell_to_close", "quantity": int(qty),
-                "type": "market" if _is_market else "limit",
-                "duration": "day",
-            }
-            if not _is_market:
-                _order_data["price"] = round(lp, 2)
-            resp = broker.session.post(
-                f"{base_url}/v1/accounts/{account_id}/orders",
-                data=_order_data,
-                headers={"Accept": "application/json"},
-                timeout=10,
-            )
-            order           = (resp.json() or {}).get("order") or {}
-            status          = str(order.get("status") or "").lower().strip()
-            broker_order_id = order.get("id") or order.get("order_id")
-            if self._is_broker_accept_status(status) and broker_order_id:
+            import requests as _requests
+            _RetryableHTTPError    = _requests.exceptions.HTTPError
+            _ConnectionError       = _requests.exceptions.ConnectionError
+            _ReadTimeout           = _requests.exceptions.ReadTimeout
+            _ConnectTimeout        = _requests.exceptions.ConnectTimeout
+            _RequestException      = _requests.exceptions.RequestException
+        except Exception:
+            # If requests isn't importable in this context, fall through to
+            # generic exception handling (preserves prior behavior).
+            _RetryableHTTPError = _ConnectionError = _ReadTimeout = \
+                _ConnectTimeout = _RequestException = Exception
+
+        _max_attempts   = 3
+        _backoff_base_s = 1.0   # 1s, 2s, 4s
+        _post_url       = f"{base_url}/v1/accounts/{account_id}/orders"
+        resp = None
+        order = {}
+        status = ""
+
+        for _attempt in range(1, _max_attempts + 1):
+            # Re-check active exit on EACH attempt — a concurrent submission
+            # or a successful prior attempt that we couldn't confirm could
+            # have created one. Never double-submit.
+            if _attempt > 1:
+                _existing = self._get_active_exit_order(position_id)
+                if _existing and str(_existing.get("local_order_id")) != str(local_id):
+                    log.warning(
+                        "[%s] submit_exit retry %d aborted — another active exit "
+                        "appeared pos=%s existing=%s",
+                        self.client_id, _attempt, position_id,
+                        _existing.get("local_order_id"),
+                    )
+                    error_msg = (
+                        f"retry_aborted_concurrent_exit:"
+                        f"{_existing.get('local_order_id')}:{_existing.get('status')}"
+                    )
+                    break
+
+            try:
+                resp = broker.session.post(
+                    _post_url,
+                    data=_order_data,
+                    headers={"Accept": "application/json"},
+                    timeout=10,
+                )
+                # Classify by HTTP status before parsing JSON
+                _sc = getattr(resp, "status_code", None)
+                if _sc is not None and 400 <= _sc < 500 and _sc != 429:
+                    # PERMANENT_REJECT — do not retry
+                    _body_snip = ""
+                    try:
+                        _body_snip = (resp.text or "")[:200]
+                    except Exception:
+                        _body_snip = "<body unreadable>"
+                    error_msg = f"broker_http_{_sc}:{_body_snip}"
+                    log.error(
+                        "[%s] submit_exit PERMANENT REJECT | pos=%s contract=%s "
+                        "http=%s body=%s",
+                        self.client_id, position_id, contract, _sc, _body_snip,
+                    )
+                    break
+
+                if _sc is not None and (_sc >= 500 or _sc == 429):
+                    # RETRYABLE_5XX / 429 — retry with backoff
+                    error_msg = f"broker_http_{_sc}_retryable"
+                    log.warning(
+                        "[%s] submit_exit retryable HTTP %s | pos=%s attempt=%d/%d",
+                        self.client_id, _sc, position_id, _attempt, _max_attempts,
+                    )
+                    if _attempt < _max_attempts:
+                        _time_module.sleep(_backoff_base_s * (2 ** (_attempt - 1)))
+                        continue
+                    break
+
+                # 2xx — parse JSON
+                try:
+                    order = (resp.json() or {}).get("order") or {}
+                except Exception as _je:
+                    # AMBIGUOUS — got 2xx but can't parse. Order may or may
+                    # not have landed. Check by tag before retrying.
+                    log.warning(
+                        "[%s] submit_exit JSON parse failed | pos=%s attempt=%d err=%s",
+                        self.client_id, position_id, _attempt, _je,
+                    )
+                    _existing_oid = self._lookup_order_by_tag(
+                        broker, base_url, account_id, str(local_id),
+                    )
+                    if _existing_oid:
+                        log.info(
+                            "[%s] submit_exit AMBIGUOUS but found by tag | "
+                            "pos=%s broker_order_id=%s — treating as success",
+                            self.client_id, position_id, _existing_oid,
+                        )
+                        order = {"id": _existing_oid, "status": "open"}
+                    else:
+                        error_msg = f"broker_ambiguous_parse:{_je}"
+                        if _attempt < _max_attempts:
+                            _time_module.sleep(_backoff_base_s * (2 ** (_attempt - 1)))
+                            continue
+                        break
+
+                status          = str(order.get("status") or "").lower().strip()
+                broker_order_id = order.get("id") or order.get("order_id")
+                # Got a clean response — exit retry loop
+                error_msg = None
+                break
+
+            except (_ConnectTimeout, _ConnectionError) as _ce:
+                # RETRYABLE_CONN — request did not reach broker, safe to retry
+                error_msg = f"broker_conn_error:{_ce}"
+                log.warning(
+                    "[%s] submit_exit conn error | pos=%s attempt=%d/%d err=%s",
+                    self.client_id, position_id, _attempt, _max_attempts, _ce,
+                )
+                if _attempt < _max_attempts:
+                    _time_module.sleep(_backoff_base_s * (2 ** (_attempt - 1)))
+                    continue
+                break
+
+            except _ReadTimeout as _rt:
+                # AMBIGUOUS — Tradier received the request, response was lost.
+                # Order MAY have landed. Query by tag before any retry.
+                log.warning(
+                    "[%s] submit_exit READ TIMEOUT (ambiguous) | pos=%s attempt=%d err=%s",
+                    self.client_id, position_id, _attempt, _rt,
+                )
+                _existing_oid = self._lookup_order_by_tag(
+                    broker, base_url, account_id, str(local_id),
+                )
+                if _existing_oid:
+                    log.info(
+                        "[%s] submit_exit RECOVERED from read timeout via tag | "
+                        "pos=%s broker_order_id=%s",
+                        self.client_id, position_id, _existing_oid,
+                    )
+                    order = {"id": _existing_oid, "status": "open"}
+                    broker_order_id = _existing_oid
+                    status = "open"
+                    error_msg = None
+                    break
+                # Not found at broker → safe to retry
+                error_msg = f"broker_read_timeout:{_rt}"
+                if _attempt < _max_attempts:
+                    _time_module.sleep(_backoff_base_s * (2 ** (_attempt - 1)))
+                    continue
+                break
+
+            except _RequestException as _re:
+                # Other requests-level error — treat as retryable conn-class
+                error_msg = f"broker_request_error:{_re}"
+                log.warning(
+                    "[%s] submit_exit request error | pos=%s attempt=%d/%d err=%s",
+                    self.client_id, position_id, _attempt, _max_attempts, _re,
+                )
+                if _attempt < _max_attempts:
+                    _time_module.sleep(_backoff_base_s * (2 ** (_attempt - 1)))
+                    continue
+                break
+
+            except Exception as _e:
+                # Unknown — do not retry, do not assume safe
+                error_msg = f"broker_error:{_e}"
+                log.error(
+                    "[%s] submit_exit unexpected error | pos=%s attempt=%d err=%s",
+                    self.client_id, position_id, _attempt, _e,
+                )
+                break
+
+        # ── Process the final response ────────────────────────────────────────
+        try:
+            if error_msg is None and self._is_broker_accept_status(status) and broker_order_id:
                 ok = self.transition(local_id, OrderStatus.EXIT_SUBMITTED,
                                      broker_order_id=broker_order_id, submitted_ts=now_utc_iso())
                 if ok:
@@ -1539,18 +1716,18 @@ class APOrderStateMachine:
                 return {"ok": False, "local_order_id": local_id,
                         "broker_order_id": broker_order_id, "status": OrderStatus.ERROR,
                         "error": error_msg, "split_brain": True}
-            elif self._is_broker_accept_status(status) and not broker_order_id:
+            elif error_msg is None and self._is_broker_accept_status(status) and not broker_order_id:
                 error_msg = f"broker_accepted_missing_order_id_quarantine:status={status or 'unknown'}"
                 ok = self.transition(local_id, OrderStatus.EXIT_SUBMITTED,
                                      submitted_ts=now_utc_iso(), last_error=error_msg)
                 return {"ok": False, "local_order_id": local_id, "broker_order_id": None,
                         "status": OrderStatus.EXIT_SUBMITTED if ok else OrderStatus.ERROR,
                         "error": error_msg, "identity_quarantine": True}
-            else:
+            elif error_msg is None:
                 error_msg = (f"broker_status:{status or 'unknown'} "
                              f"broker_order_id_missing:{not bool(broker_order_id)}")
         except Exception as e:
-            error_msg = f"broker_error:{e}"
+            error_msg = error_msg or f"broker_error:{e}"
 
         self.transition(local_id, OrderStatus.ERROR, last_error=error_msg or "unknown_error")
         self._emit_transition_event(
@@ -1569,6 +1746,63 @@ class APOrderStateMachine:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _lookup_order_by_tag(
+        self,
+        broker,
+        base_url: str,
+        account_id: str,
+        tag: str,
+    ) -> Optional[str]:
+        """Find a broker_order_id by client-side tag.
+
+        Used to recover from ambiguous broker responses (read timeout, JSON
+        parse failure mid-response) WITHOUT double-submitting. If the order
+        landed at Tradier before the response was lost, the tag we sent will
+        be on it and we can find it again — safe retry.
+
+        Returns the broker_order_id if found, else None.
+        Best-effort: any error returns None so the caller can fall through
+        to its normal retry path.
+        """
+        if not tag or not broker or not base_url or not account_id:
+            return None
+        try:
+            session = getattr(broker, "session", None)
+            if session is None:
+                return None
+            resp = session.get(
+                f"{base_url}/v1/accounts/{account_id}/orders",
+                headers={"Accept": "application/json"},
+                timeout=5,
+            )
+            if getattr(resp, "status_code", 500) >= 300:
+                return None
+            payload = resp.json() or {}
+            orders_node = payload.get("orders") or {}
+            orders = orders_node.get("order") if isinstance(orders_node, dict) else orders_node
+            if orders is None:
+                return None
+            if isinstance(orders, dict):
+                orders = [orders]
+            if not isinstance(orders, list):
+                return None
+            tag_str = str(tag)
+            for o in orders:
+                if not isinstance(o, dict):
+                    continue
+                # Tradier echoes the tag on the order. Compare as strings.
+                if str(o.get("tag") or "") == tag_str:
+                    oid = o.get("id") or o.get("order_id")
+                    if oid:
+                        return str(oid)
+            return None
+        except Exception as _e:
+            log.debug(
+                "[%s] _lookup_order_by_tag non-fatal: %s",
+                self.client_id, _e,
+            )
+            return None
 
     def _flag_split_brain_order(
         self,
