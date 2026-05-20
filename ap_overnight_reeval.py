@@ -415,33 +415,8 @@ def run_overnight_reeval(
                     #
                     # DO NOT submit to Tradier here. Submitting before breach
                     # would bypass the trigger-breach rule and enter prematurely.
-                    try:
-                        if hasattr(order_state_machine, "mark_entry_pending_trigger"):
-                            _pending_ok = order_state_machine.mark_entry_pending_trigger(local_order_id)
-                            if _pending_ok:
-                                log.info(
-                                    "[%s] OVERNIGHT_ENTRY_PENDING_TRIGGER | local=%s contract=%s "
-                                    "trigger=%.4f deferred=%s",
-                                    ticker, local_order_id, _arm_label,
-                                    entry_trigger or 0, contract_deferred,
-                                )
-                            else:
-                                log.error(
-                                    "[%s] OVERNIGHT_ENTRY_PENDING_TRIGGER_FAILED | "
-                                    "local=%s contract=%s — order monitor may cancel this order",
-                                    ticker, local_order_id, _arm_label,
-                                )
-                        else:
-                            log.error(
-                                "[%s] OVERNIGHT_ENTRY_PENDING_TRIGGER_FAILED | "
-                                "OSM missing mark_entry_pending_trigger | local=%s",
-                                ticker, local_order_id,
-                            )
-                    except Exception as _pt_err:
-                        log.error(
-                            "[%s] OVERNIGHT_ENTRY_PENDING_TRIGGER_ERROR | local=%s error=%s",
-                            ticker, local_order_id, _pt_err, exc_info=True,
-                        )
+                    # PENDING_TRIGGER was already set in Step 6b (pre-arm).
+                    # Second call removed — duplicate transition on same local_order_id.
 
                     _mark_job_watching_armed(job_id, client_id, _arm_label)
                     log.info(

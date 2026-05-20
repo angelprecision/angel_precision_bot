@@ -372,7 +372,7 @@ class APStartupRecovery:
                         with _conn() as c:
                             c.execute(
                                 "UPDATE positions SET status='OPEN', exit_reason=NULL, "
-                                "updated_at=NOW() WHERE id=%s AND client_id=%s",
+                                "updated_ts=NOW() WHERE id=%s AND client_id=%s",
                                 (pid, self.client_id),
                             )
                     run_with_retry(_revert)

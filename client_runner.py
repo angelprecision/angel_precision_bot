@@ -597,12 +597,15 @@ class ClientRunner(threading.Thread):
         return False
 
     def _is_market_hours_now(self) -> bool:
-        """True only during NYSE market hours Mon–Fri 9:25–16:05 ET."""
+        """True only during NYSE market hours Mon–Fri 9:30–16:05 ET.
+        NOTE: deliberately 9:30 not 9:25 — QPM may not have completed its
+        first heartbeat by 9:25, causing entries_allowed to stay False through
+        the most critical window of the day."""
         try:
             from zoneinfo import ZoneInfo
             from datetime import datetime as _dt, time as _t
             et = _dt.now(ZoneInfo("America/New_York"))
-            return _t(9, 25) <= et.time() <= _t(16, 5) and et.weekday() < 5
+            return _t(9, 30) <= et.time() <= _t(16, 5) and et.weekday() < 5
         except Exception:
             return True   # fail open — don't block entries on tz error
 
@@ -762,7 +765,13 @@ class ClientRunner(threading.Thread):
         if not _fill_ok:
             if _fill_dead_since is None:
                 self._fill_dead_since = time.time()
-            _fill_ok_for_entries = (time.time() - self._fill_dead_since) < 120
+            # Grace period env-tunable: FILL_MONITOR_GRACE_SEC.
+            # 300s default (was 120s) — Render cold starts with Supabase
+            # connection pooling can take 30-60s just for first DB connection.
+            # 120s was too tight: supervisor delay (15s) + runner init + QPM
+            # startup could exhaust the window before first heartbeat.
+            _fill_grace = int(os.getenv("FILL_MONITOR_GRACE_SEC", "300"))
+            _fill_ok_for_entries = (time.time() - self._fill_dead_since) < _fill_grace
         else:
             self._fill_dead_since = None
             _fill_ok_for_entries = True
@@ -2124,6 +2133,15 @@ def route_signal_to_all_clients(signal: dict):
     ticker = signal.get("ticker", "?")
 
     with _registry_lock:
+        # ── ROUTING GATE ────────────────────────────────────────────────
+        # A runner is eligible if it is alive, initialized, and not
+        # permanently failed/stopping. We deliberately do NOT gate on
+        # entries_allowed or degraded here — those are transient states
+        # (QPM not yet heartbeated, fill monitor starting up) and should
+        # not cause signals to be silently dropped. The signal goes into
+        # the durable queue and the runner processes it once entries_allowed
+        # recovers. Signals are only truly dropped if the runner is dead,
+        # stopping, or in a hard-failed state.
         active_emails = [
             email
             for email, runner in _active_runners.items()
@@ -2132,10 +2150,24 @@ def route_signal_to_all_clients(signal: dict):
                 and runner.initialized.is_set()
                 and not runner.stopping.is_set()
                 and not runner.failed.is_set()
-                and not runner.degraded.is_set()
-                and runner.entries_allowed.is_set()
             )
         ]
+        # Log a warning (not a drop) if entries are temporarily blocked
+        for email, runner in _active_runners.items():
+            if (
+                runner.is_alive()
+                and runner.initialized.is_set()
+                and not runner.stopping.is_set()
+                and not runner.failed.is_set()
+                and (runner.degraded.is_set() or not runner.entries_allowed.is_set())
+            ):
+                logger.warning(
+                    "ROUTE_WARN [%s]: runner alive but entries_allowed=%s degraded=%s — "
+                    "signal queued anyway, will execute when gate clears",
+                    email,
+                    runner.entries_allowed.is_set(),
+                    runner.degraded.is_set(),
+                )
 
     if not active_emails:
         if not ALLOW_SUPABASE_FANOUT_FALLBACK:
