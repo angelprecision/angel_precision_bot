@@ -2,13 +2,17 @@ name: Overnight Reeval
 
 on:
   schedule:
-    # 9:03 AM ET (13:03 UTC) — primary. Avoids :00 high-load minute on GitHub.
-    # Bot-side health loop also fires within 20s of 9:00 AM ET independently.
+    # 9:03 AM ET (13:03 UTC EDT / 14:03 UTC EST) — primary
+    # GitHub Actions cron can be delayed 5-30 min on high-traffic minutes.
+    # All scheduled runs use force=true so a delayed runner never gets
+    # blocked by the bot's 9:00-9:45 AM ET window guard.
     - cron: "3 13 * * 1-5"
-    # 9:11 AM ET (13:11 UTC) — backup in case primary runner was queued/delayed.
+    # 9:11 AM ET backup
     - cron: "11 13 * * 1-5"
-    # 9:19 AM ET (13:19 UTC) — final safety net. Still inside 9:00-9:25 window.
+    # 9:19 AM ET final safety net
     - cron: "19 13 * * 1-5"
+    # 9:33 AM ET extra net — catches GitHub delays past 9:30
+    - cron: "33 13 * * 1-5"
   workflow_dispatch:
     inputs:
       force:
@@ -24,18 +28,22 @@ jobs:
     steps:
       - name: Trigger overnight reeval (HMAC signed)
         run: |
-          # Scheduled runs never force — they run in the 9:00-9:45 AM ET window
-          # where the time guard is already satisfied.
-          # Manual dispatch uses the input; default is false to prevent
-          # accidentally consuming WATCHING signals outside trading hours.
-          FORCE_FLAG="${{ github.event.inputs.force || 'false' }}"
+          # Scheduled runs always force=true — GitHub Actions delays can push
+          # the run past the bot's time window, causing silent skips.
+          # force=true bypasses the window guard so delayed runs still fire.
+          IS_SCHEDULED="${{ github.event_name == 'schedule' }}"
+          if [ "$IS_SCHEDULED" = "true" ]; then
+            FORCE_FLAG="true"
+          else
+            FORCE_FLAG="${{ github.event.inputs.force || 'false' }}"
+          fi
+
           BODY="{\"force\": ${FORCE_FLAG}}"
 
           TS=$(date +%s)
           BOT_URL="${{ secrets.AP_BOT_URL }}"
           SIGNING_SECRET="${{ secrets.AP_SIGNING_SECRET }}"
 
-          # Compute HMAC: SHA256(timestamp.body)
           SIG=$(printf "%s.%s" "$TS" "$BODY" | \
             openssl dgst -sha256 -hmac "$SIGNING_SECRET" -hex | \
             sed 's/^.* //')
