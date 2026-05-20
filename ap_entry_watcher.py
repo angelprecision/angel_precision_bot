@@ -1126,7 +1126,8 @@ class APEntryWatcher:
                                 "last_error=%s",
                                 w.ticker, exc,
                             )
-                            w.expire(reason="on_trigger_exhausted_3_attempts")
+                            w.state = WatchState.EXPIRED
+                            w._release_dedup_key()
                             if _sig_id and _ticker:
                                 _ew_record(_sig_id, _ticker, "EXPIRED",
                                            "on_trigger_exhausted_3_attempts")
