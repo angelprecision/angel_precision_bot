@@ -78,7 +78,9 @@ WRONG_DIR_BUFFER_PCT = 0.001
 OVERNIGHT_THRESHOLD_HOUR = 15
 OVERNIGHT_THRESHOLD_MIN = 30
 
-MAX_INTRADAY_WATCH_MIN = 5
+MAX_INTRADAY_WATCH_MIN = int(os.getenv("MAX_INTRADAY_WATCH_MIN", "45"))
+# Default 45 min: watcher stays armed for 45 minutes after breach.
+# Was hardcoded 5 — too short for slow-moving setups. Env-tunable.
 MAX_INTRADAY_DRIFT_PCT = 0.015
 OVERNIGHT_MAX_DRIFT_PCT = 0.020  # generic/non-daily overnight drift guard
 
@@ -1095,12 +1097,42 @@ class APEntryWatcher:
                                contract=str(w.signal.get("contract_symbol", "")),
                                entry_trigger=str(w.entry_trigger or ""))
                 if self.on_trigger:
+                    # Retry on_trigger up to 3 times before expiring.
+                    # A transient Tradier timeout or DB hiccup at breach time
+                    # must not permanently kill a valid setup. On all 3 failures
+                    # the signal is expired with a clear reason — not silently lost.
+                    _trigger_attempts = getattr(w, "_trigger_attempts", 0)
                     try:
                         self.on_trigger(w)
+                        w._trigger_attempts = 0   # reset on success
                     except Exception as exc:
-                        log.error("[%s] on_trigger callback failed: %s", w.ticker, exc, exc_info=True)
+                        _trigger_attempts += 1
+                        w._trigger_attempts = _trigger_attempts
+                        log.error(
+                            "[%s] on_trigger callback failed (attempt %d/3): %s",
+                            w.ticker, _trigger_attempts, exc, exc_info=True,
+                        )
+                        if _trigger_attempts < 3:
+                            # Do NOT release dedup key — keep watcher armed for next poll
+                            log.warning(
+                                "[%s] TRIGGER_RETRY — will retry on next poll cycle (attempt %d/3)",
+                                w.ticker, _trigger_attempts,
+                            )
+                            continue  # stay in poll loop, retry on next tick
+                        else:
+                            # 3 failures — expire cleanly with reason
+                            log.error(
+                                "[%s] TRIGGER_EXHAUSTED — 3 on_trigger failures, expiring signal | "
+                                "last_error=%s",
+                                w.ticker, exc,
+                            )
+                            w.expire(reason="on_trigger_exhausted_3_attempts")
+                            if _sig_id and _ticker:
+                                _ew_record(_sig_id, _ticker, "EXPIRED",
+                                           "on_trigger_exhausted_3_attempts")
                     finally:
-                        w._release_dedup_key()
+                        if getattr(w, "_trigger_attempts", 0) == 0 or getattr(w, "_trigger_attempts", 0) >= 3:
+                            w._release_dedup_key()
                 else:
                     log.error("[%s] TRIGGERED but no on_trigger callback is wired", w.ticker)
                     w._release_dedup_key()
