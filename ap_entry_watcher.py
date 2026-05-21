@@ -69,15 +69,23 @@ def _ew_record(signal_id: str, ticker: str, to_state_name: str, reason: str, **m
 
 log = logging.getLogger("ap.entry_watcher")
 
-# FUNNEL FIX (2026-05-20): pre-open helper for the stop-touch invalidation guard.
-# Used in WatchedSignal.check() to skip pre-market stop-touch invalidation for
-# overnight/daily setups (thin pre-open spreads can spike below stop transiently).
+# FUNNEL FIX (2026-05-20, hardened 2026-05-21):
+# Pre-open helper for the stop-touch invalidation guard. Returns True from
+# midnight ET through 9:30 ET (pre-market) AND through the 5-min open-protect
+# window (9:30–9:35 ET) — spreads remain wide during the open protect window,
+# transient bid-below-stop ticks should not invalidate overnight/daily setups.
 def _is_pre_market_now() -> bool:
     try:
         from datetime import datetime as _dt
         from zoneinfo import ZoneInfo as _ZI
         et = _dt.now(_ZI("America/New_York"))
-        return et.hour < 9 or (et.hour == 9 and et.minute < 30)
+        # Pre-9:30 → pre-market
+        if et.hour < 9 or (et.hour == 9 and et.minute < 30):
+            return True
+        # 9:30–9:35 → open-protect window: still wide spreads, treat as pre-open
+        if et.hour == 9 and 30 <= et.minute < 35:
+            return True
+        return False
     except Exception:
         return False
 ET = ZoneInfo("America/New_York")
@@ -96,7 +104,7 @@ MAX_INTRADAY_WATCH_MIN = int(os.getenv("MAX_INTRADAY_WATCH_MIN", "45"))
 MAX_INTRADAY_DRIFT_PCT = 0.015
 
 # ============================================================
-# FUNNEL FIX (2026-05-20) — dedicated arm-time tolerance.
+# FUNNEL FIX (2026-05-20, hardened 2026-05-21) — dedicated arm-time tolerance.
 #
 # Production observed 12/29 orders today rejected with
 # 'watch_arm_failed:stale_price_-0.X%_from_trigger' at deltas of 0.0–0.4%.
@@ -106,25 +114,40 @@ MAX_INTRADAY_DRIFT_PCT = 0.015
 #       reject reason string only captures pct_from_trigger — making it look
 #       like a drift reject even when it's actually a too-close stop reject.
 #
-# Fix:
-#   - WATCH_ARM_STALE_TOLERANCE_PCT (default 1.0%) is env-tunable so ops can
-#     loosen without a redeploy.
-#   - Effective threshold = max(env, hard-coded raw). Env can only LOOSEN,
-#     never silently TIGHTEN below the safe 1.5% raw default.
+# Hardened logic:
+#   - WATCH_ARM_STALE_TOLERANCE_PCT (default 0.010 = 1.0%) is env-tunable.
+#   - Env actually controls the threshold (replaces the previous max() floor
+#     which prevented the env from ever loosening below 1.5%).
+#   - Safety bounds: minimum 0.001 (0.1%), maximum 0.05 (5%) — protects
+#     against fat-finger env values that would either kill all signals (too
+#     tight) or admit garbage (too loose).
 #   - Reject reason now distinguishes 'arm_drift_X%' from 'arm_below_stop'
 #     so we can tell which gate fired in post-mortem analysis.
 # ============================================================
 try:
-    WATCH_ARM_STALE_TOLERANCE_PCT = float(
-        os.getenv("WATCH_ARM_STALE_TOLERANCE_PCT", "0.010")  # 1.0%
-    )
+    _raw_tol = float(os.getenv("WATCH_ARM_STALE_TOLERANCE_PCT", "0.010"))
+    # Safety bounds — env can loosen but cannot become absurd.
+    WATCH_ARM_STALE_TOLERANCE_PCT = max(0.001, min(0.05, _raw_tol))
+    if _raw_tol != WATCH_ARM_STALE_TOLERANCE_PCT:
+        # Will be visible at startup so operator knows env was clamped.
+        _clamp_warn = True
+    else:
+        _clamp_warn = False
 except (TypeError, ValueError):
     WATCH_ARM_STALE_TOLERANCE_PCT = 0.010
+    _clamp_warn = False
 
-# Effective threshold used at arm-time: the larger of env-tunable and the safe
-# hard-coded default. Env can only loosen, never tighten.
-WATCH_ARM_EFFECTIVE_THRESHOLD_PCT = max(WATCH_ARM_STALE_TOLERANCE_PCT, MAX_INTRADAY_DRIFT_PCT)
+# Effective threshold used at arm-time. The env value IS the threshold.
+# (Previously this was max(env, MAX_INTRADAY_DRIFT_PCT) which prevented env
+# from loosening below 1.5% — defeating the purpose of the env knob.)
+WATCH_ARM_EFFECTIVE_THRESHOLD_PCT = WATCH_ARM_STALE_TOLERANCE_PCT
 
+if _clamp_warn:
+    log.warning(
+        "[entry-watcher] WATCH_ARM_STALE_TOLERANCE_PCT was clamped to safety "
+        "bounds [0.001, 0.05]; effective=%.4f",
+        WATCH_ARM_EFFECTIVE_THRESHOLD_PCT,
+    )
 log.info(
     "[entry-watcher] thresholds loaded: "
     "MAX_INTRADAY_DRIFT_PCT=%.4f WATCH_ARM_STALE_TOLERANCE_PCT=%.4f effective=%.4f",

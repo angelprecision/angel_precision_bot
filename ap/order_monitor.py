@@ -319,26 +319,27 @@ class APOrderMonitor:
                     )
 
                 if age_secs > TIMEOUT_CREATED:
-                    # FUNNEL FIX (2026-05-20): enrich cancel reason with full
-                    # forensic context so the operator can trace the missed
-                    # handoff. Previously the reason string was opaque and we
-                    # couldn't tell whether the watcher fell off, the OSM
-                    # transition failed, or the trigger callback never fired.
-                    _meta = order.get("meta") or {}
-                    _sig_id = (_meta.get("signal_id")
-                               if isinstance(_meta, dict) else None) or "?"
-                    _src = (_meta.get("source") if isinstance(_meta, dict) else None) or "?"
+                    # FUNNEL FIX (2026-05-20, hardened 2026-05-21):
+                    # Enrich cancel reason with full forensic context so the
+                    # operator can trace the missed handoff. Reads signal_id
+                    # directly from the order row (added to SELECT in the
+                    # post-merge correction). The earlier `order.get("meta")`
+                    # version was inert because the orders table has no meta
+                    # column — every LOST_HANDOFF logged signal_id=? in
+                    # production. This version resolves the real signal_id.
+                    _sig_id = order.get("signal_id") or "?"
+                    _plan_id = order.get("plan_id") or "?"
                     _enriched_reason = (
                         f"LOST_HANDOFF: CREATED for {age_secs:.0f}s > {TIMEOUT_CREATED}s — "
-                        f"never submitted (signal_id={_sig_id} source={_src} "
+                        f"never submitted (signal_id={_sig_id} plan_id={_plan_id} "
                         f"broker_order_id={broker_oid or 'null'}); "
                         f"watcher likely fell off or on_trigger never fired"
                     )
                     log.warning(
                         "[%s] LOST_HANDOFF | local=%s contract=%s age=%.0fs "
-                        "signal_id=%s source=%s broker_oid=%s",
+                        "signal_id=%s plan_id=%s broker_oid=%s",
                         self.client_id, local_id, contract, age_secs,
-                        _sig_id, _src, broker_oid or "null",
+                        _sig_id, _plan_id, broker_oid or "null",
                     )
                     self._handle_stale_entry(
                         local_id, status, contract, age_secs,
@@ -1268,7 +1269,8 @@ class APOrderMonitor:
                 c.execute(
                     """
                     SELECT local_order_id, broker_order_id, status, symbol,
-                           contract, position_id, created_ts, submitted_ts,
+                           contract, position_id, signal_id, plan_id,
+                           created_ts, submitted_ts,
                            limit_price,
                            limit_price AS price,
                            fill_price
