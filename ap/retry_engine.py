@@ -314,6 +314,9 @@ def apply_repeg(
         return False
 
     # Step 3: submit the NEW order at the new limit price.
+    # Pass local_oid as tag so the broker-side record is tied to our ID — if
+    # this submit times out mid-response, the next reconciler pass can find
+    # the order by tag instead of double-submitting.
     try:
         resp = broker.place_order(
             symbol=symbol,
@@ -321,6 +324,7 @@ def apply_repeg(
             qty=qty,
             limit_price=decision.new_limit_price,
             side="buy_to_open",
+            tag=str(local_oid),
         )
     except Exception as e:
         log.error("[%s] REPEG_RESUBMIT_FAILED local=%s err=%s", client_id, local_oid, e)

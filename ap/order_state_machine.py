@@ -1321,20 +1321,21 @@ class APOrderStateMachine:
                       or getattr(getattr(broker, "cfg", None), "account_id", None)
                       or "")
         error_msg = broker_order_id = None
-        try:
-            resp = broker.session.post(
-                f"{base_url}/v1/accounts/{account_id}/orders",
-                data={
-                    "class": "option", "symbol": ticker, "option_symbol": contract,
-                    "side": "buy_to_open", "quantity": qty,
-                    "type": "limit", "price": round(lp, 2), "duration": "day",
-                },
-                headers={"Accept": "application/json"},
-                timeout=10,
-            )
-            order          = (resp.json() or {}).get("order") or {}
-            broker_status  = str(order.get("status") or "").lower().strip()
-            broker_order_id = order.get("id") or order.get("order_id")
+        # Build order payload with Tradier 'tag' for idempotency on retry.
+        # tag MUST be local_order_id so _lookup_order_by_tag can recover from
+        # ambiguous broker responses (read timeout, JSON parse fail) without
+        # double-submitting.
+        _order_data = {
+            "class": "option", "symbol": ticker, "option_symbol": contract,
+            "side": "buy_to_open", "quantity": qty,
+            "type": "limit", "price": round(lp, 2), "duration": "day",
+            "tag": str(local_order_id)[:32],
+        }
+        order, error_msg, broker_order_id, broker_status = self._submit_order_with_retry(
+            broker=broker, base_url=base_url, account_id=account_id,
+            order_data=_order_data, local_id=local_order_id, op_label="existing_entry",
+        )
+        if error_msg is None:
             if self._is_broker_accept_status(broker_status) and broker_order_id:
                 ok = self.transition(local_order_id, OrderStatus.SUBMITTED,
                                      broker_order_id=broker_order_id, submitted_ts=now_utc_iso())
@@ -1351,8 +1352,6 @@ class APOrderStateMachine:
             else:
                 error_msg = (f"broker_status:{broker_status or 'unknown'} "
                              f"broker_order_id_missing:{not bool(broker_order_id)}")
-        except Exception as e:
-            error_msg = f"broker_error:{e}"
 
         # AUDIT-7: include broker rejection reason in observability event so
         # structured audit trail captures WHY Tradier rejected the order.
@@ -1371,6 +1370,178 @@ class APOrderStateMachine:
         )
         return {"ok": False, "local_order_id": local_order_id, "broker_order_id": broker_order_id,
                 "status": OrderStatus.ERROR, "error": error_msg}
+
+    def _submit_order_with_retry(
+        self,
+        *,
+        broker,
+        base_url: str,
+        account_id: str,
+        order_data: dict,
+        local_id: str,
+        op_label: str = "entry",
+    ):
+        """Safe broker order submission with retry + tag-based idempotency.
+
+        Returns (order_dict, error_msg, broker_order_id, status).
+        On success: error_msg is None, order_dict contains broker payload.
+        On failure: order_dict is None, error_msg describes the terminal failure.
+
+        Used by submit_entry, submit_existing_entry, and (via inline copy)
+        submit_exit. Same classified-retry pattern as submit_exit:
+
+          RETRYABLE (max 3 attempts, exponential backoff 1s/2s/4s):
+            - Connection error (request never reached broker)
+            - 5xx server errors
+            - 429 rate limit
+
+          AMBIGUOUS (order MAY have landed — tag-lookup before retry):
+            - ReadTimeout (POST sent, response lost)
+            - JSON parse failure mid-response
+
+          PERMANENT (no retry):
+            - 4xx (not 429): bad symbol, auth failure, etc.
+
+        Pre-condition: order_data["tag"] MUST be set to local_id by caller.
+        """
+        try:
+            import requests as _requests
+            _ConnectionError  = _requests.exceptions.ConnectionError
+            _ReadTimeout      = _requests.exceptions.ReadTimeout
+            _ConnectTimeout   = _requests.exceptions.ConnectTimeout
+            _RequestException = _requests.exceptions.RequestException
+        except Exception:
+            _ConnectionError = _ReadTimeout = _ConnectTimeout = _RequestException = Exception
+
+        _max_attempts   = 3
+        _backoff_base_s = 1.0
+        _post_url       = f"{base_url}/v1/accounts/{account_id}/orders"
+        error_msg       = None
+        order           = {}
+        broker_order_id = None
+        status          = ""
+
+        for _attempt in range(1, _max_attempts + 1):
+            try:
+                resp = broker.session.post(
+                    _post_url,
+                    data=order_data,
+                    headers={"Accept": "application/json"},
+                    timeout=10,
+                )
+                _sc = getattr(resp, "status_code", None)
+
+                if _sc is not None and 400 <= _sc < 500 and _sc != 429:
+                    # PERMANENT REJECT — do not retry
+                    try:
+                        _body_snip = (resp.text or "")[:200]
+                    except Exception:
+                        _body_snip = "<body unreadable>"
+                    error_msg = f"broker_http_{_sc}:{_body_snip}"
+                    log.error(
+                        "[%s] submit_%s PERMANENT REJECT | local=%s http=%s body=%s",
+                        self.client_id, op_label, local_id, _sc, _body_snip,
+                    )
+                    return None, error_msg, None, ""
+
+                if _sc is not None and (_sc >= 500 or _sc == 429):
+                    error_msg = f"broker_http_{_sc}_retryable"
+                    log.warning(
+                        "[%s] submit_%s retryable HTTP %s | local=%s attempt=%d/%d",
+                        self.client_id, op_label, _sc, local_id, _attempt, _max_attempts,
+                    )
+                    if _attempt < _max_attempts:
+                        _time_module.sleep(_backoff_base_s * (2 ** (_attempt - 1)))
+                        continue
+                    return None, error_msg, None, ""
+
+                # 2xx — parse JSON
+                try:
+                    order = (resp.json() or {}).get("order") or {}
+                except Exception as _je:
+                    # AMBIGUOUS — 2xx but unparseable. Order may have landed.
+                    log.warning(
+                        "[%s] submit_%s JSON parse failed | local=%s attempt=%d err=%s",
+                        self.client_id, op_label, local_id, _attempt, _je,
+                    )
+                    _existing_oid = self._lookup_order_by_tag(
+                        broker, base_url, account_id, str(local_id),
+                    )
+                    if _existing_oid:
+                        log.info(
+                            "[%s] submit_%s AMBIGUOUS but found by tag | "
+                            "local=%s broker_order_id=%s — treating as success",
+                            self.client_id, op_label, local_id, _existing_oid,
+                        )
+                        order = {"id": _existing_oid, "status": "open"}
+                    else:
+                        error_msg = f"broker_ambiguous_parse:{_je}"
+                        if _attempt < _max_attempts:
+                            _time_module.sleep(_backoff_base_s * (2 ** (_attempt - 1)))
+                            continue
+                        return None, error_msg, None, ""
+
+                status          = str(order.get("status") or "").lower().strip()
+                broker_order_id = order.get("id") or order.get("order_id")
+                return order, None, broker_order_id, status
+
+            except (_ConnectTimeout, _ConnectionError) as _ce:
+                # RETRYABLE_CONN — request did not reach broker, safe to retry
+                error_msg = f"broker_conn_error:{_ce}"
+                log.warning(
+                    "[%s] submit_%s conn error | local=%s attempt=%d/%d err=%s",
+                    self.client_id, op_label, local_id, _attempt, _max_attempts, _ce,
+                )
+                if _attempt < _max_attempts:
+                    _time_module.sleep(_backoff_base_s * (2 ** (_attempt - 1)))
+                    continue
+                return None, error_msg, None, ""
+
+            except _ReadTimeout as _rt:
+                # AMBIGUOUS — Tradier got it, response lost. Query by tag.
+                log.warning(
+                    "[%s] submit_%s READ TIMEOUT (ambiguous) | local=%s attempt=%d err=%s",
+                    self.client_id, op_label, local_id, _attempt, _rt,
+                )
+                _existing_oid = self._lookup_order_by_tag(
+                    broker, base_url, account_id, str(local_id),
+                )
+                if _existing_oid:
+                    log.info(
+                        "[%s] submit_%s RECOVERED from read timeout via tag | "
+                        "local=%s broker_order_id=%s",
+                        self.client_id, op_label, local_id, _existing_oid,
+                    )
+                    return ({"id": _existing_oid, "status": "open"}, None,
+                            _existing_oid, "open")
+                error_msg = f"broker_read_timeout:{_rt}"
+                if _attempt < _max_attempts:
+                    _time_module.sleep(_backoff_base_s * (2 ** (_attempt - 1)))
+                    continue
+                return None, error_msg, None, ""
+
+            except _RequestException as _re:
+                error_msg = f"broker_request_error:{_re}"
+                log.warning(
+                    "[%s] submit_%s request error | local=%s attempt=%d/%d err=%s",
+                    self.client_id, op_label, local_id, _attempt, _max_attempts, _re,
+                )
+                if _attempt < _max_attempts:
+                    _time_module.sleep(_backoff_base_s * (2 ** (_attempt - 1)))
+                    continue
+                return None, error_msg, None, ""
+
+            except Exception as _e:
+                # Unknown — do not retry, do not assume safe
+                error_msg = f"broker_error:{_e}"
+                log.error(
+                    "[%s] submit_%s unexpected error | local=%s attempt=%d err=%s",
+                    self.client_id, op_label, local_id, _attempt, _e,
+                )
+                return None, error_msg, None, ""
+
+        # Loop fell through without explicit return — defensive
+        return None, error_msg or "submit_exhausted_no_return", None, ""
 
     def submit_entry(
         self,
@@ -1396,20 +1567,17 @@ class APOrderStateMachine:
                       or getattr(getattr(broker, "cfg", None), "account_id", None)
                       or "")
         error_msg = broker_order_id = None
-        try:
-            resp = broker.session.post(
-                f"{base_url}/v1/accounts/{account_id}/orders",
-                data={
-                    "class": "option", "symbol": plan.ticker, "option_symbol": symbol,
-                    "side": "buy_to_open", "quantity": int(plan.contracts),
-                    "type": "limit", "price": round(lp, 2), "duration": "day",
-                },
-                headers={"Accept": "application/json"},
-                timeout=10,
-            )
-            order           = (resp.json() or {}).get("order") or {}
-            status          = str(order.get("status") or "").lower().strip()
-            broker_order_id = order.get("id") or order.get("order_id")
+        _order_data = {
+            "class": "option", "symbol": plan.ticker, "option_symbol": symbol,
+            "side": "buy_to_open", "quantity": int(plan.contracts),
+            "type": "limit", "price": round(lp, 2), "duration": "day",
+            "tag": str(local_id)[:32],
+        }
+        order, error_msg, broker_order_id, status = self._submit_order_with_retry(
+            broker=broker, base_url=base_url, account_id=account_id,
+            order_data=_order_data, local_id=local_id, op_label="entry",
+        )
+        if error_msg is None:
             if self._is_broker_accept_status(status) and broker_order_id:
                 ok = self.transition(local_id, OrderStatus.SUBMITTED,
                                      broker_order_id=broker_order_id, submitted_ts=now_utc_iso())
@@ -1438,8 +1606,6 @@ class APOrderStateMachine:
             else:
                 error_msg = (f"broker_status:{status or 'unknown'} "
                              f"broker_order_id_missing:{not bool(broker_order_id)}")
-        except Exception as e:
-            error_msg = f"broker_error:{e}"
 
         # AUDIT-7: broker rejection reason in observability
         self.transition(local_id, OrderStatus.ERROR, last_error=error_msg or "unknown_error")

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import requests
 from dataclasses import dataclass
 from typing import Optional, Dict, Any, List
@@ -182,10 +183,16 @@ class TradierBroker(BrokerAdapter):
         qty: int,
         limit_price: Optional[float],
         side: str = "buy_to_open",
+        *,
+        tag: Optional[str] = None,
     ) -> BrokerOrderResponse:
         """
         Places an option order.
         Returns BrokerOrderResponse (ACK/REJECTED with broker order id).
+
+        `tag` is forwarded to Tradier for client-side idempotency. On retry,
+        the caller can query orders by tag to detect whether a prior attempt
+        landed before the response was lost (avoiding double-submit).
         """
         side = (side or "buy_to_open").lower().strip()
 
@@ -200,6 +207,9 @@ class TradierBroker(BrokerAdapter):
         }
         if limit_price is not None:
             data["price"] = f"{float(limit_price):.2f}"
+        if tag:
+            # Tradier accepts tag (max 32 chars). Trim defensively.
+            data["tag"] = str(tag)[:32]
 
         if os.getenv("TRADIER_DEBUG_ORDERS", "0") == "1":
             log.info(

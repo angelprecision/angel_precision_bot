@@ -121,6 +121,8 @@ class BrokerAdapter:
         qty: int,
         limit_price: Optional[float],
         side: str = "buy_to_open",
+        *,
+        tag: Optional[str] = None,
     ) -> BrokerOrderResponse:
         raise NotImplementedError
 
@@ -202,6 +204,8 @@ class SimBroker(BrokerAdapter):
         qty: int,
         limit_price: Optional[float],
         side: str = "buy_to_open",
+        *,
+        tag: Optional[str] = None,
     ) -> BrokerOrderResponse:
         broker_order_id = f"SIM-{symbol}-{random.randint(100000,999999)}"
         fill_price = float(limit_price) if limit_price is not None else round(random.uniform(0.8, 1.2), 2)
