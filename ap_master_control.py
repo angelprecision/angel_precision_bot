@@ -604,11 +604,20 @@ class APMasterControl:
         capital is part of the hard capital gate. The status list is intentionally
         canonical and aligned with OSM/PositionManager so fallback risk math cannot
         drift from the snapshot truth path.
+
+        P0 FIX (2026-05-21): exclude phantom orders. A CREATED/PENDING_TRIGGER
+        order older than PENDING_ENTRY_PHANTOM_GRACE_SEC (default 30s) with no
+        broker_order_id never reached the broker and is not real exposure. Without
+        this exclusion, a single stale CREATED row from a prior session can pin
+        projected_total above max_capital forever — observed in production
+        2026-05-21 blocking 113 consecutive signals for tradefluencehq.
         """
         try:
             from ap.db import conn, run_with_retry
+            import os as _os
 
             statuses = tuple(sorted(_ENTRY_CAPITAL_RESERVED_STATUSES))
+            _phantom_grace_sec = int(_os.getenv("PENDING_ENTRY_PHANTOM_GRACE_SEC", "30"))
 
             def _fn():
                 with conn() as c:
@@ -629,8 +638,13 @@ class APMasterControl:
                           AND kind = 'ENTRY'
                           AND UPPER(COALESCE(status, '')) = ANY(%s)
                           AND UPPER(COALESCE(status, '')) NOT IN ('CANCELLED', 'CANCELED', 'REJECTED', 'ERROR', 'FAILED', 'FILLED', 'CLOSED')
+                          AND NOT (
+                            UPPER(COALESCE(status, '')) IN ('CREATED', 'PENDING_TRIGGER')
+                            AND (broker_order_id IS NULL OR broker_order_id = '')
+                            AND created_ts < NOW() - (%s || ' seconds')::interval
+                          )
                         """,
-                        (client_id, list(statuses)),
+                        (client_id, list(statuses), str(_phantom_grace_sec)),
                     )
                     row = c.fetchone()
                     pending_capital = float((row or {}).get("pending_capital") or 0)
@@ -649,8 +663,13 @@ class APMasterControl:
                               AND UPPER(COALESCE(status, '')) NOT IN ('CANCELLED', 'CANCELED', 'REJECTED', 'ERROR', 'FAILED', 'FILLED', 'CLOSED')
                               AND (reserved_cost IS NULL OR reserved_cost <= 0)
                               AND (limit_price IS NULL OR limit_price <= 0)
+                              AND NOT (
+                                UPPER(COALESCE(status, '')) IN ('CREATED', 'PENDING_TRIGGER')
+                                AND (broker_order_id IS NULL OR broker_order_id = '')
+                                AND created_ts < NOW() - (%s || ' seconds')::interval
+                              )
                             """,
-                            (client_id, list(statuses)),
+                            (client_id, list(statuses), str(_phantom_grace_sec)),
                         )
                         missing = int((c.fetchone() or {}).get("missing_cost") or 0)
                         if missing > 0:

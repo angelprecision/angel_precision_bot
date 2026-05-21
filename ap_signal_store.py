@@ -12,11 +12,49 @@ from __future__ import annotations
 
 import logging
 import queue
+import re
 import threading
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 
 log = logging.getLogger("ap.signal_store")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# REEVAL: signal_id resolution
+# ─────────────────────────────────────────────────────────────────────────────
+# overnight_reeval.py wraps the original signal_id with REEVAL:<uuid>:<hex6>
+# so master_control dedup treats each per-client re-evaluation as fresh. But
+# the ap_signals.signal_id column is type UUID — writing the wrapped form
+# raises Postgres 22P02 ("invalid input syntax for type uuid").
+#
+# All persistence into ap_signals must use the ORIGINAL UUID (the row that
+# was originally inserted by the scanner). The REEVAL wrapping is only an
+# in-memory dedup key, never a database column value.
+#
+# Pattern:  REEVAL:<uuid>:<6-hex-chars>
+# Strip to: <uuid>
+_REEVAL_PREFIX_RE = re.compile(
+    r"^REEVAL:([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})(?::[0-9a-fA-F]+)?$"
+)
+
+
+def canonical_signal_id(signal_id: str) -> str:
+    """Return the underlying UUID for ap_signals writes.
+
+    For a plain UUID, returns it unchanged. For a REEVAL:<uuid>:<hex>
+    wrapped ID, returns just the UUID part.
+
+    Examples:
+        '8d9338d0-5dde-4b7b-81ea-208039999b72'                  -> unchanged
+        'REEVAL:8d9338d0-...:f4dc44'                            -> '8d9338d0-...'
+    """
+    if not isinstance(signal_id, str):
+        return signal_id
+    m = _REEVAL_PREFIX_RE.match(signal_id)
+    if m:
+        return m.group(1)
+    return signal_id
 
 
 class APSignalStore:
@@ -72,8 +110,14 @@ class APSignalStore:
         Upsert a new row into ap_signals.
         Uses upsert (not insert) so retries and duplicate event delivery are safe.
         """
+        # P0 FIX (2026-05-21): canonicalize signal_id for the DB write.
+        # REEVAL:<uuid>:<hex> wrapped IDs would fail with Postgres 22P02 because
+        # the ap_signals.signal_id column is type UUID. The REEVAL wrapping is
+        # an in-memory dedup key only; the row in ap_signals is keyed by the
+        # original UUID.
+        db_signal_id = canonical_signal_id(signal_id)
         payload = {
-            "signal_id":            signal_id,
+            "signal_id":            db_signal_id,
             "client_email":         self.client_email or None,
             "system_version":       self.system_version,
             "ticker":               signal.get("ticker"),
@@ -117,10 +161,13 @@ class APSignalStore:
         # FIX: use `is not None` so an empty string explicitly clears the field
         if context_notes is not None:
             patch["context_notes"] = context_notes
+        # P0 FIX (2026-05-21): canonicalize signal_id for the .eq filter so
+        # REEVAL: wrapped IDs target the underlying ap_signals row (UUID column).
+        db_signal_id = canonical_signal_id(signal_id)
         # HIGH-015: bind by default parameter to avoid lambda closure bug
         self._enqueue(
             signal_id, f"status_{status}",
-            lambda p=patch, sid=signal_id: self.sb.table("ap_signals").update(p).eq("signal_id", sid).execute(),
+            lambda p=patch, sid=db_signal_id: self.sb.table("ap_signals").update(p).eq("signal_id", sid).execute(),
         )
 
     def update_signal_fields(
@@ -141,15 +188,20 @@ class APSignalStore:
         patch = dict(updates)
         if timestamp_flag:
             patch[timestamp_flag] = datetime.now(timezone.utc).isoformat()
+        # P0 FIX (2026-05-21): canonicalize signal_id for the .eq filter.
+        db_signal_id = canonical_signal_id(signal_id)
         # HIGH-015: bind by default parameter to avoid lambda closure bug
         self._enqueue(
             signal_id, "update_signal_fields",
-            lambda p=patch, sid=signal_id: self.sb.table("ap_signals").update(p).eq("signal_id", sid).execute(),
+            lambda p=patch, sid=db_signal_id: self.sb.table("ap_signals").update(p).eq("signal_id", sid).execute(),
         )
 
     def insert_option_outcome(self, signal_id: str, outcome: dict[str, Any]):
         """Upsert a row into ap_signal_option_outcomes."""
-        row = {"signal_id": signal_id, **outcome}
+        # P0 FIX (2026-05-21): canonicalize signal_id so foreign-key
+        # references point at the underlying ap_signals UUID.
+        db_signal_id = canonical_signal_id(signal_id)
+        row = {"signal_id": db_signal_id, **outcome}
         # HIGH-015: bind by default parameter to avoid lambda closure bug
         self._enqueue(
             signal_id, "option_outcome",
@@ -158,7 +210,10 @@ class APSignalStore:
 
     def upsert_underlying_outcome(self, signal_id: str, outcome: dict[str, Any]):
         """Upsert a row into ap_signal_underlying_outcomes."""
-        row = {"signal_id": signal_id, **outcome}
+        # P0 FIX (2026-05-21): canonicalize signal_id so foreign-key
+        # references point at the underlying ap_signals UUID.
+        db_signal_id = canonical_signal_id(signal_id)
+        row = {"signal_id": db_signal_id, **outcome}
         # HIGH-015: bind by default parameter to avoid lambda closure bug
         self._enqueue(
             signal_id, "underlying_outcome",

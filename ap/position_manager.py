@@ -373,8 +373,22 @@ class APPositionManager:
         return run_with_retry(_fn)
 
     def has_pending_entry(self, ticker: str) -> bool:
+        # P0 FIX (2026-05-21): apply the same phantom-grace exclusion that
+        # snapshot() uses. Without this, a CREATED order from a previous day
+        # that never made it to the broker (no broker_order_id, lost handoff)
+        # would block every future signal on this ticker FOREVER, because the
+        # row sits in CREATED status until the order_monitor's 120s watchdog
+        # cleans it up — and across restarts that watchdog may not re-process
+        # historical phantoms.
+        #
+        # Phantom rule (matches snapshot() in this file):
+        #   exclude orders that are simultaneously
+        #     - status in (CREATED, PENDING_TRIGGER), AND
+        #     - no broker_order_id, AND
+        #     - older than PENDING_ENTRY_PHANTOM_GRACE_SEC (default 30s)
         def _fn():
             with conn() as c:
+                _phantom_grace_sec = int(os.getenv("PENDING_ENTRY_PHANTOM_GRACE_SEC", "30"))
                 placeholders = ",".join(["%s"] * len(_PENDING_ENTRY_STATUSES))
                 c.execute(
                     f"""
@@ -384,10 +398,15 @@ class APPositionManager:
                       AND symbol=%s
                       AND kind='ENTRY'
                       AND status IN ({placeholders})
+                      AND NOT (
+                        status IN ('CREATED', 'PENDING_TRIGGER')
+                        AND (broker_order_id IS NULL OR broker_order_id = '')
+                        AND created_ts < NOW() - (%s || ' seconds')::interval
+                      )
                     ORDER BY created_ts DESC NULLS LAST, updated_ts DESC NULLS LAST
                     LIMIT 1
                     """,
-                    (self.client_id, ticker.upper(), *_PENDING_ENTRY_STATUSES),
+                    (self.client_id, ticker.upper(), *_PENDING_ENTRY_STATUSES, str(_phantom_grace_sec)),
                 )
                 return c.fetchone() is not None
         return run_with_retry(_fn)
