@@ -68,6 +68,18 @@ def _ew_record(signal_id: str, ticker: str, to_state_name: str, reason: str, **m
         pass
 
 log = logging.getLogger("ap.entry_watcher")
+
+# FUNNEL FIX (2026-05-20): pre-open helper for the stop-touch invalidation guard.
+# Used in WatchedSignal.check() to skip pre-market stop-touch invalidation for
+# overnight/daily setups (thin pre-open spreads can spike below stop transiently).
+def _is_pre_market_now() -> bool:
+    try:
+        from datetime import datetime as _dt
+        from zoneinfo import ZoneInfo as _ZI
+        et = _dt.now(_ZI("America/New_York"))
+        return et.hour < 9 or (et.hour == 9 and et.minute < 30)
+    except Exception:
+        return False
 ET = ZoneInfo("America/New_York")
 
 POLL_INTERVAL_SEC = 15
@@ -82,6 +94,44 @@ MAX_INTRADAY_WATCH_MIN = int(os.getenv("MAX_INTRADAY_WATCH_MIN", "45"))
 # Default 45 min: watcher stays armed for 45 minutes after breach.
 # Was hardcoded 5 — too short for slow-moving setups. Env-tunable.
 MAX_INTRADAY_DRIFT_PCT = 0.015
+
+# ============================================================
+# FUNNEL FIX (2026-05-20) — dedicated arm-time tolerance.
+#
+# Production observed 12/29 orders today rejected with
+# 'watch_arm_failed:stale_price_-0.X%_from_trigger' at deltas of 0.0–0.4%.
+# Two root causes possible:
+#   (a) MAX_INTRADAY_DRIFT_PCT is hard-coded 1.5% — NOT env tunable.
+#   (b) The 'stop guard' below conflates 'price below stop' with stale, and the
+#       reject reason string only captures pct_from_trigger — making it look
+#       like a drift reject even when it's actually a too-close stop reject.
+#
+# Fix:
+#   - WATCH_ARM_STALE_TOLERANCE_PCT (default 1.0%) is env-tunable so ops can
+#     loosen without a redeploy.
+#   - Effective threshold = max(env, hard-coded raw). Env can only LOOSEN,
+#     never silently TIGHTEN below the safe 1.5% raw default.
+#   - Reject reason now distinguishes 'arm_drift_X%' from 'arm_below_stop'
+#     so we can tell which gate fired in post-mortem analysis.
+# ============================================================
+try:
+    WATCH_ARM_STALE_TOLERANCE_PCT = float(
+        os.getenv("WATCH_ARM_STALE_TOLERANCE_PCT", "0.010")  # 1.0%
+    )
+except (TypeError, ValueError):
+    WATCH_ARM_STALE_TOLERANCE_PCT = 0.010
+
+# Effective threshold used at arm-time: the larger of env-tunable and the safe
+# hard-coded default. Env can only loosen, never tighten.
+WATCH_ARM_EFFECTIVE_THRESHOLD_PCT = max(WATCH_ARM_STALE_TOLERANCE_PCT, MAX_INTRADAY_DRIFT_PCT)
+
+log.info(
+    "[entry-watcher] thresholds loaded: "
+    "MAX_INTRADAY_DRIFT_PCT=%.4f WATCH_ARM_STALE_TOLERANCE_PCT=%.4f effective=%.4f",
+    MAX_INTRADAY_DRIFT_PCT,
+    WATCH_ARM_STALE_TOLERANCE_PCT,
+    WATCH_ARM_EFFECTIVE_THRESHOLD_PCT,
+)
 OVERNIGHT_MAX_DRIFT_PCT = 0.020  # generic/non-daily overnight drift guard
 
 OPEN_PROTECT_MINUTES = 5
@@ -298,7 +348,21 @@ class WatchedSignal:
                     log.debug("[%s] CALL breach reset — ask=$%.2f pulled back", self.ticker, ask)
                 self.breach_count = 0
 
-            if self.stop_level and bid <= self.stop_level * (1 - WRONG_DIR_BUFFER_PCT):
+            # FUNNEL FIX (2026-05-20): for overnight + daily setups, do NOT
+            # invalidate on a pre-market stop touch. Pre-open spreads are wide
+            # and thinly-traded extended-hours quotes can spike below stop
+            # transiently without representing a real thesis break.
+            # The validated overnight revalidation at 9:30 ET (which runs the
+            # full structural daily validator) will catch genuine breaks.
+            _pre_open_skip = (
+                (self.overnight or _safe_is_daily_signal(self))
+                and _is_pre_market_now()
+            )
+            if (
+                self.stop_level
+                and bid <= self.stop_level * (1 - WRONG_DIR_BUFFER_PCT)
+                and not _pre_open_skip
+            ):
                 self.state = WatchState.INVALIDATED
                 self.breach_count = 0
                 self._release_dedup_key()
@@ -307,6 +371,12 @@ class WatchedSignal:
                     self.ticker,
                     bid,
                     self.stop_level,
+                )
+            elif _pre_open_skip and self.stop_level and bid <= self.stop_level * (1 - WRONG_DIR_BUFFER_PCT):
+                log.debug(
+                    "[%s] pre-open stop touch ignored for daily/overnight setup "
+                    "(bid=$%.2f stop=$%.2f) — will revalidate at 9:30 ET",
+                    self.ticker, bid, self.stop_level,
                 )
 
         else:  # PUT
@@ -336,7 +406,16 @@ class WatchedSignal:
                     log.debug("[%s] PUT breach reset — bid=$%.2f pulled back", self.ticker, bid)
                 self.breach_count = 0
 
-            if self.stop_level and ask >= self.stop_level * (1 + WRONG_DIR_BUFFER_PCT):
+            # FUNNEL FIX (2026-05-20): same pre-open guard for PUT setups.
+            _pre_open_skip = (
+                (self.overnight or _safe_is_daily_signal(self))
+                and _is_pre_market_now()
+            )
+            if (
+                self.stop_level
+                and ask >= self.stop_level * (1 + WRONG_DIR_BUFFER_PCT)
+                and not _pre_open_skip
+            ):
                 self.state = WatchState.INVALIDATED
                 self.breach_count = 0
                 self._release_dedup_key()
@@ -697,25 +776,41 @@ class APEntryWatcher:
                 mid = (bid + ask) / 2 if bid > 0 and ask > 0 else max(bid, ask)
                 if mid > 0:
                     pct_from_trigger = (mid - trigger) / trigger
-                    stale = (side == "CALL" and pct_from_trigger > MAX_INTRADAY_DRIFT_PCT) or (
-                        side == "PUT" and pct_from_trigger < -MAX_INTRADAY_DRIFT_PCT
+                    # FUNNEL FIX (2026-05-20):
+                    # 1) Use WATCH_ARM_EFFECTIVE_THRESHOLD_PCT (env-tunable, env
+                    #    can only loosen, default = 1.0% or hard-coded 1.5%
+                    #    whichever is larger).
+                    # 2) Distinguish drift-stale from below-stop-stale so the
+                    #    reject reason actually tells operators which gate fired.
+                    drift_stale = (
+                        (side == "CALL" and pct_from_trigger >  WATCH_ARM_EFFECTIVE_THRESHOLD_PCT) or
+                        (side == "PUT"  and pct_from_trigger < -WATCH_ARM_EFFECTIVE_THRESHOLD_PCT)
                     )
+                    below_stop = False
                     if stop and stop > 0:
                         if side == "CALL" and mid < stop:
-                            stale = True
+                            below_stop = True
                         elif side == "PUT" and mid > stop:
-                            stale = True
-                    if stale:
-                        log.warning(
-                            "[%s] STALE SIGNAL — price $%.2f is %.1f%% from trigger $%.2f "
-                            "(side=%s) — skipping stale entry",
-                            ticker,
-                            mid,
-                            pct_from_trigger * 100.0,
-                            trigger,
-                            side,
+                            below_stop = True
+                    if drift_stale or below_stop:
+                        reason_code = (
+                            f"arm_drift_{pct_from_trigger*100:+.2f}pct_thr_{WATCH_ARM_EFFECTIVE_THRESHOLD_PCT*100:.2f}pct"
+                            if drift_stale
+                            else f"arm_below_stop_mid_{mid:.2f}_stop_{stop:.2f}"
                         )
-                        self._last_reject_reason = f"stale_price_{pct_from_trigger*100:+.1f}pct_from_trigger"
+                        log.warning(
+                            "[%s] STALE_ARM_REJECT gate=%s mid=$%.2f trigger=$%.2f "
+                            "drift=%.3f%% effective_threshold=%.3f%% side=%s stop=%s",
+                            ticker,
+                            "drift" if drift_stale else "below_stop",
+                            mid,
+                            trigger,
+                            pct_from_trigger * 100.0,
+                            WATCH_ARM_EFFECTIVE_THRESHOLD_PCT * 100.0,
+                            side,
+                            ("%.2f" % stop) if stop and stop > 0 else "none",
+                        )
+                        self._last_reject_reason = reason_code
                         return False
                     log.debug(
                         "[%s] Price check OK — $%.2f vs trigger $%.2f (%.1f%%)",
