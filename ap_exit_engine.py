@@ -3043,6 +3043,28 @@ class APExitEngine:
             except Exception as _e:
                 log.warning("exit_engine_daily_loss_self_check_failed: %s", _e)
 
+        # ── Tick-level kill-switch self-check (semantic audit 2026-05-21) ─────
+        # kill_switch semantics: operator hitting kill = full halt = entries
+        # blocked AND positions closed. The entry gate triggers force-close
+        # on kill, but only when a new signal arrives. If kill is flipped
+        # mid-session and no new signal comes, existing positions would keep
+        # running until next signal. This tick check closes that gap.
+        # Idempotent — once force-close has been requested, subsequent calls
+        # are no-ops.
+        if _mc_tick is not None and not _mc_tick.is_force_close_requested():
+            try:
+                _kfn = getattr(_mc_tick, "_kill_switch_fn", None)
+                if _kfn and _kfn():
+                    _mc_tick.request_force_close_all(
+                        reason="kill_switch_activated_tick_detected"
+                    )
+                    log.critical(
+                        "EXIT_ENGINE_KILL_SWITCH_DETECTED | force-close triggered "
+                        "from tick (operator activated kill mid-session)"
+                    )
+            except Exception as _e:
+                log.warning("exit_engine_kill_switch_self_check_failed: %s", _e)
+
         actions_to_take = []
         with self._lock:
             for pos in active:

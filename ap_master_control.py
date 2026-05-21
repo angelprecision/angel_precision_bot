@@ -824,6 +824,17 @@ class APMasterControl:
         if getattr(self, "exit_engine_down", False):
             return self._block(signal_id, ticker, client_id, "blocked_system", "exit_engine_down__protective_systems_unavailable")
         if self._kill_switch_fn and self._kill_switch_fn():
+            # SEMANTIC CLARIFICATION (P0-3 audit 2026-05-21):
+            # kill_switch ON means full halt — block entries AND force-close
+            # existing positions. This is different from pause_entries which
+            # is "block new entries, keep exits running" (cool-off after a bad
+            # session, not an emergency).
+            #
+            # Trigger is idempotent — request_force_close_all() returns False
+            # on subsequent calls. Safe to call on every signal that hits this
+            # gate; only the first one fires the actual close-all.
+            if not self.is_force_close_requested():
+                self.request_force_close_all(reason="kill_switch_activated")
             return self._block(signal_id, ticker, client_id, "blocked_system", "kill_switch_active")
         # H5: per-client entries pause. Only blocks NEW entries for THIS client
         # — evaluate() never gates exits, and other clients' runners have their
