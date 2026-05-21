@@ -78,6 +78,22 @@ class ReadinessReport:
         return asdict(self)
 
 
+def _as_bool(v) -> bool:
+    """Defensive truthy coercion. Strings like 'false', 'False', '0', 'no'
+    must NOT count as True even though Python's bool() would treat them as
+    truthy (non-empty string). DB columns are usually proper booleans but
+    test data and partial migrations can leak strings in. Fail-closed here."""
+    if v is None or v is False:
+        return False
+    if v is True:
+        return True
+    if isinstance(v, str):
+        return v.strip().lower() in ("true", "t", "1", "yes", "y")
+    if isinstance(v, (int, float)):
+        return v != 0
+    return bool(v)
+
+
 def _organ_is_online(
     organ_status: dict[str, str],
     organ_last_heartbeat: dict[str, datetime],
@@ -141,9 +157,11 @@ def compute_readiness(
         member_row.get("tradier_live_account_id")
         and member_row.get("tradier_live_access_token")
     )
-    operator_approved_live = bool(member_row.get("allow_live_trading"))
-    subscription_active = bool(member_row.get("subscription_active"))
-    kill_switch_on = bool(member_row.get("kill_switch"))
+    # Defensive bool coercion: DB columns are bool but partial migrations or
+    # legacy data may leak strings like 'false'. _as_bool fails closed.
+    operator_approved_live = _as_bool(member_row.get("allow_live_trading"))
+    subscription_active    = _as_bool(member_row.get("subscription_active"))
+    kill_switch_on         = _as_bool(member_row.get("kill_switch"))
 
     # Mode consistency:
     #   - mode=LIVE requires both live_connected AND live_operator_approved
