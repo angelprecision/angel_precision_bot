@@ -195,8 +195,8 @@ class APSelfHealingSystem:
                 if getattr(runner, "reconciler", None):
                     try:
                         runner.reconciler.stop()
-                    except Exception:
-                        pass
+                    except Exception as _e:
+                        log.warning("self_healing_reconciler_stop_failed: %s", _e)
                 if hasattr(runner, "_start_reconciler") and broker and exit_eng:
                     runner._start_reconciler(broker, exit_eng)
                     rec = getattr(runner, "reconciler", None)
@@ -418,8 +418,8 @@ class APSelfHealingSystem:
                         runner.entries_allowed.clear()
                     if hasattr(runner, "degraded"):
                         runner.degraded.set()
-            except Exception:
-                pass
+            except Exception as _e:
+                log.warning("self_healing_entries_clear_degraded_set_failed: %s", _e)
             if health.cooldown_ok():
                 summary = ", ".join(f"{s.get('ticker','?')}:{s.get('contract','?')} opt_age={s.get('option_quote_age_sec')}" for s in stale[:5])
                 self._alert(email, "quote_staleness", HealthState.WARNING, f"Stale quotes detected; entries blocked/degraded. {summary}", health)
@@ -464,8 +464,8 @@ class APSelfHealingSystem:
                     runner.entries_allowed.clear()
                 if hasattr(runner, "degraded"):
                     runner.degraded.set()
-        except Exception:
-            pass
+        except Exception as _e:
+            log.warning("self_healing_entries_clear_degraded_set_failed_2: %s", _e)
         reconciler = getattr(runner, "reconciler", None)
         rec_alive = bool(reconciler and (not hasattr(reconciler, "is_alive") or reconciler.is_alive()))
         if not rec_alive:

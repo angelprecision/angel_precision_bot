@@ -611,8 +611,8 @@ def _dispatch(
         )
         if _pair_key:
             log.info("[%s] Registered as 1-1 pair: %s", ticker, _pair_key)
-    except Exception:
-        pass
+    except Exception as _e:
+        log.warning("queue_pair_registration_failed: %s", _e)
 
     # ── 2. CONTRACT SELECTION -- skip outside market hours ──────────────────────
     _skip_contract_selection = False
@@ -982,15 +982,15 @@ def worker_loop(
 
         try:
             update_state({"last_heartbeat_ts": now_utc_iso()}, client_id=client_id)
-        except Exception:
-            pass
+        except Exception as _e:
+            log.debug("queue_update_state_heartbeat_failed: %s", _e)
         try:
             from ap.self_healing import get_healer
             h = get_healer()
             if h:
                 h.heartbeat(client_id, "worker")
-        except Exception:
-            pass
+        except Exception as _e:
+            log.debug("queue_healer_heartbeat_failed: %s", _e)
 
         job    = None
         job_id = None

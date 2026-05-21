@@ -73,8 +73,8 @@ class KillSwitch:
             )
             try:
                 os.remove(self._flag_path)
-            except Exception:
-                pass
+            except Exception as _e:
+                log.warning("kill_switch_flag_remove_failed: %s", _e)
 
     def is_killed(self) -> bool:
         """Zero-latency check. Always prefer in-memory flag over file I/O."""

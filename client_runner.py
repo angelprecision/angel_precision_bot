@@ -400,16 +400,16 @@ class ClientRunner(threading.Thread):
             try:
                 if hasattr(health_mon, "raise_dashboard_alert"):
                     health_mon.raise_dashboard_alert(self.email, reason)
-            except Exception:
-                pass
+            except Exception as _e:
+                logger.warning("runner_dashboard_alert_failed: %s", _e)
 
         healer = get_healer()
         if healer:
             try:
                 if hasattr(healer, "request_action"):
                     healer.request_action(self.email, "degraded", reason=reason)
-            except Exception:
-                pass
+            except Exception as _e:
+                logger.warning("runner_healer_request_action_failed: %s", _e)
 
         if stop_runner:
             self.stopped.set()
@@ -674,8 +674,8 @@ class ClientRunner(threading.Thread):
                 health_mon = get_monitor()
                 if health_mon and hasattr(health_mon, "raise_dashboard_alert"):
                     health_mon.raise_dashboard_alert(self.email, msg)
-            except Exception:
-                pass
+            except Exception as _e:
+                logger.warning("runner_dashboard_alert_failed_2: %s", _e)
 
         qm = APPositionQuoteMonitor(
             broker=broker,
@@ -694,16 +694,16 @@ class ClientRunner(threading.Thread):
             try:
                 setattr(exit_eng, "quote_monitor", qm)
                 setattr(exit_eng, "quotemonitor", qm)
-            except Exception:
-                pass
+            except Exception as _e:
+                logger.warning("runner_exit_eng_quote_monitor_setattr_failed: %s", _e)
 
         self.quote_monitor = qm
         self.quotemonitor = qm
         try:
             setattr(exit_eng, "quote_monitor", qm)
             setattr(exit_eng, "quotemonitor", qm)
-        except Exception:
-            pass
+        except Exception as _e:
+            logger.warning("runner_exit_eng_quote_monitor_setattr_failed_2: %s", _e)
 
         qm.start()
         logger.info("[%s] PositionQuoteMonitor started and attached to exit engine", self.email)
@@ -1059,8 +1059,8 @@ class ClientRunner(threading.Thread):
                         if exit_eng and hasattr(exit_eng, "mark_position_closed"):
                             try:
                                 exit_eng.mark_position_closed(pos_id)
-                            except Exception:
-                                pass
+                            except Exception as _e:
+                                logger.warning("runner_exit_eng_mark_closed_failed: %s", _e)
 
                         logger.info(
                             "[%s] Position %s marked CLOSED (manual client close) | contract=%s",
@@ -1129,8 +1129,8 @@ class ClientRunner(threading.Thread):
                 try:
                     if healer_ref:
                         healer_ref.heartbeat(self.email, "runner_health")
-                except Exception:
-                    pass
+                except Exception as _e:
+                    logger.debug("runner_healer_heartbeat_failed: %s", _e)
 
         self.health_thread = threading.Thread(
             target=_health_loop,
@@ -1539,8 +1539,8 @@ class ClientRunner(threading.Thread):
             try:
                 if healer_ref:
                     healer_ref.heartbeat(self.email, "runner")
-            except Exception:
-                pass
+            except Exception as _e:
+                logger.debug("runner_healer_heartbeat_failed_2: %s", _e)
             self._check_split_brain_recovery()   # BUG-5 FIX: clear sticky reasons when resolved
             self._try_recover_degraded_mode()
             self._set_entry_permission()
@@ -1569,26 +1569,26 @@ class ClientRunner(threading.Thread):
             try:
                 self.exit_reliability_monitor.stop()
                 logger.info("[%s] ExitReliabilityMonitor stopped", self.email)
-            except Exception:
-                pass
+            except Exception as _e:
+                logger.warning("runner_exit_reliability_monitor_stop_failed: %s", _e)
             finally:
                 self.exit_reliability_monitor = None
 
         if self.order_monitor:
             try:
                 self.order_monitor.stop()
-            except Exception:
-                pass
+            except Exception as _e:
+                logger.warning("runner_order_monitor_stop_failed: %s", _e)
         if self.reconciler:
             try:
                 self.reconciler.stop()
-            except Exception:
-                pass
+            except Exception as _e:
+                logger.warning("runner_reconciler_stop_failed: %s", _e)
         if self.core:
             try:
                 self.core.stop()
-            except Exception:
-                pass
+            except Exception as _e:
+                logger.warning("runner_core_stop_failed: %s", _e)
 
         # Join child threads briefly after stop signals to prevent zombie overlap.
         self._join_child_threads()
@@ -1596,22 +1596,22 @@ class ClientRunner(threading.Thread):
         try:
             from ap.order_state_machine import unregister_exit_engine
             unregister_exit_engine(self.email)
-        except Exception:
-            pass
+        except Exception as _e:
+            logger.warning("runner_unregister_exit_engine_failed: %s", _e)
 
         health_mon = get_monitor()
         if health_mon:
             try:
                 health_mon.unregister(self.email)
-            except Exception:
-                pass
+            except Exception as _e:
+                logger.warning("runner_health_mon_unregister_failed: %s", _e)
 
         healer = get_healer()
         if healer:
             try:
                 healer.unregister(self.email)
-            except Exception:
-                pass
+            except Exception as _e:
+                logger.warning("runner_healer_unregister_failed: %s", _e)
 
     def _join_child_threads(self):
         timeout = float(os.getenv("RUNNER_CHILD_JOIN_TIMEOUT_SEC", "2"))
@@ -2052,8 +2052,8 @@ class ClientRunner(threading.Thread):
                 try:
                     if healer_ref:
                         healer_ref.heartbeat(self.email, "equity_refresh")
-                except Exception:
-                    pass
+                except Exception as _e:
+                    logger.debug("runner_healer_heartbeat_failed_3: %s", _e)
 
                 try:
                     now_et = datetime.now(_ET)

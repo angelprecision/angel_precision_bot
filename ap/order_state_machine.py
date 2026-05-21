@@ -2183,8 +2183,8 @@ class APOrderStateMachine:
                 )
         try:
             run_with_retry(_fn)
-        except Exception:
-            pass
+        except Exception as _e:
+            log.warning("osm_runwithretry_fn_failed: %s", _e)
 
 
 # =============================================================================

@@ -432,8 +432,8 @@ class APPositionQuoteMonitor:
             if waker is not None:
                 try:
                     waker.set()
-                except Exception:
-                    pass
+                except Exception as _e:
+                    log.debug("quote_monitor_waker_set_failed: %s", _e)
 
     # ── Wake gating (price threshold + cooldown) ────────────────────────────
     def _should_wake(self, contract: str, opt_price: float) -> bool:
@@ -701,14 +701,14 @@ class APPositionQuoteMonitor:
             setattr(pos, "quote_opt_age_sec", opt_age)
             setattr(pos, "quoteundagesec", und_age)
             setattr(pos, "quote_und_age_sec", und_age)
-        except Exception:
-            pass
+        except Exception as _e:
+            log.debug("quote_attrs_setattr_failed: %s", _e)
 
     def _alert(self, msg: str):
         try:
             self._alert_fn(msg)
-        except Exception:
-            pass
+        except Exception as _e:
+            log.warning("quote_monitor_alert_failed: %s", _e)
 
 
 class _NullCtx:

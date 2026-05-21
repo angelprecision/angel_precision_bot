@@ -1356,8 +1356,8 @@ class APExecutionCore:
 
         try:
             self.shadow.record_live_outcome(staged.get("tier", ""), opt_pnl_pct)
-        except Exception:
-            pass
+        except Exception as _e:
+            log.warning("shadow_record_live_outcome_failed: %s", _e)
 
     def _on_position_scale(self, pos: ManagedPosition, decision):
         log.info(

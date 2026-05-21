@@ -178,8 +178,8 @@ class APStartupRecovery:
             try:
                 if hasattr(self.mc, "_position_count"):
                     self.mc._position_count += 1
-            except Exception:
-                pass
+            except Exception as _e:
+                log.warning("recovery_position_count_inc_failed: %s", _e)
 
             # Bump sector counts on master_control if tracked
             try:
@@ -188,8 +188,8 @@ class APStartupRecovery:
                     self.mc._sector_counts[sector] = (
                         self.mc._sector_counts.get(sector, 0) + 1
                     )
-            except Exception:
-                pass
+            except Exception as _e:
+                log.warning("recovery_sector_counts_inc_failed: %s", _e)
 
             log.info(
                 "[%s] RECOVERY: position restored | %s %s qty=%d status=%s pos=%s",

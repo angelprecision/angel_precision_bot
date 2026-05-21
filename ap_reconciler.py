@@ -788,8 +788,8 @@ class APBrokerReconciler:
             )
             try:
                 summary.setdefault("errors", []).append(f"stale_ack_exits: {exc}")
-            except Exception:
-                pass
+            except Exception as _e:
+                log.warning("reconciler_stale_ack_summary_append_failed: %s", _e)
 
     # ──────────────────────────────────────────────────────────────────────────
     # Exit-fill position heal (backup truth repair)
@@ -878,8 +878,8 @@ class APBrokerReconciler:
             )
             try:
                 summary.setdefault("errors", []).append(f"exit_fill_heal: {exc}")
-            except Exception:
-                pass
+            except Exception as _e:
+                log.warning("reconciler_exit_fill_heal_summary_append_failed: %s", _e)
 
     # ──────────────────────────────────────────────────────────────────────────
     # Order reconciliation
@@ -2236,8 +2236,8 @@ class APBrokerReconciler:
         if _ee:
             try:
                 _ee.mark_position_closed(str(pos_id), reason="reconciler_auto_close")
-            except Exception:
-                pass
+            except Exception as _e:
+                log.warning("reconciler_mark_position_closed_failed: %s", _e)
 
         self._ghost_tracker.pop(contract, None)
         log.info(
@@ -2565,8 +2565,9 @@ class APBrokerReconciler:
             try:
                 run_with_retry(_insert_with_ue)
                 return pos_id
-            except Exception:
-                pass  # column may not exist — fall through to bare minimal
+            except Exception as _e:
+                # column may not exist — fall through to bare minimal
+                log.debug("reconciler_insert_with_ue_failed_falling_back: %s", _e)
 
             def _insert_minimal():
                 with conn() as c:
@@ -2596,8 +2597,9 @@ class APBrokerReconciler:
             if underlying_entry > 0:
                 try:
                     self._backfill_position_underlying_entry(pos_id, underlying_entry)
-                except Exception:
-                    pass  # non-fatal; exit engine seeding still carries the value
+                except Exception as _e:
+                    # non-fatal; exit engine seeding still carries the value
+                    log.debug("reconciler_backfill_underlying_failed: %s", _e)
             return pos_id
         except Exception as sql_err:
             log.error("[%s] SQL import failed for broker position %s: %s",
@@ -3275,5 +3277,5 @@ class APBrokerReconciler:
         log.warning("[%s] RECONCILER: %s", self.client_id, msg)
         try:
             self._alert_fn(f"[reconciler:{self.client_id}] {msg}")
-        except Exception:
-            pass
+        except Exception as _e:
+            log.warning("reconciler_alert_fn_failed: %s", _e)

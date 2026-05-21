@@ -123,8 +123,8 @@ def run_overnight_reeval(
     try:
         from ap_health_registry import HEALTH as _OR_HEALTH
         _OR_HEALTH.heartbeat("ap_overnight_signal_manager")
-    except Exception:
-        pass
+    except Exception as _e:
+        log.warning("overnight_health_heartbeat_failed: %s", _e)
 
     result = {"processed": 0, "armed": 0, "rejected": 0, "skipped": 0, "errors": 0}
 

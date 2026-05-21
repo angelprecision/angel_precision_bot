@@ -2916,8 +2916,8 @@ class APExitEngine:
             try:
                 if _cached_healer is not None and self._email:
                     _cached_healer.heartbeat(self._email, "exit_engine")
-            except Exception:
-                pass
+            except Exception as _e:
+                log.debug("exit_engine_heartbeat_failed: %s", _e)
 
             # QPM: PositionQuoteMonitor can wake the exit loop immediately
             # when a material quote move arrives; otherwise this still behaves
