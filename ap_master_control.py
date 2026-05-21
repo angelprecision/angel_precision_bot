@@ -313,6 +313,18 @@ class APMasterControl:
         self._mode_fn = None
         self._seen_signals: dict[str, float] = {}  # key -> inserted_ts, expires after 1800s
         self._trade_cooldowns: dict[str, float] = {}
+        # P0-3: Daily-loss force-close state.
+        # When daily loss limit is hit, the entry gate blocks new trades AND
+        # this flag is set. The exit engine reads it on each tick and force-
+        # closes every open position via its existing authority (which uses
+        # the P0-1 retry/idempotency path). One source of truth here; close
+        # authority stays with the exit engine.
+        #   None                       → not requested
+        #   (ts: float, reason: str)   → requested at ts for reason
+        self._force_close_all_state: tuple[float, str] | None = None
+        # Guard so we only fire the request once per session even though the
+        # daily-loss check runs on every entry signal.
+        self._daily_loss_force_close_fired: bool = False
         self._seed_dedup_from_db(client_id=getattr(self, "_client_id", "default"))
         log.info(
             "APMasterControl initialized | mode=%s | score_floor=%s | ctx_floor=%s | max_pos=%s | max_cap=%.0f%% | max_sector=%.0f%% | max_ticker=%.0f%% | max_calls=%s | max_puts=%s | max_trades_today=%s | max_daily_loss=%s",
@@ -692,6 +704,83 @@ class APMasterControl:
                     pass
         return total
 
+    # ── P0-3: Daily-loss force-close circuit breaker ─────────────────────────
+    def check_daily_loss_breach(self, client_id: str = "") -> tuple[bool, dict]:
+        """Read-only check: has daily realized P&L breached the loss limit?
+
+        Returns (breached, snap). `breached=True` means realized_pnl_today is
+        at or below max_daily_loss. The snap dict is the same shape used by
+        the entry gate (with realized_pnl_today, open_positions, etc.).
+
+        Pure read — does not mutate any state, does not trigger force-close.
+        Use request_force_close_all() to actually flip the breaker.
+        """
+        try:
+            snap = self._get_snapshot(client_id or self._client_id)
+        except Exception as e:
+            log.warning("daily_loss_check_snapshot_failed: %s", e)
+            return False, {"realized_pnl_today": 0.0, "open_positions": []}
+        pnl_today = float(snap.get("realized_pnl_today", 0.0))
+        breached = pnl_today <= self.max_daily_loss
+        return breached, snap
+
+    def request_force_close_all(self, reason: str = "daily_loss_limit") -> bool:
+        """Idempotently request that all open positions be closed.
+
+        Sets `_force_close_all_state` to (timestamp, reason). The exit engine
+        reads this each tick and force-closes any position not already exiting.
+
+        Returns True if this call flipped the flag, False if it was already set
+        (idempotent — multiple calls per session are safe and only the first
+        triggers the alert).
+        """
+        if self._force_close_all_state is not None:
+            log.debug(
+                "force_close_all already requested at ts=%.0f reason=%s; ignoring new reason=%s",
+                self._force_close_all_state[0], self._force_close_all_state[1], reason,
+            )
+            return False
+        self._force_close_all_state = (time.time(), str(reason))
+        log.critical(
+            "FORCE_CLOSE_ALL REQUESTED | client=%s reason=%s | exit engine will "
+            "close every open position on its next tick",
+            self._client_id, reason,
+        )
+        # Best-effort alert
+        try:
+            if getattr(self, "_alert_fn", None):
+                self._alert_fn(
+                    f"[CRITICAL] FORCE_CLOSE_ALL triggered for {self._client_id} | "
+                    f"reason={reason} | every open position will be closed"
+                )
+        except Exception as e:
+            log.warning("force_close_all_alert_failed: %s", e)
+        return True
+
+    def is_force_close_requested(self) -> bool:
+        """True when force-close-all has been requested for this session."""
+        return self._force_close_all_state is not None
+
+    def get_force_close_state(self) -> tuple[float, str] | None:
+        """Returns (timestamp, reason) tuple if force-close requested, else None."""
+        return self._force_close_all_state
+
+    def clear_force_close(self, reason: str = "manual_clear") -> bool:
+        """Clear the force-close flag. Used by reset_session and admin endpoints.
+
+        Returns True if the flag was set and is now cleared, False if no-op.
+        """
+        if self._force_close_all_state is None:
+            return False
+        prev = self._force_close_all_state
+        self._force_close_all_state = None
+        self._daily_loss_force_close_fired = False
+        log.warning(
+            "force_close_all_cleared | client=%s previous_reason=%s clear_reason=%s",
+            self._client_id, prev[1], reason,
+        )
+        return True
+
     def get_sector_exposure(self, positions: list) -> dict[str, float]:
         exposure: dict[str, float] = {}
         for pos in positions:
@@ -858,6 +947,17 @@ class APMasterControl:
         if snap["trades_today"] >= self.max_trades_today:
             return self._block(signal_id, ticker, client_id, "blocked_risk", f"max_trades_today ({snap['trades_today']}/{self.max_trades_today})")
         if snap["realized_pnl_today"] <= self.max_daily_loss:
+            # P0-3: also trigger force-close-all so existing positions don't
+            # keep bleeding. Entry gate blocks NEW trades; this circuit breaker
+            # closes EXISTING ones. Once-per-session (idempotent).
+            if not self._daily_loss_force_close_fired:
+                self._daily_loss_force_close_fired = True
+                self.request_force_close_all(
+                    reason=(
+                        f"daily_loss_limit ${snap['realized_pnl_today']:.2f} "
+                        f"<= ${self.max_daily_loss:.2f}"
+                    )
+                )
             return self._block(signal_id, ticker, client_id, "blocked_risk", f"daily_loss_limit (${snap['realized_pnl_today']:.2f} <= ${self.max_daily_loss:.2f})")
         _open_only_tickers = {str(p.get("underlying") or p.get("ticker") or "").upper() for p in snap["open_positions"]}
         if _open_only_tickers and ticker.upper() in _open_only_tickers:
@@ -1563,6 +1663,11 @@ class APMasterControl:
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         client_prefix = client_id or (self.pm.client_id if hasattr(self.pm, "client_id") else "")
         self._seen_signals.clear()  # dict.clear() — same interface
+        # P0-3: clear force-close breaker on new session so the new trading day
+        # starts fresh. Without this, a -$500 day would leave the breaker tripped
+        # forever and the bot would close every position the next morning before
+        # any trades could be made.
+        self.clear_force_close(reason="reset_session")
         try:
             from ap.db import conn, run_with_retry
 

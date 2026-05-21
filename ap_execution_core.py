@@ -138,6 +138,14 @@ class APExecutionCore:
         self.exit_eng.on_scale = self._on_position_scale
         # FIX 2: broker-confirmed fill callback — writes proof with actual fill price
         self.exit_eng.on_exit_fill_confirmed = self._finalize_proof
+        # P0-3: give exit engine a reference to master_control so it can check
+        # the force-close-all breaker on each tick. One-way reference: exit
+        # engine READS the flag, never sets it. master_control is the sole
+        # source of truth for the flag.
+        try:
+            self.exit_eng.master_control = self.master_control
+        except Exception as _e:
+            log.warning("exit_eng_master_control_wire_failed: %s", _e)
 
         log.info(
             f"APExecutionCore initialized for {email} | "

@@ -3078,6 +3078,50 @@ class APExitEngine:
                     actions_to_take.append((pos, _eod_decision, False))
                     continue
 
+                # ── P0-3: FORCE-CLOSE-ALL PRE-GATE ────────────────────────────
+                # Daily-loss limit hit (or other circuit-breaker trip) must
+                # close every open position even with stale quotes. This is a
+                # true emergency — entry gate blocked NEW trades, this closes
+                # EXISTING ones that are still bleeding.
+                # Mirrors the EOD pre-gate pattern: bypasses quote eligibility.
+                _mc_pre = getattr(self, "master_control", None)
+                _fc_requested = False
+                _fc_reason = ""
+                try:
+                    if _mc_pre is not None and _mc_pre.is_force_close_requested():
+                        _fc_requested = True
+                        _state = _mc_pre.get_force_close_state()
+                        _fc_reason = _state[1] if _state else "force_close_requested"
+                except Exception as _fc_e:
+                    log.warning("force_close_pre_gate_check_failed: %s", _fc_e)
+
+                if (
+                    _fc_requested
+                    and not pos.exit_in_flight
+                    and not pos.closed
+                    and int(pos.quantity_remaining or 0) > 0
+                ):
+                    _fc_qty = int(pos.quantity_remaining)
+                    _fc_decision = ExitDecision(
+                        action="CLOSE_ALL",
+                        quantity=_fc_qty,
+                        reason=(
+                            f"SENTINEL FORCED EXIT -- {_fc_reason} "
+                            "| quote_gate_bypassed=True"
+                        ),
+                        urgency="IMMEDIATE",
+                        pnl_pct=option_pnl,
+                        reason_code="SENTINEL_FORCED_EXIT",
+                    )
+                    log.critical(
+                        "[%s] FORCE_CLOSE PRE-GATE EXIT | pos_id=%s | qty=%d "
+                        "| option_pnl=%.1f%% | reason=%s | bypassing quote gate",
+                        pos.ticker, pos.position_id or "?", _fc_qty,
+                        option_pnl * 100, _fc_reason,
+                    )
+                    actions_to_take.append((pos, _fc_decision, False))
+                    continue
+
                 _force_runner_check = False
                 if pos.scale_outs_done >= 1 and pos.peak_pnl_pct >= 0.40:
                     _runner_drop_now   = pos.peak_pnl_pct - option_pnl
@@ -3132,6 +3176,8 @@ class APExitEngine:
                 if _has_live_quotes or _has_peak_to_protect:
                     # Duplicate peak advance removed — handled above pre-gate.
                     # Gate now only controls whether evaluate_exit() is called.
+                    # (P0-3 force-close-all is handled by the pre-gate above
+                    # so positions can close even with stale quotes.)
                     decision = evaluate_exit(pos, now_et)
                     decision.reason_code = _classify_exit_decision(decision)
                     _ledger_exit_decision(pos, decision, client_id=getattr(pos, "client_id", "") or getattr(self, "client_id", ""))
