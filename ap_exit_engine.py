@@ -3014,6 +3014,35 @@ class APExitEngine:
         if not active:
             return
 
+        # ── P0-3 tick-level safety: daily-loss self-check ─────────────────────
+        # The entry gate triggers the force-close breaker when a NEW signal hits
+        # the daily-loss check. But if loss is breached mid-session by a fill
+        # (no new signal arriving), the breaker would not fire until the next
+        # signal — meanwhile open positions keep bleeding.
+        # Fix: exit engine self-checks every tick. Read-only check; idempotent
+        # request. If already requested, request_force_close_all() returns
+        # False and we move on. Only ever fires once per session.
+        _mc_tick = getattr(self, "master_control", None)
+        if _mc_tick is not None:
+            try:
+                breached, _bsnap = _mc_tick.check_daily_loss_breach()
+                if breached and not _mc_tick.is_force_close_requested():
+                    pnl = float(_bsnap.get("realized_pnl_today", 0.0)) if isinstance(_bsnap, dict) else 0.0
+                    limit = getattr(_mc_tick, "max_daily_loss", -0.0)
+                    _mc_tick.request_force_close_all(
+                        reason=(
+                            f"daily_loss_limit_tick_detected "
+                            f"${pnl:.2f} <= ${limit:.2f}"
+                        )
+                    )
+                    log.critical(
+                        "EXIT_ENGINE_DAILY_LOSS_BREACH_DETECTED | pnl=$%.2f "
+                        "limit=$%.2f | force-close triggered from tick (no entry signal needed)",
+                        pnl, limit,
+                    )
+            except Exception as _e:
+                log.warning("exit_engine_daily_loss_self_check_failed: %s", _e)
+
         actions_to_take = []
         with self._lock:
             for pos in active:

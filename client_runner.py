@@ -1903,6 +1903,13 @@ class ClientRunner(threading.Thread):
                 pm=self.position_manager,
             )
             self.reconciler.exit_engine = exit_eng
+            # P0-3: give reconciler master_control reference so it can self-
+            # check daily-loss breach. Belt-and-suspenders alongside exit-engine
+            # tick check — reconciler runs even if exit engine is degraded.
+            try:
+                self.reconciler.master_control = getattr(exit_eng, "master_control", None)
+            except Exception as _e:
+                logger.warning("reconciler_master_control_wire_failed: %s", _e)
             # Wire fill_monitor so reconciler can confirm it's alive
             # fill_monitor_thread is set by _start_fill_monitor() — pass it now
             # if already running, or it will be set after _start_fill_monitor() runs

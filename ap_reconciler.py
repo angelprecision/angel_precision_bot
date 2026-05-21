@@ -222,6 +222,7 @@ class APBrokerReconciler:
         self._thread: Optional[threading.Thread] = None
         self._run_count  = 0
         self.exit_engine = None      # wired by client_runner after construction
+        self.master_control = None   # wired by client_runner — P0-3 tick self-check
         self._ghost_tracker: dict[str, int] = {}  # ghost detection count per contract
         self._ghost_fill_confirmed: set[str] = set()  # broker_oids already confirmed terminal — skip re-check
         self._missing_id_exit_tracker: dict[str, int] = {}  # missing broker-id EXIT recovery pass count
@@ -339,6 +340,31 @@ class APBrokerReconciler:
             summary = _empty_summary(self.client_id, self._run_count)
 
             _pass_start = time.monotonic()
+
+            # ── P0-3 tick-level safety: daily-loss self-check ─────────────────
+            # Belt-and-suspenders with exit-engine tick check. If exit engine
+            # is degraded but reconciler is alive, this still catches a daily-
+            # loss breach mid-session. Idempotent: only fires once per session.
+            _mc_rec = getattr(self, "master_control", None)
+            if _mc_rec is not None:
+                try:
+                    breached, _bsnap = _mc_rec.check_daily_loss_breach()
+                    if breached and not _mc_rec.is_force_close_requested():
+                        pnl = float(_bsnap.get("realized_pnl_today", 0.0)) if isinstance(_bsnap, dict) else 0.0
+                        limit = getattr(_mc_rec, "max_daily_loss", -0.0)
+                        _mc_rec.request_force_close_all(
+                            reason=(
+                                f"daily_loss_limit_reconciler_detected "
+                                f"${pnl:.2f} <= ${limit:.2f}"
+                            )
+                        )
+                        log.critical(
+                            "[%s] RECONCILER_DAILY_LOSS_BREACH_DETECTED | "
+                            "pnl=$%.2f limit=$%.2f | force-close requested",
+                            self.client_id, pnl, limit,
+                        )
+                except Exception as _e:
+                    log.warning("reconciler_daily_loss_self_check_failed: %s", _e)
 
             try:
                 self._reconcile_orders(summary)
