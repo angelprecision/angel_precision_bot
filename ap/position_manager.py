@@ -1102,15 +1102,36 @@ class APPositionManager:
                 )
                 summary = c.fetchone() or {}
 
+                # FUNNEL FIX (2026-05-20): exclude phantom-CREATED orders from
+                # the slot count. A CREATED order with NO broker_order_id that
+                # is older than PENDING_ENTRY_PHANTOM_GRACE_SEC is effectively
+                # dead (the broker handoff failed) and will be cleaned up by
+                # the watchdog within the next ~120s. Counting it as pending
+                # exposure is what caused 'positions_full_at_breach' to fire
+                # 5x today with ZERO actual fills.
+                #
+                # We still count:
+                #   - CREATED orders younger than the grace window (legitimate in-flight)
+                #   - CREATED orders that have a broker_order_id (queued at broker)
+                #   - SUBMITTED, ACKNOWLEDGED, PARTIAL_FILL (real live exposure)
+                #
+                # PENDING_TRIGGER orders are watcher-armed but not yet at broker.
+                # Treated the same as CREATED for the phantom-grace rule.
+                _phantom_grace_sec = int(os.getenv("PENDING_ENTRY_PHANTOM_GRACE_SEC", "30"))
                 entry_placeholders = ",".join(["%s"] * len(_PENDING_ENTRY_STATUSES))
                 c.execute(
                     f"""
                     SELECT COUNT(*) AS n
                     FROM orders
-                    WHERE client_id=%s AND kind='ENTRY'
+                    WHERE client_id = %s AND kind = 'ENTRY'
                       AND status IN ({entry_placeholders})
+                      AND NOT (
+                        status IN ('CREATED', 'PENDING_TRIGGER')
+                        AND (broker_order_id IS NULL OR broker_order_id = '')
+                        AND created_ts < NOW() - (%s || ' seconds')::interval
+                      )
                     """,
-                    (self.client_id, *_PENDING_ENTRY_STATUSES),
+                    (self.client_id, *_PENDING_ENTRY_STATUSES, str(_phantom_grace_sec)),
                 )
                 pending_entries = int((c.fetchone() or {}).get("n") or 0)
 
