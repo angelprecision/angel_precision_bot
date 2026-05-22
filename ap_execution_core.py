@@ -1235,11 +1235,102 @@ class APExecutionCore:
 
     def _on_signal_invalidate(self, watched: WatchedSignal):
         signal_id = str(watched.signal.get("signal_id", ""))
+        plan = watched.signal.get("plan") or {}
+        contract = (
+            plan.get("contract_symbol")
+            or watched.signal.get("contract_symbol")
+            or watched.signal.get("contract")
+            or ""
+        )
+
+        # ── P1 FIX (2026-05-21): DEFERRED contract guard ───────────────────
+        # If the contract starts with 'DEFERRED:', the contract was not yet
+        # selected at watcher-arm time. Watcher invalidation on a DEFERRED
+        # contract is NOT a true thesis invalidation — it means contract
+        # selection at breach time hasn't been attempted yet. Keep the
+        # watcher in PENDING_TRIGGER and let breach-time contract selection
+        # do its job. Only log the event; do NOT permanently cancel.
+        is_deferred_contract = isinstance(contract, str) and contract.startswith("DEFERRED:")
+        if is_deferred_contract:
+            log.info(
+                "[%s] DEFERRED_CONTRACT_INVALIDATED ignored | signal_id=%s contract=%s "
+                "— not treating as true thesis break; awaiting breach-time contract selection",
+                watched.ticker, signal_id or "?", contract,
+            )
+            funnel.inc("deferred_contract_invalidated")
+            return  # Do NOT cancel the order or transition the watcher.
+
+        # ── Full forensic context for legitimate invalidations ─────────────────
+        # P1 FIX (2026-05-21): every watcher_invalidated must log:
+        # signal_id, plan_id, local_order_id, client_id, symbol, contract,
+        # CALL/PUT, trigger, current underlying, option bid/mid/ask, stop, target,
+        # setup age, exact invalidation formula, and reason_code.
+        try:
+            plan_id = (plan.get("plan_id") if isinstance(plan, dict) else None) or "?"
+            local_order_id = (
+                (plan.get("local_order_id") if isinstance(plan, dict) else None)
+                or watched.signal.get("local_order_id") or "?"
+            )
+            side = (
+                (plan.get("direction") if isinstance(plan, dict) else None)
+                or watched.signal.get("direction")
+                or watched.signal.get("side") or "?"
+            )
+            trigger = getattr(watched, "trigger_price", None) or watched.signal.get("entry_trigger")
+            stop    = (plan.get("stop_level") if isinstance(plan, dict) else None) or watched.signal.get("stop")
+            target  = (plan.get("target")     if isinstance(plan, dict) else None) or watched.signal.get("target")
+            age_secs = None
+            try:
+                if getattr(watched, "armed_at", None):
+                    import time as _t
+                    age_secs = _t.time() - watched.armed_at
+            except Exception:
+                pass
+            # Best-effort current-market snapshot.
+            current_underlying = None
+            opt_bid = opt_ask = opt_mid = None
+            try:
+                if hasattr(self, "broker") and hasattr(self.broker, "get_quote"):
+                    if watched.ticker:
+                        uq = self.broker.get_quote(watched.ticker)
+                        if isinstance(uq, dict):
+                            current_underlying = uq.get("last") or uq.get("close") or uq.get("price")
+                    if contract and not is_deferred_contract:
+                        oq = self.broker.get_quote(contract)
+                        if isinstance(oq, dict):
+                            opt_bid = oq.get("bid")
+                            opt_ask = oq.get("ask")
+                            if opt_bid and opt_ask:
+                                try:
+                                    opt_mid = (float(opt_bid) + float(opt_ask)) / 2
+                                except Exception:
+                                    opt_mid = None
+            except Exception:
+                pass
+
+            log.warning(
+                "[%s] WATCHER_INVALIDATED | signal_id=%s plan_id=%s local_order_id=%s "
+                "client_id=%s symbol=%s contract=%s side=%s trigger=%s underlying=%s "
+                "opt_bid=%s opt_ask=%s opt_mid=%s stop=%s target=%s age=%s",
+                watched.ticker, signal_id or "?", plan_id, local_order_id,
+                getattr(self, "client_id", "?"),
+                watched.ticker, contract or "?", side,
+                trigger if trigger is not None else "?",
+                current_underlying if current_underlying is not None else "?",
+                opt_bid if opt_bid is not None else "?",
+                opt_ask if opt_ask is not None else "?",
+                opt_mid if opt_mid is not None else "?",
+                stop if stop is not None else "?",
+                target if target is not None else "?",
+                f"{age_secs:.0f}s" if age_secs is not None else "?",
+            )
+        except Exception as e:
+            log.debug("watcher_invalidated forensic log failed: %s", e)
+
         if signal_id:
             self.store.update_status(signal_id, "invalidated", timestamp_flag="invalidated_at")
         self._cleanup_pending_entry_order(watched, action="cancel", reason="watcher_invalidated")
         funnel.inc("watcher_invalidated")
-        log.info(f"[{watched.ticker}] Signal invalidated -- wrong direction")
 
     def _finalize_proof(self, pos: "ManagedPosition", actual_fill_price: float = 0.0) -> None:
         """Write proof/P&L/feedback using the ACTUAL broker fill price.

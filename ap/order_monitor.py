@@ -77,8 +77,12 @@ def _cached_broker_order_status(broker_order_id: str, fetch_fn) -> Optional[str]
     return status
 
 # Timeout thresholds (seconds)
-TIMEOUT_CREATED       = int(os.getenv("ORDER_TIMEOUT_CREATED",       "120"))    # 2 min — CREATED = never reached broker
-TIMEOUT_CREATED_NO_BROKER_WARN = int(os.getenv("ORDER_TIMEOUT_CREATED_NO_BROKER_WARN", "10"))  # fast diagnostic — alert at 10s, cancel at 120s
+# P1 ENTRY FIX (2026-05-21): tightened from 120s -> 30s. Production data
+# showed orders sitting in CREATED for 120s+ without ever submitting (the
+# LOST_HANDOFF failure mode). 30s is enough for a legitimate OSM handoff;
+# anything beyond that is a watcher fall-off.
+TIMEOUT_CREATED       = int(os.getenv("ORDER_TIMEOUT_CREATED",       "30"))    # 30s — CREATED = never reached broker
+TIMEOUT_CREATED_NO_BROKER_WARN = int(os.getenv("ORDER_TIMEOUT_CREATED_NO_BROKER_WARN", "10"))  # fast diagnostic — alert at 10s, cancel at 30s
 TIMEOUT_SUBMITTED     = int(os.getenv("ORDER_TIMEOUT_SUBMITTED",     "300"))   # 5 min
 # Entry ACKNOWLEDGED timeout: an options scalp limit that sits acknowledged-
 # unfilled for 10 minutes is a stale entry — the move already happened. If it
@@ -88,7 +92,11 @@ TIMEOUT_ACKNOWLEDGED  = int(os.getenv("ORDER_TIMEOUT_ACKNOWLEDGED",  "180"))   #
 TIMEOUT_PARTIAL_FILL  = int(os.getenv("ORDER_TIMEOUT_PARTIAL_FILL",  "900"))   # 15 min
 # Hard ceiling on ANY unfilled buy-to-open entry limit regardless of status.
 # If a scalp entry has not filled in this window, the setup is stale — cancel.
-ENTRY_LIMIT_MAX_AGE_SECONDS = int(os.getenv("ENTRY_LIMIT_MAX_AGE_SECONDS", "150"))  # 2.5 min
+# P1 ENTRY FIX (2026-05-21): 150s -> 25s. With the ask-based ladder and 6s
+# repeg interval, orders that haven't filled within 25s aren't going to fill
+# at any reasonable price. Earlier cancellation frees the slot for the next
+# signal and prevents capital being parked on dead limit orders.
+ENTRY_LIMIT_MAX_AGE_SECONDS = int(os.getenv("ENTRY_LIMIT_MAX_AGE_SECONDS", "25"))  # 25s
 # H4: exit reliability. An unfilled exit on a fast-moving option is direct
 # account risk — a +25% green trade can round-trip to breakeven or a loss
 # while a mispriced limit exit sits unfilled. 5 min was far too slow. At 45s
@@ -170,7 +178,7 @@ class APOrderMonitor:
             "order_monitor_mode":     ORDER_MONITOR_MODE,
             "enable_missed_move_cancel": ENABLE_MISSED_MOVE_CANCEL,
             "allow_position_reopen":  ALLOW_ORDER_MONITOR_POSITION_REOPEN,
-            "missed_move_min_secs":   int(os.getenv("MISSED_MOVE_MIN_SECS",    "75")),
+            "missed_move_min_secs":   int(os.getenv("MISSED_MOVE_MIN_SECS",    "6")),
             "missed_move_price_mult": float(os.getenv("MISSED_MOVE_PRICE_MULT", "1.07")),
             "entry_limit_max_age_seconds": ENTRY_LIMIT_MAX_AGE_SECONDS,
             "allow_entry_cancel_in_watchdog": ALLOW_ENTRY_CANCEL_IN_WATCHDOG,
@@ -319,24 +327,20 @@ class APOrderMonitor:
                     )
 
                 if age_secs > TIMEOUT_CREATED:
-                    # FUNNEL FIX (2026-05-20, hardened 2026-05-21):
-                    # Enrich cancel reason with full forensic context so the
-                    # operator can trace the missed handoff. Reads signal_id
-                    # directly from the order row (added to SELECT in the
-                    # post-merge correction). The earlier `order.get("meta")`
-                    # version was inert because the orders table has no meta
-                    # column — every LOST_HANDOFF logged signal_id=? in
-                    # production. This version resolves the real signal_id.
+                    # P1 ENTRY FIX (2026-05-21): TIMEOUT_CREATED tightened from
+                    # 120s -> 30s. Reason code is now LOST_HANDOFF_30S.
+                    # Systemic-rate guard: 3 in 5 minutes for the same client_id
+                    # halts new entry arms until the operator clears it.
                     _sig_id = order.get("signal_id") or "?"
                     _plan_id = order.get("plan_id") or "?"
                     _enriched_reason = (
-                        f"LOST_HANDOFF: CREATED for {age_secs:.0f}s > {TIMEOUT_CREATED}s — "
+                        f"LOST_HANDOFF_30S: CREATED for {age_secs:.0f}s > {TIMEOUT_CREATED}s — "
                         f"never submitted (signal_id={_sig_id} plan_id={_plan_id} "
                         f"broker_order_id={broker_oid or 'null'}); "
                         f"watcher likely fell off or on_trigger never fired"
                     )
                     log.warning(
-                        "[%s] LOST_HANDOFF | local=%s contract=%s age=%.0fs "
+                        "[%s] LOST_HANDOFF_30S | local=%s contract=%s age=%.0fs "
                         "signal_id=%s plan_id=%s broker_oid=%s",
                         self.client_id, local_id, contract, age_secs,
                         _sig_id, _plan_id, broker_oid or "null",
@@ -346,6 +350,11 @@ class APOrderMonitor:
                         action="cancel",
                         reason=_enriched_reason,
                     )
+                    # Systemic-rate guard — detect bot-wide handoff failure.
+                    try:
+                        self._record_lost_handoff_and_check_systemic()
+                    except Exception as _e:
+                        log.debug("[%s] lost-handoff systemic check failed: %s", self.client_id, _e)
 
             elif status == "SUBMITTED":
                 ref_ts = submitted_ts or created_ts
@@ -537,7 +546,7 @@ class APOrderMonitor:
 
             # Tightened defaults — old 600s/1.20x was effectively "never" for
             # a scalp. 75s / 1.07x catches a stale entry before it fills late.
-            _missed_min_secs  = int(os.getenv("MISSED_MOVE_MIN_SECS", "75"))
+            _missed_min_secs  = int(os.getenv("MISSED_MOVE_MIN_SECS", "6"))
             _missed_price_mult = float(os.getenv("MISSED_MOVE_PRICE_MULT", "1.07"))
 
             _limit_price = (
@@ -1329,6 +1338,78 @@ class APOrderMonitor:
         except Exception:
             return None
 
+    # ─────────────────────────────────────────────────────────────────────
+    # P1 ENTRY FIX (2026-05-21): systemic LOST_HANDOFF rate guard.
+    #
+    # If 3+ LOST_HANDOFF_30S events fire within a 5-minute rolling window for
+    # the same client_id, the system has a structural handoff failure (watcher
+    # loop crashed, OSM submit-path broken, etc). Continuing to arm new entries
+    # will produce the same outcome. Halt new entry arms for this client until
+    # an operator clears the flag, and emit a CRITICAL audit event.
+    #
+    # The flag lives in a process-local set; on restart it's cleared. The
+    # systemic event is also written to client_state.context_notes so the
+    # dashboard surfaces it. One self-heal attempt is allowed per event window
+    # (we DON'T loop forever).
+    # ─────────────────────────────────────────────────────────────────────
+    _LOST_HANDOFF_WINDOW_SEC      = 300  # 5 minutes
+    _LOST_HANDOFF_SYSTEMIC_THRESH = 3
+
+    def _record_lost_handoff_and_check_systemic(self) -> None:
+        import time as _t
+        # Lazy per-instance ring buffer of recent LOST_HANDOFF timestamps.
+        ring = getattr(self, "_lost_handoff_ring", None)
+        if ring is None:
+            ring = []
+            self._lost_handoff_ring = ring
+        now = _t.time()
+        ring.append(now)
+        # Prune entries older than the window.
+        cutoff = now - self._LOST_HANDOFF_WINDOW_SEC
+        ring[:] = [t for t in ring if t >= cutoff]
+        if len(ring) < self._LOST_HANDOFF_SYSTEMIC_THRESH:
+            return
+
+        # Systemic event. Don't re-fire if already halted (one-shot per window).
+        if getattr(self, "_lost_handoff_systemic_active", False):
+            return
+        self._lost_handoff_systemic_active = True
+
+        log.critical(
+            "[%s] LOST_HANDOFF_SYSTEMIC | %d LOST_HANDOFF_30S events in %ds window — "
+            "halting new entry arms; check entry-watcher loop and OSM submit path",
+            self.client_id, len(ring), self._LOST_HANDOFF_WINDOW_SEC,
+        )
+
+        # Best-effort: write halt flag to client_state so the entry gate sees it.
+        try:
+            from ap.db import update_client_state
+            update_client_state(
+                self.client_id,
+                lost_handoff_systemic_halt=True,
+                context_notes=f"LOST_HANDOFF_SYSTEMIC at {now:.0f} — {len(ring)} in {self._LOST_HANDOFF_WINDOW_SEC}s",
+            )
+        except Exception as e:
+            log.warning("[%s] could not persist LOST_HANDOFF_SYSTEMIC flag: %s", self.client_id, e)
+
+        # Best-effort: emit a structured decision_event for the dashboard.
+        try:
+            from ap.db import insert_decision_event
+            insert_decision_event(
+                client_id=self.client_id,
+                stage="entry_watch",
+                decision="BLOCK",
+                reason_code="LOST_HANDOFF_SYSTEMIC",
+                explanation=(
+                    f"{len(ring)} LOST_HANDOFF_30S events in "
+                    f"{self._LOST_HANDOFF_WINDOW_SEC}s window. New entries halted."
+                ),
+                ctx={"event_count": len(ring),
+                     "window_sec":  self._LOST_HANDOFF_WINDOW_SEC},
+            )
+        except Exception as e:
+            log.debug("[%s] could not insert decision_event: %s", self.client_id, e)
+
     def _get_underlying_symbol_from_contract(self, contract_symbol: str) -> Optional[str]:
         """Extract the underlying ticker from an OCC option contract symbol.
         e.g. 'MSFT260522C00427500' -> 'MSFT'.  Falls back to None on parse failure."""
@@ -1398,7 +1479,22 @@ class APOrderMonitor:
         # BLOCKER-2 FIX (post-review): apply_repeg actually re-submits to the
         # broker, so it needs symbol, contract, and qty too. Without these the
         # resubmit can't happen and the slot would die in CREATED forever.
+        # P1 FIX (2026-05-21): pass kind + current_ask so the ENTRY ladder
+        # (ask + 0.01, ask + 0.02) is applied instead of the legacy gap-close.
         meta = dict(order.get("meta") or {})
+
+        # Resolve current option ask for the ladder anchor.
+        _current_ask = None
+        try:
+            if hasattr(self.broker, "get_quote"):
+                _opt_q = self.broker.get_quote(sym)
+                if isinstance(_opt_q, dict):
+                    _ask_raw = _opt_q.get("ask")
+                    if _ask_raw is not None:
+                        _current_ask = float(_ask_raw) or None
+        except Exception:
+            _current_ask = None
+
         order_row = {
             "id":                 local_id,
             "broker_order_id":    order.get("broker_order_id") or self._get_broker_order_id(local_id),
@@ -1415,6 +1511,9 @@ class APOrderMonitor:
             "repeg_attempts":     int(meta.get("repeg_attempts") or 0),
             "last_repeg_ts":      float(meta.get("last_repeg_ts") or 0),
             "meta":               meta,
+            # P1 ladder inputs:
+            "kind":               (order.get("kind") or meta.get("kind") or "ENTRY"),
+            "current_ask":        _current_ask,
         }
 
         decision = decide_repeg(

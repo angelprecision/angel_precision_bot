@@ -76,13 +76,27 @@ log = logging.getLogger("ap.retry_engine")
 
 
 # ── Config (env-tunable) ─────────────────────────────────────────────────────
+# P1 ENTRY FIX (2026-05-21):
+# Old: 30s between repegs, 50% gap-close (mid + half of (option_mid - limit)).
+# Production: orders sat 150s+ at broker, only 2 fills out of 392 entries.
+# New: 6s between repegs. Attempt 0 at ask, Attempt 1 ask+0.01, Attempt 2 ask+0.02.
+# Cap 2 attempts, total order lifetime ~25s.
 REPEG_ENABLED               = (os.getenv("REPEG_ENABLED", "1").strip().lower()
                                in ("1", "true", "yes", "on"))
 REPEG_MAX_ATTEMPTS          = int(os.getenv("REPEG_MAX_ATTEMPTS", "2"))
-REPEG_INTERVAL_SECS         = int(os.getenv("REPEG_INTERVAL_SECS", "30"))
+REPEG_INTERVAL_SECS         = int(os.getenv("REPEG_INTERVAL_SECS", "6"))
 REPEG_PROXIMITY_PCT         = float(os.getenv("REPEG_PROXIMITY_PCT", "0.08"))
 REPEG_UNDERLYING_DRIFT_PCT  = float(os.getenv("REPEG_UNDERLYING_DRIFT_PCT", "0.002"))
 REPEG_STEP_FRACTION         = float(os.getenv("REPEG_STEP_FRACTION", "0.50"))
+
+# P1 ENTRY FIX: fixed-step ladder for entry-side repegs.
+# When the order is an ENTRY, apply_repeg uses ask + ladder[attempt] instead
+# of the legacy 50%-gap formula. EXITS still use the legacy gap-close.
+ENTRY_REPEG_LADDER_PENNIES = os.getenv("ENTRY_REPEG_LADDER_PENNIES", "0.01,0.02")
+try:
+    ENTRY_REPEG_LADDER = [float(p.strip()) for p in ENTRY_REPEG_LADDER_PENNIES.split(",") if p.strip()]
+except Exception:
+    ENTRY_REPEG_LADDER = [0.01, 0.02]
 
 
 @dataclass
@@ -215,22 +229,47 @@ def decide_repeg(
     step = (current_option_price - limit_price) * REPEG_STEP_FRACTION
     # Round to penny (option ticks are typically $0.01 above $3, $0.05 below \u2014
     # rounding to penny is conservative and broker will normalize).
-    new_limit = round(limit_price + step, 2)
-    if new_limit <= limit_price:
-        # Defensive: if rounding produced no movement, force +0.01.
-        new_limit = round(limit_price + 0.01, 2)
+    # P1 ENTRY FIX (2026-05-21): for ENTRY orders use fixed-step ladder.
+    # Attempt-0 already at ask (set by contract_selector). Attempt 1=ask+0.01,
+    # Attempt 2=ask+0.02. Provably better than 50%-gap-close for entries.
+    # EXITS keep the legacy 50%-gap-close (they already work fine).
+    kind = str(order_row.get("kind") or (order_row.get("meta") or {}).get("kind") or "").upper()
+    current_ask = None
+    try:
+        current_ask = float(order_row.get("current_ask") or 0) or None
+    except (TypeError, ValueError):
+        current_ask = None
+
+    if kind == "ENTRY" and ENTRY_REPEG_LADDER:
+        idx = min(attempts, len(ENTRY_REPEG_LADDER) - 1)
+        bump = ENTRY_REPEG_LADDER[idx]
+        anchor = current_ask if (current_ask and current_ask > 0) else current_option_price
+        new_limit = round(anchor + bump, 2)
+        if new_limit <= limit_price:
+            new_limit = round(limit_price + 0.01, 2)
+        reason = f"entry_ladder_attempt{attempts + 1}_bump+{bump:.2f}"
+        step_detail = {"ladder_idx": idx, "ladder_bump": bump, "anchor": anchor}
+    else:
+        step = (current_option_price - limit_price) * REPEG_STEP_FRACTION
+        new_limit = round(limit_price + step, 2)
+        if new_limit <= limit_price:
+            new_limit = round(limit_price + 0.01, 2)
+        reason = "aligned_repeg"
+        step_detail = {"step": step}
 
     return RepegDecision(
-        ok=True, reason="aligned_repeg",
+        ok=True, reason=reason,
         new_limit_price=new_limit,
         attempts_used=attempts + 1,
         detail={"prev_limit": limit_price,
                 "current_option": current_option_price,
+                "current_ask": current_ask,
                 "gap_pct": gap_pct,
-                "step": step,
                 "signal_entry": sig_entry,
                 "underlying_spot": underlying_spot,
-                "direction": direction},
+                "direction": direction,
+                "kind": kind,
+                **step_detail},
     )
 
 
