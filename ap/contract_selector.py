@@ -1620,37 +1620,36 @@ class APContractSelectionEngine:
             except Exception:
                 dte = 0
 
-            # ── SPREAD-ADAPTIVE ENTRY PRICING ────────────────────────────
-            # Goal: best possible fill price without missing the setup.
-            # Static mid = canceled orders on wide-spread names (SMCI, BA).
-            # Static ask = overpaying on liquid names (SPY, QQQ) every trade.
-            # Solution: price based on how wide the spread is right now.
+            # ── P1 ENTRY PRICING (2026-05-21) ─────────────────────────────
+            # Observed funnel: 348 canceled / 44 expired / only 2 filled.
+            # Old spread-adaptive blend (mid / mid+40% / ask) sat unfilled
+            # 150s+ in production. Fix: LIVE Attempt-0 starts at ASK; the
+            # repeg ladder handles ask+0.01, ask+0.02 if not filled.
             #
-            # spread_pct = (ask - bid) / ask  (fraction of ask price)
+            # Scoring/ranking still uses mid (consistent across names).
+            # Paper mode keeps mid simulation so backtests are comparable.
             #
-            #   TIGHT  < 8%  → mid        (SPY, QQQ, liquid names: fills fast)
-            #   NORMAL 8-20% → mid + 40%  (MSFT, BA: blend toward ask)
-            #   WIDE   > 20% → ask        (SMCI, small caps: go right to ask)
-            #
-            # Scoring/ranking always stays on mid (consistent across names).
-            # This is the STARTING limit. The order monitor's 180s timeout
-            # then cancels if unfilled — we don't chase after 3 minutes.
+            # ENTRY_ATTEMPT0_PRICING env var ('ASK' default | 'BLEND' legacy)
+            # lets ops fall back to the old blend if needed without a redeploy.
             # ─────────────────────────────────────────────────────────────
             is_live, pricing_basis = _pricing_basis_for_mode(getattr(self, "mode", "paper"))
-            scoring_price_per_share = mid   # ranking always on mid
+            scoring_price_per_share = mid   # ranking always on mid (unchanged)
 
-            if ask <= 0:
+            _attempt0_mode = os.getenv("ENTRY_ATTEMPT0_PRICING", "ASK").strip().upper()
+            if is_live and _attempt0_mode == "ASK" and ask > 0:
+                # P1 fix: live Attempt-0 starts at ask. Repeg ladder handles
+                # any extra slippage if the ask itself walks up.
+                execution_price_per_share = ask
+                pricing_basis = "ASK_EXECUTION"
+            elif ask <= 0:
                 execution_price_per_share = mid or bid or 0.01
             elif spread_pct < 0.08:
-                # Tight spread — liquid option. Mid fills reliably.
+                # Legacy / paper / opted-out: tight spread → mid
                 execution_price_per_share = mid
             elif spread_pct < 0.20:
-                # Normal spread — price 40% of the way from mid to ask.
-                # Better than mid (fills faster), cheaper than ask.
+                # Legacy / paper / opted-out: normal spread → mid + 40%
                 execution_price_per_share = round(mid + (ask - mid) * 0.40, 2)
             else:
-                # Wide spread — illiquid. Go straight to ask; waiting at mid
-                # means a canceled order and a missed setup entirely.
                 execution_price_per_share = ask
 
             # Floor: never price below bid (would be absurd) or above ask
