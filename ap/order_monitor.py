@@ -1483,17 +1483,31 @@ class APOrderMonitor:
         # (ask + 0.01, ask + 0.02) is applied instead of the legacy gap-close.
         meta = dict(order.get("meta") or {})
 
-        # Resolve current option ask for the ladder anchor.
+        # Resolve current OPTION-CONTRACT ask for the ladder anchor.
+        # SAFETY (post-review): sym MUST be the OCC option contract symbol,
+        # NOT the underlying ticker. An OCC option symbol has the structure
+        # <ROOT><6 digits date><C|P><8 digit strike>, so it contains digits.
+        # Bare underlying tickers ('MSFT', 'SPY') are all alpha. If sym looks
+        # like an underlying, refuse the fetch — we'd otherwise quote the
+        # stock instead of the option and ladder against the wrong price.
+        _is_option_contract = isinstance(sym, str) and any(ch.isdigit() for ch in sym)
         _current_ask = None
-        try:
-            if hasattr(self.broker, "get_quote"):
-                _opt_q = self.broker.get_quote(sym)
-                if isinstance(_opt_q, dict):
-                    _ask_raw = _opt_q.get("ask")
-                    if _ask_raw is not None:
-                        _current_ask = float(_ask_raw) or None
-        except Exception:
-            _current_ask = None
+        if _is_option_contract:
+            try:
+                if hasattr(self.broker, "get_quote"):
+                    _opt_q = self.broker.get_quote(sym)
+                    if isinstance(_opt_q, dict):
+                        _ask_raw = _opt_q.get("ask")
+                        if _ask_raw is not None:
+                            _current_ask = float(_ask_raw) or None
+            except Exception:
+                _current_ask = None
+        else:
+            log.warning(
+                "[%s] _try_repeg: sym=%r is not an OCC option contract — "
+                "refusing to fetch ask. Ladder will fall back to current_option_price.",
+                self.client_id, sym,
+            )
 
         order_row = {
             "id":                 local_id,
