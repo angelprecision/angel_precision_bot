@@ -87,6 +87,36 @@ BROKER_RETRY_DELAY = 1.0
 SUBMIT_CHASE_BAND_PCT      = float(os.getenv("SUBMIT_CHASE_BAND_PCT", "0.08"))
 SUBMIT_QUOTE_MAX_AGE_MS    = int(os.getenv("SUBMIT_QUOTE_MAX_AGE_MS", "5000"))
 
+# ─── PHASE 4: account-equity-based sizing ─────────────────────────────────
+# Prior sizing was BASE_POSITION_PCT (0.02 = 2%) capped by MAX_POSITION_COST
+# = $1000. With a $100K account that gave 1 contract on a $3 premium because
+# $1000 / ($3 * 100) = 3.33 → 3 contracts … except the position_pct cap of
+# 2% gave only $2000, then MAX_POSITION_COST capped it to $1000. End result
+# was perpetual undersizing.
+#
+# Phase 4 sizes from account equity directly:
+#   position_budget = account_equity * POSITION_RISK_PCT      # default 10%
+#   qty             = floor(position_budget / (premium * 100))
+#
+# MAX_TRADE_USD remains as an ABSOLUTE outer safety cap (default $50K so it
+# does not bite normal sizing). The legacy MAX_POSITION_COST value is read
+# as the floor of MAX_TRADE_USD for back-compat — existing deployments that
+# set MAX_POSITION_COST=$1000 will see no behavior change unless they also
+# raise MAX_TRADE_USD.
+#
+# Per-client overrides: client.base_position_pct continues to win when set.
+# Operators who want the new 10% sizing for an existing client can either
+# (a) set the client column to 0.10 or (b) clear it and rely on the env
+# default POSITION_RISK_PCT.
+#
+# Acceptance examples (premium = $3.08, default POSITION_RISK_PCT = 0.10):
+#   $10K  account → budget $1000 → 1000/308 = 3.24 → 3 contracts
+#   $30K  account → budget $3000 → 3000/308 = 9.74 → 9 contracts
+#   $100K account → budget $10000 → 10000/308 = 32.46 → capped by MAX_CONTRACTS
+POSITION_RISK_PCT          = float(os.getenv("POSITION_RISK_PCT", "0.10"))
+MAX_TRADE_USD              = float(os.getenv("MAX_TRADE_USD", "50000"))
+MAX_CONTRACTS              = int(os.getenv("MAX_CONTRACTS", "50"))
+
 # Indices that bypass both the pre-10AM time gate AND the SPY-trend
 # execution gate. These ETFs ARE the broad-market regime, so blocking
 # a DIA PUT because "SPY is BULL" is circular. Must stay in sync with
@@ -401,6 +431,67 @@ def _calc_qty(max_cost: float, premium: float) -> int:
     return int(float(max_cost) // cost_per_contract)
 
 
+def _size_position(account_equity: float, premium: float, client_cfg: dict | None = None
+                   ) -> tuple[int, float, str]:
+    """PHASE 4: size an entry from account equity.
+
+    Returns (qty, position_budget, sizing_reason_code).
+
+    sizing_reason_code is one of:
+      ACCOUNT_EQUITY_PCT       — sized by POSITION_RISK_PCT (or client override)
+      MAX_TRADE_USD_CAP        — budget clamped to MAX_TRADE_USD
+      MAX_CONTRACTS_CAP        — qty clamped to MAX_CONTRACTS
+      INSUFFICIENT_BUDGET      — qty=0, budget < one contract
+      INVALID_INPUTS           — qty=0, equity<=0 or premium<=0
+
+    Logic:
+      1. risk_pct = client.base_position_pct OR POSITION_RISK_PCT (env, 0.10)
+      2. position_budget = account_equity * risk_pct
+      3. clamp position_budget to MAX_TRADE_USD (safety cap)
+      4. qty = floor(position_budget / (premium * OPT_MULTIPLIER))
+      5. clamp qty to MAX_CONTRACTS
+      6. min qty is 0 (caller decides what to do with that)
+
+    There is NO LIVE forced-1 here. If equity * risk_pct cannot afford one
+    contract, return qty=0. The caller will reject with position_too_small.
+    """
+    try:
+        account_equity = float(account_equity)
+        premium        = float(premium)
+    except (TypeError, ValueError):
+        return 0, 0.0, "INVALID_INPUTS"
+
+    if account_equity <= 0 or premium <= 0:
+        return 0, 0.0, "INVALID_INPUTS"
+
+    # client.base_position_pct continues to win when set (back-compat).
+    # The client column was historically named base_position_pct = 0.02; it
+    # has the same shape as POSITION_RISK_PCT and we treat them identically.
+    try:
+        risk_pct = float((client_cfg or {}).get("base_position_pct") or 0) or POSITION_RISK_PCT
+    except (TypeError, ValueError):
+        risk_pct = POSITION_RISK_PCT
+
+    position_budget = account_equity * risk_pct
+    reason = "ACCOUNT_EQUITY_PCT"
+
+    if position_budget > MAX_TRADE_USD:
+        position_budget = MAX_TRADE_USD
+        reason = "MAX_TRADE_USD_CAP"
+
+    cost_per_contract = premium * OPT_MULTIPLIER
+    qty = int(position_budget // cost_per_contract)
+
+    if qty <= 0:
+        return 0, float(position_budget), "INSUFFICIENT_BUDGET"
+
+    if qty > MAX_CONTRACTS:
+        qty = MAX_CONTRACTS
+        reason = "MAX_CONTRACTS_CAP"
+
+    return int(qty), float(position_budget), reason
+
+
 def _resolve_option_contract(broker, client_id: str, symbol: str, strike: float, direction: str, mode: str, exp_hint: str) -> tuple[str, float]:
     direction = (direction or "").upper()
     if direction not in ("CALL", "PUT"):
@@ -644,9 +735,13 @@ def process_signal(broker, client_id: str, signal_payload: dict) -> dict:
             return {"ok": False, "error": "symbol_locked", "symbol": symbol}
         locked = True
 
-        equity = _get_equity_for_client(broker, st, client)
-        position_pct = float(client.get("base_position_pct") or cfg.BASE_POSITION_PCT)
-        budget = min(equity * position_pct, float(cfg.MAX_POSITION_COST))
+        # PHASE 4: account-equity sizing.
+        # account_equity is the LIVE broker equity reading (falls back to
+        # current_equity / starting_equity_today on broker failure). It is
+        # the canonical input for sizing under Phase 4.
+        account_equity = _get_equity_for_client(broker, st, client)
+        # `equity` retained for back-compat with downstream reserve/audit code.
+        equity = account_equity
 
         exp_hint = (
             trigger.get("expiry_hint")
@@ -664,17 +759,31 @@ def process_signal(broker, client_id: str, signal_payload: dict) -> dict:
             locked = False
             return {"ok": False, "error": "premium_out_of_range", "details": prem_err, "premium": float(premium)}
 
-        qty = _calc_qty(min(budget, float(cfg.MAX_POSITION_COST)), premium)
+        # PHASE 4: size from account equity directly. Returns the canonical
+        # (qty, position_budget, sizing_reason_code) tuple used downstream by
+        # the dashboard. No LIVE forced-1; if qty == 0 we reject cleanly.
+        qty, position_budget, sizing_reason_code = _size_position(
+            account_equity, premium, client_cfg=client
+        )
         if qty < 1:
             release_symbol_lock(client_id, symbol)
             locked = False
-            return {"ok": False, "error": "position_too_small", "budget": float(budget), "premium": float(premium)}
+            log.warning(
+                "[%s] POSITION_TOO_SMALL symbol=%s premium=%.2f equity=%.2f "
+                "position_budget=%.2f reason=%s",
+                client_id, symbol, premium, account_equity, position_budget,
+                sizing_reason_code,
+            )
+            return {
+                "ok": False,
+                "error": "position_too_small",
+                "premium": float(premium),
+                "account_equity": float(account_equity),
+                "position_budget": float(position_budget),
+                "sizing_reason_code": sizing_reason_code,
+            }
 
         total_cost = float(qty) * float(premium) * OPT_MULTIPLIER
-        if total_cost > float(cfg.MAX_POSITION_COST):
-            qty = int(float(cfg.MAX_POSITION_COST) // (float(premium) * OPT_MULTIPLIER))
-            qty = max(1, qty)
-            total_cost = float(qty) * float(premium) * OPT_MULTIPLIER
 
         if not reserve_equity_if_available(client_id, total_cost, equity):
             release_symbol_lock(client_id, symbol)
@@ -762,6 +871,11 @@ def process_signal(broker, client_id: str, signal_payload: dict) -> dict:
             "submit_refresh_ok":  bool(refresh_ok),
             "submit_refresh_reason": str(refresh_reason or ""),
             "entry_attempt":      0,
+            # PHASE 4: sizing telemetry
+            "account_equity":     float(account_equity),
+            "position_budget":    float(position_budget),
+            "final_qty":          int(qty),
+            "sizing_reason_code": str(sizing_reason_code),
         }
         insert_order(
             client_id=client_id,
@@ -828,6 +942,11 @@ def process_signal(broker, client_id: str, signal_payload: dict) -> dict:
             "submit_limit": float(submit_limit),
             "quote_age_ms": int(quote_age_ms),
             "entry_attempt": 0,
+            # PHASE 4: sizing telemetry
+            "account_equity": float(account_equity),
+            "position_budget": float(position_budget),
+            "final_qty": int(qty),
+            "sizing_reason_code": str(sizing_reason_code),
         })
 
         return {
@@ -848,6 +967,11 @@ def process_signal(broker, client_id: str, signal_payload: dict) -> dict:
             "submit_limit": float(submit_limit),
             "quote_age_ms": int(quote_age_ms),
             "entry_attempt": 0,
+            # PHASE 4: sizing telemetry
+            "account_equity": float(account_equity),
+            "position_budget": float(position_budget),
+            "final_qty": int(qty),
+            "sizing_reason_code": str(sizing_reason_code),
         }
 
     except Exception as e:
