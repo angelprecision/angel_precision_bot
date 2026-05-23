@@ -751,8 +751,13 @@ class APExecutionCore:
                     "decision_status": "submitted",
                     "context_notes": f"entry_submitted local={local_order_id} broker={broker_order_id}",
                 })
+            # P1 ENTRY FIX (2026-05-21): tag the original ask submission as
+            # entry_attempt=0 so the dashboard log-parser can bucket attempts.
+            # entry_attempt=0 = original ask submit (this line)
+            # entry_attempt=1 = ask+0.01 repeg (emitted by retry_engine.apply_repeg)
+            # entry_attempt=2 = ask+0.02 repeg
             log.info(
-                "[%s] Entry submitted via OSM | local=%s broker=%s %sx %s @ $%.2f",
+                "[%s] Entry submitted via OSM | entry_attempt=0 local=%s broker=%s %sx %s @ $%.2f",
                 ticker,
                 local_order_id,
                 broker_order_id,
@@ -1250,15 +1255,38 @@ class APExecutionCore:
         # selection at breach time hasn't been attempted yet. Keep the
         # watcher in PENDING_TRIGGER and let breach-time contract selection
         # do its job. Only log the event; do NOT permanently cancel.
+        #
+        # SAFETY (post-review): by the time _on_signal_invalidate is called,
+        # the watcher has ALREADY set self.state = WatchState.INVALIDATED.
+        # Returning early without restoring the state would zombie the
+        # watcher in INVALIDATED — it would never check() the price again
+        # and breach-time contract selection would never run. Restore the
+        # state to PENDING explicitly so the next poll re-enters check().
         is_deferred_contract = isinstance(contract, str) and contract.startswith("DEFERRED:")
         if is_deferred_contract:
-            log.info(
-                "[%s] DEFERRED_CONTRACT_INVALIDATED ignored | signal_id=%s contract=%s "
-                "— not treating as true thesis break; awaiting breach-time contract selection",
-                watched.ticker, signal_id or "?", contract,
-            )
+            try:
+                from ap_entry_watcher import WatchState
+                _prior_state = getattr(watched, "state", None)
+                watched.state = WatchState.PENDING
+                # Reset breach counter so a stop touch doesn't immediately
+                # re-invalidate on the very next poll.
+                if hasattr(watched, "breach_count"):
+                    watched.breach_count = 0
+                log.info(
+                    "[%s] DEFERRED_CONTRACT_INVALIDATED ignored | signal_id=%s contract=%s "
+                    "— state restored %s -> PENDING; awaiting breach-time contract selection",
+                    watched.ticker, signal_id or "?", contract, _prior_state,
+                )
+            except Exception as _e:
+                # If we can't restore state, the safest thing is to still NOT cancel
+                # the order — log the failure so it can be investigated.
+                log.error(
+                    "[%s] DEFERRED_CONTRACT_INVALIDATED state-restore failed: %s — "
+                    "order NOT canceled, but watcher may be stuck in INVALIDATED",
+                    watched.ticker, _e,
+                )
             funnel.inc("deferred_contract_invalidated")
-            return  # Do NOT cancel the order or transition the watcher.
+            return  # Do NOT cancel the order or write 'invalidated' to signal store.
 
         # ── Full forensic context for legitimate invalidations ─────────────────
         # P1 FIX (2026-05-21): every watcher_invalidated must log:
