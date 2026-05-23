@@ -68,6 +68,55 @@ MAX_PREMIUM_PER_SHARE = float(os.getenv("MAX_PREMIUM_PER_SHARE", "10.00"))
 MAX_BROKER_RETRIES = 3
 BROKER_RETRY_DELAY = 1.0
 
+# ─── PHASE 3: submit-time ask refresh + chase-band guard ─────────────────────
+# After contract selection picks the ask (selector_ask) we may sit in the
+# admission/insert path for a few hundred ms before the broker.place_order
+# call. If the option ran away during that gap we want to KILL the submit
+# instead of paying a runaway premium. We re-fetch the ask immediately
+# before submit, compute the gap vs the selector_ask, and:
+#   - if gap > SUBMIT_CHASE_BAND_PCT: cancel with RUNAWAY_QUOTE_AT_SUBMIT,
+#       release equity + symbol lock, emit decision_event, return.
+#   - otherwise: use submit_ask as the broker limit (it's the fresher quote)
+#       and persist selector_ask, submit_ask, submit_limit, quote_age_ms,
+#       entry_attempt=0 in order.meta for the dashboard.
+#
+# Default chase band matches REPEG_PROXIMITY_PCT (0.08) used downstream by
+# the re-peg engine. If the refresh fails (broker quote unavailable) we fall
+# through with selector_ask — no chase block — so a quote-feed hiccup does
+# not kill all entries.
+SUBMIT_CHASE_BAND_PCT      = float(os.getenv("SUBMIT_CHASE_BAND_PCT", "0.08"))
+SUBMIT_QUOTE_MAX_AGE_MS    = int(os.getenv("SUBMIT_QUOTE_MAX_AGE_MS", "5000"))
+
+# ─── PHASE 4: account-equity-based sizing ─────────────────────────────────
+# Prior sizing was BASE_POSITION_PCT (0.02 = 2%) capped by MAX_POSITION_COST
+# = $1000. With a $100K account that gave 1 contract on a $3 premium because
+# $1000 / ($3 * 100) = 3.33 → 3 contracts … except the position_pct cap of
+# 2% gave only $2000, then MAX_POSITION_COST capped it to $1000. End result
+# was perpetual undersizing.
+#
+# Phase 4 sizes from account equity directly:
+#   position_budget = account_equity * POSITION_RISK_PCT      # default 10%
+#   qty             = floor(position_budget / (premium * 100))
+#
+# MAX_TRADE_USD remains as an ABSOLUTE outer safety cap (default $50K so it
+# does not bite normal sizing). The legacy MAX_POSITION_COST value is read
+# as the floor of MAX_TRADE_USD for back-compat — existing deployments that
+# set MAX_POSITION_COST=$1000 will see no behavior change unless they also
+# raise MAX_TRADE_USD.
+#
+# Per-client overrides: client.base_position_pct continues to win when set.
+# Operators who want the new 10% sizing for an existing client can either
+# (a) set the client column to 0.10 or (b) clear it and rely on the env
+# default POSITION_RISK_PCT.
+#
+# Acceptance examples (premium = $3.08, default POSITION_RISK_PCT = 0.10):
+#   $10K  account → budget $1000 → 1000/308 = 3.24 → 3 contracts
+#   $30K  account → budget $3000 → 3000/308 = 9.74 → 9 contracts
+#   $100K account → budget $10000 → 10000/308 = 32.46 → capped by MAX_CONTRACTS
+POSITION_RISK_PCT          = float(os.getenv("POSITION_RISK_PCT", "0.10"))
+MAX_TRADE_USD              = float(os.getenv("MAX_TRADE_USD", "50000"))
+MAX_CONTRACTS              = int(os.getenv("MAX_CONTRACTS", "50"))
+
 # Indices that bypass both the pre-10AM time gate AND the SPY-trend
 # execution gate. These ETFs ARE the broad-market regime, so blocking
 # a DIA PUT because "SPY is BULL" is circular. Must stay in sync with
@@ -382,6 +431,67 @@ def _calc_qty(max_cost: float, premium: float) -> int:
     return int(float(max_cost) // cost_per_contract)
 
 
+def _size_position(account_equity: float, premium: float, client_cfg: dict | None = None
+                   ) -> tuple[int, float, str]:
+    """PHASE 4: size an entry from account equity.
+
+    Returns (qty, position_budget, sizing_reason_code).
+
+    sizing_reason_code is one of:
+      ACCOUNT_EQUITY_PCT       — sized by POSITION_RISK_PCT (or client override)
+      MAX_TRADE_USD_CAP        — budget clamped to MAX_TRADE_USD
+      MAX_CONTRACTS_CAP        — qty clamped to MAX_CONTRACTS
+      INSUFFICIENT_BUDGET      — qty=0, budget < one contract
+      INVALID_INPUTS           — qty=0, equity<=0 or premium<=0
+
+    Logic:
+      1. risk_pct = client.base_position_pct OR POSITION_RISK_PCT (env, 0.10)
+      2. position_budget = account_equity * risk_pct
+      3. clamp position_budget to MAX_TRADE_USD (safety cap)
+      4. qty = floor(position_budget / (premium * OPT_MULTIPLIER))
+      5. clamp qty to MAX_CONTRACTS
+      6. min qty is 0 (caller decides what to do with that)
+
+    There is NO LIVE forced-1 here. If equity * risk_pct cannot afford one
+    contract, return qty=0. The caller will reject with position_too_small.
+    """
+    try:
+        account_equity = float(account_equity)
+        premium        = float(premium)
+    except (TypeError, ValueError):
+        return 0, 0.0, "INVALID_INPUTS"
+
+    if account_equity <= 0 or premium <= 0:
+        return 0, 0.0, "INVALID_INPUTS"
+
+    # client.base_position_pct continues to win when set (back-compat).
+    # The client column was historically named base_position_pct = 0.02; it
+    # has the same shape as POSITION_RISK_PCT and we treat them identically.
+    try:
+        risk_pct = float((client_cfg or {}).get("base_position_pct") or 0) or POSITION_RISK_PCT
+    except (TypeError, ValueError):
+        risk_pct = POSITION_RISK_PCT
+
+    position_budget = account_equity * risk_pct
+    reason = "ACCOUNT_EQUITY_PCT"
+
+    if position_budget > MAX_TRADE_USD:
+        position_budget = MAX_TRADE_USD
+        reason = "MAX_TRADE_USD_CAP"
+
+    cost_per_contract = premium * OPT_MULTIPLIER
+    qty = int(position_budget // cost_per_contract)
+
+    if qty <= 0:
+        return 0, float(position_budget), "INSUFFICIENT_BUDGET"
+
+    if qty > MAX_CONTRACTS:
+        qty = MAX_CONTRACTS
+        reason = "MAX_CONTRACTS_CAP"
+
+    return int(qty), float(position_budget), reason
+
+
 def _resolve_option_contract(broker, client_id: str, symbol: str, strike: float, direction: str, mode: str, exp_hint: str) -> tuple[str, float]:
     direction = (direction or "").upper()
     if direction not in ("CALL", "PUT"):
@@ -440,6 +550,39 @@ def _resolve_option_contract(broker, client_id: str, symbol: str, strike: float,
             raise ValueError(f"invalid_premium:{contract}:{premium}")
 
     return contract, premium
+
+
+def _refresh_ask_at_submit(broker, contract: str) -> tuple[float, int, bool, str]:
+    """PHASE 3: re-fetch the ask immediately before broker submit.
+
+    Returns (submit_ask, quote_age_ms, ok, reason):
+      - submit_ask:    fresh ask price (0.0 on failure)
+      - quote_age_ms:  age of the quote we just fetched (always small on success)
+      - ok:            True if we got a usable ask, False if we should fall through
+      - reason:        machine-readable reason when ok is False (e.g. 'no_quote',
+                       'broker_error', 'invalid_ask'). Empty string when ok=True.
+
+    Failure is non-fatal: callers should fall through with the selector_ask
+    (no chase-band guard) so a quote-feed hiccup does not kill all entries.
+    """
+    t0 = time.time()
+    try:
+        quote = broker.get_quote(contract) or {}
+    except Exception as e:
+        log.warning("_refresh_ask_at_submit: broker.get_quote raised contract=%s err=%s", contract, e)
+        return 0.0, 0, False, "broker_error"
+
+    try:
+        ask_raw = quote.get("ask")
+        ask = float(ask_raw) if ask_raw is not None else 0.0
+    except (TypeError, ValueError):
+        return 0.0, 0, False, "invalid_ask"
+
+    if ask <= 0:
+        return 0.0, 0, False, "no_quote"
+
+    quote_age_ms = int((time.time() - t0) * 1000)
+    return ask, quote_age_ms, True, ""
 
 
 def _submit_order_with_retry(broker, symbol: str, contract: str, qty: int, premium: float) -> tuple[bool, str | None, str | None]:
@@ -592,9 +735,13 @@ def process_signal(broker, client_id: str, signal_payload: dict) -> dict:
             return {"ok": False, "error": "symbol_locked", "symbol": symbol}
         locked = True
 
-        equity = _get_equity_for_client(broker, st, client)
-        position_pct = float(client.get("base_position_pct") or cfg.BASE_POSITION_PCT)
-        budget = min(equity * position_pct, float(cfg.MAX_POSITION_COST))
+        # PHASE 4: account-equity sizing.
+        # account_equity is the LIVE broker equity reading (falls back to
+        # current_equity / starting_equity_today on broker failure). It is
+        # the canonical input for sizing under Phase 4.
+        account_equity = _get_equity_for_client(broker, st, client)
+        # `equity` retained for back-compat with downstream reserve/audit code.
+        equity = account_equity
 
         exp_hint = (
             trigger.get("expiry_hint")
@@ -612,17 +759,31 @@ def process_signal(broker, client_id: str, signal_payload: dict) -> dict:
             locked = False
             return {"ok": False, "error": "premium_out_of_range", "details": prem_err, "premium": float(premium)}
 
-        qty = _calc_qty(min(budget, float(cfg.MAX_POSITION_COST)), premium)
+        # PHASE 4: size from account equity directly. Returns the canonical
+        # (qty, position_budget, sizing_reason_code) tuple used downstream by
+        # the dashboard. No LIVE forced-1; if qty == 0 we reject cleanly.
+        qty, position_budget, sizing_reason_code = _size_position(
+            account_equity, premium, client_cfg=client
+        )
         if qty < 1:
             release_symbol_lock(client_id, symbol)
             locked = False
-            return {"ok": False, "error": "position_too_small", "budget": float(budget), "premium": float(premium)}
+            log.warning(
+                "[%s] POSITION_TOO_SMALL symbol=%s premium=%.2f equity=%.2f "
+                "position_budget=%.2f reason=%s",
+                client_id, symbol, premium, account_equity, position_budget,
+                sizing_reason_code,
+            )
+            return {
+                "ok": False,
+                "error": "position_too_small",
+                "premium": float(premium),
+                "account_equity": float(account_equity),
+                "position_budget": float(position_budget),
+                "sizing_reason_code": sizing_reason_code,
+            }
 
         total_cost = float(qty) * float(premium) * OPT_MULTIPLIER
-        if total_cost > float(cfg.MAX_POSITION_COST):
-            qty = int(float(cfg.MAX_POSITION_COST) // (float(premium) * OPT_MULTIPLIER))
-            qty = max(1, qty)
-            total_cost = float(qty) * float(premium) * OPT_MULTIPLIER
 
         if not reserve_equity_if_available(client_id, total_cost, equity):
             release_symbol_lock(client_id, symbol)
@@ -636,9 +797,59 @@ def process_signal(broker, client_id: str, signal_payload: dict) -> dict:
         reserved = True
         reserved_cost = float(total_cost)
 
+        # PHASE 3: capture the ask used during selection.
+        selector_ask = float(premium)
+
+        # PHASE 3: re-fetch the ask immediately before broker submit.
+        # On success this gives us a fresher quote (submit_ask) and a
+        # quote_age_ms = 0 reading. On failure we fall through with
+        # selector_ask (no chase block).
+        submit_ask, quote_age_ms, refresh_ok, refresh_reason = \
+            _refresh_ask_at_submit(broker, contract)
+        if refresh_ok and submit_ask > 0 and selector_ask > 0:
+            gap_pct = (submit_ask / selector_ask) - 1.0
+        else:
+            gap_pct = 0.0
+
+        # PHASE 3: chase-band guard. If the ask ran beyond SUBMIT_CHASE_BAND_PCT
+        # while we were in the admission path, abort before paying it. The
+        # signal is not invalidated yet (Phase 5 retry can re-arm), so we
+        # mark with a distinct reason the dashboard can bucket.
+        if refresh_ok and gap_pct > SUBMIT_CHASE_BAND_PCT:
+            release_equity(client_id, reserved_cost)
+            release_symbol_lock(client_id, symbol)
+            reserved = False
+            locked = False
+            log.warning(
+                "[%s] RUNAWAY_QUOTE_AT_SUBMIT symbol=%s contract=%s "
+                "selector_ask=%.2f submit_ask=%.2f gap_pct=%.4f band=%.4f",
+                client_id, symbol, contract,
+                selector_ask, submit_ask, gap_pct, SUBMIT_CHASE_BAND_PCT,
+            )
+            audit(client_id, "WARNING", "RUNAWAY_QUOTE_AT_SUBMIT", {
+                "symbol": symbol, "contract": contract,
+                "selector_ask": float(selector_ask),
+                "submit_ask": float(submit_ask),
+                "gap_pct": float(gap_pct),
+                "band": float(SUBMIT_CHASE_BAND_PCT),
+            })
+            return {
+                "ok": False,
+                "error": "runaway_quote_at_submit",
+                "selector_ask": float(selector_ask),
+                "submit_ask": float(submit_ask),
+                "gap_pct": float(gap_pct),
+            }
+
+        # PHASE 3: use the fresher quote as the submit limit if available;
+        # otherwise fall back to the selector ask (back-compat).
+        submit_limit = float(submit_ask) if (refresh_ok and submit_ask > 0) else float(selector_ask)
+
         local_order_id = new_local_order_id()
         # AUDIT PHASE-2: persist meta so admission ordering (score) and re-peg
         # alignment gate (signal_entry_price) have what they need at decision time.
+        # PHASE 3: persist selector_ask / submit_ask / submit_limit / quote_age_ms
+        # / entry_attempt so the dashboard can chart submit-time quote drift.
         _meta = {
             "score":              float(signal_payload.get("score") or signal_payload.get("ev_score") or 0),
             "ticker":             symbol,
@@ -652,6 +863,19 @@ def process_signal(broker, client_id: str, signal_payload: dict) -> dict:
             "source":             str(signal_payload.get("source") or ""),
             "repeg_attempts":     0,
             "last_repeg_ts":      0,
+            # PHASE 3: submit-time telemetry
+            "selector_ask":       float(selector_ask),
+            "submit_ask":         float(submit_ask) if refresh_ok else None,
+            "submit_limit":       float(submit_limit),
+            "quote_age_ms":       int(quote_age_ms),
+            "submit_refresh_ok":  bool(refresh_ok),
+            "submit_refresh_reason": str(refresh_reason or ""),
+            "entry_attempt":      0,
+            # PHASE 4: sizing telemetry
+            "account_equity":     float(account_equity),
+            "position_budget":    float(position_budget),
+            "final_qty":          int(qty),
+            "sizing_reason_code": str(sizing_reason_code),
         }
         insert_order(
             client_id=client_id,
@@ -663,7 +887,7 @@ def process_signal(broker, client_id: str, signal_payload: dict) -> dict:
             contract=contract,
             direction=direction,
             qty=qty,
-            limit_price=float(premium),
+            limit_price=float(submit_limit),
             reserved_cost=float(reserved_cost),
             meta=_meta,
         )
@@ -675,7 +899,18 @@ def process_signal(broker, client_id: str, signal_payload: dict) -> dict:
             release_symbol_lock(client_id, symbol)
             return {"ok": False, "error": "killed_before_submit"}
 
-        ok, broker_order_id, err = _submit_order_with_retry(broker, symbol, contract, qty, float(premium))
+        # PHASE 3: emit explicit entry_attempt=0 token on the original submit
+        # for parity with retry_engine's REPEG_APPLIED entry_attempt=N logs.
+        log.info(
+            "[%s] ENTRY_SUBMIT order=%s entry_attempt=0 contract=%s qty=%d "
+            "selector_ask=%.2f submit_ask=%s submit_limit=%.2f quote_age_ms=%d gap_pct=%.4f",
+            client_id, local_order_id, contract, int(qty),
+            selector_ask,
+            (f"{submit_ask:.2f}" if refresh_ok else "NA"),
+            submit_limit, int(quote_age_ms), gap_pct,
+        )
+
+        ok, broker_order_id, err = _submit_order_with_retry(broker, symbol, contract, qty, float(submit_limit))
         if not ok:
             update_order(local_order_id, status="REJECTED", broker_order_id=broker_order_id, last_error=err)
             release_equity(client_id, reserved_cost)
@@ -701,6 +936,17 @@ def process_signal(broker, client_id: str, signal_payload: dict) -> dict:
             "broker_order_id": broker_order_id,
             "spy_trend": spy_trend,
             "ms": int((time.time() - t0) * 1000),
+            # PHASE 3: submit-time telemetry for dashboard
+            "selector_ask": float(selector_ask),
+            "submit_ask": float(submit_ask) if refresh_ok else None,
+            "submit_limit": float(submit_limit),
+            "quote_age_ms": int(quote_age_ms),
+            "entry_attempt": 0,
+            # PHASE 4: sizing telemetry
+            "account_equity": float(account_equity),
+            "position_budget": float(position_budget),
+            "final_qty": int(qty),
+            "sizing_reason_code": str(sizing_reason_code),
         })
 
         return {
@@ -709,12 +955,23 @@ def process_signal(broker, client_id: str, signal_payload: dict) -> dict:
             "direction": direction,
             "contract": contract,
             "qty": int(qty),
-            "premium": float(premium),
+            "premium": float(premium),  # back-compat: selector_ask value
             "reserved_cost": float(reserved_cost),
             "local_order_id": local_order_id,
             "broker_order_id": broker_order_id,
             "status": "PENDING_FILL",
             "spy_trend": spy_trend,
+            # PHASE 3: expose submit-time telemetry to callers
+            "selector_ask": float(selector_ask),
+            "submit_ask": float(submit_ask) if refresh_ok else None,
+            "submit_limit": float(submit_limit),
+            "quote_age_ms": int(quote_age_ms),
+            "entry_attempt": 0,
+            # PHASE 4: sizing telemetry
+            "account_equity": float(account_equity),
+            "position_budget": float(position_budget),
+            "final_qty": int(qty),
+            "sizing_reason_code": str(sizing_reason_code),
         }
 
     except Exception as e:

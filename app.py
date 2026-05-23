@@ -480,6 +480,22 @@ def create_app() -> Flask:
         except Exception as _bp_err:
             log.error("Health blueprint registration failed (non-fatal): %s", _bp_err)
 
+    # PR #27: telemetry endpoint exposes the Phase 6 entry_telemetry
+    # projection over HTTP so the dashboard backend can consume it
+    # without re-implementing the order.meta -> 23-field projection in JS.
+    # All routes are read-only and auth-gated (X-Admin-Key or
+    # X-Telemetry-Key). Registration is wrapped in try/except so a
+    # blueprint import failure cannot block app boot.
+    try:
+        from ap.telemetry_api import telemetry_bp as _telemetry_bp
+        app.register_blueprint(_telemetry_bp)
+        log.info("✅ Telemetry endpoints registered at /telemetry/*")
+    except Exception as _tbp_err:
+        log.error(
+            "Telemetry blueprint registration failed (non-fatal): %s",
+            _tbp_err,
+        )
+
     # ✅ Ensure default client exists BEFORE any state write
     with conn() as c:
         row = c.execute("SELECT 1 FROM clients WHERE client_id=%s", (DEFAULT_CLIENT_ID,)).fetchone()
