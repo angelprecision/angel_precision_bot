@@ -297,9 +297,13 @@ class TestArmPathBehavior:
     def test_arm_emits_armed_event_and_persists_meta(self, monitor_with_mocks, monkeypatch):
         m, osm, broker = monitor_with_mocks
 
+        # BUG-C FIX (PR #29): a contract is required so _resolve_strike
+        # can OCC-parse trigger.strike. Without it the retry now correctly
+        # ABORTS with RETRY_MISSING_TRIGGER_STRIKE.
         osm.get_order.return_value = {
             "local_order_id": "loc-1",
             "symbol": "QCOM",
+            "contract": "QCOM260523C00185000",
             "direction": "CALL",
             "meta": {
                 "signal_entry_price": 185.0,
@@ -345,6 +349,7 @@ class TestArmPathBehavior:
         osm.get_order.return_value = {
             "local_order_id": "loc-2",
             "symbol": "QCOM",
+            "contract": "QCOM260523C00185000",
             "direction": "CALL",
             "meta": {"signal_entry_price": 185.0},
         }

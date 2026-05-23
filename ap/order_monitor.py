@@ -599,61 +599,89 @@ class APOrderMonitor:
             )
             _sym = order.get("contract") or order.get("symbol", "") or contract
 
-            # ── Trigger (a): MISSED MOVE ──────────────────────────────────
+            # ── Trigger (a): RE-PEG-FIRST, then MISSED-MOVE-CANCEL ────────
+            #
+            # BUG-A FIX (PR #29, 2026-05-23): the prior shape gated _try_repeg
+            # behind `current > limit * 1.07`. That meant a $3.08 limit with
+            # a $3.10 current ask (the exact case where bumping the limit by
+            # one tick gets us filled) was IGNORED — we waited for the option
+            # to run 7% (to $3.30) before even considering a re-peg, by which
+            # point the move was already over.
+            #
+            # New shape:
+            #   Step 1 — if minimal preconditions are met (broker_oid +
+            #            age >= MISSED_MOVE_MIN_SECS + limit + sym + we got a
+            #            current option quote), ALWAYS attempt _try_repeg.
+            #            retry_engine.decide_repeg owns the alignment /
+            #            proximity / attempt-count gating; we don't second-
+            #            guess it with a 7% pre-filter.
+            #   Step 2 — only if _try_repeg DECLINED *and* the current ask is
+            #            truly above limit * MISSED_MOVE_PRICE_MULT (the
+            #            runaway threshold) do we run MISSED_MOVE_CANCEL.
+            #
+            # Net effect: bangers that move 2% from our limit get re-pegged
+            # and filled; only orders that truly ran past us get canceled.
             if (
-                ENABLE_MISSED_MOVE_CANCEL
-                and broker_oid
+                broker_oid
                 and age_secs >= _missed_min_secs
                 and _limit_price
                 and float(_limit_price) > 0
                 and _sym
             ):
                 _current = self._get_option_price(_sym)
-                if _current and _current > float(_limit_price) * _missed_price_mult:
-                    # AUDIT PHASE-2: before MISSED_MOVE_CANCEL, try an alignment-
-                    # gated re-peg. Three gates (time, proximity, underlying
-                    # alignment) must ALL pass. If alignment broke (the MSFT
-                    # 2026-05-19 case), this returns ok=False and we fall through
-                    # to the existing cancel — which is the correct behavior, the
-                    # cancel was right today, we just couldn't chase safely.
-                    if self._try_repeg(order, local_id, contract, _sym, float(_limit_price), _current, status, age_secs):
-                        return True  # re-peg applied; next tick will observe new limit
-                    _pct_above = (_current / float(_limit_price) - 1) * 100
-                    log.warning(
-                        "[%s] MISSED_MOVE_CANCEL | %s | limit=$%.2f current=$%.2f "
-                        "(%.0f%% above) status=%s age=%.0fs — move happened without us",
-                        self.client_id, _sym, float(_limit_price), _current,
-                        _pct_above, status, age_secs,
-                    )
-                    self._emit_order_event(
-                        local_order_id=local_id,
-                        stage="order_monitor",
-                        decision="REJECT",
-                        reason_code="MISSED_MOVE_ENTRY_CANCEL",
-                        explanation=(
-                            f"Canceling stale entry — option ran {_pct_above:.0f}% "
-                            f"above limit before fill (status={status}, age={age_secs:.0f}s)"
-                        ),
-                        contract=contract,
-                        inputs={
-                            "limit_price": float(_limit_price),
-                            "current_option_price": _current,
-                            "percent_above_limit": round(_pct_above, 2),
-                            "age_secs": round(age_secs, 1),
-                            "broker_order_id": broker_oid,
-                            "status": status,
-                        },
-                    )
-                    self._handle_stale_entry(
-                        local_id, status, contract, age_secs,
-                        action="cancel",
-                        reason=(
-                            f"STALE_ENTRY_CANCEL MISSED_MOVE — limit=${float(_limit_price):.2f} "
-                            f"current=${_current:.2f} ({_pct_above:.0f}% above) "
-                            f"status={status} age={age_secs:.0f}s"
-                        ),
-                    )
-                    return True
+                if _current and _current > 0:
+                    # Step 1: attempt re-peg unconditionally. The repeg engine
+                    # owns alignment/proximity/attempt gating.
+                    if self._try_repeg(
+                        order, local_id, contract, _sym,
+                        float(_limit_price), _current, status, age_secs,
+                    ):
+                        # Repeg applied; next tick observes the new limit.
+                        return True
+
+                    # Step 2: repeg declined. Only cancel if current price is
+                    # ACTUALLY runaway past limit * MISSED_MOVE_PRICE_MULT.
+                    # A repeg-decline at 2% above limit must NOT trigger
+                    # cancel — we keep working the original limit and let
+                    # the Phase 2 adaptive autocancel ceiling decide.
+                    _runaway = _current > float(_limit_price) * _missed_price_mult
+                    if ENABLE_MISSED_MOVE_CANCEL and _runaway:
+                        _pct_above = (_current / float(_limit_price) - 1) * 100
+                        log.warning(
+                            "[%s] MISSED_MOVE_CANCEL | %s | limit=$%.2f current=$%.2f "
+                            "(%.0f%% above) status=%s age=%.0fs — move happened without us",
+                            self.client_id, _sym, float(_limit_price), _current,
+                            _pct_above, status, age_secs,
+                        )
+                        self._emit_order_event(
+                            local_order_id=local_id,
+                            stage="order_monitor",
+                            decision="REJECT",
+                            reason_code="MISSED_MOVE_ENTRY_CANCEL",
+                            explanation=(
+                                f"Canceling stale entry — option ran {_pct_above:.0f}% "
+                                f"above limit before fill (status={status}, age={age_secs:.0f}s)"
+                            ),
+                            contract=contract,
+                            inputs={
+                                "limit_price": float(_limit_price),
+                                "current_option_price": _current,
+                                "percent_above_limit": round(_pct_above, 2),
+                                "age_secs": round(age_secs, 1),
+                                "broker_order_id": broker_oid,
+                                "status": status,
+                            },
+                        )
+                        self._handle_stale_entry(
+                            local_id, status, contract, age_secs,
+                            action="cancel",
+                            reason=(
+                                f"STALE_ENTRY_CANCEL MISSED_MOVE — limit=${float(_limit_price):.2f} "
+                                f"current=${_current:.2f} ({_pct_above:.0f}% above) "
+                                f"status={status} age={age_secs:.0f}s"
+                            ),
+                        )
+                        return True
 
             # ── Trigger (b): HARD ENTRY AGE ───────────────────────────────
             # A buy-to-open that has not filled within the hard ceiling is a
@@ -803,6 +831,70 @@ class APOrderMonitor:
     # acquire_symbol_lock and _count_active_entry_orders_today. Those gates
     # prevent us from arming a position while one is already open. We also
     # short-circuit if a FILLED position on the same symbol exists.
+
+    def _release_symbol_lock_for_canceled(
+        self,
+        local_order_id: str,
+        contract: Optional[str],
+    ) -> None:
+        """BUG-B FIX (PR #29): release the symbol lock for a just-canceled
+        ENTRY order so the 15-30s post-cancel retry can submit.
+
+        The symbol lock is acquired in execution.process_signal with a 90s
+        TTL. When the order is canceled within that window, the lock is
+        still live and the retry returns {error: 'symbol_locked'}.
+
+        We derive the symbol from (in priority order):
+          1. order.symbol             — the canonical underlying ticker
+          2. order.meta.ticker        — set by process_signal during admission
+          3. OCC root from contract   — fallback when neither is set
+
+        Best-effort: a release failure must never crash the monitor.
+        """
+        try:
+            from ap.execution import release_symbol_lock
+        except Exception as e:
+            log.debug(
+                "[%s] release_symbol_lock unavailable: %s",
+                self.client_id, e,
+            )
+            return
+
+        symbol = None
+        try:
+            order = self.osm.get_order(local_order_id) or {}
+            meta = order.get("meta") if isinstance(order.get("meta"), dict) else {}
+            symbol = (
+                (order.get("symbol") or "").strip().upper()
+                or (meta or {}).get("ticker")
+                or self._get_underlying_symbol_from_contract(contract)
+            )
+            if isinstance(symbol, str):
+                symbol = symbol.strip().upper()
+        except Exception as e:
+            log.debug(
+                "[%s] _release_symbol_lock_for_canceled: symbol lookup failed: %s",
+                self.client_id, e,
+            )
+
+        if not symbol:
+            log.debug(
+                "[%s] _release_symbol_lock_for_canceled: no symbol derivable for %s (contract=%s) — skipping",
+                self.client_id, local_order_id, contract,
+            )
+            return
+
+        try:
+            release_symbol_lock(self.client_id, symbol)
+            log.info(
+                "[%s] SYMBOL_LOCK_RELEASED_POST_CANCEL order=%s symbol=%s",
+                self.client_id, local_order_id, symbol,
+            )
+        except Exception as e:
+            log.debug(
+                "[%s] release_symbol_lock failed for %s/%s: %s",
+                self.client_id, local_order_id, symbol, e,
+            )
 
     def _maybe_arm_post_cancel_retry(
         self,
@@ -1199,6 +1291,13 @@ class APOrderMonitor:
                         f"[{self.client_id}] Entry order CANCELED locally | "
                         f"{contract} | {local_order_id} | CREATED/no broker_id"
                     )
+                    # BUG-B FIX (PR #29): release the symbol lock held by the
+                    # original process_signal call before retry submits.
+                    # Without this, the 15-30s retry hits symbol_locked
+                    # because the 90s TTL lock from the canceled order is
+                    # still in place. Best-effort only — a failed release must
+                    # never crash the monitor.
+                    self._release_symbol_lock_for_canceled(local_order_id, contract)
                     # PHASE 5 WIRE-IN: consider arming a post-cancel retry.
                     # CREATED/no-broker-id cancels almost never come from a
                     # retryable reason, so the engine will typically ABORT;
@@ -1225,6 +1324,13 @@ class APOrderMonitor:
                         f"[{self.client_id}] Entry order CANCELED (broker-confirmed) | "
                         f"{contract} | {local_order_id}"
                     )
+                    # BUG-B FIX (PR #29): release the symbol lock held by the
+                    # original process_signal call before retry submits.
+                    # Without this, the 15-30s retry hits symbol_locked
+                    # because the 90s TTL lock from the canceled order is
+                    # still in place. Best-effort only — a failed release must
+                    # never crash the monitor.
+                    self._release_symbol_lock_for_canceled(local_order_id, contract)
                     # PHASE 5 WIRE-IN: this is the primary retry hook.
                     # After a broker-confirmed cancel we ask post_cancel_retry
                     # whether the signal is still actionable. If ARM, the
