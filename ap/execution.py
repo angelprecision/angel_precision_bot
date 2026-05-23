@@ -68,6 +68,25 @@ MAX_PREMIUM_PER_SHARE = float(os.getenv("MAX_PREMIUM_PER_SHARE", "10.00"))
 MAX_BROKER_RETRIES = 3
 BROKER_RETRY_DELAY = 1.0
 
+# ─── PHASE 3: submit-time ask refresh + chase-band guard ─────────────────────
+# After contract selection picks the ask (selector_ask) we may sit in the
+# admission/insert path for a few hundred ms before the broker.place_order
+# call. If the option ran away during that gap we want to KILL the submit
+# instead of paying a runaway premium. We re-fetch the ask immediately
+# before submit, compute the gap vs the selector_ask, and:
+#   - if gap > SUBMIT_CHASE_BAND_PCT: cancel with RUNAWAY_QUOTE_AT_SUBMIT,
+#       release equity + symbol lock, emit decision_event, return.
+#   - otherwise: use submit_ask as the broker limit (it's the fresher quote)
+#       and persist selector_ask, submit_ask, submit_limit, quote_age_ms,
+#       entry_attempt=0 in order.meta for the dashboard.
+#
+# Default chase band matches REPEG_PROXIMITY_PCT (0.08) used downstream by
+# the re-peg engine. If the refresh fails (broker quote unavailable) we fall
+# through with selector_ask — no chase block — so a quote-feed hiccup does
+# not kill all entries.
+SUBMIT_CHASE_BAND_PCT      = float(os.getenv("SUBMIT_CHASE_BAND_PCT", "0.08"))
+SUBMIT_QUOTE_MAX_AGE_MS    = int(os.getenv("SUBMIT_QUOTE_MAX_AGE_MS", "5000"))
+
 # Indices that bypass both the pre-10AM time gate AND the SPY-trend
 # execution gate. These ETFs ARE the broad-market regime, so blocking
 # a DIA PUT because "SPY is BULL" is circular. Must stay in sync with
@@ -442,6 +461,39 @@ def _resolve_option_contract(broker, client_id: str, symbol: str, strike: float,
     return contract, premium
 
 
+def _refresh_ask_at_submit(broker, contract: str) -> tuple[float, int, bool, str]:
+    """PHASE 3: re-fetch the ask immediately before broker submit.
+
+    Returns (submit_ask, quote_age_ms, ok, reason):
+      - submit_ask:    fresh ask price (0.0 on failure)
+      - quote_age_ms:  age of the quote we just fetched (always small on success)
+      - ok:            True if we got a usable ask, False if we should fall through
+      - reason:        machine-readable reason when ok is False (e.g. 'no_quote',
+                       'broker_error', 'invalid_ask'). Empty string when ok=True.
+
+    Failure is non-fatal: callers should fall through with the selector_ask
+    (no chase-band guard) so a quote-feed hiccup does not kill all entries.
+    """
+    t0 = time.time()
+    try:
+        quote = broker.get_quote(contract) or {}
+    except Exception as e:
+        log.warning("_refresh_ask_at_submit: broker.get_quote raised contract=%s err=%s", contract, e)
+        return 0.0, 0, False, "broker_error"
+
+    try:
+        ask_raw = quote.get("ask")
+        ask = float(ask_raw) if ask_raw is not None else 0.0
+    except (TypeError, ValueError):
+        return 0.0, 0, False, "invalid_ask"
+
+    if ask <= 0:
+        return 0.0, 0, False, "no_quote"
+
+    quote_age_ms = int((time.time() - t0) * 1000)
+    return ask, quote_age_ms, True, ""
+
+
 def _submit_order_with_retry(broker, symbol: str, contract: str, qty: int, premium: float) -> tuple[bool, str | None, str | None]:
     last_error = None
 
@@ -636,9 +688,59 @@ def process_signal(broker, client_id: str, signal_payload: dict) -> dict:
         reserved = True
         reserved_cost = float(total_cost)
 
+        # PHASE 3: capture the ask used during selection.
+        selector_ask = float(premium)
+
+        # PHASE 3: re-fetch the ask immediately before broker submit.
+        # On success this gives us a fresher quote (submit_ask) and a
+        # quote_age_ms = 0 reading. On failure we fall through with
+        # selector_ask (no chase block).
+        submit_ask, quote_age_ms, refresh_ok, refresh_reason = \
+            _refresh_ask_at_submit(broker, contract)
+        if refresh_ok and submit_ask > 0 and selector_ask > 0:
+            gap_pct = (submit_ask / selector_ask) - 1.0
+        else:
+            gap_pct = 0.0
+
+        # PHASE 3: chase-band guard. If the ask ran beyond SUBMIT_CHASE_BAND_PCT
+        # while we were in the admission path, abort before paying it. The
+        # signal is not invalidated yet (Phase 5 retry can re-arm), so we
+        # mark with a distinct reason the dashboard can bucket.
+        if refresh_ok and gap_pct > SUBMIT_CHASE_BAND_PCT:
+            release_equity(client_id, reserved_cost)
+            release_symbol_lock(client_id, symbol)
+            reserved = False
+            locked = False
+            log.warning(
+                "[%s] RUNAWAY_QUOTE_AT_SUBMIT symbol=%s contract=%s "
+                "selector_ask=%.2f submit_ask=%.2f gap_pct=%.4f band=%.4f",
+                client_id, symbol, contract,
+                selector_ask, submit_ask, gap_pct, SUBMIT_CHASE_BAND_PCT,
+            )
+            audit(client_id, "WARNING", "RUNAWAY_QUOTE_AT_SUBMIT", {
+                "symbol": symbol, "contract": contract,
+                "selector_ask": float(selector_ask),
+                "submit_ask": float(submit_ask),
+                "gap_pct": float(gap_pct),
+                "band": float(SUBMIT_CHASE_BAND_PCT),
+            })
+            return {
+                "ok": False,
+                "error": "runaway_quote_at_submit",
+                "selector_ask": float(selector_ask),
+                "submit_ask": float(submit_ask),
+                "gap_pct": float(gap_pct),
+            }
+
+        # PHASE 3: use the fresher quote as the submit limit if available;
+        # otherwise fall back to the selector ask (back-compat).
+        submit_limit = float(submit_ask) if (refresh_ok and submit_ask > 0) else float(selector_ask)
+
         local_order_id = new_local_order_id()
         # AUDIT PHASE-2: persist meta so admission ordering (score) and re-peg
         # alignment gate (signal_entry_price) have what they need at decision time.
+        # PHASE 3: persist selector_ask / submit_ask / submit_limit / quote_age_ms
+        # / entry_attempt so the dashboard can chart submit-time quote drift.
         _meta = {
             "score":              float(signal_payload.get("score") or signal_payload.get("ev_score") or 0),
             "ticker":             symbol,
@@ -652,6 +754,14 @@ def process_signal(broker, client_id: str, signal_payload: dict) -> dict:
             "source":             str(signal_payload.get("source") or ""),
             "repeg_attempts":     0,
             "last_repeg_ts":      0,
+            # PHASE 3: submit-time telemetry
+            "selector_ask":       float(selector_ask),
+            "submit_ask":         float(submit_ask) if refresh_ok else None,
+            "submit_limit":       float(submit_limit),
+            "quote_age_ms":       int(quote_age_ms),
+            "submit_refresh_ok":  bool(refresh_ok),
+            "submit_refresh_reason": str(refresh_reason or ""),
+            "entry_attempt":      0,
         }
         insert_order(
             client_id=client_id,
@@ -663,7 +773,7 @@ def process_signal(broker, client_id: str, signal_payload: dict) -> dict:
             contract=contract,
             direction=direction,
             qty=qty,
-            limit_price=float(premium),
+            limit_price=float(submit_limit),
             reserved_cost=float(reserved_cost),
             meta=_meta,
         )
@@ -675,7 +785,18 @@ def process_signal(broker, client_id: str, signal_payload: dict) -> dict:
             release_symbol_lock(client_id, symbol)
             return {"ok": False, "error": "killed_before_submit"}
 
-        ok, broker_order_id, err = _submit_order_with_retry(broker, symbol, contract, qty, float(premium))
+        # PHASE 3: emit explicit entry_attempt=0 token on the original submit
+        # for parity with retry_engine's REPEG_APPLIED entry_attempt=N logs.
+        log.info(
+            "[%s] ENTRY_SUBMIT order=%s entry_attempt=0 contract=%s qty=%d "
+            "selector_ask=%.2f submit_ask=%s submit_limit=%.2f quote_age_ms=%d gap_pct=%.4f",
+            client_id, local_order_id, contract, int(qty),
+            selector_ask,
+            (f"{submit_ask:.2f}" if refresh_ok else "NA"),
+            submit_limit, int(quote_age_ms), gap_pct,
+        )
+
+        ok, broker_order_id, err = _submit_order_with_retry(broker, symbol, contract, qty, float(submit_limit))
         if not ok:
             update_order(local_order_id, status="REJECTED", broker_order_id=broker_order_id, last_error=err)
             release_equity(client_id, reserved_cost)
@@ -701,6 +822,12 @@ def process_signal(broker, client_id: str, signal_payload: dict) -> dict:
             "broker_order_id": broker_order_id,
             "spy_trend": spy_trend,
             "ms": int((time.time() - t0) * 1000),
+            # PHASE 3: submit-time telemetry for dashboard
+            "selector_ask": float(selector_ask),
+            "submit_ask": float(submit_ask) if refresh_ok else None,
+            "submit_limit": float(submit_limit),
+            "quote_age_ms": int(quote_age_ms),
+            "entry_attempt": 0,
         })
 
         return {
@@ -709,12 +836,18 @@ def process_signal(broker, client_id: str, signal_payload: dict) -> dict:
             "direction": direction,
             "contract": contract,
             "qty": int(qty),
-            "premium": float(premium),
+            "premium": float(premium),  # back-compat: selector_ask value
             "reserved_cost": float(reserved_cost),
             "local_order_id": local_order_id,
             "broker_order_id": broker_order_id,
             "status": "PENDING_FILL",
             "spy_trend": spy_trend,
+            # PHASE 3: expose submit-time telemetry to callers
+            "selector_ask": float(selector_ask),
+            "submit_ask": float(submit_ask) if refresh_ok else None,
+            "submit_limit": float(submit_limit),
+            "quote_age_ms": int(quote_age_ms),
+            "entry_attempt": 0,
         }
 
     except Exception as e:
