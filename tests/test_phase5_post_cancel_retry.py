@@ -72,7 +72,7 @@ class TestNonRetryableReasons:
     @pytest.mark.parametrize("reason", REASONS)
     def test_each_reason_aborts(self, reason):
         from ap.post_cancel_retry import evaluate_retry
-        order = {"direction": "CALL", "symbol": "QCOM",
+        order = {"direction": "CALL", "symbol": "QCOM", "contract": "QCOM260523C00185000",
                  "meta": {"signal_entry_price": 185.0, "retry_attempts": 0}}
         d = evaluate_retry(canceled_order=order, cancel_reason=reason, underlying_spot=185.0)
         assert d.action == "ABORT", f"{reason} should ABORT"
@@ -80,7 +80,7 @@ class TestNonRetryableReasons:
 
     def test_reason_case_insensitive(self):
         from ap.post_cancel_retry import evaluate_retry
-        order = {"direction": "CALL", "symbol": "QCOM", "meta": {}}
+        order = {"direction": "CALL", "symbol": "QCOM", "contract": "QCOM260523C00185000", "meta": {}}
         d = evaluate_retry(canceled_order=order, cancel_reason="RUNAWAY_QUOTE")
         assert d.action == "ABORT"
         assert d.reason_code == "NON_RETRYABLE_REASON"
@@ -102,7 +102,7 @@ class TestRetryableReasons:
     @pytest.mark.parametrize("reason", REASONS)
     def test_each_reason_arms_when_aligned(self, reason):
         from ap.post_cancel_retry import evaluate_retry
-        order = {"direction": "CALL", "symbol": "QCOM",
+        order = {"direction": "CALL", "symbol": "QCOM", "contract": "QCOM260523C00185000",
                  "meta": {"signal_entry_price": 185.0, "retry_attempts": 0}}
         d = evaluate_retry(canceled_order=order, cancel_reason=reason,
                            underlying_spot=185.0,  # exactly at signal entry
@@ -113,7 +113,7 @@ class TestRetryableReasons:
 
     def test_unknown_reason_fails_closed(self):
         from ap.post_cancel_retry import evaluate_retry
-        order = {"direction": "CALL", "symbol": "QCOM",
+        order = {"direction": "CALL", "symbol": "QCOM", "contract": "QCOM260523C00185000",
                  "meta": {"signal_entry_price": 185.0, "retry_attempts": 0}}
         d = evaluate_retry(canceled_order=order, cancel_reason="something_new",
                            underlying_spot=185.0)
@@ -128,7 +128,7 @@ class TestRetryableReasons:
 class TestMaxAttempts:
     def test_first_retry_armed(self):
         from ap.post_cancel_retry import evaluate_retry
-        order = {"direction": "CALL", "symbol": "QCOM",
+        order = {"direction": "CALL", "symbol": "QCOM", "contract": "QCOM260523C00185000",
                  "meta": {"signal_entry_price": 185.0, "retry_attempts": 0}}
         d = evaluate_retry(canceled_order=order, cancel_reason="stale_entry_timeout",
                            underlying_spot=185.0)
@@ -138,7 +138,7 @@ class TestMaxAttempts:
 
     def test_second_retry_armed(self):
         from ap.post_cancel_retry import evaluate_retry
-        order = {"direction": "CALL", "symbol": "QCOM",
+        order = {"direction": "CALL", "symbol": "QCOM", "contract": "QCOM260523C00185000",
                  "meta": {"signal_entry_price": 185.0, "retry_attempts": 1}}
         d = evaluate_retry(canceled_order=order, cancel_reason="stale_entry_timeout",
                            underlying_spot=185.0)
@@ -147,7 +147,7 @@ class TestMaxAttempts:
 
     def test_third_retry_aborted(self):
         from ap.post_cancel_retry import evaluate_retry
-        order = {"direction": "CALL", "symbol": "QCOM",
+        order = {"direction": "CALL", "symbol": "QCOM", "contract": "QCOM260523C00185000",
                  "meta": {"signal_entry_price": 185.0, "retry_attempts": 2}}
         d = evaluate_retry(canceled_order=order, cancel_reason="stale_entry_timeout",
                            underlying_spot=185.0)
@@ -157,7 +157,7 @@ class TestMaxAttempts:
 
     def test_far_above_max_aborted(self):
         from ap.post_cancel_retry import evaluate_retry
-        order = {"direction": "CALL", "symbol": "QCOM",
+        order = {"direction": "CALL", "symbol": "QCOM", "contract": "QCOM260523C00185000",
                  "meta": {"signal_entry_price": 185.0, "retry_attempts": 99}}
         d = evaluate_retry(canceled_order=order, cancel_reason="stale_entry_timeout",
                            underlying_spot=185.0)
@@ -172,7 +172,7 @@ class TestMaxAttempts:
 class TestAlignmentGate:
     def test_call_aligned_at_signal_arms(self):
         from ap.post_cancel_retry import evaluate_retry
-        order = {"direction": "CALL", "symbol": "QCOM",
+        order = {"direction": "CALL", "symbol": "QCOM", "contract": "QCOM260523C00185000",
                  "meta": {"signal_entry_price": 185.0, "retry_attempts": 0}}
         d = evaluate_retry(canceled_order=order, cancel_reason="stale_entry_timeout",
                            underlying_spot=185.0)
@@ -182,7 +182,7 @@ class TestAlignmentGate:
     def test_call_drifted_down_aborts(self):
         from ap.post_cancel_retry import evaluate_retry
         # 0.002 drift = 0.37 ; spot at 184.5 is well below floor
-        order = {"direction": "CALL", "symbol": "QCOM",
+        order = {"direction": "CALL", "symbol": "QCOM", "contract": "QCOM260523C00185000",
                  "meta": {"signal_entry_price": 185.0, "retry_attempts": 0}}
         d = evaluate_retry(canceled_order=order, cancel_reason="stale_entry_timeout",
                            underlying_spot=184.0)
@@ -192,7 +192,7 @@ class TestAlignmentGate:
 
     def test_put_aligned_at_signal_arms(self):
         from ap.post_cancel_retry import evaluate_retry
-        order = {"direction": "PUT", "symbol": "QCOM",
+        order = {"direction": "PUT", "symbol": "QCOM", "contract": "QCOM260523P00185000",
                  "meta": {"signal_entry_price": 185.0, "retry_attempts": 0}}
         d = evaluate_retry(canceled_order=order, cancel_reason="stale_entry_timeout",
                            underlying_spot=185.0)
@@ -201,7 +201,7 @@ class TestAlignmentGate:
 
     def test_put_drifted_up_aborts(self):
         from ap.post_cancel_retry import evaluate_retry
-        order = {"direction": "PUT", "symbol": "QCOM",
+        order = {"direction": "PUT", "symbol": "QCOM", "contract": "QCOM260523P00185000",
                  "meta": {"signal_entry_price": 185.0, "retry_attempts": 0}}
         d = evaluate_retry(canceled_order=order, cancel_reason="stale_entry_timeout",
                            underlying_spot=186.0)
@@ -212,7 +212,7 @@ class TestAlignmentGate:
         """Legacy orders without signal_entry_price still get the retry.
         Same back-compat behavior as retry_engine.py gate 3."""
         from ap.post_cancel_retry import evaluate_retry
-        order = {"direction": "CALL", "symbol": "QCOM",
+        order = {"direction": "CALL", "symbol": "QCOM", "contract": "QCOM260523C00185000",
                  "meta": {"retry_attempts": 0}}  # no signal_entry_price
         d = evaluate_retry(canceled_order=order, cancel_reason="stale_entry_timeout",
                            underlying_spot=185.0)
@@ -221,7 +221,7 @@ class TestAlignmentGate:
 
     def test_no_spot_allows_retry(self):
         from ap.post_cancel_retry import evaluate_retry
-        order = {"direction": "CALL", "symbol": "QCOM",
+        order = {"direction": "CALL", "symbol": "QCOM", "contract": "QCOM260523C00185000",
                  "meta": {"signal_entry_price": 185.0, "retry_attempts": 0}}
         d = evaluate_retry(canceled_order=order, cancel_reason="stale_entry_timeout",
                            underlying_spot=None)
@@ -237,7 +237,7 @@ class TestWaitSecs:
     def test_wait_in_bounds(self):
         from ap.post_cancel_retry import evaluate_retry
         rng = random.Random(1234)
-        order = {"direction": "CALL", "symbol": "QCOM",
+        order = {"direction": "CALL", "symbol": "QCOM", "contract": "QCOM260523C00185000",
                  "meta": {"signal_entry_price": 185.0, "retry_attempts": 0}}
         for _ in range(100):
             d = evaluate_retry(canceled_order=order, cancel_reason="stale_entry_timeout",
@@ -247,7 +247,7 @@ class TestWaitSecs:
 
     def test_wait_deterministic_with_seed(self):
         from ap.post_cancel_retry import evaluate_retry
-        order = {"direction": "CALL", "symbol": "QCOM",
+        order = {"direction": "CALL", "symbol": "QCOM", "contract": "QCOM260523C00185000",
                  "meta": {"signal_entry_price": 185.0, "retry_attempts": 0}}
         d1 = evaluate_retry(canceled_order=order, cancel_reason="stale_entry_timeout",
                             underlying_spot=185.0, rng=random.Random(42))
@@ -263,7 +263,7 @@ class TestWaitSecs:
 class TestRetryPayload:
     def test_payload_carries_signal_id(self):
         from ap.post_cancel_retry import evaluate_retry
-        order = {"direction": "CALL", "symbol": "QCOM", "local_order_id": "loc-1",
+        order = {"direction": "CALL", "symbol": "QCOM", "contract": "QCOM260523C00185000", "local_order_id": "loc-1",
                  "meta": {"signal_entry_price": 185.0, "retry_attempts": 0,
                           "signal_id": "sig-abc", "score": 88, "source": "scanner"}}
         d = evaluate_retry(canceled_order=order, cancel_reason="stale_entry_timeout",
@@ -280,7 +280,7 @@ class TestRetryPayload:
 
     def test_payload_carries_signal_entry_price(self):
         from ap.post_cancel_retry import evaluate_retry
-        order = {"direction": "PUT", "symbol": "AAPL", "local_order_id": "loc-2",
+        order = {"direction": "PUT", "symbol": "AAPL", "contract": "AAPL260523P00200500", "local_order_id": "loc-2",
                  "meta": {"signal_entry_price": 200.5, "retry_attempts": 0}}
         d = evaluate_retry(canceled_order=order, cancel_reason="missed_move",
                            underlying_spot=200.5)
@@ -296,7 +296,7 @@ class TestDisabledFlag:
     def test_disabled_returns_abort(self, monkeypatch):
         monkeypatch.setattr("ap.post_cancel_retry.ENTRY_RETRY_ENABLED", False)
         from ap.post_cancel_retry import evaluate_retry
-        order = {"direction": "CALL", "symbol": "QCOM",
+        order = {"direction": "CALL", "symbol": "QCOM", "contract": "QCOM260523C00185000",
                  "meta": {"signal_entry_price": 185.0, "retry_attempts": 0}}
         d = evaluate_retry(canceled_order=order, cancel_reason="stale_entry_timeout",
                            underlying_spot=185.0)
@@ -325,7 +325,7 @@ class TestReasonNormalization:
 class TestDecisionShape:
     def test_arm_carries_full_context(self):
         from ap.post_cancel_retry import evaluate_retry
-        order = {"direction": "CALL", "symbol": "QCOM", "local_order_id": "loc-3",
+        order = {"direction": "CALL", "symbol": "QCOM", "contract": "QCOM260523C00185000", "local_order_id": "loc-3",
                  "meta": {"signal_entry_price": 185.0, "retry_attempts": 0}}
         d = evaluate_retry(canceled_order=order, cancel_reason="stale_entry_timeout",
                            underlying_spot=185.0, rng=random.Random(1))
@@ -339,7 +339,7 @@ class TestDecisionShape:
 
     def test_abort_carries_full_context(self):
         from ap.post_cancel_retry import evaluate_retry
-        order = {"direction": "CALL", "symbol": "QCOM",
+        order = {"direction": "CALL", "symbol": "QCOM", "contract": "QCOM260523C00185000",
                  "meta": {"signal_entry_price": 185.0, "retry_attempts": 0}}
         d = evaluate_retry(canceled_order=order, cancel_reason="thesis_invalid",
                            underlying_spot=185.0)

@@ -141,14 +141,153 @@ class RetryDecision:
 # ----------------------------------------------------------------------
 
 def _normalize_reason(raw: str | None) -> str:
+    """BUG-D FIX (PR #29): normalize a free-text cancel reason to a canonical
+    retry-engine token.
+
+    The cancel paths in order_monitor produce sentences like:
+        'STALE_ENTRY_CANCEL MISSED_MOVE — limit=$3.08 current=$3.30 ...'
+        'ENTRY_MAX_AGE_NORMAL_REACHED unfilled at 90s ...'
+        'ENTRY_MAX_AGE_APLUS_REACHED unfilled at 120s ...'
+        'STALE_ENTRY_CANCEL ...'
+
+    Prior shape only stripped a leading prefix and lowercased, so none of
+    these matched RETRYABLE_REASONS / NON_RETRYABLE_REASONS. Effect: every
+    cancel hit UNKNOWN_REASON_FAIL_CLOSED and no retry ever armed.
+
+    Matching rules (priority order, first hit wins):
+      contains 'ENTRY_MAX_AGE_NORMAL_REACHED' -> 'entry_max_age_normal_reached'
+      contains 'ENTRY_MAX_AGE_APLUS_REACHED'  -> 'entry_max_age_aplus_reached'
+      contains 'MISSED_MOVE'                  -> 'missed_move'
+      contains 'STALE_ENTRY_TIMEOUT'
+        or     'STALE_ENTRY_CANCEL'           -> 'stale_entry_timeout'
+      contains 'RUNAWAY_QUOTE_AT_SUBMIT'      -> 'runaway_quote_at_submit'
+      contains 'RUNAWAY_QUOTE'                -> 'runaway_quote'
+      contains 'THESIS_INVALID'               -> 'thesis_invalid'
+      contains 'SPREAD_WIDE'                  -> 'spread_wide'
+      contains 'POSITIONS_FULL'               -> 'positions_full'
+      contains 'LOST_HANDOFF'                 -> 'lost_handoff'
+      contains 'RISK_GATE_BLOCKED'            -> 'risk_gate_blocked'
+      contains 'KILL_SWITCH'                  -> 'kill_switch_active'
+      contains 'BROKER_TRANSIENT'             -> 'broker_transient_error'
+      contains 'UNFILLED_AT_LADDER_TOP'       -> 'unfilled_at_ladder_top'
+      contains 'DAILY_TRADE_CAP'              -> 'daily_trade_cap'
+
+    Anything that does not match returns the prefix-stripped lowercased
+    string AS-IS so callers can still recognize legacy canonical tokens.
+    Unknown sentences land in evaluate_retry's UNKNOWN_REASON_FAIL_CLOSED.
+    """
     if not raw:
         return ""
-    s = str(raw).strip().lower()
+    s = str(raw).strip()
     # Strip optional prefixes the audit tags sometimes carry.
+    s_lower = s.lower()
     for prefix in ("cancel_reason:", "reason:", "stale_entry:"):
-        if s.startswith(prefix):
+        if s_lower.startswith(prefix):
             s = s[len(prefix):].strip()
-    return s
+            s_lower = s.lower()
+
+    s_upper = s.upper()
+
+    # Specific tokens first so 'ENTRY_MAX_AGE_NORMAL_REACHED ...' wins over
+    # the generic 'STALE_ENTRY_CANCEL' fallback.
+    if "ENTRY_MAX_AGE_NORMAL_REACHED" in s_upper:
+        return "entry_max_age_normal_reached"
+    if "ENTRY_MAX_AGE_APLUS_REACHED" in s_upper:
+        return "entry_max_age_aplus_reached"
+    if "MISSED_MOVE" in s_upper:
+        return "missed_move"
+    if "RUNAWAY_QUOTE_AT_SUBMIT" in s_upper:
+        return "runaway_quote_at_submit"
+    if "RUNAWAY_QUOTE" in s_upper:
+        return "runaway_quote"
+    if "THESIS_INVALID" in s_upper:
+        return "thesis_invalid"
+    if "SPREAD_WIDE" in s_upper:
+        return "spread_wide"
+    if "POSITIONS_FULL" in s_upper:
+        return "positions_full"
+    if "LOST_HANDOFF" in s_upper:
+        return "lost_handoff"
+    if "RISK_GATE_BLOCKED" in s_upper:
+        return "risk_gate_blocked"
+    if "KILL_SWITCH" in s_upper:
+        return "kill_switch_active"
+    if "BROKER_TRANSIENT" in s_upper:
+        return "broker_transient_error"
+    if "UNFILLED_AT_LADDER_TOP" in s_upper:
+        return "unfilled_at_ladder_top"
+    if "DAILY_TRADE_CAP" in s_upper:
+        return "daily_trade_cap"
+    # Generic stale-entry tokens last so MISSED_MOVE wins.
+    if "STALE_ENTRY_TIMEOUT" in s_upper or "STALE_ENTRY_CANCEL" in s_upper:
+        return "stale_entry_timeout"
+
+    # Truly unknown reasons: return prefix-stripped lowercased form.
+    # evaluate_retry will fail closed with UNKNOWN_REASON_FAIL_CLOSED.
+    return s_lower
+
+
+import re as _re
+
+# OCC option symbols end in 8-digit strike * 1000, e.g.
+#   'QCOM260523C00185000' -> strike 185.000
+# We trust the last 8 chars as the strike-block; the format is rigid.
+_OCC_STRIKE_RE = _re.compile(r"([CP])(\d{8})$")
+
+
+def _resolve_strike(canceled_order: dict, meta: dict) -> Optional[float]:
+    """BUG-C FIX (PR #29): resolve trigger.strike from any of four sources.
+
+    Priority:
+      1. meta.trigger.strike  (the original signal's trigger)
+      2. meta.strike          (a flat carry sometimes set during admission)
+      3. canceled_order.strike (legacy column)
+      4. OCC parse: take last (C|P)NNNNNNNN of the contract and / 1000
+
+    Returns a positive float, or None if nothing yields one.
+    """
+    # 1) meta.trigger.strike
+    try:
+        t = meta.get("trigger") if isinstance(meta.get("trigger"), dict) else None
+        if t and t.get("strike") is not None:
+            v = float(t["strike"])
+            if v > 0:
+                return v
+    except (TypeError, ValueError):
+        pass
+
+    # 2) meta.strike
+    try:
+        if meta.get("strike") is not None:
+            v = float(meta["strike"])
+            if v > 0:
+                return v
+    except (TypeError, ValueError):
+        pass
+
+    # 3) canceled_order.strike (legacy)
+    try:
+        if canceled_order.get("strike") is not None:
+            v = float(canceled_order["strike"])
+            if v > 0:
+                return v
+    except (TypeError, ValueError):
+        pass
+
+    # 4) OCC parse from contract
+    contract = canceled_order.get("contract")
+    if isinstance(contract, str) and contract:
+        m = _OCC_STRIKE_RE.search(contract.strip().upper())
+        if m:
+            try:
+                strike_raw = int(m.group(2))
+                v = strike_raw / 1000.0
+                if v > 0:
+                    return v
+            except (TypeError, ValueError):
+                pass
+
+    return None
 
 
 def _alignment_ok(direction: str, signal_entry: Optional[float], spot: Optional[float],
@@ -281,19 +420,62 @@ def evaluate_retry(
         )
     # align is True or None (None = legacy back-compat: allow)
 
-    # \u2500\u2500\u2500 ALL GATES PASS: ARM \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+    # === GATE 4 (BUG-C FIX, PR #29): strike must be resolvable ============
+    # process_signal requires trigger.strike (NOT signal_entry_price).
+    # We try four sources in priority order:
+    #   1. meta.trigger.strike
+    #   2. meta.strike
+    #   3. canceled_order.strike
+    #   4. parsed from OCC contract last-8-digits / 1000
+    # If none yield a positive float, ABORT with RETRY_MISSING_TRIGGER_STRIKE
+    # so we never hand process_signal a payload it will reject as missing_strike.
+    strike = _resolve_strike(canceled_order, meta)
+    if strike is None:
+        return RetryDecision(
+            action="ABORT", reason_code="RETRY_MISSING_TRIGGER_STRIKE",
+            explanation=(
+                "cannot resolve trigger.strike from meta.trigger.strike / "
+                "meta.strike / canceled_order.strike / contract OCC parse"
+            ),
+            **base,
+        )
+
+    # BUG-C FIX (PR #29): the symbol used by process_signal is the
+    # canonical UNDERLYING ticker, not the OCC option contract. We pull it
+    # from canceled_order.symbol (canonical) and fall back to meta.ticker.
+    symbol = (
+        (canceled_order.get("symbol") or "").strip().upper()
+        or (meta.get("ticker") or "").strip().upper()
+    )
+    if not symbol:
+        return RetryDecision(
+            action="ABORT", reason_code="RETRY_MISSING_SYMBOL",
+            explanation="cannot resolve underlying symbol from order or meta",
+            **base,
+        )
+
+    # === ALL GATES PASS: ARM ==============================================
     wait_secs = _compute_wait_secs(rng=rng)
 
-    # Build a retry payload the caller can drop into process_signal. We carry
-    # the original signal context plus our retry counter so the next loop\n    # can compose if it cancels again.
+    # BUG-C FIX (PR #29): payload now matches process_signal's required
+    # shape: symbol (not ticker) and trigger.strike (not signal_entry_price).
+    # Legacy alias 'ticker' is preserved so any consumer still keyed on it
+    # keeps working.
     retry_payload = {
         "signal_id":            meta.get("signal_id") or "",
         "source":               meta.get("source") or "post_cancel_retry",
-        "ticker":               canceled_order.get("symbol"),
+        "symbol":               symbol,
+        "ticker":               symbol,                 # legacy alias
         "direction":            direction,
         "score":                meta.get("score") or 0,
         "signal_entry_price":   signal_entry,
         "exp_hint":             meta.get("exp_hint") or "DAILY",
+        "trigger":              {
+            "strike":            float(strike),
+            # Carry the original entry price as underlying_price so
+            # _resolve_option_contract has its alignment reference.
+            "underlying_price":  float(signal_entry) if signal_entry else None,
+        },
         # Retry-specific bookkeeping the caller will persist into meta:
         "retry_attempt":        next_attempt,
         "retry_of_local_oid":   canceled_order.get("local_order_id"),
