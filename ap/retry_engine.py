@@ -419,10 +419,17 @@ def apply_repeg(
         )
         return False
 
+    # P1 ENTRY FIX (2026-05-21): emit explicit entry_attempt= token so the
+    # dashboard log-parser can bucket by attempt number.
+    # attempts_used semantics (matches spec):
+    #   entry_attempt=0 = original ask submit (no repeg)
+    #   entry_attempt=1 = first repeg (ask + 0.01 ladder)
+    #   entry_attempt=2 = second repeg (ask + 0.02 ladder)
     log.info(
-        "[%s] REPEG_APPLIED order=%s old_broker=%s new_broker=%s prev_limit=%.2f "
-        "new_limit=%.2f attempt=%d/%d reason=%s",
-        client_id, local_oid, broker_oid, new_broker_oid,
+        "[%s] REPEG_APPLIED order=%s entry_attempt=%d old_broker=%s new_broker=%s "
+        "prev_limit=%.2f new_limit=%.2f attempt=%d/%d reason=%s",
+        client_id, local_oid, decision.attempts_used,
+        broker_oid, new_broker_oid,
         decision.detail.get("prev_limit", 0.0),
         decision.new_limit_price,
         decision.attempts_used, REPEG_MAX_ATTEMPTS,

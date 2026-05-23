@@ -503,6 +503,23 @@ def process_signal(broker, client_id: str, signal_payload: dict) -> dict:
         if mode == "READ_ONLY":
             return {"ok": False, "error": "read_only_mode"}
 
+        # P1 ENTRY FIX (2026-05-21): systemic LOST_HANDOFF halt.
+        # If the order monitor detected 3+ LOST_HANDOFF_30S events within 5 min
+        # for this client, it sets client_state.lost_handoff_systemic_halt=True.
+        # That indicates a structural handoff failure (watcher loop crashed,
+        # OSM submit-path broken). Continuing to arm new entries will produce
+        # the same outcome. Block until an operator clears the flag.
+        if st.get("lost_handoff_systemic_halt"):
+            log.warning(
+                "[%s] ENTRY_BLOCKED: lost_handoff_systemic_halt set — operator must clear",
+                client_id,
+            )
+            return {
+                "ok": False,
+                "error": "lost_handoff_systemic_halt",
+                "hint": "3+ LOST_HANDOFF_30S in 5min; investigate watcher/OSM and clear flag in client_state",
+            }
+
         st = _maybe_reset_daily_state(broker, client_id, client, st)
 
         loss_check = _check_daily_loss_stop(client_id, st)
