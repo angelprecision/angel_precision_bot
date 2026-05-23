@@ -97,6 +97,22 @@ TIMEOUT_PARTIAL_FILL  = int(os.getenv("ORDER_TIMEOUT_PARTIAL_FILL",  "900"))   #
 # at any reasonable price. Earlier cancellation frees the slot for the next
 # signal and prevents capital being parked on dead limit orders.
 ENTRY_LIMIT_MAX_AGE_SECONDS = int(os.getenv("ENTRY_LIMIT_MAX_AGE_SECONDS", "25"))  # 25s
+
+# PHASE 2 ADAPTIVE AUTOCANCEL (2026-05-23):
+# 25s is the RE-EVALUATION trigger, not a hard kill. At 25s we run the
+# alignment gates (decide_repeg). If still aligned, the order may continue
+# up to ENTRY_MAX_AGE_NORMAL (90s) for a typical setup, or
+# ENTRY_MAX_AGE_APLUS (120s) for A/A+ scored setups.
+#
+# Immediate cancel happens ONLY for:
+#   thesis_invalid, spread_wide, runaway_quote, positions_full,
+#   lost_handoff_systemic, risk_gate_blocked.
+#
+# Every cancel writes an exact reason_code so the dashboard can bucket.
+ENTRY_REEVAL_AGE_SECONDS = int(os.getenv("ENTRY_REEVAL_AGE_SECONDS", "25"))
+ENTRY_MAX_AGE_NORMAL     = int(os.getenv("ENTRY_MAX_AGE_NORMAL",     "90"))
+ENTRY_MAX_AGE_APLUS      = int(os.getenv("ENTRY_MAX_AGE_APLUS",      "120"))
+ENTRY_APLUS_SCORE_THRESHOLD = float(os.getenv("ENTRY_APLUS_SCORE_THRESHOLD", "85"))
 # H4: exit reliability. An unfilled exit on a fast-moving option is direct
 # account risk — a +25% green trade can round-trip to breakeven or a loss
 # while a mispriced limit exit sits unfilled. 5 min was far too slow. At 45s
@@ -615,42 +631,113 @@ class APOrderMonitor:
 
             # ── Trigger (b): HARD ENTRY AGE ───────────────────────────────
             # A buy-to-open that has not filled within the hard ceiling is a
-            # stale scalp entry — cancel regardless of price.
-            if broker_oid and age_secs >= ENTRY_LIMIT_MAX_AGE_SECONDS:
-                log.warning(
-                    "[%s] ENTRY_ACK_TIMEOUT_CANCEL | %s | status=%s age=%.0fs "
-                    ">= %ds hard entry ceiling — scalp entry stale",
-                    self.client_id, _sym or contract, status, age_secs,
-                    ENTRY_LIMIT_MAX_AGE_SECONDS,
-                )
-                self._emit_order_event(
-                    local_order_id=local_id,
-                    stage="order_monitor",
-                    decision="REJECT",
-                    reason_code="MISSED_MOVE_ENTRY_CANCEL",
-                    explanation=(
-                        f"Canceling stale entry — unfilled {age_secs:.0f}s "
-                        f">= {ENTRY_LIMIT_MAX_AGE_SECONDS}s hard ceiling (status={status})"
-                    ),
-                    contract=contract,
-                    inputs={
-                        "limit_price": float(_limit_price) if _limit_price else 0.0,
-                        "current_option_price": 0.0,
-                        "percent_above_limit": 0.0,
-                        "age_secs": round(age_secs, 1),
-                        "broker_order_id": broker_oid,
-                        "status": status,
-                    },
-                )
-                self._handle_stale_entry(
-                    local_id, status, contract, age_secs,
-                    action="cancel",
-                    reason=(
-                        f"STALE_ENTRY_CANCEL ENTRY_ACK_TIMEOUT — unfilled {age_secs:.0f}s "
-                        f">= {ENTRY_LIMIT_MAX_AGE_SECONDS}s ceiling status={status}"
-                    ),
-                )
-                return True
+            # PHASE 2 ADAPTIVE AUTOCANCEL (2026-05-23):
+            # At ENTRY_REEVAL_AGE_SECONDS (25s default), re-evaluate alignment
+            # instead of hard-canceling. If still aligned, the order may live
+            # to ENTRY_MAX_AGE_NORMAL (90s) or ENTRY_MAX_AGE_APLUS (120s) for
+            # A/A+ setups. Hard cancel only on thesis break or hitting the
+            # absolute ceiling.
+            #
+            # Score lookup for A/A+ tier:
+            _order_meta = order.get("meta") if isinstance(order.get("meta"), dict) else {}
+            try:
+                _score = float(_order_meta.get("score") or order.get("score") or 0)
+            except (TypeError, ValueError):
+                _score = 0.0
+            _is_aplus = _score >= ENTRY_APLUS_SCORE_THRESHOLD
+            _max_age = ENTRY_MAX_AGE_APLUS if _is_aplus else ENTRY_MAX_AGE_NORMAL
+
+            if broker_oid and age_secs >= ENTRY_REEVAL_AGE_SECONDS:
+                # Step 1: if past absolute ceiling, hard-cancel with explicit reason.
+                if age_secs >= _max_age:
+                    _ceiling_reason = (
+                        "ENTRY_MAX_AGE_APLUS_REACHED" if _is_aplus
+                        else "ENTRY_MAX_AGE_NORMAL_REACHED"
+                    )
+                    log.warning(
+                        "[%s] %s | %s | status=%s age=%.0fs >= %ds (score=%.1f tier=%s)",
+                        self.client_id, _ceiling_reason, _sym or contract, status,
+                        age_secs, _max_age, _score, "A+" if _is_aplus else "normal",
+                    )
+                    self._emit_order_event(
+                        local_order_id=local_id,
+                        stage="order_monitor",
+                        decision="REJECT",
+                        reason_code=_ceiling_reason,
+                        explanation=(
+                            f"Canceling stale entry at absolute ceiling — unfilled "
+                            f"{age_secs:.0f}s >= {_max_age}s ({'A+' if _is_aplus else 'normal'} tier)"
+                        ),
+                        contract=contract,
+                        inputs={
+                            "limit_price": float(_limit_price) if _limit_price else 0.0,
+                            "age_secs":    round(age_secs, 1),
+                            "max_age":     _max_age,
+                            "score":       _score,
+                            "is_aplus":    _is_aplus,
+                            "broker_order_id": broker_oid,
+                            "status":      status,
+                        },
+                    )
+                    self._handle_stale_entry(
+                        local_id, status, contract, age_secs,
+                        action="cancel",
+                        reason=(
+                            f"{_ceiling_reason} unfilled {age_secs:.0f}s >= {_max_age}s "
+                            f"(score={_score:.1f} tier={'A+' if _is_aplus else 'normal'})"
+                        ),
+                    )
+                    return True
+
+                # Step 2: between 25s and the ceiling, run alignment re-eval.
+                # We DON'T cancel here — we just emit a re-eval telemetry event.
+                # The repeg engine (called separately at MISSED_MOVE_MIN_SECS)
+                # handles actually adjusting the limit. This step exists so
+                # operators can SEE the re-eval happening in dashboard logs.
+                #
+                # Throttle: only log re-eval once per 15s to avoid log spam.
+                _last_reeval = (_order_meta.get("last_reeval_ts") or 0)
+                try:
+                    _last_reeval = float(_last_reeval)
+                except (TypeError, ValueError):
+                    _last_reeval = 0.0
+                _import_time = __import__("time")
+                if _import_time.time() - _last_reeval >= 15:
+                    log.info(
+                        "[%s] ENTRY_REEVAL | %s | status=%s age=%.0fs (max=%ds tier=%s score=%.1f) — "
+                        "order continues if aligned",
+                        self.client_id, _sym or contract, status, age_secs, _max_age,
+                        "A+" if _is_aplus else "normal", _score,
+                    )
+                    self._emit_order_event(
+                        local_order_id=local_id,
+                        stage="order_monitor",
+                        decision="CONTINUE",
+                        reason_code="ENTRY_REEVAL",
+                        explanation=(
+                            f"Re-evaluating at {age_secs:.0f}s — ceiling={_max_age}s "
+                            f"({'A+' if _is_aplus else 'normal'} tier, score={_score:.1f})"
+                        ),
+                        contract=contract,
+                        inputs={
+                            "age_secs":    round(age_secs, 1),
+                            "max_age":     _max_age,
+                            "reeval_threshold": ENTRY_REEVAL_AGE_SECONDS,
+                            "score":       _score,
+                            "is_aplus":    _is_aplus,
+                            "status":      status,
+                        },
+                    )
+                    # Best-effort: persist last_reeval_ts in order meta to throttle.
+                    try:
+                        from ap.db import update_order
+                        new_meta = dict(_order_meta)
+                        new_meta["last_reeval_ts"] = _import_time.time()
+                        update_order(local_id, meta=new_meta)
+                    except Exception:
+                        pass
+                # Re-eval done; do NOT cancel. Order continues.
+                return False
 
         except Exception as _se:
             log.debug(
