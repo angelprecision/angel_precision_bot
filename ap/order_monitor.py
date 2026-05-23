@@ -145,6 +145,17 @@ ORDER_MONITOR_CAN_ACT = ORDER_MONITOR_MODE in {"active", "actor", "enforce", "en
 # buy-to-open is not a position — leaving it to fill late is the actual risk.
 ALLOW_ENTRY_CANCEL_IN_WATCHDOG = os.getenv("ALLOW_ENTRY_CANCEL_IN_WATCHDOG", "1").strip() == "1"
 
+# PHASE 5 WIRE-IN (2026-05-23):
+# After an ENTRY cancel is broker-confirmed, the monitor consults
+# ap.post_cancel_retry.evaluate_retry. If the decision returns ARM, the
+# retry intent is persisted into the canceled order's meta JSONB and the
+# monitor's _check_armed_retries tick re-submits via execution.process_signal
+# after the jittered wait elapses.
+#
+# The wire-in is gated by ENTRY_RETRY_ENABLED (default on) so it can be
+# disabled in production via env without a code change. Wire-in itself is
+# additive — disabling it returns the monitor to pre-PR-22 behavior.
+ENTRY_RETRY_ENABLED = os.getenv("ENTRY_RETRY_ENABLED", "1").strip().lower() in ("1", "true", "yes")
 
 
 class APOrderMonitor:
@@ -278,6 +289,21 @@ class APOrderMonitor:
                     self._check_entry_orders()
                 except Exception as e:
                     log.error(f"[{self.client_id}] OrderMonitor entry-check error: {e}")
+            # PHASE 5 WIRE-IN: armed retries are polled on the FAST cadence
+            # (every EXIT_CHECK_INTERVAL = 15s by default) so a retry whose
+            # ready_at falls inside the 15-30s wait window is submitted within
+            # one tick of its target. Putting this on the slow POLL_INTERVAL
+            # (60s) would push worst-case submit latency to ~90s after cancel
+            # — outside the spec. The check itself is cheap (one DB SELECT).
+            # Wrapped in try/except: a retry-submit failure must NEVER prevent
+            # the next stale-order tick.
+            try:
+                self._check_armed_retries()
+            except Exception as e:
+                log.error(
+                    f"[{self.client_id}] OrderMonitor armed-retry-check error: {e}",
+                    exc_info=True,
+                )
             try:
                 from ap.self_healing import get_healer as _gh
                 _h = _gh()
@@ -746,6 +772,359 @@ class APOrderMonitor:
             )
         return False
 
+    # ─── PHASE 5 WIRE-IN: post-cancel retry orchestration ──────────────────────
+    #
+    # Two methods compose the retry orchestrator:
+    #
+    #   _maybe_arm_post_cancel_retry(local_order_id, contract, reason)
+    #       Called once, immediately after a successful CANCELED transition.
+    #       Consults ap.post_cancel_retry.evaluate_retry. On ARM, persists the
+    #       retry intent into the canceled order's meta JSONB and emits
+    #       ENTRY_RETRY_ARMED. On ABORT, emits ENTRY_RETRY_ABORTED.
+    #
+    #   _check_armed_retries()
+    #       Called every EXIT_CHECK_INTERVAL by the main loop. Selects this
+    #       client's CANCELED orders whose meta carries retry_status='ARMED'
+    #       AND retry_ready_at <= NOW(). For each, builds the signal payload
+    #       and hands it to ap.execution.process_signal, then transitions the
+    #       meta to retry_status='SUBMITTED' (or 'FAILED' if process_signal
+    #       rejected). Emits ENTRY_RETRY_SUBMITTED on success.
+    #
+    # Storage choice: the retry intent is stored in the existing orders.meta
+    # JSONB column (added by 20260519_phase2_orders_meta.sql). No new table
+    # is required — the canceled order row is durable, and a JSON object on
+    # it captures everything we need. retry_status is one of:
+    #   ARMED      — evaluate_retry returned ARM; submit pending until ready_at
+    #   SUBMITTED  — process_signal accepted the retry; a new order exists
+    #   ABORTED    — evaluate_retry returned ABORT (or retry was canceled)
+    #   FAILED     — process_signal returned ok=False at retry submit
+    #
+    # Duplicate-position guard: process_signal already calls
+    # acquire_symbol_lock and _count_active_entry_orders_today. Those gates
+    # prevent us from arming a position while one is already open. We also
+    # short-circuit if a FILLED position on the same symbol exists.
+
+    def _maybe_arm_post_cancel_retry(
+        self,
+        local_order_id: str,
+        contract: str,
+        cancel_reason: str,
+    ) -> None:
+        if not ENTRY_RETRY_ENABLED:
+            return
+        try:
+            from ap.post_cancel_retry import evaluate_retry
+        except Exception as e:
+            log.debug("[%s] post_cancel_retry unavailable: %s", self.client_id, e)
+            return
+
+        order = self.osm.get_order(local_order_id) or {}
+        if not order:
+            log.warning(
+                "[%s] _maybe_arm_post_cancel_retry: order not found %s",
+                self.client_id, local_order_id,
+            )
+            return
+
+        # Resolve underlying spot for the alignment gate. Re-uses the same
+        # logic as _try_repeg — stocks live in get_quote on the underlying
+        # symbol, not on the OCC option contract.
+        meta = order.get("meta") if isinstance(order.get("meta"), dict) else {}
+        underlying = (
+            self._get_underlying_symbol_from_contract(contract)
+            or order.get("symbol")
+            or (meta or {}).get("ticker")
+        )
+        spot: Optional[float] = None
+        if underlying:
+            try:
+                if hasattr(self.broker, "get_quote"):
+                    q = self.broker.get_quote(underlying) or {}
+                    last = q.get("last") or q.get("close") or q.get("price")
+                    if last:
+                        spot = float(last)
+                    elif q.get("bid") and q.get("ask"):
+                        spot = (float(q["bid"]) + float(q["ask"])) / 2
+            except Exception as e:
+                log.debug(
+                    "[%s] retry: underlying spot lookup failed for %s: %s",
+                    self.client_id, underlying, e,
+                )
+
+        decision = evaluate_retry(
+            canceled_order=order,
+            cancel_reason=cancel_reason,
+            underlying_spot=spot,
+        )
+
+        # Build inputs/context once; emitted on both ARM and ABORT paths.
+        evt_inputs = {
+            "cancel_reason":           cancel_reason,
+            "cancel_reason_normalized": decision.cancel_reason_normalized,
+            "attempt_number":          decision.attempt_number,
+            "max_attempts":            decision.max_attempts,
+            "alignment_ok":            decision.alignment_ok,
+            "underlying_spot":         spot,
+            "signal_entry_price":      decision.signal_entry_price,
+            "direction":               decision.direction,
+        }
+
+        if decision.action == "ABORT":
+            log.info(
+                "[%s] ENTRY_RETRY_ABORTED order=%s reason=%s detail=%s",
+                self.client_id, local_order_id,
+                decision.reason_code, decision.explanation,
+            )
+            self._emit_order_event(
+                local_order_id=local_order_id,
+                stage="post_cancel_retry",
+                decision="ABORT",
+                reason_code=decision.reason_code,
+                explanation=decision.explanation,
+                contract=contract,
+                inputs=evt_inputs,
+            )
+            # Best-effort: stamp meta so the dashboard can show the abort
+            # alongside the cancel.
+            try:
+                from ap.db import update_order
+                _meta = dict(meta or {})
+                _meta["retry_status"] = "ABORTED"
+                _meta["retry_abort_reason"] = decision.reason_code
+                _meta["retry_abort_ts"] = now_utc_iso()
+                update_order(local_order_id, meta=_meta)
+            except Exception as e:
+                log.debug(
+                    "[%s] retry: failed to stamp ABORTED meta on %s: %s",
+                    self.client_id, local_order_id, e,
+                )
+            return
+
+        # action == 'ARM'
+        ready_at_epoch = time.time() + float(decision.wait_secs)
+        try:
+            from ap.db import update_order
+            _meta = dict(meta or {})
+            _meta["retry_status"]      = "ARMED"
+            _meta["retry_attempt"]     = int(decision.attempt_number)
+            _meta["retry_armed_ts"]    = now_utc_iso()
+            _meta["retry_ready_at"]    = float(ready_at_epoch)
+            _meta["retry_wait_secs"]   = float(decision.wait_secs)
+            _meta["retry_payload"]     = decision.retry_payload
+            _meta["retry_cancel_reason"] = decision.cancel_reason_normalized
+            update_order(local_order_id, meta=_meta)
+        except Exception as e:
+            log.error(
+                "[%s] retry: failed to persist ARMED meta on %s: %s — SKIPPING retry",
+                self.client_id, local_order_id, e,
+                exc_info=True,
+            )
+            return
+
+        log.info(
+            "[%s] ENTRY_RETRY_ARMED order=%s attempt=%d/%d wait=%.1fs "
+            "cancel_reason=%s direction=%s alignment_ok=%s",
+            self.client_id, local_order_id,
+            decision.attempt_number, decision.max_attempts,
+            decision.wait_secs,
+            decision.cancel_reason_normalized,
+            decision.direction, decision.alignment_ok,
+        )
+        self._emit_order_event(
+            local_order_id=local_order_id,
+            stage="post_cancel_retry",
+            decision="ARM",
+            reason_code=decision.reason_code,
+            explanation=decision.explanation,
+            contract=contract,
+            inputs={**evt_inputs, "wait_secs": decision.wait_secs,
+                    "ready_at_epoch": ready_at_epoch},
+        )
+
+    def _check_armed_retries(self) -> None:
+        """Look for this client's ARMED retries whose ready_at has passed,
+        submit each via process_signal, and update meta to SUBMITTED/FAILED.
+        """
+        if not ENTRY_RETRY_ENABLED:
+            return
+
+        # Query: this client's CANCELED orders with meta.retry_status='ARMED'
+        # and retry_ready_at <= now. Cap at 16 per tick to avoid burst submits.
+        now_epoch = time.time()
+        rows = []
+        try:
+            def _fn():
+                with conn() as c:
+                    c.execute(
+                        """
+                        SELECT local_order_id, contract, symbol, direction, meta
+                        FROM   orders
+                        WHERE  client_id = %s
+                          AND  kind = 'ENTRY'
+                          AND  status = 'CANCELED'
+                          AND  meta ->> 'retry_status' = 'ARMED'
+                          AND  COALESCE((meta ->> 'retry_ready_at')::float, 0) <= %s
+                        ORDER BY updated_ts ASC
+                        LIMIT 16
+                        """,
+                        (self.client_id, now_epoch),
+                    )
+                    return [dict(r) for r in c.fetchall()]
+            rows = run_with_retry(_fn) or []
+        except Exception as e:
+            log.error(
+                "[%s] _check_armed_retries: DB select failed: %s",
+                self.client_id, e, exc_info=True,
+            )
+            return
+
+        if not rows:
+            return
+
+        log.info(
+            "[%s] _check_armed_retries: processing %d ready retr%s",
+            self.client_id, len(rows), "y" if len(rows) == 1 else "ies",
+        )
+
+        for row in rows:
+            local_oid = row.get("local_order_id")
+            contract  = row.get("contract")
+            meta      = row.get("meta") if isinstance(row.get("meta"), dict) else {}
+            payload   = (meta or {}).get("retry_payload") or {}
+            self._submit_armed_retry(local_oid, contract, payload, meta)
+
+    def _submit_armed_retry(
+        self,
+        local_order_id: str,
+        contract: Optional[str],
+        retry_payload: dict,
+        prior_meta: dict,
+    ) -> None:
+        # Defensive: refuse to submit if the payload is empty or malformed.
+        if not isinstance(retry_payload, dict) or not retry_payload.get("ticker"):
+            log.warning(
+                "[%s] _submit_armed_retry: malformed payload for %s — marking FAILED",
+                self.client_id, local_order_id,
+            )
+            self._stamp_retry_status(local_order_id, prior_meta,
+                                     status="FAILED", detail="malformed_payload")
+            return
+
+        # Hand to the same admission path a fresh signal uses. process_signal
+        # enforces symbol lock, equity reserve, daily cap, kill-switch, trend
+        # gate, and chase-band guard. We do NOT re-implement any of that here.
+        try:
+            from ap.execution import process_signal
+        except Exception as e:
+            log.error(
+                "[%s] _submit_armed_retry: cannot import process_signal: %s",
+                self.client_id, e,
+            )
+            self._stamp_retry_status(local_order_id, prior_meta,
+                                     status="FAILED", detail=f"import_error:{e}")
+            return
+
+        try:
+            result = process_signal(self.broker, self.client_id, retry_payload)
+        except Exception as e:
+            log.error(
+                "[%s] _submit_armed_retry: process_signal raised for retry of %s: %s",
+                self.client_id, local_order_id, e, exc_info=True,
+            )
+            self._stamp_retry_status(local_order_id, prior_meta,
+                                     status="FAILED", detail=f"exception:{e}")
+            self._emit_order_event(
+                local_order_id=local_order_id,
+                stage="post_cancel_retry",
+                decision="ERROR",
+                reason_code="RETRY_SUBMIT_EXCEPTION",
+                explanation=str(e),
+                contract=contract,
+            )
+            return
+
+        if not isinstance(result, dict) or not result.get("ok"):
+            err = (result or {}).get("error", "unknown")
+            log.warning(
+                "[%s] ENTRY_RETRY_ABORTED order=%s submit-time reject: %s",
+                self.client_id, local_order_id, err,
+            )
+            self._stamp_retry_status(local_order_id, prior_meta,
+                                     status="FAILED", detail=f"submit_reject:{err}")
+            # Also emit a post-cancel-retry abort event so the dashboard
+            # records the full lifecycle (ARM → submit-time reject).
+            self._emit_order_event(
+                local_order_id=local_order_id,
+                stage="post_cancel_retry",
+                decision="ABORT",
+                reason_code="SUBMIT_REJECT",
+                explanation=str(err),
+                contract=contract,
+                inputs={"submit_result": result},
+            )
+            return
+
+        # Success: process_signal accepted the retry. A NEW local_order_id
+        # exists for the retry order; reference it back to the canceled one.
+        new_local_oid = result.get("local_order_id")
+        new_broker_oid = result.get("broker_order_id")
+        log.info(
+            "[%s] ENTRY_RETRY_SUBMITTED prev=%s new=%s broker=%s contract=%s",
+            self.client_id, local_order_id, new_local_oid, new_broker_oid,
+            result.get("contract"),
+        )
+        self._stamp_retry_status(
+            local_order_id, prior_meta,
+            status="SUBMITTED",
+            detail="",
+            extra={
+                "retry_new_local_order_id":  new_local_oid,
+                "retry_new_broker_order_id": new_broker_oid,
+                "retry_submitted_ts":        now_utc_iso(),
+            },
+        )
+        self._emit_order_event(
+            local_order_id=local_order_id,
+            stage="post_cancel_retry",
+            decision="SUBMIT",
+            reason_code="RETRY_SUBMITTED",
+            explanation=f"retry submitted as {new_local_oid}",
+            contract=result.get("contract") or contract,
+            inputs={
+                "new_local_order_id":  new_local_oid,
+                "new_broker_order_id": new_broker_oid,
+                "qty":                 result.get("qty"),
+                "submit_limit":        result.get("submit_limit"),
+                "selector_ask":        result.get("selector_ask"),
+                "submit_ask":          result.get("submit_ask"),
+            },
+        )
+
+    def _stamp_retry_status(
+        self,
+        local_order_id: str,
+        prior_meta: dict,
+        *,
+        status: str,
+        detail: str = "",
+        extra: Optional[dict] = None,
+    ) -> None:
+        try:
+            from ap.db import update_order
+            _meta = dict(prior_meta or {})
+            _meta["retry_status"]    = status
+            _meta["retry_status_ts"] = now_utc_iso()
+            if detail:
+                _meta["retry_status_detail"] = detail
+            if extra:
+                _meta.update(extra)
+            update_order(local_order_id, meta=_meta)
+        except Exception as e:
+            log.error(
+                "[%s] _stamp_retry_status failed for %s status=%s: %s",
+                self.client_id, local_order_id, status, e,
+            )
+
     def _handle_stale_entry(
         self,
         local_order_id: str,
@@ -820,6 +1199,11 @@ class APOrderMonitor:
                         f"[{self.client_id}] Entry order CANCELED locally | "
                         f"{contract} | {local_order_id} | CREATED/no broker_id"
                     )
+                    # PHASE 5 WIRE-IN: consider arming a post-cancel retry.
+                    # CREATED/no-broker-id cancels almost never come from a
+                    # retryable reason, so the engine will typically ABORT;
+                    # call it anyway so every cancel goes through the same gate.
+                    self._maybe_arm_post_cancel_retry(local_order_id, contract, reason)
                 else:
                     log.error(
                         f"[{self.client_id}] Failed local cancel for CREATED entry: {local_order_id}"
@@ -841,6 +1225,13 @@ class APOrderMonitor:
                         f"[{self.client_id}] Entry order CANCELED (broker-confirmed) | "
                         f"{contract} | {local_order_id}"
                     )
+                    # PHASE 5 WIRE-IN: this is the primary retry hook.
+                    # After a broker-confirmed cancel we ask post_cancel_retry
+                    # whether the signal is still actionable. If ARM, the
+                    # retry intent lands in meta and _check_armed_retries
+                    # re-submits after the jittered wait. If ABORT, we emit
+                    # ENTRY_RETRY_ABORTED and move on.
+                    self._maybe_arm_post_cancel_retry(local_order_id, contract, reason)
                 else:
                     log.error(
                         f"[{self.client_id}] Failed to transition entry order to CANCELED: {local_order_id}"
