@@ -7,7 +7,7 @@ Spec
   qty             = floor(position_budget / (premium * 100))
 
   - MAX_TRADE_USD is an ABSOLUTE outer safety cap (default $50K)
-  - MAX_CONTRACTS clamps qty (default 50)
+  - MAX_CONTRACTS clamps qty (default 15 per PR #30; was 50 historically)
   - NO LIVE forced-1 anywhere
   - client.base_position_pct continues to win when set
   - returns sizing_reason_code so the dashboard can attribute the result
@@ -84,11 +84,12 @@ class TestAcceptanceExamples:
 
 class TestPctApplication:
     def test_100k_account_at_5_premium(self, size_fn):
-        # 100000 * 0.10 = 10000 ; 10000 / (5 * 100) = 20 contracts
+        # 100000 * 0.10 = 10000 ; 10000 / (5 * 100) = 20 raw -> capped at
+        # MAX_CONTRACTS=15 (PR #30 operational cap).
         qty, budget, reason = size_fn(100_000.0, 5.00)
-        assert qty == 20
+        assert qty == 15
         assert budget == pytest.approx(10_000.0)
-        assert reason == "ACCOUNT_EQUITY_PCT"
+        assert reason == "MAX_CONTRACTS_CAP"
 
     def test_client_override_wins(self, size_fn):
         # client.base_position_pct = 0.02 -> only 2% of equity = $2000

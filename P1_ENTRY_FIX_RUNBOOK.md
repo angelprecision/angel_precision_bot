@@ -1,5 +1,21 @@
 # P1 Entry Execution Fix — Runbook
 
+> **HISTORICAL DOCUMENT** (PR #17, 2026-05-21).
+>
+> This runbook describes the original P1 entry-execution fix. Several
+> settings called out below have since been **superseded by Phase 2 / 3 /
+> 4 / PR #30**. In particular:
+>
+> | Mentioned here | Current truth |
+> |---|---|
+> | `ENTRY_LIMIT_MAX_AGE_SECONDS=25` as hard 25s cancel ceiling | **Deprecated.** Replaced by adaptive autocancel: `ENTRY_REEVAL_AGE_SECONDS=25` (re-eval, not cancel), `ENTRY_MAX_AGE_NORMAL=90`, `ENTRY_MAX_AGE_APLUS=120`. Setting the env var has no effect on cancel behavior. |
+> | (Implied) `MAX_CONTRACTS=6` selector pre-cap | **`MAX_CONTRACTS=15`** as of PR #30 (operational cap). |
+>
+> Refer to `ap/order_monitor.py` constants and the `phase11` / `phase12`
+> commit messages for the current behavior contract. The acceptance
+> criteria below remain useful as historical context but should not be
+> used to validate current builds.
+
 ## Why this PR
 
 Live data: **392 entries, 2 fills, 348 canceled, 44 expired**. Avg time-to-fill on the 2 wins was 33.5s. Old behavior was killing trades before they could land.

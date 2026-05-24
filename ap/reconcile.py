@@ -422,5 +422,17 @@ def run_reconciliation(client_id: str, broker=None, limit: int = 50) -> dict:
                 "processed": 0}
 
     processed = reconcile_once(broker=broker, client_id=client_id, limit=limit)
+
+    # PR #30 LIVE-SAFETY: heartbeat after every successful reconciler cycle.
+    # A watchdog elsewhere reads check_staleness() and emits CRITICAL
+    # decision_event RECONCILER_STALE when age >= RECONCILER_SLA_SECONDS.
+    # Failed cycles (no_broker_available, exception above) intentionally
+    # do NOT beat — staleness is the signal.
+    try:
+        from ap import reconciler_heartbeat as _hb
+        _hb.record_heartbeat(client_id, status="ok")
+    except Exception:
+        pass
+
     return {"ok": True, "client_id": client_id, "processed": processed}
 
