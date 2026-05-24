@@ -110,12 +110,19 @@ SUBMIT_QUOTE_MAX_AGE_MS    = int(os.getenv("SUBMIT_QUOTE_MAX_AGE_MS", "5000"))
 # default POSITION_RISK_PCT.
 #
 # Acceptance examples (premium = $3.08, default POSITION_RISK_PCT = 0.10):
-#   $10K  account → budget $1000 → 1000/308 = 3.24 → 3 contracts
-#   $30K  account → budget $3000 → 3000/308 = 9.74 → 9 contracts
-#   $100K account → budget $10000 → 10000/308 = 32.46 → capped by MAX_CONTRACTS
+#   $10K  account → budget $1000  → 1000/308   = 3.24  → 3 contracts
+#   $30K  account → budget $3000  → 3000/308   = 9.74  → 9 contracts
+#   $100K account → budget $10000 → 10000/308  = 32.46 → capped by MAX_CONTRACTS (15)
+#
+# PR #30 (2026-05-23): MAX_CONTRACTS default is the OPERATIONAL CAP, not
+# a force. The qty math is still:
+#     qty = floor(position_budget / (submit_ask * 100))
+#     qty = min(qty, MAX_CONTRACTS)
+# Default lowered from 50 → 15 to match ops policy for proof week. Set the
+# env var MAX_CONTRACTS=<int> on Render to override per-deployment.
 POSITION_RISK_PCT          = float(os.getenv("POSITION_RISK_PCT", "0.10"))
 MAX_TRADE_USD              = float(os.getenv("MAX_TRADE_USD", "50000"))
-MAX_CONTRACTS              = int(os.getenv("MAX_CONTRACTS", "50"))
+MAX_CONTRACTS              = int(os.getenv("MAX_CONTRACTS", "15"))
 
 # Indices that bypass both the pre-10AM time gate AND the SPY-trend
 # execution gate. These ETFs ARE the broad-market regime, so blocking
@@ -663,6 +670,37 @@ def process_signal(broker, client_id: str, signal_payload: dict) -> dict:
                 "hint": "3+ LOST_HANDOFF_30S in 5min; investigate watcher/OSM and clear flag in client_state",
             }
 
+        # PR #30 LIVE-SAFETY: broker-error circuit breaker.
+        # If broker submit/cancel/status errors have exceeded the threshold
+        # in the rolling window, refuse NEW entries for this client. Exits,
+        # force-exits, close-all, and reconciliation paths do NOT call
+        # process_signal, so they remain unaffected.
+        try:
+            from ap import safety_circuit as _sc
+            if _sc.is_open(client_id):
+                snap = _sc.snapshot(client_id)
+                log.warning(
+                    "[%s] BROKER_ERROR_CIRCUIT_OPEN broker_error_count=%s "
+                    "window_secs=%s sample_error=%s — blocking new entries",
+                    client_id, snap.get("broker_error_count"),
+                    snap.get("window_secs"), snap.get("last_error_sample"),
+                )
+                audit(client_id, "CRITICAL", "BROKER_ERROR_CIRCUIT_OPEN", snap)
+                return {
+                    "ok": False,
+                    "error": "broker_error_circuit_open",
+                    "hint": (
+                        "Broker errors exceeded threshold in rolling window; "
+                        "investigate broker/network. Exits, force-exits, and "
+                        "reconciliation continue."
+                    ),
+                    **snap,
+                }
+        except Exception as _sce:
+            # Breaker subsystem failure must NEVER block entries by itself.
+            # Log and continue.
+            log.debug("[%s] safety_circuit check failed (non-fatal): %s", client_id, _sce)
+
         st = _maybe_reset_daily_state(broker, client_id, client, st)
 
         loss_check = _check_daily_loss_stop(client_id, st)
@@ -734,6 +772,38 @@ def process_signal(broker, client_id: str, signal_payload: dict) -> dict:
             audit(client_id, "WARNING", "SYMBOL_LOCKED", {"symbol": symbol})
             return {"ok": False, "error": "symbol_locked", "symbol": symbol}
         locked = True
+
+        # PR #30 LIVE-SAFETY: exposure gate.
+        # Block same-symbol stacking and same-sector overload BEFORE we
+        # do equity reserve or contract resolution. Pure entry gate;
+        # exits and reconciler do NOT pass through here.
+        try:
+            from ap import exposure_gate as _eg
+            exp_check = _eg.check_exposure(client_id, symbol)
+        except Exception as _exge:
+            log.debug("[%s] exposure_gate failed (non-fatal): %s", client_id, _exge)
+            exp_check = {"ok": True, "error": None, "reason_code": None,
+                         "symbol": symbol, "sector": None}
+
+        if not exp_check.get("ok"):
+            release_symbol_lock(client_id, symbol)
+            locked = False
+            audit(client_id, "WARNING", exp_check.get("reason_code", "EXPOSURE_LIMIT"),
+                  exp_check)
+            log.warning(
+                "[%s] %s symbol=%s sector=%s open_same_symbol=%s open_same_sector=%s",
+                client_id, exp_check.get("reason_code"),
+                exp_check.get("symbol"), exp_check.get("sector"),
+                exp_check.get("open_same_symbol"),
+                exp_check.get("open_same_sector"),
+            )
+            return {"ok": False, **exp_check}
+        elif exp_check.get("sector") is None:
+            # Unmapped ticker: same-symbol cap was applied, sector skipped.
+            log.info(
+                "[%s] sector_unknown symbol=%s — enforcing same-symbol cap only",
+                client_id, exp_check.get("symbol"),
+            )
 
         # PHASE 4: account-equity sizing.
         # account_equity is the LIVE broker equity reading (falls back to
@@ -919,6 +989,17 @@ def process_signal(broker, client_id: str, signal_payload: dict) -> dict:
                 "symbol": symbol, "contract": contract,
                 "error": err, "local_order_id": local_order_id
             })
+            # PR #30 LIVE-SAFETY: feed broker submit failure into the
+            # circuit breaker. A burst of these in 120s opens the breaker
+            # and blocks the next entry; exits are unaffected.
+            try:
+                from ap import safety_circuit as _sc
+                opened = _sc.record_broker_error(client_id, err, op_kind="submit")
+                if opened:
+                    audit(client_id, "CRITICAL", "BROKER_ERROR_CIRCUIT_OPEN",
+                          _sc.snapshot(client_id))
+            except Exception:
+                pass
             return {"ok": False, "error": "broker_rejected", "details": err,
                     "local_order_id": local_order_id}
 

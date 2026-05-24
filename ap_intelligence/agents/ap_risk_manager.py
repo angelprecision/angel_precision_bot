@@ -157,7 +157,7 @@ class APRiskManager:
         daily_loss_limit_pct: float = -0.05,    # Kill switch at -5% day
         allow_0dte: bool = True,
         mode: str = None,
-        max_contracts_hard_cap: int = 6,        # mirrors contract_selector MAX_CONTRACTS
+        max_contracts_hard_cap: int = 15,       # mirrors ap.execution / contract_selector MAX_CONTRACTS (PR #30)
     ):
         self.portfolio_value        = portfolio_value
         self.risk_pct_per_trade     = risk_pct_per_trade

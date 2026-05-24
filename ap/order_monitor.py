@@ -90,13 +90,16 @@ TIMEOUT_SUBMITTED     = int(os.getenv("ORDER_TIMEOUT_SUBMITTED",     "300"))   #
 # correct ceiling for scalp entries. Exits are handled separately and faster.
 TIMEOUT_ACKNOWLEDGED  = int(os.getenv("ORDER_TIMEOUT_ACKNOWLEDGED",  "180"))   # 3 min — scalp entry ceiling
 TIMEOUT_PARTIAL_FILL  = int(os.getenv("ORDER_TIMEOUT_PARTIAL_FILL",  "900"))   # 15 min
-# Hard ceiling on ANY unfilled buy-to-open entry limit regardless of status.
-# If a scalp entry has not filled in this window, the setup is stale — cancel.
-# P1 ENTRY FIX (2026-05-21): 150s -> 25s. With the ask-based ladder and 6s
-# repeg interval, orders that haven't filled within 25s aren't going to fill
-# at any reasonable price. Earlier cancellation frees the slot for the next
-# signal and prevents capital being parked on dead limit orders.
-ENTRY_LIMIT_MAX_AGE_SECONDS = int(os.getenv("ENTRY_LIMIT_MAX_AGE_SECONDS", "25"))  # 25s
+# DEPRECATED CONSTANT: ENTRY_LIMIT_MAX_AGE_SECONDS
+# This was the pre-Phase-2 hard cancel ceiling at 25s. Phase 2 (2026-05-23)
+# replaced it with the two-step adaptive autocancel:
+#   25s  = RE-EVALUATION trigger (see ENTRY_REEVAL_AGE_SECONDS below)
+#   90s  = normal max active entry window (ENTRY_MAX_AGE_NORMAL)
+#   120s = A/A+ scored max active entry window (ENTRY_MAX_AGE_APLUS)
+# The constant is RETAINED only so legacy deployments setting the env var
+# do not break startup; it is no longer read by any decision path. Setting
+# it has NO effect on cancel behavior.
+ENTRY_LIMIT_MAX_AGE_SECONDS = int(os.getenv("ENTRY_LIMIT_MAX_AGE_SECONDS", "25"))  # deprecated; see ENTRY_REEVAL_AGE_SECONDS
 
 # PHASE 2 ADAPTIVE AUTOCANCEL (2026-05-23):
 # 25s is the RE-EVALUATION trigger, not a hard kill. At 25s we run the
@@ -303,6 +306,43 @@ class APOrderMonitor:
                 log.error(
                     f"[{self.client_id}] OrderMonitor armed-retry-check error: {e}",
                     exc_info=True,
+                )
+            # PR #30 LIVE-SAFETY: reconciler staleness watchdog.
+            # Alert-only. Does NOT change position state, does NOT block exits.
+            try:
+                from ap import reconciler_heartbeat as _hb
+                _stale = _hb.check_staleness(self.client_id)
+                if _stale.get("should_alert"):
+                    log.critical(
+                        "[%s] RECONCILER_STALE age_secs=%.1f sla_secs=%s cycles=%s",
+                        self.client_id,
+                        float(_stale.get("age_secs") or 0),
+                        _stale.get("sla_secs"),
+                        _stale.get("cycles"),
+                    )
+                    try:
+                        self._emit_order_event(
+                            local_order_id=None,
+                            stage="reconciler_watchdog",
+                            decision="CRITICAL",
+                            reason_code="RECONCILER_STALE",
+                            explanation=(
+                                f"reconciler heartbeat age "
+                                f"{_stale.get('age_secs')}s >= SLA "
+                                f"{_stale.get('sla_secs')}s"
+                            ),
+                            contract=None,
+                            inputs=_stale,
+                        )
+                    except Exception:
+                        # _emit_order_event may not accept these args in all
+                        # branches; the log.critical above is the authoritative
+                        # alert.
+                        pass
+            except Exception as _hbe:
+                log.debug(
+                    "[%s] reconciler_heartbeat watchdog non-fatal: %s",
+                    self.client_id, _hbe,
                 )
             try:
                 from ap.self_healing import get_healer as _gh
@@ -1684,6 +1724,14 @@ class APOrderMonitor:
                     return str(result).lower() if result else None
             except Exception as e:
                 log.debug(f"[{self.client_id}] Broker order query failed: {e}")
+                # PR #30 LIVE-SAFETY: feed status-query failures into the
+                # circuit breaker for this client. Threshold-burst opens
+                # the breaker and blocks new entries (exits unaffected).
+                try:
+                    from ap import safety_circuit as _sc
+                    _sc.record_broker_error(self.client_id, e, op_kind="status")
+                except Exception:
+                    pass
             return None
         return _cached_broker_order_status(broker_order_id, _fetch)
 
@@ -1710,6 +1758,13 @@ class APOrderMonitor:
 
         except Exception as e:
             log.warning(f"[{self.client_id}] Broker cancel error: {e}")
+            # PR #30 LIVE-SAFETY: feed cancel failures into the circuit
+            # breaker. Threshold-burst opens the breaker.
+            try:
+                from ap import safety_circuit as _sc
+                _sc.record_broker_error(self.client_id, e, op_kind="cancel")
+            except Exception:
+                pass
         return None
 
     def _normalize_broker_status(self, raw_status) -> str:
