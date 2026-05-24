@@ -20,26 +20,45 @@ def generate_api_key(prefix: str = "ak") -> str:
 
 
 def validate_api_key(api_key: str) -> dict | None:
+    """Look up an API key against the clients table.
+
+    Returns a dict (client_id, name, status) for ACTIVE clients only.
+    Returns None for missing keys, unknown keys, inactive clients, or any
+    DB error — fails closed.
+
+    Postgres-safe shape:
+      - uses %s placeholder (NOT ? — ap.db wraps psycopg)
+      - executes inside run_with_retry, then fetches the row separately
+      - status comparison is case-insensitive
+      - any exception is logged and swallowed (return None)
+    """
     if not api_key or not api_key.startswith("ak_"):
         return None
 
-    try:
+    def _fetch() -> dict | None:
         with conn() as c:
-            row = run_with_retry(lambda: c.execute(
-                "SELECT client_id, name, status FROM clients WHERE api_key=?",
-                (api_key,)
-            ).fetchone())
-            if not row:
-                return None
+            c.execute(
+                "SELECT client_id, name, status FROM clients WHERE api_key=%s",
+                (api_key,),
+            )
+            row = c.fetchone()
+            return dict(row) if row else None
 
-            client = dict(row)
-            if client["status"] != "ACTIVE":
-                return None
-            return client
-
+    try:
+        client = run_with_retry(_fetch)
     except Exception as e:
         log.error(f"API key validation error: {e}")
         return None
+
+    if not client:
+        return None
+
+    # Case-insensitive status check; reject anything that isn't ACTIVE.
+    status = str(client.get("status") or "").strip().upper()
+    if status != "ACTIVE":
+        return None
+
+    return client
 
 
 def check_rate_limit(key: str) -> bool:

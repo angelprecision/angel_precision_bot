@@ -112,14 +112,39 @@ def _env_bool(name: str, default: str = "0") -> bool:
     return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _new_scheme_fernet(raw_key: str) -> "Fernet":
+    """NEW scheme: ENCRYPTION_KEY is a raw 44-char base64 Fernet key used
+    directly. Matches ap/crypto.encrypt_token.
+    """
+    return Fernet(raw_key.encode())
+
+
+def _legacy_scheme_fernet(raw_key: str) -> "Fernet":
+    """LEGACY scheme: SHA256(ENCRYPTION_KEY) → urlsafe-b64 → Fernet key.
+
+    Kept so tokens encrypted by older versions of this runner still decrypt
+    while we migrate. New tokens must use the NEW scheme.
+    """
+    key_bytes = hashlib.sha256(raw_key.encode()).digest()
+    return Fernet(base64.urlsafe_b64encode(key_bytes))
+
+
 def decrypt_token(ciphertext: str, mode: str = "PAPER") -> str:
     """Decrypt a Fernet-encrypted token.
 
-    PAPER mode: falls back to plaintext if value looks unencrypted or key is wrong.
-                This allows dev/sandbox setups to work without ENCRYPTION_KEY.
+    Tries TWO schemes (in order):
+      1. NEW direct Fernet key  — matches ap.crypto.encrypt_token (the path
+         tokens take when produced via dashboard/admin onboarding).
+      2. LEGACY SHA256-derived  — tokens encrypted by the old runner code
+         path; we still accept these so live deployments do not break
+         during the migration window.
+
+    PAPER mode: falls back to plaintext if value looks unencrypted or both
+                schemes fail. Allows dev/sandbox setups to work without
+                ENCRYPTION_KEY.
     LIVE mode:  any decrypt failure is fatal — raises RuntimeError.
-                Plaintext tokens are never accepted in LIVE mode.
-                No trade should execute with an unverified broker credential.
+                Plaintext tokens are never accepted in LIVE mode. No trade
+                should execute with an unverified broker credential.
     """
     if not ciphertext:
         raise ValueError("empty token")
@@ -147,21 +172,38 @@ def decrypt_token(ciphertext: str, mode: str = "PAPER") -> str:
         logger.error("ENCRYPTION_KEY not set — cannot decrypt Fernet token; PAPER fallback to ciphertext as plaintext")
         return ciphertext
 
+    token_bytes = ciphertext.encode()
+
+    # 1) NEW scheme — direct Fernet key (matches ap/crypto.encrypt_token).
+    new_err: Exception | None = None
     try:
-        key_bytes = hashlib.sha256(_raw_key.encode()).digest()
-        fernet = Fernet(base64.urlsafe_b64encode(key_bytes))
-        return fernet.decrypt(ciphertext.encode()).decode()
-    except Exception as _dec_err:
+        return _new_scheme_fernet(_raw_key).decrypt(token_bytes).decode()
+    except Exception as _new_err:
+        new_err = _new_err  # remember for LIVE error message
+
+    # 2) LEGACY scheme — SHA256-derived Fernet key.
+    try:
+        plaintext = _legacy_scheme_fernet(_raw_key).decrypt(token_bytes).decode()
+        logger.warning(
+            "Token decrypted with LEGACY scheme — re-encrypt via dashboard to migrate"
+        )
+        return plaintext
+    except Exception as legacy_err:
         if is_live:
             raise RuntimeError(
-                f"LIVE mode token decryption failed — wrong ENCRYPTION_KEY or corrupted token. "
-                f"Detail: {_dec_err}. Fix ENCRYPTION_KEY in Render env vars."
-            ) from _dec_err
-        # PAPER: log loudly but continue with sandbox
+                "LIVE mode token decryption failed under BOTH schemes — wrong "
+                "ENCRYPTION_KEY or corrupted token. "
+                f"new_scheme_error={new_err!r}; "
+                f"legacy_scheme_error={legacy_err!r}. "
+                "Fix ENCRYPTION_KEY in Render env vars."
+            ) from legacy_err
+        # PAPER: log loudly but continue with sandbox so dev iteration keeps moving.
         logger.error(
-            "decrypt_token: Fernet decrypt failed (key='%s...') — PAPER mode, returning raw value. "
-            "This will fail at Tradier auth if the token is actually encrypted.",
-            _raw_key[:6],
+            "decrypt_token: Fernet decrypt failed under BOTH schemes "
+            "(key='%s...') — PAPER mode, returning raw value. "
+            "This will fail at Tradier auth if the token is actually encrypted. "
+            "new_err=%r legacy_err=%r",
+            _raw_key[:6], new_err, legacy_err,
         )
         return ciphertext
 

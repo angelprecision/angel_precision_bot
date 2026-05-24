@@ -596,10 +596,29 @@ def get_all_positions(client_id: str | None = None) -> list[dict]:
     return run_with_retry(_fn)
 
 
-def get_position_by_id(position_id: str) -> dict | None:
+def get_position_by_id(position_id: str, client_id: str | None = None) -> dict | None:
+    """Fetch a position row by id.
+
+    Args:
+      position_id: row primary key.
+      client_id:   OPTIONAL ownership filter. When provided, the SELECT
+                   adds 'AND client_id=%s' so a row belonging to a
+                   different tenant is NEVER returned. Callers that hit
+                   this from a client-facing endpoint MUST pass the
+                   authenticated client_id.
+
+    Returns the row dict or None. When client_id is omitted the behavior
+    is unchanged (global lookup, suitable for internal/admin use).
+    """
     def _fn():
         with conn() as c:
-            c.execute("SELECT * FROM positions WHERE id=%s", (position_id,))
+            if client_id:
+                c.execute(
+                    "SELECT * FROM positions WHERE id=%s AND client_id=%s",
+                    (position_id, client_id),
+                )
+            else:
+                c.execute("SELECT * FROM positions WHERE id=%s", (position_id,))
             return c.fetchone()
     return run_with_retry(_fn)
 
@@ -646,10 +665,32 @@ def get_all_orders() -> list[dict]:
     return run_with_retry(_fn)
 
 
-def get_order_by_id(local_order_id: str) -> dict | None:
+def get_order_by_id(local_order_id: str, client_id: str | None = None) -> dict | None:
+    """Fetch an order row by local_order_id.
+
+    Args:
+      local_order_id: the AP-side order id.
+      client_id:      OPTIONAL ownership filter. When provided, the
+                      SELECT adds 'AND client_id=%s' so a row belonging
+                      to a different tenant is NEVER returned. Callers
+                      that hit this from a client-facing endpoint MUST
+                      pass the authenticated client_id.
+
+    Returns the row dict or None. When client_id is omitted the behavior
+    is unchanged (global lookup, suitable for internal/admin use).
+    """
     def _fn():
         with conn() as c:
-            c.execute("SELECT * FROM orders WHERE local_order_id=%s", (local_order_id,))
+            if client_id:
+                c.execute(
+                    "SELECT * FROM orders WHERE local_order_id=%s AND client_id=%s",
+                    (local_order_id, client_id),
+                )
+            else:
+                c.execute(
+                    "SELECT * FROM orders WHERE local_order_id=%s",
+                    (local_order_id,),
+                )
             return c.fetchone()
     return run_with_retry(_fn)
 
