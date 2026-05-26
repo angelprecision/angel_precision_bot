@@ -150,6 +150,15 @@ IMMEDIATE_TP_PCT      = 0.12   # +12% → ACTIVATES trailing stop (was 15%)
 HARD_STOP_PCT         = -0.33  # -33% → hard stop (gives one recovery breath vs -30%)
 PROFIT_LOCK_PCT       = 0.12   # once past 15%, don't fall below +12% (protects a real gain)
 
+# PR-A / BUG-4: Unified minimum-hold floor. Previously read twice via
+# os.getenv("MIN_HOLD_MINUTES_BEFORE_SOFT_EXIT", default) with default
+# "5" in the soft-loss path and default "3" in the never-green path.
+# With the env unset (common in dev / fresh Render deploys) the two
+# paths behaved asymmetrically: a 4-minute-old position could be
+# never-green-stopped while the soft-loss path would still be holding
+# it. Both call sites now read this single constant.
+_MIN_HOLD_BEFORE_EXIT_MIN = float(os.getenv("MIN_HOLD_MINUTES_BEFORE_SOFT_EXIT", "5"))
+
 _INDEX_ETFS = {"QQQ", "SPY", "IWM", "DIA", "SPX"}
 
 
@@ -288,6 +297,16 @@ class ManagedPosition:
     closed:               bool  = False
     close_reason:         str   = ""
     opened_at:            datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+    # PR-A / BUG-1: Stop-breach confirmation timestamps. Previously
+    # written via `pos._stop_breach_ts = time.time()` with
+    # `# type: ignore[attr-defined]` — i.e. ghost attributes that were
+    # not declared on the dataclass and would be dropped by any
+    # dataclasses.replace() / asdict() roundtrip. Now declared
+    # as Optional[datetime] to match every other timestamp field
+    # (consistent with FIX-8 applied earlier to last_rejection_ts).
+    _stop_breach_ts:              Optional[datetime] = None
+    _underlying_stop_breach_ts:   Optional[datetime] = None
 
     # Exit coordination
     exit_in_flight:       bool  = False
@@ -478,51 +497,45 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
     # A single candle wick that immediately recovers should NOT trigger exit.
     # Uses HIGH urgency (bid-limit) not IMMEDIATE (market).
     if pos.is_at_stop:
-        _now_ts = time.time()
-        _stop_ts = getattr(pos, "_underlying_stop_breach_ts", None)
+        # PR-A / BUG-2: stamp is datetime now (was time.time() float).
+        _now_dt = datetime.now(timezone.utc)
+        _stop_dt = pos._underlying_stop_breach_ts
         _UNDERLYING_CONFIRM_SEC = float(os.getenv("UNDERLYING_STOP_CONFIRM_SECONDS", "30"))
 
-        if _stop_ts is None:
-            try:
-                pos._underlying_stop_breach_ts = _now_ts  # type: ignore[attr-defined]
-            except Exception:
-                pass
+        if _stop_dt is None:
+            pos._underlying_stop_breach_ts = _now_dt
             log.info(
                 "[%s] UNDERLYING_STOP_BREACH_STARTED — $%.2f at stop $%.2f "
                 "| will exit if holds >%.0fs",
                 pos.ticker, pos.current_underlying,
                 pos.underlying_stop, _UNDERLYING_CONFIRM_SEC,
             )
-        elif (_now_ts - _stop_ts) >= _UNDERLYING_CONFIRM_SEC:
-            # Breach confirmed — exit with bid-limit
-            try:
-                pos._underlying_stop_breach_ts = None  # type: ignore[attr-defined]
-            except Exception:
-                pass
-            return ExitDecision(
-                action="STOP", quantity=qty_rem,
-                reason=(
-                    f"STOP HIT — underlying ${pos.current_underlying:.2f} "
-                    f"held below stop ${pos.underlying_stop:.2f} "
-                    f"for {_now_ts - _stop_ts:.0f}s"
-                ),
-                urgency="HIGH", pnl_pct=option_pnl,
-            )
         else:
-            log.info(
-                "[%s] UNDERLYING_STOP_CONFIRMING — $%.2f below stop $%.2f "
-                "| breach=%.0fs/%.0fs",
-                pos.ticker, pos.current_underlying,
-                pos.underlying_stop, _now_ts - _stop_ts, _UNDERLYING_CONFIRM_SEC,
-            )
+            _breach_age_sec = (_now_dt - _stop_dt).total_seconds()
+            if _breach_age_sec >= _UNDERLYING_CONFIRM_SEC:
+                # Breach confirmed — exit with bid-limit
+                pos._underlying_stop_breach_ts = None
+                return ExitDecision(
+                    action="STOP", quantity=qty_rem,
+                    reason=(
+                        f"STOP HIT — underlying ${pos.current_underlying:.2f} "
+                        f"held below stop ${pos.underlying_stop:.2f} "
+                        f"for {_breach_age_sec:.0f}s"
+                    ),
+                    urgency="HIGH", pnl_pct=option_pnl,
+                )
+            else:
+                log.info(
+                    "[%s] UNDERLYING_STOP_CONFIRMING — $%.2f below stop $%.2f "
+                    "| breach=%.0fs/%.0fs",
+                    pos.ticker, pos.current_underlying,
+                    pos.underlying_stop, _breach_age_sec, _UNDERLYING_CONFIRM_SEC,
+                )
     else:
         # Underlying recovered above stop — reset confirmation timer
-        if getattr(pos, "_underlying_stop_breach_ts", None) is not None:
-            try:
-                pos._underlying_stop_breach_ts = None  # type: ignore[attr-defined]
-                log.info("[%s] UNDERLYING_STOP_RECOVERED — price reclaimed stop level", pos.ticker)
-            except Exception:
-                pass
+        if pos._underlying_stop_breach_ts is not None:
+            pos._underlying_stop_breach_ts = None
+            log.info("[%s] UNDERLYING_STOP_RECOVERED — price reclaimed stop level", pos.ticker)
 
     # ── TOUCHED PROFIT PROTECTION ─────────────────────────────────────────────
     # Once green, we LOCK IN a minimum profit. Never let a green trade
@@ -730,7 +743,9 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
     _SOFT_LOSS_PCT      = float(os.getenv("SOFT_LOSS_STOP_PCT",           "-0.12"))
     _SOFT_LOSS_DEEP_PCT = float(os.getenv("SOFT_LOSS_STOP_DEEP_PCT",      "-0.20"))
     # Minimum minutes before any soft stop can fire — give the thesis time to develop
-    _MIN_HOLD_SOFT      = float(os.getenv("MIN_HOLD_MINUTES_BEFORE_SOFT_EXIT", "5"))
+    # PR-A / BUG-4: read from unified module-level constant; both call
+    # sites (this one and the never-green path) now share the same floor.
+    _MIN_HOLD_SOFT      = _MIN_HOLD_BEFORE_EXIT_MIN
     # Stop confirmation window: breach must hold this many seconds before exit fires
     # Prevents exiting on intraday wicks that immediately recover
     _STOP_CONFIRM_SEC   = float(os.getenv("STOP_BREACH_CONFIRM_SECONDS", "45"))
@@ -751,14 +766,12 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
 
         # Stop confirmation: track when this stop level was first breached
         # If stop just breached (< STOP_CONFIRM_SECONDS ago), give it time to recover
-        _now_ts = time.time()
-        _breach_ts = getattr(pos, "_stop_breach_ts", None)
-        if _breach_ts is None:
+        # PR-A / BUG-2: stamp is datetime now (was time.time() float).
+        _now_dt = datetime.now(timezone.utc)
+        _breach_dt = pos._stop_breach_ts
+        if _breach_dt is None:
             # First time we see this breach — stamp it, don't exit yet
-            try:
-                pos._stop_breach_ts = _now_ts  # type: ignore[attr-defined]
-            except Exception:
-                pass
+            pos._stop_breach_ts = _now_dt
             log.info(
                 "[%s] STOP_BREACH_STARTED — %.1f%% loss | confirming=%s | "
                 "will exit if breach holds >%.0fs | age=%.1fmin",
@@ -770,16 +783,13 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
                 urgency="NORMAL", pnl_pct=option_pnl, reason_code="STOP_BREACH_STARTED",
             )
 
-        _breach_age_sec = _now_ts - _breach_ts
+        _breach_age_sec = (_now_dt - _breach_dt).total_seconds()
 
         # If breach lasted < confirmation window AND underlying is recovering → reset
         if _breach_age_sec < _STOP_CONFIRM_SEC:
             if _strong_confirm:
                 # Underlying moving our way — this looks like a wick, not a real break
-                try:
-                    pos._stop_breach_ts = None  # type: ignore[attr-defined]
-                except Exception:
-                    pass
+                pos._stop_breach_ts = None
                 log.info(
                     "[%s] STOP_BREACH_RESET — underlying recovered (%.2f%% move) "
                     "| option=%.1f%% | breach lasted %.0fs < %.0fs confirm window",
@@ -809,10 +819,7 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
 
         # Past -20% with confirmed breach → exit, bid-limit
         if option_pnl <= _SOFT_LOSS_DEEP_PCT:
-            try:
-                pos._stop_breach_ts = None  # type: ignore[attr-defined]
-            except Exception:
-                pass
+            pos._stop_breach_ts = None
             return ExitDecision(
                 action="CLOSE_ALL", quantity=qty_rem,
                 reason=(
@@ -838,10 +845,7 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
 
         if not _soft_confirm:
             # Thesis confirmed broken — underlying not holding, breach confirmed
-            try:
-                pos._stop_breach_ts = None  # type: ignore[attr-defined]
-            except Exception:
-                pass
+            pos._stop_breach_ts = None
             return ExitDecision(
                 action="CLOSE_ALL", quantity=qty_rem,
                 reason=(
@@ -897,7 +901,10 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
         if option_pnl <= _ng_stop:
             _ng_age_min = _position_age_minutes(pos)
             _ng_confirming, _ng_confirm_reason = _underlying_still_confirming(pos)
-            _MIN_HOLD_NG = float(os.getenv("MIN_HOLD_MINUTES_BEFORE_SOFT_EXIT", "3"))
+            # PR-A / BUG-4: read from unified module-level constant; previously
+            # defaulted to 3 here vs 5 in the soft-loss path — asymmetric when
+            # the env var was unset. Both call sites now share the same floor.
+            _MIN_HOLD_NG = _MIN_HOLD_BEFORE_EXIT_MIN
 
             # Suppress never-green stop if:
             # 1. Underlying is still confirming (thesis alive), AND
@@ -1470,10 +1477,10 @@ class APExitEngine:
         broker_order_id = str(broker_order_id or "")
         reason          = str(reason or "")
 
+        # PR-A / BUG-3: O(1) lookup via self._positions_by_id (was O(n) scan).
         with self._lock:
-            for pos in self._positions:
-                if str(pos.position_id or "") != str(position_id or ""):
-                    continue
+            _matched = self._positions_by_id.get(str(position_id or ""))
+            for pos in (_matched,) if _matched is not None else ():
                 if pos.closed or int(pos.quantity_remaining or 0) <= 0:
                     return
                 pos.exit_in_flight    = True
@@ -1609,10 +1616,10 @@ class APExitEngine:
         if "RECONCILER" in reason_s.upper():
             force = True
 
+        # PR-A / BUG-3: O(1) lookup via self._positions_by_id (was O(n) scan).
         with self._lock:
-            for pos in self._positions:
-                if str(pos.position_id or "") != str(position_id or ""):
-                    continue
+            _matched = self._positions_by_id.get(str(position_id or ""))
+            for pos in (_matched,) if _matched is not None else ():
                 if not force and not self._exit_identity_matches(
                     pos,
                     local_order_id=local_order_id,
@@ -1704,10 +1711,10 @@ class APExitEngine:
         if "RECONCILER" in reason_s.upper() or "NEGATIVE_BROKER_CHECK" in reason_s.upper():
             force = True
 
+        # PR-A / BUG-3: O(1) lookup via self._positions_by_id (was O(n) scan).
         with self._lock:
-            for pos in self._positions:
-                if str(pos.position_id or "") != str(position_id or ""):
-                    continue
+            _matched = self._positions_by_id.get(str(position_id or ""))
+            for pos in (_matched,) if _matched is not None else ():
                 if not force and not self._exit_identity_matches(
                     pos,
                     local_order_id=local_order_id,
@@ -1805,11 +1812,10 @@ class APExitEngine:
             fill_price = None
 
         applied_delta = 0
+        # PR-A / BUG-3: O(1) lookup via self._positions_by_id (was O(n) scan).
         with self._lock:
-            for pos in self._positions:
-                if pos.position_id != position_id:
-                    continue
-
+            _matched = self._positions_by_id.get(str(position_id or ""))
+            for pos in (_matched,) if _matched is not None else ():
                 if local_order_id and pos.pending_exit_local_order_id and local_order_id != pos.pending_exit_local_order_id:
                     log.warning(
                         "[exit_eng] Ignoring stale local exit fill | pos_id=%s got=%s expected=%s",
@@ -3850,15 +3856,20 @@ class APExitEngine:
             threading.Thread(target=_fire_discord, daemon=True, name="discord-runner-alert").start()
 
         # 3) Short critical section: revalidate and mark submitted.
+        # PR-A / BUG-3: O(1) lookup via self._positions_by_id when
+        # position_id is known; only fall back to the linear scan when
+        # position_id is empty (the by-object-identity path).
         with self._lock:
             current_pos = None
-            for tracked in self._positions:
-                if position_id and str(tracked.position_id or "") == position_id and not tracked.closed:
-                    current_pos = tracked
-                    break
-                if not position_id and tracked is pos and not tracked.closed:
-                    current_pos = tracked
-                    break
+            if position_id:
+                _matched = self._positions_by_id.get(str(position_id))
+                if _matched is not None and not _matched.closed:
+                    current_pos = _matched
+            else:
+                for tracked in self._positions:
+                    if tracked is pos and not tracked.closed:
+                        current_pos = tracked
+                        break
 
             if current_pos is None:
                 log.warning(
