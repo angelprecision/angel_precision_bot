@@ -118,6 +118,17 @@ RECONCILE_INTERVAL_SEC = int(os.getenv("RECONCILE_INTERVAL_SEC", "60"))  # was 1
 # the cached last summary and skip the full broker/DB/OSM pass.
 RUN_ONCE_MIN_INTERVAL_SEC = float(os.getenv("RECONCILER_RUN_ONCE_MIN_INTERVAL_SEC", "3.0"))
 
+# PR fix/health-and-reconciler-startup-noise:
+# Grace window after reconciler thread start during which a missing
+# fill_monitor wire is NOT alerted. _start_reconciler() in client_runner.py
+# fires BEFORE _start_fill_monitor() by design (other subsystems depend
+# on reconciler existence first). The first reconciler cycle therefore
+# sees fill_monitor=None for ~100ms until _start_fill_monitor assigns it.
+# 5s default covers that gap with margin; configurable per-deployment.
+FILL_MONITOR_WIRE_GRACE_SEC = float(
+    os.getenv("FILL_MONITOR_WIRE_GRACE_SEC", "5.0")
+)
+
 IMPORT_MISSING_BROKER_POSITIONS = (
     os.getenv("RECONCILER_IMPORT_MISSING_BROKER_POSITIONS", "1")
     .strip()
@@ -250,6 +261,14 @@ class APBrokerReconciler:
         if self._thread and self._thread.is_alive():
             return
         self._stop.clear()
+        # PR fix/health-and-reconciler-startup-noise:
+        # Record start timestamp so _verify_fill_monitor_or_alert can apply
+        # a grace window during which a not-yet-wired fill_monitor does
+        # NOT emit FILL_MONITOR_NOT_CONFIRMED.
+        self._started_ts = time.time()
+        # Per-instance copy of the module-level grace constant so tests can
+        # override without touching env state.
+        self._fill_monitor_wire_grace_sec = FILL_MONITOR_WIRE_GRACE_SEC
         self._thread = threading.Thread(
             target=self._loop,
             daemon=True,
@@ -443,7 +462,15 @@ class APBrokerReconciler:
             return summary
 
     def _verify_fill_monitor_or_alert(self) -> bool:
-        """Confirm the dedicated fill monitor is wired/alive when exposed."""
+        """Confirm the dedicated fill monitor is wired/alive when exposed.
+
+        PR fix/health-and-reconciler-startup-noise:
+        Apply a grace window after start() so the spurious cold-start alert
+        (reconciler thread spins up ~100ms before _start_fill_monitor assigns
+        the fill_monitor attribute) is suppressed. After the grace expires
+        the original behavior is restored: missing/dead fill_monitor alerts,
+        and require_fill_monitor=True raises RuntimeError.
+        """
         fm = getattr(self, "fill_monitor", None) or getattr(self, "fill_mon", None)
         alive = False
         if fm is not None:
@@ -457,6 +484,22 @@ class APBrokerReconciler:
             except Exception:
                 alive = False
         if not alive:
+            # Grace window check: if reconciler has been running for less
+            # than _fill_monitor_wire_grace_sec, treat as "not yet wired,
+            # no action". Only applies when _started_ts is set (i.e. came
+            # through start()); otherwise fall through to original behavior.
+            started_ts = getattr(self, "_started_ts", None)
+            grace_sec  = getattr(self, "_fill_monitor_wire_grace_sec",
+                                 FILL_MONITOR_WIRE_GRACE_SEC)
+            if started_ts is not None:
+                elapsed = time.time() - float(started_ts)
+                if elapsed < float(grace_sec):
+                    # Within grace — DO NOT alert and DO NOT raise even if
+                    # require_fill_monitor is True. The cold-start race must
+                    # resolve within grace_sec, or the next reconciler cycle
+                    # (interval_sec later) will hit the post-grace branch
+                    # and alert/raise as before.
+                    return True
             msg = (
                 "FILL_MONITOR_NOT_CONFIRMED | fill_monitor_final_hardened-7.py "
                 "not wired/alive from reconciler view; using tightened reconciler "
