@@ -794,7 +794,7 @@ def get_stale_pending_trigger_orders(client_id: str, older_than_hours: int = 8) 
         return run_with_retry(_fn) or []
     except Exception as e:
         log.error("get_stale_pending_trigger_orders failed for %s: %s", client_id, e)
-        return []
+        raise
 
 
 # =========================================================================
