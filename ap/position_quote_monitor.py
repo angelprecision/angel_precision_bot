@@ -31,6 +31,15 @@ HEARTBEAT_DEGRADED_SEC      = float(os.getenv("QUOTE_HEARTBEAT_DEGRADED_SEC", "1
 # Feature flag: migrate to snapshots-only ownership later by setting this to "0".
 DIRECT_POSITION_WRITES      = os.getenv("QUOTE_MONITOR_DIRECT_WRITES", "1") == "1"
 
+# PR: position-lifecycle-integrity-and-sizing (P0 FIX-2)
+# QPM must also persist live quote / PnL state to the positions table so the
+# dashboard, audit trail, and restart recovery have non-NULL truth. The exit
+# engine still reads in-memory state (unchanged); these are additive writes.
+# Tunable: throttle (seconds) and price-delta-trigger (fraction).
+QPM_DB_PERSIST_THROTTLE_SEC    = float(os.getenv("QPM_DB_PERSIST_THROTTLE_SEC", "5.0"))
+QPM_DB_PERSIST_PRICE_DELTA_PCT = float(os.getenv("QPM_DB_PERSIST_PRICE_DELTA_PCT", "0.01"))
+QPM_DB_PERSIST_ENABLED         = os.getenv("QPM_DB_PERSIST_ENABLED", "1") == "1"
+
 _SHARED_CACHE: dict[str, dict] = {}
 _SHARED_CACHE_LOCK = threading.Lock()
 _SHARED_BACKOFF_UNTIL = 0.0
@@ -93,6 +102,18 @@ class APPositionQuoteMonitor:
         self._last_push_price: dict[str, float] = {}
         self._last_wake_price: dict[str, float] = {}
         self._last_wake_ts:    dict[str, float] = {}
+
+        # PR: position-lifecycle-integrity-and-sizing (P0 FIX-2)
+        # Throttle state for DB persistence of live quote/PnL fields.
+        # QPM polls every ~1-2s; persisting every poll would hammer the DB.
+        # We persist when (a) >= QPM_DB_PERSIST_THROTTLE_SEC has elapsed since
+        # last persist for that position, OR (b) the option price has moved
+        # materially (>= QPM_DB_PERSIST_PRICE_DELTA_PCT). This is BEHAVIOR-
+        # PRESERVING for the exit engine (it still reads in-memory state via
+        # the ManagedPosition object); the DB write is purely for dashboard,
+        # audit, and restart-recovery integrity.
+        self._last_db_persist_ts:    dict[str, float] = {}   # pid -> epoch
+        self._last_db_persist_price: dict[str, float] = {}   # pid -> option price
 
         self._cycles = 0
         self._consecutive_failures = 0
@@ -376,9 +397,23 @@ class APPositionQuoteMonitor:
                     self._write_field(pos, "peak_pnl_pct", peak)
                     self._write_field(pos, "maxprofitseen", peak)
                     self._write_field(pos, "max_profit_seen", peak)
+                    self._write_field(pos, "optionpnlpct", pnl_pct)
+                    self._write_field(pos, "option_pnl_pct", pnl_pct)
                     if pnl_pct >= 0.05:
                         self._write_field(pos, "touchedprofit", True)
                         self._write_field(pos, "touched_profit", True)
+
+                    # PR: position-lifecycle-integrity-and-sizing (P0 FIX-2)
+                    # Persist quote/PnL to positions table. Throttled and
+                    # non-fatal. Dashboard/audit/restart-recovery only —
+                    # the exit engine continues to read in-memory state.
+                    self._persist_quote_to_db(
+                        position_id     = pid,
+                        option_price    = cur_opt,
+                        underlying_price= und_last,
+                        option_pnl_pct  = pnl_pct,
+                        now_utc         = now_utc,
+                    )
 
                 cur_underlying = _safe_float(_get_attr(pos, "currentunderlying", "current_underlying", default=None), 0.0)
                 cur_option = _safe_float(_get_attr(pos, "currentoptionprice", "current_option_price", default=None), 0.0)
@@ -464,6 +499,85 @@ class APPositionQuoteMonitor:
             setattr(pos, name, value)
         except Exception as exc:
             log.debug("[%s] write %s failed: %s", self.client_id, name, exc)
+
+    # ── P0 FIX-2: persist live quote/PnL fields to positions table ───────────
+    # The exit engine reads ManagedPosition (in memory) and remains the source
+    # of truth for exit decisions. This writer is purely for dashboard /
+    # audit / restart-recovery integrity — without it the positions table
+    # reports option_pnl_pct=0, current_option_price=NULL, peak_pnl_pct=0 on
+    # every open trade (today's MO/NOW/WFC/BA evidence).
+    #
+    # Throttled per-position: writes only when either
+    #   (a) >= QPM_DB_PERSIST_THROTTLE_SEC elapsed since last write, OR
+    #   (b) option price moved by >= QPM_DB_PERSIST_PRICE_DELTA_PCT.
+    #
+    # Scoped by (id, client_id) so a misrouted poll cannot cross-write
+    # another client's positions.
+    def _persist_quote_to_db(
+        self,
+        *,
+        position_id: str,
+        option_price: float,
+        underlying_price: float,
+        option_pnl_pct: float,
+        now_utc=None,
+    ) -> bool:
+        """Persist QPM state to the positions row. Non-fatal, throttled."""
+        if not QPM_DB_PERSIST_ENABLED:
+            return False
+        if not position_id:
+            return False
+        try:
+            now = time.time()
+            last_ts    = self._last_db_persist_ts.get(position_id, 0.0)
+            last_price = self._last_db_persist_price.get(position_id, 0.0)
+            elapsed = now - last_ts
+            if last_price > 0 and option_price > 0:
+                price_delta_pct = abs(option_price - last_price) / last_price
+            else:
+                price_delta_pct = float("inf")
+            time_ok  = elapsed >= QPM_DB_PERSIST_THROTTLE_SEC
+            price_ok = price_delta_pct >= QPM_DB_PERSIST_PRICE_DELTA_PCT
+            if not (time_ok or price_ok):
+                return False
+
+            from ap.db import conn, run_with_retry  # local import avoids cycle
+
+            def _do_update():
+                with conn() as c:
+                    c.execute(
+                        """
+                        UPDATE positions
+                        SET current_option_price = %s,
+                            current_underlying   = COALESCE(NULLIF(%s, 0), current_underlying),
+                            option_pnl_pct       = %s,
+                            updated_at           = NOW()
+                        WHERE id        = %s
+                          AND client_id = %s
+                          AND status   IN ('OPEN', 'CLOSING')
+                        """,
+                        (
+                            float(option_price) if option_price > 0 else None,
+                            float(underlying_price) if underlying_price > 0 else 0.0,
+                            float(option_pnl_pct),
+                            position_id,
+                            self.client_id,
+                        ),
+                    )
+                    return c.rowcount
+
+            rowcount = run_with_retry(_do_update) or 0
+            self._last_db_persist_ts[position_id] = now
+            if option_price > 0:
+                self._last_db_persist_price[position_id] = float(option_price)
+            return rowcount > 0
+        except Exception as exc:
+            log.debug(
+                "[%s] _persist_quote_to_db non-fatal failure for pos=%s: %s",
+                self.client_id, position_id, exc,
+            )
+            return False
+
 
     # ── Contract-aware pruning ───────────────────────────────────────────────
     def _prune_closed(self, active_ids: set[str], active_contracts: set[str]) -> None:

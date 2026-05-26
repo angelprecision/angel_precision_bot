@@ -1258,6 +1258,26 @@ class APExitEngine:
         self.strategy_version = os.getenv("AP_STRATEGY_VERSION", "ap_live_beta")
         self.git_commit       = get_git_commit()
 
+        # PR: position-lifecycle-integrity-and-sizing (P0 FIX-3)
+        # Throttle state for persisting peak/high-water/touched_profit to the
+        # positions table. The exit engine updates these in memory every
+        # cycle; persisting every cycle would hammer the DB. We persist
+        # when (a) >= EXIT_DB_PERSIST_THROTTLE_SEC has elapsed since last
+        # persist for that position, OR (b) peak_pnl_pct or touched_profit
+        # changed materially since last persist.
+        self._last_peak_persist_ts:       dict[str, float] = {}   # pid -> epoch
+        self._last_peak_persist_value:    dict[str, float] = {}   # pid -> peak
+        self._last_peak_persist_touched:  dict[str, bool]  = {}   # pid -> touched
+        self._EXIT_DB_PERSIST_THROTTLE_SEC = float(
+            os.getenv("EXIT_DB_PERSIST_THROTTLE_SEC", "5.0")
+        )
+        self._EXIT_DB_PERSIST_PEAK_DELTA = float(
+            os.getenv("EXIT_DB_PERSIST_PEAK_DELTA", "0.02")
+        )
+        self._EXIT_DB_PERSIST_ENABLED = (
+            os.getenv("EXIT_DB_PERSIST_ENABLED", "1") == "1"
+        )
+
     # ── P1: True O(1) position lookup ────────────────────────────────────────
     def get_position(self, position_id: str) -> Optional[ManagedPosition]:
         """
@@ -1274,6 +1294,90 @@ class APExitEngine:
             return None
         with self._lock:
             return self._positions_by_id.get(pid)
+
+    def _persist_peak_state_to_db(self, pos) -> bool:
+        """
+        P0 FIX-3: persist peak/high-water/touched_profit to the positions row.
+
+        The exit engine updates these in memory every evaluation cycle. They
+        are the protection layer for winning trades (PROFIT_FLOOR, trail).
+        Without DB persistence:
+          - dashboard shows peak_pnl_pct=0 on every position
+          - restart-recovery loses every position's peak (no protection)
+          - audit/proof cannot prove what protection was in force
+        Throttled: writes when >= throttle sec have elapsed OR peak moved
+        materially OR touched_profit transitioned False->True.
+
+        Non-fatal: any DB error is logged and swallowed; never blocks the
+        exit decision path. The exit engine continues to read in-memory
+        state for decisions.
+        """
+        if not getattr(self, "_EXIT_DB_PERSIST_ENABLED", True):
+            return False
+        pid = str(getattr(pos, "position_id", "") or "")
+        client_id = str(getattr(pos, "client_id", "") or getattr(self, "_email", "") or "")
+        if not pid or not client_id:
+            return False
+        try:
+            peak_now    = float(getattr(pos, "peak_pnl_pct", 0.0) or 0.0)
+            max_profit  = float(getattr(pos, "max_profit_seen", 0.0) or 0.0)
+            touched_now = bool(getattr(pos, "touched_profit", False))
+            opt_pnl     = float(getattr(pos, "option_pnl_pct", 0.0) or 0.0)
+            cur_opt     = float(getattr(pos, "current_option_price", 0.0) or 0.0)
+
+            now = time.time()
+            last_ts      = self._last_peak_persist_ts.get(pid, 0.0)
+            last_peak    = self._last_peak_persist_value.get(pid, 0.0)
+            last_touched = self._last_peak_persist_touched.get(pid, None)
+            elapsed = now - last_ts
+            peak_delta = abs(peak_now - last_peak)
+            touched_changed = (last_touched is None) or (touched_now != last_touched)
+            time_ok = elapsed >= float(getattr(self, "_EXIT_DB_PERSIST_THROTTLE_SEC", 5.0))
+            peak_ok = peak_delta >= float(getattr(self, "_EXIT_DB_PERSIST_PEAK_DELTA", 0.02))
+            if not (time_ok or peak_ok or touched_changed):
+                return False
+
+            from ap.db import conn, run_with_retry  # local import avoids cycle
+
+            def _do_update():
+                with conn() as c:
+                    c.execute(
+                        """
+                        UPDATE positions
+                        SET peak_pnl_pct        = %s,
+                            max_profit_seen     = %s,
+                            touched_profit      = %s,
+                            option_pnl_pct      = %s,
+                            current_option_price= COALESCE(NULLIF(%s, 0), current_option_price),
+                            updated_at          = NOW()
+                        WHERE id        = %s
+                          AND client_id = %s
+                          AND status   IN ('OPEN', 'CLOSING')
+                        """,
+                        (
+                            peak_now,
+                            max_profit,
+                            touched_now,
+                            opt_pnl,
+                            cur_opt if cur_opt > 0 else 0.0,
+                            pid,
+                            client_id,
+                        ),
+                    )
+                    return c.rowcount
+
+            rowcount = run_with_retry(_do_update) or 0
+            self._last_peak_persist_ts[pid]      = now
+            self._last_peak_persist_value[pid]   = peak_now
+            self._last_peak_persist_touched[pid] = touched_now
+            return rowcount > 0
+        except Exception as exc:
+            log.debug(
+                "[exit_eng] _persist_peak_state_to_db non-fatal failure for pos=%s: %s",
+                pid, exc,
+            )
+            return False
+
 
     def add_position(self, pos: ManagedPosition):
         """Track a newly broker-confirmed open position for exit protection."""
@@ -3251,6 +3355,21 @@ class APExitEngine:
                         pos.touched_profit = True
                         if _raw_pnl > pos.max_profit_seen:
                             pos.max_profit_seen = _raw_pnl
+                    # Keep in-memory option_pnl_pct fresh for the DB write
+                    # below (property-backed in some paths; setter ensures
+                    # the persistence layer sees the same value the engine
+                    # decisioned on).
+                    try:
+                        pos.option_pnl_pct = _raw_pnl
+                    except Exception:
+                        pass
+                    # PR: position-lifecycle-integrity-and-sizing (P0 FIX-3)
+                    # Persist peak / max_profit / touched / option_pnl_pct
+                    # to positions table. Throttled, non-fatal. The exit
+                    # engine continues to read in-memory state for the
+                    # exit decision itself; this is dashboard/audit/restart
+                    # integrity only.
+                    self._persist_peak_state_to_db(pos)
                 # ─────────────────────────────────────────────────────────────
 
                 if _has_live_quotes or _has_peak_to_protect:
