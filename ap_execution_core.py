@@ -127,7 +127,17 @@ class APExecutionCore:
         # master_control at construction time (FIX-4) so the engine
         # never exists without a risk-control reference. APProofLogger
         # receives the canonical mode the first time.
-        self.entry_watcher = APEntryWatcher(broker, order_state_machine=self.order_state_machine)
+        # PR-C / BUG-EW-5: pass canonical mode to the watcher at
+        # construct time so its overnight-revalidation fail-closed-on-LIVE
+        # branch actually fires for LIVE clients. Previously the watcher
+        # had no self.mode attribute and silently used PAPER fail-open
+        # for every client — a live quote outage would arm setups that
+        # should have been invalidated.
+        self.entry_watcher = APEntryWatcher(
+            broker,
+            order_state_machine=self.order_state_machine,
+            mode=self.mode,  # canonical mode from master_control
+        )
         self.exit_eng    = APExitEngine(
             broker,
             email=email,

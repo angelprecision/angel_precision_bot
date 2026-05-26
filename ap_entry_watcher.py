@@ -69,16 +69,24 @@ def _ew_record(signal_id: str, ticker: str, to_state_name: str, reason: str, **m
 
 log = logging.getLogger("ap.entry_watcher")
 
-# FUNNEL FIX (2026-05-20, hardened 2026-05-21):
+# Module-level ET zoneinfo: declared BEFORE any helper that uses it.
+ET = ZoneInfo("America/New_York")
+
+# FUNNEL FIX (2026-05-20, hardened 2026-05-21) + PR-C / BUG-EW-1:
 # Pre-open helper for the stop-touch invalidation guard. Returns True from
 # midnight ET through 9:30 ET (pre-market) AND through the 5-min open-protect
 # window (9:30–9:35 ET) — spreads remain wide during the open protect window,
 # transient bid-below-stop ticks should not invalidate overnight/daily setups.
+#
+# PR-C / BUG-EW-1: removed lazy `from datetime import` and
+# `from zoneinfo import` calls inside the function body. They added a
+# sys.modules lookup on every poll tick (this helper is called for
+# every overnight/daily signal on every 15s cycle) AND constructed a
+# new ZoneInfo("America/New_York") object every call, shadowing the
+# module-level ET constant. Now we use the module-level ET directly.
 def _is_pre_market_now() -> bool:
     try:
-        from datetime import datetime as _dt
-        from zoneinfo import ZoneInfo as _ZI
-        et = _dt.now(_ZI("America/New_York"))
+        et = datetime.now(ET)
         # Pre-9:30 → pre-market
         if et.hour < 9 or (et.hour == 9 and et.minute < 30):
             return True
@@ -88,10 +96,16 @@ def _is_pre_market_now() -> bool:
         return False
     except Exception:
         return False
-ET = ZoneInfo("America/New_York")
 
 POLL_INTERVAL_SEC = 15
 MAX_WATCH_MINUTES = 4320  # 72 hours — covers weekend holds
+
+# PR-C / Section 1 documentation note:
+# EOD_CUTOFF (15:30 ET) intentionally fires BEFORE the exit engine's
+# EOD_HARD_CLOSE (15:50 ET) in ap_exit_engine.py. This 20-minute gap
+# ensures no new entries are opened while the exit engine is in its
+# final forced-close window. Do not align these times — the gap is a
+# deliberate safety margin.
 EOD_CUTOFF_HOUR = 15
 EOD_CUTOFF_MIN = 30
 WRONG_DIR_BUFFER_PCT = 0.001
@@ -101,7 +115,18 @@ OVERNIGHT_THRESHOLD_MIN = 30
 MAX_INTRADAY_WATCH_MIN = int(os.getenv("MAX_INTRADAY_WATCH_MIN", "45"))
 # Default 45 min: watcher stays armed for 45 minutes after breach.
 # Was hardcoded 5 — too short for slow-moving setups. Env-tunable.
-MAX_INTRADAY_DRIFT_PCT = 0.015
+
+# PR-C: MAX_INTRADAY_DRIFT_PCT is now env-tunable for consistency with
+# every other arm/watch threshold. Default 0.015 (1.5%) preserved.
+MAX_INTRADAY_DRIFT_PCT = float(os.getenv("MAX_INTRADAY_DRIFT_PCT", "0.015"))
+
+# PR-C: MAX_OPTION_PREMIUM_DRIFT_PCT elevated from inline os.getenv()
+# in watch() to a module-level constant. Default 0.25 (25%) preserved.
+# If the option bid is already this far above the signal's reference
+# entry_option_price at arm time, the move has likely happened without us
+# and entering would be catching the reversal. Module-level so the dep
+# is visible to static analysis and the read isn't repeated per arm.
+MAX_OPTION_PREMIUM_DRIFT_PCT = float(os.getenv("MAX_OPTION_PREMIUM_DRIFT_PCT", "0.25"))
 
 # ============================================================
 # FUNNEL FIX (2026-05-20, hardened 2026-05-21) — dedicated arm-time tolerance.
@@ -238,9 +263,23 @@ class WatchedSignal:
         stop = signal.get("stop_price") or trigger.get("stop")
         target = signal.get("target_price") or trigger.get("pt1") or trigger.get("pt2")
 
-        self.entry_trigger = float(entry or 0) or None
-        self.stop_level = float(stop or 0) or None
-        self.target_price = float(target or 0) or None
+        # PR-C / BUG-EW-2: explicit None-or-empty check on entry.
+        # Previously \`float(entry or 0) or None\` silently coerced a literal
+        # 0.0 to None, leaving the subsequent guard to raise ValueError
+        # anyway. The pattern was confusing and conflated "missing" with
+        # "zero-valued" — raise loudly for either case.
+        def _coerce_or_none(v):
+            if v is None or v == "" or v == 0 or v == 0.0:
+                return None
+            try:
+                f = float(v)
+            except (TypeError, ValueError):
+                return None
+            return f if f != 0.0 else None
+
+        self.entry_trigger = _coerce_or_none(entry)
+        self.stop_level    = _coerce_or_none(stop)
+        self.target_price  = _coerce_or_none(target)
 
         if not self.entry_trigger:
             raise ValueError(
@@ -308,6 +347,15 @@ class WatchedSignal:
             pass
 
     def check(self, bid: float, ask: float) -> str:
+        # PR-C precedence note: when ask >= trigger AND bid <= stop on the
+        # SAME poll tick, the breach check runs FIRST (may set
+        # state=TRIGGERED), then the stop check runs and OVERWRITES with
+        # state=INVALIDATED. This is "last-write wins" and the chosen
+        # behavior is safer-by-design: a single tick where the underlying
+        # is whipsawing both directions should NOT fire an entry. Do not
+        # add an early-return after TRIGGERED — the current precedence is
+        # intentional. See tests/test_entry_watcher_audit.py
+        # TestPrecedenceTriggerVsStop for the structural guarantee.
         now = datetime.now(timezone.utc)
         self.last_quote_bid = bid
         self.last_quote_ask = ask
@@ -325,7 +373,16 @@ class WatchedSignal:
             and not _safe_is_daily_signal(self)
             and self.minutes_watching >= MAX_INTRADAY_WATCH_MIN
         ):
-            mid = (bid + ask) / 2 if bid > 0 and ask > 0 else max(bid, ask)
+            # PR-C / BUG-EW-3: explicit zero-quote guard BEFORE drift
+            # calculation. Previously a quote outage (bid=0, ask=0)
+            # produced drift = (0 - trigger) / trigger = -1.0, which for
+            # a PUT signal was below the negative threshold and silently
+            # expired the signal. Now: if both bid and ask are zero we
+            # never enter the drift branch — we wait for a real quote.
+            if bid <= 0 and ask <= 0:
+                mid = 0.0  # explicit: no quote available, skip drift check
+            else:
+                mid = (bid + ask) / 2 if bid > 0 and ask > 0 else max(bid, ask)
             if mid > 0 and self.entry_trigger:
                 drift = (mid - self.entry_trigger) / self.entry_trigger
                 stale = (self.side == "CALL" and drift > MAX_INTRADAY_DRIFT_PCT) or (
@@ -455,12 +512,22 @@ class WatchedSignal:
 class APEntryWatcher:
     """Background watcher for queue-created entry plans."""
 
-    def __init__(self, broker, order_state_machine=None, require_on_trigger: Optional[bool] = None):
+    def __init__(self, broker, order_state_machine=None,
+                 require_on_trigger: Optional[bool] = None,
+                 mode: str = "PAPER"):
         self.broker = broker
         self.order_state_machine = order_state_machine
         if require_on_trigger is None:
             require_on_trigger = os.getenv("AP_WATCHER_REQUIRE_ON_TRIGGER", "1").strip().lower() not in {"0", "false", "no"}
         self.require_on_trigger = bool(require_on_trigger)
+
+        # PR-C / BUG-EW-5: canonical mode wired from APExecutionCore at
+        # construct time. Previously self.mode was never set anywhere,
+        # so getattr(self, "mode", "PAPER") in _revalidate_overnight_at_open
+        # always returned "PAPER" — silently arming live overnight setups
+        # on pre-market quote outages instead of invalidating them. Default
+        # is PAPER for back-compat with any callers that omit the kwarg.
+        self.mode = (mode or "PAPER").upper()
         self._pending: list[WatchedSignal] = []
         self._lock = threading.Lock()
         self._running = False
@@ -556,7 +623,11 @@ class APEntryWatcher:
                 watched.ticker,
                 local_order_id,
             )
-            self._last_reject_reason = "osm_validation_failed"
+            # PR-C: every self._last_reject_reason write goes under the
+            # watcher lock so concurrent add_signal() callers cannot race
+            # on the diagnostic field.
+            with self._lock:
+                self._last_reject_reason = "osm_validation_failed"
             return False
 
         dedup_key = self._dedup_key_for_signal(watched.signal)
@@ -744,9 +815,9 @@ class APEntryWatcher:
         #
         # MAX_OPTION_PREMIUM_DRIFT: if option bid is already >25% above the
         # signal's entry_option_price, the move happened without us.
-        _MAX_OPTION_PREMIUM_DRIFT = float(
-            os.getenv("MAX_OPTION_PREMIUM_DRIFT_PCT", "0.25")
-        )
+        # PR-C: read from the module-level constant; was previously read
+        # via os.getenv() inline on every signal arm.
+        _MAX_OPTION_PREMIUM_DRIFT = MAX_OPTION_PREMIUM_DRIFT_PCT
         _signal_option_price = float(
             getattr(plan, "entry_option_price", 0)
             or signal_dict.get("entry_option_price", 0)
@@ -853,7 +924,32 @@ class APEntryWatcher:
             signal_dict["entry_price"],
             signal_dict["side"],
         )
-        return self.add_signal(signal_dict)
+        # PR-C / BUG-EW-4: when add_signal blocks (dedup, opposite-side
+        # weaker score, etc.), the OSM entry order created earlier by the
+        # queue/worker stays as a ghost CREATED row with no watcher
+        # attached. Same failure mode as the watcher_expired /
+        # watcher_invalidated cases that execution_core already cleans up
+        # via _cleanup_pending_entry_order. Here we proactively cancel
+        # the pending entry order through the existing OSM helper.
+        ok = self.add_signal(signal_dict)
+        if not ok and local_order_id and self.order_state_machine is not None:
+            cancel_fn = getattr(self.order_state_machine, "cancel_pending_entry", None)
+            if callable(cancel_fn):
+                _reject = getattr(self, "_last_reject_reason", "") or "watcher_add_signal_blocked"
+                try:
+                    cancel_fn(local_order_id, reason=f"watcher_block:{_reject}")
+                    log.info(
+                        "[%s] OSM cancel_pending_entry called after watcher block | "
+                        "local_order_id=%s reason=%s",
+                        ticker, local_order_id, _reject,
+                    )
+                except Exception as _osm_exc:
+                    log.error(
+                        "[%s] OSM cancel_pending_entry failed after watcher block | "
+                        "local_order_id=%s error=%s",
+                        ticker, local_order_id, _osm_exc,
+                    )
+        return ok
 
     def start(self):
         if self._running:
@@ -922,7 +1018,10 @@ class APEntryWatcher:
                 self._check_all()
                 if _watcher_health_ok:
                     try:
-                        from ap_health_registry import HEALTH as _WH
+                        # PR-C: _WH was already captured at thread start;
+                        # the inner `from ap_health_registry import HEALTH`
+                        # was redundant and added a sys.modules lookup per
+                        # heartbeat. Removed.
                         with self._lock:
                             _watching_count = sum(1 for w in self._pending if w.is_active)
                         _WH.heartbeat(
