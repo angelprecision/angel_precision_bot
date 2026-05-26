@@ -35,6 +35,7 @@ import copy
 from ap.trace import trace_gate
 import os
 import time
+import uuid
 from typing import Any, Optional
 
 from ap.state import update_state
@@ -76,6 +77,22 @@ def _is_regular_session_et(dt=None) -> bool:
 POLL_INTERVAL         = float(os.getenv("QUEUE_POLL_INTERVAL", "1.0"))
 PROCESSING_STALE_SECS = int(os.getenv("PROCESSING_STALE_SECS", "120"))
 ALLOW_IMMEDIATE_EXECUTION = os.getenv("ALLOW_IMMEDIATE_EXECUTION", "0").lower() in {"1", "true", "yes", "on"}
+
+# PR F / queue truth hardening: ALLOW_IMMEDIATE_EXECUTION is a money-affecting
+# kill switch — it disables the breach-watch path and lets queue.py submit
+# orders to the broker the instant a signal is dispatched, with no level/trigger
+# confirmation. Reading it silently leaves no audit trail. Emit a CRITICAL
+# log at module import so the Render logs unmistakably record when the
+# override is active. (worker_loop() repeats this on startup for operators
+# who attach mid-process.)
+if ALLOW_IMMEDIATE_EXECUTION:
+    log.critical(
+        "⚠️  ALLOW_IMMEDIATE_EXECUTION=1 — IMMEDIATE EXECUTION PATH ENABLED at "
+        "module import. The queue worker will bypass breach-watch and submit "
+        "entry orders to the broker immediately on dispatch. This is for "
+        "controlled internal testing ONLY — set ALLOW_IMMEDIATE_EXECUTION=0 "
+        "in production."
+    )
 
 
 # =============================================================================
@@ -149,7 +166,12 @@ def enqueue_signal(
     elif not payload.get("side"):
         payload["side"] = payload["direction"]
 
-    signal_id = payload.get("signal_id") or f"signal_{_now_iso()}"
+    # PR F / queue truth hardening: scanner-provided signal_id is preserved
+    # verbatim via `or` short-circuit. When the scanner omits it, the fallback
+    # MUST include a uuid suffix — timestamp-only fallbacks collide on burst
+    # enqueues within the same millisecond, producing duplicate
+    # idempotency_keys and silently dropping signals as "duplicates".
+    signal_id = payload.get("signal_id") or f"signal_{uuid.uuid4().hex[:12]}_{_now_iso()}"
     if not idempotency_key:
         idempotency_key = f"{client_id}:{signal_id}"
 
@@ -348,12 +370,20 @@ def _log_signal_to_db(
     *,
     decision_status: str = "rejected",
     queued_at: str | None = None,
-) -> None:
+) -> bool:
     """
     Write a structured signal decision to ap_signals.
 
     - True rejections:  decision_status='rejected'  (default, backward-compatible)
     - After-hours defer:decision_status='WATCHING'   so overnight_reeval can find them
+
+    Returns:
+        True  -- row successfully upserted to ap_signals.
+        False -- supabase client unavailable OR upsert raised. Caller (especially
+                 the after-hours WATCHING flow) must NOT mark the queue job
+                 WATCHING if this returns False, otherwise the operator sees a
+                 WATCHING queue job with no matching ap_signals row, which
+                 overnight_reeval can never find. (PR F / queue truth hardening.)
 
     This fixes the bug where market_closed_deferred signals were logged as rejected
     making them invisible to overnight_reeval which queries ap_signals WHERE
@@ -363,7 +393,7 @@ def _log_signal_to_db(
         import uuid as _uuid
         _sbc = _get_sb_client()
         if _sbc is None:
-            return
+            return False
 
         _status = str(decision_status or "rejected").strip() or "rejected"
 
@@ -409,8 +439,10 @@ def _log_signal_to_db(
             _row["queued_at"] = queued_at
 
         _sbc.table("ap_signals").upsert(_row, on_conflict="signal_id").execute()
+        return True
     except Exception as _rlog_exc:
         log.debug("_log_signal_to_db failed (non-fatal): %s", _rlog_exc)
+        return False
 
 
 def _log_rejection_to_db(
@@ -646,17 +678,22 @@ def _dispatch(
                 "this record is informational only (not in execution pipeline).",
                 ticker, signal_id,
             )
-            # Status: WATCHING — signal is valid, awaiting 9 AM overnight reeval to arm.
-            # The overnight reeval queries WHERE status='WATCHING' to find these signals.
-            # WATCHING here means: master control approved, contract selection deferred to breach.
-            # The overnight reeval at 9 AM will run contract selection with live quotes and
-            # arm the entry watcher. This is the correct overnight pipeline for daily scanner signals.
-            _mark_job(job_id, "WATCHING", error="after_hours_deferred:awaiting_overnight_reeval")
-            # Log to ap_signals as WATCHING — NOT rejected.
-            # overnight_reeval queries ap_signals WHERE decision_status='WATCHING'
-            # to find signals to arm at 9 AM ET. Writing 'rejected' here was the
-            # root cause of overnight signals never being processed.
-            _log_signal_to_db(
+            # PR F / queue truth hardening: write ap_signals FIRST, then mark
+            # the queue job WATCHING — and ONLY if the write succeeded. The
+            # previous order (mark WATCHING, then log) silently created a
+            # WATCHING queue job with no ap_signals row whenever the upsert
+            # failed (network blip, schema drift, no supabase client). Because
+            # overnight_reeval discovers signals via
+            #   ap_signals WHERE decision_status='WATCHING'
+            # such signals were invisible — never armed at 9 AM ET.
+            #
+            # New contract:
+            #   1. _log_signal_to_db(...) returns bool.
+            #   2. On True  → _mark_job(WATCHING, ...after_hours_deferred...).
+            #   3. On False → _mark_job terminal with the explicit reason
+            #      'ap_signals_write_failed:after_hours_deferred' so the
+            #      operator sees the failure instead of a phantom WATCHING.
+            _signals_ok = _log_signal_to_db(
                 signal_id=signal_id, client_id=client_id, ticker=ticker,
                 side=payload.get("side", ""), score=float(payload.get("score") or 0),
                 stage="contract_selection", reason_code="market_closed_deferred",
@@ -665,6 +702,24 @@ def _dispatch(
                 decision_status="WATCHING",
                 queued_at=datetime.now(timezone.utc).isoformat(),
             )
+            if not _signals_ok:
+                log.critical(
+                    "[%s] AP_SIGNALS WRITE FAILED for after-hours deferred signal "
+                    "%s — refusing to mark queue job WATCHING (overnight_reeval "
+                    "would never find it). Marking job terminal so operator sees the failure.",
+                    ticker, signal_id,
+                )
+                _mark_job(
+                    job_id, "ERROR",
+                    error="ap_signals_write_failed:after_hours_deferred",
+                )
+                return
+            # Status: WATCHING — signal is valid, awaiting 9 AM overnight reeval to arm.
+            # The overnight reeval queries WHERE status='WATCHING' to find these signals.
+            # WATCHING here means: master control approved, contract selection deferred to breach.
+            # The overnight reeval at 9 AM will run contract selection with live quotes and
+            # arm the entry watcher. This is the correct overnight pipeline for daily scanner signals.
+            _mark_job(job_id, "WATCHING", error="after_hours_deferred:awaiting_overnight_reeval")
             return
     except Exception as _mkt_err:
         log.warning("[%s] Market hours check failed: %s — proceeding", ticker, _mkt_err)
@@ -717,29 +772,14 @@ def _dispatch(
                           "real_cost": plan.max_position_usd})
         return
 
-    # ── 4. ORDER STATE MACHINE ─────────────────────────────────────────────────
-    try:
-        local_order_id = order_state_machine.create_entry_order(plan)
-        # PR E / FIX-1 (BUG-MC-1): stash local_order_id on plan.metadata
-        # so any LATER revalidate_exposure (called from execution-core at
-        # breach time, when the OSM row already exists) can pass it as
-        # exclude_local_order_id to the pending-capital SUM, preventing
-        # the current plan's reserved_cost from being double-counted.
-        try:
-            if hasattr(plan, "metadata") and isinstance(plan.metadata, dict):
-                plan.metadata["local_order_id"] = str(local_order_id)
-        except Exception:
-            pass
-        log.info(
-            f"[{ticker}] Entry order created: {local_order_id} "
-            f"contract={getattr(plan, 'contract_symbol', '?')}"
-        )
-    except Exception as e:
-        log.error(f"[{ticker}] create_entry_order() failed: {e}")
-        _mark_job(job_id, "ERROR", error=f"order_create_error: {e}")
-        return
-
-    # ── 5. ROUTE -- BREACH vs IMMEDIATE ────────────────────────────────────────
+    # ── 4. ROUTE -- BREACH vs IMMEDIATE (resolved BEFORE OSM create) ──────────
+    # PR F / queue truth hardening: route resolution AND the 3:15 PM ET
+    # cutoff MUST run BEFORE the OSM entry-order create call below. The
+    # previous order created an OSM PENDING_TRIGGER row and reserved
+    # capital, THEN ran the cutoff — leaking a stale OSM row and locked
+    # capital on every signal that arrived after 15:15 ET during the
+    # regular session.
+    #
     # Overnight signals always go breach-only — never immediate execution.
     # Use ET date to avoid UTC/ET day-boundary misclassification.
     _signal_date  = (payload.get("created_at") or payload.get("timestamp_iso") or "")[:10]
@@ -793,7 +833,9 @@ def _dispatch(
             pass
         return
 
-    # Block entries after 3:15 PM ET during market hours (weekdays only)
+    # Block entries after 3:15 PM ET during market hours (weekdays only).
+    # PR F: this MUST run BEFORE the OSM entry-order create call to avoid
+    # leaking a PENDING_TRIGGER row and reserved capital on late-day signals.
     _now_et_cut  = _now_et()
     _in_session  = _is_regular_session_et(_now_et_cut)
     _too_late    = _in_session and (
@@ -805,6 +847,28 @@ def _dispatch(
             ticker, _now_et_cut.hour, _now_et_cut.minute,
         )
         _mark_job(job_id, "REJECTED", error="entry_cutoff: too_late_in_session")
+        return
+
+    # ── 5. ORDER STATE MACHINE (create only after route + cutoff cleared) ────
+    try:
+        local_order_id = order_state_machine.create_entry_order(plan)
+        # PR E / FIX-1 (BUG-MC-1): stash local_order_id on plan.metadata
+        # so any LATER revalidate_exposure (called from execution-core at
+        # breach time, when the OSM row already exists) can pass it as
+        # exclude_local_order_id to the pending-capital SUM, preventing
+        # the current plan's reserved_cost from being double-counted.
+        try:
+            if hasattr(plan, "metadata") and isinstance(plan.metadata, dict):
+                plan.metadata["local_order_id"] = str(local_order_id)
+        except Exception:
+            pass
+        log.info(
+            f"[{ticker}] Entry order created: {local_order_id} "
+            f"contract={getattr(plan, 'contract_symbol', '?')}"
+        )
+    except Exception as e:
+        log.error(f"[{ticker}] create_entry_order() failed: {e}")
+        _mark_job(job_id, "ERROR", error=f"order_create_error: {e}")
         return
 
     if trigger_type == "breach":
@@ -977,6 +1041,19 @@ def worker_loop(
     log.info(
         f"🤖 Worker started | client={client_id} poll={poll_seconds}s path={mode_label}"
     )
+
+    # PR F / queue truth hardening: re-emit the immediate-execution override
+    # warning on worker startup. Module-import critical fires once per process;
+    # this fires every worker start (per client), so operators attaching after
+    # process launch still see the dangerous override in their logs.
+    if ALLOW_IMMEDIATE_EXECUTION:
+        log.critical(
+            "[%s] ⚠️  ALLOW_IMMEDIATE_EXECUTION=1 at worker startup — "
+            "IMMEDIATE EXECUTION PATH ENABLED. Breach-watch is BYPASSED; "
+            "orders submit instantly on dispatch. Production must set "
+            "ALLOW_IMMEDIATE_EXECUTION=0.",
+            client_id,
+        )
 
     # Log restart guard status on startup
     try:
