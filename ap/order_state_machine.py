@@ -248,7 +248,7 @@ class APOrderStateMachine:
         # potential registry mismatches when self.client_id was passed forward as a
         # lookup key. _normalize_client_key normalizes for registry lookups but
         # self.client_id itself was never cleaned.
-        self.client_id        = str(client_id or "").strip()
+        self.client_id        = str(client_id or "").strip().lower()   # normalise: matches _normalize_client_key()
         self.run_id           = os.getenv("AP_RUN_ID", "unknown")
         self.strategy_version = os.getenv("AP_STRATEGY_VERSION", "ap_live_beta")
         self.git_commit       = get_git_commit()
@@ -409,7 +409,7 @@ class APOrderStateMachine:
     # ------------------------------------------------------------------
 
     def create_entry_order(self, plan, *, limit_price=None, reserved_cost=None) -> str:
-        existing = self._get_order_by_plan(plan.plan_id, kind="ENTRY")
+        existing = self._get_order_by_plan(plan.plan_id, kind="ENTRY") if plan.plan_id else None
         if existing:
             log.warning(
                 "[%s] create_entry_order SKIPPED -- plan %s already has order %s",
@@ -1248,12 +1248,20 @@ class APOrderStateMachine:
             )
             # Update the order row so DB is consistent before broker POST
             try:
-                self._db.table("orders").update({
-                    "contract":    contract,
-                    "limit_price": round(lp, 2),
-                    "qty":         int(getattr(plan, "contracts", 0) or current.get("qty") or 0),
-                    "updated_ts":  now_utc_iso(),
-                }).eq("local_order_id", local_order_id).execute()
+                def _update_contract_pre_submit():
+                    with conn() as c:
+                        c.execute(
+                            "UPDATE orders SET contract=%s, limit_price=%s, qty=%s, updated_ts=NOW() "
+                            "WHERE local_order_id=%s AND client_id=%s",
+                            (
+                                contract,
+                                round(lp, 2),
+                                int(getattr(plan, "contracts", 0) or current.get("qty") or 0),
+                                local_order_id,
+                                self.client_id,
+                            ),
+                        )
+                run_with_retry(_update_contract_pre_submit)
             except Exception as _upd_exc:
                 log.warning("[%s] Failed to update order contract pre-submit: %s", _ticker, _upd_exc)
         else:
@@ -2090,6 +2098,7 @@ class APOrderStateMachine:
         local_order_id: str,
         fill_price: float | None = None,
         filled_qty: int | None = None,
+        pm=None,  # accept shared APPositionManager if caller has one
     ) -> None:
         """
         Copy confirmed broker fill truth from orders → positions after EXIT_FILLED.
@@ -2120,8 +2129,9 @@ class APOrderStateMachine:
                 )
                 return
 
-            from ap.position_manager import APPositionManager
-            pm = APPositionManager(self.client_id)
+            if pm is None:
+                from ap.position_manager import APPositionManager
+                pm = APPositionManager(self.client_id)
             pm.close_position_from_exit_fill(
                 position_id=position_id,
                 exit_price=float(_fill_price),
@@ -2178,7 +2188,8 @@ class APOrderStateMachine:
             with conn() as c:
                 c.execute(
                     "UPDATE orders SET last_error=%s, updated_ts=NOW() "
-                    "WHERE local_order_id=%s AND client_id=%s",
+                    "WHERE local_order_id=%s AND client_id=%s "
+                    "AND status NOT IN ('FILLED','EXIT_FILLED','REJECTED','CANCELED','EXPIRED')",
                     (error_msg, local_order_id, self.client_id),
                 )
         try:

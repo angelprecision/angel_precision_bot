@@ -1654,10 +1654,24 @@ class APBrokerReconciler:
         local_id   = order.get("local_order_id") or order.get("id")
         contract   = order.get("contract") or order.get("symbol") or "?"
         db_status  = (order.get("status") or "").upper()
-        new_status = BROKER_TO_OSM.get(broker_status, "CANCELED")
-
         # FIX-2: use the family resolver so NULL kind on an EXIT row still works.
         family = self._order_family_from_kind_and_status(order, db_status)
+
+        # Map broker status to OSM status, aware of order family (ENTRY vs EXIT)
+        if family == "EXIT":
+            _EXIT_BROKER_TO_OSM = {
+                "open":             "EXIT_ACKNOWLEDGED",
+                "pending":          "EXIT_SUBMITTED",
+                "partially_filled": "EXIT_PARTIAL_FILL",
+                "filled":           "EXIT_FILLED",
+                "canceled":         "CANCELED",
+                "cancelled":        "CANCELED",
+                "rejected":         "REJECTED",
+                "expired":          "EXPIRED",
+            }
+            new_status = _EXIT_BROKER_TO_OSM.get(broker_status, "CANCELED")
+        else:
+            new_status = BROKER_TO_OSM.get(broker_status, "CANCELED")
         # If family is unresolvable (genuinely ambiguous), fall back to raw kind rather
         # than default-to-ENTRY; log a warning so the ambiguity is visible.
         if family is None:
