@@ -47,10 +47,19 @@ BOT_MODE            = (os.getenv("AP_MODE") or os.getenv("BOT_MODE") or "PAPER")
 MAX_POSITIONS       = int(os.getenv("MAX_POSITIONS", "7"))
 
 # ── Mode metadata thresholds ────────────────────────────────────────────────
-SCORE_FLOOR_LIVE    = 75   # live: only trade validated setups
-SCORE_FLOOR_PAPER   = 45
-CONTEXT_FLOOR_LIVE  = 10.0
-CONTEXT_FLOOR_PAPER = 0.0
+# PR-B / FIX-8: floors are now env-overridable so they can be tuned
+# on Render without a code deploy (essential for proof-week response time).
+SCORE_FLOOR_LIVE    = int(os.getenv("SCORE_FLOOR_LIVE",    "75"))   # live: only trade validated setups
+SCORE_FLOOR_PAPER   = int(os.getenv("SCORE_FLOOR_PAPER",   "45"))
+CONTEXT_FLOOR_LIVE  = float(os.getenv("CONTEXT_FLOOR_LIVE",  "10.0"))
+CONTEXT_FLOOR_PAPER = float(os.getenv("CONTEXT_FLOOR_PAPER", "0.0"))
+
+# PR-B / FIX-8: single-source-of-truth for the breakeven band. Previously
+# read inline via os.getenv() in both _on_position_close and _finalize_proof
+# — same env, two reads, easy drift. Now read once at module load.
+# Stored as percent (e.g. -2.0 means -2%); callers may need /100.0 when
+# comparing against decimal pnl.
+BREAKEVEN_BAND_PCT  = float(os.getenv("BREAKEVEN_BAND_PCT", "-2.0"))
 
 # =============================================================================
 # EXECUTION CORE
@@ -63,46 +72,23 @@ class APExecutionCore:
     """
 
     def __init__(self, broker, supabase_client=None, email: str = "", position_manager=None, order_state_machine=None, data_broker=None, master_control=None, contract_selector=None):
-        self.broker            = broker
-        self.contract_selector = contract_selector  # wired for breach-time selection of deferred overnight signals
-        self.email              = email
-        self.position_manager   = position_manager
-        self.order_state_machine = order_state_machine
-        # Mode: injected master_control is canonical; BOT_MODE is the env fallback.
-        self.paper     = BOT_MODE != "LIVE"
-        self.mode      = "LIVE" if not self.paper else "PAPER"
-        self._pos_lock = threading.Lock()
-        self._position_count = 0
+        # PR-B / FIX-8: AP_MODE vs BOT_MODE conflict check at __init__
+        # (not at module import — import-time asserts break tests/scripts).
+        _ap_mode_env  = (os.environ.get("AP_MODE")  or "").upper()
+        _bot_mode_env = (os.environ.get("BOT_MODE") or "").upper()
+        if _ap_mode_env and _bot_mode_env and _ap_mode_env != _bot_mode_env:
+            raise RuntimeError(
+                f"[{email}] AP_MODE={_ap_mode_env!r} conflicts with "
+                f"BOT_MODE={_bot_mode_env!r}. Both env vars are set and "
+                f"disagree — unsafe before live trading. Set only one, or "
+                f"set both to the same value."
+            )
 
-        # Mode-specific metadata values.
-        self._score_floor   = SCORE_FLOOR_PAPER   if self.paper else SCORE_FLOOR_LIVE
-        self._context_floor = CONTEXT_FLOOR_PAPER if self.paper else CONTEXT_FLOOR_LIVE
-
-        # Signal intelligence store + tracker
-        # Tracker deduplicates strictly by signal_id so one per client is safe.
-        self.store   = APSignalStore(supabase_client, client_email=email)
-        self.tracker = APSignalTracker(supabase_client, store=self.store)
-
-        # Core modules
-        self.entry_watcher = APEntryWatcher(broker, order_state_machine=self.order_state_machine)
-        self.exit_eng    = APExitEngine(broker, email=email,
-                                           data_broker=data_broker)
-        self.feedback    = APFeedbackLoop(supabase_client, DISCORD_WEBHOOK_URL, signal_store=self.store)
-        self.shadow      = APShadowTracker(supabase_client, DISCORD_WEBHOOK_URL)
-        self._sector_counts: dict[str, int] = {}
-        self._sector_lock   = threading.Lock()
-        self.proof          = APProofLogger(
-            supabase_client=supabase_client,
-            client_email=email,
-            mode="paper" if self.paper else "live",
-        )
-        try:
-            from ap_edge_intelligence import APTradeLogger as _ATL
-            self._edge_logger = _ATL()
-        except Exception:
-            self._edge_logger = None
-
-        # ── MASTER CONTROL -- single production decision authority ─────────────
+        # PR-B / FIX-3: validate master_control FIRST and derive canonical
+        # mode BEFORE constructing any submodule. Previously, mode was
+        # derived from BOT_MODE, submodules were constructed, then mode
+        # was re-derived from master_control — a window where APProofLogger
+        # / APExitEngine could see the pre-canonical mode.
         if master_control is None:
             raise RuntimeError(
                 f"[{email}] APExecutionCore requires injected master_control. "
@@ -111,22 +97,62 @@ class APExecutionCore:
         self.master_control = master_control
         log.info("[%s] APExecutionCore using injected master_control", email)
 
-        # ── Mode + limits canonical override from master_control ──────────────
-        # Now that mc is assigned, derive paper/mode/max_pos from the single
-        # authority so execution core is always cohesive with the runner.
-        if hasattr(self, "master_control") and self.master_control is not None:
-            _mc_mode   = getattr(self.master_control, "mode", self.mode).upper()
-            self.mode  = _mc_mode
-            self.paper = _mc_mode != "LIVE"
-            self._max_positions = getattr(self.master_control, "max_positions", MAX_POSITIONS)
-            # Re-derive floors from canonical mode
-            self._score_floor   = SCORE_FLOOR_PAPER   if self.paper else SCORE_FLOOR_LIVE
-            self._context_floor = CONTEXT_FLOOR_PAPER if self.paper else CONTEXT_FLOOR_LIVE
-            # Sync proof logger mode
-            if hasattr(self, "proof"):
-                self.proof.mode = "paper" if self.paper else "live"
-        else:
-            self._max_positions = MAX_POSITIONS
+        # PR-B / FIX-3: derive canonical mode from master_control NOW.
+        # BOT_MODE is only a last-resort fallback if mc has no .mode attr.
+        _mc_mode    = (getattr(master_control, "mode", BOT_MODE) or BOT_MODE).upper()
+        self.mode   = _mc_mode
+        self.paper  = _mc_mode != "LIVE"
+        self._max_positions = getattr(master_control, "max_positions", MAX_POSITIONS)
+
+        # Mode-specific metadata values (derived from canonical mode).
+        self._score_floor   = SCORE_FLOOR_PAPER   if self.paper else SCORE_FLOOR_LIVE
+        self._context_floor = CONTEXT_FLOOR_PAPER if self.paper else CONTEXT_FLOOR_LIVE
+
+        # Plain attributes (no mode dependency).
+        self.broker            = broker
+        self.contract_selector = contract_selector  # wired for breach-time selection of deferred overnight signals
+        self.email              = email
+        self.position_manager   = position_manager
+        self.order_state_machine = order_state_machine
+        self._pos_lock = threading.Lock()
+        self._position_count = 0
+
+        # Signal intelligence store + tracker
+        # Tracker deduplicates strictly by signal_id so one per client is safe.
+        self.store   = APSignalStore(supabase_client, client_email=email)
+        self.tracker = APSignalTracker(supabase_client, store=self.store)
+
+        # PR-B / FIX-3 + FIX-4: Submodules constructed AFTER canonical
+        # mode + master_control are known. APExitEngine receives
+        # master_control at construction time (FIX-4) so the engine
+        # never exists without a risk-control reference. APProofLogger
+        # receives the canonical mode the first time.
+        self.entry_watcher = APEntryWatcher(broker, order_state_machine=self.order_state_machine)
+        self.exit_eng    = APExitEngine(
+            broker,
+            email=email,
+            data_broker=data_broker,
+            master_control=self.master_control,  # FIX-4: construct-time wiring
+        )
+        self.feedback    = APFeedbackLoop(supabase_client, DISCORD_WEBHOOK_URL, signal_store=self.store)
+        self.shadow      = APShadowTracker(supabase_client, DISCORD_WEBHOOK_URL)
+        self._sector_counts: dict[str, int] = {}
+        self._sector_lock   = threading.Lock()
+        self.proof          = APProofLogger(
+            supabase_client=supabase_client,
+            client_email=email,
+            mode="paper" if self.paper else "live",  # canonical from the start
+        )
+        try:
+            from ap_edge_intelligence import APTradeLogger as _ATL
+            self._edge_logger = _ATL()
+        except Exception:
+            self._edge_logger = None
+
+        # PR-B / FIX-3: master_control validation, canonical mode
+        # derivation, and submodule construction (above) all happen
+        # BEFORE this point. The old "MASTER CONTROL" + "Mode override"
+        # blocks that used to live here are gone — work is done upfront.
 
         # Wire watcher callbacks
         self.entry_watcher.on_trigger    = self._on_entry_trigger
@@ -138,12 +164,13 @@ class APExecutionCore:
         self.exit_eng.on_scale = self._on_position_scale
         # FIX 2: broker-confirmed fill callback — writes proof with actual fill price
         self.exit_eng.on_exit_fill_confirmed = self._finalize_proof
-        # P0-3: give exit engine a reference to master_control so it can check
-        # the force-close-all breaker on each tick. One-way reference: exit
-        # engine READS the flag, never sets it. master_control is the sole
-        # source of truth for the flag.
+        # PR-B / FIX-4 belt-and-suspenders: master_control was wired at
+        # exit-engine construction time above; re-assign here only if
+        # somehow missing (idempotent no-op in normal path). One-way
+        # reference: exit engine READS the flag, never sets it.
         try:
-            self.exit_eng.master_control = self.master_control
+            if getattr(self.exit_eng, "master_control", None) is None:
+                self.exit_eng.master_control = self.master_control
         except Exception as _e:
             log.warning("exit_eng_master_control_wire_failed: %s", _e)
 
@@ -420,6 +447,21 @@ class APExecutionCore:
             problems.append("exit_engine_missing")
         if self.tracker is None:
             problems.append("tracker_missing")
+        # PR-B / FIX-5: exit-engine callback + master_control preflight.
+        # If these are missing, positions accumulate with no exits or
+        # no risk-control reference — the worst-possible failure mode.
+        if self.exit_eng is not None:
+            if getattr(self.exit_eng, "on_exit", None) is None:
+                problems.append("exit_eng_on_exit_not_wired")
+            if getattr(self.exit_eng, "on_scale", None) is None:
+                problems.append("exit_eng_on_scale_not_wired")
+            if getattr(self.exit_eng, "master_control", None) is None:
+                problems.append("exit_eng_master_control_not_wired")
+        # PR-B / FIX-5: LIVE mode must not start without a position_manager.
+        # In paper, position_manager is optional (local fallback counter
+        # is acceptable). In LIVE, broker/DB truth is required.
+        if not self.paper and self.position_manager is None:
+            problems.append("position_manager_missing")
         if problems:
             raise RuntimeError(f"[{self.email}] APExecutionCore production startup validation failed: {','.join(problems)}")
 
@@ -812,6 +854,21 @@ class APExecutionCore:
         _ask = getattr(pos, "current_ask", 0) or 0
         _mid = getattr(pos, "current_option_price", 0) or 0
 
+        # PR-B / FIX-2: decision.suggested_limit is the FIRST authority.
+        # The exit engine already prices the exit (urgency tier-aware,
+        # bid/mid/(mid+bid)/2). When suggested_limit > 0 we honor it
+        # verbatim and skip the duplicate execution-core ladder below.
+        # The existing ladder logic is preserved as a fallback for
+        # decisions that did not produce a suggested_limit (legacy
+        # callers, paper sim, etc.).
+        #
+        # TODO(post-proof-week): delete the duplicate execution-core
+        # pricing ladder entirely and make the exit engine the sole
+        # pricing authority. Left in place for this PR to avoid
+        # fill-side-effects right before proof week.
+        _suggested_limit = float(getattr(decision, "suggested_limit", 0) or 0)
+        _suggested_limit_locked = False  # True once a valid suggested_limit is locked in
+
         # EXIT PRICING POLICY
         # ─────────────────────────────────────────────────────────────────
         # IMMEDIATE urgency (hard stop -33%, never-green, EOD) → MARKET ORDER
@@ -970,6 +1027,27 @@ class APExecutionCore:
                 _ladder_price_set = True
                 log.warning("[%s] PROFIT EXIT STEP-DOWN bid-$0.01 = $%.2f — unfilled >10s | %s", pos.ticker, _exit_limit, decision.reason)
 
+        # PR-B / FIX-2: First-authority check. If the exit engine produced
+        # a suggested_limit > 0 AND this is not a true emergency (which
+        # must go to market regardless), lock the exit engine's price and
+        # skip the ladder. This is the trail-exit spread fix: the engine
+        # prices TRAIL at (mid+bid)/2; the execution-core ladder used to
+        # override that to bid.
+        if not _use_market and _suggested_limit > 0:
+            _exit_limit = round(_suggested_limit, 2)
+            exit_price  = _exit_limit
+            _suggested_limit_locked = True
+            # Stamp submit timestamp on FIRST submit so OSM/reconciler aging
+            # paths see the same behavior they did under the legacy ladder.
+            if not getattr(pos, "exit_in_flight", False) or not _exit_submit_ts:
+                pos._exit_submit_ts = time.time()
+            pos._exit_attempts = _exit_attempts + 1
+            log.info(
+                "[%s] EXIT @ suggested_limit=$%.2f (exit-engine authority) "
+                "attempt=%d | urgency=%s | %s",
+                pos.ticker, _exit_limit, pos._exit_attempts, _urgency, decision.reason,
+            )
+
         if _use_market:
             _exit_limit = None
             exit_price = _bid if _bid > 0 else _mid
@@ -977,6 +1055,9 @@ class APExecutionCore:
                 log.critical("[%s] CLOSE BLOCKED — no quote for IMMEDIATE exit | %s", pos.ticker, decision.reason)
                 return
             log.info("[%s] MARKET EXIT @ est.$%.2f (bid) | urgency=%s | %s", pos.ticker, exit_price, _urgency, decision.reason)
+        elif _suggested_limit_locked:
+            # Already priced via decision.suggested_limit — ladder skipped.
+            pass
         elif _ladder_price_set and _exit_limit is not None and _exit_limit > 0:
             # Step-down already locked an aggressive price — DO NOT overwrite it
             exit_price = _exit_limit
@@ -1054,9 +1135,9 @@ class APExecutionCore:
             opt_pnl = 0.0
         # Breakeven band: trades within BREAKEVEN_BAND_PCT of entry count as
         # breakeven wins — not losses. Prevents $1-$2 slippage from showing
-        # as a loss when the position was effectively flat.
-        _breakeven_band = float(os.getenv("BREAKEVEN_BAND_PCT", "-2.0"))
-        win  = opt_pnl >= _breakeven_band
+        # as a loss when the position was effectively flat. PR-B / FIX-8:
+        # reads from the module-level constant, not an inline getenv.
+        win  = opt_pnl >= BREAKEVEN_BAND_PCT
         tier = sig.get("tier", "A+")
 
         if _entry_opt > 0:
@@ -1147,14 +1228,28 @@ class APExecutionCore:
         try:
             _edge_logger = self._edge_logger
             if _edge_logger:
+                # PR-B / FIX-7: edge-logger payload uses an explicit
+                # allowlist of trade-relevant fields. The earlier
+                # pos.__dict__ pattern leaked every ManagedPosition
+                # internal (including ghost fields, _submit_generation,
+                # pending_exit_*, exit_identity_quarantine, etc.) into
+                # the edge intelligence schema, creating an unstable
+                # contract that broke on every code release.
                 _edge_logger.log_trade(
                     position={
-                        **(pos.__dict__ if hasattr(pos, "__dict__") else {}),
-                        "signal": sig,
-                        "ticker": pos.ticker,
-                        "direction": pos.side,
-                        "timeframe": sig.get("timeframe", "1d"),
-                        "synthetic_entry": bool(getattr(pos, "synthetic_entry", False)),
+                        "ticker":             pos.ticker,
+                        "side":               pos.side,
+                        "direction":          pos.side,
+                        "entry_price":        getattr(pos, "entry_price", 0.0),
+                        "quantity":           getattr(pos, "quantity", 0),
+                        "quantity_remaining": getattr(pos, "quantity_remaining", 0),
+                        "opened_at":          getattr(pos, "opened_at", None),
+                        "position_id":        getattr(pos, "position_id", ""),
+                        "client_id":          getattr(pos, "client_id", ""),
+                        "signal_id":          getattr(pos, "signal_id", ""),
+                        "signal":             sig,
+                        "timeframe":          sig.get("timeframe", "1d"),
+                        "synthetic_entry":    bool(getattr(pos, "synthetic_entry", False)),
                     },
                     exit_info={
                         "exit_price": exit_price,
@@ -1167,19 +1262,10 @@ class APExecutionCore:
         except Exception as _e:
             log.debug(f"Trade logger error (non-critical): {_e}")
 
-        # Feed outcome back to intelligence audit log (builds learning dataset)
-        # signal_id resolved here for alpha tracker — store.update_status("closed")
-        # is deferred to _finalize_proof() after broker-confirmed fill.
-        signal_id = str(sig.get("signal_id", "") or "")
-        if _record_intel_outcome:
-            try:
-                _record_intel_outcome(
-                    ticker    = pos.ticker,
-                    signal_id = signal_id,        # already resolved two lines above
-                    pnl_pct   = opt_pnl / 100.0,  # opt_pnl is %, convert to decimal
-                )
-            except Exception as _alpha_err:
-                log.warning("Alpha tracker update failed: %s", _alpha_err)
+        # PR-B / FIX-6: _record_intel_outcome moved to _finalize_proof()
+        # so the intelligence dataset receives the ACTUAL broker fill P/L,
+        # not the estimated submit-time P/L. The signal_id is resolved
+        # at finalize time from the staged dict.
 
     # ── CALLBACKS: Expire / Invalidate ────────────────────────────────────────
 
@@ -1394,8 +1480,10 @@ class APExecutionCore:
         else:
             opt_pnl_pct = staged.get("opt_pnl", 0.0) / 100.0
 
-        _breakeven_band_pct = float(os.getenv("BREAKEVEN_BAND_PCT", "-2.0")) / 100.0
-        win = opt_pnl_pct >= _breakeven_band_pct
+        # PR-B / FIX-8: single-source-of-truth via module-level constant.
+        # BREAKEVEN_BAND_PCT is stored as percent (e.g. -2.0 = -2%);
+        # opt_pnl_pct here is decimal, so divide by 100.
+        win = opt_pnl_pct >= (BREAKEVEN_BAND_PCT / 100.0)
 
         slippage_vs_est = round(final_exit_price - est, 4) if est > 0 else None
         if fill > 0 and est > 0:
@@ -1485,6 +1573,22 @@ class APExecutionCore:
             self.shadow.record_live_outcome(staged.get("tier", ""), opt_pnl_pct)
         except Exception as _e:
             log.warning("shadow_record_live_outcome_failed: %s", _e)
+
+        # PR-B / FIX-6: record_intel_outcome with the ACTUAL broker fill
+        # P/L (opt_pnl_pct is decimal here, e.g. 0.18 = 18%). Previously
+        # called from _on_position_close with the estimated submit-time
+        # P/L — the intelligence dataset received pre-fill estimates.
+        if _record_intel_outcome:
+            try:
+                _intel_sig    = staged.get("signal", {}) or {}
+                _intel_sig_id = str(_intel_sig.get("signal_id", "") or "")
+                _record_intel_outcome(
+                    ticker    = staged.get("ticker", ""),
+                    signal_id = _intel_sig_id,
+                    pnl_pct   = opt_pnl_pct,  # already decimal; actual fill-based
+                )
+            except Exception as _alpha_err:
+                log.warning("Alpha tracker update failed: %s", _alpha_err)
 
     def _on_position_scale(self, pos: ManagedPosition, decision):
         log.info(
