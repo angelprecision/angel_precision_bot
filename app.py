@@ -2184,7 +2184,14 @@ def execution_health():
                 components[email] = {
                     "order_worker_alive":  bool(getattr(runner, "worker_thread", None) and runner.worker_thread.is_alive()),
                     "fill_monitor_alive":  bool(getattr(runner, "fill_monitor_thread", None) and runner.fill_monitor_thread.is_alive()),
-                    "reconciler_alive":    bool(getattr(runner, "reconciler_thread", None) and runner.reconciler_thread.is_alive()),
+                    # PR fix/health-and-reconciler-startup-noise: runner exposes
+                    # `reconciler` (the APBrokerReconciler instance), not a
+                    # `reconciler_thread` attribute. The reconciler object has
+                    # its own .is_alive() method that wraps self._thread.is_alive().
+                    # Previous expression `runner.reconciler_thread.is_alive()`
+                    # always evaluated False (nonexistent attribute), producing
+                    # a false-negative in /execution/health output.
+                    "reconciler_alive":    bool(getattr(runner, "reconciler", None) and runner.reconciler.is_alive()),
                     "equity_alive":        bool(getattr(runner, "equity_thread", None) and runner.equity_thread.is_alive()),
                     "mode":                getattr(runner, "mode", "UNKNOWN"),
                     "runner_alive":        runner.is_alive(),
