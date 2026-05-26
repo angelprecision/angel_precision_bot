@@ -16,6 +16,7 @@ import os
 import time
 import uuid
 import logging
+import warnings
 from contextlib import contextmanager
 from typing import Any, Callable
 
@@ -29,6 +30,13 @@ from psycopg2 import errors as pg_errors
 from ap.utils import now_utc_iso
 
 log = logging.getLogger("ap.db")
+
+# ---------------------------------------------------------------------------
+# Retry profile constants — callers can import these for consistent backoff.
+# Do not pass these to run_with_retry() yet; a future PR will wire callers.
+# ---------------------------------------------------------------------------
+DB_RETRY_FAST = dict(retries=3,  base_sleep=0.05, max_sleep=0.5)
+DB_RETRY_SLOW = dict(retries=10, base_sleep=0.1,  max_sleep=2.0)
 
 # HIGH-010: thread-safe pool rebuild lock
 _pool_lock = threading.Lock()
@@ -179,6 +187,12 @@ class _ConnWrapper:
         self._cur  = cursor
 
     def execute(self, sql: str, params: tuple | list = ()):
+        """Execute a SQL statement and return self for chaining.
+
+        Usage::
+            rows = c.execute("SELECT ...").fetchall()
+            c.execute("UPDATE ..."); affected = c.rowcount
+        """
         # Do NOT replace ? with %s here. The queue SQL uses the Postgres
         # JSONB key-existence operator (payload ? 'score') which the
         # naive replacement converts to payload %s 'score', giving psycopg2
@@ -281,6 +295,11 @@ def insert_order(
 ):
     """AUDIT PHASE-2: added `meta` JSONB for signal_entry_price, score,
     and re-peg counters. See migrations/20260519_phase2_orders_meta.sql."""
+    warnings.warn(
+        "insert_order() is deprecated. Use APOrderStateMachine.create_entry_order() instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     ts = now_utc_iso()
     import json as _json
     meta_json = _json.dumps(meta or {})
@@ -303,6 +322,11 @@ def insert_order(
     return run_with_retry(_fn)
 
 
+# TODO(future-PR): update_order() is legacy.
+# Status updates should go through APOrderStateMachine.transition() which
+# enforces the CAS guard (WHERE status=%s) and rowcount validation.
+# A future PR should require client_id and optional expected_status here
+# after all callers are audited.
 def update_order(
     local_order_id: str,
     *,
@@ -738,6 +762,39 @@ def get_open_orders_for_reconcile(client_id: str | None = None,
                     "ORDER BY created_ts DESC LIMIT %s", (limit,))
             return c.fetchall()
     return run_with_retry(_fn)
+
+
+def get_stale_pending_trigger_orders(client_id: str, older_than_hours: int = 8) -> list[dict]:
+    """Find ENTRY orders stuck in PENDING_TRIGGER longer than threshold.
+
+    PENDING_TRIGGER orders have not reached the broker and normally have no
+    broker_order_id, so they should NOT be included in broker polling via
+    get_open_orders_for_reconcile().
+
+    This helper exists so reconciler/health/admin tooling can detect leaked
+    watcher/queue orders that may reserve capital forever.
+    """
+    def _fn():
+        with conn() as c:
+            c.execute(
+                """
+                SELECT *
+                FROM orders
+                WHERE client_id = %s
+                  AND kind = 'ENTRY'
+                  AND status = 'PENDING_TRIGGER'
+                  AND created_ts < NOW() - (%s || ' hours')::interval
+                ORDER BY created_ts ASC
+                """,
+                (client_id, str(older_than_hours)),
+            )
+            rows = c.fetchall()
+            return [dict(r) for r in rows] if rows else []
+    try:
+        return run_with_retry(_fn) or []
+    except Exception as e:
+        log.error("get_stale_pending_trigger_orders failed for %s: %s", client_id, e)
+        return []
 
 
 # =========================================================================
