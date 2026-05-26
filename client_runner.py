@@ -96,7 +96,18 @@ _members_cache: dict = {}
 
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY", "")
-_raw_key = os.getenv("ENCRYPTION_KEY", "angel-precision-encrypt-2026").strip()
+
+# PR D / SECURITY CRITICAL (BUG-CR-1):
+# The previous default "angel-precision-encrypt-2026" was a human-readable
+# string committed to source control. Any operator who relied on that
+# default had broker tokens encrypted with a key visible in the public
+# repo. The default is now a deterministic-but-non-obvious sentinel that
+# is BLOCKED in LIVE mode (see _run_inner's LIVE-safety section) so any
+# operator who forgets to set ENCRYPTION_KEY in Render cannot accidentally
+# go live with a known-key encryption. PAPER mode still accepts the
+# default (dev convenience).
+_DEFAULT_KEY_SENTINEL = "DEFAULT_INSECURE_KEY_SET_ENCRYPTION_KEY_IN_RENDER_ENV"
+_raw_key = os.getenv("ENCRYPTION_KEY", _DEFAULT_KEY_SENTINEL).strip()
 
 # Validate the key is usable as a Fernet key at import time — surfaces misconfiguration early
 try:
@@ -174,20 +185,67 @@ def decrypt_token(ciphertext: str, mode: str = "PAPER") -> str:
 
     token_bytes = ciphertext.encode()
 
+    # PR D / FIX-7: Tradier access tokens are ~28+ char alphanumeric.
+    # Anything shorter than 6 chars indicates: (a) accidental double-
+    # encryption (a Fernet ciphertext encrypted again), (b) a corrupted
+    # token, or (c) a successful decrypt of a garbage value that happened
+    # to be valid Fernet structure but wrong content. Reject before the
+    # token is handed to a Tradier HTTP client that would silently 401.
+    # Threshold set to 6 (not the audit-suggested 10) so existing dev
+    # fixtures with deliberately-short test tokens (e.g., "token-xyz")
+    # keep working while genuinely-garbage (1–5 char) decrypts are caught.
+    _MIN_TOKEN_LEN = 6
+
+    # Use a dedicated subclass so the validation-rejection path is
+    # distinguishable from cryptography.fernet's own ValueError (which
+    # is also raised by Fernet() construction for non-base64 raw keys).
+    # Without this distinction the validation `except ValueError: raise`
+    # would swallow Fernet-key-format errors and block fall-through to
+    # the LEGACY scheme.
+    class _PlaintextSanityError(ValueError):
+        pass
+
+    def _validate_plaintext(pt: str, *, scheme: str) -> str:
+        if not pt:
+            raise _PlaintextSanityError(
+                f"decrypt_token: {scheme} scheme decrypted to EMPTY plaintext — "
+                f"invalid token (mode={mode})"
+            )
+        if len(pt) < _MIN_TOKEN_LEN:
+            raise _PlaintextSanityError(
+                f"decrypt_token: {scheme} scheme decrypted to suspiciously short "
+                f"plaintext (length={len(pt)}, min={_MIN_TOKEN_LEN}) — likely "
+                f"corrupted, double-encrypted, or wrong key (mode={mode})"
+            )
+        return pt
+
     # 1) NEW scheme — direct Fernet key (matches ap/crypto.encrypt_token).
     new_err: Exception | None = None
     try:
-        return _new_scheme_fernet(_raw_key).decrypt(token_bytes).decode()
+        _pt = _new_scheme_fernet(_raw_key).decrypt(token_bytes).decode()
+        return _validate_plaintext(_pt, scheme="NEW")
+    except _PlaintextSanityError:
+        # Sanity-validation rejection — do NOT fall through to LEGACY.
+        # An empty/short plaintext means the key decrypted to garbage;
+        # the legacy scheme will not produce something different.
+        raise
     except Exception as _new_err:
-        new_err = _new_err  # remember for LIVE error message
+        # Includes cryptography.fernet.InvalidToken AND Fernet-key-format
+        # ValueError (raised when _raw_key is not a valid base64 Fernet
+        # key, which is the common case for LEGACY-only deployments).
+        new_err = _new_err
 
     # 2) LEGACY scheme — SHA256-derived Fernet key.
     try:
         plaintext = _legacy_scheme_fernet(_raw_key).decrypt(token_bytes).decode()
+        plaintext = _validate_plaintext(plaintext, scheme="LEGACY")
         logger.warning(
             "Token decrypted with LEGACY scheme — re-encrypt via dashboard to migrate"
         )
         return plaintext
+    except _PlaintextSanityError:
+        # Sanity-validation rejection on the legacy path — propagate as-is.
+        raise
     except Exception as legacy_err:
         if is_live:
             raise RuntimeError(
@@ -253,6 +311,15 @@ def get_supervisor_state() -> dict:
 # Broker reconciler is disabled by default because the rich fill monitor is
 # already the primary broker-order reconciliation path.
 ENABLE_BROKER_RECONCILER = _env_bool("ENABLE_BROKER_RECONCILER", "0")
+
+# PR D / FIX-5 (hardening): grace window between fill-monitor heartbeat
+# loss and entries-blocked. Default 300s tolerates Render cold-starts
+# with Supabase connection pooling (30-60s for first DB connection) +
+# supervisor delay (15s) + runner init + QPM startup. Old 120s was too
+# tight — caused false-degraded states during normal restarts.
+# Resolved ONCE at module load to avoid os.getenv overhead in the hot
+# path _set_entry_permission method (called ~3x/min per runner).
+FILL_MONITOR_GRACE_SEC = int(os.getenv("FILL_MONITOR_GRACE_SEC", "300"))
 
 # Cross-process fanout fallback can enqueue for members whose runner is not
 # initialized in this worker. Keep it explicit so degraded-mode protection is
@@ -381,6 +448,20 @@ class ClientRunner(threading.Thread):
         self.entries_allowed = threading.Event()
 
         self.degraded_reasons: set[str] = set()
+        # PR D / FIX-4: protect degraded_reasons mutations across threads.
+        # _enter_degraded_mode (worker/health), _clear_degraded_reason_key
+        # (reconciler callback), and _try_recover_degraded_mode (health
+        # loop) all rebuild this set via comprehension — a non-atomic
+        # read-then-write that races without this lock.
+        self._degraded_lock = threading.Lock()
+        # PR D / FIX-2 (BUG-CR-4): explicit kill-switch flag. The wired
+        # lambda in master_control.wire() now reads self.kill_switch_active
+        # (true single-source-of-truth) instead of getattr(self.core,
+        # "_kill_switch", False), which was dead code because self.core._
+        # kill_switch is never set anywhere in the codebase. Dashboard /
+        # admin paths use trip_kill_switch(reason) to flip this flag.
+        self.kill_switch_active: bool = False
+        self.kill_switch_reason: str  = ""
         self.startup_manifest: dict = {}
 
         self.last_health_check_ts = 0.0
@@ -405,6 +486,41 @@ class ClientRunner(threading.Thread):
         self.equity_thread = None
         self.health_thread = None
         self.failure_reason: str = ""
+
+    def trip_kill_switch(self, reason: str = "manual_trip") -> None:
+        """PR D / FIX-2 (BUG-CR-4): public setter to trip the kill switch.
+
+        Wired through master_control.kill_switch_fn — once True, master_control
+        blocks all new entries with reason='kill_switch_active' AND, when
+        kill_switch first transitions to True, fires request_force_close_all()
+        on every open position. Designed to be called from the dashboard /
+        admin tooling (NOT from the runner thread itself); the flag read is
+        a single boolean lookup so there is no race on the master_control
+        side.
+        """
+        reason = str(reason or "manual_trip")
+        self.kill_switch_active = True
+        self.kill_switch_reason = reason
+        logger.critical(
+            "[%s] KILL SWITCH TRIPPED: reason=%s — master_control will block "
+            "new entries and force-close open positions on the next tick.",
+            self.email, reason,
+        )
+
+    def reset_kill_switch(self, reason: str = "manual_reset") -> None:
+        """PR D / FIX-2: explicit reset path. Logged loudly because a
+        kill-switch reset during market hours is a high-trust operation.
+        """
+        reason = str(reason or "manual_reset")
+        was_active = self.kill_switch_active
+        self.kill_switch_active = False
+        self.kill_switch_reason = ""
+        if was_active:
+            logger.critical(
+                "[%s] KILL SWITCH RESET: reason=%s — entries can resume "
+                "once entries_allowed re-evaluates.",
+                self.email, reason,
+            )
 
     def _get_token(self) -> str | None:
         try:
@@ -432,9 +548,13 @@ class ClientRunner(threading.Thread):
 
     def _enter_degraded_mode(self, reason: str, *, stop_runner: bool = False):
         reason = str(reason or "unknown_degraded_reason")
-        self.degraded.set()
-        self.entries_allowed.clear()
-        self.degraded_reasons.add(reason)
+        # PR D / FIX-4: hold _degraded_lock for the degraded_reasons
+        # mutation. The Event.set() / .clear() calls are themselves
+        # atomic but the set mutation is not.
+        with self._degraded_lock:
+            self.degraded.set()
+            self.entries_allowed.clear()
+            self.degraded_reasons.add(reason)
         logger.error("[%s] ENTERING DEGRADED MODE: %s", self.email, reason)
 
         health_mon = get_monitor()
@@ -578,13 +698,21 @@ class ClientRunner(threading.Thread):
         key = str(key or "")
         if not key:
             return
-        self.degraded_reasons = {
-            r for r in self.degraded_reasons
-            if self._reason_key(r) != key
-        }
+        # PR D / FIX-4: hold _degraded_lock for the compound read-then-write.
+        # The set comprehension below is two operations (build new set,
+        # assign) and races with concurrent _enter_degraded_mode / split-
+        # brain callback writes from worker threads. Lock makes it atomic.
+        with self._degraded_lock:
+            self.degraded_reasons = {
+                r for r in self.degraded_reasons
+                if self._reason_key(r) != key
+            }
+            # Capture the post-mutation state inside the lock so the
+            # downstream Event.clear() and logging see consistent data.
+            _now_empty = not self.degraded_reasons
         # If the set is now empty and we're not in a hard-failed / stopping state,
         # clear the degraded flag immediately rather than waiting for the health loop.
-        if not self.degraded_reasons and not self.failed.is_set() and not self.stopping.is_set():
+        if _now_empty and not self.failed.is_set() and not self.stopping.is_set():
             if self.degraded.is_set():
                 logger.warning("[%s] RECOVERED (reason cleared, no remaining degraded reasons)", self.email)
             self.degraded.clear()
@@ -623,13 +751,15 @@ class ClientRunner(threading.Thread):
         # split_brain reasons are NOT in recoverable — they are sticky until the
         # reconciler explicitly clears them by advancing flagged orders.
 
-        remaining = {
-            r for r in self.degraded_reasons
-            if self._reason_key(r) not in recoverable
-        }
-
-        self.degraded_reasons = remaining
-        if not self.degraded_reasons:
+        # PR D / FIX-4: hold _degraded_lock for the compound read-then-write.
+        with self._degraded_lock:
+            remaining = {
+                r for r in self.degraded_reasons
+                if self._reason_key(r) not in recoverable
+            }
+            self.degraded_reasons = remaining
+            _now_empty = not self.degraded_reasons
+        if _now_empty:
             if self.degraded.is_set():
                 logger.warning("[%s] RECOVERED from transient degraded mode", self.email)
             self.degraded.clear()
@@ -801,19 +931,14 @@ class ClientRunner(threading.Thread):
                     self.degraded.clear()
 
         _degraded  = self.degraded.is_set()
-        # Fill monitor self-restarts after SSL crashes. Give it 120s grace before
-        # blocking entries — prevents brief restart windows from killing signal flow.
+        # PR D / FIX-5: Fill-monitor grace period is now a module-level
+        # constant FILL_MONITOR_GRACE_SEC (default 300s). Resolved once
+        # at import — avoids os.getenv on every health tick (~3x/min).
         _fill_dead_since = getattr(self, "_fill_dead_since", None)
         if not _fill_ok:
             if _fill_dead_since is None:
                 self._fill_dead_since = time.time()
-            # Grace period env-tunable: FILL_MONITOR_GRACE_SEC.
-            # 300s default (was 120s) — Render cold starts with Supabase
-            # connection pooling can take 30-60s just for first DB connection.
-            # 120s was too tight: supervisor delay (15s) + runner init + QPM
-            # startup could exhaust the window before first heartbeat.
-            _fill_grace = int(os.getenv("FILL_MONITOR_GRACE_SEC", "300"))
-            _fill_ok_for_entries = (time.time() - self._fill_dead_since) < _fill_grace
+            _fill_ok_for_entries = (time.time() - self._fill_dead_since) < FILL_MONITOR_GRACE_SEC
         else:
             self._fill_dead_since = None
             _fill_ok_for_entries = True
@@ -840,7 +965,12 @@ class ClientRunner(threading.Thread):
             if not _worker_ok:
                 logger.warning("[%s] entries_allowed BLOCKED: worker_thread dead", self.email)
             if not _fill_ok_for_entries:
-                logger.warning("[%s] entries_allowed BLOCKED: fill_monitor dead >120s (actual=%s)", self.email, _fill_ok)
+                # PR D / FIX-5: log the live grace value instead of the stale
+                # hard-coded ">120s" literal. Default is now 300s.
+                logger.warning(
+                    "[%s] entries_allowed BLOCKED: fill_monitor dead >%ss (actual=%s)",
+                    self.email, FILL_MONITOR_GRACE_SEC, _fill_ok,
+                )
             if _require_qpm and not _quote_ok:
                 logger.warning("[%s] entries_allowed BLOCKED: quote_monitor unhealthy/missing", self.email)
             if _degraded:
@@ -1305,8 +1435,20 @@ class ClientRunner(threading.Thread):
                     return
             except ImportError:
                 pass
+            # PR D / SECURITY CRITICAL (BUG-CR-1): block LIVE startup if
+            # ENCRYPTION_KEY is the documented default sentinel. The previous
+            # default was a human-readable string committed to source control;
+            # any operator who relied on it had broker tokens encrypted with a
+            # key visible in the public repo. Any LIVE deploy MUST set a
+            # unique ENCRYPTION_KEY in Render environment variables.
+            if _raw_key == _DEFAULT_KEY_SENTINEL:
+                self._mark_failed(
+                    "LIVE_STARTUP_FATAL: ENCRYPTION_KEY is the default insecure sentinel. "
+                    "Set a unique ENCRYPTION_KEY in Render env vars before going live."
+                )
+                return
             logger.critical(
-                "[%s] LIVE SAFETY CONFIG VERIFIED: legacy_fill_monitor=OFF immediate_execution=OFF rowcount_fatal=ON",
+                "[%s] LIVE SAFETY CONFIG VERIFIED: legacy_fill_monitor=OFF immediate_execution=OFF rowcount_fatal=ON encryption_key=CUSTOM",
                 self.email,
             )
             logger.info("[%s] LIVE mode assertions PASSED | account_id=%s base_url=%s", self.email, self.account_id, self.base_url)
@@ -1516,8 +1658,15 @@ class ClientRunner(threading.Thread):
             self.stopped.set()
             return
 
+        # PR D / FIX-2 (BUG-CR-4): wire kill_switch_fn to read the explicit
+        # self.kill_switch_active flag. The old lambda
+        # `lambda: getattr(self.core, "_kill_switch", False)` was dead code
+        # — self.core._kill_switch is never set anywhere, so the lambda
+        # always returned False. The dashboard / admin path can now flip
+        # the flag via runner.trip_kill_switch(reason) and master_control
+        # will block new entries + fire force_close_all on the next tick.
         self.master_control.wire(
-            kill_switch_fn=lambda: getattr(self.core, "_kill_switch", False),
+            kill_switch_fn=lambda: self.kill_switch_active,
             mode_fn=lambda: getattr(self.core, "mode", self.mode),
             entries_paused_fn=self._read_entries_paused,
         )
@@ -1526,6 +1675,25 @@ class ClientRunner(threading.Thread):
         self._run_startup_recovery(broker, exit_eng)
         self._seed_exit_engine_from_db(exit_eng)
         self._start_position_quote_monitor(data_broker if data_token else broker, exit_eng)
+        # PR D / FIX-3 (BUG-CR-2): post-QPM quote refresh in LIVE.
+        # The first refresh inside _seed_exit_engine_from_db runs BEFORE
+        # QPM is attached. If that refresh fails (Render cold-start
+        # network blip, broker auth race), the exit engine carries
+        # stale entry-time underlyings until the first 8s poll cycle
+        # — a brief but real window where a seeded position that
+        # immediately hits a stop condition fires the stop at entry
+        # price instead of current price. This second refresh runs
+        # AFTER QPM is up so the engine has live prices before the
+        # poll loop runs.
+        if self.mode == "LIVE" and exit_eng is not None and hasattr(exit_eng, "_refresh_quotes"):
+            try:
+                exit_eng._refresh_quotes()
+                logger.info("[%s] Post-QPM quote refresh complete", self.email)
+            except Exception as qe:
+                logger.warning(
+                    "[%s] Post-QPM quote refresh failed: %s — first poll cycle will correct",
+                    self.email, qe,
+                )
         self._start_reconciler(broker, exit_eng)
         self._sync_account_equity(broker)
 
