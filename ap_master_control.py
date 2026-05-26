@@ -1378,16 +1378,20 @@ class APMasterControl:
                 # every approved plan, paper or live.
                 "sizing_context": {
                     "account_equity":   float(account_equity),
+                    # HOTFIX hotfix/master-control-sizing-context-float-none:
+                    # SizingResult dataclass has NO risk_pct / budget_usd
+                    # fields. PR #43 used `getattr(..., None)` inside float()
+                    # which raised TypeError on every signal evaluation after
+                    # 2026-05-26 15:22 UTC. We coerce the getattr result with
+                    # `or <fallback>` so None never reaches float().
                     "risk_pct":         float(
                         getattr(_sizing, "risk_pct", None)
-                        if _sizing is not None
-                        else float(os.getenv("POSITION_RISK_PCT", "0.10"))
+                        or float(os.getenv("POSITION_RISK_PCT", "0.10"))
                     ),
                     "contracts":        int(contracts),
                     "budget":           float(
                         getattr(_sizing, "budget_usd", None)
-                        if _sizing is not None
-                        else (account_equity * float(os.getenv("POSITION_RISK_PCT", "0.10")))
+                        or (account_equity * float(os.getenv("POSITION_RISK_PCT", "0.10")))
                     ),
                     "total_trades":     int(total_trades),
                     "bootstrap_mode":   bool(bootstrap_mode),
