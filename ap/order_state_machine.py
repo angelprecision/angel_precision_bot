@@ -408,7 +408,40 @@ class APOrderStateMachine:
     # Order creation
     # ------------------------------------------------------------------
 
-    def create_entry_order(self, plan, *, limit_price=None, reserved_cost=None) -> str:
+    def create_entry_order(
+        self,
+        plan,
+        *,
+        limit_price=None,
+        reserved_cost=None,
+        initial_status: Optional[str] = None,
+        meta: Optional[dict] = None,
+    ) -> str:
+        """
+        Create an ENTRY order row in the OSM.
+
+        PR fix/osm-watcher-handoff-and-entry-meta:
+          - `initial_status='PENDING_TRIGGER'` lets callers (overnight_reeval +
+            queue intraday breach path) atomically insert the row already in
+            PENDING_TRIGGER, eliminating the CREATED→PENDING_TRIGGER race that
+            caused 1,103 LOST_HANDOFF_30S cancellations on 2026-05-26. Default
+            stays 'CREATED' for backward compat with callers that intentionally
+            need the CREATED state (e.g. submit_existing_entry_with_create).
+          - `meta` lets callers persist score / tier / signal_entry_price /
+            selector quotes at INSERT time. Auto-derived defaults from the plan
+            are merged with the caller's explicit `meta` (caller wins on key
+            conflict). The result is stored as a JSON-encoded blob in
+            orders.meta AND as top-level columns (score, tier, trigger_price,
+            stop_underlying, target_underlying) so APOrderMonitor's existing
+            order.get('score') fallback (ap/order_monitor.py:738) resolves to
+            a real score on every OSM-created entry. This fixes the
+            "score=0.0 tier=normal" mis-classification that pushed A+ setups
+            into the 90s normal cancel window.
+
+        Retry metadata semantics: retry_engine continues to merge keys like
+        retry_status / retry_abort_ts into orders.meta AFTER cancel. Our INSERT
+        only writes the initial meta; we never overwrite later merges.
+        """
         existing = self._get_order_by_plan(plan.plan_id, kind="ENTRY") if plan.plan_id else None
         if existing:
             log.warning(
@@ -422,23 +455,96 @@ class APOrderStateMachine:
         rc = float(reserved_cost) if reserved_cost else (float(plan.max_position_usd) if getattr(plan, "max_position_usd", None) else None)
         ts = now_utc_iso()
 
+        # ── Initial status (FIX 2): atomic PENDING_TRIGGER for watcher-held entries ──
+        # Default 'CREATED' preserves back-compat. Only 'CREATED' and
+        # 'PENDING_TRIGGER' are valid initial states for ENTRY orders.
+        _initial_status = (initial_status or OrderStatus.CREATED).upper()
+        if _initial_status not in (OrderStatus.CREATED, OrderStatus.PENDING_TRIGGER):
+            log.warning(
+                "[%s] create_entry_order: invalid initial_status=%r — falling back to CREATED",
+                self.client_id, initial_status,
+            )
+            _initial_status = OrderStatus.CREATED
+
+        # ── Initial meta (FIX 1): auto-derive score / tier / signal alignment ──
+        # APOrderMonitor reads `meta.score` (preferred) then `order.score` then 0.
+        # Without this, every OSM-created order was scored as 0 → forced into
+        # normal-tier 90s cancel window. We populate both meta AND the top-level
+        # columns so both read paths resolve.
+        try:
+            _score_val   = float(getattr(plan, "score", 0) or 0)
+        except Exception:
+            _score_val = 0.0
+        try:
+            _tier_val    = str(getattr(plan, "tier", "") or "")
+        except Exception:
+            _tier_val = ""
+        try:
+            _trigger_val = float(getattr(plan, "trigger_price", 0) or 0)
+        except Exception:
+            _trigger_val = 0.0
+        try:
+            _stop_val    = float(getattr(plan, "stop_underlying", 0) or 0)
+        except Exception:
+            _stop_val = 0.0
+        try:
+            _target_val  = float(getattr(plan, "target_underlying", 0) or 0)
+        except Exception:
+            _target_val = 0.0
+
+        _auto_meta = {
+            "score":              _score_val,
+            "tier":               _tier_val,
+            "signal_id":          str(getattr(plan, "signal_id", "") or ""),
+            "plan_id":            str(getattr(plan, "plan_id", "") or ""),
+            "trigger_type":       str(getattr(plan, "trigger_type", "breach") or "breach"),
+            "signal_entry_price": _trigger_val,
+            "selected_contract":  str(contract or ""),
+            "contracts":          int(getattr(plan, "contracts", 0) or 0),
+            "limit_price":        float(lp) if lp is not None else None,
+            "max_position_usd":   float(rc) if rc is not None else None,
+            "pattern":            str(getattr(plan, "pattern", "") or ""),
+            "timeframe":          str(getattr(plan, "timeframe", "") or ""),
+        }
+        # Caller-supplied meta wins on conflict (e.g. queue path passing
+        # selector_ask / selector_mid / option_bid / option_ask / option_mid /
+        # account_equity / risk_pct / bootstrap_mode / total_trades).
+        _final_meta = dict(_auto_meta)
+        if meta and isinstance(meta, dict):
+            _final_meta.update(meta)
+        try:
+            import json as _json_mod
+            _meta_json = _json_mod.dumps(_final_meta, default=str)
+        except Exception as _je:
+            log.warning("[%s] create_entry_order: meta JSON encode failed (%s) — using {}",
+                        self.client_id, _je)
+            _meta_json = "{}"
+
         def _fn():
             with conn() as c:
                 c.execute(
-                    """
+                    f"""
                     INSERT INTO orders (
                         local_order_id, client_id, plan_id, signal_id,
                         kind, status,
                         symbol, contract, direction,
                         qty, limit_price, reserved_cost,
                         filled_qty,
+                        score, tier,
+                        trigger_price, stop_underlying, target_underlying,
+                        pattern, timeframe,
+                        meta,
                         created_ts, updated_ts
                     ) VALUES (
                         %s,%s,%s,%s,
-                        'ENTRY','CREATED',
+                        'ENTRY','{_initial_status}',
                         %s,%s,%s,
                         %s,%s,%s,
                         0,
+                        %s,%s,
+                        %s,%s,%s,
+                        %s,%s,
+                        %s,
                         %s,%s
                     )
                     ON CONFLICT (local_order_id) DO NOTHING
@@ -448,6 +554,13 @@ class APOrderStateMachine:
                         plan.plan_id, plan.signal_id,
                         plan.ticker, contract, plan.side.upper(),
                         int(plan.contracts), lp, rc,
+                        _score_val, _tier_val,
+                        _trigger_val if _trigger_val > 0 else None,
+                        _stop_val if _stop_val > 0 else None,
+                        _target_val if _target_val > 0 else None,
+                        _final_meta.get("pattern") or None,
+                        _final_meta.get("timeframe") or None,
+                        _meta_json,
                         ts, ts,
                     ),
                 )
@@ -467,8 +580,9 @@ class APOrderStateMachine:
                 return existing["local_order_id"] if existing else local_order_id
             raise
         log.info(
-            "[%s] ORDER CREATED (entry) | %s x%s | local_order_id=%s",
+            "[%s] ORDER CREATED (entry) | %s x%s | local_order_id=%s | status=%s score=%.1f tier=%s",
             self.client_id, contract, plan.contracts, local_order_id,
+            _initial_status, _score_val, _tier_val or "-",
         )
         return local_order_id
 

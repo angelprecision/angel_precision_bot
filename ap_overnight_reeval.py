@@ -381,7 +381,19 @@ def run_overnight_reeval(
                 except Exception:
                     pass
             try:
-                local_order_id = order_state_machine.create_entry_order(decision.plan)
+                # PR fix/osm-watcher-handoff-and-entry-meta:
+                # Insert OSM row already in PENDING_TRIGGER. Previously this path
+                # created the row in CREATED and then called
+                # mark_entry_pending_trigger() in Step 6b. The two-step approach
+                # was racing the 30s LOST_HANDOFF_30S cancellation in
+                # APOrderMonitor: 1,103 orders on 2026-05-26 went CREATED→CANCELED
+                # with no intermediate PENDING_TRIGGER transition observable in
+                # the OSM event log. Atomic initial_status='PENDING_TRIGGER'
+                # eliminates the race entirely.
+                local_order_id = order_state_machine.create_entry_order(
+                    decision.plan,
+                    initial_status="PENDING_TRIGGER",
+                )
             except Exception as osm_exc:
                 log.error("[%s] overnight_reeval: OSM create_entry_order failed: %s", ticker, osm_exc)
                 result["errors"] += 1
