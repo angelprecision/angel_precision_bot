@@ -298,8 +298,28 @@ def finalize_proof_callable():
     assert body_match, "could not locate _finalize_proof"
     body = textwrap.dedent(body_match.group(0))
 
+    # PR B follow-up: _finalize_proof now references module-level
+    # constants from ap_execution_core (FIX-8 BREAKEVEN_BAND_PCT
+    # single-source-of-truth). Mirror those into the harness namespace
+    # so the extracted method body resolves them. Source the value the
+    # same way the real module does so behavior stays in sync.
+    _be_pct_re = re.search(
+        r'^BREAKEVEN_BAND_PCT\s*=\s*float\(os\.getenv\("BREAKEVEN_BAND_PCT",\s*"(-?\d+\.?\d*)"\)\)',
+        EX_CORE, re.MULTILINE,
+    )
+    _be_default = _be_pct_re.group(1) if _be_pct_re else "-2.0"
+
     # Build a sandbox class with the method attached.
+    # Module-scope names referenced by _finalize_proof's body:
+    #   - log (module logger)
+    #   - os (for getenv, indirectly)
+    #   - BREAKEVEN_BAND_PCT (FIX-8 constant)
+    #   - _record_intel_outcome (PR B FIX-6; falls back to None if the
+    #     intelligence_bridge import fails. Safe default = None; the
+    #     method's `if _record_intel_outcome:` guard handles None.)
     src = "import os\nimport logging\nlog = logging.getLogger('test_finalize')\n"
+    src += f'BREAKEVEN_BAND_PCT = float(os.getenv("BREAKEVEN_BAND_PCT", "{_be_default}"))\n'
+    src += "_record_intel_outcome = None\n"
     src += "class _Harness:\n"
     src += textwrap.indent(body, "    ")
     ns: dict = {}

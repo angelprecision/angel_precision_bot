@@ -92,6 +92,16 @@ class _StubPosition:
         self._underlying_stop_breach_ts  = None
         self.is_trend_day                = False
         self.trend_direction             = ""
+        # PR-B: Execution-core ghost fields now declared on
+        # ManagedPosition. Stub must carry the same defaults or any
+        # evaluate_exit / _on_position_close path that touches them
+        # would raise AttributeError.
+        self._exit_submit_ts             = 0.0
+        self._exit_attempts              = 0
+        self._integrity_logged           = False
+        self._proof_staged               = None
+        self._proof_finalized            = False
+        self.proof_logged                = False
 
     @property
     def is_at_target(self) -> bool:

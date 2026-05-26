@@ -308,6 +308,24 @@ class ManagedPosition:
     _stop_breach_ts:              Optional[datetime] = None
     _underlying_stop_breach_ts:   Optional[datetime] = None
 
+    # PR-B: Execution-core ghost fields. Previously assigned dynamically
+    # in ap_execution_core.py via `# type: ignore[attr-defined]`:
+    #   pos._exit_submit_ts  / pos._exit_attempts — drive step-down ladder
+    #   pos._integrity_logged — once-per-position integrity log guard
+    #   pos._proof_staged — staged proof dict, finalized on broker fill
+    #   pos._proof_finalized / pos.proof_logged — idempotency guards
+    # Declared here so they survive dataclasses.replace() and any future
+    # asdict()/from-dict reconstruction (seed_from_db, etc).
+    # TODO(post-proof-week): consolidate proof_logged and _proof_finalized
+    # into a single proof_state field once the two guards' semantics are
+    # auditable post-live.
+    _exit_submit_ts:    float                  = 0.0
+    _exit_attempts:     int                    = 0
+    _integrity_logged:  bool                   = False
+    _proof_staged:      Optional[dict]         = None
+    _proof_finalized:   bool                   = False
+    proof_logged:       bool                   = False
+
     # Exit coordination
     exit_in_flight:       bool  = False
     pending_exit_reason:  str   = ""
@@ -1206,10 +1224,15 @@ class APExitEngine:
     """
 
     def __init__(self, broker, kill_switch_fn=None, email: str = "",
-                 data_broker=None):
+                 data_broker=None, master_control=None):
         self.broker        = broker
         self._quote_broker = data_broker or broker
         self._email        = email
+        # PR-B / FIX-4: master_control is now accepted at construction
+        # time so the post-assignment window (where exit_eng existed but
+        # had no master_control reference) is closed. The execution core
+        # still keeps the post-assignment as belt-and-suspenders.
+        self.master_control = master_control
         self._positions: list[ManagedPosition] = []
         # P1: O(1) position index keyed by position_id.
         # Kept in sync with self._positions by add_position(), expired-contract
