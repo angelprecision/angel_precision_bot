@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -30,6 +31,27 @@ except Exception:
 
 
 log = logging.getLogger("ap.master_control")
+
+# PR E / FIX-6: elevate intelligence_bridge to a module-level defensive
+# import resolved ONCE at module load. Previously _run_intelligence did
+# `from intelligence_bridge import ...` on every signal evaluation — a
+# per-tick sys.modules lookup that adds zero functional value. Fail-open
+# semantics preserved: if the import fails OR INTELLIGENCE_AVAILABLE is
+# False, _run_intelligence returns approved=True with reasoning that
+# attributes the decision to intel-unavailable.
+try:
+    from intelligence_bridge import (
+        INTELLIGENCE_AVAILABLE as _INTEL_AVAILABLE,
+        run_intelligence_check as _run_intel_check,
+    )
+except Exception as _intel_import_err:  # pragma: no cover
+    _INTEL_AVAILABLE = False
+    _run_intel_check = None
+    log.info(
+        "intelligence_bridge import unavailable at module load: %s — "
+        "_run_intelligence will fail open (approved=True) for all signals.",
+        _intel_import_err,
+    )
 
 MIN_CONTRACTS_PER_POSITION = int(os.getenv("MIN_CONTRACTS_PER_POSITION", "2"))
 
@@ -85,16 +107,38 @@ try:
 except Exception:
     _OSM_PENDING_ENTRY_STATUSES = None
 
+# PR E / FIX-5: hardcoded fallback default. Must NEVER produce an empty
+# tuple, otherwise pending-capital SUM silently returns zero and the
+# hard capital gate is bypassed. The fallback is the canonical pre-fill
+# entry lifecycle aligned with APOrderStateMachine.PENDING_ENTRY_STATUSES
+# and APPositionManager._PENDING_ENTRY_STATUSES.
+_DEFAULT_ENTRY_CAPITAL_RESERVED_STATUSES = (
+    "CREATED",
+    "PENDING_TRIGGER",
+    "SUBMITTED",
+    "ACKNOWLEDGED",
+    "PARTIAL_FILL",
+)
+
 _ENTRY_CAPITAL_RESERVED_STATUSES = tuple(
     str(s).upper().strip()
-    for s in (_OSM_PENDING_ENTRY_STATUSES or (
-        "CREATED",
-        "PENDING_TRIGGER",
-        "SUBMITTED",
-        "ACKNOWLEDGED",
-        "PARTIAL_FILL",
-    ))
+    for s in (_OSM_PENDING_ENTRY_STATUSES or _DEFAULT_ENTRY_CAPITAL_RESERVED_STATUSES)
 )
+
+# PR E / FIX-5: a defensive belt-and-suspenders check. If for any reason
+# the resolved tuple is empty (import returned an empty iterable, or a
+# future refactor breaks the fallback chain), log CRITICAL and force the
+# hardcoded default. Operators must see this in Render logs immediately
+# — an empty status tuple silently disables the capital gate.
+if not _ENTRY_CAPITAL_RESERVED_STATUSES:
+    log.critical(
+        "_ENTRY_CAPITAL_RESERVED_STATUSES resolved to EMPTY tuple — "
+        "PENDING_ENTRY_STATUSES import broken (got=%r). Forcing "
+        "hardcoded defaults to keep the capital gate functional. "
+        "Fix the OSM import path or canonical status list.",
+        _OSM_PENDING_ENTRY_STATUSES,
+    )
+    _ENTRY_CAPITAL_RESERVED_STATUSES = _DEFAULT_ENTRY_CAPITAL_RESERVED_STATUSES
 
 
 def _estimate_premium(ticker: str) -> float:
@@ -126,7 +170,10 @@ class ApprovedExecutionPlan:
     target_underlying: Optional[float]
     contract_symbol: Optional[str] = None
     limit_price: Optional[float] = None
-    mode: str = "paper"
+    # PR E / FIX-2: uppercase default. The rest of the system normalizes
+    # mode to uppercase ("LIVE" / "PAPER"); the construction site below
+    # in evaluate() also assigns uppercase.
+    mode: str = "PAPER"
     paper_sim: bool = True
     reasoning: str = ""
     intel_available: bool = False
@@ -313,6 +360,20 @@ class APMasterControl:
         self._mode_fn = None
         self._seen_signals: dict[str, float] = {}  # key -> inserted_ts, expires after 1800s
         self._trade_cooldowns: dict[str, float] = {}
+        # PR E / FIX-3: protect concurrent equity / max_daily_loss reads &
+        # writes. set_account_equity() updates both fields from the
+        # equity-sync thread while evaluate() reads them from the worker
+        # thread — a non-atomic two-field update without this lock.
+        self._equity_lock = threading.Lock()
+        # PR E / FIX-4: protect concurrent _trade_cooldowns access.
+        # ap_execution_core.py writes to master_control._trade_cooldowns
+        # from the exit-callback thread (line ~1164) while evaluate()
+        # reads it from the worker thread. The dict field is preserved
+        # for backward compat with execution-core; this lock just
+        # serializes the read in evaluate() and the clear in
+        # reset_session(). New writers should call set_cooldown()
+        # below, which acquires the lock.
+        self._cooldown_lock = threading.Lock()
         # P0-3: Daily-loss force-close state.
         # When daily loss limit is hit, the entry gate blocks new trades AND
         # this flag is set. The exit engine reads it on each tick and force-
@@ -520,25 +581,58 @@ class APMasterControl:
             log.debug("degraded alert audit insert failed (non-critical): %s", e)
 
     def set_account_equity(self, equity: float, client_id: str = ""):
-        old = self.account_equity
-        self.account_equity = float(equity)
-        # Recompute max_daily_loss proportionally to new equity.
-        # max_capital/sector/ticker pct gates recompute inline — no action needed.
-        # max_daily_loss is a fixed dollar set at startup; scale it with equity.
-        if self._startup_equity and self._startup_equity > 0:
-            loss_pct = abs(self.max_daily_loss / self._startup_equity)
-            self.max_daily_loss = -abs(self.account_equity * loss_pct)
+        # PR E / FIX-3: hold _equity_lock for the compound two-field update.
+        # Without it a worker thread reading max_daily_loss between the
+        # account_equity assignment and the max_daily_loss assignment sees
+        # an inconsistent snapshot (old equity, scaled-to-new-equity loss).
+        with self._equity_lock:
+            old = self.account_equity
+            self.account_equity = float(equity)
+            # Recompute max_daily_loss proportionally to new equity.
+            # max_capital/sector/ticker pct gates recompute inline — no action needed.
+            # max_daily_loss is a fixed dollar set at startup; scale it with equity.
+            if self._startup_equity and self._startup_equity > 0:
+                loss_pct = abs(self.max_daily_loss / self._startup_equity)
+                self.max_daily_loss = -abs(self.account_equity * loss_pct)
+            _new_equity = self.account_equity
+            _new_loss = self.max_daily_loss
         label = f"[{client_id}] " if client_id else ""
-        if abs(old - self.account_equity) > 1:
+        if abs(old - _new_equity) > 1:
             log.info(
                 "%sAccount equity updated: $%.0f -> $%.0f | max_capital=$%.0f max_sector=$%.0f max_daily_loss=$%.0f",
                 label,
                 old,
-                self.account_equity,
-                self.account_equity * self.max_capital_pct,
-                self.account_equity * self.max_sector_pct,
-                self.max_daily_loss,
+                _new_equity,
+                _new_equity * self.max_capital_pct,
+                _new_equity * self.max_sector_pct,
+                _new_loss,
             )
+
+    def set_cooldown(self, key: str, ts: float | None = None, reason: str = "") -> None:
+        """PR E / FIX-4: public, thread-safe setter for trade cooldowns.
+
+        Replaces the previous pattern of mutating master_control.
+        _trade_cooldowns directly from external threads. Acquires
+        self._cooldown_lock for the write, so concurrent reads in
+        evaluate() are guaranteed to see a fully-written entry.
+
+        Args:
+            key:    cooldown key, e.g. f"{ticker.upper()}:{direction}:cooldown".
+            ts:     timestamp (epoch seconds). Defaults to time.time().
+            reason: optional human-readable reason (logged at info level).
+
+        Backward compatibility: the existing ap_execution_core code path
+        that does `self.master_control._trade_cooldowns[key] = time.time()`
+        is left untouched in this PR (per scope) and still works because
+        the dict object is preserved.
+        """
+        if not key:
+            return
+        _ts = float(ts) if ts is not None else time.time()
+        with self._cooldown_lock:
+            self._trade_cooldowns[str(key)] = _ts
+        if reason:
+            log.info("cooldown set: %s @ %.0f reason=%s", key, _ts, reason)
 
     @staticmethod
     def _position_price_for_exposure(pos: dict) -> float:
@@ -596,7 +690,12 @@ class APMasterControl:
                     pass
         return total
 
-    def _pending_orders_capital(self, client_id: str) -> Optional[float]:
+    def _pending_orders_capital(
+        self,
+        client_id: str,
+        *,
+        exclude_local_order_id: Optional[str] = None,
+    ) -> Optional[float]:
         """
         Sum capital reserved by entry orders that may still become exposure.
 
@@ -611,6 +710,13 @@ class APMasterControl:
         this exclusion, a single stale CREATED row from a prior session can pin
         projected_total above max_capital forever — observed in production
         2026-05-21 blocking 113 consecutive signals for tradefluencehq.
+
+        PR E / FIX-1 (BUG-MC-1): support exclude_local_order_id so
+        revalidate_exposure can subtract the current plan's reserved-cost
+        row from the SUM. process_signal inserts the OSM row (with
+        reserved_cost) BEFORE calling revalidate_exposure; without
+        exclusion the plan's cost is double-counted (once via this SUM,
+        once via revalidate_exposure's `+ real_cost`).
         """
         try:
             from ap.db import conn, run_with_retry
@@ -618,6 +724,15 @@ class APMasterControl:
 
             statuses = tuple(sorted(_ENTRY_CAPITAL_RESERVED_STATUSES))
             _phantom_grace_sec = int(_os.getenv("PENDING_ENTRY_PHANTOM_GRACE_SEC", "30"))
+
+            # PR E / FIX-1: optional exclusion of one specific local_order_id
+            # (the current plan's row). Built as an explicit `AND local_order_id != %s`
+            # clause so the SQL stays a pure SUM with no Python-side post-filter.
+            _exclude_clause = ""
+            _exclude_params: tuple = ()
+            if exclude_local_order_id:
+                _exclude_clause = " AND local_order_id != %s"
+                _exclude_params = (str(exclude_local_order_id),)
 
             def _fn():
                 with conn() as c:
@@ -643,8 +758,8 @@ class APMasterControl:
                             AND (broker_order_id IS NULL OR broker_order_id = '')
                             AND created_ts < NOW() - (%s || ' seconds')::interval
                           )
-                        """,
-                        (client_id, list(statuses), str(_phantom_grace_sec)),
+                        """ + _exclude_clause,
+                        (client_id, list(statuses), str(_phantom_grace_sec)) + _exclude_params,
                     )
                     row = c.fetchone()
                     pending_capital = float((row or {}).get("pending_capital") or 0)
@@ -690,14 +805,44 @@ class APMasterControl:
             )
             return None
 
-    def _pending_capital_from_snapshot_or_db(self, snap: dict[str, Any], client_id: str) -> Optional[float]:
+    def _pending_capital_from_snapshot_or_db(
+        self,
+        snap: dict[str, Any],
+        client_id: str,
+        *,
+        exclude_local_order_id: Optional[str] = None,
+    ) -> Optional[float]:
         """Return pending ENTRY dollar exposure using the strongest available source.
 
         Prefer APPositionManager.snapshot()["pending_entry_capital"] because it is
         computed from the same active entry lifecycle states as pending_entries
         in one consistent snapshot read. Fall back to the local DB query only for
         older position-manager versions that do not expose that field.
+
+        PR E / FIX-1: when exclude_local_order_id is provided, try the DB
+        path FIRST so the SUM can exclude that specific row exactly. If the
+        DB query fails (returns None), fall back to the snapshot path — the
+        caller (revalidate_exposure) keeps its own LIVE fail-closed gate on
+        a None return, so a snapshot value is safe as a non-None fallback.
         """
+        if exclude_local_order_id:
+            _db_val = self._pending_orders_capital(
+                client_id, exclude_local_order_id=exclude_local_order_id,
+            )
+            if _db_val is not None:
+                return _db_val
+            # DB unavailable: in LIVE we must fail closed (caller handles None).
+            if self._is_live_mode() and self.pending_capital_fail_closed_live:
+                return None
+            # PAPER fallback: use the snapshot value (no exclusion possible at
+            # the snapshot layer, so we accept the small overcount — which
+            # fails closed for over-budget signals, the safer direction).
+            if isinstance(snap, dict) and snap.get("pending_entry_capital") is not None:
+                try:
+                    return float(snap.get("pending_entry_capital") or 0.0)
+                except Exception:
+                    return None
+            return None
         if isinstance(snap, dict) and snap.get("pending_entry_capital") is not None:
             try:
                 return float(snap.get("pending_entry_capital") or 0.0)
@@ -994,8 +1139,15 @@ class APMasterControl:
             return self._block(signal_id, ticker, client_id, "blocked_risk", f"ticker_already_active ({ticker})")
 
         cooldown_key = f"{ticker.upper()}:{direction_raw}:cooldown"
-        if cooldown_key in self._trade_cooldowns:
-            elapsed = time.time() - self._trade_cooldowns[cooldown_key]
+        # PR E / FIX-4: snapshot the cooldown timestamp under _cooldown_lock
+        # so it cannot change between the membership check and the read.
+        # ap_execution_core writes to _trade_cooldowns from a separate
+        # thread; without this lock we could see a partially-mutated
+        # dict (rare but real on CPython during the dict resize).
+        with self._cooldown_lock:
+            _cooldown_ts = self._trade_cooldowns.get(cooldown_key)
+        if _cooldown_ts is not None:
+            elapsed = time.time() - _cooldown_ts
             if elapsed < 1800:
                 return self._block(signal_id, ticker, client_id, "blocked_risk", f"same_setup_cooldown ({ticker} {direction_raw}, {int(1800 - elapsed)}s remaining)")
 
@@ -1151,7 +1303,13 @@ class APMasterControl:
             trigger_price=float(entry_price) if entry_price else None,
             stop_underlying=float(stop_price) if stop_price else None,
             target_underlying=float(target_price) if target_price else None,
-            mode="live" if not self.paper else "paper",
+            # PR E / FIX-2: normalize mode to uppercase LIVE/PAPER so it
+            # matches the rest of the system (master_control.mode,
+            # APEntryWatcher.mode, ap_execution_core.mode, client_runner.mode
+            # all use uppercase). Previously lowercase "live"/"paper" caused
+            # silent string mismatches in any downstream `if plan.mode ==
+            # "LIVE":` check.
+            mode="LIVE" if not self.paper else "PAPER",
             paper_sim=self.paper,
             reasoning=intel_reason or f"tier={tier} score={score:.1f} feedback={feedback_mod:.2f} setup={setup_status}",
             intel_available=intel_avail,
@@ -1199,6 +1357,13 @@ class APMasterControl:
             log.warning("[%s] Dedup persist failed in paper — proceeding: %s", ticker, _dedup_err)
         self._seen_signals[signal_key] = time.time()
         self._seen_signals[setup_key] = time.time()
+        # TODO(PR F) BUG-MC-2: This `queued` status is stamped BEFORE the
+        # queue/worker layer (route_signal_to_all_clients → enqueue_signal)
+        # has confirmed the insert. If the queue insert later fails, the
+        # signal row shows "queued" but is not actually in any queue. The
+        # fix requires moving this stamp to the post-enqueue path in
+        # client_runner / queue layer (broad changes outside master_control).
+        # Scope-deferred to PR F per audit decision (audit dated 2026-05-25).
         self._store_update(signal_id, "queued", timestamp_flag="queued_at")
 
         try:
@@ -1343,18 +1508,39 @@ class APMasterControl:
         return self._zero_snapshot(snapshot_ok=True, snapshot_error="")
 
     def _run_intelligence(self, signal: dict) -> dict[str, Any]:
+        # PR E / FIX-6: read module-level _INTEL_AVAILABLE / _run_intel_check
+        # resolved once at module load. No lazy per-signal import.
+        # Fail-open contract preserved: if intel is unavailable or any
+        # error occurs, return approved=True so a broken intel layer
+        # never blocks signals (intelligence is advisory, not a gate).
+        if not _INTEL_AVAILABLE or _run_intel_check is None:
+            return {
+                "approved": True,
+                "score": 0,
+                "contracts": 1,
+                "reasoning": "intel_unavailable",
+                "_available": False,
+            }
         try:
-            from intelligence_bridge import INTELLIGENCE_AVAILABLE, run_intelligence_check
-            if not INTELLIGENCE_AVAILABLE:
-                return {"approved": True, "score": 0, "contracts": 1, "reasoning": "intel_unavailable", "_available": False}
             trigger = signal.get("trigger") or {}
-            price = signal.get("entry_price") or trigger.get("entry") or signal.get("current_price") or 100.0
-            result = run_intelligence_check(signal, underlying_price=float(price))
+            price = (
+                signal.get("entry_price")
+                or trigger.get("entry")
+                or signal.get("current_price")
+                or 100.0
+            )
+            result = _run_intel_check(signal, underlying_price=float(price))
             result["_available"] = True
             return result
         except Exception as e:
             log.debug("Intelligence unavailable: %s", e)
-            return {"approved": True, "score": 0, "contracts": 1, "reasoning": f"intel_error: {e}", "_available": False}
+            return {
+                "approved": True,
+                "score": 0,
+                "contracts": 1,
+                "reasoning": f"intel_error: {e}",
+                "_available": False,
+            }
 
     def _fallback_tier(self, score: float) -> str:
         if score >= 85:
@@ -1437,7 +1623,22 @@ class APMasterControl:
         if self._kill_switch_fn and self._kill_switch_fn():
             return self._block(signal_id, ticker, client_id, "blocked_system", "kill_switch_active_post_snapshot")
 
-        pending_cap = self._pending_capital_from_snapshot_or_db(snap, client_id)
+        # PR E / FIX-1 (BUG-MC-1): if the OSM row for this plan already
+        # exists (queue.py stashed the local_order_id on plan.metadata
+        # after create_entry_order), pass exclude_local_order_id to the
+        # pending-capital helper so the SUM does NOT include the current
+        # plan's reserved_cost. Without this exclusion, the plan's cost
+        # is double-counted: once via the SUM and again via the `+ real_cost`
+        # addition below.
+        _plan_metadata = getattr(plan, "metadata", None)
+        _exclude_local_order_id: Optional[str] = None
+        if isinstance(_plan_metadata, dict):
+            _lo = _plan_metadata.get("local_order_id")
+            if _lo:
+                _exclude_local_order_id = str(_lo)
+        pending_cap = self._pending_capital_from_snapshot_or_db(
+            snap, client_id, exclude_local_order_id=_exclude_local_order_id,
+        )
         if pending_cap is None:
             if self._is_live_mode() and self.pending_capital_fail_closed_live:
                 return self._block(
@@ -1693,6 +1894,11 @@ class APMasterControl:
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         client_prefix = client_id or (self.pm.client_id if hasattr(self.pm, "client_id") else "")
         self._seen_signals.clear()  # dict.clear() — same interface
+        # PR E / FIX-4: clear _trade_cooldowns under _cooldown_lock so a new
+        # trading day starts with no stale cooldowns AND the clear is atomic
+        # w.r.t. any concurrent set_cooldown / execution-core writes.
+        with self._cooldown_lock:
+            self._trade_cooldowns.clear()
         # P0-3: clear force-close breaker on new session so the new trading day
         # starts fresh. Without this, a -$500 day would leave the breaker tripped
         # forever and the bot would close every position the next morning before
