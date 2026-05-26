@@ -280,6 +280,193 @@ class TestFix3EquityLock:
             f"Expected -1000.0 (2% of $50k); got {mc.max_daily_loss}"
         )
 
+    # ----------------------------------------------------------------
+    # PR E FIX-3 patch: reader-side equity snapshot
+    # ----------------------------------------------------------------
+    # A lock only protects shared state if BOTH writer and reader use
+    # the same lock. PR E's initial pass only locked the writer
+    # (set_account_equity). evaluate() and revalidate_exposure() still
+    # read self.account_equity / self.max_daily_loss directly, so a
+    # worker thread can observe a half-updated equity/loss pair
+    # (new equity, old loss) between the two assignments.
+    #
+    # Patch: add _equity_snapshot() helper that returns both values
+    # atomically under _equity_lock; callers use the local vars for
+    # all subsequent risk math. Lock is NEVER held across DB / broker /
+    # intelligence / position-manager / any slow calls — only the
+    # two-tuple snapshot is taken.
+    # ----------------------------------------------------------------
+
+    def test_equity_snapshot_helper_exists(self, mc_mod):
+        """APMasterControl must expose _equity_snapshot() as the official
+        thread-safe read API for the (equity, max_daily_loss) pair."""
+        assert hasattr(mc_mod.APMasterControl, "_equity_snapshot"), (
+            "APMasterControl must expose _equity_snapshot(self) -> "
+            "tuple[float, float] so callers can atomically read both "
+            "account_equity and max_daily_loss under _equity_lock."
+        )
+        sig = inspect.signature(mc_mod.APMasterControl._equity_snapshot)
+        params = list(sig.parameters.keys())
+        # Only `self` (no other args required).
+        assert params == ["self"], (
+            f"_equity_snapshot must take only self; got params={params}"
+        )
+
+    def test_equity_snapshot_acquires_lock(self, mc_mod):
+        """_equity_snapshot's body must acquire _equity_lock while
+        reading the two fields, then return outside the lock."""
+        src = inspect.getsource(mc_mod.APMasterControl._equity_snapshot)
+        assert "with self._equity_lock" in src, (
+            "_equity_snapshot must acquire self._equity_lock around the "
+            "compound (account_equity, max_daily_loss) read so the pair "
+            "is observed atomically."
+        )
+        # Must read both fields
+        assert "self.account_equity" in src, (
+            "_equity_snapshot must read self.account_equity"
+        )
+        assert "self.max_daily_loss" in src, (
+            "_equity_snapshot must read self.max_daily_loss"
+        )
+
+    def test_equity_snapshot_returns_consistent_pair(self, mc_mod):
+        """Runtime check: _equity_snapshot returns (equity, max_loss)
+        as a 2-tuple, with both values float."""
+        mc = _make_mc(mc_mod, mode="paper", account_equity=25000.0)
+        mc.max_daily_loss = -500.0
+        eq, loss = mc._equity_snapshot()
+        assert isinstance(eq, float) and isinstance(loss, float)
+        assert eq == 25000.0
+        assert loss == -500.0
+
+    def test_evaluate_reads_equity_via_snapshot_or_lock(self, mc_mod):
+        """evaluate() must read account_equity and max_daily_loss for
+        risk checks via _equity_snapshot() (or directly under the
+        lock). Direct unlocked reads like `self.account_equity *
+        self.max_capital_pct` race with set_account_equity.
+
+        Acceptable shapes:
+          (a) `eq, loss = self._equity_snapshot()` near the top,
+              then local `eq` / `loss` for subsequent risk math.
+          (b) `with self._equity_lock: eq = self.account_equity; ...`
+              — not preferred (lock held longer) but valid.
+        """
+        src = inspect.getsource(mc_mod.APMasterControl.evaluate)
+
+        # Must reference _equity_snapshot OR an explicit _equity_lock
+        # acquire. Either is acceptable.
+        uses_snapshot = bool(re.search(
+            r'self\._equity_snapshot\s*\(\s*\)',
+            src,
+        ))
+        uses_lock_directly = bool(re.search(
+            r'with\s+self\._equity_lock\s*:',
+            src,
+        ))
+        assert uses_snapshot or uses_lock_directly, (
+            "evaluate() must read account_equity / max_daily_loss via "
+            "self._equity_snapshot() or under `with self._equity_lock:`. "
+            "Direct unlocked reads race with set_account_equity()'s "
+            "two-field compound update."
+        )
+
+        # AND the risk-math sites must NOT reference self.account_equity
+        # / self.max_daily_loss directly in the SAME function. (One
+        # `self.account_equity` reference is allowed in the snapshot
+        # call itself, e.g. if someone wrote `self.account_equity` as a
+        # fallback — but the main capital/sector/daily-loss checks must
+        # use the local snapshot var, not self. )
+        # We enforce this by counting direct reads of self.account_equity
+        # in the body; with the snapshot pattern, the body should have
+        # at most ZERO direct reads (the helper provides the value).
+        # Allow a small tolerance (<=1) for inert fallbacks / log lines.
+        direct_equity_reads = re.findall(
+            r'\bself\.account_equity\b',
+            src,
+        )
+        direct_loss_reads = re.findall(
+            r'\bself\.max_daily_loss\b',
+            src,
+        )
+        assert len(direct_equity_reads) == 0, (
+            f"evaluate() must NOT contain direct `self.account_equity` "
+            f"reads after the snapshot — use the local snapshot variable "
+            f"for all risk math. Found {len(direct_equity_reads)} direct "
+            f"reference(s)."
+        )
+        assert len(direct_loss_reads) == 0, (
+            f"evaluate() must NOT contain direct `self.max_daily_loss` "
+            f"reads after the snapshot — use the local snapshot variable. "
+            f"Found {len(direct_loss_reads)} direct reference(s)."
+        )
+
+    def test_revalidate_exposure_reads_equity_via_snapshot_or_lock(self, mc_mod):
+        """revalidate_exposure() must also read account_equity via
+        _equity_snapshot() (or under the lock) so the risk math sees
+        a consistent equity value."""
+        src = inspect.getsource(mc_mod.APMasterControl.revalidate_exposure)
+        uses_snapshot = bool(re.search(
+            r'self\._equity_snapshot\s*\(\s*\)',
+            src,
+        ))
+        uses_lock_directly = bool(re.search(
+            r'with\s+self\._equity_lock\s*:',
+            src,
+        ))
+        assert uses_snapshot or uses_lock_directly, (
+            "revalidate_exposure() must read account_equity via "
+            "self._equity_snapshot() or under `with self._equity_lock:`."
+        )
+        # No direct `self.account_equity` reads in the body. (max_daily_loss
+        # is not used here, but check anyway in case future fixes add it.)
+        assert len(re.findall(r'\bself\.account_equity\b', src)) == 0, (
+            "revalidate_exposure() must NOT contain direct "
+            "`self.account_equity` reads — use the snapshot local var."
+        )
+        assert len(re.findall(r'\bself\.max_daily_loss\b', src)) == 0, (
+            "revalidate_exposure() must NOT contain direct "
+            "`self.max_daily_loss` reads."
+        )
+
+    def test_equity_lock_not_held_across_slow_calls_in_evaluate(self, mc_mod):
+        """Defensive structural check: the _equity_lock acquisition in
+        evaluate() must NOT span any of the known slow / external calls:
+          - self._get_snapshot(...)            (PM snapshot)
+          - self._pending_capital_from_snapshot_or_db(...)  (DB)
+          - self._run_intelligence(...)        (intel callable)
+          - self.broker. ...                   (broker)
+        Holding _equity_lock across these would serialize all worker
+        threads behind one slow call — unacceptable for a hot path.
+
+        We assert this by locating the FIRST _equity_lock-related read
+        (either `_equity_snapshot()` or `with self._equity_lock:`) and
+        verifying it is NOT inside the slow-call region. The simplest
+        sufficient check: the slow calls must NOT appear within the
+        same `with self._equity_lock:` block (if direct lock is used).
+        With the helper, the lock is auto-released before any slow
+        call by construction.
+        """
+        src = inspect.getsource(mc_mod.APMasterControl.evaluate)
+        # If the source uses `with self._equity_lock:`, ensure no slow
+        # calls appear inside the indented block. We approximate by
+        # checking each lock-block region for slow-call signatures.
+        slow_signatures = (
+            r'self\._get_snapshot\s*\(',
+            r'self\._pending_capital_from_snapshot_or_db\s*\(',
+            r'self\._run_intelligence\s*\(',
+            r'self\.broker\.',
+        )
+        for m in re.finditer(r'with\s+self\._equity_lock\s*:\s*\n', src):
+            # Take the next ~10 non-empty source lines after the lock
+            # opening; if any contains a slow signature, fail.
+            tail = src[m.end():m.end() + 800]
+            for sig in slow_signatures:
+                assert not re.search(sig, tail[:tail.find("\n\n")] if "\n\n" in tail else tail), (
+                    f"evaluate() holds _equity_lock across a slow call "
+                    f"matching {sig!r}. Snapshot the values out of the "
+                    f"lock first, then make the slow call with local vars."
+                )
+
 
 # ══════════════════════════════════════════════════════════════════
 # FIX-4 — _cooldown_lock + set_cooldown method
