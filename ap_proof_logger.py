@@ -335,6 +335,17 @@ class APProofLogger:
         exit_pricing_tier:   str  = "",
         exit_attempt:        int  = 0,
         seconds_to_fill:     float = 0.0,
+        # Trigger vs realized labeling fields (2026-05-26 forensic fix)
+        # trigger_pnl_pct:    exit-engine estimated PnL at decision time (PERCENTAGE, e.g. -37.0)
+        # trigger_option_price: option mark/mid used by exit engine at decision
+        # trigger_underlying:  underlying price at decision time
+        # trigger_reason_code: machine-readable exit reason code
+        # realized_pnl_pct:   actual broker-fill PnL (same as option_pnl_pct; explicit alias)
+        trigger_pnl_pct:     float = None,
+        trigger_option_price: float = None,
+        trigger_underlying:  float = None,
+        trigger_reason_code: str  = None,
+        realized_pnl_pct:    float = None,
     ) -> dict:
         now = datetime.now(timezone.utc)
         row = {
@@ -378,6 +389,16 @@ class APProofLogger:
             "exit_pricing_tier":  exit_pricing_tier or None,
             "exit_attempt":       exit_attempt if exit_attempt else None,
             "seconds_to_fill":    round(seconds_to_fill, 1) if seconds_to_fill else None,
+            # ── Trigger vs realized (2026-05-26 forensic labeling fix) ─────────
+            # trigger_* fields: what the exit engine saw at decision time.
+            # realized_pnl_pct: broker-fill result (alias of option_pnl_pct).
+            # Allows dashboard to show "Triggered at -37% → Filled at -0.9%"
+            # instead of making protective exits look like catastrophic losses.
+            "trigger_pnl_pct":    round(trigger_pnl_pct, 2) if trigger_pnl_pct is not None else None,
+            "trigger_option_price": round(trigger_option_price, 4) if trigger_option_price else None,
+            "trigger_underlying": round(trigger_underlying, 4) if trigger_underlying else None,
+            "trigger_reason_code": trigger_reason_code or None,
+            "realized_pnl_pct":   round(realized_pnl_pct, 2) if realized_pnl_pct is not None else None,
         }
 
         # Cache for convenience — not source of truth

@@ -3849,6 +3849,14 @@ class APExitEngine:
                 _RISK_CODES = {
                     "EOD_FORCE_CLOSE", "HARD_STOP", "STOP_HIT", "THETA_STOP",
                     "SENTINEL_FORCED_EXIT", "NEVER_GREEN_STOP", "TIME_STOP",
+                    # DEEP_LOSS_STOP fires when option_pnl exceeds -20% floor
+                    # regardless of underlying. Treat as risk exit for pricing:
+                    # fill speed matters more than price at -20%+.
+                    # Forensic note 2026-05-26: SPY 0DTE exited at bid ~$0.73
+                    # but filled at $1.15 because UNKNOWN_EXIT code path was
+                    # used instead of RISK_BID. Adding here ensures consistent
+                    # bid-start pricing on deep stops. No threshold change.
+                    "DEEP_LOSS_STOP",
                 }
                 _TRAIL_CODES = {
                     "RUNNER_TRAIL", "TRAILING_STOP", "PROFIT_LOCK",
