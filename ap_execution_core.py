@@ -1250,6 +1250,25 @@ class APExecutionCore:
                         "signal":             sig,
                         "timeframe":          sig.get("timeframe", "1d"),
                         "synthetic_entry":    bool(getattr(pos, "synthetic_entry", False)),
+                        # CODEX-1 (PR B follow-up): APTradeLogger.log_trade in
+                        # ap_edge_intelligence.py derives contract_symbol from
+                        # `option_symbol` or `contract` (line ~110), and uses
+                        # underlying_entry / underlying_stop / underlying_target
+                        # for r-multiple and risk metrics. These are all
+                        # trade-relevant identity/level fields (not internals).
+                        # Omitting them was a real regression that broke trade
+                        # analytics and the proof_trades ↔ trades_intel join.
+                        "option_symbol":      getattr(pos, "option_symbol", ""),
+                        "contract":           getattr(pos, "option_symbol", ""),  # alias
+                        "underlying_entry":   getattr(pos, "underlying_entry", 0.0),
+                        "underlying_stop":    getattr(pos, "underlying_stop", 0.0),
+                        "underlying_target":  getattr(pos, "underlying_target", 0.0),
+                        # Score / tier come from the signal dict (not pos);
+                        # the logger checks both top-level and signal nested.
+                        "score":              sig.get("score", 0),
+                        "tier":               sig.get("tier", ""),
+                        # contracts alias — logger accepts contracts | quantity | qty
+                        "contracts":          getattr(pos, "quantity", 0),
                     },
                     exit_info={
                         "exit_price": exit_price,
@@ -1512,6 +1531,14 @@ class APExecutionCore:
         # not decimal (e.g. -0.25). Convert before passing to log_trade.
         opt_pnl_pct_for_proof = round(opt_pnl_pct * 100, 2)
 
+        # CODEX-2 (PR B follow-up): proof.log_trade failure must NOT short-
+        # circuit the rest of _finalize_proof. Feedback, shadow, and the
+        # intel outcome callback are all independent of proof DB success —
+        # they're computational over the staged dict + actual fill price.
+        # Dropping them when proof errors creates silent data loss exactly
+        # in degraded DB conditions (when intel matters most for diagnosis).
+        # Track proof outcome with a flag; do NOT early-return.
+        proof_ok = True
         try:
             self.proof.log_trade(
                 ticker             = staged["ticker"],
@@ -1544,8 +1571,12 @@ class APExecutionCore:
                 slippage_vs_bid    = slippage_vs_est,
             )
         except Exception as proof_err:
-            log.error("[%s] _finalize_proof: proof.log_trade failed: %s", staged["ticker"], proof_err)
-            return
+            proof_ok = False
+            log.error(
+                "[%s] _finalize_proof: proof.log_trade failed: %s — "
+                "continuing to feedback/shadow/intel (proof-independent)",
+                staged["ticker"], proof_err,
+            )
 
         # Feedback + shadow safe to finalize here with real P&L
         try:

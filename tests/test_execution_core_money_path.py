@@ -677,3 +677,292 @@ class TestInvariantSuggestedLimitAuthority:
                 "step-down ladder block — it is the primary authority; "
                 "the ladder is a fallback."
             )
+
+
+# ══════════════════════════════════════════════════════════════════
+# CODEX-1 — Edge logger payload preserves contract_symbol
+# ══════════════════════════════════════════════════════════════════
+#
+# Codex P2 review on PR #35 flagged:
+#   "_on_position_close now sends an allowlisted `position` dict to
+#    `_edge_logger.log_trade`, but the allowlist omits both
+#    `option_symbol` and `contract`. In APTradeLogger.log_trade
+#    (`ap_edge_intelligence.py`), `contract_symbol` is derived only
+#    from those keys, so this change causes every logged trade to
+#    lose its contract identifier."
+#
+# Verified at ap_edge_intelligence.py:110 —
+#     contract_symbol = position.get("option_symbol") or position.get("contract") or ""
+#
+# Fix: add option_symbol (canonical), underlying_entry, underlying_stop,
+# underlying_target, and contracts/qty alias coverage to the allowlist.
+# These are all trade-relevant fields (not internals) and the logger
+# explicitly looks for them.
+
+class TestCodex1EdgeLoggerContractSymbol:
+    def test_edge_logger_payload_includes_option_symbol(self):
+        """Codex P2: edge logger payload must include option_symbol so
+        ap_edge_intelligence.APTradeLogger.log_trade can derive
+        contract_symbol. Without this every logged trade loses its
+        contract identifier — analytics & postmortem are broken."""
+        captured: dict = {}
+
+        class _CapturingEdge:
+            def log_trade(self, **kwargs):
+                captured.update(kwargs)
+
+        core, _, _ = _make_core()
+        core._edge_logger = _CapturingEdge()
+        pos = _new_position(option_symbol="SPY260530C00500000")
+
+        decision = ExitDecision(
+            action="CLOSE_ALL", quantity=1,
+            reason="RUNNER TRAIL", urgency="HIGH",
+            reason_code="RUNNER_TRAIL", suggested_limit=1.20,
+        )
+        core._on_position_close(pos, decision)
+
+        assert "position" in captured, "edge logger must receive 'position' dict"
+        pos_dict = captured["position"]
+        assert pos_dict.get("option_symbol") == "SPY260530C00500000", (
+            "Edge logger payload must include option_symbol so "
+            "APTradeLogger.log_trade can derive contract_symbol. "
+            f"Got option_symbol={pos_dict.get('option_symbol')!r}; "
+            f"full pos_dict keys={sorted(pos_dict.keys())}"
+        )
+
+    def test_contract_symbol_derived_downstream_is_non_empty(self):
+        """End-to-end: when the real APTradeLogger.log_trade derivation
+        rule runs on the edge logger payload, contract_symbol must NOT
+        be empty. This is the exact bug codex flagged.
+
+        Mirrors ap_edge_intelligence.py:110 verbatim:
+            contract_symbol = position.get("option_symbol")
+                              or position.get("contract") or ""
+        """
+        captured: dict = {}
+
+        class _CapturingEdge:
+            def log_trade(self, **kwargs):
+                captured.update(kwargs)
+
+        core, _, _ = _make_core()
+        core._edge_logger = _CapturingEdge()
+        pos = _new_position(option_symbol="SPY260530C00500000")
+
+        decision = ExitDecision(
+            action="CLOSE_ALL", quantity=1,
+            reason="RUNNER TRAIL", urgency="HIGH",
+            reason_code="RUNNER_TRAIL", suggested_limit=1.20,
+        )
+        core._on_position_close(pos, decision)
+
+        pos_dict = captured["position"]
+        # Replicate the EXACT derivation from ap_edge_intelligence.py:110
+        contract_symbol = pos_dict.get("option_symbol") or pos_dict.get("contract") or ""
+        assert contract_symbol != "", (
+            "contract_symbol derived from edge-logger payload using the "
+            "exact rule from ap_edge_intelligence.py:110 must NOT be "
+            "empty. An empty contract_symbol breaks trade analytics, "
+            "postmortem queries, and the proof-trades→trades_intel "
+            "join. This is the codex P2 finding."
+        )
+
+    def test_edge_logger_payload_includes_underlying_levels(self):
+        """The edge logger also uses underlying_entry, planned_stop /
+        underlying_stop, planned_target / underlying_target to compute
+        r-multiple and risk metrics. Allowlist must expose them."""
+        captured: dict = {}
+
+        class _CapturingEdge:
+            def log_trade(self, **kwargs):
+                captured.update(kwargs)
+
+        core, _, _ = _make_core()
+        core._edge_logger = _CapturingEdge()
+        pos = _new_position(
+            underlying_entry=500.00,
+            underlying_stop=499.00,
+            underlying_target=505.00,
+        )
+        decision = ExitDecision(
+            action="CLOSE_ALL", quantity=1,
+            reason="RUNNER TRAIL", urgency="HIGH",
+            reason_code="RUNNER_TRAIL", suggested_limit=1.20,
+        )
+        core._on_position_close(pos, decision)
+
+        pos_dict = captured["position"]
+        # underlying_entry is required for r_multiple calc
+        assert "underlying_entry" in pos_dict, (
+            "Edge logger payload must include underlying_entry — "
+            "APTradeLogger uses it for r-multiple and underlying_pnl_pct."
+        )
+        # stop/target accepted under EITHER alias (underlying_stop or planned_stop)
+        has_stop = (
+            "underlying_stop" in pos_dict
+            or "planned_stop" in pos_dict
+            or "stop_underlying" in pos_dict
+        )
+        has_target = (
+            "underlying_target" in pos_dict
+            or "planned_target" in pos_dict
+            or "target_underlying" in pos_dict
+        )
+        assert has_stop, (
+            "Edge logger payload must include a stop level alias "
+            "(underlying_stop / planned_stop / stop_underlying)."
+        )
+        assert has_target, (
+            "Edge logger payload must include a target level alias "
+            "(underlying_target / planned_target / target_underlying)."
+        )
+
+
+# ══════════════════════════════════════════════════════════════════
+# CODEX-2 — _finalize_proof preserves intel outcome on proof error
+# ══════════════════════════════════════════════════════════════════
+#
+# Codex P2 review on PR #35 flagged:
+#   "The intel callback was moved to _finalize_proof, but this method
+#    still returns immediately if self.proof.log_trade(...) raises.
+#    Because _record_intel_outcome now runs after that early return,
+#    any transient proof-log failure drops the intelligence outcome
+#    entirely for that trade (previously it was recorded from
+#    _on_position_close regardless of proof write status). This
+#    creates silent data loss exactly in degraded DB conditions."
+#
+# Fix: replace the bare `return` after proof.log_trade exception with a
+# flag that skips proof-dependent finalization (feedback/shadow are
+# already in their own try/except blocks) but allows intel to run.
+# Intel is purely computational from the staged dict + actual fill —
+# it has no dependency on proof DB success.
+
+class TestCodex2IntelSurvivesProofError:
+    def _staged_dict(self, pos):
+        """Realistic _proof_staged payload matching what _on_position_close
+        writes at submit-time."""
+        return {
+            "ticker": pos.ticker,
+            "pattern": "test",
+            "side": pos.side,
+            "timeframe": "1d",
+            "score": 80,
+            "tier": "A",
+            "context_score": 0,
+            "setup_status": "",
+            "entry_trigger": 500.0,
+            "entry_option_price": 1.00,
+            "exit_option_price": 1.20,
+            "underlying_entry": 500.0,
+            "underlying_exit": 502.0,
+            "contracts": 1,
+            "exit_reason": "RUNNER TRAIL",
+            "opt_pnl": 20.0,
+            "win": True,
+            "spread_pct": 0.0,
+            "chain_grade": "",
+            "opened_at": pos.opened_at,
+            "synthetic_entry": False,
+            "position_id": pos.position_id,
+            "local_order_id": "lo-1",
+            "signal": {"signal_id": "sig-pr-b-1"},
+            "paper": True,
+        }
+
+    def test_intel_outcome_recorded_when_proof_log_trade_raises(self):
+        """Codex P2: when self.proof.log_trade(...) raises in
+        _finalize_proof, _record_intel_outcome must STILL be called.
+
+        Intel data is computational (staged dict + actual fill), not
+        dependent on the proof DB. Dropping intel because proof failed
+        is silent data loss in exactly the conditions where intel
+        matters most — degraded DB."""
+        intel_mock = MagicMock()
+        with patch.object(ap_execution_core, "_record_intel_outcome", intel_mock):
+            core, _, _ = _make_core()
+            # Force proof.log_trade to raise (simulate transient DB outage)
+            core.proof = MagicMock()
+            core.proof.log_trade.side_effect = RuntimeError(
+                "transient DB connection lost"
+            )
+            pos = _new_position()
+            pos._proof_staged = self._staged_dict(pos)
+
+            # Should NOT raise — _finalize_proof must absorb proof errors
+            core._finalize_proof(pos, actual_fill_price=1.18)
+
+        assert intel_mock.called, (
+            "_record_intel_outcome must run even when proof.log_trade "
+            "raises. The intel callback is computational and independent "
+            "of proof DB success. Dropping it on proof errors creates "
+            "silent intelligence data loss in degraded DB conditions — "
+            "exactly when intel matters most for diagnosis."
+        )
+        # And the pnl_pct passed must still reflect the actual fill
+        call_kwargs = intel_mock.call_args.kwargs
+        assert abs(call_kwargs["pnl_pct"] - 0.18) < 0.001, (
+            f"Intel pnl_pct must be computed from actual fill even when "
+            f"proof errored. Got pnl_pct={call_kwargs.get('pnl_pct')}"
+        )
+
+    def test_intel_outcome_recorded_when_feedback_record_outcome_raises(self):
+        """Secondary path: feedback.record_outcome raises → intel still
+        runs. (Feedback is already in its own try/except, so this should
+        already be true; assert it as a regression guard.)"""
+        intel_mock = MagicMock()
+        with patch.object(ap_execution_core, "_record_intel_outcome", intel_mock):
+            core, _, _ = _make_core()
+            core.feedback = MagicMock()
+            core.feedback.record_outcome.side_effect = RuntimeError("feedback DB down")
+            # proof.log_trade succeeds
+            core.proof = MagicMock()
+            pos = _new_position()
+            pos._proof_staged = self._staged_dict(pos)
+
+            core._finalize_proof(pos, actual_fill_price=1.18)
+
+        assert intel_mock.called, (
+            "_record_intel_outcome must run even when "
+            "feedback.record_outcome raises."
+        )
+
+    def test_finalize_proof_does_not_reraise_on_proof_error(self):
+        """_finalize_proof is called from the exit engine's
+        on_exit_fill_confirmed callback. It must NEVER propagate
+        exceptions back to the exit engine — that would block other
+        positions from finalizing."""
+        with patch.object(ap_execution_core, "_record_intel_outcome", MagicMock()):
+            core, _, _ = _make_core()
+            core.proof = MagicMock()
+            core.proof.log_trade.side_effect = RuntimeError("DB hard down")
+            pos = _new_position()
+            pos._proof_staged = self._staged_dict(pos)
+
+            # Must not raise
+            try:
+                core._finalize_proof(pos, actual_fill_price=1.18)
+            except Exception as e:
+                pytest.fail(
+                    f"_finalize_proof must absorb all internal errors. "
+                    f"Propagating to exit engine breaks position cleanup. "
+                    f"Raised: {type(e).__name__}: {e}"
+                )
+
+    def test_finalize_proof_marks_finalized_even_on_proof_error(self):
+        """Idempotency: even when proof fails, _proof_finalized must be
+        set so retry attempts don't double-log intel. (The fix must
+        preserve the existing idempotency guard.)"""
+        with patch.object(ap_execution_core, "_record_intel_outcome", MagicMock()):
+            core, _, _ = _make_core()
+            core.proof = MagicMock()
+            core.proof.log_trade.side_effect = RuntimeError("DB down")
+            pos = _new_position()
+            pos._proof_staged = self._staged_dict(pos)
+
+            core._finalize_proof(pos, actual_fill_price=1.18)
+
+            assert getattr(pos, "_proof_finalized", False) is True, (
+                "_proof_finalized must be set True even when proof errors, "
+                "to prevent duplicate intel writes on retry."
+            )
