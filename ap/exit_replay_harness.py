@@ -82,6 +82,16 @@ class _StubPosition:
         self.scale_out_orders     = []
         self.pending_exit_action  = None
         self.pending_exit_local_order_id = None
+        # PR-A: Fields that ManagedPosition now declares; the stub must
+        # carry them too or evaluate_exit raises AttributeError when it
+        # reads pos._stop_breach_ts / pos._underlying_stop_breach_ts.
+        # is_trend_day is read by the trend-day branch in evaluate_exit;
+        # without it the harness silently swallowed AttributeError and
+        # never validated hard-stop replays (audit finding, May 2026).
+        self._stop_breach_ts             = None
+        self._underlying_stop_breach_ts  = None
+        self.is_trend_day                = False
+        self.trend_direction             = ""
 
     @property
     def is_at_target(self) -> bool:
