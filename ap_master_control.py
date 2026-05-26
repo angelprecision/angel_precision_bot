@@ -608,6 +608,29 @@ class APMasterControl:
                 _new_loss,
             )
 
+    def _equity_snapshot(self) -> tuple[float, float]:
+        """PR E FIX-3 (reader-side patch): atomic read of the
+        (account_equity, max_daily_loss) pair under _equity_lock.
+
+        set_account_equity() updates these two fields sequentially under
+        the same lock. Without locking the READ as well, a worker thread
+        can observe a half-updated pair (new equity, old loss) between
+        the two write assignments — a classic reader/writer race that a
+        write-only lock does NOT prevent.
+
+        Callers (evaluate, revalidate_exposure) must take ONE snapshot
+        at the top of the risk-check section, then use local variables
+        for all subsequent capital / daily-loss math. NEVER hold this
+        lock across DB / broker / PM / intelligence calls — the snapshot
+        is intended to be sub-microsecond.
+
+        Returns:
+            (account_equity, max_daily_loss) — both as float, consistent
+            with the most recent completed set_account_equity() update.
+        """
+        with self._equity_lock:
+            return float(self.account_equity), float(self.max_daily_loss)
+
     def set_cooldown(self, key: str, ts: float | None = None, reason: str = "") -> None:
         """PR E / FIX-4: public, thread-safe setter for trade cooldowns.
 
@@ -1094,7 +1117,17 @@ class APMasterControl:
                 )
             pending_capital_real = 0.0
         projected_total = snap["capital_deployed"] + pending_capital_real + estimated_new_cost_pre
-        max_capital = self.account_equity * self.max_capital_pct
+        # PR E FIX-3 (reader-side patch): take ONE atomic snapshot of
+        # (account_equity, max_daily_loss) under _equity_lock here.
+        # Use the local variables for ALL subsequent risk math below
+        # (capital cap, sector cap, ticker cap, daily-loss check, and
+        # the sizer call). Without this, evaluate() reads the two
+        # fields directly while set_account_equity() updates them
+        # sequentially — race on the worker thread observing a half-
+        # updated equity/loss pair. The snapshot itself is sub-µs; the
+        # lock is NEVER held across slow DB / broker / PM / intel calls.
+        account_equity, max_daily_loss = self._equity_snapshot()
+        max_capital = account_equity * self.max_capital_pct
         if projected_total > max_capital:
             return self._block(signal_id, ticker, client_id, "blocked_risk", f"capital_limit (projected ${projected_total:.0f} > ${max_capital:.0f})")
 
@@ -1103,7 +1136,8 @@ class APMasterControl:
         estimated_contracts = max(MIN_CONTRACTS_PER_POSITION, self._base_contracts(effective_score, _estimate_premium(ticker)))
         estimated_new_cost = estimated_contracts * 100 * _estimate_premium(ticker)
         projected_sector = sector_deployed + estimated_new_cost
-        effective_equity = self.account_equity
+        # PR E FIX-3: use the snapshot value, not the instance field.
+        effective_equity = account_equity
         max_sector_capital = effective_equity * self.max_sector_pct
         if projected_sector > max_sector_capital:
             return self._block(signal_id, ticker, client_id, "blocked_risk", f"sector_cap_{sector} (projected ${projected_sector:.0f} > ${max_sector_capital:.0f})")
@@ -1121,7 +1155,12 @@ class APMasterControl:
             return self._block(signal_id, ticker, client_id, "blocked_risk", f"max_puts ({snap['puts_open']}/{self.max_puts})")
         if snap["trades_today"] >= self.max_trades_today:
             return self._block(signal_id, ticker, client_id, "blocked_risk", f"max_trades_today ({snap['trades_today']}/{self.max_trades_today})")
-        if snap["realized_pnl_today"] <= self.max_daily_loss:
+        # PR E FIX-3: daily-loss check uses the snapshot value (local
+        # `max_daily_loss` from the helper above), not the instance
+        # field directly. The block uses the local variable
+        # consistently in the comparison, the force-close-all reason,
+        # and the user-facing block message.
+        if snap["realized_pnl_today"] <= max_daily_loss:
             # P0-3: also trigger force-close-all so existing positions don't
             # keep bleeding. Entry gate blocks NEW trades; this circuit breaker
             # closes EXISTING ones. Once-per-session (idempotent).
@@ -1130,10 +1169,10 @@ class APMasterControl:
                 self.request_force_close_all(
                     reason=(
                         f"daily_loss_limit ${snap['realized_pnl_today']:.2f} "
-                        f"<= ${self.max_daily_loss:.2f}"
+                        f"<= ${max_daily_loss:.2f}"
                     )
                 )
-            return self._block(signal_id, ticker, client_id, "blocked_risk", f"daily_loss_limit (${snap['realized_pnl_today']:.2f} <= ${self.max_daily_loss:.2f})")
+            return self._block(signal_id, ticker, client_id, "blocked_risk", f"daily_loss_limit (${snap['realized_pnl_today']:.2f} <= ${max_daily_loss:.2f})")
         _open_only_tickers = {str(p.get("underlying") or p.get("ticker") or "").upper() for p in snap["open_positions"]}
         if _open_only_tickers and ticker.upper() in _open_only_tickers:
             return self._block(signal_id, ticker, client_id, "blocked_risk", f"ticker_already_active ({ticker})")
@@ -1247,11 +1286,16 @@ class APMasterControl:
         _sizing = None
         if self.sizer and not bootstrap_mode:
             try:
+                # PR E FIX-3: pass the snapshot equity value (local
+                # `account_equity` from the helper above), not the
+                # instance field directly. The snapshot was taken before
+                # the risk-gate checks; the sizer benefits from the
+                # same atomic value.
                 _sizing = self.sizer.compute(
                     client_id=client_id,
                     tier=str(tier),
                     premium_per_contract=placeholder_premium,
-                    account_equity=self.account_equity,
+                    account_equity=account_equity,
                     realized_pnl_today=pnl_today,
                     position_manager=self.pm,
                 )
@@ -1607,7 +1651,13 @@ class APMasterControl:
         """
         ticker = plan.ticker
         real_cost = float(plan.max_position_usd)
-        equity = self.account_equity
+        # PR E FIX-3 (reader-side patch): take atomic snapshot of
+        # (account_equity, max_daily_loss) under _equity_lock.
+        # revalidate_exposure uses equity for capital / sector / ticker
+        # caps; max_daily_loss is not used here but the snapshot is the
+        # consistent reader API. The lock is NEVER held across
+        # _get_snapshot / _pending_capital_from_snapshot_or_db / DB calls.
+        equity, _ = self._equity_snapshot()
         signal_id = plan.signal_id
         snap = self._get_snapshot(client_id, ticker=ticker, signal_id=signal_id)
         if self._is_live_mode() and not snap.get("_snapshot_ok", True):
