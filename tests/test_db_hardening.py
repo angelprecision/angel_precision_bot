@@ -56,6 +56,20 @@ class TestStalePendingTrigger:
             result = get_stale_pending_trigger_orders("test@example.com", older_than_hours=8)
 
         assert isinstance(result, list)
+        assert len(captured_sql) == 1, "Expected exactly one SQL statement"
+        sql, params = captured_sql[0]
+
+        # Required predicates
+        assert "PENDING_TRIGGER" in sql, "SQL must filter status = PENDING_TRIGGER"
+        assert "ENTRY" in sql, "SQL must filter kind = ENTRY"
+        assert "client_id" in sql, "SQL must filter by client_id"
+        assert "created_ts" in sql and "NOW()" in sql, "SQL must include age threshold"
+        assert "ORDER BY created_ts ASC" in sql, "SQL must order by created_ts ASC"
+
+        # Required params: (client_id, str(older_than_hours))
+        assert params == ("test@example.com", "8"), (
+            f"Expected params ('test@example.com', '8') but got {params!r}"
+        )
 
     def test_function_returns_list(self):
         """Returns empty list on no rows."""
@@ -68,6 +82,14 @@ class TestStalePendingTrigger:
     def test_function_exists_and_is_callable(self):
         from ap.db import get_stale_pending_trigger_orders
         assert callable(get_stale_pending_trigger_orders)
+
+    def test_db_failure_raises_not_swallowed(self):
+        """DB/query failure must be raised, not swallowed as empty list."""
+        from ap.db import get_stale_pending_trigger_orders
+
+        with patch("ap.db.run_with_retry", side_effect=RuntimeError("db down")):
+            with pytest.raises(RuntimeError, match="db down"):
+                get_stale_pending_trigger_orders("test@example.com")
 
 
 # ---------------------------------------------------------------------------
