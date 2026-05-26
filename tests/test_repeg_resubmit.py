@@ -33,12 +33,66 @@ import pytest
 
 
 # Stub ap.db before importing retry_engine so update_order is observable.
+#
+# IMPORTANT (2026-05-26 audit fix): the previous implementation replaced
+# the entire ap.db module in sys.modules with a stub that only had
+# update_order. That polluted later tests across many files because
+# downstream `from ap.db import conn` / `from ap.db import run_with_retry`
+# fell through to the stub and got AttributeError -> ImportError.
+#
+# This version preserves whatever symbols already exist on the real
+# ap.db (conn, run_with_retry, _get_pool, etc.) and only overrides
+# update_order, then RESTORES sys.modules at module teardown via the
+# pytest teardown_module hook (atexit alone is insufficient because
+# pytest collects all modules in one process).
+import os as _os_for_db
+_os_for_db.environ.setdefault(
+    "DATABASE_URL", "postgresql://test:test@127.0.0.1:5432/test_repeg"
+)
+
+# Capture whatever ap.db currently is (real module if importable, or None).
+_prior_ap_db = sys.modules.get("ap.db")
+
+# Try to import the real ap.db first; copy its non-update_order names
+# into the stub so downstream `from ap.db import conn / run_with_retry`
+# still works for sibling test files.
 _db_stub = types.ModuleType("ap.db")
 _db_stub.update_order = MagicMock()
+try:
+    import importlib as _importlib_for_db
+    _real_db = _importlib_for_db.import_module("ap.db")
+    for _attr in ("conn", "run_with_retry", "_get_pool", "init_db",
+                  "insert_order", "new_local_order_id",
+                  "already_processed_signal", "mark_signal_processed",
+                  "create_client", "get_all_clients",
+                  "get_position_by_id", "get_all_orders", "get_order_by_id"):
+        if hasattr(_real_db, _attr):
+            setattr(_db_stub, _attr, getattr(_real_db, _attr))
+    _prior_ap_db = _real_db
+except Exception:
+    # Real module unimportable. Stub still works for retry_engine's
+    # needs (only update_order is observed). Downstream sibling tests
+    # that depend on a real ap.db also can't run without a DB, so the
+    # breakage is contained.
+    _real_db = None
+
 sys.modules["ap.db"] = _db_stub
 
 # Now safe to import.
 from ap.retry_engine import apply_repeg, RepegDecision  # noqa: E402
+
+
+def teardown_module(module):
+    """Restore sys.modules['ap.db'] when this test module finishes.
+
+    Pytest does not automatically undo sys.modules mutations made at
+    module import time. Without this, every later test in the same
+    pytest session that imports from ap.db would still see the stub.
+    """
+    if _prior_ap_db is not None:
+        sys.modules["ap.db"] = _prior_ap_db
+    else:
+        sys.modules.pop("ap.db", None)
 
 
 @pytest.fixture(autouse=True)
