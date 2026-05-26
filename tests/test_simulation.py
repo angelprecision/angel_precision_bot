@@ -25,11 +25,47 @@ import uuid
 import threading
 import pytest
 
+# DATABASE_URL must be set BEFORE any ap.db import (2026-05-26 audit fix).
+# Several tests here import paths that eagerly read DATABASE_URL. Without
+# this setdefault, 7 tests ERROR with a misleading runtime error instead
+# of running. The value is a non-routable placeholder — tests that need
+# a real DB will still skip cleanly via @requires_real_db below.
+os.environ.setdefault(
+    "DATABASE_URL",
+    "postgresql://test:test@127.0.0.1:5432/test_simulation",
+)
+os.environ.setdefault("ENCRYPTION_KEY", "test-key-for-simulation-2026")
+
 # Make project root importable
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 os.environ.setdefault("BOT_MODE", "PAPER")
 os.environ.setdefault("ALLOW_INTERNAL_MASTER_CONTROL", "1")
+
+
+# ── DB availability marker (2026-05-26 audit fix) ───────────────────────
+# Several test classes here (TestStaleEntryCancel, TestPartialFill,
+# TestExitEngineDeath, TestDBFailureLiveMode, TestReconciler, plus
+# TestKillSwitch / TestDuplicateSignalBurst / TestStartupRecovery which
+# construct APMasterControl whose __init__ seeds dedup from the DB) call
+# code that hits a real Postgres. Without a reachable DB those tests
+# fail with confusing tracebacks and hang on connection retries.
+# Probe once at import time and provide a skip marker.
+def _real_db_available() -> bool:
+    try:
+        from ap.db import conn as _conn
+        with _conn() as c:
+            c.execute("SELECT 1")
+        return True
+    except Exception:
+        return False
+
+
+_DB_AVAILABLE = _real_db_available()
+requires_real_db = pytest.mark.skipif(
+    not _DB_AVAILABLE,
+    reason="test requires real Postgres (DATABASE_URL must be reachable)",
+)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -100,6 +136,7 @@ def make_signal(ticker="TSLA", score=75, side="CALL", signal_id=None) -> dict:
 # TEST 1 — Stale Entry Cancel
 # ═══════════════════════════════════════════════════════════════════════════════
 
+@requires_real_db
 class TestStaleEntryCancel:
     """
     Submit an order. Force it to never fill.
@@ -224,6 +261,7 @@ class TestStaleEntryCancel:
 # TEST 2 — Partial Fill
 # ═══════════════════════════════════════════════════════════════════════════════
 
+@requires_real_db
 class TestPartialFill:
     """Simulate partial fill — verify PARTIAL_FILL written, exit still works."""
 
@@ -270,6 +308,7 @@ class TestPartialFill:
 # TEST 3 — Kill Switch
 # ═══════════════════════════════════════════════════════════════════════════════
 
+@requires_real_db
 class TestKillSwitch:
     """Trigger daily loss limit — entries blocked, exits still pass."""
 
@@ -291,7 +330,7 @@ class TestKillSwitch:
 
         # Simulate daily loss exceeded
         mc.daily_pnl = -150.0   # below -100 threshold
-        mc._check_daily_loss()  # trigger kill switch evaluation
+        mc.check_daily_loss_breach()  # trigger kill switch evaluation (renamed from _check_daily_loss)
 
         decision = mc.evaluate(sig, client_id="test-ks")
         assert not decision.ok, "Entry should be blocked when daily loss exceeded"
@@ -315,8 +354,11 @@ class TestKillSwitch:
             "reason": "stop loss triggered",
             "qty": 1,
         }
-        # _is_protective should return True for STOP_HIT
-        assert engine._is_protective(mock_exit), (
+        # _is_protective_exit is a module-level function in ap_exit_engine
+        # (renamed from APExitEngine._is_protective method). Signature
+        # takes a reason string, not a dict.
+        from ap_exit_engine import _is_protective_exit
+        assert _is_protective_exit(mock_exit["reason"] or mock_exit["decision_type"]), (
             "STOP_HIT should be treated as protective exit, allowed through kill switch"
         )
 
@@ -325,6 +367,7 @@ class TestKillSwitch:
 # TEST 4 — Exit Engine Death
 # ═══════════════════════════════════════════════════════════════════════════════
 
+@requires_real_db
 class TestExitEngineDeath:
     """Stop exit engine → exit_engine_down=True → master_control blocks entries."""
 
@@ -375,6 +418,7 @@ class TestExitEngineDeath:
 # TEST 5 — DB Failure in LIVE mode
 # ═══════════════════════════════════════════════════════════════════════════════
 
+@requires_real_db
 class TestDBFailureLiveMode:
     """DB unavailable at startup → LIVE mode must refuse to start."""
 
@@ -424,6 +468,7 @@ class TestDBFailureLiveMode:
 # TEST 6 — Duplicate Signal Burst
 # ═══════════════════════════════════════════════════════════════════════════════
 
+@requires_real_db
 class TestDuplicateSignalBurst:
     """Send same signal 5 times — only 1 trade taken."""
 
@@ -490,6 +535,7 @@ class TestDuplicateSignalBurst:
 # TEST 7 — Reconciler (broker vs DB mismatch)
 # ═══════════════════════════════════════════════════════════════════════════════
 
+@requires_real_db
 class TestReconciler:
     """DB says open → broker says filled → reconciler auto-corrects."""
 
@@ -547,6 +593,7 @@ class TestReconciler:
 # TEST 8 — Startup Recovery
 # ═══════════════════════════════════════════════════════════════════════════════
 
+@requires_real_db
 class TestStartupRecovery:
     """Restart recovery re-seeds dedup from DB and restores position count."""
 
@@ -593,6 +640,52 @@ class TestStartupRecovery:
         assert f"sig:{sig_id}:{client_id}" in mc._seen_signals, (
             "signal_id should be in master_control._seen_signals after recovery"
         )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# RENAME VERIFICATION (no DB required)
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# These tests verify the production method renames the suite must track,
+# WITHOUT requiring a live Postgres. The previous TestKillSwitch /
+# TestExitEngineDeath tests for these renames hang in CI because their
+# fixtures call APMasterControl.__init__ which seeds dedup from the DB.
+#
+# Production renames (audit dated 2026-05-26):
+#   ap_master_control.APMasterControl._check_daily_loss
+#     -> check_daily_loss_breach (public, no underscore)
+#   ap_exit_engine.APExitEngine._is_protective (method)
+#     -> ap_exit_engine._is_protective_exit (module-level function)
+
+def test_check_daily_loss_breach_method_exists():
+    """check_daily_loss_breach replaced _check_daily_loss in production."""
+    from ap_master_control import APMasterControl
+    assert hasattr(APMasterControl, "check_daily_loss_breach"), (
+        "Production renamed _check_daily_loss -> check_daily_loss_breach; "
+        "tests must follow."
+    )
+    # Confirm the old name is genuinely gone so we don't accept stale code.
+    assert not hasattr(APMasterControl, "_check_daily_loss"), (
+        "Old method name _check_daily_loss still exists — rename incomplete."
+    )
+
+
+def test_is_protective_exit_function_exists_and_classifies_correctly():
+    """_is_protective_exit replaced APExitEngine._is_protective.
+
+    The new signature takes a reason string (not a dict) and returns True
+    for protective exit reasons. Verifies the renamed kill-switch carve-out
+    still treats STOP_HIT / stop-loss reasons as protective.
+    """
+    from ap_exit_engine import _is_protective_exit
+    # Reasons that MUST classify as protective (allowed through kill switch)
+    assert _is_protective_exit("stop loss triggered")
+    assert _is_protective_exit("STOP_HIT")
+    assert _is_protective_exit("EOD FORCE CLOSE")
+    assert _is_protective_exit("MAX_LOSS reached")
+    # Reasons that MUST NOT classify as protective
+    assert not _is_protective_exit("manual close")
+    assert not _is_protective_exit("")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

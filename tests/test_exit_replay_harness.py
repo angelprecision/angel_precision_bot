@@ -11,6 +11,14 @@ from __future__ import annotations
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# Zero the breach-confirmation window for replay so tests prove that the
+# correct exit fires on the right price levels, not how long evaluate_exit
+# waits for confirmation. The production 45s window is a timing concern
+# verified elsewhere. MUST be set before the harness/exit-engine import
+# so evaluate_exit's os.getenv() reads it.
+os.environ.setdefault("STOP_BREACH_CONFIRM_SECONDS", "0")
+os.environ.setdefault("UNDERLYING_STOP_CONFIRM_SECONDS", "0")
+
 import pytest
 
 try:
@@ -22,8 +30,17 @@ except ImportError:
 skip = pytest.mark.skipif(not HAS_ENGINE, reason="exit engine not importable")
 
 
+from datetime import datetime, timezone
+
+# Pin replay clock to mid-session ET so EOD force-close never triggers.
+# evaluate_exit reads now_et.hour directly without a tz conversion, so
+# we pass a datetime whose .hour == 11 (well inside the 9:30-15:50
+# session, regardless of the wall-clock tz the test runner uses).
+_MID_SESSION_ET = datetime(2026, 1, 15, 11, 30, 0, tzinfo=timezone.utc)
+
+
 def run(entry, path, qty=1):
-    return replay_price_path(entry, path, qty=qty)
+    return replay_price_path(entry, path, qty=qty, now_et=_MID_SESSION_ET)
 
 
 # ── Scenario 1: single contract profit floor 15% ────────────────────────────

@@ -251,8 +251,11 @@ class TestLostHandoffForensics:
 
     def test_warning_log_emitted_for_lost_handoff(self):
         src = (REPO_ROOT / "ap" / "order_monitor.py").read_text()
+        # Production renamed the marker from LOST_HANDOFF to LOST_HANDOFF_30S
+        # when the CREATED-order timeout dropped from 120s to 30s.
+        # Semantics unchanged; only the marker string was updated.
         assert "LOST_HANDOFF_30S | local=" in src, (
-            "A WARN-level log must fire on every LOST_HANDOFF cancel so it "
+            "A WARN-level log must fire on every LOST_HANDOFF_30S cancel so it "
             "stands out in production logs."
         )
 

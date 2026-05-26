@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any, List, Optional, Sequence
 
 log = logging.getLogger("ap.exit_replay_harness")
@@ -102,6 +102,48 @@ class _StubPosition:
         self._proof_staged               = None
         self._proof_finalized            = False
         self.proof_logged                = False
+        # ── Hygiene PR: remaining ManagedPosition attrs evaluate_exit reads ──
+        # PRs #34 and #35 added 10 attributes above; this block covers the
+        # other 36 that evaluate_exit / _eval_exit / helper paths read.
+        # Without them, AttributeError is swallowed by the harness and exit
+        # decisions silently degrade. Audited against ap_exit_engine.py
+        # pos.* reads on 2026-05-26. All defaults match ManagedPosition.
+        self.quantity                                  = int(qty)
+        self.closed                                    = False
+        self.close_reason                              = ""
+        self._exit_stuck_count                         = 0
+        self._submit_generation                        = 0
+        self.last_rejection_ts                         = None
+        self.last_exit_rejected                        = False
+        self.last_exit_signal_ts                       = None
+        self.pending_exit_reason                       = ""
+        self.pending_exit_qty                          = 0
+        self.pending_exit_filled_qty                   = 0
+        self.pending_scale_counted                     = False
+        self.pending_exit_broker_order_id              = ""
+        self.pending_exit_replace_allowed              = False
+        self.pending_exit_replace_reason               = ""
+        self.pending_exit_replace_allowed_ts           = None
+        self.last_applied_exit_local_order_id          = ""
+        self.last_applied_exit_broker_order_id         = ""
+        self.last_applied_exit_cum_fill                = 0
+        self.last_applied_exit_cum_fill_by_order       = {}
+        self.last_callback_identity_missing            = False
+        self.last_callback_identity_missing_ts         = None
+        self.exit_identity_quarantine                  = False
+        self.exit_identity_quarantine_alert_count      = 0
+        self.last_exit_identity_quarantine_alert_ts    = None
+        self.last_exit_identity_quarantine_resolved_ts = None
+        self.last_exit_clear_reason                    = ""
+        self.last_exit_clear_local_order_id            = ""
+        self.last_exit_clear_broker_order_id           = ""
+        self.last_exit_identity_reject_ts              = None
+        self.last_quote_update_ts                      = None
+        self.last_quote_missing_ts                     = None
+        self.last_underlying_quote_update_ts           = None
+        self.last_underlying_quote_missing_ts          = None
+        self.last_option_quote_update_ts               = None
+        self.last_option_quote_missing_ts              = None
 
     @property
     def is_at_target(self) -> bool:
@@ -162,13 +204,14 @@ class ReplayResult:
 # ---------------------------------------------------------------------------
 
 def replay_price_path(
-    entry_price: float,
-    price_path:  Sequence[float],
+    entry_price:  float,
+    price_path:   Sequence[float],
     *,
-    qty:         int   = 1,
-    ticker:      str   = "REPLAY",
-    side:        str   = "CALL",
-    now_et:      Optional[datetime] = None,
+    qty:          int   = 1,
+    ticker:       str   = "REPLAY",
+    side:         str   = "CALL",
+    now_et:       Optional[datetime] = None,
+    step_seconds: int   = 15,
 ) -> ReplayResult:
     """
     Feed a price path into evaluate_exit() step by step.
@@ -193,13 +236,25 @@ def replay_price_path(
 
     pos     = _StubPosition(entry_price, qty, ticker, side)
     result  = ReplayResult(entry_price=entry_price, price_path=list(price_path))
-    _now_et = now_et or datetime.now(timezone.utc)
+    base_now_et = now_et or datetime.now(timezone.utc)
+    # Anchor opened_at 30 minutes before the replay clock so position-age
+    # checks don't fail with age=0s (some gates require min hold time).
+    pos.opened_at            = base_now_et - timedelta(minutes=30)
+    pos.entry_ts             = pos.opened_at
+    pos.last_quote_update    = base_now_et
+    pos.last_option_quote_ts = base_now_et
 
     for i, price in enumerate(price_path):
+        # Advance the simulated clock each step so confirmation windows
+        # (e.g. STOP_BREACH_CONFIRM_SECONDS) can elapse rather than staying
+        # pinned at age=0. The engine's internal breach timer reads wall
+        # clock via datetime.now(), so tests that need to bypass the timing
+        # entirely should set STOP_BREACH_CONFIRM_SECONDS=0 in the env.
+        step_now_et = base_now_et + timedelta(seconds=i * step_seconds)
         pos.update_price(price)
 
         try:
-            decision = evaluate_exit(pos, _now_et)
+            decision = evaluate_exit(pos, step_now_et)
         except Exception as exc:
             log.warning("evaluate_exit raised at step %d: %s", i, exc)
             decision_action = "ERROR"
