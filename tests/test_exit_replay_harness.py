@@ -16,8 +16,15 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 # waits for confirmation. The production 45s window is a timing concern
 # verified elsewhere. MUST be set before the harness/exit-engine import
 # so evaluate_exit's os.getenv() reads it.
-os.environ.setdefault("STOP_BREACH_CONFIRM_SECONDS", "0")
-os.environ.setdefault("UNDERLYING_STOP_CONFIRM_SECONDS", "0")
+#
+# Codex P2 (2026-05-25): use direct assignment, NOT os.environ.setdefault().
+# setdefault() makes these tests dependent on external process state — if
+# CI/job env or a prior test left STOP_BREACH_CONFIRM_SECONDS at a non-zero
+# value, scenarios expecting immediate stop behavior would fail non-
+# deterministically. This file's assertions validate price-level logic
+# independent of timing, so the env vars must be forced to "0" every run.
+os.environ["STOP_BREACH_CONFIRM_SECONDS"] = "0"
+os.environ["UNDERLYING_STOP_CONFIRM_SECONDS"] = "0"
 
 import pytest
 
