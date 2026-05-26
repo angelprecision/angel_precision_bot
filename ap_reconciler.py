@@ -1913,13 +1913,26 @@ class APBrokerReconciler:
         )
 
     def _broker_position_underlying(self, bp: dict) -> str:
+        # PR: sizing-bootstrap-fix
+        # Previous fallback `c_sym[:6]` produced corrupted underlyings like
+        # 'MO2605' from 'MO260529P00074000', because `_norm_underlying`'s
+        # OCC regex requires the FULL option-symbol pattern
+        # (^[A-Z]{1,6}\d{6}[CP]\d+$) and falls through to return its input
+        # unchanged when the pattern doesn't match. Pre-truncating to 6
+        # chars killed that regex and stored garbage in positions.underlying,
+        # hiding the position from the exit engine (queries by underlying='MO').
+        #
+        # Correct fallback: pass the full contract symbol to _norm_underlying,
+        # which parses the OCC root ticker correctly. If the contract isn't a
+        # parsable OCC symbol either, return whatever's left (still better
+        # than a hard 6-char slice).
         c_sym = self._broker_position_contract(bp)
         return self._norm_underlying(
             bp.get("underlying")
             or bp.get("underlying_symbol")
             or bp.get("root_symbol")
             or bp.get("ticker")
-            or c_sym[:6]
+            or c_sym
         )
 
     def _broker_position_qty(self, bp: dict) -> int:

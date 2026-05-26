@@ -589,6 +589,16 @@ class APPositionManager:
             signal_id=signal_id,
         )
 
+        # PR: sizing-bootstrap-fix
+        # entry_price was missing from the INSERT — only avg_fill was written.
+        # ManagedPosition.option_pnl_pct reads entry_price; without it the
+        # property returns 0.0 forever and profit-take/trailing-stop are dead.
+        # We also persist entry_price to opened_at + entry_ts (same timestamp).
+        # Existing column auto-detect handles deployments where entry_price
+        # column may not yet exist (graceful no-op).
+        has_entry_price_col = self._has_position_column("entry_price")
+        has_opened_at_col   = self._has_position_column("opened_at")
+
         columns = [
             "id", "client_id", "plan_id", "signal_id",
             "underlying", "contract", "direction", "qty", "avg_fill",
@@ -604,6 +614,12 @@ class APPositionManager:
             self._nullable_float(target_underlying),
             PositionStatus.OPEN, ts, ts, ts,
         ]
+        if has_entry_price_col:
+            columns.append("entry_price")
+            values.append(float(entry_price))
+        if has_opened_at_col:
+            columns.append("opened_at")
+            values.append(ts)
 
         if has_underlying_entry_col:
             columns.append("underlying_entry")
@@ -1121,6 +1137,36 @@ class APPositionManager:
                 )
                 summary = c.fetchone() or {}
 
+                # PR: sizing-bootstrap-fix
+                # total_trades = durable count of confirmed broker fills for
+                # this client across all time. Defined as ENTRY+EXIT fills in
+                # the orders table (the broker-truth side), NOT positions
+                # rows (which can be reset/reconciled). master_control reads
+                # this to decide whether bootstrap_mode is still active:
+                #   LIVE: bootstrap until total_trades >= threshold (safety)
+                #   PAPER: bootstrap is skipped entirely
+                # Without this field master_control reads 0 → bootstrap is
+                # permanently True → every order forced to qty=1 → the 10%
+                # POSITION_RISK_PCT path is unreachable.
+                try:
+                    c.execute(
+                        """
+                        SELECT COUNT(*) AS n
+                        FROM orders
+                        WHERE client_id = %s
+                          AND status IN ('FILLED','EXIT_FILLED')
+                        """,
+                        (self.client_id,),
+                    )
+                    _tt_row = c.fetchone() or {}
+                    total_trades = int(_tt_row.get("n") or 0)
+                except Exception as _tt_exc:  # pragma: no cover - defensive
+                    log.warning(
+                        "[%s] total_trades count failed (non-fatal): %s",
+                        self.client_id, _tt_exc,
+                    )
+                    total_trades = 0
+
                 # FUNNEL FIX (2026-05-20): exclude phantom-CREATED orders from
                 # the slot count. A CREATED order with NO broker_order_id that
                 # is older than PENDING_ENTRY_PHANTOM_GRACE_SEC is effectively
@@ -1185,6 +1231,10 @@ class APPositionManager:
                     "pending_exits":      pending_exits,
                     "trades_today":       int(summary.get("trades_today") or 0),
                     "realized_pnl_today": float(summary.get("realized_pnl_today") or 0),
+                    # PR: sizing-bootstrap-fix — propagate the durable
+                    # fill count up to master_control. See SELECT above for
+                    # definition (orders table, status IN FILLED/EXIT_FILLED).
+                    "total_trades":       int(total_trades),
                     # Required by APMasterControl LIVE snapshot freshness check
                     "snapshot_ts": __import__("datetime").datetime.now(
                         __import__("datetime").timezone.utc).isoformat(),

@@ -1072,8 +1072,15 @@ class APMasterControl:
                 reason_code="SNAPSHOT_UNAVAILABLE_LIVE_BLOCKED",
             )
 
+        # PR: sizing-bootstrap-fix
+        # bootstrap_mode = qty=1 safety guard for brand-new LIVE deployments.
+        # LIVE: stays active until total_trades >= BOOTSTRAP_TRADES_THRESHOLD
+        #       (default 20) so we don't fire 10% sizing on day one.
+        # PAPER: completely bypassed — paper has no live capital risk and
+        #        proof-week needs realistic sizing to be a credible proof.
+        # See _compute_bootstrap_mode helper for the canonical decision.
         total_trades = int(snap.get("total_trades") or 0)
-        bootstrap_mode = total_trades < 20
+        bootstrap_mode = self._compute_bootstrap_mode(total_trades=total_trades)
 
         # H8 (corrected): daily_profit_target_usd is a MINIMUM/milestone, NOT a
         # stop. The business goal is to make clients money — once the floor is
@@ -1365,6 +1372,37 @@ class APMasterControl:
                 "sizing_reason": _sizing.reason if _sizing is not None else "",
                 "intel_result": intel,
                 "sector": self.SECTOR_MAP.get(ticker.upper(), "other"),
+                # PR: sizing-bootstrap-fix — dedicated, named bucket so
+                # future audits can answer "why N contracts?" from a single
+                # JSON path in orders.meta. Persisted unconditionally on
+                # every approved plan, paper or live.
+                "sizing_context": {
+                    "account_equity":   float(account_equity),
+                    "risk_pct":         float(
+                        getattr(_sizing, "risk_pct", None)
+                        if _sizing is not None
+                        else float(os.getenv("POSITION_RISK_PCT", "0.10"))
+                    ),
+                    "contracts":        int(contracts),
+                    "budget":           float(
+                        getattr(_sizing, "budget_usd", None)
+                        if _sizing is not None
+                        else (account_equity * float(os.getenv("POSITION_RISK_PCT", "0.10")))
+                    ),
+                    "total_trades":     int(total_trades),
+                    "bootstrap_mode":   bool(bootstrap_mode),
+                    "mode":             "LIVE" if not self.paper else "PAPER",
+                    "score":            float(score),
+                    "tier":             str(tier),
+                    "premium_estimate": float(placeholder_premium / 100.0),
+                    "max_position_usd": float(
+                        (1 * 100 * _estimate_premium(ticker))
+                        if bootstrap_mode
+                        else float(os.getenv("MAX_TRADE_USD", "1800"))
+                    ),
+                    "max_contracts_cap": int(os.getenv("MAX_CONTRACTS", "15")),
+                    "sizing_method":    _sizing.method if _sizing is not None else "tier_fallback",
+                },
                 "snapshot_at_eval": {
                     "open_count": snap["open_count"],
                     "capital_deployed": snap["capital_deployed"],
@@ -1461,6 +1499,32 @@ class APMasterControl:
             )
 
         return ControlDecision(ok=True, stage="approved", reason="", plan=plan, signal_id=signal_id, ticker=ticker, client_id=client_id)
+
+    def _compute_bootstrap_mode(self, *, total_trades: int) -> bool:
+        """
+        Decide whether bootstrap_mode (qty=1 safety force) is active.
+
+        PR: sizing-bootstrap-fix
+
+        Decision matrix:
+          PAPER mode → always False. Paper has no live capital risk; forcing
+            qty=1 on every order kills proof-week credibility.
+          LIVE mode  → True if total_trades < BOOTSTRAP_TRADES_THRESHOLD
+            (default 20). The threshold can be lowered per-deployment via
+            env var but cannot be disabled in LIVE — a brand-new LIVE
+            service must prove itself with real fills before sizing up.
+
+        Why a method (not inline): centralizes the live-vs-paper decision in
+        one auditable place, makes it directly unit-testable, and prevents
+        future PRs from re-introducing the silent qty=1 force.
+        """
+        if self.paper:
+            return False
+        try:
+            threshold = int(os.getenv("BOOTSTRAP_TRADES_THRESHOLD", "20"))
+        except (TypeError, ValueError):
+            threshold = 20
+        return int(total_trades or 0) < threshold
 
     def _zero_snapshot(self, *, snapshot_ok: bool = True, snapshot_error: str = "") -> dict[str, Any]:
         return {
