@@ -720,6 +720,16 @@ def _dispatch(
     # ── 4. ORDER STATE MACHINE ─────────────────────────────────────────────────
     try:
         local_order_id = order_state_machine.create_entry_order(plan)
+        # PR E / FIX-1 (BUG-MC-1): stash local_order_id on plan.metadata
+        # so any LATER revalidate_exposure (called from execution-core at
+        # breach time, when the OSM row already exists) can pass it as
+        # exclude_local_order_id to the pending-capital SUM, preventing
+        # the current plan's reserved_cost from being double-counted.
+        try:
+            if hasattr(plan, "metadata") and isinstance(plan.metadata, dict):
+                plan.metadata["local_order_id"] = str(local_order_id)
+        except Exception:
+            pass
         log.info(
             f"[{ticker}] Entry order created: {local_order_id} "
             f"contract={getattr(plan, 'contract_symbol', '?')}"
