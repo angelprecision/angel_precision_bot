@@ -251,7 +251,7 @@ class TestLostHandoffForensics:
 
     def test_warning_log_emitted_for_lost_handoff(self):
         src = (REPO_ROOT / "ap" / "order_monitor.py").read_text()
-        assert "LOST_HANDOFF | local=" in src, (
+        assert "LOST_HANDOFF_30S | local=" in src, (
             "A WARN-level log must fire on every LOST_HANDOFF cancel so it "
             "stands out in production logs."
         )
