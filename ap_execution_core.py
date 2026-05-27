@@ -1229,9 +1229,17 @@ class APExecutionCore:
             # "Triggered at -37% → Filled at -0.9%" for protective exits.
             # trigger_pnl_pct is in DECIMAL form (e.g. -0.37 = -37%).
             # realized_pnl_pct is set in _finalize_proof from actual broker fill.
-            "trigger_pnl_pct":       float(getattr(decision, "pnl_pct", 0) or 0),
-            "trigger_option_price":  float(getattr(pos, "current_option_price", 0) or 0),
-            "trigger_underlying":    float(getattr(pos, "current_underlying", 0) or 0),
+            #
+            # Use explicit-None: getattr default is None, and a valid 0.0
+            # decision_pnl (legitimate flat exit) must stage as 0.0, not be
+            # collapsed via `or 0`. _finalize_proof distinguishes None
+            # (no data) from 0.0 (real zero) when writing to proof_trades.
+            "trigger_pnl_pct":       (float(getattr(decision, "pnl_pct", None))
+                                      if getattr(decision, "pnl_pct", None) is not None else None),
+            "trigger_option_price":  (float(getattr(pos, "current_option_price", None))
+                                      if getattr(pos, "current_option_price", None) is not None else None),
+            "trigger_underlying":    (float(getattr(pos, "current_underlying", None))
+                                      if getattr(pos, "current_underlying", None) is not None else None),
             "trigger_reason_code":   str(getattr(decision, "reason_code", "") or ""),
         }
         pos.proof_logged = True  # type: ignore[attr-defined]
@@ -1558,10 +1566,17 @@ class APExecutionCore:
         # where the limit submits at a bad quote and fills at a better price.
         # Example: SPY DEEP_LOSS_STOP triggered at -37% (mark collapse),
         # limit placed at bid ~$0.73, actual fill $1.15 → realized -0.9%.
-        _trigger_pnl_dec  = float(staged.get("trigger_pnl_pct", 0) or 0)  # decimal
-        _trigger_opt_px   = float(staged.get("trigger_option_price", 0) or 0)
-        _trigger_underlying = float(staged.get("trigger_underlying", 0) or 0)
-        _trigger_reason_code = str(staged.get("trigger_reason_code", "") or "")
+        #
+        # IMPORTANT: use explicit None detection, NOT falsy coalesce.
+        # A valid trigger_pnl_pct of exactly 0.0 (legitimate breakeven exit)
+        # must be persisted as 0.0, not collapsed to None by `or 0` / truthy
+        # checks. Same applies to trigger_option_price and trigger_underlying
+        # — though both should always be positive in practice, defensive
+        # explicit-None preserves the data shape contract.
+        _trigger_pnl_raw         = staged.get("trigger_pnl_pct",       None)
+        _trigger_opt_px_raw      = staged.get("trigger_option_price",  None)
+        _trigger_underlying_raw  = staged.get("trigger_underlying",    None)
+        _trigger_reason_code     = str(staged.get("trigger_reason_code", "") or "")
         # realized_pnl_pct in PERCENTAGE form for proof_trades consistency
         realized_pnl_pct_for_proof = opt_pnl_pct_for_proof  # same as option_pnl_pct; explicit alias
 
@@ -1603,10 +1618,15 @@ class APExecutionCore:
                 exit_fill_price    = fill if fill > 0 else None,
                 exit_limit_placed  = est if est > 0 else None,
                 slippage_vs_bid    = slippage_vs_est,
-                # Trigger vs realized labeling fields
-                trigger_pnl_pct    = round(_trigger_pnl_dec * 100, 2) if _trigger_pnl_dec else None,
-                trigger_option_price = _trigger_opt_px if _trigger_opt_px else None,
-                trigger_underlying = _trigger_underlying if _trigger_underlying else None,
+                # Trigger vs realized labeling fields.
+                # Explicit None detection — preserves valid 0.0 values that
+                # a falsy `if x` check would collapse to None.
+                trigger_pnl_pct    = (round(float(_trigger_pnl_raw) * 100, 2)
+                                      if _trigger_pnl_raw is not None else None),
+                trigger_option_price = (float(_trigger_opt_px_raw)
+                                        if _trigger_opt_px_raw is not None else None),
+                trigger_underlying = (float(_trigger_underlying_raw)
+                                      if _trigger_underlying_raw is not None else None),
                 trigger_reason_code = _trigger_reason_code or None,
                 realized_pnl_pct   = realized_pnl_pct_for_proof,
             )

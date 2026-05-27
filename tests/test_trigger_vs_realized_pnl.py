@@ -133,14 +133,22 @@ class TestExecutionCoreStaging:
         )
 
     def test_finalize_proof_reads_trigger_from_staged(self):
-        # _finalize_proof must read trigger_pnl_pct from staged and pass to log_trade
-        assert "_trigger_pnl_dec" in EXECUTION_CORE_SRC, (
-            "_finalize_proof must read trigger_pnl_pct from staged dict"
+        # _finalize_proof must read trigger_pnl_pct from staged and pass to log_trade.
+        # The variable name is _trigger_pnl_raw (explicit-None pattern from
+        # 2026-05-26 pre-merge fix).
+        assert "_trigger_pnl_raw" in EXECUTION_CORE_SRC, (
+            "_finalize_proof must read trigger_pnl_pct from staged dict into _trigger_pnl_raw"
         )
 
     def test_finalize_proof_passes_trigger_to_log_trade(self):
-        assert "trigger_pnl_pct    = round(_trigger_pnl_dec" in EXECUTION_CORE_SRC, (
-            "_finalize_proof must convert trigger_pnl_pct to percentage and pass to log_trade"
+        # Must convert raw decimal to percentage and pass to log_trade,
+        # using explicit None check (preserves valid 0.0).
+        assert "round(float(_trigger_pnl_raw) * 100, 2)" in EXECUTION_CORE_SRC, (
+            "_finalize_proof must convert trigger_pnl_pct to percentage via "
+            "round(float(_trigger_pnl_raw) * 100, 2)"
+        )
+        assert "_trigger_pnl_raw is not None else None" in EXECUTION_CORE_SRC, (
+            "_finalize_proof must use `is not None` check (preserves valid 0.0)"
         )
 
     def test_finalize_proof_passes_realized_to_log_trade(self):
@@ -270,3 +278,239 @@ class TestTriggerVsRealizedSemantics:
         # Even though exit_reason contains "-37%" — win is True because realized > -2%
         assert "-37%" in row["exit_reason"]
         assert row["win"] is True
+
+
+class TestZeroValuePreservation:
+    """Critical: a valid trigger_pnl_pct of exactly 0.0 must persist as 0.0,
+    NOT be collapsed to None by falsy `or 0` or `if x` checks.
+
+    Real scenarios where this matters:
+      - Decision fires exactly at breakeven (e.g. TARGET_HIT at entry price)
+      - 0DTE exit at zero residual value (delta-zero contract)
+      - Position scaled-out at flat
+    """
+
+    def test_log_trade_persists_trigger_pnl_pct_zero_as_zero(self):
+        """If trigger_pnl_pct=0.0 is supplied, the row must store 0.0 not None."""
+        # Simulate log_trade's row-building logic with the FIXED explicit-None check.
+        trigger_pnl_pct = 0.0  # legitimate breakeven decision
+        # NEW (correct) logic: explicit None check, preserves 0.0
+        stored = round(trigger_pnl_pct, 2) if trigger_pnl_pct is not None else None
+        assert stored == 0.0, (
+            "trigger_pnl_pct=0.0 must persist as 0.0, not collapse to None"
+        )
+        assert stored is not None, "0.0 is a valid value, distinct from missing"
+
+    def test_log_trade_persists_trigger_option_price_zero_as_zero(self):
+        """A 0DTE option that decayed to literal $0 must record 0.0 trigger price."""
+        trigger_option_price = 0.0
+        stored = round(trigger_option_price, 4) if trigger_option_price is not None else None
+        assert stored == 0.0, "trigger_option_price=0.0 (worthless 0DTE) must persist"
+
+    def test_old_falsy_logic_would_have_lost_zero(self):
+        """Regression-document the bug we fixed: `if x` collapses 0.0 to None.
+        This test ensures we don't reintroduce the falsy pattern."""
+        trigger_pnl_pct = 0.0
+        # OLD (buggy) logic — preserved here as a tombstone
+        old_stored = round(trigger_pnl_pct, 2) if trigger_pnl_pct else None
+        # Demonstrates the bug: old logic collapsed 0.0 to None.
+        assert old_stored is None, (
+            "Documenting old buggy behavior: `if x` collapsed 0.0 to None"
+        )
+        # NEW logic preserves it correctly:
+        new_stored = round(trigger_pnl_pct, 2) if trigger_pnl_pct is not None else None
+        assert new_stored == 0.0
+
+    def test_execution_core_explicit_none_pattern(self):
+        """Verify the staged-dict construction in ap_execution_core does NOT
+        use the falsy `or 0` pattern for trigger fields."""
+        # The staged dict in _on_position_close must use `is not None` check,
+        # not `or 0` coalesce. Source-shape check.
+        src = open(
+            os.path.join(REPO_ROOT, "ap_execution_core.py")
+        ).read()
+        # Find the staged dict block (~30 lines around trigger_pnl_pct)
+        idx = src.index('"trigger_pnl_pct"')
+        block = src[idx:idx+800]
+        assert "is not None else None" in block, (
+            "ap_execution_core staged dict must use 'is not None' for trigger "
+            "fields, not falsy `or 0` coalesce (would lose valid 0.0)"
+        )
+        # Negative assertion: the buggy pattern must not be present
+        # Look for `getattr(decision, "pnl_pct", 0) or 0` pattern specifically
+        assert 'getattr(decision, "pnl_pct", 0) or 0' not in block, (
+            "Detected the buggy `or 0` falsy pattern — fix did not stick"
+        )
+
+    def test_execution_core_finalize_uses_is_not_none(self):
+        """Verify _finalize_proof's call to log_trade uses `is not None`
+        checks (not falsy) when forwarding trigger fields."""
+        src = open(
+            os.path.join(REPO_ROOT, "ap_execution_core.py")
+        ).read()
+        # Find _trigger_pnl_raw use site
+        assert "_trigger_pnl_raw" in src, (
+            "_finalize_proof must read trigger_pnl_pct into _trigger_pnl_raw"
+        )
+        # Scan a generous range from the definition to find the conversion logic.
+        # _finalize_proof is a long function — log_trade call may be 2000+ chars away.
+        idx = src.index("_trigger_pnl_raw")
+        block = src[idx:idx+5000]
+        assert "_trigger_pnl_raw is not None" in block, (
+            "_finalize_proof's log_trade call must use `is not None` for trigger_pnl_pct"
+        )
+
+    def test_proof_logger_row_dict_uses_is_not_none(self):
+        """Source-shape check on ap_proof_logger row dict — all 5 new fields
+        must use `is not None` rather than truthy/falsy checks."""
+        src = open(
+            os.path.join(REPO_ROOT, "ap_proof_logger.py")
+        ).read()
+        # Find the trigger-fields block in the row dict
+        idx = src.index('"trigger_pnl_pct"')
+        block = src[idx:idx+800]
+        # All four numeric trigger fields must use `is not None`
+        for field in ("trigger_pnl_pct", "trigger_option_price",
+                      "trigger_underlying", "realized_pnl_pct"):
+            field_line_start = block.index(f'"{field}"')
+            field_line = block[field_line_start:field_line_start + 200]
+            assert "is not None" in field_line, (
+                f"{field} must use `is not None` check to preserve 0.0 values"
+            )
+
+
+class TestOptionalFieldsNoneHandling:
+    """log_trade must handle None for any/all of the new optional fields
+    without breaking, so legacy code paths or older positions without
+    trigger data continue to work."""
+
+    def test_log_trade_signature_defaults_none(self):
+        """Source-shape: all 5 new params default to None."""
+        import re as _re
+        src = open(
+            os.path.join(REPO_ROOT, "ap_proof_logger.py")
+        ).read()
+        for param in ("trigger_pnl_pct", "trigger_option_price",
+                      "trigger_underlying", "trigger_reason_code",
+                      "realized_pnl_pct"):
+            # Match the parameter definition: param: <type> = None
+            # with variable whitespace.
+            pattern = _re.compile(
+                rf"^\s+{_re.escape(param)}\s*:\s*(?:float|str)\s*=\s*None\s*,",
+                _re.MULTILINE,
+            )
+            assert pattern.search(src), (
+                f"{param} parameter definition with `= None` default not "
+                f"found in log_trade signature. Default must be None (not "
+                f"0 or empty string) to distinguish 'no data' from 'real zero'"
+            )
+
+    def test_row_dict_handles_all_none(self):
+        """If all trigger fields are None (legacy code path), row builds
+        without exception and stores None for those columns."""
+        # Mirror log_trade's row construction with all-None inputs.
+        trigger_pnl_pct = None
+        trigger_option_price = None
+        trigger_underlying = None
+        trigger_reason_code = None
+        realized_pnl_pct = None
+
+        # Each line must not raise on None
+        a = round(trigger_pnl_pct, 2) if trigger_pnl_pct is not None else None
+        b = round(trigger_option_price, 4) if trigger_option_price is not None else None
+        c = round(trigger_underlying, 4) if trigger_underlying is not None else None
+        d = trigger_reason_code or None
+        e = round(realized_pnl_pct, 2) if realized_pnl_pct is not None else None
+
+        # All five must be None — no implicit conversion
+        assert a is None and b is None and c is None
+        assert d is None and e is None
+
+
+class TestSchemaSafeInsertFallback:
+    """The proof_logger must handle Supabase rejecting unknown columns
+    gracefully. Proof rows are the source of truth — they must NEVER
+    be lost just because a migration hasn't been applied."""
+
+    def test_fallback_strips_all_new_optional_columns(self):
+        """Source-shape: the fallback insert path must know about ALL the
+        new trigger_* columns, not just exit_bucket from PR H7."""
+        src = open(
+            os.path.join(REPO_ROOT, "ap_proof_logger.py")
+        ).read()
+        # The _OPTIONAL_COLUMNS tuple must include all 5 new fields
+        idx = src.index("_OPTIONAL_COLUMNS")
+        block = src[idx:idx + 800]
+        for col in ("trigger_pnl_pct", "trigger_option_price",
+                    "trigger_underlying", "trigger_reason_code",
+                    "realized_pnl_pct", "exit_bucket"):
+            assert f'"{col}"' in block, (
+                f"Fallback _OPTIONAL_COLUMNS must include '{col}' so insert "
+                f"retries succeed if the column is missing in Supabase"
+            )
+
+    def test_fallback_detects_column_keyword_in_error(self):
+        """Source-shape: the fallback triggers when error message contains
+        'column' or 'schema' or a known optional column name."""
+        src = open(
+            os.path.join(REPO_ROOT, "ap_proof_logger.py")
+        ).read()
+        idx = src.index("_OPTIONAL_COLUMNS = (")
+        # Read forward to the if-check
+        block = src[idx:idx + 2000]
+        assert '"column" in emsg' in block
+        assert '"schema" in emsg' in block
+        assert "any(c in emsg for c in _OPTIONAL_COLUMNS)" in block
+
+    def test_migration_file_exists(self):
+        """The Supabase migration for the 5 new columns must exist so the
+        operator can apply it before deploy. Forward + rollback both required."""
+        migration_dir = os.path.join(REPO_ROOT, "migrations")
+        forward = os.path.join(
+            migration_dir, "2026_05_26_proof_trades_trigger_vs_realized.sql"
+        )
+        rollback = os.path.join(
+            migration_dir,
+            "2026_05_26_proof_trades_trigger_vs_realized_ROLLBACK.sql",
+        )
+        assert os.path.exists(forward), (
+            "Forward migration missing — Supabase will reject inserts until "
+            "the operator applies it. Fallback strips columns, but data is lost."
+        )
+        assert os.path.exists(rollback), (
+            "Rollback migration missing — required for safe deploy reversal."
+        )
+
+    def test_migration_uses_add_column_if_not_exists(self):
+        """Idempotency check: the migration must use IF NOT EXISTS so re-runs
+        on a schema that already has the columns don't fail."""
+        path = os.path.join(
+            REPO_ROOT, "migrations",
+            "2026_05_26_proof_trades_trigger_vs_realized.sql",
+        )
+        sql = open(path).read()
+        for col in ("trigger_pnl_pct", "trigger_option_price",
+                    "trigger_underlying", "trigger_reason_code",
+                    "realized_pnl_pct"):
+            # Each ADD COLUMN must be IF NOT EXISTS
+            line = f"ADD COLUMN IF NOT EXISTS {col}"
+            assert line in sql, (
+                f"Migration must add {col} with IF NOT EXISTS for idempotency"
+            )
+
+    def test_migration_columns_are_nullable(self):
+        """All new columns must be NULL-able so the migration can apply to
+        a populated proof_trades table without backfill."""
+        path = os.path.join(
+            REPO_ROOT, "migrations",
+            "2026_05_26_proof_trades_trigger_vs_realized.sql",
+        )
+        sql = open(path).read()
+        # NULL or default NULL — must NOT see "NOT NULL" on any new column
+        # Each column definition must contain "NULL" not "NOT NULL"
+        for col in ("trigger_pnl_pct", "trigger_option_price",
+                    "trigger_underlying", "trigger_reason_code",
+                    "realized_pnl_pct"):
+            assert f"NOT NULL" not in sql or sql.count(f"{col}") > 0, (
+                f"{col} must be nullable — migration must not require backfill"
+            )

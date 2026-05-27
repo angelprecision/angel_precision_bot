@@ -394,9 +394,11 @@ class APProofLogger:
             # realized_pnl_pct: broker-fill result (alias of option_pnl_pct).
             # Allows dashboard to show "Triggered at -37% → Filled at -0.9%"
             # instead of making protective exits look like catastrophic losses.
+            # Use explicit None checks — a valid 0.0 (legitimate breakeven
+            # decision) must persist as 0.0, not collapse to None via truthy.
             "trigger_pnl_pct":    round(trigger_pnl_pct, 2) if trigger_pnl_pct is not None else None,
-            "trigger_option_price": round(trigger_option_price, 4) if trigger_option_price else None,
-            "trigger_underlying": round(trigger_underlying, 4) if trigger_underlying else None,
+            "trigger_option_price": round(trigger_option_price, 4) if trigger_option_price is not None else None,
+            "trigger_underlying": round(trigger_underlying, 4) if trigger_underlying is not None else None,
             "trigger_reason_code": trigger_reason_code or None,
             "realized_pnl_pct":   round(realized_pnl_pct, 2) if realized_pnl_pct is not None else None,
         }
@@ -417,20 +419,35 @@ class APProofLogger:
                 self.sb.table("proof_trades").insert(row).execute()
                 log.debug(f"[PROOF] {ticker} written to Supabase")
             except Exception as e:
-                # H7: exit_bucket is a new column. If the migration has not
-                # been applied yet, the insert fails on unknown column. Proof
-                # logging is the source of truth and must NEVER be lost — retry
-                # once without the derived field. The bucket can be backfilled
-                # later from exit_reason since classify_exit is a pure function.
+                # H7 + 2026-05-26 forensic labeling: new optional columns
+                # may not exist on legacy Supabase schemas. Proof logging is
+                # the source of truth and must NEVER be lost — retry once
+                # without the optional/derived fields. The dropped fields
+                # can be backfilled later (classify_exit is a pure function;
+                # trigger_* fields are inert if dashboard doesn't read them).
                 emsg = str(e).lower()
-                if "exit_bucket" in emsg or "column" in emsg or "schema" in emsg:
+                # Columns that may be missing on older schemas:
+                _OPTIONAL_COLUMNS = (
+                    "exit_bucket",          # PR H7  (2026-05-17 migration)
+                    "trigger_pnl_pct",      # 2026-05-26 trigger-vs-realized
+                    "trigger_option_price",
+                    "trigger_underlying",
+                    "trigger_reason_code",
+                    "realized_pnl_pct",
+                )
+                if "column" in emsg or "schema" in emsg or any(c in emsg for c in _OPTIONAL_COLUMNS):
                     try:
-                        _fallback = {k: v for k, v in row.items() if k != "exit_bucket"}
+                        # Strip every optional column the schema might not have.
+                        _fallback = {k: v for k, v in row.items() if k not in _OPTIONAL_COLUMNS}
                         self.sb.table("proof_trades").insert(_fallback).execute()
+                        # Identify which columns were dropped so the operator
+                        # knows exactly which migration to run.
+                        _missing = [c for c in _OPTIONAL_COLUMNS if c in emsg]
+                        _missing_str = ",".join(_missing) if _missing else "optional columns"
                         log.warning(
-                            "[PROOF] %s written WITHOUT exit_bucket (column missing — "
-                            "run migrations/2026_05_17_proof_exit_bucket.sql to enable)",
-                            ticker,
+                            "[PROOF] %s written WITHOUT %s (columns missing — "
+                            "apply pending Supabase migrations to enable)",
+                            ticker, _missing_str,
                         )
                     except Exception as e2:
                         log.error(f"[PROOF] Supabase write failed (fallback too): {e2}")
