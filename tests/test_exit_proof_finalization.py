@@ -317,9 +317,24 @@ def finalize_proof_callable():
     #   - _record_intel_outcome (PR B FIX-6; falls back to None if the
     #     intelligence_bridge import fails. Safe default = None; the
     #     method's `if _record_intel_outcome:` guard handles None.)
-    src = "import os\nimport logging\nlog = logging.getLogger('test_finalize')\n"
+    #   - _safe_float_or_none (2026-05-26 proof-trigger safety helper;
+    #     defends trigger field casts against bad strings/NaN/Inf).
+    src = "import os\nimport math\nimport logging\nlog = logging.getLogger('test_finalize')\n"
     src += f'BREAKEVEN_BAND_PCT = float(os.getenv("BREAKEVEN_BAND_PCT", "{_be_default}"))\n'
     src += "_record_intel_outcome = None\n"
+    # Mirror _safe_float_or_none by extracting it from the real module so the
+    # harness stays in sync with whatever the real helper does. Falling back
+    # to a vendored copy if extraction fails would silently drift; we want
+    # the test to fail loudly if the helper signature/behavior changes.
+    _helper_match = re.search(
+        r"^def _safe_float_or_none\(value\):.*?(?=^def |^class )",
+        EX_CORE, re.DOTALL | re.MULTILINE,
+    )
+    assert _helper_match, (
+        "_safe_float_or_none helper not found in ap_execution_core.py — "
+        "harness cannot build. Has the helper been renamed or moved?"
+    )
+    src += textwrap.dedent(_helper_match.group(0)) + "\n"
     src += "class _Harness:\n"
     src += textwrap.indent(body, "    ")
     ns: dict = {}

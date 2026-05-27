@@ -141,11 +141,15 @@ class TestExecutionCoreStaging:
         )
 
     def test_finalize_proof_passes_trigger_to_log_trade(self):
-        # Must convert raw decimal to percentage and pass to log_trade,
-        # using explicit None check (preserves valid 0.0).
-        assert "round(float(_trigger_pnl_raw) * 100, 2)" in EXECUTION_CORE_SRC, (
+        # Must convert raw value to percentage and pass to log_trade,
+        # using explicit None check (preserves valid 0.0). The raw value
+        # has already been safely cast by _safe_float_or_none at the
+        # _trigger_pnl_raw assignment, so the conversion site no longer
+        # needs a naked float() wrap.
+        assert "round(_trigger_pnl_raw * 100, 2)" in EXECUTION_CORE_SRC, (
             "_finalize_proof must convert trigger_pnl_pct to percentage via "
-            "round(float(_trigger_pnl_raw) * 100, 2)"
+            "round(_trigger_pnl_raw * 100, 2). The raw value is already a "
+            "finite float or None thanks to _safe_float_or_none above."
         )
         assert "_trigger_pnl_raw is not None else None" in EXECUTION_CORE_SRC, (
             "_finalize_proof must use `is not None` check (preserves valid 0.0)"
@@ -322,24 +326,30 @@ class TestZeroValuePreservation:
         assert new_stored == 0.0
 
     def test_execution_core_explicit_none_pattern(self):
-        """Verify the staged-dict construction in ap_execution_core does NOT
-        use the falsy `or 0` pattern for trigger fields."""
-        # The staged dict in _on_position_close must use `is not None` check,
-        # not `or 0` coalesce. Source-shape check.
+        """Verify the staged-dict construction in ap_execution_core uses the
+        safe-float helper (which itself uses explicit None detection)."""
         src = open(
             os.path.join(REPO_ROOT, "ap_execution_core.py")
         ).read()
         # Find the staged dict block (~30 lines around trigger_pnl_pct)
         idx = src.index('"trigger_pnl_pct"')
         block = src[idx:idx+800]
-        assert "is not None else None" in block, (
-            "ap_execution_core staged dict must use 'is not None' for trigger "
-            "fields, not falsy `or 0` coalesce (would lose valid 0.0)"
+        # The staging site must use _safe_float_or_none which handles both
+        # None preservation AND bad-value defense (the strict superset of
+        # explicit-None checking).
+        assert "_safe_float_or_none(getattr(decision" in block, (
+            "ap_execution_core staged dict must call _safe_float_or_none "
+            "(handles None, '', 'nan', bad strings, unexpected types — "
+            "and preserves valid 0.0)"
         )
-        # Negative assertion: the buggy pattern must not be present
-        # Look for `getattr(decision, "pnl_pct", 0) or 0` pattern specifically
+        # Negative assertion: the buggy `or 0` falsy pattern must not be present
         assert 'getattr(decision, "pnl_pct", 0) or 0' not in block, (
             "Detected the buggy `or 0` falsy pattern — fix did not stick"
+        )
+        # Negative assertion: naked float() casts on trigger fields are gone
+        assert 'float(getattr(decision, "pnl_pct"' not in block, (
+            "Detected naked float() cast on trigger field — must use "
+            "_safe_float_or_none instead to defend against bad strings/NaN/Inf"
         )
 
     def test_execution_core_finalize_uses_is_not_none(self):
@@ -379,7 +389,222 @@ class TestZeroValuePreservation:
             )
 
 
-class TestOptionalFieldsNoneHandling:
+class TestSafeFloatHelper:
+    """The _safe_float_or_none helper defends against bad upstream data.
+
+    Required behaviors:
+      - None / "" / "nan" / bad strings / unexpected types -> None
+      - Valid numbers (incl. 0.0) -> float(value)
+      - NaN / Inf -> None (filtered out, not poisoning the proof row)
+    """
+
+    def _helper(self):
+        from ap_execution_core import _safe_float_or_none
+        return _safe_float_or_none
+
+    def test_none_returns_none(self):
+        f = self._helper()
+        assert f(None) is None
+
+    def test_empty_string_returns_none(self):
+        f = self._helper()
+        assert f("") is None
+
+    def test_zero_int_preserves_as_float(self):
+        """The critical case: 0 must become 0.0, not None."""
+        f = self._helper()
+        result = f(0)
+        assert result == 0.0
+        assert result is not None
+        assert isinstance(result, float)
+
+    def test_zero_float_preserves(self):
+        """The critical case: 0.0 must persist as 0.0 (legitimate breakeven)."""
+        f = self._helper()
+        result = f(0.0)
+        assert result == 0.0
+        assert result is not None
+
+    def test_negative_float_preserves(self):
+        f = self._helper()
+        assert f(-0.37) == -0.37
+        assert f(-37.0) == -37.0
+
+    def test_positive_float_preserves(self):
+        f = self._helper()
+        assert f(1.15) == 1.15
+        assert f(2.95) == 2.95
+
+    def test_numeric_string_converts(self):
+        f = self._helper()
+        assert f("0.5") == 0.5
+        assert f("-37") == -37.0
+
+    def test_nan_string_returns_none(self):
+        """'nan' must NOT poison proof_trades — return None."""
+        f = self._helper()
+        assert f("nan") is None
+        assert f("NaN") is None
+
+    def test_inf_string_returns_none(self):
+        f = self._helper()
+        assert f("inf") is None
+        assert f("-inf") is None
+
+    def test_actual_nan_returns_none(self):
+        """Python math.nan must filter to None, not propagate."""
+        import math
+        f = self._helper()
+        assert f(math.nan) is None
+
+    def test_actual_inf_returns_none(self):
+        import math
+        f = self._helper()
+        assert f(math.inf) is None
+        assert f(-math.inf) is None
+
+    def test_bad_string_returns_none(self):
+        f = self._helper()
+        assert f("garbage") is None
+        assert f("not a number") is None
+        assert f("$1.16") is None  # currency-formatted not parseable as float
+
+    def test_unexpected_type_returns_none(self):
+        """Object, list, dict, etc. must not crash — return None."""
+        f = self._helper()
+        assert f(object()) is None
+        assert f([]) is None
+        assert f([1.5]) is None
+        assert f({}) is None
+        assert f({"value": 1.5}) is None
+
+    def test_boolean_converts_to_one_or_zero(self):
+        """Python `float(True)` is 1.0 — accept this rather than special-case."""
+        f = self._helper()
+        assert f(True) == 1.0
+        assert f(False) == 0.0
+
+
+class TestBadValuesDoNotCrashProofPath:
+    """End-to-end: bad/blank trigger values must not crash _on_position_close
+    or _finalize_proof. The proof row is the source of truth and must always
+    be written, even if trigger data is malformed."""
+
+    def test_staging_with_bad_decision_pnl_does_not_crash(self):
+        """Simulate _on_position_close staging when decision.pnl_pct is bad."""
+        from ap_execution_core import _safe_float_or_none
+
+        # Mock decision objects with various bad pnl_pct values
+        class FakeDecision:
+            def __init__(self, pnl):
+                self.pnl_pct = pnl
+                self.reason_code = "DEEP_LOSS_STOP"
+
+        for bad_value in [None, "", "nan", "garbage", float("nan"),
+                           float("inf"), object(), [], {"x": 1}]:
+            d = FakeDecision(bad_value)
+            # Mirror the staging-site safe cast
+            staged_value = _safe_float_or_none(getattr(d, "pnl_pct", None))
+            # Must not crash, must return None or a valid finite float
+            assert staged_value is None or isinstance(staged_value, float)
+            if isinstance(staged_value, float):
+                import math
+                assert not math.isnan(staged_value)
+                assert not math.isinf(staged_value)
+
+    def test_finalize_proof_with_bad_staged_values_does_not_crash(self):
+        """Simulate _finalize_proof reading bad values from staged dict."""
+        from ap_execution_core import _safe_float_or_none
+
+        for bad_staged in [
+            {"trigger_pnl_pct": None},
+            {"trigger_pnl_pct": ""},
+            {"trigger_pnl_pct": "nan"},
+            {"trigger_pnl_pct": "garbage"},
+            {"trigger_pnl_pct": float("nan")},
+            {"trigger_pnl_pct": [1, 2]},
+            {},  # missing key
+        ]:
+            # Mirror _finalize_proof's safe read
+            raw = _safe_float_or_none(bad_staged.get("trigger_pnl_pct"))
+            assert raw is None or isinstance(raw, float)
+            # The conversion to percentage must not crash on None
+            converted = (round(raw * 100, 2) if raw is not None else None)
+            assert converted is None or isinstance(converted, (int, float))
+
+    def test_zero_through_full_pipeline(self):
+        """End-to-end: trigger_pnl_pct=0.0 must arrive in the proof row as 0.0."""
+        from ap_execution_core import _safe_float_or_none
+
+        class FakeDecision:
+            pnl_pct = 0.0  # legitimate breakeven decision
+            reason_code = "TARGET_HIT"
+
+        d = FakeDecision()
+        staged_value = _safe_float_or_none(getattr(d, "pnl_pct", None))
+        # Stage must preserve 0.0
+        assert staged_value == 0.0
+        assert staged_value is not None
+
+        # _finalize_proof read
+        raw = _safe_float_or_none({"trigger_pnl_pct": staged_value}.get("trigger_pnl_pct"))
+        assert raw == 0.0
+
+        # Conversion to percentage must yield 0.0 not None
+        converted = (round(raw * 100, 2) if raw is not None else None)
+        assert converted == 0.0
+
+    def test_source_uses_safe_float_or_none_helper(self):
+        """Source-shape: ap_execution_core.py must use _safe_float_or_none
+        for the staging-site reads (not naked float() casts)."""
+        src = open(
+            os.path.join(REPO_ROOT, "ap_execution_core.py")
+        ).read()
+        # Helper must be defined
+        assert "def _safe_float_or_none(" in src, (
+            "_safe_float_or_none helper missing from ap_execution_core.py"
+        )
+        # Staging site must use it for each trigger numeric field
+        for field_path in (
+            '_safe_float_or_none(getattr(decision, "pnl_pct"',
+            '_safe_float_or_none(getattr(pos, "current_option_price"',
+            '_safe_float_or_none(getattr(pos, "current_underlying"',
+        ):
+            assert field_path in src, (
+                f"Staging site must call _safe_float_or_none with {field_path}"
+            )
+        # _finalize_proof must use it for the staged values
+        for read_path in (
+            '_safe_float_or_none(staged.get("trigger_pnl_pct"',
+            '_safe_float_or_none(staged.get("trigger_option_price"',
+            '_safe_float_or_none(staged.get("trigger_underlying"',
+        ):
+            assert read_path in src, (
+                f"_finalize_proof must call _safe_float_or_none for {read_path}"
+            )
+
+    def test_no_naked_float_on_trigger_fields_at_staging(self):
+        """Regression guard: there must be NO naked `float(getattr(decision,
+        \"pnl_pct\"...` or `float(getattr(pos, \"current_option_price\"...`
+        anywhere in the trigger staging path."""
+        src = open(
+            os.path.join(REPO_ROOT, "ap_execution_core.py")
+        ).read()
+        # Locate the staged dict block
+        idx = src.index('"trigger_pnl_pct"')
+        block = src[idx:idx + 800]
+        # No naked floats on the trigger fields in this region
+        forbidden_patterns = [
+            'float(getattr(decision, "pnl_pct"',
+            'float(getattr(pos, "current_option_price"',
+            'float(getattr(pos, "current_underlying"',
+        ]
+        for forbidden in forbidden_patterns:
+            assert forbidden not in block, (
+                f"Naked float cast found in trigger staging: {forbidden}. "
+                f"Use _safe_float_or_none instead — naked float() crashes on "
+                f"'nan'/bad strings/unexpected types."
+            )
     """log_trade must handle None for any/all of the new optional fields
     without breaking, so legacy code paths or older positions without
     trigger data continue to work."""
