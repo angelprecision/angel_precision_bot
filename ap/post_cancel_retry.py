@@ -457,24 +457,173 @@ def evaluate_retry(
     # === ALL GATES PASS: ARM ==============================================
     wait_secs = _compute_wait_secs(rng=rng)
 
+    # PR fix/entry-retry-context-and-submit-refresh:
+    # The previous build read `meta.get(...)` only — which silently degraded
+    # score=70/tier=B/signal_id=REEVAL:... entries into score=0 / signal_id=""
+    # / signal_entry_price=None on rows whose meta JSON had been overwritten
+    # by retry-engine stamps (retry_status, retry_abort_ts, ...). The
+    # downstream submit then hit submit_reject:trend_gate / time_gate with
+    # a useless audit trail ("why did this retry fail? score=0").
+    #
+    # Read priority for every field is:
+    #   1) top-level canceled_order.<col>   (PR #44 ground truth)
+    #   2) meta.<key>                       (older paths / nested copy)
+    #   3) meta.retry_payload.<key>         (previous retry attempt mirror)
+    #   4) safe default                     (only if genuinely missing)
+    _prev_rp = (meta or {}).get("retry_payload") or {}
+    if not isinstance(_prev_rp, dict):
+        _prev_rp = {}
+
+    def _coalesce(*vals, default=None):
+        """Return the first value that is not None / not empty string / not 0
+        unless 0 is genuine. For score/numeric fields we use the
+        `_coalesce_numeric` variant below; this one is for identity fields
+        (signal_id, contract, ticker, etc.) where '' is treated as missing."""
+        for v in vals:
+            if v is None:
+                continue
+            if isinstance(v, str) and not v.strip():
+                continue
+            return v
+        return default
+
+    def _coalesce_numeric(*vals, default=0.0):
+        """Return the first value that parses to a float (None / unparseable
+        are skipped). 0 is a legitimate value when it is the ONLY value the
+        sources carry — see _coalesce_positive for score/price-style fields
+        where 0 should be treated as 'missing' so a real positive elsewhere
+        wins."""
+        for v in vals:
+            if v is None:
+                continue
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                continue
+        return default
+
+    def _coalesce_positive(*vals, default=0.0):
+        """Return the first value that parses to a POSITIVE float (>0).
+        Treats 0 / None / unparseable as 'missing'. Used for score,
+        signal_entry_price, trigger_price — fields where 0 is functionally
+        equivalent to missing and a real non-zero value from a later source
+        should win.
+
+        Priority rule per operator (2026-05-27):
+          score = top_level if top_level > 0
+                  else meta_score if meta_score > 0
+                  else prev_retry_score if prev_retry_score > 0
+                  else 0
+        """
+        for v in vals:
+            if v is None:
+                continue
+            try:
+                f = float(v)
+            except (TypeError, ValueError):
+                continue
+            if f > 0:
+                return f
+        return default
+
+    # Score: top-level column wins ONLY if positive. Per operator rule,
+    # a row with literal score=0 should not lock out a real meta.score=70
+    # or a previous retry_payload.score=70. Critical for not degrading
+    # winners (today's GOOGL pattern: row had score=70, meta got overwritten
+    # to retry_status-only — we still want the 70 surfaced).
+    score_preserved = _coalesce_positive(
+        canceled_order.get("score"),
+        meta.get("score"),
+        _prev_rp.get("score"),
+        default=0.0,
+    )
+    tier_preserved = _coalesce(
+        canceled_order.get("tier"),
+        meta.get("tier"),
+        _prev_rp.get("tier"),
+        default="",
+    )
+    signal_id_preserved = _coalesce(
+        canceled_order.get("signal_id"),
+        meta.get("signal_id"),
+        _prev_rp.get("signal_id"),
+        default="",
+    )
+    plan_id_preserved = _coalesce(
+        canceled_order.get("plan_id"),
+        meta.get("plan_id"),
+        _prev_rp.get("plan_id"),
+        default=None,
+    )
+    selected_contract_preserved = _coalesce(
+        canceled_order.get("contract"),
+        meta.get("selected_contract"),
+        meta.get("contract"),
+        _prev_rp.get("selected_contract"),
+        _prev_rp.get("contract"),
+        default=None,
+    )
+    pattern_preserved = _coalesce(
+        canceled_order.get("pattern"),
+        meta.get("pattern"),
+        _prev_rp.get("pattern"),
+        default=None,
+    )
+    timeframe_preserved = _coalesce(
+        canceled_order.get("timeframe"),
+        meta.get("timeframe"),
+        meta.get("exp_hint"),
+        _prev_rp.get("exp_hint"),
+        default="DAILY",
+    )
+    # Underlying price priority: top-level trigger_price > meta.signal_entry_price
+    # > meta.trigger.underlying_price > prev retry. Used for alignment.
+    # Same positive-wins rule as score: 0 is functionally missing.
+    underlying_price_preserved = _coalesce_positive(
+        canceled_order.get("trigger_price"),
+        meta.get("signal_entry_price"),
+        (meta.get("trigger") or {}).get("underlying_price")
+            if isinstance(meta.get("trigger"), dict) else None,
+        _prev_rp.get("signal_entry_price"),
+        (_prev_rp.get("trigger") or {}).get("underlying_price")
+            if isinstance(_prev_rp.get("trigger"), dict) else None,
+        default=0.0,
+    )
+    # If we couldn't recover an underlying price, leave the trigger.underlying_price
+    # explicitly None so process_signal knows to refresh it from a fresh quote
+    # instead of using a stale 0.0.
+    underlying_price_for_payload = (
+        float(underlying_price_preserved) if underlying_price_preserved > 0
+        else (float(signal_entry) if signal_entry else None)
+    )
+
     # BUG-C FIX (PR #29): payload now matches process_signal's required
     # shape: symbol (not ticker) and trigger.strike (not signal_entry_price).
     # Legacy alias 'ticker' is preserved so any consumer still keyed on it
     # keeps working.
     retry_payload = {
-        "signal_id":            meta.get("signal_id") or "",
+        "signal_id":            signal_id_preserved,
+        "plan_id":              plan_id_preserved,
         "source":               meta.get("source") or "post_cancel_retry",
         "symbol":               symbol,
         "ticker":               symbol,                 # legacy alias
         "direction":            direction,
-        "score":                meta.get("score") or 0,
-        "signal_entry_price":   signal_entry,
-        "exp_hint":             meta.get("exp_hint") or "DAILY",
+        "score":                score_preserved,
+        "tier":                 tier_preserved,
+        "selected_contract":    selected_contract_preserved,
+        "contract":             selected_contract_preserved,  # legacy alias
+        "pattern":              pattern_preserved,
+        "exp_hint":             timeframe_preserved,
+        "timeframe":            timeframe_preserved,
+        "signal_entry_price":   underlying_price_for_payload
+                                if underlying_price_for_payload is not None
+                                else signal_entry,
         "trigger":              {
             "strike":            float(strike),
-            # Carry the original entry price as underlying_price so
-            # _resolve_option_contract has its alignment reference.
-            "underlying_price":  float(signal_entry) if signal_entry else None,
+            # Carry the preserved entry price as underlying_price so
+            # _resolve_option_contract has its alignment reference. If we
+            # couldn't recover one, send None so submit refreshes from quote.
+            "underlying_price":  underlying_price_for_payload,
         },
         # Retry-specific bookkeeping the caller will persist into meta:
         "retry_attempt":        next_attempt,

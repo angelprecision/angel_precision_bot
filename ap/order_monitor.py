@@ -734,10 +734,30 @@ class APOrderMonitor:
             #
             # Score lookup for A/A+ tier:
             _order_meta = order.get("meta") if isinstance(order.get("meta"), dict) else {}
+            # PR fix/entry-retry-context-and-submit-refresh:
+            # Score priority is:
+            #   1) order.score      (top-level column — PR #44 ground truth)
+            #   2) order.meta.score (older paths / retry-engine mirror)
+            #   3) 0                (only if genuinely missing)
+            # Same priority for tier. The PRIOR expression
+            # (`_order_meta.get("score") or order.get("score")`) put meta FIRST,
+            # which is wrong for two reasons:
+            #   - meta.score is `None` on rows where retry_engine wrote
+            #     retry_status/retry_abort_ts but didn't carry the original meta
+            #     forward.
+            #   - top-level score is authoritative (written by OSM
+            #     create_entry_order in PR #44).
             try:
-                _score = float(_order_meta.get("score") or order.get("score") or 0)
+                _score = float(
+                    order.get("score")
+                    or _order_meta.get("score")
+                    or 0
+                )
             except (TypeError, ValueError):
                 _score = 0.0
+            _tier_str = (
+                str(order.get("tier") or _order_meta.get("tier") or "").strip()
+            )
             _is_aplus = _score >= ENTRY_APLUS_SCORE_THRESHOLD
             _max_age = ENTRY_MAX_AGE_APLUS if _is_aplus else ENTRY_MAX_AGE_NORMAL
 
@@ -748,10 +768,21 @@ class APOrderMonitor:
                         "ENTRY_MAX_AGE_APLUS_REACHED" if _is_aplus
                         else "ENTRY_MAX_AGE_NORMAL_REACHED"
                     )
+                    # PR fix/entry-retry-context-and-submit-refresh:
+                    # Display the REAL tier label (A+/A/B/etc.) from the row
+                    # when available, not the binary aplus/normal bucket. The
+                    # bucket is still used for the max-age decision but the
+                    # log text now matches the row contents — fixes the
+                    # "score=0.0 tier=normal" log noise on rows that actually
+                    # had score=70 tier=B.
+                    _tier_display = (
+                        _tier_str
+                        or ("A+" if _is_aplus else "normal")
+                    )
                     log.warning(
                         "[%s] %s | %s | status=%s age=%.0fs >= %ds (score=%.1f tier=%s)",
                         self.client_id, _ceiling_reason, _sym or contract, status,
-                        age_secs, _max_age, _score, "A+" if _is_aplus else "normal",
+                        age_secs, _max_age, _score, _tier_display,
                     )
                     self._emit_order_event(
                         local_order_id=local_id,
@@ -778,7 +809,7 @@ class APOrderMonitor:
                         action="cancel",
                         reason=(
                             f"{_ceiling_reason} unfilled {age_secs:.0f}s >= {_max_age}s "
-                            f"(score={_score:.1f} tier={'A+' if _is_aplus else 'normal'})"
+                            f"(score={_score:.1f} tier={_tier_display})"
                         ),
                     )
                     return True
@@ -1177,12 +1208,53 @@ class APOrderMonitor:
 
         if not isinstance(result, dict) or not result.get("ok"):
             err = (result or {}).get("error", "unknown")
+            # PR fix/entry-retry-context-and-submit-refresh:
+            # Classify quote-related submit rejects with explicit codes so
+            # the audit trail distinguishes runaway-quote (price moved out of
+            # chase band) from a missing refresh (broker quote API failed).
+            # Generic gates (time_gate, trend_gate, symbol_locked, ...) keep
+            # the generic submit_reject:<err> shape they had before.
+            _r = result or {}
+            if err == "runaway_quote_at_submit":
+                _detail = (
+                    f"RUNAWAY_QUOTE_AT_RETRY:gap={_r.get('gap_pct'):.4f} "
+                    f"selector_ask={_r.get('selector_ask')} "
+                    f"submit_ask={_r.get('submit_ask')}"
+                    if _r.get("gap_pct") is not None
+                    else "RUNAWAY_QUOTE_AT_RETRY"
+                )
+            elif err in ("quote_refresh_failed", "submit_quote_unavailable"):
+                # If the quote refresh outright failed (broker API error),
+                # surface that distinctly so operators can disambiguate from
+                # "price moved" runaways. process_signal already falls back
+                # to selector_ask on refresh failure unless explicitly
+                # configured otherwise; this branch is mainly defensive.
+                _detail = f"QUOTE_REFRESH_FAILED_AT_RETRY:{err}"
+            else:
+                _detail = f"submit_reject:{err}"
+            # Persist quote-refresh evidence in meta on the FAILURE path too
+            # (previously only the SUCCESS path recorded it via _emit). The
+            # dashboard / post-mortem can now answer "what was the quote at
+            # retry submit?" for every failed retry, not just successes.
             log.warning(
                 "[%s] ENTRY_RETRY_ABORTED order=%s submit-time reject: %s",
                 self.client_id, local_order_id, err,
             )
-            self._stamp_retry_status(local_order_id, prior_meta,
-                                     status="FAILED", detail=f"submit_reject:{err}")
+            self._stamp_retry_status(
+                local_order_id, prior_meta,
+                status="FAILED",
+                detail=_detail,
+                extra={
+                    "retry_submit_err":        err,
+                    "retry_selector_ask":      _r.get("selector_ask"),
+                    "retry_submit_ask":        _r.get("submit_ask"),
+                    "retry_submit_limit":      _r.get("submit_limit"),
+                    "retry_quote_age_ms":      _r.get("quote_age_ms"),
+                    "retry_gap_pct":           _r.get("gap_pct"),
+                    "retry_refresh_ok":        _r.get("refresh_ok"),
+                    "retry_refresh_reason":    _r.get("refresh_reason"),
+                },
+            )
             # Also emit a post-cancel-retry abort event so the dashboard
             # records the full lifecycle (ARM → submit-time reject).
             self._emit_order_event(
@@ -1213,6 +1285,15 @@ class APOrderMonitor:
                 "retry_new_local_order_id":  new_local_oid,
                 "retry_new_broker_order_id": new_broker_oid,
                 "retry_submitted_ts":        now_utc_iso(),
+                # PR fix/entry-retry-context-and-submit-refresh:
+                # Persist the full submit-time quote evidence on success too
+                # so success and failure rows have a consistent shape.
+                "retry_selector_ask":        result.get("selector_ask"),
+                "retry_submit_ask":          result.get("submit_ask"),
+                "retry_submit_limit":        result.get("submit_limit"),
+                "retry_quote_age_ms":        result.get("quote_age_ms"),
+                "retry_refresh_ok":          True if result.get("submit_ask") is not None else None,
+                "retry_submit_refresh_ok":   True if result.get("submit_ask") is not None else None,
             },
         )
         self._emit_order_event(
@@ -1229,6 +1310,7 @@ class APOrderMonitor:
                 "submit_limit":        result.get("submit_limit"),
                 "selector_ask":        result.get("selector_ask"),
                 "submit_ask":          result.get("submit_ask"),
+                "quote_age_ms":        result.get("quote_age_ms"),
             },
         )
 
@@ -1921,7 +2003,17 @@ class APOrderMonitor:
                            created_ts, submitted_ts,
                            limit_price,
                            limit_price AS price,
-                           fill_price
+                           fill_price,
+                           -- PR fix/entry-retry-context-and-submit-refresh:
+                           -- Include score/tier/trigger_price/meta so the A+/normal
+                           -- tier decision in _check_entry_age_and_cancel uses real
+                           -- row values instead of always falling back to 0/normal.
+                           -- Previously the SELECT omitted these and order.get("score")
+                           -- returned None → _score=0 → every order treated as normal
+                           -- tier (90s) even when score=70 (A/B tier) qualified for the
+                           -- longer window. This was the source of "score=0.0 tier=normal"
+                           -- log noise on rows that actually had score=70 tier=B.
+                           score, tier, trigger_price, meta
                     FROM orders
                     WHERE client_id=%s
                       AND kind='ENTRY'
