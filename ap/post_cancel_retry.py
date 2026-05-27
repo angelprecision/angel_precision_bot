@@ -488,8 +488,11 @@ def evaluate_retry(
         return default
 
     def _coalesce_numeric(*vals, default=0.0):
-        """Like _coalesce but treats None/missing as the only skip condition.
-        Allows 0 to be a legitimate value if the row explicitly carries it."""
+        """Return the first value that parses to a float (None / unparseable
+        are skipped). 0 is a legitimate value when it is the ONLY value the
+        sources carry — see _coalesce_positive for score/price-style fields
+        where 0 should be treated as 'missing' so a real positive elsewhere
+        wins."""
         for v in vals:
             if v is None:
                 continue
@@ -499,9 +502,36 @@ def evaluate_retry(
                 continue
         return default
 
-    # Score: top-level column wins. PR #44 writes score into orders.score
-    # at create time. Never let a meta-overwrite degrade this.
-    score_preserved = _coalesce_numeric(
+    def _coalesce_positive(*vals, default=0.0):
+        """Return the first value that parses to a POSITIVE float (>0).
+        Treats 0 / None / unparseable as 'missing'. Used for score,
+        signal_entry_price, trigger_price — fields where 0 is functionally
+        equivalent to missing and a real non-zero value from a later source
+        should win.
+
+        Priority rule per operator (2026-05-27):
+          score = top_level if top_level > 0
+                  else meta_score if meta_score > 0
+                  else prev_retry_score if prev_retry_score > 0
+                  else 0
+        """
+        for v in vals:
+            if v is None:
+                continue
+            try:
+                f = float(v)
+            except (TypeError, ValueError):
+                continue
+            if f > 0:
+                return f
+        return default
+
+    # Score: top-level column wins ONLY if positive. Per operator rule,
+    # a row with literal score=0 should not lock out a real meta.score=70
+    # or a previous retry_payload.score=70. Critical for not degrading
+    # winners (today's GOOGL pattern: row had score=70, meta got overwritten
+    # to retry_status-only — we still want the 70 surfaced).
+    score_preserved = _coalesce_positive(
         canceled_order.get("score"),
         meta.get("score"),
         _prev_rp.get("score"),
@@ -548,7 +578,8 @@ def evaluate_retry(
     )
     # Underlying price priority: top-level trigger_price > meta.signal_entry_price
     # > meta.trigger.underlying_price > prev retry. Used for alignment.
-    underlying_price_preserved = _coalesce_numeric(
+    # Same positive-wins rule as score: 0 is functionally missing.
+    underlying_price_preserved = _coalesce_positive(
         canceled_order.get("trigger_price"),
         meta.get("signal_entry_price"),
         (meta.get("trigger") or {}).get("underlying_price")
