@@ -87,6 +87,24 @@ BROKER_RETRY_DELAY = 1.0
 SUBMIT_CHASE_BAND_PCT      = float(os.getenv("SUBMIT_CHASE_BAND_PCT", "0.08"))
 SUBMIT_QUOTE_MAX_AGE_MS    = int(os.getenv("SUBMIT_QUOTE_MAX_AGE_MS", "5000"))
 
+# PR H — quote-refresh fail-safe at first submit.
+#
+# Previously: when _refresh_ask_at_submit failed (broker quote API hiccup,
+# no_quote, invalid_ask, broker_error) the bot fell through to selector_ask
+# silently — submitting at a potentially stale price with no audit signal.
+#
+# New default behavior:
+#   QUOTE_REFRESH_FAIL_OPEN=0  (default)  → reject with
+#                                          QUOTE_REFRESH_FAILED_AT_SUBMIT,
+#                                          release equity + symbol lock,
+#                                          retry engine can re-arm later.
+#   QUOTE_REFRESH_FAIL_OPEN=1            → legacy fall-through with
+#                                          selector_ask (current behavior).
+#
+# The retry path already gets the same protection because retry calls
+# process_signal() which runs through this exact check.
+QUOTE_REFRESH_FAIL_OPEN    = os.getenv("QUOTE_REFRESH_FAIL_OPEN", "0").strip() in ("1", "true", "True", "yes")
+
 # ─── PHASE 4: account-equity-based sizing ─────────────────────────────────
 # Prior sizing was BASE_POSITION_PCT (0.02 = 2%) capped by MAX_POSITION_COST
 # = $1000. With a $100K account that gave 1 contract on a $3 premium because
@@ -956,8 +974,41 @@ def process_signal(broker, client_id: str, signal_payload: dict) -> dict:
                 "gap_pct": float(gap_pct),
             }
 
+        # PR H — quote-refresh fail-safe.
+        # If the refresh failed (refresh_ok=False) and fail-open is NOT set,
+        # reject the submit with QUOTE_REFRESH_FAILED_AT_SUBMIT rather than
+        # silently submitting at the stale selector_ask. Equity and symbol
+        # lock are released so retry_engine can re-arm later. The retry path
+        # gets the same protection because it routes through this same
+        # process_signal() entrypoint.
+        if (not refresh_ok) and (not QUOTE_REFRESH_FAIL_OPEN):
+            release_equity(client_id, reserved_cost)
+            release_symbol_lock(client_id, symbol)
+            reserved = False
+            locked = False
+            log.warning(
+                "[%s] QUOTE_REFRESH_FAILED_AT_SUBMIT symbol=%s contract=%s "
+                "selector_ask=%.2f reason=%s",
+                client_id, symbol, contract,
+                selector_ask, refresh_reason or "unknown",
+            )
+            audit(client_id, "WARNING", "QUOTE_REFRESH_FAILED_AT_SUBMIT", {
+                "symbol": symbol,
+                "contract": contract,
+                "selector_ask": float(selector_ask),
+                "refresh_reason": str(refresh_reason or "unknown"),
+                "fail_open": bool(QUOTE_REFRESH_FAIL_OPEN),
+            })
+            return {
+                "ok": False,
+                "error": "quote_refresh_failed",
+                "selector_ask": float(selector_ask),
+                "refresh_reason": str(refresh_reason or "unknown"),
+            }
+
         # PHASE 3: use the fresher quote as the submit limit if available;
         # otherwise fall back to the selector ask (back-compat).
+        # PR H: this fall-through ONLY fires now when QUOTE_REFRESH_FAIL_OPEN=1.
         submit_limit = float(submit_ask) if (refresh_ok and submit_ask > 0) else float(selector_ask)
 
         local_order_id = new_local_order_id()
