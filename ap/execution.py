@@ -559,37 +559,80 @@ def _resolve_option_contract(broker, client_id: str, symbol: str, strike: float,
     return contract, premium
 
 
-def _refresh_ask_at_submit(broker, contract: str) -> tuple[float, int, bool, str]:
-    """PHASE 3: re-fetch the ask immediately before broker submit.
+def _refresh_ask_at_submit(broker, contract: str) -> tuple[float, int, bool, str, dict]:
+    """PHASE 3 + PR A: re-fetch the ask immediately before broker submit.
 
-    Returns (submit_ask, quote_age_ms, ok, reason):
+    Returns (submit_ask, quote_age_ms, ok, reason, quote_fields):
       - submit_ask:    fresh ask price (0.0 on failure)
       - quote_age_ms:  age of the quote we just fetched (always small on success)
       - ok:            True if we got a usable ask, False if we should fall through
       - reason:        machine-readable reason when ok is False (e.g. 'no_quote',
                        'broker_error', 'invalid_ask'). Empty string when ok=True.
+      - quote_fields:  dict with submit_bid, submit_ask, submit_last, submit_mid,
+                       spread_pct — forensics for orders.meta. Always returned
+                       (possibly with all None) so callers can persist it.
 
     Failure is non-fatal: callers should fall through with the selector_ask
     (no chase-band guard) so a quote-feed hiccup does not kill all entries.
+
+    PR A scope: only the new `quote_fields` return slot is forensics. The
+    submit_ask / ok / reason behavior is unchanged.
     """
     t0 = time.time()
+    _empty_qf = {
+        "submit_bid":  None,
+        "submit_ask":  None,
+        "submit_last": None,
+        "submit_mid":  None,
+        "spread_pct":  None,
+    }
     try:
         quote = broker.get_quote(contract) or {}
     except Exception as e:
         log.warning("_refresh_ask_at_submit: broker.get_quote raised contract=%s err=%s", contract, e)
-        return 0.0, 0, False, "broker_error"
+        return 0.0, 0, False, "broker_error", dict(_empty_qf)
 
     try:
         ask_raw = quote.get("ask")
         ask = float(ask_raw) if ask_raw is not None else 0.0
     except (TypeError, ValueError):
-        return 0.0, 0, False, "invalid_ask"
+        return 0.0, 0, False, "invalid_ask", dict(_empty_qf)
+
+    # PR A: extract bid/last from the SAME quote we just fetched so the
+    # submit-time evidence in orders.meta is internally consistent. Any of
+    # bid / last may be None on illiquid contracts — that's not a failure
+    # condition, just an evidence gap to record honestly.
+    def _safe_float(v):
+        try:
+            return float(v) if v is not None else None
+        except (TypeError, ValueError):
+            return None
+    bid = _safe_float(quote.get("bid"))
+    last = _safe_float(quote.get("last"))
+    submit_mid = (
+        (bid + ask) / 2.0
+        if (bid is not None and bid > 0 and ask > 0)
+        else None
+    )
+    spread_pct = (
+        (ask - bid) / submit_mid
+        if (submit_mid is not None and submit_mid > 0 and bid is not None)
+        else None
+    )
+
+    quote_fields = {
+        "submit_bid":  bid,
+        "submit_ask":  ask if ask > 0 else None,
+        "submit_last": last,
+        "submit_mid":  submit_mid,
+        "spread_pct":  spread_pct,
+    }
 
     if ask <= 0:
-        return 0.0, 0, False, "no_quote"
+        return 0.0, 0, False, "no_quote", quote_fields
 
     quote_age_ms = int((time.time() - t0) * 1000)
-    return ask, quote_age_ms, True, ""
+    return ask, quote_age_ms, True, "", quote_fields
 
 
 def _submit_order_with_retry(broker, symbol: str, contract: str, qty: int, premium: float) -> tuple[bool, str | None, str | None]:
@@ -874,7 +917,9 @@ def process_signal(broker, client_id: str, signal_payload: dict) -> dict:
         # On success this gives us a fresher quote (submit_ask) and a
         # quote_age_ms = 0 reading. On failure we fall through with
         # selector_ask (no chase block).
-        submit_ask, quote_age_ms, refresh_ok, refresh_reason = \
+        # PR A: _refresh_ask_at_submit now returns a 5th value (quote_fields)
+        # carrying submit_bid/submit_last/submit_mid/spread_pct for orders.meta.
+        submit_ask, quote_age_ms, refresh_ok, refresh_reason, _submit_quote_fields = \
             _refresh_ask_at_submit(broker, contract)
         if refresh_ok and submit_ask > 0 and selector_ask > 0:
             gap_pct = (submit_ask / selector_ask) - 1.0
@@ -933,11 +978,34 @@ def process_signal(broker, client_id: str, signal_payload: dict) -> dict:
             "source":             str(signal_payload.get("source") or ""),
             "repeg_attempts":     0,
             "last_repeg_ts":      0,
-            # PHASE 3: submit-time telemetry
+            # PHASE 3 + PR A: submit-time telemetry (forensics for orders.meta).
+            # ALL fields documented in PR A spec:
+            #   selector_bid/ask/mid/last — quote at contract-selection time.
+            #     Only selector_ask is currently wired (the price the selector
+            #     accepted). selector_bid/mid/last are None until PR F wires
+            #     them through ap_options_intelligence.evaluate_contract.
+            #   submit_bid/ask/mid/last — quote at broker-submit time (fresh).
+            #     All four populated from the same broker.get_quote() call so
+            #     they are internally consistent.
+            #   submit_limit       — the actual limit price sent to the broker.
+            #   quote_age_ms       — broker round-trip for the refresh quote.
+            #   spread_pct         — (ask-bid)/mid at submit time.
+            #   gap_pct            — (submit_ask/selector_ask) - 1.
+            #   submit_refresh_ok  — True if refresh produced a usable ask.
+            #   submit_refresh_reason — e.g. 'no_quote' / 'broker_error' / ''.
+            "selector_bid":       None,  # PR F: wire from selector return
             "selector_ask":       float(selector_ask),
-            "submit_ask":         float(submit_ask) if refresh_ok else None,
+            "selector_mid":       None,  # PR F: wire from selector return
+            "selector_last":      None,  # PR F: wire from selector return
+            "submit_bid":         _submit_quote_fields.get("submit_bid"),
+            "submit_ask":         (float(submit_ask) if refresh_ok
+                                   else _submit_quote_fields.get("submit_ask")),
+            "submit_mid":         _submit_quote_fields.get("submit_mid"),
+            "submit_last":        _submit_quote_fields.get("submit_last"),
             "submit_limit":       float(submit_limit),
             "quote_age_ms":       int(quote_age_ms),
+            "spread_pct":         _submit_quote_fields.get("spread_pct"),
+            "gap_pct":             float(gap_pct) if isinstance(gap_pct, (int, float)) else None,
             "submit_refresh_ok":  bool(refresh_ok),
             "submit_refresh_reason": str(refresh_reason or ""),
             "entry_attempt":      0,
