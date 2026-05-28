@@ -95,6 +95,21 @@ _DEFAULT_PREMIUM_FALLBACK = 3.50
 
 _PRIORITY_TICKERS = {"SPY", "QQQ", "IWM", "SPX", "NDX", "DIA"}
 _PRIORITY_FLOOR = 40.0
+
+# PR B — universal hard score floor.
+# Below SCORE_MIN_ELIGIBLE: log/watch only (REJECTED_LOW_SCORE), no broker order.
+# At/above:  eligible for normal admission path.
+# Preferred / strongest tiers are informational — used by the dashboard and
+# meta but do not change admission; eligibility is binary at SCORE_MIN_ELIGIBLE.
+# Env-overridable so you can lower without redeploy if the day is dead.
+SCORE_MIN_ELIGIBLE = float(os.getenv("SCORE_MIN_ELIGIBLE", "70"))
+SCORE_PREFERRED    = float(os.getenv("SCORE_PREFERRED",    "75"))
+SCORE_STRONGEST    = float(os.getenv("SCORE_STRONGEST",    "80"))
+
+# PR B — the index/0DTE bucket reuses _PRIORITY_TICKERS above; we do not
+# need a separate set. These tickers must NEVER trade below the hard floor
+# regardless of mode (paper or live). Today's screenshot showed SPY score-65
+# setups reaching execution; we cut that path at the root in evaluate().
 _INDEX_TO_ETF = {"^GSPC": "SPY", "^NDX": "QQQ", "^RUT": "IWM", "^DJI": "DIA"}
 
 # Canonical active ENTRY order states that reserve capital / represent pending exposure.
@@ -1209,6 +1224,24 @@ class APMasterControl:
         # protecting the green day with quality rather than by stopping.
         _eff_priority_floor = _PRIORITY_FLOOR + _post_target_score_bump
         _eff_score_floor    = self.score_floor + _post_target_score_bump
+
+        # PR B — UNIVERSAL HARD FLOOR.
+        # Runs BEFORE the legacy priority/score floor checks. Below this any
+        # signal (index or single-name) is rejected with REJECTED_LOW_SCORE.
+        # This stops score-65 SPY/QQQ setups from reaching the broker even
+        # though _PRIORITY_FLOOR=40 would have admitted them. Setups below the
+        # hard floor still appear in dashboard/watch logs via _store_update.
+        _hard_floor = SCORE_MIN_ELIGIBLE + _post_target_score_bump
+        if effective_score < _hard_floor:
+            self._store_update(
+                signal_id, "rejected_low_score",
+                f"score {effective_score:.1f} < min_eligible {_hard_floor:.1f}",
+            )
+            return self._block(
+                signal_id, ticker, client_id, "blocked_score",
+                f"REJECTED_LOW_SCORE (score={effective_score:.1f} "
+                f"min_eligible={_hard_floor:.1f})",
+            )
 
         if ticker.upper() in _PRIORITY_TICKERS:
             if effective_score < _eff_priority_floor:

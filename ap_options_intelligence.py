@@ -286,11 +286,29 @@ def evaluate_contract(
     if liquidity_penalty:  size *= 0.65   # thin chain → significant reduction
     if high_iv_warning:    size *= 0.75   # inflated premium → caution
 
+    # PR B — hard safety net at the contract evaluator. Master control's
+    # SCORE_MIN_ELIGIBLE gate (default 70) should have already rejected
+    # anything below 70, but if a caller skips master_control or the gate
+    # is bypassed, we reject here too rather than buying a half-size
+    # position on a known-weak setup. Env-overridable to match master.
+    import os as _os
+    _hard_floor = float(_os.getenv("SCORE_MIN_ELIGIBLE", "70"))
+    if signal_score < _hard_floor:
+        return ContractDecision(
+            approved=False,
+            rejection_reason=(
+                f"REJECTED_LOW_SCORE (score={signal_score:.1f} "
+                f"min_eligible={_hard_floor:.1f}) [options_intelligence safety net]"
+            ),
+        )
+
     # Score-based size (A+ gets no reduction, lower grades get less)
     if signal_score >= 90:    pass          # A+ — no penalty, full tier size
     elif signal_score >= 85:  size *= 0.90  # A  — slight haircut
     elif signal_score >= 78:  size *= 0.70  # B  — meaningful haircut
     else:                     size *= 0.50  # below B — should not reach here
+                                            # (kept as defense; will only fire
+                                            # for 70 <= score < 78 now)
 
     size = round(max(0.10, min(1.0, size)), 2)
 
