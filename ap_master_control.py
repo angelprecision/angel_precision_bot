@@ -110,6 +110,21 @@ SCORE_STRONGEST    = float(os.getenv("SCORE_STRONGEST",    "80"))
 # need a separate set. These tickers must NEVER trade below the hard floor
 # regardless of mode (paper or live). Today's screenshot showed SPY score-65
 # setups reaching execution; we cut that path at the root in evaluate().
+
+# PR C — SPY/QQQ late-day 0DTE cutoff (minimize realized-loss exposure on
+# the worst-performing setup class in our paper proof window).
+#
+# Rule:
+#   - For _PRIORITY_TICKERS (SPY/QQQ/IWM/SPX/NDX/DIA), if the signal's
+#     expiration is TODAY (0 DTE) and current time is at/after
+#     INDEX_0DTE_CUTOFF_ET, REJECT with REJECTED_0DTE_CUTOFF.
+#   - Between INDEX_LATE_DAY_CAUTION_ET and INDEX_0DTE_CUTOFF_ET, 0DTE
+#     setups must clear INDEX_LATE_DAY_SCORE_FLOOR (default 75).
+#   - Non-0DTE expirations (1+ DTE) are untouched — normal admission path.
+# Env-overridable for live tuning without redeploy.
+INDEX_0DTE_CUTOFF_ET         = os.getenv("INDEX_0DTE_CUTOFF_ET",         "14:30")  # 2:30 PM ET
+INDEX_LATE_DAY_CAUTION_ET    = os.getenv("INDEX_LATE_DAY_CAUTION_ET",    "13:30")  # 1:30 PM ET
+INDEX_LATE_DAY_SCORE_FLOOR   = float(os.getenv("INDEX_LATE_DAY_SCORE_FLOOR", "75"))
 _INDEX_TO_ETF = {"^GSPC": "SPY", "^NDX": "QQQ", "^RUT": "IWM", "^DJI": "DIA"}
 
 # Canonical active ENTRY order states that reserve capital / represent pending exposure.
@@ -1225,12 +1240,13 @@ class APMasterControl:
         _eff_priority_floor = _PRIORITY_FLOOR + _post_target_score_bump
         _eff_score_floor    = self.score_floor + _post_target_score_bump
 
-        # PR B — UNIVERSAL HARD FLOOR.
-        # Runs BEFORE the legacy priority/score floor checks. Below this any
-        # signal (index or single-name) is rejected with REJECTED_LOW_SCORE.
+        # PR B — UNIVERSAL HARD FLOOR (already on main).
+        # Runs BEFORE every other admission gate. Below this any signal
+        # (index or single-name) is rejected with REJECTED_LOW_SCORE.
         # This stops score-65 SPY/QQQ setups from reaching the broker even
-        # though _PRIORITY_FLOOR=40 would have admitted them. Setups below the
-        # hard floor still appear in dashboard/watch logs via _store_update.
+        # though _PRIORITY_FLOOR=40 would have admitted them. Setups below
+        # the hard floor still appear in dashboard/watch logs via
+        # _store_update.
         _hard_floor = SCORE_MIN_ELIGIBLE + _post_target_score_bump
         if effective_score < _hard_floor:
             self._store_update(
@@ -1242,6 +1258,88 @@ class APMasterControl:
                 f"REJECTED_LOW_SCORE (score={effective_score:.1f} "
                 f"min_eligible={_hard_floor:.1f})",
             )
+
+        # PR C — SPY/QQQ index 0DTE late-day cutoff.
+        # Runs AFTER the PR B hard floor (so a score-65 SPY 0DTE still hits
+        # REJECTED_LOW_SCORE first, cheaper) and BEFORE the legacy
+        # priority/score floor checks (so a 0DTE SPY signal arriving at
+        # 2:31 PM ET never reaches the broker no matter what its score is
+        # within the PR B floor).
+        if ticker.upper() in _PRIORITY_TICKERS:
+            try:
+                from zoneinfo import ZoneInfo as _ZI
+                from datetime import datetime as _dt, time as _dt_time
+                _now_et = _dt.now(_ZI("America/New_York"))
+                _today_str = _now_et.strftime("%Y-%m-%d")
+
+                # Resolve DTE from any of the common signal shapes.
+                _exp_raw = (
+                    signal.get("expiration")
+                    or signal.get("expiration_date")
+                    or (signal.get("trigger") or {}).get("expiration")
+                    or ""
+                )
+                _dte_raw = signal.get("dte")
+                _is_0dte = False
+                if _dte_raw is not None:
+                    try:
+                        _is_0dte = int(_dte_raw) == 0
+                    except (TypeError, ValueError):
+                        _is_0dte = False
+                if not _is_0dte and isinstance(_exp_raw, str) and _exp_raw[:10] == _today_str:
+                    _is_0dte = True
+
+                if _is_0dte:
+                    try:
+                        _ch, _cm = (int(x) for x in INDEX_0DTE_CUTOFF_ET.split(":"))
+                        _wh, _wm = (int(x) for x in INDEX_LATE_DAY_CAUTION_ET.split(":"))
+                        _cutoff   = _dt_time(_ch, _cm)
+                        _caution  = _dt_time(_wh, _wm)
+                    except Exception:
+                        _cutoff   = _dt_time(14, 30)
+                        _caution  = _dt_time(13, 30)
+
+                    _now_t = _now_et.time()
+                    if _now_t >= _cutoff:
+                        # Hard block — no 0DTE on indexes after cutoff.
+                        self._store_update(
+                            signal_id, "rejected_0dte_cutoff",
+                            f"{ticker} 0DTE after {INDEX_0DTE_CUTOFF_ET} ET",
+                        )
+                        return self._block(
+                            signal_id, ticker, client_id, "blocked_time",
+                            (
+                                f"REJECTED_0DTE_CUTOFF ({ticker} 0DTE "
+                                f"now={_now_t.strftime('%H:%M')} ET "
+                                f"cutoff={INDEX_0DTE_CUTOFF_ET} ET)"
+                            ),
+                        )
+                    if _now_t >= _caution and effective_score < INDEX_LATE_DAY_SCORE_FLOOR:
+                        # Soft window: 0DTE allowed but only at higher score.
+                        self._store_update(
+                            signal_id, "rejected_0dte_caution",
+                            (
+                                f"{ticker} 0DTE score {effective_score:.1f} < "
+                                f"late-day floor {INDEX_LATE_DAY_SCORE_FLOOR:.1f} "
+                                f"after {INDEX_LATE_DAY_CAUTION_ET} ET"
+                            ),
+                        )
+                        return self._block(
+                            signal_id, ticker, client_id, "blocked_score",
+                            (
+                                f"REJECTED_0DTE_CAUTION_PERIOD "
+                                f"(score={effective_score:.1f} < {INDEX_LATE_DAY_SCORE_FLOOR:.1f} "
+                                f"after {INDEX_LATE_DAY_CAUTION_ET} ET)"
+                            ),
+                        )
+            except Exception as _e:
+                # Defensive: if the gate itself fails (timezone import, weird
+                # signal shape, etc.) we DO NOT block on "unknown" — fall
+                # through to existing checks. We log so the operator sees it.
+                log.warning(
+                    "[%s] PR-C 0DTE gate raised, falling through: %s",
+                    ticker, _e,
+                )
 
         if ticker.upper() in _PRIORITY_TICKERS:
             if effective_score < _eff_priority_floor:
