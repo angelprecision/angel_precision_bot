@@ -1371,10 +1371,18 @@ class APMasterControl:
                     _is_0dte_for_gate = False
                     _dte_known = False  # present but unparseable
             # A parseable YYYY-MM-DD expiration also proves DTE.
-            if isinstance(_exp_sg, str) and len(_exp_sg) >= 10 and _exp_sg[4:5] == "-" and _exp_sg[7:8] == "-":
-                if _exp_sg[:10] == _today_str_sg:
-                    _is_0dte_for_gate = True
-                _dte_known = True
+            # Use strptime to actually validate the date — checking dash
+            # positions alone accepts garbage like "2026-ab-cd" or "2026-99-99"
+            # which would set _dte_known=True on data that is not a real date.
+            if isinstance(_exp_sg, str) and len(_exp_sg) >= 10:
+                try:
+                    _exp_date = _dt_sg.strptime(_exp_sg[:10], "%Y-%m-%d").date()
+                    _today_date = _dt_sg.now(_ZI_sg("America/New_York")).date()
+                    if _exp_date == _today_date:
+                        _is_0dte_for_gate = True
+                    _dte_known = True   # strptime succeeded → real date proven
+                except (ValueError, TypeError):
+                    pass  # unparseable expiration — leave _dte_known as-is
         except Exception:
             _is_0dte_for_gate = False
             _dte_known = False

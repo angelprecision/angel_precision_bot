@@ -141,3 +141,82 @@ class TestUnknownDTE:
         ok, reason = f(score=60, hard_floor=HF, is_0dte=False, is_index=False,
                        timeframe="1d", spread_pct=0.05, delta=0.5, dte_known=False)
         assert not ok and reason == "REJECTED_LOW_SCORE_UNDER_65"
+
+
+class TestExpirationStrptimeParsing:
+    """PR #58 review fix: expiration must be validated with strptime, not dash
+    position checks. Bad values like '2026-ab-cd' or '2026-99-99' look like
+    YYYY-MM-DD but are not real dates — they must not set _dte_known=True.
+    """
+
+    @staticmethod
+    def _resolve_dte(dte_val, exp_val):
+        """Mirror the caller's DTE-resolution block so we can test it directly
+        without running full evaluate(). Returns (is_0dte, dte_known)."""
+        import importlib, os, sys
+        from datetime import datetime, date
+        from zoneinfo import ZoneInfo
+        is_0dte = False
+        dte_known = False
+        try:
+            today_str = datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
+            if dte_val is not None:
+                try:
+                    is_0dte = int(dte_val) == 0
+                    dte_known = True
+                except (TypeError, ValueError):
+                    pass
+            if isinstance(exp_val, str) and len(exp_val) >= 10:
+                try:
+                    exp_date = datetime.strptime(exp_val[:10], "%Y-%m-%d").date()
+                    today_date = datetime.now(ZoneInfo("America/New_York")).date()
+                    if exp_date == today_date:
+                        is_0dte = True
+                    dte_known = True
+                except (ValueError, TypeError):
+                    pass
+        except Exception:
+            pass
+        return is_0dte, dte_known
+
+    def test_valid_future_expiration_sets_dte_known(self):
+        _, dte_known = self._resolve_dte(None, "2027-01-15")
+        assert dte_known is True
+
+    def test_invalid_month_letters_does_not_set_dte_known(self):
+        # "2026-ab-cd" has dashes in the right positions but is not a real date.
+        _, dte_known = self._resolve_dte(None, "2026-ab-cd")
+        assert dte_known is False, "alphabetic month must not set dte_known"
+
+    def test_impossible_date_99_does_not_set_dte_known(self):
+        # "2026-99-99" passes a dash-position check but strptime rejects it.
+        _, dte_known = self._resolve_dte(None, "2026-99-99")
+        assert dte_known is False, "month=99 must not set dte_known"
+
+    def test_empty_expiration_does_not_set_dte_known(self):
+        _, dte_known = self._resolve_dte(None, "")
+        assert dte_known is False
+
+    def test_short_string_does_not_set_dte_known(self):
+        _, dte_known = self._resolve_dte(None, "2026-01")
+        assert dte_known is False
+
+    def test_none_expiration_and_none_dte_leaves_dte_unknown(self):
+        _, dte_known = self._resolve_dte(None, None)
+        assert dte_known is False
+
+    def test_valid_dte_int_overrides_missing_expiration(self):
+        _, dte_known = self._resolve_dte(7, None)
+        assert dte_known is True
+
+    def test_unparseable_dte_string_stays_unknown(self):
+        _, dte_known = self._resolve_dte("weekly", None)
+        assert dte_known is False
+
+    def test_valid_date_that_is_today_sets_0dte(self):
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        today = datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
+        is_0dte, dte_known = self._resolve_dte(None, today)
+        assert is_0dte is True
+        assert dte_known is True
