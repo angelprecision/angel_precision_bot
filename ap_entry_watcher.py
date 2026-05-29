@@ -884,7 +884,7 @@ class APEntryWatcher:
                 rearm_tolerance_pct, rearm_max_attempts,
                 score_ok, tier_ok, is_rearm_eligible,
                 rearmed, expired, permanently_rejected,
-                full_payload, evaluated_at
+                full_payload
             ) VALUES (
                 %s, %s, %s,
                 %s, %s,
@@ -900,7 +900,7 @@ class APEntryWatcher:
                 %s, %s,
                 %s, %s, %s,
                 %s, %s, %s,
-                %s::jsonb, %s
+                %s::jsonb
             )
         """
         _params = (
@@ -946,9 +946,8 @@ class APEntryWatcher:
             _rearmed,
             _expired,
             _perm_reject,
-            # full payload JSONB + timestamp
+            # full payload JSONB — evaluated_at uses column DEFAULT NOW()
             _json_local.dumps(payload, default=str),
-            payload.get("evaluated_at"),
         )
 
         try:
