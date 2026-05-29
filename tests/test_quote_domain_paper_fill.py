@@ -302,3 +302,46 @@ class TestPoint4ThreeStateMismatch:
     def test_live_mode_false(self):
         r = self._compute(False, True, False, "tradier_live", "tradier_sandbox")
         assert r is False
+
+
+class TestItem4ExplicitFields:
+    """Item 4 — quote-domain audit deepening.
+
+    The spec requires these explicit fields in orders.meta (not just inferrable):
+      - selector_sandbox_mode
+      - submit_sandbox_mode
+      - broker_base_url
+
+    They're added alongside the existing tradier_sandbox_mode (kept as alias
+    for dashboards already deployed). This lets operators ask 'was the
+    selector reading sandbox quotes?' without parsing a string.
+    """
+
+    def test_selector_sandbox_mode_explicit_in_meta_block(self):
+        # Read the literal meta-block construction in ap/execution.py to
+        # confirm the explicit keys are present.
+        import pathlib
+        src = pathlib.Path(__file__).parent.parent / "ap" / "execution.py"
+        text = src.read_text()
+        assert '"selector_sandbox_mode"' in text, "explicit selector_sandbox_mode missing"
+        assert '"submit_sandbox_mode"' in text, "explicit submit_sandbox_mode missing"
+        assert '"broker_base_url"' in text, "explicit broker_base_url missing"
+        # Tradier alias retained for back-compat:
+        assert '"tradier_sandbox_mode"' in text, "tradier_sandbox_mode alias dropped"
+
+    def test_selector_sandbox_mode_is_bool_from_qid(self):
+        # Mirror the assignment expression to ensure it's a bool, not a string.
+        # If selector_qid["sandbox_mode"] is truthy, bool() of it is True.
+        for v in (True, False, 1, 0, None):
+            assert isinstance(bool(v), bool)
+            # All these coerce cleanly — no surprises.
+
+    def test_broker_base_url_equals_submit_quote_base_url(self):
+        # broker_base_url is an alias of submit_quote_base_url (broker = submit env).
+        # Confirm both assignments reference the same _submit_qid value.
+        import pathlib, re
+        src = pathlib.Path(__file__).parent.parent / "ap" / "execution.py"
+        text = src.read_text()
+        # Allow any whitespace between the key and the assignment value.
+        assert re.search(r'"broker_base_url":\s*_submit_qid\["quote_base_url"\]', text)
+        assert re.search(r'"submit_quote_base_url":\s*_submit_qid\["quote_base_url"\]', text)

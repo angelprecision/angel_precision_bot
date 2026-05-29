@@ -1234,8 +1234,12 @@ def process_signal(broker, client_id: str, signal_payload: dict) -> dict:
             # sandbox quote-domain mismatch vs. a genuine signal/contract fault.
             "selector_quote_source":   _selector_qid["quote_source"],
             "selector_quote_base_url": _selector_qid["quote_base_url"],
+            "selector_sandbox_mode":   bool(_selector_qid["sandbox_mode"]),  # item 4: explicit
             "submit_quote_source":     _submit_qid["quote_source"],
             "submit_quote_base_url":   _submit_qid["quote_base_url"],
+            "submit_sandbox_mode":     bool(_submit_qid["sandbox_mode"]),    # item 4: explicit
+            "broker_base_url":         _submit_qid["quote_base_url"],         # item 4: alias (broker == submit env)
+            # Existing alias kept for back-compat with dashboards already on main:
             "tradier_sandbox_mode":    bool(_submit_qid["sandbox_mode"]),
             "mode":                    mode,
             "quote_domain_mismatch_possible": _quote_domain_mismatch,
