@@ -158,6 +158,7 @@ def _score_allows_entry(
     timeframe: str,
     spread_pct: float | None,
     delta: float | None,
+    dte_known: bool = True,
 ) -> tuple[bool, str]:
     """Structured score eligibility — refinement of the blunt < hard_floor reject.
 
@@ -196,6 +197,16 @@ def _score_allows_entry(
     if not SCORE65_ALLOW:
         # Feature disabled — preserve existing blunt behavior exactly.
         return False, "REJECTED_LOW_SCORE"
+
+    # UNKNOWN-DTE GUARD: the entire score-65 exception depends on PROVING the
+    # setup is non-0DTE. A missing or unparseable DTE must NEVER silently
+    # become non-0DTE — that would let unknown-expiry setups slip through.
+    # The caller tracks _dte_known separately from _is_0dte_for_gate:
+    #   True  → DTE parsed cleanly or expiration date matched YYYY-MM-DD
+    #   False → DTE absent or unparseable
+    # We reject unknown before the 0DTE check so ordering is safe.
+    if not dte_known:
+        return False, "REJECTED_SCORE65_UNKNOWN_DTE"
 
     # 0DTE at score 65 is always rejected (index or single-name).
     if is_0dte:
@@ -1340,6 +1351,7 @@ class APMasterControl:
 
         # Resolve 0DTE once here (reused by PR C below). Cheap + side-effect free.
         _is_0dte_for_gate = False
+        _dte_known        = False  # item-2: True only when DTE is provable
         try:
             from zoneinfo import ZoneInfo as _ZI_sg
             from datetime import datetime as _dt_sg
@@ -1354,12 +1366,26 @@ class APMasterControl:
             if _dte_sg is not None:
                 try:
                     _is_0dte_for_gate = int(_dte_sg) == 0
+                    _dte_known = True   # parsed cleanly
                 except (TypeError, ValueError):
                     _is_0dte_for_gate = False
-            if not _is_0dte_for_gate and isinstance(_exp_sg, str) and _exp_sg[:10] == _today_str_sg:
-                _is_0dte_for_gate = True
+                    _dte_known = False  # present but unparseable
+            # A parseable YYYY-MM-DD expiration also proves DTE.
+            # Use strptime to actually validate the date — checking dash
+            # positions alone accepts garbage like "2026-ab-cd" or "2026-99-99"
+            # which would set _dte_known=True on data that is not a real date.
+            if isinstance(_exp_sg, str) and len(_exp_sg) >= 10:
+                try:
+                    _exp_date = _dt_sg.strptime(_exp_sg[:10], "%Y-%m-%d").date()
+                    _today_date = _dt_sg.now(_ZI_sg("America/New_York")).date()
+                    if _exp_date == _today_date:
+                        _is_0dte_for_gate = True
+                    _dte_known = True   # strptime succeeded → real date proven
+                except (ValueError, TypeError):
+                    pass  # unparseable expiration — leave _dte_known as-is
         except Exception:
             _is_0dte_for_gate = False
+            _dte_known = False
 
         _spread_for_gate = signal.get("spread_pct")
         try:
@@ -1380,6 +1406,7 @@ class APMasterControl:
             timeframe=signal.get("timeframe", "1d"),
             spread_pct=_spread_for_gate,
             delta=_delta_for_gate,
+            dte_known=_dte_known,
         )
         if not _score_ok:
             self._store_update(
