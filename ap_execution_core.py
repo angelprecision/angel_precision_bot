@@ -807,13 +807,22 @@ class APExecutionCore:
             broker_order_id = submit_res.get("broker_order_id")
             # Item 3 — persist selector candidate audit into orders.meta
             # (EVIDENCE ONLY, best-effort, non-destructive JSONB merge).
+            # _candidate_audit is set ONLY when breach-time deferred selection
+            # ran above. For preselected (non-deferred) orders the queue stashed
+            # the audit on approved_plan.metadata at selection time — fall back
+            # to that source so both paths produce orders.meta.selector_candidate_audit.
             try:
-                if _candidate_audit and local_order_id and hasattr(
+                _persist_ca = _candidate_audit
+                if not _persist_ca and approved_plan is not None:
+                    _pmeta = getattr(approved_plan, "metadata", None) or {}
+                    if isinstance(_pmeta, dict):
+                        _persist_ca = _pmeta.get("selector_candidate_audit")
+                if _persist_ca and local_order_id and hasattr(
                     self.order_state_machine, "update_order_meta"
                 ):
                     self.order_state_machine.update_order_meta(
                         local_order_id,
-                        {"selector_candidate_audit": _candidate_audit},
+                        {"selector_candidate_audit": _persist_ca},
                     )
             except Exception as _ca_exc:
                 log.warning("[%s] candidate_audit persist failed: %s", ticker, _ca_exc)
