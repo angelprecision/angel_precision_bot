@@ -1067,15 +1067,13 @@ class TestEodCheckAllIntegration:
         et_now = self._make_eod_et_mock()
         with _patch("ap_entry_watcher.datetime") as mock_dt:
             mock_dt.now.return_value = et_now
-            try:
-                watcher._check_all()
-            except Exception:
-                pass
+            watcher._check_all()
 
         assert w.state == WatchState.PENDING, (
             "Overnight rearm signal must NOT be expired at EOD"
         )
         assert w in watcher._pending
+        on_expire.assert_not_called()
 
     def test_eod_target_boolean_same_day_rearm(self):
         """Unit-level: same-day rearm signal must be EOD target.
