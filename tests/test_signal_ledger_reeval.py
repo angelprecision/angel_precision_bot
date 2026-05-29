@@ -102,36 +102,99 @@ class TestFetchRowConversion:
         # The fix must return dict(row) instead.
         cols = ["symbol", "client_id", "ledger_bucket"]
         row  = {"symbol": "NFLX", "client_id": "jose@example.com",
-                "ledger_bucket": "FILLED_OR_PARTIAL"}
+                "ledger_bucket": "FILLED"}
         result = self._convert(cols, row)
         # Must NOT be the column-name-to-column-name mapping
         assert result["ledger_bucket"] != "ledger_bucket", (
             "dict row was incorrectly zipped: values are column names, not data"
         )
-        assert result["ledger_bucket"] == "FILLED_OR_PARTIAL"
+        assert result["ledger_bucket"] == "FILLED"
 
     def test_dict_row_preserves_extra_columns(self):
         # dict(row) preserves all columns even if cols list is shorter.
         cols = ["symbol"]
         row  = {"symbol": "MSFT", "client_id": "jason@example.com",
-                "ledger_bucket": "TERMINAL_NO_FILL", "score": 72}
+                "ledger_bucket": "WATCHER_INVALIDATED", "score": 72}
         result = self._convert(cols, row)
         assert result["score"] == 72
-        assert result["ledger_bucket"] == "TERMINAL_NO_FILL"
+        assert result["ledger_bucket"] == "WATCHER_INVALIDATED"
 
     def test_all_ledger_bucket_values_are_expected_strings(self):
-        """Bucket values must be one of the spec-defined strings."""
+        """Bucket values must be one of the spec-defined 9 strings."""
         valid_buckets = {
             "NO_ORDER_FOR_CLIENT",
             "PENDING_TRIGGER_NO_BROKER",
+            "WATCHER_INVALIDATED",
+            "WATCHER_EXPIRED",
             "BROKER_SUBMITTED",
-            "FILLED_OR_PARTIAL",
+            "FILLED",
+            "REJECTED",
+            "CANCELED",
             "TERMINAL_NO_FILL",
             "OTHER",
         }
-        # Simulate what the SQL CASE produces: only valid bucket strings.
         for bucket in valid_buckets:
             cols = ["ledger_bucket"]
             row  = (bucket,)
             result = self._convert(cols, row)
             assert result["ledger_bucket"] in valid_buckets
+
+
+class TestNineBucketCASE:
+    """PR #57 spec update: ledger_bucket must split TERMINAL_NO_FILL into the
+    9 distinct buckets so the dashboard can show why each order died."""
+
+    @staticmethod
+    def _classify(status, broker_order_id, last_error, local_order_id="LOID"):
+        """Mirror the SQL CASE classifier in Python so we can unit-test it."""
+        if local_order_id is None:
+            return "NO_ORDER_FOR_CLIENT"
+        if status == "PENDING_TRIGGER" and broker_order_id is None:
+            return "PENDING_TRIGGER_NO_BROKER"
+        if status in ("ACK", "SUBMITTED", "ACKNOWLEDGED") and broker_order_id is not None:
+            return "BROKER_SUBMITTED"
+        if status in ("FILLED", "PARTIALLY_FILLED", "PARTIAL_FILL"):
+            return "FILLED"
+        if status == "EXPIRED" and last_error == "watcher_expired":
+            return "WATCHER_EXPIRED"
+        if status == "CANCELED" and last_error == "watcher_invalidated":
+            return "WATCHER_INVALIDATED"
+        if status == "REJECTED":
+            return "REJECTED"
+        if status in ("CANCELED", "CANCELLED"):
+            return "CANCELED"
+        if status in ("EXPIRED", "ERROR"):
+            return "TERMINAL_NO_FILL"
+        return "OTHER"
+
+    def test_watcher_invalidated_distinct_from_canceled(self):
+        # CANCELED with last_error=watcher_invalidated → WATCHER_INVALIDATED
+        b1 = self._classify("CANCELED", None, "watcher_invalidated")
+        # CANCELED with any other last_error → plain CANCELED
+        b2 = self._classify("CANCELED", "B1", "broker_canceled")
+        assert b1 == "WATCHER_INVALIDATED"
+        assert b2 == "CANCELED"
+        assert b1 != b2
+
+    def test_watcher_expired_distinct_from_terminal_no_fill(self):
+        b1 = self._classify("EXPIRED", None, "watcher_expired")
+        b2 = self._classify("EXPIRED", None, "stale_order_cleanup")
+        assert b1 == "WATCHER_EXPIRED"
+        assert b2 == "TERMINAL_NO_FILL"
+
+    def test_rejected_distinct_bucket(self):
+        assert self._classify("REJECTED", None, "broker_no_buy_power") == "REJECTED"
+
+    def test_filled_drops_or_partial_suffix(self):
+        for status in ("FILLED", "PARTIAL_FILL", "PARTIALLY_FILLED"):
+            assert self._classify(status, "B1", None) == "FILLED"
+
+    def test_acknowledged_treated_as_broker_submitted(self):
+        assert self._classify("ACKNOWLEDGED", "B1", None) == "BROKER_SUBMITTED"
+
+    def test_no_order_when_local_order_id_missing(self):
+        assert self._classify("FILLED", "B1", None, local_order_id=None) == "NO_ORDER_FOR_CLIENT"
+
+    def test_pending_trigger_needs_no_broker_to_classify(self):
+        # PENDING_TRIGGER without broker → its own bucket
+        assert self._classify("PENDING_TRIGGER", None, None) == "PENDING_TRIGGER_NO_BROKER"

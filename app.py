@@ -1082,20 +1082,28 @@ def create_app() -> Flask:
             from ap.db import run_with_retry
             rows = run_with_retry(_fetch)
 
-            # Summary counts by bucket.
+            # Summary counts by bucket. Mirrors the 9-bucket SQL CASE.
             buckets = {
-                "pending_trigger_no_broker": 0,
-                "broker_submitted":          0,
-                "filled_or_partial":         0,
-                "terminal_no_fill":          0,
                 "no_order_for_client":       0,
+                "pending_trigger_no_broker": 0,
+                "watcher_invalidated":       0,
+                "watcher_expired":           0,
+                "broker_submitted":          0,
+                "filled":                    0,
+                "rejected":                  0,
+                "canceled":                  0,
+                "terminal_no_fill":          0,
             }
             _bmap = {
-                "PENDING_TRIGGER_NO_BROKER": "pending_trigger_no_broker",
-                "BROKER_SUBMITTED":          "broker_submitted",
-                "FILLED_OR_PARTIAL":         "filled_or_partial",
-                "TERMINAL_NO_FILL":          "terminal_no_fill",
                 "NO_ORDER_FOR_CLIENT":       "no_order_for_client",
+                "PENDING_TRIGGER_NO_BROKER": "pending_trigger_no_broker",
+                "WATCHER_INVALIDATED":       "watcher_invalidated",
+                "WATCHER_EXPIRED":           "watcher_expired",
+                "BROKER_SUBMITTED":          "broker_submitted",
+                "FILLED":                    "filled",
+                "REJECTED":                  "rejected",
+                "CANCELED":                  "canceled",
+                "TERMINAL_NO_FILL":          "terminal_no_fill",
             }
             _clients, _signals = set(), set()
             for r in rows:

@@ -89,9 +89,13 @@ SELECT
   CASE
     WHEN o.local_order_id IS NULL                                              THEN 'NO_ORDER_FOR_CLIENT'
     WHEN o.status = 'PENDING_TRIGGER' AND o.broker_order_id IS NULL            THEN 'PENDING_TRIGGER_NO_BROKER'
-    WHEN o.status IN ('ACK','SUBMITTED') AND o.broker_order_id IS NOT NULL     THEN 'BROKER_SUBMITTED'
-    WHEN o.status IN ('FILLED','PARTIALLY_FILLED','PARTIAL_FILL')              THEN 'FILLED_OR_PARTIAL'
-    WHEN o.status IN ('CANCELED','CANCELLED','EXPIRED','REJECTED')             THEN 'TERMINAL_NO_FILL'
+    WHEN o.status IN ('ACK','SUBMITTED','ACKNOWLEDGED') AND o.broker_order_id IS NOT NULL THEN 'BROKER_SUBMITTED'
+    WHEN o.status IN ('FILLED','PARTIALLY_FILLED','PARTIAL_FILL')              THEN 'FILLED'
+    WHEN o.status = 'EXPIRED' AND o.last_error = 'watcher_expired'             THEN 'WATCHER_EXPIRED'
+    WHEN o.status = 'CANCELED' AND o.last_error = 'watcher_invalidated'        THEN 'WATCHER_INVALIDATED'
+    WHEN o.status = 'REJECTED'                                                 THEN 'REJECTED'
+    WHEN o.status IN ('CANCELED','CANCELLED')                                  THEN 'CANCELED'
+    WHEN o.status IN ('EXPIRED','ERROR')                                       THEN 'TERMINAL_NO_FILL'
     ELSE 'OTHER'
   END                                                      AS ledger_bucket
 FROM orders o
