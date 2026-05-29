@@ -130,3 +130,32 @@ decision table plus the feature-off path that preserves current behavior.
 5. Watch `ap_signals` for `score65_admitted` rows + their downstream fill outcomes.
 6. If a score-65 admit underperforms, set `SCORE65_ALLOW=false` — instant revert,
    no redeploy.
+
+---
+
+## ITEM-2 UPDATE — REJECTED_SCORE65_UNKNOWN_DTE (unblocks enabling)
+
+The score-65 exception is only safe when we can PROVE the setup is non-0DTE.
+Previously, an unparseable/missing DTE silently defaulted to non-0DTE (False),
+which could let an unknown-expiry 65 slip through once SCORE65_ALLOW=true.
+
+Fix:
+- `_score_allows_entry` gains `dte_known: bool = True`. When False and score is
+  in [65, hard_floor), it returns `REJECTED_SCORE65_UNKNOWN_DTE` BEFORE the
+  0DTE / spread / delta checks.
+- The caller now tracks `_dte_known` three-state: True only when the `dte`
+  field parses cleanly OR a YYYY-MM-DD expiration is present. A present-but-
+  unparseable `dte`, or no DTE signal at all, yields `_dte_known=False`.
+- Default `dte_known=True` keeps every existing call site / test unaffected.
+
+New reason code: REJECTED_SCORE65_UNKNOWN_DTE.
+
+Tests added (6): unknown DTE rejected; rejected even with clean spread/delta/
+timeframe; known non-0DTE still admitted; default-True back-comat; doesn't
+affect score>=70; under-65 still reports UNDER_65 (cheaper check first).
+Suite now 19/19.
+
+This satisfies the gate: "do not enable SCORE65_ALLOW until unknown-DTE
+rejection exists." The flag remains OFF by default — enabling still also
+requires the deployed quote-domain PR, the count query review, and one
+monitored session.

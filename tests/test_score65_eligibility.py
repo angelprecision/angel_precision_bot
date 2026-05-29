@@ -101,3 +101,45 @@ class TestScore65Eligibility:
         ok, reason = f(score=60, hard_floor=HF, is_0dte=False, is_index=False,
                        timeframe="1d", spread_pct=0.05, delta=0.5)
         assert not ok and reason == "REJECTED_LOW_SCORE_UNDER_65"
+
+    # ── item 2: unknown-DTE must reject in the 65–69 band ────────────────────
+    def test_unknown_dte_rejected(self):
+        f = _load()  # feature ON
+        ok, reason = f(score=66, hard_floor=HF, is_0dte=False, is_index=False,
+                       timeframe="1d", spread_pct=0.05, delta=0.5, dte_known=False)
+        assert not ok and reason == "REJECTED_SCORE65_UNKNOWN_DTE"
+
+    def test_unknown_dte_rejected_even_with_clean_everything(self):
+        # Clean spread + delta + daily timeframe must STILL reject if DTE unproven.
+        f = _load()
+        ok, reason = f(score=69, hard_floor=HF, is_0dte=False, is_index=False,
+                       timeframe="daily", spread_pct=0.02, delta=0.6, dte_known=False)
+        assert not ok and reason == "REJECTED_SCORE65_UNKNOWN_DTE"
+
+    def test_known_dte_non_0dte_still_admitted(self):
+        # Sanity: when DTE IS known and non-0DTE, clean setup still admits.
+        f = _load()
+        ok, reason = f(score=66, hard_floor=HF, is_0dte=False, is_index=False,
+                       timeframe="1d", spread_pct=0.05, delta=0.5, dte_known=True)
+        assert ok and reason == "ALLOWED_SCORE65_NON_0DTE_DAILY"
+
+    def test_unknown_dte_default_true_preserves_prior_tests(self):
+        # dte_known defaults to True so existing call sites/tests are unaffected.
+        f = _load()
+        ok, reason = f(score=66, hard_floor=HF, is_0dte=False, is_index=False,
+                       timeframe="1d", spread_pct=0.05, delta=0.5)
+        assert ok and reason == "ALLOWED_SCORE65_NON_0DTE_DAILY"
+
+    def test_unknown_dte_does_not_affect_above_floor(self):
+        # score>=70 is the normal path regardless of dte_known.
+        f = _load()
+        ok, reason = f(score=72, hard_floor=HF, is_0dte=False, is_index=False,
+                       timeframe="1d", spread_pct=0.05, delta=0.5, dte_known=False)
+        assert ok and reason == ""
+
+    def test_unknown_dte_under_65_still_under_65(self):
+        # Below 65 is rejected as UNDER_65, not UNKNOWN_DTE (cheaper check first).
+        f = _load()
+        ok, reason = f(score=60, hard_floor=HF, is_0dte=False, is_index=False,
+                       timeframe="1d", spread_pct=0.05, delta=0.5, dte_known=False)
+        assert not ok and reason == "REJECTED_LOW_SCORE_UNDER_65"

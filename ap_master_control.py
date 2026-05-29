@@ -158,6 +158,7 @@ def _score_allows_entry(
     timeframe: str,
     spread_pct: float | None,
     delta: float | None,
+    dte_known: bool = True,
 ) -> tuple[bool, str]:
     """Structured score eligibility — refinement of the blunt < hard_floor reject.
 
@@ -170,12 +171,20 @@ def _score_allows_entry(
       2. score < SCORE65_FLOOR (65)       -> REJECTED_LOW_SCORE_UNDER_65
       3. score in [65, hard_floor):
            - feature off (SCORE65_ALLOW)  -> REJECTED_LOW_SCORE (unchanged behavior)
+           - NOT dte_known                -> REJECTED_SCORE65_UNKNOWN_DTE
            - is_0dte                      -> REJECTED_SCORE65_0DTE
            - spread present & too wide     -> REJECTED_SCORE65_WIDE_SPREAD
            - delta present & too weak      -> REJECTED_SCORE65_WEAK_CONTRACT
            - otherwise                     -> ALLOWED_SCORE65_NON_0DTE_*
                                               (DAILY if timeframe daily/overnight,
                                                else CLEAN for non-0DTE intraday)
+
+    dte_known (item-2 fix): the ENTIRE score-65 exception depends on PROVING the
+    setup is not 0DTE. If DTE/expiration could not be parsed, the caller passes
+    dte_known=False and we reject with REJECTED_SCORE65_UNKNOWN_DTE rather than
+    letting an unparseable DTE silently default to non-0DTE and slip through.
+    Note is_0dte should be False when dte_known is False (we can't claim 0DTE
+    either) — the unknown branch fires first regardless, so ordering is safe.
 
     NOTE: quote_ok / submit_ask are NOT available at this point in the
     pipeline (they're resolved downstream in contract_selector.select() and at
@@ -196,6 +205,12 @@ def _score_allows_entry(
     if not SCORE65_ALLOW:
         # Feature disabled — preserve existing blunt behavior exactly.
         return False, "REJECTED_LOW_SCORE"
+
+    # UNKNOWN-DTE GUARD (item 2): the score-65 exception is only safe when we
+    # can PROVE the setup is non-0DTE. If DTE/expiration is missing or
+    # unparseable, reject — never let unknown DTE become an implicit non-0DTE.
+    if not dte_known:
+        return False, "REJECTED_SCORE65_UNKNOWN_DTE"
 
     # 0DTE at score 65 is always rejected (index or single-name).
     if is_0dte:
@@ -1339,7 +1354,12 @@ class APMasterControl:
         _hard_floor = SCORE_MIN_ELIGIBLE + _post_target_score_bump
 
         # Resolve 0DTE once here (reused by PR C below). Cheap + side-effect free.
+        # item-2: track whether DTE was actually PROVABLE. _is_0dte_for_gate is
+        # only meaningful when _dte_known is True. If neither the dte field nor a
+        # parseable expiration is available, _dte_known stays False and the
+        # score-65 band is rejected with REJECTED_SCORE65_UNKNOWN_DTE.
         _is_0dte_for_gate = False
+        _dte_known = False
         try:
             from zoneinfo import ZoneInfo as _ZI_sg
             from datetime import datetime as _dt_sg
@@ -1354,12 +1374,19 @@ class APMasterControl:
             if _dte_sg is not None:
                 try:
                     _is_0dte_for_gate = int(_dte_sg) == 0
+                    _dte_known = True   # dte parsed cleanly
                 except (TypeError, ValueError):
                     _is_0dte_for_gate = False
-            if not _is_0dte_for_gate and isinstance(_exp_sg, str) and _exp_sg[:10] == _today_str_sg:
-                _is_0dte_for_gate = True
+                    _dte_known = False  # dte present but unparseable
+            # A parseable expiration date also proves DTE (0DTE if it's today).
+            if isinstance(_exp_sg, str) and len(_exp_sg) >= 10 and _exp_sg[4] == "-" and _exp_sg[7] == "-":
+                # Looks like a YYYY-MM-DD date — treat as proof.
+                if _exp_sg[:10] == _today_str_sg:
+                    _is_0dte_for_gate = True
+                _dte_known = True
         except Exception:
             _is_0dte_for_gate = False
+            _dte_known = False
 
         _spread_for_gate = signal.get("spread_pct")
         try:
@@ -1380,6 +1407,7 @@ class APMasterControl:
             timeframe=signal.get("timeframe", "1d"),
             spread_pct=_spread_for_gate,
             delta=_delta_for_gate,
+            dte_known=_dte_known,
         )
         if not _score_ok:
             self._store_update(
