@@ -143,6 +143,62 @@ def _extract_abs_delta(opt: dict) -> tuple[Optional[float], str]:
     return d, "ok"
 
 
+def _build_candidate_audit(scored, underlying_price, selected_symbol, selected_reason, rejections, top_n=3):
+    """Item 3 — build the persisted selector candidate audit (EVIDENCE ONLY).
+
+    scored: list of (rank_score, opt_dict) already sorted best-first.
+    Returns a dict safe to drop into orders.meta. Never raises.
+    """
+    candidates = []
+    try:
+        for _rank, (_s, _c) in enumerate(scored[:top_n]):
+            bid = _safe_float(_c.get("bid"))
+            ask = _safe_float(_c.get("ask"))
+            mid = (bid + ask) / 2 if (bid > 0 and ask > 0) else _safe_float(_c.get("mid"))
+            last = _safe_float(_c.get("last"))
+            spread_pct = ((ask - bid) / mid) if mid > 0 else None
+            abs_delta, delta_reason = _extract_abs_delta(_c)
+            strike = _safe_float(_c.get("strike"))
+            up = _safe_float(underlying_price)
+            moneyness_pct = ((strike - up) / up) if up > 0 else None
+            candidates.append({
+                "rank":                _rank + 1,
+                "contract":            _c.get("symbol", "?"),
+                "strike":              strike,
+                "expiration":          _c.get("expiration_date") or _c.get("expiration") or "",
+                "dte":                 _c.get("dte"),
+                "bid":                 round(bid, 4),
+                "ask":                 round(ask, 4),
+                "mid":                 round(mid, 4),
+                "last":                round(last, 4),
+                "spread_pct":          round(spread_pct, 4) if spread_pct is not None else None,
+                "delta":               round(abs_delta, 4) if abs_delta is not None else None,
+                "delta_reason":        delta_reason,
+                "moneyness_pct":       round(moneyness_pct, 4) if moneyness_pct is not None else None,
+                "distance_from_underlying": round(strike - up, 4) if up > 0 else None,
+                "volume":              int(_safe_float(_c.get("volume"))),
+                "open_interest":       int(_safe_float(_c.get("open_interest"))),
+                "rank_score":          round(_safe_float(_s), 4),
+            })
+    except Exception:
+        pass
+
+    rejected = {}
+    try:
+        rejected = dict(sorted((rejections or {}).items(), key=lambda x: -x[1]))
+    except Exception:
+        rejected = {}
+
+    return {
+        "selected_contract":          selected_symbol,
+        "selected_reason":            selected_reason,
+        "underlying_price":           round(_safe_float(underlying_price), 4),
+        "candidates_considered":      len(scored) if scored else 0,
+        "top_candidates":             candidates,
+        "rejected_candidate_reasons": rejected,
+    }
+
+
 def _safe_plan_attr(plan, attr: str, default=None):
     """Get attribute from plan whether it is an object or dict."""
     try:
@@ -303,6 +359,12 @@ class SelectedContract:
     effective_budget: float = 0.0
     budget_clipped: bool = False
     pricing_basis: str = ""
+    # Item 3 — selector candidate audit (EVIDENCE ONLY, no behavior change).
+    # Top-N candidates considered, each with bid/ask/mid/last/spread/delta/dte/
+    # strike/moneyness/volume/OI + rank, plus selected_reason and the rejected
+    # candidate reasons. None when not built. Persisted into orders.meta by the
+    # execution layer so we can answer "why this contract and not that one?".
+    candidate_audit: Optional[dict] = None
 
     def to_dict(self) -> dict:
         return {
@@ -328,6 +390,7 @@ class SelectedContract:
             "effective_budget": self.effective_budget,
             "budget_clipped": self.budget_clipped,
             "pricing_basis": self.pricing_basis,
+            "candidate_audit": self.candidate_audit,
         }
 
 
@@ -954,6 +1017,21 @@ class APContractSelectionEngine:
         selected = self._build_selected(best, best_score, budget, today)
         if selected is None:
             return None
+
+        # Item 3 — attach the selector candidate audit (EVIDENCE ONLY). Built
+        # from the final sorted `scored` list + the rejection counts. Persisted
+        # downstream into orders.meta. Never affects selection. Best-effort.
+        try:
+            selected.candidate_audit = _build_candidate_audit(
+                scored,
+                underlying_price or 0.0,
+                selected_symbol=selected.contract_symbol,
+                selected_reason=selected.selection_reason,
+                rejections=_rejections,
+                top_n=int(os.getenv("SELECTOR_CANDIDATE_AUDIT_TOP_N", "3")),
+            )
+        except Exception:
+            selected.candidate_audit = None
 
         _effective_budget_used, _max_trade_cap, _budget_was_clipped = _effective_budget(budget)
         if _budget_was_clipped:

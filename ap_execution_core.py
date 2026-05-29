@@ -657,6 +657,7 @@ class APExecutionCore:
         # select the contract before the limit_price and contract_symbol checks.
         _sig_meta   = getattr(approved_plan, "metadata", {}) or {}
         _sig_dict   = sig or {}
+        _candidate_audit = None  # Item 3 — set if breach-time selection runs
         _contract_sym_raw = str(getattr(approved_plan, "contract_symbol", "") or "").strip()
         _deferred   = (
             bool(_sig_meta.get("contract_deferred"))
@@ -719,6 +720,12 @@ class APExecutionCore:
                     float(getattr(approved_plan, "limit_price", 0) or 0),
                     int(getattr(approved_plan, "contracts", 1) or 1),
                 )
+                # Item 3 — capture the selector candidate audit (EVIDENCE ONLY).
+                # Persisted into orders.meta after a successful submit below.
+                try:
+                    _candidate_audit = getattr(_sel, "candidate_audit", None)
+                except Exception:
+                    _candidate_audit = None
             except Exception as _cs_err:
                 log.critical(
                     "[%s] PRODUCTION_ENTRY_BLOCK — breach-time contract selection "
@@ -798,6 +805,27 @@ class APExecutionCore:
         if submit_res.get("ok"):
             local_order_id = submit_res.get("local_order_id")
             broker_order_id = submit_res.get("broker_order_id")
+            # Item 3 — persist selector candidate audit into orders.meta
+            # (EVIDENCE ONLY, best-effort, non-destructive JSONB merge).
+            # _candidate_audit is set ONLY when breach-time deferred selection
+            # ran above. For preselected (non-deferred) orders the queue stashed
+            # the audit on approved_plan.metadata at selection time — fall back
+            # to that source so both paths produce orders.meta.selector_candidate_audit.
+            try:
+                _persist_ca = _candidate_audit
+                if not _persist_ca and approved_plan is not None:
+                    _pmeta = getattr(approved_plan, "metadata", None) or {}
+                    if isinstance(_pmeta, dict):
+                        _persist_ca = _pmeta.get("selector_candidate_audit")
+                if _persist_ca and local_order_id and hasattr(
+                    self.order_state_machine, "update_order_meta"
+                ):
+                    self.order_state_machine.update_order_meta(
+                        local_order_id,
+                        {"selector_candidate_audit": _persist_ca},
+                    )
+            except Exception as _ca_exc:
+                log.warning("[%s] candidate_audit persist failed: %s", ticker, _ca_exc)
             if signal_id:
                 self.store.update_signal_fields(signal_id, {
                     "decision_status": "submitted",

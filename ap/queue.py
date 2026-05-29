@@ -753,6 +753,19 @@ def _dispatch(
                 f"@ ${selected.mid:.2f} x{plan.contracts} "
                 f"cost=${plan.max_position_usd:.0f}"
             )
+            # Item 3 (review fix) — stash candidate_audit on plan.metadata so
+            # execution_core can persist it into orders.meta for the preselected
+            # (non-deferred) queue path. Without this stash, only breach-time
+            # deferred selection would produce selector_candidate_audit; the
+            # normal preselected path would leave audit absent.
+            try:
+                _ca = getattr(selected, "candidate_audit", None)
+                if _ca is not None:
+                    if not hasattr(plan, "metadata") or not isinstance(plan.metadata, dict):
+                        plan.metadata = {}
+                    plan.metadata["selector_candidate_audit"] = _ca
+            except Exception:
+                pass
         except Exception as e:
             log.error(f"[{ticker}] contract_selector.select() raised: {e}")
             _mark_job(job_id, "ERROR", error=f"contract_selector_error: {e}")
