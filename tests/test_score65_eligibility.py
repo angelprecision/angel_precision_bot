@@ -101,3 +101,43 @@ class TestScore65Eligibility:
         ok, reason = f(score=60, hard_floor=HF, is_0dte=False, is_index=False,
                        timeframe="1d", spread_pct=0.05, delta=0.5)
         assert not ok and reason == "REJECTED_LOW_SCORE_UNDER_65"
+
+class TestUnknownDTE:
+    """Item 2 — dte_known guard. Added on top of PR #55 post-merge."""
+
+    def test_unknown_dte_rejected_in_65_band(self):
+        f = _load()
+        ok, reason = f(score=66, hard_floor=HF, is_0dte=False, is_index=False,
+                       timeframe="1d", spread_pct=0.05, delta=0.5, dte_known=False)
+        assert not ok and reason == "REJECTED_SCORE65_UNKNOWN_DTE"
+
+    def test_unknown_dte_rejected_even_clean_everything(self):
+        f = _load()
+        ok, reason = f(score=69, hard_floor=HF, is_0dte=False, is_index=False,
+                       timeframe="daily", spread_pct=0.02, delta=0.6, dte_known=False)
+        assert not ok and reason == "REJECTED_SCORE65_UNKNOWN_DTE"
+
+    def test_known_dte_still_admitted(self):
+        f = _load()
+        ok, reason = f(score=66, hard_floor=HF, is_0dte=False, is_index=False,
+                       timeframe="1d", spread_pct=0.05, delta=0.5, dte_known=True)
+        assert ok and reason == "ALLOWED_SCORE65_NON_0DTE_DAILY"
+
+    def test_default_dte_known_true_backcompat(self):
+        # Default dte_known=True so all existing callers/tests are unaffected.
+        f = _load()
+        ok, reason = f(score=66, hard_floor=HF, is_0dte=False, is_index=False,
+                       timeframe="1d", spread_pct=0.05, delta=0.5)
+        assert ok and reason == "ALLOWED_SCORE65_NON_0DTE_DAILY"
+
+    def test_unknown_dte_does_not_affect_score_70(self):
+        f = _load()
+        ok, reason = f(score=72, hard_floor=HF, is_0dte=False, is_index=False,
+                       timeframe="1d", spread_pct=0.05, delta=0.5, dte_known=False)
+        assert ok and reason == ""
+
+    def test_unknown_dte_below_65_still_under65(self):
+        f = _load()
+        ok, reason = f(score=60, hard_floor=HF, is_0dte=False, is_index=False,
+                       timeframe="1d", spread_pct=0.05, delta=0.5, dte_known=False)
+        assert not ok and reason == "REJECTED_LOW_SCORE_UNDER_65"
