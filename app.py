@@ -1067,7 +1067,17 @@ def create_app() -> Flask:
                 with conn() as c:
                     cur = c.execute(sql, tuple(params))
                     cols = [d[0] for d in cur.description]
-                    return [dict(zip(cols, r)) for r in cur.fetchall()]
+                    fetched = cur.fetchall()
+                    rows = []
+                    for r in fetched:
+                        if isinstance(r, dict):
+                            # psycopg2 RealDictCursor / psycopg3 Row — already
+                            # keyed by column name; copy directly to avoid
+                            # dict(zip(cols, cols)) when iterating a dict.
+                            rows.append(dict(r))
+                        else:
+                            rows.append(dict(zip(cols, r)))
+                    return rows
 
             from ap.db import run_with_retry
             rows = run_with_retry(_fetch)

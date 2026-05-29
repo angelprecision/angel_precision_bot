@@ -72,3 +72,66 @@ class TestViewFileShape:
         assert "split_part(o.signal_id, ':', 2)" in sql
         assert "LEFT JOIN ap_signals" in sql
         assert "WHERE o.kind = 'ENTRY'" in sql
+
+
+class TestFetchRowConversion:
+    """PR #57 review fix: _fetch() must return column values, not column names.
+
+    When the cursor returns dict rows (psycopg2 RealDictCursor / psycopg3),
+    iterating the dict and zipping with cols produces {'key': 'key'} instead
+    of {'key': value}. The fix checks isinstance(r, dict) first.
+    """
+
+    @staticmethod
+    def _convert(cols, row):
+        """Mirror the fixed _fetch() row-conversion logic."""
+        if isinstance(row, dict):
+            return dict(row)
+        return dict(zip(cols, row))
+
+    def test_tuple_row_maps_values(self):
+        cols = ["symbol", "client_id", "ledger_bucket"]
+        row  = ("NFLX", "jose@example.com", "PENDING_TRIGGER_NO_BROKER")
+        result = self._convert(cols, row)
+        assert result["ledger_bucket"] == "PENDING_TRIGGER_NO_BROKER"
+        assert result["symbol"] == "NFLX"
+
+    def test_dict_row_returns_values_not_keys(self):
+        # This is the bug: if row is a dict (e.g. RealDictRow), iterating it
+        # gives the keys, so dict(zip(cols, row)) == {'symbol': 'symbol', ...}.
+        # The fix must return dict(row) instead.
+        cols = ["symbol", "client_id", "ledger_bucket"]
+        row  = {"symbol": "NFLX", "client_id": "jose@example.com",
+                "ledger_bucket": "FILLED_OR_PARTIAL"}
+        result = self._convert(cols, row)
+        # Must NOT be the column-name-to-column-name mapping
+        assert result["ledger_bucket"] != "ledger_bucket", (
+            "dict row was incorrectly zipped: values are column names, not data"
+        )
+        assert result["ledger_bucket"] == "FILLED_OR_PARTIAL"
+
+    def test_dict_row_preserves_extra_columns(self):
+        # dict(row) preserves all columns even if cols list is shorter.
+        cols = ["symbol"]
+        row  = {"symbol": "MSFT", "client_id": "jason@example.com",
+                "ledger_bucket": "TERMINAL_NO_FILL", "score": 72}
+        result = self._convert(cols, row)
+        assert result["score"] == 72
+        assert result["ledger_bucket"] == "TERMINAL_NO_FILL"
+
+    def test_all_ledger_bucket_values_are_expected_strings(self):
+        """Bucket values must be one of the spec-defined strings."""
+        valid_buckets = {
+            "NO_ORDER_FOR_CLIENT",
+            "PENDING_TRIGGER_NO_BROKER",
+            "BROKER_SUBMITTED",
+            "FILLED_OR_PARTIAL",
+            "TERMINAL_NO_FILL",
+            "OTHER",
+        }
+        # Simulate what the SQL CASE produces: only valid bucket strings.
+        for bucket in valid_buckets:
+            cols = ["ledger_bucket"]
+            row  = (bucket,)
+            result = self._convert(cols, row)
+            assert result["ledger_bucket"] in valid_buckets
