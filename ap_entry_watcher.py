@@ -700,6 +700,35 @@ class APEntryWatcher:
     # _persist_watcher_audit: best-effort OSM meta merge. Never raises.
     #   Logs with persisted=false when local_order_id is absent or order not found.
 
+    def _watcher_quote_identity(self) -> dict:
+        """Return the ACTUAL quote source/base_url/sandbox flag the watcher uses.
+
+        QUOTE-DOMAIN AUDIT: _fetch_quotes() reads from self.broker.session with
+        self.broker(.cfg).base_url. We surface that real base_url here — never
+        assume — so watcher_audit rows prove which Tradier environment the
+        watcher evaluated against (sandbox = delayed paper, live = current).
+        Keys are namespaced watcher_* so they don't collide with the order's
+        selector_*/submit_* quote evidence.
+        """
+        base_url = (
+            getattr(self.broker, "base_url", None)
+            or getattr(getattr(self.broker, "cfg", None), "base_url", None)
+            or ""
+        )
+        base_url = str(base_url)
+        sandbox = "sandbox" in base_url.lower()
+        if not base_url:
+            source = "unknown"
+        elif sandbox:
+            source = "tradier_sandbox"
+        else:
+            source = "tradier_live"
+        return {
+            "watcher_quote_source":   source,
+            "watcher_quote_base_url": base_url,
+            "watcher_sandbox_mode":   bool(sandbox),
+        }
+
     def _build_watcher_audit_payload(
         self,
         w=None,
@@ -796,6 +825,11 @@ class APEntryWatcher:
             "reason_code":         reason_code,
             "raw_reason":          raw_reason,
             "evaluated_at":        datetime.now(timezone.utc).isoformat(),
+            # QUOTE-DOMAIN AUDIT: record the ACTUAL quote source the watcher
+            # used (read off self.broker, never assumed). This lets us prove
+            # whether the watcher evaluated against sandbox or live quotes —
+            # the core question behind the paper no-fill investigation.
+            **self._watcher_quote_identity(),
         }
         if extra:
             # Never allow extra to overwrite protected order fields
