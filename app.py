@@ -1013,6 +1013,104 @@ def create_app() -> Flask:
             log.error(f"Runner failures failed: {e}")
             return jsonify({"ok": False, "error": str(e)}), 500
 
+    @app.get("/admin/operator/signal-ledger")
+    @require_hmac
+    def admin_operator_signal_ledger():
+        """Item 4 — READ-ONLY multi-account signal ledger.
+
+        One row per (canonical signal, client, ENTRY order) from the
+        ap_multi_account_signal_ledger view. Answers "what happened on each
+        account for signal X?". No mutations — SELECT only.
+
+        Query params (all optional):
+          client_id, symbol, canonical_signal_id, status, bucket
+          since_hours (default 24), limit (default 500, max 2000)
+        """
+        try:
+            client_id   = (request.args.get("client_id") or "").strip()
+            symbol      = (request.args.get("symbol") or "").strip().upper()
+            canon_id    = (request.args.get("canonical_signal_id") or "").strip()
+            status      = (request.args.get("status") or "").strip()
+            bucket      = (request.args.get("bucket") or "").strip()
+            try:
+                since_hours = max(1, min(int(request.args.get("since_hours", 24)), 24 * 30))
+            except (TypeError, ValueError):
+                since_hours = 24
+            try:
+                limit = max(1, min(int(request.args.get("limit", 500)), 2000))
+            except (TypeError, ValueError):
+                limit = 500
+
+            # Parameterized WHERE — never string-interpolate user input.
+            where = ["order_created_ts > NOW() - (%s || ' hours')::interval"]
+            params: list = [str(since_hours)]
+            if client_id:
+                where.append("client_id = %s");            params.append(client_id)
+            if symbol:
+                where.append("UPPER(symbol) = %s");         params.append(symbol)
+            if canon_id:
+                where.append("canonical_signal_id = %s");   params.append(canon_id)
+            if status:
+                where.append("order_status = %s");          params.append(status)
+            if bucket:
+                where.append("ledger_bucket = %s");         params.append(bucket)
+
+            sql = (
+                "SELECT * FROM ap_multi_account_signal_ledger "
+                "WHERE " + " AND ".join(where) +
+                " ORDER BY canonical_signal_id, order_created_ts DESC "
+                "LIMIT %s"
+            )
+            params.append(limit)
+
+            def _fetch():
+                with conn() as c:
+                    cur = c.execute(sql, tuple(params))
+                    cols = [d[0] for d in cur.description]
+                    return [dict(zip(cols, r)) for r in cur.fetchall()]
+
+            from ap.db import run_with_retry
+            rows = run_with_retry(_fetch)
+
+            # Summary counts by bucket.
+            buckets = {
+                "pending_trigger_no_broker": 0,
+                "broker_submitted":          0,
+                "filled_or_partial":         0,
+                "terminal_no_fill":          0,
+                "no_order_for_client":       0,
+            }
+            _bmap = {
+                "PENDING_TRIGGER_NO_BROKER": "pending_trigger_no_broker",
+                "BROKER_SUBMITTED":          "broker_submitted",
+                "FILLED_OR_PARTIAL":         "filled_or_partial",
+                "TERMINAL_NO_FILL":          "terminal_no_fill",
+                "NO_ORDER_FOR_CLIENT":       "no_order_for_client",
+            }
+            _clients, _signals = set(), set()
+            for r in rows:
+                _b = _bmap.get(r.get("ledger_bucket"))
+                if _b:
+                    buckets[_b] += 1
+                if r.get("client_id"):
+                    _clients.add(r["client_id"])
+                if r.get("canonical_signal_id"):
+                    _signals.add(r["canonical_signal_id"])
+
+            return jsonify({
+                "ok": True,
+                "rows": rows,
+                "summary": {
+                    "total_rows":    len(rows),
+                    "clients_seen":  len(_clients),
+                    "signals_seen":  len(_signals),
+                    **buckets,
+                },
+            })
+        except Exception as e:
+            log.error(f"signal-ledger failed: {e}")
+            return jsonify({"ok": False, "error": str(e), "rows": [], "summary": {}}), 500
+
 
 
 
