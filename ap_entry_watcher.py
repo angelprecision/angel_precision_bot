@@ -222,6 +222,17 @@ WATCHER_REARM_ONLY_DAILY_OR_OVERNIGHT: bool = (
 _raw_rearm_tol = float(os.getenv("WATCHER_REARM_TOLERANCE_PCT", "0.001"))
 WATCHER_REARM_TOLERANCE_PCT: float = max(0.0, min(0.02, _raw_rearm_tol))  # clamp 0 – 2%
 WATCHER_REARM_MAX_ATTEMPTS: int = max(1, int(os.getenv("WATCHER_REARM_MAX_ATTEMPTS", "1")))
+
+# ── OSM validation strictness ─────────────────────────────────────────────────
+# When AP_WATCHER_STRICT_OSM_VALIDATION=1, the _validate_local_order_id()
+# fallback path (no recognised OSM lookup method found) returns False instead
+# of True, blocking the signal arm. Enable in staging to catch misconfigured
+# or mock OSM objects that would otherwise silently validate every signal.
+# Default is False so production backward-compatibility is preserved.
+AP_WATCHER_STRICT_OSM_VALIDATION: bool = (
+    os.getenv("AP_WATCHER_STRICT_OSM_VALIDATION", "0").strip().lower()
+    not in {"0", "false", "no"}
+)
 log.info(
     "[entry-watcher] rearm config: enabled=%s min_score=%.0f window=%ds "
     "daily_only=%s tolerance=%.4f max_attempts=%d",
@@ -686,12 +697,14 @@ class APEntryWatcher:
 
         log.warning(
             "[WATCHER_VALIDATION_FALLBACK] OSM object supplied but no recognized "
-            "local-order lookup contract exists; allowing watcher arm for "
-            "local_order_id=%s and relying on ExecutionCore recovery. "
+            "local-order lookup contract exists; local_order_id=%s. "
             "A misconfigured or mock OSM will silently validate every signal. "
-            "Set AP_WATCHER_STRICT_OSM_VALIDATION=1 to make this path reject instead.",
+            "AP_WATCHER_STRICT_OSM_VALIDATION=%s",
             local_order_id,
+            AP_WATCHER_STRICT_OSM_VALIDATION,
         )
+        if AP_WATCHER_STRICT_OSM_VALIDATION:
+            return False
         return True
 
     # ── Watcher Audit Helpers ────────────────────────────────────────────────
@@ -839,9 +852,16 @@ class APEntryWatcher:
         _score_ok    = _score >= _rearm_min_sc
         _tier_ok     = _tier == "A"
         # is_rearm_eligible is already in payload for arm_time_rearm_queued events;
-        # fall back to evaluating it for other trigger types.
+        # fall back to evaluating it for other trigger types, applying the full gate:
+        # score/tier AND (if ONLY_DAILY_OR_OVERNIGHT) is_daily_or_overnight.
+        _is_daily_or_overnight = bool(
+            payload.get("is_daily_or_overnight")
+            or payload.get("overnight")
+        )
         _eligible    = bool(payload.get("rearm_eligible") or (
-            _rearm_enabled and (_score_ok or _tier_ok)
+            _rearm_enabled
+            and (_score_ok or _tier_ok)
+            and (not _rearm_daily or _is_daily_or_overnight)
         ))
 
         # Lifecycle boolean derivation from reason_code
