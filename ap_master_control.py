@@ -106,6 +106,27 @@ SCORE_MIN_ELIGIBLE = float(os.getenv("SCORE_MIN_ELIGIBLE", "70"))
 SCORE_PREFERRED    = float(os.getenv("SCORE_PREFERRED",    "75"))
 SCORE_STRONGEST    = float(os.getenv("SCORE_STRONGEST",    "80"))
 
+# ── SCORE-65 STRUCTURED ELIGIBILITY (refinement, 2026-05-xx) ──────────────────
+# The universal hard floor at SCORE_MIN_ELIGIBLE=70 was too blunt: it rejected
+# clean non-0DTE score-65 setups on META/NFLX/QQQ/COIN even though the class we
+# actually wanted to stop was weak 0DTE / late-day index flow (esp. SPY 0DTE).
+#
+# This introduces a narrow exception band [SCORE65_FLOOR, SCORE_MIN_ELIGIBLE)
+# that is admitted ONLY when the setup is structurally safer:
+#   - NOT 0DTE
+#   - NOT a late-day index 0DTE (covered by the not-0DTE rule + PR C anyway)
+#   - spread_pct under SCORE65_MAX_SPREAD_PCT (when spread data is present)
+#   - delta not weak/far-OTM when delta data is present
+#   - timeframe is daily/overnight OR explicitly non-0DTE intraday
+#
+# Everything below SCORE65_FLOOR is still hard-rejected. 0DTE at score 65 is
+# still hard-rejected. The feature is OFF by default (SCORE65_ALLOW=false) so
+# nothing changes until the operator opts in after reviewing the count query.
+SCORE65_ALLOW            = os.getenv("SCORE65_ALLOW", "false").strip().lower() in ("1", "true", "yes", "on")
+SCORE65_FLOOR            = float(os.getenv("SCORE65_FLOOR", "65"))
+SCORE65_MAX_SPREAD_PCT   = float(os.getenv("SCORE65_MAX_SPREAD_PCT", "0.08"))   # 8% — same band as submit chase
+SCORE65_MIN_DELTA        = float(os.getenv("SCORE65_MIN_DELTA", "0.35"))        # reject weak/far-OTM if delta present
+
 # PR B — the index/0DTE bucket reuses _PRIORITY_TICKERS above; we do not
 # need a separate set. These tickers must NEVER trade below the hard floor
 # regardless of mode (paper or live). Today's screenshot showed SPY score-65
@@ -126,6 +147,74 @@ INDEX_0DTE_CUTOFF_ET         = os.getenv("INDEX_0DTE_CUTOFF_ET",         "14:30"
 INDEX_LATE_DAY_CAUTION_ET    = os.getenv("INDEX_LATE_DAY_CAUTION_ET",    "13:30")  # 1:30 PM ET
 INDEX_LATE_DAY_SCORE_FLOOR   = float(os.getenv("INDEX_LATE_DAY_SCORE_FLOOR", "75"))
 _INDEX_TO_ETF = {"^GSPC": "SPY", "^NDX": "QQQ", "^RUT": "IWM", "^DJI": "DIA"}
+
+
+def _score_allows_entry(
+    *,
+    score: float,
+    hard_floor: float,
+    is_0dte: bool,
+    is_index: bool,
+    timeframe: str,
+    spread_pct: float | None,
+    delta: float | None,
+) -> tuple[bool, str]:
+    """Structured score eligibility — refinement of the blunt < hard_floor reject.
+
+    Returns (allowed, reason_code).
+
+    Decision order:
+      1. score >= hard_floor (70)         -> ALLOWED (normal path; caller's
+                                              downstream 0DTE/quote/watcher gates
+                                              still apply). reason_code="".
+      2. score < SCORE65_FLOOR (65)       -> REJECTED_LOW_SCORE_UNDER_65
+      3. score in [65, hard_floor):
+           - feature off (SCORE65_ALLOW)  -> REJECTED_LOW_SCORE (unchanged behavior)
+           - is_0dte                      -> REJECTED_SCORE65_0DTE
+           - spread present & too wide     -> REJECTED_SCORE65_WIDE_SPREAD
+           - delta present & too weak      -> REJECTED_SCORE65_WEAK_CONTRACT
+           - otherwise                     -> ALLOWED_SCORE65_NON_0DTE_*
+                                              (DAILY if timeframe daily/overnight,
+                                               else CLEAN for non-0DTE intraday)
+
+    NOTE: quote_ok / submit_ask are NOT available at this point in the
+    pipeline (they're resolved downstream in contract_selector.select() and at
+    submit). The submit-time quote-refresh gate (QUOTE_REFRESH_FAILED_AT_SUBMIT,
+    PR-H on main) already fails closed if the quote can't be refreshed, so a
+    score-65 setup that passes here still cannot submit on a stale/failed quote.
+    We deliberately do NOT duplicate that check here against data we don't have.
+    """
+    # 1. Normal path — at or above the hard floor.
+    if score >= hard_floor:
+        return True, ""
+
+    # 2. Hard floor for the exception band itself.
+    if score < SCORE65_FLOOR:
+        return False, "REJECTED_LOW_SCORE_UNDER_65"
+
+    # 3. score in [SCORE65_FLOOR, hard_floor)
+    if not SCORE65_ALLOW:
+        # Feature disabled — preserve existing blunt behavior exactly.
+        return False, "REJECTED_LOW_SCORE"
+
+    # 0DTE at score 65 is always rejected (index or single-name).
+    if is_0dte:
+        return False, "REJECTED_SCORE65_0DTE"
+
+    # Spread gate — only when spread data is present and meaningful (>0).
+    if spread_pct is not None and spread_pct > 0 and spread_pct > SCORE65_MAX_SPREAD_PCT:
+        return False, "REJECTED_SCORE65_WIDE_SPREAD"
+
+    # Delta gate — only when delta data is present and meaningful (>0).
+    # abs() so PUT deltas (often negative) compare on magnitude.
+    if delta is not None and delta != 0 and abs(delta) < SCORE65_MIN_DELTA:
+        return False, "REJECTED_SCORE65_WEAK_CONTRACT"
+
+    # Clean non-0DTE score-65 — admit. Label by timeframe for the audit trail.
+    tf = (timeframe or "").lower()
+    if tf in ("1d", "1day", "daily", "overnight", "1wk", "1week", "weekly"):
+        return True, "ALLOWED_SCORE65_NON_0DTE_DAILY"
+    return True, "ALLOWED_SCORE65_NON_0DTE_CLEAN"
 
 # Canonical active ENTRY order states that reserve capital / represent pending exposure.
 # Keep this aligned with APOrderStateMachine.PENDING_ENTRY_STATUSES and
@@ -1240,23 +1329,73 @@ class APMasterControl:
         _eff_priority_floor = _PRIORITY_FLOOR + _post_target_score_bump
         _eff_score_floor    = self.score_floor + _post_target_score_bump
 
-        # PR B — UNIVERSAL HARD FLOOR (already on main).
-        # Runs BEFORE every other admission gate. Below this any signal
-        # (index or single-name) is rejected with REJECTED_LOW_SCORE.
-        # This stops score-65 SPY/QQQ setups from reaching the broker even
-        # though _PRIORITY_FLOOR=40 would have admitted them. Setups below
-        # the hard floor still appear in dashboard/watch logs via
-        # _store_update.
+        # PR B + SCORE-65 REFINEMENT — structured score eligibility.
+        # Runs BEFORE every other admission gate. The universal hard floor
+        # (SCORE_MIN_ELIGIBLE=70) still applies, but score-65..69 setups get a
+        # structured second look: clean non-0DTE setups may pass while 0DTE,
+        # wide-spread, and weak-contract 65s stay blocked. Feature is gated by
+        # SCORE65_ALLOW (default false) — when off, behavior is identical to
+        # the previous blunt reject.
         _hard_floor = SCORE_MIN_ELIGIBLE + _post_target_score_bump
-        if effective_score < _hard_floor:
+
+        # Resolve 0DTE once here (reused by PR C below). Cheap + side-effect free.
+        _is_0dte_for_gate = False
+        try:
+            from zoneinfo import ZoneInfo as _ZI_sg
+            from datetime import datetime as _dt_sg
+            _today_str_sg = _dt_sg.now(_ZI_sg("America/New_York")).strftime("%Y-%m-%d")
+            _exp_sg = (
+                signal.get("expiration")
+                or signal.get("expiration_date")
+                or (signal.get("trigger") or {}).get("expiration")
+                or ""
+            )
+            _dte_sg = signal.get("dte")
+            if _dte_sg is not None:
+                try:
+                    _is_0dte_for_gate = int(_dte_sg) == 0
+                except (TypeError, ValueError):
+                    _is_0dte_for_gate = False
+            if not _is_0dte_for_gate and isinstance(_exp_sg, str) and _exp_sg[:10] == _today_str_sg:
+                _is_0dte_for_gate = True
+        except Exception:
+            _is_0dte_for_gate = False
+
+        _spread_for_gate = signal.get("spread_pct")
+        try:
+            _spread_for_gate = float(_spread_for_gate) if _spread_for_gate is not None else None
+        except (TypeError, ValueError):
+            _spread_for_gate = None
+        _delta_for_gate = signal.get("delta")
+        try:
+            _delta_for_gate = float(_delta_for_gate) if _delta_for_gate is not None else None
+        except (TypeError, ValueError):
+            _delta_for_gate = None
+
+        _score_ok, _score_reason = _score_allows_entry(
+            score=effective_score,
+            hard_floor=_hard_floor,
+            is_0dte=_is_0dte_for_gate,
+            is_index=(ticker.upper() in _PRIORITY_TICKERS),
+            timeframe=signal.get("timeframe", "1d"),
+            spread_pct=_spread_for_gate,
+            delta=_delta_for_gate,
+        )
+        if not _score_ok:
             self._store_update(
                 signal_id, "rejected_low_score",
-                f"score {effective_score:.1f} < min_eligible {_hard_floor:.1f}",
+                f"score {effective_score:.1f} < min_eligible {_hard_floor:.1f} ({_score_reason})",
             )
             return self._block(
                 signal_id, ticker, client_id, "blocked_score",
-                f"REJECTED_LOW_SCORE (score={effective_score:.1f} "
+                f"{_score_reason} (score={effective_score:.1f} "
                 f"min_eligible={_hard_floor:.1f})",
+            )
+        elif _score_reason:
+            # Admitted via the score-65 exception band — record WHY for the audit.
+            self._store_update(
+                signal_id, "score65_admitted",
+                f"score {effective_score:.1f} admitted via {_score_reason}",
             )
 
         # PR C — SPY/QQQ index 0DTE late-day cutoff.
