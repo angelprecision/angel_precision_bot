@@ -105,6 +105,86 @@ SUBMIT_QUOTE_MAX_AGE_MS    = int(os.getenv("SUBMIT_QUOTE_MAX_AGE_MS", "5000"))
 # process_signal() which runs through this exact check.
 QUOTE_REFRESH_FAIL_OPEN    = os.getenv("QUOTE_REFRESH_FAIL_OPEN", "0").strip() in ("1", "true", "True", "yes")
 
+# ─── QUOTE-DOMAIN AUDIT + PAPER/LIVE EXECUTION SEPARATION ────────────────────
+# Problem: Tradier sandbox (paper) appears to judge fills against delayed quotes
+# while our selector reads quotes from a LIVE data broker (TRADIER_DATA_BASE_URL
+# defaults to https://api.tradier.com). That quote-domain mismatch makes tight
+# live-like limits fail to fill in paper even when the contract later goes green.
+#
+# This block adds:
+#   1. PAPER_ENTRY_FILL_MODE — paper-only submission policy (marketable_limit|market)
+#   2. Paper cushion knobs — make paper limits more marketable WITHOUT touching live
+#   3. A helper to detect/record the quote-domain mismatch per order
+#
+# HARD INVARIANT: none of these knobs can affect LIVE mode. Market orders are
+# impossible in LIVE from this patch. Live always uses the normal marketable
+# limit logic (submit_ask within chase band).
+
+# Paper-only fill mode. Ignored entirely when mode is LIVE.
+#   marketable_limit (default) — submit a more marketable limit than live:
+#                                 submit_ask + paper cushion (capped).
+#   market                     — submit a true market order (paper ONLY).
+PAPER_ENTRY_FILL_MODE         = os.getenv("PAPER_ENTRY_FILL_MODE", "marketable_limit").strip().lower()
+
+# Paper cushion: how much above submit_ask the paper marketable_limit sits.
+# Cushion = min(submit_ask * PAPER_ENTRY_SLIPPAGE_CUSHION_PCT,
+#               PAPER_ENTRY_MAX_CUSHION_DOLLARS)
+# Both default conservative. LIVE never uses these.
+PAPER_ENTRY_SLIPPAGE_CUSHION_PCT = float(os.getenv("PAPER_ENTRY_SLIPPAGE_CUSHION_PCT", "0.10"))  # 10%
+PAPER_ENTRY_MAX_CUSHION_DOLLARS  = float(os.getenv("PAPER_ENTRY_MAX_CUSHION_DOLLARS", "0.20"))    # $0.20/share
+
+
+def _is_sandbox_base_url(base_url) -> bool:
+    """True if the base_url points at Tradier's sandbox (delayed) environment."""
+    return "sandbox" in str(base_url or "").lower()
+
+
+def _broker_quote_identity(brk) -> dict:
+    """Return (quote_source, quote_base_url, sandbox_mode) for a broker object.
+
+    quote_source is a coarse label: 'tradier_sandbox', 'tradier_live', or
+    'unknown'. We read the ACTUAL base_url off the broker/cfg — never assume.
+    """
+    base_url = (
+        getattr(brk, "base_url", None)
+        or getattr(getattr(brk, "cfg", None), "base_url", None)
+        or ""
+    )
+    base_url = str(base_url)
+    sandbox = _is_sandbox_base_url(base_url)
+    if not base_url:
+        source = "unknown"
+    elif sandbox:
+        source = "tradier_sandbox"
+    else:
+        source = "tradier_live"
+    return {
+        "quote_source":   source,
+        "quote_base_url": base_url,
+        "sandbox_mode":   bool(sandbox),
+    }
+
+
+def _compute_paper_marketable_limit(submit_ask: float) -> tuple[float, float]:
+    """Paper-only: return (paper_limit, cushion_applied) above submit_ask.
+
+    cushion = min(submit_ask * PAPER_ENTRY_SLIPPAGE_CUSHION_PCT,
+                  PAPER_ENTRY_MAX_CUSHION_DOLLARS), floored at $0.01 so we
+    always move at least one tick more marketable. Rounded to the penny.
+    NEVER called in LIVE mode.
+    """
+    if submit_ask <= 0:
+        return submit_ask, 0.0
+    cushion = min(
+        submit_ask * PAPER_ENTRY_SLIPPAGE_CUSHION_PCT,
+        PAPER_ENTRY_MAX_CUSHION_DOLLARS,
+    )
+    if cushion < 0.01:
+        cushion = 0.01
+    paper_limit = round(submit_ask + cushion, 2)
+    return paper_limit, round(cushion, 2)
+
+
 # ─── PHASE 4: account-equity-based sizing ─────────────────────────────────
 # Prior sizing was BASE_POSITION_PCT (0.02 = 2%) capped by MAX_POSITION_COST
 # = $1000. With a $100K account that gave 1 contract on a $3 premium because
@@ -653,8 +733,16 @@ def _refresh_ask_at_submit(broker, contract: str) -> tuple[float, int, bool, str
     return ask, quote_age_ms, True, "", quote_fields
 
 
-def _submit_order_with_retry(broker, symbol: str, contract: str, qty: int, premium: float) -> tuple[bool, str | None, str | None]:
+def _submit_order_with_retry(broker, symbol: str, contract: str, qty: int, premium: float,
+                             order_type: str = "limit") -> tuple[bool, str | None, str | None]:
     last_error = None
+
+    # PAPER market-order support: when order_type == "market" we pass
+    # limit_price=None to place_order (TradierBroker treats None as a market
+    # order). The CALLER is responsible for guaranteeing this only happens in
+    # paper mode — see the hard guard at the call site. This function does not
+    # know the mode, so it defends only by requiring an explicit opt-in arg.
+    _limit_arg = None if order_type == "market" else premium
 
     for attempt in range(1, MAX_BROKER_RETRIES + 1):
         try:
@@ -662,7 +750,7 @@ def _submit_order_with_retry(broker, symbol: str, contract: str, qty: int, premi
                 symbol=symbol,
                 contract=contract,
                 qty=qty,
-                limit_price=premium,
+                limit_price=_limit_arg,
                 side="buy_to_open",
             )
 
@@ -1011,6 +1099,56 @@ def process_signal(broker, client_id: str, signal_payload: dict) -> dict:
         # PR H: this fall-through ONLY fires now when QUOTE_REFRESH_FAIL_OPEN=1.
         submit_limit = float(submit_ask) if (refresh_ok and submit_ask > 0) else float(selector_ask)
 
+        # ── QUOTE-DOMAIN AUDIT + PAPER/LIVE EXECUTION SEPARATION ──────────────
+        # Record the actual quote source/base_url for selector (data_broker)
+        # and submit (execution broker). These are read off the live broker
+        # objects — never assumed.
+        _is_paper = (mode == "PAPER")
+        _selector_brk = getattr(broker, "data_broker", None) or broker
+        _selector_qid = _broker_quote_identity(_selector_brk)
+        _submit_qid   = _broker_quote_identity(broker)
+
+        # Quote-domain mismatch: paper execution (sandbox) judging fills while
+        # the selector read from a non-sandbox (live) quote source.
+        _quote_domain_mismatch = bool(
+            _is_paper
+            and _submit_qid["sandbox_mode"]
+            and (not _selector_qid["sandbox_mode"])
+            and _selector_qid["quote_source"] != "unknown"
+        )
+
+        # Paper fill-mode policy. LIVE is never affected: the branch below only
+        # runs when _is_paper is True. Default paper_submitted_type='limit'.
+        paper_submitted_type = "limit"
+        paper_fill_mode_applied = "live_n/a" if not _is_paper else PAPER_ENTRY_FILL_MODE
+        live_submit_limit = float(submit_limit)  # preserve the live-equivalent limit for evidence
+        paper_cushion_applied = 0.0
+        paper_market_order = False
+
+        if _is_paper:
+            if PAPER_ENTRY_FILL_MODE == "market":
+                # Paper market order — allowed ONLY in paper. place_order treats
+                # limit_price=None as a market order. We hard-guard below at the
+                # broker call that mode is paper before passing None.
+                paper_market_order = True
+                paper_submitted_type = "market"
+            elif PAPER_ENTRY_FILL_MODE == "marketable_limit":
+                _basis = float(submit_ask) if (refresh_ok and submit_ask > 0) else float(submit_limit)
+                _paper_limit, paper_cushion_applied = _compute_paper_marketable_limit(_basis)
+                if _paper_limit > 0:
+                    submit_limit = _paper_limit
+                paper_submitted_type = "limit"
+            # any other value → treat as plain limit (no change), still paper.
+
+        # HARD INVARIANT enforcement: a market order can NEVER be produced in
+        # LIVE from this patch. If somehow paper_market_order is True while not
+        # paper, force it off. (Defensive; the branch above already gates on
+        # _is_paper.)
+        if paper_market_order and not _is_paper:
+            paper_market_order = False
+            paper_submitted_type = "limit"
+
+
         local_order_id = new_local_order_id()
         # AUDIT PHASE-2: persist meta so admission ordering (score) and re-peg
         # alignment gate (signal_entry_price) have what they need at decision time.
@@ -1060,6 +1198,21 @@ def process_signal(broker, client_id: str, signal_payload: dict) -> dict:
             "submit_refresh_ok":  bool(refresh_ok),
             "submit_refresh_reason": str(refresh_reason or ""),
             "entry_attempt":      0,
+            # ── QUOTE-DOMAIN AUDIT (2026-05-xx) ──────────────────────────────
+            # Source/base_url evidence so we can prove a paper no-fill was a
+            # sandbox quote-domain mismatch vs. a genuine signal/contract fault.
+            "selector_quote_source":   _selector_qid["quote_source"],
+            "selector_quote_base_url": _selector_qid["quote_base_url"],
+            "submit_quote_source":     _submit_qid["quote_source"],
+            "submit_quote_base_url":   _submit_qid["quote_base_url"],
+            "tradier_sandbox_mode":    bool(_submit_qid["sandbox_mode"]),
+            "mode":                    mode,
+            "quote_domain_mismatch_possible": _quote_domain_mismatch,
+            # ── PAPER/LIVE EXECUTION SEPARATION ──────────────────────────────
+            "paper_fill_mode":         paper_fill_mode_applied,
+            "paper_submitted_type":    paper_submitted_type,
+            "paper_cushion_applied":   float(paper_cushion_applied),
+            "live_submit_limit":       float(live_submit_limit),  # what LIVE would have sent
             # PHASE 4: sizing telemetry
             "account_equity":     float(account_equity),
             "position_budget":    float(position_budget),
@@ -1099,7 +1252,20 @@ def process_signal(broker, client_id: str, signal_payload: dict) -> dict:
             submit_limit, int(quote_age_ms), gap_pct,
         )
 
-        ok, broker_order_id, err = _submit_order_with_retry(broker, symbol, contract, qty, float(submit_limit))
+        # HARD GUARD: market order_type is ONLY ever passed in paper mode.
+        # paper_market_order can only be True when _is_paper is True (set above),
+        # but we re-assert mode here so a future refactor can't leak a market
+        # order into LIVE. In LIVE this is always "limit".
+        _order_type = "market" if (paper_market_order and _is_paper and mode == "PAPER") else "limit"
+        if _order_type == "market":
+            log.warning(
+                "[%s] PAPER_MARKET_ORDER order=%s contract=%s qty=%d "
+                "(paper-only fill mode; live would have used limit=%.2f)",
+                client_id, local_order_id, contract, int(qty), live_submit_limit,
+            )
+        ok, broker_order_id, err = _submit_order_with_retry(
+            broker, symbol, contract, qty, float(submit_limit), order_type=_order_type,
+        )
         if not ok:
             update_order(local_order_id, status="REJECTED", broker_order_id=broker_order_id, last_error=err)
             release_equity(client_id, reserved_cost)
