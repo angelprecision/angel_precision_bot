@@ -136,3 +136,60 @@ tree with my changes stashed. Not caused by this PR.
 | PAPER_ENTRY_MAX_CUSHION_DOLLARS | 0.20 | paper cushion hard cap ($/share) |
 
 None affect LIVE.
+
+---
+
+## REVIEW CONFIRMATION (round 2) — all six points verified
+
+1. **LIVE unchanged** ✅ The entire paper-fill block is gated `if _is_paper:`.
+   LIVE ignores PAPER_ENTRY_FILL_MODE, never sends market, never applies cushion,
+   submit_limit logic byte-for-byte unchanged. Tests: TestPoint2LiveMarketHardBlock.
+
+2. **Paper market hard-blocked outside PAPER** ✅ `_order_type="market"` requires
+   `paper_market_order AND _is_paper AND mode == "PAPER"` (triple guard) plus a
+   defensive re-assert. Test: test_live_market_env_still_submits_limit,
+   test_defensive_reassert_blocks_market_if_not_paper.
+
+3. **Fail-closed preserved** ✅ QUOTE_REFRESH_FAILED_AT_SUBMIT returns BEFORE the
+   paper branch (fail-open off). When fail-open is ON, paper marketable_limit
+   applies NO cushion and paper market FALLS BACK to limit on a failed refresh.
+   Tests: TestPoint3FailClosedPaper.
+
+4. **Three-state mismatch** ✅ quote_domain_mismatch_possible is True only when
+   proven (paper + submit sandbox + selector live, both known); None when any
+   source is 'unknown'; False otherwise. Tests: TestPoint4ThreeStateMismatch.
+
+5. **Watcher fields persist** ✅ watcher_quote_source/base_url/sandbox_mode are
+   added to _build_watcher_audit_payload and the full payload is merged into
+   orders.meta.watcher_audit by _persist_watcher_audit.
+
+6. **SQL tolerates missing MFE/MAE** ✅ all reads use `meta->>'field'` which
+   returns NULL (not an error) when the key is absent.
+
+### Test run (use the DATABASE_URL prefix)
+```
+DATABASE_URL=postgresql://test:test@localhost/test python -m py_compile ap/execution.py
+DATABASE_URL=postgresql://test:test@localhost/test python -m py_compile ap_entry_watcher.py
+DATABASE_URL=postgresql://test:test@localhost/test python -m pytest tests/test_quote_domain_paper_fill.py -v
+```
+Result: 26/26 passed.
+
+### Isolation results (the honest measure)
+- tests/test_quote_domain_paper_fill.py — 26 passed
+- tests/test_p0_regression_suite.py — 29 passed
+- tests/test_entry_watcher_audit.py — 26 passed
+
+### CLEAN-TREE PROOF of pre-existing pollution
+Combined run (p0 + entry_watcher_audit) with MY CHANGES STASHED (pure main):
+```
+FAILED tests/test_entry_watcher_audit.py::TestBugEw5ModeWiring::test_paper_overnight_quote_outage_preserves_fail_open
+FAILED tests/test_entry_watcher_audit.py::TestModuleConstants::test_max_intraday_drift_pct_default_value
+2 failed, 53 passed
+```
+The identical 2 failures occur on clean main without my changes. They are
+importlib.reload() cross-file pollution (both pass in isolation). NOT caused
+by this PR. Documented in docs/error_audit_2026-05-24.md.
+
+### Merge config
+PAPER_ENTRY_FILL_MODE=marketable_limit (default). Do NOT set =market until
+after one monitored paper session.

@@ -1108,14 +1108,27 @@ def process_signal(broker, client_id: str, signal_payload: dict) -> dict:
         _selector_qid = _broker_quote_identity(_selector_brk)
         _submit_qid   = _broker_quote_identity(broker)
 
-        # Quote-domain mismatch: paper execution (sandbox) judging fills while
-        # the selector read from a non-sandbox (live) quote source.
-        _quote_domain_mismatch = bool(
-            _is_paper
-            and _submit_qid["sandbox_mode"]
-            and (not _selector_qid["sandbox_mode"])
-            and _selector_qid["quote_source"] != "unknown"
-        )
+        # Quote-domain mismatch (POINT 4: three-state, only true when PROVEN).
+        #   True  — proven mismatch: paper, submit=sandbox, selector=live(known).
+        #   False — proven no-mismatch: paper, both sources known + same domain,
+        #           OR not paper.
+        #   None  — cannot prove: a relevant source is 'unknown'. Prefer null
+        #           over a misleading false so the dashboard/SQL don't claim
+        #           "no mismatch" when we simply couldn't read the base_url.
+        _sel_unknown = (_selector_qid["quote_source"] == "unknown")
+        _sub_unknown = (_submit_qid["quote_source"] == "unknown")
+        if not _is_paper:
+            # LIVE: mismatch concept doesn't apply (it's about paper fills).
+            _quote_domain_mismatch = False
+        elif _sel_unknown or _sub_unknown:
+            # Can't read one of the sources — don't assert either way.
+            _quote_domain_mismatch = None
+        elif _submit_qid["sandbox_mode"] and (not _selector_qid["sandbox_mode"]):
+            # Proven: paper fills on sandbox, selector on live.
+            _quote_domain_mismatch = True
+        else:
+            # Both known and same domain (or submit not sandbox): no mismatch.
+            _quote_domain_mismatch = False
 
         # Paper fill-mode policy. LIVE is never affected: the branch below only
         # runs when _is_paper is True. Default paper_submitted_type='limit'.
@@ -1130,13 +1143,31 @@ def process_signal(broker, client_id: str, signal_payload: dict) -> dict:
                 # Paper market order — allowed ONLY in paper. place_order treats
                 # limit_price=None as a market order. We hard-guard below at the
                 # broker call that mode is paper before passing None.
-                paper_market_order = True
-                paper_submitted_type = "market"
+                # POINT 3: even in paper, do NOT fire a market order when the
+                # quote refresh failed. A market order on a contract whose quote
+                # we couldn't even fetch is exactly the blind submit we want to
+                # avoid. Fall back to a plain limit at submit_limit (selector_ask
+                # when fail-open let us through). If fail-open is OFF, we never
+                # reach here — the QUOTE_REFRESH_FAILED return above fired first.
+                if refresh_ok and submit_ask > 0:
+                    paper_market_order = True
+                    paper_submitted_type = "market"
+                else:
+                    paper_market_order = False
+                    paper_submitted_type = "limit"
+                    log.warning(
+                        "[%s] PAPER market mode requested but quote refresh "
+                        "failed (reason=%s) — falling back to limit at %.2f",
+                        client_id, refresh_reason or "unknown", float(submit_limit),
+                    )
             elif PAPER_ENTRY_FILL_MODE == "marketable_limit":
-                _basis = float(submit_ask) if (refresh_ok and submit_ask > 0) else float(submit_limit)
-                _paper_limit, paper_cushion_applied = _compute_paper_marketable_limit(_basis)
-                if _paper_limit > 0:
-                    submit_limit = _paper_limit
+                # POINT 3: only apply the paper cushion on a fresh quote. If the
+                # refresh failed (only reachable with fail-open=1), do NOT pad a
+                # stale selector_ask — submit at submit_limit as-is.
+                if refresh_ok and submit_ask > 0:
+                    _paper_limit, paper_cushion_applied = _compute_paper_marketable_limit(float(submit_ask))
+                    if _paper_limit > 0:
+                        submit_limit = _paper_limit
                 paper_submitted_type = "limit"
             # any other value → treat as plain limit (no change), still paper.
 
