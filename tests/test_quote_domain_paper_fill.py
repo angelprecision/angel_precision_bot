@@ -182,6 +182,28 @@ class TestWatcherQuoteIdentity:
         assert ident["watcher_quote_source"] == "tradier_live"
         assert ident["watcher_sandbox_mode"] is False
 
+    def test_watcher_fallback_matches_fetch_quotes(self):
+        """POINT 3: when base_url can't be read, _watcher_quote_identity must
+        fall back to the SAME default as _fetch_quotes (sandbox), not 'unknown'.
+        Otherwise the audit mislabels a quote the watcher actually fetched from
+        sandbox."""
+        import ap_entry_watcher as w
+        importlib.reload(w)
+
+        class NoUrlBroker:
+            pass  # no base_url, no cfg → triggers the final fallback
+
+        class Stub:
+            pass
+        stub = Stub()
+        stub.broker = NoUrlBroker()
+        ident = w.APEntryWatcher._watcher_quote_identity(stub)
+        # _fetch_quotes would query https://sandbox.tradier.com in this case,
+        # so the audit must say sandbox — never 'unknown'.
+        assert ident["watcher_quote_base_url"] == "https://sandbox.tradier.com"
+        assert ident["watcher_quote_source"] == "tradier_sandbox"
+        assert ident["watcher_sandbox_mode"] is True
+
 
 # ── REVIEW-POINT TESTS (points 2, 3, 4 from the merge review) ────────────────
 

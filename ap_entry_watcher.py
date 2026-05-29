@@ -709,20 +709,25 @@ class APEntryWatcher:
         watcher evaluated against (sandbox = delayed paper, live = current).
         Keys are namespaced watcher_* so they don't collide with the order's
         selector_*/submit_* quote evidence.
+
+        POINT 3 (review): the fallback chain MUST be byte-identical to
+        _fetch_quotes — same getattr order, same final default of
+        'https://sandbox.tradier.com'. If they diverged, the audit could label
+        a quote 'unknown' while _fetch_quotes actually queried sandbox, which
+        would mislead the whole investigation. The default IS sandbox because
+        that is exactly what _fetch_quotes hits when base_url can't be read.
         """
         base_url = (
             getattr(self.broker, "base_url", None)
             or getattr(getattr(self.broker, "cfg", None), "base_url", None)
-            or ""
+            or "https://sandbox.tradier.com"
         )
         base_url = str(base_url)
         sandbox = "sandbox" in base_url.lower()
-        if not base_url:
-            source = "unknown"
-        elif sandbox:
-            source = "tradier_sandbox"
-        else:
-            source = "tradier_live"
+        # base_url is now never empty (matches _fetch_quotes default), so
+        # source is always sandbox or live — never 'unknown' for the watcher,
+        # because _fetch_quotes would never silently query an unknown host.
+        source = "tradier_sandbox" if sandbox else "tradier_live"
         return {
             "watcher_quote_source":   source,
             "watcher_quote_base_url": base_url,
