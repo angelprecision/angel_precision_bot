@@ -1242,6 +1242,51 @@ class APOrderStateMachine:
                 )
         run_with_retry(_fn)
 
+    def update_order_meta(self, local_order_id: str, meta_patch: dict) -> bool:
+        """Merge *meta_patch* into orders.meta using a safe JSONB || merge.
+
+        ONLY the keys supplied in *meta_patch* are written.  All other existing
+        meta keys are preserved by Postgres (|| is non-destructive).  Callers
+        must pass only the fields they intend to update — never the full
+        existing meta snapshot — to avoid race-condition overwrites of
+        concurrent writers (retry_status, retry_payload, etc.).
+
+        Uses COALESCE(meta, '{}'::jsonb) so rows with a NULL meta column are
+        handled safely without raising.
+
+        Returns True only when Postgres confirms rowcount > 0 (the row exists
+        and was updated).  Returns False on not-found or write error; callers
+        must treat False as best-effort only.
+        """
+        import json as _json_local
+        try:
+            _patch_json = _json_local.dumps(meta_patch, default=str)
+        except Exception:
+            return False
+
+        def _fn():
+            with conn() as c:
+                cur = c.execute(
+                    "UPDATE orders "
+                    "SET meta = COALESCE(meta, '{}'::jsonb) || %s::jsonb, "
+                    "    updated_ts = NOW() "
+                    "WHERE local_order_id = %s AND client_id = %s",
+                    (_patch_json, local_order_id, self.client_id),
+                )
+                # psycopg2: execute() returns the cursor; rowcount is on the cursor.
+                # Never use `or 1` fallback — rowcount=0 means row not found.
+                return getattr(cur, "rowcount", getattr(c, "rowcount", None))
+
+        try:
+            rowcount = run_with_retry(_fn)
+            return bool(rowcount and rowcount > 0)
+        except Exception as exc:
+            log.warning(
+                "[%s] update_order_meta failed for local_order_id=%s: %s",
+                self.client_id, local_order_id, exc,
+            )
+            return False
+
     def get_order(self, local_order_id: str):
         return self._get_order(local_order_id)
 
@@ -1483,7 +1528,7 @@ class APOrderStateMachine:
             local_order_id=local_order_id,
             old_status=latest_status,
             new_status=OrderStatus.ERROR,
-            order=current,
+            order=latest,
             decision="ERROR",
             reason_code="BROKER_REJECTED_ENTRY",
             explanation=error_msg or "unknown_error",

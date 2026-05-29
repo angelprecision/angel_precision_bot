@@ -24,6 +24,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import threading
@@ -185,6 +186,53 @@ OVERNIGHT_MAX_DRIFT_PCT = 0.020  # generic/non-daily overnight drift guard
 OPEN_PROTECT_MINUTES = 5
 MAX_OPEN_TRIGGERS = 1
 
+# ── P0-W2: Strong-signal re-arm after temporary wrong-side-of-stop ───────────
+#
+# When arm is rejected because price is temporarily on the wrong side of stop
+# (below_stop gate, NOT drift_stale), high-conviction signals enter a
+# DISARMED_WAITING_FOR_RECLAIM hold instead of being permanently killed.
+# If price reclaims the valid side within WATCHER_REARM_WINDOW_SEC, the signal
+# arms normally with the same signal_id/plan_id. If it does not, it expires.
+#
+# Only applies to: score >= WATCHER_REARM_MIN_SCORE OR tier A, AND
+# (if WATCHER_REARM_ONLY_DAILY_OR_OVERNIGHT) the signal must be daily/overnight.
+# Drift-stale rejects are always permanent — those represent a decisive miss.
+#
+# WATCHER_REARM_TOLERANCE_PCT: the underlying must clear past the stop level
+# by this fraction before re-arming. Prevents oscillation at the stop line.
+# Default 0.001 = 0.1% of stop price. For NVDA stop=212.71, reclaim fires when
+# mid <= 212.71 * 0.999 = 212.497 (PUT) or mid >= stop * 1.001 (CALL).
+#
+# WATCHER_REARM_MAX_ATTEMPTS: after this many rearm cycles (disarm → reclaim),
+# the next disarm is permanent. Default 1 — allows one recovery per signal.
+#
+# Overnight rearm expiry is market-open-aware: if the signal enters rearm mode
+# pre-market, the window starts at 9:30 ET open, not at arm time, so the signal
+# is not silently expired before quotes are even available.
+# ─────────────────────────────────────────────────────────────────────────────
+WATCHER_REARM_ENABLED: bool = (
+    os.getenv("WATCHER_REARM_ENABLED", "0").strip().lower() not in {"0", "false", "no"}
+)
+WATCHER_REARM_MIN_SCORE: float = float(os.getenv("WATCHER_REARM_MIN_SCORE", "75"))
+_raw_rearm_window = int(os.getenv("WATCHER_REARM_WINDOW_SEC", "600"))
+WATCHER_REARM_WINDOW_SEC: int = max(60, min(3600, _raw_rearm_window))  # clamp 1 min – 60 min
+WATCHER_REARM_ONLY_DAILY_OR_OVERNIGHT: bool = (
+    os.getenv("WATCHER_REARM_ONLY_DAILY_OR_OVERNIGHT", "1").strip().lower() not in {"0", "false", "no"}
+)
+_raw_rearm_tol = float(os.getenv("WATCHER_REARM_TOLERANCE_PCT", "0.001"))
+WATCHER_REARM_TOLERANCE_PCT: float = max(0.0, min(0.02, _raw_rearm_tol))  # clamp 0 – 2%
+WATCHER_REARM_MAX_ATTEMPTS: int = max(1, int(os.getenv("WATCHER_REARM_MAX_ATTEMPTS", "1")))
+log.info(
+    "[entry-watcher] rearm config: enabled=%s min_score=%.0f window=%ds "
+    "daily_only=%s tolerance=%.4f max_attempts=%d",
+    WATCHER_REARM_ENABLED,
+    WATCHER_REARM_MIN_SCORE,
+    WATCHER_REARM_WINDOW_SEC,
+    WATCHER_REARM_ONLY_DAILY_OR_OVERNIGHT,
+    WATCHER_REARM_TOLERANCE_PCT,
+    WATCHER_REARM_MAX_ATTEMPTS,
+)
+
 
 # ── Optional daily overnight validator integration ───────────────────────────
 try:
@@ -303,6 +351,13 @@ class WatchedSignal:
         self.last_quote_bid = 0.0
         self.last_quote_ask = 0.0
         self._watcher_ref = None
+        self._pending_audit: Optional[dict] = None  # audit payload staged inside check(), persisted by poll loop
+
+        # P0-W2: re-arm state — set by add_signal() when watch() marks the signal rearm-eligible.
+        self.rearm_mode: bool = False                   # True while waiting for price reclaim
+        self.rearm_expires_at: Optional[datetime] = None  # deadline for reclaim (None = no window set)
+        self.rearm_reason: str = ""                     # original arm_below_stop raw_reason
+        self.rearm_count: int = 0                       # how many disarm→reclaim cycles completed
 
         if self.overnight and _safe_is_daily_signal(self):
             self.signal["queue_status"] = OvernightWatchState.OVERNIGHT_QUEUED
@@ -330,7 +385,10 @@ class WatchedSignal:
 
     @property
     def is_active(self) -> bool:
-        return self.state == WatchState.PENDING
+        # rearm_mode signals are PENDING but NOT active — they are waiting for
+        # price to reclaim the valid side of stop and must not enter normal
+        # breach/trigger/stale-drift poll logic until reclaimed.
+        return self.state == WatchState.PENDING and not self.rearm_mode
 
     @property
     def minutes_watching(self) -> float:
@@ -443,6 +501,25 @@ class WatchedSignal:
                 and bid <= self.stop_level * (1 - WRONG_DIR_BUFFER_PCT)
                 and not _pre_open_skip
             ):
+                _call_stop_mid = (bid + ask) / 2.0 if (bid and ask) else max(bid, ask)
+                _call_wref = getattr(self, "_watcher_ref", None)
+                if _call_wref is not None:
+                    self._pending_audit = _call_wref._build_watcher_audit_payload(
+                        self,
+                        trigger_type="intraday_check",
+                        current_bid=bid,
+                        current_ask=ask,
+                        current_mid=_call_stop_mid,
+                        arm_condition=f"trigger_{self.entry_trigger:.4f}",
+                        stop_condition=f"bid_{bid:.4f}_le_call_stop_{self.stop_level:.4f}",
+                        reason_code="stop_bid_below_call_stop",
+                        raw_reason=f"bid_{bid:.4f}_broke_call_stop_{self.stop_level:.4f}",
+                        extra={
+                            "overnight": self.overnight,
+                            "is_daily": _safe_is_daily_signal(self),
+                            "pre_open_skip": _pre_open_skip,
+                        },
+                    )
                 self.state = WatchState.INVALIDATED
                 self.breach_count = 0
                 self._release_dedup_key()
@@ -496,6 +573,25 @@ class WatchedSignal:
                 and ask >= self.stop_level * (1 + WRONG_DIR_BUFFER_PCT)
                 and not _pre_open_skip
             ):
+                _put_stop_mid = (bid + ask) / 2.0 if (bid and ask) else max(bid, ask)
+                _put_wref = getattr(self, "_watcher_ref", None)
+                if _put_wref is not None:
+                    self._pending_audit = _put_wref._build_watcher_audit_payload(
+                        self,
+                        trigger_type="intraday_check",
+                        current_bid=bid,
+                        current_ask=ask,
+                        current_mid=_put_stop_mid,
+                        arm_condition=f"trigger_{self.entry_trigger:.4f}",
+                        stop_condition=f"ask_{ask:.4f}_ge_put_stop_{self.stop_level:.4f}",
+                        reason_code="stop_ask_above_put_stop",
+                        raw_reason=f"ask_{ask:.4f}_broke_put_stop_{self.stop_level:.4f}",
+                        extra={
+                            "overnight": self.overnight,
+                            "is_daily": _safe_is_daily_signal(self),
+                            "pre_open_skip": _pre_open_skip,
+                        },
+                    )
                 self.state = WatchState.INVALIDATED
                 self.breach_count = 0
                 self._release_dedup_key()
@@ -589,11 +685,677 @@ class APEntryWatcher:
                 continue
 
         log.warning(
-            "OSM object supplied but no recognized local-order lookup contract exists; "
-            "allowing watcher arm for local_order_id=%s and relying on ExecutionCore recovery",
+            "[WATCHER_VALIDATION_FALLBACK] OSM object supplied but no recognized "
+            "local-order lookup contract exists; allowing watcher arm for "
+            "local_order_id=%s and relying on ExecutionCore recovery. "
+            "A misconfigured or mock OSM will silently validate every signal. "
+            "Set AP_WATCHER_STRICT_OSM_VALIDATION=1 to make this path reject instead.",
             local_order_id,
         )
         return True
+
+    # ── Watcher Audit Helpers ────────────────────────────────────────────────
+    # _build_watcher_audit_payload: pure dict construction — safe to call inside
+    #   any lock or poll tick. No I/O.
+    # _persist_watcher_audit: best-effort OSM meta merge. Never raises.
+    #   Logs with persisted=false when local_order_id is absent or order not found.
+
+    def _build_watcher_audit_payload(
+        self,
+        w=None,
+        *,
+        symbol: str = "",
+        score: float = 0.0,
+        tier: str = "",
+        direction: str = "",
+        timeframe: str = "",
+        pattern: str = "",
+        signal_id: str = "",
+        plan_id: str = "",
+        trigger_type: str = "",
+        signal_entry_price: Optional[float] = None,
+        trigger_price: Optional[float] = None,
+        stop_price: Optional[float] = None,
+        current_bid: float = 0.0,
+        current_ask: float = 0.0,
+        current_mid: float = 0.0,
+        quote_age_ms: Optional[int] = None,
+        arm_price: Optional[float] = None,
+        arm_condition: str = "",
+        stop_condition: str = "",
+        reason_code: str = "",
+        raw_reason: str = "",
+        extra: Optional[dict] = None,
+    ) -> dict:
+        """Build a structured watcher_audit dict for any block/expire/invalidate path.
+        If a WatchedSignal (w) is provided, missing keyword fields are pulled from it.
+        Explicit keyword args always override w-derived values.
+        Pure dict construction — no I/O, safe to call inside any lock."""
+        if w is not None:
+            _sig = getattr(w, "signal", {}) or {}
+            symbol      = symbol      or getattr(w, "ticker", "")
+            score       = score       or float(getattr(w, "score", 0) or 0)
+            tier        = tier        or str(getattr(w, "grade", "") or "")
+            direction   = direction   or getattr(w, "side", "")
+            timeframe   = timeframe   or str(_sig.get("timeframe") or "")
+            pattern     = pattern     or str(_sig.get("pattern") or "")
+            signal_id   = signal_id   or str(getattr(w, "signal_id", "") or "")
+            plan_id     = plan_id     or str(_sig.get("plan_id") or "")
+            if signal_entry_price is None:
+                signal_entry_price = getattr(w, "entry_trigger", None)
+            if stop_price is None:
+                stop_price = getattr(w, "stop_level", None)
+            if not current_bid and not current_ask:
+                current_bid = float(getattr(w, "last_quote_bid", 0) or 0)
+                current_ask = float(getattr(w, "last_quote_ask", 0) or 0)
+
+        if not current_mid and (current_bid or current_ask):
+            current_mid = (
+                (current_bid + current_ask) / 2.0
+                if (current_bid and current_ask)
+                else max(current_bid, current_ask)
+            )
+
+        entry_ref = signal_entry_price if signal_entry_price is not None else trigger_price
+        dist_trigger_pct: Optional[float] = None
+        if entry_ref and current_mid:
+            try:
+                dist_trigger_pct = round((current_mid - entry_ref) / entry_ref * 100.0, 4)
+            except ZeroDivisionError:
+                pass
+        dist_stop_pct: Optional[float] = None
+        if stop_price and current_mid:
+            try:
+                dist_stop_pct = round((current_mid - stop_price) / stop_price * 100.0, 4)
+            except ZeroDivisionError:
+                pass
+
+        payload: dict = {
+            "symbol":              symbol,
+            "score":               score,
+            "tier":                tier,
+            "direction":           direction,
+            "timeframe":           timeframe,
+            "pattern":             pattern,
+            "signal_id":           signal_id,
+            "plan_id":             plan_id,
+            "trigger_type":        trigger_type,
+            "signal_entry_price":  signal_entry_price,
+            "trigger_price":       trigger_price if trigger_price is not None else signal_entry_price,
+            "stop_price":          stop_price,
+            "current_underlying":  current_mid,
+            "current_bid":         current_bid,
+            "current_ask":         current_ask,
+            "current_mid":         current_mid,
+            "quote_age_ms":        quote_age_ms,
+            "arm_price":           arm_price,
+            "arm_condition":       arm_condition,
+            "stop_condition":      stop_condition,
+            "distance_to_trigger_pct": dist_trigger_pct,
+            "distance_to_stop_pct":    dist_stop_pct,
+            "reason_code":         reason_code,
+            "raw_reason":          raw_reason,
+            "evaluated_at":        datetime.now(timezone.utc).isoformat(),
+        }
+        if extra:
+            # Never allow extra to overwrite protected order fields
+            _protected = {"retry_status", "retry_payload"}
+            for k, v in extra.items():
+                if k not in _protected:
+                    payload[k] = v
+        return payload
+
+    def _insert_watcher_audit_row(
+        self, payload: dict, local_order_id: Optional[str] = None
+    ) -> None:
+        """Best-effort INSERT into public.watcher_audit for analytics queries.
+
+        Provides a queryable row per watcher event alongside the JSONB snapshot
+        in orders.meta.  If the table does not exist yet (migration pending) or
+        ap.db is unavailable (test / CI), the insert fails silently.
+
+        Key contract: uses the snake_case key names that _build_watcher_audit_payload
+        emits — signal_id, trigger_price, reason_code, etc.  Never swaps to
+        camelCase or no-separator forms.
+        """
+        import json as _json_local  # local import keeps watcher importable without ap.db
+        try:
+            from ap.db import conn as _ap_conn, run_with_retry as _ap_retry  # type: ignore
+        except ImportError:
+            return
+
+        # Rearm config snapshot at evaluation time
+        _rearm_enabled  = WATCHER_REARM_ENABLED
+        _rearm_daily    = WATCHER_REARM_ONLY_DAILY_OR_OVERNIGHT
+        _rearm_window   = WATCHER_REARM_WINDOW_SEC
+        _rearm_min_sc   = WATCHER_REARM_MIN_SCORE
+        _rearm_tol      = WATCHER_REARM_TOLERANCE_PCT
+        _rearm_max      = WATCHER_REARM_MAX_ATTEMPTS
+
+        # Eligibility breakdown — use payload fields, not method call, to avoid
+        # re-evaluating against current env if env changed mid-session.
+        _score       = float(payload.get("score") or 0)
+        _tier        = str(payload.get("tier") or "").upper()
+        _score_ok    = _score >= _rearm_min_sc
+        _tier_ok     = _tier == "A"
+        # is_rearm_eligible is already in payload for arm_time_rearm_queued events;
+        # fall back to evaluating it for other trigger types.
+        _eligible    = bool(payload.get("rearm_eligible") or (
+            _rearm_enabled and (_score_ok or _tier_ok)
+        ))
+
+        # Lifecycle boolean derivation from reason_code
+        _reason      = str(payload.get("reason_code") or "")
+        _rearmed     = _reason == "rearm_reclaimed"
+        _expired     = _reason in {
+            "rearm_window_expired",
+            "rearm_max_attempts_expired",
+            "overnight_too_far_from_trigger",
+            "overnight_premarket_breached",
+            "overnight_live_quote_unavailable",
+        }
+        _perm_reject = _reason in {
+            "arm_drift",
+            "arm_below_stop",          # only when not rearm-eligible
+            "osm_validation_failed",
+            "dedup_block",
+            "opposite_side_conflict",
+            "same_side_block",
+        } and not _eligible
+
+        # Fetch client_id from OSM if available — not in payload
+        _client_id = getattr(
+            getattr(self, "order_state_machine", None), "client_id", None
+        )
+
+        _sql = """
+            INSERT INTO public.watcher_audit (
+                local_order_id, signal_id, client_id,
+                symbol, underlying_price,
+                score, tier, direction, timeframe, pattern,
+                trigger_price, stop_price,
+                current_bid, current_ask, current_mid,
+                arm_price,
+                distance_to_trigger_pct, distance_to_stop_pct,
+                trigger_type, reason_code, raw_reason,
+                arm_condition, stop_condition,
+                rearm_enabled, rearm_only_daily_or_overnight,
+                rearm_window_sec, rearm_min_score,
+                rearm_tolerance_pct, rearm_max_attempts,
+                score_ok, tier_ok, is_rearm_eligible,
+                rearmed, expired, permanently_rejected,
+                full_payload
+            ) VALUES (
+                %s, %s, %s,
+                %s, %s,
+                %s, %s, %s, %s, %s,
+                %s, %s,
+                %s, %s, %s,
+                %s,
+                %s, %s,
+                %s, %s, %s,
+                %s, %s,
+                %s, %s,
+                %s, %s,
+                %s, %s,
+                %s, %s, %s,
+                %s, %s, %s,
+                %s::jsonb
+            )
+        """
+        _params = (
+            local_order_id or None,
+            payload.get("signal_id") or None,
+            _client_id,
+            # instrument
+            payload.get("symbol"),
+            payload.get("current_underlying") or payload.get("current_mid"),
+            # signal quality
+            _score,
+            payload.get("tier"),
+            payload.get("direction"),
+            payload.get("timeframe"),
+            payload.get("pattern"),
+            # prices
+            payload.get("trigger_price") or payload.get("signal_entry_price"),
+            payload.get("stop_price"),
+            payload.get("current_bid"),
+            payload.get("current_ask"),
+            payload.get("current_mid"),
+            payload.get("arm_price"),
+            payload.get("distance_to_trigger_pct"),
+            payload.get("distance_to_stop_pct"),
+            # watcher decision
+            payload.get("trigger_type"),
+            payload.get("reason_code"),
+            payload.get("raw_reason"),
+            payload.get("arm_condition"),
+            payload.get("stop_condition"),
+            # rearm config snapshot
+            _rearm_enabled,
+            _rearm_daily,
+            _rearm_window,
+            _rearm_min_sc,
+            _rearm_tol,
+            _rearm_max,
+            # eligibility
+            _score_ok,
+            _tier_ok,
+            _eligible,
+            # lifecycle outcome
+            _rearmed,
+            _expired,
+            _perm_reject,
+            # full payload JSONB — evaluated_at uses column DEFAULT NOW()
+            _json_local.dumps(payload, default=str),
+        )
+
+        try:
+            def _write():
+                with _ap_conn() as _c:
+                    _cur = _c.execute(_sql, _params)
+                    return getattr(_cur, "rowcount", getattr(_c, "rowcount", None))
+            _ap_retry(_write)
+        except Exception as _exc:
+            log.warning("[watcher_audit_table] insert failed (non-critical): %s", _exc)
+
+    def _persist_watcher_audit(
+        self, local_order_id: Optional[str], payload: dict
+    ) -> None:
+        """Best-effort merge of watcher_audit into orders.meta.
+        Logs with persisted=false when local_order_id is absent or order row not found.
+        Does NOT overwrite retry_status, retry_payload, or any existing order meta key
+        other than watcher_audit / watcher_audit_history.
+        Never raises — audit must never disrupt watcher flow."""
+        try:
+            # Always attempt a table row — works even without local_order_id.
+            # Fails silently if the migration hasn't run yet or ap.db is unavailable.
+            self._insert_watcher_audit_row(payload, local_order_id=local_order_id)
+
+            if not local_order_id:
+                log.info(
+                    "[watcher_audit] no local_order_id — orders.meta skipped | reason=%s | %s",
+                    payload.get("reason_code"),
+                    json.dumps({**payload, "persisted": False}, default=str),
+                )
+                return
+
+            osm = getattr(self, "order_state_machine", None)
+            if osm is None:
+                log.info(
+                    "[watcher_audit] no OSM — orders.meta skipped | local_order_id=%s | reason=%s | %s",
+                    local_order_id,
+                    payload.get("reason_code"),
+                    json.dumps({**payload, "persisted": False}, default=str),
+                )
+                return
+
+            # Retrieve order — try every plausible OSM accessor
+            order = None
+            for _mname in ("get_order", "get_order_by_local_id", "get", "get_by_local_id"):
+                _fn = getattr(osm, _mname, None)
+                if callable(_fn):
+                    try:
+                        order = _fn(local_order_id)
+                        if order is not None:
+                            break
+                    except Exception:
+                        continue
+
+            if order is None:
+                log.info(
+                    "[watcher_audit] order not found in OSM — orders.meta skipped | "
+                    "local_order_id=%s | reason=%s",
+                    local_order_id,
+                    payload.get("reason_code"),
+                )
+                return
+
+            # Build the patch — ONLY watcher_audit and watcher_audit_history.
+            # Never read the full existing meta and pass it back into DB.
+            # That pattern risks overwriting concurrent fields (retry_status,
+            # retry_payload, submit_refresh evidence) with a stale snapshot.
+            if isinstance(order, dict):
+                _existing_meta = order.get("meta") or {}
+            else:
+                _existing_meta = getattr(order, "meta", None) or {}
+            _existing_meta = _existing_meta if isinstance(_existing_meta, dict) else {}
+            _history = list(_existing_meta.get("watcher_audit_history") or [])
+            _history.append(payload)
+            _patch = {
+                "watcher_audit":         payload,
+                "watcher_audit_history": _history[-5:],
+            }
+
+            # Try every plausible OSM meta-update method (patch dict only)
+            _persisted = False
+            for _mname in ("update_order_meta", "patch_meta", "set_meta", "update_meta"):
+                _fn = getattr(osm, _mname, None)
+                if callable(_fn):
+                    try:
+                        _result = _fn(local_order_id, _patch)
+                        # update_order_meta returns bool; older shims may return None
+                        _persisted = bool(_result) if _result is not None else True
+                        break
+                    except Exception as _me:
+                        log.debug(
+                            "[watcher_audit] %s(%s) failed: %s", _mname, local_order_id, _me
+                        )
+
+            # Direct SQL fallback — for deployments where the OSM predates
+            # update_order_meta.  Conditional import keeps ap_entry_watcher
+            # importable in test / CI environments without ap.db.
+            # Writes only _patch (not full meta). Uses COALESCE so NULL meta
+            # rows are handled safely.  Rowcount is read from the cursor, not
+            # from a fallback that would turn 0 into 1.
+            if not _persisted:
+                try:
+                    from ap.db import conn as _ap_conn, run_with_retry as _ap_retry  # type: ignore
+                    _client_id = getattr(osm, "client_id", "")
+                    _patch_json = json.dumps(_patch, default=str)
+                    if _client_id:
+                        _fb_sql = (
+                            "UPDATE orders "
+                            "SET meta = COALESCE(meta, '{}'::jsonb) || %s::jsonb, "
+                            "    updated_ts = NOW() "
+                            "WHERE local_order_id = %s AND client_id = %s"
+                        )
+                        _fb_params = (_patch_json, local_order_id, _client_id)
+                    else:
+                        _fb_sql = (
+                            "UPDATE orders "
+                            "SET meta = COALESCE(meta, '{}'::jsonb) || %s::jsonb, "
+                            "    updated_ts = NOW() "
+                            "WHERE local_order_id = %s"
+                        )
+                        _fb_params = (_patch_json, local_order_id)
+
+                    def _update_fn():
+                        with _ap_conn() as _c:
+                            _cur = _c.execute(_fb_sql, _fb_params)
+                            return getattr(_cur, "rowcount", getattr(_c, "rowcount", None))
+
+                    _rowcount = _ap_retry(_update_fn)
+                    _persisted = bool(_rowcount and _rowcount > 0)
+                except ImportError:
+                    pass  # ap.db not available (test env / CI) — fall through to log
+                except Exception as _sql_exc:
+                    log.debug("[watcher_audit] direct SQL fallback failed: %s", _sql_exc)
+
+            if _persisted:
+                log.debug(
+                    "[watcher_audit] persisted | local_order_id=%s reason=%s",
+                    local_order_id,
+                    payload.get("reason_code"),
+                )
+            else:
+                log.info(
+                    "[watcher_audit] OSM meta update not available — logging payload | "
+                    "local_order_id=%s | %s",
+                    local_order_id,
+                    json.dumps({**payload, "persisted": False}, default=str),
+                )
+        except Exception as _exc:
+            log.warning("[watcher_audit] persist failed (non-critical): %s", _exc)
+
+    # ── P0-W2: Re-arm eligibility + reclaim poll ─────────────────────────────
+
+    def _is_rearm_eligible(
+        self,
+        score: float,
+        tier: str,
+        is_overnight_or_daily: bool,
+    ) -> bool:
+        """Return True when a wrong-side-of-stop arm failure should enter DISARMED
+        wait mode instead of permanently rejecting the signal.
+
+        Eligibility requires ALL of:
+          - WATCHER_REARM_ENABLED=1 (env default: off — must be explicitly enabled)
+          - score >= WATCHER_REARM_MIN_SCORE OR tier is 'A'
+          - if WATCHER_REARM_ONLY_DAILY_OR_OVERNIGHT: signal must be overnight or daily
+
+        Drift-stale rejects are NEVER eligible — those mean price has moved
+        decisively away from trigger, not temporarily beyond the stop.
+        """
+        if not WATCHER_REARM_ENABLED:
+            return False
+        score_ok = score >= WATCHER_REARM_MIN_SCORE
+        tier_ok = str(tier or "").upper() == "A"
+        if not (score_ok or tier_ok):
+            return False
+        if WATCHER_REARM_ONLY_DAILY_OR_OVERNIGHT and not is_overnight_or_daily:
+            return False
+        return True
+
+    def _check_rearm_signals(self) -> None:
+        """Poll all DISARMED_WAITING_FOR_RECLAIM signals. Called from _check_all()
+        during market hours (after the pre-market gate, so never before 9:30 ET).
+
+        For each rearm signal:
+          - Timeout elapsed → expire, fire on_expire, clean from pending.
+          - Price reclaimed valid side + tolerance → flip rearm_mode=False so normal
+            poll picks it up next cycle. Log + audit the reclaim.
+          - Otherwise → log debug, continue waiting.
+
+        All state changes are written to watcher_audit via _persist_watcher_audit."""
+        with self._lock:
+            rearm_signals = [
+                w for w in self._pending
+                if getattr(w, "rearm_mode", False) and w.state == WatchState.PENDING
+            ]
+        if not rearm_signals:
+            return
+
+        tickers = list({w.ticker for w in rearm_signals})
+        try:
+            quotes = self._fetch_quotes(tickers)
+        except Exception as exc:
+            log.warning("[rearm] Quote fetch failed: %s", exc)
+            return
+
+        now = datetime.now(timezone.utc)
+        to_expire: list = []
+        to_rearm: list = []
+
+        for w in rearm_signals:
+            # ── Timeout check ──────────────────────────────────────────────
+            if w.rearm_expires_at and now >= w.rearm_expires_at:
+                to_expire.append(w)
+                continue
+
+            quote = quotes.get(w.ticker)
+            if not quote:
+                continue
+
+            bid = float(quote.get("bid", 0) or 0)
+            ask = float(quote.get("ask", 0) or 0)
+            if bid == 0 and ask == 0:
+                last = float(quote.get("last", 0) or 0)
+                bid = ask = last
+            mid = (bid + ask) / 2.0 if (bid and ask) else max(bid, ask)
+            if mid <= 0:
+                continue
+
+            # ── Direction-aware reclaim check ──────────────────────────────
+            # CALL: was disarmed because mid < call_stop (dropped below support).
+            #   Reclaim: mid rises back above stop + tolerance buffer.
+            # PUT:  was disarmed because mid > put_stop (rallied above resistance).
+            #   Reclaim: mid falls back below stop - tolerance buffer.
+            reclaimed = False
+            reclaim_threshold = 0.0
+            if w.stop_level:
+                if w.side == "CALL":
+                    reclaim_threshold = w.stop_level * (1.0 + WATCHER_REARM_TOLERANCE_PCT)
+                    reclaimed = mid >= reclaim_threshold
+                else:  # PUT
+                    reclaim_threshold = w.stop_level * (1.0 - WATCHER_REARM_TOLERANCE_PCT)
+                    reclaimed = mid <= reclaim_threshold
+
+            if reclaimed:
+                to_rearm.append((w, bid, ask, mid, reclaim_threshold))
+            else:
+                remaining = (
+                    max(0.0, (w.rearm_expires_at - now).total_seconds())
+                    if w.rearm_expires_at else 0.0
+                )
+                log.debug(
+                    "[%s] REARM_WAIT | side=%s mid=%.4f stop=%.4f "
+                    "reclaim_threshold=%.4f window_remaining=%.0fs",
+                    w.ticker, w.side, mid,
+                    w.stop_level or 0.0,
+                    reclaim_threshold,
+                    remaining,
+                )
+
+        # ── Process expirations — state change inside lock, I/O outside ───
+        expired_signals: list = []
+        with self._lock:
+            for w in to_expire:
+                if getattr(w, "rearm_mode", False) and w.state == WatchState.PENDING:
+                    w.rearm_mode = False
+                    w.state = WatchState.EXPIRED
+                    w._release_dedup_key()
+                    expired_signals.append(w)
+
+        for w in expired_signals:
+            _exp_audit = self._build_watcher_audit_payload(
+                w,
+                trigger_type="rearm_check",
+                reason_code="rearm_window_expired",
+                raw_reason=(
+                    f"rearm_window_{WATCHER_REARM_WINDOW_SEC}s_elapsed_no_reclaim"
+                    f"_side_{w.side}_stop_{w.stop_level:.4f}"
+                    if w.stop_level else f"rearm_window_{WATCHER_REARM_WINDOW_SEC}s_elapsed"
+                ),
+                extra={
+                    "rearm_count":       w.rearm_count,
+                    "rearm_reason":      w.rearm_reason,
+                    "rearm_window_sec":  WATCHER_REARM_WINDOW_SEC,
+                },
+            )
+            self._persist_watcher_audit(w.signal.get("local_order_id"), _exp_audit)
+            _sig_id = str(w.signal.get("signal_id", ""))
+            if _sig_id and w.ticker:
+                _ew_record(_sig_id, w.ticker, "EXPIRED", "rearm_window_expired")
+            log.info(
+                "[%s] REARM_EXPIRED — no reclaim within %ds | side=%s stop=%s | expiring",
+                w.ticker, WATCHER_REARM_WINDOW_SEC, w.side,
+                f"{w.stop_level:.4f}" if w.stop_level else "none",
+            )
+            if self.on_expire:
+                try:
+                    self.on_expire(w)
+                except Exception as _exc:
+                    log.error(
+                        "[%s] on_expire failed during rearm expiry: %s", w.ticker, _exc, exc_info=True
+                    )
+
+        if expired_signals:
+            with self._lock:
+                _exp_ids = {id(w) for w in expired_signals}
+                self._pending = [w for w in self._pending if id(w) not in _exp_ids]
+
+        # ── Process reclaims — flip inside lock, audit+log outside ────────
+        rearmed_signals: list = []
+        _max_attempt_expired: list = []  # signals that hit limit during reclaim evaluation
+        with self._lock:
+            for w, bid, ask, mid, reclaim_threshold in to_rearm:
+                if getattr(w, "rearm_mode", False) and w.state == WatchState.PENDING:
+                    # Guard: if already at max rearm attempts, expire instead of re-arming
+                    if w.rearm_count >= WATCHER_REARM_MAX_ATTEMPTS:
+                        w.rearm_mode = False
+                        w.state = WatchState.EXPIRED
+                        w._release_dedup_key()
+                        _max_attempt_expired.append(w)   # separate list — cleanup runs below
+                        log.info(
+                            "[%s] REARM_MAX_ATTEMPTS reached (%d) — expiring on reclaim",
+                            w.ticker, WATCHER_REARM_MAX_ATTEMPTS,
+                        )
+                        continue
+                    w.rearm_mode = False
+                    w.rearm_count += 1
+                    w.last_quote_bid = bid
+                    w.last_quote_ask = ask
+                    rearmed_signals.append((w, bid, ask, mid, reclaim_threshold))
+
+        # Max-attempts expiry: callbacks + pending cleanup.
+        # Must run after the lock is released; separate from the timeout expiry path
+        # because expired_signals cleanup already ran above.
+        for w in _max_attempt_expired:
+            _max_audit = self._build_watcher_audit_payload(
+                w,
+                trigger_type="rearm_check",
+                reason_code="rearm_max_attempts_expired",
+                raw_reason=(
+                    f"rearm_count_{w.rearm_count}_reached_max_{WATCHER_REARM_MAX_ATTEMPTS}"
+                    f"_on_reclaim_side_{w.side}"
+                ),
+                extra={
+                    "rearm_count":        w.rearm_count,
+                    "rearm_max_attempts": WATCHER_REARM_MAX_ATTEMPTS,
+                    "rearm_reason":       w.rearm_reason,
+                },
+            )
+            self._persist_watcher_audit(w.signal.get("local_order_id"), _max_audit)
+            _sig_id = str(w.signal.get("signal_id", ""))
+            if _sig_id and w.ticker:
+                _ew_record(_sig_id, w.ticker, "EXPIRED", "rearm_max_attempts_expired")
+            log.info(
+                "[%s] REARM_MAX_ATTEMPTS_EXPIRED | side=%s stop=%s | removing from pending",
+                w.ticker, w.side,
+                f"{w.stop_level:.4f}" if w.stop_level else "none",
+            )
+            if self.on_expire:
+                try:
+                    self.on_expire(w)
+                except Exception as _exc:
+                    log.error(
+                        "[%s] on_expire failed on max-attempts expiry: %s",
+                        w.ticker, _exc, exc_info=True,
+                    )
+
+        if _max_attempt_expired:
+            with self._lock:
+                _max_ids = {id(w) for w in _max_attempt_expired}
+                self._pending = [w for w in self._pending if id(w) not in _max_ids]
+
+        for w, bid, ask, mid, reclaim_threshold in rearmed_signals:
+            _reclaim_dir = "above" if w.side == "CALL" else "below"
+            _rearm_audit = self._build_watcher_audit_payload(
+                w,
+                trigger_type="rearm_check",
+                current_bid=bid,
+                current_ask=ask,
+                current_mid=mid,
+                arm_condition=f"trigger_{w.entry_trigger:.4f}" if w.entry_trigger else "",
+                stop_condition=(
+                    f"mid_{mid:.4f}_{_reclaim_dir}_reclaim_threshold_{reclaim_threshold:.4f}"
+                ),
+                reason_code="rearm_reclaimed",
+                raw_reason=(
+                    f"mid_{mid:.4f}_reclaimed_{_reclaim_dir}"
+                    f"_stop_{w.stop_level:.4f}_tol_{WATCHER_REARM_TOLERANCE_PCT:.4f}"
+                    if w.stop_level else f"mid_{mid:.4f}_reclaimed"
+                ),
+                extra={
+                    "rearm_count":       w.rearm_count,
+                    "rearm_reason":      w.rearm_reason,
+                    "reclaim_mid":       mid,
+                    "reclaim_threshold": reclaim_threshold,
+                    "stop_level":        w.stop_level,
+                    "rearm_tolerance":   WATCHER_REARM_TOLERANCE_PCT,
+                },
+            )
+            self._persist_watcher_audit(w.signal.get("local_order_id"), _rearm_audit)
+            log.info(
+                "[%s] REARM_RECLAIMED — price returned to valid side | side=%s "
+                "mid=%.4f stop=%.4f threshold=%.4f rearm_count=%d | "
+                "arming for breach detection",
+                w.ticker, w.side, mid,
+                w.stop_level or 0.0,
+                reclaim_threshold,
+                w.rearm_count,
+            )
 
     def add_signal(self, signal: dict) -> bool:
         now_et = datetime.now(ET)
@@ -623,6 +1385,13 @@ class APEntryWatcher:
                 watched.ticker,
                 local_order_id,
             )
+            _osm_audit = self._build_watcher_audit_payload(
+                watched,
+                trigger_type="add_signal_block",
+                reason_code="osm_validation_failed",
+                raw_reason=f"local_order_id={local_order_id}_not_in_osm",
+            )
+            self._persist_watcher_audit(local_order_id, _osm_audit)
             # PR-C: every self._last_reject_reason write goes under the
             # watcher lock so concurrent add_signal() callers cannot race
             # on the diagnostic field.
@@ -644,18 +1413,41 @@ class APEntryWatcher:
                     watched.ticker,
                     dedup_key,
                 )
+                _dedup_audit = self._build_watcher_audit_payload(
+                    watched,
+                    trigger_type="add_signal_block",
+                    reason_code="dedup_block",
+                    raw_reason=f"signal_id_{dedup_key}_already_armed",
+                    extra={"dedup_key": dedup_key, "persisted": False},
+                )
+                log.info(
+                    "[watcher_audit] dedup_block | local_order_id=%s | %s",
+                    watched.signal.get("local_order_id"),
+                    json.dumps(_dedup_audit, default=str),
+                )
                 self._last_reject_reason = "dedup_block"
                 return False
 
+            # Conflict detection must include rearm_mode signals.
+            # A DISARMED_WAITING_FOR_RECLAIM signal is still a live position attempt
+            # with an open OSM order. Treating it as invisible (is_active=False)
+            # would allow a new opposite-side signal to arm alongside it, and if
+            # the disarmed signal later reclaims, both would be active simultaneously.
+            # Using (w.is_active or w.rearm_mode) ensures rearm signals participate
+            # in the same scoring and cancellation logic as normal signals.
             same_side = [
                 w
                 for w in self._pending
-                if w.is_active and w.ticker == watched.ticker and w.side == watched.side
+                if (w.is_active or getattr(w, "rearm_mode", False))
+                and w.ticker == watched.ticker
+                and w.side == watched.side
             ]
             opposite_side = [
                 w
                 for w in self._pending
-                if w.is_active and w.ticker == watched.ticker and w.side != watched.side
+                if (w.is_active or getattr(w, "rearm_mode", False))
+                and w.ticker == watched.ticker
+                and w.side != watched.side
             ]
 
             # Never keep both CALL and PUT armed for the same ticker. Stronger
@@ -678,13 +1470,41 @@ class APEntryWatcher:
                         _local_oid = w.signal.get("local_order_id")
                         if _local_oid and self.order_state_machine and hasattr(self.order_state_machine, "cancel_pending_entry"):
                             try:
-                                self.order_state_machine.cancel_pending_entry(
+                                _cancel_ok = self.order_state_machine.cancel_pending_entry(
                                     _local_oid, reason="direction_flip_watcher_cancel"
                                 )
+                                if not _cancel_ok:
+                                    log.error(
+                                        "[%s] direction_flip: cancel_pending_entry returned False "
+                                        "for local_order_id=%s — OSM row may be stuck in "
+                                        "PENDING_TRIGGER. Investigate immediately.",
+                                        w.ticker, _local_oid,
+                                    )
                             except Exception as _exc:
                                 log.warning("[%s] OSM cancel failed for direction_flip: %s", w.ticker, _exc)
                     self._pending = [w for w in self._pending if w not in opposite_side]
                 else:
+                    _opp_audit = self._build_watcher_audit_payload(
+                        watched,
+                        trigger_type="add_signal_block",
+                        reason_code="opposite_side_conflict",
+                        raw_reason=(
+                            f"blocked_{watched.side}_{watched.score:.1f}"
+                            f"_existing_{best_opp.side}_{best_opp.score:.1f}"
+                        ),
+                        extra={
+                            "blocked_side":    watched.side,
+                            "blocked_score":   watched.score,
+                            "existing_side":   best_opp.side,
+                            "existing_score":  best_opp.score,
+                            "persisted":       False,
+                        },
+                    )
+                    log.info(
+                        "[watcher_audit] opposite_side_conflict | local_order_id=%s | %s",
+                        watched.signal.get("local_order_id"),
+                        json.dumps(_opp_audit, default=str),
+                    )
                     self._last_reject_reason = "opposite_side_conflict"
                     log.info(
                         "[%s] SAFE_MODE_BLOCK_OPPOSITE — keeping existing %s score=%.1f, "
@@ -715,13 +1535,40 @@ class APEntryWatcher:
                         _local_oid = w.signal.get("local_order_id")
                         if _local_oid and self.order_state_machine and hasattr(self.order_state_machine, "cancel_pending_entry"):
                             try:
-                                self.order_state_machine.cancel_pending_entry(
+                                _cancel_ok = self.order_state_machine.cancel_pending_entry(
                                     _local_oid, reason="same_side_replace_watcher_cancel"
                                 )
+                                if not _cancel_ok:
+                                    log.error(
+                                        "[%s] same_side_replace: cancel_pending_entry returned False "
+                                        "for local_order_id=%s — OSM row may be stuck in "
+                                        "PENDING_TRIGGER. Investigate immediately.",
+                                        w.ticker, _local_oid,
+                                    )
                             except Exception as _exc:
                                 log.warning("[%s] OSM cancel failed for same_side_replace: %s", w.ticker, _exc)
                     self._pending = [w for w in self._pending if w not in same_side]
                 else:
+                    _ss_audit = self._build_watcher_audit_payload(
+                        watched,
+                        trigger_type="add_signal_block",
+                        reason_code="same_side_block",
+                        raw_reason=(
+                            f"blocked_{watched.side}_{watched.score:.1f}"
+                            f"_existing_same_side_{best_same.score:.1f}"
+                        ),
+                        extra={
+                            "blocked_score":   watched.score,
+                            "existing_score":  best_same.score,
+                            "side":            watched.side,
+                            "persisted":       False,
+                        },
+                    )
+                    log.info(
+                        "[watcher_audit] same_side_block | local_order_id=%s | %s",
+                        watched.signal.get("local_order_id"),
+                        json.dumps(_ss_audit, default=str),
+                    )
                     self._last_reject_reason = "same_side_block"
                     log.info(
                         "[%s] SAME_SIDE_BLOCK — keeping %s score=%.1f, "
@@ -737,16 +1584,58 @@ class APEntryWatcher:
                 self._dedup_set.add(dedup_key)
 
             self._pending.append(watched)
+
+            # P0-W2: consume rearm marker placed by watch() arm-time path.
+            # The marker is a private key in watched.signal (which IS signal_dict
+            # by reference). Pop it so it never propagates downstream.
+            _rearm_at_arm = bool(watched.signal.pop("__watcher_rearm_pending", False))
+            _rearm_arm_reason = str(watched.signal.pop("__watcher_rearm_reason", "") or "")
+            if _rearm_at_arm:
+                watched.rearm_mode = True
+                watched.rearm_reason = _rearm_arm_reason
+                watched.signal["queue_status"] = "DISARMED_WAITING_FOR_RECLAIM"
+                # Overnight-aware expiry: if signal is overnight/daily and we are
+                # pre-market, start the window from 9:30 ET open, not right now,
+                # so the signal is not silently expired before quotes are available.
+                _rearm_window = timedelta(seconds=WATCHER_REARM_WINDOW_SEC)
+                _now_utc = datetime.now(timezone.utc)
+                if watched.overnight or _safe_is_daily_signal(watched):
+                    try:
+                        _market_open_et = datetime.now(ET).replace(
+                            hour=9, minute=30, second=0, microsecond=0
+                        ).astimezone(timezone.utc)
+                        if _now_utc < _market_open_et:
+                            watched.rearm_expires_at = _market_open_et + _rearm_window
+                        else:
+                            watched.rearm_expires_at = _now_utc + _rearm_window
+                    except Exception:
+                        watched.rearm_expires_at = _now_utc + _rearm_window
+                else:
+                    watched.rearm_expires_at = _now_utc + _rearm_window
+                log.info(
+                    "[%s] DISARMED_WAITING_FOR_RECLAIM | side=%s score=%.1f tier=%s | "
+                    "reason=%s | rearm_window=%ds | expires=%s UTC",
+                    watched.ticker,
+                    watched.side,
+                    watched.score,
+                    watched.grade,
+                    _rearm_arm_reason,
+                    WATCHER_REARM_WINDOW_SEC,
+                    watched.rearm_expires_at.strftime("%H:%M:%S") if watched.rearm_expires_at else "?",
+                )
+
             overnight_count = sum(1 for w in self._pending if w.overnight and w.is_active)
             same_day_count = sum(1 for w in self._pending if not w.overnight and w.is_active)
             active_total = sum(1 for w in self._pending if w.is_active)
+            rearm_total = sum(1 for w in self._pending if getattr(w, "rearm_mode", False))
 
         log.info(
-            "[%s] Added to watch queue — %d same-day + %d overnight = %d active",
+            "[%s] Added to watch queue — %d same-day + %d overnight = %d active | %d rearm-wait",
             watched.ticker,
             same_day_count,
             overnight_count,
             active_total,
+            rearm_total,
         )
         return True
 
@@ -886,26 +1775,116 @@ class APEntryWatcher:
                             below_stop = True
                         elif side == "PUT" and mid > stop:
                             below_stop = True
-                    if drift_stale or below_stop:
+                    if drift_stale:
+                        # Drift stale: price has moved decisively away from trigger.
+                        # Structurally missed — no re-arm opportunity.
                         reason_code = (
-                            f"arm_drift_{pct_from_trigger*100:+.2f}pct_thr_{WATCH_ARM_EFFECTIVE_THRESHOLD_PCT*100:.2f}pct"
-                            if drift_stale
-                            else f"arm_below_stop_mid_{mid:.2f}_stop_{stop:.2f}"
+                            f"arm_drift_{pct_from_trigger*100:+.2f}pct"
+                            f"_thr_{WATCH_ARM_EFFECTIVE_THRESHOLD_PCT*100:.2f}pct"
                         )
                         log.warning(
-                            "[%s] STALE_ARM_REJECT gate=%s mid=$%.2f trigger=$%.2f "
-                            "drift=%.3f%% effective_threshold=%.3f%% side=%s stop=%s",
-                            ticker,
-                            "drift" if drift_stale else "below_stop",
-                            mid,
-                            trigger,
+                            "[%s] STALE_ARM_REJECT gate=drift mid=$%.2f trigger=$%.2f "
+                            "drift=%.3f%% effective_threshold=%.3f%% side=%s",
+                            ticker, mid, trigger,
                             pct_from_trigger * 100.0,
                             WATCH_ARM_EFFECTIVE_THRESHOLD_PCT * 100.0,
                             side,
-                            ("%.2f" % stop) if stop and stop > 0 else "none",
                         )
+                        _drift_audit = self._build_watcher_audit_payload(
+                            None,
+                            symbol=ticker,
+                            score=float(signal_dict.get("score") or 0),
+                            tier=str(signal_dict.get("grade") or ""),
+                            direction=side,
+                            timeframe=str(signal_dict.get("timeframe") or ""),
+                            pattern=str(signal_dict.get("pattern") or ""),
+                            signal_id=str(signal_dict.get("signal_id") or ""),
+                            plan_id=str(signal_dict.get("plan_id") or ""),
+                            trigger_type="arm_time",
+                            signal_entry_price=trigger,
+                            trigger_price=trigger,
+                            stop_price=stop,
+                            current_bid=bid,
+                            current_ask=ask,
+                            current_mid=mid,
+                            arm_price=mid,
+                            arm_condition=(
+                                f"drift_{pct_from_trigger*100:+.2f}pct"
+                                f"_vs_threshold_{WATCH_ARM_EFFECTIVE_THRESHOLD_PCT*100:.2f}pct"
+                            ),
+                            stop_condition=f"stop_{stop:.4f}" if stop and stop > 0 else "",
+                            reason_code="arm_drift",
+                            raw_reason=reason_code,
+                        )
+                        self._persist_watcher_audit(local_order_id, _drift_audit)
                         self._last_reject_reason = reason_code
                         return False
+
+                    elif below_stop:
+                        # Wrong-side-of-stop: price is temporarily on the wrong side.
+                        # For strong daily/overnight signals this may be transient —
+                        # check rearm eligibility before permanently rejecting.
+                        reason_code = f"arm_below_stop_mid_{mid:.2f}_stop_{stop:.2f}"
+                        log.warning(
+                            "[%s] STALE_ARM_REJECT gate=below_stop mid=$%.2f trigger=$%.2f "
+                            "drift=%.3f%% side=%s stop=%.2f",
+                            ticker, mid, trigger,
+                            pct_from_trigger * 100.0,
+                            side, stop,
+                        )
+                        _score_val = float(signal_dict.get("score") or 0)
+                        _tier_val = str(signal_dict.get("grade") or "")
+                        _is_daily_or_overnight = post_session or pre_market or _is_overnight_signal
+                        _stop_audit = self._build_watcher_audit_payload(
+                            None,
+                            symbol=ticker,
+                            score=_score_val,
+                            tier=_tier_val,
+                            direction=side,
+                            timeframe=str(signal_dict.get("timeframe") or ""),
+                            pattern=str(signal_dict.get("pattern") or ""),
+                            signal_id=str(signal_dict.get("signal_id") or ""),
+                            plan_id=str(signal_dict.get("plan_id") or ""),
+                            trigger_type="arm_time",
+                            signal_entry_price=trigger,
+                            trigger_price=trigger,
+                            stop_price=stop,
+                            current_bid=bid,
+                            current_ask=ask,
+                            current_mid=mid,
+                            arm_price=mid,
+                            arm_condition=f"mid_{mid:.4f}_wrong_side_of_stop_{stop:.4f}",
+                            stop_condition=f"stop_{stop:.4f}" if stop and stop > 0 else "",
+                            reason_code="arm_below_stop",
+                            raw_reason=reason_code,
+                        )
+                        if self._is_rearm_eligible(_score_val, _tier_val, _is_daily_or_overnight):
+                            # Signal accepted into watcher in DISARMED state.
+                            # add_signal() will flip rearm_mode=True via __watcher_rearm_pending.
+                            # OSM order stays alive — on_expire fires on timeout if no reclaim.
+                            _stop_audit["trigger_type"] = "arm_time_rearm_queued"
+                            _stop_audit["rearm_eligible"] = True
+                            _stop_audit["rearm_window_sec"] = WATCHER_REARM_WINDOW_SEC
+                            _stop_audit["is_daily_or_overnight"] = _is_daily_or_overnight
+                            log.info(
+                                "[%s] ARM_BELOW_STOP → REARM_ELIGIBLE | "
+                                "score=%.1f tier=%s daily_overnight=%s | "
+                                "entering disarm window=%ds",
+                                ticker, _score_val, _tier_val,
+                                _is_daily_or_overnight,
+                                WATCHER_REARM_WINDOW_SEC,
+                            )
+                            self._persist_watcher_audit(local_order_id, _stop_audit)
+                            # Mark for rearm mode — consumed and cleaned by add_signal()
+                            signal_dict["__watcher_rearm_pending"] = True
+                            signal_dict["__watcher_rearm_reason"] = reason_code
+                            # Do NOT set _last_reject_reason — this is not a rejection
+                            # Do NOT return False — fall through to add_signal()
+                        else:
+                            # Low-score / intraday / not eligible — permanent reject
+                            self._persist_watcher_audit(local_order_id, _stop_audit)
+                            self._last_reject_reason = reason_code
+                            return False
                     log.debug(
                         "[%s] Price check OK — $%.2f vs trigger $%.2f (%.1f%%)",
                         ticker,
@@ -931,7 +1910,33 @@ class APEntryWatcher:
         # watcher_invalidated cases that execution_core already cleans up
         # via _cleanup_pending_entry_order. Here we proactively cancel
         # the pending entry order through the existing OSM helper.
-        ok = self.add_signal(signal_dict)
+        try:
+            ok = self.add_signal(signal_dict)
+        finally:
+            signal_dict.pop("__watcher_rearm_pending", None)
+            signal_dict.pop("__watcher_rearm_reason", None)
+        if not ok:
+            # add_signal already logged the audit for locked-path blocks (dedup/opposite/same-side).
+            # Attempt a best-effort DB persist here using the full signal context available in watch().
+            _blk_reject = getattr(self, "_last_reject_reason", "") or "watcher_add_signal_blocked"
+            _blk_audit = self._build_watcher_audit_payload(
+                None,
+                symbol=ticker,
+                score=float(signal_dict.get("score") or 0),
+                tier=str(signal_dict.get("grade") or ""),
+                direction=side,
+                timeframe=str(signal_dict.get("timeframe") or ""),
+                pattern=str(signal_dict.get("pattern") or ""),
+                signal_id=str(signal_dict.get("signal_id") or ""),
+                plan_id=str(signal_dict.get("plan_id") or ""),
+                trigger_type="add_signal_block",
+                signal_entry_price=trigger,
+                trigger_price=trigger,
+                stop_price=stop,
+                reason_code=_blk_reject,
+                raw_reason=_blk_reject,
+            )
+            self._persist_watcher_audit(local_order_id, _blk_audit)
         if not ok and local_order_id and self.order_state_machine is not None:
             cancel_fn = getattr(self.order_state_machine, "cancel_pending_entry", None)
             if callable(cancel_fn):
@@ -1000,6 +2005,13 @@ class APEntryWatcher:
                     "last_bid": w.last_quote_bid,
                     "last_ask": w.last_quote_ask,
                     "breach_count": w.breach_count,
+                    "rearm_mode": getattr(w, "rearm_mode", False),
+                    "rearm_count": getattr(w, "rearm_count", 0),
+                    "rearm_expires_at": (
+                        w.rearm_expires_at.isoformat()
+                        if getattr(w, "rearm_expires_at", None) else None
+                    ),
+                    "rearm_reason": getattr(w, "rearm_reason", ""),
                 }
                 for w in self._pending
             ]
@@ -1053,7 +2065,16 @@ class APEntryWatcher:
                 expired = []
                 surviving = []
                 for w in self._pending:
-                    if w.is_active and not w.overnight:
+                    # Expire both actively-watching and rearm-wait same-day signals.
+                    # rearm_mode signals have is_active=False so they were previously
+                    # invisible to this gate and would ghost as PENDING overnight.
+                    _is_eod_target = (
+                        (w.is_active and not w.overnight)
+                        or (getattr(w, "rearm_mode", False) and not w.overnight)
+                    )
+                    if _is_eod_target:
+                        if getattr(w, "rearm_mode", False):
+                            w.rearm_mode = False  # clear before state change
                         w.state = WatchState.EXPIRED
                         w._release_dedup_key()
                         # BUG TRAP: WATCHING → EXPIRED logged here.
@@ -1090,6 +2111,7 @@ class APEntryWatcher:
 
         self._revalidate_overnight_at_open()
         self._poll_active_signals(open_protect_active=open_protect_active)
+        self._check_rearm_signals()
 
     def _revalidate_overnight_at_open(self) -> None:
         with self._lock:
@@ -1105,6 +2127,17 @@ class APEntryWatcher:
                 try:
                     result = _validator_recheck_overnight_daily(w, self.broker)
                 except Exception as exc:
+                    _ov_exc_audit = self._build_watcher_audit_payload(
+                        w,
+                        trigger_type="overnight_revalidation",
+                        reason_code="overnight_daily_validator_error",
+                        raw_reason=f"validator_exception_{type(exc).__name__}",
+                        extra={
+                            "queue_status": str(w.signal.get("queue_status") or ""),
+                            "is_daily": True,
+                        },
+                    )
+                    self._persist_watcher_audit(w.signal.get("local_order_id"), _ov_exc_audit)
                     w.state = WatchState.INVALIDATED
                     w.signal["queue_status"] = OvernightWatchState.INVALIDATED
                     w._release_dedup_key()
@@ -1113,6 +2146,22 @@ class APEntryWatcher:
                     continue
 
                 if not getattr(result, "valid", False):
+                    _ov_inv_audit = self._build_watcher_audit_payload(
+                        w,
+                        trigger_type="overnight_revalidation",
+                        reason_code="overnight_daily_invalidated",
+                        raw_reason=(
+                            f"{getattr(result, 'reason_code', 'UNKNOWN')}"
+                            f"_{getattr(result, 'reason_text', '')}"
+                        ),
+                        extra={
+                            "queue_status":     str(w.signal.get("queue_status") or ""),
+                            "validator_reason": getattr(result, "reason_code", "UNKNOWN"),
+                            "validator_text":   getattr(result, "reason_text", ""),
+                            "is_daily":         True,
+                        },
+                    )
+                    self._persist_watcher_audit(w.signal.get("local_order_id"), _ov_inv_audit)
                     w.state = WatchState.INVALIDATED
                     w.signal["queue_status"] = OvernightWatchState.INVALIDATED
                     w._release_dedup_key()
@@ -1156,6 +2205,20 @@ class APEntryWatcher:
                 # PAPER: fail open (arm watcher) — sandbox is for learning, not money protection.
                 _is_live_watcher = str(getattr(self, "mode", "PAPER")).upper() == "LIVE"
                 if _is_live_watcher:
+                    _ov_quot_audit = self._build_watcher_audit_payload(
+                        w,
+                        trigger_type="overnight_revalidation",
+                        current_bid=0.0,
+                        current_ask=0.0,
+                        current_mid=0.0,
+                        reason_code="overnight_live_quote_unavailable",
+                        raw_reason="live_overnight_recheck_quote_zero_invalidated",
+                        extra={
+                            "mode": "LIVE",
+                            "quote_available": False,
+                        },
+                    )
+                    self._persist_watcher_audit(w.signal.get("local_order_id"), _ov_quot_audit)
                     w.state = WatchState.INVALIDATED
                     w._release_dedup_key()
                     log.warning(
@@ -1182,6 +2245,19 @@ class APEntryWatcher:
             )
 
             if premarket_breached:
+                _ov_pre_audit = self._build_watcher_audit_payload(
+                    w,
+                    trigger_type="overnight_revalidation",
+                    current_bid=bid,
+                    current_ask=ask,
+                    current_mid=mid,
+                    arm_condition=f"trigger_{w.entry_trigger:.4f}",
+                    stop_condition=f"stop_{w.stop_level:.4f}" if w.stop_level else "",
+                    reason_code="overnight_premarket_breached",
+                    raw_reason=f"mid_{mid:.4f}_already_through_trigger_{w.entry_trigger:.4f}",
+                    extra={"drift_pct": round(drift * 100.0, 4)},
+                )
+                self._persist_watcher_audit(w.signal.get("local_order_id"), _ov_pre_audit)
                 w.state = WatchState.EXPIRED
                 w._release_dedup_key()
                 log.info(
@@ -1193,6 +2269,23 @@ class APEntryWatcher:
                 )
                 to_remove.append(w)
             elif too_far:
+                _ov_drift_audit = self._build_watcher_audit_payload(
+                    w,
+                    trigger_type="overnight_revalidation",
+                    current_bid=bid,
+                    current_ask=ask,
+                    current_mid=mid,
+                    arm_condition=f"trigger_{w.entry_trigger:.4f}",
+                    stop_condition=f"stop_{w.stop_level:.4f}" if w.stop_level else "",
+                    reason_code="overnight_too_far_from_trigger",
+                    raw_reason=(
+                        f"mid_{mid:.4f}_drifted_{drift*100.0:+.2f}pct"
+                        f"_from_trigger_{w.entry_trigger:.4f}"
+                        f"_max_{OVERNIGHT_MAX_DRIFT_PCT*100:.1f}pct"
+                    ),
+                    extra={"drift_pct": round(drift * 100.0, 4)},
+                )
+                self._persist_watcher_audit(w.signal.get("local_order_id"), _ov_drift_audit)
                 w.state = WatchState.EXPIRED
                 w._release_dedup_key()
                 log.info(
@@ -1366,6 +2459,11 @@ class APEntryWatcher:
                     except Exception as exc:
                         log.error("[%s] on_expire callback failed: %s", w.ticker, exc, exc_info=True)
             elif w.state == WatchState.INVALIDATED:
+                _pending_audit = getattr(w, "_pending_audit", None)
+                if _pending_audit:
+                    self._persist_watcher_audit(
+                        w.signal.get("local_order_id"), _pending_audit
+                    )
                 if _sig_id and _ticker:
                     _ew_record(_sig_id, _ticker, "INVALIDATED",
                                "signal_invalidated_in_poll_loop")
