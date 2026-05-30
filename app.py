@@ -1430,6 +1430,282 @@ def create_app() -> Flask:
             return jsonify({"ok": False, "error": str(e), "ghost_orders": [], "summary": {}}), 500
 
 
+    @app.get("/admin/operator/ghost-orders/dry-run")
+    @require_hmac
+    def admin_operator_ghost_orders_dry_run():
+        """READ-ONLY DRY-RUN classifier for ghost orders.
+
+        Classifies each candidate row into a proposed action WITHOUT mutating
+        anything. This endpoint exists so we can review what a cleanup pass
+        WOULD do before any cleanup endpoint is built.
+
+        ┌──────────────────────────────────────────────────────────────────┐
+        │ HARD RULE                                                        │
+        │   This endpoint performs NO mutation under any circumstance.    │
+        │   It does NOT call:                                              │
+        │     - cancel_pending_entry / expire_pending_entry / transition  │
+        │     - update_order_meta or any OSM mutation method              │
+        │     - any broker submit/cancel                                   │
+        │   It does NOT execute INSERT, UPDATE, DELETE, or DROP.          │
+        │   It only runs SELECT and returns proposed_action strings.      │
+        └──────────────────────────────────────────────────────────────────┘
+
+        Proposed actions (one per row):
+          would_expire_pending_entry      — stale beyond expire_threshold
+          would_cancel_pending_entry      — stale beyond cancel_threshold
+                                            but not yet expire_threshold
+          skip_recent                     — within recent_skip_hours
+          skip_has_broker_order_id        — broker already saw this order
+          skip_not_entry                  — kind != 'ENTRY'
+          skip_not_pending_trigger        — status != 'PENDING_TRIGGER'
+          skip_missing_local_order_id     — local_order_id is null
+          skip_unclear_state              — none of the above apply
+
+        Query params (all parameterized, all optional):
+          recent_skip_hours    (default 1, range 0..168)
+          cancel_threshold     (default 24, range 1..720) — hours
+          expire_threshold     (default 72, range 1..720) — hours
+          client_id            (optional filter)
+          symbol               (optional filter)
+          limit                (default 500, max 2000)
+        """
+        try:
+            recent_skip_hours = max(0, min(int(request.args.get("recent_skip_hours", 1)), 168))
+        except (TypeError, ValueError):
+            recent_skip_hours = 1
+        try:
+            cancel_threshold = max(1, min(int(request.args.get("cancel_threshold", 24)), 24 * 30))
+        except (TypeError, ValueError):
+            cancel_threshold = 24
+        try:
+            expire_threshold = max(1, min(int(request.args.get("expire_threshold", 72)), 24 * 30))
+        except (TypeError, ValueError):
+            expire_threshold = 72
+        try:
+            limit = max(1, min(int(request.args.get("limit", 500)), 2000))
+        except (TypeError, ValueError):
+            limit = 500
+        client_id_filter = (request.args.get("client_id") or "").strip()
+        symbol_filter = (request.args.get("symbol") or "").strip().upper()
+
+        # Sanity: expire_threshold must be > cancel_threshold so the classifier
+        # buckets land in the intended order. If a caller inverts them, treat
+        # them as equal (collapses 'would_cancel' into 'would_expire').
+        if expire_threshold < cancel_threshold:
+            expire_threshold = cancel_threshold
+
+        # Pull a SUPERSET of rows so the classifier can distinguish skip_*
+        # buckets — we don't pre-filter by kind/status/broker_order_id, we
+        # let the classifier explain why each row is being skipped.
+        # We DO restrict by age_hours > 0 (nothing fresher than now) and
+        # cap by limit. We also filter by client_id/symbol if provided.
+        where = ["1 = 1"]
+        params: list = []
+        if client_id_filter:
+            where.append("client_id = %s")
+            params.append(client_id_filter)
+        if symbol_filter:
+            where.append("UPPER(symbol) = %s")
+            params.append(symbol_filter)
+        # Codex P2 fix — the SQL lookback must NOT cap at a hardcoded 30 days,
+        # because expire_threshold can request up to 720h (also 30d) and a
+        # strict-greater-than at 30d would exclude rows exactly 30d old (and
+        # any row beyond) from classification.
+        #
+        # Lookback is derived from the requested thresholds plus a generous
+        # buffer so any row whose age >= expire_threshold lands in scope and
+        # can be classified as would_expire_pending_entry. Buffer = 168h (1w)
+        # so that even at the max expire_threshold (720h / 30d), rows up to
+        # ~37 days old are still scanned. >= boundary is used (NOT strict >)
+        # so a row whose age equals the cutoff is INCLUDED.
+        LOOKBACK_BUFFER_HOURS = 168  # 1 week — generous safety margin
+        lookback_hours = max(
+            expire_threshold,
+            cancel_threshold,
+            recent_skip_hours,
+        ) + LOOKBACK_BUFFER_HOURS
+        where.append("updated_ts >= NOW() - (%s::text || ' hours')::interval")
+        params.append(str(lookback_hours))
+
+        sql = (
+            "SELECT local_order_id, "
+            "       client_id, "
+            "       kind, "
+            "       status, "
+            "       broker_order_id, "
+            "       symbol, "
+            "       contract, "
+            "       qty, "
+            "       limit_price, "
+            "       score, "
+            "       tier, "
+            "       last_error, "
+            "       created_ts, "
+            "       updated_ts, "
+            "       EXTRACT(EPOCH FROM (NOW() - updated_ts)) / 3600.0 AS age_hours "
+            "FROM orders "
+            "WHERE " + " AND ".join(where) +
+            "   AND (kind = 'ENTRY' OR status = 'PENDING_TRIGGER' "
+            "        OR (kind IS NULL AND status IS NULL)) "
+            " ORDER BY updated_ts ASC LIMIT %s"
+        )
+        params.append(limit)
+
+        try:
+            def _fetch():
+                with conn() as c:
+                    cur = c.execute(sql, tuple(params))
+                    cols = [d[0] for d in cur.description]
+                    fetched = cur.fetchall()
+                    rows = []
+                    for r in fetched:
+                        if isinstance(r, dict):
+                            rows.append(dict(r))
+                        else:
+                            rows.append(dict(zip(cols, r)))
+                    return rows
+
+            from ap.db import run_with_retry
+            rows = run_with_retry(_fetch)
+
+            # Pure-Python classifier. No DB writes anywhere — we only READ the
+            # row's fields and return a string label per row.
+            def _classify(row: dict) -> str:
+                """Return one of the 8 documented proposed_action strings.
+
+                Order matters — earlier rules short-circuit later ones.
+                """
+                kind = row.get("kind")
+                status = row.get("status")
+                broker_id = row.get("broker_order_id")
+                loid = row.get("local_order_id")
+                age = row.get("age_hours")
+                try:
+                    age_f = float(age) if age is not None else None
+                except (TypeError, ValueError):
+                    age_f = None
+
+                # Structural skips first — these row shapes can never be
+                # ghost-cleanup candidates regardless of age.
+                if not loid:
+                    return "skip_missing_local_order_id"
+                if broker_id:
+                    return "skip_has_broker_order_id"
+                if (kind or "").upper() != "ENTRY":
+                    return "skip_not_entry"
+                if (status or "").upper() != "PENDING_TRIGGER":
+                    return "skip_not_pending_trigger"
+
+                # Age-based gates. If age is unknown, we cannot safely classify
+                # it as expire/cancel — fall through to skip_unclear_state.
+                if age_f is None:
+                    return "skip_unclear_state"
+                if age_f < float(recent_skip_hours):
+                    return "skip_recent"
+                if age_f >= float(expire_threshold):
+                    return "would_expire_pending_entry"
+                if age_f >= float(cancel_threshold):
+                    return "would_cancel_pending_entry"
+
+                # Between recent_skip_hours and cancel_threshold — too old to
+                # be "recent" but not stale enough to act on.
+                return "skip_unclear_state"
+
+            # Defensive: track every valid action string we may emit, so the
+            # summary dict always lists all buckets even when count = 0.
+            ALL_ACTIONS = (
+                "would_expire_pending_entry",
+                "would_cancel_pending_entry",
+                "skip_recent",
+                "skip_has_broker_order_id",
+                "skip_not_entry",
+                "skip_not_pending_trigger",
+                "skip_missing_local_order_id",
+                "skip_unclear_state",
+            )
+            ELIGIBLE_ACTIONS = {
+                "would_expire_pending_entry",
+                "would_cancel_pending_entry",
+            }
+
+            from collections import defaultdict
+            action_counts: "dict[str,int]" = {k: 0 for k in ALL_ACTIONS}
+            per_client: "dict[str,dict[str,int]]" = defaultdict(lambda: {k: 0 for k in ALL_ACTIONS})
+            per_symbol: "dict[str,dict[str,int]]" = defaultdict(lambda: {k: 0 for k in ALL_ACTIONS})
+            classified = []
+
+            for r in rows:
+                action = _classify(r)
+                action_counts[action] = action_counts.get(action, 0) + 1
+                if r.get("client_id"):
+                    per_client[r["client_id"]][action] = per_client[r["client_id"]].get(action, 0) + 1
+                if r.get("symbol"):
+                    per_symbol[r["symbol"]][action] = per_symbol[r["symbol"]].get(action, 0) + 1
+                row_out = dict(r)
+                # Coerce age_hours to a clean float for JSON output.
+                ah = row_out.get("age_hours")
+                if ah is not None:
+                    try:
+                        row_out["age_hours"] = round(float(ah), 2)
+                    except (TypeError, ValueError):
+                        pass
+                row_out["proposed_action"] = action
+                classified.append(row_out)
+
+            rows_eligible = sum(action_counts[a] for a in ELIGIBLE_ACTIONS)
+            rows_skipped = len(classified) - rows_eligible
+
+            # Compact per-client / per-symbol summaries (drop empty buckets).
+            def _compact(d: dict) -> dict:
+                return {k: v for k, v in d.items() if v > 0}
+
+            per_client_summary = {
+                cid: _compact(buckets) for cid, buckets in per_client.items()
+            }
+            per_symbol_summary = {
+                sym: _compact(buckets) for sym, buckets in per_symbol.items()
+            }
+
+            return jsonify({
+                "ok": True,
+                "report_only": True,                # explicit invariants
+                "dry_run": True,
+                "mutation_performed": False,
+                "thresholds": {
+                    "recent_skip_hours":    recent_skip_hours,
+                    "cancel_threshold":     cancel_threshold,
+                    "expire_threshold":     expire_threshold,
+                    "lookback_hours":       lookback_hours,
+                },
+                "rows_scanned":   len(classified),
+                "rows_eligible":  rows_eligible,
+                "rows_skipped":   rows_skipped,
+                "proposed_actions": classified,
+                "action_summary":   action_counts,
+                "per_client_summary": per_client_summary,
+                "per_symbol_summary": per_symbol_summary,
+                "note": (
+                    "DRY-RUN ONLY. Classifies candidate rows into proposed "
+                    "actions WITHOUT mutating the database. No INSERT/UPDATE/"
+                    "DELETE, no OSM cancel_pending_entry/expire_pending_entry/"
+                    "transition calls, no broker calls. The 'would_*' labels "
+                    "indicate what a cleanup pass would do — actual cleanup "
+                    "endpoints will be added in a separate, later PR."
+                ),
+            })
+        except Exception as e:
+            log.error(f"ghost-orders dry-run failed: {e}")
+            return jsonify({
+                "ok": False,
+                "error": str(e),
+                "report_only": True,
+                "dry_run": True,
+                "mutation_performed": False,
+                "proposed_actions": [],
+                "action_summary": {},
+            }), 500
+
+
     @app.post("/admin/force_initialize")
     @require_hmac
     def admin_force_initialize():
