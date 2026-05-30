@@ -198,3 +198,38 @@ class TestNineBucketCASE:
     def test_pending_trigger_needs_no_broker_to_classify(self):
         # PENDING_TRIGGER without broker → its own bucket
         assert self._classify("PENDING_TRIGGER", None, None) == "PENDING_TRIGGER_NO_BROKER"
+
+
+class TestViewExposesQuoteDomainFields:
+    """The ledger view must expose the PR #59 quote-domain fields so the
+    operator dashboard can render the Quote Domain panel without an extra
+    backend call. Purely additive — these fields already exist in orders.meta.
+    """
+
+    @staticmethod
+    def _view_text():
+        path = os.path.join(os.path.dirname(__file__), "..", "sql", "views",
+                            "ap_multi_account_signal_ledger.sql")
+        with open(path) as f:
+            return f.read()
+
+    def test_view_exposes_selector_sandbox_fields(self):
+        text = self._view_text()
+        assert "selector_quote_source" in text
+        assert "selector_quote_base_url" in text
+        assert "selector_sandbox_mode" in text
+
+    def test_view_exposes_submit_sandbox_fields(self):
+        text = self._view_text()
+        assert "submit_quote_source" in text
+        assert "submit_quote_base_url" in text
+        assert "submit_sandbox_mode" in text
+
+    def test_view_exposes_broker_base_url(self):
+        text = self._view_text()
+        assert "broker_base_url" in text
+
+    def test_view_exposes_watcher_sandbox_mode(self):
+        text = self._view_text()
+        # Watcher sandbox lives inside watcher_audit jsonb
+        assert "'watcher_audit'->>'watcher_sandbox_mode'" in text
