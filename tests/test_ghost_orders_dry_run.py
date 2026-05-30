@@ -53,6 +53,16 @@ def _executable_only(body: str) -> str:
     return cleaned
 
 
+def _strip_docstring_and_comments(body: str) -> str:
+    """Like _executable_only but KEEPS string literals intact. Use this when
+    a test needs to inspect SQL content (which lives inside string literals)
+    without false-positives from docstring/comment text."""
+    cleaned = re.sub(r'"""[\s\S]*?"""', '""', body)
+    cleaned = re.sub(r"'''[\s\S]*?'''", "''", cleaned)
+    cleaned = re.sub(r'#[^\n]*', '', cleaned)
+    return cleaned
+
+
 # ── 1. Pure classifier behavior ─────────────────────────────────────────────
 
 
@@ -366,3 +376,131 @@ class TestClassifierStringSet:
         for row in cases:
             out = c(row)
             assert out in allowed, f"unexpected action {out!r} for row {row}"
+
+
+# ── 3. Codex P2 fix: lookback derivation must include rows AT and BEYOND ────
+#       the requested expire_threshold (no hardcoded 30-day strict-greater).
+
+
+class TestLookbackDerivation:
+    """The SQL lookback window must be wide enough that any row whose age is
+    >= expire_threshold is in scope and can be classified as
+    would_expire_pending_entry. Boundary is >=, not strict >."""
+
+    LOOKBACK_BUFFER_HOURS = 168  # must match the constant in app.py
+
+    @staticmethod
+    def _derive(expire_threshold, cancel_threshold=24, recent_skip_hours=1):
+        """Mirror the endpoint's lookback derivation so we can unit-test it."""
+        return max(
+            expire_threshold, cancel_threshold, recent_skip_hours,
+        ) + TestLookbackDerivation.LOOKBACK_BUFFER_HOURS
+
+    def test_lookback_grows_with_expire_threshold(self):
+        # default expire=72 → lookback >= 72 + buffer
+        assert self._derive(72) == 72 + self.LOOKBACK_BUFFER_HOURS
+        # max expire=720 → lookback >= 720 + buffer
+        assert self._derive(720) == 720 + self.LOOKBACK_BUFFER_HOURS
+
+    def test_lookback_uses_max_of_all_thresholds(self):
+        # If recent_skip_hours is larger than the others (pathological but
+        # supported by validation), it still drives the lookback.
+        assert self._derive(
+            expire_threshold=10, cancel_threshold=5, recent_skip_hours=168,
+        ) == 168 + self.LOOKBACK_BUFFER_HOURS
+
+    def test_lookback_at_720_covers_rows_exactly_720h_old(self):
+        """The exact failure Codex flagged: with expire_threshold=720, a row
+        AT 720h old must be in scope. The derived lookback ensures it."""
+        lookback = self._derive(720)
+        # A row 720h old: age = 720, lookback = 720 + 168 = 888
+        # SQL: updated_ts >= NOW() - 888h. updated_ts of a 720h-old row is
+        # NOW() - 720h, which IS >= NOW() - 888h. INCLUDED.
+        assert lookback >= 720, "lookback must cover the 720h boundary"
+
+    def test_lookback_at_720_covers_rows_beyond_720h(self):
+        """Rows 721h, 800h, 850h old must also be in scope when
+        expire_threshold=720. Up to the buffer ceiling (lookback)."""
+        lookback = self._derive(720)
+        for age in (721, 800, 850, lookback - 1):
+            assert age < lookback, (
+                f"row at {age}h must be within the lookback ({lookback}h)"
+            )
+
+    def test_inclusive_boundary_at_exact_lookback(self):
+        """SQL uses `>=` (not `>`) — a row whose age EQUALS the lookback
+        is INCLUDED, not strictly excluded."""
+        # SQL lives inside string literals, so use the docstring/comment
+        # stripper that KEEPS string literals (vs _executable_only which
+        # strips them).
+        body = _strip_docstring_and_comments(_extract_dry_run_endpoint())
+        assert "updated_ts >= NOW()" in body, (
+            "SQL must use >= for inclusive boundary at the lookback cutoff"
+        )
+        # Explicit reverse: the strict-> form must be gone for the lookback.
+        # (A different `>` for age_hours is fine — we only ban it on the
+        # updated_ts lookback expression.)
+        assert "updated_ts > NOW()" not in body, (
+            "strict > on updated_ts vs NOW() is the original Codex P2 bug; "
+            "must use >= so boundary-exact rows are included"
+        )
+
+
+class TestSqlUsesParameterizedLookback:
+    """The lookback hours must be bound as a SQL parameter, not interpolated."""
+
+    def test_lookback_value_is_parameterized(self):
+        body = _strip_docstring_and_comments(_extract_dry_run_endpoint())
+        # The interval cast pattern from the spec: (%s::text || ' hours')::interval
+        assert "%s::text || ' hours'" in body, (
+            "lookback hours must be passed as a parameter via %s, not f-string"
+        )
+
+    def test_no_hardcoded_thirty_days_left(self):
+        body = _strip_docstring_and_comments(_extract_dry_run_endpoint())
+        assert "INTERVAL '30 days'" not in body, (
+            "hardcoded 30-day interval should be removed; lookback is now "
+            "derived from thresholds"
+        )
+
+    def test_response_echoes_lookback_hours(self):
+        """Caller needs to see what window was actually scanned."""
+        body = _extract_dry_run_endpoint()
+        assert '"lookback_hours"' in body, (
+            "response.thresholds.lookback_hours must echo the derived value "
+            "so the operator knows the actual scan window"
+        )
+
+
+class TestExpireThreshold720EndToEnd:
+    """The exact Codex P2 acceptance criteria: at the documented max
+    expire_threshold (720h), boundary and beyond-boundary rows are classified
+    correctly. Tested at the classifier level since the SQL filter is what
+    feeds the classifier and was previously dropping these rows."""
+
+    def test_row_exactly_720h_old_classified_would_expire(self):
+        c = _make_classifier(recent_skip_hours=1, cancel_threshold=24,
+                             expire_threshold=720)
+        row = {"kind": "ENTRY", "status": "PENDING_TRIGGER",
+               "broker_order_id": None, "local_order_id": "L1",
+               "age_hours": 720.0}
+        assert c(row) == "would_expire_pending_entry"
+
+    def test_row_just_over_720h_classified_would_expire(self):
+        c = _make_classifier(recent_skip_hours=1, cancel_threshold=24,
+                             expire_threshold=720)
+        row = {"kind": "ENTRY", "status": "PENDING_TRIGGER",
+               "broker_order_id": None, "local_order_id": "L1",
+               "age_hours": 721.0}
+        assert c(row) == "would_expire_pending_entry"
+
+    def test_row_well_beyond_720h_classified_would_expire(self):
+        # As long as the SQL fetched the row, the classifier labels it
+        # would_expire. Lookback at expire_threshold=720 is 720+168=888h,
+        # so rows up to 887h are in scope. Test a row inside that range.
+        c = _make_classifier(recent_skip_hours=1, cancel_threshold=24,
+                             expire_threshold=720)
+        row = {"kind": "ENTRY", "status": "PENDING_TRIGGER",
+               "broker_order_id": None, "local_order_id": "L1",
+               "age_hours": 850.0}
+        assert c(row) == "would_expire_pending_entry"

@@ -1507,9 +1507,25 @@ def create_app() -> Flask:
         if symbol_filter:
             where.append("UPPER(symbol) = %s")
             params.append(symbol_filter)
-        # Only look at orders touched in the last 30 days — keeps the query
-        # bounded and matches the realistic lifecycle for a "ghost" candidate.
-        where.append("updated_ts > NOW() - INTERVAL '30 days'")
+        # Codex P2 fix — the SQL lookback must NOT cap at a hardcoded 30 days,
+        # because expire_threshold can request up to 720h (also 30d) and a
+        # strict-greater-than at 30d would exclude rows exactly 30d old (and
+        # any row beyond) from classification.
+        #
+        # Lookback is derived from the requested thresholds plus a generous
+        # buffer so any row whose age >= expire_threshold lands in scope and
+        # can be classified as would_expire_pending_entry. Buffer = 168h (1w)
+        # so that even at the max expire_threshold (720h / 30d), rows up to
+        # ~37 days old are still scanned. >= boundary is used (NOT strict >)
+        # so a row whose age equals the cutoff is INCLUDED.
+        LOOKBACK_BUFFER_HOURS = 168  # 1 week — generous safety margin
+        lookback_hours = max(
+            expire_threshold,
+            cancel_threshold,
+            recent_skip_hours,
+        ) + LOOKBACK_BUFFER_HOURS
+        where.append("updated_ts >= NOW() - (%s::text || ' hours')::interval")
+        params.append(str(lookback_hours))
 
         sql = (
             "SELECT local_order_id, "
@@ -1659,6 +1675,7 @@ def create_app() -> Flask:
                     "recent_skip_hours":    recent_skip_hours,
                     "cancel_threshold":     cancel_threshold,
                     "expire_threshold":     expire_threshold,
+                    "lookback_hours":       lookback_hours,
                 },
                 "rows_scanned":   len(classified),
                 "rows_eligible":  rows_eligible,
