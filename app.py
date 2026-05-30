@@ -1960,6 +1960,15 @@ def create_app() -> Flask:
                 action    = r["proposed_action"]
                 new_status = _GHOST_ACTION_STATUS[action]
 
+                # Action-specific age threshold for the CAS staleness guard:
+                # the row must still be old enough at UPDATE time, not just
+                # at SELECT time.
+                age_threshold = (
+                    expire_threshold
+                    if action == "would_expire_pending_entry"
+                    else cancel_threshold
+                )
+
                 meta_patch = {
                     "ghost_cleanup":        True,
                     "ghost_cleanup_action": action,
@@ -1970,8 +1979,25 @@ def create_app() -> Flask:
                 }
                 meta_patch_json = _json.dumps(meta_patch, default=str)
 
-                # Single atomic UPDATE. RETURNING local_order_id confirms
-                # whether Postgres actually updated the row.
+                # Single atomic UPDATE with full CAS / staleness guards.
+                # RETURNING local_order_id confirms the row was actually
+                # changed. If RETURNING is empty, any WHERE condition
+                # failed — the row is skipped as where_guard_no_match.
+                #
+                # CAS guards added vs the initial WHERE set:
+                #   updated_ts = %s
+                #     — exact snapshot match from the SELECT. If any
+                #       process touched the row after the scan (e.g. a
+                #       watcher re-arm that bumped updated_ts), this
+                #       condition fails and we skip safely.
+                #   updated_ts <= NOW() - (%s::text || ' hours')::interval
+                #     — row must still be old enough at UPDATE time using
+                #       the action-specific threshold (cancel_threshold or
+                #       expire_threshold). Belt-and-suspenders: even if
+                #       updated_ts matches the snapshot, a freshly-armed
+                #       row whose watcher re-computed something cannot
+                #       accidentally pass just because it was stale at
+                #       scan time.
                 update_sql = (
                     "UPDATE orders "
                     "SET status         = %s, "
@@ -1984,6 +2010,8 @@ def create_app() -> Flask:
                     "  AND broker_order_id IS NULL "
                     "  AND local_order_id  IS NOT NULL "
                     "  AND (meta->>'ghost_cleanup') IS DISTINCT FROM 'true' "
+                    "  AND updated_ts      = %s "
+                    "  AND updated_ts      <= NOW() - (%s::text || ' hours')::interval "
                     "RETURNING local_order_id"
                 )
                 update_params = (
@@ -1991,6 +2019,8 @@ def create_app() -> Flask:
                     "ghost_cleanup_manual",
                     meta_patch_json,
                     loid,
+                    r.get("updated_ts"),       # CAS: exact snapshot timestamp
+                    str(age_threshold),        # staleness: action-specific threshold
                 )
 
                 def _do_update(usql=update_sql, uparams=update_params):

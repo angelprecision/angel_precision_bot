@@ -495,3 +495,100 @@ class TestSharedClassifierUsed:
     def test_module_level_sql_builder_exists(self):
         src = _read_app()
         assert "def _ghost_build_sql_and_params(" in src
+
+
+# ── Codex P2 fix: CAS / staleness guards in UPDATE WHERE ─────────────────────
+
+class TestCasGuardsInUpdateSql:
+    """Codex P2: the UPDATE WHERE must include staleness guards so a row that
+    was touched between SELECT and UPDATE cannot be accidentally cleaned.
+
+    Two guards are required:
+      updated_ts = %s                                         (exact CAS)
+      updated_ts <= NOW() - (%s::text || ' hours')::interval  (still stale)
+    """
+
+    @staticmethod
+    def _update_sql_block():
+        """Extract the UPDATE SQL string from the cleanup endpoint source."""
+        body = _strip_docstring_and_comments(_extract_cleanup_endpoint())
+        # Find from 'UPDATE orders' to 'RETURNING local_order_id'
+        m = re.search(r'UPDATE orders.*?RETURNING local_order_id', body, re.S)
+        assert m, "UPDATE...RETURNING block not found in cleanup endpoint"
+        return m.group(0)
+
+    def test_update_sql_includes_updated_ts_exact_match(self):
+        """Test 1 of Codex P2: UPDATE WHERE must include `updated_ts = %s`
+        so an intervening update_ts change causes the CAS to miss."""
+        sql = self._update_sql_block()
+        assert "updated_ts      = %s" in sql or "updated_ts = %s" in sql, (
+            "UPDATE WHERE must include 'updated_ts = %s' for exact CAS guard"
+        )
+
+    def test_update_sql_includes_staleness_threshold(self):
+        """Test 2 of Codex P2: UPDATE WHERE must include the age-threshold
+        condition so the row is still stale at update time."""
+        sql = self._update_sql_block()
+        assert "updated_ts" in sql and "%s::text || ' hours'" in sql, (
+            "UPDATE WHERE must include 'updated_ts <= NOW() - "
+            "(%s::text || \\' hours\\')::interval'"
+        )
+        assert "<=" in sql, (
+            "staleness condition must use <= (row must be AT LEAST as old as threshold)"
+        )
+
+    def test_update_params_include_scanned_updated_ts(self):
+        """Test 3 of Codex P2: update_params must pass the scanned updated_ts
+        as the CAS parameter so Postgres compares against the snapshot."""
+        body = _extract_cleanup_endpoint()
+        # The scanned updated_ts is stored as r.get("updated_ts")
+        assert 'r.get("updated_ts")' in body, (
+            "update_params must include r.get('updated_ts') so the CAS guard "
+            "compares against the value read at scan time"
+        )
+
+    def test_update_params_include_action_specific_threshold(self):
+        """Test 4 of Codex P2: the staleness threshold passed to the UPDATE
+        must be action-specific (cancel vs expire threshold)."""
+        body = _extract_cleanup_endpoint()
+        # The age_threshold variable must be set per-action
+        assert "age_threshold" in body, (
+            "update_params must use an action-specific age_threshold variable"
+        )
+        assert "expire_threshold" in body and "cancel_threshold" in body, (
+            "both expire_threshold and cancel_threshold must appear in the "
+            "action-specific threshold selection"
+        )
+        # The threshold must be passed as a param (str conversion for interval)
+        assert 'str(age_threshold)' in body, (
+            "age_threshold must be converted to str and passed as the interval "
+            "parameter: (%s::text || ' hours')::interval"
+        )
+
+    def test_where_guard_no_match_returned_when_cas_fails(self):
+        """Test 5 of Codex P2: when RETURNING is empty (CAS or staleness guard
+        failed), skip_reason must be 'where_guard_no_match'."""
+        body = _extract_cleanup_endpoint()
+        assert "where_guard_no_match" in body, (
+            "empty RETURNING must produce skip_reason='where_guard_no_match' "
+            "so callers can see which rows were protected by the CAS guard"
+        )
+
+    def test_cas_guard_ordering_in_sql(self):
+        """Structural: both CAS conditions must appear in the WHERE clause,
+        AFTER the structural guards (kind/status/broker_order_id/ghost_cleanup),
+        BEFORE RETURNING."""
+        sql = self._update_sql_block()
+        pos_ghost = sql.find("ghost_cleanup")
+        pos_cas   = sql.find("updated_ts      = %s") if "updated_ts      = %s" in sql \
+                    else sql.find("updated_ts = %s")
+        pos_stale = sql.find("updated_ts      <=") if "updated_ts      <=" in sql \
+                    else sql.find("updated_ts <=")
+        pos_ret   = sql.find("RETURNING")
+        assert pos_ghost > 0 and pos_cas > 0 and pos_stale > 0 and pos_ret > 0
+        assert pos_ghost < pos_cas < pos_ret, (
+            "CAS guard must come after structural guards and before RETURNING"
+        )
+        assert pos_ghost < pos_stale < pos_ret, (
+            "staleness guard must come after structural guards and before RETURNING"
+        )
