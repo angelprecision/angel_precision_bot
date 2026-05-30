@@ -1130,6 +1130,287 @@ def create_app() -> Flask:
             return jsonify({"ok": False, "error": str(e), "rows": [], "summary": {}}), 500
 
 
+    @app.get("/admin/operator/fairness-audit")
+    @require_hmac
+    def admin_operator_fairness_audit():
+        """Item 6 — READ-ONLY client fairness / fan-out mismatch audit.
+
+        Aggregates the multi-account signal ledger by canonical_signal_id and
+        reports, per signal:
+          - n_clients               — distinct clients that have a row
+          - clients_seen            — list of those client_ids
+          - missing_clients         — active clients with NO order row (if
+                                      ?active_clients=a@x.com,b@y.com given)
+          - n_filled                — how many clients filled
+          - n_blocked               — how many clients in any *_NO_BROKER /
+                                      WATCHER_* / REJECTED / CANCELED bucket
+          - contract_mismatch       — True if clients used different contracts
+          - qty_mismatch            — True if clients used different qty
+          - bucket_breakdown        — { bucket: n }
+          - earliest_order_ts, latest_order_ts
+
+        Read-only. SELECT only. No order mutation, no cleanup, no cancel.
+        Mutation paths are intentionally NOT in this endpoint.
+        """
+        try:
+            since_hours = max(1, min(int(request.args.get("since_hours", 24)), 24 * 30))
+        except (TypeError, ValueError):
+            since_hours = 24
+        try:
+            min_clients = max(0, int(request.args.get("min_clients", 0)))
+        except (TypeError, ValueError):
+            min_clients = 0
+        try:
+            limit = max(1, min(int(request.args.get("limit", 200)), 2000))
+        except (TypeError, ValueError):
+            limit = 200
+        canonical_id = (request.args.get("canonical_signal_id") or "").strip()
+        active_clients_raw = (request.args.get("active_clients") or "").strip()
+        active_clients = [c.strip() for c in active_clients_raw.split(",") if c.strip()]
+        only_mismatch = request.args.get("only_mismatch", "0").strip() in ("1", "true", "yes")
+
+        where = ["order_created_ts > NOW() - (%s || ' hours')::interval"]
+        params: list = [str(since_hours)]
+        if canonical_id:
+            where.append("canonical_signal_id = %s")
+            params.append(canonical_id)
+
+        sql = (
+            "SELECT canonical_signal_id, client_id, symbol, contract, qty, "
+            "       order_status, ledger_bucket, broker_order_id, "
+            "       order_created_ts, order_updated_ts "
+            "FROM ap_multi_account_signal_ledger "
+            "WHERE " + " AND ".join(where) +
+            " ORDER BY canonical_signal_id, order_created_ts"
+        )
+
+        try:
+            def _fetch():
+                with conn() as c:
+                    cur = c.execute(sql, tuple(params))
+                    cols = [d[0] for d in cur.description]
+                    fetched = cur.fetchall()
+                    rows = []
+                    for r in fetched:
+                        if isinstance(r, dict):
+                            rows.append(dict(r))
+                        else:
+                            rows.append(dict(zip(cols, r)))
+                    return rows
+
+            from ap.db import run_with_retry
+            rows = run_with_retry(_fetch)
+
+            # Group by canonical_signal_id and compute mismatch flags.
+            from collections import defaultdict
+            groups: "dict[str, list[dict]]" = defaultdict(list)
+            for r in rows:
+                cid = r.get("canonical_signal_id") or ""
+                if cid:
+                    groups[cid].append(r)
+
+            BLOCKED_BUCKETS = {
+                "PENDING_TRIGGER_NO_BROKER", "WATCHER_INVALIDATED",
+                "WATCHER_EXPIRED", "REJECTED", "CANCELED", "TERMINAL_NO_FILL",
+            }
+
+            signals_out = []
+            for sig_id, sig_rows in groups.items():
+                clients_seen = sorted({r.get("client_id") for r in sig_rows if r.get("client_id")})
+                if min_clients and len(clients_seen) < min_clients:
+                    continue
+                missing_clients = sorted(set(active_clients) - set(clients_seen)) if active_clients else []
+                contracts = {r.get("contract") for r in sig_rows if r.get("contract")}
+                qtys = {r.get("qty") for r in sig_rows if r.get("qty") is not None}
+                contract_mismatch = len(contracts) > 1
+                qty_mismatch = len(qtys) > 1
+                n_filled = sum(1 for r in sig_rows if r.get("ledger_bucket") == "FILLED")
+                n_blocked = sum(1 for r in sig_rows if r.get("ledger_bucket") in BLOCKED_BUCKETS)
+
+                bucket_breakdown: "dict[str,int]" = defaultdict(int)
+                for r in sig_rows:
+                    b = r.get("ledger_bucket")
+                    if b:
+                        bucket_breakdown[b] += 1
+
+                ts_list = [r.get("order_created_ts") for r in sig_rows if r.get("order_created_ts")]
+                # ts values may be datetime or strings; coerce to str for JSON
+                ts_sorted = sorted(str(t) for t in ts_list) if ts_list else []
+
+                # First row defines symbol display; symbol is COALESCED in view.
+                symbol_display = sig_rows[0].get("symbol") if sig_rows else None
+
+                # Mismatch flag: any of (contract/qty/missing_clients) differ across clients.
+                has_mismatch = bool(contract_mismatch or qty_mismatch or missing_clients)
+                if only_mismatch and not has_mismatch:
+                    continue
+
+                signals_out.append({
+                    "canonical_signal_id": sig_id,
+                    "symbol":              symbol_display,
+                    "n_clients":           len(clients_seen),
+                    "clients_seen":        clients_seen,
+                    "missing_clients":     missing_clients,
+                    "n_filled":            n_filled,
+                    "n_blocked":           n_blocked,
+                    "contract_mismatch":   contract_mismatch,
+                    "qty_mismatch":        qty_mismatch,
+                    "distinct_contracts":  sorted(c for c in contracts if c),
+                    "distinct_qtys":       sorted(q for q in qtys if q is not None),
+                    "bucket_breakdown":    dict(bucket_breakdown),
+                    "earliest_order_ts":   ts_sorted[0] if ts_sorted else None,
+                    "latest_order_ts":     ts_sorted[-1] if ts_sorted else None,
+                    "has_mismatch":        has_mismatch,
+                })
+
+            # Sort: signals with mismatch first, then by latest_order_ts desc.
+            signals_out.sort(key=lambda s: (
+                not s["has_mismatch"],
+                s["latest_order_ts"] or "",
+            ), reverse=False)
+            signals_out.sort(key=lambda s: s["latest_order_ts"] or "", reverse=True)
+            signals_out.sort(key=lambda s: not s["has_mismatch"])
+
+            # Cap.
+            signals_out = signals_out[:limit]
+
+            total_mismatch = sum(1 for s in signals_out if s["has_mismatch"])
+            total_signals = len(signals_out)
+            total_filled = sum(s["n_filled"] for s in signals_out)
+            total_blocked = sum(s["n_blocked"] for s in signals_out)
+            return jsonify({
+                "ok": True,
+                "signals": signals_out,
+                "summary": {
+                    "signals_examined":     total_signals,
+                    "signals_with_mismatch": total_mismatch,
+                    "total_filled_outcomes": total_filled,
+                    "total_blocked_outcomes": total_blocked,
+                    "active_clients_param": active_clients,
+                },
+            })
+        except Exception as e:
+            log.error(f"fairness-audit failed: {e}")
+            return jsonify({"ok": False, "error": str(e), "signals": [], "summary": {}}), 500
+
+
+    @app.get("/admin/operator/ghost-orders")
+    @require_hmac
+    def admin_operator_ghost_orders():
+        """Item 7 — READ-ONLY ghost-order REPORT (no cleanup, no cancel).
+
+        Identifies orders that look stranded:
+          - kind='ENTRY'
+          - status='PENDING_TRIGGER'
+          - broker_order_id IS NULL  (never submitted to broker)
+          - updated_ts older than ?stale_hours (default 24)
+
+        REPORT ONLY. This endpoint does NOT mutate, cancel, expire, or delete.
+        Per spec, automated cleanup/dry-run endpoints come in a SEPARATE PR
+        after this report proves what set of rows is safe to act on.
+
+        Query params:
+          stale_hours (default 24, min 1, max 720)
+          client_id   (optional filter)
+          symbol      (optional filter)
+          limit       (default 500, max 2000)
+        """
+        try:
+            stale_hours = max(1, min(int(request.args.get("stale_hours", 24)), 24 * 30))
+        except (TypeError, ValueError):
+            stale_hours = 24
+        try:
+            limit = max(1, min(int(request.args.get("limit", 500)), 2000))
+        except (TypeError, ValueError):
+            limit = 500
+        client_id_filter = (request.args.get("client_id") or "").strip()
+        symbol_filter = (request.args.get("symbol") or "").strip().upper()
+
+        where = [
+            "kind = 'ENTRY'",
+            "status = 'PENDING_TRIGGER'",
+            "broker_order_id IS NULL",
+            "updated_ts < NOW() - (%s || ' hours')::interval",
+        ]
+        params: list = [str(stale_hours)]
+        if client_id_filter:
+            where.append("client_id = %s")
+            params.append(client_id_filter)
+        if symbol_filter:
+            where.append("UPPER(symbol) = %s")
+            params.append(symbol_filter)
+
+        sql = (
+            "SELECT local_order_id, client_id, plan_id, signal_id, symbol, "
+            "       contract, direction, qty, limit_price, reserved_cost, "
+            "       trigger_price, score, tier, pattern, timeframe, "
+            "       last_error, created_ts, updated_ts, "
+            "       EXTRACT(EPOCH FROM (NOW() - updated_ts)) / 3600.0 AS stale_hours_age "
+            "FROM orders "
+            "WHERE " + " AND ".join(where) +
+            " ORDER BY updated_ts ASC LIMIT %s"
+        )
+        params.append(limit)
+
+        try:
+            def _fetch():
+                with conn() as c:
+                    cur = c.execute(sql, tuple(params))
+                    cols = [d[0] for d in cur.description]
+                    fetched = cur.fetchall()
+                    rows = []
+                    for r in fetched:
+                        if isinstance(r, dict):
+                            rows.append(dict(r))
+                        else:
+                            rows.append(dict(zip(cols, r)))
+                    return rows
+
+            from ap.db import run_with_retry
+            rows = run_with_retry(_fetch)
+
+            # Summary: per-client counts + oldest age + total reserved capital.
+            from collections import defaultdict
+            per_client: "dict[str,int]" = defaultdict(int)
+            total_reserved = 0.0
+            oldest_age = 0.0
+            for r in rows:
+                if r.get("client_id"):
+                    per_client[r["client_id"]] += 1
+                rc = r.get("reserved_cost")
+                if rc is not None:
+                    try:
+                        total_reserved += float(rc)
+                    except (TypeError, ValueError):
+                        pass
+                age = r.get("stale_hours_age")
+                if age is not None:
+                    try:
+                        oldest_age = max(oldest_age, float(age))
+                    except (TypeError, ValueError):
+                        pass
+
+            return jsonify({
+                "ok": True,
+                "report_only": True,                       # explicit: no mutation
+                "stale_hours_threshold": stale_hours,
+                "ghost_orders": rows,
+                "summary": {
+                    "total_ghost_orders":    len(rows),
+                    "clients_with_ghosts":   len(per_client),
+                    "per_client_counts":     dict(per_client),
+                    "total_reserved_capital": round(total_reserved, 2),
+                    "oldest_age_hours":      round(oldest_age, 2),
+                },
+                "note": (
+                    "READ-ONLY REPORT. No mutation, dry-run, or cleanup is "
+                    "performed by this endpoint. Cleanup endpoints will be "
+                    "added in a separate PR after this report is reviewed."
+                ),
+            })
+        except Exception as e:
+            log.error(f"ghost-orders report failed: {e}")
+            return jsonify({"ok": False, "error": str(e), "ghost_orders": [], "summary": {}}), 500
 
 
     @app.post("/admin/force_initialize")
