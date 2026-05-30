@@ -198,3 +198,137 @@ class TestNineBucketCASE:
     def test_pending_trigger_needs_no_broker_to_classify(self):
         # PENDING_TRIGGER without broker → its own bucket
         assert self._classify("PENDING_TRIGGER", None, None) == "PENDING_TRIGGER_NO_BROKER"
+
+
+class TestViewExposesQuoteDomainFields:
+    """The ledger view must expose the PR #59 quote-domain fields so the
+    operator dashboard can render the Quote Domain panel without an extra
+    backend call.
+
+    CREATE OR REPLACE VIEW invariant: new columns MUST be appended at the
+    end of the SELECT list. Postgres rejects the replacement if existing
+    column names/positions change. These tests assert the new columns
+    appear AFTER the pre-existing final column (ledger_bucket).
+    """
+
+    @staticmethod
+    def _view_text():
+        path = os.path.join(os.path.dirname(__file__), "..", "sql", "views",
+                            "ap_multi_account_signal_ledger.sql")
+        with open(path) as f:
+            return f.read()
+
+    @staticmethod
+    def _pos(text, needle):
+        """Position of needle in the view body. -1 if missing."""
+        return text.find(needle)
+
+    def test_view_exposes_selector_sandbox_fields(self):
+        text = self._view_text()
+        assert "selector_quote_source" in text
+        assert "selector_quote_base_url" in text
+        assert "selector_sandbox_mode" in text
+
+    def test_view_exposes_submit_sandbox_fields(self):
+        text = self._view_text()
+        assert "submit_quote_source" in text
+        assert "submit_quote_base_url" in text
+        assert "submit_sandbox_mode" in text
+
+    def test_view_exposes_broker_base_url(self):
+        text = self._view_text()
+        assert "broker_base_url" in text
+
+    def test_view_exposes_watcher_sandbox_mode(self):
+        text = self._view_text()
+        # Watcher sandbox lives inside watcher_audit jsonb
+        assert "'watcher_audit'->>'watcher_sandbox_mode'" in text
+
+    # ── Column-ORDER invariants (the actual CREATE OR REPLACE VIEW gate) ──
+
+    def test_new_columns_appended_after_ledger_bucket(self):
+        """Every new column added by this PR must appear AFTER the existing
+        final column 'AS ledger_bucket'. Inserting them in the middle would
+        break Supabase's CREATE OR REPLACE VIEW."""
+        text = self._view_text()
+        anchor = self._pos(text, "AS ledger_bucket")
+        assert anchor > 0, "ledger_bucket column not found — view shape changed"
+        new_cols = [
+            "AS selector_quote_source",
+            "AS selector_quote_base_url",
+            "AS selector_sandbox_mode",
+            "AS submit_quote_source",
+            "AS submit_quote_base_url",
+            "AS submit_sandbox_mode",
+            "AS broker_base_url",
+            "AS tradier_sandbox_mode",
+            "AS watcher_sandbox_mode",
+        ]
+        for col in new_cols:
+            pos = self._pos(text, col)
+            assert pos > anchor, (
+                f"{col} must appear AFTER 'AS ledger_bucket' (pos {anchor}); "
+                f"found at {pos}. CREATE OR REPLACE VIEW requires existing "
+                "column order to be preserved — new columns must be appended."
+            )
+
+    def test_pre_existing_columns_still_in_original_order(self):
+        """Spot-check: the pre-existing columns must still appear in their
+        original relative order (canonical_signal_id ... ledger_bucket).
+        Picks a few stable anchors across the view.
+
+        Anchors are chosen from both aliased columns (AS x) and bare column
+        references (o.x,) — the view uses both forms."""
+        text = self._view_text()
+        anchors = [
+            "AS canonical_signal_id",
+            "AS order_signal_id",
+            "o.client_id,",                  # bare column ref
+            "AS symbol",
+            "AS order_status",
+            "o.broker_order_id,",            # bare column ref
+            "AS watcher_reason_code",
+            "AS watcher_quote_source",
+            "AS selector_candidate_audit",
+            "AS order_updated_ts",
+            "AS ledger_bucket",
+        ]
+        positions = [self._pos(text, a) for a in anchors]
+        for a, p in zip(anchors, positions):
+            assert p > 0, f"pre-existing column anchor {a!r} missing from view"
+        # Strictly increasing positions = original order preserved
+        for i in range(1, len(positions)):
+            assert positions[i] > positions[i - 1], (
+                f"column order changed: {anchors[i]} appears before "
+                f"{anchors[i - 1]} — CREATE OR REPLACE VIEW will reject this"
+            )
+
+    def test_new_columns_appended_in_a_contiguous_block(self):
+        """Defensive: all 9 new columns should appear as a contiguous block
+        at the end. This catches any future drift where someone interleaves
+        new columns with pre-existing ones again."""
+        text = self._view_text()
+        new_cols = [
+            "AS selector_quote_source",
+            "AS selector_quote_base_url",
+            "AS selector_sandbox_mode",
+            "AS submit_quote_source",
+            "AS submit_quote_base_url",
+            "AS submit_sandbox_mode",
+            "AS broker_base_url",
+            "AS tradier_sandbox_mode",
+            "AS watcher_sandbox_mode",
+        ]
+        new_positions = sorted([self._pos(text, c) for c in new_cols])
+        from_pos = self._pos(text, "FROM orders o")
+        # All new columns must precede the FROM clause (they're in the SELECT).
+        for c, p in zip(new_cols, new_positions):
+            assert 0 < p < from_pos, f"{c} not in SELECT body"
+        # No pre-existing column should appear between the new columns and FROM.
+        between = text[new_positions[0]:from_pos]
+        for old in ("AS watcher_reason_code", "AS canonical_signal_id",
+                    "o.broker_order_id,", "AS order_status"):
+            assert old not in between, (
+                f"pre-existing column {old} appears AFTER a new column — "
+                "new columns are not a contiguous appended block"
+            )

@@ -97,7 +97,25 @@ SELECT
     WHEN o.status IN ('CANCELED','CANCELLED')                                  THEN 'CANCELED'
     WHEN o.status IN ('EXPIRED','ERROR')                                       THEN 'TERMINAL_NO_FILL'
     ELSE 'OTHER'
-  END                                                      AS ledger_bucket
+  END                                                      AS ledger_bucket,
+  -- ── APPENDED COLUMNS ──────────────────────────────────────────────────
+  -- These were added AFTER the initial view release. CREATE OR REPLACE VIEW
+  -- requires existing column names/positions to remain unchanged, so all
+  -- new columns are appended here at the end. Do not insert new columns
+  -- in the middle — always append.
+  --
+  -- Added: PR #61 — surface PR #59 quote-domain fields from orders.meta
+  -- so the Operator Truth dashboard can render the Quote Domain panel
+  -- without an extra backend call.
+  o.meta->>'selector_quote_source'                         AS selector_quote_source,
+  o.meta->>'selector_quote_base_url'                       AS selector_quote_base_url,
+  o.meta->>'selector_sandbox_mode'                         AS selector_sandbox_mode,
+  o.meta->>'submit_quote_source'                           AS submit_quote_source,
+  o.meta->>'submit_quote_base_url'                         AS submit_quote_base_url,
+  o.meta->>'submit_sandbox_mode'                           AS submit_sandbox_mode,
+  o.meta->>'broker_base_url'                               AS broker_base_url,
+  o.meta->>'tradier_sandbox_mode'                          AS tradier_sandbox_mode,
+  o.meta->'watcher_audit'->>'watcher_sandbox_mode'         AS watcher_sandbox_mode
 FROM orders o
 LEFT JOIN ap_signals s
   ON s.signal_id::text =
