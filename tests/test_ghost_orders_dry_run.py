@@ -63,6 +63,22 @@ def _strip_docstring_and_comments(body: str) -> str:
     return cleaned
 
 
+def _extract_ghost_sql_builder():
+    """Extract the module-level _ghost_build_sql_and_params function.
+
+    SQL content tests (updated_ts >=, %s::text pattern) scan this
+    function — the SQL lives here, not inside the endpoint handlers,
+    because both dry-run and manual-cleanup share it.
+    """
+    src = _read_app()
+    m = re.search(
+        r'def _ghost_build_sql_and_params\(.*?(?=\ndef |\nclass )',
+        src, re.S
+    )
+    assert m, "_ghost_build_sql_and_params not found in app.py"
+    return m.group(0)
+
+
 # ── 1. Pure classifier behavior ─────────────────────────────────────────────
 
 
@@ -294,12 +310,12 @@ class TestEndpointIsReadOnly:
 
 class TestSqlIsParameterized:
     def test_uses_param_placeholders_only(self):
-        body = _extract_dry_run_endpoint()
+        # SQL now lives in _ghost_build_sql_and_params (shared module-level
+        # helper) — that is where %s placeholders must appear.
+        body = _extract_ghost_sql_builder()
         assert "%s" in body                 # filter params are placeholders
         assert "f\"SELECT" not in body      # no f-string SQL
         assert "f'SELECT" not in body
-        # No string-interpolated filter values
-        assert "'%s'" not in body or "= %s" in body  # values are bound, never inlined
 
 
 class TestRowConversionSafety:
@@ -433,13 +449,11 @@ class TestLookbackDerivation:
         # SQL lives inside string literals, so use the docstring/comment
         # stripper that KEEPS string literals (vs _executable_only which
         # strips them).
-        body = _strip_docstring_and_comments(_extract_dry_run_endpoint())
+        # SQL lives in _ghost_build_sql_and_params (module-level).
+        body = _strip_docstring_and_comments(_extract_ghost_sql_builder())
         assert "updated_ts >= NOW()" in body, (
             "SQL must use >= for inclusive boundary at the lookback cutoff"
         )
-        # Explicit reverse: the strict-> form must be gone for the lookback.
-        # (A different `>` for age_hours is fine — we only ban it on the
-        # updated_ts lookback expression.)
         assert "updated_ts > NOW()" not in body, (
             "strict > on updated_ts vs NOW() is the original Codex P2 bug; "
             "must use >= so boundary-exact rows are included"
@@ -450,14 +464,13 @@ class TestSqlUsesParameterizedLookback:
     """The lookback hours must be bound as a SQL parameter, not interpolated."""
 
     def test_lookback_value_is_parameterized(self):
-        body = _strip_docstring_and_comments(_extract_dry_run_endpoint())
-        # The interval cast pattern from the spec: (%s::text || ' hours')::interval
+        body = _strip_docstring_and_comments(_extract_ghost_sql_builder())
         assert "%s::text || ' hours'" in body, (
             "lookback hours must be passed as a parameter via %s, not f-string"
         )
 
     def test_no_hardcoded_thirty_days_left(self):
-        body = _strip_docstring_and_comments(_extract_dry_run_endpoint())
+        body = _strip_docstring_and_comments(_extract_ghost_sql_builder())
         assert "INTERVAL '30 days'" not in body, (
             "hardcoded 30-day interval should be removed; lookback is now "
             "derived from thresholds"

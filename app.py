@@ -441,6 +441,137 @@ def _fetch_broker_equity() -> float:
     return 0.0
 
 
+# ── Ghost-order shared helpers ─────────────────────────────────────────────
+#
+# These constants and functions are shared between
+#   GET  /admin/operator/ghost-orders/dry-run        (PR #62)
+#   POST /admin/operator/ghost-orders/manual-cleanup (PR #63)
+#
+# Keeping them at module level enforces that both endpoints use the
+# EXACT SAME classifier logic. Any divergence would mean the cleanup
+# acts on a different set than the dry-run previewed.
+
+_GHOST_LOOKBACK_BUFFER_HOURS = 168  # 1-week safety margin on top of max threshold
+
+_GHOST_ALL_ACTIONS = (
+    "would_expire_pending_entry",
+    "would_cancel_pending_entry",
+    "skip_recent",
+    "skip_has_broker_order_id",
+    "skip_not_entry",
+    "skip_not_pending_trigger",
+    "skip_missing_local_order_id",
+    "skip_unclear_state",
+)
+
+_GHOST_ELIGIBLE_ACTIONS = frozenset({
+    "would_expire_pending_entry",
+    "would_cancel_pending_entry",
+})
+
+# Status an order transitions to for each eligible action.
+_GHOST_ACTION_STATUS = {
+    "would_cancel_pending_entry": "CANCELED",
+    "would_expire_pending_entry": "EXPIRED",
+}
+
+
+def _ghost_classify_row(
+    row: dict,
+    *,
+    recent_skip_hours: float,
+    cancel_threshold: float,
+    expire_threshold: float,
+) -> str:
+    """Classify a single orders-table row into one of the 8 documented action
+    strings. Rule order matters — earlier rules short-circuit later ones.
+
+    This is the SINGLE authoritative classifier. Both the dry-run endpoint
+    and the manual-cleanup endpoint call this function so their behaviour
+    stays in exact sync.
+    """
+    kind      = row.get("kind")
+    status    = row.get("status")
+    broker_id = row.get("broker_order_id")
+    loid      = row.get("local_order_id")
+    age       = row.get("age_hours")
+    try:
+        age_f = float(age) if age is not None else None
+    except (TypeError, ValueError):
+        age_f = None
+
+    # Structural skips — these row shapes can never be ghost-cleanup
+    # candidates regardless of age.
+    if not loid:
+        return "skip_missing_local_order_id"
+    if broker_id:
+        return "skip_has_broker_order_id"
+    if (kind or "").upper() != "ENTRY":
+        return "skip_not_entry"
+    if (status or "").upper() != "PENDING_TRIGGER":
+        return "skip_not_pending_trigger"
+
+    # Age-based gates. If age cannot be determined we cannot safely
+    # classify — fall through to skip_unclear_state.
+    if age_f is None:
+        return "skip_unclear_state"
+    if age_f < float(recent_skip_hours):
+        return "skip_recent"
+    if age_f >= float(expire_threshold):
+        return "would_expire_pending_entry"
+    if age_f >= float(cancel_threshold):
+        return "would_cancel_pending_entry"
+
+    return "skip_unclear_state"
+
+
+def _ghost_build_sql_and_params(
+    *,
+    recent_skip_hours: int,
+    cancel_threshold: int,
+    expire_threshold: int,
+    client_id_filter: str,
+    symbol_filter: str,
+    local_order_ids: list,
+    limit: int,
+) -> "tuple[str, list]":
+    """Build the SELECT SQL and bound params for the ghost-orders scan.
+
+    Shared between dry-run (GET) and manual-cleanup (POST) so they
+    always scan the same candidate set.
+    """
+    lookback_hours = (
+        max(expire_threshold, cancel_threshold, recent_skip_hours)
+        + _GHOST_LOOKBACK_BUFFER_HOURS
+    )
+    where  = ["1 = 1"]
+    params: list = []
+    if client_id_filter:
+        where.append("client_id = %s")
+        params.append(client_id_filter)
+    if symbol_filter:
+        where.append("UPPER(symbol) = %s")
+        params.append(symbol_filter)
+    if local_order_ids:
+        where.append("local_order_id = ANY(%s)")
+        params.append(local_order_ids)
+    where.append("updated_ts >= NOW() - (%s::text || ' hours')::interval")
+    params.append(str(lookback_hours))
+    sql = (
+        "SELECT local_order_id, client_id, kind, status, broker_order_id, "
+        "       symbol, contract, qty, limit_price, score, tier, last_error, "
+        "       created_ts, updated_ts, meta, "
+        "       EXTRACT(EPOCH FROM (NOW() - updated_ts)) / 3600.0 AS age_hours "
+        "FROM orders "
+        "WHERE " + " AND ".join(where) +
+        "   AND (kind = 'ENTRY' OR status = 'PENDING_TRIGGER' "
+        "        OR (kind IS NULL AND status IS NULL)) "
+        " ORDER BY updated_ts ASC LIMIT %s"
+    )
+    params.append(limit)
+    return sql, params, lookback_hours
+
+
 def create_app() -> Flask:
     app = Flask(__name__)
     app.config["MAX_CONTENT_LENGTH"] = MAX_CONTENT_LENGTH
@@ -1494,62 +1625,16 @@ def create_app() -> Flask:
         if expire_threshold < cancel_threshold:
             expire_threshold = cancel_threshold
 
-        # Pull a SUPERSET of rows so the classifier can distinguish skip_*
-        # buckets — we don't pre-filter by kind/status/broker_order_id, we
-        # let the classifier explain why each row is being skipped.
-        # We DO restrict by age_hours > 0 (nothing fresher than now) and
-        # cap by limit. We also filter by client_id/symbol if provided.
-        where = ["1 = 1"]
-        params: list = []
-        if client_id_filter:
-            where.append("client_id = %s")
-            params.append(client_id_filter)
-        if symbol_filter:
-            where.append("UPPER(symbol) = %s")
-            params.append(symbol_filter)
-        # Codex P2 fix — the SQL lookback must NOT cap at a hardcoded 30 days,
-        # because expire_threshold can request up to 720h (also 30d) and a
-        # strict-greater-than at 30d would exclude rows exactly 30d old (and
-        # any row beyond) from classification.
-        #
-        # Lookback is derived from the requested thresholds plus a generous
-        # buffer so any row whose age >= expire_threshold lands in scope and
-        # can be classified as would_expire_pending_entry. Buffer = 168h (1w)
-        # so that even at the max expire_threshold (720h / 30d), rows up to
-        # ~37 days old are still scanned. >= boundary is used (NOT strict >)
-        # so a row whose age equals the cutoff is INCLUDED.
-        LOOKBACK_BUFFER_HOURS = 168  # 1 week — generous safety margin
-        lookback_hours = max(
-            expire_threshold,
-            cancel_threshold,
-            recent_skip_hours,
-        ) + LOOKBACK_BUFFER_HOURS
-        where.append("updated_ts >= NOW() - (%s::text || ' hours')::interval")
-        params.append(str(lookback_hours))
-
-        sql = (
-            "SELECT local_order_id, "
-            "       client_id, "
-            "       kind, "
-            "       status, "
-            "       broker_order_id, "
-            "       symbol, "
-            "       contract, "
-            "       qty, "
-            "       limit_price, "
-            "       score, "
-            "       tier, "
-            "       last_error, "
-            "       created_ts, "
-            "       updated_ts, "
-            "       EXTRACT(EPOCH FROM (NOW() - updated_ts)) / 3600.0 AS age_hours "
-            "FROM orders "
-            "WHERE " + " AND ".join(where) +
-            "   AND (kind = 'ENTRY' OR status = 'PENDING_TRIGGER' "
-            "        OR (kind IS NULL AND status IS NULL)) "
-            " ORDER BY updated_ts ASC LIMIT %s"
+        # Use shared helper so dry-run and manual-cleanup scan the same rows.
+        sql, params, lookback_hours = _ghost_build_sql_and_params(
+            recent_skip_hours=recent_skip_hours,
+            cancel_threshold=cancel_threshold,
+            expire_threshold=expire_threshold,
+            client_id_filter=client_id_filter,
+            symbol_filter=symbol_filter,
+            local_order_ids=[],
+            limit=limit,
         )
-        params.append(limit)
 
         try:
             def _fetch():
@@ -1568,65 +1653,18 @@ def create_app() -> Flask:
             from ap.db import run_with_retry
             rows = run_with_retry(_fetch)
 
-            # Pure-Python classifier. No DB writes anywhere — we only READ the
-            # row's fields and return a string label per row.
+            # Use the shared module-level classifier.
             def _classify(row: dict) -> str:
-                """Return one of the 8 documented proposed_action strings.
+                return _ghost_classify_row(
+                    row,
+                    recent_skip_hours=recent_skip_hours,
+                    cancel_threshold=cancel_threshold,
+                    expire_threshold=expire_threshold,
+                )
 
-                Order matters — earlier rules short-circuit later ones.
-                """
-                kind = row.get("kind")
-                status = row.get("status")
-                broker_id = row.get("broker_order_id")
-                loid = row.get("local_order_id")
-                age = row.get("age_hours")
-                try:
-                    age_f = float(age) if age is not None else None
-                except (TypeError, ValueError):
-                    age_f = None
-
-                # Structural skips first — these row shapes can never be
-                # ghost-cleanup candidates regardless of age.
-                if not loid:
-                    return "skip_missing_local_order_id"
-                if broker_id:
-                    return "skip_has_broker_order_id"
-                if (kind or "").upper() != "ENTRY":
-                    return "skip_not_entry"
-                if (status or "").upper() != "PENDING_TRIGGER":
-                    return "skip_not_pending_trigger"
-
-                # Age-based gates. If age is unknown, we cannot safely classify
-                # it as expire/cancel — fall through to skip_unclear_state.
-                if age_f is None:
-                    return "skip_unclear_state"
-                if age_f < float(recent_skip_hours):
-                    return "skip_recent"
-                if age_f >= float(expire_threshold):
-                    return "would_expire_pending_entry"
-                if age_f >= float(cancel_threshold):
-                    return "would_cancel_pending_entry"
-
-                # Between recent_skip_hours and cancel_threshold — too old to
-                # be "recent" but not stale enough to act on.
-                return "skip_unclear_state"
-
-            # Defensive: track every valid action string we may emit, so the
-            # summary dict always lists all buckets even when count = 0.
-            ALL_ACTIONS = (
-                "would_expire_pending_entry",
-                "would_cancel_pending_entry",
-                "skip_recent",
-                "skip_has_broker_order_id",
-                "skip_not_entry",
-                "skip_not_pending_trigger",
-                "skip_missing_local_order_id",
-                "skip_unclear_state",
-            )
-            ELIGIBLE_ACTIONS = {
-                "would_expire_pending_entry",
-                "would_cancel_pending_entry",
-            }
+            # Use the module-level action constants.
+            ALL_ACTIONS     = _GHOST_ALL_ACTIONS
+            ELIGIBLE_ACTIONS = _GHOST_ELIGIBLE_ACTIONS
 
             from collections import defaultdict
             action_counts: "dict[str,int]" = {k: 0 for k in ALL_ACTIONS}
@@ -1703,6 +1741,375 @@ def create_app() -> Flask:
                 "mutation_performed": False,
                 "proposed_actions": [],
                 "action_summary": {},
+            }), 500
+
+
+    @app.post("/admin/operator/ghost-orders/manual-cleanup")
+    @require_hmac
+    def admin_operator_ghost_orders_manual_cleanup():
+        """Manual ghost-order cleanup — HMAC-protected, audit-logged, narrowly scoped.
+
+        DEFAULT: dry_run=true. The endpoint performs NO mutation unless the
+        caller explicitly passes {"dry_run": false} in the JSON body.
+
+        WHAT IT TOUCHES:
+          Only orders matching ALL of the following at mutation time:
+            kind           = 'ENTRY'
+            status         = 'PENDING_TRIGGER'
+            broker_order_id IS NULL
+            local_order_id  IS NOT NULL
+            proposed_action in ('would_cancel_pending_entry',
+                                 'would_expire_pending_entry')
+            meta->>'ghost_cleanup' IS DISTINCT FROM 'true'   (idempotency)
+
+        WHAT IT NEVER DOES:
+            No DELETE or DROP.
+            No broker cancel/submit/place calls.
+            No EXIT-order touches.
+            No watcher / selector / sizing / score changes.
+            No automatic / scheduled execution.
+
+        Status mapping (OSM conventions):
+            would_cancel_pending_entry  → CANCELED + last_error='ghost_cleanup_manual'
+            would_expire_pending_entry  → EXPIRED  + last_error='ghost_cleanup_manual'
+
+        Audit trail (JSONB merge, non-destructive):
+            ghost_cleanup          : true
+            ghost_cleanup_action   : proposed_action string
+            ghost_cleanup_at       : ISO timestamp
+            ghost_cleanup_by       : 'admin_manual_endpoint'
+            prior_status           : 'PENDING_TRIGGER'
+            prior_updated_ts       : row's updated_ts at scan time
+
+        Idempotency:
+            Re-running produces 0 mutations — already-cleaned rows have
+            meta->>'ghost_cleanup'='true' which the WHERE clause excludes,
+            and their status is no longer PENDING_TRIGGER.
+
+        Request body (JSON):
+            dry_run             bool    default true
+            recent_skip_hours   int     default 1    (0..168)
+            cancel_threshold    int     default 24   (1..720) hours
+            expire_threshold    int     default 72   (1..720) hours
+            client_id           str     optional filter
+            symbol              str     optional filter
+            local_order_ids     list    optional filter (precise row targeting)
+            limit               int     default 500  max 2000
+        """
+        import json as _json
+        from datetime import datetime, timezone
+
+        body = request.get_json(force=True, silent=True) or {}
+
+        # ── Parse + validate ──────────────────────────────────────────────
+        # dry_run defaults to true — caller must explicitly pass false.
+        dry_run = body.get("dry_run", True)
+        if not isinstance(dry_run, bool):
+            dry_run = str(dry_run).lower() not in ("false", "0", "no")
+
+        try:
+            recent_skip_hours = max(0, min(int(body.get("recent_skip_hours", 1)), 168))
+        except (TypeError, ValueError):
+            recent_skip_hours = 1
+        try:
+            cancel_threshold = max(1, min(int(body.get("cancel_threshold", 24)), 24 * 30))
+        except (TypeError, ValueError):
+            cancel_threshold = 24
+        try:
+            expire_threshold = max(1, min(int(body.get("expire_threshold", 72)), 24 * 30))
+        except (TypeError, ValueError):
+            expire_threshold = 72
+        try:
+            limit = max(1, min(int(body.get("limit", 500)), 2000))
+        except (TypeError, ValueError):
+            limit = 500
+
+        # Clamp: expire_threshold must be >= cancel_threshold.
+        if expire_threshold < cancel_threshold:
+            expire_threshold = cancel_threshold
+
+        client_id_filter = str(body.get("client_id") or "").strip()
+        symbol_filter    = str(body.get("symbol") or "").strip().upper()
+        raw_ids          = body.get("local_order_ids")
+        local_order_ids  = [str(x) for x in raw_ids if x] if isinstance(raw_ids, list) else []
+
+        # ── Classify candidates (same SQL + classifier as dry-run) ────────
+        sql, params, lookback_hours = _ghost_build_sql_and_params(
+            recent_skip_hours=recent_skip_hours,
+            cancel_threshold=cancel_threshold,
+            expire_threshold=expire_threshold,
+            client_id_filter=client_id_filter,
+            symbol_filter=symbol_filter,
+            local_order_ids=local_order_ids,
+            limit=limit,
+        )
+
+        try:
+            def _fetch():
+                with conn() as c:
+                    cur = c.execute(sql, tuple(params))
+                    cols = [d[0] for d in cur.description]
+                    fetched = cur.fetchall()
+                    rows = []
+                    for r in fetched:
+                        if isinstance(r, dict):
+                            rows.append(dict(r))
+                        else:
+                            rows.append(dict(zip(cols, r)))
+                    return rows
+
+            from ap.db import run_with_retry
+            scanned_rows = run_with_retry(_fetch)
+
+            # Classify every scanned row using the shared module-level helper.
+            classified = []
+            for r in scanned_rows:
+                action = _ghost_classify_row(
+                    r,
+                    recent_skip_hours=recent_skip_hours,
+                    cancel_threshold=cancel_threshold,
+                    expire_threshold=expire_threshold,
+                )
+                row_out = dict(r)
+                ah = row_out.get("age_hours")
+                if ah is not None:
+                    try:
+                        row_out["age_hours"] = round(float(ah), 2)
+                    except (TypeError, ValueError):
+                        pass
+                row_out["proposed_action"] = action
+                classified.append(row_out)
+
+            # Split into eligible (will mutate) and ineligible (will skip).
+            eligible = [r for r in classified if r["proposed_action"] in _GHOST_ELIGIBLE_ACTIONS]
+            ineligible = [r for r in classified if r["proposed_action"] not in _GHOST_ELIGIBLE_ACTIONS]
+
+            # Build summaries from classified rows (both dry_run paths use this).
+            from collections import defaultdict
+            action_counts: "dict[str,int]" = {k: 0 for k in _GHOST_ALL_ACTIONS}
+            per_client: "dict[str,dict[str,int]]" = defaultdict(lambda: {k: 0 for k in _GHOST_ALL_ACTIONS})
+            per_symbol: "dict[str,dict[str,int]]" = defaultdict(lambda: {k: 0 for k in _GHOST_ALL_ACTIONS})
+            for r in classified:
+                a = r["proposed_action"]
+                action_counts[a] = action_counts.get(a, 0) + 1
+                if r.get("client_id"):
+                    per_client[r["client_id"]][a] = per_client[r["client_id"]].get(a, 0) + 1
+                if r.get("symbol"):
+                    per_symbol[r["symbol"]][a] = per_symbol[r["symbol"]].get(a, 0) + 1
+
+            def _compact(d: dict) -> dict:
+                return {k: v for k, v in d.items() if v > 0}
+
+            per_client_summary = {cid: _compact(b) for cid, b in per_client.items()}
+            per_symbol_summary = {sym: _compact(b) for sym, b in per_symbol.items()}
+
+            # ── DRY-RUN: return classification without touching DB ─────────
+            if dry_run:
+                return jsonify({
+                    "ok": True,
+                    "dry_run": True,
+                    "mutation_performed": False,
+                    "thresholds": {
+                        "recent_skip_hours": recent_skip_hours,
+                        "cancel_threshold":  cancel_threshold,
+                        "expire_threshold":  expire_threshold,
+                        "lookback_hours":    lookback_hours,
+                    },
+                    "rows_scanned":  len(classified),
+                    "rows_eligible": len(eligible),
+                    "rows_mutated":  0,
+                    "rows_skipped":  len(ineligible),
+                    "proposed_actions": classified,
+                    "mutated":  [],
+                    "skipped":  ineligible,
+                    "action_summary":     action_counts,
+                    "per_client_summary": per_client_summary,
+                    "per_symbol_summary": per_symbol_summary,
+                    "note": (
+                        "DRY-RUN (default). Pass {\"dry_run\": false} in the "
+                        "JSON body to execute. No rows were mutated."
+                    ),
+                })
+
+            # ── LIVE MUTATION: dry_run=false ──────────────────────────────
+            # Each eligible row gets ONE parameterized UPDATE with a full
+            # WHERE safety gate. The gate re-checks every structural
+            # constraint atomically inside Postgres, so even if a row's
+            # state changed since the SELECT, the UPDATE is a no-op (0 rows
+            # returned by RETURNING).
+            #
+            # Meta is merged non-destructively with COALESCE || JSONB so no
+            # existing meta keys are overwritten.
+            #
+            # HARD RULES enforced by WHERE clause:
+            #   kind = 'ENTRY'                         (no EXIT)
+            #   status = 'PENDING_TRIGGER'             (no filled/acked/etc.)
+            #   broker_order_id IS NULL                (no broker contact)
+            #   local_order_id IS NOT NULL             (structural)
+            #   local_order_id = %s                    (exact row)
+            #   (meta->>'ghost_cleanup') IS DISTINCT   (idempotency)
+            #     FROM 'true'
+
+            now_iso = datetime.now(timezone.utc).isoformat()
+            mutated_rows = []
+            skipped_rows = list(ineligible)  # ineligible always skipped
+
+            for r in eligible:
+                loid      = r["local_order_id"]
+                client_id = r.get("client_id", "")
+                action    = r["proposed_action"]
+                new_status = _GHOST_ACTION_STATUS[action]
+
+                # Action-specific age threshold for the CAS staleness guard:
+                # the row must still be old enough at UPDATE time, not just
+                # at SELECT time.
+                age_threshold = (
+                    expire_threshold
+                    if action == "would_expire_pending_entry"
+                    else cancel_threshold
+                )
+
+                meta_patch = {
+                    "ghost_cleanup":        True,
+                    "ghost_cleanup_action": action,
+                    "ghost_cleanup_at":     now_iso,
+                    "ghost_cleanup_by":     "admin_manual_endpoint",
+                    "prior_status":         "PENDING_TRIGGER",
+                    "prior_updated_ts":     str(r.get("updated_ts") or ""),
+                }
+                meta_patch_json = _json.dumps(meta_patch, default=str)
+
+                # Single atomic UPDATE with full CAS / staleness guards.
+                # RETURNING local_order_id confirms the row was actually
+                # changed. If RETURNING is empty, any WHERE condition
+                # failed — the row is skipped as where_guard_no_match.
+                #
+                # CAS guards added vs the initial WHERE set:
+                #   updated_ts = %s
+                #     — exact snapshot match from the SELECT. If any
+                #       process touched the row after the scan (e.g. a
+                #       watcher re-arm that bumped updated_ts), this
+                #       condition fails and we skip safely.
+                #   updated_ts <= NOW() - (%s::text || ' hours')::interval
+                #     — row must still be old enough at UPDATE time using
+                #       the action-specific threshold (cancel_threshold or
+                #       expire_threshold). Belt-and-suspenders: even if
+                #       updated_ts matches the snapshot, a freshly-armed
+                #       row whose watcher re-computed something cannot
+                #       accidentally pass just because it was stale at
+                #       scan time.
+                update_sql = (
+                    "UPDATE orders "
+                    "SET status         = %s, "
+                    "    last_error     = %s, "
+                    "    updated_ts     = NOW(), "
+                    "    meta           = COALESCE(meta, '{}'::jsonb) || %s::jsonb "
+                    "WHERE local_order_id  = %s "
+                    "  AND kind            = 'ENTRY' "
+                    "  AND status          = 'PENDING_TRIGGER' "
+                    "  AND broker_order_id IS NULL "
+                    "  AND local_order_id  IS NOT NULL "
+                    "  AND (meta->>'ghost_cleanup') IS DISTINCT FROM 'true' "
+                    "  AND updated_ts      = %s "
+                    "  AND updated_ts      <= NOW() - (%s::text || ' hours')::interval "
+                    "RETURNING local_order_id"
+                )
+                update_params = (
+                    new_status,
+                    "ghost_cleanup_manual",
+                    meta_patch_json,
+                    loid,
+                    r.get("updated_ts"),       # CAS: exact snapshot timestamp
+                    str(age_threshold),        # staleness: action-specific threshold
+                )
+
+                def _do_update(usql=update_sql, uparams=update_params):
+                    with conn() as c:
+                        cur = c.execute(usql, uparams)
+                        cols = [d[0] for d in cur.description]
+                        fetched = cur.fetchall()
+                        return [
+                            dict(row) if isinstance(row, dict) else dict(zip(cols, row))
+                            for row in fetched
+                        ]
+
+                try:
+                    returned = run_with_retry(_do_update)
+                except Exception as upd_err:
+                    log.error(
+                        "ghost-cleanup UPDATE failed for local_order_id=%s: %s",
+                        loid, upd_err,
+                    )
+                    r_skip = dict(r)
+                    r_skip["skip_reason"] = f"update_error: {upd_err}"
+                    skipped_rows.append(r_skip)
+                    continue
+
+                if returned:
+                    # RETURNING produced a row → UPDATE matched and changed.
+                    r_out = dict(r)
+                    r_out["new_status"]            = new_status
+                    r_out["ghost_cleanup_at"]      = now_iso
+                    r_out["ghost_cleanup_action"]  = action
+                    mutated_rows.append(r_out)
+                    log.info(
+                        "ghost-cleanup: mutated local_order_id=%s client=%s "
+                        "action=%s new_status=%s",
+                        loid, client_id, action, new_status,
+                    )
+                else:
+                    # RETURNING empty → row no longer matched (already cleaned,
+                    # status changed, or broker_order_id was set between scan
+                    # and update — all are correct safety outcomes).
+                    r_skip = dict(r)
+                    r_skip["skip_reason"] = "where_guard_no_match"
+                    skipped_rows.append(r_skip)
+                    log.info(
+                        "ghost-cleanup: WHERE guard skipped local_order_id=%s "
+                        "(already cleaned or state changed since scan)",
+                        loid,
+                    )
+
+            mutation_performed = len(mutated_rows) > 0
+
+            return jsonify({
+                "ok": True,
+                "dry_run": False,
+                "mutation_performed": mutation_performed,
+                "thresholds": {
+                    "recent_skip_hours": recent_skip_hours,
+                    "cancel_threshold":  cancel_threshold,
+                    "expire_threshold":  expire_threshold,
+                    "lookback_hours":    lookback_hours,
+                },
+                "rows_scanned":  len(classified),
+                "rows_eligible": len(eligible),
+                "rows_mutated":  len(mutated_rows),
+                "rows_skipped":  len(skipped_rows),
+                "proposed_actions": classified,
+                "mutated":  mutated_rows,
+                "skipped":  skipped_rows,
+                "action_summary":     action_counts,
+                "per_client_summary": per_client_summary,
+                "per_symbol_summary": per_symbol_summary,
+                "note": (
+                    "Manual ghost-order cleanup. Only ENTRY/PENDING_TRIGGER/"
+                    "no-broker rows whose age met the threshold were updated. "
+                    "No broker calls were made. No rows were deleted. "
+                    "Re-running this endpoint is idempotent: already-cleaned "
+                    "rows are excluded by the WHERE guard."
+                ),
+            })
+
+        except Exception as e:
+            log.error("ghost-orders manual-cleanup failed: %s", e)
+            return jsonify({
+                "ok": False,
+                "error": str(e),
+                "dry_run": dry_run,
+                "mutation_performed": False,
+                "mutated":  [],
+                "skipped":  [],
             }), 500
 
 
