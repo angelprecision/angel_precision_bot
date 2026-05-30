@@ -71,15 +71,6 @@ SELECT
   o.meta->>'mode'                                          AS mode,
   o.meta->>'paper_fill_mode'                               AS paper_fill_mode,
   o.meta->>'quote_domain_mismatch_possible'               AS quote_domain_mismatch_possible,
-  -- PR #59 quote-domain audit fields (top-level meta keys)
-  o.meta->>'selector_quote_source'                         AS selector_quote_source,
-  o.meta->>'selector_quote_base_url'                       AS selector_quote_base_url,
-  o.meta->>'selector_sandbox_mode'                         AS selector_sandbox_mode,
-  o.meta->>'submit_quote_source'                           AS submit_quote_source,
-  o.meta->>'submit_quote_base_url'                         AS submit_quote_base_url,
-  o.meta->>'submit_sandbox_mode'                           AS submit_sandbox_mode,
-  o.meta->>'broker_base_url'                               AS broker_base_url,
-  o.meta->>'tradier_sandbox_mode'                          AS tradier_sandbox_mode,
   o.meta->'watcher_audit'->>'reason_code'                  AS watcher_reason_code,
   o.meta->'watcher_audit'->>'raw_reason'                   AS watcher_raw_reason,
   o.meta->'watcher_audit'->>'current_bid'                  AS watcher_current_bid,
@@ -91,7 +82,6 @@ SELECT
   o.meta->'watcher_audit'->>'distance_to_stop_pct'         AS watcher_distance_to_stop_pct,
   o.meta->'watcher_audit'->>'watcher_quote_source'         AS watcher_quote_source,
   o.meta->'watcher_audit'->>'watcher_quote_base_url'       AS watcher_quote_base_url,
-  o.meta->'watcher_audit'->>'watcher_sandbox_mode'         AS watcher_sandbox_mode,
   o.meta->'selector_candidate_audit'                       AS selector_candidate_audit,
   s.created_at                                             AS signal_created_at,
   o.created_ts                                             AS order_created_ts,
@@ -107,7 +97,25 @@ SELECT
     WHEN o.status IN ('CANCELED','CANCELLED')                                  THEN 'CANCELED'
     WHEN o.status IN ('EXPIRED','ERROR')                                       THEN 'TERMINAL_NO_FILL'
     ELSE 'OTHER'
-  END                                                      AS ledger_bucket
+  END                                                      AS ledger_bucket,
+  -- ── APPENDED COLUMNS ──────────────────────────────────────────────────
+  -- These were added AFTER the initial view release. CREATE OR REPLACE VIEW
+  -- requires existing column names/positions to remain unchanged, so all
+  -- new columns are appended here at the end. Do not insert new columns
+  -- in the middle — always append.
+  --
+  -- Added: PR #61 — surface PR #59 quote-domain fields from orders.meta
+  -- so the Operator Truth dashboard can render the Quote Domain panel
+  -- without an extra backend call.
+  o.meta->>'selector_quote_source'                         AS selector_quote_source,
+  o.meta->>'selector_quote_base_url'                       AS selector_quote_base_url,
+  o.meta->>'selector_sandbox_mode'                         AS selector_sandbox_mode,
+  o.meta->>'submit_quote_source'                           AS submit_quote_source,
+  o.meta->>'submit_quote_base_url'                         AS submit_quote_base_url,
+  o.meta->>'submit_sandbox_mode'                           AS submit_sandbox_mode,
+  o.meta->>'broker_base_url'                               AS broker_base_url,
+  o.meta->>'tradier_sandbox_mode'                          AS tradier_sandbox_mode,
+  o.meta->'watcher_audit'->>'watcher_sandbox_mode'         AS watcher_sandbox_mode
 FROM orders o
 LEFT JOIN ap_signals s
   ON s.signal_id::text =
