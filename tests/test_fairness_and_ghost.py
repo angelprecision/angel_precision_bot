@@ -251,3 +251,68 @@ class TestRowConversionSafety:
 
     def test_both_endpoints_safe_row_conversion(self):
         self._both_have_isinstance_dict()
+
+
+class TestGhostOrdersUsesMetaForJsonbColumns:
+    """Patch: PR #60 review fix. plan_id / signal_id / direction / pattern /
+    timeframe / reserved_cost / trigger_price live inside orders.meta (jsonb),
+    not as top-level columns on the orders table. The SELECT must use
+    meta->>'<key>' to extract them so Supabase doesn't error on missing
+    column names.
+    """
+
+    @staticmethod
+    def _extract_ghost_endpoint():
+        src = pathlib.Path(__file__).parent.parent / "app.py"
+        text = src.read_text()
+        m = re.search(
+            r'@app\.get\("/admin/operator/ghost-orders"\).*?(?=@app\.(?:get|post|route)\()',
+            text, re.S
+        )
+        assert m, "could not locate ghost-orders endpoint"
+        return m.group(0)
+
+    def test_plan_id_pulled_from_meta(self):
+        body = self._extract_ghost_endpoint()
+        assert "meta->>'plan_id'" in body
+
+    def test_signal_id_pulled_from_meta(self):
+        body = self._extract_ghost_endpoint()
+        assert "meta->>'signal_id'" in body
+
+    def test_direction_coalesced_from_meta(self):
+        body = self._extract_ghost_endpoint()
+        # Either direction or side may live in meta — COALESCE handles both.
+        assert "COALESCE(meta->>'direction', meta->>'side')" in body
+
+    def test_pattern_and_timeframe_pulled_from_meta(self):
+        body = self._extract_ghost_endpoint()
+        assert "meta->>'pattern'" in body
+        assert "meta->>'timeframe'" in body
+
+    def test_numeric_meta_fields_use_nullif_before_cast(self):
+        body = self._extract_ghost_endpoint()
+        # Empty strings in jsonb would crash a direct ::numeric cast.
+        # NULLIF turns '' into NULL first.
+        assert "NULLIF(meta->>'reserved_cost', '')::numeric" in body
+        assert "NULLIF(meta->>'trigger_price', '')::numeric" in body
+
+    def test_top_level_columns_still_bare(self):
+        """local_order_id, client_id, symbol, contract, qty, limit_price,
+        score, tier, last_error, created_ts, updated_ts ARE real columns on
+        orders — they must remain bare (no meta->> wrapping)."""
+        body = self._extract_ghost_endpoint()
+        # Check each bare column is in the SELECT as a column (not as meta->>):
+        for col in ("local_order_id", "client_id", "symbol", "contract",
+                    "qty", "limit_price", "score", "tier", "last_error",
+                    "created_ts", "updated_ts"):
+            assert col in body
+            assert f"meta->>'{col}'" not in body, (
+                f"'{col}' is a real orders column — must NOT be pulled from meta"
+            )
+
+    def test_stale_hours_cast_uses_text_for_safety(self):
+        body = self._extract_ghost_endpoint()
+        # %s::text || ' hours' ensures any psycopg coercion still produces
+        # a string before the interval cast.
+        assert "%s::text || ' hours'" in body

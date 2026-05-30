@@ -1330,7 +1330,7 @@ def create_app() -> Flask:
             "kind = 'ENTRY'",
             "status = 'PENDING_TRIGGER'",
             "broker_order_id IS NULL",
-            "updated_ts < NOW() - (%s || ' hours')::interval",
+            "updated_ts < NOW() - (%s::text || ' hours')::interval",
         ]
         params: list = [str(stale_hours)]
         if client_id_filter:
@@ -1340,11 +1340,28 @@ def create_app() -> Flask:
             where.append("UPPER(symbol) = %s")
             params.append(symbol_filter)
 
+        # Pull plan_id / signal_id / direction / reserved_cost / trigger_price /
+        # pattern / timeframe from JSONB meta — they live there, not as top-level
+        # columns on orders. NULLIF guards numeric casts against empty strings.
         sql = (
-            "SELECT local_order_id, client_id, plan_id, signal_id, symbol, "
-            "       contract, direction, qty, limit_price, reserved_cost, "
-            "       trigger_price, score, tier, pattern, timeframe, "
-            "       last_error, created_ts, updated_ts, "
+            "SELECT local_order_id, "
+            "       client_id, "
+            "       meta->>'plan_id'                AS plan_id, "
+            "       meta->>'signal_id'              AS signal_id, "
+            "       symbol, "
+            "       contract, "
+            "       COALESCE(meta->>'direction', meta->>'side') AS direction, "
+            "       qty, "
+            "       limit_price, "
+            "       NULLIF(meta->>'reserved_cost', '')::numeric  AS reserved_cost, "
+            "       NULLIF(meta->>'trigger_price', '')::numeric  AS trigger_price, "
+            "       score, "
+            "       tier, "
+            "       meta->>'pattern'                AS pattern, "
+            "       meta->>'timeframe'              AS timeframe, "
+            "       last_error, "
+            "       created_ts, "
+            "       updated_ts, "
             "       EXTRACT(EPOCH FROM (NOW() - updated_ts)) / 3600.0 AS stale_hours_age "
             "FROM orders "
             "WHERE " + " AND ".join(where) +
