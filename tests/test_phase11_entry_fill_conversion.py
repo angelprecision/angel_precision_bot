@@ -512,3 +512,147 @@ class TestBugDNormalization:
                            underlying_spot=185.0)
         assert d.action == "ARM"
         assert d.cancel_reason_normalized == "entry_max_age_normal_reached"
+
+
+# ============================================================
+# PR66: PAPER-only entry max-age split
+# ============================================================
+
+class TestPR66PaperLiveEntryMaxAge:
+    """
+    PAPER entries must survive past 90s and cancel at 180s.
+    LIVE entries must still cancel at 90s.
+    """
+
+    def _make_monitor(self, client_mode: str):
+        """Build a minimal APOrderMonitor with the given client_mode."""
+        from ap.order_monitor import APOrderMonitor
+        m = MagicMock()
+        m.get_order.return_value = None
+        broker = MagicMock()
+        broker.get_quote.return_value = {"bid": 1.20, "ask": 1.30}
+        monitor = APOrderMonitor(
+            client_id="test@example.com",
+            broker=broker,
+            order_state_machine=m,
+            position_manager=MagicMock(),
+            client_mode=client_mode,
+        )
+        # Stub cancel path so _handle_stale_entry doesn't hit DB
+        monitor._handle_stale_entry = MagicMock(return_value=True)
+        monitor._emit_order_event   = MagicMock()
+        monitor._get_broker_order_id = MagicMock(return_value="BRK-001")
+        monitor._try_repeg          = MagicMock(return_value=False)
+        monitor._record_symbol_lock = MagicMock()
+        return monitor
+
+    def _make_order(self, age_secs: float, score: float = 70.0) -> dict:
+        """Build an order dict with the given simulated age."""
+        from datetime import datetime, timezone, timedelta
+        created = datetime.now(timezone.utc) - timedelta(seconds=age_secs)
+        return {
+            "local_order_id": "ORD-TEST-001",
+            "broker_order_id": "BRK-001",
+            "symbol": "SPY",
+            "contract": "SPY260620C00540000",
+            "status": "SUBMITTED",
+            "limit_price": 2.50,
+            "score": score,
+            "tier": "B",
+            "direction": "CALL",
+            "qty": 1,
+            "meta": {"score": score, "tier": "B", "direction": "CALL", "retry_count": 0},
+            "created_ts": created.isoformat(),
+            "updated_ts": created.isoformat(),
+        }
+
+    def test_paper_order_survives_past_90s(self):
+        """PAPER order at age=91s must NOT be canceled (ceiling is 180s)."""
+        monitor = self._make_monitor("PAPER")
+        order = self._make_order(age_secs=91.0)
+        canceled = monitor._check_stale_entry_cancel(
+            order, "ORD-TEST-001", "SUBMITTED", order["contract"], 91.0
+        )
+        # _handle_stale_entry must NOT have been called with action=cancel
+        for call in monitor._handle_stale_entry.call_args_list:
+            assert call.kwargs.get("action") != "cancel", (
+                "PAPER order at 91s must not be canceled (ceiling is 180s)"
+            )
+        # If it returned True via missed-move that's ok; what matters is
+        # the max-age path didn't fire. If no cancel at all, assert passes.
+        # (The repeg/missed-move path may or may not fire — not under test here.)
+
+    def test_paper_order_canceled_at_180s(self):
+        """PAPER order at age=181s must be canceled with ENTRY_MAX_AGE_NORMAL_REACHED."""
+        monitor = self._make_monitor("PAPER")
+        order = self._make_order(age_secs=181.0)
+        monitor._check_stale_entry_cancel(
+            order, "ORD-TEST-001", "SUBMITTED", order["contract"], 181.0
+        )
+        # _handle_stale_entry must have been called with action="cancel"
+        assert any(
+            call.kwargs.get("action") == "cancel"
+            for call in monitor._handle_stale_entry.call_args_list
+        ), "PAPER order at 181s must be canceled"
+        # emit_order_event must include max_age=180 and mode=PAPER
+        emit_calls = monitor._emit_order_event.call_args_list
+        assert emit_calls, "emit_order_event must be called on max-age cancel"
+        inputs = emit_calls[-1].kwargs.get("inputs", {})
+        assert inputs.get("mode") == "PAPER", f"mode must be PAPER, got {inputs.get('mode')}"
+        assert inputs.get("max_age_seconds") == 180, (
+            f"max_age_seconds must be 180 for PAPER, got {inputs.get('max_age_seconds')}"
+        )
+        assert inputs.get("cancel_reason") == "ENTRY_MAX_AGE_NORMAL_REACHED"
+
+    def test_live_order_canceled_at_90s(self):
+        """LIVE order at age=91s must be canceled — strict 90s ceiling unchanged."""
+        monitor = self._make_monitor("LIVE")
+        order = self._make_order(age_secs=91.0)
+        monitor._check_stale_entry_cancel(
+            order, "ORD-TEST-001", "SUBMITTED", order["contract"], 91.0
+        )
+        assert any(
+            call.kwargs.get("action") == "cancel"
+            for call in monitor._handle_stale_entry.call_args_list
+        ), "LIVE order at 91s must be canceled at 90s ceiling"
+        emit_calls = monitor._emit_order_event.call_args_list
+        assert emit_calls, "emit_order_event must be called on max-age cancel"
+        inputs = emit_calls[-1].kwargs.get("inputs", {})
+        assert inputs.get("mode") == "LIVE", f"mode must be LIVE, got {inputs.get('mode')}"
+        assert inputs.get("max_age_seconds") == 90, (
+            f"max_age_seconds must be 90 for LIVE, got {inputs.get('max_age_seconds')}"
+        )
+
+    def test_metadata_fields_present(self):
+        """All required PR66 metadata fields must appear in emit_order_event inputs."""
+        monitor = self._make_monitor("PAPER")
+        order = self._make_order(age_secs=181.0)
+        monitor._check_stale_entry_cancel(
+            order, "ORD-TEST-001", "SUBMITTED", order["contract"], 181.0
+        )
+        emit_calls = monitor._emit_order_event.call_args_list
+        assert emit_calls, "emit_order_event must be called"
+        inputs = emit_calls[-1].kwargs.get("inputs", {})
+        required = [
+            "cancel_reason", "mode", "max_age_seconds", "actual_age_seconds",
+            "symbol", "direction", "contract", "score", "tier",
+            "limit_price", "bid", "ask", "mid", "retries",
+        ]
+        missing = [f for f in required if f not in inputs]
+        assert not missing, f"Missing metadata fields: {missing}"
+
+    def test_env_overrides_respected(self):
+        """PAPER_ENTRY_MAX_AGE_SECONDS env var must change the PAPER ceiling."""
+        import importlib
+        import ap.order_monitor as om
+        original_paper = om.PAPER_ENTRY_MAX_AGE_NORMAL
+        try:
+            os.environ["PAPER_ENTRY_MAX_AGE_SECONDS"] = "240"
+            importlib.reload(om)
+            assert om.PAPER_ENTRY_MAX_AGE_NORMAL == 240, (
+                f"Expected 240, got {om.PAPER_ENTRY_MAX_AGE_NORMAL}"
+            )
+        finally:
+            del os.environ["PAPER_ENTRY_MAX_AGE_SECONDS"]
+            importlib.reload(om)
+            assert om.PAPER_ENTRY_MAX_AGE_NORMAL == original_paper
