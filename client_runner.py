@@ -431,6 +431,12 @@ class ClientRunner(threading.Thread):
         super().__init__(daemon=True, name=f"runner-{member['email']}")
         self.member = member
         self.email  = member["email"]
+        # p0/guard-startup-phantom-clear: marker used by _clear_old_phantom_orders
+        # so the cleanup never wipes ENTRY orders created during this runner's
+        # startup grace window (default 180s). Set at construction so any
+        # cleanup that fires before run() has the right reference.
+        import time as _time
+        self._runner_startup_ts = _time.time()
 
         # Resolve credentials once at construction — single source of truth.
         # Raises RuntimeError if credentials are missing or mode is misconfigured.
@@ -1846,14 +1852,42 @@ class ClientRunner(threading.Thread):
             # live order, leaving an open position at Tradier with no tracking in DB.
             #
             # Two-tier defence:
-            #   Tier A (safe): CREATED/PENDING_TRIGGER with no broker ID — these were
-            #     never submitted. Age gate: PHANTOM_ORDER_MIN_AGE_MINUTES (default 5).
+            #   Tier A (safe, hardened by p0/guard-startup-phantom-clear):
+            #     ENTRY kind only, CREATED/PENDING_TRIGGER, no broker_order_id,
+            #     no submitted_ts, age >= STARTUP_PHANTOM_CLEAR_MIN_AGE_SECONDS
+            #     (default 600s = 10 min), not currently watcher-armed,
+            #     created BEFORE this runner's startup grace window.
             #   Tier B (guarded): SUBMITTED/ACKNOWLEDGED with no broker ID — only cancel
             #     if last_error indicates a known pre-submission state (never reached broker)
             #     OR age exceeds PHANTOM_SUBMITTED_MIN_AGE_MINUTES (default 30 in LIVE,
             #     5 in PAPER). Any split-brain order with a real last_error should be left
             #     for the reconciler to resolve on the next pass.
-            min_age = int(os.getenv("PHANTOM_ORDER_MIN_AGE_MINUTES", "5"))
+            #
+            # p0/guard-startup-phantom-clear scope locks: only this method is
+            # modified. Tier B SQL, env defaults, and audit logging are unchanged.
+
+            # Tier A age gate — operator-tunable in seconds (preferred) with
+            # legacy minutes fallback for back-compat. Default 600s = 10 min;
+            # the previous default was 5 min and Friday's audit showed 407
+            # cancels under that window, many of which were fresh pre-submit
+            # entries that hadn't had a chance to submit yet.
+            _legacy_min_age_min = int(os.getenv("PHANTOM_ORDER_MIN_AGE_MINUTES", "5"))
+            min_age_seconds = int(os.getenv(
+                "STARTUP_PHANTOM_CLEAR_MIN_AGE_SECONDS",
+                str(max(600, _legacy_min_age_min * 60)),
+            ))
+            # Startup grace window: orders created within STARTUP_GRACE_SECONDS
+            # of this runner's process start are NEVER cancelled by this path,
+            # even if their absolute age exceeds min_age_seconds. Defends
+            # against deploys/restarts that race against in-flight signals.
+            startup_grace_seconds = int(os.getenv("STARTUP_PHANTOM_CLEAR_GRACE_SECONDS", "180"))
+            cleanup_rule_version = "v2"
+            startup_ts = getattr(self, "_runner_startup_ts", None)
+            if startup_ts is None:
+                # Defensive: if the runner didn't record its start time,
+                # treat NOW as start to be maximally conservative.
+                import time as _time
+                startup_ts = _time.time()
             submitted_min_age = int(os.getenv(
                 "PHANTOM_SUBMITTED_MIN_AGE_MINUTES",
                 "30" if self.mode == "LIVE" else "5",
@@ -1861,23 +1895,88 @@ class ClientRunner(threading.Thread):
 
             def _clear_phantoms():
                 with _conn() as c:
-                    # Tier A: pre-submission states — safe to cancel by age alone.
+                    # Tier A: pre-submission ENTRY orders only. Hardened gates:
+                    #   - kind = 'ENTRY'              (exits never go here)
+                    #   - broker_order_id IS NULL / blank / sentinel
+                    #   - submitted_ts IS NULL        (never reached broker submit)
+                    #   - age >= min_age_seconds      (operator-tunable)
+                    #   - created_ts <= NOW() - startup_grace_seconds
+                    #                                 (don't wipe orders created
+                    #                                  during this runner's grace
+                    #                                  window)
+                    #   - meta->'watcher_audit'->>'reason_code' IS NULL
+                    #     OR the watcher audit indicates an invalidation/expiry.
+                    #                                 (don't wipe orders that
+                    #                                  the watcher still considers
+                    #                                  pending; let the watcher
+                    #                                  cancel them with the real
+                    #                                  reason instead.)
+                    #
+                    # Audit: meta is MERGED (jsonb concat) so existing
+                    # watcher_audit, sizing_context, signal_id, etc. are NEVER
+                    # overwritten. The cleanup_phantom_audit key carries the
+                    # full decision context for post-mortem.
+                    #
+                    # CAS safety: the SQL itself encodes the age gate; an order
+                    # whose updated_ts moved forward (e.g. transitioned to
+                    # SUBMITTED by the worker between our SELECT and UPDATE)
+                    # falls out of the status filter and is not touched.
                     c.execute(
                         """
                         UPDATE orders
                         SET status = %s,
                             last_error = %s,
-                            updated_ts = NOW()
+                            updated_ts = NOW(),
+                            meta = COALESCE(meta, '{}'::jsonb) || jsonb_build_object(
+                                'cleanup_phantom_audit', jsonb_build_object(
+                                    'block_stage',         'startup_cleanup',
+                                    'block_reason',        'startup_phantom_clear_pre_submit',
+                                    'cleanup_decision',    'cancelled',
+                                    'cleanup_rule_version',%s,
+                                    'min_age_seconds',     %s,
+                                    'startup_grace_seconds', %s,
+                                    'startup_grace_active', false,
+                                    'had_broker_order_id', false,
+                                    'had_submitted_ts',    false,
+                                    'watcher_armed',       false,
+                                    'age_seconds',         EXTRACT(EPOCH FROM (NOW() - created_ts)),
+                                    'cleanup_ts',          NOW()::text
+                                )
+                            )
                         WHERE client_id = %s
+                          AND kind = 'ENTRY'
                           AND status IN ('CREATED', 'PENDING_TRIGGER')
-                          AND created_ts < NOW() - (%s || ' minutes')::interval
+                          AND created_ts < NOW() - (%s || ' seconds')::interval
+                          AND created_ts < to_timestamp(%s)
+                          AND submitted_ts IS NULL
                           AND (
                                 broker_order_id IS NULL
                              OR TRIM(COALESCE(broker_order_id, '')) = ''
                              OR UPPER(TRIM(COALESCE(broker_order_id, ''))) IN ('N/A', 'NA', 'NONE', 'NULL')
                           )
+                          AND (
+                                meta->'watcher_audit' IS NULL
+                             OR meta->'watcher_audit'->>'reason_code' IN (
+                                    'watcher_invalidated', 'watcher_expired',
+                                    'stop_bid_below_call_stop', 'stop_ask_above_put_stop',
+                                    'overnight_daily_invalidated',
+                                    'overnight_premarket_breached',
+                                    'overnight_too_far_from_trigger',
+                                    'rearm_window_expired',
+                                    'opposite_side_replaced_stale_or_weaker'
+                                )
+                          )
                         """,
-                        ("CANCELED", "startup_phantom_clear_pre_submit", self.email, str(min_age)),
+                        (
+                            "CANCELED",
+                            "startup_phantom_clear_pre_submit",
+                            cleanup_rule_version,
+                            min_age_seconds,
+                            startup_grace_seconds,
+                            self.email,
+                            str(min_age_seconds),
+                            float(startup_ts) - startup_grace_seconds,
+                        ),
                     )
                     tier_a = c.rowcount or 0
 
