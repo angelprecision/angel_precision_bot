@@ -61,6 +61,18 @@ CONTEXT_FLOOR_PAPER = float(os.getenv("CONTEXT_FLOOR_PAPER", "0.0"))
 # comparing against decimal pnl.
 BREAKEVEN_BAND_PCT  = float(os.getenv("BREAKEVEN_BAND_PCT", "-2.0"))
 
+# ── P0: Breach-time entry pricing controls ────────────────────────────────────
+# These match the existing process_signal() path in ap/execution.py and bring
+# the watcher-breach path to parity.
+# ENTRY_PAPER_ASK_CROSS_CENTS: how far above current ask the paper limit sits.
+# ENTRY_LIVE_ASK_CROSS_CENTS:  how far above current ask the live limit sits.
+# ENTRY_MAX_PRICE_DRIFT_PCT_FROM_PLAN: cancel if ask > plan * (1 + this).
+#   Default 0.25 = 25%. Prevents chasing if the option has already run hard
+#   between queue time and breach time.
+ENTRY_PAPER_ASK_CROSS_CENTS        = float(os.getenv("ENTRY_PAPER_ASK_CROSS_CENTS",        "0.02"))
+ENTRY_LIVE_ASK_CROSS_CENTS         = float(os.getenv("ENTRY_LIVE_ASK_CROSS_CENTS",         "0.01"))
+ENTRY_MAX_PRICE_DRIFT_PCT_FROM_PLAN = float(os.getenv("ENTRY_MAX_PRICE_DRIFT_PCT_FROM_PLAN", "0.25"))
+
 # =============================================================================
 # EXECUTION CORE
 # =============================================================================
@@ -740,14 +752,16 @@ class APExecutionCore:
                     })
                 return
 
-        # 4) Require the approved plan to carry a valid limit price.
-        submit_limit = getattr(approved_plan, "limit_price", None)
+        # 4) Require the approved plan to carry a valid limit price (used as
+        #    the drift baseline — the actual submit limit is re-anchored to the
+        #    current option ask in step 4b below).
+        _plan_limit = getattr(approved_plan, "limit_price", None)
         try:
-            submit_limit = float(submit_limit)
+            _plan_limit = float(_plan_limit)
         except Exception:
-            submit_limit = 0.0
+            _plan_limit = 0.0
 
-        if submit_limit <= 0:
+        if _plan_limit <= 0:
             log.critical("[%s] PRODUCTION_ENTRY_BLOCK — approved plan missing valid limit_price", ticker)
             funnel.inc("order_failed")
             if signal_id:
@@ -784,14 +798,142 @@ class APExecutionCore:
                 })
             return
 
-        # 5) Submit unchanged.
+        # 4b) P0 FIX: refresh the option contract ask immediately before submit.
+        #
+        # ROOT CAUSE FIXED HERE: the prior code submitted at approved_plan.limit_price
+        # which was set at contract-selection time. For overnight/queued signals that
+        # can be hours old. The option ask has moved. Tradier receives a limit far below
+        # the current ask. The order sits unfilled. This block brings the watcher-breach
+        # path to parity with process_signal() in ap/execution.py which already does
+        # this correctly via _refresh_ask_at_submit().
+        try:
+            from ap.execution import _refresh_ask_at_submit as _breach_refresh_ask
+        except ImportError:
+            _breach_refresh_ask = None
+
+        _entry_pricing_decision = "ASK_CROSSED"
+        _submit_ask = 0.0
+        _refresh_ok = False
+        _refresh_reason = "import_failed"
+        _submit_quote_fields = {
+            "submit_bid": None, "submit_ask": None,
+            "submit_last": None, "submit_mid": None, "spread_pct": None,
+        }
+
+        if _breach_refresh_ask is not None:
+            _submit_ask, _quote_age_ms, _refresh_ok, _refresh_reason, _submit_quote_fields =                 _breach_refresh_ask(self.broker, approved_contract)
+        else:
+            # _refresh_ask_at_submit unavailable — treat as refresh failure
+            _refresh_ok = False
+            _refresh_reason = "import_failed"
+            _quote_age_ms = 0
+
+        if not _refresh_ok or _submit_ask <= 0:
+            # Fail closed: never submit at a stale plan price when we can't get
+            # a fresh ask. The retry engine can re-arm after a delay.
+            _entry_pricing_decision = "QUOTE_REFRESH_FAILED" if not _refresh_ok else "MISSING_ASK"
+            log.critical(
+                "[%s] ENTRY_PRICING_BLOCK — breach-time quote refresh failed "
+                "contract=%s reason=%s refresh_ok=%s submit_ask=%s | blocking submit",
+                ticker, approved_contract, _refresh_reason, _refresh_ok, _submit_ask,
+            )
+            funnel.inc("order_failed")
+            if signal_id:
+                self.store.update_signal_fields(signal_id, {
+                    "decision_status": "blocked_at_breach",
+                    "context_notes": f"breach_quote_refresh_failed:{_refresh_reason}",
+                })
+            return
+
+        # Spread sanity guard (wide spread = illiquid contract, skip).
+        _spread_pct = _submit_quote_fields.get("spread_pct") or 0.0
+        _max_spread = float(os.getenv("ENTRY_MAX_SPREAD_PCT", "0.50"))
+        if _spread_pct > _max_spread:
+            _entry_pricing_decision = "SPREAD_TOO_WIDE"
+            log.warning(
+                "[%s] ENTRY_PRICING_BLOCK — spread too wide at breach "
+                "contract=%s spread_pct=%.3f max=%.3f | blocking submit",
+                ticker, approved_contract, _spread_pct, _max_spread,
+            )
+            funnel.inc("order_failed")
+            if signal_id:
+                self.store.update_signal_fields(signal_id, {
+                    "decision_status": "blocked_at_breach",
+                    "context_notes": f"breach_spread_too_wide:{_spread_pct:.3f}",
+                })
+            return
+
+        # Drift guard: if the current ask has run more than ENTRY_MAX_PRICE_DRIFT_PCT_FROM_PLAN
+        # above the original plan price, the move has already happened — don't chase.
+        _drift_pct = (_submit_ask / _plan_limit) - 1.0 if _plan_limit > 0 else 0.0
+        if _drift_pct > ENTRY_MAX_PRICE_DRIFT_PCT_FROM_PLAN:
+            _entry_pricing_decision = "ENTRY_PRICE_DRIFT_TOO_HIGH"
+            log.warning(
+                "[%s] ENTRY_PRICING_BLOCK — ask drifted too far from plan at breach "
+                "contract=%s plan_limit=%.2f submit_ask=%.2f drift=%.1f%% max=%.1f%% | blocking",
+                ticker, approved_contract, _plan_limit, _submit_ask,
+                _drift_pct * 100, ENTRY_MAX_PRICE_DRIFT_PCT_FROM_PLAN * 100,
+            )
+            funnel.inc("order_failed")
+            if signal_id:
+                self.store.update_signal_fields(signal_id, {
+                    "decision_status": "blocked_at_breach",
+                    "context_notes": (
+                        f"breach_entry_price_drift_too_high:"
+                        f"plan={_plan_limit:.2f} ask={_submit_ask:.2f} "
+                        f"drift={_drift_pct*100:.1f}%"
+                    ),
+                })
+            return
+
+        # Compute the broker-submitted limit: ask + mode-appropriate crossing pennies.
+        _ask_cross = ENTRY_PAPER_ASK_CROSS_CENTS if self.paper else ENTRY_LIVE_ASK_CROSS_CENTS
+        submit_limit = round(_submit_ask + _ask_cross, 2)
+
+        # Keep approved_plan in sync so OSM and DB record the correct price.
+        try:
+            approved_plan.limit_price = submit_limit
+        except Exception:
+            pass  # plan is a namespace; attribute assignment is always valid
+
+        # Build the entry pricing audit to persist in orders.meta post-submit.
+        _entry_pricing_audit = {
+            "entry_pricing_audit":         True,
+            "selected_contract":           approved_contract,
+            "original_limit_price":        _plan_limit,
+            "original_selector_ask":       _plan_limit,  # plan_limit = selector ask at selection time
+            "submit_bid":                  _submit_quote_fields.get("submit_bid"),
+            "submit_mid":                  _submit_quote_fields.get("submit_mid"),
+            "submit_ask":                  float(_submit_ask),
+            "submit_last":                 _submit_quote_fields.get("submit_last"),
+            "submitted_limit_price":       float(submit_limit),
+            "limit_vs_submit_ask_pct":     round((_ask_cross / _submit_ask) * 100, 4) if _submit_ask > 0 else None,
+            "quote_refreshed_at_submit":   True,
+            "quote_age_ms":                int(_quote_age_ms),
+            "spread_pct_at_submit":        _submit_quote_fields.get("spread_pct"),
+            "sandbox_mode":                self.paper,
+            "broker_base_url":             getattr(getattr(self.broker, "cfg", None), "base_url", None),
+            "pricing_rule":                "PAPER_ASK_CROSS" if self.paper else "LIVE_ASK_CROSS",
+            "ask_cross_cents":             _ask_cross,
+            "drift_from_plan_pct":         round(_drift_pct * 100, 4),
+            "entry_price_decision":        _entry_pricing_decision,
+            "attempt_number":              0,
+            "retry_reprice_count":         0,
+        }
+
+        # 5) Submit with the refreshed, ask-anchored limit price.
         log.info(
-            "[%s] %s — submitting EXISTING queue order via approved plan | local=%s contract=%s @ $%.2f x%s",
+            "[%s] %s — submitting EXISTING queue order | local=%s contract=%s "
+            "plan_ask=%.2f submit_ask=%.2f cross=+%.2f limit=%.2f drift=%.1f%% x%s",
             ticker,
             "PAPER" if self.paper else "LIVE",
             queue_local_order_id,
             approved_contract,
+            _plan_limit,
+            _submit_ask,
+            _ask_cross,
             submit_limit,
+            _drift_pct * 100,
             approved_qty,
         )
 
@@ -805,6 +947,14 @@ class APExecutionCore:
         if submit_res.get("ok"):
             local_order_id = submit_res.get("local_order_id")
             broker_order_id = submit_res.get("broker_order_id")
+            # P0: persist entry pricing audit into orders.meta (best-effort).
+            if local_order_id and hasattr(self.order_state_machine, "update_order_meta"):
+                try:
+                    self.order_state_machine.update_order_meta(
+                        local_order_id, _entry_pricing_audit
+                    )
+                except Exception as _audit_exc:
+                    log.warning("[%s] entry_pricing_audit persist failed: %s", ticker, _audit_exc)
             # Item 3 — persist selector candidate audit into orders.meta
             # (EVIDENCE ONLY, best-effort, non-destructive JSONB merge).
             # _candidate_audit is set ONLY when breach-time deferred selection
