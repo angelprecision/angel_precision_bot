@@ -116,6 +116,13 @@ ENTRY_REEVAL_AGE_SECONDS = int(os.getenv("ENTRY_REEVAL_AGE_SECONDS", "25"))
 ENTRY_MAX_AGE_NORMAL     = int(os.getenv("ENTRY_MAX_AGE_NORMAL",     "90"))
 ENTRY_MAX_AGE_APLUS      = int(os.getenv("ENTRY_MAX_AGE_APLUS",      "120"))
 ENTRY_APLUS_SCORE_THRESHOLD = float(os.getenv("ENTRY_APLUS_SCORE_THRESHOLD", "85"))
+
+# PR66: Paper/live split for entry max-age.
+# Paper (sandbox) Tradier fills and quotes can lag vs live — valid test
+# orders were canceling before they could fill. LIVE keeps the strict 90s
+# ceiling; PAPER gets 2x breathing room.
+PAPER_ENTRY_MAX_AGE_NORMAL = int(os.getenv("PAPER_ENTRY_MAX_AGE_SECONDS", "180"))
+LIVE_ENTRY_MAX_AGE_NORMAL  = int(os.getenv("LIVE_ENTRY_MAX_AGE_SECONDS",   "90"))
 # H4: exit reliability. An unfilled exit on a fast-moving option is direct
 # account risk — a +25% green trade can round-trip to breakeven or a loss
 # while a mispriced limit exit sits unfilled. 5 min was far too slow. At 45s
@@ -171,6 +178,7 @@ class APOrderMonitor:
             broker=broker,
             order_state_machine=osm,
             position_manager=pm,
+            client_mode=runner.mode,    # PR66: always pass "PAPER" or "LIVE" explicitly
         )
         monitor.start()   # starts daemon thread
         monitor.stop()    # signals thread to exit
@@ -184,6 +192,10 @@ class APOrderMonitor:
         position_manager,
         exit_engine=None,
         alert_fn=None,
+        # PR66: "PAPER" or "LIVE". Default is "LIVE" so any call site that
+        # forgets to pass client_mode uses the strict 90s ceiling rather than
+        # the relaxed 180s paper ceiling. Missing wiring fails safe, not relaxed.
+        client_mode: str = "LIVE",
     ):
         self.client_id   = client_id
         self.broker      = broker
@@ -191,6 +203,9 @@ class APOrderMonitor:
         self.pm          = position_manager
         self.exit_engine = exit_engine
         self.alert_fn    = alert_fn
+        # PR66: store mode for per-mode max-age selection.
+        # "or LIVE" guards against explicit None/empty being passed — fail safe.
+        self.client_mode = str(client_mode or "LIVE").strip().upper()
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
@@ -759,7 +774,12 @@ class APOrderMonitor:
                 str(order.get("tier") or _order_meta.get("tier") or "").strip()
             )
             _is_aplus = _score >= ENTRY_APLUS_SCORE_THRESHOLD
-            _max_age = ENTRY_MAX_AGE_APLUS if _is_aplus else ENTRY_MAX_AGE_NORMAL
+            # PR66: PAPER entries get more breathing room (sandbox fills lag).
+            # LIVE keeps the strict ceiling.  A+ tier always uses ENTRY_MAX_AGE_APLUS
+            # regardless of mode — the wider A+ window already provides relief.
+            _is_paper = (self.client_mode == "PAPER")
+            _normal_ceiling = PAPER_ENTRY_MAX_AGE_NORMAL if _is_paper else LIVE_ENTRY_MAX_AGE_NORMAL
+            _max_age = ENTRY_MAX_AGE_APLUS if _is_aplus else _normal_ceiling
 
             if broker_oid and age_secs >= ENTRY_REEVAL_AGE_SECONDS:
                 # Step 1: if past absolute ceiling, hard-cancel with explicit reason.
@@ -780,10 +800,25 @@ class APOrderMonitor:
                         or ("A+" if _is_aplus else "normal")
                     )
                     log.warning(
-                        "[%s] %s | %s | status=%s age=%.0fs >= %ds (score=%.1f tier=%s)",
+                        "[%s] %s | %s | status=%s age=%.0fs >= %ds (score=%.1f tier=%s mode=%s)",
                         self.client_id, _ceiling_reason, _sym or contract, status,
-                        age_secs, _max_age, _score, _tier_display,
+                        age_secs, _max_age, _score, _tier_display, self.client_mode,
                     )
+                    # Capture live quote for metadata (best-effort — never blocks cancel).
+                    _bid, _ask, _mid = None, None, None
+                    try:
+                        _quote = self.broker.get_quote(_sym)
+                        if _quote:
+                            _bid = _quote.get("bid")
+                            _ask = _quote.get("ask")
+                            if _bid is not None and _ask is not None:
+                                try:
+                                    _mid = round((float(_bid) + float(_ask)) / 2, 4)
+                                except Exception:
+                                    pass
+                    except Exception:
+                        pass
+                    _retries = int(_order_meta.get("retry_count") or 0)
                     self._emit_order_event(
                         local_order_id=local_id,
                         stage="order_monitor",
@@ -791,17 +826,34 @@ class APOrderMonitor:
                         reason_code=_ceiling_reason,
                         explanation=(
                             f"Canceling stale entry at absolute ceiling — unfilled "
-                            f"{age_secs:.0f}s >= {_max_age}s ({'A+' if _is_aplus else 'normal'} tier)"
+                            f"{age_secs:.0f}s >= {_max_age}s "
+                            f"({'A+' if _is_aplus else 'normal'} tier, mode={self.client_mode})"
                         ),
                         contract=contract,
                         inputs={
-                            "limit_price": float(_limit_price) if _limit_price else 0.0,
-                            "age_secs":    round(age_secs, 1),
-                            "max_age":     _max_age,
-                            "score":       _score,
-                            "is_aplus":    _is_aplus,
+                            # PR66 required metadata fields.
+                            # cancel_reason mirrors _ceiling_reason so A+ orders
+                            # correctly record ENTRY_MAX_AGE_APLUS_REACHED, not NORMAL.
+                            "cancel_reason":  _ceiling_reason,
+                            "mode":           self.client_mode,
+                            "max_age_seconds": _max_age,
+                            "actual_age_seconds": round(age_secs, 1),
+                            "symbol":         order.get("symbol") or "",
+                            "direction":      _order_meta.get("direction") or _order_meta.get("side") or "",
+                            "contract":       contract or "",
+                            "score":          _score,
+                            "tier":           _tier_display,
+                            "limit_price":    float(_limit_price) if _limit_price else 0.0,
+                            "bid":            _bid,
+                            "ask":            _ask,
+                            "mid":            _mid,
+                            "retries":        _retries,
+                            # Existing fields kept for backward compat
+                            "age_secs":       round(age_secs, 1),
+                            "max_age":        _max_age,
+                            "is_aplus":       _is_aplus,
                             "broker_order_id": broker_oid,
-                            "status":      status,
+                            "status":         status,
                         },
                     )
                     self._handle_stale_entry(
@@ -809,7 +861,7 @@ class APOrderMonitor:
                         action="cancel",
                         reason=(
                             f"{_ceiling_reason} unfilled {age_secs:.0f}s >= {_max_age}s "
-                            f"(score={_score:.1f} tier={_tier_display})"
+                            f"(score={_score:.1f} tier={_tier_display} mode={self.client_mode})"
                         ),
                     )
                     return True
