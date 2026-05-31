@@ -222,6 +222,40 @@ WATCHER_REARM_ONLY_DAILY_OR_OVERNIGHT: bool = (
 _raw_rearm_tol = float(os.getenv("WATCHER_REARM_TOLERANCE_PCT", "0.001"))
 WATCHER_REARM_TOLERANCE_PCT: float = max(0.0, min(0.02, _raw_rearm_tol))  # clamp 0 – 2%
 WATCHER_REARM_MAX_ATTEMPTS: int = max(1, int(os.getenv("WATCHER_REARM_MAX_ATTEMPTS", "1")))
+
+# Opposite-side conflict smart-eligibility (P0 PR):
+# Friday's audit: 419/871 (~48%) of canceled entries were
+# watcher_block:opposite_side_conflict. Many were against stale or already-
+# canceled opposite watchers. New rule set below; env-overridable.
+#
+# Decision matrix:
+#   1. If opposite watcher is STALE (older than OPPOSITE_CONFLICT_MAX_AGE_SEC)
+#      AND has lower-or-equal score, ignore it. New signal admits.
+#   2. If opposite watcher score > new score AND fresh, BLOCK new (current
+#      behavior preserved — protect the better setup).
+#   3. If new score > opposite score, FLIP (cancel opposite, admit new —
+#      current behavior preserved).
+#   4. Equal scores within OPPOSITE_CONFLICT_SCORE_TIE_PCT of each other,
+#      prefer the higher-tier timeframe (1d/4h beats 1h/15m). Daily beats
+#      intraday on tie.
+#   5. New signal can override if it is non-rearm/active + opposite is rearm-only
+#      (rearm signals are weaker by design).
+OPPOSITE_CONFLICT_MAX_AGE_SEC      = int(os.getenv("OPPOSITE_CONFLICT_MAX_AGE_SEC", "600"))   # 10 min default
+OPPOSITE_CONFLICT_SCORE_TIE_PCT    = float(os.getenv("OPPOSITE_CONFLICT_SCORE_TIE_PCT", "0.03"))  # within 3pts = tie
+
+# Timeframe tier preference (higher wins on ties). Daily/4h/overnight
+# structurally stronger than intraday for failed-directional setups.
+_OPPOSITE_TF_TIER = {
+    "1d": 5, "d": 5, "daily": 5,
+    "4h": 4, "240m": 4, "4hour": 4,
+    "1h": 3, "60m": 3, "hourly": 3,
+    "30m": 2,
+    "15m": 1, "5m": 1, "1m": 1,
+}
+
+def _opposite_tf_rank(tf: str) -> int:
+    return _OPPOSITE_TF_TIER.get(str(tf or "").lower().strip(), 0)
+
 log.info(
     "[entry-watcher] rearm config: enabled=%s min_score=%.0f window=%ds "
     "daily_only=%s tolerance=%.4f max_attempts=%d",
@@ -1491,9 +1525,78 @@ class APEntryWatcher:
 
             # Never keep both CALL and PUT armed for the same ticker. Stronger
             # score wins. Equal/lower score gets blocked to avoid OSM conflict.
+            #
+            # P0 PR smart-eligibility: prune the opposite_side candidate set
+            # before the conflict decision. A stale or non-active opposite
+            # should NOT block a fresh signal. We keep the legacy stronger-
+            # score-wins / flip semantics; we only refine what counts as a
+            # valid opposite to compare against.
             if opposite_side:
-                best_opp = max(opposite_side, key=lambda w: w.score)
-                if watched.score > best_opp.score:
+                # Same-symbol opposite filter — already guaranteed by the
+                # ticker check above, kept as a documented invariant.
+                _now_dt = datetime.now(timezone.utc)
+                _fresh_opps = []
+                _stale_opps_ignored = []
+                for _opp in opposite_side:
+                    _opp_age_sec = max(0.0, (_now_dt - _opp.created_at).total_seconds())
+                    _opp_is_terminal = _opp.state in (
+                        WatchState.CANCELLED,
+                        WatchState.EXPIRED,
+                        WatchState.INVALIDATED,
+                    )
+                    _opp_is_rearm_only = (
+                        getattr(_opp, "rearm_mode", False) and not _opp.is_active
+                    )
+                    if _opp_is_terminal:
+                        _stale_opps_ignored.append(
+                            (_opp, "opp_in_terminal_state", _opp_age_sec)
+                        )
+                        continue
+                    if (_opp_age_sec > OPPOSITE_CONFLICT_MAX_AGE_SEC
+                            and _opp.score <= watched.score):
+                        # Stale opposite that is not stronger — ignore.
+                        _stale_opps_ignored.append(
+                            (_opp, "opp_stale_not_stronger", _opp_age_sec)
+                        )
+                        continue
+                    if (_opp_is_rearm_only and not getattr(watched, "rearm_mode", False)
+                            and watched.score >= _opp.score):
+                        # Fresh active beats rearm-only at equal/higher score.
+                        _stale_opps_ignored.append(
+                            (_opp, "opp_rearm_only_weaker", _opp_age_sec)
+                        )
+                        continue
+                    _fresh_opps.append(_opp)
+
+                if _stale_opps_ignored:
+                    for _opp, _why, _age in _stale_opps_ignored:
+                        log.info(
+                            "[%s] OPPOSITE_IGNORED %s | opp_side=%s opp_score=%.1f "
+                            "opp_age=%.0fs new_side=%s new_score=%.1f",
+                            watched.ticker, _why, _opp.side, _opp.score, _age,
+                            watched.side, watched.score,
+                        )
+
+                # If pruning eliminated all opposites, admit normally.
+                if not _fresh_opps:
+                    opposite_side = []
+
+            if opposite_side:
+                best_opp = max(_fresh_opps if '_fresh_opps' in dir() and _fresh_opps else opposite_side,
+                               key=lambda w: w.score)
+                # Equal-score tie-break: prefer higher-tier timeframe.
+                _opp_score = best_opp.score
+                _new_score = watched.score
+                _scores_tied = abs(_new_score - _opp_score) <= OPPOSITE_CONFLICT_SCORE_TIE_PCT * max(1.0, _opp_score)
+                if _scores_tied:
+                    _opp_tf = (best_opp.signal or {}).get("timeframe", "")
+                    _new_tf = (watched.signal or {}).get("timeframe", "")
+                    _opp_tier = _opposite_tf_rank(_opp_tf)
+                    _new_tier = _opposite_tf_rank(_new_tf)
+                    # If new has strictly higher tier, treat as winner.
+                    if _new_tier > _opp_tier:
+                        _new_score = _opp_score + 0.01  # tip the scales for the > check below
+                if _new_score > best_opp.score:
                     for w in opposite_side:
                         w.state = WatchState.CANCELLED
                         w._release_dedup_key()
@@ -1523,6 +1626,26 @@ class APEntryWatcher:
                                 log.warning("[%s] OSM cancel failed for direction_flip: %s", w.ticker, _exc)
                     self._pending = [w for w in self._pending if w not in opposite_side]
                 else:
+                    # P0 PR — structured opposite_side_conflict audit.
+                    # The block is the SAFE choice; we preserve the legacy
+                    # "weaker setup loses to stronger opposite" semantic but
+                    # add the conflicting-signal fields so the post-mortem
+                    # can answer: was this correct? was the opposite stale?
+                    # was it a tie that timeframe-tier should have flipped?
+                    _opp_age_sec = max(
+                        0.0,
+                        (datetime.now(timezone.utc) - best_opp.created_at).total_seconds(),
+                    )
+                    _opp_signal = best_opp.signal or {}
+                    _new_signal = watched.signal or {}
+                    _decision_rule = (
+                        "opp_stronger_fresh" if best_opp.score > watched.score
+                        else (
+                            "opp_higher_tf_tier_on_tie"
+                            if _scores_tied
+                            else "opp_equal_or_higher_score_blocks"
+                        )
+                    )
                     _opp_audit = self._build_watcher_audit_payload(
                         watched,
                         trigger_type="add_signal_block",
@@ -1532,6 +1655,30 @@ class APEntryWatcher:
                             f"_existing_{best_opp.side}_{best_opp.score:.1f}"
                         ),
                         extra={
+                            # Required structured fields (P0 PR spec):
+                            "block_stage":              "watcher",
+                            "block_reason":             "opposite_side_conflict",
+                            "symbol":                   watched.ticker,
+                            "current_local_order_id":   _new_signal.get("local_order_id"),
+                            "current_direction":        watched.side,
+                            "current_score":            watched.score,
+                            "current_timeframe":        _new_signal.get("timeframe"),
+                            "current_pattern":          _new_signal.get("pattern"),
+                            "current_signal_id":        watched.signal_id,
+                            "conflicting_local_order_id": _opp_signal.get("local_order_id"),
+                            "conflicting_direction":    best_opp.side,
+                            "conflicting_score":        best_opp.score,
+                            "conflicting_timeframe":    _opp_signal.get("timeframe"),
+                            "conflicting_pattern":      _opp_signal.get("pattern"),
+                            "conflicting_signal_id":    best_opp.signal_id,
+                            "conflicting_state":        str(best_opp.state),
+                            "conflict_age_seconds":     _opp_age_sec,
+                            "conflict_scope":           "same_symbol_opposite_direction",
+                            "decision_rule":            _decision_rule,
+                            "score_tie_window_pct":     OPPOSITE_CONFLICT_SCORE_TIE_PCT,
+                            "max_age_threshold_sec":    OPPOSITE_CONFLICT_MAX_AGE_SEC,
+                            "stale_opps_ignored_count": len(_stale_opps_ignored) if '_stale_opps_ignored' in dir() else 0,
+                            # Back-compat keys (old dashboard / replay scripts):
                             "blocked_side":    watched.side,
                             "blocked_score":   watched.score,
                             "existing_side":   best_opp.side,
