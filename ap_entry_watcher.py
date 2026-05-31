@@ -1569,13 +1569,125 @@ class APEntryWatcher:
                     _fresh_opps.append(_opp)
 
                 if _stale_opps_ignored:
+                    # P1 (Codex review): a pruned-as-stale opposite watcher
+                    # MUST be cancelled and removed from _pending before we
+                    # admit the new signal; otherwise both CALL and PUT can
+                    # remain armed for the same ticker, leaving OSM rows
+                    # stuck in PENDING_TRIGGER. The pruning was the
+                    # admission decision; this loop enacts the bookkeeping.
+                    _opps_to_drop = []
                     for _opp, _why, _age in _stale_opps_ignored:
-                        log.info(
-                            "[%s] OPPOSITE_IGNORED %s | opp_side=%s opp_score=%.1f "
-                            "opp_age=%.0fs new_side=%s new_score=%.1f",
-                            watched.ticker, _why, _opp.side, _opp.score, _age,
-                            watched.side, watched.score,
+                        _was_terminal = _opp.state in (
+                            WatchState.CANCELLED,
+                            WatchState.EXPIRED,
+                            WatchState.INVALIDATED,
                         )
+                        if _was_terminal:
+                            # Already in a terminal state — no OSM call
+                            # needed; just make sure it is not still in
+                            # _pending (defensive: poll-loop usually purges
+                            # terminal watchers but we cannot rely on timing).
+                            _action = "ignored_terminal"
+                            _opps_to_drop.append(_opp)
+                        else:
+                            # Still PENDING / WATCHING etc. — actively
+                            # cancel so OSM PENDING_TRIGGER is released.
+                            _opp.state = WatchState.CANCELLED
+                            _opp._release_dedup_key()
+                            _opps_to_drop.append(_opp)
+                            _local_oid = (_opp.signal or {}).get("local_order_id")
+                            _osm = self.order_state_machine
+                            if _local_oid and _osm and hasattr(_osm, "cancel_pending_entry"):
+                                try:
+                                    _cancel_ok = _osm.cancel_pending_entry(
+                                        _local_oid,
+                                        reason="opposite_side_replaced_stale_or_weaker",
+                                    )
+                                    if not _cancel_ok:
+                                        log.error(
+                                            "[%s] opposite_side_replaced_stale_or_weaker: "
+                                            "OSM cancel_pending_entry returned False for "
+                                            "local_order_id=%s reason=%s opp_side=%s "
+                                            "opp_score=%.1f — OSM row may be stuck in "
+                                            "PENDING_TRIGGER.",
+                                            watched.ticker, _local_oid, _why,
+                                            _opp.side, _opp.score,
+                                        )
+                                except Exception as _exc:
+                                    log.warning(
+                                        "[%s] OSM cancel raised during "
+                                        "opposite_side_replaced_stale_or_weaker for "
+                                        "local_order_id=%s: %s",
+                                        watched.ticker, _local_oid, _exc,
+                                    )
+                            _action = (
+                                "cancelled_rearm_weaker"
+                                if _why == "opp_rearm_only_weaker"
+                                else "cancelled_stale_active"
+                            )
+
+                        # Structured log line per ignored opposite (audit).
+                        log.info(
+                            "[%s] OPPOSITE_IGNORED %s | action=%s opp_side=%s "
+                            "opp_score=%.1f opp_age=%.0fs opp_state=%s new_side=%s "
+                            "new_score=%.1f",
+                            watched.ticker, _why, _action, _opp.side, _opp.score,
+                            _age, str(_opp.state), watched.side, watched.score,
+                        )
+
+                        # Best-effort audit stamp onto the cancelled opposite's
+                        # order row so the post-mortem can reconstruct WHY a
+                        # stale row was cancelled by an opposite signal.
+                        if _action != "ignored_terminal":
+                            try:
+                                _opp_audit_replaced = self._build_watcher_audit_payload(
+                                    _opp,
+                                    trigger_type="opposite_side_replaced",
+                                    reason_code="opposite_side_replaced_stale_or_weaker",
+                                    raw_reason=(
+                                        f"{_why}_replaced_by_{watched.side}_{watched.score:.1f}"
+                                    ),
+                                    extra={
+                                        "block_stage":              "watcher",
+                                        "block_reason":             "opposite_side_replaced_stale_or_weaker",
+                                        "symbol":                   watched.ticker,
+                                        "replacing_local_order_id": (watched.signal or {}).get("local_order_id"),
+                                        "replacing_direction":      watched.side,
+                                        "replacing_score":          watched.score,
+                                        "replacing_signal_id":      watched.signal_id,
+                                        "replaced_local_order_id":  (_opp.signal or {}).get("local_order_id"),
+                                        "replaced_direction":       _opp.side,
+                                        "replaced_score":           _opp.score,
+                                        "replaced_signal_id":       _opp.signal_id,
+                                        "replaced_age_seconds":     _age,
+                                        "replaced_state":           str(_opp.state),
+                                        "decision_rule":            _why,
+                                        "ignored_opposite_action":  _action,
+                                    },
+                                )
+                                _replaced_oid = (_opp.signal or {}).get("local_order_id")
+                                if _replaced_oid:
+                                    try:
+                                        self._persist_watcher_audit(_replaced_oid, _opp_audit_replaced)
+                                    except Exception as _persist_exc:
+                                        log.debug(
+                                            "[%s] persist audit on replaced opposite "
+                                            "failed (best-effort): %s",
+                                            watched.ticker, _persist_exc,
+                                        )
+                            except Exception as _audit_exc:
+                                log.debug(
+                                    "[%s] build audit on replaced opposite "
+                                    "failed (best-effort): %s",
+                                    watched.ticker, _audit_exc,
+                                )
+
+                    # Remove all dropped opposites from _pending (under the
+                    # outer self._lock that already wraps this whole block).
+                    if _opps_to_drop:
+                        self._pending = [
+                            w for w in self._pending if w not in _opps_to_drop
+                        ]
 
                 # If pruning eliminated all opposites, admit normally.
                 if not _fresh_opps:
