@@ -1876,6 +1876,13 @@ class ClientRunner(threading.Thread):
                 "STARTUP_PHANTOM_CLEAR_MIN_AGE_SECONDS",
                 str(max(600, _legacy_min_age_min * 60)),
             ))
+            # Tier B keeps the original minutes-style param it always used
+            # (PHANTOM_ORDER_MIN_AGE_MINUTES). PR p0/guard-startup-phantom-clear
+            # only hardens Tier A; restoring the `min_age` name here preserves
+            # the original Tier B SQL parameter exactly. Codex pre-merge review
+            # caught the NameError this would otherwise raise inside
+            # _clear_phantoms() and rollback Tier A.
+            min_age = _legacy_min_age_min
             # Startup grace window: orders created within STARTUP_GRACE_SECONDS
             # of this runner's process start are NEVER cancelled by this path,
             # even if their absolute age exceeds min_age_seconds. Defends
