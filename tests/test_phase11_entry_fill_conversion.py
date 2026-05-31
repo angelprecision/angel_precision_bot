@@ -656,3 +656,53 @@ class TestPR66PaperLiveEntryMaxAge:
             del os.environ["PAPER_ENTRY_MAX_AGE_SECONDS"]
             importlib.reload(om)
             assert om.PAPER_ENTRY_MAX_AGE_NORMAL == original_paper
+    def test_aplus_cancel_reason_is_aplus_reached(self):
+        """Issue 2: cancel_reason in inputs must match _ceiling_reason.
+        A+ orders must record ENTRY_MAX_AGE_APLUS_REACHED, not NORMAL."""
+        monitor = self._make_monitor("PAPER")
+        # Score 90 >= ENTRY_APLUS_SCORE_THRESHOLD (85) → A+, ceiling=120s
+        order = self._make_order(age_secs=181.0, score=90.0)
+        order["meta"]["score"] = 90.0
+        monitor._check_stale_entry_cancel(
+            order, "ORD-TEST-001", "SUBMITTED", order["contract"], 121.0
+        )
+        emit_calls = monitor._emit_order_event.call_args_list
+        assert emit_calls, "emit_order_event must be called on A+ max-age cancel"
+        inputs = emit_calls[-1].kwargs.get("inputs", {})
+        assert inputs.get("cancel_reason") == "ENTRY_MAX_AGE_APLUS_REACHED", (
+            f"A+ order must record ENTRY_MAX_AGE_APLUS_REACHED, got {inputs.get('cancel_reason')}"
+        )
+        # reason_code on the event itself must also match
+        reason_code = emit_calls[-1].kwargs.get("reason_code")
+        assert reason_code == "ENTRY_MAX_AGE_APLUS_REACHED", (
+            f"reason_code must be ENTRY_MAX_AGE_APLUS_REACHED, got {reason_code}"
+        )
+
+    def test_default_client_mode_is_live_strict(self):
+        """Issue 1 safety net: APOrderMonitor() with no client_mode must default
+        to LIVE (90s ceiling), not PAPER (180s ceiling)."""
+        from ap.order_monitor import APOrderMonitor
+        from unittest.mock import MagicMock
+        m = MagicMock()
+        m.get_order.return_value = None
+        monitor = APOrderMonitor(
+            client_id="default-test@example.com",
+            broker=MagicMock(),
+            order_state_machine=m,
+            position_manager=MagicMock(),
+            # client_mode intentionally omitted — default must be LIVE
+        )
+        assert monitor.client_mode == "LIVE", (
+            f"Default client_mode must be LIVE (fail-safe), got {monitor.client_mode!r}"
+        )
+
+    def test_self_healing_passes_mode_attribute(self):
+        """Issue 1 source fix: self_healing.py must use getattr(runner, 'mode', 'LIVE').
+        Verify the source contains the correct expression."""
+        src = (REPO_ROOT / "ap" / "self_healing.py").read_text()
+        # Use single-quoted target to avoid nested quote collision
+        assert ("getattr(runner, 'mode', 'LIVE')" in src or
+                'getattr(runner, "mode", "LIVE")' in src), (
+            "ap/self_healing.py must pass client_mode=getattr(runner, 'mode', 'LIVE') to APOrderMonitor"
+        )
+

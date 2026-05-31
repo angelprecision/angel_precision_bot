@@ -171,6 +171,11 @@ class APSelfHealingSystem:
                     order_state_machine=runner.order_state_machine,
                     position_manager=runner.position_manager,
                     exit_engine=getattr(getattr(runner, "core", None), "exit_eng", None),
+                    # PR66: propagate the runner's actual mode so a LIVE runner
+                    # that self-heals keeps the strict 90s ceiling.
+                    # getattr(..., "LIVE") fallback: if mode is somehow unset after
+                    # a partial restart, fail safe to LIVE (strict), not PAPER (relaxed).
+                    client_mode=getattr(runner, "mode", "LIVE"),
                 )
                 runner.order_monitor.start()
                 return True

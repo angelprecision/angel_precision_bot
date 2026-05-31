@@ -178,6 +178,7 @@ class APOrderMonitor:
             broker=broker,
             order_state_machine=osm,
             position_manager=pm,
+            client_mode=runner.mode,    # PR66: always pass "PAPER" or "LIVE" explicitly
         )
         monitor.start()   # starts daemon thread
         monitor.stop()    # signals thread to exit
@@ -191,7 +192,10 @@ class APOrderMonitor:
         position_manager,
         exit_engine=None,
         alert_fn=None,
-        client_mode:       str = "PAPER",   # PR66: "PAPER" or "LIVE"
+        # PR66: "PAPER" or "LIVE". Default is "LIVE" so any call site that
+        # forgets to pass client_mode uses the strict 90s ceiling rather than
+        # the relaxed 180s paper ceiling. Missing wiring fails safe, not relaxed.
+        client_mode: str = "LIVE",
     ):
         self.client_id   = client_id
         self.broker      = broker
@@ -200,7 +204,8 @@ class APOrderMonitor:
         self.exit_engine = exit_engine
         self.alert_fn    = alert_fn
         # PR66: store mode for per-mode max-age selection.
-        self.client_mode = str(client_mode or "PAPER").strip().upper()
+        # "or LIVE" guards against explicit None/empty being passed — fail safe.
+        self.client_mode = str(client_mode or "LIVE").strip().upper()
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
@@ -826,8 +831,10 @@ class APOrderMonitor:
                         ),
                         contract=contract,
                         inputs={
-                            # PR66 required metadata fields
-                            "cancel_reason":  "ENTRY_MAX_AGE_NORMAL_REACHED",
+                            # PR66 required metadata fields.
+                            # cancel_reason mirrors _ceiling_reason so A+ orders
+                            # correctly record ENTRY_MAX_AGE_APLUS_REACHED, not NORMAL.
+                            "cancel_reason":  _ceiling_reason,
                             "mode":           self.client_mode,
                             "max_age_seconds": _max_age,
                             "actual_age_seconds": round(age_secs, 1),
