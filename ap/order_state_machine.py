@@ -1461,6 +1461,54 @@ class APOrderStateMachine:
                     "broker_order_id": current.get("broker_order_id"),
                     "status": OrderStatus.ERROR, "error": error_msg}
 
+        # ── LIMIT-PRICE DB SYNC (non-deferred / preselected queued orders) ────
+        # For DEFERRED orders, _update_contract_pre_submit (above) already wrote
+        # the refreshed limit_price alongside the contract + qty update.
+        # For preselected / queued orders no DB write has occurred yet — the row
+        # still holds the stale selector-time ask from when the order was queued.
+        #
+        # WHY THIS MATTERS: order_monitor reads orders.limit_price for the repeg
+        # baseline. If the DB holds the old stale price while the broker received
+        # the refreshed ask-crossed limit, repeg will evaluate proximity against
+        # the wrong number (possibly declining when it should fire, or firing with
+        # the wrong delta).
+        #
+        # FAIL-CLOSED: if the sync write fails, block the broker POST. A live
+        # broker order paired with a stale DB row is the split-brain condition
+        # this guard exists to prevent.
+        if not _db_is_deferred:
+            _db_stored_lp = float(current.get("limit_price") or 0)
+            if abs(_db_stored_lp - lp) > 0.001:
+                try:
+                    def _sync_limit_price():
+                        with conn() as c:
+                            c.execute(
+                                "UPDATE orders SET limit_price=%s, updated_ts=NOW() "
+                                "WHERE local_order_id=%s AND client_id=%s",
+                                (round(lp, 2), local_order_id, self.client_id),
+                            )
+                    run_with_retry(_sync_limit_price)
+                    log.info(
+                        "[%s] LIMIT_PRICE_SYNCED %.2f → %.2f order=%s (preselected entry)",
+                        ticker, _db_stored_lp, lp, local_order_id,
+                    )
+                except Exception as _lp_exc:
+                    _err = f"limit_price_db_sync_failed:{_lp_exc}"
+                    log.critical(
+                        "[%s] ENTRY_SUBMIT_BLOCKED — limit_price DB sync failed "
+                        "(%.2f → %.2f) order=%s | blocking broker POST to prevent "
+                        "DB/broker limit drift (order_monitor repeg would read stale price)",
+                        ticker, _db_stored_lp, lp, local_order_id,
+                    )
+                    self.transition(local_order_id, OrderStatus.ERROR, last_error=_err)
+                    return {
+                        "ok":              False,
+                        "local_order_id":  local_order_id,
+                        "broker_order_id": current.get("broker_order_id"),
+                        "status":          OrderStatus.ERROR,
+                        "error":           _err,
+                    }
+
         # Stale-read protection before broker POST
         latest = self._get_order(local_order_id)
         if not latest:
