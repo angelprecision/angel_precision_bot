@@ -121,8 +121,36 @@ ENTRY_APLUS_SCORE_THRESHOLD = float(os.getenv("ENTRY_APLUS_SCORE_THRESHOLD", "85
 # Paper (sandbox) Tradier fills and quotes can lag vs live — valid test
 # orders were canceling before they could fill. LIVE keeps the strict 90s
 # ceiling; PAPER gets 2x breathing room.
-PAPER_ENTRY_MAX_AGE_NORMAL = int(os.getenv("PAPER_ENTRY_MAX_AGE_SECONDS", "180"))
+# PR #68 — PAPER default bumped from 180s to 300s so the new reprice ladder
+# (10s/25s/40s) + market fallback (45s) have room to run before the age
+# ceiling fires. LIVE behavior intentionally unchanged at 90s.
+PAPER_ENTRY_MAX_AGE_NORMAL = int(os.getenv("PAPER_ENTRY_MAX_AGE_SECONDS", "300"))
 LIVE_ENTRY_MAX_AGE_NORMAL  = int(os.getenv("LIVE_ENTRY_MAX_AGE_SECONDS",   "90"))
+
+# PR #68 — PAPER-mode entry retry + market fallback.
+# In sandbox mode, marketable limit orders frequently sit unfilled because
+# Tradier sandbox's matching engine uses a lagged quote feed. We add a
+# reprice ladder + bounded market fallback so paper-proof sessions actually
+# get fills when the underlying moves in the bot's favor. LIVE mode is
+# strictly unaffected by all of the following.
+def _parse_int_list(raw: str, default: list[int]) -> list[int]:
+    try:
+        out = [int(x.strip()) for x in (raw or "").split(",") if x.strip()]
+        return sorted(set(out)) if out else default
+    except Exception:
+        return default
+
+PAPER_ENTRY_REPEG_LADDER_SECONDS   = _parse_int_list(
+    os.getenv("PAPER_ENTRY_REPEG_SECONDS", "10,25,40"),
+    default=[10, 25, 40],
+)
+ENTRY_PAPER_ASK_CROSS_CENTS        = float(os.getenv("ENTRY_PAPER_ASK_CROSS_CENTS", "0.05"))
+ENTRY_LIVE_ASK_CROSS_CENTS         = float(os.getenv("ENTRY_LIVE_ASK_CROSS_CENTS",  "0.01"))
+PAPER_ENTRY_MARKET_FALLBACK_ENABLED       = os.getenv("PAPER_ENTRY_MARKET_FALLBACK_ENABLED", "true").strip().lower() in ("1", "true", "yes")
+PAPER_ENTRY_MARKET_FALLBACK_AFTER_SECONDS = int(os.getenv("PAPER_ENTRY_MARKET_FALLBACK_AFTER_SECONDS", "45"))
+# Spread guard: PAPER market fallback only fires when the spread is not
+# pathologically wide. Default mirrors selector's max-spread check.
+PAPER_ENTRY_MARKET_FALLBACK_MAX_SPREAD_PCT = float(os.getenv("PAPER_ENTRY_MARKET_FALLBACK_MAX_SPREAD_PCT", "0.25"))
 # H4: exit reliability. An unfilled exit on a fast-moving option is direct
 # account risk — a +25% green trade can round-trip to breakeven or a loss
 # while a mispriced limit exit sits unfilled. 5 min was far too slow. At 45s
@@ -780,6 +808,36 @@ class APOrderMonitor:
             _is_paper = (self.client_mode == "PAPER")
             _normal_ceiling = PAPER_ENTRY_MAX_AGE_NORMAL if _is_paper else LIVE_ENTRY_MAX_AGE_NORMAL
             _max_age = ENTRY_MAX_AGE_APLUS if _is_aplus else _normal_ceiling
+
+            # PR #68 — PAPER entry retry ladder + market fallback.
+            # Strict scope: this block only runs when client_mode='PAPER' AND
+            # broker_oid is set AND the order is still ENTRY/SUBMITTED/ACK.
+            # LIVE mode falls through unchanged.
+            #
+            # The ladder reprices at 10s/25s/40s using the current ask plus
+            # ENTRY_PAPER_ASK_CROSS_CENTS, and at 45s (if enabled) submits a
+            # bounded market order. The order is NEVER cancelled by the age
+            # ceiling before the ladder has had a chance to run.
+            if _is_paper and broker_oid:
+                try:
+                    self._paper_entry_retry_and_fallback(
+                        order=order,
+                        local_id=local_id,
+                        broker_oid=broker_oid,
+                        contract=contract,
+                        sym=_sym,
+                        score=_score,
+                        tier_str=_tier_display if '_tier_display' in dir() else _tier_str,
+                        is_aplus=_is_aplus,
+                        age_secs=age_secs,
+                        order_meta=_order_meta,
+                    )
+                except Exception as _exc:
+                    log.warning(
+                        "[%s] paper_entry_retry_and_fallback raised — "
+                        "falling through to legacy age-cancel: %s",
+                        self.client_id, _exc,
+                    )
 
             if broker_oid and age_secs >= ENTRY_REEVAL_AGE_SECONDS:
                 # Step 1: if past absolute ceiling, hard-cancel with explicit reason.
@@ -2209,6 +2267,483 @@ class APOrderMonitor:
             out.append(ch)
         root = "".join(out)
         return root or None
+
+    def _paper_entry_retry_and_fallback(
+        self,
+        *,
+        order: dict,
+        local_id: str,
+        broker_oid: str,
+        contract: str,
+        sym: str,
+        score: float,
+        tier_str: str,
+        is_aplus: bool,
+        age_secs: float,
+        order_meta: dict,
+    ) -> None:
+        """PR #68 — PAPER-mode entry retry ladder + market fallback.
+
+        Strict scope: invoked only when client_mode='PAPER' and the order
+        has a broker_order_id. LIVE mode never reaches this helper.
+
+        Ladder semantics (env-overridable):
+          - PAPER_ENTRY_REPEG_SECONDS    = '10,25,40' — reprice checkpoints
+          - ENTRY_PAPER_ASK_CROSS_CENTS  = 0.05      — added to ask at reprice
+          - PAPER_ENTRY_MARKET_FALLBACK_AFTER_SECONDS = 45 — market fallback
+          - PAPER_ENTRY_MARKET_FALLBACK_ENABLED       = true (default)
+          - PAPER_ENTRY_MARKET_FALLBACK_MAX_SPREAD_PCT = 0.25 (safety)
+
+        We track per-order how many reprices have fired in meta so we don't
+        thrash on every monitor tick:
+          meta.paper_entry_retry_enabled  bool
+          meta.reprice_attempt_count       int
+          meta.last_reprice_age_seconds    float (seconds at last reprice)
+          meta.market_fallback_used        bool
+          meta.marketable_unfilled_seen    bool
+
+        On every fire we persist:
+          old_limit_price / new_limit_price (or 'MARKET')
+          current_bid / current_ask / current_mid / current_last
+          spread_pct, final_cancel_reason
+        plus the existing PR-A submit-time quote fields stay untouched.
+
+        Logs (structured, one per event):
+          PAPER_ENTRY_MARKETABLE_UNFILLED
+          PAPER_ENTRY_REPEG_ATTEMPT
+          PAPER_ENTRY_REPEG_OK
+          PAPER_ENTRY_REPEG_FAILED
+          PAPER_ENTRY_MARKET_FALLBACK
+          PAPER_ENTRY_CANCEL_AFTER_RETRIES (set by caller after this returns)
+        """
+        # Defensive: refuse to run if anything indicates LIVE.
+        if self.client_mode != "PAPER":
+            return
+
+        ladder = PAPER_ENTRY_REPEG_LADDER_SECONDS or [10, 25, 40]
+        attempts_done = int(order_meta.get("reprice_attempt_count") or 0)
+        market_used   = bool(order_meta.get("market_fallback_used") or False)
+
+        # Already used market fallback — nothing more to do, let age win.
+        if market_used:
+            return
+
+        # Determine which step we're at. Each ladder rung fires at most once.
+        next_rung_idx = attempts_done
+        rung_age = ladder[next_rung_idx] if next_rung_idx < len(ladder) else None
+
+        # Fetch fresh option quote (single call, used for ladder + fallback).
+        live_bid = live_ask = live_mid = live_last = None
+        spread_pct = None
+        try:
+            q = self.broker.get_quote(contract) if hasattr(self.broker, "get_quote") else None
+            if isinstance(q, dict):
+                _b = q.get("bid"); _a = q.get("ask"); _l = q.get("last")
+                try: live_bid = float(_b) if _b is not None else None
+                except (TypeError, ValueError): pass
+                try: live_ask = float(_a) if _a is not None else None
+                except (TypeError, ValueError): pass
+                try: live_last = float(_l) if _l is not None else None
+                except (TypeError, ValueError): pass
+                if live_bid is not None and live_ask is not None and live_bid > 0 and live_ask > 0:
+                    live_mid = round((live_bid + live_ask) / 2.0, 4)
+                    spread_pct = (live_ask - live_bid) / live_mid if live_mid else None
+        except Exception as _e:
+            log.debug("[%s] paper_retry quote fetch failed for %s: %s",
+                      self.client_id, contract, _e)
+
+        # Marketable-unfilled detection (audit only — doesn't block anything).
+        try:
+            current_limit = float(order.get("limit_price") or 0)
+        except (TypeError, ValueError):
+            current_limit = 0.0
+        is_marketable = (
+            current_limit > 0 and live_ask is not None and live_ask > 0
+            and current_limit >= live_ask
+        )
+        if is_marketable and not order_meta.get("marketable_unfilled_seen"):
+            log.info(
+                "[%s] PAPER_ENTRY_MARKETABLE_UNFILLED | %s contract=%s "
+                "limit=%.2f ask=%.2f age=%.0fs",
+                self.client_id, sym, contract, current_limit, live_ask, age_secs,
+            )
+
+        # ----- Reprice ladder -----
+        if rung_age is not None and age_secs >= rung_age and next_rung_idx < len(ladder):
+            log.info(
+                "[%s] PAPER_ENTRY_REPEG_ATTEMPT | %s contract=%s attempt=%d/%d "
+                "age=%.0fs limit=%.2f bid=%s ask=%s",
+                self.client_id, sym, contract,
+                next_rung_idx + 1, len(ladder), age_secs, current_limit,
+                live_bid, live_ask,
+            )
+            # Sanity: need a usable ask to reprice at.
+            if live_ask is None or live_ask <= 0:
+                log.warning(
+                    "[%s] PAPER_ENTRY_REPEG_FAILED | %s no_quote contract=%s",
+                    self.client_id, sym, contract,
+                )
+                self._stamp_paper_retry_meta(
+                    local_id,
+                    {
+                        "paper_entry_retry_enabled": True,
+                        "reprice_attempt_count":     attempts_done + 1,
+                        "last_reprice_age_seconds":  float(age_secs),
+                        "last_reprice_outcome":      "no_quote",
+                        "marketable_unfilled_seen":  bool(is_marketable),
+                        "current_bid":   live_bid,
+                        "current_ask":   live_ask,
+                        "current_mid":   live_mid,
+                        "current_last": live_last,
+                        "spread_pct":    spread_pct,
+                    },
+                )
+                return
+            new_limit = round(live_ask + ENTRY_PAPER_ASK_CROSS_CENTS, 2)
+            ok, outcome = self._paper_replace_at_new_limit(
+                order=order, broker_oid=broker_oid, contract=contract,
+                sym=sym, new_limit=new_limit,
+            )
+            if ok:
+                log.info(
+                    "[%s] PAPER_ENTRY_REPEG_OK | %s contract=%s new_limit=%.2f",
+                    self.client_id, sym, contract, new_limit,
+                )
+            else:
+                log.warning(
+                    "[%s] PAPER_ENTRY_REPEG_FAILED | %s contract=%s new_limit=%.2f outcome=%s",
+                    self.client_id, sym, contract, new_limit, outcome,
+                )
+            _meta_patch = {
+                "paper_entry_retry_enabled":  True,
+                "reprice_attempt_count":      attempts_done + 1,
+                "last_reprice_age_seconds":   float(age_secs),
+                "last_reprice_outcome":       outcome,
+                "marketable_unfilled_seen":   bool(is_marketable),
+                "old_limit_price":            current_limit,
+                "new_limit_price":            new_limit,
+                "attempted_new_limit":        new_limit,
+                "current_bid":                live_bid,
+                "current_ask":                live_ask,
+                "current_mid":                live_mid,
+                "current_last":               live_last,
+                "spread_pct":                 spread_pct,
+            }
+            # If the cancel succeeded but the replacement did NOT, surface
+            # that as a top-level meta flag so the dashboard / post-mortem
+            # never assumes the order is still open. Acceptance criteria
+            # require the canonical outcome string + the canceled broker_order_id
+            # + the attempted_new_limit so the audit trail is unambiguous.
+            if outcome.startswith("replace_failed_after_cancel") or outcome == "replace_bad_response_after_cancel":
+                _meta_patch["replace_failed_after_cancel"] = True
+                _meta_patch["final_cancel_reason"] = outcome
+                # Normalize the canonical outcome key per PR #69 acceptance.
+                # Granular subtype is preserved in final_cancel_reason above.
+                _meta_patch["last_reprice_outcome"] = "replace_failed_after_cancel"
+                _meta_patch["canceled_broker_order_id"] = broker_oid
+            self._stamp_paper_retry_meta(local_id, _meta_patch)
+            return
+
+        # ----- Market fallback at 45s -----
+        if (
+            PAPER_ENTRY_MARKET_FALLBACK_ENABLED
+            and age_secs >= PAPER_ENTRY_MARKET_FALLBACK_AFTER_SECONDS
+        ):
+            # Sanity gates: valid quote + sane spread.
+            if live_ask is None or live_ask <= 0 or live_bid is None or live_bid <= 0:
+                log.warning(
+                    "[%s] PAPER_ENTRY_MARKET_FALLBACK skipped — missing quote "
+                    "%s contract=%s bid=%s ask=%s",
+                    self.client_id, sym, contract, live_bid, live_ask,
+                )
+                return
+            if spread_pct is not None and spread_pct > PAPER_ENTRY_MARKET_FALLBACK_MAX_SPREAD_PCT:
+                log.warning(
+                    "[%s] PAPER_ENTRY_MARKET_FALLBACK skipped — spread %.3f > %.3f "
+                    "%s contract=%s",
+                    self.client_id, spread_pct,
+                    PAPER_ENTRY_MARKET_FALLBACK_MAX_SPREAD_PCT,
+                    sym, contract,
+                )
+                return
+
+            log.warning(
+                "[%s] PAPER_ENTRY_MARKET_FALLBACK | %s contract=%s age=%.0fs "
+                "bid=%.2f ask=%.2f spread_pct=%.3f",
+                self.client_id, sym, contract, age_secs,
+                live_bid, live_ask, spread_pct or 0.0,
+            )
+            ok, outcome = self._paper_replace_to_market(
+                order=order, broker_oid=broker_oid, contract=contract, sym=sym,
+            )
+            _meta_patch = {
+                "paper_entry_retry_enabled":   True,
+                "market_fallback_used":        True,
+                "market_fallback_outcome":     outcome,
+                "market_fallback_age_seconds": float(age_secs),
+                "marketable_unfilled_seen":    bool(is_marketable),
+                "old_limit_price":             current_limit,
+                "new_limit_price":             "MARKET",
+                "attempted_market_fallback":   True,
+                "current_bid":                 live_bid,
+                "current_ask":                 live_ask,
+                "current_mid":                 live_mid,
+                "current_last":                live_last,
+                "spread_pct":                  spread_pct,
+            }
+            if outcome.startswith("replace_failed_after_cancel") or outcome == "replace_bad_response_after_cancel":
+                _meta_patch["replace_failed_after_cancel"] = True
+                _meta_patch["final_cancel_reason"] = outcome
+                # Canonical outcome key per PR #69 acceptance.
+                _meta_patch["last_reprice_outcome"] = "replace_failed_after_cancel"
+                _meta_patch["canceled_broker_order_id"] = broker_oid
+            self._stamp_paper_retry_meta(local_id, _meta_patch)
+
+    # ------------------------------------------------------------------
+    # PR #68 + Codex P1 patch (2026-06-01):
+    # The canonical broker submit method across this codebase is
+    # broker.place_order(...) — NOT submit_option. Used by
+    # ap/execution.py:749, ap/exit_manager.py:205, ap/retry_engine.py:360,
+    # and the Tradier adapter at ap/brokers/tradier.py:179. The previous
+    # PR-69 draft called a non-existent submit_option, which would have
+    # cancelled the open broker order and then raised AttributeError on
+    # the replacement, leaving the local row pointing at a cancelled
+    # broker_order_id with no live replacement.
+    #
+    # Both _paper_replace_* helpers below now:
+    #   1. Verify hasattr(self.broker, 'place_order') BEFORE any cancel.
+    #      If absent, log PAPER_ENTRY_*_UNSUPPORTED and return False with
+    #      no destructive action.
+    #   2. Cancel the existing broker order.
+    #   3. Call broker.place_order(symbol, contract, qty, limit_price,
+    #      side='buy_to_open', tag=local_oid).
+    #   4. Parse the dict-or-object response the same way
+    #      retry_engine.apply_repeg does (broker_order_id / order_id / id;
+    #      status in ACK/ACKED/FILLED/SUBMITTED/OK/ACCEPTED/PENDING/OPEN).
+    #   5. On success: write update_order with the new broker_order_id
+    #      and limit_price (or keep limit_price for the market path).
+    #   6. On post-cancel submit failure: write update_order with
+    #      status=CANCELED + last_error="replace_failed_after_cancel:<...>"
+    #      AND have the caller stamp meta.replace_failed_after_cancel=True
+    #      so it never lies that the order is still open.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _parse_broker_place_response(resp) -> tuple[Optional[str], str, Optional[str]]:
+        """Extract (broker_order_id, status_upper, error) from a place_order
+        response. Mirrors retry_engine.apply_repeg parsing exactly."""
+        if isinstance(resp, dict):
+            oid    = resp.get("broker_order_id") or resp.get("order_id") or resp.get("id")
+            status = str(resp.get("status") or "").upper()
+            error  = resp.get("error")
+        else:
+            oid    = getattr(resp, "broker_order_id", None) or getattr(resp, "order_id", None)
+            status = str(getattr(resp, "status", "") or "").upper()
+            error  = getattr(resp, "error", None)
+        return (str(oid) if oid else None), status, (str(error) if error else None)
+
+    @staticmethod
+    def _broker_place_ok(status: str) -> bool:
+        return status in ("ACK", "ACKED", "FILLED", "SUBMITTED", "OK",
+                          "ACCEPTED", "PENDING", "OPEN")
+
+    def _paper_replace(
+        self,
+        *,
+        order: dict,
+        broker_oid: str,
+        contract: str,
+        sym: str,
+        new_limit: Optional[float],   # None => market
+        unsupported_log_tag: str,     # e.g. 'PAPER_ENTRY_REPEG' / 'PAPER_ENTRY_MARKET_FALLBACK'
+    ) -> tuple[bool, str]:
+        """Cancel + replace a broker order. Returns (ok, outcome_str).
+
+        outcome_str values (for meta stamping by caller):
+          'replaced_ok'
+          'broker_missing_place_order'        — NO cancel performed
+          'invalid_qty'                       — NO cancel performed
+          'cancel_failed'                     — NO replacement submitted
+          'replace_failed_after_cancel'       — cancel succeeded, replace did NOT
+          'replace_failed_after_cancel_exception'
+          'replace_bad_response_after_cancel'
+        """
+        local_oid = order.get("local_order_id") or order.get("id")
+
+        # 1) Pre-flight: never cancel if we can't replace.
+        if not hasattr(self.broker, "place_order"):
+            log.error(
+                "[%s] %s_UNSUPPORTED | broker %s has no place_order — "
+                "skipping replace; original order remains.",
+                self.client_id, unsupported_log_tag,
+                type(self.broker).__name__,
+            )
+            return False, "broker_missing_place_order"
+
+        # 2) Pre-flight: build the replacement request.
+        qty = order.get("qty") or order.get("quantity") or 0
+        try:
+            qty = int(qty)
+        except (TypeError, ValueError):
+            qty = 0
+        if qty <= 0:
+            log.warning("[%s] %s_UNSUPPORTED | invalid qty=%r local=%s",
+                        self.client_id, unsupported_log_tag, qty, local_oid)
+            return False, "invalid_qty"
+
+        # 3) Cancel the existing broker order.
+        try:
+            cancel_resp = self.broker.cancel_order(broker_oid)
+        except Exception as e:
+            log.warning(
+                "[%s] %s | cancel raised broker=%s err=%s — replacement aborted, "
+                "original order unchanged.",
+                self.client_id, unsupported_log_tag, broker_oid, e,
+            )
+            return False, "cancel_failed"
+        _cancel_err = None
+        if isinstance(cancel_resp, dict):
+            _cancel_err = cancel_resp.get("error")
+        elif cancel_resp is None:
+            _cancel_err = "no_response"
+        if _cancel_err:
+            log.warning(
+                "[%s] %s | cancel failed broker=%s err=%s — replacement aborted, "
+                "original order may still be live.",
+                self.client_id, unsupported_log_tag, broker_oid, _cancel_err,
+            )
+            return False, "cancel_failed"
+
+        # 4) Cancel succeeded — from here we MUST either land a replacement
+        #    or transition the local row to CANCELED with a clear reason.
+        try:
+            resp = self.broker.place_order(
+                symbol=sym,
+                contract=contract,
+                qty=qty,
+                limit_price=(float(new_limit) if new_limit is not None else None),
+                side="buy_to_open",
+                tag=str(local_oid) if local_oid else None,
+            )
+        except Exception as e:
+            log.error(
+                "[%s] %s | place_order raised after cancel local=%s err=%s",
+                self.client_id, unsupported_log_tag, local_oid, e,
+            )
+            self._mark_local_cancelled_after_failed_replace(
+                local_oid, reason=f"replace_failed_after_cancel_exception:{e}",
+            )
+            return False, "replace_failed_after_cancel_exception"
+
+        new_oid, status, err = self._parse_broker_place_response(resp)
+        if err or not new_oid or not self._broker_place_ok(status):
+            log.error(
+                "[%s] %s | replace bad response after cancel local=%s "
+                "new_oid=%s status=%s err=%s",
+                self.client_id, unsupported_log_tag, local_oid,
+                new_oid, status, err,
+            )
+            self._mark_local_cancelled_after_failed_replace(
+                local_oid,
+                reason=f"replace_bad_response_after_cancel:{err or status or 'no_oid'}",
+            )
+            return False, "replace_bad_response_after_cancel"
+
+        # 5) Success — write back the new broker id + (new limit if any).
+        try:
+            from ap.db import update_order
+            if new_limit is not None:
+                update_order(
+                    local_order_id=local_oid,
+                    broker_order_id=new_oid,
+                    limit_price=float(new_limit),
+                    status="SUBMITTED",
+                )
+            else:
+                # Market path: keep limit_price column unchanged — we don't
+                # have a real limit anymore. update_order(limit_price=None)
+                # would null the column on some implementations; safer to
+                # omit the kwarg entirely.
+                update_order(
+                    local_order_id=local_oid,
+                    broker_order_id=new_oid,
+                    status="SUBMITTED",
+                )
+        except Exception as e:
+            log.error(
+                "[%s] %s | replace succeeded at broker but local update_order "
+                "raised — broker now has %s but local still references %s. "
+                "err=%s",
+                self.client_id, unsupported_log_tag, new_oid, broker_oid, e,
+            )
+            # Replacement is live at broker. Don't mark local cancelled — the
+            # reconciler will resolve on its next pass.
+            return True, "replaced_ok_but_local_write_failed"
+
+        return True, "replaced_ok"
+
+    def _mark_local_cancelled_after_failed_replace(self, local_oid, reason: str) -> None:
+        """After a successful broker cancel + failed replace, transition the
+        local row to CANCELED so nothing in the system keeps treating the
+        order as open. Best-effort — a failure here is logged but doesn't
+        re-raise."""
+        if not local_oid:
+            return
+        try:
+            from ap.db import update_order
+            update_order(
+                local_order_id=local_oid,
+                status="CANCELED",
+                last_error=reason[:240],
+            )
+        except Exception as e:
+            log.error(
+                "[%s] failed to mark local CANCELED after failed replace "
+                "local=%s reason=%s err=%s",
+                self.client_id, local_oid, reason, e,
+            )
+
+    def _paper_replace_at_new_limit(
+        self, *, order: dict, broker_oid: str, contract: str, sym: str,
+        new_limit: float,
+    ) -> tuple[bool, str]:
+        """Reprice path: cancel current + place new limit. Returns (ok, outcome)."""
+        return self._paper_replace(
+            order=order, broker_oid=broker_oid, contract=contract, sym=sym,
+            new_limit=float(new_limit),
+            unsupported_log_tag="PAPER_ENTRY_REPEG",
+        )
+
+    def _paper_replace_to_market(
+        self, *, order: dict, broker_oid: str, contract: str, sym: str,
+    ) -> tuple[bool, str]:
+        """Market fallback: cancel current + place market (limit_price=None).
+        Returns (ok, outcome)."""
+        return self._paper_replace(
+            order=order, broker_oid=broker_oid, contract=contract, sym=sym,
+            new_limit=None,
+            unsupported_log_tag="PAPER_ENTRY_MARKET_FALLBACK",
+        )
+
+    def _stamp_paper_retry_meta(self, local_order_id: str, extra: dict) -> None:
+        """Merge PR #68 retry fields into orders.meta without overwriting prior keys."""
+        try:
+            from ap.db import conn as _conn
+            import json as _json
+            patch = _json.dumps({k: v for k, v in (extra or {}).items()}, default=str)
+            with _conn() as c:
+                c.execute(
+                    """
+                    UPDATE orders
+                    SET meta = COALESCE(meta, '{}'::jsonb) || %s::jsonb,
+                        updated_ts = NOW()
+                    WHERE local_order_id = %s AND client_id = %s
+                    """,
+                    (patch, local_order_id, self.client_id),
+                )
+        except Exception as e:
+            log.debug("[%s] _stamp_paper_retry_meta failed for %s: %s",
+                      self.client_id, local_order_id, e)
 
     def _try_repeg(
         self,
