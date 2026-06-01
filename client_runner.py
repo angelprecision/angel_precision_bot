@@ -1513,6 +1513,33 @@ class ClientRunner(threading.Thread):
         throttle_threshold = -abs(float(os.getenv("THROTTLE_THRESHOLD", str(equity * throttle_pct))))
         stop_threshold = -abs(float(os.getenv("STOP_THRESHOLD", str(equity * stop_pct))))
 
+        # Per-client DB override takes precedence over env vars when set.
+        # Operators set these via the admin panel or:
+        #   UPDATE clients SET throttle_threshold_usd=-1500, stop_threshold_usd=-3000
+        #   WHERE client_id='<email>';
+        _db_throttle = client_cfg.get("throttle_threshold_usd")
+        _db_stop     = client_cfg.get("stop_threshold_usd")
+        if _db_throttle is not None:
+            try:
+                throttle_threshold = float(_db_throttle)
+            except (TypeError, ValueError):
+                logger.warning("[%s] Invalid throttle_threshold_usd in DB: %r — using env", self.email, _db_throttle)
+        if _db_stop is not None:
+            try:
+                stop_threshold = float(_db_stop)
+            except (TypeError, ValueError):
+                logger.warning("[%s] Invalid stop_threshold_usd in DB: %r — using env", self.email, _db_stop)
+
+        # Startup validation — warn immediately if thresholds are misordered.
+        # The sizer's compute() will defensively swap them at runtime, but we
+        # want operators to fix the source config, not rely on the swap.
+        from ap.position_sizer import validate_sizer_thresholds
+        validate_sizer_thresholds(
+            throttle_threshold, stop_threshold,
+            client_id=self.email, symbol="(startup)",
+            log_fn=lambda msg, *a, **kw: logger.warning(msg, *a, **kw),
+        )
+
         position_sizer = APPositionSizer(
             throttle_threshold=throttle_threshold,
             stop_threshold=stop_threshold,
@@ -1982,7 +2009,11 @@ class ClientRunner(threading.Thread):
                         "daily_max_loss_pct, initial_equity, "
                         "max_capital_pct, max_sector_pct, max_ticker_pct, "
                         "max_calls, max_puts, score_floor, context_floor, "
-                        "daily_profit_target_usd, entries_enabled "
+                        "daily_profit_target_usd, entries_enabled, "
+                        # PR sizer-threshold-order: per-client override columns.
+                        # NULL means 'use env var'. Both must be negative when set;
+                        # DB constraint chk_thresholds_ordered enforces ordering.
+                        "throttle_threshold_usd, stop_threshold_usd "
                         "FROM clients WHERE client_id=%s",
                         (self.email,),
                     )
