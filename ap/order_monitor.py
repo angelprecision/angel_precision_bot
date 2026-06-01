@@ -2422,6 +2422,7 @@ class APOrderMonitor:
                 "marketable_unfilled_seen":   bool(is_marketable),
                 "old_limit_price":            current_limit,
                 "new_limit_price":            new_limit,
+                "attempted_new_limit":        new_limit,
                 "current_bid":                live_bid,
                 "current_ask":                live_ask,
                 "current_mid":                live_mid,
@@ -2430,10 +2431,16 @@ class APOrderMonitor:
             }
             # If the cancel succeeded but the replacement did NOT, surface
             # that as a top-level meta flag so the dashboard / post-mortem
-            # never assumes the order is still open.
+            # never assumes the order is still open. Acceptance criteria
+            # require the canonical outcome string + the canceled broker_order_id
+            # + the attempted_new_limit so the audit trail is unambiguous.
             if outcome.startswith("replace_failed_after_cancel") or outcome == "replace_bad_response_after_cancel":
                 _meta_patch["replace_failed_after_cancel"] = True
                 _meta_patch["final_cancel_reason"] = outcome
+                # Normalize the canonical outcome key per PR #69 acceptance.
+                # Granular subtype is preserved in final_cancel_reason above.
+                _meta_patch["last_reprice_outcome"] = "replace_failed_after_cancel"
+                _meta_patch["canceled_broker_order_id"] = broker_oid
             self._stamp_paper_retry_meta(local_id, _meta_patch)
             return
 
@@ -2477,6 +2484,7 @@ class APOrderMonitor:
                 "marketable_unfilled_seen":    bool(is_marketable),
                 "old_limit_price":             current_limit,
                 "new_limit_price":             "MARKET",
+                "attempted_market_fallback":   True,
                 "current_bid":                 live_bid,
                 "current_ask":                 live_ask,
                 "current_mid":                 live_mid,
@@ -2486,6 +2494,9 @@ class APOrderMonitor:
             if outcome.startswith("replace_failed_after_cancel") or outcome == "replace_bad_response_after_cancel":
                 _meta_patch["replace_failed_after_cancel"] = True
                 _meta_patch["final_cancel_reason"] = outcome
+                # Canonical outcome key per PR #69 acceptance.
+                _meta_patch["last_reprice_outcome"] = "replace_failed_after_cancel"
+                _meta_patch["canceled_broker_order_id"] = broker_oid
             self._stamp_paper_retry_meta(local_id, _meta_patch)
 
     # ------------------------------------------------------------------
