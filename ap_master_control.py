@@ -1549,10 +1549,19 @@ class APMasterControl:
         # approved effective_score.  Gate is a no-op when
         # QUALITY_MODE_ENABLED != true; all caps and cooldowns are enforced
         # only in quality mode.  Does NOT touch exits, broker, or pricing.
+        #
+        # quality_mode_result is the canonical output of this module.
+        # It is attached to:
+        #   - plan.metadata["quality_mode_result"]      (approved AND blocked)
+        #   - plan.metadata["score_audit"]["quality_mode_result"]  (approved)
+        # PR-73 reads these fields; it does not recompute QM outcome.
+        # If QM is disabled, build_disabled_result() provides a null-safe
+        # object so PR-73 can render gracefully before PR-72 is merged.
+        _qm_verdict = None
         try:
-            from ap_quality_mode import check as _qm_check
+            import ap_quality_mode as _qm_mod
             _snap_for_qm = self._get_snapshot(client_id, ticker=ticker, signal_id=signal_id)
-            _qm_verdict = _qm_check(
+            _qm_verdict = _qm_mod.check(
                 signal=signal,
                 client_id=client_id,
                 intel_status=intel.get("intel_status"),
@@ -1574,16 +1583,21 @@ class APMasterControl:
                     _qm_verdict.quality_mode_reason,
                     reason_code=_qm_verdict.log_code,
                 )
-                # Attach quality-mode metadata so the rejection feed and
-                # proof logger can surface reason + signal context.
+                # Attach quality_mode_result + signal context to the block
+                # plan so the rejection feed and proof logger can read it.
                 if _qm_block.plan is None:
                     from decision_packet import APTradePlan
+                    _block_meta = {
+                        **_qm_verdict.meta,
+                        "signal_id":           signal_id,
+                        "quality_mode_result": _qm_verdict.quality_mode_result,
+                    }
                     _qm_block = _qm_block._replace(
                         plan=APTradePlan(
                             symbol=ticker,
                             direction=signal.get("direction", ""),
                             contracts=0,
-                            metadata={**_qm_verdict.meta, "signal_id": signal_id},
+                            metadata=_block_meta,
                         )
                     ) if hasattr(_qm_block, "_replace") else _qm_block
                 return _qm_block
@@ -1592,6 +1606,13 @@ class APMasterControl:
         except Exception as _qm_err:
             log.error("[%s] Quality mode gate raised (fail-open): %s", ticker, _qm_err)
         # ── end PR-72 ─────────────────────────────────────────────────────
+        # Build a null-safe disabled result for the approved-plan metadata
+        # path below. Used when QM is off OR when the gate raised/skipped.
+        try:
+            import ap_quality_mode as _qm_mod_fb
+            _qm_disabled_result = _qm_mod_fb.build_disabled_result()
+        except Exception:
+            _qm_disabled_result = None
 
         intel_contracts = int(intel.get("contracts", 1) or 1)
         if bootstrap_mode:
@@ -1765,6 +1786,23 @@ class APMasterControl:
                     "snapshot_ts": snap.get("_snapshot_ts"),
                     "snapshot_age_sec": snap.get("_snapshot_age_sec"),
                     "snapshot_error": snap.get("_snapshot_error"),
+                },
+                # PR-72: Quality Mode result — the canonical audit object.
+                # Populated on every approved signal (enabled or disabled).
+                # PR-73 reads this path; it does not recompute QM outcome.
+                # score_audit.quality_mode_result mirrors this for callers
+                # that navigate via score_audit.
+                "quality_mode_result": (
+                    _qm_verdict.quality_mode_result
+                    if _qm_verdict is not None
+                    else _qm_disabled_result
+                ),
+                "score_audit": {
+                    "quality_mode_result": (
+                        _qm_verdict.quality_mode_result
+                        if _qm_verdict is not None
+                        else _qm_disabled_result
+                    ),
                 },
             },
         )
