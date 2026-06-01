@@ -3372,8 +3372,29 @@ class APExitEngine:
                     self._persist_peak_state_to_db(pos)
                 # ─────────────────────────────────────────────────────────────
 
-                if _has_live_quotes or _has_peak_to_protect:
-                    # Duplicate peak advance removed — handled above pre-gate.
+                # HOTFIX: quote gate must not block evaluate_exit() when:
+                # 1. Position has no quotes but has been open long enough to
+                #    have triggered a stop (> HARD_STOP_STALE_AGE_MINUTES mins)
+                # 2. Last known option price is non-zero (can evaluate vs entry)
+                # 3. Position is past time-stop threshold
+                # Without this, a QPM gap silently freezes ALL exit logic for
+                # the affected position — stops, force-closes, everything.
+                _has_entry_price  = (getattr(pos, "entry_price", 0) or 0) > 0
+                _age_mins         = _position_age_minutes(pos)
+                _stale_age_thresh = float(os.getenv("HARD_STOP_STALE_AGE_MINUTES", "8"))
+                _position_old_enough = _age_mins >= _stale_age_thresh
+                # Any last-known option price counts — we can evaluate against entry
+                _last_known_price = (
+                    (getattr(pos, "current_option_price", 0) or 0) > 0
+                    or (getattr(pos, "current_bid", 0) or 0) > 0
+                )
+                _should_evaluate = (
+                    _has_live_quotes
+                    or _has_peak_to_protect
+                    or (_has_entry_price and _last_known_price)
+                    or (_has_entry_price and _position_old_enough)
+                )
+                if _should_evaluate:
                     # Gate now only controls whether evaluate_exit() is called.
                     # (P0-3 force-close-all is handled by the pre-gate above
                     # so positions can close even with stale quotes.)
