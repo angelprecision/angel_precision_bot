@@ -2400,11 +2400,10 @@ class APOrderMonitor:
                 )
                 return
             new_limit = round(live_ask + ENTRY_PAPER_ASK_CROSS_CENTS, 2)
-            ok = self._paper_replace_at_new_limit(
+            ok, outcome = self._paper_replace_at_new_limit(
                 order=order, broker_oid=broker_oid, contract=contract,
                 sym=sym, new_limit=new_limit,
             )
-            outcome = "ok" if ok else "failed"
             if ok:
                 log.info(
                     "[%s] PAPER_ENTRY_REPEG_OK | %s contract=%s new_limit=%.2f",
@@ -2412,26 +2411,30 @@ class APOrderMonitor:
                 )
             else:
                 log.warning(
-                    "[%s] PAPER_ENTRY_REPEG_FAILED | %s contract=%s new_limit=%.2f",
-                    self.client_id, sym, contract, new_limit,
+                    "[%s] PAPER_ENTRY_REPEG_FAILED | %s contract=%s new_limit=%.2f outcome=%s",
+                    self.client_id, sym, contract, new_limit, outcome,
                 )
-            self._stamp_paper_retry_meta(
-                local_id,
-                {
-                    "paper_entry_retry_enabled":  True,
-                    "reprice_attempt_count":      attempts_done + 1,
-                    "last_reprice_age_seconds":   float(age_secs),
-                    "last_reprice_outcome":       outcome,
-                    "marketable_unfilled_seen":   bool(is_marketable),
-                    "old_limit_price":            current_limit,
-                    "new_limit_price":            new_limit,
-                    "current_bid":                live_bid,
-                    "current_ask":                live_ask,
-                    "current_mid":                live_mid,
-                    "current_last":               live_last,
-                    "spread_pct":                 spread_pct,
-                },
-            )
+            _meta_patch = {
+                "paper_entry_retry_enabled":  True,
+                "reprice_attempt_count":      attempts_done + 1,
+                "last_reprice_age_seconds":   float(age_secs),
+                "last_reprice_outcome":       outcome,
+                "marketable_unfilled_seen":   bool(is_marketable),
+                "old_limit_price":            current_limit,
+                "new_limit_price":            new_limit,
+                "current_bid":                live_bid,
+                "current_ask":                live_ask,
+                "current_mid":                live_mid,
+                "current_last":               live_last,
+                "spread_pct":                 spread_pct,
+            }
+            # If the cancel succeeded but the replacement did NOT, surface
+            # that as a top-level meta flag so the dashboard / post-mortem
+            # never assumes the order is still open.
+            if outcome.startswith("replace_failed_after_cancel") or outcome == "replace_bad_response_after_cancel":
+                _meta_patch["replace_failed_after_cancel"] = True
+                _meta_patch["final_cancel_reason"] = outcome
+            self._stamp_paper_retry_meta(local_id, _meta_patch)
             return
 
         # ----- Market fallback at 45s -----
@@ -2463,119 +2466,253 @@ class APOrderMonitor:
                 self.client_id, sym, contract, age_secs,
                 live_bid, live_ask, spread_pct or 0.0,
             )
-            ok = self._paper_replace_to_market(
+            ok, outcome = self._paper_replace_to_market(
                 order=order, broker_oid=broker_oid, contract=contract, sym=sym,
             )
-            self._stamp_paper_retry_meta(
-                local_id,
-                {
-                    "paper_entry_retry_enabled":  True,
-                    "market_fallback_used":       True,
-                    "market_fallback_outcome":    "ok" if ok else "failed",
-                    "market_fallback_age_seconds": float(age_secs),
-                    "marketable_unfilled_seen":   bool(is_marketable),
-                    "old_limit_price":            current_limit,
-                    "new_limit_price":            "MARKET",
-                    "current_bid":                live_bid,
-                    "current_ask":                live_ask,
-                    "current_mid":                live_mid,
-                    "current_last":               live_last,
-                    "spread_pct":                 spread_pct,
-                },
-            )
+            _meta_patch = {
+                "paper_entry_retry_enabled":   True,
+                "market_fallback_used":        True,
+                "market_fallback_outcome":     outcome,
+                "market_fallback_age_seconds": float(age_secs),
+                "marketable_unfilled_seen":    bool(is_marketable),
+                "old_limit_price":             current_limit,
+                "new_limit_price":             "MARKET",
+                "current_bid":                 live_bid,
+                "current_ask":                 live_ask,
+                "current_mid":                 live_mid,
+                "current_last":                live_last,
+                "spread_pct":                  spread_pct,
+            }
+            if outcome.startswith("replace_failed_after_cancel") or outcome == "replace_bad_response_after_cancel":
+                _meta_patch["replace_failed_after_cancel"] = True
+                _meta_patch["final_cancel_reason"] = outcome
+            self._stamp_paper_retry_meta(local_id, _meta_patch)
 
     # ------------------------------------------------------------------
+    # PR #68 + Codex P1 patch (2026-06-01):
+    # The canonical broker submit method across this codebase is
+    # broker.place_order(...) — NOT submit_option. Used by
+    # ap/execution.py:749, ap/exit_manager.py:205, ap/retry_engine.py:360,
+    # and the Tradier adapter at ap/brokers/tradier.py:179. The previous
+    # PR-69 draft called a non-existent submit_option, which would have
+    # cancelled the open broker order and then raised AttributeError on
+    # the replacement, leaving the local row pointing at a cancelled
+    # broker_order_id with no live replacement.
+    #
+    # Both _paper_replace_* helpers below now:
+    #   1. Verify hasattr(self.broker, 'place_order') BEFORE any cancel.
+    #      If absent, log PAPER_ENTRY_*_UNSUPPORTED and return False with
+    #      no destructive action.
+    #   2. Cancel the existing broker order.
+    #   3. Call broker.place_order(symbol, contract, qty, limit_price,
+    #      side='buy_to_open', tag=local_oid).
+    #   4. Parse the dict-or-object response the same way
+    #      retry_engine.apply_repeg does (broker_order_id / order_id / id;
+    #      status in ACK/ACKED/FILLED/SUBMITTED/OK/ACCEPTED/PENDING/OPEN).
+    #   5. On success: write update_order with the new broker_order_id
+    #      and limit_price (or keep limit_price for the market path).
+    #   6. On post-cancel submit failure: write update_order with
+    #      status=CANCELED + last_error="replace_failed_after_cancel:<...>"
+    #      AND have the caller stamp meta.replace_failed_after_cancel=True
+    #      so it never lies that the order is still open.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _parse_broker_place_response(resp) -> tuple[Optional[str], str, Optional[str]]:
+        """Extract (broker_order_id, status_upper, error) from a place_order
+        response. Mirrors retry_engine.apply_repeg parsing exactly."""
+        if isinstance(resp, dict):
+            oid    = resp.get("broker_order_id") or resp.get("order_id") or resp.get("id")
+            status = str(resp.get("status") or "").upper()
+            error  = resp.get("error")
+        else:
+            oid    = getattr(resp, "broker_order_id", None) or getattr(resp, "order_id", None)
+            status = str(getattr(resp, "status", "") or "").upper()
+            error  = getattr(resp, "error", None)
+        return (str(oid) if oid else None), status, (str(error) if error else None)
+
+    @staticmethod
+    def _broker_place_ok(status: str) -> bool:
+        return status in ("ACK", "ACKED", "FILLED", "SUBMITTED", "OK",
+                          "ACCEPTED", "PENDING", "OPEN")
+
+    def _paper_replace(
+        self,
+        *,
+        order: dict,
+        broker_oid: str,
+        contract: str,
+        sym: str,
+        new_limit: Optional[float],   # None => market
+        unsupported_log_tag: str,     # e.g. 'PAPER_ENTRY_REPEG' / 'PAPER_ENTRY_MARKET_FALLBACK'
+    ) -> tuple[bool, str]:
+        """Cancel + replace a broker order. Returns (ok, outcome_str).
+
+        outcome_str values (for meta stamping by caller):
+          'replaced_ok'
+          'broker_missing_place_order'        — NO cancel performed
+          'invalid_qty'                       — NO cancel performed
+          'cancel_failed'                     — NO replacement submitted
+          'replace_failed_after_cancel'       — cancel succeeded, replace did NOT
+          'replace_failed_after_cancel_exception'
+          'replace_bad_response_after_cancel'
+        """
+        local_oid = order.get("local_order_id") or order.get("id")
+
+        # 1) Pre-flight: never cancel if we can't replace.
+        if not hasattr(self.broker, "place_order"):
+            log.error(
+                "[%s] %s_UNSUPPORTED | broker %s has no place_order — "
+                "skipping replace; original order remains.",
+                self.client_id, unsupported_log_tag,
+                type(self.broker).__name__,
+            )
+            return False, "broker_missing_place_order"
+
+        # 2) Pre-flight: build the replacement request.
+        qty = order.get("qty") or order.get("quantity") or 0
+        try:
+            qty = int(qty)
+        except (TypeError, ValueError):
+            qty = 0
+        if qty <= 0:
+            log.warning("[%s] %s_UNSUPPORTED | invalid qty=%r local=%s",
+                        self.client_id, unsupported_log_tag, qty, local_oid)
+            return False, "invalid_qty"
+
+        # 3) Cancel the existing broker order.
+        try:
+            cancel_resp = self.broker.cancel_order(broker_oid)
+        except Exception as e:
+            log.warning(
+                "[%s] %s | cancel raised broker=%s err=%s — replacement aborted, "
+                "original order unchanged.",
+                self.client_id, unsupported_log_tag, broker_oid, e,
+            )
+            return False, "cancel_failed"
+        _cancel_err = None
+        if isinstance(cancel_resp, dict):
+            _cancel_err = cancel_resp.get("error")
+        elif cancel_resp is None:
+            _cancel_err = "no_response"
+        if _cancel_err:
+            log.warning(
+                "[%s] %s | cancel failed broker=%s err=%s — replacement aborted, "
+                "original order may still be live.",
+                self.client_id, unsupported_log_tag, broker_oid, _cancel_err,
+            )
+            return False, "cancel_failed"
+
+        # 4) Cancel succeeded — from here we MUST either land a replacement
+        #    or transition the local row to CANCELED with a clear reason.
+        try:
+            resp = self.broker.place_order(
+                symbol=sym,
+                contract=contract,
+                qty=qty,
+                limit_price=(float(new_limit) if new_limit is not None else None),
+                side="buy_to_open",
+                tag=str(local_oid) if local_oid else None,
+            )
+        except Exception as e:
+            log.error(
+                "[%s] %s | place_order raised after cancel local=%s err=%s",
+                self.client_id, unsupported_log_tag, local_oid, e,
+            )
+            self._mark_local_cancelled_after_failed_replace(
+                local_oid, reason=f"replace_failed_after_cancel_exception:{e}",
+            )
+            return False, "replace_failed_after_cancel_exception"
+
+        new_oid, status, err = self._parse_broker_place_response(resp)
+        if err or not new_oid or not self._broker_place_ok(status):
+            log.error(
+                "[%s] %s | replace bad response after cancel local=%s "
+                "new_oid=%s status=%s err=%s",
+                self.client_id, unsupported_log_tag, local_oid,
+                new_oid, status, err,
+            )
+            self._mark_local_cancelled_after_failed_replace(
+                local_oid,
+                reason=f"replace_bad_response_after_cancel:{err or status or 'no_oid'}",
+            )
+            return False, "replace_bad_response_after_cancel"
+
+        # 5) Success — write back the new broker id + (new limit if any).
+        try:
+            from ap.db import update_order
+            if new_limit is not None:
+                update_order(
+                    local_order_id=local_oid,
+                    broker_order_id=new_oid,
+                    limit_price=float(new_limit),
+                    status="SUBMITTED",
+                )
+            else:
+                # Market path: keep limit_price column unchanged — we don't
+                # have a real limit anymore. update_order(limit_price=None)
+                # would null the column on some implementations; safer to
+                # omit the kwarg entirely.
+                update_order(
+                    local_order_id=local_oid,
+                    broker_order_id=new_oid,
+                    status="SUBMITTED",
+                )
+        except Exception as e:
+            log.error(
+                "[%s] %s | replace succeeded at broker but local update_order "
+                "raised — broker now has %s but local still references %s. "
+                "err=%s",
+                self.client_id, unsupported_log_tag, new_oid, broker_oid, e,
+            )
+            # Replacement is live at broker. Don't mark local cancelled — the
+            # reconciler will resolve on its next pass.
+            return True, "replaced_ok_but_local_write_failed"
+
+        return True, "replaced_ok"
+
+    def _mark_local_cancelled_after_failed_replace(self, local_oid, reason: str) -> None:
+        """After a successful broker cancel + failed replace, transition the
+        local row to CANCELED so nothing in the system keeps treating the
+        order as open. Best-effort — a failure here is logged but doesn't
+        re-raise."""
+        if not local_oid:
+            return
+        try:
+            from ap.db import update_order
+            update_order(
+                local_order_id=local_oid,
+                status="CANCELED",
+                last_error=reason[:240],
+            )
+        except Exception as e:
+            log.error(
+                "[%s] failed to mark local CANCELED after failed replace "
+                "local=%s reason=%s err=%s",
+                self.client_id, local_oid, reason, e,
+            )
+
     def _paper_replace_at_new_limit(
         self, *, order: dict, broker_oid: str, contract: str, sym: str,
         new_limit: float,
-    ) -> bool:
-        """Cancel current broker order and submit a fresh limit at new_limit.
-        Returns True iff a new broker order is live."""
-        try:
-            cancel_resp = self.broker.cancel_order(broker_oid)
-            if not cancel_resp or (isinstance(cancel_resp, dict) and cancel_resp.get("error")):
-                log.warning("[%s] paper_replace cancel failed broker=%s err=%s",
-                            self.client_id, broker_oid, cancel_resp)
-                return False
-        except Exception as e:
-            log.warning("[%s] paper_replace cancel raised: %s", self.client_id, e)
-            return False
-        qty = order.get("qty") or order.get("quantity") or 0
-        try:
-            qty = int(qty)
-        except (TypeError, ValueError):
-            return False
-        if qty <= 0:
-            return False
-        try:
-            resp = self.broker.submit_option(
-                symbol=sym,
-                contract=contract,
-                qty=qty,
-                limit_price=float(new_limit),
-                side="buy_to_open",
-            )
-            new_oid = getattr(resp, "broker_order_id", None) or (
-                resp.get("broker_order_id") if isinstance(resp, dict) else None
-            )
-            if not new_oid:
-                return False
-            from ap.db import update_order
-            update_order(
-                local_order_id=order.get("local_order_id") or order.get("id"),
-                broker_order_id=str(new_oid),
-                limit_price=float(new_limit),
-                status="SUBMITTED",
-            )
-            return True
-        except Exception as e:
-            log.warning("[%s] paper_replace resubmit raised: %s", self.client_id, e)
-            return False
+    ) -> tuple[bool, str]:
+        """Reprice path: cancel current + place new limit. Returns (ok, outcome)."""
+        return self._paper_replace(
+            order=order, broker_oid=broker_oid, contract=contract, sym=sym,
+            new_limit=float(new_limit),
+            unsupported_log_tag="PAPER_ENTRY_REPEG",
+        )
 
     def _paper_replace_to_market(
         self, *, order: dict, broker_oid: str, contract: str, sym: str,
-    ) -> bool:
-        """Cancel current limit and resubmit at MARKET (PAPER mode only)."""
-        try:
-            cancel_resp = self.broker.cancel_order(broker_oid)
-            if not cancel_resp or (isinstance(cancel_resp, dict) and cancel_resp.get("error")):
-                log.warning("[%s] paper_market_fallback cancel failed broker=%s err=%s",
-                            self.client_id, broker_oid, cancel_resp)
-                return False
-        except Exception as e:
-            log.warning("[%s] paper_market_fallback cancel raised: %s", self.client_id, e)
-            return False
-        qty = order.get("qty") or order.get("quantity") or 0
-        try:
-            qty = int(qty)
-        except (TypeError, ValueError):
-            return False
-        if qty <= 0:
-            return False
-        try:
-            resp = self.broker.submit_option(
-                symbol=sym,
-                contract=contract,
-                qty=qty,
-                limit_price=None,        # None -> market in broker submit
-                side="buy_to_open",
-            )
-            new_oid = getattr(resp, "broker_order_id", None) or (
-                resp.get("broker_order_id") if isinstance(resp, dict) else None
-            )
-            if not new_oid:
-                return False
-            from ap.db import update_order
-            update_order(
-                local_order_id=order.get("local_order_id") or order.get("id"),
-                broker_order_id=str(new_oid),
-                # limit_price=None signals market; keep DB column unchanged.
-                status="SUBMITTED",
-            )
-            return True
-        except Exception as e:
-            log.warning("[%s] paper_market_fallback submit raised: %s", self.client_id, e)
-            return False
+    ) -> tuple[bool, str]:
+        """Market fallback: cancel current + place market (limit_price=None).
+        Returns (ok, outcome)."""
+        return self._paper_replace(
+            order=order, broker_oid=broker_oid, contract=contract, sym=sym,
+            new_limit=None,
+            unsupported_log_tag="PAPER_ENTRY_MARKET_FALLBACK",
+        )
 
     def _stamp_paper_retry_meta(self, local_order_id: str, extra: dict) -> None:
         """Merge PR #68 retry fields into orders.meta without overwriting prior keys."""
