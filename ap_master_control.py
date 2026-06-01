@@ -1544,6 +1544,55 @@ class APMasterControl:
             self._store_update(signal_id, "rejected", f"intel_blocked: {intel_reason[:100]}")
             return self._block(signal_id, ticker, client_id, "blocked_intel", f"intel_rejected: {intel_reason[:80]}")
 
+        # ── PR-72: Quality Mode gate ──────────────────────────────────────
+        # Runs AFTER score-floor and intel gate so we operate on the final
+        # approved effective_score.  Gate is a no-op when
+        # QUALITY_MODE_ENABLED != true; all caps and cooldowns are enforced
+        # only in quality mode.  Does NOT touch exits, broker, or pricing.
+        try:
+            from ap_quality_mode import check as _qm_check
+            _snap_for_qm = self._get_snapshot(client_id, ticker=ticker, signal_id=signal_id)
+            _qm_verdict = _qm_check(
+                signal=signal,
+                client_id=client_id,
+                intel_status=intel.get("intel_status"),
+                daily_trades_today=int(_snap_for_qm.get("trades_today", 0) or 0),
+                open_positions=int(
+                    (_snap_for_qm.get("open_count") or 0)
+                    + (_snap_for_qm.get("pending_entries") or 0)
+                ),
+                approved_score=effective_score,
+            )
+            if not _qm_verdict.allowed:
+                self._store_update(
+                    signal_id, "rejected",
+                    f"quality_mode_blocked: {_qm_verdict.quality_mode_reason}",
+                )
+                _qm_block = self._block(
+                    signal_id, ticker, client_id,
+                    "blocked_quality_mode",
+                    _qm_verdict.quality_mode_reason,
+                    reason_code=_qm_verdict.log_code,
+                )
+                # Attach quality-mode metadata so the rejection feed and
+                # proof logger can surface reason + signal context.
+                if _qm_block.plan is None:
+                    from decision_packet import APTradePlan
+                    _qm_block = _qm_block._replace(
+                        plan=APTradePlan(
+                            symbol=ticker,
+                            direction=signal.get("direction", ""),
+                            contracts=0,
+                            metadata={**_qm_verdict.meta, "signal_id": signal_id},
+                        )
+                    ) if hasattr(_qm_block, "_replace") else _qm_block
+                return _qm_block
+        except ImportError:
+            log.warning("[%s] ap_quality_mode not found — quality gate skipped", ticker)
+        except Exception as _qm_err:
+            log.error("[%s] Quality mode gate raised (fail-open): %s", ticker, _qm_err)
+        # ── end PR-72 ─────────────────────────────────────────────────────
+
         intel_contracts = int(intel.get("contracts", 1) or 1)
         if bootstrap_mode:
             intel_contracts = 1
