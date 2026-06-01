@@ -247,10 +247,16 @@ class TestStartupValidationWired:
         assert callable(validate_sizer_thresholds)
 
     def test_migration_sql_exists(self):
-        """Migration SQL file must exist with correct column definitions."""
+        """Migration SQL file must exist with correct column definitions and all three clients."""
         sql_path = REPO_ROOT / "sql" / "2026_05_31_sizer_threshold_columns.sql"
         assert sql_path.exists(), f"Migration SQL missing: {sql_path}"
         content = sql_path.read_text()
         assert "throttle_threshold_usd" in content
         assert "stop_threshold_usd" in content
         assert "chk_thresholds_ordered" in content
+        # All three active paper clients must be addressed
+        assert "jasoncosby1@gmail.com" in content
+        assert "jose.vasquez4011@gmail.com" in content
+        assert "tradefluencehq@gmail.com" in content
+        # tradefluencehq gets account-appropriate smaller values
+        assert "-350" in content or "-500" in content

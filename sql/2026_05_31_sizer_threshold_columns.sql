@@ -46,10 +46,26 @@ ALTER TABLE clients
 -- tradefluencehq: set to similar conservative defaults.
 -- Adjust these to match the actual equity of each client.
 
+-- Per-client correct values based on startup manifest equity:
+--
+--   jasoncosby1@gmail.com   equity ~$100K  throttle=-1500 (~1.5%)  stop=-3000 (~3.0%)
+--   jose.vasquez4011@gmail.com equity ~$100K throttle=-1500 (~1.5%) stop=-3000 (~3.0%)
+--   tradefluencehq@gmail.com  equity ~$17.5K throttle=-350  (~2.0%)  stop=-875  (~5.0%)
+--
+-- Logs showed all three had throttle=-1994.26 stop=-1500.00 (reversed).
+-- The -1994.26 figure was equity*2% falling through env-var default;
+-- STOP_THRESHOLD=-1500 was hardcoded in Render, producing the misordering.
+
 UPDATE clients SET
   throttle_threshold_usd = -1500.00,
   stop_threshold_usd     = -3000.00
-WHERE client_id IN ('jasoncosby1@gmail.com', 'tradefluencehq@gmail.com')
+WHERE client_id IN ('jasoncosby1@gmail.com', 'jose.vasquez4011@gmail.com')
+  AND throttle_threshold_usd IS NULL;
+
+UPDATE clients SET
+  throttle_threshold_usd = -350.00,
+  stop_threshold_usd     = -875.00
+WHERE client_id = 'tradefluencehq@gmail.com'
   AND throttle_threshold_usd IS NULL;
 
 COMMENT ON COLUMN clients.throttle_threshold_usd IS
