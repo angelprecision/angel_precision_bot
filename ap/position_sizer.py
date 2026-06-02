@@ -31,6 +31,61 @@ import ap.db as db
 
 log = logging.getLogger("ap.position_sizer")
 
+
+# ---------------------------------------------------------------------------
+# Threshold ordering validator (req 6)
+# ---------------------------------------------------------------------------
+
+def validate_sizer_thresholds(
+    throttle: float,
+    stop: float,
+    client_id: str = "",
+    symbol: str = "",
+    *,
+    log_fn=None,
+) -> bool:
+    """Warn at startup (or any call time) if sizer thresholds are misordered.
+
+    Returns True when thresholds are correctly ordered (no swap needed).
+    Returns False and emits a WARNING when throttle is more negative than stop.
+
+    Correct:   throttle=-1500  stop=-2000   (throttle > stop, both negative)
+    Incorrect: throttle=-2000  stop=-1500   (throttle < stop, will be swapped)
+
+    Parameters
+    ----------
+    throttle  : throttle_threshold value (must be negative, less negative than stop)
+    stop      : stop_threshold value (must be negative, more negative than throttle)
+    client_id : for log context
+    symbol    : for log context (optional)
+    log_fn    : callable(message) — defaults to log.warning
+    """
+    if log_fn is None:
+        log_fn = log.warning
+
+    if throttle >= 0 or stop >= 0:
+        log_fn(
+            "[SIZER_THRESHOLD_INVALID] client=%s symbol=%s "
+            "Both thresholds must be negative. Got throttle=%.2f stop=%.2f. "
+            "Check THROTTLE_THRESHOLD / STOP_THRESHOLD env vars or clients DB columns.",
+            client_id, symbol, throttle, stop,
+        )
+        return False
+
+    if stop > throttle:
+        log_fn(
+            "[SIZER_THRESHOLD_MISORDERED] client=%s symbol=%s "
+            "throttle=%.2f is more negative than stop=%.2f — these are swapped. "
+            "Correct: throttle=-1500 stop=-2000 (throttle less negative than stop). "
+            "Fix: set THROTTLE_THRESHOLD to a smaller-magnitude loss trigger and "
+            "STOP_THRESHOLD to the larger-magnitude hard stop, "
+            "or update throttle_threshold_usd / stop_threshold_usd in the clients table.",
+            client_id, symbol, throttle, stop,
+        )
+        return False
+
+    return True
+
 _TIER_MAX: dict[str, int] = {
     "A+": 20,
     "A": 10,
@@ -105,6 +160,8 @@ class APPositionSizer:
         self.throttle_pct = abs(float(throttle_pct or 0.02))
         self.stop_pct = abs(float(stop_pct or 0.05))
         self.throttle_factor = max(0.0, min(float(throttle_factor), 1.0))
+        # Populated by compute() when thresholds are auto-corrected at runtime.
+        self._last_threshold_correction: dict | None = None
         self.min_history = max(1, int(min_history))
         self.kelly_fraction = max(0.0, min(float(kelly_fraction), 1.0))
 
@@ -160,13 +217,31 @@ class APPositionSizer:
         )
 
         if stop_threshold > throttle_threshold:
-            log.warning(
-                "Sizer thresholds misordered (stop less negative than throttle); "
-                "swapping to preserve user intent | throttle=%.2f stop=%.2f",
-                throttle_threshold,
-                stop_threshold,
-            )
+            _orig_throttle = throttle_threshold
+            _orig_stop     = stop_threshold
             stop_threshold, throttle_threshold = throttle_threshold, stop_threshold
+            log.warning(
+                "[SIZER_THRESHOLD_CORRECTED] client=%s "
+                "Stop less negative than throttle — values were swapped. "
+                "sizer_thresholds_corrected=true "
+                "original_throttle=%.2f original_stop=%.2f "
+                "corrected_throttle=%.2f corrected_stop=%.2f. "
+                "Fix source: set THROTTLE_THRESHOLD (smaller loss) < STOP_THRESHOLD (larger loss) "
+                "or update throttle_threshold_usd/stop_threshold_usd in the clients table.",
+                client_id,
+                _orig_throttle, _orig_stop,
+                throttle_threshold, stop_threshold,
+            )
+            # Structured dict for downstream audit / alerting.
+            self._last_threshold_correction = {
+                "sizer_thresholds_corrected": True,
+                "client_id":          client_id,
+                "symbol":             "",   # compute() has no symbol param; populated by caller if needed
+                "original_throttle":  _orig_throttle,
+                "original_stop":      _orig_stop,
+                "corrected_throttle": throttle_threshold,
+                "corrected_stop":     stop_threshold,
+            }
 
         if drawdown <= stop_threshold:
             log.warning(
