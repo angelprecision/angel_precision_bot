@@ -1797,12 +1797,37 @@ class APMasterControl:
                     if _qm_verdict is not None
                     else _qm_disabled_result
                 ),
+                # PR73: score_audit — complete scoring visibility.
+                # Extends the skeleton written by PR-72 with all gate fields.
+                # Read-only — zero changes to scoring logic, tiers, or floors.
                 "score_audit": {
-                    "quality_mode_result": (
+                    "final_score":          effective_score,
+                    "raw_score":            score,
+                    "ev_score":             float(signal.get("ev_score") or 0),
+                    "score_floor":          float(_eff_score_floor),
+                    "post_target_bump":     float(_post_target_score_bump),
+                    "tier":                 str(tier),
+                    "gate_status":          "APPROVED",
+                    "approved":             True,
+                    "reject_reasons":       [],
+                    "score_reason":         _score_reason or "",
+                    "score_components":     signal.get("score_breakdown") or {},
+                    "setup_status":         setup_status,
+                    # quality_mode_result: canonical output from PR-72.
+                    # PR-73 reads this; it does not recompute QM outcome.
+                    "quality_mode_result":  (
                         _qm_verdict.quality_mode_result
                         if _qm_verdict is not None
                         else _qm_disabled_result
                     ),
+                    "intel_result": {
+                        "approved":  intel_approve,
+                        "score":     intel_score,
+                        "reason":    intel_reason[:200] if intel_reason else "",
+                        "available": intel_avail,
+                    } if intel_avail else None,
+                    "mode":                 "LIVE" if not self.paper else "PAPER",
+                    "effective_mode":       current_mode,
                 },
             },
         )
