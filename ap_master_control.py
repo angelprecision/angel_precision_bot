@@ -1911,6 +1911,72 @@ class APMasterControl:
                 details={"error": str(e)},
             )
 
+        # ── P0: Hybrid Client Quality Gate ─────────────────────────────────
+        # Terminal gate: if blocked here, signal_id cannot be re-approved.
+        # Inserted after QM verdict, after plan is built, before final approve.
+        try:
+            from ap_hybrid_client_quality_gate import evaluate_client_quality_gate
+            import os as _os
+            if _os.getenv("HYBRID_CLIENT_QUALITY_MODE", "false").strip().lower() in ("true", "1"):
+                _hcqg_snap = {
+                    "trades_today":    int(snap.get("total_trades", 0) or 0),
+                    "daily_trades":    int(snap.get("daily_trades", 0)
+                                          or snap.get("total_trades", 0) or 0),
+                    "intraday_trades": int(snap.get("intraday_trades", 0) or 0),
+                    "symbol_trades":   snap.get("symbol_trades") or {},
+                }
+                _hcqg = evaluate_client_quality_gate(
+                    signal=signal,
+                    client_id=client_id,
+                    snapshot=_hcqg_snap,
+                    live_quote=None,       # watcher-time quote check is live
+                    underlying_price=None, # ditto — pre-submit check uses watcher
+                )
+                # Persist gate metadata into plan regardless of outcome
+                if plan.metadata is None:
+                    plan.metadata = {}
+                plan.metadata["hybrid_client_quality_gate"] = _hcqg.to_meta()
+                # Hard termination — no re-approval
+                if not _hcqg.allowed:
+                    self._store_update(
+                        signal_id, "rejected",
+                        f"hybrid_client_gate: {_hcqg.block_reason}",
+                    )
+                    log.info(
+                        "[%s] HYBRID_GATE BLOCK | client=%s lane=%s reason=%s",
+                        ticker, client_id, _hcqg.quality_lane, _hcqg.block_reason,
+                    )
+                    _gate_block = self._block(
+                        signal_id, ticker, client_id,
+                        "blocked_hybrid_client_gate",
+                        _hcqg.block_reason or "hybrid_client_quality_gate",
+                        reason_code=_hcqg.block_reason,
+                    )
+                    if _gate_block.plan is None:
+                        from decision_packet import APTradePlan
+                        _gate_block = type(_gate_block)(
+                            ok=False, stage="blocked_hybrid_client_gate",
+                            reason=_hcqg.block_reason or "",
+                            plan=plan, signal_id=signal_id,
+                            ticker=ticker, client_id=client_id,
+                        )
+                    elif _gate_block.plan is not None:
+                        if _gate_block.plan.metadata is None:
+                            _gate_block.plan.metadata = {}
+                        _gate_block.plan.metadata["hybrid_client_quality_gate"] = _hcqg.to_meta()
+                    return _gate_block
+        except ImportError:
+            log.debug("ap_hybrid_client_quality_gate not found — gate skipped (install module)")
+        except Exception as _hcqg_err:
+            # Gate errors must FAIL CLOSED — block the signal
+            log.error("[%s] HYBRID_GATE ERROR — blocking as safety: %s", ticker, _hcqg_err)
+            return self._block(
+                signal_id, ticker, client_id,
+                "blocked_hybrid_client_gate",
+                f"hybrid_gate_error: {_hcqg_err}",
+                reason_code="HYBRID_GATE_ERROR",
+            )
+
         return ControlDecision(ok=True, stage="approved", reason="", plan=plan, signal_id=signal_id, ticker=ticker, client_id=client_id)
 
     def _compute_bootstrap_mode(self, *, total_trades: int) -> bool:
