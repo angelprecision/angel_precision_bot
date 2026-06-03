@@ -1942,10 +1942,26 @@ class APMasterControl:
                 plan.metadata["scanner_intake_status"]     = _hcqg_meta.get("scanner_intake_status", "EVALUATED")
                 # Hard termination — no re-approval
                 if not _hcqg.allowed:
-                    self._store_update(
-                        signal_id, "rejected",
-                        f"hybrid_client_gate: {_hcqg.block_reason}",
+                    # PR86: persist eligibility classification to ap_signals.
+                    # Use existing decision_status + context_notes columns — no schema change.
+                    # OBSERVE_NOT_CLIENT → status "observed_not_client" so reports can query:
+                    #   WHERE decision_status = 'observed_not_client'
+                    # Structured context_notes prefix makes observe_reason machine-readable.
+                    _pr86_status = (
+                        "observed_not_client"
+                        if _hcqg.client_eligibility_status == "OBSERVE_NOT_CLIENT"
+                        else "rejected"
                     )
+                    _pr86_notes = (
+                        f"[{_hcqg.client_eligibility_status}"
+                        + (f":{_hcqg.observe_reason}" if _hcqg.observe_reason else "")
+                        + f"] {_hcqg.block_reason}"
+                        + f" | lane={_hcqg.quality_lane}"
+                        + f" | score={_hcqg.metadata.get('score', '?')}"
+                        + f" | tf={_hcqg.metadata.get('timeframe', '?')}"
+                        + f" | pattern={_hcqg.metadata.get('pattern', '?')}"
+                    )
+                    self._store_update(signal_id, _pr86_status, _pr86_notes)
                     log.info(
                         "[%s] HYBRID_GATE %s | client=%s lane=%s reason=%s observe=%s",
                         ticker,
