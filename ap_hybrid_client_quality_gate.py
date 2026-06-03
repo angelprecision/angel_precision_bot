@@ -145,11 +145,77 @@ def _resolve_tier(signal: dict) -> tuple[str, str, bool]:
 
 # ── Gate decision ─────────────────────────────────────────────────────────────
 
+# ── Eligibility classification ───────────────────────────────────────────────
+
+# Every signal gets one of three statuses:
+#   CLIENT_ELIGIBLE      — passes gate; may fan out to client accounts
+#   OBSERVE_NOT_CLIENT   — valid/interesting but not client-safe; keep for research
+#   BLOCKED              — hard invalid (bad geometry, missing fields, cap overflow,
+#                          stale quote); not routable and not useful for live research
+
+# OBSERVE reason codes (PR86)
+_OBSERVE_REASONS = {
+    "client_intraday_failed_dir_quarantine": "observe_failed_dir_quarantine",
+    "client_intraday_no_whitelist":          "observe_intraday_not_whitelisted",
+    "client_intraday_pattern_not_whitelisted":"observe_intraday_not_whitelisted",
+    "client_daily_pattern_not_whitelisted":  "observe_pattern_unproven",
+    "client_tier_block":                     "observe_pattern_unproven",
+    "client_timeframe_not_in_lane":          "observe_intraday_not_whitelisted",
+}
+# score_below_70 is OBSERVE when score is 65-69, BLOCKED below 65
+_OBSERVE_SCORE_FLOOR = 65.0
+
+# BLOCKED reason codes — hard invalid, no research value
+_HARD_BLOCKED_REASONS = {
+    "invalid_trigger_stop_geometry",
+    "client_timeframe_missing",
+    "entry_confirm_failed_option_fade",
+    "entry_confirm_failed_underlying_reversal",
+    "entry_confirm_failed_stale_quote",
+    "entry_confirm_failed_spread",
+    "client_total_daily_cap_reached",
+    "client_daily_lane_cap_reached",
+    "client_intraday_cap_reached",
+    "client_symbol_duplicate_block",
+    "HYBRID_GATE_ERROR",
+}
+
+
+def _classify_eligibility(block_reason: Optional[str],
+                           score: float) -> tuple[str, Optional[str]]:
+    """
+    Return (client_eligibility_status, observe_reason).
+    Called for every gate outcome (allowed AND blocked).
+    """
+    if block_reason is None:
+        return "CLIENT_ELIGIBLE", None
+
+    # Score 65-69: observable, not client-safe
+    if block_reason == "client_score_below_70":
+        if score >= _OBSERVE_SCORE_FLOOR:
+            return "OBSERVE_NOT_CLIENT", "observe_score_65_69"
+        return "BLOCKED", None
+
+    # Known observe reasons
+    if block_reason in _OBSERVE_REASONS:
+        return "OBSERVE_NOT_CLIENT", _OBSERVE_REASONS[block_reason]
+
+    # Hard blocks
+    if block_reason in _HARD_BLOCKED_REASONS:
+        return "BLOCKED", None
+
+    # Default: treat unknown block reasons as OBSERVE for safety
+    return "OBSERVE_NOT_CLIENT", "observe_manual_research_only"
+
+
 @dataclass
 class HybridGateDecision:
     allowed: bool
-    quality_lane: str           # DAILY_CLIENT / INTRADAY_CLIENT / BLOCKED
-    block_reason: Optional[str] # None if allowed
+    quality_lane: str                    # DAILY_CLIENT / INTRADAY_CLIENT / BLOCKED
+    block_reason: Optional[str]          # None if allowed
+    client_eligibility_status: str = "CLIENT_ELIGIBLE"  # CLIENT_ELIGIBLE / OBSERVE_NOT_CLIENT / BLOCKED
+    observe_reason: Optional[str]  = None               # only for OBSERVE_NOT_CLIENT
+    scanner_intake_status: str     = "EVALUATED"        # RECEIVED / EVALUATED / INVALID_INPUT
     metadata: dict = field(default_factory=dict)
 
     @property
@@ -157,24 +223,58 @@ class HybridGateDecision:
         return self.block_reason
 
     def to_meta(self) -> dict:
-        return {
-            "hybrid_client_quality_mode": True,
-            "quality_lane":               self.quality_lane,
-            "client_eligible":            self.allowed,
-            "block_reason":               self.block_reason,
-            **self.metadata,
-        }
+        m = dict(self.metadata)
+        # Always use the dataclass fields as source of truth — not metadata dict
+        m["hybrid_client_quality_mode"]  = True
+        m["quality_lane"]                = self.quality_lane
+        m["client_eligible"]             = self.allowed
+        m["client_eligibility_status"]   = self.client_eligibility_status
+        m["observe_reason"]              = self.observe_reason
+        m["scanner_intake_status"]       = self.scanner_intake_status
+        m["block_reason"]                = self.block_reason
+        return m
 
 
 def _block(reason: str, lane: str, meta: dict) -> HybridGateDecision:
-    log.info("[HYBRID_GATE] BLOCKED lane=%s reason=%s", lane, reason)
-    return HybridGateDecision(allowed=False, quality_lane=lane,
-                              block_reason=reason, metadata=meta)
+    score = float(meta.get("score") or 0)
+    elig, obs_reason = _classify_eligibility(reason, score)
+    level = "OBSERVE" if elig == "OBSERVE_NOT_CLIENT" else "BLOCK"
+    log.info("[HYBRID_GATE] %s lane=%s reason=%s eligibility=%s",
+             level, lane, reason, elig)
+    return HybridGateDecision(
+        allowed=False,
+        quality_lane=lane,
+        block_reason=reason,
+        client_eligibility_status=elig,
+        observe_reason=obs_reason,
+        scanner_intake_status="EVALUATED",
+        metadata=meta,
+    )
 
 def _allow(lane: str, meta: dict) -> HybridGateDecision:
     log.info("[HYBRID_GATE] ALLOWED lane=%s", lane)
-    return HybridGateDecision(allowed=True, quality_lane=lane,
-                              block_reason=None, metadata=meta)
+    return HybridGateDecision(
+        allowed=True,
+        quality_lane=lane,
+        block_reason=None,
+        client_eligibility_status="CLIENT_ELIGIBLE",
+        observe_reason=None,
+        scanner_intake_status="EVALUATED",
+        metadata=meta,
+    )
+
+def _invalid(reason: str, meta: dict) -> HybridGateDecision:
+    """Hard invalid input — not even worth observing."""
+    log.info("[HYBRID_GATE] INVALID_INPUT reason=%s", reason)
+    return HybridGateDecision(
+        allowed=False,
+        quality_lane="BLOCKED",
+        block_reason=reason,
+        client_eligibility_status="BLOCKED",
+        observe_reason=None,
+        scanner_intake_status="INVALID_INPUT",
+        metadata=meta,
+    )
 
 
 # ── Main gate ─────────────────────────────────────────────────────────────────
@@ -210,6 +310,9 @@ def evaluate_client_quality_gate(
             allowed=True,
             quality_lane="GATE_DISABLED",
             block_reason=None,
+            client_eligibility_status="CLIENT_ELIGIBLE",
+            observe_reason=None,
+            scanner_intake_status="EVALUATED",
             metadata={"hybrid_client_quality_mode": False},
         )
 
@@ -255,6 +358,7 @@ def evaluate_client_quality_gate(
 
     # Base metadata attached to every gate decision (pass + block)
     base_meta = {
+        # Signal identity
         "symbol":          ticker,
         "direction":       direction,
         "timeframe":       timeframe,
@@ -268,6 +372,16 @@ def evaluate_client_quality_gate(
         "entry_confirm_seconds": entry_confirm_s,
         "geometry_valid":  None,
         "tier_missing":    tier_missing,
+        # Scanner source metadata (PR86)
+        "scanner_type":    str(signal.get("scanner_type")    or signal.get("scanner_source") or ""),
+        "scanner_name":    str(signal.get("scanner_name")    or ""),
+        "scanner_version": str(signal.get("scanner_version") or ""),
+        "pattern_family":  str(signal.get("pattern_family")  or ""),
+        "signal_id":       str(signal.get("signal_id")       or signal.get("plan_id") or ""),
+        "scanner_intake_status": "EVALUATED",
+        # PR86 eligibility — set by _classify_eligibility at decision time
+        "client_eligibility_status": None,  # filled in by _block/_allow
+        "observe_reason":            None,
         # Safe-rollout resolution provenance
         "resolved_score_source":     score_src,
         "resolved_pattern_source":   pat_src,
