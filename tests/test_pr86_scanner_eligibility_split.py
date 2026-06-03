@@ -229,3 +229,59 @@ def test_classify_geometry_is_blocked():
 def test_classify_unknown_reason_is_observe():
     s, r = _classify_eligibility("some_future_reason", 72)
     assert s == "OBSERVE_NOT_CLIENT" and r == "observe_manual_research_only"
+
+
+# ── Signal audit persistence ──────────────────────────────────────────────────
+# These test the _classify_eligibility output that drives the MC store call.
+# The MC uses (client_eligibility_status, observe_reason) from the decision
+# to set decision_status and context_notes in ap_signals.
+
+def test_observe_decision_has_correct_status_fields():
+    """Gate decision carries the fields MC needs to write observed_not_client."""
+    g = _g(_sig(score=67))  # OBSERVE_NOT_CLIENT — score 65-69
+    assert g.client_eligibility_status == "OBSERVE_NOT_CLIENT"
+    assert g.observe_reason == "observe_score_65_69"
+    assert g.block_reason  == "client_score_below_70"
+    # MC will write: decision_status="observed_not_client"
+    # context_notes="[OBSERVE_NOT_CLIENT:observe_score_65_69] client_score_below_70 | ..."
+
+def test_blocked_decision_has_rejected_status():
+    """BLOCKED decisions still produce status=rejected (not observed_not_client)."""
+    g = _g(_sig(trigger_price=180, stop_underlying=182, direction="CALL"))
+    assert g.client_eligibility_status == "BLOCKED"
+    assert g.observe_reason is None
+    # MC will write: decision_status="rejected"
+
+def test_failed_dir_observe_fields():
+    """FAILED_DIR quarantine: MC writes observed_not_client with specific reason."""
+    g = _g(_sig(timeframe="60m", pattern="FAILED_DIR_2D_60min",
+                trigger_price=180, stop_underlying=175))
+    assert g.client_eligibility_status == "OBSERVE_NOT_CLIENT"
+    assert g.observe_reason == "observe_failed_dir_quarantine"
+    # context_notes prefix: [OBSERVE_NOT_CLIENT:observe_failed_dir_quarantine]
+
+def test_intraday_observe_fields():
+    """Non-whitelisted intraday: MC writes observed_not_client."""
+    os.environ["INTRADAY_CLIENT_PATTERN_WHITELIST"] = ""
+    g = _g(_sig(timeframe="30m", pattern="2-3",
+                trigger_price=180, stop_underlying=175))
+    assert g.client_eligibility_status == "OBSERVE_NOT_CLIENT"
+    assert g.observe_reason == "observe_intraday_not_whitelisted"
+
+def test_no_client_order_for_observe():
+    """OBSERVE_NOT_CLIENT always returns allowed=False — no order created."""
+    for sig_kw in [
+        _sig(score=67),
+        _sig(timeframe="60m", pattern="FAILED_DIR_2D_60min",
+             trigger_price=180, stop_underlying=175),
+        _sig(pattern="2-1"),  # non-whitelisted daily
+    ]:
+        g = _g(sig_kw)
+        if g.client_eligibility_status == "OBSERVE_NOT_CLIENT":
+            assert g.allowed is False, f"OBSERVE must return allowed=False: {sig_kw}"
+
+def test_client_eligible_returns_allowed_true():
+    """CLIENT_ELIGIBLE always returns allowed=True — order may be created."""
+    g = _g(_sig())
+    assert g.client_eligibility_status == "CLIENT_ELIGIBLE"
+    assert g.allowed is True
