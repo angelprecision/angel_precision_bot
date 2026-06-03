@@ -29,6 +29,13 @@ MAX_CLIENT_TRADES_PER_DAY        = 5
 MAX_CLIENT_DAILY_TRADES          = 3
 MAX_CLIENT_INTRADAY_TRADES       = 2
 MAX_CLIENT_SYMBOL_TRADES_PER_DAY = 1
+
+Cap block reason codes
+----------------------
+client_total_daily_cap_reached   — 5/day total across both lanes
+client_daily_lane_cap_reached    — 3/day daily lane
+client_intraday_cap_reached      — 2/day intraday lane
+client_symbol_duplicate_block    — 1/day per symbol
 MAX_PRE_ENTRY_OPTION_FADE_PCT    = 8
 MAX_PRE_ENTRY_UNDERLYING_REVERSAL_PCT = 0.25
 
@@ -394,11 +401,11 @@ def evaluate_client_quality_gate(
     sym_today       = int(symbol_trades.get(ticker.upper(), 0))
 
     if trades_today >= max_total:
-        return _block("client_daily_cap_reached", lane,
+        return _block("client_total_daily_cap_reached", lane,
                       {**base_meta, "trades_today": trades_today, "max": max_total})
 
     if lane == "DAILY_CLIENT" and daily_trades >= max_daily:
-        return _block("client_daily_cap_reached", lane,
+        return _block("client_daily_lane_cap_reached", lane,
                       {**base_meta,
                        "daily_trades": daily_trades, "max_daily": max_daily})
 
