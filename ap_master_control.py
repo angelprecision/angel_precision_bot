@@ -1935,7 +1935,11 @@ class APMasterControl:
                 # Persist gate metadata into plan regardless of outcome
                 if plan.metadata is None:
                     plan.metadata = {}
-                plan.metadata["hybrid_client_quality_gate"] = _hcqg.to_meta()
+                _hcqg_meta = _hcqg.to_meta()
+                plan.metadata["hybrid_client_quality_gate"] = _hcqg_meta
+                # PR86: bubble eligibility to top-level plan metadata
+                plan.metadata["client_eligibility_status"] = _hcqg_meta.get("client_eligibility_status", "CLIENT_ELIGIBLE")
+                plan.metadata["scanner_intake_status"]     = _hcqg_meta.get("scanner_intake_status", "EVALUATED")
                 # Hard termination — no re-approval
                 if not _hcqg.allowed:
                     self._store_update(
@@ -1943,8 +1947,11 @@ class APMasterControl:
                         f"hybrid_client_gate: {_hcqg.block_reason}",
                     )
                     log.info(
-                        "[%s] HYBRID_GATE BLOCK | client=%s lane=%s reason=%s",
-                        ticker, client_id, _hcqg.quality_lane, _hcqg.block_reason,
+                        "[%s] HYBRID_GATE %s | client=%s lane=%s reason=%s observe=%s",
+                        ticker,
+                        "OBSERVE" if _hcqg.client_eligibility_status == "OBSERVE_NOT_CLIENT" else "BLOCK",
+                        client_id, _hcqg.quality_lane, _hcqg.block_reason,
+                        _hcqg.observe_reason,
                     )
                     _gate_block = self._block(
                         signal_id, ticker, client_id,
@@ -1963,7 +1970,10 @@ class APMasterControl:
                     elif _gate_block.plan is not None:
                         if _gate_block.plan.metadata is None:
                             _gate_block.plan.metadata = {}
-                        _gate_block.plan.metadata["hybrid_client_quality_gate"] = _hcqg.to_meta()
+                        _hcqg_meta_gb = _hcqg_meta if "_hcqg_meta" in dir() else _hcqg.to_meta()
+                        _gate_block.plan.metadata["hybrid_client_quality_gate"] = _hcqg_meta_gb
+                        _gate_block.plan.metadata["client_eligibility_status"] = _hcqg_meta_gb.get("client_eligibility_status", "BLOCKED")
+                        _gate_block.plan.metadata["scanner_intake_status"]     = _hcqg_meta_gb.get("scanner_intake_status", "EVALUATED")
                     return _gate_block
         except ImportError:
             log.debug("ap_hybrid_client_quality_gate not found — gate skipped (install module)")
