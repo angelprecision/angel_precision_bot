@@ -1,7 +1,7 @@
 """
 ap_hybrid_client_quality_gate.py
 =================================
-P0: Hybrid Client Quality Gate
+P0: Hybrid Client Quality Gate  (hardened — P0 follow-up field fallbacks)
 
 Protects client accounts from low-quality signals while keeping
 real B-tier daily winners flowing.  Called by ap_master_control.evaluate()
@@ -29,8 +29,24 @@ MAX_CLIENT_TRADES_PER_DAY        = 5
 MAX_CLIENT_DAILY_TRADES          = 3
 MAX_CLIENT_INTRADAY_TRADES       = 2
 MAX_CLIENT_SYMBOL_TRADES_PER_DAY = 1
+
+Cap block reason codes
+----------------------
+client_total_daily_cap_reached   — 5/day total across both lanes
+client_daily_lane_cap_reached    — 3/day daily lane
+client_intraday_cap_reached      — 2/day intraday lane
+client_symbol_duplicate_block    — 1/day per symbol
 MAX_PRE_ENTRY_OPTION_FADE_PCT    = 8
 MAX_PRE_ENTRY_UNDERLYING_REVERSAL_PCT = 0.25
+
+Hardening changes (P0 follow-up)
+---------------------------------
+- Score resolved from: score → score_total → merge_score → scanner_score → intel_score
+- Pattern resolved from: pattern → pattern_id → setup_combo → pattern_family
+- Timeframe resolved from: timeframe → time_horizon  (missing → block, no 1d default)
+- Tier resolved from: tier → score_grade  (missing → audit flag, not silent pass)
+- Snapshot: daily_trades and intraday_trades read independently, no total_trades alias
+- Resolution metadata: resolved_*_source fields on every decision
 """
 
 from __future__ import annotations
@@ -43,10 +59,10 @@ log = logging.getLogger(__name__)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-_DAILY_TIMEFRAMES  = {"1d", "daily", "1D", "D", "d"}
+_DAILY_TIMEFRAMES    = {"1d", "daily", "1D", "D", "d"}
 _INTRADAY_TIMEFRAMES = {"15m", "30m", "60m", "15", "30", "60",
                         "15min", "30min", "60min"}
-_ALLOWED_TIERS     = {"A", "A+", "B"}
+_ALLOWED_TIERS       = {"A", "A+", "B"}
 
 # ── Config helpers ────────────────────────────────────────────────────────────
 
@@ -64,6 +80,67 @@ def _env_set(key: str, default: str = "") -> set[str]:
     if not raw:
         return set()
     return {p.strip() for p in raw.split(",") if p.strip()}
+
+
+# ── Field resolution helpers ──────────────────────────────────────────────────
+
+def _resolve_score(signal: dict) -> tuple[float, str]:
+    """
+    Return (score, source_key) using fallback chain.
+    Returns (0.0, 'missing') only if no numeric value found in any key.
+    """
+    for key in ("score", "score_total", "merge_score", "scanner_score", "intel_score"):
+        v = signal.get(key)
+        if v is not None:
+            try:
+                f = float(v)
+                if f > 0:               # skip explicit 0 — try next key
+                    return f, key
+            except (TypeError, ValueError):
+                pass
+    # Accept 0 from "score" if nothing else found
+    for key in ("score", "score_total", "merge_score", "scanner_score", "intel_score"):
+        v = signal.get(key)
+        if v is not None:
+            try:
+                return float(v), key
+            except (TypeError, ValueError):
+                pass
+    return 0.0, "missing"
+
+
+def _resolve_pattern(signal: dict) -> tuple[str, str]:
+    """Return (pattern, source_key)."""
+    for key in ("pattern", "pattern_id", "setup_combo", "pattern_family"):
+        v = str(signal.get(key) or "").strip()
+        if v:
+            return v, key
+    return "", "missing"
+
+
+def _resolve_timeframe(signal: dict) -> tuple[Optional[str], str]:
+    """
+    Return (timeframe, source_key).
+    Returns (None, 'missing') if not found — caller must block, NOT default to 1d.
+    """
+    for key in ("timeframe", "time_horizon"):
+        v = str(signal.get(key) or "").strip()
+        if v:
+            return v, key
+    return None, "missing"
+
+
+def _resolve_tier(signal: dict) -> tuple[str, str, bool]:
+    """
+    Return (tier, source_key, tier_missing).
+    tier_missing=True means no tier was found — audit flag only,
+    not a hard block by itself.
+    """
+    for key in ("tier", "score_grade"):
+        v = str(signal.get(key) or "").strip().upper()
+        if v:
+            return v, key, False
+    return "", "missing", True
 
 
 # ── Gate decision ─────────────────────────────────────────────────────────────
@@ -150,19 +227,33 @@ def evaluate_client_quality_gate(
     max_fade         = _env_float("MAX_PRE_ENTRY_OPTION_FADE_PCT", 8.0)
     max_reversal     = _env_float("MAX_PRE_ENTRY_UNDERLYING_REVERSAL_PCT", 0.25)
 
-    # ── Extract signal fields ─────────────────────────────────────────────
+    # ── Resolve fields with fallback chains ───────────────────────────────
     ticker    = str(signal.get("symbol") or signal.get("ticker") or "?").upper()
     direction = str(signal.get("direction") or signal.get("side") or "CALL").upper()
-    timeframe = str(signal.get("timeframe") or "1d").strip()
-    pattern   = str(signal.get("pattern")   or "").strip()
-    tier      = str(signal.get("tier")      or "").strip().upper()
-    score     = float(signal.get("score")   or 0)
+
+    score,     score_src = _resolve_score(signal)
+    pattern,   pat_src   = _resolve_pattern(signal)
+    timeframe, tf_src    = _resolve_timeframe(signal)
+    tier,      tier_src, tier_missing = _resolve_tier(signal)
+
     stop_ul   = _safe_float(signal.get("stop_underlying"))
     trig_ul   = _safe_float(signal.get("trigger_price"))
     target_ul = _safe_float(signal.get("target_underlying"))
     spread_pct= _safe_float(signal.get("spread_pct") or signal.get("spread_pct_at_submit"))
 
-    # Base metadata attached to every gate decision
+    # Audit: capture raw field values for rollout debugging
+    raw_score_fields = {
+        k: signal.get(k)
+        for k in ("score", "score_total", "merge_score", "scanner_score", "intel_score")
+        if signal.get(k) is not None
+    }
+    raw_pattern_fields = {
+        k: signal.get(k)
+        for k in ("pattern", "pattern_id", "setup_combo", "pattern_family")
+        if signal.get(k) is not None
+    }
+
+    # Base metadata attached to every gate decision (pass + block)
     base_meta = {
         "symbol":          ticker,
         "direction":       direction,
@@ -176,6 +267,14 @@ def evaluate_client_quality_gate(
         "spread_pct":      spread_pct,
         "entry_confirm_seconds": entry_confirm_s,
         "geometry_valid":  None,
+        "tier_missing":    tier_missing,
+        # Safe-rollout resolution provenance
+        "resolved_score_source":     score_src,
+        "resolved_pattern_source":   pat_src,
+        "resolved_timeframe_source": tf_src,
+        "resolved_tier_source":      tier_src,
+        "raw_score_fields":          raw_score_fields,
+        "raw_pattern_fields":        raw_pattern_fields,
     }
 
     lane = "BLOCKED"  # will be set per-path
@@ -187,25 +286,32 @@ def evaluate_client_quality_gate(
 
     # ── 2. Tier gate ─────────────────────────────────────────────────────
     allowed_tiers = _ALLOWED_TIERS if allow_tier_b else {"A", "A+"}
-    if tier and tier not in allowed_tiers:
+    if not tier_missing and tier and tier not in allowed_tiers:
+        # Tier is present but not in the allowed set — hard block
         return _block("client_tier_block", lane,
                       {**base_meta, "allowed_tiers": list(allowed_tiers)})
+    # tier_missing: audit flag only — allow if score + pattern/timeframe pass
+    # (tier_missing=True is persisted in metadata for every decision)
 
-    # ── 3. Determine lane ─────────────────────────────────────────────────
-    tf_norm = timeframe.lower().replace("min", "m").replace(" ", "")
-    is_daily   = (timeframe in _DAILY_TIMEFRAMES or
-                  tf_norm in {"1d", "daily", "d"})
-    is_intraday= (timeframe in _INTRADAY_TIMEFRAMES or
-                  tf_norm in {"15m", "30m", "60m"})
+    # ── 3. Timeframe — no 1d default; missing = block ────────────────────
+    if timeframe is None:
+        # Missing timeframe cannot be assumed daily — block explicitly
+        return _block("client_timeframe_missing", lane,
+                      {**base_meta,
+                       "reason": "timeframe not found in signal or time_horizon"})
+
+    tf_norm    = timeframe.lower().replace("min", "m").replace(" ", "")
+    is_daily   = timeframe in _DAILY_TIMEFRAMES or tf_norm in {"1d", "daily", "d"}
+    is_intraday= timeframe in _INTRADAY_TIMEFRAMES or tf_norm in {"15m", "30m", "60m"}
 
     if is_daily:
         lane = "DAILY_CLIENT"
     elif is_intraday:
         lane = "INTRADAY_CLIENT"
     else:
-        # Timeframe not in any client lane
         return _block("client_timeframe_not_in_lane", lane,
-                      {**base_meta, "reason": f"timeframe={timeframe} not daily or intraday"})
+                      {**base_meta,
+                       "reason": f"timeframe={timeframe} not daily or intraday"})
 
     base_meta["quality_lane"] = lane
 
@@ -217,11 +323,7 @@ def evaluate_client_quality_gate(
 
     # ── 5. Pattern whitelist gate ─────────────────────────────────────────
     if lane == "DAILY_CLIENT":
-        if daily_whitelist and pattern not in daily_whitelist:
-            # Allow empty daily_whitelist to pass all (backwards compat)
-            pass  # whitelist is enforced only if non-empty
         if daily_whitelist:
-            # Check if pattern matches any whitelist entry (prefix or exact)
             if not any(pattern == w or pattern.startswith(w)
                        for w in daily_whitelist):
                 return _block("client_daily_pattern_not_whitelisted", lane,
@@ -230,42 +332,35 @@ def evaluate_client_quality_gate(
                                "pattern": pattern})
 
     elif lane == "INTRADAY_CLIENT":
-        # Intraday whitelist is empty by default → block ALL intraday for clients
         if not intra_whitelist:
             return _block("client_intraday_no_whitelist", lane,
                           {**base_meta,
-                           "reason": "INTRADAY_CLIENT_PATTERN_WHITELIST is empty — no intraday patterns approved for clients yet"})
+                           "reason": "INTRADAY_CLIENT_PATTERN_WHITELIST is empty"})
         if not any(pattern == w or pattern.startswith(w)
                    for w in intra_whitelist):
             return _block("client_intraday_pattern_not_whitelisted", lane,
                           {**base_meta, "whitelist": list(intra_whitelist)})
 
     # ── 6. Trigger/stop geometry hard gate ───────────────────────────────
-    geometry_valid = True
+    geometry_valid  = True
     geometry_reason = None
     if trig_ul is not None and stop_ul is not None:
-        if direction == "CALL":
-            if stop_ul >= trig_ul:
-                geometry_valid = False
-                geometry_reason = (
-                    f"CALL stop_underlying ({stop_ul}) >= trigger_price ({trig_ul}) — "
-                    "stop is on the wrong side of trigger"
-                )
-        elif direction == "PUT":
-            if stop_ul <= trig_ul:
-                geometry_valid = False
-                geometry_reason = (
-                    f"PUT stop_underlying ({stop_ul}) <= trigger_price ({trig_ul}) — "
-                    "stop is on the wrong side of trigger"
-                )
+        if direction == "CALL" and stop_ul >= trig_ul:
+            geometry_valid  = False
+            geometry_reason = (
+                f"CALL stop_underlying ({stop_ul}) >= trigger_price ({trig_ul})"
+            )
+        elif direction == "PUT" and stop_ul <= trig_ul:
+            geometry_valid  = False
+            geometry_reason = (
+                f"PUT stop_underlying ({stop_ul}) <= trigger_price ({trig_ul})"
+            )
     base_meta["geometry_valid"] = geometry_valid
     if not geometry_valid:
         return _block("invalid_trigger_stop_geometry", lane,
                       {**base_meta, "geometry_reason": geometry_reason})
 
     # ── 7. Pre-entry option fade check ───────────────────────────────────
-    # If a live quote is available, check the option hasn't faded too much
-    # from the decision price before the watcher arms
     if live_quote:
         entry_price = _safe_float(signal.get("entry_option_price") or
                                    signal.get("limit_price"))
@@ -274,12 +369,12 @@ def evaluate_client_quality_gate(
                                    live_quote.get("ask"))
         if entry_price and current_mid and entry_price > 0:
             fade_pct = (entry_price - current_mid) / entry_price * 100
-            base_meta["quote_age_ms"]  = live_quote.get("age_ms")
+            base_meta["quote_age_ms"]    = live_quote.get("age_ms")
             base_meta["option_fade_pct"] = round(fade_pct, 2)
             if fade_pct > max_fade:
                 return _block("entry_confirm_failed_option_fade", lane,
                               {**base_meta,
-                               "fade_pct": round(fade_pct, 2),
+                               "fade_pct":     round(fade_pct, 2),
                                "max_fade_pct": max_fade})
 
     # ── 8. Pre-entry underlying reversal check ────────────────────────────
@@ -290,27 +385,27 @@ def evaluate_client_quality_gate(
             return _block("entry_confirm_failed_underlying_reversal", lane,
                           {**base_meta,
                            "underlying_price": underlying_price,
-                           "reversal_pct": round(reversal_pct, 2)})
+                           "reversal_pct":     round(reversal_pct, 2)})
         if direction == "PUT"  and underlying_price > trig_ul * (1 + max_reversal / 100):
             return _block("entry_confirm_failed_underlying_reversal", lane,
                           {**base_meta,
                            "underlying_price": underlying_price,
-                           "reversal_pct": round(reversal_pct, 2)})
+                           "reversal_pct":     round(reversal_pct, 2)})
 
     # ── 9. Per-client caps ────────────────────────────────────────────────
-    trades_today   = int(snapshot.get("trades_today",    0) or 0)
-    daily_trades   = int(snapshot.get("daily_trades",    0) or 0)
-    intraday_trades= int(snapshot.get("intraday_trades", 0) or 0)
-    symbol_trades  = dict(snapshot.get("symbol_trades",  {}) or {})
-    sym_today      = int(symbol_trades.get(ticker.upper(), 0))
+    # Read each counter independently — never alias daily_trades to total_trades
+    trades_today    = int(snapshot.get("total_trades",   snapshot.get("trades_today",    0)) or 0)
+    daily_trades    = int(snapshot.get("daily_trades",   0) or 0)
+    intraday_trades = int(snapshot.get("intraday_trades",0) or 0)
+    symbol_trades   = dict(snapshot.get("symbol_trades", {}) or {})
+    sym_today       = int(symbol_trades.get(ticker.upper(), 0))
 
     if trades_today >= max_total:
-        return _block("client_daily_cap_reached", lane,
-                      {**base_meta,
-                       "trades_today": trades_today, "max": max_total})
+        return _block("client_total_daily_cap_reached", lane,
+                      {**base_meta, "trades_today": trades_today, "max": max_total})
 
     if lane == "DAILY_CLIENT" and daily_trades >= max_daily:
-        return _block("client_daily_cap_reached", lane,
+        return _block("client_daily_lane_cap_reached", lane,
                       {**base_meta,
                        "daily_trades": daily_trades, "max_daily": max_daily})
 
@@ -327,12 +422,17 @@ def evaluate_client_quality_gate(
     # ── 10. All gates passed — inject confirmation config ─────────────────
     base_meta["confirmation_required"]  = True
     base_meta["confirmation_seconds"]   = entry_confirm_s
-    base_meta["max_pre_entry_option_fade_pct"] = max_fade
-    base_meta["max_pre_entry_underlying_reversal_pct"] = max_reversal
+    base_meta["max_pre_entry_option_fade_pct"]           = max_fade
+    base_meta["max_pre_entry_underlying_reversal_pct"]   = max_reversal
 
     log.info(
-        "[HYBRID_GATE] PASS | client=%s ticker=%s lane=%s score=%.1f tier=%s pattern=%s",
-        client_id, ticker, lane, score, tier, pattern,
+        "[HYBRID_GATE] PASS | client=%s ticker=%s lane=%s score=%.1f(src=%s) "
+        "tier=%s(missing=%s) pattern=%s(src=%s) tf=%s(src=%s)",
+        client_id, ticker, lane,
+        score, score_src,
+        tier, tier_missing,
+        pattern, pat_src,
+        timeframe, tf_src,
     )
     return _allow(lane, base_meta)
 
