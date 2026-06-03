@@ -971,7 +971,7 @@ class APExecutionCore:
                 live_ask         = _submit_quote_fields.get("submit_ask"),
                 live_quote_age_ms= _quote_age_ms if "_quote_age_ms" in dir() else None,
                 underlying_last  = _underlying_last,
-                decision_option_price = float(getattr(approved_plan, "limit_price", 0) or 0) or None,
+                decision_option_price = float(_plan_limit or 0) or None,  # use saved pre-overwrite decision price
                 score     = float(_sig_for_confirm.get("score") or 0) or None,
                 tier      = str(getattr(approved_plan, "tier", "") or ""),
                 timeframe = str(_sig_for_confirm.get("timeframe") or "1d"),
@@ -996,10 +996,10 @@ class APExecutionCore:
                 )
                 funnel.inc("entry_confirm_blocked")
                 if signal_id:
+                    # Only write to known ap_signals columns — no unknown fields
                     self.store.update_signal_fields(signal_id, {
                         "decision_status": "blocked_at_breach",
                         "context_notes":   _fail_reason,
-                        "entry_confirm_meta": _confirm_meta,
                     })
                 if queue_local_order_id and hasattr(self.order_state_machine, "update_order_meta"):
                     try:
