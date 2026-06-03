@@ -390,31 +390,60 @@ class APProofLogger:
             f"{exit_reason} | score={score:.0f} ctx={context_score:.0f}"
         )
 
-        # Write to Supabase immediately — this is the source of truth
+        # Write to Supabase immediately — this is the source of truth.
+        # Three-stage fallback so trades are NEVER silently lost on column drift:
+        #   Stage 1: full row (all fields including slippage tracking)
+        #   Stage 2: strip slippage + exit_bucket (columns that may not exist yet)
+        #   Stage 3: core-only rows (guaranteed columns — minimal but never lost)
+        _SLIPPAGE_COLS = {
+            "exit_bid", "exit_ask", "exit_mid", "exit_limit_placed",
+            "exit_fill_price", "slippage_vs_mid", "slippage_vs_bid",
+            "exit_pricing_tier", "exit_attempt", "seconds_to_fill",
+        }
+        _CORE_COLS = {
+            "client_email", "mode", "system_version", "opened_at", "closed_at",
+            "ticker", "pattern", "side", "timeframe", "score", "tier",
+            "entry_option_price", "exit_option_price", "contracts",
+            "exit_reason", "option_pnl_pct", "underlying_pnl_pct", "win",
+            "synthetic_entry", "position_id", "local_order_id",
+        }
         if self.sb:
             try:
                 self.sb.table("proof_trades").insert(row).execute()
-                log.debug(f"[PROOF] {ticker} written to Supabase")
-            except Exception as e:
-                # H7: exit_bucket is a new column. If the migration has not
-                # been applied yet, the insert fails on unknown column. Proof
-                # logging is the source of truth and must NEVER be lost — retry
-                # once without the derived field. The bucket can be backfilled
-                # later from exit_reason since classify_exit is a pure function.
-                emsg = str(e).lower()
-                if "exit_bucket" in emsg or "column" in emsg or "schema" in emsg:
+                log.debug("[PROOF] %s written to Supabase (full row)", ticker)
+            except Exception as e1:
+                emsg1 = str(e1).lower()
+                if not any(k in emsg1 for k in ("column", "schema", "field", "violat", "null", "type")):
+                    log.error("[PROOF] Supabase write failed (non-schema error): %s", e1)
+                else:
+                    # Stage 2: strip slippage columns + exit_bucket
+                    _stage2 = {k: v for k, v in row.items()
+                               if k not in _SLIPPAGE_COLS and k != "exit_bucket"}
                     try:
-                        _fallback = {k: v for k, v in row.items() if k != "exit_bucket"}
-                        self.sb.table("proof_trades").insert(_fallback).execute()
+                        self.sb.table("proof_trades").insert(_stage2).execute()
                         log.warning(
-                            "[PROOF] %s written WITHOUT exit_bucket (column missing — "
-                            "run migrations/2026_05_17_proof_exit_bucket.sql to enable)",
+                            "[PROOF] %s written without slippage columns — "                            "run proof_trades migration to add: %s",
                             ticker,
+                            ", ".join(sorted(_SLIPPAGE_COLS | {"exit_bucket"})),
                         )
                     except Exception as e2:
-                        log.error(f"[PROOF] Supabase write failed (fallback too): {e2}")
-                else:
-                    log.error(f"[PROOF] Supabase write failed: {e}")
+                        emsg2 = str(e2).lower()
+                        if not any(k in emsg2 for k in ("column", "schema", "field")):
+                            log.error("[PROOF] Supabase write failed stage-2 (non-schema): %s", e2)
+                        else:
+                            # Stage 3: core columns only — guaranteed minimal write
+                            _stage3 = {k: v for k, v in row.items() if k in _CORE_COLS}
+                            try:
+                                self.sb.table("proof_trades").insert(_stage3).execute()
+                                log.warning(
+                                    "[PROOF] %s written with CORE COLUMNS ONLY — "                                    "proof_trades schema is significantly out of date. "                                    "Run all migrations immediately.",
+                                    ticker,
+                                )
+                            except Exception as e3:
+                                log.error(
+                                    "[PROOF] ALL WRITE ATTEMPTS FAILED for %s — "                                    "TRADE WILL NOT APPEAR IN PROOF. Error: %s",
+                                    ticker, e3,
+                                )
 
         return row
 
