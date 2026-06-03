@@ -937,6 +937,90 @@ class APExecutionCore:
             approved_qty,
         )
 
+        # ── P0 follow-up: Entry Confirmation Preflight ──────────────────────────
+        # Runs AFTER live ask refresh (live quote available), BEFORE broker submit.
+        # For plans with confirmation_required=True (set by PR74 Hybrid Gate),
+        # checks: quote age, spread, option fade, underlying reversal.
+        # Non-blocking for non-client plans — fast-path if confirmation_required=False.
+        _confirm_meta = {}
+        try:
+            from ap_entry_confirmation import check_entry_confirmation
+            _sig_for_confirm = watched.signal or {}
+            _plan_meta_for_confirm = getattr(approved_plan, "metadata", {}) or {}
+            _sandbox = bool(
+                _plan_meta_for_confirm.get("sandbox_mode")
+                or getattr(self.broker, "sandbox", False)
+            )
+            _underlying_last = None
+            try:
+                # Re-use the latest watcher underlying quote if available
+                _ul_ask = getattr(watched, "last_quote_ask", None)
+                _ul_bid = getattr(watched, "last_quote_bid", None)
+                if _ul_ask and _ul_bid and _ul_ask > 0 and _ul_bid > 0:
+                    _underlying_last = (_ul_ask + _ul_bid) / 2
+                elif _ul_ask and _ul_ask > 0:
+                    _underlying_last = _ul_ask
+            except Exception:
+                pass
+
+            _confirm_result = check_entry_confirmation(
+                plan             = approved_plan,
+                direction        = str(getattr(approved_plan, "side", "CALL") or "CALL").upper(),
+                trigger_price    = float(getattr(approved_plan, "trigger_price", 0) or 0) or None,
+                live_bid         = _submit_quote_fields.get("submit_bid"),
+                live_ask         = _submit_quote_fields.get("submit_ask"),
+                live_quote_age_ms= _quote_age_ms if "_quote_age_ms" in dir() else None,
+                underlying_last  = _underlying_last,
+                decision_option_price = float(getattr(approved_plan, "limit_price", 0) or 0) or None,
+                score     = float(_sig_for_confirm.get("score") or 0) or None,
+                tier      = str(getattr(approved_plan, "tier", "") or ""),
+                timeframe = str(_sig_for_confirm.get("timeframe") or "1d"),
+                sandbox_mode = _sandbox,
+            )
+            _confirm_meta = _confirm_result.to_meta(
+                started_at   = _confirm_result.metadata.get("live_entry_ts", ""),
+                completed_at = __import__("datetime").datetime.now(
+                    __import__("datetime").timezone.utc).isoformat(),
+            )
+            if not _confirm_result.passed:
+                _fail_reason = _confirm_result.fail_reason or "entry_confirm_failed"
+                log.info(
+                    "[%s] ENTRY_CONFIRM_BLOCK — %s | client=%s | "
+                    "spread=%.3f fade=%.2f reversal=%.3f age=%.1fs",
+                    ticker, _fail_reason,
+                    str(watched.signal.get("client_id", "?") if watched.signal else "?"),
+                    float(_confirm_meta.get("spread_pct") or 0),
+                    float(_confirm_meta.get("option_move_pct") or 0),
+                    float(_confirm_meta.get("underlying_move_pct") or 0),
+                    float(_confirm_meta.get("quote_age_seconds") or 0),
+                )
+                funnel.inc("entry_confirm_blocked")
+                if signal_id:
+                    self.store.update_signal_fields(signal_id, {
+                        "decision_status": "blocked_at_breach",
+                        "context_notes":   _fail_reason,
+                        "entry_confirm_meta": _confirm_meta,
+                    })
+                if queue_local_order_id and hasattr(self.order_state_machine, "update_order_meta"):
+                    try:
+                        self.order_state_machine.update_order_meta(
+                            queue_local_order_id, {"entry_confirmation": _confirm_meta})
+                    except Exception:
+                        pass
+                return   # NO BROKER SUBMIT
+        except ImportError:
+            log.debug("ap_entry_confirmation not found — preflight skipped")
+        except Exception as _ec_err:
+            # Fail-closed for confirmation errors — block the submit
+            log.error("[%s] ENTRY_CONFIRM_ERROR — failing closed: %s", ticker, _ec_err)
+            funnel.inc("entry_confirm_blocked")
+            if signal_id:
+                self.store.update_signal_fields(signal_id, {
+                    "decision_status": "blocked_at_breach",
+                    "context_notes":   f"entry_confirm_error: {_ec_err}",
+                })
+            return
+
         submit_res = self.order_state_machine.submit_existing_entry(
             local_order_id=queue_local_order_id,
             broker=self.broker,
@@ -955,6 +1039,13 @@ class APExecutionCore:
                     )
                 except Exception as _audit_exc:
                     log.warning("[%s] entry_pricing_audit persist failed: %s", ticker, _audit_exc)
+                # P0 follow-up: persist confirmation preflight metadata on success
+                if _confirm_meta:
+                    try:
+                        self.order_state_machine.update_order_meta(
+                            local_order_id, {"entry_confirmation": _confirm_meta})
+                    except Exception:
+                        pass
             # Item 3 — persist selector candidate audit into orders.meta
             # (EVIDENCE ONLY, best-effort, non-destructive JSONB merge).
             # _candidate_audit is set ONLY when breach-time deferred selection
