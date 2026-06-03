@@ -16,16 +16,6 @@ os.environ.update({
     "MAX_CLIENT_SYMBOL_TRADES_PER_DAY":   "1",
 })
 
-# Import from the new hardened module in current dir
-import importlib, sys
-sys.path.insert(0, '/home/claude')
-# Reload to pick up new version
-if 'ap_hybrid_client_quality_gate' in sys.modules:
-    del sys.modules['ap_hybrid_client_quality_gate']
-import shutil
-shutil.copy('/home/claude/harden_gate_new.py',
-            '/home/claude/ap_hybrid_client_quality_gate.py')
-
 from ap_hybrid_client_quality_gate import (
     evaluate_client_quality_gate,
     _resolve_score, _resolve_pattern, _resolve_timeframe, _resolve_tier,
@@ -164,9 +154,8 @@ def test_daily_trades_not_aliased_to_total():
     g = _g({"symbol":"AAPL","direction":"CALL","timeframe":"1d",
              "pattern":"2-3","tier":"A","score":75,
              "trigger_price":180,"stop_underlying":175}, snap)
-    assert g.block_reason == "client_daily_cap_reached"
+    assert g.block_reason == "client_total_daily_cap_reached"
     assert g.metadata.get("trades_today") == 5  # total cap hit
-    # Confirm it's the total cap not the daily lane cap
     assert g.metadata.get("max") == 5
 
 def test_daily_lane_cap_independent():
@@ -177,7 +166,7 @@ def test_daily_lane_cap_independent():
              "pattern":"2-3","tier":"A","score":75,
              "trigger_price":180,"stop_underlying":175}, snap)
     assert g.allowed is False
-    assert g.block_reason == "client_daily_cap_reached"
+    assert g.block_reason == "client_daily_lane_cap_reached"
     assert g.metadata.get("daily_trades") == 3
 
 def test_intraday_cap_independent():
