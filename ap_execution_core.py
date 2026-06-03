@@ -1009,7 +1009,53 @@ class APExecutionCore:
                         pass
                 return   # NO BROKER SUBMIT
         except ImportError:
-            log.debug("ap_entry_confirmation not found — preflight skipped")
+            # When confirmation_required=True, a missing module is NOT safe to skip.
+            # Client-eligible trades must not bypass confirmation — fail closed.
+            _gate_meta_imp = (getattr(approved_plan, "metadata", {}) or {})
+            _hcqg_imp      = _gate_meta_imp.get("hybrid_client_quality_gate") or {}
+            if _hcqg_imp.get("confirmation_required"):
+                log.critical(
+                    "[%s] ENTRY_CONFIRM_MODULE_MISSING — confirmation_required=True "
+                    "but ap_entry_confirmation is not deployed. "
+                    "Blocking client submit to preserve gate integrity.",
+                    ticker,
+                )
+                self._alert_degraded(
+                    "ENTRY_CONFIRM_MODULE_MISSING",
+                    severity="CRITICAL",
+                    client_id=str(
+                        watched.signal.get("client_id", "?") if watched.signal else "?"
+                    ),
+                    ticker=ticker,
+                    signal_id=signal_id,
+                    details={"reason": "entry_confirm_module_missing",
+                             "confirmation_required": True},
+                )
+                funnel.inc("entry_confirm_blocked")
+                if signal_id:
+                    self.store.update_signal_fields(signal_id, {
+                        "decision_status": "blocked_at_breach",
+                        "context_notes":   "entry_confirm_module_missing",
+                    })
+                if queue_local_order_id and hasattr(self.order_state_machine,
+                                                    "update_order_meta"):
+                    try:
+                        self.order_state_machine.update_order_meta(
+                            queue_local_order_id,
+                            {"entry_confirmation": {
+                                "confirmation_required": True,
+                                "confirmation_passed":   False,
+                                "confirmation_fail_reason": "entry_confirm_module_missing",
+                            }},
+                        )
+                    except Exception:
+                        pass
+                return   # NO BROKER SUBMIT
+            # confirmation not required — module absence is safe to skip
+            log.debug(
+                "ap_entry_confirmation not found — preflight skipped "
+                "(confirmation_required=False for this signal)"
+            )
         except Exception as _ec_err:
             # Fail-closed for confirmation errors — block the submit
             log.error("[%s] ENTRY_CONFIRM_ERROR — failing closed: %s", ticker, _ec_err)
