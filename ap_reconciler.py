@@ -532,9 +532,16 @@ class APBrokerReconciler:
         return None
 
     def _extract_avg_fill_price(self, broker_raw: dict) -> Optional[float]:
+        # Only use confirmed execution-fill keys. "price" and "avg_price" are
+        # NOT used — "price" is Tradier's limit/stop price, not the fill price.
+        # Using limit price as fill price produces false P&L and silently wrong
+        # proof records. Only avg_fill_price / fill_price / filled_avg_price are
+        # real execution prices from Tradier's order response.
         for key in (
-            "avg_fill_price", "average_fill_price", "fill_price",
-            "filled_avg_price", "avg_price", "price",
+            "avg_fill_price",
+            "average_fill_price",
+            "fill_price",
+            "filled_avg_price",
         ):
             if key not in broker_raw:
                 continue
@@ -658,7 +665,7 @@ class APBrokerReconciler:
                             contract, symbol, status, qty, filled_qty,
                             submitted_ts, updated_ts,
                             EXTRACT(EPOCH FROM (
-                                NOW() - COALESCE(submitted_ts, updated_ts, created_ts)
+                                NOW() - submitted_ts
                             )) AS age_sec
                         FROM orders
                         WHERE client_id = %s
@@ -667,9 +674,11 @@ class APBrokerReconciler:
                           AND COALESCE(filled_qty, 0) = 0
                           AND broker_order_id IS NOT NULL
                           AND broker_order_id <> ''
+                          AND submitted_ts IS NOT NULL
                           AND EXTRACT(EPOCH FROM (
-                              NOW() - COALESCE(submitted_ts, updated_ts, created_ts)
+                              NOW() - submitted_ts
                           )) >= %s
+                          AND EXTRACT(EPOCH FROM (NOW() - submitted_ts)) < 3600
                         ORDER BY submitted_ts ASC NULLS LAST
                         LIMIT 25
                         """,
