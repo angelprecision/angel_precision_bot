@@ -999,8 +999,20 @@ class ClientRunner(threading.Thread):
         stop_threshold: float,
         data_broker_is_dedicated: bool,
         exit_eng,
+        # Risk profile effective values — passed from _start() locals
+        mc_score_floor: float = 65.0,
+        mc_ctx_floor: float   = 0.0,
+        mc_capital_pct: float = 0.40,
+        mc_sector_pct: float  = 0.25,
+        mc_ticker_pct: float  = 0.10,
+        risk_profile_source: str  = "GLOBAL_ENV_DEFAULT",
+        risk_profile_valid: bool  = False,
+        missing_risk_fields: list = None,
     ):
-        self.startup_manifest = {
+        if missing_risk_fields is None:
+            missing_risk_fields = []
+        try:
+            self.startup_manifest = {
             "client_id": self.email,
             "account_id": self.account_id,
             "mode": self.mode,
@@ -1025,21 +1037,32 @@ class ClientRunner(threading.Thread):
             "max_daily_loss": float(max_loss),
             "throttle_threshold": float(throttle_threshold),
             "stop_threshold": float(stop_threshold),
-            "score_floor": _mc_score_floor,
-            "context_floor": _mc_ctx_floor,
-            "max_capital_pct": _mc_capital_pct,
-            "max_sector_pct": _mc_sector_pct,
-            "max_ticker_pct": _mc_ticker_pct,
-            "risk_profile_source": _risk_profile_source,
-            "risk_profile_valid": len(_missing_live) == 0,
-            "missing_risk_fields": _missing_live,
-            "effective_score_floor": _mc_score_floor,
-            "effective_context_floor": _mc_ctx_floor,
-            "effective_max_capital_pct": _mc_capital_pct,
-            "effective_max_sector_pct": _mc_sector_pct,
+            "score_floor": mc_score_floor,
+            "context_floor": mc_ctx_floor,
+            "max_capital_pct": mc_capital_pct,
+            "max_sector_pct": mc_sector_pct,
+            "max_ticker_pct": mc_ticker_pct,
+            "risk_profile_source": risk_profile_source,
+            "risk_profile_valid": risk_profile_valid,
+            "missing_risk_fields": missing_risk_fields,
+            "effective_score_floor": mc_score_floor,
+            "effective_context_floor": mc_ctx_floor,
+            "effective_max_capital_pct": mc_capital_pct,
+            "effective_max_sector_pct": mc_sector_pct,
             "effective_daily_max_loss_pct": loss_pct,
         }
-        logger.info("[%s] Startup manifest: %s", self.email, self.startup_manifest)
+            logger.info("[%s] Startup manifest: %s", self.email, self.startup_manifest)
+        except Exception as _manifest_exc:
+            logger.error(
+                "[%s] Startup manifest build failed (%s) — continuing with empty manifest. "
+                "This is non-fatal.", self.email, _manifest_exc,
+            )
+            if not self.startup_manifest:
+                self.startup_manifest = {
+                    "client_id": self.email,
+                    "mode":      getattr(self, "mode", "unknown"),
+                    "manifest_error": str(_manifest_exc),
+                }
 
     def _validate_control_stack(self):
         problems = []
@@ -1528,10 +1551,18 @@ class ClientRunner(threading.Thread):
         ]
         _missing_live = [
             f for f in _REQUIRED
-            if _is_live_runner and _rp.get(
+            if _rp.get(
                 next((k for k, v in _rp_field_map.items() if v == f), f)
             ) is None
         ] if _is_live_runner else []
+        # LIVE fail-closed: if any required risk field is missing, do not
+        # allow the runner to start with global defaults.
+        if _is_live_runner and _missing_live:
+            raise RuntimeError(
+                f"[{self.email}] LIVE RISK PROFILE INCOMPLETE — missing required "
+                f"fields {_missing_live}. Runner will not start with global defaults. "
+                f"Set all required fields in client_risk_profiles."
+            )
         # Equity truth: fetch from Tradier FIRST before creating master_control.
         # This ensures capital gates are always calibrated to the client's actual
         # account balance — not a hardcoded default. $25K default is last resort only.
@@ -1807,6 +1838,14 @@ class ClientRunner(threading.Thread):
             stop_threshold=stop_threshold,
             data_broker_is_dedicated=bool(data_token),
             exit_eng=exit_eng,
+            mc_score_floor=_mc_score_floor,
+            mc_ctx_floor=_mc_ctx_floor,
+            mc_capital_pct=_mc_capital_pct,
+            mc_sector_pct=_mc_sector_pct,
+            mc_ticker_pct=_mc_ticker_pct,
+            risk_profile_source=_risk_profile_source,
+            risk_profile_valid=(len(_missing_live) == 0),
+            missing_risk_fields=_missing_live,
         )
 
         self._validate_control_stack()
@@ -2287,18 +2326,20 @@ class ClientRunner(threading.Thread):
         if not _attached_rp:
             # Try fetching from Supabase directly if not attached
             try:
-                _rp_res = (
-                    self.sb.table("client_risk_profiles")
-                    .select("*")
-                    .eq("client_email", self.email)
-                    .limit(1)
-                    .execute()
-                )
-                if _rp_res.data:
-                    _attached_rp = _rp_res.data[0]
+                from ap.queue import _get_sb_client as _get_sb
+                _sb_inst = _get_sb()
+                if _sb_inst:
+                    _rp_res = (
+                        _sb_inst.table("client_risk_profiles")
+                        .select("*")
+                        .eq("client_email", self.email)
+                        .limit(1)
+                        .execute()
+                    )
+                    if _rp_res.data:
+                        _attached_rp = _rp_res.data[0]
             except Exception as _rp_load_err:
-                import logging as _log
-                _log.getLogger("ap.client_runner").warning(
+                logger.warning(
                     "[%s] Could not load client_risk_profiles: %s",
                     self.email, _rp_load_err,
                 )
@@ -2313,11 +2354,7 @@ class ClientRunner(threading.Thread):
                         "daily_max_loss_pct, initial_equity, "
                         "max_capital_pct, max_sector_pct, max_ticker_pct, "
                         "max_calls, max_puts, score_floor, context_floor, "
-                        "daily_profit_target_usd, entries_enabled, "
-                        # PR sizer-threshold-order: per-client override columns.
-                        # NULL means 'use env var'. Both must be negative when set;
-                        # DB constraint chk_thresholds_ordered enforces ordering.
-                        "throttle_threshold_usd, stop_threshold_usd "
+                        "daily_profit_target_usd, entries_enabled "
                         "FROM clients WHERE client_id=%s",
                         (self.email,),
                     )
