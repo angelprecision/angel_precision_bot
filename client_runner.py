@@ -1880,19 +1880,34 @@ class ClientRunner(threading.Thread):
             # live order, leaving an open position at Tradier with no tracking in DB.
             #
             # Two-tier defence:
-            #   Tier A (safe, hardened by p0/guard-startup-phantom-clear):
+            #   Tier A (safe, hardened by p0/guard-startup-phantom-clear AND
+            #     p0/startup-cleanup-safe-skip):
             #     ENTRY kind only, CREATED/PENDING_TRIGGER, no broker_order_id,
-            #     no submitted_ts, age >= STARTUP_PHANTOM_CLEAR_MIN_AGE_SECONDS
-            #     (default 600s = 10 min), not currently watcher-armed,
-            #     created BEFORE this runner's startup grace window.
+            #     no submitted_ts, no filled_ts, no position_id, age >=
+            #     STARTUP_PHANTOM_CLEAR_MIN_AGE_SECONDS (default 900s = 15 min,
+            #     per 2026-06-03 parity incident), not currently watcher-armed,
+            #     created BEFORE this runner's startup grace window, AND the
+            #     canonical_signal_id has no active/recent sibling row on any
+            #     client.
             #   Tier B (guarded): SUBMITTED/ACKNOWLEDGED with no broker ID — only cancel
             #     if last_error indicates a known pre-submission state (never reached broker)
             #     OR age exceeds PHANTOM_SUBMITTED_MIN_AGE_MINUTES (default 30 in LIVE,
             #     5 in PAPER). Any split-brain order with a real last_error should be left
             #     for the reconciler to resolve on the next pass.
             #
-            # p0/guard-startup-phantom-clear scope locks: only this method is
-            # modified. Tier B SQL, env defaults, and audit logging are unchanged.
+            # 2026-06-03 parity safety (p0/startup-cleanup-safe-skip):
+            #   Tier A no longer blindly cancels. Candidates are partitioned into
+            #   three buckets and stamped with explicit reason codes so SQL
+            #   audits can distinguish them:
+            #     - STARTUP_CLEANUP_CANCELED_STALE_ORPHAN  : truly stale, no peer activity
+            #     - STARTUP_CLEANUP_SKIPPED_ACTIVE_SIGNAL  : canonical signal is alive
+            #                                                on a peer client — mark
+            #                                                RETRY_ELIGIBLE for re-eval
+            #     - STARTUP_CLEANUP_SKIPPED_RECENT_ROW     : within age/grace window
+            #                                                — never touched here
+            #
+            # p0 scope locks: only this method is modified. Tier B SQL, env
+            # defaults, and audit logging are unchanged.
 
             # Tier A age gate — operator-tunable in seconds (preferred) with
             # legacy minutes fallback for back-compat. Default 600s = 10 min;
@@ -1900,9 +1915,12 @@ class ClientRunner(threading.Thread):
             # cancels under that window, many of which were fresh pre-submit
             # entries that hadn't had a chance to submit yet.
             _legacy_min_age_min = int(os.getenv("PHANTOM_ORDER_MIN_AGE_MINUTES", "5"))
+            # 2026-06-03 parity incident: raised default from 600s (10 min) to
+            # 900s (15 min) per the safe-skip spec. Operators can override via
+            # the env var; legacy minute fallback preserved for back-compat.
             min_age_seconds = int(os.getenv(
                 "STARTUP_PHANTOM_CLEAR_MIN_AGE_SECONDS",
-                str(max(600, _legacy_min_age_min * 60)),
+                str(max(900, _legacy_min_age_min * 60)),
             ))
             # Tier B keeps the original minutes-style param it always used
             # (PHANTOM_ORDER_MIN_AGE_MINUTES). PR p0/guard-startup-phantom-clear
@@ -1930,15 +1948,21 @@ class ClientRunner(threading.Thread):
 
             def _clear_phantoms():
                 with _conn() as c:
-                    # Tier A: pre-submission ENTRY orders only. Hardened gates:
+                    # Tier A (2026-06-03 parity-safe rewrite):
+                    #
+                    # Pre-submission ENTRY orders only. Hardened gates:
                     #   - kind = 'ENTRY'              (exits never go here)
                     #   - broker_order_id IS NULL / blank / sentinel
                     #   - submitted_ts IS NULL        (never reached broker submit)
-                    #   - age >= min_age_seconds      (operator-tunable)
+                    #   - filled_ts IS NULL           (never partially/fully filled)
+                    #   - position_id IS NULL         (never reached position lifecycle)
+                    #   - status IN ('CREATED','PENDING_TRIGGER','PENDING','DEFERRED')
+                    #   - age >= min_age_seconds      (default 900s = 15 min)
                     #   - created_ts <= NOW() - startup_grace_seconds
                     #                                 (don't wipe orders created
                     #                                  during this runner's grace
-                    #                                  window)
+                    #                                  window — those become
+                    #                                  STARTUP_CLEANUP_SKIPPED_RECENT_ROW)
                     #   - meta->'watcher_audit'->>'reason_code' IS NULL
                     #     OR the watcher audit indicates an invalidation/expiry.
                     #                                 (don't wipe orders that
@@ -1947,73 +1971,166 @@ class ClientRunner(threading.Thread):
                     #                                  cancel them with the real
                     #                                  reason instead.)
                     #
+                    # PARITY SAFETY (2026-06-03 fix):
+                    #   Even after all the above pass, we partition the surviving
+                    #   candidates by whether the same canonical_signal_id has a
+                    #   peer row on ANY client that is alive (SUBMITTED,
+                    #   ACKNOWLEDGED, FILLED, or recently created in the parity
+                    #   window). If so, the row is NOT canceled — it is moved to
+                    #   RETRY_ELIGIBLE with reason STARTUP_CLEANUP_SKIPPED_ACTIVE_SIGNAL
+                    #   so the post-fill peer-retry path (future PR) can re-evaluate.
+                    #   Truly orphaned rows get STARTUP_CLEANUP_CANCELED_STALE_ORPHAN.
+                    #
                     # Audit: meta is MERGED (jsonb concat) so existing
                     # watcher_audit, sizing_context, signal_id, etc. are NEVER
                     # overwritten. The cleanup_phantom_audit key carries the
                     # full decision context for post-mortem.
                     #
-                    # CAS safety: the SQL itself encodes the age gate; an order
+                    # CAS safety: the SQL itself encodes every gate; an order
                     # whose updated_ts moved forward (e.g. transitioned to
                     # SUBMITTED by the worker between our SELECT and UPDATE)
                     # falls out of the status filter and is not touched.
+                    #
+                    # Forward-compat: the canonical_signal_id column is added
+                    # by migrations/20260604_canonical_signal_id_and_ledger.sql
+                    # (PR #79). The CTE below references it with a defensive
+                    # COALESCE so a missing column (pre-migration) gracefully
+                    # falls back to comparing on signal_id only.
+                    parity_window_seconds = int(os.getenv(
+                        "STARTUP_PHANTOM_PARITY_WINDOW_SECONDS", "900",
+                    ))
                     c.execute(
                         """
-                        UPDATE orders
-                        SET status = %s,
-                            last_error = %s,
-                            updated_ts = NOW(),
-                            meta = COALESCE(meta, '{}'::jsonb) || jsonb_build_object(
-                                'cleanup_phantom_audit', jsonb_build_object(
-                                    'block_stage',         'startup_cleanup',
-                                    'block_reason',        'startup_phantom_clear_pre_submit',
-                                    'cleanup_decision',    'cancelled',
-                                    'cleanup_rule_version',%s,
-                                    'min_age_seconds',     %s,
-                                    'startup_grace_seconds', %s,
-                                    'startup_grace_active', false,
-                                    'had_broker_order_id', false,
-                                    'had_submitted_ts',    false,
-                                    'watcher_armed',       false,
-                                    'age_seconds',         EXTRACT(EPOCH FROM (NOW() - created_ts)),
-                                    'cleanup_ts',          NOW()::text
-                                )
-                            )
-                        WHERE client_id = %s
-                          AND kind = 'ENTRY'
-                          AND status IN ('CREATED', 'PENDING_TRIGGER')
-                          AND created_ts < NOW() - (%s || ' seconds')::interval
-                          AND created_ts < to_timestamp(%s)
-                          AND submitted_ts IS NULL
-                          AND (
-                                broker_order_id IS NULL
-                             OR TRIM(COALESCE(broker_order_id, '')) = ''
-                             OR UPPER(TRIM(COALESCE(broker_order_id, ''))) IN ('N/A', 'NA', 'NONE', 'NULL')
-                          )
-                          AND (
-                                meta->'watcher_audit' IS NULL
-                             OR meta->'watcher_audit'->>'reason_code' IN (
-                                    'watcher_invalidated', 'watcher_expired',
-                                    'stop_bid_below_call_stop', 'stop_ask_above_put_stop',
-                                    'overnight_daily_invalidated',
-                                    'overnight_premarket_breached',
-                                    'overnight_too_far_from_trigger',
-                                    'rearm_window_expired',
-                                    'opposite_side_replaced_stale_or_weaker'
-                                )
-                          )
+                        WITH candidates AS (
+                            SELECT  o.local_order_id,
+                                    o.signal_id,
+                                    COALESCE(o.canonical_signal_id, o.signal_id) AS canon_id,
+                                    o.created_ts
+                            FROM    orders o
+                            WHERE   o.client_id = %s
+                              AND   o.kind = 'ENTRY'
+                              AND   o.status IN ('CREATED','PENDING_TRIGGER','PENDING','DEFERRED')
+                              AND   o.created_ts < NOW() - (%s || ' seconds')::interval
+                              AND   o.created_ts < to_timestamp(%s)
+                              AND   o.submitted_ts IS NULL
+                              AND   o.filled_ts IS NULL
+                              AND   o.position_id IS NULL
+                              AND   (
+                                        o.broker_order_id IS NULL
+                                    OR  TRIM(COALESCE(o.broker_order_id, '')) = ''
+                                    OR  UPPER(TRIM(COALESCE(o.broker_order_id, ''))) IN ('N/A','NA','NONE','NULL')
+                                    )
+                              AND   (
+                                        o.meta->'watcher_audit' IS NULL
+                                    OR  o.meta->'watcher_audit'->>'reason_code' IN (
+                                            'watcher_invalidated','watcher_expired',
+                                            'stop_bid_below_call_stop','stop_ask_above_put_stop',
+                                            'overnight_daily_invalidated',
+                                            'overnight_premarket_breached',
+                                            'overnight_too_far_from_trigger',
+                                            'rearm_window_expired',
+                                            'opposite_side_replaced_stale_or_weaker'
+                                        )
+                                    )
+                        ),
+                        active_peers AS (
+                            SELECT  DISTINCT COALESCE(p.canonical_signal_id, p.signal_id) AS canon_id
+                            FROM    orders p
+                            JOIN    candidates ca
+                              ON    COALESCE(p.canonical_signal_id, p.signal_id)
+                                  = ca.canon_id
+                            WHERE   COALESCE(p.canonical_signal_id, p.signal_id) IS NOT NULL
+                              AND   (
+                                        p.status IN ('SUBMITTED','ACKNOWLEDGED','FILLED','PARTIALLY_FILLED')
+                                    OR  p.filled_ts IS NOT NULL
+                                    OR  p.submitted_ts IS NOT NULL
+                                    OR  p.created_ts > NOW() - (%s || ' seconds')::interval
+                                    )
+                        ),
+                        cancel_targets AS (
+                            UPDATE orders o
+                            SET    status = 'CANCELED',
+                                   last_error = 'STARTUP_CLEANUP_CANCELED_STALE_ORPHAN',
+                                   updated_ts = NOW(),
+                                   meta = COALESCE(o.meta, '{}'::jsonb) || jsonb_build_object(
+                                       'cleanup_phantom_audit', jsonb_build_object(
+                                           'block_stage',         'startup_cleanup',
+                                           'block_reason',        'STARTUP_CLEANUP_CANCELED_STALE_ORPHAN',
+                                           'cleanup_decision',    'cancelled',
+                                           'cleanup_rule_version',%s,
+                                           'min_age_seconds',     %s,
+                                           'startup_grace_seconds', %s,
+                                           'startup_grace_active', false,
+                                           'had_broker_order_id', false,
+                                           'had_submitted_ts',    false,
+                                           'had_filled_ts',       false,
+                                           'had_position_id',     false,
+                                           'canonical_signal_active', false,
+                                           'parity_window_seconds', %s,
+                                           'watcher_armed',       false,
+                                           'age_seconds',         EXTRACT(EPOCH FROM (NOW() - o.created_ts)),
+                                           'cleanup_ts',          NOW()::text
+                                       )
+                                   )
+                            FROM   candidates ca
+                            WHERE  o.local_order_id = ca.local_order_id
+                              AND  NOT EXISTS (
+                                       SELECT 1 FROM active_peers ap
+                                       WHERE  ap.canon_id = ca.canon_id
+                                   )
+                            RETURNING o.local_order_id
+                        ),
+                        skip_targets AS (
+                            UPDATE orders o
+                            SET    status = 'RETRY_ELIGIBLE',
+                                   last_error = 'STARTUP_CLEANUP_SKIPPED_ACTIVE_SIGNAL',
+                                   updated_ts = NOW(),
+                                   meta = COALESCE(o.meta, '{}'::jsonb) || jsonb_build_object(
+                                       'cleanup_phantom_audit', jsonb_build_object(
+                                           'block_stage',         'startup_cleanup',
+                                           'block_reason',        'STARTUP_CLEANUP_SKIPPED_ACTIVE_SIGNAL',
+                                           'cleanup_decision',    'skipped_retry_eligible',
+                                           'cleanup_rule_version',%s,
+                                           'min_age_seconds',     %s,
+                                           'startup_grace_seconds', %s,
+                                           'canonical_signal_active', true,
+                                           'parity_window_seconds', %s,
+                                           'age_seconds',         EXTRACT(EPOCH FROM (NOW() - o.created_ts)),
+                                           'cleanup_ts',          NOW()::text
+                                       )
+                                   )
+                            FROM   candidates ca
+                            WHERE  o.local_order_id = ca.local_order_id
+                              AND  EXISTS (
+                                       SELECT 1 FROM active_peers ap
+                                       WHERE  ap.canon_id = ca.canon_id
+                                   )
+                            RETURNING o.local_order_id
+                        )
+                        SELECT
+                            (SELECT COUNT(*) FROM cancel_targets) AS canceled,
+                            (SELECT COUNT(*) FROM skip_targets)   AS retry_eligible
                         """,
                         (
-                            "CANCELED",
-                            "startup_phantom_clear_pre_submit",
-                            cleanup_rule_version,
-                            min_age_seconds,
-                            startup_grace_seconds,
                             self.email,
                             str(min_age_seconds),
                             float(startup_ts) - startup_grace_seconds,
+                            str(parity_window_seconds),
+                            cleanup_rule_version, min_age_seconds, startup_grace_seconds,
+                            str(parity_window_seconds),
+                            cleanup_rule_version, min_age_seconds, startup_grace_seconds,
+                            str(parity_window_seconds),
                         ),
                     )
-                    tier_a = c.rowcount or 0
+                    _row = c.fetchone() or (0, 0)
+                    # Support dict-cursor and tuple-cursor results.
+                    if isinstance(_row, dict):
+                        tier_a_cancel = int(_row.get("canceled") or 0)
+                        tier_a_skip   = int(_row.get("retry_eligible") or 0)
+                    else:
+                        tier_a_cancel = int(_row[0] or 0)
+                        tier_a_skip   = int(_row[1] or 0)
+                    tier_a = tier_a_cancel + tier_a_skip
 
                     # Tier B: submitted/acknowledged with no broker ID — only cancel if
                     # last_error signals a known never-reached-broker state, OR age exceeds
@@ -2049,11 +2166,25 @@ class ClientRunner(threading.Thread):
                         ),
                     )
                     tier_b = c.rowcount or 0
-                    return tier_a, tier_b
+                    return tier_a_cancel, tier_a_skip, tier_b
 
-            tier_a, tier_b = run_with_retry(_clear_phantoms)
-            if tier_a:
-                logger.info("[%s] Startup: cleared %s pre-submit phantom orders", self.email, tier_a)
+            tier_a_cancel, tier_a_skip, tier_b = run_with_retry(_clear_phantoms)
+            if tier_a_cancel:
+                logger.info(
+                    "[%s] Startup: cleared %s pre-submit phantom orders "
+                    "(STARTUP_CLEANUP_CANCELED_STALE_ORPHAN)",
+                    self.email, tier_a_cancel,
+                )
+            if tier_a_skip:
+                # Parity safety: peer client(s) have an alive row on the same
+                # canonical_signal_id. These were NOT canceled — they are now
+                # RETRY_ELIGIBLE so the peer-retry path can re-evaluate.
+                logger.info(
+                    "[%s] Startup: marked %s rows RETRY_ELIGIBLE "
+                    "(STARTUP_CLEANUP_SKIPPED_ACTIVE_SIGNAL) — canonical signal "
+                    "is active on a peer client",
+                    self.email, tier_a_skip,
+                )
             if tier_b:
                 log_fn = logger.critical if self.mode == "LIVE" else logger.warning
                 log_fn(
