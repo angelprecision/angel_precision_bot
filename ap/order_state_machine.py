@@ -58,6 +58,15 @@ except ImportError:
     pg_errors = None
 from ap.utils import now_utc_iso
 
+# P0 client-parity (2026-06-04): canonical_signal_id groups the same
+# market opportunity across every active eligible client account so the
+# parity ledger and audit queries can detect fanout failures.
+try:
+    from ap_canonical_signal import build_canonical_signal_id
+except Exception:  # pragma: no cover — fallback keeps OSM functional
+    def build_canonical_signal_id(signal_id, signal=None):  # type: ignore
+        return signal_id if isinstance(signal_id, str) else ""
+
 try:
     from ap.observability import emit_decision_event, get_git_commit, make_config_hash
 except Exception:  # pragma: no cover
@@ -492,10 +501,14 @@ class APOrderStateMachine:
         except Exception:
             _target_val = 0.0
 
+        _raw_signal_id = str(getattr(plan, "signal_id", "") or "")
+        _canonical_signal_id = build_canonical_signal_id(_raw_signal_id) or None
+
         _auto_meta = {
             "score":              _score_val,
             "tier":               _tier_val,
-            "signal_id":          str(getattr(plan, "signal_id", "") or ""),
+            "signal_id":          _raw_signal_id,
+            "canonical_signal_id": _canonical_signal_id or "",
             "plan_id":            str(getattr(plan, "plan_id", "") or ""),
             "trigger_type":       str(getattr(plan, "trigger_type", "breach") or "breach"),
             "signal_entry_price": _trigger_val,
@@ -526,6 +539,7 @@ class APOrderStateMachine:
                     f"""
                     INSERT INTO orders (
                         local_order_id, client_id, plan_id, signal_id,
+                        canonical_signal_id,
                         kind, status,
                         symbol, contract, direction,
                         qty, limit_price, reserved_cost,
@@ -537,6 +551,7 @@ class APOrderStateMachine:
                         created_ts, updated_ts
                     ) VALUES (
                         %s,%s,%s,%s,
+                        %s,
                         'ENTRY','{_initial_status}',
                         %s,%s,%s,
                         %s,%s,%s,
@@ -552,6 +567,7 @@ class APOrderStateMachine:
                     (
                         local_order_id, self.client_id,
                         plan.plan_id, plan.signal_id,
+                        _canonical_signal_id,
                         plan.ticker, contract, plan.side.upper(),
                         int(plan.contracts), lp, rc,
                         _score_val, _tier_val,
@@ -610,12 +626,17 @@ class APOrderStateMachine:
         local_id = local_order_id or str(uuid.uuid4())
         ts = now_utc_iso()
 
+        # P0 client-parity: stamp canonical_signal_id on exit rows too so the
+        # full lifecycle (entry + exit) groups by the same opportunity id.
+        _exit_canonical_id = build_canonical_signal_id(signal_id) or None
+
         def _fn():
             with conn() as c:
                 c.execute(
                     """
                     INSERT INTO orders (
                         local_order_id, client_id, position_id, plan_id, signal_id,
+                        canonical_signal_id,
                         kind, status,
                         symbol, contract, direction,
                         qty, limit_price, reserved_cost,
@@ -623,6 +644,7 @@ class APOrderStateMachine:
                         created_ts, updated_ts
                     ) VALUES (
                         %s,%s,%s,%s,%s,
+                        %s,
                         'EXIT','EXIT_REQUESTED',
                         %s,%s,%s,
                         %s,%s,%s,
@@ -634,6 +656,7 @@ class APOrderStateMachine:
                     (
                         local_id, self.client_id,
                         position_id, plan_id, signal_id,
+                        _exit_canonical_id,
                         symbol.upper(), contract, direction.upper(),
                         int(qty),
                         float(limit_price) if limit_price else None,
