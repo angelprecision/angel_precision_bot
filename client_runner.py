@@ -2655,6 +2655,19 @@ def route_signal_to_all_clients(signal: dict):
                     runner.degraded.is_set(),
                 )
 
+    # PR1: Create one opportunity row per active client BEFORE fanout.
+    # Fail-safe — never blocks routing.
+    if active_emails:
+        try:
+            from ap.opportunity_ledger import create_opportunities
+            create_opportunities(
+                signal_id=signal_id,
+                client_ids=active_emails,
+                payload=signal,
+            )
+        except Exception as _ol_err:
+            log.debug("opportunity_ledger.create_opportunities skipped: %s", _ol_err)
+
     if not active_emails:
         if not ALLOW_SUPABASE_FANOUT_FALLBACK:
             with _registry_lock:
