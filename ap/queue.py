@@ -491,6 +491,16 @@ def _dispatch(
     """
     ticker = payload.get("ticker") or payload.get("symbol", "?")
 
+    # Resolve canonical_signal_id — primary idempotency key for opportunity ledger.
+    # PR79 build_canonical_signal_id prevents REEVAL suffix variants from
+    # fragmenting opportunity rows.
+    _canonical_signal_id = payload.get("canonical_signal_id") or signal_id
+    try:
+        from ap_canonical_signal import build_canonical_signal_id as _build_cid
+        _canonical_signal_id = _build_cid(payload) or _canonical_signal_id
+    except Exception:
+        pass  # canonical module optional — fallback to signal_id
+
     # live_mode is derived from master_control.mode — it is NOT passed as a parameter.
     # master_control is the sole authority for LIVE vs PAPER mode in _dispatch.
     # worker_loop's live_mode parameter is only used for the mode label log and
@@ -573,7 +583,9 @@ def _dispatch(
         # PR1: mark ledger row as MISSED
         try:
             from ap.opportunity_ledger import mark_missed, STAGE_UNKNOWN
-            mark_missed(signal_id, client_id, STAGE_UNKNOWN, str(decision.reason or "mc_blocked"))
+            mark_missed(signal_id, client_id, STAGE_UNKNOWN,
+                        str(decision.reason or "mc_blocked"),
+                        canonical_signal_id=_canonical_signal_id)
         except Exception: pass
         trace_gate(str(payload.get("signal_id","")), ticker, "MC_REJECTED", "REJECT",
                    reason=decision.reason, score=float(payload.get("score") or 0))
@@ -787,7 +799,9 @@ def _dispatch(
         )
         try:
             from ap.opportunity_ledger import mark_missed, STAGE_CLIENT_PREFLIGHT
-            mark_missed(signal_id, client_id, STAGE_CLIENT_PREFLIGHT, str(revalidation.reason or "revalidation_block"))
+            mark_missed(signal_id, client_id, STAGE_CLIENT_PREFLIGHT,
+                        str(revalidation.reason or "revalidation_block"),
+                        canonical_signal_id=_canonical_signal_id)
         except Exception: pass
         _mark_job(job_id, "REJECTED",
                   result={"stage": "revalidation", "reason": revalidation.reason,
@@ -872,42 +886,61 @@ def _dispatch(
         return
 
     # ── 4.5 PR2: Client State Preflight ─────────────────────────────────────
-    # Captures exact reason why each client passes/fails before order creation.
-    # If preflight fails: update ledger + return; do NOT create broker order.
+    # Runs preflight snapshot on every CLIENT_ELIGIBLE signal.
+    #
+    # CLIENT_PREFLIGHT_ENFORCE=false (default):
+    #   - build_client_trade_preflight() runs and writes full snapshot to ledger
+    #   - if preflight fails → mark CLIENT_SKIPPED for audit, but DO NOT return
+    #   - execution continues unchanged
+    # CLIENT_PREFLIGHT_ENFORCE=true:
+    #   - if preflight fails → block before order creation (future enforcement)
+    _pf_enforce = str(os.getenv("CLIENT_PREFLIGHT_ENFORCE", "false")).strip().lower() in ("true", "1")
+    _pf_eligible = True   # default: allow through unless enforce=True + failed
     try:
-        from ap.client_preflight import build_client_trade_preflight, KILL_SWITCH_ON
-        from ap.opportunity_ledger import mark_skipped, STAGE_CLIENT_PREFLIGHT
+        from ap.client_preflight import build_client_trade_preflight
+        from ap.opportunity_ledger import update_opportunity, mark_skipped, STAGE_CLIENT_PREFLIGHT, PREFLIGHT_PASSED
         _preflight = build_client_trade_preflight(client_id, payload, plan)
-        # Always persist snapshot to ledger (pass or fail)
+        # Always persist the full preflight snapshot (pass or fail)
+        _pf_status = PREFLIGHT_PASSED if _preflight.eligible else "CLIENT_SKIPPED"
         try:
-            from ap.opportunity_ledger import update_opportunity
             update_opportunity(
                 signal_id, client_id,
-                "ORDER_CREATED" if _preflight.eligible else "CLIENT_SKIPPED",
+                _pf_status,
+                canonical_signal_id=_canonical_signal_id,
                 kill_switch_state=_preflight.kill_switch,
                 entries_paused_state=_preflight.entries_paused,
                 buying_power_snapshot=_preflight.buying_power,
                 cap_snapshot={
-                    "daily_count":       _preflight.daily_trade_count,
-                    "lane_count":        _preflight.daily_lane_count,
-                    "open_positions":    _preflight.open_positions_count,
-                    "pending_entries":   _preflight.pending_entries_count,
+                    "daily_count":    _preflight.daily_trade_count,
+                    "lane_count":     _preflight.daily_lane_count,
+                    "open_positions": _preflight.open_positions_count,
+                    "pending_entries":_preflight.pending_entries_count,
                 },
                 extra_meta={"preflight": _preflight.to_dict()},
             )
         except Exception: pass
         if not _preflight.eligible:
             log.info(
-                "[%s] PREFLIGHT BLOCK | client=%s reason=%s",
-                ticker, client_id, _preflight.block_reason,
+                "[%s] PREFLIGHT %s | client=%s reason=%s enforce=%s",
+                ticker,
+                "BLOCK" if _pf_enforce else "AUDIT",
+                client_id, _preflight.block_reason, _pf_enforce,
             )
-            mark_skipped(
-                signal_id, client_id,
-                STAGE_CLIENT_PREFLIGHT,
-                str(_preflight.block_reason or "unknown_preflight_block"),
-            )
-            _mark_job(job_id, "REJECTED", error=f"preflight:{_preflight.block_reason}")
-            return
+            try:
+                mark_skipped(
+                    signal_id, client_id,
+                    STAGE_CLIENT_PREFLIGHT,
+                    str(_preflight.block_reason or "unknown_preflight_block"),
+                    canonical_signal_id=_canonical_signal_id,
+                )
+            except Exception: pass
+            if _pf_enforce:
+                # enforce=true: block before order creation
+                _mark_job(job_id, "REJECTED",
+                          error=f"preflight_enforced:{_preflight.block_reason}")
+                return
+            # enforce=false: audit only — execution continues below
+            _pf_eligible = False  # captured for metrics; does NOT stop execution
     except ImportError:
         pass   # preflight module optional — skip silently
     except Exception as _pf_err:
@@ -930,10 +963,12 @@ def _dispatch(
             f"[{ticker}] Entry order created: {local_order_id} "
             f"contract={getattr(plan, 'contract_symbol', '?')}"
         )
-        # PR1: ORDER_CREATED (preflight already set this if it ran successfully)
+        # PR1: ORDER_CREATED — only mark AFTER create_entry_order() returns
+        # local_order_id. Status was PREFLIGHT_PASSED before this point.
         try:
             from ap.opportunity_ledger import update_opportunity, ORDER_CREATED
             update_opportunity(signal_id, client_id, ORDER_CREATED,
+                               canonical_signal_id=_canonical_signal_id,
                                order_local_id=str(local_order_id))
         except Exception: pass
     except Exception as e:
