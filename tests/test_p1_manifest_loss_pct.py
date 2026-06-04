@@ -3,7 +3,9 @@ tests/test_p1_manifest_loss_pct.py
 Regression: _build_startup_manifest must not reference caller-local variables.
 """
 import os, sys, threading
-sys.path.insert(0, '/home/claude')
+from pathlib import Path
+REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT))
 
 import pytest
 
@@ -143,7 +145,7 @@ def test_runner_not_stopped_after_manifest():
 
 def test_source_code_has_no_bare_loss_pct_in_manifest():
     """Source-level: no bare 'loss_pct' reference inside _build_startup_manifest."""
-    src = open('/home/claude/p1_cr_fixed.py').read()
+    src = (REPO_ROOT / "client_runner.py").read_text()
     idx = src.find('    def _build_startup_manifest(')
     fn_end = src.find('\n    def ', idx + 1)
     fn = src[idx:fn_end]
@@ -154,5 +156,5 @@ def test_source_code_has_no_bare_loss_pct_in_manifest():
 
 def test_source_code_call_site_passes_daily_max_loss_pct():
     """Call site must pass daily_max_loss_pct=loss_pct."""
-    src = open('/home/claude/p1_cr_fixed.py').read()
+    src = (REPO_ROOT / "client_runner.py").read_text()
     assert 'daily_max_loss_pct=loss_pct,' in src
