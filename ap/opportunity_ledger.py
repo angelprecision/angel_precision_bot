@@ -32,6 +32,7 @@ ORDER_CREATED      = "ORDER_CREATED"
 WATCHER_ARMED      = "WATCHER_ARMED"
 BROKER_SUBMITTED   = "BROKER_SUBMITTED"
 FILLED             = "FILLED"
+PREFLIGHT_PASSED   = "PREFLIGHT_PASSED"  # client cleared preflight, order about to be created
 MISSED             = "MISSED"
 RETRY_ELIGIBLE     = "RETRY_ELIGIBLE"
 RETRY_SUBMITTED    = "RETRY_SUBMITTED"
@@ -55,6 +56,17 @@ STAGE_UNKNOWN             = "UNKNOWN"
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _resolve_canonical(canonical_signal_id: Optional[str],
+                        signal_id: str) -> str:
+    """
+    Return the canonical_signal_id for idempotency key.
+    Falls back to signal_id if canonical is unavailable.
+    REEVAL suffixes must NOT fragment opportunity rows — callers should
+    pass the base canonical_signal_id, not the suffixed variant.
+    """
+    return (canonical_signal_id or signal_id or "").strip() or signal_id
 
 
 def _get_sb():
@@ -93,12 +105,14 @@ def create_opportunities(
     ticker  = str(payload.get("ticker") or payload.get("symbol") or "")
     created = 0
 
+    canonical = _resolve_canonical(canonical_signal_id, signal_id)
+
     for client_id in client_ids:
         try:
             sb.table("client_signal_opportunities").upsert(
                 {
                     "signal_id":              signal_id,
-                    "canonical_signal_id":    canonical_signal_id or signal_id,
+                    "canonical_signal_id":    canonical,
                     "client_id":              client_id,
                     "symbol":                 ticker,
                     "direction":              str(payload.get("direction") or payload.get("side") or ""),
@@ -120,7 +134,9 @@ def create_opportunities(
                         "target_price":   payload.get("target_price"),
                     },
                 },
-                on_conflict="signal_id,client_id",
+                # Primary idempotency key: canonical_signal_id + client_id
+                # Prevents REEVAL suffix variants from duplicating rows.
+                on_conflict="canonical_signal_id,client_id",
             ).execute()
             created += 1
         except Exception as e:
@@ -138,6 +154,7 @@ def update_opportunity(
     client_id: str,
     status: str,
     *,
+    canonical_signal_id: Optional[str] = None,
     miss_stage: Optional[str] = None,
     miss_reason: Optional[str] = None,
     order_local_id: Optional[str] = None,
@@ -188,9 +205,10 @@ def update_opportunity(
         if cap_snapshot:  patch["metadata"]["cap_snapshot"]  = cap_snapshot
         if extra_meta:    patch["metadata"].update(extra_meta)
 
+    canonical = _resolve_canonical(canonical_signal_id, signal_id)
     try:
         sb.table("client_signal_opportunities").update(patch).eq(
-            "signal_id", signal_id
+            "canonical_signal_id", canonical
         ).eq("client_id", client_id).execute()
         return True
     except Exception as e:
@@ -206,11 +224,14 @@ def mark_skipped(
     client_id: str,
     miss_stage: str,
     miss_reason: str,
+    *,
+    canonical_signal_id: Optional[str] = None,
     **kwargs,
 ) -> bool:
     """Convenience: mark a client as skipped before order creation."""
     return update_opportunity(
         signal_id, client_id, CLIENT_SKIPPED,
+        canonical_signal_id=canonical_signal_id,
         miss_stage=miss_stage, miss_reason=miss_reason, **kwargs
     )
 
@@ -220,10 +241,13 @@ def mark_missed(
     client_id: str,
     miss_stage: str,
     miss_reason: str,
+    *,
+    canonical_signal_id: Optional[str] = None,
     **kwargs,
 ) -> bool:
     """Convenience: mark a client as terminally missed."""
     return update_opportunity(
         signal_id, client_id, MISSED,
+        canonical_signal_id=canonical_signal_id,
         miss_stage=miss_stage, miss_reason=miss_reason, **kwargs
     )
