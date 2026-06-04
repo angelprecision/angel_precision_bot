@@ -570,6 +570,11 @@ def _dispatch(
 
     if not decision.ok:
         log.info(f"[{ticker}] BLOCKED | stage={decision.stage} reason={decision.reason}")
+        # PR1: mark ledger row as MISSED
+        try:
+            from ap.opportunity_ledger import mark_missed, STAGE_UNKNOWN
+            mark_missed(signal_id, client_id, STAGE_UNKNOWN, str(decision.reason or "mc_blocked"))
+        except Exception: pass
         trace_gate(str(payload.get("signal_id","")), ticker, "MC_REJECTED", "REJECT",
                    reason=decision.reason, score=float(payload.get("score") or 0))
         _mark_job(job_id, "REJECTED",
@@ -780,6 +785,10 @@ def _dispatch(
             f"[{ticker}] BLOCKED at re-validation (real premium) | "
             f"reason={revalidation.reason}"
         )
+        try:
+            from ap.opportunity_ledger import mark_missed, STAGE_CLIENT_PREFLIGHT
+            mark_missed(signal_id, client_id, STAGE_CLIENT_PREFLIGHT, str(revalidation.reason or "revalidation_block"))
+        except Exception: pass
         _mark_job(job_id, "REJECTED",
                   result={"stage": "revalidation", "reason": revalidation.reason,
                           "real_cost": plan.max_position_usd})
@@ -862,6 +871,48 @@ def _dispatch(
         _mark_job(job_id, "REJECTED", error="entry_cutoff: too_late_in_session")
         return
 
+    # ── 4.5 PR2: Client State Preflight ─────────────────────────────────────
+    # Captures exact reason why each client passes/fails before order creation.
+    # If preflight fails: update ledger + return; do NOT create broker order.
+    try:
+        from ap.client_preflight import build_client_trade_preflight, KILL_SWITCH_ON
+        from ap.opportunity_ledger import mark_skipped, STAGE_CLIENT_PREFLIGHT
+        _preflight = build_client_trade_preflight(client_id, payload, plan)
+        # Always persist snapshot to ledger (pass or fail)
+        try:
+            from ap.opportunity_ledger import update_opportunity
+            update_opportunity(
+                signal_id, client_id,
+                "ORDER_CREATED" if _preflight.eligible else "CLIENT_SKIPPED",
+                kill_switch_state=_preflight.kill_switch,
+                entries_paused_state=_preflight.entries_paused,
+                buying_power_snapshot=_preflight.buying_power,
+                cap_snapshot={
+                    "daily_count":       _preflight.daily_trade_count,
+                    "lane_count":        _preflight.daily_lane_count,
+                    "open_positions":    _preflight.open_positions_count,
+                    "pending_entries":   _preflight.pending_entries_count,
+                },
+                extra_meta={"preflight": _preflight.to_dict()},
+            )
+        except Exception: pass
+        if not _preflight.eligible:
+            log.info(
+                "[%s] PREFLIGHT BLOCK | client=%s reason=%s",
+                ticker, client_id, _preflight.block_reason,
+            )
+            mark_skipped(
+                signal_id, client_id,
+                STAGE_CLIENT_PREFLIGHT,
+                str(_preflight.block_reason or "unknown_preflight_block"),
+            )
+            _mark_job(job_id, "REJECTED", error=f"preflight:{_preflight.block_reason}")
+            return
+    except ImportError:
+        pass   # preflight module optional — skip silently
+    except Exception as _pf_err:
+        log.warning("[%s] preflight check failed (non-blocking): %s", ticker, _pf_err)
+
     # ── 5. ORDER STATE MACHINE (create only after route + cutoff cleared) ────
     try:
         local_order_id = order_state_machine.create_entry_order(plan)
@@ -879,6 +930,12 @@ def _dispatch(
             f"[{ticker}] Entry order created: {local_order_id} "
             f"contract={getattr(plan, 'contract_symbol', '?')}"
         )
+        # PR1: ORDER_CREATED (preflight already set this if it ran successfully)
+        try:
+            from ap.opportunity_ledger import update_opportunity, ORDER_CREATED
+            update_opportunity(signal_id, client_id, ORDER_CREATED,
+                               order_local_id=str(local_order_id))
+        except Exception: pass
     except Exception as e:
         log.error(f"[{ticker}] create_entry_order() failed: {e}")
         _mark_job(job_id, "ERROR", error=f"order_create_error: {e}")
