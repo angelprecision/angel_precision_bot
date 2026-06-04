@@ -27,17 +27,19 @@ log = logging.getLogger("ap.opportunity_ledger")
 
 # ── Status constants ──────────────────────────────────────────────────────────
 CREATED            = "CREATED"
-CLIENT_SKIPPED     = "CLIENT_SKIPPED"
-ORDER_CREATED      = "ORDER_CREATED"
+CLIENT_ELIGIBLE    = "CLIENT_ELIGIBLE"
+PREFLIGHT_PASSED   = "PREFLIGHT_PASSED"    # cleared preflight, continuing to order creation
+PREFLIGHT_WARNING  = "PREFLIGHT_WARNING"   # preflight detected issue but enforce=false, execution continued
+CLIENT_SKIPPED     = "CLIENT_SKIPPED"      # preflight blocked (enforce=true only)
+ORDER_CREATED      = "ORDER_CREATED"       # written ONLY after create_entry_order() returns valid local_order_id
 WATCHER_ARMED      = "WATCHER_ARMED"
 BROKER_SUBMITTED   = "BROKER_SUBMITTED"
+BROKER_ACKED       = "BROKER_ACKED"
 FILLED             = "FILLED"
-PREFLIGHT_PASSED   = "PREFLIGHT_PASSED"  # client cleared preflight, order about to be created
 MISSED             = "MISSED"
-RETRY_ELIGIBLE     = "RETRY_ELIGIBLE"
-RETRY_SUBMITTED    = "RETRY_SUBMITTED"
-RETRY_FILLED       = "RETRY_FILLED"
-RETRY_BLOCKED      = "RETRY_BLOCKED"
+# NOTE: RETRY_* statuses are reserved for a future retry evaluator PR.
+# PR81 must not create or consume these statuses automatically.
+RETRY_ELIGIBLE     = "RETRY_ELIGIBLE"   # reserved — not written by PR81
 
 # ── Miss stage constants ──────────────────────────────────────────────────────
 STAGE_CLIENT_PREFLIGHT    = "CLIENT_PREFLIGHT"
@@ -141,8 +143,9 @@ def create_opportunities(
             created += 1
         except Exception as e:
             log.warning(
-                "opportunity_ledger.create_opportunities failed | client=%s signal=%s err=%s",
-                client_id, signal_id, e,
+                "CLIENT_OPPORTUNITY_LEDGER_WRITE_FAILED | "
+                "stage=create_opportunities client=%s signal=%s canonical=%s err=%s",
+                client_id, signal_id, canonical, e,
             )
 
     log.debug("opportunity_ledger: created %d/%d rows for signal=%s", created, len(client_ids), signal_id)
@@ -167,6 +170,10 @@ def update_opportunity(
     kill_switch_state: Optional[bool] = None,
     entries_paused_state: Optional[bool] = None,
     entry_confirmation_result: Optional[str] = None,
+    # Amendment 2: distinguish observe from enforce
+    preflight_enforced: Optional[bool] = None,    # True=enforce blocked; False=observe only
+    execution_continued: Optional[bool] = None,   # True=trade was allowed despite preflight warning
+    would_block_reason: Optional[str] = None,     # block reason when observe mode didn't stop execution
     retry_status: Optional[str] = None,
     retry_reason: Optional[str] = None,
     extra_meta: Optional[dict] = None,
@@ -175,6 +182,7 @@ def update_opportunity(
     """
     Update an opportunity row's status and optional miss/fill metadata.
     Fail-safe — never raises; returns True if write succeeded.
+    Logs CLIENT_OPPORTUNITY_LEDGER_WRITE_FAILED on failure (Amendment 5).
     """
     if not signal_id or not client_id:
         return False
@@ -197,6 +205,9 @@ def update_opportunity(
     if kill_switch_state       is not None: patch["kill_switch_state"]        = kill_switch_state
     if entries_paused_state    is not None: patch["entries_paused_state"]     = entries_paused_state
     if entry_confirmation_result is not None: patch["entry_confirmation_result"] = entry_confirmation_result
+    if preflight_enforced      is not None: patch["preflight_enforced"]       = preflight_enforced
+    if execution_continued     is not None: patch["execution_continued"]      = execution_continued
+    if would_block_reason      is not None: patch["would_block_reason"]       = would_block_reason
     if retry_status            is not None: patch["retry_status"]             = retry_status
     if retry_reason            is not None: patch["retry_reason"]             = retry_reason
 
@@ -212,9 +223,11 @@ def update_opportunity(
         ).eq("client_id", client_id).execute()
         return True
     except Exception as e:
+        # Amendment 5: never silent — log with full context
         log.warning(
-            "opportunity_ledger.update_opportunity failed | client=%s signal=%s status=%s err=%s",
-            client_id, signal_id, status, e,
+            "CLIENT_OPPORTUNITY_LEDGER_WRITE_FAILED | "
+            "stage=update_opportunity status=%s client=%s signal=%s canonical=%s err=%s",
+            status, client_id, signal_id, canonical, e,
         )
         return False
 

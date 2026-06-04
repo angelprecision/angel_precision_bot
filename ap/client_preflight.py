@@ -71,7 +71,15 @@ class ClientTradePreflight:
     snapshot_ts:             str
     metadata:                dict = field(default_factory=dict)
 
-    def to_dict(self) -> dict:
+    def to_dict(self, *, preflight_enforced: bool = False,
+                execution_continued: bool = True) -> dict:
+        """Return a serialisable snapshot of the preflight result.
+
+        Amendment 6: includes preflight_enforced and execution_continued
+        so the ledger row carries the full truth about what happened.
+        Unknown/unavailable states are recorded as descriptive strings
+        rather than hard defaults that could cause false blocks.
+        """
         return {
             "client_id":                self.client_id,
             "client_active":            self.client_active,
@@ -84,7 +92,8 @@ class ClientTradePreflight:
             "has_account_id":           self.has_account_id,
             "has_access_token":         self.has_access_token,
             "broker_credentials_present": self.broker_credentials_present,
-            "buying_power":             self.buying_power,
+            "buying_power":             self.buying_power
+                                        if self.buying_power > 0 else "buying_power_unavailable",
             "estimated_cost":           self.estimated_cost,
             "max_trade_cost":           self.max_trade_cost,
             "daily_trade_count":        self.daily_trade_count,
@@ -102,6 +111,9 @@ class ClientTradePreflight:
             "eligible":                 self.eligible,
             "block_reason":             self.block_reason,
             "snapshot_ts":              self.snapshot_ts,
+            # Amendment 2+6: enforcement context
+            "preflight_enforced":       preflight_enforced,
+            "execution_continued":      execution_continued,
         }
 
 

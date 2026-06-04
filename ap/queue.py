@@ -888,61 +888,105 @@ def _dispatch(
     # ── 4.5 PR2: Client State Preflight ─────────────────────────────────────
     # Runs preflight snapshot on every CLIENT_ELIGIBLE signal.
     #
-    # CLIENT_PREFLIGHT_ENFORCE=false (default):
-    #   - build_client_trade_preflight() runs and writes full snapshot to ledger
-    #   - if preflight fails → mark CLIENT_SKIPPED for audit, but DO NOT return
-    #   - execution continues unchanged
-    # CLIENT_PREFLIGHT_ENFORCE=true:
-    #   - if preflight fails → block before order creation (future enforcement)
+    # Amendment 1+2: two distinct modes
+    #   CLIENT_PREFLIGHT_ENFORCE=false (default) — OBSERVE ONLY:
+    #     - build_client_trade_preflight() runs and writes full snapshot to ledger
+    #     - if preflight fails → PREFLIGHT_WARNING + execution_continued=True
+    #     - DO NOT call mark_skipped(); DO NOT return; DO NOT reject the job
+    #     - existing order creation path continues unchanged
+    #   CLIENT_PREFLIGHT_ENFORCE=true — ENFORCE:
+    #     - if preflight fails → CLIENT_SKIPPED + execution_continued=False
+    #     - block before order creation
     _pf_enforce = str(os.getenv("CLIENT_PREFLIGHT_ENFORCE", "false")).strip().lower() in ("true", "1")
     _pf_eligible = True   # default: allow through unless enforce=True + failed
     try:
         from ap.client_preflight import build_client_trade_preflight
-        from ap.opportunity_ledger import update_opportunity, mark_skipped, STAGE_CLIENT_PREFLIGHT, PREFLIGHT_PASSED
+        from ap.opportunity_ledger import (
+            update_opportunity, mark_skipped,
+            STAGE_CLIENT_PREFLIGHT, PREFLIGHT_PASSED, PREFLIGHT_WARNING, CLIENT_SKIPPED,
+        )
         _preflight = build_client_trade_preflight(client_id, payload, plan)
-        # Always persist the full preflight snapshot (pass or fail)
-        _pf_status = PREFLIGHT_PASSED if _preflight.eligible else "CLIENT_SKIPPED"
-        try:
-            update_opportunity(
-                signal_id, client_id,
-                _pf_status,
-                canonical_signal_id=_canonical_signal_id,
-                kill_switch_state=_preflight.kill_switch,
-                entries_paused_state=_preflight.entries_paused,
-                buying_power_snapshot=_preflight.buying_power,
-                cap_snapshot={
-                    "daily_count":    _preflight.daily_trade_count,
-                    "lane_count":     _preflight.daily_lane_count,
-                    "open_positions": _preflight.open_positions_count,
-                    "pending_entries":_preflight.pending_entries_count,
-                },
-                extra_meta={"preflight": _preflight.to_dict()},
+
+        if _preflight.eligible:
+            # Preflight passed — record PREFLIGHT_PASSED (Amendment 3: not ORDER_CREATED)
+            _pf_status           = PREFLIGHT_PASSED
+            _pf_enforced_flag    = _pf_enforce
+            _pf_exec_continued   = True
+            _pf_would_block      = None
+        elif not _pf_enforce:
+            # Amendment 1+2: observe only — PREFLIGHT_WARNING, execution continues
+            _pf_status           = PREFLIGHT_WARNING
+            _pf_enforced_flag    = False
+            _pf_exec_continued   = True
+            _pf_would_block      = str(_preflight.block_reason or "unknown_preflight_block")
+        else:
+            # Amendment 2: enforcement — CLIENT_SKIPPED, execution blocked
+            _pf_status           = CLIENT_SKIPPED
+            _pf_enforced_flag    = True
+            _pf_exec_continued   = False
+            _pf_would_block      = str(_preflight.block_reason or "unknown_preflight_block")
+
+        # Amendment 5: named log tag on failure — never silent
+        _ol_ok = update_opportunity(
+            signal_id, client_id,
+            _pf_status,
+            canonical_signal_id=_canonical_signal_id,
+            kill_switch_state=_preflight.kill_switch,
+            entries_paused_state=_preflight.entries_paused,
+            buying_power_snapshot=_preflight.buying_power,
+            cap_snapshot={
+                "daily_count":    _preflight.daily_trade_count,
+                "lane_count":     _preflight.daily_lane_count,
+                "open_positions": _preflight.open_positions_count,
+                "pending_entries":_preflight.pending_entries_count,
+            },
+            # Amendment 2: persist enforcement context on every preflight write
+            preflight_enforced=_pf_enforced_flag,
+            execution_continued=_pf_exec_continued,
+            would_block_reason=_pf_would_block,
+            # Amendment 6: full snapshot including enforcement context
+            extra_meta={"preflight": _preflight.to_dict(
+                preflight_enforced=_pf_enforced_flag,
+                execution_continued=_pf_exec_continued,
+            )},
+        )
+        if not _ol_ok:
+            log.warning(
+                "[%s] CLIENT_OPPORTUNITY_LEDGER_WRITE_FAILED | "
+                "stage=preflight_status client=%s signal=%s canonical=%s status=%s",
+                ticker, client_id, signal_id, _canonical_signal_id, _pf_status,
             )
-        except Exception: pass
+
         if not _preflight.eligible:
             log.info(
                 "[%s] PREFLIGHT %s | client=%s reason=%s enforce=%s",
                 ticker,
-                "BLOCK" if _pf_enforce else "AUDIT",
+                "BLOCK" if _pf_enforce else "WARN",
                 client_id, _preflight.block_reason, _pf_enforce,
             )
-            try:
-                mark_skipped(
+            if _pf_enforce:
+                # Enforcement mode: mark CLIENT_SKIPPED and block execution
+                _sk_ok = mark_skipped(
                     signal_id, client_id,
                     STAGE_CLIENT_PREFLIGHT,
                     str(_preflight.block_reason or "unknown_preflight_block"),
                     canonical_signal_id=_canonical_signal_id,
                 )
-            except Exception: pass
-            if _pf_enforce:
-                # enforce=true: block before order creation
+                if not _sk_ok:
+                    log.warning(
+                        "[%s] CLIENT_OPPORTUNITY_LEDGER_WRITE_FAILED | "
+                        "stage=mark_skipped client=%s signal=%s",
+                        ticker, client_id, signal_id,
+                    )
                 _mark_job(job_id, "REJECTED",
                           error=f"preflight_enforced:{_preflight.block_reason}")
                 return
-            # enforce=false: audit only — execution continues below
+            # Observe mode: PREFLIGHT_WARNING written above; execution continues
             _pf_eligible = False  # captured for metrics; does NOT stop execution
     except ImportError:
         pass   # preflight module optional — skip silently
+    except Exception as _pf_err:
+        log.warning("[%s] preflight check failed (non-blocking): %s", ticker, _pf_err)
     except Exception as _pf_err:
         log.warning("[%s] preflight check failed (non-blocking): %s", ticker, _pf_err)
 
