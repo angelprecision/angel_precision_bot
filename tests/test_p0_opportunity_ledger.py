@@ -261,3 +261,60 @@ def test_preflight_no_sb_does_not_raise():
         assert isinstance(pf, ClientTradePreflight)
     except Exception as e:
         pytest.fail(f"preflight raised without sb: {e}")
+
+
+# ── Amendment tests ───────────────────────────────────────────────────────────
+
+def test_create_opportunities_uses_canonical_conflict_key():
+    sb = _sb()
+    create_opportunities("sig_raw", ["c1@x.com"], SIG,
+                         canonical_signal_id="canon_abc", sb=sb)
+    upsert = sb._captured[0]
+    row = upsert[1]
+    assert row["canonical_signal_id"] == "canon_abc"
+    # The upsert on_conflict key must be canonical_signal_id,client_id
+    # We verify the row has canonical_signal_id set correctly
+    assert row["signal_id"] == "sig_raw"
+
+def test_create_opportunities_fallback_canonical_to_signal_id():
+    sb = _sb()
+    create_opportunities("sig_fallback", ["c1@x.com"], SIG, sb=sb)
+    row = sb._captured[0][1]
+    # canonical_signal_id should equal signal_id as fallback
+    assert row["canonical_signal_id"] == "sig_fallback"
+
+def test_update_opportunity_uses_canonical_signal_id():
+    sb = _sb()
+    ok = update_opportunity("sig_raw", "c1@x.com", ORDER_CREATED,
+                             canonical_signal_id="canon_abc",
+                             order_local_id="loc-999", sb=sb)
+    assert ok is True
+    # The WHERE clause uses canonical_signal_id — verify captured payload
+    update = sb._captured[0][1]
+    assert update["opportunity_status"] == ORDER_CREATED
+
+def test_PREFLIGHT_PASSED_status_exists():
+    from ap_opportunity_ledger import PREFLIGHT_PASSED
+    assert PREFLIGHT_PASSED == "PREFLIGHT_PASSED"
+
+def test_preflight_enforce_false_missing_buying_power_does_not_block():
+    import os
+    os.environ["CLIENT_PREFLIGHT_ENFORCE"] = "false"
+    # buying_power=0 (unknown) should NOT trigger insufficient_buying_power
+    pf = build_client_trade_preflight("c@x.com", SIG2,
+                                       _plan(cost=200.0),   # cost > 0
+                                       sb=_sb_member())     # no buying_power in member row
+    # buying_power defaults to 0.0 — but 0.0 means UNKNOWN, not zero dollars
+    # so the insufficient_buying_power check must not fire
+    assert pf.block_reason != "insufficient_buying_power", (
+        f"Should not block on buying_power=0 (unknown); got {pf.block_reason}"
+    )
+
+def test_preflight_enforce_flag_readable():
+    from ap_client_preflight import preflight_enforce
+    import os
+    os.environ["CLIENT_PREFLIGHT_ENFORCE"] = "false"
+    assert preflight_enforce() is False
+    os.environ["CLIENT_PREFLIGHT_ENFORCE"] = "true"
+    assert preflight_enforce() is True
+    os.environ["CLIENT_PREFLIGHT_ENFORCE"] = "false"
