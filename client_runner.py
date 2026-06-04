@@ -1548,6 +1548,7 @@ class ClientRunner(threading.Thread):
             "max_capital_pct", "max_sector_pct", "max_ticker_pct",
             "max_calls", "max_puts", "score_floor", "context_floor",
             "max_concurrent_positions", "daily_max_loss_pct",
+            "entries_enabled",   # PR84 amendment: must match PR83 boot list exactly
         ]
         _missing_live = [
             f for f in _REQUIRED
