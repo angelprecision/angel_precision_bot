@@ -151,8 +151,27 @@ def decide_repeg(
         order_row.get("direction")
         or order_row.get("side")
         or (order_row.get("meta") or {}).get("direction")
+        or (order_row.get("meta") or {}).get("side")
         or ""
-    ).upper()
+    ).upper().strip()
+
+    if direction not in ("CALL", "PUT"):
+        # Last-resort: infer from OCC contract symbol.
+        # OCC format: ROOT + 6-digit date + C|P + 8-digit strike.
+        # Type char is always between digits — avoids matching a C/P in the root.
+        # Examples:  ORCL260605P00230000 → PUT
+        #            SPY260605C00580000  → CALL
+        import re as _re
+        _contract = str(order_row.get("contract") or order_row.get("symbol") or "").upper()
+        _m = _re.search(r"\d([CP])\d", _contract)
+        if _m:
+            direction = "CALL" if _m.group(1) == "C" else "PUT"
+            log.info(
+                "decide_repeg: inferred direction=%s from contract=%s (order=%s)",
+                direction, _contract,
+                order_row.get("id") or order_row.get("local_order_id"),
+            )
+
     if direction not in ("CALL", "PUT"):
         return RepegDecision(ok=False, reason="unknown_direction", detail={"direction": direction})
 

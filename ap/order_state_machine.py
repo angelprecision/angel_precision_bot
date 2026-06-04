@@ -458,6 +458,26 @@ class APOrderStateMachine:
                 self.client_id, plan.plan_id, existing["local_order_id"],
             )
             return existing["local_order_id"]
+
+        # ── Req 2: Validate contracts > 0 before inserting ───────────────
+        # An order with qty=0 reaches order_monitor ACKNOWLEDGED and loops
+        # forever on PAPER_ENTRY_REPEG_UNSUPPORTED / HYDRATION_FAILED.
+        # Block the insert here so the bad row never enters the DB.
+        _contracts = int(getattr(plan, "contracts", 0) or 0)
+        if _contracts <= 0:
+            log.error(
+                "[%s] create_entry_order BLOCKED — invalid_entry_qty: "
+                "plan %s has contracts=%s <= 0. "
+                "Sizer must return contracts > 0 before an entry order is created.",
+                self.client_id, getattr(plan, "plan_id", "?"), _contracts,
+            )
+            raise ValueError(
+                f"invalid_entry_qty: plan.contracts={_contracts} for client={self.client_id}"
+            )
+
+        # ── Req 1+3: Normalise direction from plan.side ───────────────────
+        _side_raw = str(getattr(plan, "side", "") or "").upper().strip()
+        _direction = _side_raw if _side_raw in ("CALL", "PUT") else _side_raw
         local_order_id = str(uuid.uuid4())
         contract = getattr(plan, "contract_symbol", None) or plan.ticker
         lp = float(limit_price) if limit_price else (float(plan.limit_price) if getattr(plan, "limit_price", None) else None)
@@ -513,11 +533,17 @@ class APOrderStateMachine:
             "trigger_type":       str(getattr(plan, "trigger_type", "breach") or "breach"),
             "signal_entry_price": _trigger_val,
             "selected_contract":  str(contract or ""),
-            "contracts":          int(getattr(plan, "contracts", 0) or 0),
+            "contracts":          _contracts,   # hydrated + validated above
             "limit_price":        float(lp) if lp is not None else None,
             "max_position_usd":   float(rc) if rc is not None else None,
             "pattern":            str(getattr(plan, "pattern", "") or ""),
             "timeframe":          str(getattr(plan, "timeframe", "") or ""),
+            # Req 1+3: persist direction + symbol so _try_repeg hydration always
+            # has meta fallbacks even if orders.direction / orders.symbol are blank.
+            "direction":          _direction,
+            "side":               _direction,   # alias — retry_engine reads both
+            "symbol":             str(getattr(plan, "ticker", "") or ""),
+
         }
         # Caller-supplied meta wins on conflict (e.g. queue path passing
         # selector_ask / selector_mid / option_bid / option_ask / option_mid /
@@ -568,8 +594,8 @@ class APOrderStateMachine:
                         local_order_id, self.client_id,
                         plan.plan_id, plan.signal_id,
                         _canonical_signal_id,
-                        plan.ticker, contract, plan.side.upper(),
-                        int(plan.contracts), lp, rc,
+                        plan.ticker, contract, _direction,
+                        _contracts, lp, rc,
                         _score_val, _tier_val,
                         _trigger_val if _trigger_val > 0 else None,
                         _stop_val if _stop_val > 0 else None,
