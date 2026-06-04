@@ -1008,6 +1008,7 @@ class ClientRunner(threading.Thread):
         risk_profile_source: str  = "GLOBAL_ENV_DEFAULT",
         risk_profile_valid: bool  = False,
         missing_risk_fields: list = None,
+        daily_max_loss_pct: float = 0.06,
     ):
         if missing_risk_fields is None:
             missing_risk_fields = []
@@ -1049,7 +1050,7 @@ class ClientRunner(threading.Thread):
             "effective_context_floor": mc_ctx_floor,
             "effective_max_capital_pct": mc_capital_pct,
             "effective_max_sector_pct": mc_sector_pct,
-            "effective_daily_max_loss_pct": loss_pct,
+            "effective_daily_max_loss_pct": daily_max_loss_pct,
         }
             logger.info("[%s] Startup manifest: %s", self.email, self.startup_manifest)
         except Exception as _manifest_exc:
@@ -1847,6 +1848,7 @@ class ClientRunner(threading.Thread):
             risk_profile_source=_risk_profile_source,
             risk_profile_valid=(len(_missing_live) == 0),
             missing_risk_fields=_missing_live,
+            daily_max_loss_pct=loss_pct,
         )
 
         self._validate_control_stack()
