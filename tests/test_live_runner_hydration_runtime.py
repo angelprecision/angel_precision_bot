@@ -127,6 +127,7 @@ def _make_hydration_runner(mode: str = "live", attached_profile=None):
                 "max_capital_pct", "max_sector_pct", "max_ticker_pct",
                 "max_calls", "max_puts", "score_floor", "context_floor",
                 "max_concurrent_positions", "daily_max_loss_pct",
+                "entries_enabled",   # PR84 amendment — must mirror client_runner.py exactly
             ]
             _missing_live = [
                 f for f in _REQUIRED
@@ -375,3 +376,70 @@ def test_global_env_defaults_not_used_when_profile_present():
     )
     assert score_floor == 70.0, "Profile score_floor=70 must override env default 65"
     assert source == "CLIENT_RISK_PROFILE"
+
+
+def test_client_runner_required_list_contains_entries_enabled():
+    """Source-level check: the actual client_runner.py _REQUIRED list must contain
+    entries_enabled. Catches any future edit that removes it from the source."""
+    import re, pathlib
+    _src_path = pathlib.Path(__file__).resolve().parents[1] / "client_runner.py"
+    src = _src_path.read_text()
+    # Find the runtime _REQUIRED block (not the boot _REQUIRED_LIVE_FIELDS block)
+    m = re.search(r"_REQUIRED\s*=\s*\[([^\]]+)\]", src)
+    assert m, "Could not find _REQUIRED list in client_runner.py"
+    required_block = m.group(1)
+    assert "entries_enabled" in required_block, (
+        f"client_runner.py runtime _REQUIRED must include entries_enabled. "
+        f"Block found:\n{required_block}"
+    )
+
+
+# ── PR84 amendment: entries_enabled in runtime _REQUIRED ─────────────────────
+# These three tests confirm the actual client_runner.py _REQUIRED list
+# includes entries_enabled and behaves correctly for each missing/null/false case.
+
+def test_live_entries_enabled_missing_raises():
+    """LIVE profile with entries_enabled key absent → LIVE RISK PROFILE INCOMPLETE
+    and the error names entries_enabled."""
+    profile_no_entries = {k: v for k, v in JASON_PROFILE.items() if k != "entries_enabled"}
+    runner = _make_hydration_runner("live")
+    with pytest.raises(RuntimeError) as exc_info:
+        runner.run_hydration(mock_sb=_make_mock_sb(profile_no_entries))
+    msg = str(exc_info.value)
+    assert "LIVE RISK PROFILE INCOMPLETE" in msg, f"Wrong error: {msg}"
+    assert "entries_enabled" in msg, (
+        f"Error must name entries_enabled as missing field. Got: {msg}"
+    )
+
+
+def test_live_entries_enabled_null_raises():
+    """LIVE profile with entries_enabled=None (null) → LIVE RISK PROFILE INCOMPLETE
+    and the error names entries_enabled."""
+    profile_null_entries = dict(JASON_PROFILE, entries_enabled=None)
+    runner = _make_hydration_runner("live")
+    with pytest.raises(RuntimeError) as exc_info:
+        runner.run_hydration(mock_sb=_make_mock_sb(profile_null_entries))
+    msg = str(exc_info.value)
+    assert "LIVE RISK PROFILE INCOMPLETE" in msg, f"Wrong error: {msg}"
+    assert "entries_enabled" in msg, (
+        f"Error must name entries_enabled as null field. Got: {msg}"
+    )
+
+
+def test_live_entries_enabled_false_passes_required_check():
+    """LIVE profile with entries_enabled=False → field is explicitly configured.
+    False is a valid boolean value (entries are intentionally disabled).
+    Required-field completeness check must pass; RuntimeError must NOT be raised."""
+    profile_disabled = dict(JASON_PROFILE, entries_enabled=False)
+    runner = _make_hydration_runner("live")
+    try:
+        cfg, score_floor, capital_pct, max_pos, source, missing = runner.run_hydration(
+            mock_sb=_make_mock_sb(profile_disabled)
+        )
+    except RuntimeError as e:
+        pytest.fail(
+            f"entries_enabled=False must pass required-field check but raised: {e}"
+        )
+    assert "entries_enabled" not in missing, (
+        "entries_enabled=False must not appear in missing fields list"
+    )
