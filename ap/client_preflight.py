@@ -110,6 +110,15 @@ def _ef(key: str, default: int) -> int:
     except: return default
 
 
+def preflight_enforce() -> bool:
+    """
+    CLIENT_PREFLIGHT_ENFORCE=false (default) — run preflight, write audit,
+    but DO NOT block execution. Decision is made in queue.py.
+    CLIENT_PREFLIGHT_ENFORCE=true — enforce: block on failure before order create.
+    """
+    return os.getenv("CLIENT_PREFLIGHT_ENFORCE", "false").strip().lower() in ("true", "1")
+
+
 def build_client_trade_preflight(
     client_id: str,
     signal: dict,
@@ -282,10 +291,21 @@ def build_client_trade_preflight(
 
     broker_credentials_present = has_account_id and has_access_token
 
-    # ── Evaluate eligibility in priority order ────────────────────────────────
-    eligible     = True
+    # ── Evaluate eligibility ─────────────────────────────────────────────────
+    # When CLIENT_PREFLIGHT_ENFORCE=false (default), all blocks are captured
+    # for audit but do NOT gate execution — that decision is made in queue.py.
+    # When enforce=true, the caller (queue.py) respects eligible=False.
+    #
+    # Hard vs soft blocks:
+    #   Hard: definitively known (kill_switch, approved, subscription, credentials).
+    #         Always reported accurately regardless of enforce flag.
+    #   Soft: may be unknown (buying_power=0 means unread, not zero;
+    #         mode data might be stale). Only block when data is confirmed present.
+    _enforce  = preflight_enforce()
+    eligible  = True
     block_reason = None
 
+    # Hard blocks — accurate regardless of enforce flag
     if not approved:
         eligible = False; block_reason = CLIENT_NOT_APPROVED
     elif not subscription_active:
@@ -296,9 +316,14 @@ def build_client_trade_preflight(
         eligible = False; block_reason = ENTRIES_PAUSED
     elif not broker_credentials_present:
         eligible = False; block_reason = MISSING_BROKER_CREDENTIALS
-    elif tradier_mode != expected_mode and expected_mode in ("live", "paper"):
-        eligible = False; block_reason = BROKER_MODE_MISMATCH
+
+    # Soft blocks — only apply when enforce=true OR data is confirmed present
+    elif tradier_mode and expected_mode in ("live", "paper") and tradier_mode != expected_mode:
+        # Only block on mode mismatch if both sides are known
+        if _enforce or (tradier_mode and expected_mode):
+            eligible = False; block_reason = BROKER_MODE_MISMATCH
     elif buying_power > 0 and estimated_cost > 0 and estimated_cost > buying_power:
+        # buying_power=0 means UNKNOWN — skip this check when enforce=false
         eligible = False; block_reason = INSUFFICIENT_BUYING_POWER
     elif estimated_cost > 0 and max_trade_cost > 0 and estimated_cost > max_trade_cost:
         eligible = False; block_reason = ESTIMATED_COST_EXCEEDS_LIMIT
