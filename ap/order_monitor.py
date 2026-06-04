@@ -2801,6 +2801,102 @@ class APOrderMonitor:
         # (ask + 0.01, ask + 0.02) is applied instead of the legacy gap-close.
         meta = dict(order.get("meta") or {})
 
+        # ── Req 1: Qty hydration ──────────────────────────────────────────────
+        # orders.qty may be 0 (falsy) even when meta.contracts / orders.quantity
+        # carry the real value.  Must check explicit zero vs None separately.
+        def _resolve_qty(order: dict, meta: dict):
+            sources = [
+                ("orders.qty",        order.get("qty")),
+                ("orders.quantity",   order.get("quantity")),
+                ("orders.contracts",  order.get("contracts")),
+                ("meta.contracts",    meta.get("contracts")),
+                ("meta.qty",          meta.get("qty")),
+                ("meta.original_qty", meta.get("original_qty")),
+            ]
+            for src_name, val in sources:
+                try:
+                    n = int(val)
+                    if n > 0:
+                        return n, src_name
+                except (TypeError, ValueError):
+                    pass
+            return 0, "no_valid_source"
+
+        _resolved_qty, _qty_src = _resolve_qty(order, meta)
+        log.debug(
+            "[%s] _try_repeg qty resolution: resolved=%s source=%s "
+            "raw={qty=%r, quantity=%r, contracts=%r, meta.contracts=%r} "
+            "local=%s contract=%s",
+            self.client_id, _resolved_qty, _qty_src,
+            order.get("qty"), order.get("quantity"),
+            order.get("contracts"), meta.get("contracts"),
+            local_id, contract,
+        )
+        if _resolved_qty <= 0:
+            log.warning(
+                "[%s] HYDRATION_FAILED local=%s contract=%s client=%s "
+                "reason=invalid_qty resolved=%s qty_sources=%r "
+                "— skipping repeg, marking invalid_entry_qty",
+                self.client_id, local_id, contract, self.client_id,
+                _resolved_qty,
+                {s: v for s, v in [
+                    ("orders.qty", order.get("qty")),
+                    ("orders.quantity", order.get("quantity")),
+                    ("meta.contracts", meta.get("contracts")),
+                ]},
+            )
+            self._emit_order_event(
+                local_order_id=local_id,
+                stage="order_monitor",
+                decision="REJECT",
+                reason_code="invalid_entry_qty",
+                explanation=(
+                    f"Re-peg blocked: qty resolved to {_resolved_qty} "
+                    f"from all sources (orders.qty={order.get('qty')!r}, "
+                    f"meta.contracts={meta.get('contracts')!r}). "
+                    "Fix: ensure plan.contracts > 0 before create_entry_order."
+                ),
+                contract=contract,
+                inputs={
+                    "local_order_id":   local_id,
+                    "client_id":        self.client_id,
+                    "contract":         contract,
+                    "orders_qty":       order.get("qty"),
+                    "orders_quantity":  order.get("quantity"),
+                    "orders_contracts": order.get("contracts"),
+                    "meta_contracts":   meta.get("contracts"),
+                    "qty_source":       _qty_src,
+                },
+            )
+            return False
+
+        # ── Req 3: Direction hydration ────────────────────────────────────────
+        # Infer direction from orders.direction → orders.side → meta.direction
+        # → meta.side → OCC contract symbol (C/P between digits = last resort).
+        import re as _re
+        def _resolve_direction(order: dict, meta: dict, contract_sym: str):
+            for src_name, val in [
+                ("orders.direction", order.get("direction")),
+                ("orders.side",      order.get("side")),
+                ("meta.direction",   meta.get("direction")),
+                ("meta.side",        meta.get("side")),
+            ]:
+                if val and str(val).upper().strip() in ("CALL", "PUT"):
+                    return str(val).upper().strip(), src_name
+            _m = _re.search(r"\d([CP])\d", str(contract_sym or "").upper())
+            if _m:
+                return ("CALL" if _m.group(1) == "C" else "PUT"), "contract_inferred"
+            return "", "unknown"
+
+        _resolved_dir, _dir_src = _resolve_direction(order, meta, contract or _sym)
+        log.debug(
+            "[%s] _try_repeg direction resolution: resolved=%r source=%s "
+            "raw={direction=%r, side=%r, meta.dir=%r} local=%s contract=%s",
+            self.client_id, _resolved_dir, _dir_src,
+            order.get("direction"), order.get("side"), meta.get("direction"),
+            local_id, contract,
+        )
+
         # Resolve current OPTION-CONTRACT ask for the ladder anchor.
         # SAFETY (post-review): sym MUST be the OCC option contract symbol,
         # NOT the underlying ticker. An OCC option symbol has the structure
@@ -2832,11 +2928,9 @@ class APOrderMonitor:
             "broker_order_id":    order.get("broker_order_id") or self._get_broker_order_id(local_id),
             "symbol":             order.get("symbol") or meta.get("ticker"),
             "contract":            contract or order.get("contract"),
-            "qty":                 order.get("qty") or order.get("quantity"),
+            "qty":                 _resolved_qty,       # hydrated above; always > 0 at this point
             "limit_price":        limit_price,
-            "direction":          (order.get("direction")
-                                   or order.get("side")
-                                   or meta.get("direction")),
+            "direction":          _resolved_dir,        # hydrated above; source logged
             "signal_entry_price": (order.get("signal_entry_price")
                                    or meta.get("signal_entry_price")
                                    or meta.get("entry_price")),
@@ -2846,6 +2940,9 @@ class APOrderMonitor:
             # P1 ladder inputs:
             "kind":               (order.get("kind") or meta.get("kind") or "ENTRY"),
             "current_ask":        _current_ask,
+            # Observability (Req 4):
+            "resolved_qty_source":       _qty_src,
+            "resolved_direction_source": _dir_src,
         }
 
         decision = decide_repeg(
