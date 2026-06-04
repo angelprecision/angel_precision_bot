@@ -1025,11 +1025,19 @@ class ClientRunner(threading.Thread):
             "max_daily_loss": float(max_loss),
             "throttle_threshold": float(throttle_threshold),
             "stop_threshold": float(stop_threshold),
-            "score_floor": float(os.getenv("SCORE_FLOOR", "65")),
-            "context_floor": float(os.getenv("CONTEXT_FLOOR", "0.0")),
-            "max_capital_pct": float(os.getenv("MAX_CAPITAL_PCT", "0.40")),
-            "max_sector_pct": float(os.getenv("MAX_SECTOR_PCT", "0.25")),
-            "max_ticker_pct": float(os.getenv("MAX_TICKER_PCT", "0.10")),
+            "score_floor": _mc_score_floor,
+            "context_floor": _mc_ctx_floor,
+            "max_capital_pct": _mc_capital_pct,
+            "max_sector_pct": _mc_sector_pct,
+            "max_ticker_pct": _mc_ticker_pct,
+            "risk_profile_source": _risk_profile_source,
+            "risk_profile_valid": len(_missing_live) == 0,
+            "missing_risk_fields": _missing_live,
+            "effective_score_floor": _mc_score_floor,
+            "effective_context_floor": _mc_ctx_floor,
+            "effective_max_capital_pct": _mc_capital_pct,
+            "effective_max_sector_pct": _mc_sector_pct,
+            "effective_daily_max_loss_pct": loss_pct,
         }
         logger.info("[%s] Startup manifest: %s", self.email, self.startup_manifest)
 
@@ -1490,6 +1498,40 @@ class ClientRunner(threading.Thread):
         self.position_manager = APPositionManager(client_id=self.email)
 
         client_cfg = self._load_client_config()
+        # Merge client_risk_profiles into client_cfg with highest priority.
+        # Risk profile fields override anything from the clients table.
+        _rp = getattr(self, "_risk_profile", {}) or {}
+        _rp_field_map = {
+            "max_capital_pct":   "max_capital_pct",
+            "max_sector_pct":    "max_sector_pct",
+            "max_ticker_pct":    "max_ticker_pct",
+            "max_calls":         "max_calls",
+            "max_puts":          "max_puts",
+            "score_floor":       "score_floor",
+            "context_floor":     "context_floor",
+            "max_positions":     "max_concurrent_positions",  # map to clients table key
+            "daily_max_loss_pct":"daily_max_loss_pct",
+            "entries_enabled":   "entries_enabled",
+            "daily_profit_target_usd": "daily_profit_target_usd",
+        }
+        _risk_profile_source = "GLOBAL_ENV_DEFAULT"
+        for _rp_key, _cfg_key in _rp_field_map.items():
+            if _rp.get(_rp_key) is not None:
+                client_cfg[_cfg_key] = _rp[_rp_key]
+                _risk_profile_source = "CLIENT_RISK_PROFILE"
+        # Validate: in LIVE mode, every required field must come from risk profile
+        _is_live_runner = str(self.mode).lower() == "live"
+        _REQUIRED = [
+            "max_capital_pct", "max_sector_pct", "max_ticker_pct",
+            "max_calls", "max_puts", "score_floor", "context_floor",
+            "max_concurrent_positions", "daily_max_loss_pct",
+        ]
+        _missing_live = [
+            f for f in _REQUIRED
+            if _is_live_runner and _rp.get(
+                next((k for k, v in _rp_field_map.items() if v == f), f)
+            ) is None
+        ] if _is_live_runner else []
         # Equity truth: fetch from Tradier FIRST before creating master_control.
         # This ensures capital gates are always calibrated to the client's actual
         # account balance — not a hardcoded default. $25K default is last resort only.
@@ -2228,15 +2270,39 @@ class ClientRunner(threading.Thread):
         return paused
 
     def _load_client_config(self) -> dict:
-        """Load per-client risk profile from the clients table.
+        """Load per-client risk profile.
+
+        Source priority (highest to lowest):
+        1. client_risk_profiles row (explicit per-client limits — required for LIVE)
+        2. clients table columns (legacy per-client overrides)
+        3. Global env defaults (PAPER only — never for LIVE)
 
         H3: Risk caps were previously global env vars — every client shared
         MAX_CAPITAL_PCT / MAX_SECTOR_PCT / MAX_TICKER_PCT / MAX_CALLS /
         MAX_PUTS / SCORE_FLOOR. That cannot serve a $5K beta client and a
-        proven $35K client simultaneously. These columns are nullable: a NULL
-        means "use the global env default" so existing clients behave EXACTLY
-        as before until an operator sets an explicit per-client override.
+        proven $35K client simultaneously.
         """
+        # Check if a validated risk profile was attached at boot
+        _attached_rp = getattr(self, "_risk_profile", None)
+        if not _attached_rp:
+            # Try fetching from Supabase directly if not attached
+            try:
+                _rp_res = (
+                    self.sb.table("client_risk_profiles")
+                    .select("*")
+                    .eq("client_email", self.email)
+                    .limit(1)
+                    .execute()
+                )
+                if _rp_res.data:
+                    _attached_rp = _rp_res.data[0]
+            except Exception as _rp_load_err:
+                import logging as _log
+                _log.getLogger("ap.client_runner").warning(
+                    "[%s] Could not load client_risk_profiles: %s",
+                    self.email, _rp_load_err,
+                )
+        self._risk_profile = _attached_rp or {}
         try:
             from ap.db import conn as _conn
 
@@ -2882,38 +2948,61 @@ def _fetch_active_members(sb: Client) -> list[dict]:
                 allowed.append(m)
             members = allowed
 
-        # FIX 5: LIVE clients must have a valid client_risk_profiles row.
-        # Never let a live client trade on global fallback defaults.
+        # LIVE risk profile validation.
+        # In LIVE mode: every client MUST have a client_risk_profiles row with
+        # ALL required fields non-null. Null = "use global default" is
+        # acceptable for PAPER but not for live client money.
+        _REQUIRED_LIVE_FIELDS = [
+            "max_capital_pct", "max_sector_pct", "max_ticker_pct",
+            "max_calls", "max_puts", "score_floor", "context_floor",
+            "max_positions", "daily_max_loss_pct", "entries_enabled",
+        ]
+        # Store the full risk profile rows keyed by email for later use
+        _risk_profiles: dict = {}
         if _is_live and members:
             try:
                 _emails = [m["email"] for m in members]
-                _rp = (
+                _rp_res = (
                     sb.table("client_risk_profiles")
-                    .select("client_email")
+                    .select("*")
                     .in_("client_email", _emails)
                     .execute()
                 )
-                _have_rp = {r.get("client_email") for r in (_rp.data or [])}
+                for _rp_row in (_rp_res.data or []):
+                    _risk_profiles[_rp_row["client_email"]] = _rp_row
             except Exception as _rp_exc:
-                # If the risk profile table cannot be read, fail SAFE for live:
-                # treat as nobody having a profile (drops all -> zero -> boot
-                # hard-fail below). Better to fail a deploy than trade live on
-                # unknown risk limits.
                 logger.critical(
                     "LIVE RISK-PROFILE CHECK FAILED to query client_risk_profiles "
                     "(%s). Failing safe — no live client will load.", _rp_exc,
                 )
-                _have_rp = set()
             _rp_ok = []
             for m in members:
-                if m["email"] not in _have_rp:
+                _email = m["email"]
+                if _email not in _risk_profiles:
                     logger.critical(
                         "LIVE RISK GUARDRAIL | %s has NO client_risk_profiles "
                         "row — DROPPED. Live clients must have explicit risk "
                         "limits, never global fallback defaults.",
-                        m["email"],
+                        _email,
                     )
                     continue
+                # Validate all required fields are non-null
+                _rp_row = _risk_profiles[_email]
+                _missing = [
+                    f for f in _REQUIRED_LIVE_FIELDS
+                    if _rp_row.get(f) is None
+                ]
+                if _missing:
+                    logger.critical(
+                        "LIVE RISK GUARDRAIL | %s has NULL required risk fields "
+                        "%s — DROPPED. Set all required fields in "
+                        "client_risk_profiles before going live.",
+                        _email, _missing,
+                    )
+                    continue
+                # Attach validated risk profile to member dict for ClientRunner
+                m["_risk_profile"] = _rp_row
+                m["_risk_profile_valid"] = True
                 _rp_ok.append(m)
             members = _rp_ok
 
