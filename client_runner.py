@@ -1999,13 +1999,40 @@ class ClientRunner(threading.Thread):
                     parity_window_seconds = int(os.getenv(
                         "STARTUP_PHANTOM_PARITY_WINDOW_SECONDS", "900",
                     ))
+                    #
+                    # CTE pipeline (2026-06-04 parity-safe, six skip reasons):
+                    #
+                    #   candidates       - rows that pass every Tier A WHERE filter
+                    #   peer_filled      - canonical_id has a FILLED row on ANY client
+                    #   signal_active    - canonical_id has SUBMITTED/ACKNOWLEDGED or
+                    #                       a row created within the parity window
+                    #   watcher_armed    - the candidate's own meta still indicates an
+                    #                       ARMED watcher (no invalidation reason yet)
+                    #   retry_eligible   - the row was already on a retry path before
+                    #                       startup (status=RETRY_ELIGIBLE or meta flag)
+                    #
+                    #   classified       - per-candidate skip reason picked by CASE,
+                    #                       in priority order:
+                    #                         1. STARTUP_CLEANUP_SKIPPED_PEER_CLIENT_FILLED
+                    #                         2. STARTUP_CLEANUP_SKIPPED_ACTIVE_SIGNAL
+                    #                         3. STARTUP_CLEANUP_SKIPPED_WATCHER_ARMED
+                    #                         4. STARTUP_CLEANUP_SKIPPED_RETRY_ELIGIBLE
+                    #                         5. (NULL  -> cancel as stale orphan)
+                    #
+                    #   cancel_targets   - candidates where skip_reason IS NULL
+                    #                       -> STARTUP_CLEANUP_CANCELED_STALE_ORPHAN
+                    #   skip_targets     - candidates where skip_reason IS NOT NULL
+                    #                       -> RETRY_ELIGIBLE with the explicit reason
+                    #
                     c.execute(
                         """
                         WITH candidates AS (
                             SELECT  o.local_order_id,
                                     o.signal_id,
                                     COALESCE(o.canonical_signal_id, o.signal_id) AS canon_id,
-                                    o.created_ts
+                                    o.created_ts,
+                                    o.status                                 AS cand_status,
+                                    o.meta                                   AS cand_meta
                             FROM    orders o
                             WHERE   o.client_id = %s
                               AND   o.kind = 'ENTRY'
@@ -2033,7 +2060,7 @@ class ClientRunner(threading.Thread):
                                         )
                                     )
                         ),
-                        active_peers AS (
+                        peer_filled AS (
                             SELECT  DISTINCT COALESCE(p.canonical_signal_id, p.signal_id) AS canon_id
                             FROM    orders p
                             JOIN    candidates ca
@@ -2041,11 +2068,47 @@ class ClientRunner(threading.Thread):
                                   = ca.canon_id
                             WHERE   COALESCE(p.canonical_signal_id, p.signal_id) IS NOT NULL
                               AND   (
-                                        p.status IN ('SUBMITTED','ACKNOWLEDGED','FILLED','PARTIALLY_FILLED')
+                                        p.status IN ('FILLED','PARTIALLY_FILLED')
                                     OR  p.filled_ts IS NOT NULL
+                                    )
+                        ),
+                        signal_active AS (
+                            SELECT  DISTINCT COALESCE(p.canonical_signal_id, p.signal_id) AS canon_id
+                            FROM    orders p
+                            JOIN    candidates ca
+                              ON    COALESCE(p.canonical_signal_id, p.signal_id)
+                                  = ca.canon_id
+                            WHERE   COALESCE(p.canonical_signal_id, p.signal_id) IS NOT NULL
+                              AND   (
+                                        p.status IN ('SUBMITTED','ACKNOWLEDGED')
                                     OR  p.submitted_ts IS NOT NULL
                                     OR  p.created_ts > NOW() - (%s || ' seconds')::interval
                                     )
+                        ),
+                        classified AS (
+                            SELECT
+                                ca.local_order_id,
+                                ca.canon_id,
+                                CASE
+                                    WHEN pf.canon_id IS NOT NULL THEN
+                                        'STARTUP_CLEANUP_SKIPPED_PEER_CLIENT_FILLED'
+                                    WHEN sa.canon_id IS NOT NULL THEN
+                                        'STARTUP_CLEANUP_SKIPPED_ACTIVE_SIGNAL'
+                                    WHEN ca.cand_meta->'watcher_audit' IS NOT NULL
+                                         AND COALESCE(ca.cand_meta->'watcher_audit'->>'armed','false') = 'true'
+                                         AND ca.cand_meta->'watcher_audit'->>'reason_code' IS NULL
+                                        THEN
+                                        'STARTUP_CLEANUP_SKIPPED_WATCHER_ARMED'
+                                    WHEN ca.cand_status = 'RETRY_ELIGIBLE'
+                                         OR (ca.cand_meta ? 'retry_eligible'
+                                             AND COALESCE(ca.cand_meta->>'retry_eligible','false') = 'true')
+                                        THEN
+                                        'STARTUP_CLEANUP_SKIPPED_RETRY_ELIGIBLE'
+                                    ELSE NULL
+                                END AS skip_reason
+                            FROM    candidates ca
+                            LEFT JOIN peer_filled   pf ON pf.canon_id = ca.canon_id
+                            LEFT JOIN signal_active sa ON sa.canon_id = ca.canon_id
                         ),
                         cancel_targets AS (
                             UPDATE orders o
@@ -2066,50 +2129,56 @@ class ClientRunner(threading.Thread):
                                            'had_filled_ts',       false,
                                            'had_position_id',     false,
                                            'canonical_signal_active', false,
+                                           'peer_client_filled',  false,
                                            'parity_window_seconds', %s,
                                            'watcher_armed',       false,
                                            'age_seconds',         EXTRACT(EPOCH FROM (NOW() - o.created_ts)),
                                            'cleanup_ts',          NOW()::text
                                        )
                                    )
-                            FROM   candidates ca
-                            WHERE  o.local_order_id = ca.local_order_id
-                              AND  NOT EXISTS (
-                                       SELECT 1 FROM active_peers ap
-                                       WHERE  ap.canon_id = ca.canon_id
-                                   )
+                            FROM   classified cls
+                            WHERE  o.local_order_id = cls.local_order_id
+                              AND  cls.skip_reason IS NULL
                             RETURNING o.local_order_id
                         ),
                         skip_targets AS (
                             UPDATE orders o
                             SET    status = 'RETRY_ELIGIBLE',
-                                   last_error = 'STARTUP_CLEANUP_SKIPPED_ACTIVE_SIGNAL',
+                                   last_error = cls.skip_reason,
                                    updated_ts = NOW(),
                                    meta = COALESCE(o.meta, '{}'::jsonb) || jsonb_build_object(
                                        'cleanup_phantom_audit', jsonb_build_object(
                                            'block_stage',         'startup_cleanup',
-                                           'block_reason',        'STARTUP_CLEANUP_SKIPPED_ACTIVE_SIGNAL',
+                                           'block_reason',        cls.skip_reason,
                                            'cleanup_decision',    'skipped_retry_eligible',
                                            'cleanup_rule_version',%s,
                                            'min_age_seconds',     %s,
                                            'startup_grace_seconds', %s,
-                                           'canonical_signal_active', true,
+                                           'canonical_signal_active', (cls.skip_reason <> 'STARTUP_CLEANUP_SKIPPED_PEER_CLIENT_FILLED'
+                                                                       AND cls.skip_reason <> 'STARTUP_CLEANUP_SKIPPED_RETRY_ELIGIBLE'),
+                                           'peer_client_filled',  (cls.skip_reason = 'STARTUP_CLEANUP_SKIPPED_PEER_CLIENT_FILLED'),
+                                           'watcher_armed',       (cls.skip_reason = 'STARTUP_CLEANUP_SKIPPED_WATCHER_ARMED'),
                                            'parity_window_seconds', %s,
                                            'age_seconds',         EXTRACT(EPOCH FROM (NOW() - o.created_ts)),
                                            'cleanup_ts',          NOW()::text
                                        )
                                    )
-                            FROM   candidates ca
-                            WHERE  o.local_order_id = ca.local_order_id
-                              AND  EXISTS (
-                                       SELECT 1 FROM active_peers ap
-                                       WHERE  ap.canon_id = ca.canon_id
-                                   )
-                            RETURNING o.local_order_id
+                            FROM   classified cls
+                            WHERE  o.local_order_id = cls.local_order_id
+                              AND  cls.skip_reason IS NOT NULL
+                            RETURNING o.local_order_id, cls.skip_reason
                         )
                         SELECT
                             (SELECT COUNT(*) FROM cancel_targets) AS canceled,
-                            (SELECT COUNT(*) FROM skip_targets)   AS retry_eligible
+                            (SELECT COUNT(*) FROM skip_targets)   AS skipped,
+                            (SELECT COUNT(*) FROM skip_targets
+                                WHERE skip_reason = 'STARTUP_CLEANUP_SKIPPED_PEER_CLIENT_FILLED') AS skip_peer_filled,
+                            (SELECT COUNT(*) FROM skip_targets
+                                WHERE skip_reason = 'STARTUP_CLEANUP_SKIPPED_ACTIVE_SIGNAL')      AS skip_active,
+                            (SELECT COUNT(*) FROM skip_targets
+                                WHERE skip_reason = 'STARTUP_CLEANUP_SKIPPED_WATCHER_ARMED')      AS skip_watcher,
+                            (SELECT COUNT(*) FROM skip_targets
+                                WHERE skip_reason = 'STARTUP_CLEANUP_SKIPPED_RETRY_ELIGIBLE')     AS skip_retry
                         """,
                         (
                             self.email,
@@ -2122,14 +2191,22 @@ class ClientRunner(threading.Thread):
                             str(parity_window_seconds),
                         ),
                     )
-                    _row = c.fetchone() or (0, 0)
+                    _row = c.fetchone() or (0, 0, 0, 0, 0, 0)
                     # Support dict-cursor and tuple-cursor results.
                     if isinstance(_row, dict):
-                        tier_a_cancel = int(_row.get("canceled") or 0)
-                        tier_a_skip   = int(_row.get("retry_eligible") or 0)
+                        tier_a_cancel       = int(_row.get("canceled") or 0)
+                        tier_a_skip         = int(_row.get("skipped") or 0)
+                        skip_peer_filled    = int(_row.get("skip_peer_filled") or 0)
+                        skip_active         = int(_row.get("skip_active") or 0)
+                        skip_watcher        = int(_row.get("skip_watcher") or 0)
+                        skip_retry          = int(_row.get("skip_retry") or 0)
                     else:
-                        tier_a_cancel = int(_row[0] or 0)
-                        tier_a_skip   = int(_row[1] or 0)
+                        tier_a_cancel       = int(_row[0] or 0)
+                        tier_a_skip         = int(_row[1] or 0)
+                        skip_peer_filled    = int(_row[2] or 0)
+                        skip_active         = int(_row[3] or 0)
+                        skip_watcher        = int(_row[4] or 0)
+                        skip_retry          = int(_row[5] or 0)
                     tier_a = tier_a_cancel + tier_a_skip
 
                     # Tier B: submitted/acknowledged with no broker ID — only cancel if
@@ -2166,9 +2243,92 @@ class ClientRunner(threading.Thread):
                         ),
                     )
                     tier_b = c.rowcount or 0
-                    return tier_a_cancel, tier_a_skip, tier_b
 
-            tier_a_cancel, tier_a_skip, tier_b = run_with_retry(_clear_phantoms)
+                    # --------------------------------------------------------
+                    # Retro peer rescue (Acceptance criterion 4, Test 3):
+                    #   If a *prior* startup pass (or any earlier code path)
+                    #   left rows CANCELED with last_error in
+                    #     ('startup_phantom_clear_pre_submit',
+                    #      'STARTUP_CLEANUP_CANCELED_STALE_ORPHAN')
+                    #   and the SAME canonical_signal_id now has a peer FILLED
+                    #   row on any client, flip those rescued rows to
+                    #   RETRY_ELIGIBLE so the peer-retry consumer (next PR)
+                    #   can re-evaluate them through the safe entry path.
+                    #
+                    #   This is bounded to rows canceled within the last
+                    #   STARTUP_PEER_RESCUE_WINDOW_SECONDS (default 3600 = 1h)
+                    #   so we never resurrect ancient losers.
+                    # --------------------------------------------------------
+                    peer_rescue_window_seconds = int(os.getenv(
+                        "STARTUP_PEER_RESCUE_WINDOW_SECONDS", "3600",
+                    ))
+                    c.execute(
+                        """
+                        WITH rescue_candidates AS (
+                            SELECT  o.local_order_id,
+                                    COALESCE(o.canonical_signal_id, o.signal_id) AS canon_id
+                            FROM    orders o
+                            WHERE   o.client_id = %s
+                              AND   o.kind = 'ENTRY'
+                              AND   o.status = 'CANCELED'
+                              AND   o.submitted_ts IS NULL
+                              AND   o.filled_ts IS NULL
+                              AND   o.position_id IS NULL
+                              AND   o.last_error IN (
+                                        'startup_phantom_clear_pre_submit',
+                                        'STARTUP_CLEANUP_CANCELED_STALE_ORPHAN'
+                                    )
+                              AND   o.updated_ts > NOW() - (%s || ' seconds')::interval
+                              AND   COALESCE(o.canonical_signal_id, o.signal_id) IS NOT NULL
+                        ),
+                        rescue_peer_filled AS (
+                            SELECT  DISTINCT COALESCE(p.canonical_signal_id, p.signal_id) AS canon_id
+                            FROM    orders p
+                            JOIN    rescue_candidates rc
+                              ON    COALESCE(p.canonical_signal_id, p.signal_id)
+                                  = rc.canon_id
+                            WHERE   (
+                                        p.status IN ('FILLED','PARTIALLY_FILLED')
+                                    OR  p.filled_ts IS NOT NULL
+                                    )
+                        )
+                        UPDATE orders o
+                        SET    status = 'RETRY_ELIGIBLE',
+                               last_error = 'STARTUP_CLEANUP_SKIPPED_PEER_CLIENT_FILLED',
+                               updated_ts = NOW(),
+                               meta = COALESCE(o.meta, '{}'::jsonb) || jsonb_build_object(
+                                   'cleanup_phantom_audit', jsonb_build_object(
+                                       'block_stage',         'startup_cleanup_retro_rescue',
+                                       'block_reason',        'STARTUP_CLEANUP_SKIPPED_PEER_CLIENT_FILLED',
+                                       'cleanup_decision',    'rescued_retry_eligible',
+                                       'cleanup_rule_version',%s,
+                                       'peer_client_filled',  true,
+                                       'rescue_window_seconds', %s,
+                                       'previous_last_error', o.last_error,
+                                       'cleanup_ts',          NOW()::text
+                                   )
+                               )
+                        FROM   rescue_candidates rc
+                        JOIN   rescue_peer_filled pf ON pf.canon_id = rc.canon_id
+                        WHERE  o.local_order_id = rc.local_order_id
+                        """,
+                        (
+                            self.email,
+                            str(peer_rescue_window_seconds),
+                            cleanup_rule_version,
+                            peer_rescue_window_seconds,
+                        ),
+                    )
+                    tier_a_rescue = c.rowcount or 0
+
+                    return (tier_a_cancel, tier_a_skip, tier_b,
+                            skip_peer_filled, skip_active, skip_watcher,
+                            skip_retry, tier_a_rescue)
+
+            (tier_a_cancel, tier_a_skip, tier_b,
+             skip_peer_filled, skip_active, skip_watcher,
+             skip_retry, tier_a_rescue) = run_with_retry(_clear_phantoms)
+
             if tier_a_cancel:
                 logger.info(
                     "[%s] Startup: cleared %s pre-submit phantom orders "
@@ -2178,12 +2338,22 @@ class ClientRunner(threading.Thread):
             if tier_a_skip:
                 # Parity safety: peer client(s) have an alive row on the same
                 # canonical_signal_id. These were NOT canceled — they are now
-                # RETRY_ELIGIBLE so the peer-retry path can re-evaluate.
+                # RETRY_ELIGIBLE with the specific skip reason (peer_filled,
+                # active_signal, watcher_armed, or retry_eligible).
                 logger.info(
-                    "[%s] Startup: marked %s rows RETRY_ELIGIBLE "
-                    "(STARTUP_CLEANUP_SKIPPED_ACTIVE_SIGNAL) — canonical signal "
-                    "is active on a peer client",
+                    "[%s] Startup: skipped %s rows (peer_filled=%s active=%s "
+                    "watcher_armed=%s retry_eligible=%s) — marked RETRY_ELIGIBLE",
                     self.email, tier_a_skip,
+                    skip_peer_filled, skip_active, skip_watcher, skip_retry,
+                )
+            if tier_a_rescue:
+                # Retro peer rescue: previously canceled rows whose canonical
+                # peer has since filled were flipped to RETRY_ELIGIBLE.
+                logger.info(
+                    "[%s] Startup: rescued %s previously-canceled rows "
+                    "(STARTUP_CLEANUP_SKIPPED_PEER_CLIENT_FILLED) — peer client "
+                    "filled the same canonical signal",
+                    self.email, tier_a_rescue,
                 )
             if tier_b:
                 log_fn = logger.critical if self.mode == "LIVE" else logger.warning
