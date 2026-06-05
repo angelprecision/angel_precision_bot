@@ -1239,8 +1239,18 @@ class APMasterControl:
         if effective_count >= self.max_positions:
             return self._block(signal_id, ticker, client_id, "blocked_risk", f"max_positions_with_pending ({effective_count}/{self.max_positions})")
 
-        estimated_contracts_pre = max(MIN_CONTRACTS_PER_POSITION, self._base_contracts(effective_score, _estimate_premium(ticker)))
-        estimated_new_cost_pre = estimated_contracts_pre * 100 * _estimate_premium(ticker)
+        # PR p0/bootstrap-affordable-selection (2026-06-05):
+        # In LIVE bootstrap mode we intend to buy ONE contract and the real
+        # premium is unknown until the contract selector picks a strike.
+        # The old code multiplied a static $3.50 fallback premium by
+        # MIN_CONTRACTS_PER_POSITION (>=2 by default) and rejected the
+        # signal before the selector could find an affordable contract
+        # priced under the cap. Spec rule (5): "do not hard-reject a signal
+        # solely because a static preselection premium estimate exceeds the
+        # cap when an affordable contract may exist."
+        #
+        # Outside bootstrap, behaviour is unchanged: the static estimate
+        # still gates pre-selection to avoid wasted selector work.
         pending_capital_real = self._pending_capital_from_snapshot_or_db(snap, client_id)
         if pending_capital_real is None:
             if current_mode == "LIVE" and self.pending_capital_fail_closed_live:
@@ -1253,38 +1263,105 @@ class APMasterControl:
                     reason_code="PENDING_CAPITAL_UNAVAILABLE",
                 )
             pending_capital_real = 0.0
-        projected_total = snap["capital_deployed"] + pending_capital_real + estimated_new_cost_pre
+
         # PR E FIX-3 (reader-side patch): take ONE atomic snapshot of
         # (account_equity, max_daily_loss) under _equity_lock here.
-        # Use the local variables for ALL subsequent risk math below
-        # (capital cap, sector cap, ticker cap, daily-loss check, and
-        # the sizer call). Without this, evaluate() reads the two
-        # fields directly while set_account_equity() updates them
-        # sequentially — race on the worker thread observing a half-
-        # updated equity/loss pair. The snapshot itself is sub-µs; the
-        # lock is NEVER held across slow DB / broker / PM / intel calls.
+        # Use the local variables for ALL subsequent risk math below.
         account_equity, max_daily_loss = self._equity_snapshot()
         max_capital = account_equity * self.max_capital_pct
-        if projected_total > max_capital:
-            return self._block(signal_id, ticker, client_id, "blocked_risk", f"capital_limit (projected ${projected_total:.0f} > ${max_capital:.0f})")
+
+        # Remaining capital the selector is allowed to spend on this trade.
+        # Floor at 0 — a negative remaining means the account is already at
+        # or above its cap; no new entry can be approved regardless of
+        # static estimates.
+        remaining_capital_for_this_trade = max(
+            0.0,
+            max_capital - snap["capital_deployed"] - pending_capital_real,
+        )
+
+        # Two pre-block strategies:
+        #   - LIVE  (bootstrap OR post-bootstrap): use the affordability
+        #     flow. Skip the static-premium pre-block whenever
+        #     remaining_capital > 0; let the selector search the chain for
+        #     a contract whose real ask fits. revalidate_exposure() does
+        #     the final real-cost check.
+        #   - PAPER (non-bootstrap): keep the static-estimate pre-block
+        #     so paper proof-week sizing stays comparable to historical
+        #     behaviour. PAPER bootstrap (rare) follows the LIVE path.
+        #
+        # Review fix #2 (2026-06-05): a small LIVE account that crosses
+        # the bootstrap threshold (default 20 trades) must NOT regress to
+        # the static-fallback false-reject path. The condition below is
+        # is_live_mode — not bootstrap_mode — so the affordability flow
+        # stays active for the entire life of any LIVE client.
+        _use_affordability_flow = bootstrap_mode or self._is_live_mode()
+        if _use_affordability_flow:
+            # intended_contracts is 1 in bootstrap (rule 7); for post-
+            # bootstrap LIVE we still defer to the selector and let the
+            # final-cost revalidation enforce the cap. Pre-block only when
+            # remaining_capital cannot fund even the lowest-cost contract.
+            estimated_contracts_pre = 1 if bootstrap_mode else 0
+            estimated_new_cost_pre = 0.0   # unknown until selector runs
+            if remaining_capital_for_this_trade <= 0.0:
+                return self._block(
+                    signal_id, ticker, client_id, "blocked_risk",
+                    f"capital_limit_no_remaining (deployed=${snap['capital_deployed']:.0f} "
+                    f"pending=${pending_capital_real:.0f} cap=${max_capital:.0f})",
+                )
+        else:
+            # PAPER non-bootstrap: keep the existing static-estimate
+            # pre-check so selector work is skipped when the projection
+            # clearly exceeds the cap. Final cost is still revalidated
+            # post-selection (revalidate_exposure runs in PAPER too).
+            estimated_contracts_pre = max(
+                MIN_CONTRACTS_PER_POSITION,
+                self._base_contracts(effective_score, _estimate_premium(ticker)),
+            )
+            estimated_new_cost_pre = estimated_contracts_pre * 100 * _estimate_premium(ticker)
+            projected_total = snap["capital_deployed"] + pending_capital_real + estimated_new_cost_pre
+            if projected_total > max_capital:
+                return self._block(
+                    signal_id, ticker, client_id, "blocked_risk",
+                    f"capital_limit (projected ${projected_total:.0f} > ${max_capital:.0f})",
+                )
 
         sector = self.SECTOR_MAP.get(ticker.upper(), "other")
         sector_deployed = self._sector_capital_deployed(snap["open_positions"] + snap["closing_positions"], sector)
-        estimated_contracts = max(MIN_CONTRACTS_PER_POSITION, self._base_contracts(effective_score, _estimate_premium(ticker)))
-        estimated_new_cost = estimated_contracts * 100 * _estimate_premium(ticker)
-        projected_sector = sector_deployed + estimated_new_cost
         # PR E FIX-3: use the snapshot value, not the instance field.
         effective_equity = account_equity
         max_sector_capital = effective_equity * self.max_sector_pct
-        if projected_sector > max_sector_capital:
-            return self._block(signal_id, ticker, client_id, "blocked_risk", f"sector_cap_{sector} (projected ${projected_sector:.0f} > ${max_sector_capital:.0f})")
-
-        ticker_deployed = self._ticker_capital_deployed(snap["open_positions"] + snap["closing_positions"], ticker)
-        estimated_new_cost_ticker = estimated_contracts * 100 * _estimate_premium(ticker)
-        projected_ticker = ticker_deployed + estimated_new_cost_ticker
         max_ticker_capital = effective_equity * self.max_ticker_pct
-        if projected_ticker > max_ticker_capital:
-            return self._block(signal_id, ticker, client_id, "blocked_risk", f"ticker_cap_{ticker.upper()} (projected ${projected_ticker:.0f} > ${max_ticker_capital:.0f})")
+        ticker_deployed = self._ticker_capital_deployed(snap["open_positions"] + snap["closing_positions"], ticker)
+
+        # Sector / ticker caps: same split as the capital cap above.
+        # Affordability flow (LIVE always, plus any PAPER bootstrap) only
+        # pre-blocks when a bucket is fully saturated. Final per-trade
+        # contribution is checked against real_cost in
+        # revalidate_exposure() after the selector picks a real strike.
+        if _use_affordability_flow:
+            if sector_deployed >= max_sector_capital:
+                return self._block(
+                    signal_id, ticker, client_id, "blocked_risk",
+                    f"sector_cap_{sector}_saturated (deployed=${sector_deployed:.0f} >= cap=${max_sector_capital:.0f})",
+                )
+            if ticker_deployed >= max_ticker_capital:
+                return self._block(
+                    signal_id, ticker, client_id, "blocked_risk",
+                    f"ticker_cap_{ticker.upper()}_saturated (deployed=${ticker_deployed:.0f} >= cap=${max_ticker_capital:.0f})",
+                )
+            estimated_contracts = 1 if bootstrap_mode else 0
+            estimated_new_cost = 0.0
+        else:
+            estimated_contracts = max(MIN_CONTRACTS_PER_POSITION, self._base_contracts(effective_score, _estimate_premium(ticker)))
+            estimated_new_cost = estimated_contracts * 100 * _estimate_premium(ticker)
+            projected_sector = sector_deployed + estimated_new_cost
+            if projected_sector > max_sector_capital:
+                return self._block(signal_id, ticker, client_id, "blocked_risk", f"sector_cap_{sector} (projected ${projected_sector:.0f} > ${max_sector_capital:.0f})")
+
+            estimated_new_cost_ticker = estimated_contracts * 100 * _estimate_premium(ticker)
+            projected_ticker = ticker_deployed + estimated_new_cost_ticker
+            if projected_ticker > max_ticker_capital:
+                return self._block(signal_id, ticker, client_id, "blocked_risk", f"ticker_cap_{ticker.upper()} (projected ${projected_ticker:.0f} > ${max_ticker_capital:.0f})")
 
         if norm_side == "CALL" and snap["calls_open"] >= self.max_calls:
             return self._block(signal_id, ticker, client_id, "blocked_risk", f"max_calls ({snap['calls_open']}/{self.max_calls})")
@@ -1712,7 +1789,20 @@ class APMasterControl:
             pattern=signal.get("pattern", signal.get("pattern_id", "")),
             timeframe=signal.get("timeframe", "1d"),
             contracts=contracts,
-            max_position_usd=(1 * 100 * _estimate_premium(ticker)) if bootstrap_mode else float(os.getenv("MAX_TRADE_USD", "1800")),
+            # PR p0/bootstrap-affordable-selection (2026-06-05) + review fix #2:
+            # For ANY LIVE client (bootstrap or post-bootstrap) we pass
+            # remaining_capital as the selector budget. The selector reads
+            # plan.max_position_usd and only returns contracts whose real
+            # ask*100 fits inside it. revalidate_exposure() then enforces
+            # the actual cost against the same cap before broker submission.
+            #
+            # PAPER non-bootstrap continues to use the static MAX_TRADE_USD
+            # env so paper proof-week sizing is comparable to historical runs.
+            max_position_usd=(
+                remaining_capital_for_this_trade
+                if _use_affordability_flow
+                else float(os.getenv("MAX_TRADE_USD", "1800"))
+            ),
             tier=str(tier),
             score=score,
             intel_score=intel_score,
@@ -1766,13 +1856,30 @@ class APMasterControl:
                     "score":            float(score),
                     "tier":             str(tier),
                     "premium_estimate": float(placeholder_premium / 100.0),
+                    "static_premium_estimate": float(_estimate_premium(ticker)),
                     "max_position_usd": float(
-                        (1 * 100 * _estimate_premium(ticker))
-                        if bootstrap_mode
+                        remaining_capital_for_this_trade
+                        if _use_affordability_flow
                         else float(os.getenv("MAX_TRADE_USD", "1800"))
                     ),
                     "max_contracts_cap": int(os.getenv("MAX_CONTRACTS", "15")),
                     "sizing_method":    _sizing.method if _sizing is not None else "tier_fallback",
+                    # PR p0/bootstrap-affordable-selection telemetry per spec.
+                    # These fields surface every input the post-mortem needs
+                    # to answer "why did the selector see this budget?".
+                    "account_equity":          float(account_equity),
+                    "max_capital_pct":         float(self.max_capital_pct),
+                    "max_capital_allowed":     float(max_capital),
+                    "capital_deployed":        float(snap["capital_deployed"]),
+                    "pending_capital":         float(pending_capital_real),
+                    "remaining_capital":       float(remaining_capital_for_this_trade),
+                    "intended_contracts":      int(contracts if bootstrap_mode else estimated_contracts_pre),
+                    "max_affordable_premium": (
+                        round(remaining_capital_for_this_trade / 100.0, 4)
+                        if _use_affordability_flow and remaining_capital_for_this_trade > 0
+                        else None
+                    ),
+                    "affordability_flow":  bool(_use_affordability_flow),
                 },
                 "snapshot_at_eval": {
                     "open_count": snap["open_count"],
@@ -2193,6 +2300,57 @@ class APMasterControl:
         approved capital-utilization rows before returning.
         """
         ticker = plan.ticker
+
+        # ---------------------------------------------------------------
+        # PR p0/bootstrap-affordable-selection — review fix #1 (2026-06-05):
+        # Bootstrap quantity is INVIOLATE = 1. The contract selector
+        # (ap/contract_selector.py:1240, 1259) mutates plan.contracts to
+        # selected.affordable_contracts — which can be 2, 3, 4+ for cheap
+        # tickers. That escape would let a bootstrap trade buy multiple
+        # contracts while still under the dollar cap, violating the qty=1
+        # bootstrap safety guarantee.
+        #
+        # We re-read bootstrap_mode from the plan's sizing_context (stamped
+        # by evaluate() before selection) and clamp BEFORE computing
+        # real_cost. This is the single chokepoint between selector
+        # mutation and broker submission, so the clamp is sufficient.
+        # ---------------------------------------------------------------
+        _plan_meta_for_clamp = getattr(plan, "metadata", None) or {}
+        _sizing_ctx          = _plan_meta_for_clamp.get("sizing_context") or {}
+        _bootstrap_now       = bool(_sizing_ctx.get("bootstrap_mode", False))
+        if _bootstrap_now and self._is_live_mode():
+            _selector_meta = getattr(plan, "selector_metadata", None) or {}
+            _ppc = _selector_meta.get("premium_per_contract")
+            if _ppc is None:
+                # Fall back to the per-share execution price * 100 if the
+                # selector didn't surface premium_per_contract. Either way,
+                # plan.contracts is forced to 1.
+                _exec_pps = getattr(plan, "selector_execution_price", None)
+                if _exec_pps is not None:
+                    _ppc = float(_exec_pps) * 100.0
+            if _ppc is not None and _ppc > 0:
+                if plan.contracts != 1:
+                    log.info(
+                        "[%s] bootstrap_clamp: selector wanted %s contracts, "
+                        "forcing to 1 (premium_per_contract=$%.2f)",
+                        ticker, plan.contracts, float(_ppc),
+                    )
+                plan.contracts = 1
+                plan.max_position_usd = float(_ppc)  # 1 × premium_per_contract
+            else:
+                # Defensive: if the selector didn't populate premium info,
+                # still clamp the qty so we never submit > 1 contract in
+                # bootstrap. The capital revalidation below will use the
+                # current plan.max_position_usd as-is.
+                if plan.contracts != 1:
+                    log.warning(
+                        "[%s] bootstrap_clamp: forcing plan.contracts=1 but "
+                        "selector premium_per_contract missing — max_position_usd "
+                        "left at $%.2f for revalidation",
+                        ticker, float(plan.max_position_usd),
+                    )
+                plan.contracts = 1
+
         real_cost = float(plan.max_position_usd)
         # PR E FIX-3 (reader-side patch): take atomic snapshot of
         # (account_equity, max_daily_loss) under _equity_lock.
@@ -2279,6 +2437,10 @@ class APMasterControl:
             )
 
         if proj_total > max_capital:
+            # PR p0/bootstrap-affordable-selection (2026-06-05): canonical
+            # reason code per spec rule (6). This is the LAST gate before
+            # broker submission; if we land here, the selector returned a
+            # contract whose real ask exceeds the client's remaining cap.
             reason = f"capital_limit: ${proj_total:.0f} > ${max_capital:.0f}"
             _log_revalidation(True, reason)
             return self._block(
@@ -2286,7 +2448,11 @@ class APMasterControl:
                 ticker,
                 client_id,
                 "blocked_risk",
-                f"revalidate_capital_limit (${proj_total:.0f} > ${max_capital:.0f} | deployed=${snap['capital_deployed']:.0f} pending=${pending_cap:.0f} real_cost=${real_cost:.0f})",
+                f"ACTUAL_CONTRACT_COST_EXCEEDS_CLIENT_CAPITAL_LIMIT "
+                f"(${proj_total:.0f} > ${max_capital:.0f} | "
+                f"deployed=${snap['capital_deployed']:.0f} pending=${pending_cap:.0f} "
+                f"real_cost=${real_cost:.0f})",
+                reason_code="ACTUAL_CONTRACT_COST_EXCEEDS_CLIENT_CAPITAL_LIMIT",
             )
 
         if proj_sector > max_sector:
