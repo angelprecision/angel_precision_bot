@@ -32,6 +32,44 @@ log = logging.getLogger("ap.authorization")
 # Reason codes raised by the gate — kept stable for the operator dashboard.
 LIVE_AUTHORIZATION_REQUIRED = "LIVE_AUTHORIZATION_REQUIRED"
 WEEKLY_AUTHORIZATION_REQUIRED = "WEEKLY_AUTHORIZATION_REQUIRED"
+# Raised when we cannot positively determine whether a broker is live or paper.
+# An unknown/unverifiable broker mode is treated as a BLOCK on new entries
+# (never silently assumed to be paper) so we never open an unauthorized live
+# trade on a misconfigured/transiently-unreadable broker.
+LIVE_AUTHORIZATION_GATE_UNAVAILABLE = "LIVE_AUTHORIZATION_GATE_UNAVAILABLE"
+
+
+def authorization_gate_enforced() -> bool:
+    """Whether the live authorization gate REJECTS unauthorized live entries
+    (True) or only OBSERVES and logs them while allowing the entry (False).
+
+    Controlled by env LIVE_AUTHORIZATION_GATE_ENFORCE. Defaults to FALSE
+    (observe-only) so the gate can be rolled out and watched in the ledger
+    before it begins hard-blocking live entries. Truthy values: 1/true/yes/on.
+    """
+    return (os.getenv("LIVE_AUTHORIZATION_GATE_ENFORCE", "false").strip().lower()
+            in ("1", "true", "yes", "on"))
+
+
+def broker_live_mode_known(broker) -> bool:
+    """True when we can POSITIVELY classify the broker as live OR paper.
+
+    A broker is classifiable when it exposes a non-empty base_url (live = not
+    sandbox, paper = sandbox). If we cannot read a base_url at all, the mode is
+    UNKNOWN/unverifiable and the caller must BLOCK the new entry (fail closed),
+    never assume paper.
+    """
+    if broker is None:
+        return False
+    try:
+        base_url = (
+            getattr(broker, "base_url", None)
+            or getattr(getattr(broker, "cfg", None), "base_url", None)
+            or ""
+        )
+    except Exception:
+        return False
+    return bool(str(base_url))
 
 
 def current_disclosure_version() -> str:

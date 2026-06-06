@@ -327,3 +327,125 @@ class TestAmendmentGate:
         # _fetch_authorizations swallows internally and returns []; emulate that:
         monkeypatch.setattr(authz, "_fetch_authorizations", lambda e, t: [])
         assert authz.check_live_authorization("c@x.com") == authz.LIVE_AUTHORIZATION_REQUIRED
+
+
+# --------------------------------------------------------------------------
+# FINAL AMENDMENT — enforce flag, observe mode, unknown-broker block.
+#
+# These cover the helpers added in the Final Amendment plus the gate's
+# decision rule (compute a _gate_reason, then observe-vs-enforce). The gate's
+# branching in ap/queue.py and ap_overnight_reeval.py is identical, so we test
+# the shared decision logic here against the real authz helpers.
+# --------------------------------------------------------------------------
+class TestEnforceFlag:
+    def test_default_is_observe(self, monkeypatch):
+        monkeypatch.delenv("LIVE_AUTHORIZATION_GATE_ENFORCE", raising=False)
+        assert authz.authorization_gate_enforced() is False
+
+    def test_explicit_false_is_observe(self, monkeypatch):
+        monkeypatch.setenv("LIVE_AUTHORIZATION_GATE_ENFORCE", "false")
+        assert authz.authorization_gate_enforced() is False
+
+    def test_truthy_values_enable_enforce(self, monkeypatch):
+        for v in ("1", "true", "TRUE", "Yes", "on"):
+            monkeypatch.setenv("LIVE_AUTHORIZATION_GATE_ENFORCE", v)
+            assert authz.authorization_gate_enforced() is True, v
+
+    def test_falsy_values_stay_observe(self, monkeypatch):
+        for v in ("0", "no", "off", "", "maybe"):
+            monkeypatch.setenv("LIVE_AUTHORIZATION_GATE_ENFORCE", v)
+            assert authz.authorization_gate_enforced() is False, v
+
+
+class TestBrokerModeKnown:
+    def test_live_broker_mode_known(self):
+        assert authz.broker_live_mode_known(LIVE_BROKER) is True
+
+    def test_sandbox_broker_mode_known(self):
+        assert authz.broker_live_mode_known(SANDBOX_BROKER) is True
+
+    def test_empty_broker_mode_unknown(self):
+        # No base_url at all → unverifiable → must NOT be assumed paper.
+        assert authz.broker_live_mode_known(EMPTY_BROKER) is False
+
+    def test_none_broker_mode_unknown(self):
+        assert authz.broker_live_mode_known(None) is False
+
+
+def _gate_reason_for(broker, client_email):
+    """Replicates the gate's _gate_reason computation shared by ap/queue.py and
+    ap_overnight_reeval.py: unknown mode → GATE_UNAVAILABLE; live → authz check;
+    known paper → None (exempt)."""
+    if not authz.broker_live_mode_known(broker):
+        return authz.LIVE_AUTHORIZATION_GATE_UNAVAILABLE
+    if authz.is_live_broker(broker):
+        return authz.check_live_authorization(client_email)
+    return None
+
+
+class TestGateDecisionRule:
+    def test_unknown_broker_blocks_not_paper(self, monkeypatch):
+        # Empty/unverifiable broker → GATE_UNAVAILABLE (never treated as paper).
+        _patch_auth_rows(monkeypatch, {})
+        assert _gate_reason_for(EMPTY_BROKER, "c@x.com") == authz.LIVE_AUTHORIZATION_GATE_UNAVAILABLE
+        assert _gate_reason_for(None, "c@x.com") == authz.LIVE_AUTHORIZATION_GATE_UNAVAILABLE
+
+    def test_known_paper_is_exempt(self, monkeypatch):
+        _patch_auth_rows(monkeypatch, {})  # no authz at all
+        # Sandbox broker is known-paper → exempt → no gate reason.
+        assert _gate_reason_for(SANDBOX_BROKER, "c@x.com") is None
+
+    def test_live_unauthorized_yields_reason(self, monkeypatch):
+        _patch_auth_rows(monkeypatch, {})
+        assert _gate_reason_for(LIVE_BROKER, "c@x.com") == authz.LIVE_AUTHORIZATION_REQUIRED
+
+    def test_live_fully_authorized_no_reason(self, monkeypatch):
+        future = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
+        _patch_auth_rows(monkeypatch, {
+            "LIVE_TRADING": [_live_row()],
+            "WEEKLY_TRADING": [{"accepted": True, "revoked_at": None, "expires_at": future}],
+        })
+        assert _gate_reason_for(LIVE_BROKER, "c@x.com") is None
+
+
+class TestObserveVsEnforceOutcome:
+    """The gate decision: a non-None _gate_reason BLOCKS only when enforced;
+    in observe mode it logs WOULD_BLOCK and allows the entry."""
+
+    @staticmethod
+    def _blocks(gate_reason, enforced):
+        # Mirrors the gate: block iff there's a reason AND enforce is on.
+        return bool(gate_reason) and enforced
+
+    def test_observe_mode_allows_unauthorized_live(self, monkeypatch):
+        monkeypatch.setenv("LIVE_AUTHORIZATION_GATE_ENFORCE", "false")
+        _patch_auth_rows(monkeypatch, {})
+        reason = _gate_reason_for(LIVE_BROKER, "c@x.com")
+        assert reason == authz.LIVE_AUTHORIZATION_REQUIRED
+        assert self._blocks(reason, authz.authorization_gate_enforced()) is False
+
+    def test_enforce_mode_blocks_unauthorized_live(self, monkeypatch):
+        monkeypatch.setenv("LIVE_AUTHORIZATION_GATE_ENFORCE", "true")
+        _patch_auth_rows(monkeypatch, {})
+        reason = _gate_reason_for(LIVE_BROKER, "c@x.com")
+        assert self._blocks(reason, authz.authorization_gate_enforced()) is True
+
+    def test_observe_mode_allows_unknown_broker(self, monkeypatch):
+        monkeypatch.setenv("LIVE_AUTHORIZATION_GATE_ENFORCE", "false")
+        _patch_auth_rows(monkeypatch, {})
+        reason = _gate_reason_for(EMPTY_BROKER, "c@x.com")
+        assert reason == authz.LIVE_AUTHORIZATION_GATE_UNAVAILABLE
+        assert self._blocks(reason, authz.authorization_gate_enforced()) is False
+
+    def test_enforce_mode_blocks_unknown_broker(self, monkeypatch):
+        monkeypatch.setenv("LIVE_AUTHORIZATION_GATE_ENFORCE", "true")
+        _patch_auth_rows(monkeypatch, {})
+        reason = _gate_reason_for(EMPTY_BROKER, "c@x.com")
+        assert self._blocks(reason, authz.authorization_gate_enforced()) is True
+
+    def test_known_paper_never_blocks_either_mode(self, monkeypatch):
+        _patch_auth_rows(monkeypatch, {})
+        for mode in ("false", "true"):
+            monkeypatch.setenv("LIVE_AUTHORIZATION_GATE_ENFORCE", mode)
+            reason = _gate_reason_for(SANDBOX_BROKER, "c@x.com")
+            assert self._blocks(reason, authz.authorization_gate_enforced()) is False

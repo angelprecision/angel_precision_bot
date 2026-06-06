@@ -863,40 +863,79 @@ def _dispatch(
         return
 
     # ── 4.5 LIVE AUTHORIZATION GATE (NEW LIVE entries only) ───────────────────
-    # Server-side, runs BEFORE any entry order is created. Blocks a NEW LIVE
-    # entry when the client lacks a valid one-time LIVE_TRADING authorization or
-    # a valid WEEKLY_TRADING authorization. Paper/sandbox clients are EXEMPT —
-    # is_live_broker() returns False for them so this block is skipped entirely.
+    # Server-side, runs BEFORE any entry order is created. Evaluated for a NEW
+    # entry when the client either (a) routes to a LIVE broker but lacks a valid
+    # one-time LIVE_TRADING + valid WEEKLY_TRADING authorization, or (b) has an
+    # UNKNOWN/unverifiable broker mode (we never assume paper).
+    #
+    # Two enforcement modes (env LIVE_AUTHORIZATION_GATE_ENFORCE, default FALSE):
+    #   • OBSERVE (false): log LIVE_AUTHORIZATION_WOULD_BLOCK and CONTINUE the
+    #     entry — rollout/observation phase.
+    #   • ENFORCE (true): REJECT the entry and log LIVE_ENTRY_BLOCKED.
+    #
+    # Known paper/sandbox clients are EXEMPT — is_live_broker() is False AND the
+    # mode is known, so neither branch fires.
+    #
     # This gate NEVER runs on exits, stop-losses, emergency exits, profit-taking,
     # reconciliation, position monitoring, or EOD flattening — none of those go
     # through _dispatch (which only creates NEW entries).
     try:
-        from ap.authorization import is_live_broker, check_live_authorization
-        if is_live_broker(broker):
-            _authz_reason = check_live_authorization(client_id)
-            if _authz_reason:
+        from ap.authorization import (
+            is_live_broker, broker_live_mode_known, check_live_authorization,
+            authorization_gate_enforced, LIVE_AUTHORIZATION_GATE_UNAVAILABLE,
+        )
+        _gate_reason = None
+        if not broker_live_mode_known(broker):
+            # Unknown/unverifiable broker mode — fail closed, never assume paper.
+            _gate_reason = LIVE_AUTHORIZATION_GATE_UNAVAILABLE
+        elif is_live_broker(broker):
+            _gate_reason = check_live_authorization(client_id)
+        # Known paper/sandbox → _gate_reason stays None (exempt).
+
+        if _gate_reason:
+            _enforced = authorization_gate_enforced()
+            if not _enforced:
+                # OBSERVE MODE — log intent and CONTINUE (do not block the entry).
+                log.warning(
+                    "[%s] LIVE_AUTHORIZATION_WOULD_BLOCK — %s | client=%s (observe mode; entry allowed)",
+                    ticker, _gate_reason, client_id,
+                )
+                try:
+                    from ap.execution import audit
+                    audit(client_id, "WARNING", "LIVE_AUTHORIZATION_WOULD_BLOCK", {
+                        "reason_code": _gate_reason,
+                        "ticker": ticker,
+                        "signal_id": signal_id,
+                        "enforced": False,
+                    })
+                except Exception as _audit_exc:
+                    log.debug("[%s] WOULD_BLOCK audit write failed: %s", ticker, _audit_exc)
+                # fall through — entry proceeds in observe mode.
+            else:
+                # ENFORCE MODE — reject the new live entry.
                 log.warning(
                     "[%s] LIVE ENTRY BLOCKED — %s | client=%s",
-                    ticker, _authz_reason, client_id,
+                    ticker, _gate_reason, client_id,
                 )
                 _mark_job(job_id, "REJECTED",
                           result={"stage": "live_authorization",
-                                  "reason": _authz_reason})
+                                  "reason": _gate_reason})
                 # Permanent structured rejection record — operator dashboard reads
                 # this to show WHY no trade was created.
                 _log_rejection_to_db(
                     signal_id=signal_id, client_id=client_id, ticker=ticker,
                     side=payload.get("side", ""), score=float(payload.get("score") or 0),
-                    stage="live_authorization", reason_code=_authz_reason,
-                    human_reason=_authz_reason, payload=payload,
+                    stage="live_authorization", reason_code=_gate_reason,
+                    human_reason=_gate_reason, payload=payload,
                 )
                 # audit_log row (LIVE_ENTRY_BLOCKED) for compliance trail.
                 try:
                     from ap.execution import audit
                     audit(client_id, "WARNING", "LIVE_ENTRY_BLOCKED", {
-                        "reason_code": _authz_reason,
+                        "reason_code": _gate_reason,
                         "ticker": ticker,
                         "signal_id": signal_id,
+                        "enforced": True,
                     })
                 except Exception as _audit_exc:
                     log.debug("[%s] LIVE_ENTRY_BLOCKED audit write failed: %s", ticker, _audit_exc)
@@ -906,7 +945,7 @@ def _dispatch(
                         ticker=ticker,
                         side=payload.get("side", ""),
                         stage="live_authorization",
-                        reason=_authz_reason,
+                        reason=_gate_reason,
                         score=float(payload.get("score") or 0),
                         pattern=payload.get("pattern_id") or payload.get("pattern", ""),
                     )
@@ -914,25 +953,28 @@ def _dispatch(
                     pass
                 return
     except Exception as _authz_exc:
-        # Fail CLOSED for live clients: if the gate itself errors, do NOT create a
-        # live entry. Paper clients already returned above (is_live_broker False),
-        # so reaching here with a live broker and an error means we cannot prove
-        # authorization — block rather than risk an unauthorized live order.
+        # Fail CLOSED for live clients when the gate ENFORCES: if the gate itself
+        # errors, do NOT create a live entry. In observe mode, a gate error must
+        # not block trading (the gate is non-blocking by design there).
         try:
-            _live = False
-            from ap.authorization import is_live_broker as _ilb
-            _live = _ilb(broker)
+            from ap.authorization import (
+                is_live_broker as _ilb, broker_live_mode_known as _bmk,
+                authorization_gate_enforced as _enf,
+            )
+            _enforced = _enf()
+            # "Risky" = live OR unknown mode (anything that isn't known-paper).
+            _risky = (not _bmk(broker)) or _ilb(broker)
         except Exception:
-            _live = False
-        if _live:
+            _enforced, _risky = False, False
+        if _enforced and _risky:
             log.error(
-                "[%s] LIVE authorization gate error — failing closed: %s",
+                "[%s] LIVE authorization gate error — failing closed (enforce): %s",
                 ticker, _authz_exc,
             )
             _mark_job(job_id, "REJECTED",
                       error=f"live_authorization_gate_error: {_authz_exc}")
             return
-        log.debug("[%s] authorization gate skipped (non-live): %s", ticker, _authz_exc)
+        log.debug("[%s] authorization gate skipped (observe or non-live): %s", ticker, _authz_exc)
 
     # ── 5. ORDER STATE MACHINE (create only after route + cutoff cleared) ────
     try:
@@ -1130,6 +1172,23 @@ def worker_loop(
     log.info(
         f"🤖 Worker started | client={client_id} poll={poll_seconds}s path={mode_label}"
     )
+
+    # Live authorization gate mode — surface on every worker start so operators
+    # can confirm whether the gate is BLOCKING (enforce) or only OBSERVING.
+    try:
+        from ap.authorization import authorization_gate_enforced
+        _gate_enforced = authorization_gate_enforced()
+        log.info(
+            "[%s] LIVE_AUTHORIZATION_GATE mode=%s (LIVE_AUTHORIZATION_GATE_ENFORCE=%s) — %s",
+            client_id,
+            "ENFORCE" if _gate_enforced else "OBSERVE",
+            os.getenv("LIVE_AUTHORIZATION_GATE_ENFORCE", "false"),
+            "unauthorized/unknown-mode new live entries are BLOCKED"
+            if _gate_enforced else
+            "unauthorized/unknown-mode new live entries are LOGGED ONLY (allowed)",
+        )
+    except Exception as _gate_log_exc:
+        log.warning("[%s] could not read live authorization gate mode: %s", client_id, _gate_log_exc)
 
     # PR F / queue truth hardening: re-emit the immediate-execution override
     # warning on worker startup. Module-import critical fires once per process;
