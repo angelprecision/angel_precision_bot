@@ -518,3 +518,50 @@ class TestProofSchemaGuard:
         assert pl.proof_trades_execution_mode_present(_FakeSB()) is True
         # Even if a later call would error, the cached True is returned.
         assert pl.proof_trades_execution_mode_present(_FakeSB(Exception("column missing"))) is True
+
+
+# --------------------------------------------------------------------------
+# FINAL AMENDMENT (review) — weekly window lower bound (trading_week_start).
+#
+# A weekend submission covers the UPCOMING Mon–Fri and must NOT satisfy the
+# live-entry gate until that week's Monday 00:00 ET has arrived. Mirrors the
+# dashboard backend's valid_weekly_authorization lower bound.
+# --------------------------------------------------------------------------
+class TestWeeklyWindowLowerBound:
+    def test_not_valid_before_window_start(self, monkeypatch):
+        start  = (datetime.now(timezone.utc) + timedelta(days=2)).isoformat()
+        future = (datetime.now(timezone.utc) + timedelta(days=6)).isoformat()
+        _patch_auth_rows(monkeypatch, {
+            "WEEKLY_TRADING": [{"accepted": True, "revoked_at": None,
+                                "expires_at": future, "trading_week_start": start}],
+        })
+        assert authz.valid_weekly_authorization("c@x.com") is False
+
+    def test_valid_once_window_started(self, monkeypatch):
+        start  = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+        future = (datetime.now(timezone.utc) + timedelta(days=3)).isoformat()
+        _patch_auth_rows(monkeypatch, {
+            "WEEKLY_TRADING": [{"accepted": True, "revoked_at": None,
+                                "expires_at": future, "trading_week_start": start}],
+        })
+        assert authz.valid_weekly_authorization("c@x.com") is True
+
+    def test_saturday_submission_blocks_live_gate_until_window(self, monkeypatch):
+        # Saturday submission: window start in the future -> the live-entry gate
+        # (check_live_authorization) must report WEEKLY_AUTHORIZATION_REQUIRED.
+        start  = (datetime.now(timezone.utc) + timedelta(days=2)).isoformat()
+        future = (datetime.now(timezone.utc) + timedelta(days=6)).isoformat()
+        _patch_auth_rows(monkeypatch, {
+            "LIVE_TRADING": [_live_row()],
+            "WEEKLY_TRADING": [{"accepted": True, "revoked_at": None,
+                                "expires_at": future, "trading_week_start": start}],
+        })
+        assert authz.check_live_authorization("c@x.com") == authz.WEEKLY_AUTHORIZATION_REQUIRED
+
+    def test_missing_trading_week_start_is_backward_compatible(self, monkeypatch):
+        # Older rows without trading_week_start fall back to expires-only check.
+        future = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
+        _patch_auth_rows(monkeypatch, {
+            "WEEKLY_TRADING": [{"accepted": True, "revoked_at": None, "expires_at": future}],
+        })
+        assert authz.valid_weekly_authorization("c@x.com") is True

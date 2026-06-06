@@ -127,7 +127,8 @@ def _fetch_authorizations(client_email: str, authorization_type: str) -> list[di
         with conn() as c:
             c.execute(
                 """
-                SELECT accepted, disclosure_version, revoked_at, expires_at
+                SELECT accepted, disclosure_version, revoked_at,
+                       expires_at, trading_week_start
                 FROM client_authorizations
                 WHERE client_email = %s
                   AND authorization_type = %s
@@ -192,7 +193,13 @@ def valid_live_authorization(client_email: str) -> bool:
 
 def valid_weekly_authorization(client_email: str) -> bool:
     """True if the client has a valid WEEKLY_TRADING authorization:
-    accepted, not revoked, and now <= expires_at."""
+    accepted, not revoked, and now is INSIDE the window
+    trading_week_start <= now <= expires_at.
+
+    The trading_week_start lower bound mirrors the dashboard backend: a weekend
+    submission (whose window is the upcoming Mon–Fri) must NOT be honored until
+    that trading week has actually begun.
+    """
     now = _now_utc()
     for row in _fetch_authorizations(client_email, "WEEKLY_TRADING"):
         if not row.get("accepted"):
@@ -201,6 +208,10 @@ def valid_weekly_authorization(client_email: str) -> bool:
             continue
         expires_at = _as_datetime(row.get("expires_at"))
         if expires_at is None or now > expires_at:
+            continue
+        start_at = _as_datetime(row.get("trading_week_start"))
+        if start_at is not None and now < start_at:
+            # Window has not started yet (e.g. weekend submission).
             continue
         return True
     return False
