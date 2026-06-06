@@ -1384,6 +1384,69 @@ def create_app() -> Flask:
             return jsonify({"ok": False, "error": str(e), "clients": []}), 500
 
 
+    # =====================================================================
+    # PR89 — Trade Volume Funnel + Scanner Gap Audit (READ-ONLY)
+    # =====================================================================
+    @app.get("/admin/operator/trade-volume-funnel")
+    @require_hmac
+    def admin_operator_trade_volume_funnel():
+        """PR89 — READ-ONLY operator report explaining why we are not
+        averaging 5 executable trades per day across all active clients.
+
+        The report decomposes the lifecycle from scanner signal generation
+        through filled trades into 11 ordered stages and surfaces, at each
+        stage, the drop count, drop %, and top normalized drop reasons.
+        Adds per-client, per-scanner, per-symbol, and per-pod breakdowns,
+        followed by deterministic action-item conclusions.
+
+        SELECT-only. NO trading behavior is touched.
+
+        Query params (all optional):
+          start, end     ISO-8601 timestamps. Defaults: today's market
+                         open (09:30 ET) → now.
+          client_id      filter to one client (substring match on client_id).
+          symbol         filter to one symbol (exact, uppercased).
+          scanner        filter on scanner_name / scanner_type / pattern.
+          timeframe      exact-match timeframe filter.
+          mode           all | live | paper | intraday | daily.
+
+        Response is JSON with keys:
+          ok, generated_at, window, filters, data_quality, summary, funnel,
+          client_breakdown, scanner_breakdown, symbol_breakdown,
+          pod_delivery, action_items.
+
+        Partial-data tolerance: if a source table is unavailable (missing
+        on the deployment), the affected counts return 0 and a warning is
+        appended to `data_quality` rather than masking the gap with fake
+        zeros.
+        """
+        try:
+            from ap.funnel_audit import build_funnel_report
+            report = build_funnel_report(
+                start     = (request.args.get("start") or "").strip() or None,
+                end       = (request.args.get("end") or "").strip() or None,
+                client_id = (request.args.get("client_id") or "").strip() or None,
+                symbol    = (request.args.get("symbol") or "").strip() or None,
+                scanner   = (request.args.get("scanner") or "").strip() or None,
+                timeframe = (request.args.get("timeframe") or "").strip() or None,
+                mode      = (request.args.get("mode") or "").strip() or None,
+            )
+            return jsonify(report)
+        except Exception as e:
+            log.error(f"trade-volume-funnel failed: {e}", exc_info=True)
+            return jsonify({
+                "ok":           False,
+                "error":        str(e),
+                "summary":      {},
+                "funnel":       [],
+                "action_items": [{
+                    "severity": "critical",
+                    "code":     "FUNNEL_REPORT_FAILED",
+                    "message":  f"Funnel report failed to build: {e}",
+                }],
+            }), 500
+
+
     @app.get("/admin/operator/fairness-audit")
     @require_hmac
     def admin_operator_fairness_audit():
