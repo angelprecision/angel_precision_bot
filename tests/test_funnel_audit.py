@@ -120,9 +120,12 @@ def test_report_partial_data_tolerance(_reload_module, monkeypatch):
     monkeypatch.setattr(_reload_module, "_sb_client", lambda: None)
     report = _reload_module.build_funnel_report()
     assert report["ok"] is True
-    assert isinstance(report["data_quality"], list)
-    # Every source should have raised a supabase_unavailable warning.
-    assert any("supabase_unavailable" in w for w in report["data_quality"])
+    dq = report["data_quality"]
+    # PR89 readiness amendment: data_quality is now a structured dict.
+    assert isinstance(dq, dict)
+    assert dq["has_partial_data"] is True
+    assert dq["warnings"]
+    assert any("supabase_unavailable" in w for w in dq["warnings"])
     # Funnel still has all 11 steps.
     assert [step["step"] for step in report["funnel"]] == list(
         _reload_module.FUNNEL_STEPS
@@ -131,6 +134,170 @@ def test_report_partial_data_tolerance(_reload_module, monkeypatch):
     assert all(s["count"] == 0 for s in report["funnel"])
     # Action items always have at least one entry.
     assert len(report["action_items"]) >= 1
+
+
+# ──────────────────────────────────────────────────────────────────────
+# PR89 readiness amendment — partial-data honesty tests
+# ──────────────────────────────────────────────────────────────────────
+
+def _fakes_one_source_failing(monkeypatch, fa, failing_table: str):
+    """Wire fake fetchers where exactly one table fails. Other tables
+    return empty success (no rows, no error)."""
+
+    def fake_safe_select(table, sb, *, start_iso, end_iso, ts_col,
+                         columns="*", page=2000):
+        if table == failing_table:
+            return [], f"{table}:RelationDoesNotExist:relation does not exist"
+        return [], None
+
+    def fake_safe_select_all(table, sb, *, columns="*", filters=None):
+        if table == failing_table:
+            return [], f"{table}:RelationDoesNotExist:relation does not exist"
+        return [], None
+
+    monkeypatch.setattr(fa, "_safe_select", fake_safe_select)
+    monkeypatch.setattr(fa, "_safe_select_all", fake_safe_select_all)
+    monkeypatch.setattr(fa, "_sb_client", lambda: object())  # truthy
+
+
+def test_source_failure_does_not_imply_zero_scanner_supply(_reload_module, monkeypatch):
+    """PR89 readiness amendment §2: when the scanner source is unavailable,
+    the action item must NOT say ‘scanner supply is low’. It must explicitly
+    say the source is unavailable."""
+    fa = _reload_module
+    # Both ap_signals AND client_signal_opportunities fail — we have NO
+    # honest read of scanner supply.
+    def fake_safe_select(table, sb, *, start_iso, end_iso, ts_col,
+                         columns="*", page=2000):
+        if table in ("ap_signals", "client_signal_opportunities"):
+            return [], f"{table}:RelationDoesNotExist:relation does not exist"
+        return [], None
+    def fake_safe_select_all(table, sb, *, columns="*", filters=None):
+        return [], None
+    monkeypatch.setattr(fa, "_safe_select", fake_safe_select)
+    monkeypatch.setattr(fa, "_safe_select_all", fake_safe_select_all)
+    monkeypatch.setattr(fa, "_sb_client", lambda: object())
+
+    report = fa.build_funnel_report()
+
+    codes = {it["code"] for it in report["action_items"]}
+    messages = " | ".join(it["message"] for it in report["action_items"])
+
+    # MUST surface the source-unavailable conclusion.
+    assert "SCANNER_SOURCE_UNAVAILABLE" in codes
+    # MUST NOT claim scanner supply is low (the truth is: we cannot tell).
+    # The forbidden phrasing is the FALSE conclusion ‘scanner supply is low:
+    # only N’. The HONEST message contains ‘whether scanner supply is low’
+    # — we must reject the former without false-matching the latter.
+    assert "LOW_SCANNER_SUPPLY" not in codes
+    assert "scanner supply is low:" not in messages.lower()
+    assert "only 0 client_eligible signals" not in messages.lower()
+    # And the exact spec phrasing must appear:
+    assert "cannot determine" in messages.lower()
+
+
+def test_source_failure_sets_has_partial_data(_reload_module, monkeypatch):
+    """PR89 readiness amendment §1: any source failure must set
+    summary.has_partial_data=True and populate partial_data_sources."""
+    fa = _reload_module
+    _fakes_one_source_failing(monkeypatch, fa, failing_table="ap_signals")
+
+    report = fa.build_funnel_report()
+
+    # summary flags
+    assert report["summary"]["has_partial_data"] is True
+    assert "ap_signals" in report["summary"]["partial_data_sources"]
+
+    # data_quality structured shape
+    dq = report["data_quality"]
+    assert dq["has_partial_data"] is True
+    assert dq["partial_data_sources"] == ["ap_signals"]
+    failures = dq["source_failures"]
+    assert len(failures) == 1
+    f = failures[0]
+    assert f["table"] == "ap_signals"
+    # source_failures must include the affected stages.
+    assert set(f["stages"]) == {"SCANNER_GENERATED", "CLIENT_ELIGIBLE"}
+    assert "RelationDoesNotExist" in f["error"]
+    # data_quality.warnings retains the original list[str] for back-compat.
+    assert any("ap_signals" in w for w in dq["warnings"])
+
+
+def test_funnel_marks_unavailable_stages(_reload_module, monkeypatch):
+    """Stages whose backing source failed must carry unavailable=True so
+    the dashboard can refuse to red-color a misleading zero."""
+    fa = _reload_module
+    _fakes_one_source_failing(monkeypatch, fa, failing_table="orders")
+
+    report = fa.build_funnel_report()
+
+    by_step = {f["step"]: f for f in report["funnel"]}
+    # orders failure affects: ORDER_CREATED, WATCHER_ARMED, BROKER_SUBMITTED, FILLED
+    for step in ("ORDER_CREATED", "WATCHER_ARMED",
+                 "BROKER_SUBMITTED", "FILLED"):
+        assert by_step[step]["unavailable"] is True, (
+            f"{step} should be marked unavailable when orders source fails"
+        )
+    # Other stages should NOT be marked unavailable.
+    for step in ("SCANNER_GENERATED", "CLIENT_ELIGIBLE"):
+        assert by_step[step]["unavailable"] is False
+
+    # And the broker action item must reflect the unavailable source, not
+    # synthesize a "low fill rate" conclusion.
+    codes = {it["code"] for it in report["action_items"]}
+    assert "BROKER_SOURCE_UNAVAILABLE" in codes
+    assert "BROKER_LOW_FILL_RATE" not in codes
+
+
+def test_action_items_distinguish_unavailable_from_true_zero(_reload_module, monkeypatch):
+    """With ALL sources available and zero rows everywhere, the report
+    must say 'no bottleneck detected' / 'scanner supply low' — a HONEST
+    zero. It must NOT say any source is unavailable."""
+    fa = _reload_module
+
+    def fake_safe_select(table, sb, *, start_iso, end_iso, ts_col,
+                         columns="*", page=2000):
+        return [], None  # success, but no data
+    def fake_safe_select_all(table, sb, *, columns="*", filters=None):
+        return [], None  # also empty success
+    monkeypatch.setattr(fa, "_safe_select", fake_safe_select)
+    monkeypatch.setattr(fa, "_safe_select_all", fake_safe_select_all)
+    monkeypatch.setattr(fa, "_sb_client", lambda: object())
+
+    report = fa.build_funnel_report()
+
+    # has_partial_data MUST be False — the sources answered, the answer was
+    # "zero rows". That IS a true zero.
+    assert report["summary"]["has_partial_data"] is False
+    assert report["summary"]["partial_data_sources"] == []
+    assert report["data_quality"]["has_partial_data"] is False
+    assert report["data_quality"]["source_failures"] == []
+
+    codes = {it["code"] for it in report["action_items"]}
+    # No source-unavailable codes should fire.
+    assert "PARTIAL_DATA" not in codes
+    assert "SCANNER_SOURCE_UNAVAILABLE" not in codes
+    assert "SCANNER_SOURCE_PARTIAL" not in codes
+    assert "BROKER_SOURCE_UNAVAILABLE" not in codes
+    assert "POD_DELIVERY_SOURCE_UNAVAILABLE" not in codes
+    # The honest "low scanner supply" conclusion SHOULD fire (true zero).
+    assert "LOW_SCANNER_SUPPLY" in codes
+
+
+def test_partial_data_action_item_is_first(_reload_module, monkeypatch):
+    """PR89 readiness amendment: when any source fails, the very first
+    action_item must be PARTIAL_DATA so the operator sees it before any
+    other conclusion that might be based on incomplete data."""
+    fa = _reload_module
+    _fakes_one_source_failing(monkeypatch, fa, failing_table="client_signal_opportunities")
+
+    report = fa.build_funnel_report()
+
+    assert report["action_items"], "action_items must never be empty"
+    first = report["action_items"][0]
+    assert first["code"] == "PARTIAL_DATA"
+    assert first["severity"] == "critical"
+    assert "client_signal_opportunities" in first["message"]
 
 
 # ─────────────────────────────────────────────────────────────────────────────

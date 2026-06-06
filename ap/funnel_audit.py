@@ -410,7 +410,49 @@ def build_funnel_report(
         mode_norm = "all"
 
     sb = _sb_client()
-    data_quality: list[str] = []
+
+    # ----------------------------------------------------------------------
+    # Structured data-quality tracker.
+    #
+    # We treat ANY source-fetch failure as a fact that must be surfaced to
+    # the operator — a missing source can never masquerade as zero activity.
+    # Each failure is recorded with: table, stage (which lifecycle stages
+    # depend on this source), and a short error string.
+    #
+    # Backward-compatibility note: older clients read `data_quality` as a
+    # list of strings. We keep that list as `data_quality.warnings` so that
+    # JSON-shape parity holds; structured failures live under
+    # `data_quality.source_failures`. Any consumer can still flatten
+    # warnings + source_failures for display.
+    # ----------------------------------------------------------------------
+    source_failures: list[dict] = []
+    warnings: list[str] = []
+
+    # Map each source table to the funnel stages it materially affects, so
+    # the operator can read at a glance "this stage's count is 0 because
+    # the source was unavailable, not because nothing happened."
+    STAGES_BY_SOURCE: dict[str, list[str]] = {
+        "ap_signals":                  ["SCANNER_GENERATED", "CLIENT_ELIGIBLE"],
+        "orders":                       ["ORDER_CREATED", "WATCHER_ARMED",
+                                         "BROKER_SUBMITTED", "FILLED"],
+        "client_signal_opportunities":  ["OPPORTUNITY_CREATED", "PREFLIGHT_PASSED",
+                                         "ENTRY_CONFIRMED", "BROKER_ACKED"],
+        "members":                      ["client_breakdown", "pod_delivery"],
+        "proof_trades":                 ["EXITED"],
+    }
+
+    def _record_warn(table: str, warn: Optional[str]) -> None:
+        """Promote a (table, warn) tuple into the structured tracker."""
+        if not warn:
+            return
+        # warn format from _safe_select / _safe_select_all is "table:detail".
+        detail = warn.split(":", 1)[1] if ":" in warn else warn
+        source_failures.append({
+            "table":  table,
+            "stages": list(STAGES_BY_SOURCE.get(table, [])),
+            "error":  detail.strip() or "unknown",
+        })
+        warnings.append(warn)
 
     # --- 1. Pull ap_signals (scanner supply + gate decisions) -------------
     signals, warn = _safe_select(
@@ -419,8 +461,7 @@ def build_funnel_report(
         columns=("signal_id,client_email,ticker,pattern,timeframe,side,score,"
                  "tier,decision_status,context_notes,created_at"),
     )
-    if warn:
-        data_quality.append(warn)
+    _record_warn("ap_signals", warn)
 
     # --- 2. Pull orders (lifecycle from creation to fill) ------------------
     orders, warn = _safe_select(
@@ -431,8 +472,7 @@ def build_funnel_report(
                  "pattern,timeframe,direction,signal_id,canonical_signal_id,"
                  "last_error,created_ts,updated_ts,submitted_ts,meta"),
     )
-    if warn:
-        data_quality.append(warn)
+    _record_warn("orders", warn)
 
     # --- 3. Pull client_signal_opportunities (per-client fanout truth) -----
     opps, warn = _safe_select(
@@ -447,16 +487,14 @@ def build_funnel_report(
                  "spread_pct,preflight_enforced,execution_continued,"
                  "retry_status,retry_reason,created_at,updated_at,metadata"),
     )
-    if warn:
-        data_quality.append(warn)
+    _record_warn("client_signal_opportunities", warn)
 
     # --- 4. Pull members (active clients + execution_pod) ------------------
     members, warn = _safe_select_all(
         "members", sb,
         columns="email,execution_pod,allow_live_trading,approved,subscription_active,status",
     )
-    if warn:
-        data_quality.append(warn)
+    _record_warn("members", warn)
     active_clients = [
         m for m in (members or [])
         if (m.get("approved") in (True, "true", 1, "1")
@@ -477,9 +515,19 @@ def build_funnel_report(
         start_iso=start_iso, end_iso=end_iso, ts_col="created_at",
         columns="trade_id,client_email,signal_id,status,exit_bucket,created_at",
     )
-    if warn:
-        # proof_trades may not exist on every deploy — treat as soft warning
-        data_quality.append(warn)
+    _record_warn("proof_trades", warn)
+
+    # ----------------------------------------------------------------------
+    # Compute partial-data flags now so action_items and summary share the
+    # SAME source-of-truth set rather than each recomputing it.
+    # ----------------------------------------------------------------------
+    unavailable_sources: set[str] = {f["table"] for f in source_failures}
+    has_partial_data = bool(unavailable_sources)
+    partial_data_sources = sorted(unavailable_sources)
+    # Which lifecycle stages cannot be trusted to be "true zero":
+    unavailable_stages: set[str] = set()
+    for f in source_failures:
+        unavailable_stages.update(f.get("stages") or [])
 
     # --- Apply user filters across all datasets ----------------------------
     cid_lc = (client_id or "").strip().lower()
@@ -645,6 +693,9 @@ def build_funnel_report(
         "fill_rate_from_client_eligible": fill_rate_from_eligible,
         "fill_rate_from_broker_submitted": fill_rate_from_submitted,
         "active_clients":              n_active_clients,
+        # Partial-data honesty (PR89 readiness amendment):
+        "has_partial_data":            has_partial_data,
+        "partial_data_sources":        partial_data_sources,
     }
 
     # ----------------------------------------------------------------------
@@ -656,6 +707,7 @@ def build_funnel_report(
         orders=entry_orders,
         opps=opps_f,
         rejected_reasons=rejected_reasons,
+        unavailable_stages=unavailable_stages,
     )
 
     # ----------------------------------------------------------------------
@@ -703,6 +755,7 @@ def build_funnel_report(
         scanner_breakdown=scanner_breakdown,
         pod_delivery=pod_delivery,
         rejected_reasons=rejected_reasons,
+        unavailable_sources=unavailable_sources,
     )
 
     return {
@@ -720,7 +773,17 @@ def build_funnel_report(
             "timeframe": timeframe or None,
             "mode":      mode_norm,
         },
-        "data_quality":      data_quality,
+        # Structured data quality (PR89 readiness amendment). `warnings`
+        # preserves the original list[str] shape for any consumer still
+        # reading the old contract; `source_failures` is the new authoritative
+        # detail (table, affected stages, error).
+        "data_quality": {
+            "has_partial_data":      has_partial_data,
+            "partial_data_sources":  partial_data_sources,
+            "unavailable_stages":    sorted(unavailable_stages),
+            "source_failures":       source_failures,
+            "warnings":              warnings,
+        },
         "summary":           summary,
         "funnel":            funnel,
         "client_breakdown":  client_breakdown,
@@ -749,8 +812,16 @@ def _top_reasons(counter: Counter, k: int = 3) -> list[dict]:
 
 def _build_ordered_funnel(*, summary: dict, signals: list[dict],
                           orders: list[dict], opps: list[dict],
-                          rejected_reasons: Counter) -> list[dict]:
-    """Build the §1.2 ordered funnel with drop_from_previous + reasons."""
+                          rejected_reasons: Counter,
+                          unavailable_stages: Optional[set[str]] = None,
+                          ) -> list[dict]:
+    """Build the §1.2 ordered funnel with drop_from_previous + reasons.
+
+    `unavailable_stages` is the set of stage names whose backing source
+    failed to load. Each affected stage gets `unavailable=true` in its
+    output dict so the dashboard can refuse to red-color a misleading zero.
+    """
+    unavailable_stages = unavailable_stages or set()
     # Per-step reason collectors
     cli_elig_reasons: Counter = rejected_reasons.copy()  # signals dropped before CLIENT_ELIGIBLE
     opp_create_reasons: Counter = Counter()
@@ -826,19 +897,25 @@ def _build_ordered_funnel(*, summary: dict, signals: list[dict],
     funnel: list[dict] = []
     prev_count: Optional[int] = None
     for step, count, reasons in counts:
+        is_unavailable = step in unavailable_stages
         if prev_count is None or prev_count == 0:
             drop = 0
             drop_pct = 0.0
         else:
             drop = max(0, prev_count - count)
             drop_pct = round(100.0 * drop / prev_count, 2) if prev_count else 0.0
-        funnel.append({
+        entry = {
             "step":              step,
             "count":             int(count),
             "drop_from_previous": int(drop),
             "drop_pct":          drop_pct,
             "top_drop_reasons":  _top_reasons(reasons, k=3),
-        })
+            "unavailable":       is_unavailable,
+        }
+        # When the source is unavailable, the count is not meaningful as a
+        # "true zero" — mark it so downstream consumers can render it as
+        # "—" or with a warning rather than treating it as a real drop.
+        funnel.append(entry)
         prev_count = count
     return funnel
 
@@ -1131,29 +1208,87 @@ def _build_action_items(*, summary: dict, funnel: list[dict],
                         client_breakdown: list[dict],
                         scanner_breakdown: list[dict],
                         pod_delivery: list[dict],
-                        rejected_reasons: Counter) -> list[dict]:
+                        rejected_reasons: Counter,
+                        unavailable_sources: Optional[set[str]] = None,
+                        ) -> list[dict]:
+    """Deterministic operator conclusions.
+
+    PR89 readiness amendment: when a source is unavailable, the conclusions
+    that DEPEND on that source MUST say so explicitly rather than treat a
+    zero count as a real "nothing happened" signal.
+    """
+    unavailable_sources = unavailable_sources or set()
     items: list[dict] = []
 
-    # 1. Scanner supply
-    cli_elig = summary["client_eligible_signals"]
-    if cli_elig < 5:
+    # 0. Partial data — always the first item when any source failed.
+    #    This is the operator's #1 cue that the rest of the conclusions
+    #    must be read with caveats.
+    if unavailable_sources:
+        items.append({
+            "severity": "critical",
+            "code":     "PARTIAL_DATA",
+            "message":  (
+                "Partial data — one or more sources failed: "
+                + ", ".join(sorted(unavailable_sources))
+                + ". Counts for affected stages cannot be trusted as "
+                  "‘true zero’."
+            ),
+        })
+
+    # 1. Scanner supply — honest about unavailable sources.
+    #    If ap_signals AND client_signal_opportunities are both unavailable,
+    #    we have NO way to know how many signals the scanner produced.
+    cli_elig  = summary["client_eligible_signals"]
+    n_scanner = summary["scanner_signals_total"]
+    scanner_source_unavailable = (
+        "ap_signals" in unavailable_sources
+        and "client_signal_opportunities" in unavailable_sources
+    )
+    if scanner_source_unavailable:
+        items.append({
+            "severity": "critical",
+            "code":     "SCANNER_SOURCE_UNAVAILABLE",
+            "message":  ("Scanner source unavailable — cannot determine "
+                         "whether scanner supply is low."),
+        })
+    elif "ap_signals" in unavailable_sources:
+        # Partial: signals table missing but opportunities may give a hint.
+        items.append({
+            "severity": "warn",
+            "code":     "SCANNER_SOURCE_PARTIAL",
+            "message":  ("Scanner signal source (ap_signals) unavailable — "
+                         "scanner-supply assessment is incomplete; only "
+                         "opportunity-ledger evidence is being used."),
+        })
+    elif cli_elig < 5:
         items.append({
             "severity": "warn" if cli_elig > 0 else "critical",
             "code":     "LOW_SCANNER_SUPPLY",
             "message":  f"Scanner supply is low: only {cli_elig} CLIENT_ELIGIBLE signals in window.",
         })
 
-    # 2. Quality-gate bottleneck
-    n_scanner = summary["scanner_signals_total"]
-    if n_scanner > 0 and cli_elig == 0:
+    # 2. Quality-gate bottleneck — only meaningful when scanner data is real.
+    if (n_scanner > 0 and cli_elig == 0
+            and not scanner_source_unavailable
+            and "ap_signals" not in unavailable_sources):
         items.append({
             "severity": "critical",
             "code":     "QUALITY_GATE_BLOCKING_ALL",
             "message":  f"Intraday scanner generated {n_scanner} signals but 0 passed quality gates.",
         })
 
-    # 3. Eligible but missing pod delivery
-    if cli_elig > 0 and pod_delivery:
+    # 3. Eligible but missing pod delivery — requires both opps + members.
+    pod_source_unavailable = bool(
+        unavailable_sources & {"client_signal_opportunities", "members"}
+    )
+    if pod_source_unavailable:
+        items.append({
+            "severity": "warn",
+            "code":     "POD_DELIVERY_SOURCE_UNAVAILABLE",
+            "message":  ("Pod delivery source unavailable — cannot determine "
+                         "whether signals reached every pod."),
+        })
+    elif cli_elig > 0 and pod_delivery:
         worst = pod_delivery[0]
         if worst["missing_opportunity_rows"] > 0:
             items.append({
@@ -1193,10 +1328,17 @@ def _build_action_items(*, summary: dict, funnel: list[dict],
                          f"(reason: {top_reason.lower()})."),
         })
 
-    # 6. Broker submitted but not filling
+    # 6. Broker submitted but not filling — requires the orders table.
     sub = summary["broker_submitted"]
     fill = summary["filled"]
-    if sub >= 4 and fill / max(sub, 1) < 0.5:
+    if "orders" in unavailable_sources:
+        items.append({
+            "severity": "warn",
+            "code":     "BROKER_SOURCE_UNAVAILABLE",
+            "message":  ("Broker source (orders) unavailable — cannot determine "
+                         "whether broker is rejecting or failing to fill."),
+        })
+    elif sub >= 4 and fill / max(sub, 1) < 0.5:
         items.append({
             "severity": "warn",
             "code":     "BROKER_LOW_FILL_RATE",
@@ -1229,7 +1371,9 @@ def _build_action_items(*, summary: dict, funnel: list[dict],
                              f"(top reason: {reason.lower()})."),
             })
 
-    # 9. If everything else is empty, surface the bare scanner-vs-fill gap
+    # 9. If everything else is empty, surface the bare scanner-vs-fill gap —
+    #    but ONLY when we have honest scanner + broker data. With partial
+    #    data, the PARTIAL_DATA item at position 0 already serves that role.
     if not items:
         items.append({
             "severity": "info",
