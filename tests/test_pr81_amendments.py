@@ -31,6 +31,8 @@ def _make_preflight(eligible=True, block_reason=None, kill_switch=False,
         subscription_active=subscription_active,
         kill_switch=kill_switch,
         entries_paused=False,
+        maintenance_mode=False,
+        scanner_routing_enabled=True,
         tradier_active_mode="paper",
         expected_mode="paper",
         has_account_id=True,
@@ -250,7 +252,9 @@ class TestCanonicalIdempotency:
         upsert_calls = []
         sb = MagicMock()
         sb.table.return_value.upsert.side_effect = (
-            lambda row, on_conflict=None: (upsert_calls.append(row) or MagicMock())
+            lambda row, on_conflict=None, ignore_duplicates=False: (
+                upsert_calls.append(row) or MagicMock()
+            )
         )
         sb.table.return_value.upsert.return_value.execute.return_value = MagicMock()
 

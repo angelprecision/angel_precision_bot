@@ -1261,6 +1261,129 @@ def create_app() -> Flask:
             return jsonify({"ok": False, "error": str(e), "rows": [], "summary": {}}), 500
 
 
+    # =====================================================================
+    # PR81 Amendment §8 — Client Opportunity Ledger admin endpoints
+    # =====================================================================
+
+    @app.get("/admin/operator/client-opportunities")
+    @require_hmac
+    def admin_operator_client_opportunities():
+        """READ-ONLY client_signal_opportunities query (Amendment §8).
+
+        Query params (all optional):
+          canonical_signal_id, signal_id, client_id, status, start, end
+          (ISO timestamps), limit (default 500, max 2000).
+        No mutation. Returns one row per matching opportunity.
+        """
+        try:
+            from ap.queue import _get_sb_client
+            sb = _get_sb_client()
+            if not sb:
+                return jsonify({"ok": False, "error": "supabase_unavailable",
+                                "rows": []}), 503
+
+            canonical = (request.args.get("canonical_signal_id") or "").strip()
+            sig_id    = (request.args.get("signal_id") or "").strip()
+            client_id = (request.args.get("client_id") or "").strip()
+            status    = (request.args.get("status") or "").strip()
+            start_ts  = (request.args.get("start") or "").strip()
+            end_ts    = (request.args.get("end") or "").strip()
+            try:
+                limit = max(1, min(int(request.args.get("limit", 500)), 2000))
+            except (TypeError, ValueError):
+                limit = 500
+
+            q = sb.table("client_signal_opportunities").select("*")
+            if canonical: q = q.eq("canonical_signal_id", canonical)
+            if sig_id:    q = q.eq("signal_id", sig_id)
+            if client_id: q = q.eq("client_id", client_id)
+            if status:    q = q.eq("opportunity_status", status)
+            if start_ts:  q = q.gte("created_at", start_ts)
+            if end_ts:    q = q.lte("created_at", end_ts)
+            rows = q.order("created_at", desc=True).limit(limit).execute().data or []
+            return jsonify({"ok": True, "count": len(rows), "rows": rows})
+        except Exception as e:
+            log.error(f"client-opportunities failed: {e}")
+            return jsonify({"ok": False, "error": str(e), "rows": []}), 500
+
+
+    @app.get("/admin/operator/client-parity-signal/<canonical_signal_id>")
+    @require_hmac
+    def admin_operator_client_parity_signal(canonical_signal_id):
+        """READ-ONLY side-by-side parity view (Amendment §8).
+
+        For one canonical_signal_id, returns every expected client's
+        opportunity row with status, miss stage/reason, order IDs,
+        broker IDs, timestamps, preflight snapshot, execution_continued,
+        preflight_enforced, and fanout timing. No mutation.
+        """
+        try:
+            from ap.queue import _get_sb_client
+            sb = _get_sb_client()
+            if not sb:
+                return jsonify({"ok": False, "error": "supabase_unavailable",
+                                "rows": []}), 503
+
+            canonical = (canonical_signal_id or "").strip()
+            if not canonical:
+                return jsonify({"ok": False, "error": "missing canonical_signal_id",
+                                "rows": []}), 400
+
+            rows = (
+                sb.table("client_signal_opportunities")
+                .select("*")
+                .eq("canonical_signal_id", canonical)
+                .order("client_id")
+                .execute().data
+                or []
+            )
+
+            # Best-effort fan-out timing window (first-write → last-write).
+            timestamps = [r.get("created_at") for r in rows if r.get("created_at")]
+            updates    = [r.get("updated_at") for r in rows if r.get("updated_at")]
+            fanout = {
+                "first_created_at": min(timestamps) if timestamps else None,
+                "last_created_at":  max(timestamps) if timestamps else None,
+                "last_updated_at":  max(updates)    if updates    else None,
+            }
+
+            # Build the side-by-side projection.
+            clients = []
+            for r in rows:
+                meta = r.get("metadata") or {}
+                clients.append({
+                    "client_id":             r.get("client_id"),
+                    "signal_id":             r.get("signal_id"),
+                    "opportunity_status":    r.get("opportunity_status"),
+                    "miss_stage":            r.get("miss_stage"),
+                    "miss_reason":           r.get("miss_reason"),
+                    "order_local_id":        r.get("order_local_id"),
+                    "broker_order_id":       r.get("broker_order_id"),
+                    "position_id":           r.get("position_id"),
+                    "preflight_enforced":    r.get("preflight_enforced"),
+                    "execution_continued":   r.get("execution_continued"),
+                    "would_block_reason":    r.get("would_block_reason"),
+                    "kill_switch_state":     r.get("kill_switch_state"),
+                    "entries_paused_state":  r.get("entries_paused_state"),
+                    "buying_power_snapshot": r.get("buying_power_snapshot"),
+                    "created_at":            r.get("created_at"),
+                    "updated_at":            r.get("updated_at"),
+                    "preflight_snapshot":    meta.get("preflight"),
+                    "cap_snapshot":          meta.get("cap_snapshot"),
+                })
+
+            return jsonify({
+                "ok":                  True,
+                "canonical_signal_id": canonical,
+                "client_count":        len(clients),
+                "fanout":              fanout,
+                "clients":             clients,
+            })
+        except Exception as e:
+            log.error(f"client-parity-signal failed: {e}")
+            return jsonify({"ok": False, "error": str(e), "clients": []}), 500
+
+
     @app.get("/admin/operator/fairness-audit")
     @require_hmac
     def admin_operator_fairness_audit():

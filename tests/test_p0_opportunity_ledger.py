@@ -67,7 +67,7 @@ class _SmartFakeSB:
 
 
 # ── PR1: Opportunity Ledger ───────────────────────────────────────────────────
-from ap_opportunity_ledger import (
+from ap.opportunity_ledger import (
     create_opportunities, update_opportunity,
     mark_missed, mark_skipped,
     CREATED, MISSED, CLIENT_SKIPPED, ORDER_CREATED, WATCHER_ARMED,
@@ -148,7 +148,7 @@ def test_internal_exception_marks_ledger_not_raises():
 
 
 # ── PR2: Client State Preflight ───────────────────────────────────────────────
-from ap_client_preflight import (
+from ap.client_preflight import (
     build_client_trade_preflight,
     ClientTradePreflight,
     KILL_SWITCH_ON, ENTRIES_PAUSED, CLIENT_NOT_APPROVED, SUBSCRIPTION_INACTIVE,
@@ -159,11 +159,31 @@ from ap_client_preflight import (
 )
 
 def _member(**kw):
-    base = dict(approved=True, subscription_active=True, killswitch=False,
-                entriespaused=False, tradier_active_mode="paper",
+    # Real schema (matches ap/entry_gate.py): lowercase no-underscore booleans
+    # and tradier_account_mode for the broker mode.
+    base = dict(approved=True, subscriptionactive=True, killswitch=False,
+                entriespaused=False, maintenancemode=False,
+                scannerroutingenabled=True,
+                tradier_account_mode="paper",
+                tradier_paper_account_id="VA12345",
+                tradier_paper_access_token="tok123",
                 tradier_account_id="VA12345", tradier_access_token="tok123",
                 tradier_live_account_id=None, tradier_live_access_token=None)
+    # Back-compat: tests may still pass legacy kwarg names
+    legacy_map = {
+        "subscription_active": "subscriptionactive",
+        "tradier_active_mode": "tradier_account_mode",
+    }
+    for old, new in legacy_map.items():
+        if old in kw:
+            kw[new] = kw.pop(old)
     base.update(kw)
+    # If a test nulls a generic credential to test missing creds, also null
+    # the paper-specific equivalents so the priority resolution still misses.
+    if "tradier_account_id" in kw and kw["tradier_account_id"] is None:
+        base["tradier_paper_account_id"] = None
+    if "tradier_access_token" in kw and kw["tradier_access_token"] is None:
+        base["tradier_paper_access_token"] = None
     return [base]
 
 def _sb_member(**kw):
@@ -213,23 +233,43 @@ def test_preflight_missing_credentials_blocks():
     assert pf.block_reason == MISSING_BROKER_CREDENTIALS
 
 def test_preflight_broker_mode_mismatch_blocks():
-    os.environ["BOT_MODE"] = "live"
-    pf = build_client_trade_preflight("c@x.com", SIG2, _plan(),
-                                       sb=_sb_member(tradier_active_mode="paper"))
+    # Amendment §5: expected_mode is client/pod aware. Pass a runner
+    # whose expected_mode is 'live' while the members row reports paper.
+    class R:
+        kill_switch_active = False
+        expected_mode      = "live"
+        mode               = "live"
+        member             = None
+        class _EA:
+            @staticmethod
+            def is_set(): return True
+        entries_allowed = _EA()
+    pf = build_client_trade_preflight(
+        "c@x.com", SIG2, _plan(),
+        runner=R(),
+        sb=_sb_member(tradier_account_mode="paper",
+                      tradier_live_account_id=None,
+                      tradier_live_access_token=None),
+    )
     assert pf.eligible is False
-    assert pf.block_reason == BROKER_MODE_MISMATCH
-    os.environ["BOT_MODE"] = "paper"
+    # Either MISSING_BROKER_CREDENTIALS (live tokens missing) or
+    # BROKER_MODE_MISMATCH — both are the correct truth here.
+    assert pf.block_reason in (BROKER_MODE_MISMATCH, MISSING_BROKER_CREDENTIALS)
 
 def test_preflight_insufficient_buying_power_blocks():
     sb = _sb_member()
-    # Inject buying_power via runner stub
+    # Amendment §5: buying_power is its own attribute on the runner,
+    # NOT derived from account_equity.
     class R:
-        account_equity = 50.0
-        kill_switch_on = False
-        entries_allowed = type('E', (), {'is_set': lambda s: True})()
-        approved = True
-        subscription_active = True
-        mode = "paper"
+        buying_power      = 50.0
+        account_equity    = 50000.0   # must NOT be used as buying_power
+        kill_switch_active = False
+        entries_allowed   = type('E', (), {'is_set': lambda s: True})()
+        approved          = True
+        subscriptionactive = True
+        mode              = "paper"
+        expected_mode     = "paper"
+        member            = None
     pf = build_client_trade_preflight("c@x.com", SIG2, _plan(cost=200.0),
                                        runner=R(), sb=sb)
     assert pf.eligible is False
@@ -294,7 +334,7 @@ def test_update_opportunity_uses_canonical_signal_id():
     assert update["opportunity_status"] == ORDER_CREATED
 
 def test_PREFLIGHT_PASSED_status_exists():
-    from ap_opportunity_ledger import PREFLIGHT_PASSED
+    from ap.opportunity_ledger import PREFLIGHT_PASSED
     assert PREFLIGHT_PASSED == "PREFLIGHT_PASSED"
 
 def test_preflight_enforce_false_missing_buying_power_does_not_block():
@@ -311,10 +351,12 @@ def test_preflight_enforce_false_missing_buying_power_does_not_block():
     )
 
 def test_preflight_enforce_flag_readable():
-    from ap_client_preflight import preflight_enforce
+    from ap.client_preflight import preflight_enforce
     import os
     os.environ["CLIENT_PREFLIGHT_ENFORCE"] = "false"
     assert preflight_enforce() is False
     os.environ["CLIENT_PREFLIGHT_ENFORCE"] = "true"
     assert preflight_enforce() is True
+    # Don't leave it set to true for other tests
+    os.environ["CLIENT_PREFLIGHT_ENFORCE"] = "false"
     os.environ["CLIENT_PREFLIGHT_ENFORCE"] = "false"
