@@ -238,6 +238,38 @@ def _max_equity_drawdown(pnls: list) -> float:
 # PROOF LOGGER
 # =============================================================================
 
+def _resolve_entry_execution_mode(local_order_id: str) -> str:
+    """Resolve the execution mode for a proof_trades row from the ORIGINATING
+    entry order — the source of truth stamped at entry creation time.
+
+    Reads orders.execution_mode (preferred) then orders.meta.execution_mode.
+    Returns 'live' or 'paper' when the entry order carries a valid mode, else
+    'unknown'. Never guesses 'live': a missing/absent mode is always 'unknown'.
+    """
+    if not local_order_id:
+        return "unknown"
+    try:
+        from ap.db import get_order_by_id
+        order = get_order_by_id(local_order_id)
+    except Exception as e:
+        log.debug("execution_mode lookup failed for %s: %s", local_order_id, e)
+        return "unknown"
+    if not order:
+        return "unknown"
+    mode = str(order.get("execution_mode") or "").lower().strip()
+    if mode not in ("live", "paper"):
+        meta = order.get("meta")
+        if isinstance(meta, str):
+            try:
+                import json as _json
+                meta = _json.loads(meta)
+            except Exception:
+                meta = None
+        if isinstance(meta, dict):
+            mode = str(meta.get("execution_mode") or "").lower().strip()
+    return mode if mode in ("live", "paper") else "unknown"
+
+
 class APProofLogger:
     """
     Logs trade outcomes to Supabase and generates daily proof summaries.
@@ -337,9 +369,15 @@ class APProofLogger:
         seconds_to_fill:     float = 0.0,
     ) -> dict:
         now = datetime.now(timezone.utc)
+        # execution_mode is COPIED from the originating entry order (source of
+        # truth stamped at entry creation), NOT recomputed from self.mode — the
+        # client may have switched modes while the position was open. Missing →
+        # 'unknown' (never guess 'live').
+        _execution_mode = _resolve_entry_execution_mode(local_order_id)
         row = {
             "client_email":       self.email,
             "mode":               self.mode,
+            "execution_mode":     _execution_mode,
             "system_version":     SYSTEM_VERSION,
             "opened_at":          (opened_at or now).isoformat(),
             "closed_at":          (closed_at or now).isoformat(),
@@ -401,7 +439,8 @@ class APProofLogger:
             "exit_pricing_tier", "exit_attempt", "seconds_to_fill",
         }
         _CORE_COLS = {
-            "client_email", "mode", "system_version", "opened_at", "closed_at",
+            "client_email", "mode", "execution_mode", "system_version",
+            "opened_at", "closed_at",
             "ticker", "pattern", "side", "timeframe", "score", "tier",
             "entry_option_price", "exit_option_price", "contracts",
             "exit_reason", "option_pnl_pct", "underlying_pnl_pct", "win",

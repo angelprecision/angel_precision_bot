@@ -862,9 +862,85 @@ def _dispatch(
         _mark_job(job_id, "REJECTED", error="entry_cutoff: too_late_in_session")
         return
 
+    # ── 4.5 LIVE AUTHORIZATION GATE (NEW LIVE entries only) ───────────────────
+    # Server-side, runs BEFORE any entry order is created. Blocks a NEW LIVE
+    # entry when the client lacks a valid one-time LIVE_TRADING authorization or
+    # a valid WEEKLY_TRADING authorization. Paper/sandbox clients are EXEMPT —
+    # is_live_broker() returns False for them so this block is skipped entirely.
+    # This gate NEVER runs on exits, stop-losses, emergency exits, profit-taking,
+    # reconciliation, position monitoring, or EOD flattening — none of those go
+    # through _dispatch (which only creates NEW entries).
+    try:
+        from ap.authorization import is_live_broker, check_live_authorization
+        if is_live_broker(broker):
+            _authz_reason = check_live_authorization(client_id)
+            if _authz_reason:
+                log.warning(
+                    "[%s] LIVE ENTRY BLOCKED — %s | client=%s",
+                    ticker, _authz_reason, client_id,
+                )
+                _mark_job(job_id, "REJECTED",
+                          result={"stage": "live_authorization",
+                                  "reason": _authz_reason})
+                # Permanent structured rejection record — operator dashboard reads
+                # this to show WHY no trade was created.
+                _log_rejection_to_db(
+                    signal_id=signal_id, client_id=client_id, ticker=ticker,
+                    side=payload.get("side", ""), score=float(payload.get("score") or 0),
+                    stage="live_authorization", reason_code=_authz_reason,
+                    human_reason=_authz_reason, payload=payload,
+                )
+                # audit_log row (LIVE_ENTRY_BLOCKED) for compliance trail.
+                try:
+                    from ap.execution import audit
+                    audit(client_id, "WARNING", "LIVE_ENTRY_BLOCKED", {
+                        "reason_code": _authz_reason,
+                        "ticker": ticker,
+                        "signal_id": signal_id,
+                    })
+                except Exception as _audit_exc:
+                    log.debug("[%s] LIVE_ENTRY_BLOCKED audit write failed: %s", ticker, _audit_exc)
+                try:
+                    from ap.rejection_feed import post_master_control_block
+                    post_master_control_block(
+                        ticker=ticker,
+                        side=payload.get("side", ""),
+                        stage="live_authorization",
+                        reason=_authz_reason,
+                        score=float(payload.get("score") or 0),
+                        pattern=payload.get("pattern_id") or payload.get("pattern", ""),
+                    )
+                except Exception:
+                    pass
+                return
+    except Exception as _authz_exc:
+        # Fail CLOSED for live clients: if the gate itself errors, do NOT create a
+        # live entry. Paper clients already returned above (is_live_broker False),
+        # so reaching here with a live broker and an error means we cannot prove
+        # authorization — block rather than risk an unauthorized live order.
+        try:
+            _live = False
+            from ap.authorization import is_live_broker as _ilb
+            _live = _ilb(broker)
+        except Exception:
+            _live = False
+        if _live:
+            log.error(
+                "[%s] LIVE authorization gate error — failing closed: %s",
+                ticker, _authz_exc,
+            )
+            _mark_job(job_id, "REJECTED",
+                      error=f"live_authorization_gate_error: {_authz_exc}")
+            return
+        log.debug("[%s] authorization gate skipped (non-live): %s", ticker, _authz_exc)
+
     # ── 5. ORDER STATE MACHINE (create only after route + cutoff cleared) ────
     try:
-        local_order_id = order_state_machine.create_entry_order(plan)
+        from ap.authorization import execution_mode_for_broker
+        _entry_exec_mode = execution_mode_for_broker(broker)
+        local_order_id = order_state_machine.create_entry_order(
+            plan, execution_mode=_entry_exec_mode,
+        )
         # PR E / FIX-1 (BUG-MC-1): stash local_order_id on plan.metadata
         # so any LATER revalidate_exposure (called from execution-core at
         # breach time, when the OSM row already exists) can pass it as

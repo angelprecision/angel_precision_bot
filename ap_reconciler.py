@@ -2381,6 +2381,10 @@ class APBrokerReconciler:
                 spread_pct         = 0.0,
                 chain_grade        = "",
                 synthetic_entry    = False,
+                position_id        = str(pos_id or ""),
+                # Copy execution_mode from the originating entry order (resolved
+                # inside log_trade). Absent → 'unknown'; never guesses 'live'.
+                local_order_id     = str(pos.get("local_order_id") or ""),
             )
             log.info(
                 "[%s] proof_trade logged for reconciler auto-close | %s | pnl=%.1f%%",

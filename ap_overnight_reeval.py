@@ -368,6 +368,48 @@ def run_overnight_reeval(
                 except Exception:
                     pass
 
+            # Step 5.5: LIVE AUTHORIZATION GATE — overnight reeval arms NEW entries
+            # that fire at next open, so a LIVE client must be authorized here too.
+            # Paper/sandbox clients are exempt (is_live_broker False). Fail closed
+            # for LIVE clients on gate error.
+            try:
+                from ap.authorization import is_live_broker, check_live_authorization
+                if is_live_broker(broker):
+                    _authz_reason = check_live_authorization(client_id)
+                    if _authz_reason:
+                        log.warning("[%s] overnight_reeval: LIVE ENTRY BLOCKED — %s | client=%s",
+                                    ticker, _authz_reason, client_id)
+                        _mark_job_rejected(job_id, client_id, f"live_authorization:{_authz_reason}")
+                        _log_rejection_supabase(
+                            signal_id=signal_id, client_id=client_id, ticker=ticker,
+                            side=side, score=float(signal.get("score") or 0),
+                            stage="live_authorization",
+                            reason_code=_authz_reason, human_reason=_authz_reason,
+                            payload=signal,
+                        )
+                        try:
+                            from ap.execution import audit
+                            audit(client_id, "WARNING", "LIVE_ENTRY_BLOCKED", {
+                                "reason_code": _authz_reason, "ticker": ticker,
+                                "signal_id": signal_id, "path": "overnight_reeval",
+                            })
+                        except Exception:
+                            pass
+                        result["rejected"] += 1
+                        continue
+            except Exception as _authz_exc:
+                try:
+                    from ap.authorization import is_live_broker as _ilb
+                    _live = _ilb(broker)
+                except Exception:
+                    _live = False
+                if _live:
+                    log.error("[%s] overnight_reeval: LIVE authz gate error — failing closed: %s",
+                              ticker, _authz_exc)
+                    _mark_job_rejected(job_id, client_id, f"live_authorization_gate_error:{_authz_exc}")
+                    result["errors"] += 1
+                    continue
+
             # Step 6: Create OSM entry order — let OSM generate a fresh UUID.
             # Do NOT pass local_order_id: static IDs cause OSM conflicts on retry.
             # For deferred contracts: ensure contract_symbol is NOT set to the
@@ -390,9 +432,11 @@ def run_overnight_reeval(
                 # with no intermediate PENDING_TRIGGER transition observable in
                 # the OSM event log. Atomic initial_status='PENDING_TRIGGER'
                 # eliminates the race entirely.
+                from ap.authorization import execution_mode_for_broker
                 local_order_id = order_state_machine.create_entry_order(
                     decision.plan,
                     initial_status="PENDING_TRIGGER",
+                    execution_mode=execution_mode_for_broker(broker),
                 )
             except Exception as osm_exc:
                 log.error("[%s] overnight_reeval: OSM create_entry_order failed: %s", ticker, osm_exc)
