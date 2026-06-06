@@ -69,16 +69,31 @@ TERMINAL_STATUSES = frozenset({
     WATCHER_INVALIDATED, ENTRY_CONFIRMATION_FAILED,
 })
 
-# ── Monotonic status ranking (Final Amendment v2 §1) ────────────────────────
-# update_opportunity() must NEVER regress a row to an earlier lifecycle state.
-# Every status has a rank; an incoming status with a lower rank than the
-# current status is rejected (status update skipped) and logged as
-# CLIENT_OPPORTUNITY_STATUS_REGRESSION_BLOCKED. Metadata and identifier
-# fields may still be enriched in the same write — only the status field is
-# preserved.
+# ── Monotonic status ranking (Final Amendment v3 — broker truth wins) ──────────
+# update_opportunity() must NEVER regress a row to an earlier lifecycle state
+# UNLESS the incoming truth is a broker-confirmed FILLED, which may repair any
+# prior FALSE terminal no-fill/miss outcome (EXPIRED, CANCELED, MISSED,
+# BROKER_REJECTED, WATCHER_INVALIDATED, ENTRY_CONFIRMATION_FAILED,
+# INTERNAL_ERROR, CLIENT_SKIPPED).
 #
-# All terminal outcomes share rank 100 so one terminal cannot overwrite a
-# different terminal already set (first-truth wins for terminals).
+# Ranking:
+#   * FILLED = 100 — the single highest terminal truth.
+#   * All other terminals = 90 — below FILLED so a later broker-confirmed
+#     FILLED can repair them, but above all non-terminal states so they
+#     cannot be regressed by progress statuses.
+#   * Non-terminal states keep their 10..80 ranks.
+#
+# Update rules (encoded in update_opportunity below):
+#   1. FILLED can override any non-FILLED status, including non-FILLED
+#      terminals.
+#   2. Once FILLED is written, no non-FILLED status may overwrite it.
+#   3. A non-FILLED terminal cannot replace a different non-FILLED terminal
+#      (the first truthful no-fill terminal wins) — prevents EXPIRED -> CANCELED
+#      flapping in the reconciler.
+#   4. Lower-rank incoming never overwrites higher-rank current.
+#   5. Metadata / identifier fields (broker_order_id, order_local_id,
+#      position_id, miss_reason, extra_meta, etc.) are ALWAYS allowed to
+#      enrich the row, even when the status update itself is blocked.
 STATUS_RANK: dict[str, int] = {
     CREATED:                    10,
     CLIENT_ELIGIBLE:            20,
@@ -88,15 +103,18 @@ STATUS_RANK: dict[str, int] = {
     WATCHER_ARMED:              60,
     BROKER_SUBMITTED:           70,
     BROKER_ACKED:               80,
+    # Non-FILLED terminals — all rank 90 so FILLED can repair, but they
+    # outrank every non-terminal progress status.
+    WATCHER_INVALIDATED:        90,
+    ENTRY_CONFIRMATION_FAILED:  90,
+    BROKER_REJECTED:            90,
+    EXPIRED:                    90,
+    CANCELED:                   90,
+    MISSED:                     90,
+    CLIENT_SKIPPED:             90,
+    INTERNAL_ERROR:             90,
+    # FILLED is the single highest truth state — broker confirmation.
     FILLED:                    100,
-    WATCHER_INVALIDATED:       100,
-    ENTRY_CONFIRMATION_FAILED: 100,
-    BROKER_REJECTED:           100,
-    EXPIRED:                   100,
-    CANCELED:                  100,
-    MISSED:                    100,
-    CLIENT_SKIPPED:            100,
-    INTERNAL_ERROR:            100,
 }
 
 
@@ -402,20 +420,34 @@ def update_opportunity(
     _current_rank  = status_rank(_current_status)
     _write_status  = True
 
-    if _current_status:
-        # Terminal cannot be replaced by a different status (even another
-        # terminal). FILLED stays FILLED, MISSED stays MISSED.
-        if _is_terminal(_current_status) and _current_status != status:
+    if _current_status and _current_status != status:
+        # Rule 2: FILLED is absolute — nothing may overwrite it.
+        if _current_status == FILLED:
             _write_status = False
-        # Or lower-ranked incoming.
+        # Rule 1: FILLED is the broker-truth repair status — it can override
+        # any prior non-FILLED status, including non-FILLED terminal
+        # no-fill/miss states (EXPIRED/CANCELED/MISSED/BROKER_REJECTED/
+        # WATCHER_INVALIDATED/ENTRY_CONFIRMATION_FAILED/INTERNAL_ERROR/
+        # CLIENT_SKIPPED). This is the whole point of broker_truth_wins:
+        # if the broker later proves the entry filled, the ledger reflects
+        # the truth, not the earlier false miss.
+        elif status == FILLED:
+            _write_status = True
+        # Rule 3: a non-FILLED terminal cannot replace a different
+        # non-FILLED terminal (first truthful no-fill terminal wins).
+        elif _is_terminal(_current_status) and _is_terminal(status):
+            _write_status = False
+        # Rule 4: lower-ranked incoming never overwrites higher-ranked current.
         elif _incoming_rank < _current_rank:
             _write_status = False
 
     if not _write_status:
+        # Amendment v3: log includes current_status and incoming_status with
+        # the exact field names the dashboard / operator queries on.
         log.info(
             "CLIENT_OPPORTUNITY_STATUS_REGRESSION_BLOCKED | "
-            "client=%s signal=%s canonical=%s current=%s incoming=%s",
-            client_id, signal_id, canonical, _current_status, status,
+            "client_id=%s canonical_signal_id=%s current_status=%s incoming_status=%s signal_id=%s",
+            client_id, canonical, _current_status, status, signal_id,
         )
 
     patch: dict[str, Any] = {"updated_at": now}
@@ -569,7 +601,29 @@ def mark_filled(signal_id: str, client_id: str, *,
                 canonical_signal_id: Optional[str] = None,
                 order_local_id: Optional[str] = None,
                 broker_order_id: Optional[str] = None,
-                position_id: Optional[str] = None, **kwargs) -> bool:
+                position_id: Optional[str] = None,
+                fill_price: Optional[float] = None,
+                filled_qty: Optional[int] = None,
+                fill_ts: Optional[str] = None,
+                source: Optional[str] = None,
+                extra_meta: Optional[dict] = None,
+                **kwargs) -> bool:
+    """Mark an opportunity FILLED with full broker-truth proof context.
+
+    Amendment v3: FILLED may repair any prior non-FILLED terminal. To make
+    that repair auditable, every FILLED write carries the proof context the
+    caller had at the time (broker_order_id, position_id, fill price/qty/ts,
+    and the call site — OSM transition, broker reconciliation, fill monitor).
+    Anything not represented by a dedicated column is folded into metadata.
+    """
+    _proof: dict[str, Any] = {}
+    if fill_price is not None: _proof["fill_price"] = fill_price
+    if filled_qty is not None: _proof["filled_qty"] = filled_qty
+    if fill_ts     is not None: _proof["fill_ts"]    = fill_ts
+    if source      is not None: _proof["fill_source"] = source
+    if extra_meta:               _proof.update(extra_meta)
+    if _proof:
+        kwargs["extra_meta"] = {"fill_proof": _proof, **(kwargs.get("extra_meta") or {})}
     return update_opportunity(
         signal_id, client_id, FILLED,
         canonical_signal_id=canonical_signal_id,

@@ -173,8 +173,9 @@ class TestStatusMonotonicity:
         # check passes). Either way, no regression occurred.
         assert upd["row"].get("opportunity_status", FILLED) == FILLED
 
-    def test_terminal_cannot_be_replaced_by_different_terminal(self):
-        """Once a row is FILLED, EXPIRED cannot overwrite it."""
+    def test_filled_cannot_be_replaced_by_other_terminal(self):
+        """Broker-truth FILLED is absolute. Amendment v3: nothing overwrites
+        FILLED, including other non-FILLED terminals."""
         from ap.opportunity_ledger import update_opportunity, FILLED, EXPIRED
         sb = _SB(seed={("CANON", "c@x.com"): {"opportunity_status": FILLED}})
         update_opportunity(
@@ -183,7 +184,7 @@ class TestStatusMonotonicity:
         )
         upd = [c for c in sb.calls["client_signal_opportunities"] if c["op"] == "update"][-1]
         assert "opportunity_status" not in upd["row"], (
-            f"first terminal must win; patch={upd['row']}"
+            f"FILLED must win against any non-FILLED terminal; patch={upd['row']}"
         )
 
     def test_metadata_enrichment_survives_blocked_regression(self):
@@ -220,7 +221,9 @@ class TestStatusMonotonicity:
 class TestStatusRankShape:
     def test_required_rank_values(self):
         from ap.opportunity_ledger import STATUS_RANK
-        # Spot-check the exact ranks the amendment specified.
+        # Amendment v3 (broker truth wins): FILLED is the single highest
+        # truth (100); all other terminals share rank 90 so a later
+        # broker-confirmed FILLED can repair a prior false terminal miss.
         assert STATUS_RANK["CREATED"]            ==  10
         assert STATUS_RANK["CLIENT_ELIGIBLE"]    ==  20
         assert STATUS_RANK["PREFLIGHT_WARNING"]  ==  30
@@ -229,10 +232,11 @@ class TestStatusRankShape:
         assert STATUS_RANK["WATCHER_ARMED"]      ==  60
         assert STATUS_RANK["BROKER_SUBMITTED"]   ==  70
         assert STATUS_RANK["BROKER_ACKED"]       ==  80
-        for terminal in ("FILLED", "WATCHER_INVALIDATED", "ENTRY_CONFIRMATION_FAILED",
+        for terminal in ("WATCHER_INVALIDATED", "ENTRY_CONFIRMATION_FAILED",
                           "BROKER_REJECTED", "EXPIRED", "CANCELED", "MISSED",
                           "CLIENT_SKIPPED", "INTERNAL_ERROR"):
-            assert STATUS_RANK[terminal] == 100, terminal
+            assert STATUS_RANK[terminal] == 90, terminal
+        assert STATUS_RANK["FILLED"] == 100
 
 
 # ── §2 Migration dedup ranking ────────────────────────────────────────────────

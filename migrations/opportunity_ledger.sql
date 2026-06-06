@@ -66,12 +66,20 @@ UPDATE client_signal_opportunities
  WHERE canonical_signal_id IS NULL OR canonical_signal_id = '';
 
 -- ── §1.2 Resolve duplicate (canonical_signal_id, client_id) rows ─────────────
--- Final Amendment v2 §2: terminals must rank ABOVE non-terminals so dedup
--- never deletes a terminal truth (FILLED, BROKER_REJECTED, EXPIRED, CANCELED,
--- MISSED, CLIENT_SKIPPED, INTERNAL_ERROR, WATCHER_INVALIDATED,
--- ENTRY_CONFIRMATION_FAILED) in favor of a preliminary status
--- (PREFLIGHT_*, ORDER_CREATED, WATCHER_ARMED, BROKER_SUBMITTED, BROKER_ACKED).
--- Tie-break: prefer the more recently updated row.
+-- Final Amendment v3 (broker truth wins):
+--   * FILLED is the HIGHEST terminal truth (rank 1000). A broker-confirmed
+--     FILLED row outranks every other status, so if duplicates exist for
+--     the same (canonical_signal_id, client_id) the FILLED row is kept.
+--   * All other terminals (BROKER_REJECTED, EXPIRED, CANCELED, MISSED,
+--     CLIENT_SKIPPED, INTERNAL_ERROR, WATCHER_INVALIDATED,
+--     ENTRY_CONFIRMATION_FAILED) rank 920..990 — strictly above every
+--     non-terminal but strictly below FILLED. They cannot displace FILLED,
+--     but they outrank any preliminary status (PREFLIGHT_*, ORDER_CREATED,
+--     WATCHER_ARMED, BROKER_SUBMITTED, BROKER_ACKED) so dedup never deletes
+--     a terminal no-fill truth in favor of a preliminary status.
+--   * Tie-break: prefer the more recently updated row.
+-- This matches the runtime monotonic ranking in ap/opportunity_ledger.py:
+--   FILLED = 100; non-FILLED terminals = 90; non-terminals = 10..80.
 WITH ranked AS (
   SELECT
     id,

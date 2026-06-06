@@ -968,6 +968,9 @@ class APOrderStateMachine:
                 broker_order_id=broker_order_id or current.get("broker_order_id"),
                 position_id=position_id or current.get("position_id"),
                 last_error=last_error,
+                fill_price=fill_price,
+                filled_qty=filled_qty,
+                filled_ts=filled_ts,
             )
         except Exception as _ledger_exc:
             log.debug(
@@ -1009,6 +1012,9 @@ class APOrderStateMachine:
         broker_order_id=None,
         position_id=None,
         last_error: Optional[str] = None,
+        fill_price=None,
+        filled_qty=None,
+        filled_ts=None,
     ) -> None:
         """Translate an OSM transition into the appropriate opportunity-
         ledger update. ENTRY orders only. Wires Final Amendment v2 §3.
@@ -1046,7 +1052,7 @@ class APOrderStateMachine:
 
         try:
             from ap.opportunity_ledger import (
-                update_opportunity,
+                update_opportunity, mark_filled,
                 STAGE_BROKER_ACK, STAGE_FILL_MONITOR,
             )
         except Exception:
@@ -1057,12 +1063,29 @@ class APOrderStateMachine:
         if miss_stage:
             miss_reason = last_error or opp_status.lower()
 
+        if opp_status == "FILLED":
+            # Amendment v3: FILLED carries full broker-truth proof so the
+            # repair is auditable. The transition() caller supplies fill
+            # price / qty / ts; we tag the source as the OSM transition.
+            mark_filled(
+                signal_id or canonical, client_id,
+                canonical_signal_id=canonical,
+                order_local_id=local_id or None,
+                broker_order_id=broker_id,
+                position_id=pos_id,
+                fill_price=(float(fill_price) if fill_price is not None else None),
+                filled_qty=(int(filled_qty) if filled_qty is not None else None),
+                fill_ts=(str(filled_ts) if filled_ts else None),
+                source="osm_transition",
+            )
+            return
+
         update_opportunity(
             signal_id or canonical, client_id, opp_status,
             canonical_signal_id=canonical,
             order_local_id=local_id or None,
             broker_order_id=broker_id,
-            position_id=pos_id if opp_status == "FILLED" else None,
+            position_id=None,
             miss_stage=miss_stage,
             miss_reason=miss_reason,
         )
