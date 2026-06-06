@@ -270,6 +270,66 @@ def _resolve_entry_execution_mode(local_order_id: str) -> str:
     return mode if mode in ("live", "paper") else "unknown"
 
 
+# ── proof_trades.execution_mode schema guard ──────────────────────────────
+# The proof logger writes proof_trades.execution_mode on every close, and
+# live-only performance accounting depends on it. If the column is missing the
+# insert silently falls back to a degraded write (or fails entirely), and live
+# clients would lose execution-mode attribution. This guard verifies the column
+# exists BEFORE the first insert and surfaces a loud CRITICAL otherwise. The
+# result is cached so we probe the catalog at most once per process.
+_EXECUTION_MODE_COLUMN_OK: Optional[bool] = None
+
+
+def proof_trades_execution_mode_present(supabase_client) -> Optional[bool]:
+    """Return True if proof_trades.execution_mode exists, False if confirmed
+    missing, or None if it could not be determined (no client / probe error).
+
+    Cached after the first definitive answer. A probe error returns None and is
+    NOT cached, so a transient failure can be re-checked on a later call.
+    """
+    global _EXECUTION_MODE_COLUMN_OK
+    if _EXECUTION_MODE_COLUMN_OK is not None:
+        return _EXECUTION_MODE_COLUMN_OK
+    if supabase_client is None:
+        return None
+    try:
+        # PostgREST: selecting a non-existent column raises; selecting it with
+        # limit(1) is a cheap existence probe that does not depend on any rows.
+        supabase_client.table("proof_trades").select("execution_mode").limit(1).execute()
+        _EXECUTION_MODE_COLUMN_OK = True
+        return True
+    except Exception as e:
+        emsg = str(e).lower()
+        if any(k in emsg for k in ("column", "execution_mode", "schema", "does not exist", "42703")):
+            _EXECUTION_MODE_COLUMN_OK = False
+            return False
+        # Non-schema/transient error — do not cache, report unknown.
+        log.debug("proof_trades.execution_mode probe inconclusive: %s", e)
+        return None
+
+
+def ensure_proof_trades_schema(supabase_client) -> bool:
+    """Startup guard: confirm proof_trades.execution_mode exists before the proof
+    logger begins inserting it. Logs CRITICAL with the migration to run if the
+    column is missing. Returns True when present, False when confirmed missing,
+    True (optimistic) when the check is inconclusive so we never block trading on
+    a transient catalog read.
+    """
+    present = proof_trades_execution_mode_present(supabase_client)
+    if present is False:
+        log.critical(
+            "[PROOF] SCHEMA GUARD FAILED — proof_trades.execution_mode is MISSING. "
+            "Live-only performance attribution will be lost. Run migration "
+            "migrations/20260606_orders_execution_mode.sql before live trading."
+        )
+        return False
+    if present is True:
+        log.info("[PROOF] schema guard OK — proof_trades.execution_mode present.")
+        return True
+    log.warning("[PROOF] schema guard inconclusive — could not verify proof_trades.execution_mode.")
+    return True
+
+
 class APProofLogger:
     """
     Logs trade outcomes to Supabase and generates daily proof summaries.

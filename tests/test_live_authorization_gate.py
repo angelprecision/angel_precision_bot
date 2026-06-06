@@ -449,3 +449,72 @@ class TestObserveVsEnforceOutcome:
             monkeypatch.setenv("LIVE_AUTHORIZATION_GATE_ENFORCE", mode)
             reason = _gate_reason_for(SANDBOX_BROKER, "c@x.com")
             assert self._blocks(reason, authz.authorization_gate_enforced()) is False
+
+
+# --------------------------------------------------------------------------
+# FINAL AMENDMENT (review) — proof_trades.execution_mode schema guard.
+#
+# The proof logger writes proof_trades.execution_mode on every close. These
+# tests confirm the startup guard correctly detects presence/absence and
+# caches a definitive answer (but not a transient/inconclusive one).
+# --------------------------------------------------------------------------
+class _FakeSelectChain:
+    def __init__(self, raise_exc=None):
+        self._raise = raise_exc
+    def select(self, *a, **k): return self
+    def limit(self, *a, **k): return self
+    def execute(self):
+        if self._raise:
+            raise self._raise
+        return type("R", (), {"data": [], "count": 0})()
+
+
+class _FakeSB:
+    def __init__(self, raise_exc=None):
+        self._raise = raise_exc
+    def table(self, name):
+        return _FakeSelectChain(self._raise)
+
+
+class TestProofSchemaGuard:
+    def _reset_cache(self):
+        import ap_proof_logger as pl
+        pl._EXECUTION_MODE_COLUMN_OK = None
+
+    def test_present_when_select_succeeds(self):
+        import ap_proof_logger as pl
+        self._reset_cache()
+        assert pl.proof_trades_execution_mode_present(_FakeSB()) is True
+        assert pl.ensure_proof_trades_schema(_FakeSB()) is True
+
+    def test_missing_when_column_error(self):
+        import ap_proof_logger as pl
+        self._reset_cache()
+        exc = Exception('column "execution_mode" does not exist')
+        assert pl.proof_trades_execution_mode_present(_FakeSB(exc)) is False
+        # ensure_* returns False (blocking signal) when confirmed missing.
+        self._reset_cache()
+        assert pl.ensure_proof_trades_schema(_FakeSB(exc)) is False
+
+    def test_inconclusive_on_transient_error_not_cached(self):
+        import ap_proof_logger as pl
+        self._reset_cache()
+        exc = Exception("connection reset by peer")
+        assert pl.proof_trades_execution_mode_present(_FakeSB(exc)) is None
+        # Not cached → a later successful probe flips to True.
+        assert pl.proof_trades_execution_mode_present(_FakeSB()) is True
+        # ensure_* is optimistic (True) on inconclusive so trading is not blocked.
+        self._reset_cache()
+        assert pl.ensure_proof_trades_schema(_FakeSB(exc)) is True
+
+    def test_none_client_is_inconclusive(self):
+        import ap_proof_logger as pl
+        self._reset_cache()
+        assert pl.proof_trades_execution_mode_present(None) is None
+
+    def test_definitive_answer_is_cached(self):
+        import ap_proof_logger as pl
+        self._reset_cache()
+        assert pl.proof_trades_execution_mode_present(_FakeSB()) is True
+        # Even if a later call would error, the cached True is returned.
+        assert pl.proof_trades_execution_mode_present(_FakeSB(Exception("column missing"))) is True

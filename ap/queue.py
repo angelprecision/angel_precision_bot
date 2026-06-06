@@ -1190,6 +1190,15 @@ def worker_loop(
     except Exception as _gate_log_exc:
         log.warning("[%s] could not read live authorization gate mode: %s", client_id, _gate_log_exc)
 
+    # Schema guard: confirm proof_trades.execution_mode exists before the proof
+    # logger starts inserting it. Logs CRITICAL (does not crash) if missing so
+    # live-only attribution cannot silently degrade unnoticed.
+    try:
+        from ap_proof_logger import ensure_proof_trades_schema
+        ensure_proof_trades_schema(_get_sb_client())
+    except Exception as _schema_exc:
+        log.warning("[%s] proof_trades schema guard could not run: %s", client_id, _schema_exc)
+
     # PR F / queue truth hardening: re-emit the immediate-execution override
     # warning on worker startup. Module-import critical fires once per process;
     # this fires every worker start (per client), so operators attaching after
