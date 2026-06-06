@@ -1007,6 +1007,28 @@ class APExecutionCore:
                             queue_local_order_id, {"entry_confirmation": _confirm_meta})
                     except Exception:
                         pass
+                # PR81 Final Amendment v2 §3: ENTRY_CONFIRMATION_FAILED ledger write.
+                try:
+                    from ap.opportunity_ledger import (
+                        update_opportunity, STAGE_ENTRY_CONFIRMATION,
+                    )
+                    _client_id_for_ledger = str(
+                        watched.signal.get("client_id") if watched.signal else ""
+                    ) or getattr(self, "client_id", "")
+                    _canon = str(
+                        (watched.signal or {}).get("canonical_signal_id") or signal_id
+                    )
+                    update_opportunity(
+                        signal_id or _canon, _client_id_for_ledger,
+                        "ENTRY_CONFIRMATION_FAILED",
+                        canonical_signal_id=_canon,
+                        miss_stage=STAGE_ENTRY_CONFIRMATION,
+                        miss_reason=_fail_reason,
+                        order_local_id=str(queue_local_order_id) if queue_local_order_id else None,
+                        entry_confirmation_result=_fail_reason,
+                    )
+                except Exception:
+                    pass
                 return   # NO BROKER SUBMIT
         except ImportError:
             # When confirmation_required=True, a missing module is NOT safe to skip.
@@ -1050,6 +1072,28 @@ class APExecutionCore:
                         )
                     except Exception:
                         pass
+                # PR81 Final Amendment v2 §3: ENTRY_CONFIRMATION_FAILED ledger write.
+                try:
+                    from ap.opportunity_ledger import (
+                        update_opportunity, STAGE_ENTRY_CONFIRMATION,
+                    )
+                    _client_id_for_ledger = str(
+                        watched.signal.get("client_id") if watched.signal else ""
+                    ) or getattr(self, "client_id", "")
+                    _canon = str(
+                        (watched.signal or {}).get("canonical_signal_id") or signal_id
+                    )
+                    update_opportunity(
+                        signal_id or _canon, _client_id_for_ledger,
+                        "ENTRY_CONFIRMATION_FAILED",
+                        canonical_signal_id=_canon,
+                        miss_stage=STAGE_ENTRY_CONFIRMATION,
+                        miss_reason="entry_confirm_module_missing",
+                        order_local_id=str(queue_local_order_id) if queue_local_order_id else None,
+                        entry_confirmation_result="entry_confirm_module_missing",
+                    )
+                except Exception:
+                    pass
                 return   # NO BROKER SUBMIT
             # confirmation not required — module absence is safe to skip
             log.debug(
@@ -1065,6 +1109,28 @@ class APExecutionCore:
                     "decision_status": "blocked_at_breach",
                     "context_notes":   f"entry_confirm_error: {_ec_err}",
                 })
+            # PR81 Final Amendment v2 §3: ENTRY_CONFIRMATION_FAILED ledger write.
+            try:
+                from ap.opportunity_ledger import (
+                    update_opportunity, STAGE_ENTRY_CONFIRMATION,
+                )
+                _client_id_for_ledger = str(
+                    watched.signal.get("client_id") if watched.signal else ""
+                ) or getattr(self, "client_id", "")
+                _canon = str(
+                    (watched.signal or {}).get("canonical_signal_id") or signal_id
+                )
+                update_opportunity(
+                    signal_id or _canon, _client_id_for_ledger,
+                    "ENTRY_CONFIRMATION_FAILED",
+                    canonical_signal_id=_canon,
+                    miss_stage=STAGE_ENTRY_CONFIRMATION,
+                    miss_reason=f"entry_confirm_error:{_ec_err}",
+                    order_local_id=str(queue_local_order_id) if queue_local_order_id else None,
+                    entry_confirmation_result=f"entry_confirm_error:{_ec_err}",
+                )
+            except Exception:
+                pass
             return
 
         submit_res = self.order_state_machine.submit_existing_entry(

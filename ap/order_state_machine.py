@@ -956,6 +956,24 @@ class APOrderStateMachine:
             broker_order_id=broker_order_id, filled_qty=filled_qty,
             fill_price=fill_price, last_error=last_error,
         )
+        # ── PR81 Final Amendment v2 §3: opportunity-ledger lifecycle hook ──────
+        # Fan the OSM transition out to the client_signal_opportunities row
+        # for ENTRY orders only. Fail-safe: never raises, never blocks the
+        # OSM caller. Exit transitions are intentionally ignored — the
+        # opportunity ledger tracks the entry lifecycle, not exit lifecycle.
+        try:
+            self._notify_opportunity_ledger(
+                current=current,
+                new_status=new_status,
+                broker_order_id=broker_order_id or current.get("broker_order_id"),
+                position_id=position_id or current.get("position_id"),
+                last_error=last_error,
+            )
+        except Exception as _ledger_exc:
+            log.debug(
+                "[%s] opportunity ledger notify failed (non-fatal): %s",
+                self.client_id, _ledger_exc,
+            )
         self._handle_exit_engine_hooks(
             current=current, new_status=new_status, position_id=position_id,
             filled_qty=filled_qty, fill_price=fill_price,
@@ -963,6 +981,91 @@ class APOrderStateMachine:
             local_order_id=local_order_id,
         )
         return True
+
+    # =====================================================================
+    # PR81 Final Amendment v2 §3 — opportunity-ledger lifecycle bridge
+    # =====================================================================
+    # OSM order status → opportunity_status mapping. ENTRY orders only.
+    _ENTRY_OSM_TO_OPPORTUNITY: dict = {
+        OrderStatus.SUBMITTED:    "BROKER_SUBMITTED",
+        OrderStatus.ACKNOWLEDGED: "BROKER_ACKED",
+        OrderStatus.FILLED:       "FILLED",
+        # Terminals
+        OrderStatus.REJECTED:     "BROKER_REJECTED",
+        OrderStatus.EXPIRED:      "EXPIRED",
+        OrderStatus.CANCELED:     "CANCELED",
+    }
+    # Miss-stage for each terminal mapping.
+    _ENTRY_TERMINAL_MISS_STAGE: dict = {
+        "BROKER_REJECTED": "BROKER_ACK",
+        "EXPIRED":         "FILL_MONITOR",
+        "CANCELED":        "FILL_MONITOR",
+    }
+
+    def _notify_opportunity_ledger(
+        self, *,
+        current: dict,
+        new_status: str,
+        broker_order_id=None,
+        position_id=None,
+        last_error: Optional[str] = None,
+    ) -> None:
+        """Translate an OSM transition into the appropriate opportunity-
+        ledger update. ENTRY orders only. Wires Final Amendment v2 §3.
+
+        Mapping:
+            SUBMITTED         → BROKER_SUBMITTED
+            ACKNOWLEDGED      → BROKER_ACKED
+            FILLED            → FILLED (with broker_order_id + position_id)
+            REJECTED          → BROKER_REJECTED  (miss_stage=BROKER_ACK)
+            EXPIRED           → EXPIRED           (miss_stage=FILL_MONITOR)
+            CANCELED          → CANCELED          (miss_stage=FILL_MONITOR)
+        Exit orders, PARTIAL_FILL, ERROR are intentionally not propagated.
+        """
+        kind = str((current or {}).get("kind") or "").upper()
+        if kind != "ENTRY":
+            return
+        opp_status = self._ENTRY_OSM_TO_OPPORTUNITY.get(new_status)
+        if not opp_status:
+            return
+
+        signal_id  = str((current or {}).get("signal_id") or "")
+        canonical  = str((current or {}).get("canonical_signal_id") or signal_id)
+        client_id  = str((current or {}).get("client_id") or self.client_id or "")
+        local_id   = str((current or {}).get("local_order_id") or "")
+        broker_id  = str(broker_order_id or "") or None
+        pos_id     = str(position_id or "") or None
+
+        if not (signal_id or canonical) or not client_id:
+            log.debug(
+                "[%s] opportunity ledger notify skipped — missing ids | "
+                "signal_id=%r canonical=%r client=%r",
+                self.client_id, signal_id, canonical, client_id,
+            )
+            return
+
+        try:
+            from ap.opportunity_ledger import (
+                update_opportunity,
+                STAGE_BROKER_ACK, STAGE_FILL_MONITOR,
+            )
+        except Exception:
+            return
+
+        miss_stage = self._ENTRY_TERMINAL_MISS_STAGE.get(opp_status)
+        miss_reason = None
+        if miss_stage:
+            miss_reason = last_error or opp_status.lower()
+
+        update_opportunity(
+            signal_id or canonical, client_id, opp_status,
+            canonical_signal_id=canonical,
+            order_local_id=local_id or None,
+            broker_order_id=broker_id,
+            position_id=pos_id if opp_status == "FILLED" else None,
+            miss_stage=miss_stage,
+            miss_reason=miss_reason,
+        )
 
     def _handle_exit_engine_hooks(
         self,

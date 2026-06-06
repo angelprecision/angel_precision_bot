@@ -66,7 +66,50 @@ PROGRESSED_STATUSES = frozenset({
 TERMINAL_STATUSES = frozenset({
     FILLED, EXPIRED, CANCELED, MISSED, CLIENT_SKIPPED,
     BROKER_REJECTED, INTERNAL_ERROR,
+    WATCHER_INVALIDATED, ENTRY_CONFIRMATION_FAILED,
 })
+
+# ── Monotonic status ranking (Final Amendment v2 §1) ────────────────────────
+# update_opportunity() must NEVER regress a row to an earlier lifecycle state.
+# Every status has a rank; an incoming status with a lower rank than the
+# current status is rejected (status update skipped) and logged as
+# CLIENT_OPPORTUNITY_STATUS_REGRESSION_BLOCKED. Metadata and identifier
+# fields may still be enriched in the same write — only the status field is
+# preserved.
+#
+# All terminal outcomes share rank 100 so one terminal cannot overwrite a
+# different terminal already set (first-truth wins for terminals).
+STATUS_RANK: dict[str, int] = {
+    CREATED:                    10,
+    CLIENT_ELIGIBLE:            20,
+    PREFLIGHT_WARNING:          30,
+    PREFLIGHT_PASSED:           40,
+    ORDER_CREATED:              50,
+    WATCHER_ARMED:              60,
+    BROKER_SUBMITTED:           70,
+    BROKER_ACKED:               80,
+    FILLED:                    100,
+    WATCHER_INVALIDATED:       100,
+    ENTRY_CONFIRMATION_FAILED: 100,
+    BROKER_REJECTED:           100,
+    EXPIRED:                   100,
+    CANCELED:                  100,
+    MISSED:                    100,
+    CLIENT_SKIPPED:            100,
+    INTERNAL_ERROR:            100,
+}
+
+
+def status_rank(status: Optional[str]) -> int:
+    """Return the monotonic rank for a status string. Unknown statuses get
+    rank 0 so any known status will replace them."""
+    if not status:
+        return 0
+    return STATUS_RANK.get(str(status), 0)
+
+
+def _is_terminal(status: Optional[str]) -> bool:
+    return bool(status) and str(status) in TERMINAL_STATUSES
 
 # ── Miss stage constants (Amendment §4) ──────────────────────────────────────
 STAGE_CLIENT_PREFLIGHT    = "CLIENT_PREFLIGHT"
@@ -329,7 +372,55 @@ def update_opportunity(
         return False
 
     now    = _now()
-    patch  = {"opportunity_status": status, "updated_at": now}
+    canonical = _resolve_canonical(canonical_signal_id, signal_id)
+
+    # ── Monotonic guard (Final Amendment v2 §1) ─────────────────────────
+    # Read the current row's status. If incoming would regress, drop the
+    # status field from the patch (keep enrichment fields). Terminal
+    # statuses are never overwritten by a different status.
+    _current_status: Optional[str] = None
+    try:
+        existing = (
+            sb.table("client_signal_opportunities")
+            .select("opportunity_status")
+            .eq("canonical_signal_id", canonical)
+            .eq("client_id", client_id)
+            .limit(1)
+            .execute()
+            .data
+            or []
+        )
+        if existing:
+            _current_status = (existing[0] or {}).get("opportunity_status")
+    except Exception:
+        # Non-fatal: if the read fails we fall through and let the update
+        # attempt log its own write failure. We refuse to silently regress
+        # though — unknown current status keeps the incoming write as-is.
+        _current_status = None
+
+    _incoming_rank = status_rank(status)
+    _current_rank  = status_rank(_current_status)
+    _write_status  = True
+
+    if _current_status:
+        # Terminal cannot be replaced by a different status (even another
+        # terminal). FILLED stays FILLED, MISSED stays MISSED.
+        if _is_terminal(_current_status) and _current_status != status:
+            _write_status = False
+        # Or lower-ranked incoming.
+        elif _incoming_rank < _current_rank:
+            _write_status = False
+
+    if not _write_status:
+        log.info(
+            "CLIENT_OPPORTUNITY_STATUS_REGRESSION_BLOCKED | "
+            "client=%s signal=%s canonical=%s current=%s incoming=%s",
+            client_id, signal_id, canonical, _current_status, status,
+        )
+
+    patch: dict[str, Any] = {"updated_at": now}
+    if _write_status:
+        patch["opportunity_status"] = status
 
     if miss_stage              is not None: patch["miss_stage"]               = miss_stage
     if miss_reason             is not None: patch["miss_reason"]              = miss_reason
@@ -347,8 +438,6 @@ def update_opportunity(
     if would_block_reason      is not None: patch["would_block_reason"]       = would_block_reason
     if retry_status            is not None: patch["retry_status"]             = retry_status
     if retry_reason            is not None: patch["retry_reason"]             = retry_reason
-
-    canonical = _resolve_canonical(canonical_signal_id, signal_id)
 
     # Metadata merge — read existing first so we don't clobber the preflight
     # snapshot when a later ORDER_CREATED / FILLED write adds new keys.

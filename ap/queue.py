@@ -891,7 +891,17 @@ def _dispatch(
         _mark_job(job_id, "REJECTED", error="entry_cutoff: too_late_in_session")
         return
 
-    # ── 4.5 PR2: Client State Preflight ─────────────────────────────────────
+    # ── 4.6 PR81: Client State Preflight ─────────────────────────────────────
+    # REBASE NOTE (Final Amendment v2 §4): PR #87 inserts the LIVE
+    # authorization gate at section 4.5 — it MUST remain the hard control
+    # gate and run BEFORE this client-state preflight. The final order is:
+    #   1. master_control.evaluate()        (existing)
+    #   2. live authorization gate          (PR #87, section 4.5)
+    #   3. client-state preflight           (PR #81, section 4.6, OBSERVE ONLY)
+    #   4. order_state_machine.create_entry_order(plan, execution_mode=...)
+    # CLIENT_PREFLIGHT_ENFORCE defaults to false; preflight never weakens
+    # the authorization gate.
+    #
     # Runs preflight snapshot on every CLIENT_ELIGIBLE signal.
     #
     # Amendment 1+2: two distinct modes

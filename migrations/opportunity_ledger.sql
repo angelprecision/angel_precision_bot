@@ -66,9 +66,12 @@ UPDATE client_signal_opportunities
  WHERE canonical_signal_id IS NULL OR canonical_signal_id = '';
 
 -- ── §1.2 Resolve duplicate (canonical_signal_id, client_id) rows ─────────────
--- Keep the row with the most-progressed lifecycle state; delete the rest.
--- Ordering (higher = keep): FILLED, BROKER_ACKED, BROKER_SUBMITTED, ORDER_CREATED,
--- WATCHER_ARMED, PREFLIGHT_PASSED, PREFLIGHT_WARNING, CLIENT_SKIPPED, MISSED, CREATED.
+-- Final Amendment v2 §2: terminals must rank ABOVE non-terminals so dedup
+-- never deletes a terminal truth (FILLED, BROKER_REJECTED, EXPIRED, CANCELED,
+-- MISSED, CLIENT_SKIPPED, INTERNAL_ERROR, WATCHER_INVALIDATED,
+-- ENTRY_CONFIRMATION_FAILED) in favor of a preliminary status
+-- (PREFLIGHT_*, ORDER_CREATED, WATCHER_ARMED, BROKER_SUBMITTED, BROKER_ACKED).
+-- Tie-break: prefer the more recently updated row.
 WITH ranked AS (
   SELECT
     id,
@@ -76,20 +79,28 @@ WITH ranked AS (
       PARTITION BY canonical_signal_id, client_id
       ORDER BY
         CASE opportunity_status
-          WHEN 'FILLED'             THEN 100
-          WHEN 'BROKER_ACKED'       THEN  90
-          WHEN 'BROKER_SUBMITTED'   THEN  80
-          WHEN 'WATCHER_ARMED'      THEN  70
-          WHEN 'ORDER_CREATED'      THEN  60
-          WHEN 'PREFLIGHT_PASSED'   THEN  50
-          WHEN 'PREFLIGHT_WARNING'  THEN  40
-          WHEN 'CLIENT_SKIPPED'     THEN  30
-          WHEN 'MISSED'             THEN  20
-          WHEN 'INTERNAL_ERROR'     THEN  15
-          WHEN 'CREATED'            THEN  10
-          ELSE                            0
+          -- Terminals (all outrank every non-terminal)
+          WHEN 'FILLED'                    THEN 1000
+          WHEN 'BROKER_REJECTED'           THEN  990
+          WHEN 'EXPIRED'                   THEN  980
+          WHEN 'CANCELED'                  THEN  970
+          WHEN 'MISSED'                    THEN  960
+          WHEN 'CLIENT_SKIPPED'            THEN  950
+          WHEN 'INTERNAL_ERROR'            THEN  940
+          WHEN 'WATCHER_INVALIDATED'       THEN  930
+          WHEN 'ENTRY_CONFIRMATION_FAILED' THEN  920
+          -- Non-terminal progress
+          WHEN 'BROKER_ACKED'              THEN   90
+          WHEN 'BROKER_SUBMITTED'          THEN   80
+          WHEN 'WATCHER_ARMED'             THEN   70
+          WHEN 'ORDER_CREATED'             THEN   60
+          WHEN 'PREFLIGHT_PASSED'          THEN   50
+          WHEN 'PREFLIGHT_WARNING'         THEN   40
+          WHEN 'CLIENT_ELIGIBLE'           THEN   20
+          WHEN 'CREATED'                   THEN   10
+          ELSE                                     0
         END DESC,
-        updated_at DESC,
+        updated_at DESC NULLS LAST,
         id DESC
     ) AS rn
   FROM client_signal_opportunities
