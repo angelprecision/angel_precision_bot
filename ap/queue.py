@@ -491,6 +491,16 @@ def _dispatch(
     """
     ticker = payload.get("ticker") or payload.get("symbol", "?")
 
+    # Resolve canonical_signal_id — primary idempotency key for opportunity ledger.
+    # PR79 build_canonical_signal_id prevents REEVAL suffix variants from
+    # fragmenting opportunity rows.
+    _canonical_signal_id = payload.get("canonical_signal_id") or signal_id
+    try:
+        from ap_canonical_signal import build_canonical_signal_id as _build_cid
+        _canonical_signal_id = _build_cid(payload) or _canonical_signal_id
+    except Exception:
+        pass  # canonical module optional — fallback to signal_id
+
     # live_mode is derived from master_control.mode — it is NOT passed as a parameter.
     # master_control is the sole authority for LIVE vs PAPER mode in _dispatch.
     # worker_loop's live_mode parameter is only used for the mode label log and
@@ -570,6 +580,19 @@ def _dispatch(
 
     if not decision.ok:
         log.info(f"[{ticker}] BLOCKED | stage={decision.stage} reason={decision.reason}")
+        # PR1 + Amendment §4: map MC reason to canonical miss stage instead
+        # of always writing STAGE_UNKNOWN.
+        try:
+            from ap.opportunity_ledger import mark_missed, map_reason_to_stage
+            _mc_stage = map_reason_to_stage(
+                f"{decision.stage or ''} {decision.reason or ''}"
+            )
+            mark_missed(signal_id, client_id, _mc_stage,
+                        str(decision.reason or "mc_blocked"),
+                        canonical_signal_id=_canonical_signal_id,
+                        extra_meta={"mc_decision_stage": str(decision.stage or ""),
+                                    "mc_decision_reason": str(decision.reason or "")})
+        except Exception: pass
         trace_gate(str(payload.get("signal_id","")), ticker, "MC_REJECTED", "REJECT",
                    reason=decision.reason, score=float(payload.get("score") or 0))
         _mark_job(job_id, "REJECTED",
@@ -780,6 +803,12 @@ def _dispatch(
             f"[{ticker}] BLOCKED at re-validation (real premium) | "
             f"reason={revalidation.reason}"
         )
+        try:
+            from ap.opportunity_ledger import mark_missed, STAGE_CLIENT_PREFLIGHT
+            mark_missed(signal_id, client_id, STAGE_CLIENT_PREFLIGHT,
+                        str(revalidation.reason or "revalidation_block"),
+                        canonical_signal_id=_canonical_signal_id)
+        except Exception: pass
         _mark_job(job_id, "REJECTED",
                   result={"stage": "revalidation", "reason": revalidation.reason,
                           "real_cost": plan.max_position_usd})
@@ -976,6 +1005,121 @@ def _dispatch(
             return
         log.debug("[%s] authorization gate skipped (observe or non-live): %s", ticker, _authz_exc)
 
+    # ── 4.6 PR81: Client State Preflight ─────────────────────────────────────
+    # REBASE NOTE (Final Amendment v2 §4): PR #87 inserts the LIVE
+    # authorization gate at section 4.5 — it MUST remain the hard control
+    # gate and run BEFORE this client-state preflight. The final order is:
+    #   1. master_control.evaluate()        (existing)
+    #   2. live authorization gate          (PR #87, section 4.5)
+    #   3. client-state preflight           (PR #81, section 4.6, OBSERVE ONLY)
+    #   4. order_state_machine.create_entry_order(plan, execution_mode=...)
+    # CLIENT_PREFLIGHT_ENFORCE defaults to false; preflight never weakens
+    # the authorization gate.
+    #
+    # Runs preflight snapshot on every CLIENT_ELIGIBLE signal.
+    #
+    # Amendment 1+2: two distinct modes
+    #   CLIENT_PREFLIGHT_ENFORCE=false (default) — OBSERVE ONLY:
+    #     - build_client_trade_preflight() runs and writes full snapshot to ledger
+    #     - if preflight fails → PREFLIGHT_WARNING + execution_continued=True
+    #     - DO NOT call mark_skipped(); DO NOT return; DO NOT reject the job
+    #     - existing order creation path continues unchanged
+    #   CLIENT_PREFLIGHT_ENFORCE=true — ENFORCE:
+    #     - if preflight fails → CLIENT_SKIPPED + execution_continued=False
+    #     - block before order creation
+    _pf_enforce = str(os.getenv("CLIENT_PREFLIGHT_ENFORCE", "false")).strip().lower() in ("true", "1")
+    _pf_eligible = True   # default: allow through unless enforce=True + failed
+    try:
+        from ap.client_preflight import build_client_trade_preflight
+        from ap.opportunity_ledger import (
+            update_opportunity, mark_skipped,
+            STAGE_CLIENT_PREFLIGHT, PREFLIGHT_PASSED, PREFLIGHT_WARNING, CLIENT_SKIPPED,
+        )
+        _preflight = build_client_trade_preflight(client_id, payload, plan)
+
+        if _preflight.eligible:
+            # Preflight passed — record PREFLIGHT_PASSED (Amendment 3: not ORDER_CREATED)
+            _pf_status           = PREFLIGHT_PASSED
+            _pf_enforced_flag    = _pf_enforce
+            _pf_exec_continued   = True
+            _pf_would_block      = None
+        elif not _pf_enforce:
+            # Amendment 1+2: observe only — PREFLIGHT_WARNING, execution continues
+            _pf_status           = PREFLIGHT_WARNING
+            _pf_enforced_flag    = False
+            _pf_exec_continued   = True
+            _pf_would_block      = str(_preflight.block_reason or "unknown_preflight_block")
+        else:
+            # Amendment 2: enforcement — CLIENT_SKIPPED, execution blocked
+            _pf_status           = CLIENT_SKIPPED
+            _pf_enforced_flag    = True
+            _pf_exec_continued   = False
+            _pf_would_block      = str(_preflight.block_reason or "unknown_preflight_block")
+
+        # Amendment 5: named log tag on failure — never silent
+        _ol_ok = update_opportunity(
+            signal_id, client_id,
+            _pf_status,
+            canonical_signal_id=_canonical_signal_id,
+            kill_switch_state=_preflight.kill_switch,
+            entries_paused_state=_preflight.entries_paused,
+            buying_power_snapshot=_preflight.buying_power,
+            cap_snapshot={
+                "daily_count":    _preflight.daily_trade_count,
+                "lane_count":     _preflight.daily_lane_count,
+                "open_positions": _preflight.open_positions_count,
+                "pending_entries":_preflight.pending_entries_count,
+            },
+            # Amendment 2: persist enforcement context on every preflight write
+            preflight_enforced=_pf_enforced_flag,
+            execution_continued=_pf_exec_continued,
+            would_block_reason=_pf_would_block,
+            # Amendment 6: full snapshot including enforcement context
+            extra_meta={"preflight": _preflight.to_dict(
+                preflight_enforced=_pf_enforced_flag,
+                execution_continued=_pf_exec_continued,
+            )},
+        )
+        if not _ol_ok:
+            log.warning(
+                "[%s] CLIENT_OPPORTUNITY_LEDGER_WRITE_FAILED | "
+                "stage=preflight_status client=%s signal=%s canonical=%s status=%s",
+                ticker, client_id, signal_id, _canonical_signal_id, _pf_status,
+            )
+
+        if not _preflight.eligible:
+            log.info(
+                "[%s] PREFLIGHT %s | client=%s reason=%s enforce=%s",
+                ticker,
+                "BLOCK" if _pf_enforce else "WARN",
+                client_id, _preflight.block_reason, _pf_enforce,
+            )
+            if _pf_enforce:
+                # Enforcement mode: mark CLIENT_SKIPPED and block execution
+                _sk_ok = mark_skipped(
+                    signal_id, client_id,
+                    STAGE_CLIENT_PREFLIGHT,
+                    str(_preflight.block_reason or "unknown_preflight_block"),
+                    canonical_signal_id=_canonical_signal_id,
+                )
+                if not _sk_ok:
+                    log.warning(
+                        "[%s] CLIENT_OPPORTUNITY_LEDGER_WRITE_FAILED | "
+                        "stage=mark_skipped client=%s signal=%s",
+                        ticker, client_id, signal_id,
+                    )
+                _mark_job(job_id, "REJECTED",
+                          error=f"preflight_enforced:{_preflight.block_reason}")
+                return
+            # Observe mode: PREFLIGHT_WARNING written above; execution continues
+            _pf_eligible = False  # captured for metrics; does NOT stop execution
+    except ImportError:
+        pass   # preflight module optional — skip silently
+    except Exception as _pf_err:
+        # Amendment §6: preflight failure is non-blocking. The duplicate
+        # except clause was unreachable dead code — removed.
+        log.warning("[%s] preflight check failed (non-blocking): %s", ticker, _pf_err)
+
     # ── 5. ORDER STATE MACHINE (create only after route + cutoff cleared) ────
     try:
         from ap.authorization import execution_mode_for_broker
@@ -997,8 +1141,29 @@ def _dispatch(
             f"[{ticker}] Entry order created: {local_order_id} "
             f"contract={getattr(plan, 'contract_symbol', '?')}"
         )
+        # PR1: ORDER_CREATED — only mark AFTER create_entry_order() returns
+        # local_order_id. Status was PREFLIGHT_PASSED before this point.
+        try:
+            from ap.opportunity_ledger import update_opportunity, ORDER_CREATED
+            update_opportunity(signal_id, client_id, ORDER_CREATED,
+                               canonical_signal_id=_canonical_signal_id,
+                               order_local_id=str(local_order_id))
+        except Exception: pass
     except Exception as e:
         log.error(f"[{ticker}] create_entry_order() failed: {e}")
+        # Amendment §7: persist the failure to the opportunity ledger so the
+        # row does not remain permanently at PREFLIGHT_PASSED.
+        try:
+            from ap.opportunity_ledger import (
+                update_opportunity, MISSED, STAGE_ORDER_CREATION,
+            )
+            update_opportunity(
+                signal_id, client_id, MISSED,
+                canonical_signal_id=_canonical_signal_id,
+                miss_stage=STAGE_ORDER_CREATION,
+                miss_reason=f"order_create_error:{e}",
+            )
+        except Exception: pass
         _mark_job(job_id, "ERROR", error=f"order_create_error: {e}")
         return
 
@@ -1043,6 +1208,15 @@ def _dispatch(
                     "[%s] WATCH_ARM_FAILED | local=%s | reason=%s",
                     ticker, local_order_id, _reject_reason,
                 )
+                # Amendment §3: persist watcher invalidation to the ledger.
+                try:
+                    from ap.opportunity_ledger import mark_watcher_invalidated
+                    mark_watcher_invalidated(
+                        signal_id, client_id, _reject_reason,
+                        canonical_signal_id=_canonical_signal_id,
+                        order_local_id=str(local_order_id),
+                    )
+                except Exception: pass
                 try:
                     # Persist exact reason to orders.last_error so dashboard shows it
                     if hasattr(order_state_machine, "expire_pending_entry"):
@@ -1063,6 +1237,15 @@ def _dispatch(
                 f"[{ticker}] Handed to entry watcher | "
                 f"trigger=${getattr(plan, 'trigger_price', '?')}"
             )
+            # Amendment §3: WATCHER_ARMED ledger update.
+            try:
+                from ap.opportunity_ledger import mark_watcher_armed
+                mark_watcher_armed(
+                    signal_id, client_id,
+                    canonical_signal_id=_canonical_signal_id,
+                    order_local_id=str(local_order_id),
+                )
+            except Exception: pass
 
             # Queue job = WATCHING only after watcher arm succeeded.
             _mark_job(job_id, "WATCHING",
@@ -1083,6 +1266,15 @@ def _dispatch(
                     order_state_machine.transition(local_order_id, "ERROR", last_error=f"watcher_error:{e}")
             except Exception as _cancel_err:
                 log.error("[%s] Failed to cancel/transition order after watcher error: %s", ticker, _cancel_err)
+            # Amendment §3 + §7: persist INTERNAL_ERROR to the ledger.
+            try:
+                from ap.opportunity_ledger import mark_internal_error
+                mark_internal_error(
+                    signal_id, client_id, f"watcher_error:{e}",
+                    canonical_signal_id=_canonical_signal_id,
+                    order_local_id=str(local_order_id) if 'local_order_id' in dir() else None,
+                )
+            except Exception: pass
             _mark_job(job_id, "ERROR", error=f"watcher_error: {e}")
     else:
         log.warning(
@@ -1120,6 +1312,19 @@ def _dispatch(
                     "[%s] Immediate submit failed safely | local=%s error=%s",
                     ticker, local_order_id, submit_res.get("error"),
                 )
+                # Amendment §3: persist broker-submit failure to ledger.
+                try:
+                    from ap.opportunity_ledger import (
+                        update_opportunity, MISSED, STAGE_BROKER_SUBMIT,
+                    )
+                    update_opportunity(
+                        signal_id, client_id, MISSED,
+                        canonical_signal_id=_canonical_signal_id,
+                        miss_stage=STAGE_BROKER_SUBMIT,
+                        miss_reason=str(submit_res.get("error") or "submit_failed"),
+                        order_local_id=str(local_order_id),
+                    )
+                except Exception: pass
                 _mark_job(job_id, "ERROR", error=f"submit_error:{submit_res.get('error')}")
                 return
 
@@ -1127,6 +1332,16 @@ def _dispatch(
                 "[%s] Order submitted immediately after broker acceptance | local=%s broker=%s",
                 ticker, local_order_id, submit_res.get("broker_order_id"),
             )
+            # Amendment §3: BROKER_SUBMITTED ledger update.
+            try:
+                from ap.opportunity_ledger import mark_broker_submitted
+                mark_broker_submitted(
+                    signal_id, client_id,
+                    canonical_signal_id=_canonical_signal_id,
+                    order_local_id=str(local_order_id),
+                    broker_order_id=str(submit_res.get("broker_order_id") or ""),
+                )
+            except Exception: pass
 
             _mark_job(job_id, "SUBMITTED",
                       result={"plan_id": plan.plan_id,
@@ -1138,6 +1353,15 @@ def _dispatch(
             return
         except Exception as e:
             log.error(f"[{ticker}] immediate submit failed: {e}", exc_info=True)
+            # Amendment §3 + §7: persist INTERNAL_ERROR to the ledger.
+            try:
+                from ap.opportunity_ledger import mark_internal_error
+                mark_internal_error(
+                    signal_id, client_id, f"submit_error:{e}",
+                    canonical_signal_id=_canonical_signal_id,
+                    order_local_id=str(local_order_id) if 'local_order_id' in dir() else None,
+                )
+            except Exception: pass
             _mark_job(job_id, "ERROR", error=f"submit_error: {e}")
 
 
