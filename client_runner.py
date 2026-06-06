@@ -2761,6 +2761,27 @@ def route_signal_to_all_clients(signal: dict):
                     runner.degraded.is_set(),
                 )
 
+    # PR1: Create one opportunity row per active client BEFORE fanout.
+    # Uses canonical_signal_id as primary idempotency key (PR79 / PR81 amend).
+    # Fail-safe — never blocks routing.
+    if active_emails:
+        try:
+            from ap.opportunity_ledger import create_opportunities
+            _canonical_sid = signal.get("canonical_signal_id") or signal_id
+            try:
+                from ap_canonical_signal import build_canonical_signal_id as _bcsid
+                _canonical_sid = _bcsid(signal) or _canonical_sid
+            except Exception:
+                pass
+            create_opportunities(
+                signal_id=signal_id,
+                canonical_signal_id=_canonical_sid,
+                client_ids=active_emails,
+                payload=signal,
+            )
+        except Exception as _ol_err:
+            log.debug("opportunity_ledger.create_opportunities skipped: %s", _ol_err)
+
     if not active_emails:
         if not ALLOW_SUPABASE_FANOUT_FALLBACK:
             with _registry_lock:
