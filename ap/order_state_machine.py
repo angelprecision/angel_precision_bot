@@ -425,6 +425,7 @@ class APOrderStateMachine:
         reserved_cost=None,
         initial_status: Optional[str] = None,
         meta: Optional[dict] = None,
+        execution_mode: Optional[str] = None,
     ) -> str:
         """
         Create an ENTRY order row in the OSM.
@@ -524,6 +525,13 @@ class APOrderStateMachine:
         _raw_signal_id = str(getattr(plan, "signal_id", "") or "")
         _canonical_signal_id = build_canonical_signal_id(_raw_signal_id) or None
 
+        # execution_mode is stamped at ENTRY creation and is the source of truth
+        # for proof_trades on close. Only 'live'/'paper' are valid; anything else
+        # is dropped to NULL so the close-time copy resolves to 'unknown'.
+        _exec_mode = str(execution_mode or "").lower().strip()
+        if _exec_mode not in ("live", "paper"):
+            _exec_mode = None
+
         _auto_meta = {
             "score":              _score_val,
             "tier":               _tier_val,
@@ -543,6 +551,9 @@ class APOrderStateMachine:
             "direction":          _direction,
             "side":               _direction,   # alias — retry_engine reads both
             "symbol":             str(getattr(plan, "ticker", "") or ""),
+            # execution_mode mirrored into meta as a JSON fallback alongside the
+            # top-level orders.execution_mode column.
+            "execution_mode":     _exec_mode,
 
         }
         # Caller-supplied meta wins on conflict (e.g. queue path passing
@@ -573,6 +584,7 @@ class APOrderStateMachine:
                         score, tier,
                         trigger_price, stop_underlying, target_underlying,
                         pattern, timeframe,
+                        execution_mode,
                         meta,
                         created_ts, updated_ts
                     ) VALUES (
@@ -585,6 +597,7 @@ class APOrderStateMachine:
                         %s,%s,
                         %s,%s,%s,
                         %s,%s,
+                        %s,
                         %s,
                         %s,%s
                     )
@@ -602,6 +615,7 @@ class APOrderStateMachine:
                         _target_val if _target_val > 0 else None,
                         _final_meta.get("pattern") or None,
                         _final_meta.get("timeframe") or None,
+                        _exec_mode,
                         _meta_json,
                         ts, ts,
                     ),

@@ -368,6 +368,79 @@ def run_overnight_reeval(
                 except Exception:
                     pass
 
+            # Step 5.5: LIVE AUTHORIZATION GATE — overnight reeval arms NEW entries
+            # that fire at next open, so a LIVE client must be evaluated here too.
+            # Same semantics as ap/queue.py: an UNKNOWN/unverifiable broker mode
+            # is treated as a block candidate (never assumed paper); known paper/
+            # sandbox clients are exempt. OBSERVE mode logs WOULD_BLOCK and arms
+            # the entry anyway; ENFORCE mode rejects it. Gate errors fail closed
+            # only in ENFORCE mode for live/unknown brokers.
+            try:
+                from ap.authorization import (
+                    is_live_broker, broker_live_mode_known, check_live_authorization,
+                    authorization_gate_enforced, LIVE_AUTHORIZATION_GATE_UNAVAILABLE,
+                )
+                _gate_reason = None
+                if not broker_live_mode_known(broker):
+                    _gate_reason = LIVE_AUTHORIZATION_GATE_UNAVAILABLE
+                elif is_live_broker(broker):
+                    _gate_reason = check_live_authorization(client_id)
+
+                if _gate_reason:
+                    if not authorization_gate_enforced():
+                        # OBSERVE MODE — log and ARM anyway.
+                        log.warning("[%s] overnight_reeval: LIVE_AUTHORIZATION_WOULD_BLOCK — %s | client=%s (observe mode; armed)",
+                                    ticker, _gate_reason, client_id)
+                        try:
+                            from ap.execution import audit
+                            audit(client_id, "WARNING", "LIVE_AUTHORIZATION_WOULD_BLOCK", {
+                                "reason_code": _gate_reason, "ticker": ticker,
+                                "signal_id": signal_id, "path": "overnight_reeval",
+                                "enforced": False,
+                            })
+                        except Exception:
+                            pass
+                        # fall through — entry is armed in observe mode.
+                    else:
+                        # ENFORCE MODE — reject the armed entry.
+                        log.warning("[%s] overnight_reeval: LIVE ENTRY BLOCKED — %s | client=%s",
+                                    ticker, _gate_reason, client_id)
+                        _mark_job_rejected(job_id, client_id, f"live_authorization:{_gate_reason}")
+                        _log_rejection_supabase(
+                            signal_id=signal_id, client_id=client_id, ticker=ticker,
+                            side=side, score=float(signal.get("score") or 0),
+                            stage="live_authorization",
+                            reason_code=_gate_reason, human_reason=_gate_reason,
+                            payload=signal,
+                        )
+                        try:
+                            from ap.execution import audit
+                            audit(client_id, "WARNING", "LIVE_ENTRY_BLOCKED", {
+                                "reason_code": _gate_reason, "ticker": ticker,
+                                "signal_id": signal_id, "path": "overnight_reeval",
+                                "enforced": True,
+                            })
+                        except Exception:
+                            pass
+                        result["rejected"] += 1
+                        continue
+            except Exception as _authz_exc:
+                try:
+                    from ap.authorization import (
+                        is_live_broker as _ilb, broker_live_mode_known as _bmk,
+                        authorization_gate_enforced as _enf,
+                    )
+                    _enforced = _enf()
+                    _risky = (not _bmk(broker)) or _ilb(broker)
+                except Exception:
+                    _enforced, _risky = False, False
+                if _enforced and _risky:
+                    log.error("[%s] overnight_reeval: LIVE authz gate error — failing closed (enforce): %s",
+                              ticker, _authz_exc)
+                    _mark_job_rejected(job_id, client_id, f"live_authorization_gate_error:{_authz_exc}")
+                    result["errors"] += 1
+                    continue
+
             # Step 6: Create OSM entry order — let OSM generate a fresh UUID.
             # Do NOT pass local_order_id: static IDs cause OSM conflicts on retry.
             # For deferred contracts: ensure contract_symbol is NOT set to the
@@ -390,9 +463,11 @@ def run_overnight_reeval(
                 # with no intermediate PENDING_TRIGGER transition observable in
                 # the OSM event log. Atomic initial_status='PENDING_TRIGGER'
                 # eliminates the race entirely.
+                from ap.authorization import execution_mode_for_broker
                 local_order_id = order_state_machine.create_entry_order(
                     decision.plan,
                     initial_status="PENDING_TRIGGER",
+                    execution_mode=execution_mode_for_broker(broker),
                 )
             except Exception as osm_exc:
                 log.error("[%s] overnight_reeval: OSM create_entry_order failed: %s", ticker, osm_exc)
