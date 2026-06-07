@@ -3509,6 +3509,80 @@ def admin_force_exit_position(position_id: str):
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
+# =============================================================================
+# PR #90 — Live Execution Journal (read-only, admin-protected)
+#
+# Two endpoints behind @_require_admin (same HMAC pattern as every other
+# /admin/* route). Both READ-ONLY — never write, never mutate trading state.
+# =============================================================================
+
+@app.get("/admin/operator/live-execution-journal")
+@_require_admin
+def admin_live_execution_journal():
+    """Live Execution Truth Layer.
+
+    Query params (all optional):
+      start                ISO timestamp or YYYY-MM-DD (default: 24h ago)
+      end                  ISO timestamp or YYYY-MM-DD (default: now)
+      client_id            exact match
+      symbol               case-insensitive match
+      canonical_signal_id  exact match
+      status               filter by current_lifecycle_stage
+
+    Returns the PR-90 spec shape:
+      summary, trades, client_breakdown, symbol_breakdown,
+      failure_breakdown, action_items, data_quality, window, filters.
+
+    Never mutates DB. Never exposes secrets, broker tokens, or HMAC keys.
+    """
+    try:
+        from ap.operator.live_execution_journal import build_journal
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"journal module unavailable: {e}"}), 503
+
+    try:
+        report = build_journal(
+            start=request.args.get("start") or None,
+            end=request.args.get("end") or None,
+            client_id=request.args.get("client_id") or None,
+            symbol=request.args.get("symbol") or None,
+            canonical_signal_id=request.args.get("canonical_signal_id") or None,
+            status=request.args.get("status") or None,
+        )
+    except Exception as e:
+        # build_journal already swallows DB errors into data_quality; this
+        # except catches a programming error in the module itself.
+        admin_log.error("live-execution-journal failed: %s", e)
+        return jsonify({"ok": False, "error": f"journal build failed: {e}"}), 500
+
+    return jsonify({"ok": True, **report})
+
+
+@app.get("/admin/operator/live-execution-truth-sample")
+@_require_admin
+def admin_live_execution_truth_sample():
+    """Debug endpoint: return ONE end-to-end journey for a specific
+    canonical_signal_id (and optionally client_id). Read-only."""
+    canonical = (request.args.get("canonical_signal_id") or "").strip()
+    if not canonical:
+        return jsonify({"ok": False, "error": "canonical_signal_id query param required"}), 400
+    try:
+        from ap.operator.live_execution_journal import build_journey_sample
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"journal module unavailable: {e}"}), 503
+
+    try:
+        sample = build_journey_sample(
+            canonical_signal_id=canonical,
+            client_id=(request.args.get("client_id") or "").strip() or None,
+        )
+    except Exception as e:
+        admin_log.error("live-execution-truth-sample failed: %s", e)
+        return jsonify({"ok": False, "error": f"sample build failed: {e}"}), 500
+
+    return jsonify(sample)
+
+
 @app.get("/health")
 def health_basic():
     """Basic liveness check — no auth required."""
