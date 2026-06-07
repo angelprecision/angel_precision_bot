@@ -3032,7 +3032,17 @@ def create_app() -> Flask:
     @app.get("/tradier/test")
     @require_hmac
     def tradier_test():
-        broker = app.config["BROKER"]
+        broker = app.config.get("BROKER")
+        if broker is None:
+            return jsonify({
+                "ok": False,
+                "error": "no_global_broker",
+                "detail": (
+                    "Global broker not initialized — multi-client supervisor mode "
+                    "uses per-client Tradier credentials. Use the per-client "
+                    "health endpoint instead."
+                ),
+            }), 503
         if cfg.BOT_MODE not in ("PAPER", "LIVE"):
             return jsonify({"ok": False, "error": "only_paper_live"}), 400
         try:
