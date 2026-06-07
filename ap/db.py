@@ -42,12 +42,19 @@ DB_RETRY_SLOW = dict(retries=10, base_sleep=0.1,  max_sleep=2.0)
 _pool_lock = threading.Lock()
 
 # ── Connection pool ───────────────────────────────────────────────────────────
-DATABASE_URL = os.getenv("DATABASE_URL", "")
+DATABASE_URL = (
+    os.getenv("DATABASE_URL")
+    or os.getenv("DATABASE_URI")
+    or os.getenv("SUPABASE_DB_URL")
+    or os.getenv("POSTGRES_URL")
+    or ""
+)
 
 if not DATABASE_URL:
     raise RuntimeError(
-        "DATABASE_URL env var is required. "
-        "Get it from Supabase → Settings → Database → Connection String → URI"
+        "No database URL configured. Set DATABASE_URL (or DATABASE_URI / "
+        "SUPABASE_DB_URL / POSTGRES_URL) to the Supabase connection string. "
+        "Found in: Supabase → Settings → Database → Connection String → URI"
     )
 
 _pool: psycopg2.pool.ThreadedConnectionPool | None = None
@@ -99,6 +106,15 @@ def run_with_retry(fn: Callable[[], Any], retries: int = 10,
             pg_errors.SerializationFailure,
             pg_errors.LockNotAvailable,    # advisory lock contention
         ) as e:
+            # Supabase pooler circuit-breaker — fail fast, do NOT retry.
+            # Retrying hammers the DB and extends the outage.
+            _msg = str(e).lower()
+            if "ecircuitbreaker" in _msg or "too many authentication failures" in _msg:
+                log.error(
+                    "Supabase pooler circuit breaker active — failing fast "
+                    "to avoid hammering DB. Error: %s", e
+                )
+                raise
             if attempt < retries:
                 log.warning(f"DB transient error (attempt {attempt+1}/{retries}): {e}")
                 time.sleep(delay)
