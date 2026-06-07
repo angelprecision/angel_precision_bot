@@ -1208,6 +1208,76 @@ def _dispatch(
                     "[%s] WATCH_ARM_FAILED | local=%s | reason=%s",
                     ticker, local_order_id, _reject_reason,
                 )
+
+                # =============================================================
+                # PR #92 — Watcher Arm Audit (additive; cannot block cleanup)
+                # =============================================================
+                # Classify the raw_reason into a structured taxonomy and merge
+                # a dossier-shaped audit into orders.meta.watcher_arm_audit.
+                # Every step is wrapped so a failure here NEVER affects the
+                # existing arm-failure cleanup path below.
+                #
+                # We do NOT wire the retry's arm_callable to entry_watcher.watch
+                # in this PR — the retry module is plumbing only. Once we have
+                # several sessions of audit data confirming the taxonomy, a
+                # follow-up PR can hook the actual re-arm path.
+                # =============================================================
+                try:
+                    from ap_watcher_arm_audit import (
+                        classify_arm_failure, build_watcher_arm_audit,
+                        BUCKET_QUOTE_READINESS_UNKNOWN,
+                    )
+                    from ap_watcher_arm_persist import persist_watcher_arm_audit
+                    _pr92_classification = classify_arm_failure(_reject_reason)
+                    _pr92_pod_id = (
+                        getattr(plan, "pod_id", None)
+                        or os.environ.get("POD_ID")
+                        or None
+                    )
+                    _pr92_audit = build_watcher_arm_audit(
+                        classification=_pr92_classification,
+                        symbol=ticker,
+                        direction=getattr(plan, "direction", None),
+                        timeframe=getattr(plan, "timeframe", None),
+                        pattern=getattr(plan, "pattern", None),
+                        signal_id=str(signal_id) if signal_id else None,
+                        canonical_signal_id=_canonical_signal_id,
+                        plan_id=getattr(plan, "plan_id", None),
+                        client_id=str(client_id) if client_id else None,
+                        pod_id=_pr92_pod_id,
+                        local_order_id=str(local_order_id) if local_order_id else None,
+                        trigger_price=getattr(plan, "trigger_price", None),
+                        stop_price=getattr(plan, "stop_price", None),
+                        target_price=getattr(plan, "target_price", None),
+                    )
+                    log.info(
+                        "WATCHER_ARM_AUDIT signal_id=%s canonical_signal_id=%s "
+                        "client_id=%s symbol=%s direction=%s conceptual_bucket=%s "
+                        "reason_code=%s final_decision=%s",
+                        signal_id, _canonical_signal_id, client_id, ticker,
+                        getattr(plan, "direction", None),
+                        _pr92_classification.bucket,
+                        _pr92_classification.reason_code,
+                        _pr92_audit.get("final_decision"),
+                    )
+                    try:
+                        persist_watcher_arm_audit(
+                            local_order_id=local_order_id,
+                            audit=_pr92_audit,
+                        )
+                    except Exception as _persist_exc:
+                        log.warning(
+                            "[%s] watcher_arm_audit persist skipped: %s",
+                            ticker, _persist_exc,
+                        )
+                except Exception as _pr92_exc:
+                    # PR92 is reporting-only — never let it break arm cleanup.
+                    log.warning(
+                        "[%s] watcher_arm_audit build skipped: %s",
+                        ticker, _pr92_exc,
+                    )
+                # =============================================================
+
                 # Amendment §3: persist watcher invalidation to the ledger.
                 try:
                     from ap.opportunity_ledger import mark_watcher_invalidated
