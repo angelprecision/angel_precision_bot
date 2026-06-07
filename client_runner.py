@@ -1008,7 +1008,6 @@ class ClientRunner(threading.Thread):
         risk_profile_source: str  = "GLOBAL_ENV_DEFAULT",
         risk_profile_valid: bool  = False,
         missing_risk_fields: list = None,
-        daily_max_loss_pct: float = 0.06,
     ):
         if missing_risk_fields is None:
             missing_risk_fields = []
@@ -1050,7 +1049,7 @@ class ClientRunner(threading.Thread):
             "effective_context_floor": mc_ctx_floor,
             "effective_max_capital_pct": mc_capital_pct,
             "effective_max_sector_pct": mc_sector_pct,
-            "effective_daily_max_loss_pct": daily_max_loss_pct,
+            "effective_daily_max_loss_pct": loss_pct,
         }
             logger.info("[%s] Startup manifest: %s", self.email, self.startup_manifest)
         except Exception as _manifest_exc:
@@ -1549,7 +1548,6 @@ class ClientRunner(threading.Thread):
             "max_capital_pct", "max_sector_pct", "max_ticker_pct",
             "max_calls", "max_puts", "score_floor", "context_floor",
             "max_concurrent_positions", "daily_max_loss_pct",
-            "entries_enabled",   # PR84 amendment: must match PR83 boot list exactly
         ]
         _missing_live = [
             f for f in _REQUIRED
@@ -1848,7 +1846,6 @@ class ClientRunner(threading.Thread):
             risk_profile_source=_risk_profile_source,
             risk_profile_valid=(len(_missing_live) == 0),
             missing_risk_fields=_missing_live,
-            daily_max_loss_pct=loss_pct,
         )
 
         self._validate_control_stack()
@@ -2761,27 +2758,6 @@ def route_signal_to_all_clients(signal: dict):
                     runner.degraded.is_set(),
                 )
 
-    # PR1: Create one opportunity row per active client BEFORE fanout.
-    # Uses canonical_signal_id as primary idempotency key (PR79 / PR81 amend).
-    # Fail-safe — never blocks routing.
-    if active_emails:
-        try:
-            from ap.opportunity_ledger import create_opportunities
-            _canonical_sid = signal.get("canonical_signal_id") or signal_id
-            try:
-                from ap_canonical_signal import build_canonical_signal_id as _bcsid
-                _canonical_sid = _bcsid(signal) or _canonical_sid
-            except Exception:
-                pass
-            create_opportunities(
-                signal_id=signal_id,
-                canonical_signal_id=_canonical_sid,
-                client_ids=active_emails,
-                payload=signal,
-            )
-        except Exception as _ol_err:
-            log.debug("opportunity_ledger.create_opportunities skipped: %s", _ol_err)
-
     if not active_emails:
         if not ALLOW_SUPABASE_FANOUT_FALLBACK:
             with _registry_lock:
@@ -3066,6 +3042,68 @@ def _fetch_active_members(sb: Client) -> list[dict]:
                 m["_risk_profile_valid"] = True
                 _rp_ok.append(m)
             members = _rp_ok
+
+        # Per-client broker credential validation (PR: Remove Global Tradier Guard)
+        # Validates each assigned client has usable broker creds before running.
+        # Skips only the failing client — never crashes the pod.
+        if _is_live and members:
+            _cred_ok     = []
+            _cred_missing = []
+            for m in members:
+                _email   = m.get("email", "")
+                _mode_m  = (m.get("tradier_active_mode") or "paper").lower()
+                if _mode_m == "live":
+                    _has_creds = bool(
+                        m.get("tradier_live_account_id") and
+                        m.get("tradier_live_access_token")
+                    )
+                    _allow_live = bool(m.get("allow_live_trading", False) or
+                                       m.get("approved", False))
+                else:
+                    _has_creds  = bool(
+                        m.get("tradier_account_id") and
+                        m.get("tradier_access_token")
+                    )
+                    _allow_live = True  # paper always allowed
+
+                if not _has_creds:
+                    logger.error(
+                        "Client skipped: missing Tradier credentials | "
+                        "client_id=%s email=%s pod_id=%s mode=%s",
+                        m.get("id"), _email, _pod_id, _mode_m,
+                    )
+                    _cred_missing.append(_email)
+                    continue
+
+                if _mode_m == "live" and not _allow_live:
+                    logger.error(
+                        "Client skipped: allow_live_trading not set | "
+                        "client_id=%s email=%s pod_id=%s",
+                        m.get("id"), _email, _pod_id,
+                    )
+                    _cred_missing.append(_email)
+                    continue
+
+                _cred_ok.append(m)
+
+            members = _cred_ok
+
+            # POD_BOOT summary log
+            _global_fallback = bool(
+                os.environ.get("TRADIER_ACCESS_TOKEN") and
+                os.environ.get("TRADIER_ACCOUNT_ID")
+            )
+            logger.info(
+                "[POD_BOOT] pod_id=%s mode=LIVE assigned_clients=%d "
+                "broker_valid=%d broker_missing=%d "
+                "skipped=%s global_tradier_fallback=%s",
+                _pod_id,
+                len(members) + len(_cred_missing),
+                len(members),
+                len(_cred_missing),
+                _cred_missing or "none",
+                str(_global_fallback).lower(),
+            )
 
         # FIX 3: runtime overflow must preserve already-active runners.
         # Never sort all members and keep first N — that can drop a client
