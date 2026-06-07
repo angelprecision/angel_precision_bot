@@ -44,6 +44,7 @@ without duplicating logic.
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import math
 from dataclasses import dataclass, field
@@ -305,6 +306,7 @@ SELECT
     o.pattern,
     o.timeframe,
     o.qty,
+    o.position_id                              AS entry_position_id,
     o.contract                                 AS selected_contract,
     o.status                                   AS entry_order_status,
     o.broker_order_id                          AS broker_entry_order_id_orders,
@@ -312,6 +314,9 @@ SELECT
     o.created_ts                               AS opportunity_created_at,
     o.last_error                               AS order_last_error,
     o.meta                                     AS order_meta,
+    exit_o.status                              AS exit_order_status,
+    exit_o.broker_order_id                     AS broker_exit_order_id_orders,
+    exit_o.last_error                          AS exit_order_last_error,
     p.id                                       AS proof_id,
     p.execution_mode                           AS proof_execution_mode,
     p.broker_reconciled,
@@ -337,14 +342,20 @@ SELECT
     cso.miss_reason                            AS opp_miss_reason,
     cso.block_reason                           AS opp_block_reason,
     cso.scanner_name                           AS scanner,
-    cso.created_ts                             AS opportunity_ledger_created_at
+    cso.created_ts                             AS opportunity_ledger_created_at,
+    m.execution_pod                            AS member_execution_pod
 FROM orders o
 LEFT JOIN proof_trades p
     ON p.local_order_id = o.local_order_id
+LEFT JOIN orders exit_o
+    ON exit_o.position_id = o.position_id
+   AND exit_o.kind = 'EXIT'
 LEFT JOIN client_signal_opportunities cso
     ON cso.canonical_signal_id =
        COALESCE(o.canonical_signal_id, o.signal_id)
    AND cso.client_id = o.client_id
+LEFT JOIN members m
+    ON m.client_id = o.client_id
 WHERE o.kind = 'ENTRY'
 """
 
@@ -387,14 +398,49 @@ def _shape_trade_row(row: dict[str, Any]) -> dict[str, Any]:
     are returned as None — never faked. Caller is responsible for adding
     data_quality warnings for missing required fields.
     """
-    # Prefer proof_trades broker ids; fall back to orders.broker_order_id
-    # for the entry side (we never have a proof row before close).
+    # Prefer proof_trades broker ids; fall back to the matching orders row
+    # (entry: o.broker_order_id; exit: exit_o.broker_order_id via LEFT JOIN).
     broker_entry_order_id = (
         row.get("broker_entry_order_id_proof")
         or row.get("broker_entry_order_id_orders")
         or None
     )
-    broker_exit_order_id = row.get("broker_exit_order_id_proof") or None
+    broker_exit_order_id = (
+        row.get("broker_exit_order_id_proof")
+        or row.get("broker_exit_order_id_orders")
+        or None
+    )
+
+    # Exit-order status from LEFT JOIN. Read-only: returns None when no
+    # EXIT-kind row exists yet (e.g. open positions, or legacy rows where
+    # the exit was never persisted). _data_quality surfaces the warning.
+    exit_order_status = row.get("exit_order_status")
+
+    # ---- pod_id derivation chain ----
+    # 1) orders.meta->>'pod_id' (writer-stamped at order creation time)
+    # 2) members.execution_pod (canonical per-client assignment)
+    # client_signal_opportunities has no pod_id column in current schema, so
+    # it is not part of the chain. Returns None if neither source resolves.
+    pod_id_value: Optional[str] = None
+    om = row.get("order_meta")
+    if isinstance(om, dict):
+        v = om.get("pod_id")
+        if isinstance(v, str) and v.strip():
+            pod_id_value = v.strip()
+    elif isinstance(om, str) and om.strip():
+        # meta may arrive as a JSON string in some code paths
+        try:
+            parsed = json.loads(om)
+            if isinstance(parsed, dict):
+                v = parsed.get("pod_id")
+                if isinstance(v, str) and v.strip():
+                    pod_id_value = v.strip()
+        except (ValueError, TypeError):
+            pass
+    if not pod_id_value:
+        m_pod = row.get("member_execution_pod")
+        if isinstance(m_pod, str) and m_pod.strip():
+            pod_id_value = m_pod.strip()
 
     # Execution mode: prefer the proof row (closed truth); fall back to
     # the order's stamped mode.
@@ -411,7 +457,7 @@ def _shape_trade_row(row: dict[str, Any]) -> dict[str, Any]:
     lifecycle = derive_lifecycle_stage(
         opp_status=row.get("opp_status"),
         order_status=row.get("entry_order_status"),
-        exit_order_status=None,  # exit-side status not joined yet
+        exit_order_status=exit_order_status,
         proof_closed=proof_closed,
         has_entry_fill=has_entry_fill,
         has_exit_fill=has_exit_fill,
@@ -444,7 +490,7 @@ def _shape_trade_row(row: dict[str, Any]) -> dict[str, Any]:
         "signal_id":                row.get("signal_id"),
         "client_id":                row.get("client_id"),
         "client_display_id":        client_display_id(row.get("client_id")),
-        "pod_id":                   None,
+        "pod_id":                   pod_id_value,
         "symbol":                   row.get("symbol"),
         "direction":                row.get("direction"),
         "pattern":                  row.get("pattern"),
@@ -462,7 +508,7 @@ def _shape_trade_row(row: dict[str, Any]) -> dict[str, Any]:
         "selected_contract":        row.get("selected_contract"),
         "qty":                      row.get("qty"),
         "entry_order_status":       row.get("entry_order_status"),
-        "exit_order_status":        None,  # not joined; future PR can add
+        "exit_order_status":        exit_order_status,
         "entry_fill_price":         _safe_float(row.get("entry_option_price")),
         "exit_fill_price":          _safe_float(row.get("exit_fill_price")),
         "entry_fill_qty":           _safe_float(row.get("broker_entry_filled_qty")),
@@ -781,6 +827,20 @@ def _data_quality(trades: list[dict[str, Any]],
             if t.get("exit_price_source") in (None, PRICE_SOURCE_LEGACY_UNKNOWN, PRICE_SOURCE_MISSING_EXIT):
                 _warn("missing_exit_price_source",
                       "Closed live trade has no proven exit_price_source", t)
+            # New: closed live trade must have an EXIT-kind orders row.
+            if t.get("exit_order_status") is None:
+                _warn("EXIT_ORDER_NOT_FOUND",
+                      "Closed live trade has no matching orders row with kind='EXIT'. "
+                      "Reconcile with broker exit history.", t)
+
+        # pod_id should resolve for any trade with a client_id. If it does
+        # not, the writer side (or members.execution_pod) is missing data.
+        # This warning is severity-low — the journal still returns the row
+        # with pod_id=None — but operators need to fix the source.
+        if t.get("client_id") and not t.get("pod_id"):
+            _warn("POD_ID_UNAVAILABLE",
+                  "Trade has no resolvable pod_id (orders.meta.pod_id absent "
+                  "and members.execution_pod NULL).", t)
 
     coverage_pct = round(100.0 * covered / live_count, 2) if live_count else None
     return {

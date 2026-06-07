@@ -82,6 +82,10 @@ class _FakeCursor:
                     "official_db_default","opp_status","opp_miss_stage",
                     "opp_miss_reason","opp_block_reason","scanner",
                     "opportunity_ledger_created_at",
+                    # PR90 amendment columns
+                    "entry_position_id","exit_order_status",
+                    "broker_exit_order_id_orders","exit_order_last_error",
+                    "member_execution_pod",
                 ]
             ]
 
@@ -160,6 +164,13 @@ def _live_row(**overrides) -> dict:
         "opp_block_reason":          None,
         "scanner":                   "scanner_322",
         "opportunity_ledger_created_at": "2026-06-05T13:55:00+00:00",
+        # PR90 amendment: exit-order LEFT JOIN columns
+        "entry_position_id":         "pos-1",
+        "exit_order_status":         "FILLED",
+        "broker_exit_order_id_orders": "ORD-EXIT-1",
+        "exit_order_last_error":     None,
+        # PR90 amendment: pod_id chain (member fallback by default)
+        "member_execution_pod":      "live-pod-1",
     }
     row.update(overrides)
     return row
@@ -220,6 +231,9 @@ def test_t2_submitted_no_fill_surfaces_in_action_items():
         broker_exit_filled_qty=None,
         realized_pnl_pct=None,
         exit_reason=None,
+        # No exit-side order yet for a submitted-no-fill entry
+        exit_order_status=None,
+        broker_exit_order_id_orders=None,
     )]
     out = build_journal(conn_factory=_fake_factory(rows))
     t = out["trades"][0]
@@ -294,6 +308,7 @@ def test_t7_missing_fields_return_null_and_data_quality_warning():
         broker_entry_order_id_orders=None,
         broker_entry_order_id_proof=None,
         broker_exit_order_id_proof=None,
+        broker_exit_order_id_orders=None,
         entry_price_source=None,
         exit_price_source=None,
     )]
@@ -567,4 +582,136 @@ def test_migration_file_exists_and_is_idempotent():
     for forbidden in ["DROP", "DELETE FROM", "TRUNCATE"]:
         assert forbidden not in sql.upper(), f"migration contains {forbidden}"
     # Must default official=false
-    assert "DEFAULT FALSE" in sql.upper()
+    assert "DEFAULT FALSE" in sql.upper(), "official must default to false"
+
+
+def test_migration_has_defensive_columns_and_join_indexes():
+    """PR90 amendment: migration must defensively ensure every proof_trades
+    column the journal READS exists, and create all five join indexes the
+    query path depends on."""
+    path = os.path.join(ROOT, "migrations",
+                        "20260607_live_execution_journal_proof_fields.sql")
+    sql = open(path).read()
+    sql_up = sql.upper()
+
+    # 5 defensive ADD COLUMN IF NOT EXISTS for columns the journal reads
+    # from proof_trades (in addition to the 9 new proof-lock columns).
+    defensive_columns = [
+        "EXECUTION_MODE",
+        "BROKER_RECONCILED",
+        "SYNTHETIC_ENTRY",
+        "LOCAL_ORDER_ID",
+        "EXIT_FILL_PRICE",
+    ]
+    for col in defensive_columns:
+        # Look for "ADD COLUMN IF NOT EXISTS <col>" specifically.
+        needle = f"ADD COLUMN IF NOT EXISTS {col}"
+        assert needle in sql_up, (
+            f"migration must include defensive '{needle}' (got fragment: "
+            f"{[ln for ln in sql_up.splitlines() if col in ln]})"
+        )
+
+    # 5 join indexes (CREATE INDEX IF NOT EXISTS) the journal query depends on.
+    required_index_targets = [
+        "PROOF_TRADES (LOCAL_ORDER_ID)",
+        "ORDERS (LOCAL_ORDER_ID)",
+        "ORDERS (CREATED_TS",          # may be created_ts DESC
+        "ORDERS (CANONICAL_SIGNAL_ID)",
+        "CLIENT_SIGNAL_OPPORTUNITIES (CANONICAL_SIGNAL_ID, CLIENT_ID)",
+    ]
+    for target in required_index_targets:
+        assert target in sql_up, (
+            f"migration must create an IF NOT EXISTS index on {target}"
+        )
+    # And each is wrapped in CREATE INDEX IF NOT EXISTS
+    assert sql_up.count("CREATE INDEX IF NOT EXISTS") >= 5, (
+        "migration must use CREATE INDEX IF NOT EXISTS for every new index"
+    )
+
+
+# ===========================================================================
+# PR90 amendment: exit-order LEFT JOIN + pod_id derivation
+# ===========================================================================
+
+def test_exit_order_status_surfaced_when_present():
+    """When the LEFT JOIN to orders (kind='EXIT') finds a row, its status
+    must appear on the journal entry."""
+    rows = [_live_row(exit_order_status="FILLED",
+                       broker_exit_order_id_orders="ORD-EXIT-7")]
+    out = build_journal(conn_factory=_fake_factory(rows))
+    t = out["trades"][0]
+    assert t["exit_order_status"] == "FILLED"
+    # broker_exit_order_id should resolve through the orders fallback if no proof row
+    assert t["broker_exit_order_id"] in ("ORD-EXIT-1", "ORD-EXIT-7")
+
+
+def test_exit_order_missing_returns_null_and_warning_when_closed_live():
+    """Closed live trade without a matching EXIT-kind orders row must
+    return exit_order_status=null AND surface EXIT_ORDER_NOT_FOUND in
+    data_quality.warnings. The row is NOT faked."""
+    rows = [_live_row(
+        exit_order_status=None,
+        broker_exit_order_id_orders=None,
+        broker_exit_order_id_proof=None,
+    )]
+    out = build_journal(conn_factory=_fake_factory(rows))
+    t = out["trades"][0]
+    # Returned as null — never faked
+    assert t["exit_order_status"] is None
+    # The closed-live trade should surface the EXIT_ORDER_NOT_FOUND warning
+    codes = {w["code"] for w in out["data_quality"]["warnings"]}
+    assert "EXIT_ORDER_NOT_FOUND" in codes
+    # Read-only contract: no faked status
+    assert t["broker_exit_order_id"] is None
+
+
+def test_pod_id_from_orders_meta_takes_precedence():
+    """orders.meta->>'pod_id' wins over members.execution_pod."""
+    rows = [_live_row(
+        order_meta={"pod_id": "live-pod-2"},
+        member_execution_pod="live-pod-1",
+    )]
+    out = build_journal(conn_factory=_fake_factory(rows))
+    assert out["trades"][0]["pod_id"] == "live-pod-2"
+
+
+def test_pod_id_falls_back_to_members_execution_pod():
+    """With no orders.meta.pod_id, the journal falls back to
+    members.execution_pod from the LEFT JOIN."""
+    rows = [_live_row(
+        order_meta=None,
+        member_execution_pod="live-pod-1",
+    )]
+    out = build_journal(conn_factory=_fake_factory(rows))
+    assert out["trades"][0]["pod_id"] == "live-pod-1"
+    # No POD_ID_UNAVAILABLE warning when pod_id resolves
+    codes = {w["code"] for w in out["data_quality"]["warnings"]}
+    assert "POD_ID_UNAVAILABLE" not in codes
+
+
+def test_pod_id_unavailable_warning_when_no_source_resolves():
+    """When neither orders.meta.pod_id nor members.execution_pod is
+    available, pod_id is null AND data_quality surfaces POD_ID_UNAVAILABLE.
+    Trade row is still returned (not dropped)."""
+    rows = [_live_row(
+        order_meta=None,
+        member_execution_pod=None,
+    )]
+    out = build_journal(conn_factory=_fake_factory(rows))
+    t = out["trades"][0]
+    assert t["pod_id"] is None
+    codes = {w["code"] for w in out["data_quality"]["warnings"]}
+    assert "POD_ID_UNAVAILABLE" in codes
+    # Trade row is still surfaced — never dropped
+    assert t["client_id"] is not None
+
+
+def test_pod_id_meta_json_string_parsed():
+    """Some code paths serialize order_meta as a JSON string. The journal
+    must still extract pod_id without error."""
+    rows = [_live_row(
+        order_meta=json.dumps({"pod_id": "live-pod-9"}),
+        member_execution_pod="live-pod-1",
+    )]
+    out = build_journal(conn_factory=_fake_factory(rows))
+    assert out["trades"][0]["pod_id"] == "live-pod-9"
