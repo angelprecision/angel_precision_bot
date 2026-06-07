@@ -362,7 +362,21 @@ def build_broker():
         account_id = os.getenv("TRADIER_ACCOUNT_ID", "").strip()
 
         if not access_token or not account_id:
-            raise RuntimeError("Missing TRADIER_ACCESS_TOKEN or TRADIER_ACCOUNT_ID")
+            # In multi-client supervisor mode, broker credentials are validated
+            # per client — global env vars are not required.
+            # Only fail if SINGLE_CLIENT mode explicitly requires them.
+            _single = os.getenv("SINGLE_CLIENT_EMAIL", "").strip()
+            if _single:
+                raise RuntimeError(
+                    "Missing TRADIER_ACCESS_TOKEN or TRADIER_ACCOUNT_ID "
+                    "(required in SINGLE_CLIENT mode)"
+                )
+            log.warning(
+                "Global TRADIER_ACCESS_TOKEN / TRADIER_ACCOUNT_ID not set — "
+                "continuing because broker credentials are validated per client. "
+                "Set these only for SINGLE_CLIENT / legacy single-process mode."
+            )
+            return None
 
         log.info(f"Initializing Tradier broker ({cfg.BOT_MODE})")
         return TradierBroker(TradierConfig(
@@ -686,8 +700,15 @@ def create_app() -> Flask:
     log.info("✅ State initialized")
 
     broker = build_broker()
+    if broker is None:
+        # Multi-client supervisor mode — per-client credentials used instead.
+        log.info(
+            "✅ Global broker not initialized (supervisor/multi-client mode) — "
+            "per-client Tradier credentials will be used by each ClientRunner."
+        )
+    else:
+        log.info("✅ Broker initialized")
     app.config["BROKER"] = broker
-    log.info("✅ Broker initialized")
 
     if os.getenv("RUN_SUPERVISOR") == "1":
         global THREADS_STARTED
