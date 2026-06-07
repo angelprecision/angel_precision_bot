@@ -3067,6 +3067,68 @@ def _fetch_active_members(sb: Client) -> list[dict]:
                 _rp_ok.append(m)
             members = _rp_ok
 
+        # Per-client broker credential validation (PR: Remove Global Tradier Guard)
+        # Validates each assigned client has usable broker creds before running.
+        # Skips only the failing client — never crashes the pod.
+        if _is_live and members:
+            _cred_ok     = []
+            _cred_missing = []
+            for m in members:
+                _email   = m.get("email", "")
+                _mode_m  = (m.get("tradier_active_mode") or "paper").lower()
+                if _mode_m == "live":
+                    _has_creds = bool(
+                        m.get("tradier_live_account_id") and
+                        m.get("tradier_live_access_token")
+                    )
+                    _allow_live = bool(m.get("allow_live_trading", False) or
+                                       m.get("approved", False))
+                else:
+                    _has_creds  = bool(
+                        m.get("tradier_account_id") and
+                        m.get("tradier_access_token")
+                    )
+                    _allow_live = True  # paper always allowed
+
+                if not _has_creds:
+                    logger.error(
+                        "Client skipped: missing Tradier credentials | "
+                        "client_id=%s email=%s pod_id=%s mode=%s",
+                        m.get("id"), _email, _pod_id, _mode_m,
+                    )
+                    _cred_missing.append(_email)
+                    continue
+
+                if _mode_m == "live" and not _allow_live:
+                    logger.error(
+                        "Client skipped: allow_live_trading not set | "
+                        "client_id=%s email=%s pod_id=%s",
+                        m.get("id"), _email, _pod_id,
+                    )
+                    _cred_missing.append(_email)
+                    continue
+
+                _cred_ok.append(m)
+
+            members = _cred_ok
+
+            # POD_BOOT summary log
+            _global_fallback = bool(
+                os.environ.get("TRADIER_ACCESS_TOKEN") and
+                os.environ.get("TRADIER_ACCOUNT_ID")
+            )
+            logger.info(
+                "[POD_BOOT] pod_id=%s mode=LIVE assigned_clients=%d "
+                "broker_valid=%d broker_missing=%d "
+                "skipped=%s global_tradier_fallback=%s",
+                _pod_id,
+                len(members) + len(_cred_missing),
+                len(members),
+                len(_cred_missing),
+                _cred_missing or "none",
+                str(_global_fallback).lower(),
+            )
+
         # FIX 3: runtime overflow must preserve already-active runners.
         # Never sort all members and keep first N — that can drop a client
         # whose runner is already trading. Keep active pod runners first;
