@@ -1234,6 +1234,27 @@ def _dispatch(
                         or os.environ.get("POD_ID")
                         or None
                     )
+                    # ── PR92 amendment: explicit quote snapshot coverage ──────
+                    # No new quote fetches. Extract best-available quote from
+                    # plan / watcher result / order meta / last reject context.
+                    # If none available, flag explicitly — never fake values.
+                    _pr92_underlying_q = (
+                        getattr(plan, "underlying_quote", None)
+                        or getattr(plan, "last_underlying_quote", None)
+                        or (getattr(plan, "metadata", None) or {}).get("underlying_quote")
+                        or (getattr(plan, "metadata", None) or {}).get("quote_snapshot", {}).get("underlying")
+                    )
+                    _pr92_option_q = (
+                        getattr(plan, "option_quote", None)
+                        or getattr(plan, "last_option_quote", None)
+                        or (getattr(plan, "metadata", None) or {}).get("option_quote")
+                        or (getattr(plan, "metadata", None) or {}).get("quote_snapshot", {}).get("option")
+                    )
+                    _pr92_quote_src = (
+                        getattr(plan, "quote_source", None)
+                        or (getattr(plan, "metadata", None) or {}).get("quote_source")
+                    )
+                    _pr92_snap_available = bool(_pr92_underlying_q or _pr92_option_q)
                     _pr92_audit = build_watcher_arm_audit(
                         classification=_pr92_classification,
                         symbol=ticker,
@@ -1249,6 +1270,18 @@ def _dispatch(
                         trigger_price=getattr(plan, "trigger_price", None),
                         stop_price=getattr(plan, "stop_price", None),
                         target_price=getattr(plan, "target_price", None),
+                        # Quote snapshot — pass what we found; None means truly absent
+                        underlying=_pr92_underlying_q,
+                        option=_pr92_option_q,
+                        quote_source=_pr92_quote_src,
+                        # Explicit coverage flags
+                        quote_snapshot_available=_pr92_snap_available,
+                        underlying_quote_available=bool(_pr92_underlying_q),
+                        option_quote_available=bool(_pr92_option_q),
+                        quote_snapshot_missing_reason=(
+                            None if _pr92_snap_available
+                            else "not_available_in_queue_arm_failure_context"
+                        ),
                     )
                     log.info(
                         "WATCHER_ARM_AUDIT signal_id=%s canonical_signal_id=%s "
