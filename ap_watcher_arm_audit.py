@@ -660,6 +660,11 @@ def build_watcher_arm_audit(
     quote_request_started_at:   Optional[str] = None,
     quote_request_completed_at: Optional[str] = None,
     quote_request_latency_ms:   Optional[float] = None,
+    # PR92 amendment: explicit quote snapshot coverage (no new fetches)
+    quote_snapshot_available:       Optional[bool] = None,
+    underlying_quote_available:     Optional[bool] = None,
+    option_quote_available:         Optional[bool] = None,
+    quote_snapshot_missing_reason:  Optional[str]  = None,
 ) -> dict[str, Any]:
     """Build the canonical watcher_arm_audit JSON. Output is dossier-shaped
     (spec §10) so PR93 can ingest it directly.
@@ -766,6 +771,43 @@ def build_watcher_arm_audit(
         "option_quote_ts":             (option or {}).get("quote_ts")
                                         or (option or {}).get("ts"),
         "option_quote_age_seconds":    quote_age_seconds(option),
+        # PR92 amendment: explicit quote snapshot coverage flags
+        # These tell consumers whether quote data was available — never fake values.
+        "quote_snapshot_available": (
+            quote_snapshot_available if quote_snapshot_available is not None
+            else bool(underlying or option)
+        ),
+        "underlying_quote_available": (
+            underlying_quote_available if underlying_quote_available is not None
+            else bool(underlying)
+        ),
+        "option_quote_available": (
+            option_quote_available if option_quote_available is not None
+            else bool(option)
+        ),
+        "quote_snapshot_missing_reason": (
+            quote_snapshot_missing_reason
+            if quote_snapshot_missing_reason is not None
+            else (None if (underlying or option)
+                  else "not_available_in_queue_arm_failure_context")
+        ),
+        # data_quality/warnings — present when quote snapshot is absent
+        "data_quality": {
+            "warnings": (
+                []
+                if (underlying or option)
+                else [
+                    {
+                        "code":           "QUOTE_SNAPSHOT_UNAVAILABLE",
+                        "message":        (
+                            "Watcher arm audit classified raw reason, but no full "
+                            "quote snapshot was available in this branch."
+                        ),
+                        "affected_stage": "watcher_arm",
+                    }
+                ]
+            ),
+        },
         # Quote source / domain
         "quote_source":                quote_source,
         "quote_snapshot_id":           quote_snapshot_id,
