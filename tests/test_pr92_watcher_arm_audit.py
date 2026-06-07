@@ -854,3 +854,149 @@ def test_attempt_record_includes_all_required_keys():
         "decision_after_attempt",
     ):
         assert key in rec
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PR92 amendment — quote snapshot coverage tests
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestQuoteSnapshotCoverage:
+    """Verify explicit quote coverage flags and data_quality/warnings."""
+
+    def _cls(self, raw="underlying price unavailable"):
+        return classify_arm_failure(raw)
+
+    # 1. Audit builds with no quote snapshot
+    def test_audit_builds_with_no_quote_snapshot(self):
+        audit = build_watcher_arm_audit(
+            classification=self._cls(),
+            symbol="AAPL",
+        )
+        assert isinstance(audit, dict)
+        assert "final_decision" in audit
+
+    # 2. Missing quote snapshot is explicitly flagged
+    def test_missing_quote_flagged_quote_snapshot_available_false(self):
+        audit = build_watcher_arm_audit(
+            classification=self._cls(),
+            symbol="AAPL",
+            # No underlying or option passed
+        )
+        assert audit["quote_snapshot_available"] is False
+
+    def test_missing_quote_flagged_underlying_quote_available_false(self):
+        audit = build_watcher_arm_audit(classification=self._cls())
+        assert audit["underlying_quote_available"] is False
+
+    def test_missing_quote_flagged_option_quote_available_false(self):
+        audit = build_watcher_arm_audit(classification=self._cls())
+        assert audit["option_quote_available"] is False
+
+    def test_missing_quote_snapshot_reason_set(self):
+        audit = build_watcher_arm_audit(classification=self._cls())
+        assert audit["quote_snapshot_missing_reason"] ==             "not_available_in_queue_arm_failure_context"
+
+    # 3. Quote fields are null, not fake
+    def test_underlying_bid_is_null_when_no_quote(self):
+        audit = build_watcher_arm_audit(classification=self._cls())
+        assert audit["underlying_bid"] is None
+
+    def test_underlying_ask_is_null_when_no_quote(self):
+        audit = build_watcher_arm_audit(classification=self._cls())
+        assert audit["underlying_ask"] is None
+
+    def test_underlying_mid_is_null_when_no_quote(self):
+        audit = build_watcher_arm_audit(classification=self._cls())
+        assert audit["underlying_mid"] is None
+
+    def test_underlying_last_is_null_when_no_quote(self):
+        audit = build_watcher_arm_audit(classification=self._cls())
+        assert audit["underlying_last"] is None
+
+    def test_underlying_quote_ts_is_null_when_no_quote(self):
+        audit = build_watcher_arm_audit(classification=self._cls())
+        assert audit["underlying_quote_ts"] is None
+
+    def test_underlying_quote_age_seconds_is_null_when_no_quote(self):
+        audit = build_watcher_arm_audit(classification=self._cls())
+        assert audit["underlying_quote_age_seconds"] is None
+
+    def test_option_bid_is_null_when_no_quote(self):
+        audit = build_watcher_arm_audit(classification=self._cls())
+        assert audit["option_bid"] is None
+
+    def test_option_ask_is_null_when_no_quote(self):
+        audit = build_watcher_arm_audit(classification=self._cls())
+        assert audit["option_ask"] is None
+
+    def test_option_mid_is_null_when_no_quote(self):
+        audit = build_watcher_arm_audit(classification=self._cls())
+        assert audit["option_mid"] is None
+
+    def test_option_last_is_null_when_no_quote(self):
+        audit = build_watcher_arm_audit(classification=self._cls())
+        assert audit["option_last"] is None
+
+    def test_option_quote_ts_is_null_when_no_quote(self):
+        audit = build_watcher_arm_audit(classification=self._cls())
+        assert audit["option_quote_ts"] is None
+
+    def test_option_quote_age_seconds_is_null_when_no_quote(self):
+        audit = build_watcher_arm_audit(classification=self._cls())
+        assert audit["option_quote_age_seconds"] is None
+
+    # 4. data_quality/warnings emitted when no quote
+    def test_data_quality_warnings_emitted_when_no_quote(self):
+        audit = build_watcher_arm_audit(classification=self._cls())
+        warnings = audit.get("data_quality", {}).get("warnings", [])
+        assert len(warnings) == 1
+        assert warnings[0]["code"] == "QUOTE_SNAPSHOT_UNAVAILABLE"
+        assert warnings[0]["affected_stage"] == "watcher_arm"
+        assert "quote snapshot" in warnings[0]["message"].lower()
+
+    def test_data_quality_warnings_empty_when_quote_present(self):
+        audit = build_watcher_arm_audit(
+            classification=self._cls(),
+            underlying={"bid": 185.0, "ask": 185.1, "quote_ts": "2026-06-04T13:00:00Z"},
+        )
+        warnings = audit.get("data_quality", {}).get("warnings", [])
+        assert warnings == []
+
+    # 5. Coverage flags correct when quote IS present
+    def test_coverage_flags_true_when_underlying_present(self):
+        audit = build_watcher_arm_audit(
+            classification=self._cls(),
+            underlying={"bid": 185.0, "ask": 185.1},
+        )
+        assert audit["quote_snapshot_available"] is True
+        assert audit["underlying_quote_available"] is True
+        assert audit["quote_snapshot_missing_reason"] is None
+
+    def test_coverage_flags_explicit_override_respected(self):
+        """Caller-supplied flags take precedence over inferred."""
+        audit = build_watcher_arm_audit(
+            classification=self._cls(),
+            underlying=None,
+            quote_snapshot_available=False,
+            underlying_quote_available=False,
+            option_quote_available=False,
+            quote_snapshot_missing_reason="not_available_in_queue_arm_failure_context",
+        )
+        assert audit["quote_snapshot_available"] is False
+        assert audit["quote_snapshot_missing_reason"] ==             "not_available_in_queue_arm_failure_context"
+
+    # 6. reason_code classification still works from raw_reason
+    def test_reason_code_classification_works_without_quote(self):
+        cls = classify_arm_failure("underlying price unavailable")
+        audit = build_watcher_arm_audit(classification=cls)
+        assert audit["reason_code"] is not None
+        assert audit["raw_reason"] == "underlying price unavailable"
+
+    # 7. Secret redaction still applies
+    def test_secret_redaction_with_no_quote(self):
+        audit = build_watcher_arm_audit(
+            classification=self._cls(),
+            broker_base_url="https://sandbox.tradier.com/v1/accounts/VA12345?token=SECRET_TOKEN",
+        )
+        audit_str = str(audit)
+        assert "SECRET_TOKEN" not in audit_str
