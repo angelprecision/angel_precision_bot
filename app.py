@@ -3583,6 +3583,251 @@ def admin_live_execution_truth_sample():
     return jsonify(sample)
 
 
+# =============================================================================
+# PR #91 — Daily Operator Folders -> Weekly Archive Pipeline
+# =============================================================================
+# Archive/reporting only. No trading logic changes.
+#
+# Admin routes:
+#   POST /admin/daily-rollup/run    build + upsert one day
+#   GET  /admin/daily-rollup/       read one day (Supabase preferred,
+#                                    disk fallback)
+#   POST /admin/weekly-rollup/run   aggregate one week from daily artifacts
+#   GET  /admin/weekly-rollup/      read one week
+#   GET  /admin/operator/folder-status  day-by-day complete/partial/missing
+#
+# Cron routes (CRON_SECRET via X-Cron-Secret header):
+#   POST /cron/daily-rollup    intended after market close
+#   POST /cron/weekly-rollup   aggregate already-created daily folders
+#
+# Read-only routes serve from Supabase first; disk fallback returns
+# source='disk_fallback' so consumers can tell which path they got.
+# =============================================================================
+
+import os as _os_pr91
+
+CRON_SECRET = _os_pr91.environ.get("CRON_SECRET", "").strip()
+
+
+def _require_cron_secret():
+    """Header-based gate for /cron/* routes. Returns Flask response on
+    failure or None on pass."""
+    if not CRON_SECRET:
+        return jsonify({"ok": False, "error": "CRON_SECRET not configured"}), 503
+    supplied = request.headers.get("X-Cron-Secret", "")
+    import hmac as _hmac_cron
+    if not _hmac_cron.compare_digest(supplied, CRON_SECRET):
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    return None
+
+
+def _parse_date_arg(value):
+    """Accept 'YYYY-MM-DD' or None -> today (UTC). Raises ValueError on bad input."""
+    from datetime import datetime as _dt, timezone as _tz
+    if value is None or value == "":
+        return _dt.now(_tz.utc).date()
+    return _dt.strptime(str(value)[:10], "%Y-%m-%d").date()
+
+
+def _run_daily_rollup(date_value, *, disk_export=True):
+    """Shared helper for admin + cron daily rollup. Builds, upserts,
+    and returns the response dict."""
+    from ap_operator_daily_folders import (
+        build_daily_operator_folder, upsert_daily_folder,
+    )
+    folder = build_daily_operator_folder(
+        date_value,
+        disk_export=disk_export,
+    )
+    wrote = upsert_daily_folder(folder)
+    return {
+        "ok":               True,
+        "date":             folder.folder_date.isoformat(),
+        "iso_week":         folder.iso_week,
+        "sections_written": [s for s in folder.sections.keys()
+                              if s not in folder.missing_sections],
+        "missing_sections": list(folder.missing_sections),
+        "section_errors":   dict(folder.section_errors),
+        "source_status":    folder.source_status,
+        "supabase_written": bool(wrote),
+    }
+
+
+def _run_weekly_rollup(*, iso_week=None, date_value=None, disk_export=True):
+    from ap_operator_daily_folders import iso_week_string
+    from ap_operator_weekly_rollup import (
+        build_weekly_rollup, upsert_weekly_rollup,
+    )
+    if iso_week:
+        target = iso_week
+    elif date_value is not None:
+        target = iso_week_string(date_value)
+    else:
+        from datetime import datetime as _dt, timezone as _tz
+        target = iso_week_string(_dt.now(_tz.utc).date())
+    rollup = build_weekly_rollup(target, disk_export=disk_export)
+    wrote = upsert_weekly_rollup(rollup)
+    public = rollup.to_public()
+    public["supabase_written"] = bool(wrote)
+    return public
+
+
+@app.post("/admin/daily-rollup/run")
+@_require_admin
+def admin_daily_rollup_run():
+    """Build the full daily operator folder, upsert to Supabase,
+    optionally mirror to disk. Body: {date, force}."""
+    try:
+        body = request.get_json(silent=True) or {}
+        target_date = _parse_date_arg(body.get("date"))
+    except ValueError as e:
+        return jsonify({"ok": False, "error": f"bad date: {e}"}), 400
+    try:
+        out = _run_daily_rollup(target_date, disk_export=True)
+    except Exception as e:
+        admin_log.error("daily-rollup/run failed: %s", e)
+        return jsonify({"ok": False, "error": f"daily rollup failed: {e}"}), 500
+    return jsonify(out)
+
+
+@app.get("/admin/daily-rollup/")
+@_require_admin
+def admin_daily_rollup_get():
+    """Return a stored daily folder. Supabase preferred, disk fallback.
+    Response includes source='supabase' or source='disk_fallback'."""
+    raw = request.args.get("date")
+    try:
+        target_date = _parse_date_arg(raw)
+    except ValueError as e:
+        return jsonify({"ok": False, "error": f"bad date: {e}"}), 400
+    try:
+        from ap_operator_daily_folders import fetch_daily_folder, read_disk_export
+        row = fetch_daily_folder(target_date)
+        if row is not None:
+            return jsonify({"ok": True, "source": "supabase", "folder": row})
+        disk = read_disk_export(target_date)
+        if disk is not None:
+            return jsonify({"ok": True, "source": "disk_fallback", "folder": disk})
+        return jsonify({"ok": False, "error": "not_found", "date": target_date.isoformat()}), 404
+    except Exception as e:
+        admin_log.error("daily-rollup GET failed: %s", e)
+        return jsonify({"ok": False, "error": f"daily rollup read failed: {e}"}), 500
+
+
+@app.post("/admin/weekly-rollup/run")
+@_require_admin
+def admin_weekly_rollup_run():
+    """Build weekly rollup from daily artifacts. Body: {date} or {iso_week}."""
+    body = request.get_json(silent=True) or {}
+    iso_week = body.get("iso_week")
+    raw_date = body.get("date")
+    try:
+        date_value = _parse_date_arg(raw_date) if raw_date else None
+    except ValueError as e:
+        return jsonify({"ok": False, "error": f"bad date: {e}"}), 400
+    try:
+        out = _run_weekly_rollup(iso_week=iso_week, date_value=date_value, disk_export=True)
+    except Exception as e:
+        admin_log.error("weekly-rollup/run failed: %s", e)
+        return jsonify({"ok": False, "error": f"weekly rollup failed: {e}"}), 500
+    return jsonify({"ok": True, **out})
+
+
+@app.get("/admin/weekly-rollup/")
+@_require_admin
+def admin_weekly_rollup_get():
+    """Read a stored weekly rollup row by ISO week (or by date)."""
+    iso_week = request.args.get("iso_week") or None
+    raw_date = request.args.get("date") or None
+    if not iso_week and raw_date:
+        try:
+            from ap_operator_daily_folders import iso_week_string
+            iso_week = iso_week_string(_parse_date_arg(raw_date))
+        except ValueError as e:
+            return jsonify({"ok": False, "error": f"bad date: {e}"}), 400
+    if not iso_week:
+        return jsonify({"ok": False, "error": "iso_week or date required"}), 400
+    try:
+        from ap_operator_weekly_rollup import fetch_weekly_rollup
+        row = fetch_weekly_rollup(iso_week)
+        if row is None:
+            return jsonify({"ok": False, "error": "not_found", "iso_week": iso_week}), 404
+        return jsonify({"ok": True, "source": "supabase", "weekly": row})
+    except Exception as e:
+        admin_log.error("weekly-rollup GET failed: %s", e)
+        return jsonify({"ok": False, "error": f"weekly rollup read failed: {e}"}), 500
+
+
+@app.get("/admin/operator/folder-status")
+@_require_admin
+def admin_operator_folder_status():
+    """Day-by-day status grid for the weekly archive dashboard. Returns
+    the same daily_index / days_present / days_missing / section_errors_by_day
+    structure as the weekly rollup, but built on-demand without writing."""
+    iso_week = request.args.get("iso_week") or None
+    raw_date = request.args.get("date") or None
+    try:
+        from ap_operator_daily_folders import iso_week_string
+        if not iso_week:
+            iso_week = iso_week_string(_parse_date_arg(raw_date))
+        from ap_operator_weekly_rollup import build_weekly_rollup
+        rollup = build_weekly_rollup(iso_week, disk_export=False)
+        return jsonify({"ok": True, **rollup.to_public()})
+    except Exception as e:
+        admin_log.error("operator/folder-status failed: %s", e)
+        return jsonify({"ok": False, "error": f"folder status failed: {e}"}), 500
+
+
+@app.post("/cron/daily-rollup")
+def cron_daily_rollup():
+    """Cron entry point: build prior trading day daily folder. Triggered
+    after market close. Protected by CRON_SECRET via X-Cron-Secret header."""
+    guard = _require_cron_secret()
+    if guard is not None:
+        return guard
+    body = request.get_json(silent=True) or {}
+    raw_date = body.get("date")
+    try:
+        if raw_date:
+            target_date = _parse_date_arg(raw_date)
+        else:
+            # After market close: rollup TODAY (US trading day already closed).
+            # If invoked outside trading hours (overnight cron), default to today;
+            # caller can override with explicit date.
+            from datetime import datetime as _dt, timezone as _tz
+            target_date = _dt.now(_tz.utc).date()
+    except ValueError as e:
+        return jsonify({"ok": False, "error": f"bad date: {e}"}), 400
+    try:
+        out = _run_daily_rollup(target_date, disk_export=True)
+    except Exception as e:
+        admin_log.error("cron/daily-rollup failed: %s", e)
+        return jsonify({"ok": False, "error": f"daily rollup failed: {e}"}), 500
+    return jsonify(out)
+
+
+@app.post("/cron/weekly-rollup")
+def cron_weekly_rollup():
+    """Cron entry point: aggregate daily folders into the weekly archive.
+    Does NOT silently skip missing days — they are surfaced in days_missing."""
+    guard = _require_cron_secret()
+    if guard is not None:
+        return guard
+    body = request.get_json(silent=True) or {}
+    iso_week = body.get("iso_week")
+    raw_date = body.get("date")
+    try:
+        date_value = _parse_date_arg(raw_date) if raw_date else None
+    except ValueError as e:
+        return jsonify({"ok": False, "error": f"bad date: {e}"}), 400
+    try:
+        out = _run_weekly_rollup(iso_week=iso_week, date_value=date_value, disk_export=True)
+    except Exception as e:
+        admin_log.error("cron/weekly-rollup failed: %s", e)
+        return jsonify({"ok": False, "error": f"weekly rollup failed: {e}"}), 500
+    return jsonify({"ok": True, **out})
+
+
 @app.get("/health")
 def health_basic():
     """Basic liveness check — no auth required."""
