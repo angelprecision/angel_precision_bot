@@ -625,8 +625,25 @@ def test_migration_file_exists_and_is_idempotent():
     # The 15 section columns must all be present
     for sec in SECTION_NAMES:
         assert sec.upper() in sql_up, f"migration must define column {sec}"
-    # weekly_rollups primary key on iso_week
-    assert "ISO_WEEK                 TEXT        PRIMARY KEY" in sql_up
+    # PR91 amendment: weekly_rollups must be backward-compatible.
+    # iso_week is NOT the primary key (legacy PK preserved). Instead
+    # we rely on a UNIQUE PARTIAL INDEX as the ON CONFLICT target.
+    assert "CREATE UNIQUE INDEX IF NOT EXISTS UQ_WEEKLY_ROLLUPS_ISO_WEEK" in sql_up
+    assert "WHERE ISO_WEEK IS NOT NULL" in sql_up
+    # iso_week must be defensively ADDed via ALTER for legacy installs.
+    assert "ADD COLUMN IF NOT EXISTS ISO_WEEK                TEXT" in sql_up
+    # The fresh-install CREATE TABLE must NOT pin iso_week as the PK.
+    # (We use id BIGSERIAL on fresh installs so legacy PKs are never replaced.)
+    fresh_create = sql_up[sql_up.index("CREATE TABLE IF NOT EXISTS WEEKLY_ROLLUPS"):]
+    fresh_create = fresh_create[:fresh_create.index(");")]
+    assert "ISO_WEEK                 TEXT        PRIMARY KEY" not in fresh_create, (
+        "PR91 amendment: iso_week must NOT be the primary key on fresh installs "
+        "(would collide with legacy PK shape)"
+    )
+    # Best-effort iso_week backfill from week_start must be present.
+    assert "UPDATE WEEKLY_ROLLUPS" in sql_up
+    assert "WHERE ISO_WEEK IS NULL" in sql_up
+    assert "AND WEEK_START IS NOT NULL" in sql_up
 
 
 def test_iso_week_helpers_round_trip():
@@ -634,3 +651,244 @@ def test_iso_week_helpers_round_trip():
     start, end = iso_week_bounds("2026-W23")
     assert start == date(2026, 6, 1)   # Monday
     assert end == date(2026, 6, 7)     # Sunday
+
+
+# ===========================================================================
+# PR91 AMENDMENT — weekly_rollups backward-compatibility tests
+# ===========================================================================
+# Spec (from user):
+#   * weekly_rollups may already exist without iso_week
+#   * migration must add iso_week safely
+#   * legacy weekly rows must not be deleted or broken
+#   * weekly archive route must remain backward-compatible
+#   * PR91 weekly rollup can write new iso_week rows without changing
+#     the old primary key behavior
+# ===========================================================================
+
+class _LegacyAwareCursor:
+    """Cursor that simulates a pre-PR91 weekly_rollups table:
+      * a legacy row that lacks the iso_week column (and any PR91 column)
+      * fresh PR91 rows coexist via the unique partial index on iso_week
+    The store is a dict keyed by either iso_week (PR91 rows) or a sentinel
+    legacy id (legacy rows)."""
+
+    def __init__(self, store: dict):
+        self._store = store
+        self.description = None
+        self._result: list = []
+        self.writes = 0
+
+    def execute(self, sql, args=None):
+        s = (sql or "").strip().lower()
+        args = args or []
+        if s.startswith("select"):
+            # SELECT * FROM weekly_rollups WHERE iso_week=%s
+            iso = args[0] if args else None
+            row = self._store.get("weekly", {}).get(iso)
+            self._result = [row] if row else []
+            self.description = [(k, None) for k in (row.keys() if row else ["iso_week"])]
+        else:
+            self.writes += 1
+            if "insert into weekly_rollups" in s:
+                # Parse the INSERT to reconstruct columns + values.
+                lp = s.find("(")
+                rp = s.find(")", lp + 1)
+                cols = [c.strip() for c in s[lp + 1: rp].split(",")]
+                row = dict(zip(cols, list(args)))
+                # Decode JSONB string blobs back to objects
+                for k, v in list(row.items()):
+                    if isinstance(v, str) and v and v[0] in "[{" and v[-1] in "]}":
+                        try:
+                            row[k] = json.loads(v)
+                        except Exception:
+                            pass
+                # ON CONFLICT (iso_week) DO UPDATE — simulate by replacing
+                # any row sharing the same iso_week key.
+                self._store.setdefault("weekly", {})[row["iso_week"]] = row
+
+    def fetchone(self):
+        if not self._result:
+            return None
+        r = self._result[0]
+        return tuple(r.get(d[0]) for d in self.description)
+
+    def fetchall(self):
+        return [tuple(r.get(d[0]) for d in self.description) for r in self._result]
+
+
+class _LegacyConn:
+    def __init__(self, cur):
+        self._cur = cur
+    def __enter__(self):
+        return self._cur
+    def __exit__(self, *exc):
+        return False
+
+
+def _make_legacy_factory(store):
+    def factory():
+        return _LegacyConn(_LegacyAwareCursor(store))
+    return factory
+
+
+def test_16_legacy_weekly_rollups_table_without_iso_week_does_not_break_fetch():
+    """Simulate a pre-existing weekly_rollups row from an earlier PR
+    that has neither iso_week nor any PR91 column. fetch_weekly_rollup
+    must NOT crash; it must return None (legacy row keyed differently)
+    OR return a row decorated with compatibility_warnings if found."""
+    # Store a 'legacy' row keyed by the iso label so the SELECT can find it.
+    # The row body intentionally lacks PR91 columns.
+    legacy_row = {
+        "iso_week":   "2026-W22",
+        # NOTE: NO PR91 columns (no days_present, totals, etc.)
+        # Legacy columns the old dashboard might have written:
+        "summary":    {"legacy": True, "closed_trades": 7},
+        "days":       ["2026-05-25", "2026-05-26"],
+    }
+    store = {"weekly": {"2026-W22": legacy_row}}
+    factory = _make_legacy_factory(store)
+    out = fetch_weekly_rollup("2026-W22", conn_factory=factory)
+    assert out is not None
+    # Legacy columns are preserved — no rename, no delete
+    assert out.get("summary") == {"legacy": True, "closed_trades": 7}
+    assert out.get("days") == ["2026-05-25", "2026-05-26"]
+    # Compatibility warnings are surfaced for missing PR91 columns
+    warnings = out.get("compatibility_warnings") or []
+    codes = [w.get("code") for w in warnings]
+    assert any(c == "LEGACY_WEEKLY_ROLLUP_MISSING_COLUMN" for c in codes)
+    missing_cols = {w.get("column") for w in warnings}
+    # At least the PR91 aggregate columns should be flagged
+    assert "days_present" in missing_cols
+    assert "totals" in missing_cols
+
+
+def test_17_migration_adds_iso_week_via_alter_safely():
+    """Migration must be additive: when weekly_rollups already exists
+    without iso_week, the ALTER TABLE...ADD COLUMN IF NOT EXISTS iso_week
+    is the line that lands it. This test asserts that line is present
+    and uses the IF NOT EXISTS guard."""
+    path = os.path.join(ROOT, "migrations",
+                        "20260608_operator_daily_folders.sql")
+    sql = open(path).read()
+    sql_up = sql.upper()
+    # ALTER TABLE WEEKLY_ROLLUPS appears, with ADD COLUMN IF NOT EXISTS ISO_WEEK
+    assert "ALTER TABLE WEEKLY_ROLLUPS" in sql_up
+    assert "ADD COLUMN IF NOT EXISTS ISO_WEEK" in sql_up
+    # No PK drop / replace
+    assert "DROP CONSTRAINT" not in sql_up
+    assert "DROP PRIMARY KEY" not in sql_up
+
+
+def test_18_legacy_weekly_rows_not_deleted_or_broken_by_migration_text():
+    """Static check: the migration must contain NO destructive statements
+    against weekly_rollups data. Backfill must be bounded by
+    iso_week IS NULL so it never overwrites a populated row."""
+    path = os.path.join(ROOT, "migrations",
+                        "20260608_operator_daily_folders.sql")
+    sql = open(path).read()
+    sql_up = sql.upper()
+    for forbidden in (
+        "DROP TABLE WEEKLY_ROLLUPS",
+        "DELETE FROM WEEKLY_ROLLUPS",
+        "TRUNCATE WEEKLY_ROLLUPS",
+        "ALTER TABLE WEEKLY_ROLLUPS DROP COLUMN",
+        "ALTER TABLE WEEKLY_ROLLUPS RENAME",
+        "ALTER TABLE WEEKLY_ROLLUPS ALTER COLUMN",
+    ):
+        assert forbidden not in sql_up, f"migration contains forbidden: {forbidden}"
+    # The backfill UPDATE must be bounded by iso_week IS NULL
+    # (otherwise it would overwrite legitimate values).
+    assert "UPDATE WEEKLY_ROLLUPS" in sql_up
+    assert "WHERE ISO_WEEK IS NULL" in sql_up
+
+
+def test_19_weekly_archive_route_backward_compatible_via_fetch_warning():
+    """The /admin/weekly-rollup GET path returns whatever fetch_weekly_rollup
+    yields. As long as fetch_weekly_rollup returns the legacy row with
+    compatibility_warnings (Test 16), the public route remains
+    backward-compatible — it does NOT crash on a legacy row.
+
+    Here we simulate the route's read path against a legacy store and
+    verify the resulting payload is JSON-serializable and includes the
+    warnings."""
+    legacy_row = {
+        "iso_week": "2026-W22",
+        "summary":  {"closed_trades": 3},
+    }
+    store = {"weekly": {"2026-W22": legacy_row}}
+    factory = _make_legacy_factory(store)
+    out = fetch_weekly_rollup("2026-W22", conn_factory=factory)
+    # Must be JSON-serializable — i.e. dict only, no datetime, etc.
+    blob = json.dumps(out, default=str)
+    assert "2026-W22" in blob
+    assert "compatibility_warnings" in blob
+
+
+def test_20_pr91_can_write_new_iso_week_without_touching_legacy_pk():
+    """PR91's upsert path writes ONLY the columns the migration
+    guarantees on every install (iso_week + the PR91 aggregate columns).
+    We never reference 'id' or any legacy PK column in the upsert SQL
+    — so the legacy primary key (whatever it was) is untouched.
+
+    Here we verify the generated upsert SQL by inspecting the column
+    list that to_db_row() emits."""
+    from ap_operator_weekly_rollup import WeeklyRollup
+    rollup = WeeklyRollup(
+        iso_week="2026-W23",
+        week_start=date(2026, 6, 1),
+        week_end=date(2026, 6, 7),
+        generated_at="2026-06-07T00:00:00+00:00",
+        totals={"total_signals": 12},
+    )
+    row = rollup.to_db_row()
+    cols = set(row.keys())
+    # We DO NOT include 'id' (would collide with legacy BIGSERIAL/SERIAL PKs)
+    assert "id" not in cols
+    # We DO include iso_week and every PR91 aggregate column
+    must_include = {
+        "iso_week", "week_start", "week_end", "generated_at",
+        "days_present", "days_missing", "daily_index",
+        "section_errors_by_day", "missing_sections_by_day",
+        "source_status_by_day", "totals",
+    }
+    assert must_include.issubset(cols), f"missing: {must_include - cols}"
+    # And the new write actually lands in the store via the upsert.
+    store: dict = {}
+    factory = _make_legacy_factory(store)
+    assert upsert_weekly_rollup(rollup, conn_factory=factory) is True
+    assert "2026-W23" in store["weekly"]
+    persisted = store["weekly"]["2026-W23"]
+    assert persisted["iso_week"] == "2026-W23"
+    # Re-running the upsert overwrites the same iso_week row — no new row.
+    rollup2 = WeeklyRollup(
+        iso_week="2026-W23",
+        week_start=date(2026, 6, 1),
+        week_end=date(2026, 6, 7),
+        generated_at="2026-06-07T12:00:00+00:00",
+        totals={"total_signals": 99},
+    )
+    assert upsert_weekly_rollup(rollup2, conn_factory=factory) is True
+    assert len(store["weekly"]) == 1
+    assert store["weekly"]["2026-W23"]["totals"]["total_signals"] == 99
+
+
+def test_21_upsert_refuses_to_write_null_iso_week():
+    """Defensive: a rollup with empty iso_week must NOT be written
+    because the ON CONFLICT target is the unique partial index on
+    iso_week WHERE iso_week IS NOT NULL. Writing NULL would create an
+    unconstrained duplicate. The module records a compatibility warning
+    instead."""
+    from ap_operator_weekly_rollup import WeeklyRollup
+    rollup = WeeklyRollup(
+        iso_week="",   # explicit empty string — also covers None
+        week_start=date(2026, 6, 1),
+        week_end=date(2026, 6, 7),
+        generated_at="2026-06-07T00:00:00+00:00",
+    )
+    store: dict = {}
+    factory = _make_legacy_factory(store)
+    ok = upsert_weekly_rollup(rollup, conn_factory=factory)
+    assert ok is False
+    assert store.get("weekly", {}) == {}
+    codes = [w.get("code") for w in rollup.compatibility_warnings]
+    assert "REFUSED_WRITE_NO_ISO_WEEK" in codes

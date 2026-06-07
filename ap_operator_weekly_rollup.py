@@ -217,8 +217,16 @@ class WeeklyRollup:
     missing_sections_by_day: dict[str, list[str]]          = field(default_factory=dict)
     source_status_by_day:    dict[str, str]                = field(default_factory=dict)
     totals:                  dict[str, Any]                = field(default_factory=dict)
+    # PR91 amendment: backward-compat warnings (legacy rows missing iso_week,
+    # legacy schema differences, etc.). Surfaced in to_public() so the
+    # weekly dashboard can flag the day rather than crashing.
+    compatibility_warnings:  list[dict[str, Any]]          = field(default_factory=list)
 
     def to_db_row(self) -> dict[str, Any]:
+        # NOTE: 'id' (BIGSERIAL on fresh installs) is never set by us.
+        # We ONLY write the columns the PR91 migration guarantees exist
+        # on every install (legacy or fresh). The ON CONFLICT target is
+        # the uq_weekly_rollups_iso_week unique partial index.
         return {
             "iso_week":                self.iso_week,
             "week_start":              self.week_start.isoformat(),
@@ -268,6 +276,9 @@ class WeeklyRollup:
             "top_failure_reason":             t.get("top_failure_reason"),
             "client_discrepancy_count":       t.get("client_discrepancy_count"),
             "partial_keys":                   t.get("partial_keys", []),
+            # PR91 amendment: backward-compat warnings (always present,
+            # empty list when the schema is fully PR91-shaped).
+            "compatibility_warnings":         list(self.compatibility_warnings),
         }
 
 
@@ -393,8 +404,32 @@ def upsert_weekly_rollup(
     *,
     conn_factory=None,
 ) -> bool:
+    """Upsert a weekly rollup row.
+
+    Backward-compat note (PR91 amendment): the ON CONFLICT target is the
+    iso_week column, which Postgres resolves against the unique partial
+    index `uq_weekly_rollups_iso_week` created by the PR91 migration.
+    We deliberately do NOT name a primary-key constraint here — the
+    legacy primary key (if any) may differ in shape, and we are not
+    allowed to touch it. The unique partial index covers exactly the
+    rows whose iso_week IS NOT NULL, which is precisely the set of
+    rows PR91 ever writes.
+
+    We also do NOT write the BIGSERIAL `id` column on fresh installs.
+    The fresh-install table has id BIGSERIAL PRIMARY KEY which
+    auto-populates on INSERT.
+    """
     cf = conn_factory if conn_factory is not None else _default_conn_factory()
     if cf is None:
+        return False
+    if not rollup.iso_week:
+        # Refuse to write a row without iso_week — the conflict target
+        # cannot match a NULL value and a legacy row could be created
+        # by accident. Surface as a compatibility warning instead.
+        rollup.compatibility_warnings.append({
+            "code":    "REFUSED_WRITE_NO_ISO_WEEK",
+            "message": "upsert_weekly_rollup refused to write a row with NULL iso_week",
+        })
         return False
     row = rollup.to_db_row()
     cols = list(row.keys())
@@ -426,6 +461,14 @@ def fetch_weekly_rollup(
     *,
     conn_factory=None,
 ) -> Optional[dict[str, Any]]:
+    """Fetch a weekly rollup row by iso_week, tolerating legacy schemas.
+
+    Backward-compat (PR91 amendment): if the row exists but is missing
+    any PR91-introduced column, we DO NOT crash. We surface a
+    compatibility_warnings list on the returned dict so the dashboard
+    can flag the row and the user knows the underlying record came from
+    an older PR. We never overwrite or delete legacy columns.
+    """
     cf = conn_factory if conn_factory is not None else _default_conn_factory()
     if cf is None:
         return None
@@ -437,8 +480,26 @@ def fetch_weekly_rollup(
             if not row:
                 return None
             if isinstance(row, dict):
-                return dict(row)
-            return dict(zip(desc, row))
+                out = dict(row)
+            else:
+                out = dict(zip(desc, row))
+            # Attach compatibility warnings for any missing PR91 column.
+            out.setdefault("compatibility_warnings", [])
+            for pr91_col in (
+                "iso_week", "week_start", "week_end",
+                "days_present", "days_missing", "daily_index",
+                "section_errors_by_day", "missing_sections_by_day",
+                "source_status_by_day", "totals",
+            ):
+                if pr91_col not in out:
+                    out["compatibility_warnings"].append({
+                        "code":    "LEGACY_WEEKLY_ROLLUP_MISSING_COLUMN",
+                        "column":  pr91_col,
+                        "message": (f"weekly_rollups row for {iso_week} is missing "
+                                    f"PR91 column '{pr91_col}'. The row predates the "
+                                    f"PR91 migration; treat as partial."),
+                    })
+            return out
     except Exception as e:
         log.warning("fetch_weekly_rollup failed for %s: %s", iso_week, e)
         return None
