@@ -581,51 +581,6 @@ def _dispatch(
     if not decision.ok:
         log.info(f"[{ticker}] BLOCKED | stage={decision.stage} reason={decision.reason}")
 
-        # Overnight-candidate rescue: if market is closed AND signal is 1d/1w,
-        # write it as WATCHING for morning reeval instead of discarding.
-        # MC score thresholds are calibrated for intraday live quotes; daily
-        # setups need to be re-evaluated at breach time with live data.
-        try:
-            _oc_now_et    = _now_et()
-            _oc_in_mkt    = _is_regular_session_et(_oc_now_et)
-            _oc_timeframe = str(payload.get("timeframe") or "1d").lower().strip()
-            _oc_valid_tfs = {"1d", "daily", "overnight", "1w", "weekly"}
-            _oc_bypass    = bool(payload.get("bypass_market_hours") or payload.get("test_mode"))
-            _overnight_enforce = str(
-                __import__("os").getenv("OVERNIGHT_ENABLED", "true")
-            ).lower() in ("true", "1")
-            if (not _oc_in_mkt and not _oc_bypass and
-                    _oc_timeframe in _oc_valid_tfs and _overnight_enforce):
-                log.info(
-                    "[%s] overnight_candidate_loaded=true signal=%s market_hours=false "
-                    "timeframe=%s mc_block_reason=%s contract_selection=deferred "
-                    "execution_pipeline=watching_for_morning_reeval "
-                    "— overriding MC block to WATCHING for morning reeval",
-                    ticker, signal_id, _oc_timeframe, decision.reason,
-                )
-                _oc_ok = _log_signal_to_db(
-                    signal_id=signal_id, client_id=client_id, ticker=ticker,
-                    side=payload.get("side", ""), score=float(payload.get("score") or 0),
-                    stage="mc_blocked_overnight_rescue",
-                    reason_code="overnight_candidate_deferred",
-                    human_reason=(
-                        f"MC blocked ({decision.reason}) during after-hours — "
-                        "deferred to morning reeval with live quotes."
-                    ),
-                    payload=payload,
-                    decision_status="WATCHING",
-                    queued_at=datetime.now(timezone.utc).isoformat(),
-                )
-                if _oc_ok:
-                    _mark_job(job_id, "WATCHING",
-                              error="overnight_candidate:mc_block_overridden_for_reeval")
-                else:
-                    _mark_job(job_id, "REJECTED",
-                              error=f"mc_block:{decision.reason}:ap_signals_write_failed")
-                return
-        except Exception as _oc_err:
-            log.debug("[%s] overnight rescue check failed (non-blocking): %s",
-                      ticker, _oc_err)
 
         # PR1 + Amendment §4: map MC reason to canonical miss stage instead
         # of always writing STAGE_UNKNOWN.
