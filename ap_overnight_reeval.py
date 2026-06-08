@@ -180,6 +180,27 @@ def run_overnight_reeval(
         ticker = signal.get("ticker") or signal.get("symbol", "?")
         side = (signal.get("side") or "").upper()
 
+        # Guard: if this signal entered WATCHING via MC rescue and we're in LIVE,
+        # do not arm it unless OVERNIGHT_MC_RESCUE_ENABLED=true.
+        try:
+            _wm = signal.get("_watching_meta") or {}
+            _is_mc_rescue = bool(_wm.get("mc_rescue", False))
+            _mc_rescue_allowed = (
+                __import__("os").getenv("OVERNIGHT_MC_RESCUE_ENABLED", "false")
+                .strip().lower() in ("true", "1")
+            )
+            if _is_mc_rescue and not _mc_rescue_allowed:
+                log.info(
+                    "[%s] overnight_reeval: SKIP mc_rescue=true signal=%s "
+                    "OVERNIGHT_MC_RESCUE_ENABLED=false — rescued MC-rejects "
+                    "cannot arm in LIVE by default",
+                    ticker, signal_id,
+                )
+                result["skipped"] = result.get("skipped", 0) + 1
+                continue
+        except Exception:
+            pass
+
         try:
             # Age check: skip stale signals
             sig_date = _signal_date(signal)
@@ -190,10 +211,17 @@ def run_overnight_reeval(
                     _mark_job_rejected(job_id, client_id, f"stale_signal:age={age_days}d")
                     if _lifecycle_ok:
                         try:
+                            # Establish WATCHING state first to prevent NONE→REJECTED
+                            # lifecycle error. Signal entered from WATCHING queue job.
+                            try:
+                                signal_watching(signal_id, ticker, _LO.OVERNIGHT_EVAL,
+                                                "stale_check_pre_reject")
+                            except Exception:
+                                pass
                             _sig_rejected(signal_id, ticker, _LO.OVERNIGHT_EVAL,
                                           f"stale_signal age={age_days}d",
-                                          _RC.VALIDATION, "STALE_SIGNAL", _RS.INFO,
-                                          age_days=age_days)
+                                          _RC.VALIDATION, "OVERNIGHT_STALE_SIGNAL",
+                                          _RS.INFO, age_days=age_days)
                         except Exception:
                             pass
                     result["rejected"] += 1
