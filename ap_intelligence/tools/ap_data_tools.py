@@ -34,9 +34,47 @@ def _cache_path(key: str) -> Path:
     safe = key.replace("/", "_").replace(":", "_")
     return CACHE_DIR / f"{safe}.json"
 
-def _safe_json_default(obj):
-    """Convert non-serializable types so yfinance NaN/Timestamp never crashes."""
-    import math, datetime
+# ── JSON boundary serialization ──────────────────────────────────────────────
+# NaN values from yfinance (missing PE, earnings, etc.) must survive the cache
+# cycle as float('nan') so scoring agents can apply their own isnan() guards.
+# Replacing NaN→None changes scoring semantics: agents that do
+# `if math.isnan(val): skip` would instead receive None, treating missing
+# data as a concrete value (often 0 or negative), collapsing scores.
+#
+# Fix: encode NaN/Inf as sentinel dicts at write time; decode back at read time.
+# Timestamps are encoded as ISO strings (safe; agents don't use them as floats).
+# No other data transformation happens — scoring values are never modified here.
+
+_NAN_SENTINEL     = {"__nan__": True}
+_INF_SENTINEL     = {"__inf__": True}
+_NEG_INF_SENTINEL = {"__neginf__": True}
+
+
+def _nan_preprocess(data):
+    """Pre-process before json.dump: NaN/Inf→sentinel dicts.
+    json.dumps' default= callback is never invoked for float — it serializes
+    them natively as 'NaN' (invalid JSON). Pre-processing converts them to
+    dicts first so json.dump produces valid, round-trippable JSON.
+    Does NOT modify in-memory data; only the value passed to json.dump changes.
+    """
+    import math
+    if isinstance(data, float):
+        if math.isnan(data):  return {"__nan__": True}
+        if math.isinf(data):  return {"__inf__": True} if data > 0 else {"__neginf__": True}
+        return data
+    if isinstance(data, dict):
+        return {k: _nan_preprocess(v) for k, v in data.items()}
+    if isinstance(data, list):
+        return [_nan_preprocess(v) for v in data]
+    return data
+
+
+def _nan_safe_encoder(obj):
+    """JSON default= handler: Timestamp→ISO, unknown types→str.
+    Called only for types json.dumps cannot handle natively (not floats).
+    NaN floats are handled by _nan_preprocess before this runs.
+    """
+    import datetime
     try:
         import pandas as _pd
         if isinstance(obj, _pd.Timestamp):
@@ -47,20 +85,21 @@ def _safe_json_default(obj):
         pass
     if isinstance(obj, (datetime.datetime, datetime.date)):
         return obj.isoformat()
-    if isinstance(obj, float) and (math.isnan(obj) or math.isinf(obj)):
-        return None
     return str(obj)
 
-def _sanitize_for_json(data):
-    """Replace float NaN/Inf with None so json.dump never writes invalid JSON."""
-    import math
-    if isinstance(data, float):
-        return None if (math.isnan(data) or math.isinf(data)) else data
+
+def _nan_safe_decode(data):
+    """Decode NaN sentinels back to float('nan')/float('inf') after json.load."""
     if isinstance(data, dict):
-        return {k: _sanitize_for_json(v) for k, v in data.items()}
+        if len(data) == 1:
+            if data == _NAN_SENTINEL:     return float("nan")
+            if data == _INF_SENTINEL:     return float("inf")
+            if data == _NEG_INF_SENTINEL: return float("-inf")
+        return {k: _nan_safe_decode(v) for k, v in data.items()}
     if isinstance(data, list):
-        return [_sanitize_for_json(v) for v in data]
+        return [_nan_safe_decode(v) for v in data]
     return data
+
 
 def _cache_get(key: str):
     p = _cache_path(key)
@@ -69,18 +108,23 @@ def _cache_get(key: str):
         if age < 3600:  # 1 hour TTL
             try:
                 with open(p) as f:
-                    return json.load(f)
+                    raw = json.load(f)
+                # Restore NaN sentinels → float('nan') so scoring agents see NaN
+                return _nan_safe_decode(raw)
             except (json.JSONDecodeError, ValueError):
-                # Cache file has NaN or other invalid JSON — delete and refresh
+                # Corrupt cache — delete and let caller fetch fresh
                 try: p.unlink()
                 except Exception: pass
     return None
 
+
 def _cache_set(key: str, data):
     p = _cache_path(key)
     with open(p, "w") as f:
-        # Sanitize NaN/Inf to None and use default= for Timestamps
-        json.dump(_sanitize_for_json(data), f, default=_safe_json_default)
+        # Pre-process converts NaN→sentinel dicts (json.dumps never calls default= for floats).
+        # Then _nan_safe_encoder handles Timestamps and any other non-standard types.
+        # In-memory data is not modified — only the value passed to json.dump changes.
+        json.dump(_nan_preprocess(data), f, default=_nan_safe_encoder)
 
 # ─────────────────────────────────────────────
 # TRADIER PRICE DATA
