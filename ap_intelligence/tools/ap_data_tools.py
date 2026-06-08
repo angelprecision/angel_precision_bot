@@ -34,19 +34,53 @@ def _cache_path(key: str) -> Path:
     safe = key.replace("/", "_").replace(":", "_")
     return CACHE_DIR / f"{safe}.json"
 
+def _safe_json_default(obj):
+    """Convert non-serializable types so yfinance NaN/Timestamp never crashes."""
+    import math, datetime
+    try:
+        import pandas as _pd
+        if isinstance(obj, _pd.Timestamp):
+            return obj.isoformat()
+        if isinstance(obj, _pd.Series):
+            return obj.tolist()
+    except ImportError:
+        pass
+    if isinstance(obj, (datetime.datetime, datetime.date)):
+        return obj.isoformat()
+    if isinstance(obj, float) and (math.isnan(obj) or math.isinf(obj)):
+        return None
+    return str(obj)
+
+def _sanitize_for_json(data):
+    """Replace float NaN/Inf with None so json.dump never writes invalid JSON."""
+    import math
+    if isinstance(data, float):
+        return None if (math.isnan(data) or math.isinf(data)) else data
+    if isinstance(data, dict):
+        return {k: _sanitize_for_json(v) for k, v in data.items()}
+    if isinstance(data, list):
+        return [_sanitize_for_json(v) for v in data]
+    return data
+
 def _cache_get(key: str):
     p = _cache_path(key)
     if p.exists():
         age = time.time() - p.stat().st_mtime
         if age < 3600:  # 1 hour TTL
-            with open(p) as f:
-                return json.load(f)
+            try:
+                with open(p) as f:
+                    return json.load(f)
+            except (json.JSONDecodeError, ValueError):
+                # Cache file has NaN or other invalid JSON — delete and refresh
+                try: p.unlink()
+                except Exception: pass
     return None
 
 def _cache_set(key: str, data):
     p = _cache_path(key)
     with open(p, "w") as f:
-        json.dump(data, f)
+        # Sanitize NaN/Inf to None and use default= for Timestamps
+        json.dump(_sanitize_for_json(data), f, default=_safe_json_default)
 
 # ─────────────────────────────────────────────
 # TRADIER PRICE DATA
