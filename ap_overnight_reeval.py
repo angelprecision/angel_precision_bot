@@ -357,34 +357,45 @@ def run_overnight_reeval(
                         continue
                     else:
                         # Audit-only — log but do NOT block. Preserve original score.
+                        # Do NOT reconstruct the decision object — leave it intact.
+                        _reeval_score_audit = getattr(decision, "score", None)
                         log.info(
                             "[%s] overnight_reeval: OVERNIGHT_SCORE_RECHECK_DISABLED "
                             "signal=%s original_score=%.1f "
                             "overnight_reeval_score=%s (ignored) — continuing",
-                            ticker, signal_id, _original_score,
-                            getattr(decision, "score", "n/a"),
+                            ticker, signal_id, _original_score, _reeval_score_audit,
                         )
-                        # Restore original score so downstream sees the scanner value
+                        # Preserve original scanner score — never overwrite with reeval score
                         signal["score"] = _original_score
+                        # Persist score audit metadata into plan.metadata if plan exists
                         if decision.plan is not None:
-                            decision = type(decision)(
-                                ok=True,
-                                plan=decision.plan,
-                                reason=decision.reason,
-                                stage=decision.stage,
-                                score=_original_score,
-                            )
+                            try:
+                                if not hasattr(decision.plan, "metadata") or decision.plan.metadata is None:
+                                    decision.plan.metadata = {}
+                                if isinstance(decision.plan.metadata, dict):
+                                    decision.plan.metadata.update({
+                                        "original_signal_score":                _original_score,
+                                        "overnight_reeval_score":               _reeval_score_audit,
+                                        "overnight_reeval_score_recheck_enabled": False,
+                                        "overnight_reeval_score_source":        "master_control_audit_only",
+                                    })
+                            except Exception:
+                                pass
+                            # decision.ok may be False here — that is fine.
+                            # We do not block when recheck is disabled.
+                            # Downstream code uses decision.plan; ok flag is irrelevant.
                         else:
-                            # MC failed to build a plan even in audit mode — skip
+                            # MC returned no plan — cannot select contract or arm watcher.
+                            # Skip/retry rather than reject: plan absence is data-not-ready.
                             log.warning(
-                                "[%s] overnight_reeval: MC returned no plan "
-                                "for audit-only recheck — skipping signal %s",
+                                "[%s] overnight_reeval: OVERNIGHT_SCORE_RECHECK_AUDIT_ONLY "
+                                "MC returned no plan — skipping signal %s for retry",
                                 ticker, signal_id,
                             )
                             result["skipped"] = result.get("skipped", 0) + 1
                             continue
                 else:
-                    # MC approved — log score audit metadata
+                    # MC approved — log and persist score audit metadata
                     _reeval_score = getattr(decision, "score", None)
                     log.info(
                         "[%s] overnight_reeval: MC approved %s "
@@ -396,6 +407,20 @@ def run_overnight_reeval(
                     )
                     # Never overwrite the original signal score
                     signal["score"] = _original_score
+                    # Persist metadata into plan when plan exists
+                    if decision.plan is not None:
+                        try:
+                            if not hasattr(decision.plan, "metadata") or decision.plan.metadata is None:
+                                decision.plan.metadata = {}
+                            if isinstance(decision.plan.metadata, dict):
+                                decision.plan.metadata.update({
+                                    "original_signal_score":                _original_score,
+                                    "overnight_reeval_score":               _reeval_score,
+                                    "overnight_reeval_score_recheck_enabled": _OVERNIGHT_REEVAL_SCORE_RECHECK_ENABLED,
+                                    "overnight_reeval_score_source":        "master_control",
+                                })
+                        except Exception:
+                            pass
 
             except Exception as mc_exc:
                 log.error("[%s] overnight_reeval: master_control.evaluate failed: %s",
