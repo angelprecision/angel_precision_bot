@@ -335,7 +335,7 @@ class APPortfolioManager:
                         "You are a portfolio manager at Angel Precision, an elite options trading firm. "
                         "Write a 2-sentence trade rationale. Be direct and specific. "
                         "Reference the score drivers. No fluff.\n\n"
-                        f"Trade data:\n{json.dumps(payload, indent=2)}"
+                        f"Trade data:\n{json.dumps(payload, indent=2, default=str)}"
                     )
                 }],
                 max_tokens=120, temperature=0.2,
