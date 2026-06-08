@@ -51,6 +51,21 @@ OVERNIGHT_SIGNAL_MAX_AGE_DAYS = int(os.getenv("OVERNIGHT_SIGNAL_MAX_AGE_DAYS", "
 # Default 18h — covers signals from previous session's close to pre-market.
 _SIGNALS_LOOKBACK_HOURS = int(os.getenv("SIGNALS_LOOKBACK", "18"))
 
+# OVERNIGHT_SNAPSHOT_FAIL_CLOSED: when false (default), a missing market
+# snapshot is DATA_NOT_READY, not a true invalidation — keep watching.
+_OVERNIGHT_SNAPSHOT_FAIL_CLOSED = (
+    os.getenv("OVERNIGHT_SNAPSHOT_FAIL_CLOSED", "false").strip().lower()
+    in ("true", "1")
+)
+
+# OVERNIGHT_REEVAL_SCORE_RECHECK_ENABLED: when false (default), already-WATCHING
+# signals are NOT re-scored by master_control.evaluate() at morning reeval.
+# Original scanner score is preserved. Set true only for research/testing.
+_OVERNIGHT_REEVAL_SCORE_RECHECK_ENABLED = (
+    os.getenv("OVERNIGHT_REEVAL_SCORE_RECHECK_ENABLED", "false").strip().lower()
+    in ("true", "1")
+)
+
 
 def _et_now() -> datetime:
     from zoneinfo import ZoneInfo
@@ -247,62 +262,144 @@ def run_overnight_reeval(
             )
 
             if not validation.valid:
-                log.info("[%s] overnight_reeval: INVALIDATED %s — %s", ticker, signal_id, validation.reason_code)
-                _mark_job_rejected(job_id, client_id, f"overnight_invalidated:{validation.reason_code}")
-                _log_rejection_supabase(
-                    signal_id=signal_id, client_id=client_id, ticker=ticker,
-                    side=side, score=float(signal.get("score") or 0),
-                    stage="overnight_reeval",
-                    reason_code=validation.reason_code,
-                    human_reason=validation.reason_text,
-                    payload=signal,
-                )
-                if _lifecycle_ok:
-                    try:
-                        _sig_rejected(signal_id, ticker, _LO.OVERNIGHT_EVAL,
-                                      f"overnight_invalidated: {validation.reason_text}",
-                                      _RC.VALIDATION, validation.reason_code, _RS.INFO)
-                    except Exception:
-                        pass
-                result["rejected"] += 1
-                continue
+                # Distinguish data-unavailable from true invalidation.
+                _is_snapshot_miss = "SNAPSHOT_UNAVAILABLE" in (
+                    validation.reason_code or ""
+                ).upper()
 
-            log.info("[%s] overnight_reeval: VALID %s — arming entry watcher | entry_trigger=%.4f",
-                     ticker, signal_id, entry_trigger or 0)
-
-            # Step 4: Master control pre-check (score gates, capital, etc.)
-            # Use a fresh REEVAL: signal_id so master_control dedup doesn't block it.
-            # The original signal was already deduped when it first arrived — overnight
-            # reeval is a legitimate second evaluation of the same setup.
-            try:
-                import uuid as _uuid2
-                reeval_signal = {**signal, "signal_id": f"REEVAL:{signal_id}:{_uuid2.uuid4().hex[:6]}"}
-                # Clear this ticker/side from dedup cache if possible
-                try:
-                    direction = signal.get("side", "").upper()
-                    timeframe = signal.get("timeframe", "1d")
-                    setup_key = f"{client_id}:{ticker.upper()}:{direction}:{timeframe}"
-                    orig_key = f"sig:{signal_id}:{client_id}"
-                    mc_seen = getattr(master_control, "_seen_signals", {})
-                    mc_seen.pop(orig_key, None)
-                    mc_seen.pop(setup_key, None)
-                except Exception:
-                    pass
-                decision = master_control.evaluate(reeval_signal, client_id=client_id)
-                if not decision.ok:
-                    log.info("[%s] overnight_reeval: MC blocked %s — %s", ticker, signal_id, decision.reason)
-                    _mark_job_rejected(job_id, client_id, f"mc_blocked:{decision.reason}")
+                if _is_snapshot_miss and not _OVERNIGHT_SNAPSHOT_FAIL_CLOSED:
+                    # DATA_NOT_READY — keep the signal WATCHING for next retry.
+                    # OVERNIGHT_SNAPSHOT_FAIL_CLOSED=false (default).
+                    log.warning(
+                        "[%s] overnight_reeval: OVERNIGHT_SNAPSHOT_UNAVAILABLE %s — "
+                        "reason_code=OVERNIGHT_SNAPSHOT_UNAVAILABLE "
+                        "category=DATA_UNAVAILABLE severity=WARNING "
+                        "final_decision=RETRY_LATER "
+                        "human_reason='Market snapshot unavailable — retry later'",
+                        ticker, signal_id,
+                    )
+                    result["skipped"] = result.get("skipped", 0) + 1
+                    continue   # leave job WATCHING for next reeval run
+                else:
+                    # True invalidation (or fail-closed mode for snapshot miss)
+                    log.info(
+                        "[%s] overnight_reeval: OVERNIGHT_TRUE_INVALIDATION %s — %s",
+                        ticker, signal_id, validation.reason_code,
+                    )
+                    _mark_job_rejected(
+                        job_id, client_id,
+                        f"overnight_invalidated:{validation.reason_code}",
+                    )
+                    _log_rejection_supabase(
+                        signal_id=signal_id, client_id=client_id, ticker=ticker,
+                        side=side, score=float(signal.get("score") or 0),
+                        stage="overnight_reeval",
+                        reason_code=validation.reason_code,
+                        human_reason=validation.reason_text,
+                        payload=signal,
+                    )
                     if _lifecycle_ok:
                         try:
-                            _sig_rejected(signal_id, ticker, _LO.MASTER_CONTROL,
-                                          f"mc_blocked: {decision.reason}",
-                                          _RC.RISK, "MC_BLOCKED", _RS.INFO)
+                            _sig_rejected(signal_id, ticker, _LO.OVERNIGHT_EVAL,
+                                          f"overnight_invalidated: {validation.reason_text}",
+                                          _RC.VALIDATION, validation.reason_code, _RS.INFO)
                         except Exception:
                             pass
                     result["rejected"] += 1
                     continue
+
+            log.info("[%s] overnight_reeval: VALID %s — arming entry watcher | entry_trigger=%.4f",
+                     ticker, signal_id, entry_trigger or 0)
+
+            # Step 4: Master control — plan hydration only by default.
+            # OVERNIGHT_REEVAL_SCORE_RECHECK_ENABLED=false (default):
+            #   Already-WATCHING signals must NOT be blocked by a new morning
+            #   score. Original scanner score is preserved. MC is called only to
+            #   hydrate plan fields needed for contract selection + watcher arm.
+            # OVERNIGHT_REEVAL_SCORE_RECHECK_ENABLED=true (research only):
+            #   Runs full MC evaluate; logs both scores; never overwrites signal score.
+            _original_score = float(signal.get("score") or 0)
+            try:
+                import uuid as _uuid2
+                reeval_signal = {**signal,
+                                 "signal_id": f"REEVAL:{signal_id}:{_uuid2.uuid4().hex[:6]}"}
+                # Clear dedup cache so MC doesn't block on signal_id match
+                try:
+                    _mc_seen = getattr(master_control, "_seen_signals", {})
+                    _mc_seen.pop(f"sig:{signal_id}:{client_id}", None)
+                    _mc_seen.pop(
+                        f"{client_id}:{ticker.upper()}:{signal.get('side','').upper()}:{signal.get('timeframe','1d')}",
+                        None,
+                    )
+                except Exception:
+                    pass
+
+                decision = master_control.evaluate(reeval_signal, client_id=client_id)
+
+                if not decision.ok:
+                    if _OVERNIGHT_REEVAL_SCORE_RECHECK_ENABLED:
+                        # Enforce mode — block on MC rejection
+                        log.info(
+                            "[%s] overnight_reeval: MC blocked %s — %s "
+                            "overnight_reeval_score_recheck_enabled=true",
+                            ticker, signal_id, decision.reason,
+                        )
+                        _mark_job_rejected(job_id, client_id,
+                                           f"mc_blocked:{decision.reason}")
+                        if _lifecycle_ok:
+                            try:
+                                _sig_rejected(signal_id, ticker, _LO.MASTER_CONTROL,
+                                              f"mc_blocked: {decision.reason}",
+                                              _RC.RISK, "MC_BLOCKED", _RS.INFO)
+                            except Exception:
+                                pass
+                        result["rejected"] += 1
+                        continue
+                    else:
+                        # Audit-only — log but do NOT block. Preserve original score.
+                        log.info(
+                            "[%s] overnight_reeval: OVERNIGHT_SCORE_RECHECK_DISABLED "
+                            "signal=%s original_score=%.1f "
+                            "overnight_reeval_score=%s (ignored) — continuing",
+                            ticker, signal_id, _original_score,
+                            getattr(decision, "score", "n/a"),
+                        )
+                        # Restore original score so downstream sees the scanner value
+                        signal["score"] = _original_score
+                        if decision.plan is not None:
+                            decision = type(decision)(
+                                ok=True,
+                                plan=decision.plan,
+                                reason=decision.reason,
+                                stage=decision.stage,
+                                score=_original_score,
+                            )
+                        else:
+                            # MC failed to build a plan even in audit mode — skip
+                            log.warning(
+                                "[%s] overnight_reeval: MC returned no plan "
+                                "for audit-only recheck — skipping signal %s",
+                                ticker, signal_id,
+                            )
+                            result["skipped"] = result.get("skipped", 0) + 1
+                            continue
+                else:
+                    # MC approved — log score audit metadata
+                    _reeval_score = getattr(decision, "score", None)
+                    log.info(
+                        "[%s] overnight_reeval: MC approved %s "
+                        "original_signal_score=%.1f overnight_reeval_score=%s "
+                        "overnight_reeval_score_recheck_enabled=%s "
+                        "overnight_reeval_score_source=master_control",
+                        ticker, signal_id, _original_score, _reeval_score,
+                        _OVERNIGHT_REEVAL_SCORE_RECHECK_ENABLED,
+                    )
+                    # Never overwrite the original signal score
+                    signal["score"] = _original_score
+
             except Exception as mc_exc:
-                log.error("[%s] overnight_reeval: master_control.evaluate failed: %s", ticker, mc_exc)
+                log.error("[%s] overnight_reeval: master_control.evaluate failed: %s",
+                          ticker, mc_exc)
                 result["errors"] += 1
                 continue
 
