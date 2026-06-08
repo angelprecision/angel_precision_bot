@@ -46,6 +46,14 @@ if TYPE_CHECKING:
 # How many calendar days back a signal is still considered "fresh"
 # e.g. a Friday signal is valid Monday morning = 3 days
 OVERNIGHT_SIGNAL_MAX_AGE_DAYS = int(os.getenv("OVERNIGHT_SIGNAL_MAX_AGE_DAYS", "4"))
+
+# OVERNIGHT_SNAPSHOT_FAIL_CLOSED: false (default) = snapshot unavailable
+# before market open is DATA_NOT_READY, not a true invalidation.
+# Signal stays WATCHING; retry at next reeval window.
+_OVERNIGHT_SNAPSHOT_FAIL_CLOSED = (
+    os.getenv("OVERNIGHT_SNAPSHOT_FAIL_CLOSED", "false").strip().lower()
+    in ("true", "1")
+)
 # SIGNALS_LOOKBACK: hours-based alternative. When set, takes precedence over
 # OVERNIGHT_SIGNAL_MAX_AGE_DAYS for the initial created_at cutoff query.
 # Default 18h — covers signals from previous session's close to pre-market.
@@ -247,8 +255,25 @@ def run_overnight_reeval(
             )
 
             if not validation.valid:
-                log.info("[%s] overnight_reeval: INVALIDATED %s — %s", ticker, signal_id, validation.reason_code)
-                _mark_job_rejected(job_id, client_id, f"overnight_invalidated:{validation.reason_code}")
+                # Distinguish snapshot-unavailable (DATA_NOT_READY) from true invalidation.
+                _snap_miss = "SNAPSHOT_UNAVAILABLE" in (validation.reason_code or "").upper()
+                if _snap_miss and not _OVERNIGHT_SNAPSHOT_FAIL_CLOSED:
+                    # Pre-market snapshot not ready — keep signal WATCHING for next retry.
+                    # OVERNIGHT_SNAPSHOT_FAIL_CLOSED=false (default).
+                    log.warning(
+                        "[%s] overnight_reeval: OVERNIGHT_SNAPSHOT_UNAVAILABLE %s "
+                        "category=DATA_UNAVAILABLE severity=WARNING "
+                        "final_decision=RETRY_LATER "
+                        "human_reason='Market snapshot unavailable — retry later'",
+                        ticker, signal_id,
+                    )
+                    result["skipped"] = result.get("skipped", 0) + 1
+                    continue  # leave job WATCHING for next reeval run
+                # True invalidation — reject
+                log.info("[%s] overnight_reeval: OVERNIGHT_TRUE_INVALIDATION %s — %s",
+                         ticker, signal_id, validation.reason_code)
+                _mark_job_rejected(job_id, client_id,
+                                   f"overnight_invalidated:{validation.reason_code}")
                 _log_rejection_supabase(
                     signal_id=signal_id, client_id=client_id, ticker=ticker,
                     side=side, score=float(signal.get("score") or 0),
