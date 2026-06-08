@@ -46,6 +46,10 @@ if TYPE_CHECKING:
 # How many calendar days back a signal is still considered "fresh"
 # e.g. a Friday signal is valid Monday morning = 3 days
 OVERNIGHT_SIGNAL_MAX_AGE_DAYS = int(os.getenv("OVERNIGHT_SIGNAL_MAX_AGE_DAYS", "4"))
+# SIGNALS_LOOKBACK: hours-based alternative. When set, takes precedence over
+# OVERNIGHT_SIGNAL_MAX_AGE_DAYS for the initial created_at cutoff query.
+# Default 18h — covers signals from previous session's close to pre-market.
+_SIGNALS_LOOKBACK_HOURS = int(os.getenv("SIGNALS_LOOKBACK", "18"))
 
 
 def _et_now() -> datetime:
@@ -636,10 +640,17 @@ def _fetch_watching_signals(client_id: str) -> list:
         if not sb_url or not sb_key:
             log.warning("_fetch_watching_signals[ap_signals]: missing Supabase credentials")
         else:
-            cutoff = (
-                datetime.now(timezone.utc)
-                - timedelta(days=OVERNIGHT_SIGNAL_MAX_AGE_DAYS + 1)
-            ).isoformat()
+            # Use SIGNALS_LOOKBACK (hours) when set; fall back to day-based
+            _lookback_hours = _SIGNALS_LOOKBACK_HOURS
+            if _lookback_hours and _lookback_hours > 0:
+                cutoff = (
+                    datetime.now(timezone.utc) - timedelta(hours=_lookback_hours)
+                ).isoformat()
+            else:
+                cutoff = (
+                    datetime.now(timezone.utc)
+                    - timedelta(days=OVERNIGHT_SIGNAL_MAX_AGE_DAYS + 1)
+                ).isoformat()
             sb = _cc(sb_url, sb_key)
             # ── MULTI-CLIENT FAN-OUT FIX ──────────────────────────────────
             # Do NOT filter ap_signals by client_email here. WATCHING rows in
