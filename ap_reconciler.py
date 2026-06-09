@@ -1999,21 +1999,27 @@ class APBrokerReconciler:
                     # If broker truth is unavailable, default to OPEN+unmanaged
                     # (conservative — never hide live exposure).
                     if broker_truth_ok:
-                        broker_holds  = contract.upper() in broker_open_syms
-                        repair_status = "OPEN" if broker_holds else "CLOSED_REPAIR"
-                        close_src     = (
-                            "REPAIR_FROM_FILLED_ORDER" if broker_holds
+                        broker_holds       = contract.upper() in broker_open_syms
+                        repair_status      = "OPEN" if broker_holds else "CLOSED_REPAIR"
+                        qty_remaining_val  = qty if broker_holds else 0
+                        close_src          = (
+                            "REPAIR_FROM_FILLED_ORDER"    if broker_holds
                             else "BROKER_MANUAL_CLOSE_IMPORT"
                         )
-                        exit_reason   = (
+                        close_confidence   = "HIGH"
+                        exit_reason        = (
                             None if broker_holds
                             else "manual_or_external_close_unpriced"
                         )
                     else:
-                        broker_holds  = None   # unknown
-                        repair_status = "OPEN"
-                        close_src     = "REPAIR_FROM_FILLED_ORDER"
-                        exit_reason   = None
+                        # Broker truth unavailable — default to OPEN+unmanaged.
+                        # Never treat auth/network errors as broker=flat.
+                        broker_holds       = None
+                        repair_status      = "OPEN"
+                        qty_remaining_val  = qty
+                        close_src          = "REPAIR_FROM_FILLED_ORDER"
+                        close_confidence   = "MANUAL_REVIEW"
+                        exit_reason        = None
 
                     log.info(
                         "[%s] backfill_create_position order=%s contract=%s "
@@ -2045,13 +2051,16 @@ class APBrokerReconciler:
                                 self.client_id, contract, _cip_err,
                             )
 
-                    # Fallback: minimal direct INSERT (idempotent via ON CONFLICT)
+                    # Fallback: minimal direct INSERT (idempotent via ON CONFLICT).
+                    # Does NOT write source — column does not exist in production schema.
                     if not pos_id:
                         import uuid as _uuid
                         _pid = str(_uuid.uuid4())
                         def _insert(pid=_pid, c=contract, u=underlying,
-                                    s=side, q=qty, px=entry_px, ts=filled_ts,
-                                    b=broker_id, li=local_id):
+                                    s=side, q=qty, qr=qty_remaining_val,
+                                    px=entry_px, ts=filled_ts,
+                                    b=broker_id, li=local_id,
+                                    cs=close_src, cc=close_confidence):
                             with conn() as cur:
                                 cur.execute(
                                     """
@@ -2062,7 +2071,9 @@ class APBrokerReconciler:
                                         qty, quantity_remaining,
                                         avg_fill, entry_price,
                                         entry_ts, created_at, updated_at,
-                                        status, source,
+                                        status,
+                                        unmanaged,
+                                        close_source, close_confidence,
                                         local_order_id, broker_order_id
                                     ) VALUES (
                                         %s, %s,
@@ -2072,7 +2083,9 @@ class APBrokerReconciler:
                                         %s, %s,
                                         COALESCE(%s::timestamptz, NOW()),
                                         NOW(), NOW(),
-                                        'OPEN', 'REPAIR_FROM_FILLED_ORDER',
+                                        'OPEN',
+                                        TRUE,
+                                        %s, %s,
                                         %s, %s
                                     )
                                     ON CONFLICT (id) DO NOTHING
@@ -2081,9 +2094,11 @@ class APBrokerReconciler:
                                     (pid, self.client_id,
                                      u, c, c,
                                      s, s,
-                                     q, q,
+                                     q, qr,
                                      px, px,
-                                     ts, li, b),
+                                     ts,
+                                     cs, cc,
+                                     li, b),
                                 )
                                 row = cur.fetchone()
                                 return str(row[0]) if row else pid
@@ -2092,30 +2107,33 @@ class APBrokerReconciler:
                     if not pos_id:
                         raise RuntimeError("position creation returned no id")
 
-                    # Patch final status / close fields outside OPEN case
-                    if repair_status != "OPEN" or close_src or exit_reason:
-                        try:
-                            def _patch(pid=pos_id, st=repair_status,
-                                       cs=close_src, er=exit_reason):
-                                with conn() as cur:
-                                    cur.execute(
-                                        """
-                                        UPDATE positions
-                                        SET status      = %s,
-                                            source      = 'REPAIR_FROM_FILLED_ORDER',
-                                            close_source= %s,
-                                            exit_reason = %s,
-                                            updated_at  = NOW()
-                                        WHERE id = %s AND client_id = %s
-                                        """,
-                                        (st, cs, er, pid, self.client_id),
-                                    )
-                            run_with_retry(_patch)
-                        except Exception as _pe:
-                            log.warning(
-                                "[%s] backfill patch status failed pos=%s: %s",
-                                self.client_id, pos_id, _pe,
-                            )
+                    # Patch final status / close fields.
+                    # Does NOT write source — not in production positions schema.
+                    try:
+                        def _patch(pid=pos_id, st=repair_status,
+                                   qr=qty_remaining_val, cs=close_src,
+                                   cc=close_confidence, er=exit_reason):
+                            with conn() as cur:
+                                cur.execute(
+                                    """
+                                    UPDATE positions
+                                    SET status             = %s,
+                                        quantity_remaining = %s,
+                                        unmanaged          = TRUE,
+                                        close_source       = %s,
+                                        close_confidence   = %s,
+                                        exit_reason        = %s,
+                                        updated_at         = NOW()
+                                    WHERE id = %s AND client_id = %s
+                                    """,
+                                    (st, qr, cs, cc, er, pid, self.client_id),
+                                )
+                        run_with_retry(_patch)
+                    except Exception as _pe:
+                        log.warning(
+                            "[%s] backfill patch status failed pos=%s: %s",
+                            self.client_id, pos_id, _pe,
+                        )
 
                     # Link order → new position
                     self._link_order_to_position(local_id, pos_id)
