@@ -2873,7 +2873,12 @@ class APBrokerReconciler:
                 exit_option_price  = exit_px,
                 underlying_entry   = 0.0,
                 underlying_exit    = 0.0,
-                contracts          = db_qty or 1,
+                # close_qty = actual contracts closed in this reconciler pass.
+                # db_qty = original entry quantity, which may be higher if prior
+                # scale-outs already reduced quantity_remaining before this fires.
+                # Proof/performance must reflect actual closed contracts, not the
+                # original entry size.
+                contracts          = close_qty or 1,
                 exit_reason        = f"RECONCILER_AUTO_CLOSE | {close_confidence} | broker_position_missing",
                 option_pnl_pct     = pnl_pct / 100.0,
                 underlying_pnl_pct = 0.0,
