@@ -274,16 +274,25 @@ def _risk_allows_trade(risk: dict) -> tuple[bool, str]:
 
 
 def _count_missing_fundamentals(result: dict) -> int:
-    """Estimate missing fundamental fields from signal_breakdown."""
-    import math
-    sb  = result.get("signal_breakdown") or {}
-    raw = sb.get("fundamentals") or {}
-    # Default confidence of exactly 50 = unavailable (pipeline default)
-    conf = float(raw.get("confidence", 50))
-    sig  = str(raw.get("signal", "neutral")).lower()
+    """
+    Count/estimate missing fundamental fields for audit logging only.
+    Checks explicit fields first; falls back to neutral+confidence==50.
+    Not required for scanner fallback — used for audit/logging only.
+    """
+    sb   = result.get("signal_breakdown") or {}
+    fund = sb.get("fundamentals") or {}
+    if fund.get("missing_fundamental_count") is not None:
+        return int(fund.get("missing_fundamental_count", 0))
+    if fund.get("unavailable_fields"):
+        return len(fund.get("unavailable_fields") or [])
+    if fund.get("available") is False or fund.get("fundamentals_available") is False:
+        return 7
+    if result.get("yfinance_unavailable") or result.get("data_unavailable"):
+        return 7
+    conf = float(fund.get("confidence", 50))
+    sig  = str(fund.get("signal", "neutral")).lower()
     if sig == "neutral" and conf == 50.0:
-        # Pipeline default — fundamentals were unavailable
-        return 7   # all standard yfinance fields missing
+        return 7
     return 0
 
 
@@ -330,59 +339,62 @@ def _map_result(result: dict, fallback_score: float) -> dict:
 
     # ── action == "skip" (portfolio manager decision) ─────────────────────────
     if action == "skip":
-        # Distinguish two skip causes:
-        #   1. Low intel score from missing/neutral fundamentals ("insufficient edge")
-        #      → scanner-approved score is primary; intel score is advisory only
-        #   2. Hard block (neutral direction, risk manager rejected, contract quality)
-        #      → always block regardless of scanner score
-        _missing_count     = _count_missing_fundamentals(result)
-        _is_data_skip      = "insufficient edge" in reasoning
-        _is_hard_block     = any(p in reasoning for p in (
-            "Scanner signal is neutral",
-            "Risk Manager",
-            "Contract quality failed",
-        ))
+        # Hard-block phrases — always reject regardless of scanner score.
+        # Matched case-insensitively. risk_reason "approved"/"none"/"" is non-hard.
+        _HARD_PHRASES = (
+            "risk manager", "scanner signal is neutral", "neutral direction",
+            "contract quality failed", "risk veto", "hard risk",
+            "capital", "buying power", "auth",
+        )
+        _reasoning_lower   = reasoning.lower()
+        _risk_reason_lower = (risk_reason or "").lower().strip()
+        _risk_says_ok      = _risk_reason_lower in (
+            "", "none", "approved", "ok", "null", "n/a", "risk ok"
+        )
+        _is_data_skip  = "insufficient edge" in _reasoning_lower
+        _is_hard_block = (
+            not _risk_says_ok or
+            any(p in _reasoning_lower for p in _HARD_PHRASES)
+        )
+        _missing_count = _count_missing_fundamentals(result)
 
         log.info(
             "[%s] GATE_G_SKIP scanner_score=%.1f intel_score=%.1f "
             "effective_score=%.1f missing_fundamental_count=%d "
             "hard_risk_reason=%s is_data_skip=%s is_hard_block=%s",
             ticker, fallback_score, intel_score, intel_score,
-            _missing_count,
-            risk_reason or "none",
+            _missing_count, risk_reason or "none",
             _is_data_skip, _is_hard_block,
         )
 
+        # Scanner-approved fallback: when scanner_score >= GATE_G_SCANNER_MIN_ELIGIBLE
+        # and skip is "insufficient edge" and no hard block, approve with scanner score.
+        # missing_fundamental_count is audit only — not a gate condition.
+        # Intel score is stored as observe-only metadata.
         if (_is_data_skip
                 and not _is_hard_block
-                and _missing_count > 0
                 and fallback_score >= GATE_G_SCANNER_MIN_ELIGIBLE):
-            # Allow scanner fallback ONLY when all four conditions are met:
-            #   1. Skip reason is "insufficient edge" (data-driven, not hard risk)
-            #   2. missing_fundamental_count > 0 (confirmed missing data)
-            #   3. No hard risk finding
-            #   4. scanner_score >= GATE_G_SCANNER_MIN_ELIGIBLE (default 70)
-            # If fundamentals are present but intel score is still < 60, keep the reject.
             log.info(
                 "[%s] GATE_G_SCANNER_APPROVED scanner_score=%.1f intel_score=%.1f "
-                "effective_score=%.1f missing_fundamental_count=%d "
-                "hard_risk_reason=none "
-                "decision=ALLOW — scanner score overrides intel data-gap skip",
+                "effective_score=%.1f second_score_mode=observe_only "
+                "missing_fundamental_count=%d hard_risk_reason=none decision=ALLOW",
                 ticker, fallback_score, intel_score, fallback_score, _missing_count,
             )
             return {
-                "approved":     True,
-                "score":        round(fallback_score, 1),
-                "contracts":    max(1, contracts),
-                "reasoning":    (
+                "approved":          True,
+                "score":             round(fallback_score, 1),
+                "contracts":         max(1, contracts),
+                "reasoning":         (
                     f"scanner_approved_score={fallback_score:.1f} "
                     f"intel_score={intel_score:.1f} "
-                    f"missing_fundamentals={_missing_count} "
-                    f"gate=DATA_UNAVAILABLE_SCANNER_FALLBACK"
+                    f"missing_fundamental_count={_missing_count} "
+                    f"second_score_mode=observe_only "
+                    f"gate=SCANNER_APPROVED_INTEL_OBSERVE_ONLY"
                 ),
-                "intel_status": "DATA_UNAVAILABLE_SCANNER_FALLBACK",
-                "intel_score":  round(intel_score, 1),
-                "risk_detail":  risk,
+                "intel_status":      "SCANNER_APPROVED_INTEL_OBSERVE_ONLY",
+                "intel_score":       round(intel_score, 1),
+                "second_score_mode": "observe_only",
+                "risk_detail":       risk,
             }
 
         # Hard block or genuine skip — block as before
@@ -390,7 +402,7 @@ def _map_result(result: dict, fallback_score: float) -> dict:
             return _collect_gate(
                 status="SKIP_OVERRIDE",
                 score=score,
-                reasoning=f"intel_skip_override: {reasoning[:100]} (1 contract data collection)",
+                reasoning=f"intel_skip_override: {reasoning[:100]} (1 contract)",
                 risk_detail=risk,
             )
         return _block_gate(
@@ -399,7 +411,6 @@ def _map_result(result: dict, fallback_score: float) -> dict:
             reasoning=f"intel_skip: {reasoning[:160]}",
             risk_detail=risk,
         )
-
     # ── Low confidence (intel score below approve threshold) ──────────────────
     if score < INTEL_APPROVE_THRESHOLD:
         log.info(
