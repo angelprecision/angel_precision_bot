@@ -1880,7 +1880,7 @@ class APBrokerReconciler:
                 with conn() as c:
                     c.execute(
                         """
-                        SELECT local_order_id, contract, option_symbol, symbol,
+                        SELECT local_order_id, contract, symbol,
                                filled_ts, fill_price, filled_qty, direction
                         FROM orders
                         WHERE client_id = %s
@@ -1892,8 +1892,8 @@ class APBrokerReconciler:
                         """,
                         (self.client_id,),
                     )
-                    cols = [d[0] for d in c.description]
-                    return [dict(zip(cols, row)) for row in c.fetchall()]
+                    rows = c.fetchall()
+                    return [dict(r) for r in rows]
             orphans = run_with_retry(_fetch)
             if not orphans:
                 return
@@ -1904,8 +1904,7 @@ class APBrokerReconciler:
             )
             linked = failed = 0
             for o in orphans:
-                contract = (o.get("contract") or o.get("option_symbol")
-                            or o.get("symbol") or "").strip()
+                contract = (o.get("contract") or o.get("symbol") or "").strip()
                 if not contract:
                     failed += 1
                     continue
