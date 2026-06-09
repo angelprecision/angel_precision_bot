@@ -1233,11 +1233,32 @@ class APMasterControl:
                     _post_target_score_bump,
                 )
 
+        # Slot check: only actual broker-submitted/filled exposure counts.
+        # PENDING_TRIGGER / WATCHING / DEFERRED watcher rows are excluded from
+        # pending_entries since the position_manager fix. Log when watchers are
+        # present so ops can confirm the accounting is correct.
+        _watcher_count = snap.get("watcher_count", 0)
+        if _watcher_count > 0:
+            log.info(
+                "[%s] watcher_allowed_not_counted_as_position: "
+                "client=%s watcher_rows=%d open=%d pending_broker=%d max=%d "
+                "— PENDING_TRIGGER/WATCHING/DEFERRED rows do not consume slots",
+                ticker, client_id, _watcher_count,
+                snap["open_count"], snap["pending_entries"], self.max_positions,
+            )
+
         if snap["open_count"] >= self.max_positions:
-            return self._block(signal_id, ticker, client_id, "blocked_risk", f"max_positions ({snap['open_count']}/{self.max_positions})")
+            return self._block(
+                signal_id, ticker, client_id, "blocked_risk",
+                f"blocked_actual_position_limit open={snap['open_count']} max={self.max_positions}",
+            )
         effective_count = snap["open_count"] + snap["pending_entries"]
         if effective_count >= self.max_positions:
-            return self._block(signal_id, ticker, client_id, "blocked_risk", f"max_positions_with_pending ({effective_count}/{self.max_positions})")
+            return self._block(
+                signal_id, ticker, client_id, "blocked_risk",
+                f"blocked_actual_position_limit open={snap['open_count']} "
+                f"pending_broker={snap['pending_entries']} max={self.max_positions}",
+            )
 
         # PR p0/bootstrap-affordable-selection (2026-06-05):
         # In LIVE bootstrap mode we intend to buy ONE contract and the real
@@ -2120,7 +2141,8 @@ class APMasterControl:
             "puts_open": 0,
             "capital_deployed": 0.0,
             "pending_entries": 0,
-            "pending_exits": 0,
+            "watcher_count":  0,
+            "pending_exits":  0,
             "trades_today": 0,
             "realized_pnl_today": 0.0,
             "total_trades": 0,
@@ -2167,7 +2189,8 @@ class APMasterControl:
                 snap.setdefault("puts_open", 0)
                 snap.setdefault("capital_deployed", 0.0)
                 snap.setdefault("pending_entries", 0)
-                snap.setdefault("pending_exits", 0)
+                snap.setdefault("watcher_count",  0)
+                snap.setdefault("pending_exits",  0)
                 snap.setdefault("trades_today", 0)
                 snap.setdefault("realized_pnl_today", 0.0)
                 snap.setdefault("total_trades", 0)
