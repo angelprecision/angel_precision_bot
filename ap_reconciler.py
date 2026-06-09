@@ -1873,14 +1873,25 @@ class APBrokerReconciler:
                  self.client_id, local_order_id, position_id)
 
     def _backfill_missing_position_links(self) -> None:
-        """Startup repair: find FILLED orders with position_id=null and link them."""
+        """
+        Startup repair. For every FILLED ENTRY order with position_id=null:
+          1. Search positions by contract + timestamp proximity.
+          2. If found — link orders.position_id.
+          3. If not found — CREATE a repaired position row from the filled order,
+             set status=OPEN if broker still holds it / CLOSED_REPAIR if flat,
+             then link orders.position_id to the new row.
+        Logs:
+          missing_position_created_from_filled_order — position created
+          order_position_link_success — link written
+          filled_order_missing_position_p0 — only if create+link both fail
+        """
         try:
             from ap.db import conn, run_with_retry
             def _fetch():
                 with conn() as c:
                     c.execute(
                         """
-                        SELECT local_order_id, contract, symbol,
+                        SELECT local_order_id, broker_order_id, contract, symbol,
                                filled_ts, fill_price, filled_qty, direction
                         FROM orders
                         WHERE client_id = %s
@@ -1897,25 +1908,46 @@ class APBrokerReconciler:
             orphans = run_with_retry(_fetch)
             if not orphans:
                 return
+
             log.warning(
                 "[%s] backfill_missing_position_links: %d FILLED orders "
-                "have position_id=null — attempting repair",
+                "have position_id=null — searching for existing positions "
+                "or creating repaired rows",
                 self.client_id, len(orphans),
             )
-            linked = failed = 0
+
+            # Ask broker once for all open positions (used to set repair status)
+            broker_open_syms = set()
+            try:
+                if self.broker and hasattr(self.broker, "list_positions"):
+                    for bp in (self.broker.list_positions() or []):
+                        sym = str(bp.get("symbol") or "").upper()
+                        if sym:
+                            broker_open_syms.add(sym)
+            except Exception as _bpe:
+                log.warning("[%s] backfill broker position fetch failed: %s",
+                            self.client_id, _bpe)
+
+            linked = created = failed = 0
             for o in orphans:
-                contract = (o.get("contract") or o.get("symbol") or "").strip()
+                contract = self._norm_contract(
+                    o.get("contract") or o.get("symbol") or ""
+                )
+                local_id  = str(o.get("local_order_id") or "")
+                broker_id = str(o.get("broker_order_id") or "")
                 if not contract:
                     failed += 1
                     continue
+
                 try:
+                    # ── Step 1: look for existing position row ─────────────────
                     def _find(c=contract, ts=o.get("filled_ts")):
                         with conn() as cur:
                             cur.execute(
                                 """
                                 SELECT id FROM positions
                                 WHERE client_id = %s
-                                  AND (LOWER(contract) = LOWER(%s)
+                                  AND (LOWER(contract)      = LOWER(%s)
                                        OR LOWER(option_symbol) = LOWER(%s))
                                 ORDER BY ABS(EXTRACT(EPOCH FROM
                                   (COALESCE(entry_ts, created_at)
@@ -1928,28 +1960,144 @@ class APBrokerReconciler:
                             row = cur.fetchone()
                             return str(row[0]) if row else None
                     pos_id = run_with_retry(_find)
+
                     if pos_id:
-                        self._link_order_to_position(
-                            str(o.get("local_order_id") or ""), pos_id
-                        )
+                        self._link_order_to_position(local_id, pos_id)
                         linked += 1
+                        continue
+
+                    # ── Step 2: no position row exists — create from order ─────
+                    underlying = self._norm_underlying(contract)
+                    side       = (o.get("direction") or "CALL").upper()
+                    qty        = int(o.get("filled_qty") or 0)
+                    entry_px   = float(o.get("fill_price") or 0.0)
+                    filled_ts  = o.get("filled_ts")
+
+                    # Determine status from broker truth
+                    broker_holds = contract.upper() in broker_open_syms
+                    repair_status = "OPEN" if broker_holds else "CLOSED_REPAIR"
+                    unmanaged     = not broker_holds
+
+                    log.info(
+                        "[%s] backfill_create_position order=%s contract=%s "
+                        "side=%s qty=%d entry_px=%.4f broker_holds=%s "
+                        "repair_status=%s",
+                        self.client_id, local_id, contract,
+                        side, qty, entry_px, broker_holds, repair_status,
+                    )
+
+                    # Use _create_imported_position if qty/price are valid
+                    if qty > 0 and entry_px > 0:
+                        try:
+                            pos_id = self._create_imported_position(
+                                contract=contract,
+                                underlying=underlying,
+                                side=side,
+                                qty=qty,
+                                entry_px=entry_px,
+                                broker_position={},  # no live broker row
+                                underlying_entry=0.0,
+                                price_untrusted=False,
+                            )
+                        except Exception as _cip_err:
+                            log.warning(
+                                "[%s] _create_imported_position failed for %s: %s "
+                                "— falling back to direct SQL",
+                                self.client_id, contract, _cip_err,
+                            )
+                            pos_id = None
                     else:
-                        failed += 1
-                        log.error(
-                            "[%s] filled_order_missing_position_p0 "
-                            "order=%s contract=%s filled_ts=%s — "
-                            "no matching position row found",
-                            self.client_id,
-                            o.get("local_order_id"), contract, o.get("filled_ts"),
-                        )
+                        pos_id = None
+
+                    # Fallback: direct minimal SQL insert
+                    if not pos_id:
+                        import uuid as _uuid
+                        _pos_uuid = str(_uuid.uuid4())
+                        _now_ts   = filled_ts or "NOW()"
+                        def _insert(pid=_pos_uuid, c=contract, u=underlying,
+                                    s=side, q=qty, px=entry_px, ts=filled_ts):
+                            with conn() as cur:
+                                cur.execute(
+                                    """
+                                    INSERT INTO positions (
+                                        id, client_id, underlying, contract,
+                                        option_symbol, direction, side,
+                                        qty, quantity_remaining,
+                                        avg_fill, entry_price,
+                                        entry_ts, created_at, updated_at,
+                                        status, source
+                                    ) VALUES (
+                                        %s,%s,%s,%s,
+                                        %s,%s,%s,
+                                        %s,%s,
+                                        %s,%s,
+                                        COALESCE(%s::timestamptz,NOW()),
+                                        NOW(), NOW(),
+                                        'OPEN','REPAIR_FROM_FILLED_ORDER'
+                                    )
+                                    ON CONFLICT (id) DO NOTHING
+                                    RETURNING id
+                                    """,
+                                    (pid, self.client_id, u, c,
+                                     c, s, s,
+                                     q, q,
+                                     px, px,
+                                     ts),
+                                )
+                                row = cur.fetchone()
+                                return str(row[0]) if row else pid
+                        pos_id = run_with_retry(_insert)
+
+                    if not pos_id:
+                        raise RuntimeError("position creation returned no id")
+
+                    # Patch repair_status and unmanaged flag outside PM path
+                    if repair_status != "OPEN" or unmanaged:
+                        try:
+                            def _patch(pid=pos_id, st=repair_status, u=unmanaged):
+                                with conn() as cur:
+                                    cur.execute(
+                                        """
+                                        UPDATE positions
+                                        SET status=%s,
+                                            source='REPAIR_FROM_FILLED_ORDER',
+                                            close_source=%s,
+                                            updated_at=NOW()
+                                        WHERE id=%s AND client_id=%s
+                                        """,
+                                        (st,
+                                         "BROKER_MANUAL_CLOSE_IMPORT" if u else None,
+                                         pid, self.client_id),
+                                    )
+                            run_with_retry(_patch)
+                        except Exception as _pe:
+                            log.warning("[%s] patch repair_status failed: %s",
+                                        self.client_id, _pe)
+
+                    # Link order → new position
+                    self._link_order_to_position(local_id, pos_id)
+                    created += 1
+                    log.info(
+                        "[%s] missing_position_created_from_filled_order "
+                        "order=%s position=%s contract=%s side=%s qty=%d "
+                        "entry_px=%.4f repair_status=%s broker_holds=%s",
+                        self.client_id, local_id, pos_id, contract,
+                        side, qty, entry_px, repair_status, broker_holds,
+                    )
+
                 except Exception as _be:
                     failed += 1
-                    log.error("[%s] backfill_link_error order=%s err=%s",
-                              self.client_id, o.get("local_order_id"), _be)
+                    log.error(
+                        "[%s] filled_order_missing_position_p0 "
+                        "order=%s contract=%s err=%s — "
+                        "create+link failed; manual review required",
+                        self.client_id, local_id, contract, _be,
+                    )
+
             log.info(
                 "[%s] backfill_missing_position_links done: "
-                "linked=%d failed=%d total=%d",
-                self.client_id, linked, failed, len(orphans),
+                "linked=%d created=%d failed=%d total=%d",
+                self.client_id, linked, created, failed, len(orphans),
             )
         except Exception as _bfe:
             log.error("[%s] _backfill_missing_position_links error: %s",
