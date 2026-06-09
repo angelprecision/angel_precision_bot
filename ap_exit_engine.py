@@ -198,6 +198,27 @@ def _option_root(option_symbol: str) -> str:
     return sym[:m.start()].strip()
 
 
+def _extract_ticker_from_occ(occ: str) -> str:
+    """Extract root underlying ticker from OCC contract symbol.
+    RIVN260612P00016500 -> RIVN, C260612C00136000 -> C (single-letter ok)
+    """
+    import re as _re
+    m = _re.match(r"^([A-Z]+)\d", str(occ or "").upper())
+    return m.group(1) if m else str(occ or "")[:5]
+
+
+def _infer_direction_from_occ(occ: str) -> str:
+    """Infer CALL or PUT from OCC contract symbol.
+    The option type char sits between the 6-digit expiry and the 8-digit strike.
+    RIVN260612P00016500 -> PUT   C260612C00136000 -> CALL
+    """
+    import re as _re
+    m = _re.search(r"\d([CP])\d", str(occ or "").upper())
+    if m:
+        return "CALL" if m.group(1) == "C" else "PUT"
+    return "CALL"   # safe default — never blocks exit evaluation
+
+
 def _normalize_ticker(ticker: str, option_symbol: str = "") -> str:
     """
     Normalize a stored underlying ticker against an OCC option symbol.
@@ -1238,6 +1259,9 @@ class APExitEngine:
         # Kept in sync with self._positions by add_position(), expired-contract
         # cleanup, mark_position_closed(), and note_partial_exit_fill() close path.
         self._positions_by_id: dict[str, ManagedPosition] = {}
+        # P0 broker-repair: stored by seed_from_db() so _broker_position_precheck
+        # can load/repair missing positions without passing pm as a parameter.
+        self._position_manager = None
         self._lock         = threading.RLock()
 
         # QPM/admin safety controls:
@@ -2974,6 +2998,10 @@ class APExitEngine:
 
     def seed_from_db(self, position_manager):
         """Re-hydrate in-memory positions from DB on startup."""
+        # Store position_manager for use by _broker_position_precheck repair path.
+        # This is the only point where it is naturally available; no constructor
+        # change needed.
+        self._position_manager = position_manager
         try:
             rows = position_manager.get_active_positions()
             if not rows:
@@ -3060,23 +3088,31 @@ class APExitEngine:
 
     def _broker_position_precheck(self) -> bool:
         """
-        Before every exit cycle: verify broker position truth.
-        If broker has positions missing from the exit engine, attempt to
-        load them from DB so exits are not silently missed.
-        Returns True if broker truth is confirmed, False if unavailable.
+        P0 HOTFIX: Before every exit cycle — fetch broker positions and repair
+        any that are missing from the exit engine.
 
-        EXIT_UNSAFE_BROKER_TRUTH_UNAVAILABLE is logged and an alert fired
-        if the broker fetch fails — exit engine holds but does NOT stop.
+        Flow for each broker position missing from engine:
+          1. Fetch live quote (bid/ask/last -> current mark price + P&L pct).
+          2. Look up in DB via position_manager.get_position_by_contract().
+          3. If missing from DB: repair/create via open_position().
+          4. Build ManagedPosition, add to self._positions immediately.
+          5. Set current price state from live quote.
+          6. Call evaluate_exit() for the audit log (submission happens in
+             the _check_all_positions loop that continues after this returns).
+          7. Log EXIT_ENGINE_REPAIRED_BROKER_POSITION_AND_EVALUATED_EXIT.
+
+        Returns True if check passed or repairs made; False only if broker
+        fetch itself failed (non-blocking).
         """
         if not self.broker or not hasattr(self.broker, "list_positions"):
-            return True   # broker doesn't support list_positions — skip precheck
+            return True   # broker doesn't support list_positions -- skip
 
         try:
             broker_positions = self.broker.list_positions() or []
         except Exception as _bp_err:
             log.error(
                 "[exit_eng] EXIT_UNSAFE_BROKER_TRUTH_UNAVAILABLE "
-                "client=%s broker.list_positions() failed: %s — "
+                "client=%s broker.list_positions() failed: %s -- "
                 "continuing with local engine state; exits not blocked",
                 self._email, _bp_err,
             )
@@ -3088,9 +3124,8 @@ class APExitEngine:
             if int(p.get("quantity") or 0) != 0
         }
         if not broker_syms:
-            return True   # broker has no positions — consistent if engine is also empty
+            return True   # broker has no positions -- consistent if engine empty
 
-        # Symbols currently in the exit engine
         with self._lock:
             engine_syms = {
                 str(getattr(p, "option_symbol", "") or "").upper()
@@ -3099,19 +3134,141 @@ class APExitEngine:
             }
 
         missing_from_engine = broker_syms - engine_syms
-        if missing_from_engine:
-            log.error(
-                "[exit_eng] EXIT_UNSAFE_BROKER_TRUTH_UNAVAILABLE "
-                "client=%s broker_positions=%s engine_positions=%s "
-                "missing_from_engine=%s — broker has positions not tracked by exit engine; "
-                "DB may be out of sync. Run /admin/clients/%s/positions/repair-from-broker.",
-                self._email, sorted(broker_syms), sorted(engine_syms),
-                sorted(missing_from_engine), self._email,
+        if not missing_from_engine:
+            return True   # engine and broker agree -- no repair needed
+
+        # ── Repair each missing position ─────────────────────────────────
+        pm         = self._position_manager    # set by seed_from_db; may be None
+        account_id = getattr(getattr(self.broker, "cfg", None), "account_id", "unknown")
+
+        for bp in broker_positions:
+            sym = str(bp.get("symbol") or "").upper()
+            if sym not in missing_from_engine:
+                continue
+
+            broker_qty        = int(bp.get("quantity") or 0)
+            broker_cost_basis = float(bp.get("cost_basis") or 0)
+            broker_side       = str(bp.get("side") or "").upper()
+            if broker_side not in ("CALL", "PUT"):
+                broker_side = _infer_direction_from_occ(sym)
+            avg_entry_px = (
+                round(broker_cost_basis / (broker_qty * 100), 4)
+                if broker_qty > 0 and broker_cost_basis > 0 else 0.0
             )
-            return False
+
+            # 1. Fetch live quote
+            broker_mark = broker_bid = broker_ask = 0.0
+            broker_pnl_pct = None
+            try:
+                quote = self.broker.get_quote(sym) or {}
+                broker_bid  = float(quote.get("bid") or 0)
+                broker_ask  = float(quote.get("ask") or 0)
+                broker_last = float(quote.get("last") or 0)
+                broker_mark = broker_bid if broker_bid > 0 else broker_last
+                if broker_mark > 0 and avg_entry_px > 0:
+                    broker_pnl_pct = round((broker_mark - avg_entry_px) / avg_entry_px, 4)
+            except Exception as _qe:
+                log.warning("[exit_eng] broker quote fetch failed for %s: %s", sym, _qe)
+
+            # 2+3. Find or repair DB row
+            db_seen_before = False
+            db_repaired    = False
+            position_id    = None
+            db_row: dict   = {}
+
+            if pm is not None:
+                try:
+                    _found = pm.get_position_by_contract(sym)
+                    if _found:
+                        db_seen_before = True
+                        position_id = str(_found.get("id") or "")
+                        db_row = _found
+                    else:
+                        # DB row missing -- repair from broker truth
+                        import uuid as _uuid
+                        _ticker = _extract_ticker_from_occ(sym)
+                        _safe_entry = avg_entry_px if avg_entry_px > 0 else 0.01
+                        position_id = pm.open_position(
+                            plan_id          = f"broker_repair_{_uuid.uuid4().hex[:8]}",
+                            signal_id        = f"broker_repair_{_uuid.uuid4().hex[:8]}",
+                            ticker           = _ticker,
+                            contract         = sym,
+                            side             = broker_side,
+                            qty              = broker_qty,
+                            entry_price      = _safe_entry,
+                            underlying_entry = 0.0,
+                            tier             = "BROKER_REPAIR",
+                            score            = 0.0,
+                        )
+                        db_repaired = True
+                        db_row = pm.get_position(position_id) or {}
+                except Exception as _dbe:
+                    log.warning(
+                        "[exit_eng] broker repair DB lookup/upsert failed sym=%s: %s",
+                        sym, _dbe,
+                    )
+
+            # 4+5. Build ManagedPosition and set live prices
+            _ticker_for_mp = _extract_ticker_from_occ(sym)
+            position_id    = position_id or f"broker-repair-{sym}"
+            _entry_for_mp  = float(
+                db_row.get("avg_fill") or db_row.get("entry_price") or avg_entry_px or 0.01
+            )
+            mp = ManagedPosition(
+                ticker            = _ticker_for_mp,
+                option_symbol     = sym,
+                side              = broker_side,
+                quantity          = broker_qty,
+                entry_price       = _entry_for_mp,
+                underlying_entry  = float(db_row.get("underlying_entry") or 0),
+                underlying_target = float(db_row.get("target_underlying") or 0),
+                underlying_stop   = float(db_row.get("stop_underlying") or 0),
+                position_id       = position_id,
+                client_id         = self._email,
+                signal_id         = str(db_row.get("signal_id") or "broker_repair"),
+            )
+            mp.quantity_remaining = int(db_row.get("quantity_remaining") or broker_qty)
+            mp.scale_outs_done    = int(db_row.get("scale_outs_done") or 0)
+            if broker_mark > 0:
+                mp.current_option_price = broker_mark
+                mp.current_bid          = broker_bid
+                mp.current_ask          = broker_ask
+            if broker_pnl_pct is not None and broker_pnl_pct > 0:
+                mp.peak_pnl_pct   = broker_pnl_pct
+                mp.touched_profit = True
+
+            # Add to engine NOW -- _check_all_positions loop evaluates/submits after
+            self.add_position(mp)
+
+            # 6. Evaluate exit rule for the audit log (submission happens in outer loop)
+            exit_rule_triggered = False
+            reason_no_exit      = ""
+            try:
+                _decision = evaluate_exit(mp)
+                _action   = getattr(_decision, "action", None)
+                if _action and _action not in ("", "HOLD"):
+                    exit_rule_triggered = True
+                else:
+                    reason_no_exit = str(getattr(_decision, "reason", "below_threshold"))
+            except Exception as _ee:
+                reason_no_exit = f"evaluate_exit_error:{_ee}"
+
+            # 7. Required structured audit log
+            log.warning(
+                "[%s] EXIT_ENGINE_REPAIRED_BROKER_POSITION_AND_EVALUATED_EXIT | "
+                "client_email=%s account_id=%s contract_symbol=%s "
+                "broker_qty=%d broker_cost_basis=%.2f broker_mark_or_bid=%.4f "
+                "broker_pnl_pct=%s engine_seen_before=False db_seen_before=%s "
+                "db_repaired=%s exit_rule_triggered=%s exit_order_submitted=False "
+                "reason_no_exit=%r",
+                self._email,
+                self._email, account_id, sym,
+                broker_qty, broker_cost_basis, broker_mark,
+                f"{broker_pnl_pct:.4f}" if broker_pnl_pct is not None else "unknown",
+                db_seen_before, db_repaired, exit_rule_triggered, reason_no_exit,
+            )
 
         return True
-
     def _check_all_positions(self):
         today_et = _et_session_date()
 
