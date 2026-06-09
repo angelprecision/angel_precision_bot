@@ -3211,19 +3211,54 @@ class APExitEngine:
             opened_at        = opened_at or _now,
         )
 
+    def _fetch_broker_quote(self, sym: str) -> dict:
+        """
+        Fetch live bid/ask/mark for an option symbol from Tradier quotes API.
+        Returns dict with keys: bid, ask, mid, last. All default 0.0 on failure.
+        Never raises — exits must not crash on a missing quote.
+        """
+        _empty = {"bid": 0.0, "ask": 0.0, "mid": 0.0, "last": 0.0}
+        try:
+            import requests as _req
+            base = getattr(self.broker, "base_url", None) or "https://api.tradier.com"
+            token = (getattr(self.broker, "access_token", None)
+                     or getattr(self.broker, "_access_token", None))
+            if not token:
+                return _empty
+            resp = _req.get(
+                f"{base}/v1/markets/quotes",
+                params={"symbols": sym, "greeks": "false"},
+                headers={"Authorization": f"Bearer {token}",
+                         "Accept": "application/json"},
+                timeout=5,
+            )
+            if resp.status_code != 200:
+                return _empty
+            data = resp.json()
+            q = (data or {}).get("quotes", {}).get("quote", {})
+            if isinstance(q, list):
+                q = q[0] if q else {}
+            bid  = float(q.get("bid")  or 0.0)
+            ask  = float(q.get("ask")  or 0.0)
+            last = float(q.get("last") or 0.0)
+            mid  = (bid + ask) / 2.0 if bid > 0 and ask > 0 else last
+            return {"bid": bid, "ask": ask, "mid": mid, "last": last}
+        except Exception:
+            return _empty
+
     def _broker_position_precheck(self) -> bool:
         """
         Before every exit cycle: fetch broker positions and repair/load any
-        that are missing from the exit engine, then return.
-        Returns True if broker truth is confirmed (or broker not supported).
-        Returns False if broker fetch fails (cycle proceeds with local state).
+        that are missing from the exit engine. After loading, set live quote
+        data and seed peak_pnl_pct / touched_profit so the normal exit loop
+        can evaluate them in the same cycle.
 
-        Spec behavior:
-        - If broker has positions not in engine: load from DB or create DB row,
-          then add to engine via add_position() so same cycle evaluates exits.
-        - Never assume zero positions when broker has live positions.
-        - EXIT_UNSAFE_BROKER_TRUTH_UNAVAILABLE logged on broker failure.
-        - EXIT_UNSAFE_BROKER_POSITION_REPAIR_FAILED logged on repair failure.
+        Safety rules:
+          - Never submit an exit order here — that is the exit loop's job.
+          - Never assume flat on a broker fetch failure (auth error ≠ no positions).
+          - EXIT_UNSAFE_BROKER_TRUTH_UNAVAILABLE logged on broker fetch failure.
+          - EXIT_UNSAFE_BROKER_POSITION_REPAIR_FAILED logged on repair failure.
+          - Already-tracked engine positions are never duplicated.
         """
         if not self.broker or not hasattr(self.broker, "list_positions"):
             return True
@@ -3235,7 +3270,7 @@ class APExitEngine:
             log.error(
                 "[exit_eng] EXIT_UNSAFE_BROKER_TRUTH_UNAVAILABLE "
                 "client=%s broker.list_positions() failed: %s — "
-                "continuing with local engine state",
+                "continuing with local engine state; exits not blocked",
                 self._email, _bp_err,
             )
             return False
@@ -3260,23 +3295,33 @@ class APExitEngine:
 
         missing_from_engine = broker_syms - engine_syms
 
-        # ── 3. Full cycle audit log ───────────────────────────────────────────
-        repaired_syms     = []
-        loaded_db_syms    = []
+        # ── 3. Repair / load each missing position ────────────────────────────
+        repaired_syms      = []
+        loaded_db_syms     = []
         repair_failed_syms = []
 
         for sym in sorted(missing_from_engine):
             bp  = broker_map[sym]
             qty = int(bp.get("quantity") or 0)
+            cost_basis = float(bp.get("cost_basis") or 0)
+            entry_px   = cost_basis / max(qty, 1) / 100
+
+            db_seen     = False
+            db_repaired = False
+            pos         = None
+
             log.warning(
                 "[exit_eng] broker_position_missing_from_engine "
-                "client=%s account=%s symbol=%s qty=%d — attempting repair",
-                self._email, getattr(self.broker, "account_id", "?"), sym, qty,
+                "client=%s account=%s symbol=%s qty=%d entry_px=%.4f"
+                " — attempting repair",
+                self._email, getattr(self.broker, "account_id", "?"),
+                sym, qty, entry_px,
             )
 
             # ── 3a. Try DB load ───────────────────────────────────────────────
             db_row = self._load_db_position_row(sym)
             if db_row:
+                db_seen = True
                 try:
                     pos = self._managed_position_from_row(db_row, qty_override=qty)
                     self.add_position(pos)
@@ -3286,42 +3331,87 @@ class APExitEngine:
                         "client=%s symbol=%s pos_id=%s qty=%d side=%s",
                         self._email, sym, db_row.get("id"), qty, pos.side,
                     )
-                    continue
                 except Exception as _le:
-                    log.warning("[exit_eng] DB row load failed for %s: %s — trying upsert", sym, _le)
+                    log.warning(
+                        "[exit_eng] DB row load failed for %s: %s — trying upsert",
+                        sym, _le,
+                    )
+                    pos = None
 
-            # ── 3b. Create DB row from broker truth ───────────────────────────
-            try:
-                new_id = self._upsert_broker_position_to_db(sym, bp)
-                minimal_row = {
-                    "id":                 new_id or "",
-                    "contract":           sym,
-                    "option_symbol":      sym,
-                    "underlying":         self._underlying_from_occ(sym),
-                    "side":               self._parse_occ_side(sym),
-                    "qty":                qty,
-                    "quantity_remaining": qty,
-                    "entry_price":        float(bp.get("cost_basis") or 0) / max(qty, 1) / 100,
-                    "avg_fill":           float(bp.get("cost_basis") or 0) / max(qty, 1) / 100,
-                    "entry_ts":           bp.get("date_acquired"),
-                }
-                pos = self._managed_position_from_row(minimal_row, qty_override=qty)
-                self.add_position(pos)
-                repaired_syms.append(sym)
-                log.info(
-                    "[exit_eng] broker_exit_repair_success "
-                    "client=%s symbol=%s side=%s qty=%d source=broker_exit_repair "
-                    "db_row_id=%s",
-                    self._email, sym, pos.side, qty, new_id or "none",
-                )
-            except Exception as _re_err:
-                repair_failed_syms.append(sym)
-                log.error(
-                    "[exit_eng] EXIT_UNSAFE_BROKER_POSITION_REPAIR_FAILED "
-                    "client=%s account=%s symbol=%s error=%s — "
-                    "position will not be exit-evaluated this cycle",
-                    self._email, getattr(self.broker, "account_id", "?"), sym, _re_err,
-                )
+            # ── 3b. Create DB row from broker truth if still no pos ───────────
+            if pos is None:
+                try:
+                    new_id = self._upsert_broker_position_to_db(sym, bp)
+                    minimal_row = {
+                        "id":                 new_id or "",
+                        "contract":           sym,
+                        "option_symbol":      sym,
+                        "underlying":         self._underlying_from_occ(sym),
+                        "side":               self._parse_occ_side(sym),
+                        "qty":                qty,
+                        "quantity_remaining": qty,
+                        "entry_price":        entry_px,
+                        "avg_fill":           entry_px,
+                        "entry_ts":           bp.get("date_acquired"),
+                    }
+                    pos = self._managed_position_from_row(minimal_row, qty_override=qty)
+                    self.add_position(pos)
+                    repaired_syms.append(sym)
+                    db_repaired = True
+                    log.info(
+                        "[exit_eng] broker_exit_repair_success "
+                        "client=%s symbol=%s side=%s qty=%d source=broker_exit_repair "
+                        "db_row_id=%s",
+                        self._email, sym, pos.side, qty, new_id or "none",
+                    )
+                except Exception as _re_err:
+                    repair_failed_syms.append(sym)
+                    log.error(
+                        "[exit_eng] EXIT_UNSAFE_BROKER_POSITION_REPAIR_FAILED "
+                        "client=%s account=%s symbol=%s error=%s",
+                        self._email, getattr(self.broker, "account_id", "?"),
+                        sym, _re_err,
+                    )
+                    continue   # skip quote + log for this symbol
+
+            # ── 3c. Fetch live quote and seed price state ─────────────────────
+            quote       = self._fetch_broker_quote(sym)
+            broker_mark = quote["mid"] or quote["bid"] or quote["last"]
+            broker_bid  = quote["bid"]
+            broker_ask  = quote["ask"]
+
+            if broker_mark > 0:
+                pos.current_option_price = broker_mark
+                if hasattr(pos, "current_bid"):
+                    pos.current_bid = broker_bid
+                if hasattr(pos, "current_ask"):
+                    pos.current_ask = broker_ask
+
+            # Seed peak P&L / touched_profit if broker price shows a gain
+            broker_pnl_pct = 0.0
+            if pos.entry_price > 0 and broker_mark > 0:
+                broker_pnl_pct = (broker_mark - pos.entry_price) / pos.entry_price
+                if broker_pnl_pct > 0:
+                    if broker_pnl_pct > pos.peak_pnl_pct:
+                        pos.peak_pnl_pct = broker_pnl_pct
+                    pos.touched_profit = True
+
+            # ── 3d. Required structured log (precheck — no exit submitted here)
+            log.info(
+                "[exit_eng] EXIT_ENGINE_REPAIRED_BROKER_POSITION_AND_EVALUATED_EXIT "
+                "client=%s account=%s contract_symbol=%s broker_qty=%d "
+                "broker_cost_basis=%.2f broker_mark_or_bid=%.4f broker_pnl_pct=%.2f "
+                "engine_seen_before=%s db_seen_before=%s db_repaired=%s "
+                "exit_rule_triggered=%s exit_order_submitted=%s reason_no_exit=%s",
+                self._email,
+                getattr(self.broker, "account_id", "?"),
+                sym, qty, cost_basis, broker_mark, broker_pnl_pct,
+                False,       # engine_seen_before — we just found it missing
+                db_seen, db_repaired,
+                False,       # exit_rule_triggered — evaluated by normal loop
+                False,       # exit_order_submitted — precheck never submits
+                "position_loaded_for_normal_exit_loop_evaluation",
+            )
 
         # ── 4. Summary audit log ──────────────────────────────────────────────
         log.info(
