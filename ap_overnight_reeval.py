@@ -64,6 +64,38 @@ _OVERNIGHT_REEVAL_SCORE_RECHECK_ENABLED = (
     os.getenv("OVERNIGHT_REEVAL_SCORE_RECHECK_ENABLED", "false").strip().lower()
     in ("true", "1")
 )
+
+
+def _hydrate_plan_from_signal(signal):
+    """Build a minimal TradePlan-compatible namespace from a WATCHING signal.
+    Used when MC rejects on intel/second-score but recheck is disabled —
+    the signal was already scanner-approved and has all the fields needed
+    for contract deferment + watcher arming.
+    """
+    import types as _types
+    _trig = float(signal.get("entry_trigger") or 0) or None
+    return _types.SimpleNamespace(
+        ticker          = signal.get("ticker") or signal.get("symbol"),
+        side            = (signal.get("side") or "").upper(),
+        direction       = (signal.get("side") or "").upper(),
+        score           = float(signal.get("score") or 0),
+        timeframe       = str(signal.get("timeframe") or "1d"),
+        entry_trigger   = _trig,
+        trigger_price   = _trig,
+        trigger_type    = "breach",
+        prior_day_high  = signal.get("prior_day_high"),
+        prior_day_low   = signal.get("prior_day_low"),
+        pattern         = signal.get("pattern"),
+        tier            = signal.get("tier"),
+        contract_symbol = None,
+        contracts       = None,
+        limit_price     = None,
+        metadata        = {
+            "overnight":             True,
+            "hydrated_from_signal":  True,
+            "second_score_mode":     "observe_only",
+        },
+    )
 # SIGNALS_LOOKBACK: hours-based alternative. When set, takes precedence over
 # OVERNIGHT_SIGNAL_MAX_AGE_DAYS for the initial created_at cutoff query.
 # Default 18h — covers signals from previous session's close to pre-market.
@@ -244,18 +276,27 @@ def run_overnight_reeval(
             if prior_levels.get("prior_day_close"):
                 signal["prior_day_close"] = prior_levels["prior_day_close"]
 
-            # If both prior levels are unavailable and the signal does not carry
-            # its own entry_trigger, we cannot derive a breach level. This is a
-            # DATA_UNAVAILABLE condition (broker history fetch failed) — keep
-            # WATCHING and retry, do not permanently reject.
-            _has_trigger = bool(float(signal.get("entry_trigger") or 0))
-            if prior_day_high is None and prior_day_low is None and not _has_trigger:
+            # Side-specific prior-level check:
+            #   CALL needs prior_day_high (or explicit entry_trigger)
+            #   PUT  needs prior_day_low  (or explicit entry_trigger)
+            # If the required level is unavailable due to broker/history fetch
+            # failure, keep WATCHING and retry — do not permanently reject.
+            _has_trigger  = bool(float(signal.get("entry_trigger") or 0))
+            _side_upper   = (side or "").upper()
+            _missing_level = None
+            if not _has_trigger:
+                if _side_upper == "CALL" and prior_day_high is None:
+                    _missing_level = "prior_day_high"
+                elif _side_upper == "PUT" and prior_day_low is None:
+                    _missing_level = "prior_day_low"
+            if _missing_level:
                 log.warning(
                     "[%s] overnight_reeval: OVERNIGHT_PRIOR_LEVELS_UNAVAILABLE "
-                    "signal=%s category=DATA_UNAVAILABLE severity=WARNING "
+                    "signal=%s side=%s missing=%s "
+                    "category=DATA_UNAVAILABLE severity=WARNING "
                     "final_decision=RETRY_LATER "
                     "reason_code=OVERNIGHT_PRIOR_LEVELS_UNAVAILABLE",
-                    ticker, signal_id,
+                    ticker, signal_id, _side_upper, _missing_level,
                 )
                 result["skipped"] = result.get("skipped", 0) + 1
                 continue  # leave job WATCHING for next reeval run
@@ -370,34 +411,59 @@ def run_overnight_reeval(
                     if (_is_intel_block
                             and not _is_hard_safety_block
                             and not _OVERNIGHT_REEVAL_SCORE_RECHECK_ENABLED):
-                        # Intel/second-score skip — keep WATCHING for next retry
+                        # Intel/second-score block on already-WATCHING signal.
+                        # Do NOT skip and do NOT reject. Hydrate a minimal plan
+                        # from the scanner-approved signal and proceed to arm path.
                         log.info(
                             "[%s] overnight_reeval: OVERNIGHT_SCORE_RECHECK_DISABLED "
-                            "signal=%s mc_reason=%s — intel/second-score block "
-                            "treated as RETRY_LATER (hard safety not triggered)",
+                            "signal=%s mc_reason=%s "
+                            "decision=PROCEED_TO_ARM second_score_mode=observe_only "
+                            "— intel/second-score ignored, using scanner-approved signal",
                             ticker, signal_id, decision.reason,
                         )
-                        result["skipped"] = result.get("skipped", 0) + 1
-                        continue
-
-                    # Hard safety block OR recheck enabled — reject as before
-                    log.info(
-                        "[%s] overnight_reeval: MC blocked %s — %s "
-                        "(hard_safety=%s intel=%s recheck_enabled=%s)",
-                        ticker, signal_id, decision.reason,
-                        _is_hard_safety_block, _is_intel_block,
-                        _OVERNIGHT_REEVAL_SCORE_RECHECK_ENABLED,
-                    )
-                    _mark_job_rejected(job_id, client_id, f"mc_blocked:{decision.reason}")
-                    if _lifecycle_ok:
+                        _hydrated = _hydrate_plan_from_signal(signal)
                         try:
-                            _sig_rejected(signal_id, ticker, _LO.MASTER_CONTROL,
-                                          f"mc_blocked: {decision.reason}",
-                                          _RC.RISK, "MC_BLOCKED", _RS.INFO)
+                            if getattr(decision, "plan", None) is None:
+                                decision.plan = _hydrated
+                            else:
+                                # MC built a plan but rejected on intel — keep MC's
+                                # plan and overlay signal fields the watcher needs.
+                                for _attr in ("ticker", "side", "score", "timeframe",
+                                              "entry_trigger", "trigger_price",
+                                              "prior_day_high", "prior_day_low"):
+                                    if getattr(decision.plan, _attr, None) in (None, 0, "", 0.0):
+                                        setattr(decision.plan, _attr,
+                                                getattr(_hydrated, _attr, None))
+                            decision.ok = True
                         except Exception:
-                            pass
-                    result["rejected"] += 1
-                    continue
+                            # decision is immutable — build a fresh namespace
+                            import types as _types_p
+                            decision = _types_p.SimpleNamespace(
+                                ok=True, plan=_hydrated,
+                                reason=f"observe_only:{decision.reason}",
+                                score=float(signal.get("score") or 0),
+                            )
+                        # Fall through to Step 5 (contract selection / arm)
+                    else:
+                        # Hard safety block OR recheck enabled — reject as before
+                        log.info(
+                            "[%s] overnight_reeval: MC blocked %s — %s "
+                            "(hard_safety=%s intel=%s recheck_enabled=%s)",
+                            ticker, signal_id, decision.reason,
+                            _is_hard_safety_block, _is_intel_block,
+                            _OVERNIGHT_REEVAL_SCORE_RECHECK_ENABLED,
+                        )
+                        _mark_job_rejected(job_id, client_id,
+                                           f"mc_blocked:{decision.reason}")
+                        if _lifecycle_ok:
+                            try:
+                                _sig_rejected(signal_id, ticker, _LO.MASTER_CONTROL,
+                                              f"mc_blocked: {decision.reason}",
+                                              _RC.RISK, "MC_BLOCKED", _RS.INFO)
+                            except Exception:
+                                pass
+                        result["rejected"] += 1
+                        continue
             except Exception as mc_exc:
                 log.error("[%s] overnight_reeval: master_control.evaluate failed: %s", ticker, mc_exc)
                 result["errors"] += 1
