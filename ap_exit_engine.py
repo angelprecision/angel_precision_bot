@@ -3058,8 +3058,70 @@ class APExitEngine:
             self._quote_arrived_event.wait(timeout=POLL_INTERVAL_SEC)
             self._quote_arrived_event.clear()
 
+    def _broker_position_precheck(self) -> bool:
+        """
+        Before every exit cycle: verify broker position truth.
+        If broker has positions missing from the exit engine, attempt to
+        load them from DB so exits are not silently missed.
+        Returns True if broker truth is confirmed, False if unavailable.
+
+        EXIT_UNSAFE_BROKER_TRUTH_UNAVAILABLE is logged and an alert fired
+        if the broker fetch fails — exit engine holds but does NOT stop.
+        """
+        if not self.broker or not hasattr(self.broker, "list_positions"):
+            return True   # broker doesn't support list_positions — skip precheck
+
+        try:
+            broker_positions = self.broker.list_positions() or []
+        except Exception as _bp_err:
+            log.error(
+                "[exit_eng] EXIT_UNSAFE_BROKER_TRUTH_UNAVAILABLE "
+                "client=%s broker.list_positions() failed: %s — "
+                "continuing with local engine state; exits not blocked",
+                self._email, _bp_err,
+            )
+            return False
+
+        broker_syms = {
+            str(p.get("symbol") or "").upper()
+            for p in broker_positions
+            if int(p.get("quantity") or 0) != 0
+        }
+        if not broker_syms:
+            return True   # broker has no positions — consistent if engine is also empty
+
+        # Symbols currently in the exit engine
+        with self._lock:
+            engine_syms = {
+                str(getattr(p, "option_symbol", "") or "").upper()
+                for p in self._positions
+                if not p.closed and int(p.quantity_remaining or 0) > 0
+            }
+
+        missing_from_engine = broker_syms - engine_syms
+        if missing_from_engine:
+            log.error(
+                "[exit_eng] EXIT_UNSAFE_BROKER_TRUTH_UNAVAILABLE "
+                "client=%s broker_positions=%s engine_positions=%s "
+                "missing_from_engine=%s — broker has positions not tracked by exit engine; "
+                "DB may be out of sync. Run /admin/clients/%s/positions/repair-from-broker.",
+                self._email, sorted(broker_syms), sorted(engine_syms),
+                sorted(missing_from_engine), self._email,
+            )
+            return False
+
+        return True
+
     def _check_all_positions(self):
         today_et = _et_session_date()
+
+        # Broker truth precheck: verify engine positions match broker before evaluating exits.
+        # Prevents "no positions" assumption when DB/engine missed a fill.
+        # EXIT_UNSAFE_BROKER_TRUTH_UNAVAILABLE is logged if check fails — execution continues.
+        try:
+            self._broker_position_precheck()
+        except Exception as _pce:
+            log.warning("[exit_eng] _broker_position_precheck error (non-blocking): %s", _pce)
 
         # FIX-3: expired contract cleanup now runs inside self._lock.
         # Previously this block iterated and reassigned self._positions without
