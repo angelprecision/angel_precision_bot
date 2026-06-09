@@ -3058,39 +3058,187 @@ class APExitEngine:
             self._quote_arrived_event.wait(timeout=POLL_INTERVAL_SEC)
             self._quote_arrived_event.clear()
 
+    # ── Broker precheck helpers ──────────────────────────────────────────────
+
+    @staticmethod
+    def _parse_occ_side(symbol: str) -> str:
+        """Parse CALL/PUT from OCC option symbol using the standard C/P right character.
+        OCC format: {underlying}{YYMMDD}{C|P}{strike_padded_8digits}
+        E.g. RIVN260612P00016500 → PUT   C260612C00136000 → CALL
+        Never use string-contains "C" or "P" — COIN/BAC/etc would be misread.
+        """
+        import re as _re
+        m = _re.match(r'^([A-Z]+)(\d{6})([CP])(\d{8})$', symbol.strip().upper())
+        if m:
+            return "CALL" if m.group(3) == "C" else "PUT"
+        # fallback: walk past root letters + 6 digits
+        s = symbol.strip().upper()
+        i = 0
+        while i < len(s) and s[i].isalpha(): i += 1  # skip root
+        i += 6                                          # skip YYMMDD
+        if i < len(s) and s[i] in ("C", "P"):
+            return "CALL" if s[i] == "C" else "PUT"
+        return "UNKNOWN"
+
+    @staticmethod
+    def _underlying_from_occ(symbol: str) -> str:
+        """Extract underlying ticker from OCC symbol (letters before the date)."""
+        import re as _re
+        m = _re.match(r'^([A-Z]+)\d{6}[CP]\d+$', symbol.strip().upper())
+        return m.group(1) if m else symbol.strip().upper()[:5]
+
+    def _load_db_position_row(self, sym: str) -> dict | None:
+        """Look up an OPEN/CLOSING positions row for this client + contract symbol."""
+        try:
+            from ap.db import conn, run_with_retry
+            def _q():
+                with conn() as c:
+                    c.execute(
+                        """
+                        SELECT id, underlying, contract, option_symbol, side, direction,
+                               qty, quantity_remaining, avg_fill, entry_price,
+                               entry_ts, status, signal_id
+                        FROM positions
+                        WHERE client_id = %s
+                          AND status IN ('OPEN','CLOSING')
+                          AND (
+                            UPPER(contract)      = UPPER(%s)
+                            OR UPPER(option_symbol) = UPPER(%s)
+                          )
+                        ORDER BY entry_ts DESC NULLS LAST
+                        LIMIT 1
+                        """,
+                        (self._email, sym, sym),
+                    )
+                    row = c.fetchone()
+                    if row:
+                        cols = [d[0] for d in c.description]
+                        return dict(zip(cols, row))
+            return run_with_retry(_q)
+        except Exception as _de:
+            log.warning("[exit_eng] _load_db_position_row %s failed: %s", sym, _de)
+            return None
+
+    def _upsert_broker_position_to_db(self, sym: str, bp: dict) -> str | None:
+        """Create a minimal OPEN positions row from broker data. Returns row id or None."""
+        try:
+            from ap.db import conn, run_with_retry
+            import re as _re
+            underlying = self._underlying_from_occ(sym)
+            side       = self._parse_occ_side(sym)
+            qty        = int(bp.get("quantity") or 0)
+            cost_basis = float(bp.get("cost_basis") or 0)
+            entry_px   = round(cost_basis / max(qty, 1) / 100, 6) if qty > 0 and cost_basis > 0 else 0.0
+            entry_ts   = bp.get("date_acquired")
+
+            def _ins():
+                with conn() as c:
+                    c.execute(
+                        """
+                        INSERT INTO positions
+                            (client_id, underlying, contract, option_symbol, side, direction,
+                             qty, quantity_remaining, entry_price, avg_fill,
+                             status, source, entry_ts)
+                        VALUES
+                            (%s, %s, %s, %s, %s, %s,
+                             %s, %s, %s, %s,
+                             'OPEN', 'broker_exit_repair', %s)
+                        ON CONFLICT DO NOTHING
+                        RETURNING id
+                        """,
+                        (self._email, underlying, sym, sym, side, side,
+                         qty, qty, entry_px, entry_px,
+                         entry_ts),
+                    )
+                    row = c.fetchone()
+                    return str(row[0]) if row else None
+            return run_with_retry(_ins)
+        except Exception as _ue:
+            log.error("[exit_eng] _upsert_broker_position_to_db %s failed: %s", sym, _ue)
+            return None
+
+    def _managed_position_from_row(self, row: dict, qty_override: int = 0) -> "ManagedPosition":
+        """Build a ManagedPosition from a DB row (or minimal broker data dict)."""
+        sym       = str(row.get("contract") or row.get("option_symbol") or "")
+        ticker    = str(row.get("underlying") or self._underlying_from_occ(sym))
+        side_raw  = str(row.get("side") or row.get("direction") or "").upper()
+        side      = side_raw if side_raw in ("CALL", "PUT") else self._parse_occ_side(sym)
+        qty       = int(row.get("quantity_remaining") or row.get("qty") or qty_override or 1)
+        entry_px  = float(row.get("entry_price") or row.get("avg_fill") or 0.0)
+        pos_id    = str(row.get("id") or "")
+        sig_id    = str(row.get("signal_id") or "")
+        opened_at = None
+        try:
+            import datetime as _dt
+            raw_ts = row.get("entry_ts")
+            if raw_ts:
+                if isinstance(raw_ts, str):
+                    opened_at = _dt.datetime.fromisoformat(raw_ts.replace("Z","+00:00"))
+                elif isinstance(raw_ts, _dt.datetime):
+                    opened_at = raw_ts
+        except Exception:
+            pass
+        if opened_at and opened_at.tzinfo is None:
+            import datetime as _dt
+            opened_at = opened_at.replace(tzinfo=_dt.timezone.utc)
+
+        _now = datetime.now(timezone.utc)
+        return ManagedPosition(
+            ticker           = ticker,
+            option_symbol    = sym,
+            side             = side,
+            quantity         = qty,
+            entry_price      = entry_px,
+            underlying_entry = 0.0,   # unknown from broker data — exits use current price
+            underlying_target= 0.0,   # no target on repair — trailing/EOD rules still apply
+            underlying_stop  = 0.0,   # no stop on repair — EOD/expiry rules protect
+            position_id      = pos_id,
+            client_id        = self._email,
+            signal_id        = sig_id,
+            quantity_remaining = qty,
+            opened_at        = opened_at or _now,
+        )
+
     def _broker_position_precheck(self) -> bool:
         """
-        Before every exit cycle: verify broker position truth.
-        If broker has positions missing from the exit engine, attempt to
-        load them from DB so exits are not silently missed.
-        Returns True if broker truth is confirmed, False if unavailable.
+        Before every exit cycle: fetch broker positions and repair/load any
+        that are missing from the exit engine, then return.
+        Returns True if broker truth is confirmed (or broker not supported).
+        Returns False if broker fetch fails (cycle proceeds with local state).
 
-        EXIT_UNSAFE_BROKER_TRUTH_UNAVAILABLE is logged and an alert fired
-        if the broker fetch fails — exit engine holds but does NOT stop.
+        Spec behavior:
+        - If broker has positions not in engine: load from DB or create DB row,
+          then add to engine via add_position() so same cycle evaluates exits.
+        - Never assume zero positions when broker has live positions.
+        - EXIT_UNSAFE_BROKER_TRUTH_UNAVAILABLE logged on broker failure.
+        - EXIT_UNSAFE_BROKER_POSITION_REPAIR_FAILED logged on repair failure.
         """
         if not self.broker or not hasattr(self.broker, "list_positions"):
-            return True   # broker doesn't support list_positions — skip precheck
+            return True
 
+        # ── 1. Fetch broker positions ─────────────────────────────────────────
         try:
             broker_positions = self.broker.list_positions() or []
         except Exception as _bp_err:
             log.error(
                 "[exit_eng] EXIT_UNSAFE_BROKER_TRUTH_UNAVAILABLE "
                 "client=%s broker.list_positions() failed: %s — "
-                "continuing with local engine state; exits not blocked",
+                "continuing with local engine state",
                 self._email, _bp_err,
             )
             return False
 
-        broker_syms = {
-            str(p.get("symbol") or "").upper()
+        broker_map = {
+            str(p.get("symbol") or "").upper(): p
             for p in broker_positions
             if int(p.get("quantity") or 0) != 0
         }
-        if not broker_syms:
-            return True   # broker has no positions — consistent if engine is also empty
+        broker_syms = set(broker_map.keys())
 
-        # Symbols currently in the exit engine
+        if not broker_syms:
+            return True   # broker confirms no open positions
+
+        # ── 2. Current engine symbols ─────────────────────────────────────────
         with self._lock:
             engine_syms = {
                 str(getattr(p, "option_symbol", "") or "").upper()
@@ -3099,18 +3247,87 @@ class APExitEngine:
             }
 
         missing_from_engine = broker_syms - engine_syms
-        if missing_from_engine:
-            log.error(
-                "[exit_eng] EXIT_UNSAFE_BROKER_TRUTH_UNAVAILABLE "
-                "client=%s broker_positions=%s engine_positions=%s "
-                "missing_from_engine=%s — broker has positions not tracked by exit engine; "
-                "DB may be out of sync. Run /admin/clients/%s/positions/repair-from-broker.",
-                self._email, sorted(broker_syms), sorted(engine_syms),
-                sorted(missing_from_engine), self._email,
-            )
-            return False
 
-        return True
+        # ── 3. Full cycle audit log ───────────────────────────────────────────
+        repaired_syms     = []
+        loaded_db_syms    = []
+        repair_failed_syms = []
+
+        for sym in sorted(missing_from_engine):
+            bp  = broker_map[sym]
+            qty = int(bp.get("quantity") or 0)
+            log.warning(
+                "[exit_eng] broker_position_missing_from_engine "
+                "client=%s account=%s symbol=%s qty=%d — attempting repair",
+                self._email, getattr(self.broker, "account_id", "?"), sym, qty,
+            )
+
+            # ── 3a. Try DB load ───────────────────────────────────────────────
+            db_row = self._load_db_position_row(sym)
+            if db_row:
+                try:
+                    pos = self._managed_position_from_row(db_row, qty_override=qty)
+                    self.add_position(pos)
+                    loaded_db_syms.append(sym)
+                    log.info(
+                        "[exit_eng] broker_repair_loaded_from_db "
+                        "client=%s symbol=%s pos_id=%s qty=%d side=%s",
+                        self._email, sym, db_row.get("id"), qty, pos.side,
+                    )
+                    continue
+                except Exception as _le:
+                    log.warning("[exit_eng] DB row load failed for %s: %s — trying upsert", sym, _le)
+
+            # ── 3b. Create DB row from broker truth ───────────────────────────
+            try:
+                new_id = self._upsert_broker_position_to_db(sym, bp)
+                minimal_row = {
+                    "id":                 new_id or "",
+                    "contract":           sym,
+                    "option_symbol":      sym,
+                    "underlying":         self._underlying_from_occ(sym),
+                    "side":               self._parse_occ_side(sym),
+                    "qty":                qty,
+                    "quantity_remaining": qty,
+                    "entry_price":        float(bp.get("cost_basis") or 0) / max(qty, 1) / 100,
+                    "avg_fill":           float(bp.get("cost_basis") or 0) / max(qty, 1) / 100,
+                    "entry_ts":           bp.get("date_acquired"),
+                }
+                pos = self._managed_position_from_row(minimal_row, qty_override=qty)
+                self.add_position(pos)
+                repaired_syms.append(sym)
+                log.info(
+                    "[exit_eng] broker_exit_repair_success "
+                    "client=%s symbol=%s side=%s qty=%d source=broker_exit_repair "
+                    "db_row_id=%s",
+                    self._email, sym, pos.side, qty, new_id or "none",
+                )
+            except Exception as _re_err:
+                repair_failed_syms.append(sym)
+                log.error(
+                    "[exit_eng] EXIT_UNSAFE_BROKER_POSITION_REPAIR_FAILED "
+                    "client=%s account=%s symbol=%s error=%s — "
+                    "position will not be exit-evaluated this cycle",
+                    self._email, getattr(self.broker, "account_id", "?"), sym, _re_err,
+                )
+
+        # ── 4. Summary audit log ──────────────────────────────────────────────
+        log.info(
+            "[exit_eng] broker_precheck_summary "
+            "client=%s account=%s "
+            "broker_position_count=%d broker_symbols=%s "
+            "engine_position_count=%d engine_symbols=%s "
+            "missing_from_engine=%s "
+            "loaded_from_db_symbols=%s repaired_symbols=%s repair_failed_symbols=%s",
+            self._email,
+            getattr(self.broker, "account_id", "?"),
+            len(broker_syms), sorted(broker_syms),
+            len(engine_syms), sorted(engine_syms),
+            sorted(missing_from_engine),
+            loaded_db_syms, repaired_syms, repair_failed_syms,
+        )
+
+        return len(repair_failed_syms) == 0
 
     def _check_all_positions(self):
         today_et = _et_session_date()
