@@ -61,6 +61,26 @@ _PENDING_ENTRY_STATUSES = (
     "ACKNOWLEDGED",
     "PARTIAL_FILL",
 )
+
+# Statuses that consume an actual position slot — broker order is live or filled.
+# PENDING_TRIGGER / WATCHING / DEFERRED / CREATED are watcher or pre-submit states:
+# no broker order exists yet, no capital is committed at the broker.
+# These must NOT count toward max_positions / max_calls / max_puts slot limits.
+_SLOT_CONSUMING_STATUSES = (
+    "SUBMITTED",
+    "ACKNOWLEDGED",
+    "PARTIAL_FILL",
+    "PARTIALLY_FILLED",   # alternate spelling in some OSM versions
+)
+
+# Watcher/pre-submit states that must never consume a slot.
+_WATCHER_ENTRY_STATUSES = (
+    "NEW",
+    "PROCESSING",
+    "WATCHING",
+    "PENDING_TRIGGER",
+    "DEFERRED",
+)
 _PENDING_EXIT_STATUSES = (
     "EXIT_REQUESTED",
     "EXIT_SUBMITTED",
@@ -1167,38 +1187,64 @@ class APPositionManager:
                     )
                     total_trades = 0
 
-                # FUNNEL FIX (2026-05-20): exclude phantom-CREATED orders from
-                # the slot count. A CREATED order with NO broker_order_id that
-                # is older than PENDING_ENTRY_PHANTOM_GRACE_SEC is effectively
-                # dead (the broker handoff failed) and will be cleaned up by
-                # the watchdog within the next ~120s. Counting it as pending
-                # exposure is what caused 'positions_full_at_breach' to fire
-                # 5x today with ZERO actual fills.
+                # SLOT ACCOUNTING FIX: only actual broker-submitted orders
+                # consume position slots. PENDING_TRIGGER / WATCHING / DEFERRED
+                # are watcher-armed setups — no broker order exists, no capital
+                # is committed. Counting them caused max_positions_with_pending
+                # to fire with 0 actual fills across all clients.
                 #
-                # We still count:
-                #   - CREATED orders younger than the grace window (legitimate in-flight)
-                #   - CREATED orders that have a broker_order_id (queued at broker)
-                #   - SUBMITTED, ACKNOWLEDGED, PARTIAL_FILL (real live exposure)
-                #
-                # PENDING_TRIGGER orders are watcher-armed but not yet at broker.
-                # Treated the same as CREATED for the phantom-grace rule.
+                # Slot-consuming statuses: SUBMITTED, ACKNOWLEDGED, PARTIAL_FILL.
+                # CREATED orders (pre-submit, <30s phantom grace) still count
+                # to catch legitimate in-flight broker handoffs.
+                # PENDING_TRIGGER/WATCHING/DEFERRED NEVER count toward slots.
                 _phantom_grace_sec = int(os.getenv("PENDING_ENTRY_PHANTOM_GRACE_SEC", "30"))
-                entry_placeholders = ",".join(["%s"] * len(_PENDING_ENTRY_STATUSES))
+                slot_placeholders = ",".join(["%s"] * len(_SLOT_CONSUMING_STATUSES))
                 c.execute(
                     f"""
                     SELECT COUNT(*) AS n
                     FROM orders
                     WHERE client_id = %s AND kind = 'ENTRY'
-                      AND status IN ({entry_placeholders})
+                      AND status IN ({slot_placeholders})
+                    """,
+                    (self.client_id, *_SLOT_CONSUMING_STATUSES),
+                )
+                pending_entries = int((c.fetchone() or {}).get("n") or 0)
+
+                # Count watcher/pre-submit rows separately for logging/audit.
+                # These are NOT slot-consuming but are tracked for observability.
+                watcher_placeholders = ",".join(["%s"] * len(_WATCHER_ENTRY_STATUSES))
+                c.execute(
+                    f"""
+                    SELECT COUNT(*) AS n
+                    FROM orders
+                    WHERE client_id = %s AND kind = 'ENTRY'
+                      AND status IN ({watcher_placeholders})
                       AND NOT (
-                        status IN ('CREATED', 'PENDING_TRIGGER')
+                        status = 'PENDING_TRIGGER'
                         AND (broker_order_id IS NULL OR broker_order_id = '')
                         AND created_ts < NOW() - (%s || ' seconds')::interval
                       )
                     """,
-                    (self.client_id, *_PENDING_ENTRY_STATUSES, str(_phantom_grace_sec)),
+                    (self.client_id, *_WATCHER_ENTRY_STATUSES, str(_phantom_grace_sec)),
                 )
-                pending_entries = int((c.fetchone() or {}).get("n") or 0)
+                watcher_count = int((c.fetchone() or {}).get("n") or 0)
+
+                # Also count CREATED orders in phantom-grace window (may be in-flight)
+                c.execute(
+                    """
+                    SELECT COUNT(*) AS n
+                    FROM orders
+                    WHERE client_id = %s AND kind = 'ENTRY'
+                      AND status = 'CREATED'
+                      AND NOT (
+                        (broker_order_id IS NULL OR broker_order_id = '')
+                        AND created_ts < NOW() - (%s || ' seconds')::interval
+                      )
+                    """,
+                    (self.client_id, str(_phantom_grace_sec)),
+                )
+                created_in_flight = int((c.fetchone() or {}).get("n") or 0)
+                pending_entries = pending_entries + created_in_flight
 
                 exit_placeholders = ",".join(["%s"] * len(_PENDING_EXIT_STATUSES))
                 c.execute(
@@ -1228,6 +1274,7 @@ class APPositionManager:
                     "puts_open":          sum(1 for p in active if p.get("direction") == "PUT"),
                     "capital_deployed":   float(summary.get("capital_deployed") or 0),
                     "pending_entries":    pending_entries,
+                    "watcher_count":      watcher_count,
                     "pending_exits":      pending_exits,
                     "trades_today":       int(summary.get("trades_today") or 0),
                     "realized_pnl_today": float(summary.get("realized_pnl_today") or 0),
