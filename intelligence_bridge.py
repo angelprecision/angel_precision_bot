@@ -83,6 +83,11 @@ INTELLIGENCE_AVAILABLE: bool = _package_ready  # MED-008: derive from actual reg
 INTEL_TIMEOUT_SECONDS:   float = float(os.getenv("INTEL_TIMEOUT_SECONDS",  "8.0"))
 INTEL_APPROVE_THRESHOLD: float = float(os.getenv("INTEL_APPROVE_THRESHOLD", "35.0"))
 
+# Minimum scanner score for the data-gap fallback path.
+# Must be the live-eligible floor (70), not the generic intel threshold (35).
+# A scanner score of 35 with missing fundamentals is not a confirmed setup.
+GATE_G_SCANNER_MIN_ELIGIBLE: float = float(os.getenv("GATE_G_SCANNER_MIN_ELIGIBLE", "70.0"))
+
 # Gate G policy:
 # - LIVE defaults fail-closed: intel unavailable/timeout/error/skip/low-score/risk-veto blocks.
 # - Paper/research may opt into 1-contract data-collection overrides.
@@ -348,10 +353,16 @@ def _map_result(result: dict, fallback_score: float) -> dict:
             _is_data_skip, _is_hard_block,
         )
 
-        if _is_data_skip and not _is_hard_block and fallback_score >= INTEL_APPROVE_THRESHOLD:
-            # Intel score is low solely due to missing/neutral fundamentals.
-            # Scanner-approved score >= INTEL_APPROVE_THRESHOLD.
-            # Allow through using scanner score. Log as data-unavailable, not rejection.
+        if (_is_data_skip
+                and not _is_hard_block
+                and _missing_count > 0
+                and fallback_score >= GATE_G_SCANNER_MIN_ELIGIBLE):
+            # Allow scanner fallback ONLY when all four conditions are met:
+            #   1. Skip reason is "insufficient edge" (data-driven, not hard risk)
+            #   2. missing_fundamental_count > 0 (confirmed missing data)
+            #   3. No hard risk finding
+            #   4. scanner_score >= GATE_G_SCANNER_MIN_ELIGIBLE (default 70)
+            # If fundamentals are present but intel score is still < 60, keep the reject.
             log.info(
                 "[%s] GATE_G_SCANNER_APPROVED scanner_score=%.1f intel_score=%.1f "
                 "effective_score=%.1f missing_fundamental_count=%d "
