@@ -3171,7 +3171,11 @@ class APExitEngine:
         ticker    = str(row.get("underlying") or self._underlying_from_occ(sym))
         side_raw  = str(row.get("side") or row.get("direction") or "").upper()
         side      = side_raw if side_raw in ("CALL", "PUT") else self._parse_occ_side(sym)
-        qty       = int(row.get("quantity_remaining") or row.get("qty") or qty_override or 1)
+        # P0-PARTIAL-CLOSE: do NOT use `or` — quantity_remaining=0 is a valid
+        # value meaning fully closed. Falling back to qty would load original
+        # entry size into the exit engine for a row that has zero contracts left.
+        _qr = row.get("quantity_remaining")
+        qty = int(_qr if _qr is not None else (row.get("qty") or qty_override or 1))
         entry_px  = float(row.get("entry_price") or row.get("avg_fill") or 0.0)
         pos_id    = str(row.get("id") or "")
         sig_id    = str(row.get("signal_id") or "")

@@ -2,7 +2,7 @@
 -- P0 MIGRATION: Audit + broker-safe repair of CLOSED positions with remaining qty
 -- File: migrations/20260609_p0_partial_close_repair.sql
 -- Author: Angel Precision Intelligence
--- Date: 2026-06-09 (revised)
+-- Date: 2026-06-09 (revised v3)
 --
 -- Context
 -- -------
@@ -15,76 +15,86 @@
 --   AAPL: qty=5 remaining=3  BA:  qty=5  remaining=3
 --   C:    qty=7 remaining=5
 --
--- Safety principle
--- ----------------
--- exit_price IS NOT NULL does NOT prove broker-flat.
--- It may only prove a partial exit or scale-out occurred.
--- The ONLY safe automatic zeroing is for contracts that have already expired
--- (OCC expiry date is in the past), because expired options are always flat.
--- Everything else requires manual broker verification before touching state.
+-- Safety principles
+-- -----------------
+-- 1. positions.expiry_date does NOT exist in this schema.
+--    Expiry is derived from the OCC contract symbol string (YYMMDD chars 7-12).
+--    PostgreSQL regex: SUBSTRING(contract FROM '\d{6}(?=[CP])') → 'YYMMDD'
+--    Converted to date: TO_DATE(match, 'YYMMDD')
 --
--- What this migration does
--- ------------------------
---  STEP 1  Audit-only SELECT — shows all bad rows with full context.
---          Run this first, review output before proceeding.
+-- 2. exit_price IS NOT NULL does NOT prove broker-flat.
+--    It may only prove a partial exit or scale-out occurred.
 --
---  STEP 2  Auto-repair only expired contracts:
---          expiry_date < NOW() → quantity_remaining=0, close_source=CLOSED_REPAIR
---          Safe: expired options cannot be held by any broker.
+-- 3. The ONLY safe automatic zeroing is for EXPIRED contracts:
+--    An expired option cannot be held by any broker.
+--    All other rows require manual broker verification.
 --
---  STEP 3  Flag everything else as MANUAL_REVIEW_REQUIRED WITHOUT changing
---          status or quantity_remaining. Operator must check Tradier for each row.
---
---  STEP 4  Post-repair verification SELECT.
+-- Safe rule
+-- ---------
+--   expired contract (OCC expiry < today)   → auto-zero quantity_remaining=0
+--   all other CLOSED+remaining>0 rows       → MANUAL_REVIEW_REQUIRED
+--                                             status and quantity_remaining UNCHANGED
 --
 -- The runtime reconciler (_repair_closed_positions_with_remaining_qty) handles
--- live broker-truth verification going forward. This migration handles historical debt.
+-- live broker-truth verification for MANUAL_REVIEW_REQUIRED rows going forward.
 --
 -- Safe to run multiple times (idempotent WHERE clauses throughout).
 -- =============================================================================
 
--- ── STEP 1: AUDIT — review this output before running Steps 2–3 ──────────────
--- Run this block alone first. Confirm the rows look as expected.
--- Pay attention to expiry_date: expired contracts are auto-repairable.
--- Non-expired contracts need broker verification.
+-- ── HELPER: OCC expiry extraction ────────────────────────────────────────────
+-- OCC symbol format: {root}{YYMMDD}{C|P}{8-digit-strike}
+-- Example: PG260620C00155000 → expiry string '260620' → date 2026-06-20
+-- Regex captures the 6-digit sequence immediately before a C or P.
+-- If the contract does not match OCC format, TO_DATE returns NULL safely.
+
+-- ── STEP 1: AUDIT — run this first, review before proceeding ─────────────────
+-- Shows all bad rows with expiry derived from OCC symbol.
+-- Review the repair_action column for each row before running Steps 2-3.
 SELECT
     id,
     client_id,
-    COALESCE(option_symbol, contract)                       AS option_contract,
+    COALESCE(option_symbol, contract)                           AS option_contract,
     qty,
     quantity_remaining,
     status,
     close_source,
     exit_ts,
     exit_price,
-    expiry_date,
+    -- Derive expiry from OCC symbol — no expiry_date column in schema
+    TO_DATE(
+        SUBSTRING(COALESCE(option_symbol, contract) FROM '\d{6}(?=[CP])'),
+        'YYMMDD'
+    )                                                           AS derived_expiry,
     CASE
-        WHEN expiry_date IS NOT NULL AND expiry_date < NOW()
-            THEN 'EXPIRED — safe to auto-zero'
-        WHEN exit_price IS NOT NULL AND exit_price > 0
-            THEN 'HAS_EXIT_PRICE — needs broker verify before zeroing'
+        WHEN TO_DATE(
+                SUBSTRING(COALESCE(option_symbol, contract) FROM '\d{6}(?=[CP])'),
+                'YYMMDD'
+             ) < CURRENT_DATE
+            THEN 'EXPIRED — safe to auto-zero quantity_remaining'
+        WHEN TO_DATE(
+                SUBSTRING(COALESCE(option_symbol, contract) FROM '\d{6}(?=[CP])'),
+                'YYMMDD'
+             ) IS NULL
+            THEN 'NON-OCC SYMBOL — manual review required'
         ELSE
-            'NO_EXIT_PRICE — needs broker verify before zeroing'
-    END                                                     AS repair_recommendation
+            'NOT YET EXPIRED — broker verify required before touching'
+    END                                                         AS repair_action
 FROM positions
 WHERE UPPER(status) = 'CLOSED'
   AND COALESCE(quantity_remaining, 0) > 0
-ORDER BY client_id, expiry_date NULLS LAST, entry_ts DESC;
+ORDER BY client_id, derived_expiry NULLS LAST, entry_ts DESC;
 
 -- =============================================================================
--- STOP HERE. Review the audit output above.
--- Only proceed to Steps 2–3 after reviewing each row.
+-- STOP. Review the audit output above.
+-- Only proceed to Steps 2-3 after confirming each row's repair_action.
 -- =============================================================================
 
 BEGIN;
 
 -- ── STEP 2: Auto-repair EXPIRED contracts only ────────────────────────────────
--- Expired options cannot be held by any broker. Zero their quantity_remaining.
--- This is the ONLY safe automatic fix — no broker call needed.
---
--- Condition: expiry_date column must exist and be in the past.
--- If your schema uses a different column name (e.g. expiration_date, exp_date),
--- update the column name below before running.
+-- Expired options cannot be held by any broker — safe to zero without a broker call.
+-- Condition: OCC-derived expiry date is before today (CURRENT_DATE).
+-- Non-OCC symbols produce NULL from TO_DATE and are excluded by IS NOT NULL.
 UPDATE positions
 SET
     quantity_remaining = 0,
@@ -92,30 +102,40 @@ SET
     updated_at         = NOW()
 WHERE UPPER(status) = 'CLOSED'
   AND COALESCE(quantity_remaining, 0) > 0
-  AND expiry_date IS NOT NULL
-  AND expiry_date < NOW();
+  AND TO_DATE(
+        SUBSTRING(COALESCE(option_symbol, contract) FROM '\d{6}(?=[CP])'),
+        'YYMMDD'
+      ) IS NOT NULL
+  AND TO_DATE(
+        SUBSTRING(COALESCE(option_symbol, contract) FROM '\d{6}(?=[CP])'),
+        'YYMMDD'
+      ) < CURRENT_DATE;
 
--- ── STEP 3: Flag non-expired rows for manual broker verification ──────────────
--- Do NOT change status or quantity_remaining here.
--- Operator must check Tradier for each flagged row before resolving.
---
--- Rows already flagged are skipped (idempotent).
+-- ── STEP 3: Flag all remaining rows for manual broker verification ────────────
+-- DO NOT change status or quantity_remaining here.
+-- Covers: not-yet-expired contracts, non-OCC symbols, any unresolved row.
+-- Idempotent: rows already flagged are skipped.
 UPDATE positions
 SET
     close_source = 'MANUAL_REVIEW_REQUIRED',
     updated_at   = NOW()
 WHERE UPPER(status) = 'CLOSED'
   AND COALESCE(quantity_remaining, 0) > 0
-  AND (expiry_date IS NULL OR expiry_date >= NOW())
   AND close_source != 'MANUAL_REVIEW_REQUIRED';  -- idempotent
 
 -- ── STEP 4: Post-repair verification ─────────────────────────────────────────
 SELECT
     close_source,
-    COUNT(*)                    AS row_count,
-    SUM(quantity_remaining)     AS total_remaining_qty,
-    MIN(expiry_date)            AS earliest_expiry,
-    MAX(expiry_date)            AS latest_expiry
+    COUNT(*)                                                    AS row_count,
+    SUM(quantity_remaining)                                     AS total_remaining_qty,
+    MIN(TO_DATE(
+        SUBSTRING(COALESCE(option_symbol, contract) FROM '\d{6}(?=[CP])'),
+        'YYMMDD'
+    ))                                                          AS earliest_derived_expiry,
+    MAX(TO_DATE(
+        SUBSTRING(COALESCE(option_symbol, contract) FROM '\d{6}(?=[CP])'),
+        'YYMMDD'
+    ))                                                          AS latest_derived_expiry
 FROM positions
 WHERE UPPER(status) = 'CLOSED'
   AND COALESCE(quantity_remaining, 0) > 0
@@ -127,15 +147,15 @@ COMMIT;
 -- =============================================================================
 -- POST-MIGRATION OPERATOR CHECKLIST
 -- =============================================================================
--- After running, you will have two categories of rows remaining:
+-- After running, two categories of rows may remain:
 --
--- A. CLOSED_REPAIR rows (quantity_remaining=0)
---    These are expired contracts — no further action needed.
+-- A. CLOSED_REPAIR (quantity_remaining=0)
+--    Expired contracts — no further action needed.
 --
--- B. MANUAL_REVIEW_REQUIRED rows (quantity_remaining still > 0)
---    For each row: check Tradier broker account for the option contract.
+-- B. MANUAL_REVIEW_REQUIRED (quantity_remaining still > 0)
+--    For each row: check the option contract in Tradier broker account.
 --
---    Case 1 — Broker is flat (contract not held):
+--    Case 1 — Broker is flat (contract not held, or confirmed expired):
 --      UPDATE positions
 --      SET    quantity_remaining = 0,
 --             close_source       = 'CLOSED_REPAIR',
@@ -149,18 +169,18 @@ COMMIT;
 --             close_source       = 'PARTIAL_CLOSE_REPAIR',
 --             updated_at         = NOW()
 --      WHERE  id = '<row_id>';
---      -- The runtime reconciler will then re-seed the exit engine for this row.
+--      -- The runtime reconciler will re-seed the exit engine for this row.
 --
 --    Case 3 — Broker API unavailable / cannot verify:
 --      Leave as MANUAL_REVIEW_REQUIRED.
---      The runtime _repair_closed_positions_with_remaining_qty() will attempt
+--      The runtime _repair_closed_positions_with_remaining_qty() will retry
 --      broker verification on every reconciler cycle until resolved.
 --
--- C. Final check — no normal rows should remain:
+-- C. Final check — confirm no unresolved rows remain:
 --    SELECT id, client_id, contract, status, quantity_remaining, close_source
 --    FROM   positions
 --    WHERE  UPPER(status) = 'CLOSED'
 --      AND  COALESCE(quantity_remaining, 0) > 0
 --      AND  close_source NOT IN ('MANUAL_REVIEW_REQUIRED', 'CLOSED_REPAIR');
---    -- This should return 0 rows after all operator steps are complete.
+--    -- Should return 0 rows after all operator steps are complete.
 -- =============================================================================

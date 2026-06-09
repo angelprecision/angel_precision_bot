@@ -318,17 +318,17 @@ def report_summary():
         with conn() as c:
             if client_id:
                 order_stats = run_with_retry(lambda: c.execute(
-                    "SELECT status, COUNT(*) as count FROM orders WHERE client_id=? GROUP BY status",
+                    "SELECT status, COUNT(*) as count FROM orders WHERE client_id=%s GROUP BY status",
                     (client_id,),
                 ).fetchall())
 
                 pos_stats = run_with_retry(lambda: c.execute(
-                    "SELECT status, COUNT(*) as count FROM positions WHERE client_id=? GROUP BY status",
+                    "SELECT status, COUNT(*) as count FROM positions WHERE client_id=%s GROUP BY status",
                     (client_id,),
                 ).fetchall())
 
                 queue_stats = run_with_retry(lambda: c.execute(
-                    "SELECT status, COUNT(*) as count FROM trade_queue WHERE client_id=? GROUP BY status",
+                    "SELECT status, COUNT(*) as count FROM trade_queue WHERE client_id=%s GROUP BY status",
                     (client_id,),
                 ).fetchall())
             else:
@@ -389,7 +389,7 @@ def monitor_positions():
                 rows = run_with_retry(lambda: c.execute(
                     f"SELECT *, client_id AS client_email, "
                     f"COALESCE(option_symbol, contract) AS option_contract "
-                    f"FROM positions WHERE client_id=? AND ({_ACTIVE_STATUS_CLAUSE}) "
+                    f"FROM positions WHERE client_id=%s AND ({_ACTIVE_STATUS_CLAUSE}) "
                     f"ORDER BY entry_ts DESC",
                     (client_id,),
                 ).fetchall())
@@ -446,12 +446,12 @@ def force_exit_position(position_id):
             )
             if client_id:
                 pos_row = run_with_retry(lambda: c.execute(
-                    f"SELECT * FROM positions WHERE id=? AND client_id=? AND ({_ACTIVE_CLAUSE_ID})",
+                    f"SELECT * FROM positions WHERE id=%s AND client_id=%s AND ({_ACTIVE_CLAUSE_ID})",
                     (position_id, client_id),
                 ).fetchone())
             else:
                 pos_row = run_with_retry(lambda: c.execute(
-                    f"SELECT * FROM positions WHERE id=? AND ({_ACTIVE_CLAUSE_ID})",
+                    f"SELECT * FROM positions WHERE id=%s AND ({_ACTIVE_CLAUSE_ID})",
                     (position_id,),
                 ).fetchone())
 
@@ -461,7 +461,7 @@ def force_exit_position(position_id):
             pos = dict(pos_row)
 
             run_with_retry(lambda: c.execute(
-                "UPDATE positions SET status='CLOSING', exit_reason='MANUAL_EXIT' WHERE id=?",
+                "UPDATE positions SET status='CLOSING', exit_reason='MANUAL_EXIT' WHERE id=%s",
                 (position_id,),
             ))
 
@@ -485,7 +485,7 @@ def flatten_all_positions():
         with conn() as c:
             # P0-PARTIAL-CLOSE: include all live statuses and qty_remaining guard
             rows = run_with_retry(lambda: c.execute(
-                "SELECT * FROM positions WHERE client_id=? AND ("
+                "SELECT * FROM positions WHERE client_id=%s AND ("
                 "UPPER(COALESCE(status,'')) IN ('OPEN','CLOSING','PARTIAL','ACTIVE') "
                 "OR COALESCE(quantity_remaining, 0) > 0)",
                 (client_id,),
@@ -496,7 +496,7 @@ def flatten_all_positions():
                 return jsonify({"ok": True, "message": "no_open_positions", "closed": 0}), 200
 
             run_with_retry(lambda: c.execute(
-                "UPDATE positions SET status='CLOSING', exit_reason='FLATTEN_ALL' WHERE client_id=? AND status='OPEN'",
+                "UPDATE positions SET status='CLOSING', exit_reason='FLATTEN_ALL' WHERE client_id=%s AND status='OPEN'",
                 (client_id,),
             ))
 
