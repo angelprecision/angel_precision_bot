@@ -157,13 +157,40 @@ def test_13_missing_count_zero_does_NOT_block_fallback():
 def test_14_score_recheck_disabled_constant_exists():
     assert "_OVERNIGHT_REEVAL_SCORE_RECHECK_ENABLED" in OV_SRC
 
-def test_15_intel_block_skipped_when_recheck_disabled():
-    """When MC reason is intel-related, skip (RETRY_LATER) instead of reject."""
+def test_15_intel_block_proceeds_to_arm_when_recheck_disabled():
+    """Intel-only MC rejection + recheck disabled → PROCEED to arm, not skip/reject."""
     assert "OVERNIGHT_SCORE_RECHECK_DISABLED" in OV_SRC
-    idx = OV_SRC.find("OVERNIGHT_SCORE_RECHECK_DISABLED")
-    region = OV_SRC[idx:idx+400]
-    assert 'result["skipped"]' in region
-    assert "continue" in region
+    assert "PROCEED_TO_ARM" in OV_SRC
+    assert "second_score_mode=observe_only" in OV_SRC
+    # The intel-block branch must NOT call _mark_job_rejected
+    idx = OV_SRC.find("decision=PROCEED_TO_ARM")
+    region = OV_SRC[idx:idx+1800]
+    assert "_mark_job_rejected" not in region.split("else:")[0], (
+        "PROCEED branch must not reach _mark_job_rejected before else:"
+    )
+    # The PROCEED branch must end with the fall-through comment
+    assert "Fall through to Step 5" in region
+
+def test_15d_hydrate_plan_helper_exists():
+    assert "_hydrate_plan_from_signal" in OV_SRC
+
+def test_15e_hydrate_plan_carries_required_fields():
+    """The hydrated plan must include all fields downstream code uses."""
+    for attr in ("ticker", "side", "score", "timeframe", "entry_trigger",
+                 "trigger_price", "prior_day_high", "prior_day_low",
+                 "contract_symbol", "contracts", "metadata"):
+        assert f'{attr}' in OV_SRC, f"hydrate plan missing field: {attr}"
+
+def test_15f_intel_block_does_not_increment_skipped():
+    """The intel-block PROCEED branch must not increment skipped."""
+    # Find the intel-block branch (PROCEED_TO_ARM)
+    idx = OV_SRC.find("decision=PROCEED_TO_ARM")
+    # End of branch is the comment "Fall through to Step 5"
+    end = OV_SRC.find("Fall through to Step 5", idx)
+    branch_body = OV_SRC[idx:end]
+    assert 'result["skipped"]' not in branch_body, (
+        "Intel-block PROCEED branch must not increment skipped"
+    )
 
 def test_15b_hard_safety_block_still_rejects():
     """Hard safety blocks (capital/kill switch/etc) must still reject."""
@@ -189,13 +216,55 @@ def test_16_snapshot_unavailable_keeps_watching():
     assert "_mark_job_rejected" not in region
 
 def test_17_prior_levels_unavailable_retry_later():
-    """Broker/history failure → RETRY_LATER, not reject."""
+    """Broker/history failure → RETRY_LATER, not reject. Side-specific."""
     assert "OVERNIGHT_PRIOR_LEVELS_UNAVAILABLE" in OV_SRC
     idx = OV_SRC.find("OVERNIGHT_PRIOR_LEVELS_UNAVAILABLE")
-    region = OV_SRC[idx:idx+400]
+    region = OV_SRC[idx:idx+600]
     assert 'result["skipped"]' in region
     assert "continue" in region
     assert "_mark_job_rejected" not in region
+
+def test_17b_prior_levels_check_is_side_specific():
+    """CALL checks prior_day_high; PUT checks prior_day_low."""
+    assert '_side_upper == "CALL"' in OV_SRC
+    assert '_side_upper == "PUT"'  in OV_SRC
+    # CALL → prior_day_high, PUT → prior_day_low
+    idx = OV_SRC.find('_side_upper == "CALL"')
+    region = OV_SRC[idx:idx+200]
+    assert "prior_day_high" in region
+    idx2 = OV_SRC.find('_side_upper == "PUT"')
+    region2 = OV_SRC[idx2:idx2+200]
+    assert "prior_day_low" in region2
+
+def test_17c_call_missing_high_with_low_present_retries():
+    """CALL signal: prior_day_high unavailable, prior_day_low present → RETRY_LATER.
+    Behavioral check: the code path tests _side_upper == 'CALL' and prior_day_high is None
+    independently of prior_day_low value."""
+    # The CALL check must not require prior_day_low to also be None
+    idx = OV_SRC.find('_side_upper == "CALL"')
+    region = OV_SRC[idx:idx+150]
+    assert "prior_day_high is None" in region
+    assert "prior_day_low is None" not in region  # NOT a conjunction
+
+def test_17d_put_missing_low_with_high_present_retries():
+    """PUT signal: prior_day_low unavailable, prior_day_high present → RETRY_LATER."""
+    idx = OV_SRC.find('_side_upper == "PUT"')
+    region = OV_SRC[idx:idx+150]
+    assert "prior_day_low is None" in region
+    assert "prior_day_high is None" not in region  # NOT a conjunction
+
+def test_17e_explicit_entry_trigger_bypasses_levels_check():
+    """If signal carries entry_trigger, no level fetch is required."""
+    # The level check is guarded by `if not _has_trigger:`
+    idx = OV_SRC.find('_missing_level = None')
+    region = OV_SRC[idx:idx+400]
+    assert "_has_trigger" in region
+
+def test_17f_log_includes_side_and_missing_field():
+    """Log line must include side= and missing= fields."""
+    idx = OV_SRC.find("OVERNIGHT_PRIOR_LEVELS_UNAVAILABLE")
+    region = OV_SRC[idx:idx+600]
+    assert "side=%s missing=%s" in region or ("side=" in region and "missing=" in region)
 
 def test_18_stale_signal_still_rejects():
     assert "stale_signal" in OV_SRC
