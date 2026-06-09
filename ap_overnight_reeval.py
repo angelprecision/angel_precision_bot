@@ -54,6 +54,16 @@ _OVERNIGHT_SNAPSHOT_FAIL_CLOSED = (
     os.getenv("OVERNIGHT_SNAPSHOT_FAIL_CLOSED", "false").strip().lower()
     in ("true", "1")
 )
+
+# OVERNIGHT_REEVAL_SCORE_RECHECK_ENABLED=false (default):
+# Already-WATCHING signals must not be hard-killed by a fresh morning
+# second/intel score. Hard safety checks (capital, kill switch, client
+# enabled, auth, hard risk veto, contract quality) STILL apply — only
+# the intel/second-score block is treated as skip→RETRY_LATER.
+_OVERNIGHT_REEVAL_SCORE_RECHECK_ENABLED = (
+    os.getenv("OVERNIGHT_REEVAL_SCORE_RECHECK_ENABLED", "false").strip().lower()
+    in ("true", "1")
+)
 # SIGNALS_LOOKBACK: hours-based alternative. When set, takes precedence over
 # OVERNIGHT_SIGNAL_MAX_AGE_DAYS for the initial created_at cutoff query.
 # Default 18h — covers signals from previous session's close to pre-market.
@@ -234,6 +244,22 @@ def run_overnight_reeval(
             if prior_levels.get("prior_day_close"):
                 signal["prior_day_close"] = prior_levels["prior_day_close"]
 
+            # If both prior levels are unavailable and the signal does not carry
+            # its own entry_trigger, we cannot derive a breach level. This is a
+            # DATA_UNAVAILABLE condition (broker history fetch failed) — keep
+            # WATCHING and retry, do not permanently reject.
+            _has_trigger = bool(float(signal.get("entry_trigger") or 0))
+            if prior_day_high is None and prior_day_low is None and not _has_trigger:
+                log.warning(
+                    "[%s] overnight_reeval: OVERNIGHT_PRIOR_LEVELS_UNAVAILABLE "
+                    "signal=%s category=DATA_UNAVAILABLE severity=WARNING "
+                    "final_decision=RETRY_LATER "
+                    "reason_code=OVERNIGHT_PRIOR_LEVELS_UNAVAILABLE",
+                    ticker, signal_id,
+                )
+                result["skipped"] = result.get("skipped", 0) + 1
+                continue  # leave job WATCHING for next reeval run
+
             # Step 2: Derive entry_trigger if not provided by scanner
             # The Strat: CALL entries breach prior-day high; PUT entries breach prior-day low
             entry_trigger = (
@@ -315,7 +341,53 @@ def run_overnight_reeval(
                     pass
                 decision = master_control.evaluate(reeval_signal, client_id=client_id)
                 if not decision.ok:
-                    log.info("[%s] overnight_reeval: MC blocked %s — %s", ticker, signal_id, decision.reason)
+                    # Classify the rejection: intel/second-score vs hard safety.
+                    # When OVERNIGHT_REEVAL_SCORE_RECHECK_ENABLED=false, intel/
+                    # second-score blocks are treated as skip→RETRY_LATER.
+                    # Hard safety blocks ALWAYS reject regardless of the flag.
+                    _r = (decision.reason or "").lower()
+                    _intel_phrases = (
+                        "intel_skip", "blocked_intel", "intel_score",
+                        "insufficient edge", "gate_g", "gate g",
+                        "scanner_approved_intel_observe_only",
+                        "data_unavailable_scanner_fallback",
+                    )
+                    _hard_safety_phrases = (
+                        "capital", "buying_power", "buying power",
+                        "kill_switch", "kill switch",
+                        "entries_paused", "entries paused",
+                        "client_disabled", "client disabled",
+                        "auth", "invalid_side", "invalid side",
+                        "invalid direction", "risk_limit", "risk limit",
+                        "daily_loss", "daily loss",
+                        "risk manager", "risk_manager",
+                        "contract quality failed", "contract_quality",
+                        "scanner signal is neutral", "neutral direction",
+                    )
+                    _is_intel_block        = any(p in _r for p in _intel_phrases)
+                    _is_hard_safety_block  = any(p in _r for p in _hard_safety_phrases)
+
+                    if (_is_intel_block
+                            and not _is_hard_safety_block
+                            and not _OVERNIGHT_REEVAL_SCORE_RECHECK_ENABLED):
+                        # Intel/second-score skip — keep WATCHING for next retry
+                        log.info(
+                            "[%s] overnight_reeval: OVERNIGHT_SCORE_RECHECK_DISABLED "
+                            "signal=%s mc_reason=%s — intel/second-score block "
+                            "treated as RETRY_LATER (hard safety not triggered)",
+                            ticker, signal_id, decision.reason,
+                        )
+                        result["skipped"] = result.get("skipped", 0) + 1
+                        continue
+
+                    # Hard safety block OR recheck enabled — reject as before
+                    log.info(
+                        "[%s] overnight_reeval: MC blocked %s — %s "
+                        "(hard_safety=%s intel=%s recheck_enabled=%s)",
+                        ticker, signal_id, decision.reason,
+                        _is_hard_safety_block, _is_intel_block,
+                        _OVERNIGHT_REEVAL_SCORE_RECHECK_ENABLED,
+                    )
                     _mark_job_rejected(job_id, client_id, f"mc_blocked:{decision.reason}")
                     if _lifecycle_ok:
                         try:
