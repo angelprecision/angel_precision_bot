@@ -1232,8 +1232,10 @@ def process_pending_order(
                         def _link_back():
                             with _fm_conn() as c:
                                 c.execute(
-                                    "UPDATE orders SET position_id=%s "
-                                    "WHERE client_id=%s AND local_order_id=%s",
+                                    "UPDATE orders "
+                                    "SET position_id=%s, updated_ts=NOW() "
+                                    "WHERE client_id=%s AND local_order_id=%s "
+                                    "AND (position_id IS NULL OR position_id='')",
                                     (position_id, client_id, local_id),
                                 )
                         _fm_retry(_link_back)
