@@ -154,3 +154,172 @@ def test_10c_required_log_fields_present():
                   "engine_seen_before", "db_seen_before", "db_repaired",
                   "exit_rule_triggered", "exit_order_submitted", "reason_no_exit"]:
         assert field in PRECHECK_BODY, f"required log field missing: {field}"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# OFFLINE INTEGRATION TEST — exact RIVN live failure mode, fully mocked
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# OFFLINE INTEGRATION TEST — exact RIVN live failure mode, fully mocked
+# Exercises the real _broker_position_precheck code path end-to-end.
+# No Tradier, Supabase, or real order submission. Fully offline.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _build_engine_under_test():
+    """
+    Extracts _managed_position_from_row, _fetch_broker_quote, and
+    _broker_position_precheck from the actual source file, exec's them into
+    a FakeEngine with all external I/O replaced by mocks.
+    Static helpers (_parse_occ_side, _underlying_from_occ) are inline mocks
+    to avoid @staticmethod decorator extraction issues.
+    """
+    import re as _re, textwrap as _tw, logging as _log_mod, threading
+
+    _src = SRC  # already loaded at module level from the source file
+
+    def _extract(name):
+        # Stop lookahead at next `def` OR next decorator `@`
+        m = _re.search(
+            rf"(    def {name}\b.*?)(?=\n    (?:def |@)|\Z)", _src, re.DOTALL
+        )
+        assert m, f"method {name} not found in source"
+        return _tw.dedent(m.group(1))
+
+    # ── Minimal ManagedPosition stand-in ─────────────────────────────────────
+    class _MP:
+        """Accepts any kwargs the real ManagedPosition dataclass accepts."""
+        _defaults = dict(
+            ticker="", option_symbol="", side="CALL",
+            quantity=1, quantity_remaining=1, entry_price=0.0,
+            underlying_entry=0.0, underlying_target=0.0, underlying_stop=0.0,
+            position_id="", client_id="", signal_id="",
+            current_option_price=0.0, current_bid=0.0, current_ask=0.0,
+            peak_pnl_pct=0.0, touched_profit=False, closed=False,
+        )
+        def __init__(self, **kw):
+            for k, v in {**self._defaults, **kw}.items():
+                setattr(self, k, v)
+
+    # ── Engine under test ─────────────────────────────────────────────────────
+    class _FakeBroker:
+        account_id   = "6yb82774"
+        base_url     = "https://api.tradier.com"
+        access_token = "fake_token"
+        def __init__(self, positions=None, fail=False):
+            self._positions = positions or []
+            self._fail      = fail
+        def list_positions(self):
+            if self._fail: raise RuntimeError("auth_failed_401")
+            return self._positions
+
+    class _FakeEngine:
+        def __init__(self, broker, existing_positions=None):
+            self.broker          = broker
+            self._email          = "jasoncosby1@gmail.com"
+            self._positions      = list(existing_positions or [])
+            self._lock           = threading.Lock()
+            self.pm              = None
+            self._upserted_syms  = []
+            self._submit_calls   = []
+            self._mock_quote     = {"bid":0.0,"ask":0.0,"mid":0.0,"last":0.0}
+
+        # Static helpers as simple methods (avoid @staticmethod exec issues)
+        def _parse_occ_side(self, sym):
+            m = re.match(r'^([A-Z]+)(\d{6})([CP])(\d+)$', sym.upper())
+            return ("CALL" if m and m.group(3) == "C" else "PUT") if m else "CALL"
+
+        def _underlying_from_occ(self, sym):
+            m = re.match(r'^([A-Z]+)\d', sym.upper())
+            return m.group(1) if m else sym[:4]
+
+        def add_position(self, pos):
+            self._positions.append(pos)
+
+        def _load_db_position_row(self, sym):
+            return None   # DB always empty in this test
+
+        def _upsert_broker_position_to_db(self, sym, bp):
+            self._upserted_syms.append(sym.upper())
+            return f"repair-{sym}"
+
+        def _fetch_broker_quote(self, sym):
+            return self._mock_quote.copy()
+
+    # ── Exec the real methods into _FakeEngine ────────────────────────────────
+    import datetime as _dtmod
+    _log = _log_mod.getLogger("test_pr100")
+    _g = {
+        "__name__":       "ap_exit_engine",
+        "log":            _log,
+        "datetime":       _dtmod.datetime,
+        "timezone":       _dtmod.timezone,
+        "re":             re,
+        "ManagedPosition": _MP,
+    }
+
+    for _mname in ["_managed_position_from_row",
+                   "_broker_position_precheck"]:
+        # Note: _fetch_broker_quote kept as mock (real version makes HTTP calls)
+        _code = _extract(_mname)
+        _local = {}
+        exec(compile(_code, f"ap_exit_engine::{_mname}", "exec"), _g, _local)
+        setattr(_FakeEngine, _mname, _local[_mname])
+
+    return _FakeEngine, _FakeBroker, _MP
+
+
+def test_rivn_offline_integration(caplog):
+    """
+    Offline integration — exact Jason failure mode.
+    Broker: RIVN260612P00016500 qty=1 cost_basis=61.00
+    DB: empty.  Quote: mid=0.90 (+47.5% gain on 0.61 entry).
+    """
+    import logging
+
+    _FakeEngine, _FakeBroker, _MP = _build_engine_under_test()
+
+    broker = _FakeBroker(positions=[{
+        "symbol": "RIVN260612P00016500", "quantity": 1, "cost_basis": 61.00,
+    }])
+    eng = _FakeEngine(broker)
+    eng._mock_quote = {"bid": 0.85, "ask": 0.95, "mid": 0.90, "last": 0.88}
+
+    with caplog.at_level(logging.INFO, logger="test_pr100"):
+        result = eng._broker_position_precheck()
+
+    # 1. Engine contains RIVN
+    syms = [p.option_symbol.upper() for p in eng._positions]
+    assert "RIVN260612P00016500" in syms, f"RIVN not loaded. syms={syms}"
+
+    # 2. ManagedPosition fields
+    pos = next(p for p in eng._positions if "RIVN" in p.option_symbol)
+    assert pos.option_symbol.upper() == "RIVN260612P00016500"
+    assert pos.quantity_remaining == 1
+    assert abs(pos.current_option_price - 0.90) < 0.001, \
+        f"current_option_price={pos.current_option_price}"
+    assert pos.touched_profit is True, "touched_profit must be True (+47.5%)"
+    assert pos.peak_pnl_pct > 0.40, f"peak_pnl_pct={pos.peak_pnl_pct}"
+
+    # 3. DB was empty so upsert was called
+    assert "RIVN260612P00016500" in eng._upserted_syms, \
+        "upsert must run when DB has no row"
+
+    # 4. No exit order submitted inside precheck
+    assert eng._submit_calls == []
+
+    # 5. Structured log emitted
+    assert any("EXIT_ENGINE_REPAIRED_BROKER_POSITION_AND_EVALUATED_EXIT" in m
+               for m in caplog.messages), \
+        f"Required log not found. messages={caplog.messages[:5]}"
+
+    # 6. Broker failure → False, existing positions untouched
+    bad_eng = _FakeEngine(_FakeBroker(fail=True),
+                          existing_positions=[_MP(option_symbol="AAPL260612C00190000",
+                                                  quantity_remaining=1)])
+    with caplog.at_level(logging.ERROR, logger="test_pr100"):
+        r2 = bad_eng._broker_position_precheck()
+    assert r2 is False
+    assert len(bad_eng._positions) == 1, "broker failure must not modify positions"
+    assert any("EXIT_UNSAFE_BROKER_TRUTH_UNAVAILABLE" in m for m in caplog.messages)
