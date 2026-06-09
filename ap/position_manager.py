@@ -159,7 +159,11 @@ class APPositionManager:
                     """
                     SELECT COUNT(*) AS n
                     FROM positions
-                    WHERE client_id=%s AND status IN ('OPEN','CLOSING')
+                    WHERE client_id=%s
+                      AND (
+                        UPPER(COALESCE(status,'')) IN ('OPEN','CLOSING','PARTIAL','ACTIVE')
+                        OR COALESCE(quantity_remaining, 0) > 0
+                      )
                     """,
                     (self.client_id,),
                 )
@@ -174,7 +178,10 @@ class APPositionManager:
                     SELECT 1
                     FROM positions
                     WHERE client_id=%s AND underlying=%s
-                      AND status IN ('OPEN','CLOSING')
+                      AND (
+                        UPPER(COALESCE(status,'')) IN ('OPEN','CLOSING','PARTIAL','ACTIVE')
+                        OR COALESCE(quantity_remaining, 0) > 0
+                      )
                     ORDER BY entry_ts DESC NULLS LAST, created_at DESC NULLS LAST
                     LIMIT 1
                     """,
@@ -199,13 +206,23 @@ class APPositionManager:
         return run_with_retry(_fn)
 
     def get_active_positions(self) -> list[dict]:
+        """Return all positions that are live and need exit management.
+
+        P0-PARTIAL-CLOSE: expands status filter to include PARTIAL and ACTIVE,
+        and adds COALESCE(quantity_remaining,0)>0 safety guard so any row
+        incorrectly marked CLOSED with remaining contracts is still included.
+        """
         def _fn():
             with conn() as c:
                 c.execute(
                     """
                     SELECT *
                     FROM positions
-                    WHERE client_id=%s AND status IN ('OPEN','CLOSING')
+                    WHERE client_id=%s
+                      AND (
+                        UPPER(COALESCE(status,'')) IN ('OPEN','CLOSING','PARTIAL','ACTIVE')
+                        OR COALESCE(quantity_remaining, 0) > 0
+                      )
                     ORDER BY entry_ts DESC NULLS LAST, created_at DESC NULLS LAST
                     """,
                     (self.client_id,),

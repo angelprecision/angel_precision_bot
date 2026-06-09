@@ -143,7 +143,14 @@ DB_OPEN_STATUSES = frozenset({
 })
 
 # Canonical set of position statuses treated as live — used in SQL queries throughout.
-DB_OPEN_POSITION_STATUSES = ("OPEN", "CLOSING")
+# PARTIAL is added so scale-out rows are visible to the reconciler; ACTIVE kept
+# for legacy rows produced by earlier schema versions.
+DB_OPEN_POSITION_STATUSES = ("OPEN", "CLOSING", "PARTIAL", "ACTIVE")
+
+# P0-PARTIAL-CLOSE: Status transitions for the reconciler auto-close path.
+# A position is only CLOSED when quantity_remaining reaches 0.
+# Anything with remaining qty must stay managed.
+_RECONCILER_CLOSED_WITH_REMAINING_REPAIR_STATUSES = frozenset({"CLOSED", "CLOSED_REPAIR"})
 
 BROKER_FILLED   = frozenset({"filled", "partially_filled"})
 BROKER_TERMINAL = frozenset({"canceled", "cancelled", "rejected", "expired"})
@@ -184,6 +191,13 @@ def _empty_summary(client_id: str, run: int = 0) -> dict:
     """
     Return a zeroed summary dict with all standard keys present.
     Used for both real runs and skip-path returns so callers never KeyError.
+
+    P0-PARTIAL-CLOSE diagnostic counters (added):
+      closed_positions_with_remaining_qty_count   — total CLOSED rows w/ qty_remaining>0 seen
+      closed_positions_with_remaining_qty_recent  — those seen in this specific pass
+      broker_positions_hidden_by_closed_status_count — broker-live but DB-CLOSED, caught by repair
+      reconciler_partial_close_preserved_count    — auto-close attempts downgraded to PARTIAL
+      reconciler_full_close_count                 — auto-closes that legitimately set CLOSED
     """
     return {
         "run":                 run,
@@ -198,6 +212,12 @@ def _empty_summary(client_id: str, run: int = 0) -> dict:
         "elapsed_sec":         0.0,
         "errors":              [],
         "skipped":             False,
+        # ── P0-PARTIAL-CLOSE diagnostics ──────────────────────────────────────
+        "closed_positions_with_remaining_qty_count":    0,
+        "closed_positions_with_remaining_qty_recent":   0,
+        "broker_positions_hidden_by_closed_status_count": 0,
+        "reconciler_partial_close_preserved_count":     0,
+        "reconciler_full_close_count":                  0,
     }
 
 
@@ -422,6 +442,19 @@ class APBrokerReconciler:
                 log.error("[%s] Position reconcile error: %s", self.client_id, e, exc_info=True)
                 summary["errors"].append(f"positions: {e}")
                 self._report_health_error(f"positions_reconcile_error: {e}", fatal=False)
+
+            # P0-PARTIAL-CLOSE: repair any CLOSED rows that still have
+            # quantity_remaining > 0.  Runs after _reconcile_positions so the
+            # normal ghost-close path has already run; this pass catches any
+            # rows that were incorrectly marked CLOSED before this fix was
+            # deployed, as well as future regressions.
+            try:
+                self._repair_closed_positions_with_remaining_qty(summary)
+            except Exception as e:
+                log.error(
+                    "[%s] Partial-close repair error: %s", self.client_id, e, exc_info=True
+                )
+                summary["errors"].append(f"partial_close_repair: {e}")
 
             try:
                 self._check_duplicate_positions(summary)
@@ -2629,6 +2662,40 @@ class APBrokerReconciler:
             client_id=self.client_id,
         )
 
+        self._execute_reconciler_close(
+            pos=pos,
+            contract=contract,
+            underlying=underlying,
+            db_qty=db_qty,
+            entry_px=entry_px,
+            exit_px=exit_px,
+            close_confidence=close_confidence,
+            summary=summary,
+            side=side if "side" in dir() else (pos.get("side") or pos.get("direction") or "CALL"),
+        )
+
+    def _execute_reconciler_close(
+        self,
+        *,
+        pos: dict,
+        contract: str,
+        underlying: str,
+        db_qty: int,
+        entry_px: float,
+        exit_px: float,
+        close_confidence: str,
+        summary: dict,
+        side: str = "CALL",
+    ) -> None:
+        """
+        P0-PARTIAL-CLOSE: Extracted auto-close DB write.
+        Called by _handle_db_position_missing_at_broker after three-pass ghost
+        confirmation. The ONLY place that writes RECONCILER_AUTO_CLOSE to positions.
+
+        Rule: status=CLOSED iff quantity_remaining becomes 0.
+              Otherwise status=PARTIAL (broker is flat but prior scale-outs exist).
+        """
+        pos_id = pos.get("id") or pos.get("position_id")
         pnl_dollars = round((exit_px - entry_px) * db_qty * 100, 2)
         pnl_pct     = round(((exit_px - entry_px) / entry_px) * 100, 2) if entry_px > 0 else 0.0
 
@@ -2637,41 +2704,129 @@ class APBrokerReconciler:
 
             _now = datetime.now(timezone.utc).isoformat()
 
+            # ── P0-PARTIAL-CLOSE SAFETY: fetch current quantity_remaining ─────
+            # The reconciler only knows db_qty (original entry quantity).
+            # quantity_remaining reflects any prior scale-outs.  We must
+            # honour that value: if broker is flat (no position) we close the
+            # remaining contracts, but we do NOT set status=CLOSED unless
+            # that reduces quantity_remaining to 0.
+            #
+            # Rule:
+            #   remaining_after_close = max(0, current_remaining - db_qty_to_close)
+            #   if remaining_after_close <= 0 → status = 'CLOSED'
+            #   else                          → status = 'PARTIAL'   (keep managed)
+            #
+            # We use db_qty as the "quantity to close" because the caller
+            # confirmed broker has zero contracts for this position.
+
             def _close():
                 with conn() as c:
+                    # Re-fetch the row under lock so we use the freshest remaining qty.
+                    c.execute(
+                        "SELECT quantity_remaining, qty FROM positions "
+                        "WHERE id = %s AND client_id = %s FOR UPDATE",
+                        (pos_id, self.client_id),
+                    )
+                    row = c.fetchone()
+                    if not row:
+                        return None
+
+                    _row = dict(row)
+                    _stored_remaining = _row.get("quantity_remaining")
+                    _stored_qty       = int(_row.get("qty") or db_qty or 0)
+
+                    # Resolve current remaining; fall back to full qty if null
+                    if _stored_remaining is None:
+                        current_remaining = _stored_qty
+                    else:
+                        current_remaining = int(_stored_remaining)
+
+                    # How many contracts does this auto-close account for?
+                    # Broker says zero — so we close whatever is remaining.
+                    close_qty         = current_remaining  # all that's left, per broker
+                    new_remaining     = 0                   # broker is flat
+
+                    # ── SAFETY RULE: qty_remaining > 0 → cannot be CLOSED ────
+                    if new_remaining <= 0:
+                        final_status = "CLOSED"
+                    else:
+                        # Should not happen (close_qty = current_remaining above),
+                        # but belt-and-suspenders: never hide live exposure.
+                        final_status = "PARTIAL"
+                        log.warning(
+                            "[%s] P0-PARTIAL-CLOSE-GUARD | %s | pos=%s | "
+                            "new_remaining=%d > 0 after auto-close attempt — "
+                            "setting PARTIAL instead of CLOSED",
+                            self.client_id, contract, pos_id, new_remaining,
+                        )
+
+                    # Recompute P&L using the contracts actually being closed
+                    _pnl_closed   = round((exit_px - entry_px) * max(close_qty, 1) * 100, 2)
+                    _pnl_pct      = round(((exit_px - entry_px) / entry_px) * 100, 2) if entry_px > 0 else 0.0
+
                     c.execute(
                         """
                         UPDATE positions
-                        SET    status            = 'CLOSED',
-                               exit_ts           = %s,
-                               exit_price        = %s,
-                               realized_pnl      = %s,
-                               realized_pnl_pct  = %s,
-                               close_source      = %s,
-                               close_confidence  = %s
+                        SET    status             = %s,
+                               exit_ts            = %s,
+                               exit_price         = %s,
+                               realized_pnl       = %s,
+                               realized_pnl_pct   = %s,
+                               quantity_remaining = %s,
+                               close_source       = %s,
+                               close_confidence   = %s
                         WHERE  id = %s AND client_id = %s
                         """,
                         (
+                            final_status,
                             _now,
                             exit_px,
-                            pnl_dollars,
-                            pnl_pct,
+                            _pnl_closed,
+                            _pnl_pct,
+                            new_remaining,
                             "RECONCILER_AUTO_CLOSE",
                             close_confidence,
                             pos_id,
                             self.client_id,
                         ),
                     )
+                    return {
+                        "final_status":   final_status,
+                        "close_qty":      close_qty,
+                        "new_remaining":  new_remaining,
+                        "pnl_dollars":    _pnl_closed,
+                        "pnl_pct":        _pnl_pct,
+                    }
 
-            _rwr(_close)
+            _result = _rwr(_close)
         except Exception as e:
             log.error("[%s] RECONCILE close DB write failed %s: %s",
                       self.client_id, pos_id, e)
             summary["positions_alerted"] += 1
             return
 
+        if _result is None:
+            log.warning("[%s] RECONCILE close: pos %s not found during lock-fetch", self.client_id, pos_id)
+            summary["positions_alerted"] += 1
+            return
+
+        final_status  = _result["final_status"]
+        close_qty     = _result["close_qty"]
+        new_remaining = _result["new_remaining"]
+        pnl_dollars   = _result["pnl_dollars"]
+        pnl_pct       = _result["pnl_pct"]
+
+        # Update diagnostic counters
+        if final_status == "CLOSED":
+            summary["reconciler_full_close_count"] = \
+                int(summary.get("reconciler_full_close_count", 0)) + 1
+        else:
+            summary["reconciler_partial_close_preserved_count"] = \
+                int(summary.get("reconciler_partial_close_preserved_count", 0)) + 1
+
+        # Only notify exit engine if position is truly fully closed
         _ee = getattr(self, "exit_engine", None)
-        if _ee:
+        if _ee and final_status == "CLOSED":
             try:
                 _ee.mark_position_closed(str(pos_id), reason="reconciler_auto_close")
             except Exception as _e:
@@ -2680,11 +2835,23 @@ class APBrokerReconciler:
         self._ghost_tracker.pop(contract, None)
         log.info(
             "[%s] FINALIZED TRADE | %s | pos=%s | entry=%.4f exit=%.4f "
-            "pnl=$%.2f (%.1f%%) source=RECONCILER confidence=%s",
+            "closed_qty=%d remaining=%d pnl=$%.2f (%.1f%%) "
+            "status=%s source=RECONCILER confidence=%s",
             self.client_id, contract, pos_id, entry_px, exit_px,
-            pnl_dollars, pnl_pct, close_confidence,
+            close_qty, new_remaining, pnl_dollars, pnl_pct,
+            final_status, close_confidence,
         )
         summary["positions_corrected"] += 1
+
+        # ── Auto-log to proof_trades only on full close ───────────────────────
+        # Partial reconciler closes should not generate a proof_trade because the
+        # position is still open and will produce a final proof entry on full exit.
+        if final_status != "CLOSED":
+            log.info(
+                "[%s] PARTIAL_RECONCILER_CLOSE skipping proof_trade | %s | remaining=%d",
+                self.client_id, contract, new_remaining,
+            )
+            return
 
         # ── Auto-log to proof_trades so manual/reconciler closes appear in ledger ──
         # Without this, any position closed outside the exit engine (manual broker
@@ -3486,6 +3653,183 @@ class APBrokerReconciler:
             if self._broker_order_is_exit_like(raw):
                 return True
         return False
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # P0-PARTIAL-CLOSE: broker-truth repair for CLOSED rows with remaining qty
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def _repair_closed_positions_with_remaining_qty(self, summary: dict) -> None:
+        """
+        P0-PARTIAL-CLOSE repair pass.
+
+        Detects rows where status=CLOSED but quantity_remaining > 0 — invalid state
+        that hides live broker exposure from operator views and exit engine.
+
+        For each such row:
+          1. Check broker truth.
+          2. Broker still holds the contract  → restore to PARTIAL (or OPEN if never
+             partially exited), update quantity_remaining from broker, log warning.
+          3. Broker is flat                   → set quantity_remaining=0, keep CLOSED,
+             add close_source=CLOSED_REPAIR so the row is traceable.
+          4. Broker unavailable               → flag manual review, do NOT change status
+             (conservative: never hide live exposure on broker API errors).
+
+        Called by run_once() after _reconcile_positions().
+        Zero-impact if no such rows exist.
+        """
+        try:
+            from ap.db import conn, run_with_retry
+
+            # ── Step 1: find all CLOSED rows with quantity_remaining > 0 ──────
+            def _scan():
+                with conn() as c:
+                    c.execute(
+                        """
+                        SELECT id, contract, option_symbol, underlying, ticker,
+                               qty, quantity_remaining, avg_fill, entry_price,
+                               close_source, client_id
+                        FROM   positions
+                        WHERE  client_id           = %s
+                          AND  UPPER(status)        = 'CLOSED'
+                          AND  COALESCE(quantity_remaining, 0) > 0
+                        ORDER  BY entry_ts DESC NULLS LAST
+                        LIMIT  100
+                        """,
+                        (self.client_id,),
+                    )
+                    return [dict(r) for r in c.fetchall()]
+
+            bad_rows = run_with_retry(_scan) or []
+            if not bad_rows:
+                return
+
+            count = len(bad_rows)
+            summary["closed_positions_with_remaining_qty_count"] = \
+                int(summary.get("closed_positions_with_remaining_qty_count", 0)) + count
+            summary["closed_positions_with_remaining_qty_recent"] = \
+                int(summary.get("closed_positions_with_remaining_qty_recent", 0)) + count
+
+            log.warning(
+                "[%s] P0-PARTIAL-CLOSE-REPAIR | found %d CLOSED row(s) with "
+                "quantity_remaining > 0 — running broker-truth check",
+                self.client_id, count,
+            )
+
+            # ── Step 2: fetch broker truth once ──────────────────────────────
+            broker_open_by_contract: dict[str, int] = {}
+            broker_truth_available  = False
+            try:
+                if self.broker and hasattr(self.broker, "list_positions"):
+                    bp_list = self.broker.list_positions() or []
+                    for bp in bp_list:
+                        sym = self._norm_contract(
+                            str(bp.get("symbol") or bp.get("contract") or "")
+                        )
+                        qty = self._broker_position_qty(bp)
+                        if sym and qty > 0:
+                            broker_open_by_contract[sym] = qty
+                    broker_truth_available = True
+            except Exception as _bpe:
+                log.warning(
+                    "[%s] P0-PARTIAL-CLOSE-REPAIR broker fetch failed: %s — "
+                    "flagging rows for manual review without changing status",
+                    self.client_id, _bpe,
+                )
+
+            # ── Step 3: per-row repair ────────────────────────────────────────
+            for row in bad_rows:
+                pos_id     = row.get("id")
+                contract   = self._norm_contract(
+                    row.get("contract") or row.get("option_symbol") or ""
+                )
+                rem_qty    = int(row.get("quantity_remaining") or 0)
+                full_qty   = int(row.get("qty") or rem_qty)
+
+                if not broker_truth_available:
+                    # Cannot verify — flag for operator, do not touch status
+                    log.error(
+                        "[%s] P0-PARTIAL-CLOSE-REPAIR MANUAL-REVIEW-REQUIRED | "
+                        "pos=%s contract=%s quantity_remaining=%d | "
+                        "broker truth unavailable; status left as CLOSED to avoid "
+                        "re-opening a genuinely closed position",
+                        self.client_id, pos_id, contract, rem_qty,
+                    )
+                    summary["broker_positions_hidden_by_closed_status_count"] = \
+                        int(summary.get("broker_positions_hidden_by_closed_status_count", 0)) + 1
+                    continue
+
+                broker_qty = broker_open_by_contract.get(contract, 0)
+
+                if broker_qty > 0:
+                    # Broker still holds this contract — restore to managed status
+                    restore_status = "PARTIAL" if full_qty > rem_qty else "OPEN"
+                    restore_remaining = min(broker_qty, rem_qty)  # trust broker qty
+
+                    def _restore(pid=pos_id, st=restore_status, rq=restore_remaining):
+                        with conn() as c:
+                            c.execute(
+                                """
+                                UPDATE positions
+                                SET    status             = %s,
+                                       quantity_remaining = %s,
+                                       close_source       = 'PARTIAL_CLOSE_REPAIR',
+                                       updated_at         = NOW()
+                                WHERE  id         = %s
+                                  AND  client_id  = %s
+                                  AND  UPPER(status) = 'CLOSED'
+                                """,
+                                (st, rq, pid, self.client_id),
+                            )
+                            return c.rowcount
+
+                    updated = run_with_retry(_restore)
+                    if updated:
+                        summary["broker_positions_hidden_by_closed_status_count"] = \
+                            int(summary.get("broker_positions_hidden_by_closed_status_count", 0)) + 1
+                        log.warning(
+                            "[%s] P0-PARTIAL-CLOSE-REPAIR RESTORED | "
+                            "pos=%s contract=%s | was CLOSED qty_remaining=%d | "
+                            "broker holds qty=%d → status=%s quantity_remaining=%d | "
+                            "close_source set to PARTIAL_CLOSE_REPAIR",
+                            self.client_id, pos_id, contract,
+                            rem_qty, broker_qty, restore_status, restore_remaining,
+                        )
+                        # Re-seed the exit engine so this position gets managed again
+                        self._seed_exit_engine_from_position(dict(row) | {
+                            "status": restore_status,
+                            "quantity_remaining": restore_remaining,
+                        })
+                else:
+                    # Broker is flat — fix the DB row (zero remaining, stay CLOSED)
+                    def _flatten(pid=pos_id):
+                        with conn() as c:
+                            c.execute(
+                                """
+                                UPDATE positions
+                                SET    quantity_remaining = 0,
+                                       close_source       = 'CLOSED_REPAIR',
+                                       updated_at         = NOW()
+                                WHERE  id        = %s
+                                  AND  client_id = %s
+                                  AND  UPPER(status) = 'CLOSED'
+                                """,
+                                (pid, self.client_id),
+                            )
+                            return c.rowcount
+
+                    run_with_retry(_flatten)
+                    log.info(
+                        "[%s] P0-PARTIAL-CLOSE-REPAIR FLATTEN | "
+                        "pos=%s contract=%s | broker is flat, setting "
+                        "quantity_remaining=0, close_source=CLOSED_REPAIR",
+                        self.client_id, pos_id, contract,
+                    )
+
+        except Exception as exc:
+            log.error(
+                "[%s] _repair_closed_positions_with_remaining_qty failed: %s",
+                self.client_id, exc, exc_info=True,
+            )
 
     # ──────────────────────────────────────────────────────────────────────────
     # Duplicate position check

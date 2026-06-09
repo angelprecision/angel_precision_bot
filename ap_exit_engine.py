@@ -3088,7 +3088,12 @@ class APExitEngine:
         return m.group(1) if m else symbol.strip().upper()[:5]
 
     def _load_db_position_row(self, sym: str) -> dict | None:
-        """Look up an OPEN/CLOSING positions row for this client + contract symbol."""
+        """Look up an active positions row for this client + contract symbol.
+
+        P0-PARTIAL-CLOSE: status filter expanded to include PARTIAL and ACTIVE,
+        AND adds a quantity_remaining safety guard so a row incorrectly marked
+        CLOSED but with remaining qty is still found and managed.
+        """
         try:
             from ap.db import conn, run_with_retry
             def _q():
@@ -3100,9 +3105,12 @@ class APExitEngine:
                                entry_ts, status, signal_id
                         FROM positions
                         WHERE client_id = %s
-                          AND status IN ('OPEN','CLOSING')
                           AND (
-                            UPPER(contract)      = UPPER(%s)
+                            UPPER(COALESCE(status,'')) IN ('OPEN','CLOSING','PARTIAL','ACTIVE')
+                            OR COALESCE(quantity_remaining, 0) > 0
+                          )
+                          AND (
+                            UPPER(contract)         = UPPER(%s)
                             OR UPPER(option_symbol) = UPPER(%s)
                           )
                         ORDER BY entry_ts DESC NULLS LAST
