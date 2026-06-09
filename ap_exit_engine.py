@@ -3088,7 +3088,12 @@ class APExitEngine:
         return m.group(1) if m else symbol.strip().upper()[:5]
 
     def _load_db_position_row(self, sym: str) -> dict | None:
-        """Look up an OPEN/CLOSING positions row for this client + contract symbol."""
+        """Look up an active positions row for this client + contract symbol.
+
+        P0-PARTIAL-CLOSE: status filter expanded to include PARTIAL and ACTIVE,
+        AND adds a quantity_remaining safety guard so a row incorrectly marked
+        CLOSED but with remaining qty is still found and managed.
+        """
         try:
             from ap.db import conn, run_with_retry
             def _q():
@@ -3100,9 +3105,12 @@ class APExitEngine:
                                entry_ts, status, signal_id
                         FROM positions
                         WHERE client_id = %s
-                          AND status IN ('OPEN','CLOSING')
                           AND (
-                            UPPER(contract)      = UPPER(%s)
+                            UPPER(COALESCE(status,'')) IN ('OPEN','CLOSING','PARTIAL','ACTIVE')
+                            OR COALESCE(quantity_remaining, 0) > 0
+                          )
+                          AND (
+                            UPPER(contract)         = UPPER(%s)
                             OR UPPER(option_symbol) = UPPER(%s)
                           )
                         ORDER BY entry_ts DESC NULLS LAST
@@ -3163,7 +3171,11 @@ class APExitEngine:
         ticker    = str(row.get("underlying") or self._underlying_from_occ(sym))
         side_raw  = str(row.get("side") or row.get("direction") or "").upper()
         side      = side_raw if side_raw in ("CALL", "PUT") else self._parse_occ_side(sym)
-        qty       = int(row.get("quantity_remaining") or row.get("qty") or qty_override or 1)
+        # P0-PARTIAL-CLOSE: do NOT use `or` — quantity_remaining=0 is a valid
+        # value meaning fully closed. Falling back to qty would load original
+        # entry size into the exit engine for a row that has zero contracts left.
+        _qr = row.get("quantity_remaining")
+        qty = int(_qr if _qr is not None else (row.get("qty") or qty_override or 1))
         entry_px  = float(row.get("entry_price") or row.get("avg_fill") or 0.0)
         pos_id    = str(row.get("id") or "")
         sig_id    = str(row.get("signal_id") or "")
