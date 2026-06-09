@@ -277,6 +277,12 @@ class APBrokerReconciler:
         self._thread.start()
         self._verify_fill_monitor_or_alert()
         self._heartbeat("started", thread_alive=True)
+        # P0: on startup, link any FILLED orders that have position_id=null
+        try:
+            self._backfill_missing_position_links()
+        except Exception as _bf_err:
+            log.error("[%s] startup backfill_missing_position_links error: %s",
+                      self.client_id, _bf_err)
         log.info(
             "[%s] Reconciler started (interval=%ds market_hours_effective<=15s "
             "import_missing_broker_positions=%s run_once_min_interval=%.1fs)",
@@ -1689,7 +1695,20 @@ class APBrokerReconciler:
             )
 
             if family == "ENTRY" and new_status == "FILLED" and self.pm:
-                self._ensure_position_for_filled_entry(order, filled_qty, avg_fill, summary)
+                _rec_pos_id = self._ensure_position_for_filled_entry(
+                    order, filled_qty, avg_fill, summary
+                )
+                if _rec_pos_id:
+                    try:
+                        self._link_order_to_position(
+                            str(order.get("local_order_id") or ""), _rec_pos_id
+                        )
+                    except Exception as _le:
+                        log.error(
+                            "[%s] order_position_link_failed reconciler order=%s pos=%s err=%s",
+                            self.client_id,
+                            order.get("local_order_id"), _rec_pos_id, _le,
+                        )
         except Exception as e:
             log.error("[%s] Reconcile transition error: %s", self.client_id, e)
 
@@ -1794,6 +1813,12 @@ class APBrokerReconciler:
         if existing:
             pos_id = str(existing.get("id") or existing.get("position_id") or "")
             self._seed_exit_engine_from_position(existing)
+            try:
+                self._link_order_to_position(
+                    str(order.get("local_order_id") or ""), pos_id
+                )
+            except Exception:
+                pass
             return pos_id
 
         try:
@@ -1829,6 +1854,106 @@ class APBrokerReconciler:
                       self.client_id, order.get("local_order_id"), _pm_err)
             summary["positions_alerted"] += 1
             return None
+
+    def _link_order_to_position(self, local_order_id: str, position_id: str) -> None:
+        """Write orders.position_id. Idempotent — only updates NULL rows."""
+        if not local_order_id or not position_id:
+            return
+        from ap.db import conn, run_with_retry
+        def _write():
+            with conn() as c:
+                c.execute(
+                    "UPDATE orders SET position_id=%s "
+                    "WHERE client_id=%s AND local_order_id=%s "
+                    "AND (position_id IS NULL OR position_id='')",
+                    (position_id, self.client_id, local_order_id),
+                )
+        run_with_retry(_write)
+        log.info("[%s] order_position_link_success order=%s position=%s",
+                 self.client_id, local_order_id, position_id)
+
+    def _backfill_missing_position_links(self) -> None:
+        """Startup repair: find FILLED orders with position_id=null and link them."""
+        try:
+            from ap.db import conn, run_with_retry
+            def _fetch():
+                with conn() as c:
+                    c.execute(
+                        """
+                        SELECT local_order_id, contract, symbol,
+                               filled_ts, fill_price, filled_qty, direction
+                        FROM orders
+                        WHERE client_id = %s
+                          AND kind = 'ENTRY'
+                          AND status = 'FILLED'
+                          AND (position_id IS NULL OR position_id = '')
+                        ORDER BY filled_ts DESC NULLS LAST
+                        LIMIT 100
+                        """,
+                        (self.client_id,),
+                    )
+                    rows = c.fetchall()
+                    return [dict(r) for r in rows]
+            orphans = run_with_retry(_fetch)
+            if not orphans:
+                return
+            log.warning(
+                "[%s] backfill_missing_position_links: %d FILLED orders "
+                "have position_id=null — attempting repair",
+                self.client_id, len(orphans),
+            )
+            linked = failed = 0
+            for o in orphans:
+                contract = (o.get("contract") or o.get("symbol") or "").strip()
+                if not contract:
+                    failed += 1
+                    continue
+                try:
+                    def _find(c=contract, ts=o.get("filled_ts")):
+                        with conn() as cur:
+                            cur.execute(
+                                """
+                                SELECT id FROM positions
+                                WHERE client_id = %s
+                                  AND (LOWER(contract) = LOWER(%s)
+                                       OR LOWER(option_symbol) = LOWER(%s))
+                                ORDER BY ABS(EXTRACT(EPOCH FROM
+                                  (COALESCE(entry_ts, created_at)
+                                   - COALESCE(%s::timestamptz, NOW()))))
+                                  ASC NULLS LAST
+                                LIMIT 1
+                                """,
+                                (self.client_id, c, c, ts),
+                            )
+                            row = cur.fetchone()
+                            return str(row[0]) if row else None
+                    pos_id = run_with_retry(_find)
+                    if pos_id:
+                        self._link_order_to_position(
+                            str(o.get("local_order_id") or ""), pos_id
+                        )
+                        linked += 1
+                    else:
+                        failed += 1
+                        log.error(
+                            "[%s] filled_order_missing_position_p0 "
+                            "order=%s contract=%s filled_ts=%s — "
+                            "no matching position row found",
+                            self.client_id,
+                            o.get("local_order_id"), contract, o.get("filled_ts"),
+                        )
+                except Exception as _be:
+                    failed += 1
+                    log.error("[%s] backfill_link_error order=%s err=%s",
+                              self.client_id, o.get("local_order_id"), _be)
+            log.info(
+                "[%s] backfill_missing_position_links done: "
+                "linked=%d failed=%d total=%d",
+                self.client_id, linked, failed, len(orphans),
+            )
+        except Exception as _bfe:
+            log.error("[%s] _backfill_missing_position_links error: %s",
+                      self.client_id, _bfe)
 
     def _check_ghost_fills(self, summary: dict):
         """

@@ -1214,11 +1214,51 @@ def process_pending_order(
 
                 _seed_exit_engine(exit_engine, position_id, order, result, signal_id)
 
+                # Write position_id back to orders row.
+                # osm.transition above was called without position_id because the
+                # position didn't exist yet — _open_position_safe created it after.
+                # Without this write the orders row has position_id=null forever.
+                log.info(
+                    "[%s] order_filled_detected order=%s contract=%s qty=%d "
+                    "position_link_result=%s",
+                    client_id, local_id,
+                    order.get("contract") or order.get("symbol"),
+                    int(new_filled or 0),
+                    "success" if position_id else "MISSING",
+                )
+                if position_id:
+                    try:
+                        from ap.db import conn as _fm_conn, run_with_retry as _fm_retry
+                        def _link_back():
+                            with _fm_conn() as c:
+                                c.execute(
+                                    "UPDATE orders "
+                                    "SET position_id=%s, updated_ts=NOW() "
+                                    "WHERE client_id=%s AND local_order_id=%s "
+                                    "AND (position_id IS NULL OR position_id='')",
+                                    (position_id, client_id, local_id),
+                                )
+                        _fm_retry(_link_back)
+                        log.info(
+                            "[%s] order_position_link_success order=%s position=%s "
+                            "contract=%s",
+                            client_id, local_id, position_id,
+                            order.get("contract") or order.get("symbol"),
+                        )
+                    except Exception as _link_err:
+                        log.error(
+                            "[%s] order_position_link_failed order=%s position=%s "
+                            "err=%s",
+                            client_id, local_id, position_id, _link_err,
+                        )
+
                 if not position_id:
                     log.critical(
-                        "[%s] CRITICAL: _open_position_safe returned None for %s %s "
-                        "(fill confirmed but no position record created — exit engine BLIND to this position)",
-                        client_id, order.get("symbol"), local_id,
+                        "[%s] filled_order_missing_position_p0 order=%s contract=%s "
+                        "(fill confirmed but no position record created — "
+                        "exit engine BLIND to this position)",
+                        client_id, local_id,
+                        order.get("contract") or order.get("symbol"),
                     )
 
             except Exception as exc:
