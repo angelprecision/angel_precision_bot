@@ -939,7 +939,10 @@ class APMasterControl:
                               AND UPPER(COALESCE(contract, '')) NOT LIKE 'DEFERRED:%%'
                               AND (reserved_cost IS NULL OR reserved_cost <= 0)
                               AND (limit_price IS NULL OR limit_price <= 0)
-                              AND (broker_order_id IS NOT NULL AND broker_order_id <> '')
+                              AND (
+                                (broker_order_id IS NOT NULL AND broker_order_id <> '')
+                                OR submitted_ts IS NOT NULL
+                              )
                               AND NOT (
                                 UPPER(COALESCE(status, '')) IN ('CREATED', 'PENDING_TRIGGER')
                                 AND (broker_order_id IS NULL OR broker_order_id = '')
