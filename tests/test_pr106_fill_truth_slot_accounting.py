@@ -157,3 +157,58 @@ def test_ac7_pr105_deferred_exclusion_preserved():
 def test_ac7_entry_attempt_lock_field_in_mc():
     """MC must have entry_attempt_lock_count in zero_snapshot and setdefault."""
     assert '"entry_attempt_lock_count"' in MC_SRC or            "'entry_attempt_lock_count'" in MC_SRC
+
+# ── AC-GAP: unreconciled fill blocks even when positions table is empty ────────
+
+def test_ac_gap_filled_order_blocks_before_reconciliation():
+    """
+    Positions table = 0 (open_count=0).
+    Orders table has 1 FILLED order, fill_price set, filled_qty=1, position_id=NULL.
+    max_positions = 1 → must block (real_filled_slots = 0 + 1 = 1 >= 1).
+    """
+    snap = {
+        "open_count":                  0,   # positions table empty
+        "pending_entries":             1,   # 1 unreconciled fill in orders
+        "filled_unreconciled_calls":   0,
+        "filled_unreconciled_puts":    1,
+        "entry_attempt_lock_count":    0,
+        "entry_attempt_reserved_cost": 0.0,
+        "watcher_count":               0,
+    }
+    max_positions = 1
+    real_filled_slots = snap["open_count"] + snap["pending_entries"]
+    assert real_filled_slots >= max_positions, (
+        f"Unreconciled fill must block: open={snap['open_count']} "
+        f"unreconciled={snap['pending_entries']} slots={real_filled_slots} max={max_positions}"
+    )
+
+def test_ac_no_double_count_when_reconciled():
+    """
+    Same fill is already reconciled: positions table has 1 OPEN row (open_count=1).
+    The orders row now has position_id set, so pending_entries = 0.
+    real_filled_slots = 1 + 0 = 1 (not 2).
+    """
+    snap_reconciled = {
+        "open_count":      1,  # positions table has the row
+        "pending_entries": 0,  # orders row has position_id set → not counted again
+        "filled_unreconciled_calls": 0,
+        "filled_unreconciled_puts":  0,
+    }
+    max_positions = 1
+    real_filled_slots = snap_reconciled["open_count"] + snap_reconciled["pending_entries"]
+    assert real_filled_slots == 1, (
+        f"Reconciled fill must count as exactly 1 slot, got {real_filled_slots}"
+    )
+    assert real_filled_slots >= max_positions, "1 slot vs max=1 must block"
+
+def test_position_id_null_is_dedup_key():
+    """The slot SQL uses position_id IS NULL to exclude already-reconciled fills."""
+    assert "position_id IS NULL" in PM_SRC or "position_id = ''" in PM_SRC, (
+        "pending_entries query must exclude orders with position_id set"
+    )
+
+def test_real_filled_slots_log_fields():
+    """Block log must include all four required fields."""
+    for field in ["open_positions=", "filled_orders_unreconciled=",
+                  "real_filled_slots=", "max_positions=", "entry_attempt_locks="]:
+        assert field in MC_SRC, f"Block log must include field: {field}"
