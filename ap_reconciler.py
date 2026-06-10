@@ -1976,8 +1976,10 @@ class APBrokerReconciler:
                 with conn() as c:
                     c.execute(
                         """
-                        SELECT local_order_id, broker_order_id, contract,
-                               option_symbol, symbol,
+                        SELECT local_order_id, broker_order_id,
+                               contract,
+                               contract AS option_symbol,
+                               symbol,
                                filled_ts, fill_price, filled_qty, direction,
                                execution_mode
                         FROM orders
