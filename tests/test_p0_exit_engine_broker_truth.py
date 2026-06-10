@@ -375,3 +375,63 @@ def test_broker_precheck_stale_db_qty_zero_loaded_with_broker_qty():
     assert mp.quantity_remaining == 3, (
         f"ManagedPosition.quantity_remaining must be broker qty=3, got {mp.quantity_remaining}"
     )
+
+def test_log_honesty_repair_failed_reason_in_added_log():
+    """
+    Fix 3: EXIT_BROKER_POSITION_ADDED_TO_ENGINE log must include repair_failed_reason=%s,
+    not a hardcoded empty string.
+    The synthetic path sets repair_failed_reason to a non-empty value;
+    the log must print it.
+    """
+    fn_start = EE_SRC.find("# ── 3e. Required structured log")
+    fn_end   = EE_SRC.find("\n            # ── 4.", fn_start)
+    log_block = EE_SRC[fn_start:fn_end]
+    # Must use %s placeholder, not hardcoded empty
+    assert "repair_failed_reason=%s" in log_block, (
+        "ADDED_TO_ENGINE log must use repair_failed_reason=%s (not hardcoded empty)"
+    )
+    # Must pass the variable, not empty string literal
+    assert "repair_failed_reason or" in log_block or            "repair_failed_reason," in log_block, (
+        "ADDED_TO_ENGINE log must pass repair_failed_reason variable"
+    )
+
+def test_repaired_syms_only_for_real_db_rows():
+    """
+    Fix 2/Option A: repaired_syms must only be appended when new_id is truthy.
+    Synthetic-id loads go to engine_loaded_synthetic_syms.
+    """
+    assert "engine_loaded_synthetic_syms" in EE_SRC, (
+        "engine_loaded_synthetic_syms list must exist in precheck"
+    )
+    # repaired_syms.append must be guarded by `if new_id:`
+    idx = EE_SRC.find("repaired_syms.append(sym)")
+    region = EE_SRC[max(0, idx - 150) : idx + 50]
+    assert "if new_id" in region, (
+        "repaired_syms.append must only run when new_id is a real DB id"
+    )
+    # engine_loaded_synthetic_syms.append must be in the else branch
+    idx2 = EE_SRC.find("engine_loaded_synthetic_syms.append(sym)")
+    assert idx2 > 0, "engine_loaded_synthetic_syms.append must be called in the else branch"
+
+def test_summary_includes_engine_loaded_synthetic():
+    """Fix 4: summary log must include engine_loaded_synthetic field."""
+    idx = EE_SRC.rfind("EXIT_BROKER_PRECHECK_SUMMARY")
+    region = EE_SRC[idx:idx + 600]
+    assert "engine_loaded_synthetic" in region, (
+        "EXIT_BROKER_PRECHECK_SUMMARY must include engine_loaded_synthetic field"
+    )
+    assert "repaired_from_broker" in region, (
+        "EXIT_BROKER_PRECHECK_SUMMARY must still include repaired_from_broker (DB-confirmed only)"
+    )
+
+def test_synthetic_path_sets_db_repaired_false():
+    """
+    Fix 1 (existing): when upsert returns None, db_repaired must be set False
+    before add_position is called.
+    """
+    idx = EE_SRC.find("db_repaired         = False")
+    assert idx > 0, "db_repaired=False must be set in the synthetic-id path"
+    region = EE_SRC[idx : idx + 300]
+    assert "db_upsert_returned_no_id" in region or "synthetic" in region, (
+        "db_repaired=False path must be near synthetic id logic"
+    )
