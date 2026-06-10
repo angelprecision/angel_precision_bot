@@ -1215,9 +1215,22 @@ class APPositionManager:
                 # broker-fill state. SUBMITTED/ACKNOWLEDGED/CREATED without
                 # fill are entry-attempt locks only — not position slots.
                 _phantom_grace_sec = int(os.getenv("PENDING_ENTRY_PHANTOM_GRACE_SEC", "30"))
+                # pending_entries = broker-confirmed fills NOT yet reconciled
+                # to the positions table (position_id IS NULL).
+                # If the same fill already has a positions row, open_count
+                # captures it — we must NOT double-count here.
                 c.execute(
                     """
-                    SELECT COUNT(*) AS n
+                    SELECT
+                      COUNT(*) AS n,
+                      COUNT(*) FILTER (
+                        WHERE UPPER(COALESCE(direction,'')) = 'CALL'
+                           OR UPPER(COALESCE(side,'')) = 'CALL'
+                      ) AS calls_unreconciled,
+                      COUNT(*) FILTER (
+                        WHERE UPPER(COALESCE(direction,'')) = 'PUT'
+                           OR UPPER(COALESCE(side,'')) = 'PUT'
+                      ) AS puts_unreconciled
                     FROM orders
                     WHERE client_id = %s AND kind = 'ENTRY'
                       AND (
@@ -1231,10 +1244,14 @@ class APPositionManager:
                         'CANCELED', 'CANCELLED', 'EXPIRED', 'REJECTED',
                         'ERROR', 'FAILED', 'CLOSED'
                       )
+                      AND (position_id IS NULL OR position_id = '')
                     """,
                     (self.client_id,),
                 )
-                pending_entries = int((c.fetchone() or {}).get("n") or 0)
+                _slot_row = c.fetchone() or {}
+                pending_entries              = int(_slot_row.get("n")                   or 0)
+                filled_unreconciled_calls    = int(_slot_row.get("calls_unreconciled")  or 0)
+                filled_unreconciled_puts     = int(_slot_row.get("puts_unreconciled")   or 0)
 
                 # Entry-attempt lock: in-flight broker submits (duplicate-submit
                 # protection only; NOT counted as position slots or real exposure).
@@ -1353,7 +1370,9 @@ class APPositionManager:
                     "puts_open":          sum(1 for p in active if p.get("direction") == "PUT"),
                     "capital_deployed":   float(summary.get("capital_deployed") or 0),
                     "pending_entry_capital": pending_entry_capital,
-                    "pending_entries":    pending_entries,
+                    "pending_entries":           pending_entries,
+                    "filled_unreconciled_calls":  filled_unreconciled_calls,
+                    "filled_unreconciled_puts":   filled_unreconciled_puts,
                     "entry_attempt_lock_count":    entry_attempt_lock_count,
                     "entry_attempt_reserved_cost": entry_attempt_reserved_cost,
                     "watcher_count":      watcher_count,
