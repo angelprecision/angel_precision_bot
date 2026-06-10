@@ -2058,7 +2058,13 @@ class APBrokerReconciler:
 
             # ── 2. historical_live — safe CLOSED_REPAIR only if fill data ──────
             for o in buckets["historical_live"]:
-                contract = self._norm_contract(o.get("contract") or o.get("symbol") or "")
+                raw_contract = (
+                    o.get("option_symbol")
+                    or o.get("contract")
+                    or o.get("symbol")
+                    or ""
+                )
+                contract = self._norm_contract(raw_contract)
                 local_id = str(o.get("local_order_id") or "")
                 if not contract:
                     continue
@@ -2102,7 +2108,13 @@ class APBrokerReconciler:
 
             # ── 3. manual_review — escalate to P0 only if broker confirms ──────
             for o in buckets["manual_review"]:
-                contract = self._norm_contract(o.get("contract") or o.get("symbol") or "")
+                raw_contract = (
+                    o.get("option_symbol")
+                    or o.get("contract")
+                    or o.get("symbol")
+                    or ""
+                )
+                contract = self._norm_contract(raw_contract)
                 local_id = str(o.get("local_order_id") or "")
                 if not contract:
                     continue
@@ -2126,7 +2138,13 @@ class APBrokerReconciler:
 
             # ── 4. current_live — full P0 repair ─────────────────────────────
             for o in buckets["current_live"]:
-                contract  = self._norm_contract(o.get("contract") or o.get("symbol") or "")
+                raw_contract = (
+                    o.get("option_symbol")
+                    or o.get("contract")
+                    or o.get("symbol")
+                    or ""
+                )
+                contract = self._norm_contract(raw_contract)
                 local_id  = str(o.get("local_order_id")  or "")
                 broker_id = str(o.get("broker_order_id") or "")
                 if not contract:
