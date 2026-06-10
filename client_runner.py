@@ -959,6 +959,24 @@ class ClientRunner(threading.Thread):
             and _fill_ok_for_entries
             and _quote_ok
         )
+        # PR-110: for LIVE mode, additionally block entries if the broker
+        # precheck has a confirmed auth/HTTP error (4xx). A 401/403 means
+        # the exit engine cannot verify broker positions and cannot safely
+        # evaluate exits — live entries must not proceed.
+        # Paper mode is advisory only (broker precheck is sandbox).
+        if ready and self.mode == "LIVE":
+            _exit_eng = getattr(getattr(self, "core", None), "exit_eng", None)
+            if _exit_eng is not None:
+                _bp_http = getattr(_exit_eng, "_broker_precheck_last_http_status", 0)
+                _bp_ok   = getattr(_exit_eng, "_broker_precheck_last_ok", True)
+                # Block if last known HTTP status is a 4xx auth/client error
+                if _bp_http and 400 <= _bp_http < 500 and not _bp_ok:
+                    logger.warning(
+                        "[%s] entries_allowed BLOCKED: broker_precheck_http_%s — "
+                        "exit engine cannot verify broker positions; live entries unsafe",
+                        self.email, _bp_http,
+                    )
+                    ready = False
         if ready:
             self.entries_allowed.set()
         else:

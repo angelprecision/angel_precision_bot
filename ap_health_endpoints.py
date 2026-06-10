@@ -397,6 +397,267 @@ setInterval(() => {{
     return Response(html, mimetype="text/html")
 
 
+
+
+# ── PR-110: Per-client live-control organ health ───────────────────────────────
+# GET /health/organs and /health/clients both return the same JSON response.
+# Never returns HTML. Always valid JSON, even on errors.
+
+_REQUIRED_LIVE_ORGANS = [
+    "client_runner",
+    "exit_engine",
+    "fill_monitor",
+    "reconciler",
+    "broker_precheck",
+]
+
+# Stale threshold for broker precheck (seconds since last successful run)
+_BROKER_PRECHECK_STALE_S = float(
+    __import__("os").getenv("BROKER_PRECHECK_STALE_S", "120")
+)
+
+
+def _build_client_organ_report(email: str, runner) -> dict:
+    """
+    Build a single client organ health dict from a live ClientRunner instance.
+    Reads runner state directly — no external calls.
+    """
+    import time as _time
+
+    mode        = str(getattr(runner, "mode", "UNKNOWN")).upper()
+    account_id  = str(getattr(runner, "account_id", ""))
+    pod_id      = __import__("os").getenv("AP_POD_ID", "live-pod-001")
+
+    # ── Thread liveness ──────────────────────────────────────────────────
+    runner_thread  = getattr(runner, "runner_thread", None) or getattr(runner, "_thread", None)
+    worker_thread  = getattr(runner, "worker_thread", None)
+    fill_thread    = getattr(runner, "fill_monitor_thread", None)
+    core           = getattr(runner, "core", None)
+    exit_eng       = getattr(core, "exit_eng", None) if core else None
+    reconciler     = getattr(runner, "reconciler", None)
+
+    _runner_alive   = runner.is_alive() if hasattr(runner, "is_alive") else False
+    _fill_alive     = bool(fill_thread and fill_thread.is_alive())
+    _worker_alive   = bool(worker_thread and worker_thread.is_alive())
+    _exit_present   = exit_eng is not None
+    _reconciler_ok  = reconciler is not None
+
+    # ── Heartbeat ages ───────────────────────────────────────────────────
+    now = _time.time()
+    _fm_last  = getattr(runner, "last_fill_monitor_heartbeat_ts", 0) or 0
+    _wk_last  = getattr(runner, "last_worker_heartbeat_ts", 0) or 0
+    _eq_last  = getattr(runner, "last_equity_heartbeat_ts", 0) or 0
+
+    cr_age   = round(now - _wk_last, 1) if _wk_last else None
+    fm_age   = round(now - _fm_last, 1) if _fm_last else None
+    # Exit engine heartbeat: use health registry if registered
+    ee_age   = None
+    try:
+        from ap_health_registry import HEALTH
+        snap = HEALTH.snapshot()
+        if "ap_exit_engine" in snap:
+            ee_age = round(snap["ap_exit_engine"]["heartbeat_age_s"], 1)
+    except Exception:
+        pass
+
+    # ── Broker precheck metrics ──────────────────────────────────────────
+    bp_last_ts     = getattr(exit_eng, "_broker_precheck_last_ts", 0) or 0
+    bp_last_ok     = getattr(exit_eng, "_broker_precheck_last_ok", False)
+    bp_http_status = getattr(exit_eng, "_broker_precheck_last_http_status", 0)
+    bp_pos_count   = getattr(exit_eng, "_broker_precheck_last_position_count", 0)
+    bp_ran         = bp_last_ts > 0
+    bp_age         = round(now - bp_last_ts, 1) if bp_ran else None
+    bp_stale       = (not bp_ran) or (bp_age is not None and bp_age > _BROKER_PRECHECK_STALE_S)
+    bp_online      = bp_ran and bp_last_ok and not bp_stale
+
+    # ── Organ online/stale booleans ──────────────────────────────────────
+    # "online" = alive + heartbeating recently
+    _fill_stale_threshold = float(
+        __import__("os").getenv("FILL_MONITOR_GRACE_SEC", "300")
+    )
+    fill_online = _fill_alive and (fm_age is None or fm_age < _fill_stale_threshold)
+    cr_online   = _runner_alive and (cr_age is None or cr_age < 120)
+    ee_online   = _exit_present and (ee_age is None or ee_age < 90)
+    rec_online  = _reconciler_ok
+
+    # ── Broker symbols ───────────────────────────────────────────────────
+    broker_symbols = []
+    if exit_eng is not None:
+        try:
+            with exit_eng._lock:
+                broker_symbols = [
+                    str(getattr(p, "option_symbol", "") or "")
+                    for p in exit_eng._positions
+                    if not p.closed and int(p.quantity_remaining or 0) > 0
+                ]
+        except Exception:
+            pass
+
+    # ── Blocking reasons + live_control_ready ────────────────────────────
+    blocking: list[str] = []
+
+    if not cr_online:
+        if not _runner_alive:
+            blocking.append("client_runner_dead")
+        elif cr_age is not None and cr_age >= 120:
+            blocking.append("client_runner_stale")
+        else:
+            blocking.append("client_runner_missing")
+
+    if not ee_online:
+        if not _exit_present:
+            blocking.append("exit_engine_missing")
+        elif ee_age is not None and ee_age >= 90:
+            blocking.append("exit_engine_stale")
+        else:
+            blocking.append("exit_engine_degraded")
+
+    if not fill_online:
+        if not _fill_alive:
+            blocking.append("fill_monitor_missing")
+        else:
+            blocking.append("fill_monitor_stale")
+
+    if not rec_online:
+        blocking.append("reconciler_missing")
+
+    if not bp_online:
+        if not bp_ran:
+            blocking.append("broker_precheck_never_ran")
+        elif not bp_last_ok:
+            status_suffix = str(bp_http_status) if bp_http_status and bp_http_status > 0 else "unknown"
+            blocking.append(f"broker_precheck_http_{status_suffix}")
+        elif bp_stale:
+            blocking.append("broker_precheck_stale")
+        else:
+            blocking.append("broker_position_check_unavailable")
+
+    # Additional: degraded mode
+    if getattr(runner, "degraded", None) and runner.degraded.is_set():
+        degraded_reasons = sorted(getattr(runner, "degraded_reasons", set()))
+        for r in degraded_reasons:
+            blocking.append(f"degraded_{r}")
+
+    # For LIVE clients all organs required; PAPER clients only block on
+    # runner/exit/fill (broker precheck is advisory in paper mode)
+    if mode == "LIVE":
+        live_control_ready = len(blocking) == 0
+    else:
+        critical_blocking = [b for b in blocking
+                             if not b.startswith(("broker_precheck", "reconciler"))]
+        live_control_ready = len(critical_blocking) == 0
+
+    return {
+        "client_email":               email,
+        "account_id":                 account_id,
+        "execution_mode":             mode.lower(),
+        "pod_id":                     pod_id,
+
+        "client_runner_online":       cr_online,
+        "exit_engine_online":         ee_online,
+        "fill_monitor_online":        fill_online,
+        "reconciler_online":          rec_online,
+        "broker_precheck_online":     bp_online,
+        "broker_precheck_last_http_status": bp_http_status,
+        "broker_position_count":      bp_pos_count if bp_ran else 0,
+        "broker_symbols":             broker_symbols,
+
+        "last_heartbeat_age_seconds": {
+            "client_runner":  cr_age,
+            "exit_engine":    ee_age,
+            "fill_monitor":   fm_age,
+            "reconciler":     None,    # reconciler is event-driven, no heartbeat ts
+            "broker_precheck": bp_age,
+        },
+
+        "live_control_ready": live_control_ready,
+        "blocking_reasons":   blocking,
+
+        # additional diagnostics
+        "entries_allowed":    bool(
+            getattr(runner, "entries_allowed", None)
+            and runner.entries_allowed.is_set()
+        ),
+        "initialized":        bool(
+            getattr(runner, "initialized", None)
+            and runner.initialized.is_set()
+        ),
+        "degraded":           bool(
+            getattr(runner, "degraded", None)
+            and runner.degraded.is_set()
+        ),
+    }
+
+
+@health_bp.route("/organs")
+@health_bp.route("/clients")
+def organs():
+    """
+    PR-110: Per-client live-control organ health.
+    Returns JSON always — never HTML. Never 404.
+    Used by operator console to verify live machine is safe before entries.
+    Alias: /health/clients
+    """
+    import time as _time
+
+    try:
+        from client_runner import _active_runners
+    except Exception as _import_err:
+        return jsonify({
+            "ok": False,
+            "error": f"runner_module_unavailable: {_import_err}",
+            "clients": [],
+        })
+
+    from ap_health_registry import HEALTH
+
+    client_reports = []
+    overall_ok = True
+
+    try:
+        runners_snapshot = dict(_active_runners)
+    except Exception as _e:
+        return jsonify({
+            "ok": False,
+            "error": f"runner_registry_unavailable: {_e}",
+            "clients": [],
+        })
+
+    for email, runner in runners_snapshot.items():
+        try:
+            report = _build_client_organ_report(email, runner)
+        except Exception as _re:
+            log.warning("[health/organs] error building report for %s: %s", email, _re)
+            report = {
+                "client_email":       email,
+                "execution_mode":     "unknown",
+                "live_control_ready": False,
+                "blocking_reasons":   [f"report_build_error:{_re}"],
+                "error":              str(_re),
+            }
+        if not report.get("live_control_ready"):
+            overall_ok = False
+        client_reports.append(report)
+
+    # Top-level mode: LIVE if any client is live
+    has_live = any(
+        r.get("execution_mode", "").lower() == "live"
+        for r in client_reports
+    )
+
+    return jsonify({
+        "ok":      overall_ok,
+        "mode":    "LIVE" if has_live else "PAPER",
+        "clients": client_reports,
+        "summary": {
+            "total_clients":      len(client_reports),
+            "live_control_ready": sum(1 for r in client_reports if r.get("live_control_ready")),
+            "live_control_blocked": sum(1 for r in client_reports if not r.get("live_control_ready")),
+        },
+        "generated_at": _time.time(),
+    })
+
+
 @health_bp.route("/kill", methods=["POST"])
 def kill():
     """Trigger local kill switch. Body: {"reason": "manual operator halt"}"""

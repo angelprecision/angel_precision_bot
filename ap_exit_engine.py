@@ -1254,6 +1254,15 @@ class APExitEngine:
         self.on_scale: Optional[Callable] = None
         self._kill_switch_fn = kill_switch_fn
 
+        # PR-110: Broker precheck metrics — read by /health/organs.
+        # Updated on every _broker_position_precheck() call so the
+        # /health/organs endpoint can report broker precheck freshness
+        # and block live entries if the broker is returning auth errors.
+        self._broker_precheck_last_ts:          float = 0.0   # epoch; 0 = never ran
+        self._broker_precheck_last_ok:          bool  = False  # True once confirmed working
+        self._broker_precheck_last_http_status: int   = 0      # 0=never; 200=ok; 401/5xx=error
+        self._broker_precheck_last_position_count: int = 0
+
         self.run_id           = os.getenv("AP_RUN_ID", "unknown")
         self.strategy_version = os.getenv("AP_STRATEGY_VERSION", "ap_live_beta")
         self.git_commit       = get_git_commit()
@@ -3061,19 +3070,38 @@ class APExitEngine:
     def _broker_position_precheck(self) -> bool:
         """
         Before every exit cycle: verify broker position truth.
-        If broker has positions missing from the exit engine, attempt to
-        load them from DB so exits are not silently missed.
-        Returns True if broker truth is confirmed, False if unavailable.
-
-        EXIT_UNSAFE_BROKER_TRUTH_UNAVAILABLE is logged and an alert fired
-        if the broker fetch fails — exit engine holds but does NOT stop.
+        If broker has positions missing from the exit engine, log alert.
+        Returns True if broker truth confirmed, False if unavailable.
+        PR-110: updates self._broker_precheck_* metrics for /health/organs.
         """
+        import time as _time
         if not self.broker or not hasattr(self.broker, "list_positions"):
             return True   # broker doesn't support list_positions — skip precheck
 
         try:
             broker_positions = self.broker.list_positions() or []
+            # Successful broker call — update metrics
+            self._broker_precheck_last_ts             = _time.time()
+            self._broker_precheck_last_ok             = True
+            self._broker_precheck_last_http_status    = 200
+            self._broker_precheck_last_position_count = len(broker_positions)
         except Exception as _bp_err:
+            # Detect HTTP status from exception message if broker surfaces it
+            _err_str = str(_bp_err)
+            _http_status = 0
+            # Extract HTTP status code (4xx/5xx) from broker error string.
+            # Avoids regex escape issues; simple token scan.
+            for _tok in _err_str.replace(":", " ").replace("/", " ").split():
+                try:
+                    _code = int(_tok)
+                    if 400 <= _code <= 599:
+                        _http_status = _code
+                        break
+                except (ValueError, TypeError):
+                    pass
+            self._broker_precheck_last_ts          = _time.time()
+            self._broker_precheck_last_ok          = False
+            self._broker_precheck_last_http_status = _http_status or -1   # -1 = error, status unknown
             log.error(
                 "[exit_eng] EXIT_UNSAFE_BROKER_TRUTH_UNAVAILABLE "
                 "client=%s broker.list_positions() failed: %s — "
