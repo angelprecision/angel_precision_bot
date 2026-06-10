@@ -906,6 +906,13 @@ class APMasterControl:
                           AND kind = 'ENTRY'
                           AND UPPER(COALESCE(status, '')) = ANY(%s)
                           AND UPPER(COALESCE(status, '')) NOT IN ('CANCELLED', 'CANCELED', 'REJECTED', 'ERROR', 'FAILED', 'FILLED', 'CLOSED')
+                          AND UPPER(COALESCE(contract, '')) NOT LIKE 'DEFERRED:%%'
+                          AND NOT (
+                            UPPER(COALESCE(status, '')) IN ('CREATED', 'PENDING_TRIGGER',
+                                                            'WATCHING', 'SELECTED', 'RETRY_ELIGIBLE')
+                            AND (broker_order_id IS NULL OR broker_order_id = '')
+                            AND submitted_ts IS NULL
+                          )
                           AND NOT (
                             UPPER(COALESCE(status, '')) IN ('CREATED', 'PENDING_TRIGGER')
                             AND (broker_order_id IS NULL OR broker_order_id = '')
@@ -929,8 +936,10 @@ class APMasterControl:
                               AND kind = 'ENTRY'
                               AND UPPER(COALESCE(status, '')) = ANY(%s)
                               AND UPPER(COALESCE(status, '')) NOT IN ('CANCELLED', 'CANCELED', 'REJECTED', 'ERROR', 'FAILED', 'FILLED', 'CLOSED')
+                              AND UPPER(COALESCE(contract, '')) NOT LIKE 'DEFERRED:%%'
                               AND (reserved_cost IS NULL OR reserved_cost <= 0)
                               AND (limit_price IS NULL OR limit_price <= 0)
+                              AND (broker_order_id IS NOT NULL AND broker_order_id <> '')
                               AND NOT (
                                 UPPER(COALESCE(status, '')) IN ('CREATED', 'PENDING_TRIGGER')
                                 AND (broker_order_id IS NULL OR broker_order_id = '')
