@@ -1930,9 +1930,12 @@ class APBrokerReconciler:
           'historical_null_mode'   execution_mode IS NULL + expired         → legacy skip
           'manual_review'          execution_mode IS NULL + unexpired       → unknown exposure
         """
-        mode     = (o.get("execution_mode") or "").lower().strip()
-        contract = o.get("contract") or o.get("symbol") or ""
-        expiry   = self._occ_expiry(contract)
+        mode       = (o.get("execution_mode") or "").lower().strip()
+        occ_symbol = (o.get("option_symbol")
+                      or o.get("contract")
+                      or o.get("symbol")
+                      or "")
+        expiry     = self._occ_expiry(occ_symbol)
         expired  = (expiry is not None and expiry < today)
 
         if mode == "live":
@@ -1973,7 +1976,8 @@ class APBrokerReconciler:
                 with conn() as c:
                     c.execute(
                         """
-                        SELECT local_order_id, broker_order_id, contract, symbol,
+                        SELECT local_order_id, broker_order_id, contract,
+                               option_symbol, symbol,
                                filled_ts, fill_price, filled_qty, direction,
                                execution_mode
                         FROM orders
