@@ -1225,11 +1225,9 @@ class APPositionManager:
                       COUNT(*) AS n,
                       COUNT(*) FILTER (
                         WHERE UPPER(COALESCE(direction,'')) = 'CALL'
-                           OR UPPER(COALESCE(side,'')) = 'CALL'
                       ) AS calls_unreconciled,
                       COUNT(*) FILTER (
                         WHERE UPPER(COALESCE(direction,'')) = 'PUT'
-                           OR UPPER(COALESCE(side,'')) = 'PUT'
                       ) AS puts_unreconciled
                     FROM orders
                     WHERE client_id = %s AND kind = 'ENTRY'
