@@ -218,3 +218,51 @@ def test_ac5_capital_excludes_wrong_mode():
         "Paper fill must not contribute to live client capital"
     )
     db.close()
+
+# ── Explicit combined mode-isolation test ────────────────────────────────────
+
+def test_mode_isolation_live_paper_null():
+    """
+    Fixture has three rows per direction:
+      - execution_mode='live'
+      - execution_mode='paper'
+      - execution_mode=NULL
+
+    Live snapshot  → counts only live row  → n=1, calls=1, puts=0
+    Paper snapshot → counts only paper row → n=1, calls=0, puts=1
+    Null-mode rows are excluded in both.
+    """
+    CLIENT = "test-isolation@example.com"
+    rows = [
+        # live CALL
+        {"client_id": CLIENT, "kind": "ENTRY", "direction": "CALL",
+         "status": "FILLED", "execution_mode": "live",
+         "filled_qty": 1, "fill_price": 2.50, "position_id": None},
+        # paper PUT
+        {"client_id": CLIENT, "kind": "ENTRY", "direction": "PUT",
+         "status": "FILLED", "execution_mode": "paper",
+         "filled_qty": 1, "fill_price": 0.61, "position_id": None},
+        # null-mode historical orphan
+        {"client_id": CLIENT, "kind": "ENTRY", "direction": "CALL",
+         "status": "FILLED", "execution_mode": None,
+         "filled_qty": 1, "fill_price": 1.80, "position_id": None},
+    ]
+    db = _db(rows)
+
+    # Live snapshot: only live CALL counts
+    live = _run_slot(db, CLIENT, mode="live")
+    assert live.get("n", 0) == 1,                f"live n: expected 1, got {live.get('n')}"
+    assert live.get("calls_unreconciled", 0) == 1,f"live calls: expected 1"
+    assert live.get("puts_unreconciled",  0) == 0,f"live puts: expected 0 (paper PUT excluded)"
+    assert live.get("orphan_null_mode",   0) == 1,f"live null_mode: expected 1"
+    assert live.get("orphan_wrong_mode",  0) == 1,f"live wrong_mode: expected 1 (paper row)"
+
+    # Paper snapshot: only paper PUT counts
+    paper = _run_slot(db, CLIENT, mode="paper")
+    assert paper.get("n", 0) == 1,                f"paper n: expected 1, got {paper.get('n')}"
+    assert paper.get("calls_unreconciled", 0) == 0,f"paper calls: expected 0 (live CALL excluded)"
+    assert paper.get("puts_unreconciled",  0) == 1,f"paper puts: expected 1"
+    assert paper.get("orphan_null_mode",   0) == 1,f"paper null_mode: expected 1"
+    assert paper.get("orphan_wrong_mode",  0) == 1,f"paper wrong_mode: expected 1 (live row)"
+
+    db.close()
