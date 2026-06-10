@@ -3402,9 +3402,10 @@ class APExitEngine:
             return True
 
         # ── 3. Repair / load each missing position ────────────────────────────
-        repaired_syms      = []
-        loaded_db_syms     = []
-        repair_failed_syms = []
+        repaired_syms               = []   # DB insert/re-query confirmed real id
+        loaded_db_syms              = []   # existing DB row found and loaded
+        repair_failed_syms          = []   # add_position never called
+        engine_loaded_synthetic_syms = []  # engine loaded but no confirmed DB row
 
         for sym in sorted(missing_from_engine):
             bp         = broker_map[sym]
@@ -3534,7 +3535,10 @@ class APExitEngine:
                         prefer_qty_override=True,
                     )
                     self.add_position(pos)
-                    repaired_syms.append(sym)
+                    if new_id:
+                        repaired_syms.append(sym)              # confirmed DB row
+                    else:
+                        engine_loaded_synthetic_syms.append(sym)  # engine-only, no DB row
                 except Exception as _re_err:
                     repair_failed_syms.append(sym)
                     repair_failed_reason = f"{type(_re_err).__name__}: {_re_err}"
@@ -3607,11 +3611,11 @@ class APExitEngine:
                 "[exit_eng] EXIT_BROKER_POSITION_ADDED_TO_ENGINE "
                 "client=%s account=%s contract_symbol=%s "
                 "db_seen_before=%s db_status_before=%s db_qty_before=%s "
-                "broker_qty=%d loaded_qty=%d db_repaired=%s repair_failed_reason= "
+                "broker_qty=%d loaded_qty=%d db_repaired=%s repair_failed_reason=%s "
                 "added_to_engine=true will_evaluate_this_cycle=true quote_status=%s",
                 self._email, _account_id, sym,
                 db_seen, db_status_before, db_qty_before,
-                broker_qty, loaded_qty, db_repaired, _quote_status,
+                broker_qty, loaded_qty, db_repaired, repair_failed_reason or "", _quote_status,
             )
             log.info(
                 "[exit_eng] EXIT_ENGINE_REPAIRED_BROKER_POSITION_AND_EVALUATED_EXIT "
@@ -3631,12 +3635,14 @@ class APExitEngine:
             "[exit_eng] EXIT_BROKER_PRECHECK_SUMMARY "
             "client=%s account=%s broker_position_count=%d broker_symbols=%s "
             "engine_position_count=%d engine_symbols=%s missing_from_engine=%s "
-            "loaded_from_db=%s repaired_from_broker=%s repair_failed=%s",
+            "loaded_from_db=%s repaired_from_broker=%s "
+            "engine_loaded_synthetic=%s repair_failed=%s",
             self._email, _account_id,
             len(broker_syms), sorted(broker_syms),
             len(engine_syms), sorted(engine_syms),
             sorted(missing_from_engine),
-            loaded_db_syms, repaired_syms, repair_failed_syms,
+            loaded_db_syms, repaired_syms,
+            engine_loaded_synthetic_syms, repair_failed_syms,
         )
 
         return len(repair_failed_syms) == 0
