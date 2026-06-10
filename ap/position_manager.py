@@ -1133,7 +1133,7 @@ class APPositionManager:
     # before/after states under heavy churn.
     # ------------------------------------------------------------------
 
-    def snapshot(self) -> dict:
+    def snapshot(self, *, mode: Optional[str] = None) -> dict:
         """
         Consistent-ish account snapshot for master-control gates.
 
@@ -1217,25 +1217,39 @@ class APPositionManager:
                 _phantom_grace_sec = int(os.getenv("PENDING_ENTRY_PHANTOM_GRACE_SEC", "30"))
                 # pending_entries = broker-confirmed fills NOT yet reconciled
                 # to the positions table (position_id IS NULL).
-                # execution_mode IS NOT NULL — excludes historical null-mode
-                # orphan rows (PR #107 classified these as historical_null_mode).
-                # Those rows have no corresponding live broker exposure and must
-                # not consume active position slots (PR #112).
+                # Filtered to current execution mode (live/paper) so historical
+                # null-mode orphans and wrong-mode fills never block active slots.
+                # Fail-closed: if mode is unknown, exclude null-mode rows only
+                # (IS NOT NULL) rather than counting everything.
+                _snap_mode = (mode or "").strip().lower() or None
+                _mode_predicate = (
+                    "LOWER(COALESCE(execution_mode, '')) = LOWER(%s)"
+                    if _snap_mode
+                    else "execution_mode IS NOT NULL"
+                )
+                _mode_params = (_snap_mode,) if _snap_mode else ()
+                # orphan_wrong_mode always uses one explicit %s (mode or '')
+                # so it works whether or not _snap_mode is known.
+                _wrong_mode_val = _snap_mode or ""
                 c.execute(
-                    """
+                    f"""
                     SELECT
                       COUNT(*) FILTER (
-                        WHERE execution_mode IS NOT NULL
+                        WHERE {_mode_predicate}
                       ) AS n,
                       COUNT(*) FILTER (
                         WHERE execution_mode IS NULL
                       ) AS orphan_null_mode,
                       COUNT(*) FILTER (
                         WHERE execution_mode IS NOT NULL
+                          AND LOWER(execution_mode) != LOWER(%s)
+                      ) AS orphan_wrong_mode,
+                      COUNT(*) FILTER (
+                        WHERE {_mode_predicate}
                           AND UPPER(COALESCE(direction,'')) = 'CALL'
                       ) AS calls_unreconciled,
                       COUNT(*) FILTER (
-                        WHERE execution_mode IS NOT NULL
+                        WHERE {_mode_predicate}
                           AND UPPER(COALESCE(direction,'')) = 'PUT'
                       ) AS puts_unreconciled
                     FROM orders
@@ -1253,19 +1267,20 @@ class APPositionManager:
                       )
                       AND (position_id IS NULL OR position_id = '')
                     """,
-                    (self.client_id,),
+                    (*_mode_params, _wrong_mode_val, *_mode_params, *_mode_params, self.client_id),
                 )
                 _slot_row = c.fetchone() or {}
                 pending_entries              = int(_slot_row.get("n")                   or 0)
                 filled_unreconciled_calls    = int(_slot_row.get("calls_unreconciled")  or 0)
                 filled_unreconciled_puts     = int(_slot_row.get("puts_unreconciled")   or 0)
                 _orphan_null_mode            = int(_slot_row.get("orphan_null_mode")    or 0)
-                if _orphan_null_mode:
+                _orphan_wrong_mode           = int(_slot_row.get("orphan_wrong_mode")   or 0)
+                if _orphan_null_mode or _orphan_wrong_mode:
                     log.info(
                         "[%s] SNAPSHOT_ORPHAN_FILLED_IGNORED "
-                        "client=%s count=%d "
-                        "reason=execution_mode_null_not_current_mode",
-                        self.client_id, self.client_id, _orphan_null_mode,
+                        "client=%s null_mode_count=%d wrong_mode_count=%d expected_mode=%s",
+                        self.client_id, self.client_id,
+                        _orphan_null_mode, _orphan_wrong_mode, _snap_mode or "unknown",
                     )
 
                 # Entry-attempt lock: in-flight broker submits (duplicate-submit
@@ -1339,7 +1354,7 @@ class APPositionManager:
                 # Does NOT count reserved_cost from unfilled submit attempts.
                 try:
                     c.execute(
-                        """
+                        f"""
                         SELECT COALESCE(SUM(
                             CASE
                                 WHEN fill_price IS NOT NULL AND COALESCE(filled_qty,0) > 0
@@ -1352,7 +1367,7 @@ class APPositionManager:
                         FROM orders
                         WHERE client_id = %s
                           AND kind = 'ENTRY'
-                          AND execution_mode IS NOT NULL
+                          AND {_mode_predicate}
                           AND (
                             COALESCE(filled_qty, 0) > 0
                             OR fill_price IS NOT NULL
@@ -1364,7 +1379,7 @@ class APPositionManager:
                               NOT IN ('CANCELLED','CANCELED','REJECTED','ERROR',
                                       'FAILED','CLOSED')
                         """,
-                        (self.client_id,),
+                        (self.client_id, *_mode_params),
                     )
                     _cap_row = c.fetchone() or {}
                     pending_entry_capital = float(_cap_row.get("cap") or 0.0)
