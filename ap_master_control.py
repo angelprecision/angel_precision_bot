@@ -2229,7 +2229,7 @@ class APMasterControl:
                             snapshot_ok=False,
                             snapshot_error="snapshot_client_mismatch_live_blocked",
                         )
-                snap = self.pm.snapshot()
+                snap = self.pm.snapshot(mode=self.mode.lower())
                 if not isinstance(snap, dict):
                     raise TypeError(f"snapshot() returned {type(snap).__name__}, expected dict")
                 snap.setdefault("open_count", 0)
