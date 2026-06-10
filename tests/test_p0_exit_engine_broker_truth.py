@@ -266,3 +266,112 @@ def test_broker_fetch_failure_does_not_mark_flat():
     assert "self._positions" not in except_block, (
         "Broker fetch failure must not touch local engine positions"
     )
+
+# ── Behavioral: _broker_position_precheck end-to-end ─────────────────────────
+
+def test_broker_precheck_stale_db_qty_zero_loaded_with_broker_qty():
+    """
+    Behavioral regression test for _broker_position_precheck().
+
+    Setup:
+      - broker.list_positions returns RIVN260612P00016500 qty=3
+      - engine has no current positions
+      - _load_db_position_row returns DB row: status=OPEN qty=3 quantity_remaining=0 (stale)
+      - _fetch_broker_quote returns empty quote (all zeros)
+
+    Expected:
+      - add_position is called
+      - added ManagedPosition.quantity == 3
+      - added ManagedPosition.quantity_remaining == 3
+      - quote failure does not block loading
+      - _broker_position_precheck() returns True
+    """
+    engine_cls = getattr(_EE_MOD, "APExitEngine", None)
+    if engine_cls is None:
+        pytest.skip("APExitEngine not found in test env")
+
+    import threading
+    CONTRACT = "RIVN260612P00016500"
+
+    # Build a minimal engine stub
+    eng = engine_cls.__new__(engine_cls)
+    eng._email      = "jasoncosby1@gmail.com"
+    eng._lock       = threading.Lock()
+    eng._positions  = []
+
+    # Stub broker: returns one position with qty=3
+    mock_broker = MagicMock()
+    mock_broker.account_id   = "VA23856850"
+    mock_broker.list_positions.return_value = [{
+        "symbol":     CONTRACT,
+        "quantity":   3,
+        "cost_basis": 183.0,   # 0.61 * 3 * 100
+        "date_acquired": "2026-06-10",
+    }]
+    eng.broker = mock_broker
+
+    # Stub DB row: status=OPEN, qty=3, quantity_remaining=0 (stale)
+    db_row = {
+        "id":                 "pos-stale-rivn",
+        "contract":           CONTRACT,
+        "option_symbol":      CONTRACT,
+        "underlying":         "RIVN",
+        "side":               "PUT",
+        "direction":          "PUT",
+        "qty":                3,
+        "quantity_remaining": 0,   # ← stale
+        "entry_price":        0.61,
+        "avg_fill":           0.61,
+        "entry_ts":           None,
+        "status":             "OPEN",
+        "signal_id":          None,
+    }
+
+    added_positions = []
+
+    def _fake_add_position(pos):
+        added_positions.append(pos)
+
+    def _fake_load_db_row(sym):
+        return db_row if sym.upper() == CONTRACT else None
+
+    def _fake_fetch_quote(_sym):
+        # Empty quote — all zeros — quote failure
+        return {"mark": 0.0, "bid": 0.0, "ask": 0.0, "mid": 0.0, "last": 0.0}
+
+    def _fake_repair_qty(*a, **kw):
+        pass   # DB repair is best-effort
+
+    eng.add_position          = _fake_add_position
+    eng._load_db_position_row = _fake_load_db_row
+    eng._fetch_broker_quote   = _fake_fetch_quote
+
+    # ap.db is imported inside the DB repair path — stub it in sys.modules
+    # so the best-effort repair attempt doesn't raise ModuleNotFoundError.
+    import sys, types
+    _ap_stub  = types.ModuleType("ap")
+    _db_stub  = types.ModuleType("ap.db")
+    # run_with_retry calls f() — for DB repair, just silently skip
+    _db_stub.run_with_retry = lambda f: None
+    _db_stub.conn = MagicMock()
+    _ap_stub.db   = _db_stub
+    sys.modules.setdefault("ap",    _ap_stub)
+    sys.modules.setdefault("ap.db", _db_stub)
+
+    result = eng._broker_position_precheck()
+
+    # Assertions
+    assert result is True, (
+        "_broker_position_precheck must return True when repair succeeds "
+        f"(got {result})"
+    )
+    assert len(added_positions) == 1, (
+        f"add_position must be called once; called {len(added_positions)} times"
+    )
+    mp = added_positions[0]
+    assert mp.quantity == 3, (
+        f"ManagedPosition.quantity must be broker qty=3, got {mp.quantity}"
+    )
+    assert mp.quantity_remaining == 3, (
+        f"ManagedPosition.quantity_remaining must be broker qty=3, got {mp.quantity_remaining}"
+    )
