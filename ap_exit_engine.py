@@ -3128,10 +3128,17 @@ class APExitEngine:
             return None
 
     def _upsert_broker_position_to_db(self, sym: str, bp: dict) -> str | None:
-        """Create a minimal OPEN positions row from broker data. Returns row id or None."""
+        """
+        Create a minimal OPEN positions row from broker data. Returns row id or None.
+
+        Production-safe: does NOT write optional columns (source, account_id, etc.)
+        that may not exist in the production schema. Uses only guaranteed columns.
+
+        ON CONFLICT fallback: if INSERT returns None (row already exists), re-query
+        by client_id + contract so repair can proceed with the existing id.
+        """
         try:
             from ap.db import conn, run_with_retry
-            import re as _re
             underlying = self._underlying_from_occ(sym)
             side       = self._parse_occ_side(sym)
             qty        = int(bp.get("quantity") or 0)
@@ -3143,39 +3150,90 @@ class APExitEngine:
                 with conn() as c:
                     c.execute(
                         """
-                        INSERT INTO positions
-                            (client_id, underlying, contract, option_symbol, side, direction,
-                             qty, quantity_remaining, entry_price, avg_fill,
-                             status, source, entry_ts)
-                        VALUES
-                            (%s, %s, %s, %s, %s, %s,
-                             %s, %s, %s, %s,
-                             'OPEN', 'broker_exit_repair', %s)
+                        INSERT INTO positions (
+                            client_id, underlying, contract, option_symbol,
+                            side, direction,
+                            qty, quantity_remaining,
+                            entry_price, avg_fill,
+                            status, entry_ts, updated_at
+                        ) VALUES (
+                            %s, %s, %s, %s,
+                            %s, %s,
+                            %s, %s,
+                            %s, %s,
+                            'OPEN', %s, NOW()
+                        )
                         ON CONFLICT DO NOTHING
                         RETURNING id
                         """,
-                        (self._email, underlying, sym, sym, side, side,
-                         qty, qty, entry_px, entry_px,
+                        (self._email, underlying, sym, sym,
+                         side, side,
+                         qty, qty,
+                         entry_px, entry_px,
                          entry_ts),
                     )
                     row = c.fetchone()
-                    return str(row[0]) if row else None
+                    if row:
+                        return str(row[0])
+                    # ON CONFLICT DO NOTHING — row already exists; re-query to get id
+                    c.execute(
+                        """
+                        SELECT id FROM positions
+                        WHERE client_id = %s
+                          AND (
+                            UPPER(contract)         = UPPER(%s)
+                            OR UPPER(option_symbol) = UPPER(%s)
+                          )
+                        ORDER BY entry_ts DESC NULLS LAST, updated_at DESC NULLS LAST
+                        LIMIT 1
+                        """,
+                        (self._email, sym, sym),
+                    )
+                    existing = c.fetchone()
+                    if existing:
+                        log.info(
+                            "[exit_eng] _upsert_broker_position_to_db ON CONFLICT re-query "
+                            "returned existing id for %s client=%s",
+                            sym, self._email,
+                        )
+                        return str(existing[0])
+                    return None
             return run_with_retry(_ins)
         except Exception as _ue:
-            log.error("[exit_eng] _upsert_broker_position_to_db %s failed: %s", sym, _ue)
+            log.error("[exit_eng] _upsert_broker_position_to_db %s failed: %s: %s",
+                      sym, type(_ue).__name__, _ue)
             return None
 
-    def _managed_position_from_row(self, row: dict, qty_override: int = 0) -> "ManagedPosition":
-        """Build a ManagedPosition from a DB row (or minimal broker data dict)."""
+    def _managed_position_from_row(
+        self, row: dict, qty_override: int = 0, *, prefer_qty_override: bool = False
+    ) -> "ManagedPosition":
+        """
+        Build a ManagedPosition from a DB row (or minimal broker data dict).
+
+        prefer_qty_override=False (default — DB-seed / normal load):
+            Preserves existing safe behavior. quantity_remaining=0 stays 0.
+            Does not resurrect closed DB-only rows.
+
+        prefer_qty_override=True (broker precheck mode):
+            When qty_override > 0, broker qty wins over stale DB quantity_remaining.
+            Stale quantity_remaining=0 is overridden by broker truth.
+            Only used inside _broker_position_precheck().
+        """
         sym       = str(row.get("contract") or row.get("option_symbol") or "")
         ticker    = str(row.get("underlying") or self._underlying_from_occ(sym))
         side_raw  = str(row.get("side") or row.get("direction") or "").upper()
         side      = side_raw if side_raw in ("CALL", "PUT") else self._parse_occ_side(sym)
-        # P0-PARTIAL-CLOSE: do NOT use `or` — quantity_remaining=0 is a valid
-        # value meaning fully closed. Falling back to qty would load original
-        # entry size into the exit engine for a row that has zero contracts left.
         _qr = row.get("quantity_remaining")
-        qty = int(_qr if _qr is not None else (row.get("qty") or qty_override or 1))
+        _db_qty_before = int(_qr if _qr is not None else (row.get("qty") or 0))
+        # Broker-truth mode: qty_override wins when prefer_qty_override=True and override>0.
+        # Normal DB-seed mode: preserve P0-PARTIAL-CLOSE behavior (qr=0 stays 0).
+        if prefer_qty_override and qty_override and int(qty_override) > 0:
+            qty = int(qty_override)
+        else:
+            # P0-PARTIAL-CLOSE: do NOT use `or` — quantity_remaining=0 is a valid
+            # value meaning fully closed. Falling back to qty would load original
+            # entry size into the exit engine for a row that has zero contracts left.
+            qty = int(_qr if _qr is not None else (row.get("qty") or qty_override or 1))
         entry_px  = float(row.get("entry_price") or row.get("avg_fill") or 0.0)
         pos_id    = str(row.get("id") or "")
         sig_id    = str(row.get("signal_id") or "")
@@ -3195,7 +3253,7 @@ class APExitEngine:
             opened_at = opened_at.replace(tzinfo=_dt.timezone.utc)
 
         _now = datetime.now(timezone.utc)
-        return ManagedPosition(
+        mp = ManagedPosition(
             ticker           = ticker,
             option_symbol    = sym,
             side             = side,
@@ -3210,6 +3268,18 @@ class APExitEngine:
             quantity_remaining = qty,
             opened_at        = opened_at or _now,
         )
+        # Final broker-truth enforcement: if prefer_qty_override is active,
+        # ensure both quantity fields match broker qty regardless of constructor defaults.
+        if prefer_qty_override and qty_override and int(qty_override) > 0:
+            mp.quantity            = int(qty_override)
+            mp.quantity_remaining  = int(qty_override)
+            if _db_qty_before != int(qty_override):
+                log.info(
+                    "[exit_eng] EXIT_BROKER_POSITION_DB_QTY_STALE_REPAIRED_IN_MEMORY "
+                    "sym=%s db_qty_before=%d broker_qty=%d loaded_qty=%d",
+                    sym, _db_qty_before, int(qty_override), mp.quantity_remaining,
+                )
+        return mp
 
     def _fetch_broker_quote(self, sym: str) -> dict:
         """
@@ -3238,11 +3308,13 @@ class APExitEngine:
             q = (data or {}).get("quotes", {}).get("quote", {})
             if isinstance(q, list):
                 q = q[0] if q else {}
+            mark = float(q.get("mark") or 0.0)
             bid  = float(q.get("bid")  or 0.0)
             ask  = float(q.get("ask")  or 0.0)
             last = float(q.get("last") or 0.0)
-            mid  = (bid + ask) / 2.0 if bid > 0 and ask > 0 else last
-            return {"bid": bid, "ask": ask, "mid": mid, "last": last}
+            # mark → mid(bid,ask) → last → bid → ask (dashboard-aligned fallback)
+            mid = (bid + ask) / 2.0 if bid > 0 and ask > 0 else last
+            return {"mark": mark, "bid": bid, "ask": ask, "mid": mid, "last": last}
         except Exception:
             return _empty
 
@@ -3259,9 +3331,21 @@ class APExitEngine:
           - EXIT_UNSAFE_BROKER_TRUTH_UNAVAILABLE logged on broker fetch failure.
           - EXIT_UNSAFE_BROKER_POSITION_REPAIR_FAILED logged on repair failure.
           - Already-tracked engine positions are never duplicated.
+          - Broker qty wins over stale DB quantity_remaining=0 (PR#P0-exit-broker-truth).
+          - Quote failure never blocks position loading (quote_status=QUOTE_UNAVAILABLE).
+          - source column never written — production schema may not have it.
         """
+        _account_id = getattr(self.broker, "account_id", "?")
+
         if not self.broker or not hasattr(self.broker, "list_positions"):
             return True
+
+        # ── 0. Count current engine positions for structured logging ──────────
+        with self._lock:
+            _local_count = sum(
+                1 for p in self._positions
+                if not p.closed and int(p.quantity_remaining or 0) > 0
+            )
 
         # ── 1. Fetch broker positions ─────────────────────────────────────────
         try:
@@ -3269,21 +3353,22 @@ class APExitEngine:
         except Exception as _bp_err:
             log.error(
                 "[exit_eng] EXIT_UNSAFE_BROKER_TRUTH_UNAVAILABLE "
-                "client=%s broker.list_positions() failed: %s — "
-                "continuing with local engine state; exits not blocked",
-                self._email, _bp_err,
+                "client=%s account=%s error=%s error_type=%s "
+                "broker_truth_available=false local_engine_position_count=%d — "
+                "continuing with local engine state; exits not blocked; "
+                "never assumes broker is flat",
+                self._email, _account_id,
+                _bp_err, type(_bp_err).__name__,
+                _local_count,
             )
             return False
 
         broker_map = {
             str(p.get("symbol") or "").upper(): p
             for p in broker_positions
-            if int(p.get("quantity") or 0) != 0
+            if int(p.get("quantity") or 0) > 0
         }
         broker_syms = set(broker_map.keys())
-
-        if not broker_syms:
-            return True   # broker confirms no open positions
 
         # ── 2. Current engine symbols ─────────────────────────────────────────
         with self._lock:
@@ -3295,46 +3380,113 @@ class APExitEngine:
 
         missing_from_engine = broker_syms - engine_syms
 
+        log.info(
+            "[exit_eng] EXIT_BROKER_PRECHECK_START "
+            "client=%s account=%s broker_position_count=%d engine_position_count=%d "
+            "broker_symbols=%s engine_symbols=%s missing_from_engine=%s",
+            self._email, _account_id,
+            len(broker_syms), len(engine_syms),
+            sorted(broker_syms), sorted(engine_syms),
+            sorted(missing_from_engine),
+        )
+
+        if not missing_from_engine:
+            # All broker positions already tracked — log summary and return
+            log.info(
+                "[exit_eng] EXIT_BROKER_PRECHECK_SUMMARY "
+                "client=%s account=%s broker_position_count=%d "
+                "engine_position_count=%d missing_from_engine=0 "
+                "all_broker_positions_tracked=true",
+                self._email, _account_id, len(broker_syms), len(engine_syms),
+            )
+            return True
+
         # ── 3. Repair / load each missing position ────────────────────────────
-        repaired_syms      = []
-        loaded_db_syms     = []
-        repair_failed_syms = []
+        repaired_syms               = []   # DB insert/re-query confirmed real id
+        loaded_db_syms              = []   # existing DB row found and loaded
+        repair_failed_syms          = []   # add_position never called
+        engine_loaded_synthetic_syms = []  # engine loaded but no confirmed DB row
 
         for sym in sorted(missing_from_engine):
-            bp  = broker_map[sym]
-            qty = int(bp.get("quantity") or 0)
+            bp         = broker_map[sym]
+            broker_qty = int(bp.get("quantity") or 0)
             cost_basis = float(bp.get("cost_basis") or 0)
-            entry_px   = cost_basis / max(qty, 1) / 100
+            entry_px   = cost_basis / max(broker_qty, 1) / 100
 
-            db_seen     = False
-            db_repaired = False
-            pos         = None
+            db_seen            = False
+            db_repaired        = False
+            db_status_before   = None
+            db_qty_before      = None
+            pos                = None
+            repair_failed_reason = ""
 
             log.warning(
-                "[exit_eng] broker_position_missing_from_engine "
-                "client=%s account=%s symbol=%s qty=%d entry_px=%.4f"
-                " — attempting repair",
-                self._email, getattr(self.broker, "account_id", "?"),
-                sym, qty, entry_px,
+                "[exit_eng] EXIT_BROKER_POSITION_MISSING_FROM_ENGINE "
+                "client=%s account=%s contract_symbol=%s broker_qty=%d entry_px=%.4f "
+                "— attempting broker-truth repair",
+                self._email, _account_id, sym, broker_qty, entry_px,
             )
 
             # ── 3a. Try DB load ───────────────────────────────────────────────
             db_row = self._load_db_position_row(sym)
             if db_row:
-                db_seen = True
+                db_seen          = True
+                db_status_before = db_row.get("status")
+                db_qty_before    = int(db_row.get("quantity_remaining") or 0)
+                log.info(
+                    "[exit_eng] EXIT_BROKER_POSITION_DB_ROW_FOUND "
+                    "client=%s contract_symbol=%s db_status_before=%s "
+                    "db_qty_before=%d broker_qty=%d",
+                    self._email, sym, db_status_before, db_qty_before, broker_qty,
+                )
+                # Repair stale quantity_remaining=0 in DB before loading into engine
+                if db_qty_before == 0 and broker_qty > 0:
+                    try:
+                        from ap.db import conn, run_with_retry
+                        def _repair_qty(pid=str(db_row.get("id") or ""), bq=broker_qty):
+                            with conn() as c:
+                                c.execute(
+                                    """
+                                    UPDATE positions
+                                    SET quantity_remaining = %s,
+                                        qty               = GREATEST(COALESCE(qty, 0), %s),
+                                        status            = 'OPEN',
+                                        updated_at        = NOW()
+                                    WHERE id = %s AND client_id = %s
+                                    """,
+                                    (bq, bq, pid, self._email),
+                                )
+                        run_with_retry(_repair_qty)
+                        db_repaired = True
+                        log.info(
+                            "[exit_eng] EXIT_BROKER_POSITION_DB_QTY_STALE_REPAIRED "
+                            "client=%s contract_symbol=%s db_qty_before=%d "
+                            "broker_qty=%d db_repaired=true",
+                            self._email, sym, db_qty_before, broker_qty,
+                        )
+                    except Exception as _dre:
+                        # Non-fatal — still load with broker qty even if DB repair fails
+                        log.warning(
+                            "[exit_eng] EXIT_BROKER_POSITION_DB_QTY_STALE_REPAIR_FAILED "
+                            "client=%s contract_symbol=%s db_qty_before=%d "
+                            "broker_qty=%d error=%s: %s "
+                            "— loading with broker qty anyway",
+                            self._email, sym, db_qty_before, broker_qty,
+                            type(_dre).__name__, _dre,
+                        )
                 try:
-                    pos = self._managed_position_from_row(db_row, qty_override=qty)
+                    # Broker-truth mode: prefer_qty_override ensures stale qr=0 is overridden
+                    pos = self._managed_position_from_row(
+                        db_row,
+                        qty_override=broker_qty,
+                        prefer_qty_override=True,
+                    )
                     self.add_position(pos)
                     loaded_db_syms.append(sym)
-                    log.info(
-                        "[exit_eng] broker_repair_loaded_from_db "
-                        "client=%s symbol=%s pos_id=%s qty=%d side=%s",
-                        self._email, sym, db_row.get("id"), qty, pos.side,
-                    )
                 except Exception as _le:
                     log.warning(
-                        "[exit_eng] DB row load failed for %s: %s — trying upsert",
-                        sym, _le,
+                        "[exit_eng] DB row load failed for %s: %s: %s — trying upsert",
+                        sym, type(_le).__name__, _le,
                     )
                     pos = None
 
@@ -3342,50 +3494,108 @@ class APExitEngine:
             if pos is None:
                 try:
                     new_id = self._upsert_broker_position_to_db(sym, bp)
+
+                    # Determine real id: use DB id when available; otherwise a
+                    # synthetic id so the engine can track this position without
+                    # claiming a DB row exists.
+                    if new_id:
+                        _pos_id    = new_id
+                        db_repaired = True
+                    else:
+                        # Upsert returned None — engine still loads with synthetic id
+                        # so the position is visible and will evaluate this cycle.
+                        # db_repaired stays False: no confirmed DB row.
+                        _pos_id             = f"broker-repair-{self._email}-{sym}"
+                        db_repaired         = False
+                        repair_failed_reason = (
+                            "db_upsert_returned_no_id_engine_loaded_synthetic"
+                        )
+                        log.warning(
+                            "[exit_eng] EXIT_BROKER_POSITION_UPSERT_NO_ID "
+                            "client=%s contract_symbol=%s — using synthetic position_id; "
+                            "engine will still load and evaluate this position",
+                            self._email, sym,
+                        )
+
                     minimal_row = {
-                        "id":                 new_id or "",
+                        "id":                 _pos_id,
                         "contract":           sym,
                         "option_symbol":      sym,
                         "underlying":         self._underlying_from_occ(sym),
                         "side":               self._parse_occ_side(sym),
-                        "qty":                qty,
-                        "quantity_remaining": qty,
+                        "qty":                broker_qty,
+                        "quantity_remaining": broker_qty,
                         "entry_price":        entry_px,
                         "avg_fill":           entry_px,
                         "entry_ts":           bp.get("date_acquired"),
                     }
-                    pos = self._managed_position_from_row(minimal_row, qty_override=qty)
-                    self.add_position(pos)
-                    repaired_syms.append(sym)
-                    db_repaired = True
-                    log.info(
-                        "[exit_eng] broker_exit_repair_success "
-                        "client=%s symbol=%s side=%s qty=%d source=broker_exit_repair "
-                        "db_row_id=%s",
-                        self._email, sym, pos.side, qty, new_id or "none",
+                    pos = self._managed_position_from_row(
+                        minimal_row,
+                        qty_override=broker_qty,
+                        prefer_qty_override=True,
                     )
+                    self.add_position(pos)
+                    if new_id:
+                        repaired_syms.append(sym)              # confirmed DB row
+                    else:
+                        engine_loaded_synthetic_syms.append(sym)  # engine-only, no DB row
                 except Exception as _re_err:
                     repair_failed_syms.append(sym)
+                    repair_failed_reason = f"{type(_re_err).__name__}: {_re_err}"
                     log.error(
                         "[exit_eng] EXIT_UNSAFE_BROKER_POSITION_REPAIR_FAILED "
-                        "client=%s account=%s symbol=%s error=%s",
-                        self._email, getattr(self.broker, "account_id", "?"),
-                        sym, _re_err,
+                        "client=%s account=%s contract_symbol=%s error=%s",
+                        self._email, _account_id, sym, repair_failed_reason,
                     )
-                    continue   # skip quote + log for this symbol
+                    log.error(
+                        "[exit_eng] EXIT_BROKER_POSITION_ADDED_TO_ENGINE "
+                        "client=%s account=%s contract_symbol=%s "
+                        "db_seen_before=%s db_status_before=%s db_qty_before=%s "
+                        "broker_qty=%d loaded_qty=0 db_repaired=%s "
+                        "repair_failed_reason=%s added_to_engine=false "
+                        "will_evaluate_this_cycle=false quote_status=N/A",
+                        self._email, _account_id, sym,
+                        db_seen, db_status_before, db_qty_before,
+                        broker_qty, db_repaired, repair_failed_reason,
+                    )
+                    continue
 
-            # ── 3c. Fetch live quote and seed price state ─────────────────────
+            # ── 3c. Verify loaded_qty > 0 (fail-safe broker-truth enforcement) ─
+            loaded_qty = int(getattr(pos, "quantity_remaining", 0) or 0)
+            if loaded_qty <= 0 and broker_qty > 0:
+                # Should not happen after prefer_qty_override, but enforce as safety net
+                log.warning(
+                    "[exit_eng] EXIT_BROKER_PRECHECK_QTY_ZERO_FORCE "
+                    "client=%s contract_symbol=%s loaded_qty=%d broker_qty=%d "
+                    "— forcing broker qty",
+                    self._email, sym, loaded_qty, broker_qty,
+                )
+                pos.quantity           = broker_qty
+                pos.quantity_remaining = broker_qty
+                loaded_qty             = broker_qty
+
+            # ── 3d. Fetch live quote and seed price state ─────────────────────
             quote       = self._fetch_broker_quote(sym)
-            broker_mark = quote["mid"] or quote["bid"] or quote["last"]
-            broker_bid  = quote["bid"]
-            broker_ask  = quote["ask"]
+            # mark → mid(bid,ask) → last → bid → ask (dashboard-aligned fallback)
+            broker_mark = (quote.get("mark") or 0.0) or (quote.get("mid") or 0.0) or                           (quote.get("last") or 0.0) or (quote.get("bid") or 0.0) or                           (quote.get("ask") or 0.0)
+            broker_bid  = quote.get("bid", 0.0)
+            broker_ask  = quote.get("ask", 0.0)
+            _quote_status = "OK" if broker_mark > 0 else "QUOTE_UNAVAILABLE"
 
+            # Position is ALWAYS added regardless of quote availability
             if broker_mark > 0:
                 pos.current_option_price = broker_mark
                 if hasattr(pos, "current_bid"):
                     pos.current_bid = broker_bid
                 if hasattr(pos, "current_ask"):
                     pos.current_ask = broker_ask
+            else:
+                log.warning(
+                    "[exit_eng] EXIT_BROKER_PRECHECK_QUOTE_UNAVAILABLE "
+                    "client=%s contract_symbol=%s quote_status=QUOTE_UNAVAILABLE "
+                    "— position still added to engine; will_evaluate_this_cycle=true",
+                    self._email, sym,
+                )
 
             # Seed peak P&L / touched_profit if broker price shows a gain
             broker_pnl_pct = 0.0
@@ -3396,37 +3606,43 @@ class APExitEngine:
                         pos.peak_pnl_pct = broker_pnl_pct
                     pos.touched_profit = True
 
-            # ── 3d. Required structured log (precheck — no exit submitted here)
+            # ── 3e. Required structured log ────────────────────────────────────
+            log.info(
+                "[exit_eng] EXIT_BROKER_POSITION_ADDED_TO_ENGINE "
+                "client=%s account=%s contract_symbol=%s "
+                "db_seen_before=%s db_status_before=%s db_qty_before=%s "
+                "broker_qty=%d loaded_qty=%d db_repaired=%s repair_failed_reason=%s "
+                "added_to_engine=true will_evaluate_this_cycle=true quote_status=%s",
+                self._email, _account_id, sym,
+                db_seen, db_status_before, db_qty_before,
+                broker_qty, loaded_qty, db_repaired, repair_failed_reason or "", _quote_status,
+            )
             log.info(
                 "[exit_eng] EXIT_ENGINE_REPAIRED_BROKER_POSITION_AND_EVALUATED_EXIT "
                 "client=%s account=%s contract_symbol=%s broker_qty=%d "
                 "broker_cost_basis=%.2f broker_mark_or_bid=%.4f broker_pnl_pct=%.2f "
-                "engine_seen_before=%s db_seen_before=%s db_repaired=%s "
-                "exit_rule_triggered=%s exit_order_submitted=%s reason_no_exit=%s",
-                self._email,
-                getattr(self.broker, "account_id", "?"),
-                sym, qty, cost_basis, broker_mark, broker_pnl_pct,
-                False,       # engine_seen_before — we just found it missing
-                db_seen, db_repaired,
-                False,       # exit_rule_triggered — evaluated by normal loop
-                False,       # exit_order_submitted — precheck never submits
-                "position_loaded_for_normal_exit_loop_evaluation",
+                "engine_seen_before=false db_seen_before=%s db_repaired=%s "
+                "exit_rule_triggered=false exit_order_submitted=false "
+                "reason_no_exit=position_loaded_for_normal_exit_loop_evaluation "
+                "will_evaluate_this_cycle=true quote_status=%s",
+                self._email, _account_id, sym,
+                broker_qty, cost_basis, broker_mark, broker_pnl_pct,
+                db_seen, db_repaired, _quote_status,
             )
 
-        # ── 4. Summary audit log ──────────────────────────────────────────────
+        # ── 4. Summary audit log ──────────────────────────────────────════════
         log.info(
-            "[exit_eng] broker_precheck_summary "
-            "client=%s account=%s "
-            "broker_position_count=%d broker_symbols=%s "
-            "engine_position_count=%d engine_symbols=%s "
-            "missing_from_engine=%s "
-            "loaded_from_db_symbols=%s repaired_symbols=%s repair_failed_symbols=%s",
-            self._email,
-            getattr(self.broker, "account_id", "?"),
+            "[exit_eng] EXIT_BROKER_PRECHECK_SUMMARY "
+            "client=%s account=%s broker_position_count=%d broker_symbols=%s "
+            "engine_position_count=%d engine_symbols=%s missing_from_engine=%s "
+            "loaded_from_db=%s repaired_from_broker=%s "
+            "engine_loaded_synthetic=%s repair_failed=%s",
+            self._email, _account_id,
             len(broker_syms), sorted(broker_syms),
             len(engine_syms), sorted(engine_syms),
             sorted(missing_from_engine),
-            loaded_db_syms, repaired_syms, repair_failed_syms,
+            loaded_db_syms, repaired_syms,
+            engine_loaded_synthetic_syms, repair_failed_syms,
         )
 
         return len(repair_failed_syms) == 0
