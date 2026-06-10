@@ -1209,36 +1209,66 @@ class APPositionManager:
                     )
                     total_trades = 0
 
-                # SLOT ACCOUNTING FIX: only actual broker-submitted orders
-                # consume position slots. PENDING_TRIGGER / WATCHING / DEFERRED
-                # are watcher-armed setups — no broker order exists, no capital
-                # is committed. Counting them caused max_positions_with_pending
-                # to fire with 0 actual fills across all clients.
-                #
-                # Slot-consuming statuses: SUBMITTED, ACKNOWLEDGED, PARTIAL_FILL.
-                # CREATED orders (pre-submit, <30s phantom grace) still count
-                # to catch legitimate in-flight broker handoffs.
-                # PENDING_TRIGGER/WATCHING/DEFERRED NEVER count toward slots.
+                # REAL POSITION SLOT ACCOUNTING (PR#106):
+                # A slot is consumed only after broker-confirmed fill truth.
+                # filled_qty > 0 OR fill_price IS NOT NULL OR status is a
+                # broker-fill state. SUBMITTED/ACKNOWLEDGED/CREATED without
+                # fill are entry-attempt locks only — not position slots.
                 _phantom_grace_sec = int(os.getenv("PENDING_ENTRY_PHANTOM_GRACE_SEC", "30"))
-                slot_placeholders = ",".join(["%s"] * len(_SLOT_CONSUMING_STATUSES))
                 c.execute(
-                    f"""
+                    """
                     SELECT COUNT(*) AS n
                     FROM orders
                     WHERE client_id = %s AND kind = 'ENTRY'
-                      AND status IN ({slot_placeholders})
-                      AND UPPER(COALESCE(contract, '')) NOT LIKE 'DEFERRED:%%'
+                      AND (
+                        COALESCE(filled_qty, 0) > 0
+                        OR fill_price IS NOT NULL
+                        OR UPPER(COALESCE(status, '')) IN (
+                            'PARTIAL_FILL', 'PARTIALLY_FILLED', 'FILLED', 'OPEN'
+                        )
+                      )
+                      AND UPPER(COALESCE(status, '')) NOT IN (
+                        'CANCELED', 'CANCELLED', 'EXPIRED', 'REJECTED',
+                        'ERROR', 'FAILED', 'CLOSED'
+                      )
+                    """,
+                    (self.client_id,),
+                )
+                pending_entries = int((c.fetchone() or {}).get("n") or 0)
+
+                # Entry-attempt lock: in-flight broker submits (duplicate-submit
+                # protection only; NOT counted as position slots or real exposure).
+                c.execute(
+                    """
+                    SELECT COUNT(*) AS n,
+                           COALESCE(SUM(
+                               COALESCE(NULLIF(reserved_cost, 0),
+                                   CASE WHEN limit_price > 0
+                                        THEN limit_price * qty * 100
+                                        ELSE 0 END)
+                           ), 0) AS reserved
+                    FROM orders
+                    WHERE client_id = %s AND kind = 'ENTRY'
+                      AND UPPER(COALESCE(status, '')) IN ('CREATED', 'SUBMITTED', 'ACKNOWLEDGED')
                       AND (
                         (broker_order_id IS NOT NULL AND broker_order_id <> '')
                         OR submitted_ts IS NOT NULL
                       )
+                      AND COALESCE(filled_qty, 0) = 0
+                      AND fill_price IS NULL
+                      AND UPPER(COALESCE(contract, '')) NOT LIKE 'DEFERRED:%%'
+                      AND UPPER(COALESCE(status, '')) NOT IN (
+                        'CANCELED', 'CANCELLED', 'EXPIRED', 'REJECTED',
+                        'ERROR', 'FAILED', 'CLOSED'
+                      )
                     """,
-                    (self.client_id, *_SLOT_CONSUMING_STATUSES),
+                    (self.client_id,),
                 )
-                pending_entries = int((c.fetchone() or {}).get("n") or 0)
+                _lock_row = c.fetchone() or {}
+                entry_attempt_lock_count    = int(_lock_row.get("n") or 0)
+                entry_attempt_reserved_cost = float(_lock_row.get("reserved") or 0.0)
 
-                # Count watcher/pre-submit rows separately for logging/audit.
-                # These are NOT slot-consuming but are tracked for observability.
+                # Watcher/pre-submit rows for audit/logging only.
                 watcher_placeholders = ",".join(["%s"] * len(_WATCHER_ENTRY_STATUSES))
                 c.execute(
                     f"""
@@ -1256,23 +1286,6 @@ class APPositionManager:
                 )
                 watcher_count = int((c.fetchone() or {}).get("n") or 0)
 
-                # Also count CREATED orders in phantom-grace window (may be in-flight)
-                c.execute(
-                    """
-                    SELECT COUNT(*) AS n
-                    FROM orders
-                    WHERE client_id = %s AND kind = 'ENTRY'
-                      AND status = 'CREATED'
-                      AND NOT (
-                        (broker_order_id IS NULL OR broker_order_id = '')
-                        AND created_ts < NOW() - (%s || ' seconds')::interval
-                      )
-                    """,
-                    (self.client_id, str(_phantom_grace_sec)),
-                )
-                created_in_flight = int((c.fetchone() or {}).get("n") or 0)
-                pending_entries = pending_entries + created_in_flight
-
                 exit_placeholders = ",".join(["%s"] * len(_PENDING_EXIT_STATUSES))
                 c.execute(
                     f"""
@@ -1288,30 +1301,35 @@ class APPositionManager:
                 opens = [p for p in active if p.get("status") == PositionStatus.OPEN]
                 closing = [p for p in active if p.get("status") == PositionStatus.CLOSING]
 
-                # pending_entry_capital: sum of reserved_cost for
-                # broker-confirmed submitted/in-flight orders only.
-                # DEFERRED:* and unsubmitted PENDING_TRIGGER rows are excluded.
+                # real_deployed_capital: fill-truth cost of confirmed positions.
+                # Uses fill_price * filled_qty * 100 (broker-confirmed fill).
+                # Falls back to positions table capital_deployed for OPEN positions.
+                # Does NOT count reserved_cost from unfilled submit attempts.
                 try:
                     c.execute(
                         """
                         SELECT COALESCE(SUM(
-                            COALESCE(NULLIF(reserved_cost,0),
-                                CASE WHEN limit_price > 0 THEN limit_price * qty * 100
-                                     ELSE 0 END)
+                            CASE
+                                WHEN fill_price IS NOT NULL AND COALESCE(filled_qty,0) > 0
+                                THEN fill_price * filled_qty * 100
+                                WHEN COALESCE(filled_qty,0) > 0 AND reserved_cost IS NOT NULL
+                                THEN reserved_cost
+                                ELSE 0
+                            END
                         ), 0) AS cap
                         FROM orders
                         WHERE client_id = %s
                           AND kind = 'ENTRY'
-                          AND status IN ('SUBMITTED','ACKNOWLEDGED','PARTIAL_FILL',
-                                        'PARTIALLY_FILLED','CREATED')
-                          AND UPPER(COALESCE(contract,'')) NOT LIKE 'DEFERRED:%%'
                           AND (
-                            (broker_order_id IS NOT NULL AND broker_order_id <> '')
-                            OR submitted_ts IS NOT NULL
+                            COALESCE(filled_qty, 0) > 0
+                            OR fill_price IS NOT NULL
+                            OR UPPER(COALESCE(status,'')) IN (
+                                'PARTIAL_FILL','PARTIALLY_FILLED','FILLED','OPEN'
+                            )
                           )
                           AND UPPER(COALESCE(status,''))
                               NOT IN ('CANCELLED','CANCELED','REJECTED','ERROR',
-                                      'FAILED','FILLED','CLOSED')
+                                      'FAILED','CLOSED')
                         """,
                         (self.client_id,),
                     )
@@ -1336,6 +1354,8 @@ class APPositionManager:
                     "capital_deployed":   float(summary.get("capital_deployed") or 0),
                     "pending_entry_capital": pending_entry_capital,
                     "pending_entries":    pending_entries,
+                    "entry_attempt_lock_count":    entry_attempt_lock_count,
+                    "entry_attempt_reserved_cost": entry_attempt_reserved_cost,
                     "watcher_count":      watcher_count,
                     "pending_exits":      pending_exits,
                     "trades_today":       int(summary.get("trades_today") or 0),
