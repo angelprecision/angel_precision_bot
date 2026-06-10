@@ -1271,17 +1271,24 @@ class APMasterControl:
                 snap.get("entry_attempt_reserved_cost", 0.0),
             )
 
-        if snap["open_count"] >= self.max_positions:
+        # real_filled_slots = reconciled positions + unreconciled broker fills.
+        # pending_entries is deduplicated: only counts filled orders where
+        # position_id IS NULL (not yet in positions table), so the same
+        # broker-confirmed fill is never counted twice.
+        _open       = int(snap.get("open_count")      or 0)
+        _unreconciled = int(snap.get("pending_entries") or 0)
+        _locks      = int(snap.get("entry_attempt_lock_count", 0))
+        _real_slots = _open + _unreconciled
+
+        if _real_slots >= self.max_positions:
             return self._block(
                 signal_id, ticker, client_id, "blocked_risk",
-                f"blocked_actual_position_limit open={snap['open_count']} max={self.max_positions}",
-            )
-        effective_count = snap["open_count"] + snap["pending_entries"]
-        if effective_count >= self.max_positions:
-            return self._block(
-                signal_id, ticker, client_id, "blocked_risk",
-                f"blocked_actual_position_limit open={snap['open_count']} "
-                f"filled_slots={snap['pending_entries']} max={self.max_positions}",
+                f"blocked_actual_position_limit "
+                f"open_positions={_open} "
+                f"filled_orders_unreconciled={_unreconciled} "
+                f"real_filled_slots={_real_slots} "
+                f"max_positions={self.max_positions} "
+                f"entry_attempt_locks={_locks}",
             )
 
         # PR p0/bootstrap-affordable-selection (2026-06-05):
@@ -1408,10 +1415,24 @@ class APMasterControl:
             if projected_ticker > max_ticker_capital:
                 return self._block(signal_id, ticker, client_id, "blocked_risk", f"ticker_cap_{ticker.upper()} (projected ${projected_ticker:.0f} > ${max_ticker_capital:.0f})")
 
-        if norm_side == "CALL" and snap["calls_open"] >= self.max_calls:
-            return self._block(signal_id, ticker, client_id, "blocked_risk", f"max_calls ({snap['calls_open']}/{self.max_calls})")
-        if norm_side == "PUT" and snap["puts_open"] >= self.max_puts:
-            return self._block(signal_id, ticker, client_id, "blocked_risk", f"max_puts ({snap['puts_open']}/{self.max_puts})")
+        _real_calls = int(snap.get("calls_open") or 0) + int(snap.get("filled_unreconciled_calls") or 0)
+        _real_puts  = int(snap.get("puts_open")  or 0) + int(snap.get("filled_unreconciled_puts")  or 0)
+        if norm_side == "CALL" and _real_calls >= self.max_calls:
+            return self._block(
+                signal_id, ticker, client_id, "blocked_risk",
+                f"blocked_actual_position_limit "
+                f"open_calls={snap.get('calls_open',0)} "
+                f"unreconciled_calls={snap.get('filled_unreconciled_calls',0)} "
+                f"real_calls={_real_calls}/{self.max_calls}",
+            )
+        if norm_side == "PUT" and _real_puts >= self.max_puts:
+            return self._block(
+                signal_id, ticker, client_id, "blocked_risk",
+                f"blocked_actual_position_limit "
+                f"open_puts={snap.get('puts_open',0)} "
+                f"unreconciled_puts={snap.get('filled_unreconciled_puts',0)} "
+                f"real_puts={_real_puts}/{self.max_puts}",
+            )
         if snap["trades_today"] >= self.max_trades_today:
             return self._block(signal_id, ticker, client_id, "blocked_risk", f"max_trades_today ({snap['trades_today']}/{self.max_trades_today})")
         # PR E FIX-3: daily-loss check uses the snapshot value (local
@@ -2167,6 +2188,8 @@ class APMasterControl:
             "pending_entries": 0,
             "entry_attempt_lock_count":    0,
             "entry_attempt_reserved_cost": 0.0,
+            "filled_unreconciled_calls":   0,
+            "filled_unreconciled_puts":    0,
             "watcher_count":  0,
             "pending_exits":  0,
             "trades_today": 0,
@@ -2217,6 +2240,8 @@ class APMasterControl:
                 snap.setdefault("pending_entries", 0)
                 snap.setdefault("entry_attempt_lock_count",    0)
                 snap.setdefault("entry_attempt_reserved_cost", 0.0)
+                snap.setdefault("filled_unreconciled_calls",   0)
+                snap.setdefault("filled_unreconciled_puts",    0)
                 snap.setdefault("watcher_count",  0)
                 snap.setdefault("pending_exits",  0)
                 snap.setdefault("trades_today", 0)
