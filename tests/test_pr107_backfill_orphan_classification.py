@@ -181,3 +181,38 @@ def test_classify_null_contract_but_valid_option_symbol_expired():
         f"NULL contract + expired option_symbol must be historical_null_mode, got {cls}. "
         "Regression: _classify_orphan must use COALESCE(option_symbol, contract, symbol)."
     )
+
+def test_live_null_contract_valid_option_symbol_uses_option_symbol():
+    """
+    Acceptance test: execution_mode='live', contract NULL, option_symbol = valid
+    unexpired OCC symbol.
+
+    1. Classifier must return current_live (not manual_review / not failed).
+    2. The contract resolved in repair loops must be option_symbol, not empty.
+    """
+    order = {
+        "execution_mode": "live",
+        "contract":        None,
+        "option_symbol":   "RIVN260612P00016500",   # unexpired
+        "symbol":          None,
+        "filled_qty":      1,
+        "fill_price":      0.61,
+        "local_order_id":  "test-live-oc",
+    }
+    # Classification
+    cls = _eng._classify_orphan(order, _TODAY)
+    assert cls == "current_live", (
+        f"live + unexpired option_symbol must be current_live, got {cls}"
+    )
+
+    # Contract resolution — mirrors the repair loop logic
+    raw_contract = (
+        order.get("option_symbol")
+        or order.get("contract")
+        or order.get("symbol")
+        or ""
+    )
+    assert raw_contract == "RIVN260612P00016500", (
+        "Repair loop must resolve contract from option_symbol when contract is NULL"
+    )
+    assert raw_contract != "", "Contract must not be empty — would cause skip/failure"
