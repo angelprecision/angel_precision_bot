@@ -1217,17 +1217,26 @@ class APPositionManager:
                 _phantom_grace_sec = int(os.getenv("PENDING_ENTRY_PHANTOM_GRACE_SEC", "30"))
                 # pending_entries = broker-confirmed fills NOT yet reconciled
                 # to the positions table (position_id IS NULL).
-                # If the same fill already has a positions row, open_count
-                # captures it — we must NOT double-count here.
+                # execution_mode IS NOT NULL — excludes historical null-mode
+                # orphan rows (PR #107 classified these as historical_null_mode).
+                # Those rows have no corresponding live broker exposure and must
+                # not consume active position slots (PR #112).
                 c.execute(
                     """
                     SELECT
-                      COUNT(*) AS n,
                       COUNT(*) FILTER (
-                        WHERE UPPER(COALESCE(direction,'')) = 'CALL'
+                        WHERE execution_mode IS NOT NULL
+                      ) AS n,
+                      COUNT(*) FILTER (
+                        WHERE execution_mode IS NULL
+                      ) AS orphan_null_mode,
+                      COUNT(*) FILTER (
+                        WHERE execution_mode IS NOT NULL
+                          AND UPPER(COALESCE(direction,'')) = 'CALL'
                       ) AS calls_unreconciled,
                       COUNT(*) FILTER (
-                        WHERE UPPER(COALESCE(direction,'')) = 'PUT'
+                        WHERE execution_mode IS NOT NULL
+                          AND UPPER(COALESCE(direction,'')) = 'PUT'
                       ) AS puts_unreconciled
                     FROM orders
                     WHERE client_id = %s AND kind = 'ENTRY'
@@ -1250,6 +1259,14 @@ class APPositionManager:
                 pending_entries              = int(_slot_row.get("n")                   or 0)
                 filled_unreconciled_calls    = int(_slot_row.get("calls_unreconciled")  or 0)
                 filled_unreconciled_puts     = int(_slot_row.get("puts_unreconciled")   or 0)
+                _orphan_null_mode            = int(_slot_row.get("orphan_null_mode")    or 0)
+                if _orphan_null_mode:
+                    log.info(
+                        "[%s] SNAPSHOT_ORPHAN_FILLED_IGNORED "
+                        "client=%s count=%d "
+                        "reason=execution_mode_null_not_current_mode",
+                        self.client_id, self.client_id, _orphan_null_mode,
+                    )
 
                 # Entry-attempt lock: in-flight broker submits (duplicate-submit
                 # protection only; NOT counted as position slots or real exposure).
@@ -1335,6 +1352,7 @@ class APPositionManager:
                         FROM orders
                         WHERE client_id = %s
                           AND kind = 'ENTRY'
+                          AND execution_mode IS NOT NULL
                           AND (
                             COALESCE(filled_qty, 0) > 0
                             OR fill_price IS NOT NULL
