@@ -3493,8 +3493,31 @@ class APExitEngine:
             if pos is None:
                 try:
                     new_id = self._upsert_broker_position_to_db(sym, bp)
+
+                    # Determine real id: use DB id when available; otherwise a
+                    # synthetic id so the engine can track this position without
+                    # claiming a DB row exists.
+                    if new_id:
+                        _pos_id    = new_id
+                        db_repaired = True
+                    else:
+                        # Upsert returned None — engine still loads with synthetic id
+                        # so the position is visible and will evaluate this cycle.
+                        # db_repaired stays False: no confirmed DB row.
+                        _pos_id             = f"broker-repair-{self._email}-{sym}"
+                        db_repaired         = False
+                        repair_failed_reason = (
+                            "db_upsert_returned_no_id_engine_loaded_synthetic"
+                        )
+                        log.warning(
+                            "[exit_eng] EXIT_BROKER_POSITION_UPSERT_NO_ID "
+                            "client=%s contract_symbol=%s — using synthetic position_id; "
+                            "engine will still load and evaluate this position",
+                            self._email, sym,
+                        )
+
                     minimal_row = {
-                        "id":                 new_id or "",
+                        "id":                 _pos_id,
                         "contract":           sym,
                         "option_symbol":      sym,
                         "underlying":         self._underlying_from_occ(sym),
@@ -3512,7 +3535,6 @@ class APExitEngine:
                     )
                     self.add_position(pos)
                     repaired_syms.append(sym)
-                    db_repaired = True
                 except Exception as _re_err:
                     repair_failed_syms.append(sym)
                     repair_failed_reason = f"{type(_re_err).__name__}: {_re_err}"
