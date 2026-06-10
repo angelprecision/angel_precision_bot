@@ -158,3 +158,26 @@ def test_current_live_still_logs_p0():
     end = SRC.find("\n    def ", idx + 1)
     live_section = SRC[idx:end]
     assert "filled_order_missing_position_p0" in live_section
+
+def test_classify_null_contract_but_valid_option_symbol_expired():
+    """
+    Regression: execution_mode IS NULL, contract NULL/malformed,
+    option_symbol contains expired OCC contract.
+    Must classify as historical_null_mode (not manual_review).
+    Without the option_symbol fix, _occ_expiry would receive None or a
+    non-OCC string and return None, causing expired rows to be misclassified
+    as manual_review.
+    """
+    order = {
+        "execution_mode": None,
+        "contract":        None,                         # missing/malformed
+        "option_symbol":   "TSLA260212C00200000",        # Feb 2026 — expired
+        "symbol":          None,
+        "filled_qty":      1,
+        "fill_price":      2.50,
+    }
+    cls = _eng._classify_orphan(order, _TODAY)
+    assert cls == "historical_null_mode", (
+        f"NULL contract + expired option_symbol must be historical_null_mode, got {cls}. "
+        "Regression: _classify_orphan must use COALESCE(option_symbol, contract, symbol)."
+    )
