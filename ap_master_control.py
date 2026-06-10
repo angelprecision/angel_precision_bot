@@ -892,34 +892,30 @@ class APMasterControl:
                     c.execute(
                         """
                         SELECT COALESCE(SUM(
-                            COALESCE(
-                                NULLIF(reserved_cost, 0),
-                                CASE
-                                    WHEN limit_price IS NOT NULL AND limit_price > 0
-                                    THEN limit_price * qty * 100
-                                    ELSE 0
-                                END
-                            )
+                            CASE
+                                WHEN fill_price IS NOT NULL AND COALESCE(filled_qty, 0) > 0
+                                THEN fill_price * filled_qty * 100
+                                WHEN COALESCE(filled_qty, 0) > 0 AND reserved_cost IS NOT NULL
+                                THEN reserved_cost
+                                ELSE 0
+                            END
                         ), 0) AS pending_capital
                         FROM orders
                         WHERE client_id = %s
                           AND kind = 'ENTRY'
-                          AND UPPER(COALESCE(status, '')) = ANY(%s)
-                          AND UPPER(COALESCE(status, '')) NOT IN ('CANCELLED', 'CANCELED', 'REJECTED', 'ERROR', 'FAILED', 'FILLED', 'CLOSED')
-                          AND UPPER(COALESCE(contract, '')) NOT LIKE 'DEFERRED:%%'
-                          AND NOT (
-                            UPPER(COALESCE(status, '')) IN ('CREATED', 'PENDING_TRIGGER',
-                                                            'WATCHING', 'SELECTED', 'RETRY_ELIGIBLE')
-                            AND (broker_order_id IS NULL OR broker_order_id = '')
-                            AND submitted_ts IS NULL
+                          AND (
+                            COALESCE(filled_qty, 0) > 0
+                            OR fill_price IS NOT NULL
+                            OR UPPER(COALESCE(status, '')) IN (
+                                'PARTIAL_FILL', 'PARTIALLY_FILLED', 'FILLED', 'OPEN'
+                            )
                           )
-                          AND NOT (
-                            UPPER(COALESCE(status, '')) IN ('CREATED', 'PENDING_TRIGGER')
-                            AND (broker_order_id IS NULL OR broker_order_id = '')
-                            AND created_ts < NOW() - (%s || ' seconds')::interval
+                          AND UPPER(COALESCE(status, '')) NOT IN (
+                            'CANCELLED', 'CANCELED', 'REJECTED', 'ERROR',
+                            'FAILED', 'CLOSED'
                           )
                         """ + _exclude_clause,
-                        (client_id, list(statuses), str(_phantom_grace_sec)) + _exclude_params,
+                        (client_id,) + _exclude_params,
                     )
                     row = c.fetchone()
                     pending_capital = float((row or {}).get("pending_capital") or 0)
@@ -928,28 +924,30 @@ class APMasterControl:
                     # reserved_cost nor limit_price has unknown dollar exposure.
                     # Do not silently count it as $0 in live capital gates.
                     if self._is_live_mode() and self.pending_capital_fail_closed_live:
+                        # Integrity guard: a fill-truth row (confirmed position)
+                        # with no fill_price and no filled_qty is unknown exposure.
+                        # Only check rows that constitute real positions.
                         c.execute(
                             """
                             SELECT COUNT(*) AS missing_cost
                             FROM orders
                             WHERE client_id = %s
                               AND kind = 'ENTRY'
-                              AND UPPER(COALESCE(status, '')) = ANY(%s)
-                              AND UPPER(COALESCE(status, '')) NOT IN ('CANCELLED', 'CANCELED', 'REJECTED', 'ERROR', 'FAILED', 'FILLED', 'CLOSED')
-                              AND UPPER(COALESCE(contract, '')) NOT LIKE 'DEFERRED:%%'
-                              AND (reserved_cost IS NULL OR reserved_cost <= 0)
-                              AND (limit_price IS NULL OR limit_price <= 0)
                               AND (
-                                (broker_order_id IS NOT NULL AND broker_order_id <> '')
-                                OR submitted_ts IS NOT NULL
+                                COALESCE(filled_qty, 0) > 0
+                                OR fill_price IS NOT NULL
+                                OR UPPER(COALESCE(status, '')) IN (
+                                    'PARTIAL_FILL', 'PARTIALLY_FILLED', 'FILLED', 'OPEN'
+                                )
                               )
-                              AND NOT (
-                                UPPER(COALESCE(status, '')) IN ('CREATED', 'PENDING_TRIGGER')
-                                AND (broker_order_id IS NULL OR broker_order_id = '')
-                                AND created_ts < NOW() - (%s || ' seconds')::interval
+                              AND UPPER(COALESCE(status, '')) NOT IN (
+                                'CANCELLED', 'CANCELED', 'REJECTED', 'ERROR',
+                                'FAILED', 'CLOSED'
                               )
+                              AND COALESCE(filled_qty, 0) = 0
+                              AND fill_price IS NULL
                             """,
-                            (client_id, list(statuses), str(_phantom_grace_sec)),
+                            (client_id,),
                         )
                         missing = int((c.fetchone() or {}).get("missing_cost") or 0)
                         if missing > 0:
@@ -1253,23 +1251,44 @@ class APMasterControl:
         if _watcher_count > 0:
             log.info(
                 "[%s] watcher_allowed_not_counted_as_position: "
-                "client=%s watcher_rows=%d open=%d pending_broker=%d max=%d "
-                "— PENDING_TRIGGER/WATCHING/DEFERRED rows do not consume slots",
+                "client=%s watcher_rows=%d open=%d real_slots=%d "
+                "entry_attempt_locks=%d max=%d "
+                "— WATCHING/DEFERRED/pre-fill rows do not consume real position slots",
                 ticker, client_id, _watcher_count,
-                snap["open_count"], snap["pending_entries"], self.max_positions,
+                snap["open_count"], snap["pending_entries"],
+                snap.get("entry_attempt_lock_count", 0), self.max_positions,
             )
 
-        if snap["open_count"] >= self.max_positions:
-            return self._block(
-                signal_id, ticker, client_id, "blocked_risk",
-                f"blocked_actual_position_limit open={snap['open_count']} max={self.max_positions}",
+        # Log entry-attempt locks separately — they are not position slots
+        _lock_count = snap.get("entry_attempt_lock_count", 0)
+        if _lock_count > 0:
+            log.info(
+                "[%s] submitted_unfilled_not_counted_as_position: "
+                "client=%s entry_attempt_locks=%d reserved=$%.0f "
+                "— in-flight submits are duplicate-submit protection only; "
+                "not position slots",
+                ticker, client_id, _lock_count,
+                snap.get("entry_attempt_reserved_cost", 0.0),
             )
-        effective_count = snap["open_count"] + snap["pending_entries"]
-        if effective_count >= self.max_positions:
+
+        # real_filled_slots = reconciled positions + unreconciled broker fills.
+        # pending_entries is deduplicated: only counts filled orders where
+        # position_id IS NULL (not yet in positions table), so the same
+        # broker-confirmed fill is never counted twice.
+        _open       = int(snap.get("open_count")      or 0)
+        _unreconciled = int(snap.get("pending_entries") or 0)
+        _locks      = int(snap.get("entry_attempt_lock_count", 0))
+        _real_slots = _open + _unreconciled
+
+        if _real_slots >= self.max_positions:
             return self._block(
                 signal_id, ticker, client_id, "blocked_risk",
-                f"blocked_actual_position_limit open={snap['open_count']} "
-                f"pending_broker={snap['pending_entries']} max={self.max_positions}",
+                f"blocked_actual_position_limit "
+                f"open_positions={_open} "
+                f"filled_orders_unreconciled={_unreconciled} "
+                f"real_filled_slots={_real_slots} "
+                f"max_positions={self.max_positions} "
+                f"entry_attempt_locks={_locks}",
             )
 
         # PR p0/bootstrap-affordable-selection (2026-06-05):
@@ -1396,10 +1415,24 @@ class APMasterControl:
             if projected_ticker > max_ticker_capital:
                 return self._block(signal_id, ticker, client_id, "blocked_risk", f"ticker_cap_{ticker.upper()} (projected ${projected_ticker:.0f} > ${max_ticker_capital:.0f})")
 
-        if norm_side == "CALL" and snap["calls_open"] >= self.max_calls:
-            return self._block(signal_id, ticker, client_id, "blocked_risk", f"max_calls ({snap['calls_open']}/{self.max_calls})")
-        if norm_side == "PUT" and snap["puts_open"] >= self.max_puts:
-            return self._block(signal_id, ticker, client_id, "blocked_risk", f"max_puts ({snap['puts_open']}/{self.max_puts})")
+        _real_calls = int(snap.get("calls_open") or 0) + int(snap.get("filled_unreconciled_calls") or 0)
+        _real_puts  = int(snap.get("puts_open")  or 0) + int(snap.get("filled_unreconciled_puts")  or 0)
+        if norm_side == "CALL" and _real_calls >= self.max_calls:
+            return self._block(
+                signal_id, ticker, client_id, "blocked_risk",
+                f"blocked_actual_position_limit "
+                f"open_calls={snap.get('calls_open',0)} "
+                f"unreconciled_calls={snap.get('filled_unreconciled_calls',0)} "
+                f"real_calls={_real_calls}/{self.max_calls}",
+            )
+        if norm_side == "PUT" and _real_puts >= self.max_puts:
+            return self._block(
+                signal_id, ticker, client_id, "blocked_risk",
+                f"blocked_actual_position_limit "
+                f"open_puts={snap.get('puts_open',0)} "
+                f"unreconciled_puts={snap.get('filled_unreconciled_puts',0)} "
+                f"real_puts={_real_puts}/{self.max_puts}",
+            )
         if snap["trades_today"] >= self.max_trades_today:
             return self._block(signal_id, ticker, client_id, "blocked_risk", f"max_trades_today ({snap['trades_today']}/{self.max_trades_today})")
         # PR E FIX-3: daily-loss check uses the snapshot value (local
@@ -2153,6 +2186,10 @@ class APMasterControl:
             "puts_open": 0,
             "capital_deployed": 0.0,
             "pending_entries": 0,
+            "entry_attempt_lock_count":    0,
+            "entry_attempt_reserved_cost": 0.0,
+            "filled_unreconciled_calls":   0,
+            "filled_unreconciled_puts":    0,
             "watcher_count":  0,
             "pending_exits":  0,
             "trades_today": 0,
@@ -2201,6 +2238,10 @@ class APMasterControl:
                 snap.setdefault("puts_open", 0)
                 snap.setdefault("capital_deployed", 0.0)
                 snap.setdefault("pending_entries", 0)
+                snap.setdefault("entry_attempt_lock_count",    0)
+                snap.setdefault("entry_attempt_reserved_cost", 0.0)
+                snap.setdefault("filled_unreconciled_calls",   0)
+                snap.setdefault("filled_unreconciled_puts",    0)
                 snap.setdefault("watcher_count",  0)
                 snap.setdefault("pending_exits",  0)
                 snap.setdefault("trades_today", 0)
