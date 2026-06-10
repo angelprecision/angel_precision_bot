@@ -74,12 +74,17 @@ _SLOT_CONSUMING_STATUSES = (
 )
 
 # Watcher/pre-submit states that must never consume a slot.
+# SELECTED = contract candidate only; no broker submission yet.
+# RETRY_ELIGIBLE = marked for retry; not yet re-submitted.
+# DEFERRED = placeholder; contract field may be DEFERRED:<ticker>.
 _WATCHER_ENTRY_STATUSES = (
     "NEW",
     "PROCESSING",
     "WATCHING",
     "PENDING_TRIGGER",
     "DEFERRED",
+    "SELECTED",
+    "RETRY_ELIGIBLE",
 )
 _PENDING_EXIT_STATUSES = (
     "EXIT_REQUESTED",
@@ -1222,6 +1227,11 @@ class APPositionManager:
                     FROM orders
                     WHERE client_id = %s AND kind = 'ENTRY'
                       AND status IN ({slot_placeholders})
+                      AND UPPER(COALESCE(contract, '')) NOT LIKE 'DEFERRED:%%'
+                      AND (
+                        (broker_order_id IS NOT NULL AND broker_order_id <> '')
+                        OR submitted_ts IS NOT NULL
+                      )
                     """,
                     (self.client_id, *_SLOT_CONSUMING_STATUSES),
                 )
@@ -1278,6 +1288,40 @@ class APPositionManager:
                 opens = [p for p in active if p.get("status") == PositionStatus.OPEN]
                 closing = [p for p in active if p.get("status") == PositionStatus.CLOSING]
 
+                # pending_entry_capital: sum of reserved_cost for
+                # broker-confirmed submitted/in-flight orders only.
+                # DEFERRED:* and unsubmitted PENDING_TRIGGER rows are excluded.
+                try:
+                    c.execute(
+                        """
+                        SELECT COALESCE(SUM(
+                            COALESCE(NULLIF(reserved_cost,0),
+                                CASE WHEN limit_price > 0 THEN limit_price * qty * 100
+                                     ELSE 0 END)
+                        ), 0) AS cap
+                        FROM orders
+                        WHERE client_id = %s
+                          AND kind = 'ENTRY'
+                          AND status IN ('SUBMITTED','ACKNOWLEDGED','PARTIAL_FILL',
+                                        'PARTIALLY_FILLED','CREATED')
+                          AND UPPER(COALESCE(contract,'')) NOT LIKE 'DEFERRED:%%'
+                          AND (
+                            (broker_order_id IS NOT NULL AND broker_order_id <> '')
+                            OR submitted_ts IS NOT NULL
+                          )
+                          AND UPPER(COALESCE(status,''))
+                              NOT IN ('CANCELLED','CANCELED','REJECTED','ERROR',
+                                      'FAILED','FILLED','CLOSED')
+                        """,
+                        (self.client_id,),
+                    )
+                    _cap_row = c.fetchone() or {}
+                    pending_entry_capital = float(_cap_row.get("cap") or 0.0)
+                except Exception as _pec_err:
+                    log.warning("[%s] pending_entry_capital query failed (non-fatal): %s",
+                                self.client_id, _pec_err)
+                    pending_entry_capital = None
+
                 return {
                     "snapshot_ts":        datetime.now(timezone.utc).isoformat(),
                     "generated_at":       datetime.now(timezone.utc).isoformat(),
@@ -1290,6 +1334,7 @@ class APPositionManager:
                     "calls_open":         sum(1 for p in active if p.get("direction") == "CALL"),
                     "puts_open":          sum(1 for p in active if p.get("direction") == "PUT"),
                     "capital_deployed":   float(summary.get("capital_deployed") or 0),
+                    "pending_entry_capital": pending_entry_capital,
                     "pending_entries":    pending_entries,
                     "watcher_count":      watcher_count,
                     "pending_exits":      pending_exits,
