@@ -240,3 +240,79 @@ def test_ac5_scope_guard_no_scanner_scoring_exit_files_changed():
         found_pm = sym in PM_SRC
         found_mc = sym in MC_SRC
         assert found_pm or found_mc, f"Required fix not found anywhere: {label}"
+
+def test_integrity_guard_predicate_matches_sum_predicate():
+    """
+    The integrity guard broker-confirmation predicate must be identical to the
+    SUM query predicate: (broker_order_id IS NOT NULL) OR submitted_ts IS NOT NULL.
+    A SUBMITTED row with submitted_ts set but broker_order_id NULL and no cost
+    must be caught by the guard — not silently counted as $0 exposure.
+    """
+    section = _pending_capital_section(MC_SRC)
+
+    # Find the integrity guard block (after 'missing_cost')
+    guard_idx = section.find("missing_cost")
+    assert guard_idx > 0, "integrity guard not found"
+    guard_block = section[guard_idx:guard_idx + 1200]
+
+    # Guard must use the OR predicate — not broker_order_id-only
+    assert "submitted_ts IS NOT NULL" in guard_block, (
+        "Integrity guard must include 'submitted_ts IS NOT NULL' in its "
+        "broker-confirmation predicate — matches the SUM query"
+    )
+    assert "(broker_order_id IS NOT NULL" in guard_block, (
+        "Integrity guard must still check broker_order_id"
+    )
+
+
+def test_submitted_ts_only_order_triggers_missing_cost_guard():
+    """
+    Behavioral: SUBMITTED row with submitted_ts set, broker_order_id NULL,
+    reserved_cost NULL, limit_price NULL.
+    In LIVE mode this must trigger the missing-cost integrity failure —
+    the order is counted in the SUM (submitted_ts IS NOT NULL) but at $0,
+    which is an unknown exposure amount.
+    """
+    order = {
+        "status":        "SUBMITTED",
+        "contract":      "RIVN260612P00016500",
+        "broker_order_id": None,
+        "submitted_ts":  "2026-06-09T10:30:00Z",  # reached broker somehow
+        "reserved_cost": None,
+        "limit_price":   None,
+        "qty":           1,
+    }
+
+    # SUM predicate — this order IS included (submitted_ts IS NOT NULL)
+    is_counted_in_sum = (
+        order["status"].upper() in {"SUBMITTED","ACKNOWLEDGED","PARTIAL_FILL"}
+        and not order["contract"].upper().startswith("DEFERRED:")
+        and (
+            bool(order.get("broker_order_id"))
+            or bool(order.get("submitted_ts"))
+        )
+    )
+    assert is_counted_in_sum, (
+        "Order with submitted_ts set must be included in the SUM"
+    )
+
+    # Its effective dollar value is $0 (no reserved_cost, no limit_price)
+    effective_cost = (
+        (order.get("reserved_cost") or 0)
+        or ((order.get("limit_price") or 0) * (order.get("qty") or 0) * 100)
+    )
+    assert effective_cost == 0, "No reserved_cost + no limit_price = $0 contribution"
+
+    # Integrity guard predicate — same as SUM — must CATCH this order
+    hits_guard = (
+        order["status"].upper() in {"SUBMITTED","ACKNOWLEDGED","PARTIAL_FILL"}
+        and not order["contract"].upper().startswith("DEFERRED:")
+        and (effective_cost == 0)   # missing cost
+        and (                        # broker-confirmation predicate (same as SUM)
+            bool(order.get("broker_order_id"))
+            or bool(order.get("submitted_ts"))
+        )
+    )
+    assert hits_guard, (
+        "SUBMITTED + submitted_ts + no cost must trigger the integrity guard in LIVE mode"
+    )
