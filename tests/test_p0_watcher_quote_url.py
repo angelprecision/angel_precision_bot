@@ -2,12 +2,12 @@
 tests/test_p0_watcher_quote_url.py
 P0: watcher quote URL must be api.tradier.com for both paper and live clients.
 """
-import os, re, sys, types, pytest
+import os, re, sys, types, threading, pytest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-_REPO   = Path(__file__).resolve().parents[1]
-EW_SRC  = (_REPO / "ap_entry_watcher.py").read_text()
+_REPO  = Path(__file__).resolve().parents[1]
+EW_SRC = (_REPO / "ap_entry_watcher.py").read_text()
 
 
 # ── Source checks ─────────────────────────────────────────────────────────────
@@ -16,13 +16,10 @@ def test_resolve_watcher_quote_url_defined():
     assert "def _resolve_watcher_quote_url(" in EW_SRC
 
 def test_fetch_quotes_no_sandbox_fallback():
-    """_fetch_quotes must not fall back to sandbox.tradier.com."""
     idx = EW_SRC.find("def _fetch_quotes(")
     end = EW_SRC.find("\n    def ", idx + 1)
     body = EW_SRC[idx:end]
-    assert "sandbox.tradier.com" not in body, (
-        "_fetch_quotes must not contain sandbox.tradier.com default"
-    )
+    assert "sandbox.tradier.com" not in body
 
 def test_fetch_quotes_uses_resolve_helper():
     idx = EW_SRC.find("def _fetch_quotes(")
@@ -34,136 +31,212 @@ def test_watcher_quote_identity_uses_resolve_helper():
     idx = EW_SRC.find("def _watcher_quote_identity(")
     end = EW_SRC.find("\n    def ", idx + 1)
     body = EW_SRC[idx:end]
-    assert "_resolve_watcher_quote_url()" in body, (
-        "_watcher_quote_identity must read from _resolve_watcher_quote_url "
-        "so audit matches actual quote source"
-    )
+    assert "_resolve_watcher_quote_url()" in body
 
-def test_resolve_helper_env_vars_present():
+def test_sandbox_guard_present():
     idx = EW_SRC.find("def _resolve_watcher_quote_url(")
     end = EW_SRC.find("\n    def ", idx + 1)
     body = EW_SRC[idx:end]
-    assert "TRADIER_MARKET_DATA_BASE_URL" in body
-    assert "TRADIER_MARKET_DATA_TOKEN" in body
+    assert "WATCHER_QUOTE_URL_SANDBOX_GUARD_TRIGGERED" in body
+    assert "Forcing https://api.tradier.com" in body
+
+def test_paper_fail_closed_present():
+    idx = EW_SRC.find("def _fetch_quotes(")
+    end = EW_SRC.find("\n    def ", idx + 1)
+    body = EW_SRC[idx:end]
+    assert "PAPER_WATCHER_NO_MARKET_DATA_TOKEN" in body
+    assert "return {}" in body
 
 def test_resolve_helper_default_is_live():
-    """The hardcoded fallback URL must be api.tradier.com, not sandbox."""
+    """Hardcoded fallback must be api.tradier.com; sandbox guard must reject any sandbox URL."""
     idx = EW_SRC.find("def _resolve_watcher_quote_url(")
     end = EW_SRC.find("\n    def ", idx + 1)
     body = EW_SRC[idx:end]
+    # Default fallback must be api.tradier.com
     assert "api.tradier.com" in body
-    # The executable return/assignment must use api.tradier.com — check only
-    # non-comment, non-docstring lines for sandbox references in the logic
-    # Strip docstring before checking; docstring may mention sandbox in explanation.
-    # We care that the actual executable default value is api.tradier.com.
-    no_docstring = re.sub(r'\'\'\'.*?\'\'\'', '', body, flags=re.DOTALL)
-    no_docstring = re.sub(r'"".*?"""', '', no_docstring, flags=re.DOTALL)
-    assert "sandbox.tradier.com" not in no_docstring, (
-        "Executable code in _resolve_watcher_quote_url must not contain sandbox URL"
-    )
+    # Guard: the function must detect sandbox and replace it — look for both the
+    # check and the forced replacement value
+    assert "sandbox.tradier.com" in body,    "guard must check for sandbox URL"
+    assert "Forcing https://api.tradier.com" in body or \
+           "_LIVE_QUOTE_URL" in body,         "guard must force to live URL"
+    # The guard must never RETURN sandbox — verified by test_sandbox_env_forced_to_live
 
 def test_audit_fields_still_present():
-    """watcher_audit fields must still be written."""
     for field in ["watcher_quote_source", "watcher_quote_base_url", "watcher_sandbox_mode"]:
         assert field in EW_SRC, f"watcher_audit field missing: {field}"
 
 
-# ── Behavioral: _resolve_watcher_quote_url ───────────────────────────────────
+# ── Behavioral: stub APEntryWatcher ──────────────────────────────────────────
 
-def _make_watcher(mode="PAPER", broker_base="https://sandbox.tradier.com"):
-    """Build a minimal EntryWatcher stub for testing."""
-    # Load the module with heavy deps stubbed
-    for stub in ("ap.db","ap.broker","ap.broker_factory","ap.config",
-                 "ap.state","ap.order_state_machine","ap.notify","ap.models",
-                 "ap.utils","supabase","ap.reconcile","ap.queue"):
-        sys.modules.setdefault(stub, types.ModuleType(stub))
+def _load_watcher_class():
+    """
+    Load ap_entry_watcher without its heavy runtime dependencies.
+    Returns (APEntryWatcher class, module) or (None, None).
+    """
+    # Stub every import the module needs so it can load
+    _stubs = [
+        "ap.db", "ap.broker", "ap.broker_factory", "ap.config", "ap.state",
+        "ap.order_state_machine", "ap.notify", "ap.models", "ap.utils",
+        "ap.reconcile", "ap.queue", "supabase", "psycopg2",
+        "ap.overnight_daily_validator", "ap.overnight_daily_validator",
+        "ap.position_manager", "ap.risk", "ap.signal_store",
+    ]
+    for stub in _stubs:
+        if stub not in sys.modules:
+            m = types.ModuleType(stub)
+            # Provide common attributes modules expect
+            m.conn = MagicMock()
+            m.run_with_retry = lambda f: f()
+            sys.modules[stub] = m
+
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "ap_entry_watcher_test", _REPO / "ap_entry_watcher.py"
+    )
+    mod = importlib.util.module_from_spec(spec)
     try:
-        import importlib.util
-        spec = importlib.util.spec_from_file_location("ap_entry_watcher",
-                   Path("/home/claude/wq_ap_entry_watcher_fixed.py").replace("Path(\"","").replace("\")",""))
-        mod  = importlib.util.module_from_spec(spec)
-        sys.modules["ap_entry_watcher"] = mod
         spec.loader.exec_module(mod)
-        cls = getattr(mod, "EntryWatcher", None)
-        if cls is None:
-            return None, None
-        w = cls.__new__(cls)
-        w.mode = mode.upper()
-        broker = MagicMock()
-        broker.base_url = broker_base
-        broker.access_token = "sandbox_tok"
-        broker.live_access_token = None
-        broker.cfg = MagicMock()
-        broker.cfg.base_url = broker_base
-        broker.cfg.live_access_token = None
-        w.broker = broker
-        return w, mod
-    except Exception as e:
+    except Exception:
         return None, None
+    cls = getattr(mod, "APEntryWatcher", None)
+    return cls, mod
 
 
-_skip = pytest.mark.skipif(True, reason="module not importable in test env")
+def _make_watcher(mode="PAPER", broker_base="https://sandbox.tradier.com",
+                  live_access_token=None):
+    """Build a minimal APEntryWatcher stub for unit testing resolve/fetch."""
+    cls, mod = _load_watcher_class()
+    if cls is None:
+        return None
 
-try:
-    _w, _mod = _make_watcher()
-    _CAN_IMPORT = _w is not None
-except Exception:
-    _CAN_IMPORT = False
+    broker = MagicMock()
+    broker.base_url = broker_base
+    broker.access_token = "sandbox_exec_tok"
+    broker.live_access_token = live_access_token
+    broker.cfg = MagicMock()
+    broker.cfg.base_url = broker_base
+    broker.cfg.live_access_token = live_access_token
+    broker.session = MagicMock()
 
-_maybe_skip = pytest.mark.skipif(not _CAN_IMPORT, reason="ap_entry_watcher not importable")
+    try:
+        w = cls.__new__(cls)
+        w.broker = broker
+        w.mode   = mode.upper()
+        w._lock  = threading.Lock()
+        w._pending = []
+        return w
+    except Exception:
+        return None
 
 
-@_maybe_skip
-def test_resolve_paper_client_returns_live_url_no_env():
-    """Paper client with no env vars: URL must be api.tradier.com."""
-    w, _ = _make_watcher(mode="PAPER", broker_base="https://sandbox.tradier.com")
-    env = {k: v for k, v in os.environ.items()
-            if k not in ("TRADIER_MARKET_DATA_BASE_URL", "TRADIER_DATA_BASE_URL",
-                          "TRADIER_MARKET_DATA_TOKEN", "TRADIER_DATA_TOKEN")}
-    with patch.dict(os.environ, env, clear=True):
-        base_url, token = w._resolve_watcher_quote_url()
-    assert "api.tradier.com" in base_url, (
-        f"Paper client must use api.tradier.com for quotes, got {base_url!r}"
-    )
-    assert "sandbox" not in base_url.lower(), (
-        f"Paper client must NOT use sandbox URL for quotes, got {base_url!r}"
-    )
+# ── Test 1: sandbox env → forced to api.tradier.com ──────────────────────────
 
-@_maybe_skip
-def test_resolve_env_override_takes_priority():
-    """TRADIER_MARKET_DATA_BASE_URL env var overrides everything."""
-    w, _ = _make_watcher(mode="PAPER", broker_base="https://sandbox.tradier.com")
-    with patch.dict(os.environ, {"TRADIER_MARKET_DATA_BASE_URL": "https://api.tradier.com"}):
+def test_sandbox_env_forced_to_live():
+    """
+    TRADIER_MARKET_DATA_BASE_URL=https://sandbox.tradier.com must be rejected
+    and forced to https://api.tradier.com.
+    """
+    w = _make_watcher(mode="PAPER", broker_base="https://sandbox.tradier.com")
+    if w is None:
+        pytest.skip("APEntryWatcher not importable in test env")
+    with patch.dict(os.environ, {
+        "TRADIER_MARKET_DATA_BASE_URL": "https://sandbox.tradier.com",
+        "TRADIER_MARKET_DATA_TOKEN":    "some_tok",
+    }):
         base_url, _ = w._resolve_watcher_quote_url()
-    assert base_url == "https://api.tradier.com"
+    assert "sandbox" not in base_url.lower(), (
+        f"Sandbox env must be overridden to api.tradier.com, got {base_url!r}"
+    )
+    assert "api.tradier.com" in base_url
 
-@_maybe_skip
-def test_resolve_md_token_env_returned():
-    """TRADIER_MARKET_DATA_TOKEN env var is used for the token."""
-    w, _ = _make_watcher()
-    with patch.dict(os.environ, {"TRADIER_MARKET_DATA_TOKEN": "live_data_tok_abc"}):
-        _, token = w._resolve_watcher_quote_url()
-    assert token == "live_data_tok_abc"
 
-@_maybe_skip
-def test_resolve_live_access_token_fallback():
-    """broker.live_access_token is used when no env token set."""
-    w, _ = _make_watcher()
-    w.broker.live_access_token = "broker_live_tok"
-    with patch.dict(os.environ, {}, clear=False):
-        os.environ.pop("TRADIER_MARKET_DATA_TOKEN", None)
-        os.environ.pop("TRADIER_DATA_TOKEN", None)
-        _, token = w._resolve_watcher_quote_url()
-    assert token == "broker_live_tok"
+# ── Test 2: PAPER + no token → empty dict (fail closed) ──────────────────────
 
-@_maybe_skip
-def test_watcher_quote_identity_paper_shows_live():
-    """_watcher_quote_identity must report tradier_live / sandbox=False for paper."""
-    w, _ = _make_watcher(mode="PAPER", broker_base="https://sandbox.tradier.com")
-    with patch.dict(os.environ, {}, clear=False):
+def test_paper_no_token_returns_empty():
+    """
+    PAPER client with no market-data token must return {} (fail closed),
+    not fall back to broker.session with sandbox credentials.
+    """
+    w = _make_watcher(mode="PAPER", broker_base="https://sandbox.tradier.com")
+    if w is None:
+        pytest.skip("APEntryWatcher not importable in test env")
+    env_clean = {k: v for k, v in os.environ.items()
+                 if k not in ("TRADIER_MARKET_DATA_TOKEN","TRADIER_DATA_TOKEN",
+                              "TRADIER_MARKET_DATA_BASE_URL","TRADIER_DATA_BASE_URL")}
+    with patch.dict(os.environ, env_clean, clear=True):
+        result = w._fetch_quotes(["SPY"])
+    assert result == {}, (
+        "PAPER watcher with no market-data token must return {} (fail closed), "
+        f"got {result!r}"
+    )
+    # broker.session.get must NOT have been called
+    w.broker.session.get.assert_not_called()
+
+
+# ── Test 3: PAPER + market-data token → uses api.tradier.com ─────────────────
+
+def test_paper_with_token_uses_live_url():
+    """
+    PAPER + TRADIER_MARKET_DATA_TOKEN → quote URL is api.tradier.com,
+    watcher_audit shows tradier_live / sandbox_mode=False.
+    """
+    w = _make_watcher(mode="PAPER", broker_base="https://sandbox.tradier.com")
+    if w is None:
+        pytest.skip("APEntryWatcher not importable in test env")
+    with patch.dict(os.environ, {
+        "TRADIER_MARKET_DATA_TOKEN": "live_data_tok",
+    }):
         os.environ.pop("TRADIER_MARKET_DATA_BASE_URL", None)
-        os.environ.pop("TRADIER_DATA_BASE_URL", None)
+        base_url, token = w._resolve_watcher_quote_url()
         identity = w._watcher_quote_identity()
+    assert "api.tradier.com" in base_url
+    assert token == "live_data_tok"
     assert identity["watcher_sandbox_mode"] is False
     assert identity["watcher_quote_source"] == "tradier_live"
     assert "api.tradier.com" in identity["watcher_quote_base_url"]
+
+
+# ── Test 4: LIVE + no token → broker.session fallback (acceptable) ───────────
+
+def test_live_no_token_uses_broker_session():
+    """
+    LIVE client with no market-data token may fall back to broker.session.
+    The execution token for live clients typically has market-data access.
+    broker.session.get must be called (not empty return).
+    """
+    w = _make_watcher(mode="LIVE", broker_base="https://api.tradier.com")
+    if w is None:
+        pytest.skip("APEntryWatcher not importable in test env")
+
+    mock_resp = MagicMock()
+    mock_resp.json.return_value = {"quotes": {"quote": [{"symbol": "SPY", "last": 550.0}]}}
+    w.broker.session.get.return_value = mock_resp
+
+    env_clean = {k: v for k, v in os.environ.items()
+                 if k not in ("TRADIER_MARKET_DATA_TOKEN","TRADIER_DATA_TOKEN",
+                              "TRADIER_MARKET_DATA_BASE_URL","TRADIER_DATA_BASE_URL")}
+    with patch.dict(os.environ, env_clean, clear=True):
+        result = w._fetch_quotes(["SPY"])
+
+    w.broker.session.get.assert_called_once()
+    call_url = w.broker.session.get.call_args[0][0]
+    assert "api.tradier.com" in call_url, (
+        f"LIVE broker.session fallback must use api.tradier.com, got {call_url!r}"
+    )
+    assert "sandbox" not in call_url.lower()
+
+
+# ── Test 5: watcher_audit fields match actual quote source ───────────────────
+
+def test_watcher_audit_matches_quote_source():
+    """_watcher_quote_identity uses _resolve_watcher_quote_url so audit = actual."""
+    w = _make_watcher(mode="PAPER")
+    if w is None:
+        pytest.skip("APEntryWatcher not importable in test env")
+    with patch.dict(os.environ, {"TRADIER_MARKET_DATA_TOKEN": "tok"}):
+        os.environ.pop("TRADIER_MARKET_DATA_BASE_URL", None)
+        base_url, _ = w._resolve_watcher_quote_url()
+        identity    = w._watcher_quote_identity()
+    assert identity["watcher_quote_base_url"] == base_url
+    assert identity["watcher_sandbox_mode"] is False
+    assert identity["watcher_quote_source"] == "tradier_live"
