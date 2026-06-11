@@ -466,3 +466,45 @@ def test_log_sites_use_breakdown_dict():
     """All LIVE log sites must use _bd_*.get() not manual derivation."""
     for bd_var in ["_bd_resize", "_bd_unafford", "_bd_eval"]:
         assert f"{bd_var}.get(" in MC_SRC, f"Log site must use {bd_var}.get(...)"
+
+# ── Final wording fix: reason string must not use pending_submitted=${pending_cap} ──
+
+def test_unaffordable_reason_string_no_pending_submitted_equals_total():
+    """
+    The capital_limit_contract_unaffordable reason string must not print
+    pending_submitted=${pending_cap} — that mislabels total reserved capital
+    as submitted-only pending.
+    """
+    # Find the reason f-string block
+    idx = MC_SRC.find('f"capital_limit_contract_unaffordable "')
+    assert idx > 0, "capital_limit_contract_unaffordable reason f-string not found"
+    region = MC_SRC[idx : idx + 800]
+    # Must NOT contain the bad pattern
+    assert 'pending_submitted=${pending_cap' not in region, (
+        "reason string must not use pending_submitted=${pending_cap} — "
+        "pending_cap is total reserved capital, not submitted-only"
+    )
+
+def test_unaffordable_reason_string_has_separated_fields():
+    """
+    The reason string must include the three separated fields from _bd_unafford.
+    """
+    idx = MC_SRC.find('f"capital_limit_contract_unaffordable "')
+    region = MC_SRC[idx : idx + 800]
+    for field in [
+        "pending_submitted_entry_exposure=",
+        "filled_unreconciled_exposure=",
+        "pending_total_capital_reserved=",
+    ]:
+        assert field in region, (
+            f"capital_limit_contract_unaffordable reason must include: {field}"
+        )
+
+def test_unaffordable_reason_string_has_reason_code():
+    idx   = MC_SRC.find('f"capital_limit_contract_unaffordable "')
+    # The reason string spans multiple f-string lines; find its closing )
+    close = MC_SRC.find("\n                    )", idx)
+    region = MC_SRC[idx : close + 30]
+    assert "reason_code=CAPITAL_LIMIT_CONTRACT_UNAFFORDABLE" in region, (
+        f"reason_code must be in reason string. region=...{region[-200:]!r}"
+    )
