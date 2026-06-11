@@ -148,7 +148,13 @@ OwnerLike = Union[str, LifecycleOwner]
 LEGAL_TRANSITIONS: Dict[Optional[SignalState], set] = {
     # None means this process has no in-memory state yet.
     # CREATED = brand-new signal. ADOPTED = existing persisted/watcher signal after restart.
-    None: {SignalState.CREATED, SignalState.ADOPTED, SignalState.RECOVERED_POSITION},
+    # None = no prior in-memory state (new process / restarted watcher).
+    # INVALIDATED/CANCELLED/EXPIRED allowed so watcher before-trigger invalidation
+    # does not produce a spurious ERROR lifecycle row (PR p0-watcher-audit-schema).
+    None: {
+        SignalState.CREATED, SignalState.ADOPTED, SignalState.RECOVERED_POSITION,
+        SignalState.INVALIDATED, SignalState.CANCELLED, SignalState.EXPIRED,
+    },
     SignalState.CREATED: {
         SignalState.PERSISTED, SignalState.REJECTED, SignalState.ERROR,
     },
