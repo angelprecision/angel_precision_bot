@@ -574,39 +574,34 @@ class TestP0ABudgetCap:
 
 
 # =============================================================================
-# PAPER live quote source verification
+# PAPER live quote source verification (amended — fail-closed behavior)
 # =============================================================================
 
 class TestPaperLiveQuoteSource:
     """
-    Verify that the correct live-data broker is used for P0B in paper mode.
-    The sandbox execution broker returns canned quotes; the data_broker
-    attribute on the broker returns live-market quotes.
+    Verify the fail-closed P0B paper quote routing logic.
+
+    Production wiring (ap_execution_core.py):
+      self.broker.data_broker = data_broker   (only when data_broker is live)
+
+    Production behavior (ap/execution.py P0B):
+      PAPER + data_broker present  → use data_broker for final quote check
+      PAPER + no data_broker       → fail closed: PAPER_FINAL_QUOTE_NO_LIVE_DATA_BROKER
+      LIVE                         → use broker as-is (IS the live source)
     """
 
-    def test_data_broker_attribute_used_for_paper(self):
-        """
-        When mode==PAPER and broker has a data_broker attribute,
-        final_quote_check_before_submit should be called with data_broker.
-        This test verifies the routing logic pattern matches what execution.py does.
-        """
-        # Simulate: paper broker has data_broker (live) attribute
-        live_broker = StubBroker({OCC: {"bid": 1.20, "ask": 1.25}})
-        sandbox_broker = StubBroker({OCC: {"bid": 0.0, "ask": 0.0}})
+    def test_paper_with_data_broker_uses_live_source(self):
+        """PAPER + data_broker present → live broker used, quote passes."""
+        live_broker    = StubBroker({OCC: {"bid": 1.20, "ask": 1.25}})
+        sandbox_broker = StubBroker({OCC: {"bid": 0.0,  "ask": 0.0}})
+        # APExecutionCore sets this in production
         sandbox_broker.data_broker = live_broker
 
-        # This is the exact pattern in execution.py:
         mode = "PAPER"
-        _p0b_quote_broker = (
-            (getattr(sandbox_broker, "data_broker", None) or sandbox_broker)
-            if mode == "PAPER"
-            else sandbox_broker
-        )
+        _p0b_data_broker = getattr(sandbox_broker, "data_broker", None)
+        assert _p0b_data_broker is live_broker,             "data_broker attribute not resolved from broker"
 
-        # Must resolve to the live broker, not sandbox
-        assert _p0b_quote_broker is live_broker
-
-        # The final check uses live quotes, not sandbox zeros
+        _p0b_quote_broker = _p0b_data_broker  # is_paper_mode=True path
         r = final_quote_check_before_submit(
             _p0b_quote_broker, OCC,
             max_spread_pct=0.50, min_premium=10.0, max_premium=350.0,
@@ -614,29 +609,48 @@ class TestPaperLiveQuoteSource:
         )
         assert r["ok"] is True
         assert r["final_bid"] == 1.20
+        # Sandbox broker must NOT have been called
+        assert len(sandbox_broker.calls) == 0
+
+    def test_paper_without_data_broker_triggers_fail_closed(self):
+        """PAPER + no data_broker → execution.py must reject with PAPER_FINAL_QUOTE_NO_LIVE_DATA_BROKER.
+        Simulates the fail-closed logic directly (without full process_signal wiring)."""
+        sandbox_broker = StubBroker({OCC: {"bid": 0.0, "ask": 0.0}})
+        # No data_broker attribute — simulates TRADIER_DATA_TOKEN not set
+
+        mode = "PAPER"
+        _is_paper_mode   = (mode == "PAPER")
+        _p0b_data_broker = getattr(sandbox_broker, "data_broker", None)
+
+        # This is the exact condition execution.py checks before calling _final_quote_check
+        should_fail_closed = _is_paper_mode and (_p0b_data_broker is None)
+        assert should_fail_closed is True,             "Expected fail-closed condition when PAPER broker has no data_broker"
+
+        # Sandbox broker should never be called for P0B quote truth
+        assert len(sandbox_broker.calls) == 0
+
+    def test_paper_data_broker_same_as_broker_no_attach(self):
+        """When data_broker IS the same object as broker (TRADIER_DATA_TOKEN absent,
+        client_runner falls back to data_broker=broker), execution_core skips
+        attaching the attribute (data_broker is not broker check). P0B then
+        sees no data_broker and fails closed as expected."""
+        broker = StubBroker({OCC: {"bid": 1.10, "ask": 1.15}})
+        # Simulate: data_broker=broker (same object, no dedicated live token)
+        data_broker = broker
+        # APExecutionCore only attaches when data_broker is not None AND not broker:
+        if data_broker is not None and data_broker is not broker:
+            broker.data_broker = data_broker
+        # Should NOT be attached
+        assert not hasattr(broker, "data_broker"),             "data_broker must not be attached when it equals execution broker"
 
     def test_live_mode_uses_execution_broker_directly(self):
-        """For LIVE, broker IS the live source — no data_broker indirection."""
+        """LIVE mode: broker IS the live source, no data_broker lookup."""
         live_broker = StubBroker({OCC: {"bid": 1.20, "ask": 1.25}})
-        # No data_broker attribute on live broker
-
         mode = "LIVE"
+        _is_paper_mode = (mode == "PAPER")
         _p0b_quote_broker = (
-            (getattr(live_broker, "data_broker", None) or live_broker)
-            if mode == "PAPER"
+            getattr(live_broker, "data_broker", None)
+            if _is_paper_mode
             else live_broker
         )
         assert _p0b_quote_broker is live_broker
-
-    def test_paper_no_data_broker_attr_falls_back_to_broker(self):
-        """If paper broker has no data_broker attribute, falls back to itself."""
-        broker = StubBroker({OCC: {"bid": 1.10, "ask": 1.15}})
-        # No data_broker attribute
-
-        mode = "PAPER"
-        _p0b_quote_broker = (
-            (getattr(broker, "data_broker", None) or broker)
-            if mode == "PAPER"
-            else broker
-        )
-        assert _p0b_quote_broker is broker
