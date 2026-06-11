@@ -10,7 +10,7 @@ Tests every scenario from the PR-review spec:
   3. Selector could afford 4 cheap contracts -> still clamped to 1.
   4. Selector returns $1.95 contract -> 1 contract, $195 cost.
   5. Selector returns $3.50 contract -> revalidate_exposure rejects
-     with ACTUAL_CONTRACT_COST_EXCEEDS_CLIENT_CAPITAL_LIMIT.
+     with CAPITAL_LIMIT_CONTRACT_UNAFFORDABLE.
   6. Small LIVE client AFTER bootstrap ends (total_trades >= threshold):
      the static $3.50 fallback alone must NOT recreate the $1,050 false
      reject when remaining_capital > 0.
@@ -240,7 +240,7 @@ def test_t4_selector_returns_195_contract_passes():
 
 # ---------------------------------------------------------------------------
 # Test 5: Selector returns $3.50 contract -> revalidate blocks with
-# ACTUAL_CONTRACT_COST_EXCEEDS_CLIENT_CAPITAL_LIMIT
+# CAPITAL_LIMIT_CONTRACT_UNAFFORDABLE
 # ---------------------------------------------------------------------------
 
 def test_t5_selector_returns_350_contract_blocked_with_canonical_reason():
@@ -250,8 +250,8 @@ def test_t5_selector_returns_350_contract_blocked_with_canonical_reason():
     _simulate_selector_mutation(plan, premium_per_contract=350.0, affordable_contracts=1)
     decision = m.revalidate_exposure(plan)
     assert not decision.ok
-    assert decision.reason_code == "ACTUAL_CONTRACT_COST_EXCEEDS_CLIENT_CAPITAL_LIMIT"
-    assert "ACTUAL_CONTRACT_COST_EXCEEDS_CLIENT_CAPITAL_LIMIT" in decision.reason
+    assert decision.reason_code == "CAPITAL_LIMIT_CONTRACT_UNAFFORDABLE"
+    assert "CAPITAL_LIMIT_CONTRACT_UNAFFORDABLE" in decision.reason
     # Clamp still ran first \u2014 contracts must be 1 even on block
     assert plan.contracts == 1
 
@@ -363,4 +363,4 @@ def test_t9_revalidate_blocks_when_selector_exceeds_cap():
     _simulate_selector_mutation(plan, premium_per_contract=250.0, affordable_contracts=1)
     decision = m.revalidate_exposure(plan)
     assert not decision.ok
-    assert decision.reason_code == "ACTUAL_CONTRACT_COST_EXCEEDS_CLIENT_CAPITAL_LIMIT"
+    assert decision.reason_code == "CAPITAL_LIMIT_CONTRACT_UNAFFORDABLE"

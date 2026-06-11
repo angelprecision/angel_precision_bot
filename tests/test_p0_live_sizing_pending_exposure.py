@@ -42,30 +42,34 @@ def test_pending_capital_from_snapshot_sums_both():
         "_pending_capital_from_snapshot_or_db must call breakdown helper"
     )
 
-def test_live_resize_log_present():
-    assert "LIVE_SMALL_ACCOUNT_RESIZE" in MC_SRC
-    assert "LIVE_SMALL_ACCOUNT_UNAFFORDABLE" in MC_SRC
+def test_affordable_resize_log_present():
+    assert "SMALL_ACCOUNT_AFFORDABLE_QTY_RESIZE" in MC_SRC
+    assert "SMALL_ACCOUNT_CONTRACT_UNAFFORDABLE" in MC_SRC
+    assert "LIVE_SMALL_ACCOUNT_RESIZE" not in MC_SRC
+    assert "LIVE_SMALL_ACCOUNT_UNAFFORDABLE" not in MC_SRC
 
 def test_resize_log_has_all_required_fields():
-    idx = MC_SRC.find("LIVE_SMALL_ACCOUNT_RESIZE")
+    idx = MC_SRC.find("SMALL_ACCOUNT_AFFORDABLE_QTY_RESIZE")
     region = MC_SRC[idx:idx + 600]
-    for field in ["client_email", "execution_mode=live", "client_cap",
+    for field in ["client_email", "execution_mode=%s", "client_cap",
                   "capital_deployed", "pending_submitted_entry_exposure",
                   "filled_unreconciled_exposure", "remaining_capital",
                   "candidate_limit", "computed_qty", "original_qty",
-                  "final_qty", "resized_for_small_live=true"]:
-        assert field in region, f"LIVE_SMALL_ACCOUNT_RESIZE missing field: {field}"
+                  "final_qty", "resized_for_affordable_qty=true"]:
+        assert field in region, (
+            f"SMALL_ACCOUNT_AFFORDABLE_QTY_RESIZE missing field: {field}"
+        )
 
 def test_capital_limit_contract_unaffordable_present():
     assert "capital_limit_contract_unaffordable" in MC_SRC
 
 def test_resize_path_before_hard_block():
-    """LIVE resize must happen before the hard capital_limit block."""
+    """Affordable resize must happen before the hard capital_limit block."""
     reval_idx  = MC_SRC.find("def revalidate_exposure")
-    resize_idx = MC_SRC.find("LIVE_SMALL_ACCOUNT_RESIZE", reval_idx)
+    resize_idx = MC_SRC.find("SMALL_ACCOUNT_AFFORDABLE_QTY_RESIZE", reval_idx)
     block_idx  = MC_SRC.find("ACTUAL_CONTRACT_COST_EXCEEDS_CLIENT_CAPITAL_LIMIT", reval_idx)
     assert reval_idx < resize_idx < block_idx, (
-        "LIVE resize log must appear before hard block in revalidate_exposure"
+        "Affordable resize log must appear before hard block in revalidate_exposure"
     )
 
 
@@ -262,21 +266,21 @@ def test_ac5_open_status_in_sql():
 # ── Amendment AC6: separate pending_submitted vs filled_unreconciled in log ───
 
 def test_ac6_resize_log_has_pending_total_field():
-    idx = MC_SRC.find("LIVE_SMALL_ACCOUNT_RESIZE")
+    idx = MC_SRC.find("SMALL_ACCOUNT_AFFORDABLE_QTY_RESIZE")
     region = MC_SRC[idx:idx + 700]
     assert "pending_total_capital_reserved" in region, (
-        "LIVE_SMALL_ACCOUNT_RESIZE must log pending_total_capital_reserved"
+        "SMALL_ACCOUNT_AFFORDABLE_QTY_RESIZE must log pending_total_capital_reserved"
     )
 
 def test_ac6_unaffordable_log_has_pending_total_field():
-    idx = MC_SRC.find("LIVE_SMALL_ACCOUNT_UNAFFORDABLE")
+    idx = MC_SRC.find("SMALL_ACCOUNT_CONTRACT_UNAFFORDABLE")
     region = MC_SRC[idx:idx + 700]
     assert "pending_total_capital_reserved" in region
 
 def test_ac6_resize_separates_submitted_and_filled():
     # breakdown helper provides the separation — log uses _bd_resize.get()
-    idx = MC_SRC.find("LIVE_SMALL_ACCOUNT_RESIZE")
-    region = MC_SRC[max(0, idx - 500) : idx + 700]
+    idx = MC_SRC.find("SMALL_ACCOUNT_AFFORDABLE_QTY_RESIZE")
+    region = MC_SRC[max(0, idx - 500) : idx + 1200]
     assert "_bd_resize.get(" in region, (
         "Resize log must use breakdown dict _bd_resize.get(...)"
     )
@@ -308,10 +312,10 @@ def test_ac3_unaffordable_reason_code():
 # ── Amendment Fix 4: proj_sector/proj_ticker recomputed after resize ─────────
 
 def test_fix4_proj_sector_recomputed_after_resize():
-    idx = MC_SRC.find("_resized_for_live     = True")
+    idx = MC_SRC.find("_resized_for_affordable_qty = True")
     region = MC_SRC[max(0, idx-300):idx+200]
     assert "proj_sector" in region, (
-        "proj_sector must be recomputed after resize, before _resized_for_live=True"
+        "proj_sector must be recomputed after resize, before _resized_for_affordable_qty=True"
     )
     assert "proj_ticker" in region
 
@@ -463,7 +467,7 @@ def test_block_message_uses_pending_total_not_submitted():
     )
 
 def test_log_sites_use_breakdown_dict():
-    """All LIVE log sites must use _bd_*.get() not manual derivation."""
+    """All small-account log sites must use _bd_*.get() not manual derivation."""
     for bd_var in ["_bd_resize", "_bd_unafford", "_bd_eval"]:
         assert f"{bd_var}.get(" in MC_SRC, f"Log site must use {bd_var}.get(...)"
 
