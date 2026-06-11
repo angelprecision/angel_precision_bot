@@ -915,7 +915,7 @@ class APMasterControl:
                         WHERE client_id = %s
                           AND kind = 'ENTRY'
                           AND UPPER(COALESCE(status, '')) IN (
-                              'CREATED', 'SUBMITTED', 'ACKNOWLEDGED', 'PENDING'
+                              'CREATED', 'SUBMITTED', 'ACKNOWLEDGED', 'PENDING', 'OPEN'
                           )
                           AND (
                             (broker_order_id IS NOT NULL AND broker_order_id <> '')
@@ -967,23 +967,28 @@ class APMasterControl:
         a None return, so a snapshot value is safe as a non-None fallback.
         """
         if exclude_local_order_id:
-            _db_val = self._pending_orders_capital(
+            # Broker-proof submitted pending excluding the current order.
+            # Must still add fill-truth unreconciled fills — they are separate
+            # exposure that does NOT go away just because we exclude one order id.
+            _submitted_excl = self._pending_orders_capital(
                 client_id, exclude_local_order_id=exclude_local_order_id,
             )
-            if _db_val is not None:
-                return _db_val
-            # DB unavailable: in LIVE we must fail closed (caller handles None).
-            if self._is_live_mode() and self.pending_capital_fail_closed_live:
-                return None
-            # PAPER fallback: use the snapshot value (no exclusion possible at
-            # the snapshot layer, so we accept the small overcount — which
-            # fails closed for over-budget signals, the safer direction).
+            if _submitted_excl is None:
+                # DB unavailable: in LIVE we must fail closed.
+                if self._is_live_mode() and self.pending_capital_fail_closed_live:
+                    return None
+                _submitted_excl = 0.0
+
+            # Always add fill-truth component regardless of exclusion path.
+            _filled_unreconciled_excl = 0.0
             if isinstance(snap, dict) and snap.get("pending_entry_capital") is not None:
                 try:
-                    return float(snap.get("pending_entry_capital") or 0.0)
+                    _filled_unreconciled_excl = float(snap.get("pending_entry_capital") or 0.0)
                 except Exception:
-                    return None
-            return None
+                    if self._is_live_mode() and self.pending_capital_fail_closed_live:
+                        return None
+
+            return _submitted_excl + _filled_unreconciled_excl
         # PR P0-SIZING: total pending = broker-proof submitted unfilled orders
         # PLUS fill-truth unreconciled fills (not yet in positions table).
         # These two are mutually exclusive:
@@ -1351,18 +1356,23 @@ class APMasterControl:
             estimated_contracts_pre = 1 if bootstrap_mode else 0
             estimated_new_cost_pre = 0.0   # unknown until selector runs
             if remaining_capital_for_this_trade <= 0.0:
+                _filled_unreconciled_eval = float(snap.get("pending_entry_capital") or 0)
+                _pending_submitted_eval   = max(0.0, pending_capital_real - _filled_unreconciled_eval)
                 log.warning(
                     "[%s] LIVE_SMALL_ACCOUNT_UNAFFORDABLE "
                     "client_email=%s execution_mode=%s client_cap=%.0f "
                     "capital_deployed=%.0f pending_submitted_entry_exposure=%.0f "
-                    "filled_unreconciled_exposure=%.0f remaining_capital=%.0f "
+                    "filled_unreconciled_exposure=%.0f "
+                    "pending_total_capital_reserved=%.0f "
+                    "remaining_capital=%.0f "
                     "candidate_limit=N/A computed_qty=0 original_qty=N/A final_qty=0 "
                     "reason=capital_limit_no_remaining",
                     ticker, client_id, current_mode,
                     max_capital,
                     float(snap.get("capital_deployed", 0)),
+                    _pending_submitted_eval,
+                    _filled_unreconciled_eval,
                     pending_capital_real,
-                    float(snap.get("pending_entry_capital") or 0),
                     remaining_capital_for_this_trade,
                 )
                 return self._block(
@@ -2548,31 +2558,47 @@ class APMasterControl:
                     plan.max_position_usd = _final_qty * _limit_price_pc
                     real_cost             = plan.max_position_usd
                     proj_total            = snap["capital_deployed"] + pending_cap + real_cost
+                    # Recompute sector/ticker projections with resized real_cost
+                    # so downstream cap checks don't use the original paper qty cost.
+                    proj_sector           = sector_deployed + real_cost
+                    proj_ticker           = ticker_deployed + real_cost
                     _resized_for_live     = True
+                    _filled_unreconciled_for_log = float(snap.get("pending_entry_capital") or 0)
+                    _pending_submitted_for_log   = max(0.0, pending_cap - _filled_unreconciled_for_log)
                     log.info(
                         "[%s] LIVE_SMALL_ACCOUNT_RESIZE "
                         "client_email=%s execution_mode=live client_cap=%.0f "
                         "capital_deployed=%.0f pending_submitted_entry_exposure=%.0f "
-                        "filled_unreconciled_exposure=%.0f remaining_capital=%.0f "
+                        "filled_unreconciled_exposure=%.0f "
+                        "pending_total_capital_reserved=%.0f "
+                        "remaining_capital=%.0f "
                         "candidate_limit=%.4f computed_qty=%d original_qty=%d "
                         "final_qty=%d resized_for_small_live=true",
                         ticker, client_id, max_capital,
-                        float(snap.get("capital_deployed", 0)), pending_cap,
-                        float(snap.get("pending_entry_capital") or 0),
+                        float(snap.get("capital_deployed", 0)),
+                        _pending_submitted_for_log,
+                        _filled_unreconciled_for_log,
+                        pending_cap,
                         _remaining_now, _candidate_limit,
                         _computed_qty, _original_qty, _final_qty,
                     )
                 else:
+                    _filled_unreconciled_for_log = float(snap.get("pending_entry_capital") or 0)
+                    _pending_submitted_for_log   = max(0.0, pending_cap - _filled_unreconciled_for_log)
                     log.warning(
                         "[%s] LIVE_SMALL_ACCOUNT_UNAFFORDABLE "
                         "client_email=%s execution_mode=live client_cap=%.0f "
                         "capital_deployed=%.0f pending_submitted_entry_exposure=%.0f "
-                        "filled_unreconciled_exposure=%.0f remaining_capital=%.0f "
+                        "filled_unreconciled_exposure=%.0f "
+                        "pending_total_capital_reserved=%.0f "
+                        "remaining_capital=%.0f "
                         "candidate_limit=%.4f computed_qty=0 original_qty=%d "
                         "final_qty=0 reason=capital_limit_contract_unaffordable",
                         ticker, client_id, max_capital,
-                        float(snap.get("capital_deployed", 0)), pending_cap,
-                        float(snap.get("pending_entry_capital") or 0),
+                        float(snap.get("capital_deployed", 0)),
+                        _pending_submitted_for_log,
+                        _filled_unreconciled_for_log,
+                        pending_cap,
                         _remaining_now, _candidate_limit, _original_qty,
                     )
                     reason = (
@@ -2588,7 +2614,7 @@ class APMasterControl:
                     _log_revalidation(True, reason)
                     return self._block(
                         signal_id, ticker, client_id, "blocked_risk", reason,
-                        reason_code="ACTUAL_CONTRACT_COST_EXCEEDS_CLIENT_CAPITAL_LIMIT",
+                        reason_code="CAPITAL_LIMIT_CONTRACT_UNAFFORDABLE",
                     )
 
             if proj_total > max_capital and not _resized_for_live:
