@@ -824,7 +824,9 @@ def _dispatch(
         except Exception: pass
         _mark_job(job_id, "REJECTED",
                   result={"stage": "revalidation", "reason": revalidation.reason,
-                          "real_cost": plan.max_position_usd})
+                          "real_cost": plan.max_position_usd},
+                  error=(f"revalidation:{revalidation.reason}"
+                         if revalidation.reason else "revalidation:block"))
         return
 
     # ── 4. ROUTE -- BREACH vs IMMEDIATE (resolved BEFORE OSM create) ──────────
@@ -961,7 +963,8 @@ def _dispatch(
                 )
                 _mark_job(job_id, "REJECTED",
                           result={"stage": "live_authorization",
-                                  "reason": _gate_reason})
+                                  "reason": _gate_reason},
+                          error=f"live_authorization:{_gate_reason}")
                 # Permanent structured rejection record — operator dashboard reads
                 # this to show WHY no trade was created.
                 _log_rejection_to_db(

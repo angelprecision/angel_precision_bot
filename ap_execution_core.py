@@ -122,6 +122,17 @@ class APExecutionCore:
 
         # Plain attributes (no mode dependency).
         self.broker            = broker
+        # P0B paper-quote-truth: attach data_broker onto self.broker so that
+        # process_signal (which receives only `broker`) can resolve the live
+        # market-data source via getattr(broker, "data_broker", None).
+        # data_broker is the live Tradier instance when TRADIER_DATA_TOKEN is
+        # set; it equals broker itself when the token is absent (client_runner
+        # sets data_broker=broker as a fallback in that case — acceptable
+        # because both are then the same object and no silent sandbox leak
+        # occurs). This attribute is used only for quote reads, never for
+        # order submission.
+        if data_broker is not None and data_broker is not broker:
+            self.broker.data_broker = data_broker
         self.contract_selector = contract_selector  # wired for breach-time selection of deferred overnight signals
         self.email              = email
         self.position_manager   = position_manager

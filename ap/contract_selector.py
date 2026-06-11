@@ -47,6 +47,14 @@ from dataclasses import dataclass, field
 from datetime import date, timedelta
 from typing import Optional
 
+# P0A: direct option quote revalidation (do not remove — restores flow for
+# liquid tickers with stale/zero chain data without weakening safety rules).
+from ap.contract_quote_revalidator import (
+    revalidate_with_direct_quote  as _revalidate_direct,
+    should_revalidate             as _should_revalidate,
+    DEFAULT_REVALIDATE_TOP_N,
+)
+
 TICKER_MAX_PREMIUM_PER_CONTRACT = {
     "NVDA":  1500.0,  "TSLA": 1200.0,  "MSTR": 2000.0,
     "META":   800.0,  "MSFT":  800.0,  "AMZN":  800.0,
@@ -773,6 +781,9 @@ class APContractSelectionEngine:
         survivors  = []
         _rejections: dict = {}
         _pro_tiers:  dict = {"A": 0, "B": 0}
+        # P2: per-selector-pass direct-quote budget so one stale chain cannot
+        # trigger hundreds of Tradier quote fetches.
+        _p0a_budget: int = DEFAULT_REVALIDATE_TOP_N
 
         for opt in chain:
             if _PRO_QUALITY_ENABLED:
@@ -784,6 +795,42 @@ class APContractSelectionEngine:
                     except Exception:
                         _dte = 0
                 pro_tier, pro_reason = _pro_contract_quality(opt, ticker, _dte)
+
+                # ── P0A/FIX-2: direct quote recovery inside pro-quality ───────
+                # When pro_quality would hard-reject for a revalidatable reason
+                # (zero/missing bid-ask, bid_below_0.1) AND the market is open
+                # AND the per-pass budget allows it, fetch a direct option quote
+                # and rerun pro_quality on the patched opt before rejecting.
+                # _p0a_budget is checked before AND decremented after every call
+                # regardless of the action result, so the cap applies to all
+                # outcomes: PASS, REJECT_DIRECT_ZERO, REJECT_UNAVAILABLE, SKIP_*.
+                if pro_tier == "REJECT" and _should_revalidate(pro_reason) and _p0a_budget > 0:
+                    _rv_pro = _revalidate_direct(
+                        self.data_broker,
+                        opt,
+                        pro_reason,
+                    )
+                    _p0a_budget -= 1   # always decrement — counts the fetch attempt
+                    if _rv_pro.get("action") == "PASS" and _rv_pro.get("opt_updated"):
+                        _opt_pro = _rv_pro["opt_updated"]
+                        # Rerun pro_quality with patched bid/ask
+                        pro_tier, pro_reason = _pro_contract_quality(_opt_pro, ticker, _dte)
+                        if pro_tier != "REJECT":
+                            # Pro quality passed on direct quote — use patched opt
+                            opt = _opt_pro
+                            log.info(
+                                "[%s] P0A pro_quality_recovered chain_reason=%s "                                "direct_bid=%.4f direct_ask=%.4f contract=%s",
+                                ticker, _rv_pro["audit"].get("chain_bid", 0),
+                                _rv_pro["audit"].get("direct_bid", 0),
+                                _rv_pro["audit"].get("direct_ask", 0),
+                                opt.get("symbol", "?"),
+                            )
+                        # else: direct quote fetched but still fails — fall through to reject
+                    elif _rv_pro.get("action") in ("REJECT_DIRECT_ZERO", "REJECT_UNAVAILABLE"):
+                        pro_reason = _rv_pro.get("reason_code") or pro_reason
+                    # SKIP_NOT_MARKET_HOURS / SKIP_NOT_REVALIDATABLE: original reason stands.
+                # ── end P0A/FIX-2 ────────────────────────────────────────────
+
                 if pro_tier == "REJECT":
                     _rejections[pro_reason] = _rejections.get(pro_reason, 0) + 1
                     try:
@@ -828,6 +875,77 @@ class APContractSelectionEngine:
                 min_oi=_eff_min_oi,
                 min_volume=_eff_min_volume,
             )
+
+            # ── P0A: direct quote revalidation ────────────────────────────
+            # When the chain row produced a revalidatable reject (zero/missing
+            # bid-ask, bid_below_0.1, NO_CHAIN_DATA, zero liquidity) AND the
+            # market is open AND the per-pass budget allows it, fetch a direct
+            # option quote and re-run quality checks against the fresh quote.
+            # Safety rules (spread, premium, affordability, capital) are
+            # re-enforced against the direct quote — never bypassed.
+            # _p0a_budget is checked before AND decremented after every call
+            # regardless of result, so REJECT_DIRECT_ZERO / REJECT_UNAVAILABLE
+            # consume the budget exactly as PASS does.
+            if result is not None and _should_revalidate(result) and _p0a_budget > 0:
+                _rv = _revalidate_direct(
+                    self.data_broker,
+                    opt,
+                    result,
+                )
+                _p0a_budget -= 1   # always decrement — counts the fetch attempt
+                _rv_action = _rv.get("action")
+                if _rv_action == "PASS" and _rv.get("opt_updated"):
+                    # Direct quote was valid.  Re-run quality filter on the
+                    # patched opt (bid/ask replaced with direct-quote values).
+                    _opt_patched = _rv["opt_updated"]
+                    _result2 = self._quality_filter(
+                        _opt_patched, today,
+                        max_spread_pct=_eff_max_spread,
+                        min_oi=_eff_min_oi,
+                        min_volume=_eff_min_volume,
+                    )
+                    if _result2 is None:
+                        # Direct quote rescued this contract — use patched opt
+                        log.info(
+                            "[%s] P0A direct_quote_recovered chain=%s direct_bid=%.4f "
+                            "direct_ask=%.4f contract=%s",
+                            ticker, result,
+                            _rv["audit"].get("direct_bid", 0),
+                            _rv["audit"].get("direct_ask", 0),
+                            opt.get("symbol", "?"),
+                        )
+                        survivors.append(_opt_patched)
+                        # Emit PASS event with audit fields
+                        try:
+                            self._emit_selector_event(
+                                plan,
+                                stage="quality_filter_direct_quote",
+                                decision="PASS",
+                                reason_code="DIRECT_QUOTE_RECOVERED_CHAIN_ZERO",
+                                explanation=(
+                                    f"chain rejected ({result}) but direct "
+                                    f"quote recovered bid={_rv['audit'].get('direct_bid')} "
+                                    f"ask={_rv['audit'].get('direct_ask')}"
+                                ),
+                                contract=opt.get("symbol"),
+                                context=_rv.get("audit") or {},
+                            )
+                        except Exception:
+                            pass
+                        continue   # ← skip the standard reject branch below
+                    else:
+                        # Direct quote fetched but still fails quality (e.g.
+                        # spread too wide at direct prices) — reject with the
+                        # real reason from the re-run, not the chain reason.
+                        result = _result2
+                elif _rv_action in ("REJECT_DIRECT_ZERO", "REJECT_UNAVAILABLE"):
+                    # Direct quote confirmed invalid or unavailable.
+                    # Use the specific direct-quote reason code.
+                    result = _rv.get("reason_code") or result
+                # SKIP_NOT_MARKET_HOURS / SKIP_NOT_REVALIDATABLE:
+                # fall through with original chain reject reason unchanged.
+            # ── end P0A ───────────────────────────────────────────────────
+
             if result is None:
                 survivors.append(opt)
             else:
