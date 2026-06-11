@@ -734,34 +734,53 @@ class APEntryWatcher:
     # _persist_watcher_audit: best-effort OSM meta merge. Never raises.
     #   Logs with persisted=false when local_order_id is absent or order not found.
 
+    def _resolve_watcher_quote_url(self) -> tuple:
+        """
+        Resolve (base_url, token) for watcher QUOTE fetches.
+
+        Execution mode must NOT determine the quote URL:
+          - Paper execution uses sandbox for orders, but watcher quote/trigger/
+            stop/invalidation must evaluate against live market data.
+          - Live execution: live for both orders and quotes.
+
+        URL priority:
+          1. TRADIER_MARKET_DATA_BASE_URL env var
+          2. TRADIER_DATA_BASE_URL env var
+          3. https://api.tradier.com  (hardcoded live default — NEVER sandbox)
+
+        Token priority:
+          1. TRADIER_MARKET_DATA_TOKEN env var
+          2. TRADIER_DATA_TOKEN env var
+          3. broker.live_access_token attribute
+          4. broker.cfg.live_access_token attribute
+          5. None  (caller falls back to broker.session)
+
+        Never returns sandbox.tradier.com as the quote URL.
+        """
+        import os as _os
+        base_url = str(
+            _os.getenv("TRADIER_MARKET_DATA_BASE_URL")
+            or _os.getenv("TRADIER_DATA_BASE_URL")
+            or "https://api.tradier.com"
+        ).rstrip("/")
+        token = (
+            _os.getenv("TRADIER_MARKET_DATA_TOKEN")
+            or _os.getenv("TRADIER_DATA_TOKEN")
+            or getattr(self.broker, "live_access_token", None)
+            or getattr(getattr(self.broker, "cfg", None), "live_access_token", None)
+        )
+        return base_url, token or None
+
     def _watcher_quote_identity(self) -> dict:
         """Return the ACTUAL quote source/base_url/sandbox flag the watcher uses.
 
-        QUOTE-DOMAIN AUDIT: _fetch_quotes() reads from self.broker.session with
-        self.broker(.cfg).base_url. We surface that real base_url here — never
-        assume — so watcher_audit rows prove which Tradier environment the
-        watcher evaluated against (sandbox = delayed paper, live = current).
-        Keys are namespaced watcher_* so they don't collide with the order's
-        selector_*/submit_* quote evidence.
-
-        POINT 3 (review): the fallback chain MUST be byte-identical to
-        _fetch_quotes — same getattr order, same final default of
-        'https://sandbox.tradier.com'. If they diverged, the audit could label
-        a quote 'unknown' while _fetch_quotes actually queried sandbox, which
-        would mislead the whole investigation. The default IS sandbox because
-        that is exactly what _fetch_quotes hits when base_url can't be read.
+        Now reads from _resolve_watcher_quote_url() — the same function that
+        _fetch_quotes() uses — so watcher_audit rows always match reality.
+        Paper execution_mode no longer implies sandbox quotes.
         """
-        base_url = (
-            getattr(self.broker, "base_url", None)
-            or getattr(getattr(self.broker, "cfg", None), "base_url", None)
-            or "https://sandbox.tradier.com"
-        )
-        base_url = str(base_url)
+        base_url, _ = self._resolve_watcher_quote_url()
         sandbox = "sandbox" in base_url.lower()
-        # base_url is now never empty (matches _fetch_quotes default), so
-        # source is always sandbox or live — never 'unknown' for the watcher,
-        # because _fetch_quotes would never silently query an unknown host.
-        source = "tradier_sandbox" if sandbox else "tradier_live"
+        source  = "tradier_sandbox" if sandbox else "tradier_live"
         return {
             "watcher_quote_source":   source,
             "watcher_quote_base_url": base_url,
@@ -2797,17 +2816,36 @@ class APEntryWatcher:
 
         symbols = ",".join(sorted(set(clean_tickers)))
         try:
-            base_url = (
-                getattr(self.broker, "base_url", None)
-                or getattr(getattr(self.broker, "cfg", None), "base_url", None)
-                or "https://sandbox.tradier.com"
-            )
-            resp = self.broker.session.get(
-                f"{base_url}/v1/markets/quotes",
-                params={"symbols": symbols, "greeks": "false"},
-                headers={"Accept": "application/json"},
-                timeout=5,
-            )
+            # PR P0-WATCHER-QUOTES: always use live market-data URL/token.
+            # Paper execution uses sandbox for orders but watcher quote
+            # decisions must evaluate against real-time market prices.
+            base_url, md_token = self._resolve_watcher_quote_url()
+            if md_token:
+                import requests as _req
+                resp = _req.get(
+                    f"{base_url}/v1/markets/quotes",
+                    params={"symbols": symbols, "greeks": "false"},
+                    headers={
+                        "Authorization": f"Bearer {md_token}",
+                        "Accept": "application/json",
+                    },
+                    timeout=5,
+                )
+            else:
+                # No dedicated market-data token available — use broker session
+                # with the resolved (live) base URL. Works when the execution
+                # token also has live market-data access (live-mode clients).
+                log.warning(
+                    "[watcher_quotes] No TRADIER_MARKET_DATA_TOKEN configured — "
+                    "using broker session with %s; paper clients may get stale quotes",
+                    base_url,
+                )
+                resp = self.broker.session.get(
+                    f"{base_url}/v1/markets/quotes",
+                    params={"symbols": symbols, "greeks": "false"},
+                    headers={"Accept": "application/json"},
+                    timeout=5,
+                )
             data = resp.json()
             quotes_raw = data.get("quotes", {}).get("quote", [])
             if isinstance(quotes_raw, dict):
