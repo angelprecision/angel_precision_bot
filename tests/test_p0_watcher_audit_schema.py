@@ -170,3 +170,42 @@ def test_watcher_decision_audit_params_use_text_client_id():
     """_insert_watcher_audit_row must coerce client_id to str (not UUID)."""
     idx = EW_SRC.find("str(_client_id) if _client_id is not None else None")
     assert idx > 0, "client_id must be str-coerced before INSERT"
+
+# ── Amendment: quote_age_ms in INSERT ────────────────────────────────────────
+
+def test_insert_has_quote_age_ms():
+    idx = EW_SRC.find("INSERT INTO public.watcher_decision_audit")
+    end = EW_SRC.find("::", idx)  # finds ::jsonb
+    region = EW_SRC[idx:end + 20]
+    assert "quote_age_ms" in region, (
+        "watcher_decision_audit INSERT must include quote_age_ms column"
+    )
+    # Also verify it appears in params
+    params_idx = EW_SRC.find('payload.get("quote_age_ms")')
+    assert params_idx > 0 and params_idx > idx, (
+        'params must include payload.get("quote_age_ms")'
+    )
+
+def test_order_row_id_documented_nullable():
+    """order_row_id is null from watcher context — documented near the INSERT."""
+    # Find the INSERT itself (not just the function name which appears elsewhere)
+    idx = EW_SRC.find("INSERT INTO public.watcher_decision_audit")
+    # The comment about order_row_id appears after the INSERT SQL and params
+    region = EW_SRC[idx:idx + 5000]
+    assert "order_row_id" in region, "order_row_id must be documented near INSERT params"
+    assert "local_order_id" in region, "local_order_id is the primary join key"
+
+# ── Amendment: lifecycle fix in ap_lifecycle.py (the one watcher imports) ────
+
+def test_ap_lifecycle_root_has_fix():
+    """ap_lifecycle.py (root) — imported by ap_entry_watcher — must have the fix."""
+    lc_root = _REPO / "ap_lifecycle.py"
+    if not lc_root.exists():
+        pytest.skip("ap_lifecycle.py not in repo")
+    content = lc_root.read_text()
+    idx = content.find("None:")
+    region = content[idx:idx+300]
+    assert "INVALIDATED" in region, (
+        "ap_lifecycle.py (root, imported by watcher) must allow NONE→INVALIDATED"
+    )
+
