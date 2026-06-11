@@ -1352,7 +1352,7 @@ class APMasterControl:
             if remaining_capital_for_this_trade <= 0.0:
                 _bd_eval = self._get_pending_capital_breakdown(snap, client_id) or {}
                 log.warning(
-                    "[%s] LIVE_SMALL_ACCOUNT_UNAFFORDABLE "
+                    "[%s] SMALL_ACCOUNT_CONTRACT_UNAFFORDABLE "
                     "client_email=%s execution_mode=%s client_cap=%.0f "
                     "capital_deployed=%.0f pending_submitted_entry_exposure=%.0f "
                     "filled_unreconciled_exposure=%.0f "
@@ -2392,6 +2392,7 @@ class APMasterControl:
         approved capital-utilization rows before returning.
         """
         ticker = plan.ticker
+        execution_mode = "live" if self._is_live_mode() else "paper"
 
         # ---------------------------------------------------------------
         # PR p0/bootstrap-affordable-selection — review fix #1 (2026-06-05):
@@ -2509,6 +2510,7 @@ class APMasterControl:
         def _log_revalidation(blocked: bool, block_reason: str = "") -> None:
             self._log_capital_utilization(
                 client_id=client_id,
+                execution_mode=execution_mode,
                 ticker=ticker,
                 signal_id=signal_id,
                 deployed=snap["capital_deployed"],
@@ -2529,44 +2531,44 @@ class APMasterControl:
             )
 
         if proj_total > max_capital:
-            # PR P0-SIZING: for LIVE non-bootstrap clients, try to resize
-            # the order quantity down before hard-blocking. A small live
-            # account should be able to trade 1 affordable contract even
-            # when the paper/global quantity would exceed the cap.
-            _resized_for_live = False
-            if self._is_live_mode() and not _bootstrap_now and plan.contracts > 0:
-                _original_qty    = plan.contracts
-                _limit_price_pc  = real_cost / plan.contracts   # cost per contract (already × 100)
-                _remaining_now   = max(0.0, max_capital - snap["capital_deployed"] - pending_cap)
+            # PR P0 paper+live affordable resize: if the selected contract is
+            # real and the original quantity exceeds the remaining capital,
+            # resize the quantity for either execution mode before blocking.
+            _resized_for_affordable_qty = False
+            if plan.contracts > 0 and real_cost > 0:
+                _original_qty    = int(plan.contracts)
+                _cost_per_contract = real_cost / _original_qty   # already × 100
+                _remaining_now   = max_capital - snap["capital_deployed"] - pending_cap
                 _computed_qty    = (
-                    int(_remaining_now // _limit_price_pc)
-                    if _limit_price_pc > 0 else 0
+                    int(_remaining_now // _cost_per_contract)
+                    if _cost_per_contract > 0 else 0
                 )
-                _candidate_limit = _limit_price_pc / 100.0       # option premium per share
+                _candidate_limit = _cost_per_contract / 100.0    # option premium per share
 
                 if _computed_qty >= 1:
                     # Resize is viable — adjust plan before continuing
                     _final_qty            = min(_original_qty, _computed_qty)
                     plan.contracts        = _final_qty
-                    plan.max_position_usd = _final_qty * _limit_price_pc
+                    plan.max_position_usd = float(_final_qty * _cost_per_contract)
                     real_cost             = plan.max_position_usd
                     proj_total            = snap["capital_deployed"] + pending_cap + real_cost
+                    pct_used              = proj_total / equity * 100 if equity > 0 else 0
                     # Recompute sector/ticker projections with resized real_cost
                     # so downstream cap checks don't use the original paper qty cost.
                     proj_sector           = sector_deployed + real_cost
                     proj_ticker           = ticker_deployed + real_cost
-                    _resized_for_live     = True
+                    _resized_for_affordable_qty = True
                     _bd_resize = self._get_pending_capital_breakdown(snap, client_id) or {}
                     log.info(
-                        "[%s] LIVE_SMALL_ACCOUNT_RESIZE "
-                        "client_email=%s execution_mode=live client_cap=%.0f "
+                        "[%s] SMALL_ACCOUNT_AFFORDABLE_QTY_RESIZE "
+                        "client_email=%s execution_mode=%s client_cap=%.0f "
                         "capital_deployed=%.0f pending_submitted_entry_exposure=%.0f "
                         "filled_unreconciled_exposure=%.0f "
                         "pending_total_capital_reserved=%.0f "
                         "remaining_capital=%.0f "
                         "candidate_limit=%.4f computed_qty=%d original_qty=%d "
-                        "final_qty=%d resized_for_small_live=true",
-                        ticker, client_id, max_capital,
+                        "final_qty=%d resized_for_affordable_qty=true",
+                        ticker, client_id, execution_mode, max_capital,
                         float(snap.get("capital_deployed", 0)),
                         _bd_resize.get("pending_submitted_entry_exposure", 0.0),
                         _bd_resize.get("filled_unreconciled_exposure", 0.0),
@@ -2577,24 +2579,24 @@ class APMasterControl:
                 else:
                     _bd_unafford = self._get_pending_capital_breakdown(snap, client_id) or {}
                     log.warning(
-                        "[%s] LIVE_SMALL_ACCOUNT_UNAFFORDABLE "
-                        "client_email=%s execution_mode=live client_cap=%.0f "
+                        "[%s] SMALL_ACCOUNT_CONTRACT_UNAFFORDABLE "
+                        "client_email=%s execution_mode=%s client_cap=%.0f "
                         "capital_deployed=%.0f pending_submitted_entry_exposure=%.0f "
                         "filled_unreconciled_exposure=%.0f "
                         "pending_total_capital_reserved=%.0f "
                         "remaining_capital=%.0f "
-                        "candidate_limit=%.4f computed_qty=0 original_qty=%d "
+                        "candidate_limit=%.4f computed_qty=%d original_qty=%d "
                         "final_qty=0 reason=capital_limit_contract_unaffordable",
-                        ticker, client_id, max_capital,
+                        ticker, client_id, execution_mode, max_capital,
                         float(snap.get("capital_deployed", 0)),
                         _bd_unafford.get("pending_submitted_entry_exposure", 0.0),
                         _bd_unafford.get("filled_unreconciled_exposure", 0.0),
                         _bd_unafford.get("pending_total_capital_reserved", pending_cap),
-                        _remaining_now, _candidate_limit, _original_qty,
+                        _remaining_now, _candidate_limit, _computed_qty, _original_qty,
                     )
                     reason = (
                         f"capital_limit_contract_unaffordable "
-                        f"client_email={client_id} execution_mode=live "
+                        f"client_email={client_id} execution_mode={execution_mode} "
                         f"client_cap=${max_capital:.0f} "
                         f"capital_deployed=${snap['capital_deployed']:.0f} "
                         f"pending_submitted_entry_exposure=$"
@@ -2603,9 +2605,9 @@ class APMasterControl:
                         f"{_bd_unafford.get('filled_unreconciled_exposure', 0.0):.0f} "
                         f"pending_total_capital_reserved=$"
                         f"{_bd_unafford.get('pending_total_capital_reserved', pending_cap):.0f} "
-                        f"remaining=${_remaining_now:.0f} "
+                        f"remaining_capital=${_remaining_now:.0f} "
                         f"candidate_limit={_candidate_limit:.4f} "
-                        f"computed_qty=0 original_qty={_original_qty} final_qty=0 "
+                        f"computed_qty={_computed_qty} original_qty={_original_qty} final_qty=0 "
                         f"reason_code=CAPITAL_LIMIT_CONTRACT_UNAFFORDABLE"
                     )
                     _log_revalidation(True, reason)
@@ -2614,7 +2616,7 @@ class APMasterControl:
                         reason_code="CAPITAL_LIMIT_CONTRACT_UNAFFORDABLE",
                     )
 
-            if proj_total > max_capital and not _resized_for_live:
+            if proj_total > max_capital and not _resized_for_affordable_qty:
                 reason = f"capital_limit: ${proj_total:.0f} > ${max_capital:.0f}"
                 _log_revalidation(True, reason)
                 return self._block(
@@ -2623,6 +2625,7 @@ class APMasterControl:
                     client_id,
                     "blocked_risk",
                     f"ACTUAL_CONTRACT_COST_EXCEEDS_CLIENT_CAPITAL_LIMIT "
+                    f"execution_mode={execution_mode} "
                     f"(${proj_total:.0f} > ${max_capital:.0f} | "
                     f"deployed=${snap['capital_deployed']:.0f} pending=${pending_cap:.0f} "
                     f"real_cost=${real_cost:.0f})",
@@ -2745,6 +2748,7 @@ class APMasterControl:
         self,
         *,
         client_id: str,
+        execution_mode: str,
         ticker: str,
         signal_id: str,
         deployed: float,
@@ -2765,6 +2769,7 @@ class APMasterControl:
     ):
         record = {
             "event": "capital_utilization",
+            "execution_mode": execution_mode,
             "ticker": ticker,
             "signal_id": signal_id,
             "deployed": round(deployed, 2),
@@ -2786,8 +2791,9 @@ class APMasterControl:
             "account_equity": round(self.account_equity, 2),
         }
         log.info(
-            "[%s] CAPITAL_UTIL | %s | deployed=$%.0f pending=$%.0f new=$%.0f projected=$%.0f/%.0f (%.1f%%) headroom=$%.0f | %s",
+            "[%s] CAPITAL_UTIL | mode=%s | %s | deployed=$%.0f pending=$%.0f new=$%.0f projected=$%.0f/%.0f (%.1f%%) headroom=$%.0f | %s",
             client_id,
+            execution_mode,
             ticker,
             deployed,
             pending,
