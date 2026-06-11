@@ -1115,8 +1115,17 @@ def process_signal(broker, client_id: str, signal_payload: dict) -> dict:
             # FIX 3: pass qty so execution_cost = execution_price * 100 * qty
             #        is validated against budget_usd (total_cost already equals
             #        qty * premium * 100 but we re-check with the fresh quote).
+            # PAPER quote truth: for PAPER entries the execution broker may be
+            # sandbox (which returns stale/canned quotes). Use the live-market
+            # data broker (same source as the selector and direct-quote revalidator)
+            # for the final quote check. For LIVE, broker IS the live source.
+            _p0b_quote_broker = (
+                (getattr(broker, "data_broker", None) or broker)
+                if mode == "PAPER"
+                else broker
+            )
             _p0b = _final_quote_check(
-                broker,
+                _p0b_quote_broker,
                 contract,
                 max_spread_pct=float(os.getenv("MAX_SPREAD_PCT", "0.50")),
                 min_premium=float(client.get("min_premium") or
