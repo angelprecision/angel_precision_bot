@@ -798,18 +798,21 @@ class APContractSelectionEngine:
 
                 # ── P0A/FIX-2: direct quote recovery inside pro-quality ───────
                 # When pro_quality would hard-reject for a revalidatable reason
-                # (zero/missing bid-ask, bid_below_0.1) AND the market is open,
-                # attempt a direct option quote fetch and rerun pro_quality on
-                # the patched opt before accepting the reject.
+                # (zero/missing bid-ask, bid_below_0.1) AND the market is open
+                # AND the per-pass budget allows it, fetch a direct option quote
+                # and rerun pro_quality on the patched opt before rejecting.
+                # _p0a_budget is checked before AND decremented after every call
+                # regardless of the action result, so the cap applies to all
+                # outcomes: PASS, REJECT_DIRECT_ZERO, REJECT_UNAVAILABLE, SKIP_*.
                 if pro_tier == "REJECT" and _should_revalidate(pro_reason) and _p0a_budget > 0:
                     _rv_pro = _revalidate_direct(
                         self.data_broker,
                         opt,
                         pro_reason,
                     )
+                    _p0a_budget -= 1   # always decrement — counts the fetch attempt
                     if _rv_pro.get("action") == "PASS" and _rv_pro.get("opt_updated"):
                         _opt_pro = _rv_pro["opt_updated"]
-                        _p0a_budget -= 1
                         # Rerun pro_quality with patched bid/ask
                         pro_tier, pro_reason = _pro_contract_quality(_opt_pro, ticker, _dte)
                         if pro_tier != "REJECT":
@@ -822,11 +825,10 @@ class APContractSelectionEngine:
                                 _rv_pro["audit"].get("direct_ask", 0),
                                 opt.get("symbol", "?"),
                             )
-                        else:
-                            # Direct quote fetched but still fails pro_quality
-                            pass  # fall through to standard reject below
+                        # else: direct quote fetched but still fails — fall through to reject
                     elif _rv_pro.get("action") in ("REJECT_DIRECT_ZERO", "REJECT_UNAVAILABLE"):
                         pro_reason = _rv_pro.get("reason_code") or pro_reason
+                    # SKIP_NOT_MARKET_HOURS / SKIP_NOT_REVALIDATABLE: original reason stands.
                 # ── end P0A/FIX-2 ────────────────────────────────────────────
 
                 if pro_tier == "REJECT":
@@ -877,17 +879,20 @@ class APContractSelectionEngine:
             # ── P0A: direct quote revalidation ────────────────────────────
             # When the chain row produced a revalidatable reject (zero/missing
             # bid-ask, bid_below_0.1, NO_CHAIN_DATA, zero liquidity) AND the
-            # market is open, fetch a direct option quote for this exact OCC
-            # symbol and re-run quality checks against the fresh quote.
-            # This restores trade flow for liquid tickers whose chain rows are
-            # stale.  Safety rules (spread, premium, affordability, capital)
-            # are re-enforced against the direct quote — never bypassed.
-            if result is not None and _should_revalidate(result):
+            # market is open AND the per-pass budget allows it, fetch a direct
+            # option quote and re-run quality checks against the fresh quote.
+            # Safety rules (spread, premium, affordability, capital) are
+            # re-enforced against the direct quote — never bypassed.
+            # _p0a_budget is checked before AND decremented after every call
+            # regardless of result, so REJECT_DIRECT_ZERO / REJECT_UNAVAILABLE
+            # consume the budget exactly as PASS does.
+            if result is not None and _should_revalidate(result) and _p0a_budget > 0:
                 _rv = _revalidate_direct(
                     self.data_broker,
                     opt,
                     result,
                 )
+                _p0a_budget -= 1   # always decrement — counts the fetch attempt
                 _rv_action = _rv.get("action")
                 if _rv_action == "PASS" and _rv.get("opt_updated"):
                     # Direct quote was valid.  Re-run quality filter on the
