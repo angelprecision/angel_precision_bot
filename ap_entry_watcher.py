@@ -758,11 +758,24 @@ class APEntryWatcher:
         Never returns sandbox.tradier.com as the quote URL.
         """
         import os as _os
+        _LIVE_QUOTE_URL = "https://api.tradier.com"
         base_url = str(
             _os.getenv("TRADIER_MARKET_DATA_BASE_URL")
             or _os.getenv("TRADIER_DATA_BASE_URL")
-            or "https://api.tradier.com"
+            or _LIVE_QUOTE_URL
         ).rstrip("/")
+        # Sandbox guard: if the resolved URL is sandbox (misconfigured env or
+        # env reset), force to live market data and log a hard error.
+        if "sandbox.tradier.com" in base_url.lower():
+            log.error(
+                "[watcher_quotes] WATCHER_QUOTE_URL_SANDBOX_GUARD_TRIGGERED "
+                "resolved_url=%s — sandbox URL must not be used for watcher "
+                "quote/trigger/stop/invalidation decisions. "
+                "Forcing https://api.tradier.com. "
+                "Set TRADIER_MARKET_DATA_BASE_URL=https://api.tradier.com to silence.",
+                base_url,
+            )
+            base_url = _LIVE_QUOTE_URL
         token = (
             _os.getenv("TRADIER_MARKET_DATA_TOKEN")
             or _os.getenv("TRADIER_DATA_TOKEN")
@@ -2832,12 +2845,26 @@ class APEntryWatcher:
                     timeout=5,
                 )
             else:
-                # No dedicated market-data token available — use broker session
-                # with the resolved (live) base URL. Works when the execution
-                # token also has live market-data access (live-mode clients).
+                _is_paper = str(getattr(self, "mode", "PAPER")).upper() == "PAPER"
+                if _is_paper:
+                    # PAPER + no live market-data token: fail closed.
+                    # broker.session holds sandbox execution credentials;
+                    # using them against api.tradier.com would fail auth.
+                    # Return empty so watcher treats this as quote_unavailable
+                    # and retries later rather than making a broken API call.
+                    log.error(
+                        "[watcher_quotes] PAPER_WATCHER_NO_MARKET_DATA_TOKEN "
+                        "mode=PAPER base_url=%s — watcher quotes cannot run without "
+                        "TRADIER_MARKET_DATA_TOKEN. Returning empty (quote_unavailable). "
+                        "Set TRADIER_MARKET_DATA_TOKEN on Render to fix.",
+                        base_url,
+                    )
+                    return {}
+                # LIVE clients: execution token typically has market-data access.
+                # Use broker.session with the live URL (safe for live mode only).
                 log.warning(
                     "[watcher_quotes] No TRADIER_MARKET_DATA_TOKEN configured — "
-                    "using broker session with %s; paper clients may get stale quotes",
+                    "falling back to live broker session with %s (LIVE mode only).",
                     base_url,
                 )
                 resp = self.broker.session.get(
