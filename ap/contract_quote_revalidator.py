@@ -362,6 +362,7 @@ def final_quote_check_before_submit(
     max_premium: float,
     budget_usd: float,
     is_live: bool,
+    qty: int = 1,
 ) -> dict:
     """
     Final pre-submit direct quote refresh + hard validation gate.
@@ -461,14 +462,18 @@ def final_quote_check_before_submit(
             **qf,
         }
 
+    # FIX 3: validate full order cost (qty contracts) against budget.
+    # execution_cost = execution_price * 100 * qty
+    _qty = max(1, int(qty))
     execution_price = ask_f if is_live else mid
-    execution_cost  = execution_price * 100.0
+    execution_cost  = execution_price * 100.0 * _qty
     if execution_cost > budget_usd:
         return {
             "ok":          False,
             "reason_code": REASON_FINAL_CONTRACT_UNAFFORDABLE,
             "explanation": (
-                f"execution cost ${execution_cost:.2f} > budget ${budget_usd:.2f}"
+                f"order cost ${execution_cost:.2f} "
+                f"({_qty}x${execution_price:.4f}x100) > budget ${budget_usd:.2f}"
             ),
             **qf,
         }
