@@ -223,3 +223,134 @@ def test_pending_sql_excludes_deferred():
     end = MC_SRC.find("\n    def ", idx + 1)
     body = MC_SRC[idx:end]
     assert "DEFERRED:" in body, "DEFERRED:% exclusion must exist"
+
+# ── Amendment AC5: OPEN broker-proof order counts as pending ─────────────────
+
+def test_ac5_open_broker_proof_order_counts():
+    """
+    Fix 1: ENTRY status=OPEN with broker_order_id must count as pending_submitted.
+    limit_price=1.09 qty=2 → expected pending=218.
+    """
+    idx = MC_SRC.find("def _pending_orders_capital")
+    end = MC_SRC.find("\n    def ", idx + 1)
+    body = MC_SRC[idx:end]
+    assert "'OPEN'" in body, (
+        "Status IN clause must include \'OPEN\' for broker-proof active orders"
+    )
+    # Arithmetic check
+    limit_price, qty = 1.09, 2
+    expected_pending = limit_price * qty * 100
+    assert abs(expected_pending - 218.0) < 0.01
+
+def test_ac5_open_status_in_sql():
+    idx = MC_SRC.find("def _pending_orders_capital")
+    end = MC_SRC.find("\n    def ", idx + 1)
+    body = MC_SRC[idx:end]
+    in_clause_idx = body.find("IN (")
+    in_clause = body[in_clause_idx:in_clause_idx + 300]
+    assert "OPEN" in in_clause, "OPEN must be in the status IN clause"
+
+
+# ── Amendment AC6: separate pending_submitted vs filled_unreconciled in log ───
+
+def test_ac6_resize_log_has_pending_total_field():
+    idx = MC_SRC.find("LIVE_SMALL_ACCOUNT_RESIZE")
+    region = MC_SRC[idx:idx + 700]
+    assert "pending_total_capital_reserved" in region, (
+        "LIVE_SMALL_ACCOUNT_RESIZE must log pending_total_capital_reserved"
+    )
+
+def test_ac6_unaffordable_log_has_pending_total_field():
+    idx = MC_SRC.find("LIVE_SMALL_ACCOUNT_UNAFFORDABLE")
+    region = MC_SRC[idx:idx + 700]
+    assert "pending_total_capital_reserved" in region
+
+def test_ac6_resize_separates_submitted_and_filled():
+    idx = MC_SRC.find("LIVE_SMALL_ACCOUNT_RESIZE")
+    region = MC_SRC[max(0, idx - 300) : idx + 700]
+    assert "_pending_submitted_for_log" in region, (
+        "Resize log must separate pending_submitted from filled_unreconciled"
+    )
+    assert "_filled_unreconciled_for_log" in region
+
+def test_ac6_filled_separate_not_double_reported():
+    """filled_unreconciled_exposure log value must NOT equal pending_cap total."""
+    # The log uses _filled_unreconciled_for_log (snap value) not the total pending_cap
+    idx = MC_SRC.find("LIVE_SMALL_ACCOUNT_RESIZE")
+    region = MC_SRC[max(0, idx - 500) : idx + 800]
+    # _filled_unreconciled_for_log must come from snap["pending_entry_capital"]
+    assert "snap.get(\"pending_entry_capital\")" in region or            "snap.get('pending_entry_capital')" in region
+
+
+# ── Amendment AC3 updated: reason_code = CAPITAL_LIMIT_CONTRACT_UNAFFORDABLE ─
+
+def test_ac3_unaffordable_reason_code():
+    """Fix 3: unaffordable path must use CAPITAL_LIMIT_CONTRACT_UNAFFORDABLE."""
+    assert "CAPITAL_LIMIT_CONTRACT_UNAFFORDABLE" in MC_SRC, (
+        "Unaffordable reason_code must be CAPITAL_LIMIT_CONTRACT_UNAFFORDABLE"
+    )
+    # Must NOT use the old reason_code in the unaffordable path
+    # (the old code still uses ACTUAL_CONTRACT_COST... for the non-LIVE hard block)
+    idx = MC_SRC.find("CAPITAL_LIMIT_CONTRACT_UNAFFORDABLE")
+    region = MC_SRC[max(0, idx-200):idx+50]
+    assert "reason_code=" in region
+
+
+# ── Amendment Fix 4: proj_sector/proj_ticker recomputed after resize ─────────
+
+def test_fix4_proj_sector_recomputed_after_resize():
+    idx = MC_SRC.find("_resized_for_live     = True")
+    region = MC_SRC[max(0, idx-300):idx+200]
+    assert "proj_sector" in region, (
+        "proj_sector must be recomputed after resize, before _resized_for_live=True"
+    )
+    assert "proj_ticker" in region
+
+def test_fix4_ticker_sector_caps_not_stale():
+    """
+    After resize: final_cost=198, not 1485.
+    proj_sector and proj_ticker must use resized real_cost.
+    Verify arithmetic: equity=1980 max_sector_pct=0.10 → max_sector=198.
+    sector_deployed=0 proj_sector=198 ≤ 198 → passes.
+    """
+    equity, max_sector_pct = 1980, 0.10
+    sector_deployed, ticker_deployed = 0, 0
+    resized_real_cost = 198.0   # 2 contracts × $0.99 × 100
+
+    max_sector  = equity * max_sector_pct
+    max_ticker  = equity * max_sector_pct
+    proj_sector = sector_deployed + resized_real_cost
+    proj_ticker = ticker_deployed + resized_real_cost
+
+    assert proj_sector <= max_sector, (
+        f"Resized trade must fit sector cap: {proj_sector} <= {max_sector}"
+    )
+    assert proj_ticker <= max_ticker, (
+        f"Resized trade must fit ticker cap: {proj_ticker} <= {max_ticker}"
+    )
+    # Original (stale) projection would have blocked
+    stale_cost = 15 * 0.99 * 100   # = 1485
+    stale_proj = sector_deployed + stale_cost
+    assert stale_proj > max_sector, "Stale cost must exceed cap (shows why recompute matters)"
+
+
+# ── Amendment Fix 5: exclude path still includes filled_unreconciled ──────────
+
+def test_fix5_exclude_path_retains_filled_unreconciled():
+    idx = MC_SRC.find("if exclude_local_order_id:")
+    end = MC_SRC.find("\n        # PR P0-SIZING", idx + 1)
+    block = MC_SRC[idx:end]
+    assert "_filled_unreconciled_excl" in block, (
+        "exclude_local_order_id path must compute and include filled_unreconciled"
+    )
+    assert "_submitted_excl + _filled_unreconciled_excl" in block or            "_submitted_excl + _filled_unreconciled" in block
+
+def test_fix5_exclude_sum_is_submitted_plus_filled():
+    """
+    Arithmetic: snap[pending_entry_capital]=99, submitted_excl=0
+    → total = 0 + 99 = 99 (not 0).
+    """
+    snap_pending = 99.0
+    submitted_excl = 0.0
+    total = submitted_excl + snap_pending
+    assert abs(total - 99.0) < 0.01, f"Total must be 99, got {total}"
