@@ -2597,10 +2597,16 @@ class APMasterControl:
                         f"client_email={client_id} execution_mode=live "
                         f"client_cap=${max_capital:.0f} "
                         f"capital_deployed=${snap['capital_deployed']:.0f} "
-                        f"pending_submitted=${pending_cap:.0f} "
+                        f"pending_submitted_entry_exposure=$"
+                        f"{_bd_unafford.get('pending_submitted_entry_exposure', 0.0):.0f} "
+                        f"filled_unreconciled_exposure=$"
+                        f"{_bd_unafford.get('filled_unreconciled_exposure', 0.0):.0f} "
+                        f"pending_total_capital_reserved=$"
+                        f"{_bd_unafford.get('pending_total_capital_reserved', pending_cap):.0f} "
                         f"remaining=${_remaining_now:.0f} "
                         f"candidate_limit={_candidate_limit:.4f} "
-                        f"computed_qty=0 original_qty={_original_qty} final_qty=0"
+                        f"computed_qty=0 original_qty={_original_qty} final_qty=0 "
+                        f"reason_code=CAPITAL_LIMIT_CONTRACT_UNAFFORDABLE"
                     )
                     _log_revalidation(True, reason)
                     return self._block(
