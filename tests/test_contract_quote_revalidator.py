@@ -417,3 +417,54 @@ def test_reject_reasons_are_distinct():
         REASON_FINAL_CONTRACT_UNAFFORDABLE,
     }
     assert len(codes) == 7, "reason codes must be distinct"
+
+
+# =============================================================================
+# FIX 3 — qty-aware order cost validation
+# =============================================================================
+
+class TestFinalQuoteQtyValidation:
+
+    def _kwargs(self, **over):
+        defaults = dict(
+            max_spread_pct=0.50, min_premium=10.0, max_premium=350.0,
+            budget_usd=500.0, is_live=True,
+        )
+        defaults.update(over)
+        return defaults
+
+    def test_single_contract_within_budget_passes(self):
+        broker = StubBroker({OCC: {"bid": 4.90, "ask": 5.00}})
+        r = final_quote_check_before_submit(broker, OCC, qty=1, **self._kwargs(budget_usd=500.0))
+        assert r["ok"] is True
+
+    def test_multi_contract_total_cost_rejected(self):
+        """qty=2, ask=2.60 -> total = 2 * 2.60 * 100 = 520 > budget=500 -> reject."""
+        broker = StubBroker({OCC: {"bid": 2.55, "ask": 2.60}})
+        r = final_quote_check_before_submit(broker, OCC, qty=2,
+                                            **self._kwargs(budget_usd=500.0, max_premium=600.0))
+        assert r["ok"] is False
+        assert r["reason_code"] == REASON_FINAL_CONTRACT_UNAFFORDABLE
+
+    def test_multi_contract_within_budget_passes(self):
+        """qty=2, ask=2.40 -> total = 2 * 2.40 * 100 = 480 <= budget=500 -> pass."""
+        broker = StubBroker({OCC: {"bid": 2.35, "ask": 2.40}})
+        r = final_quote_check_before_submit(broker, OCC, qty=2,
+                                            **self._kwargs(budget_usd=500.0, max_premium=600.0))
+        assert r["ok"] is True
+
+    def test_qty_default_1_backward_compat(self):
+        """Callers that omit qty still work correctly."""
+        broker = StubBroker({OCC: {"bid": 4.90, "ask": 5.00}})
+        r = final_quote_check_before_submit(broker, OCC, **self._kwargs(budget_usd=500.0))
+        assert r["ok"] is True
+
+
+# =============================================================================
+# P2 — DEFAULT_REVALIDATE_TOP_N is exported
+# =============================================================================
+
+def test_default_revalidate_top_n_exported():
+    from ap.contract_quote_revalidator import DEFAULT_REVALIDATE_TOP_N
+    assert isinstance(DEFAULT_REVALIDATE_TOP_N, int)
+    assert DEFAULT_REVALIDATE_TOP_N > 0
