@@ -984,6 +984,7 @@ class APEntryWatcher:
                 trigger_price, stop_price, target_price,
                 current_underlying, current_bid, current_ask, current_mid,
                 watcher_quote_source, watcher_sandbox_mode, watcher_quote_base_url,
+                quote_age_ms,
                 payload
             ) VALUES (
                 %s, %s, %s, %s, %s,
@@ -992,6 +993,7 @@ class APEntryWatcher:
                 %s, %s, %s,
                 %s, %s, %s, %s,
                 %s, %s, %s,
+                %s,
                 %s::jsonb
             )
         """
@@ -1026,7 +1028,12 @@ class APEntryWatcher:
             _wq_source,
             _wq_sandbox,
             _wq_url,
+            # quote freshness: populated from payload if _build_watcher_audit_payload set it
+            payload.get("quote_age_ms"),
             # full payload JSONB
+            # order_row_id (orders.id bigint) is left NULL here — watcher context
+            # only has local_order_id (text).  order_row_id may be backfilled by
+            # reconciler or analytics query: SELECT id FROM orders WHERE local_order_id=...
             _json_local.dumps(payload, default=str),
         )
 
