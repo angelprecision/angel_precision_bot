@@ -913,15 +913,13 @@ class APEntryWatcher:
     def _insert_watcher_audit_row(
         self, payload: dict, local_order_id: Optional[str] = None
     ) -> None:
-        """Best-effort INSERT into public.watcher_audit for analytics queries.
+        """Best-effort INSERT into public.watcher_decision_audit for analytics.
 
-        Provides a queryable row per watcher event alongside the JSONB snapshot
-        in orders.meta.  If the table does not exist yet (migration pending) or
-        ap.db is unavailable (test / CI), the insert fails silently.
-
-        Key contract: uses the snake_case key names that _build_watcher_audit_payload
-        emits — signal_id, trigger_price, reason_code, etc.  Never swaps to
-        camelCase or no-separator forms.
+        Writes to the NEW watcher_decision_audit table (text client_id, text
+        local_order_id) — NOT the legacy public.watcher_audit (UUID fields).
+        The legacy table stays untouched and unmigrated.
+        orders.meta.watcher_audit remains the primary per-order embedded proof
+        and is written by _persist_watcher_audit (unchanged).
         """
         import json as _json_local  # local import keeps watcher importable without ap.db
         try:
@@ -973,37 +971,26 @@ class APEntryWatcher:
             getattr(self, "order_state_machine", None), "client_id", None
         )
 
+        # Quote identity fields from payload (set by _build_watcher_audit_payload)
+        _wq_source  = payload.get("watcher_quote_source")
+        _wq_sandbox = payload.get("watcher_sandbox_mode")
+        _wq_url     = payload.get("watcher_quote_base_url")
+
         _sql = """
-            INSERT INTO public.watcher_audit (
-                local_order_id, signal_id, client_id,
-                symbol, underlying_price,
-                score, tier, direction, timeframe, pattern,
-                trigger_price, stop_price,
-                current_bid, current_ask, current_mid,
-                arm_price,
-                distance_to_trigger_pct, distance_to_stop_pct,
-                trigger_type, reason_code, raw_reason,
-                arm_condition, stop_condition,
-                rearm_enabled, rearm_only_daily_or_overnight,
-                rearm_window_sec, rearm_min_score,
-                rearm_tolerance_pct, rearm_max_attempts,
-                score_ok, tier_ok, is_rearm_eligible,
-                rearmed, expired, permanently_rejected,
-                full_payload
+            INSERT INTO public.watcher_decision_audit (
+                local_order_id, signal_id, canonical_signal_id, plan_id, client_id,
+                execution_mode, symbol, contract, direction, pattern, timeframe, tier, score,
+                decision, reason_code, raw_reason,
+                trigger_price, stop_price, target_price,
+                current_underlying, current_bid, current_ask, current_mid,
+                watcher_quote_source, watcher_sandbox_mode, watcher_quote_base_url,
+                payload
             ) VALUES (
-                %s, %s, %s,
-                %s, %s,
                 %s, %s, %s, %s, %s,
-                %s, %s,
+                %s, %s, %s, %s, %s, %s, %s, %s,
                 %s, %s, %s,
-                %s,
-                %s, %s,
                 %s, %s, %s,
-                %s, %s,
-                %s, %s,
-                %s, %s,
-                %s, %s,
-                %s, %s, %s,
+                %s, %s, %s, %s,
                 %s, %s, %s,
                 %s::jsonb
             )
@@ -1011,47 +998,35 @@ class APEntryWatcher:
         _params = (
             local_order_id or None,
             payload.get("signal_id") or None,
-            _client_id,
-            # instrument
+            payload.get("canonical_signal_id") or None,
+            payload.get("plan_id") or None,
+            str(_client_id) if _client_id is not None else None,
+            # execution context
+            payload.get("execution_mode") or getattr(self, "mode", None),
             payload.get("symbol"),
-            payload.get("current_underlying") or payload.get("current_mid"),
-            # signal quality
-            _score,
-            payload.get("tier"),
+            payload.get("contract") or payload.get("symbol"),
             payload.get("direction"),
-            payload.get("timeframe"),
             payload.get("pattern"),
+            payload.get("timeframe"),
+            payload.get("tier"),
+            _score,
+            # watcher decision
+            payload.get("trigger_type") or payload.get("decision"),
+            payload.get("reason_code"),
+            payload.get("raw_reason"),
             # prices
             payload.get("trigger_price") or payload.get("signal_entry_price"),
             payload.get("stop_price"),
+            payload.get("target_price"),
+            payload.get("current_underlying") or payload.get("current_mid"),
             payload.get("current_bid"),
             payload.get("current_ask"),
             payload.get("current_mid"),
-            payload.get("arm_price"),
-            payload.get("distance_to_trigger_pct"),
-            payload.get("distance_to_stop_pct"),
-            # watcher decision
-            payload.get("trigger_type"),
-            payload.get("reason_code"),
-            payload.get("raw_reason"),
-            payload.get("arm_condition"),
-            payload.get("stop_condition"),
-            # rearm config snapshot
-            _rearm_enabled,
-            _rearm_daily,
-            _rearm_window,
-            _rearm_min_sc,
-            _rearm_tol,
-            _rearm_max,
-            # eligibility
-            _score_ok,
-            _tier_ok,
-            _eligible,
-            # lifecycle outcome
-            _rearmed,
-            _expired,
-            _perm_reject,
-            # full payload JSONB — evaluated_at uses column DEFAULT NOW()
+            # quote source proof (api.tradier.com after P0 fix)
+            _wq_source,
+            _wq_sandbox,
+            _wq_url,
+            # full payload JSONB
             _json_local.dumps(payload, default=str),
         )
 
@@ -1062,7 +1037,7 @@ class APEntryWatcher:
                     return getattr(_cur, "rowcount", getattr(_c, "rowcount", None))
             _ap_retry(_write)
         except Exception as _exc:
-            log.warning("[watcher_audit_table] insert failed (non-critical): %s", _exc)
+            log.warning("[watcher_decision_audit] insert failed (non-critical): %s", _exc)
 
     def _persist_watcher_audit(
         self, local_order_id: Optional[str], payload: dict
