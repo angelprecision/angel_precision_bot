@@ -50,8 +50,9 @@ from typing import Optional
 # P0A: direct option quote revalidation (do not remove — restores flow for
 # liquid tickers with stale/zero chain data without weakening safety rules).
 from ap.contract_quote_revalidator import (
-    revalidate_with_direct_quote as _revalidate_direct,
+    revalidate_with_direct_quote  as _revalidate_direct,
     should_revalidate             as _should_revalidate,
+    DEFAULT_REVALIDATE_TOP_N,
 )
 
 TICKER_MAX_PREMIUM_PER_CONTRACT = {
@@ -780,6 +781,9 @@ class APContractSelectionEngine:
         survivors  = []
         _rejections: dict = {}
         _pro_tiers:  dict = {"A": 0, "B": 0}
+        # P2: per-selector-pass direct-quote budget so one stale chain cannot
+        # trigger hundreds of Tradier quote fetches.
+        _p0a_budget: int = DEFAULT_REVALIDATE_TOP_N
 
         for opt in chain:
             if _PRO_QUALITY_ENABLED:
@@ -791,6 +795,40 @@ class APContractSelectionEngine:
                     except Exception:
                         _dte = 0
                 pro_tier, pro_reason = _pro_contract_quality(opt, ticker, _dte)
+
+                # ── P0A/FIX-2: direct quote recovery inside pro-quality ───────
+                # When pro_quality would hard-reject for a revalidatable reason
+                # (zero/missing bid-ask, bid_below_0.1) AND the market is open,
+                # attempt a direct option quote fetch and rerun pro_quality on
+                # the patched opt before accepting the reject.
+                if pro_tier == "REJECT" and _should_revalidate(pro_reason) and _p0a_budget > 0:
+                    _rv_pro = _revalidate_direct(
+                        self.data_broker,
+                        opt,
+                        pro_reason,
+                    )
+                    if _rv_pro.get("action") == "PASS" and _rv_pro.get("opt_updated"):
+                        _opt_pro = _rv_pro["opt_updated"]
+                        _p0a_budget -= 1
+                        # Rerun pro_quality with patched bid/ask
+                        pro_tier, pro_reason = _pro_contract_quality(_opt_pro, ticker, _dte)
+                        if pro_tier != "REJECT":
+                            # Pro quality passed on direct quote — use patched opt
+                            opt = _opt_pro
+                            log.info(
+                                "[%s] P0A pro_quality_recovered chain_reason=%s "                                "direct_bid=%.4f direct_ask=%.4f contract=%s",
+                                ticker, _rv_pro["audit"].get("chain_bid", 0),
+                                _rv_pro["audit"].get("direct_bid", 0),
+                                _rv_pro["audit"].get("direct_ask", 0),
+                                opt.get("symbol", "?"),
+                            )
+                        else:
+                            # Direct quote fetched but still fails pro_quality
+                            pass  # fall through to standard reject below
+                    elif _rv_pro.get("action") in ("REJECT_DIRECT_ZERO", "REJECT_UNAVAILABLE"):
+                        pro_reason = _rv_pro.get("reason_code") or pro_reason
+                # ── end P0A/FIX-2 ────────────────────────────────────────────
+
                 if pro_tier == "REJECT":
                     _rejections[pro_reason] = _rejections.get(pro_reason, 0) + 1
                     try:
