@@ -1112,18 +1112,37 @@ def process_signal(broker, client_id: str, signal_payload: dict) -> dict:
         _p0b_enabled = os.getenv("FINAL_QUOTE_CHECK_ENABLED", "true").lower() != "false"
         if _p0b_enabled:
             # FIX 1: use client.get() — client_cfg is not defined in this scope.
-            # FIX 3: pass qty so execution_cost = execution_price * 100 * qty
-            #        is validated against budget_usd (total_cost already equals
-            #        qty * premium * 100 but we re-check with the fresh quote).
-            # PAPER quote truth: for PAPER entries the execution broker may be
-            # sandbox (which returns stale/canned quotes). Use the live-market
-            # data broker (same source as the selector and direct-quote revalidator)
-            # for the final quote check. For LIVE, broker IS the live source.
-            _p0b_quote_broker = (
-                (getattr(broker, "data_broker", None) or broker)
-                if mode == "PAPER"
-                else broker
-            )
+            # FIX 3: pass qty so execution_cost = execution_price * 100 * qty.
+            # PAPER quote truth: fail closed when no live data broker is attached.
+            #   PAPER + data_broker present  → use data_broker for quote truth
+            #   PAPER + no data_broker       → reject with PAPER_FINAL_QUOTE_NO_LIVE_DATA_BROKER
+            #   LIVE                         → use broker (IS the live source)
+            # Order submission always stays on the execution broker regardless.
+            _is_paper_mode = (mode == "PAPER")
+            _p0b_data_broker = getattr(broker, "data_broker", None)
+            if _is_paper_mode and _p0b_data_broker is None:
+                # Fail closed: PAPER account has no live data broker attached.
+                # Using the sandbox broker for final quote truth would return
+                # stale/canned data and defeat the safety gate.
+                release_equity(client_id, reserved_cost)
+                release_symbol_lock(client_id, symbol)
+                reserved = False
+                locked = False
+                log.warning(
+                    "[%s] PAPER_FINAL_QUOTE_NO_LIVE_DATA_BROKER symbol=%s contract=%s",
+                    client_id, symbol, contract,
+                )
+                audit(client_id, "WARNING", "PAPER_FINAL_QUOTE_NO_LIVE_DATA_BROKER", {
+                    "symbol":   symbol,
+                    "contract": contract,
+                    "hint":     "Set TRADIER_DATA_TOKEN to enable live quote truth for PAPER P0B gate",
+                })
+                return {
+                    "ok":    False,
+                    "error": "PAPER_FINAL_QUOTE_NO_LIVE_DATA_BROKER",
+                    "local_order_id": local_order_id,
+                }
+            _p0b_quote_broker = _p0b_data_broker if _is_paper_mode else broker
             _p0b = _final_quote_check(
                 _p0b_quote_broker,
                 contract,
