@@ -26,6 +26,9 @@ from __future__ import annotations
 
 import os
 import time
+from ap.contract_quote_revalidator import (
+    final_quote_check_before_submit as _final_quote_check,
+)
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -1098,6 +1101,77 @@ def process_signal(broker, client_id: str, signal_payload: dict) -> dict:
         # otherwise fall back to the selector ask (back-compat).
         # PR H: this fall-through ONLY fires now when QUOTE_REFRESH_FAIL_OPEN=1.
         submit_limit = float(submit_ask) if (refresh_ok and submit_ask > 0) else float(selector_ask)
+
+        # ── P0B: final direct-quote hard gate before broker submit ────────────
+        # Fetch a fresh direct option quote and enforce spread, premium,
+        # affordability, and capital limits one final time.  This protects
+        # against contracts whose quotes moved adversely between selection
+        # and submission.  Non-blocking on quote-fetch error when
+        # QUOTE_REFRESH_FAIL_OPEN=1 (same policy as the chase-band guard).
+        # Does NOT touch scanner, exits, or any live-capital safety gate.
+        _p0b_enabled = os.getenv("FINAL_QUOTE_CHECK_ENABLED", "true").lower() != "false"
+        if _p0b_enabled:
+            _p0b = _final_quote_check(
+                broker,
+                contract,
+                max_spread_pct=float(os.getenv("MAX_SPREAD_PCT", "0.50")),
+                min_premium=float(getattr(client_cfg, "min_premium", None) or
+                                  os.getenv("MIN_PREMIUM", "10.0")),
+                max_premium=float(getattr(client_cfg, "max_premium", None) or
+                                  os.getenv("MAX_PREMIUM", "350.0")),
+                budget_usd=float(total_cost),
+                is_live=(mode == "LIVE"),
+            )
+            if not _p0b["ok"]:
+                release_equity(client_id, reserved_cost)
+                release_symbol_lock(client_id, symbol)
+                reserved = False
+                locked = False
+                _p0b_reason = _p0b.get("reason_code") or "FINAL_CONTRACT_QUOTE_INVALID"
+                log.warning(
+                    "[%s] P0B_FINAL_QUOTE_GATE_REJECT symbol=%s contract=%s "
+                    "reason=%s bid=%s ask=%s spread_pct=%s",
+                    client_id, symbol, contract,
+                    _p0b_reason,
+                    _p0b.get("final_bid"), _p0b.get("final_ask"),
+                    ("%.3f" % _p0b["spread_pct"]) if _p0b.get("spread_pct") else "N/A",
+                )
+                audit(client_id, "WARNING", "P0B_FINAL_QUOTE_GATE_REJECT", {
+                    "symbol":      symbol,
+                    "contract":    contract,
+                    "reason_code": _p0b_reason,
+                    "explanation": _p0b.get("explanation"),
+                    "final_bid":   _p0b.get("final_bid"),
+                    "final_ask":   _p0b.get("final_ask"),
+                    "final_mid":   _p0b.get("final_mid"),
+                    "spread_pct":  _p0b.get("spread_pct"),
+                    "quote_age_ms": _p0b.get("quote_age_ms"),
+                })
+                return {
+                    "ok":          False,
+                    "error":       _p0b_reason,
+                    "explanation": _p0b.get("explanation"),
+                    "final_bid":   _p0b.get("final_bid"),
+                    "final_ask":   _p0b.get("final_ask"),
+                    "local_order_id": local_order_id,
+                }
+            else:
+                # Use the final-gate ask as submit_limit for precision
+                if _p0b.get("final_ask") and _p0b["final_ask"] > 0:
+                    _p0b_ask = float(_p0b["final_ask"])
+                    if mode == "LIVE":
+                        submit_limit = _p0b_ask
+                    else:
+                        submit_limit = float(_p0b.get("final_mid") or submit_limit)
+                    log.info(
+                        "[%s] P0B_FINAL_QUOTE_VALID symbol=%s contract=%s "
+                        "final_bid=%.4f final_ask=%.4f age_ms=%s",
+                        client_id, symbol, contract,
+                        float(_p0b.get("final_bid") or 0),
+                        _p0b_ask,
+                        _p0b.get("quote_age_ms"),
+                    )
+        # ── end P0B ──────────────────────────────────────────────────────────
 
         # ── QUOTE-DOMAIN AUDIT + PAPER/LIVE EXECUTION SEPARATION ──────────────
         # Record the actual quote source/base_url for selector (data_broker)
