@@ -889,27 +889,41 @@ class APMasterControl:
 
             def _fn():
                 with conn() as c:
+                    # PR P0-SIZING: broker-proof predicate — only count ENTRY
+                    # orders that have actually been submitted to the broker.
+                    # Rows without broker_order_id AND without submitted_ts were
+                    # never dispatched; rejected/failed/watching/deferred rows
+                    # are excluded by the NOT IN terminal clause.
+                    # Cost = reserved_cost first, then limit_price * qty fallback.
+                    # Do NOT use fill-truth cost here — fills belong to deployed
+                    # capital (positions table) or filled_unreconciled_exposure
+                    # (position_manager.snapshot), not to pending submitted orders.
                     c.execute(
                         """
                         SELECT COALESCE(SUM(
-                            CASE
-                                WHEN fill_price IS NOT NULL AND COALESCE(filled_qty, 0) > 0
-                                THEN fill_price * filled_qty * 100
-                                WHEN COALESCE(filled_qty, 0) > 0 AND reserved_cost IS NOT NULL
-                                THEN reserved_cost
-                                ELSE 0
-                            END
-                        ), 0) AS pending_capital
+                            COALESCE(
+                                NULLIF(reserved_cost, 0),
+                                CASE
+                                    WHEN COALESCE(limit_price, 0) > 0
+                                         AND COALESCE(qty, 0) > 0
+                                    THEN limit_price * qty * 100
+                                    ELSE 0
+                                END
+                            )
+                        ), 0) AS pending_submitted_entry_exposure
                         FROM orders
                         WHERE client_id = %s
                           AND kind = 'ENTRY'
-                          AND (
-                            COALESCE(filled_qty, 0) > 0
-                            OR fill_price IS NOT NULL
-                            OR UPPER(COALESCE(status, '')) IN (
-                                'PARTIAL_FILL', 'PARTIALLY_FILLED', 'FILLED', 'OPEN'
-                            )
+                          AND UPPER(COALESCE(status, '')) IN (
+                              'CREATED', 'SUBMITTED', 'ACKNOWLEDGED', 'PENDING', 'OPEN'
                           )
+                          AND (
+                            (broker_order_id IS NOT NULL AND broker_order_id <> '')
+                            OR submitted_ts IS NOT NULL
+                          )
+                          AND COALESCE(filled_qty, 0) = 0
+                          AND fill_price IS NULL
+                          AND UPPER(COALESCE(contract, '')) NOT LIKE 'DEFERRED:%%'
                           AND UPPER(COALESCE(status, '')) NOT IN (
                             'CANCELLED', 'CANCELED', 'REJECTED', 'ERROR',
                             'FAILED', 'CLOSED'
@@ -918,43 +932,7 @@ class APMasterControl:
                         (client_id,) + _exclude_params,
                     )
                     row = c.fetchone()
-                    pending_capital = float((row or {}).get("pending_capital") or 0)
-
-                    # LIVE integrity guard: an active ENTRY order with neither
-                    # reserved_cost nor limit_price has unknown dollar exposure.
-                    # Do not silently count it as $0 in live capital gates.
-                    if self._is_live_mode() and self.pending_capital_fail_closed_live:
-                        # Integrity guard: a fill-truth row (confirmed position)
-                        # with no fill_price and no filled_qty is unknown exposure.
-                        # Only check rows that constitute real positions.
-                        c.execute(
-                            """
-                            SELECT COUNT(*) AS missing_cost
-                            FROM orders
-                            WHERE client_id = %s
-                              AND kind = 'ENTRY'
-                              AND (
-                                COALESCE(filled_qty, 0) > 0
-                                OR fill_price IS NOT NULL
-                                OR UPPER(COALESCE(status, '')) IN (
-                                    'PARTIAL_FILL', 'PARTIALLY_FILLED', 'FILLED', 'OPEN'
-                                )
-                              )
-                              AND UPPER(COALESCE(status, '')) NOT IN (
-                                'CANCELLED', 'CANCELED', 'REJECTED', 'ERROR',
-                                'FAILED', 'CLOSED'
-                              )
-                              AND COALESCE(filled_qty, 0) = 0
-                              AND fill_price IS NULL
-                            """,
-                            (client_id,),
-                        )
-                        missing = int((c.fetchone() or {}).get("missing_cost") or 0)
-                        if missing > 0:
-                            raise RuntimeError(
-                                f"pending_capital_integrity_failure: {missing} active ENTRY order(s) missing reserved_cost and limit_price"
-                            )
-
+                    pending_capital = float((row or {}).get("pending_submitted_entry_exposure") or 0)
                     return pending_capital
 
             return run_with_retry(_fn)
@@ -968,47 +946,39 @@ class APMasterControl:
             )
             return None
 
-    def _pending_capital_from_snapshot_or_db(
+    def _get_pending_capital_breakdown(
         self,
         snap: dict[str, Any],
         client_id: str,
         *,
         exclude_local_order_id: Optional[str] = None,
-    ) -> Optional[float]:
-        """Return pending ENTRY dollar exposure using the strongest available source.
-
-        Prefer APPositionManager.snapshot()["pending_entry_capital"] because it is
-        computed from the same active entry lifecycle states as pending_entries
-        in one consistent snapshot read. Fall back to the local DB query only for
-        older position-manager versions that do not expose that field.
-
-        PR E / FIX-1: when exclude_local_order_id is provided, try the DB
-        path FIRST so the SUM can exclude that specific row exactly. If the
-        DB query fails (returns None), fall back to the snapshot path — the
-        caller (revalidate_exposure) keeps its own LIVE fail-closed gate on
-        a None return, so a snapshot value is safe as a non-None fallback.
+    ) -> Optional[dict]:
         """
-        if exclude_local_order_id:
-            _db_val = self._pending_orders_capital(
-                client_id, exclude_local_order_id=exclude_local_order_id,
-            )
-            if _db_val is not None:
-                return _db_val
-            # DB unavailable: in LIVE we must fail closed (caller handles None).
+        Return a dict with independent pending exposure components.
+
+        Keys:
+          pending_submitted_entry_exposure  — broker-proof unfilled submitted orders
+          filled_unreconciled_exposure      — fill-truth unreconciled fills (snap)
+          pending_total_capital_reserved    — sum of both (use for cap math)
+
+        Returns None on LIVE fail-closed when DB is unavailable.
+        Never derives submitted pending by subtracting from total.
+        Each component comes directly from its authoritative source.
+        """
+        # Component 1: broker-proof submitted-but-unfilled orders
+        pending_submitted = self._pending_orders_capital(
+            client_id, exclude_local_order_id=exclude_local_order_id,
+        )
+        if pending_submitted is None:
             if self._is_live_mode() and self.pending_capital_fail_closed_live:
                 return None
-            # PAPER fallback: use the snapshot value (no exclusion possible at
-            # the snapshot layer, so we accept the small overcount — which
-            # fails closed for over-budget signals, the safer direction).
-            if isinstance(snap, dict) and snap.get("pending_entry_capital") is not None:
-                try:
-                    return float(snap.get("pending_entry_capital") or 0.0)
-                except Exception:
-                    return None
-            return None
+            pending_submitted = 0.0
+
+        # Component 2: fill-truth unreconciled fills (position_manager snapshot)
+        filled_unreconciled = 0.0
         if isinstance(snap, dict) and snap.get("pending_entry_capital") is not None:
             try:
-                return float(snap.get("pending_entry_capital") or 0.0)
+                filled_unreconciled = float(snap.get("pending_entry_capital") or 0.0)
             except Exception as e:
                 self._alert_degraded(
                     "SNAPSHOT_PENDING_ENTRY_CAPITAL_INVALID",
@@ -1018,7 +988,32 @@ class APMasterControl:
                 )
                 if self._is_live_mode() and self.pending_capital_fail_closed_live:
                     return None
-        return self._pending_orders_capital(client_id)
+
+        return {
+            "pending_submitted_entry_exposure": pending_submitted,
+            "filled_unreconciled_exposure":     filled_unreconciled,
+            "pending_total_capital_reserved":   pending_submitted + filled_unreconciled,
+        }
+
+    def _pending_capital_from_snapshot_or_db(
+        self,
+        snap: dict[str, Any],
+        client_id: str,
+        *,
+        exclude_local_order_id: Optional[str] = None,
+    ) -> Optional[float]:
+        """Return total pending ENTRY dollar exposure (for capital-gate math).
+
+        Thin wrapper over _get_pending_capital_breakdown that preserves the
+        float-returning contract expected by all existing callers.
+        Returns None on LIVE fail-closed when DB is unavailable.
+        """
+        bd = self._get_pending_capital_breakdown(
+            snap, client_id, exclude_local_order_id=exclude_local_order_id,
+        )
+        if bd is None:
+            return None
+        return bd["pending_total_capital_reserved"]
 
     def _ticker_capital_deployed(self, positions: list, ticker: str) -> float:
         total = 0.0
@@ -1355,10 +1350,31 @@ class APMasterControl:
             estimated_contracts_pre = 1 if bootstrap_mode else 0
             estimated_new_cost_pre = 0.0   # unknown until selector runs
             if remaining_capital_for_this_trade <= 0.0:
+                _bd_eval = self._get_pending_capital_breakdown(snap, client_id) or {}
+                log.warning(
+                    "[%s] LIVE_SMALL_ACCOUNT_UNAFFORDABLE "
+                    "client_email=%s execution_mode=%s client_cap=%.0f "
+                    "capital_deployed=%.0f pending_submitted_entry_exposure=%.0f "
+                    "filled_unreconciled_exposure=%.0f "
+                    "pending_total_capital_reserved=%.0f "
+                    "remaining_capital=%.0f "
+                    "candidate_limit=N/A computed_qty=0 original_qty=N/A final_qty=0 "
+                    "reason=capital_limit_no_remaining",
+                    ticker, client_id, current_mode,
+                    max_capital,
+                    float(snap.get("capital_deployed", 0)),
+                    _bd_eval.get("pending_submitted_entry_exposure", 0.0),
+                    _bd_eval.get("filled_unreconciled_exposure", 0.0),
+                    _bd_eval.get("pending_total_capital_reserved", pending_capital_real),
+                    remaining_capital_for_this_trade,
+                )
                 return self._block(
                     signal_id, ticker, client_id, "blocked_risk",
-                    f"capital_limit_no_remaining (deployed=${snap['capital_deployed']:.0f} "
-                    f"pending=${pending_capital_real:.0f} cap=${max_capital:.0f})",
+                    f"capital_limit_no_remaining "
+                    f"client_cap=${max_capital:.0f} "
+                    f"deployed=${snap['capital_deployed']:.0f} "
+                    f"pending_total=${pending_capital_real:.0f} "
+                    f"remaining=${remaining_capital_for_this_trade:.0f}",
                 )
         else:
             # PAPER non-bootstrap: keep the existing static-estimate
@@ -2513,23 +2529,105 @@ class APMasterControl:
             )
 
         if proj_total > max_capital:
-            # PR p0/bootstrap-affordable-selection (2026-06-05): canonical
-            # reason code per spec rule (6). This is the LAST gate before
-            # broker submission; if we land here, the selector returned a
-            # contract whose real ask exceeds the client's remaining cap.
-            reason = f"capital_limit: ${proj_total:.0f} > ${max_capital:.0f}"
-            _log_revalidation(True, reason)
-            return self._block(
-                signal_id,
-                ticker,
-                client_id,
-                "blocked_risk",
-                f"ACTUAL_CONTRACT_COST_EXCEEDS_CLIENT_CAPITAL_LIMIT "
-                f"(${proj_total:.0f} > ${max_capital:.0f} | "
-                f"deployed=${snap['capital_deployed']:.0f} pending=${pending_cap:.0f} "
-                f"real_cost=${real_cost:.0f})",
-                reason_code="ACTUAL_CONTRACT_COST_EXCEEDS_CLIENT_CAPITAL_LIMIT",
-            )
+            # PR P0-SIZING: for LIVE non-bootstrap clients, try to resize
+            # the order quantity down before hard-blocking. A small live
+            # account should be able to trade 1 affordable contract even
+            # when the paper/global quantity would exceed the cap.
+            _resized_for_live = False
+            if self._is_live_mode() and not _bootstrap_now and plan.contracts > 0:
+                _original_qty    = plan.contracts
+                _limit_price_pc  = real_cost / plan.contracts   # cost per contract (already × 100)
+                _remaining_now   = max(0.0, max_capital - snap["capital_deployed"] - pending_cap)
+                _computed_qty    = (
+                    int(_remaining_now // _limit_price_pc)
+                    if _limit_price_pc > 0 else 0
+                )
+                _candidate_limit = _limit_price_pc / 100.0       # option premium per share
+
+                if _computed_qty >= 1:
+                    # Resize is viable — adjust plan before continuing
+                    _final_qty            = min(_original_qty, _computed_qty)
+                    plan.contracts        = _final_qty
+                    plan.max_position_usd = _final_qty * _limit_price_pc
+                    real_cost             = plan.max_position_usd
+                    proj_total            = snap["capital_deployed"] + pending_cap + real_cost
+                    # Recompute sector/ticker projections with resized real_cost
+                    # so downstream cap checks don't use the original paper qty cost.
+                    proj_sector           = sector_deployed + real_cost
+                    proj_ticker           = ticker_deployed + real_cost
+                    _resized_for_live     = True
+                    _bd_resize = self._get_pending_capital_breakdown(snap, client_id) or {}
+                    log.info(
+                        "[%s] LIVE_SMALL_ACCOUNT_RESIZE "
+                        "client_email=%s execution_mode=live client_cap=%.0f "
+                        "capital_deployed=%.0f pending_submitted_entry_exposure=%.0f "
+                        "filled_unreconciled_exposure=%.0f "
+                        "pending_total_capital_reserved=%.0f "
+                        "remaining_capital=%.0f "
+                        "candidate_limit=%.4f computed_qty=%d original_qty=%d "
+                        "final_qty=%d resized_for_small_live=true",
+                        ticker, client_id, max_capital,
+                        float(snap.get("capital_deployed", 0)),
+                        _bd_resize.get("pending_submitted_entry_exposure", 0.0),
+                        _bd_resize.get("filled_unreconciled_exposure", 0.0),
+                        _bd_resize.get("pending_total_capital_reserved", pending_cap),
+                        _remaining_now, _candidate_limit,
+                        _computed_qty, _original_qty, _final_qty,
+                    )
+                else:
+                    _bd_unafford = self._get_pending_capital_breakdown(snap, client_id) or {}
+                    log.warning(
+                        "[%s] LIVE_SMALL_ACCOUNT_UNAFFORDABLE "
+                        "client_email=%s execution_mode=live client_cap=%.0f "
+                        "capital_deployed=%.0f pending_submitted_entry_exposure=%.0f "
+                        "filled_unreconciled_exposure=%.0f "
+                        "pending_total_capital_reserved=%.0f "
+                        "remaining_capital=%.0f "
+                        "candidate_limit=%.4f computed_qty=0 original_qty=%d "
+                        "final_qty=0 reason=capital_limit_contract_unaffordable",
+                        ticker, client_id, max_capital,
+                        float(snap.get("capital_deployed", 0)),
+                        _bd_unafford.get("pending_submitted_entry_exposure", 0.0),
+                        _bd_unafford.get("filled_unreconciled_exposure", 0.0),
+                        _bd_unafford.get("pending_total_capital_reserved", pending_cap),
+                        _remaining_now, _candidate_limit, _original_qty,
+                    )
+                    reason = (
+                        f"capital_limit_contract_unaffordable "
+                        f"client_email={client_id} execution_mode=live "
+                        f"client_cap=${max_capital:.0f} "
+                        f"capital_deployed=${snap['capital_deployed']:.0f} "
+                        f"pending_submitted_entry_exposure=$"
+                        f"{_bd_unafford.get('pending_submitted_entry_exposure', 0.0):.0f} "
+                        f"filled_unreconciled_exposure=$"
+                        f"{_bd_unafford.get('filled_unreconciled_exposure', 0.0):.0f} "
+                        f"pending_total_capital_reserved=$"
+                        f"{_bd_unafford.get('pending_total_capital_reserved', pending_cap):.0f} "
+                        f"remaining=${_remaining_now:.0f} "
+                        f"candidate_limit={_candidate_limit:.4f} "
+                        f"computed_qty=0 original_qty={_original_qty} final_qty=0 "
+                        f"reason_code=CAPITAL_LIMIT_CONTRACT_UNAFFORDABLE"
+                    )
+                    _log_revalidation(True, reason)
+                    return self._block(
+                        signal_id, ticker, client_id, "blocked_risk", reason,
+                        reason_code="CAPITAL_LIMIT_CONTRACT_UNAFFORDABLE",
+                    )
+
+            if proj_total > max_capital and not _resized_for_live:
+                reason = f"capital_limit: ${proj_total:.0f} > ${max_capital:.0f}"
+                _log_revalidation(True, reason)
+                return self._block(
+                    signal_id,
+                    ticker,
+                    client_id,
+                    "blocked_risk",
+                    f"ACTUAL_CONTRACT_COST_EXCEEDS_CLIENT_CAPITAL_LIMIT "
+                    f"(${proj_total:.0f} > ${max_capital:.0f} | "
+                    f"deployed=${snap['capital_deployed']:.0f} pending=${pending_cap:.0f} "
+                    f"real_cost=${real_cost:.0f})",
+                    reason_code="ACTUAL_CONTRACT_COST_EXCEEDS_CLIENT_CAPITAL_LIMIT",
+                )
 
         if proj_sector > max_sector:
             reason = f"sector_cap_{sector}: ${proj_sector:.0f} > ${max_sector:.0f}"
