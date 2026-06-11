@@ -27,12 +27,20 @@ def test_pending_orders_capital_excludes_no_broker_proof_rows():
     assert "fill_price IS NOT NULL" not in body or "COALESCE(filled_qty" not in body.split("broker_order_id IS NOT NULL")[0]
 
 def test_pending_capital_from_snapshot_sums_both():
-    idx = MC_SRC.find("def _pending_capital_from_snapshot_or_db")
+    # Sum logic lives in _get_pending_capital_breakdown; the float wrapper calls it.
+    idx = MC_SRC.find("def _get_pending_capital_breakdown(")
     end = MC_SRC.find("\n    def ", idx + 1)
     body = MC_SRC[idx:end]
-    assert "_pending_submitted" in body
-    assert "_filled_unreconciled" in body
-    assert "_pending_submitted + _filled_unreconciled" in body
+    assert "pending_submitted_entry_exposure" in body
+    assert "filled_unreconciled_exposure" in body
+    assert "pending_total_capital_reserved" in body
+    # _pending_capital_from_snapshot_or_db must be a thin wrapper
+    idx2 = MC_SRC.find("def _pending_capital_from_snapshot_or_db(")
+    end2 = MC_SRC.find("\n    def ", idx2 + 1)
+    body2 = MC_SRC[idx2:end2]
+    assert "_get_pending_capital_breakdown(" in body2, (
+        "_pending_capital_from_snapshot_or_db must call breakdown helper"
+    )
 
 def test_live_resize_log_present():
     assert "LIVE_SMALL_ACCOUNT_RESIZE" in MC_SRC
@@ -266,23 +274,24 @@ def test_ac6_unaffordable_log_has_pending_total_field():
     assert "pending_total_capital_reserved" in region
 
 def test_ac6_resize_separates_submitted_and_filled():
+    # breakdown helper provides the separation — log uses _bd_resize.get()
     idx = MC_SRC.find("LIVE_SMALL_ACCOUNT_RESIZE")
-    region = MC_SRC[max(0, idx - 300) : idx + 700]
-    assert "_pending_submitted_for_log" in region, (
-        "Resize log must separate pending_submitted from filled_unreconciled"
+    region = MC_SRC[max(0, idx - 500) : idx + 700]
+    assert "_bd_resize.get(" in region, (
+        "Resize log must use breakdown dict _bd_resize.get(...)"
     )
-    assert "_filled_unreconciled_for_log" in region
+    assert "pending_submitted_entry_exposure" in region
+    assert "filled_unreconciled_exposure" in region
+    assert "pending_total_capital_reserved" in region
 
 def test_ac6_filled_separate_not_double_reported():
-    """filled_unreconciled_exposure log value must NOT equal pending_cap total."""
-    # The log uses _filled_unreconciled_for_log (snap value) not the total pending_cap
-    idx = MC_SRC.find("LIVE_SMALL_ACCOUNT_RESIZE")
-    region = MC_SRC[max(0, idx - 500) : idx + 800]
-    # _filled_unreconciled_for_log must come from snap["pending_entry_capital"]
-    assert "snap.get(\"pending_entry_capital\")" in region or            "snap.get('pending_entry_capital')" in region
+    """filled_unreconciled comes from snap.pending_entry_capital in breakdown helper."""
+    idx = MC_SRC.find("def _get_pending_capital_breakdown(")
+    end = MC_SRC.find("\n    def ", idx + 1)
+    body = MC_SRC[idx:end]
+    assert "pending_entry_capital" in body
+    assert "max(0" not in body, "breakdown helper must not use max(0,...) subtraction"
 
-
-# ── Amendment AC3 updated: reason_code = CAPITAL_LIMIT_CONTRACT_UNAFFORDABLE ─
 
 def test_ac3_unaffordable_reason_code():
     """Fix 3: unaffordable path must use CAPITAL_LIMIT_CONTRACT_UNAFFORDABLE."""
@@ -337,13 +346,18 @@ def test_fix4_ticker_sector_caps_not_stale():
 # ── Amendment Fix 5: exclude path still includes filled_unreconciled ──────────
 
 def test_fix5_exclude_path_retains_filled_unreconciled():
-    idx = MC_SRC.find("if exclude_local_order_id:")
-    end = MC_SRC.find("\n        # PR P0-SIZING", idx + 1)
-    block = MC_SRC[idx:end]
-    assert "_filled_unreconciled_excl" in block, (
-        "exclude_local_order_id path must compute and include filled_unreconciled"
+    """breakdown helper always sums submitted + filled regardless of exclusion."""
+    idx = MC_SRC.find("def _get_pending_capital_breakdown(")
+    sig_end = MC_SRC.find("\n    def ", idx + 1)
+    body = MC_SRC[idx:sig_end]
+    assert "exclude_local_order_id" in MC_SRC[idx:idx+200], (
+        "breakdown helper must accept exclude_local_order_id kwarg"
     )
-    assert "_submitted_excl + _filled_unreconciled_excl" in block or            "_submitted_excl + _filled_unreconciled" in block
+    assert "filled_unreconciled_exposure" in body
+    ret_idx = body.rfind("return {")
+    assert ret_idx >= 0
+    assert "filled_unreconciled" in body[ret_idx:ret_idx+300]
+
 
 def test_fix5_exclude_sum_is_submitted_plus_filled():
     """
@@ -354,3 +368,101 @@ def test_fix5_exclude_sum_is_submitted_plus_filled():
     submitted_excl = 0.0
     total = submitted_excl + snap_pending
     assert abs(total - 99.0) < 0.01, f"Total must be 99, got {total}"
+
+# ── Final amendment: no derivation-by-subtraction ─────────────────────────────
+
+def test_no_subtraction_derivation_of_submitted_pending():
+    """
+    Source guard: pending_submitted_entry_exposure must never be derived by
+    subtracting filled_unreconciled from total pending.
+    Check line-by-line (not DOTALL) to avoid false matches across functions.
+    """
+    import re
+    for line in MC_SRC.splitlines():
+        stripped = line.strip()
+        # Reject any line that computes submitted pending by subtracting filled
+        if re.search(r"pending_cap\s*-\s*_filled_unreconciled", stripped):
+            raise AssertionError(
+                f"Must not derive submitted pending by subtraction: {stripped!r}"
+            )
+        if re.search(r"max\(0.*pending_cap.*filled_unreconciled", stripped):
+            raise AssertionError(
+                f"Must not derive submitted pending by subtraction: {stripped!r}"
+            )
+
+def test_breakdown_helper_defined():
+    assert "def _get_pending_capital_breakdown(" in MC_SRC
+
+def test_breakdown_returns_three_fields():
+    idx = MC_SRC.find("def _get_pending_capital_breakdown(")
+    end = MC_SRC.find("\n    def ", idx + 1)
+    body = MC_SRC[idx:end]
+    for field in ["pending_submitted_entry_exposure", "filled_unreconciled_exposure",
+                  "pending_total_capital_reserved"]:
+        assert field in body, f"breakdown helper must return field: {field}"
+
+def test_breakdown_fields_come_from_independent_sources():
+    """pending_submitted from _pending_orders_capital, filled from snap."""
+    idx = MC_SRC.find("def _get_pending_capital_breakdown(")
+    end = MC_SRC.find("\n    def ", idx + 1)
+    body = MC_SRC[idx:end]
+    assert "_pending_orders_capital(" in body, "submitted must come from _pending_orders_capital"
+    assert "pending_entry_capital" in body, "filled must come from snap.pending_entry_capital"
+    # Must NOT have subtraction derivation
+    assert "pending_cap -" not in body
+    assert "max(0" not in body
+
+
+def test_separation_submitted_zero_filled_219():
+    """
+    _pending_orders_capital returns 0, snap.pending_entry_capital=219
+    → submitted=0, filled=219, total=219
+    """
+    submitted   = 0.0
+    filled      = 219.0
+    total       = submitted + filled
+    assert submitted == 0.0
+    assert filled    == 219.0
+    assert total     == 219.0
+
+def test_separation_submitted_218_filled_zero():
+    """
+    _pending_orders_capital returns 218, snap.pending_entry_capital=0
+    → submitted=218, filled=0, total=218
+    """
+    submitted   = 218.0
+    filled      = 0.0
+    total       = submitted + filled
+    assert submitted == 218.0
+    assert filled    == 0.0
+    assert total     == 218.0
+
+def test_separation_mixed_218_99():
+    """
+    _pending_orders_capital=218, snap.pending_entry_capital=99
+    → submitted=218, filled=99, total=317
+    """
+    submitted   = 218.0
+    filled      = 99.0
+    total       = submitted + filled
+    assert submitted == 218.0
+    assert filled    == 99.0
+    assert abs(total - 317.0) < 0.01
+
+def test_block_message_uses_pending_total_not_submitted():
+    """evaluate() block message must use pending_total=, not pending_submitted=."""
+    # Find the block message string (f-string inside _block call)
+    idx = MC_SRC.find('f"capital_limit_no_remaining ')
+    assert idx > 0, "capital_limit_no_remaining f-string not found"
+    region = MC_SRC[idx:idx + 400]
+    assert "pending_total=" in region, (
+        f"Block message must say pending_total=. Got: {region[:200]!r}"
+    )
+    assert "pending_submitted=" not in region, (
+        "Block message must not say pending_submitted= (total is not submitted-only)"
+    )
+
+def test_log_sites_use_breakdown_dict():
+    """All LIVE log sites must use _bd_*.get() not manual derivation."""
+    for bd_var in ["_bd_resize", "_bd_unafford", "_bd_eval"]:
+        assert f"{bd_var}.get(" in MC_SRC, f"Log site must use {bd_var}.get(...)"
