@@ -1111,15 +1111,20 @@ def process_signal(broker, client_id: str, signal_payload: dict) -> dict:
         # Does NOT touch scanner, exits, or any live-capital safety gate.
         _p0b_enabled = os.getenv("FINAL_QUOTE_CHECK_ENABLED", "true").lower() != "false"
         if _p0b_enabled:
+            # FIX 1: use client.get() — client_cfg is not defined in this scope.
+            # FIX 3: pass qty so execution_cost = execution_price * 100 * qty
+            #        is validated against budget_usd (total_cost already equals
+            #        qty * premium * 100 but we re-check with the fresh quote).
             _p0b = _final_quote_check(
                 broker,
                 contract,
                 max_spread_pct=float(os.getenv("MAX_SPREAD_PCT", "0.50")),
-                min_premium=float(getattr(client_cfg, "min_premium", None) or
+                min_premium=float(client.get("min_premium") or
                                   os.getenv("MIN_PREMIUM", "10.0")),
-                max_premium=float(getattr(client_cfg, "max_premium", None) or
+                max_premium=float(client.get("max_premium") or
                                   os.getenv("MAX_PREMIUM", "350.0")),
                 budget_usd=float(total_cost),
+                qty=int(qty),
                 is_live=(mode == "LIVE"),
             )
             if not _p0b["ok"]:
