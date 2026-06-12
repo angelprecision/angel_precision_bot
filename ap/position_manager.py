@@ -105,24 +105,91 @@ def _filled_entry_row_cost(row: dict) -> float:
     return 0.0
 
 
-def _summarize_fill_truth_rows(fill_rows: list[dict], open_position_ids: set[str]) -> dict[str, float | int]:
-    normalized_open_ids = {
-        str(position_id).strip()
-        for position_id in (open_position_ids or set())
-        if str(position_id).strip()
+def _normalize_match_value(value, *, uppercase: bool = False) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    return text.upper() if uppercase else text.lower()
+
+
+def _order_identifier(row: dict) -> str:
+    for key in ("local_order_id", "broker_order_id", "id", "signal_id", "plan_id", "contract"):
+        value = str(row.get(key) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _active_position_match_indexes(active_positions: list[dict]) -> dict[str, dict[str, dict]]:
+    indexes = {
+        "position_id": {},
+        "broker_order_id": {},
+        "local_order_id": {},
+        "signal_id": {},
+        "plan_id": {},
+        "contract": {},
     }
+    for position in active_positions or []:
+        normalized_pairs = (
+            ("position_id", _normalize_match_value(position.get("id"))),
+            ("broker_order_id", _normalize_match_value(position.get("broker_order_id"))),
+            ("local_order_id", _normalize_match_value(position.get("local_order_id"))),
+            ("signal_id", _normalize_match_value(position.get("signal_id"))),
+            ("plan_id", _normalize_match_value(position.get("plan_id"))),
+            ("contract", _normalize_match_value(position.get("contract"), uppercase=True)),
+        )
+        for key, normalized_value in normalized_pairs:
+            if normalized_value and normalized_value not in indexes[key]:
+                indexes[key][normalized_value] = position
+    return indexes
+
+
+def _match_fill_row_to_active_position(fill_row: dict, active_position_indexes: dict[str, dict[str, dict]]) -> tuple[dict | None, str]:
+    match_order = (
+        ("position_id", _normalize_match_value(fill_row.get("position_id"))),
+        ("broker_order_id", _normalize_match_value(fill_row.get("broker_order_id"))),
+        ("local_order_id", _normalize_match_value(fill_row.get("local_order_id"))),
+        ("signal_id", _normalize_match_value(fill_row.get("signal_id"))),
+        ("plan_id", _normalize_match_value(fill_row.get("plan_id"))),
+        ("contract", _normalize_match_value(fill_row.get("contract"), uppercase=True)),
+    )
+    for match_key, match_value in match_order:
+        if not match_value:
+            continue
+        matched_position = active_position_indexes.get(match_key, {}).get(match_value)
+        if matched_position:
+            return matched_position, match_key
+    return None, ""
+
+
+def _summarize_fill_truth_rows(fill_rows: list[dict], active_positions: list[dict]) -> dict[str, float | int | list]:
+    active_position_indexes = _active_position_match_indexes(active_positions or [])
     filled_unreconciled_entry_capital = 0.0
     ignored_already_reconciled_fill_capital = 0.0
+    ignored_already_reconciled_order_ids: list[str] = []
+    ignored_reconciled_match_keys: list[str] = []
     pending_entries = 0
     filled_unreconciled_calls = 0
     filled_unreconciled_puts = 0
 
     for row in fill_rows or []:
         row_cost = _filled_entry_row_cost(row)
-        position_id = str(row.get("position_id") or "").strip()
-        if position_id:
-            if position_id in normalized_open_ids:
-                ignored_already_reconciled_fill_capital += row_cost
+        matched_position, match_key = _match_fill_row_to_active_position(row, active_position_indexes)
+        if matched_position:
+            ignored_already_reconciled_fill_capital += row_cost
+            order_id = _order_identifier(row)
+            if order_id:
+                ignored_already_reconciled_order_ids.append(order_id)
+            matched_position_id = str(matched_position.get("id") or "").strip()
+            if match_key:
+                if order_id:
+                    ignored_reconciled_match_keys.append(
+                        f"{order_id}:{match_key}:{matched_position_id or 'active_position'}"
+                    )
+                else:
+                    ignored_reconciled_match_keys.append(
+                        f"{match_key}:{matched_position_id or 'active_position'}"
+                    )
             continue
 
         pending_entries += 1
@@ -140,6 +207,8 @@ def _summarize_fill_truth_rows(fill_rows: list[dict], open_position_ids: set[str
         "filled_unreconciled_puts": filled_unreconciled_puts,
         "filled_unreconciled_entry_capital": filled_unreconciled_entry_capital,
         "ignored_already_reconciled_fill_capital": ignored_already_reconciled_fill_capital,
+        "ignored_already_reconciled_order_ids": ignored_already_reconciled_order_ids,
+        "ignored_reconciled_match_keys": ignored_reconciled_match_keys,
     }
 
 
@@ -1456,7 +1525,13 @@ class APPositionManager:
                     c.execute(
                         f"""
                         SELECT
+                            id,
                             position_id,
+                            broker_order_id,
+                            local_order_id,
+                            signal_id,
+                            plan_id,
+                            contract,
                             direction,
                             fill_price,
                             filled_qty,
@@ -1483,10 +1558,22 @@ class APPositionManager:
                     _fill_rows = c.fetchall() or []
                     _fill_summary = _summarize_fill_truth_rows(
                         _fill_rows,
-                        set(open_position_ids),
+                        active,
+                    )
+                    pending_entries = int(_fill_summary.get("pending_entries") or 0)
+                    filled_unreconciled_calls = int(_fill_summary.get("filled_unreconciled_calls") or 0)
+                    filled_unreconciled_puts = int(_fill_summary.get("filled_unreconciled_puts") or 0)
+                    filled_unreconciled_entry_capital = float(
+                        _fill_summary.get("filled_unreconciled_entry_capital") or 0.0
                     )
                     ignored_already_reconciled_fill_capital = float(
                         _fill_summary.get("ignored_already_reconciled_fill_capital") or 0.0
+                    )
+                    ignored_already_reconciled_order_ids = list(
+                        _fill_summary.get("ignored_already_reconciled_order_ids") or []
+                    )
+                    ignored_reconciled_match_keys = list(
+                        _fill_summary.get("ignored_reconciled_match_keys") or []
                     )
                 except Exception as _fill_summary_err:
                     log.warning(
@@ -1495,6 +1582,8 @@ class APPositionManager:
                         _fill_summary_err,
                     )
                     ignored_already_reconciled_fill_capital = 0.0
+                    ignored_already_reconciled_order_ids = []
+                    ignored_reconciled_match_keys = []
 
                 pending_entry_capital = filled_unreconciled_entry_capital
 
@@ -1520,6 +1609,8 @@ class APPositionManager:
                     "entry_attempt_lock_count":    entry_attempt_lock_count,
                     "entry_attempt_reserved_cost": entry_attempt_reserved_cost,
                     "ignored_already_reconciled_fill_capital": ignored_already_reconciled_fill_capital,
+                    "ignored_already_reconciled_order_ids": ignored_already_reconciled_order_ids,
+                    "ignored_reconciled_match_keys": ignored_reconciled_match_keys,
                     "watcher_count":      watcher_count,
                     "pending_exits":      pending_exits,
                     "trades_today":       int(summary.get("trades_today") or 0),

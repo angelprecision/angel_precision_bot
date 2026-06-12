@@ -1154,6 +1154,12 @@ class APMasterControl:
             "ignored_already_reconciled_fill_capital": float(
                 (snap or {}).get("ignored_already_reconciled_fill_capital") or 0.0
             ),
+            "ignored_already_reconciled_order_ids": list(
+                (snap or {}).get("ignored_already_reconciled_order_ids") or []
+            ),
+            "ignored_reconciled_match_keys": list(
+                (snap or {}).get("ignored_reconciled_match_keys") or []
+            ),
             "capital_deployed": float((snap or {}).get("capital_deployed") or 0.0),
             "position_capital_deployed": float(
                 (snap or {}).get("position_capital_deployed")
@@ -1179,6 +1185,7 @@ class APMasterControl:
             "pending_submitted_entry_exposure=%.0f filled_unreconciled_entry_capital=%.0f "
             "ignored_already_reconciled_fill_capital=%.0f "
             "counted_order_ids=%s ignored_order_ids_by_status=%s "
+            "ignored_already_reconciled_order_ids=%s ignored_reconciled_match_keys=%s "
             "open_position_ids=%s runtime_execution_mode=%s",
             ticker,
             float(breakdown.get("capital_deployed", 0.0) or 0.0),
@@ -1188,6 +1195,8 @@ class APMasterControl:
             float(breakdown.get("ignored_already_reconciled_fill_capital", 0.0) or 0.0),
             breakdown.get("counted_order_ids", []),
             breakdown.get("ignored_order_ids_by_status", {}),
+            breakdown.get("ignored_already_reconciled_order_ids", []),
+            breakdown.get("ignored_reconciled_match_keys", []),
             breakdown.get("open_position_ids", []),
             breakdown.get("runtime_execution_mode"),
         )
@@ -1622,6 +1631,8 @@ class APMasterControl:
                     "ignored_already_reconciled_fill_capital": float(
                         _bd_eval.get("ignored_already_reconciled_fill_capital", 0.0)
                     ),
+                    "ignored_already_reconciled_order_ids":   _bd_eval.get("ignored_already_reconciled_order_ids", []),
+                    "ignored_reconciled_match_keys":          _bd_eval.get("ignored_reconciled_match_keys", []),
                     "remaining_capital":                  float(remaining_capital_for_this_trade),
                     "counted_order_ids":                  _bd_eval.get("counted_order_ids", []),
                     "counted_order_statuses":             _bd_eval.get("counted_order_statuses", []),
@@ -2478,6 +2489,8 @@ class APMasterControl:
             "filled_unreconciled_calls":   0,
             "filled_unreconciled_puts":    0,
             "ignored_already_reconciled_fill_capital": 0.0,
+            "ignored_already_reconciled_order_ids": [],
+            "ignored_reconciled_match_keys": [],
             "watcher_count":  0,
             "pending_exits":  0,
             "trades_today": 0,
@@ -2535,6 +2548,8 @@ class APMasterControl:
                 snap.setdefault("filled_unreconciled_calls",   0)
                 snap.setdefault("filled_unreconciled_puts",    0)
                 snap.setdefault("ignored_already_reconciled_fill_capital", 0.0)
+                snap.setdefault("ignored_already_reconciled_order_ids", [])
+                snap.setdefault("ignored_reconciled_match_keys", [])
                 snap.setdefault("watcher_count",  0)
                 snap.setdefault("pending_exits",  0)
                 snap.setdefault("trades_today", 0)

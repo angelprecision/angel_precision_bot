@@ -64,6 +64,8 @@ def test_snapshot_exposes_split_capital_truth_fields():
         "entry_attempt_reserved_cost",
         "filled_unreconciled_entry_capital",
         "ignored_already_reconciled_fill_capital",
+        "ignored_already_reconciled_order_ids",
+        "ignored_reconciled_match_keys",
         "open_position_ids",
     ]:
         assert field in PM_SRC, f"snapshot must expose {field}"
@@ -81,49 +83,87 @@ def test_capital_breakdown_proof_log_has_required_fields():
         "ignored_already_reconciled_fill_capital",
         "counted_order_ids",
         "ignored_order_ids_by_status",
+        "ignored_already_reconciled_order_ids",
+        "ignored_reconciled_match_keys",
         "open_position_ids",
         "runtime_execution_mode",
     ]:
         assert field in region, f"CAPITAL_BREAKDOWN_PROOF missing {field}"
 
 
-def test_reconciled_open_fill_is_ignored_not_counted(modules):
+def test_linked_reconciled_open_fill_is_ignored_not_counted(modules):
     pm_mod, _ = modules
     summary = pm_mod._summarize_fill_truth_rows(
         [
             {
                 "position_id": "pos-1",
+                "id": "ord-1",
                 "direction": "CALL",
                 "fill_price": 2.50,
                 "filled_qty": 1,
                 "reserved_cost": None,
             }
         ],
-        {"pos-1"},
+        [{"id": "pos-1", "status": "OPEN"}],
     )
     assert summary["pending_entries"] == 0
     assert summary["filled_unreconciled_entry_capital"] == pytest.approx(0.0)
     assert summary["ignored_already_reconciled_fill_capital"] == pytest.approx(250.0)
+    assert summary["ignored_already_reconciled_order_ids"] == ["ord-1"]
+    assert summary["ignored_reconciled_match_keys"] == ["ord-1:position_id:pos-1"]
 
 
-def test_unreconciled_fill_counts_as_filled_unreconciled_capital(modules):
+def test_unlinked_but_represented_fill_is_ignored_when_active_position_matches(modules):
     pm_mod, _ = modules
     summary = pm_mod._summarize_fill_truth_rows(
         [
             {
                 "position_id": None,
+                "broker_order_id": "br-1",
+                "contract": "SPY_061226C00550000",
+                "direction": "CALL",
+                "fill_price": 2.50,
+                "filled_qty": 1,
+                "reserved_cost": None,
+            }
+        ],
+        [
+            {
+                "id": "pos-1",
+                "status": "OPEN",
+                "broker_order_id": "br-1",
+                "contract": "SPY_061226C00550000",
+            }
+        ],
+    )
+    assert summary["pending_entries"] == 0
+    assert summary["filled_unreconciled_entry_capital"] == pytest.approx(0.0)
+    assert summary["ignored_already_reconciled_fill_capital"] == pytest.approx(250.0)
+    assert summary["ignored_already_reconciled_order_ids"] == ["br-1"]
+    assert summary["ignored_reconciled_match_keys"] == ["br-1:broker_order_id:pos-1"]
+
+
+def test_truly_unreconciled_fill_counts_as_filled_unreconciled_capital(modules):
+    pm_mod, _ = modules
+    summary = pm_mod._summarize_fill_truth_rows(
+        [
+            {
+                "position_id": None,
+                "broker_order_id": "br-2",
                 "direction": "PUT",
                 "fill_price": 0.61,
                 "filled_qty": 1,
                 "reserved_cost": None,
             }
         ],
-        set(),
+        [],
     )
     assert summary["pending_entries"] == 1
     assert summary["filled_unreconciled_puts"] == 1
     assert summary["filled_unreconciled_entry_capital"] == pytest.approx(61.0)
     assert summary["ignored_already_reconciled_fill_capital"] == pytest.approx(0.0)
+    assert summary["ignored_already_reconciled_order_ids"] == []
+    assert summary["ignored_reconciled_match_keys"] == []
 
 
 def test_breakdown_prefers_new_field_over_legacy_pending_entry_capital(modules):
@@ -136,6 +176,8 @@ def test_breakdown_prefers_new_field_over_legacy_pending_entry_capital(modules):
         "filled_unreconciled_entry_capital": 0.0,
         "pending_entry_capital": 250.0,
         "ignored_already_reconciled_fill_capital": 250.0,
+        "ignored_already_reconciled_order_ids": ["br-1"],
+        "ignored_reconciled_match_keys": ["br-1:broker_order_id:pos-1"],
         "open_position_ids": ["pos-1"],
     }
     breakdown = mc._get_pending_capital_breakdown(
@@ -147,6 +189,8 @@ def test_breakdown_prefers_new_field_over_legacy_pending_entry_capital(modules):
     assert breakdown["filled_unreconciled_entry_capital"] == pytest.approx(0.0)
     assert breakdown["pending_total_capital_reserved"] == pytest.approx(0.0)
     assert breakdown["ignored_already_reconciled_fill_capital"] == pytest.approx(250.0)
+    assert breakdown["ignored_already_reconciled_order_ids"] == ["br-1"]
+    assert breakdown["ignored_reconciled_match_keys"] == ["br-1:broker_order_id:pos-1"]
     assert breakdown["open_position_ids"] == ["pos-1"]
 
 
