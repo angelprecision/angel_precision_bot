@@ -848,7 +848,9 @@ class APMasterControl:
         client_id: str,
         *,
         exclude_local_order_id: Optional[str] = None,
-    ) -> Optional[float]:
+        runtime_execution_mode: Optional[str] = None,
+        with_diagnostics: bool = False,
+    ) -> Optional[float] | dict:
         """
         Sum capital reserved by entry orders that may still become exposure.
 
@@ -887,20 +889,35 @@ class APMasterControl:
                 _exclude_clause = " AND local_order_id != %s"
                 _exclude_params = (str(exclude_local_order_id),)
 
+            # PR #121: broker-proof predicate with execution_mode filter and
+            # explicit ignore-buckets. Active broker statuses now match the
+            # spec exactly: SUBMITTED, ACCEPTED, OPEN, PARTIALLY_FILLED,
+            # PENDING_SUBMIT, PARTIAL_FILL, ACKNOWLEDGED. PENDING_TRIGGER and
+            # CREATED rows without a broker handshake are excluded — they
+            # represent watcher/local-only intent, not real exposure.
+            _ACTIVE_BROKER_STATUSES = (
+                'SUBMITTED', 'ACCEPTED', 'OPEN',
+                'PARTIALLY_FILLED', 'PARTIAL_FILL',
+                'PENDING_SUBMIT', 'ACKNOWLEDGED',
+            )
+
+            # Resolve the runtime execution_mode for THIS client. Required so
+            # historical mode='paper' rows do not count when client is now
+            # running live (and vice versa). NULL mode rows are NEVER counted
+            # — they predate the execution_mode column and are not provable.
+            _rmode = (runtime_execution_mode or '').strip().lower() or None
+
             def _fn():
                 with conn() as c:
-                    # PR P0-SIZING: broker-proof predicate — only count ENTRY
-                    # orders that have actually been submitted to the broker.
-                    # Rows without broker_order_id AND without submitted_ts were
-                    # never dispatched; rejected/failed/watching/deferred rows
-                    # are excluded by the NOT IN terminal clause.
-                    # Cost = reserved_cost first, then limit_price * qty fallback.
-                    # Do NOT use fill-truth cost here — fills belong to deployed
-                    # capital (positions table) or filled_unreconciled_exposure
-                    # (position_manager.snapshot), not to pending submitted orders.
+                    # COUNTED rows: broker-proof submitted entries for this
+                    # client AND runtime execution_mode.
                     c.execute(
                         """
-                        SELECT COALESCE(SUM(
+                        SELECT
+                            local_order_id,
+                            broker_order_id,
+                            UPPER(COALESCE(status, '')) AS status_uc,
+                            COALESCE(execution_mode, '') AS execution_mode,
                             COALESCE(
                                 NULLIF(reserved_cost, 0),
                                 CASE
@@ -909,14 +926,11 @@ class APMasterControl:
                                     THEN limit_price * qty * 100
                                     ELSE 0
                                 END
-                            )
-                        ), 0) AS pending_submitted_entry_exposure
+                            ) AS row_cost
                         FROM orders
                         WHERE client_id = %s
                           AND kind = 'ENTRY'
-                          AND UPPER(COALESCE(status, '')) IN (
-                              'CREATED', 'SUBMITTED', 'ACKNOWLEDGED', 'PENDING', 'OPEN'
-                          )
+                          AND UPPER(COALESCE(status, '')) = ANY(%s)
                           AND (
                             (broker_order_id IS NOT NULL AND broker_order_id <> '')
                             OR submitted_ts IS NOT NULL
@@ -924,16 +938,114 @@ class APMasterControl:
                           AND COALESCE(filled_qty, 0) = 0
                           AND fill_price IS NULL
                           AND UPPER(COALESCE(contract, '')) NOT LIKE 'DEFERRED:%%'
-                          AND UPPER(COALESCE(status, '')) NOT IN (
-                            'CANCELLED', 'CANCELED', 'REJECTED', 'ERROR',
-                            'FAILED', 'CLOSED'
-                          )
+                          AND COALESCE(execution_mode, '') = %s
+                          AND COALESCE(last_error, '') NOT ILIKE %s
+                          AND COALESCE(last_error, '') NOT ILIKE %s
                         """ + _exclude_clause,
-                        (client_id,) + _exclude_params,
+                        (
+                            client_id,
+                            list(_ACTIVE_BROKER_STATUSES),
+                            _rmode or '',
+                            '%watcher_invalidated%',
+                            '%STARTUP_CLEANUP_CANCELED_STALE_ORPHAN%',
+                        ) + _exclude_params,
                     )
-                    row = c.fetchone()
-                    pending_capital = float((row or {}).get("pending_submitted_entry_exposure") or 0)
-                    return pending_capital
+                    counted_rows = c.fetchall() or []
+                    counted_total = sum(float(r['row_cost'] or 0) for r in counted_rows)
+
+                    if not with_diagnostics:
+                        return counted_total
+
+                    # Build IGNORED diagnostic — every reserved_cost row that
+                    # was NOT counted, grouped by reject bucket. Surfaced into
+                    # capital_limit_no_remaining result_json so operators can
+                    # see why $1551 of canceled reservations did not block.
+                    c.execute(
+                        """
+                        SELECT
+                            local_order_id,
+                            broker_order_id,
+                            UPPER(COALESCE(status, '')) AS status_uc,
+                            COALESCE(execution_mode, '__null__') AS execution_mode,
+                            COALESCE(last_error, '') AS last_error,
+                            COALESCE(reserved_cost, 0) AS reserved_cost,
+                            submitted_ts
+                        FROM orders
+                        WHERE client_id = %s
+                          AND kind = 'ENTRY'
+                          AND COALESCE(reserved_cost, 0) > 0
+                          AND local_order_id NOT IN (
+                              SELECT local_order_id FROM orders
+                              WHERE client_id = %s
+                                AND kind = 'ENTRY'
+                                AND UPPER(COALESCE(status, '')) = ANY(%s)
+                                AND (
+                                  (broker_order_id IS NOT NULL AND broker_order_id <> '')
+                                  OR submitted_ts IS NOT NULL
+                                )
+                                AND COALESCE(filled_qty, 0) = 0
+                                AND fill_price IS NULL
+                                AND COALESCE(execution_mode, '') = %s
+                          )
+                        """,
+                        (
+                            client_id,
+                            client_id,
+                            list(_ACTIVE_BROKER_STATUSES),
+                            _rmode or '',
+                        ),
+                    )
+                    ignored_rows = c.fetchall() or []
+
+                    # Group ignored rows by reject reason for diagnostics.
+                    ignored_reserved_cost_by_status: dict = {}
+                    ignored_order_ids_by_status:     dict = {}
+                    for r in ignored_rows:
+                        status_uc = r['status_uc'] or 'UNKNOWN'
+                        emode     = r['execution_mode']
+                        last_err  = (r['last_error'] or '').lower()
+                        broker_id = r['broker_order_id']
+                        submitted = r['submitted_ts']
+
+                        if 'watcher_invalidated' in last_err:
+                            bucket = 'watcher_invalidated'
+                        elif 'startup_cleanup_canceled_stale_orphan' in last_err.lower():
+                            bucket = 'startup_cleanup_canceled_stale_orphan'
+                        elif emode == '__null__' or emode == '':
+                            bucket = 'execution_mode_null_or_missing'
+                        elif _rmode and emode != _rmode:
+                            bucket = f'execution_mode_mismatch:{emode}'
+                        elif (not broker_id) and (submitted is None):
+                            bucket = 'never_submitted_no_broker_id_no_submit_ts'
+                        elif status_uc in ('CANCELED', 'CANCELLED'):
+                            bucket = 'canceled'
+                        elif status_uc in ('REJECTED', 'ERROR', 'FAILED'):
+                            bucket = f'terminal:{status_uc}'
+                        elif status_uc == 'EXPIRED':
+                            bucket = 'expired'
+                        elif status_uc in ('CREATED', 'PENDING_TRIGGER'):
+                            bucket = f'local_only:{status_uc}'
+                        else:
+                            bucket = f'other:{status_uc}'
+
+                        ignored_reserved_cost_by_status[bucket] = (
+                            ignored_reserved_cost_by_status.get(bucket, 0.0)
+                            + float(r['reserved_cost'] or 0)
+                        )
+                        ignored_order_ids_by_status.setdefault(bucket, []).append(
+                            r['local_order_id']
+                        )
+
+                    return {
+                        'pending_submitted_entry_exposure': counted_total,
+                        'counted_order_ids':                [r['local_order_id'] for r in counted_rows],
+                        'counted_order_statuses':           [r['status_uc']      for r in counted_rows],
+                        'counted_broker_order_ids':         [r['broker_order_id'] for r in counted_rows],
+                        'ignored_reserved_cost_by_status':  ignored_reserved_cost_by_status,
+                        'ignored_order_ids_by_status':      ignored_order_ids_by_status,
+                        'runtime_execution_mode':           _rmode,
+                        'active_broker_statuses':           list(_ACTIVE_BROKER_STATUSES),
+                    }
 
             return run_with_retry(_fn)
         except Exception as e:
@@ -952,6 +1064,7 @@ class APMasterControl:
         client_id: str,
         *,
         exclude_local_order_id: Optional[str] = None,
+        runtime_execution_mode: Optional[str] = None,
     ) -> Optional[dict]:
         """
         Return a dict with independent pending exposure components.
@@ -965,14 +1078,32 @@ class APMasterControl:
         Never derives submitted pending by subtracting from total.
         Each component comes directly from its authoritative source.
         """
-        # Component 1: broker-proof submitted-but-unfilled orders
-        pending_submitted = self._pending_orders_capital(
-            client_id, exclude_local_order_id=exclude_local_order_id,
+        # Component 1: broker-proof submitted-but-unfilled orders.
+        # PR #121: request the diagnostic dict so we can surface counted/
+        # ignored bucket detail when blocking with capital_limit_no_remaining.
+        _diag = self._pending_orders_capital(
+            client_id,
+            exclude_local_order_id=exclude_local_order_id,
+            runtime_execution_mode=runtime_execution_mode,
+            with_diagnostics=True,
         )
-        if pending_submitted is None:
+        if _diag is None:
             if self._is_live_mode() and self.pending_capital_fail_closed_live:
                 return None
-            pending_submitted = 0.0
+            _diag = {
+                "pending_submitted_entry_exposure": 0.0,
+                "counted_order_ids":                [],
+                "counted_order_statuses":           [],
+                "counted_broker_order_ids":         [],
+                "ignored_reserved_cost_by_status":  {},
+                "ignored_order_ids_by_status":      {},
+                "runtime_execution_mode":           (runtime_execution_mode or "").lower() or None,
+                "active_broker_statuses":           [],
+            }
+        elif isinstance(_diag, (int, float)):
+            # Old call site path (no diagnostics requested) — wrap.
+            _diag = {"pending_submitted_entry_exposure": float(_diag)}
+        pending_submitted = float(_diag.get("pending_submitted_entry_exposure") or 0.0)
 
         # Component 2: fill-truth unreconciled fills (position_manager snapshot)
         filled_unreconciled = 0.0
@@ -989,10 +1120,18 @@ class APMasterControl:
                 if self._is_live_mode() and self.pending_capital_fail_closed_live:
                     return None
 
+        # Merge: keep all diagnostic fields so callers can surface them.
         return {
             "pending_submitted_entry_exposure": pending_submitted,
             "filled_unreconciled_exposure":     filled_unreconciled,
             "pending_total_capital_reserved":   pending_submitted + filled_unreconciled,
+            "counted_order_ids":                _diag.get("counted_order_ids", []),
+            "counted_order_statuses":           _diag.get("counted_order_statuses", []),
+            "counted_broker_order_ids":         _diag.get("counted_broker_order_ids", []),
+            "ignored_reserved_cost_by_status":  _diag.get("ignored_reserved_cost_by_status", {}),
+            "ignored_order_ids_by_status":      _diag.get("ignored_order_ids_by_status", {}),
+            "runtime_execution_mode":           _diag.get("runtime_execution_mode"),
+            "active_broker_statuses":           _diag.get("active_broker_statuses", []),
         }
 
     def _pending_capital_from_snapshot_or_db(
@@ -1350,7 +1489,25 @@ class APMasterControl:
             estimated_contracts_pre = 1 if bootstrap_mode else 0
             estimated_new_cost_pre = 0.0   # unknown until selector runs
             if remaining_capital_for_this_trade <= 0.0:
-                _bd_eval = self._get_pending_capital_breakdown(snap, client_id) or {}
+                # PR #121: pass runtime_execution_mode so historical NULL-mode
+                # and wrong-mode rows are excluded from the breakdown. Also
+                # capture diagnostic buckets (ignored_*) and surface into
+                # result_json so the operator can immediately see why pending
+                # exposure blocked the trade.
+                _bd_eval = self._get_pending_capital_breakdown(
+                    snap, client_id,
+                    runtime_execution_mode=str(current_mode or '').lower(),
+                ) or {}
+                _pending_submitted_real = float(
+                    _bd_eval.get("pending_submitted_entry_exposure", 0.0)
+                )
+                _filled_unreconciled    = float(
+                    _bd_eval.get("filled_unreconciled_exposure", 0.0)
+                )
+                _pending_total_real     = float(
+                    _bd_eval.get("pending_total_capital_reserved", pending_capital_real)
+                )
+
                 log.warning(
                     "[%s] SMALL_ACCOUNT_CONTRACT_UNAFFORDABLE "
                     "client_email=%s execution_mode=%s client_cap=%.0f "
@@ -1358,23 +1515,48 @@ class APMasterControl:
                     "filled_unreconciled_exposure=%.0f "
                     "pending_total_capital_reserved=%.0f "
                     "remaining_capital=%.0f "
+                    "counted_order_ids=%s ignored_buckets=%s "
                     "candidate_limit=N/A computed_qty=0 original_qty=N/A final_qty=0 "
                     "reason=capital_limit_no_remaining",
                     ticker, client_id, current_mode,
                     max_capital,
                     float(snap.get("capital_deployed", 0)),
-                    _bd_eval.get("pending_submitted_entry_exposure", 0.0),
-                    _bd_eval.get("filled_unreconciled_exposure", 0.0),
-                    _bd_eval.get("pending_total_capital_reserved", pending_capital_real),
+                    _pending_submitted_real,
+                    _filled_unreconciled,
+                    _pending_total_real,
                     remaining_capital_for_this_trade,
+                    _bd_eval.get("counted_order_ids", []),
+                    list((_bd_eval.get("ignored_reserved_cost_by_status") or {}).keys()),
                 )
+
+                # PR #121: full diagnostic payload into result_json.
+                _block_meta = {
+                    "client_id":                          client_id,
+                    "execution_mode":                     str(current_mode or '').lower(),
+                    "client_cap":                         float(max_capital),
+                    "deployed_exposure":                  float(snap.get("capital_deployed", 0)),
+                    "pending_submitted_entry_exposure":   _pending_submitted_real,
+                    "filled_unreconciled_exposure":       _filled_unreconciled,
+                    "pending_total_capital_reserved":     _pending_total_real,
+                    "remaining_capital":                  float(remaining_capital_for_this_trade),
+                    "counted_order_ids":                  _bd_eval.get("counted_order_ids", []),
+                    "counted_order_statuses":             _bd_eval.get("counted_order_statuses", []),
+                    "counted_broker_order_ids":           _bd_eval.get("counted_broker_order_ids", []),
+                    "ignored_reserved_cost_by_status":    _bd_eval.get("ignored_reserved_cost_by_status", {}),
+                    "ignored_order_ids_by_status":        _bd_eval.get("ignored_order_ids_by_status", {}),
+                    "active_broker_statuses":             _bd_eval.get("active_broker_statuses", []),
+                }
+
                 return self._block(
                     signal_id, ticker, client_id, "blocked_risk",
                     f"capital_limit_no_remaining "
                     f"client_cap=${max_capital:.0f} "
                     f"deployed=${snap['capital_deployed']:.0f} "
-                    f"pending_total=${pending_capital_real:.0f} "
+                    f"pending_submitted=${_pending_submitted_real:.0f} "
+                    f"pending_total=${_pending_total_real:.0f} "
                     f"remaining=${remaining_capital_for_this_trade:.0f}",
+                    reason_code="CAPITAL_LIMIT_NO_REMAINING",
+                    meta=_block_meta,
                 )
         else:
             # PAPER non-bootstrap: keep the existing static-estimate
