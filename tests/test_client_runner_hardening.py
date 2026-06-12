@@ -54,6 +54,10 @@ Coverage map (7 fixes + structural invariants):
       ValueError in BOTH modes
     - Normal-length plaintext passes through unchanged
 
+  FIX-8 order_monitor entry_watcher wiring (2)
+    - Both production APOrderMonitor construction paths pass entry_watcher
+    - A normal startup-built monitor preserves watcher-owned PENDING_TRIGGER rows
+
   INV — Structural invariants (2)
     - BUG-CR-3 resolution: APExecutionCore constructs APEntryWatcher
       with mode=self.mode — runner-side mutation is NOT needed and is
@@ -550,6 +554,190 @@ class TestFix7DecryptTokenSanityValidation:
             f"Normal plaintext must pass through unchanged. "
             f"Expected {normal!r}, got {out!r}"
         )
+
+
+# ══════════════════════════════════════════════════════════════════
+# FIX-8 — order_monitor entry_watcher wiring
+# ══════════════════════════════════════════════════════════════════
+
+class TestFix8OrderMonitorWatcherWiring:
+    def test_production_order_monitor_call_sites_pass_entry_watcher(self, client_runner_mod):
+        """Both production constructors must pass the runner/core watcher.
+
+        The repo has many APOrderMonitor(...) test call sites, but only two
+        production construction paths matter for this PR:
+        - ClientRunner normal startup
+        - self_healing order-monitor restart
+        """
+        run_inner_src = inspect.getsource(client_runner_mod.ClientRunner._run_inner)
+        assert (
+            'entry_watcher=getattr(self.core, "entry_watcher", None)' in run_inner_src
+            or "entry_watcher=getattr(self.core, 'entry_watcher', None)" in run_inner_src
+        ), (
+            "ClientRunner normal startup must pass self.core.entry_watcher "
+            "into APOrderMonitor so watcher-owned PENDING_TRIGGER rows are "
+            "actively provable, not downgraded to ownership-unknown."
+        )
+
+        healer_src = (REPO_ROOT / "ap" / "self_healing.py").read_text()
+        assert (
+            'entry_watcher=getattr(getattr(runner, "core", None), "entry_watcher", None)' in healer_src
+            or "entry_watcher=getattr(getattr(runner, 'core', None), 'entry_watcher', None)" in healer_src
+        ), (
+            "self_healing restart must pass runner.core.entry_watcher into "
+            "APOrderMonitor so recovered runners keep watcher ownership proof."
+        )
+
+    def test_normal_startup_monitor_receives_watcher_and_preserves_owned_pending_trigger(
+        self,
+        client_runner_mod,
+        monkeypatch,
+        caplog,
+    ):
+        """Runtime regression: the normal startup-built monitor must carry
+        core.entry_watcher, and that monitor must preserve a watcher-owned
+        stale PENDING_TRIGGER row instead of expiring it.
+        """
+        import logging
+        from datetime import datetime, timedelta, timezone
+
+        import ap.db as db_mod
+        import ap.brokers.tradier as tradier_mod
+        import ap.contract_selector as contract_selector_mod
+        import ap.order_monitor as order_monitor_mod
+        import ap.order_state_machine as order_state_machine_mod
+        import ap.position_manager as position_manager_mod
+        import ap.position_sizer as position_sizer_mod
+        import ap_execution_core as execution_core_mod
+        import ap_master_control as master_control_mod
+
+        watcher = MagicMock()
+        watcher.has_order.return_value = True
+        exit_eng = MagicMock()
+        exit_eng._refresh_quotes = MagicMock()
+
+        class _FakeBroker:
+            def __init__(self, cfg):
+                self.cfg = cfg
+
+            def get_account_equity(self):
+                return 25000.0
+
+        class _FakeMasterControl:
+            def __init__(self, **_kwargs):
+                self.wire = MagicMock()
+
+        class _FakeOrderStateMachine:
+            def __init__(self, client_id: str):
+                self.client_id = client_id
+                self.expire_calls: list[tuple[str, str]] = []
+                self.transition_calls: list[tuple[str, str, dict]] = []
+
+            def get_split_brain_orders(self):
+                return []
+
+            def expire_pending_entry(self, local_order_id: str, *, reason: str):
+                self.expire_calls.append((local_order_id, reason))
+                return True
+
+            def transition(self, local_order_id: str, status: str, **kwargs):
+                self.transition_calls.append((local_order_id, status, dict(kwargs)))
+                return True
+
+        class _FakeCore:
+            def __init__(self, **_kwargs):
+                self.entry_watcher = watcher
+                self.exit_eng = exit_eng
+                self.mode = "PAPER"
+
+            def start(self):
+                return None
+
+        monkeypatch.setattr(tradier_mod, "TradierConfig", lambda **kwargs: types.SimpleNamespace(**kwargs))
+        monkeypatch.setattr(tradier_mod, "TradierBroker", _FakeBroker)
+        monkeypatch.setattr(master_control_mod, "APMasterControl", _FakeMasterControl)
+        monkeypatch.setattr(position_manager_mod, "APPositionManager", lambda client_id: MagicMock(client_id=client_id))
+        monkeypatch.setattr(order_state_machine_mod, "APOrderStateMachine", _FakeOrderStateMachine)
+        monkeypatch.setattr(contract_selector_mod, "APContractSelectionEngine", lambda **_kwargs: MagicMock())
+        monkeypatch.setattr(execution_core_mod, "APExecutionCore", _FakeCore)
+        monkeypatch.setattr(position_sizer_mod, "validate_sizer_thresholds", lambda *a, **kw: None)
+        monkeypatch.setattr(client_runner_mod, "APPositionSizer", lambda **_kwargs: MagicMock())
+        monkeypatch.setattr(client_runner_mod, "APEarningsGuard", lambda *a, **kw: MagicMock())
+        monkeypatch.setattr(client_runner_mod, "APIVRankFilter", lambda *a, **kw: MagicMock())
+        monkeypatch.setattr(db_mod, "ensure_client_exists", lambda *a, **kw: None)
+        monkeypatch.setattr(client_runner_mod, "get_monitor", lambda: None)
+        monkeypatch.setattr(client_runner_mod, "get_healer", lambda: None)
+        monkeypatch.setattr(client_runner_mod, "SUPABASE_URL", "")
+        monkeypatch.setattr(client_runner_mod, "SUPABASE_SERVICE_KEY", "")
+        monkeypatch.setattr(client_runner_mod, "create_client", lambda *a, **kw: None)
+        monkeypatch.setattr(client_runner_mod.APOrderMonitor, "start", lambda self: None)
+
+        runner = client_runner_mod.ClientRunner(
+            {
+                "email": "runtime-watcher@test.local",
+                "tradier_account_id": "PAPER-1234",
+                "tradier_access_token": "paper-token-1234567890",
+            }
+        )
+        runner.stopped.set()
+
+        monkeypatch.setattr(runner, "_get_token", lambda: "paper-token-1234567890")
+        monkeypatch.setattr(runner, "_clear_old_phantom_orders", lambda: None)
+        monkeypatch.setattr(runner, "_load_client_config", lambda: {})
+        monkeypatch.setattr(runner, "_validate_execution_core_started", lambda: None)
+        monkeypatch.setattr(runner, "_register_exit_engine", lambda _exit_eng: None)
+        monkeypatch.setattr(runner, "_run_startup_recovery", lambda _broker, _exit_eng: None)
+        monkeypatch.setattr(runner, "_seed_exit_engine_from_db", lambda _exit_eng: None)
+        monkeypatch.setattr(runner, "_start_position_quote_monitor", lambda _broker, _exit_eng: None)
+        monkeypatch.setattr(runner, "_start_reconciler", lambda _broker, _exit_eng: None)
+        monkeypatch.setattr(runner, "_sync_account_equity", lambda _broker: None)
+        monkeypatch.setattr(runner, "_start_fill_monitor", lambda _broker, _exit_eng: None)
+        monkeypatch.setattr(runner, "_assert_fill_monitor_alive", lambda: None)
+        monkeypatch.setattr(runner, "_start_equity_refresh", lambda _broker: None)
+        monkeypatch.setattr(runner, "_start_worker_thread", lambda _broker: None)
+        monkeypatch.setattr(runner, "_assert_worker_alive", lambda: None)
+        monkeypatch.setattr(runner, "_build_startup_manifest", lambda **_kwargs: None)
+        monkeypatch.setattr(runner, "_validate_control_stack", lambda: None)
+        monkeypatch.setattr(runner, "_set_entry_permission", lambda: None)
+        monkeypatch.setattr(runner, "_start_runtime_health_loop", lambda: None)
+
+        runner._run_inner()
+
+        assert runner.order_monitor is not None, "Normal startup must construct an order monitor"
+        assert runner.order_monitor.entry_watcher is watcher, (
+            "Normal startup-built APOrderMonitor must receive the same "
+            "entry_watcher instance from runner.core."
+        )
+
+        monkeypatch.setattr(order_monitor_mod, "PENDING_TRIGGER_CLEANUP_ENABLED", True)
+        monkeypatch.setattr(order_monitor_mod, "PENDING_TRIGGER_MAX_AGE_SECONDS", 60)
+        monkeypatch.setattr(order_monitor_mod, "PENDING_TRIGGER_CLEANUP_DRY_RUN", False)
+
+        created = datetime.now(timezone.utc) - timedelta(seconds=120)
+        runner.order_monitor._emit_order_event = MagicMock()
+        runner.order_monitor._get_active_entry_orders = MagicMock(
+            return_value=[
+                {
+                    "local_order_id": "pending-1",
+                    "status": "PENDING_TRIGGER",
+                    "symbol": "AAPL",
+                    "contract": "AAPL260619C00100000",
+                    "broker_order_id": None,
+                    "submitted_ts": None,
+                    "created_ts": created.isoformat(),
+                    "updated_ts": created.isoformat(),
+                }
+            ]
+        )
+
+        caplog.set_level(logging.INFO, logger="ap.order_monitor")
+        runner.order_monitor._check_entry_orders()
+
+        watcher.has_order.assert_called_once_with("pending-1")
+        assert runner.order_state_machine.expire_calls == []
+        assert runner.order_state_machine.transition_calls == []
+        assert "watcher_owner_state=True" in caplog.text
+        assert "cleanup_action=preserve_watcher_owned" in caplog.text
 
 
 # ══════════════════════════════════════════════════════════════════
