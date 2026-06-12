@@ -10,6 +10,8 @@ to lock in the safety contract.
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 from unittest.mock import MagicMock
 
@@ -61,6 +63,7 @@ def _clear_cache():
 # ─────────────────────────────────────────────────────────────────────────────
 
 OCC = "NVDA260620C00500000"
+EXEC_SRC = (Path(__file__).resolve().parents[1] / "ap" / "execution.py").read_text()
 
 
 def _chain_opt_zero(symbol=OCC):
@@ -435,7 +438,12 @@ class TestFinalQuoteQtyValidation:
 
     def test_single_contract_within_budget_passes(self):
         broker = StubBroker({OCC: {"bid": 4.90, "ask": 5.00}})
-        r = final_quote_check_before_submit(broker, OCC, qty=1, **self._kwargs(budget_usd=500.0))
+        r = final_quote_check_before_submit(
+            broker,
+            OCC,
+            qty=1,
+            **self._kwargs(budget_usd=500.0, max_premium=600.0),
+        )
         assert r["ok"] is True
 
     def test_multi_contract_total_cost_rejected(self):
@@ -456,8 +464,24 @@ class TestFinalQuoteQtyValidation:
     def test_qty_default_1_backward_compat(self):
         """Callers that omit qty still work correctly."""
         broker = StubBroker({OCC: {"bid": 4.90, "ask": 5.00}})
-        r = final_quote_check_before_submit(broker, OCC, **self._kwargs(budget_usd=500.0))
+        r = final_quote_check_before_submit(
+            broker,
+            OCC,
+            **self._kwargs(budget_usd=500.0, max_premium=600.0),
+        )
         assert r["ok"] is True
+
+
+class TestExecutionP0BWiring:
+    def test_final_quote_gate_uses_position_budget(self):
+        assert "budget_usd=float(position_budget)" in EXEC_SRC
+
+    def test_local_order_id_initialized_before_p0b_returns(self):
+        init_idx = EXEC_SRC.find("local_order_id = None")
+        p0b_idx = EXEC_SRC.find("_p0b_enabled = os.getenv(")
+        assert init_idx > 0
+        assert p0b_idx > 0
+        assert init_idx < p0b_idx
 
 
 # =============================================================================

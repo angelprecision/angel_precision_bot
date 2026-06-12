@@ -792,6 +792,7 @@ def process_signal(broker, client_id: str, signal_payload: dict) -> dict:
     locked = False
     reserved = False
     reserved_cost = 0.0
+    local_order_id = None
 
     try:
         client = get_client(client_id)
@@ -1151,7 +1152,7 @@ def process_signal(broker, client_id: str, signal_payload: dict) -> dict:
                                   os.getenv("MIN_PREMIUM", "10.0")),
                 max_premium=float(client.get("max_premium") or
                                   os.getenv("MAX_PREMIUM", "350.0")),
-                budget_usd=float(total_cost),
+                budget_usd=float(position_budget),
                 qty=int(qty),
                 is_live=(mode == "LIVE"),
             )

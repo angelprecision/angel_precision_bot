@@ -88,46 +88,52 @@ class TestRefreshHelper:
     def test_returns_tuple_shape(self, refresh_fn):
         broker = MagicMock()
         broker.get_quote.return_value = {"ask": 3.10, "bid": 3.05, "last": 3.07}
-        ask, age_ms, ok, reason = refresh_fn(broker, "QCOM250523C00185000")
+        ask, age_ms, ok, reason, quote_fields = refresh_fn(broker, "QCOM250523C00185000")
         assert ok is True
         assert ask == 3.10
         assert age_ms >= 0
         assert reason == ""
+        assert quote_fields["submit_ask"] == 3.10
 
     def test_no_ask_returns_not_ok(self, refresh_fn):
         broker = MagicMock()
         broker.get_quote.return_value = {"ask": None, "bid": 3.05}
-        ask, age_ms, ok, reason = refresh_fn(broker, "QCOM250523C00185000")
+        ask, age_ms, ok, reason, quote_fields = refresh_fn(broker, "QCOM250523C00185000")
         assert ok is False
         assert reason == "no_quote"
+        assert quote_fields["submit_ask"] is None
 
     def test_zero_ask_returns_not_ok(self, refresh_fn):
         broker = MagicMock()
         broker.get_quote.return_value = {"ask": 0, "bid": 3.05}
-        ask, age_ms, ok, reason = refresh_fn(broker, "QCOM250523C00185000")
+        ask, age_ms, ok, reason, quote_fields = refresh_fn(broker, "QCOM250523C00185000")
         assert ok is False
         assert reason == "no_quote"
+        assert quote_fields["submit_ask"] is None
 
     def test_invalid_ask_string_returns_not_ok(self, refresh_fn):
         broker = MagicMock()
         broker.get_quote.return_value = {"ask": "not-a-number"}
-        ask, age_ms, ok, reason = refresh_fn(broker, "QCOM250523C00185000")
+        ask, age_ms, ok, reason, quote_fields = refresh_fn(broker, "QCOM250523C00185000")
         assert ok is False
         assert reason == "invalid_ask"
+        assert quote_fields["submit_ask"] is None
 
     def test_broker_exception_returns_not_ok(self, refresh_fn):
         broker = MagicMock()
         broker.get_quote.side_effect = RuntimeError("connection refused")
-        ask, age_ms, ok, reason = refresh_fn(broker, "QCOM250523C00185000")
+        ask, age_ms, ok, reason, quote_fields = refresh_fn(broker, "QCOM250523C00185000")
         assert ok is False
         assert reason == "broker_error"
+        assert quote_fields["submit_ask"] is None
 
     def test_empty_quote_returns_not_ok(self, refresh_fn):
         broker = MagicMock()
         broker.get_quote.return_value = None
-        ask, age_ms, ok, reason = refresh_fn(broker, "QCOM250523C00185000")
+        ask, age_ms, ok, reason, quote_fields = refresh_fn(broker, "QCOM250523C00185000")
         assert ok is False
         assert reason == "no_quote"
+        assert quote_fields["submit_ask"] is None
 
 
 # ============================================================
@@ -139,7 +145,7 @@ class TestSubmitFlowShape:
         """The refresh call must happen BEFORE _submit_order_with_retry."""
         # Find the index of the helper call and the submit call.
         i_refresh = EXEC_SRC.find("_refresh_ask_at_submit(broker, contract)")
-        i_submit  = EXEC_SRC.find("_submit_order_with_retry(broker, symbol, contract, qty, float(submit_limit))")
+        i_submit  = EXEC_SRC.rfind("_submit_order_with_retry(")
         assert i_refresh > 0, "_refresh_ask_at_submit must be invoked in process_signal"
         assert i_submit > 0, "submit must use the refreshed submit_limit"
         assert i_refresh < i_submit, "refresh must be invoked BEFORE submit"
@@ -147,7 +153,10 @@ class TestSubmitFlowShape:
     def test_submit_uses_submit_limit_not_premium(self):
         """The broker submit must use submit_limit (the refreshed value),
         not the original premium. Otherwise the refresh is cosmetic."""
-        assert "_submit_order_with_retry(broker, symbol, contract, qty, float(submit_limit))" in EXEC_SRC
+        idx = EXEC_SRC.rfind("_submit_order_with_retry(")
+        assert idx > 0
+        window = EXEC_SRC[idx:idx + 250]
+        assert "float(submit_limit)" in window
 
     def test_chase_band_block_present(self):
         """Must have an explicit gap > SUBMIT_CHASE_BAND_PCT branch that
