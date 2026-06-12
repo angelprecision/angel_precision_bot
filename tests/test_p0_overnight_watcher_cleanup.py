@@ -587,6 +587,7 @@ def test_overnight_watch_false_cleanup_failure_marks_cleanup_failed_error_and_pr
     assert proof["metadata"]["cleanup_method"] == "transition:EXPIRED"
     assert proof["metadata"]["cleanup_success"] is False
     assert proof["metadata"]["original_reason"] == "overnight_watch_arm_failed:armed_false"
+    assert "OVERNIGHT_WATCH_ARM_FAILED_CLEANUP_FAILED" in caplog.text
     assert "cleanup_success=False" in caplog.text
     assert "overnight_watch_arm_failed_cleanup_failed" in caplog.text
 
@@ -745,6 +746,7 @@ def test_overnight_watch_exception_cleanup_failure_marks_cleanup_failed_error_an
     assert proof["metadata"]["cleanup_method"] == "transition:EXPIRED"
     assert proof["metadata"]["cleanup_success"] is False
     assert proof["metadata"]["original_reason"] == "overnight_watch_arm_failed:exception:watcher boom"
+    assert "OVERNIGHT_WATCH_ARM_FAILED_CLEANUP_FAILED" in caplog.text
     assert "cleanup_success=False" in caplog.text
 
 

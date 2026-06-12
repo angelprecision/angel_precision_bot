@@ -1070,7 +1070,8 @@ def run_overnight_reeval(
                     if not _cleanup_success:
                         _cleanup_failed_reason = _watch_arm_cleanup_failed_reason(_full_error)
                         log.critical(
-                            "[%s] overnight_reeval: watch arm failed but local ENTRY cleanup failed "
+                            "[%s] OVERNIGHT_WATCH_ARM_FAILED_CLEANUP_FAILED | "
+                            "watch arm failed but local ENTRY cleanup failed "
                             "| local_order_id=%s cleanup_method=%s reason=%s "
                             "| cleanup_success=%s cleanup_failed_reason=%s",
                             ticker,
@@ -1135,7 +1136,8 @@ def run_overnight_reeval(
                 if not _cleanup_success:
                     _cleanup_failed_reason = _watch_arm_cleanup_failed_reason(_full_error)
                     log.critical(
-                        "[%s] overnight_reeval: entry_watcher.watch exception and local ENTRY cleanup failed "
+                        "[%s] OVERNIGHT_WATCH_ARM_FAILED_CLEANUP_FAILED | "
+                        "entry_watcher.watch exception and local ENTRY cleanup failed "
                         "| local_order_id=%s cleanup_method=%s reason=%s "
                         "| cleanup_success=%s cleanup_failed_reason=%s",
                         ticker,
