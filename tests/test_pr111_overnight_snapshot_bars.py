@@ -466,3 +466,128 @@ class TestLiveMarketDataURL:
         assert len(sandbox_literals) == 0, (
             f"Found sandbox.tradier.com in string literals: {sandbox_literals}"
         )
+
+
+# =============================================================================
+# PR #111 amend P1 — sandbox URL sanitisation inside the resolver
+#
+# Spec: if broker.market_data_base_url, broker.quote_base_url,
+# broker.cfg.market_data_base_url, TRADIER_MARKET_DATA_BASE_URL, or
+# TRADIER_DATA_BASE_URL are set to https://sandbox.tradier.com, the resolver
+# must skip that value (with a warning) and fall through to the next candidate,
+# ultimately returning https://api.tradier.com.
+# =============================================================================
+
+class TestResolverSandboxSanitisation:
+    """Spec: resolver must never return sandbox.tradier.com regardless of source."""
+
+    def _load(self):
+        """Load the patched module from local file or repo path."""
+        import importlib.util, sys
+        from pathlib import Path
+        patched = Path("/home/claude/overnight_daily_validator_v3.py")
+        if not patched.exists():
+            patched = Path(__file__).resolve().parents[1] / "ap" / "overnight_daily_validator.py"
+        key = f"ap.overnight_daily_validator_{patched.stat().st_mtime}"
+        if key in sys.modules:
+            return sys.modules[key]
+        spec = importlib.util.spec_from_file_location(key, patched)
+        mod  = importlib.util.module_from_spec(spec)
+        sys.modules[key] = mod
+        spec.loader.exec_module(mod)
+        return mod
+
+    def _bare_broker(self, **attrs):
+        """Broker with only the attrs given; all others raise AttributeError."""
+        from unittest.mock import MagicMock
+        b = MagicMock(spec=list(attrs.keys()))
+        for k, v in attrs.items():
+            setattr(b, k, v)
+        return b
+
+    # Required test 1: broker.market_data_base_url = sandbox → api.tradier.com
+    def test_broker_market_data_base_url_sandbox_rejected(self, caplog):
+        """Spec req 6a: broker.market_data_base_url=sandbox → resolver falls through."""
+        import logging
+        mod = self._load()
+        b = self._bare_broker(market_data_base_url="https://sandbox.tradier.com")
+        with caplog.at_level(logging.WARNING, logger="ap.overnight_daily_validator"):
+            result = mod._resolve_market_data_base_url(b)
+        assert result == "https://api.tradier.com", (
+            f"Expected api.tradier.com, got {result!r}"
+        )
+        assert "OVERNIGHT_MARKET_DATA_SANDBOX_URL_IGNORED" in caplog.text
+        assert "broker.market_data_base_url" in caplog.text
+
+    # Required test 2: broker.quote_base_url = sandbox → api.tradier.com
+    def test_broker_quote_base_url_sandbox_rejected(self, caplog):
+        """Spec req 6b: broker.quote_base_url=sandbox → resolver falls through."""
+        import logging
+        mod = self._load()
+        b = self._bare_broker(quote_base_url="https://sandbox.tradier.com")
+        with caplog.at_level(logging.WARNING, logger="ap.overnight_daily_validator"):
+            result = mod._resolve_market_data_base_url(b)
+        assert result == "https://api.tradier.com"
+        assert "OVERNIGHT_MARKET_DATA_SANDBOX_URL_IGNORED" in caplog.text
+        assert "broker.quote_base_url" in caplog.text
+
+    # Required test 3: env TRADIER_MARKET_DATA_BASE_URL = sandbox → api.tradier.com
+    def test_env_tradier_market_data_base_url_sandbox_rejected(self, caplog, monkeypatch):
+        """Spec req 6c: env var=sandbox → resolver falls through to hard-coded live URL."""
+        import logging
+        mod = self._load()
+        monkeypatch.setenv("TRADIER_MARKET_DATA_BASE_URL", "https://sandbox.tradier.com")
+        b = self._bare_broker()   # no broker attrs at all
+        with caplog.at_level(logging.WARNING, logger="ap.overnight_daily_validator"):
+            result = mod._resolve_market_data_base_url(b)
+        assert result == "https://api.tradier.com"
+        assert "OVERNIGHT_MARKET_DATA_SANDBOX_URL_IGNORED" in caplog.text
+        assert "env.TRADIER_MARKET_DATA_BASE_URL" in caplog.text
+
+    # Bonus: TRADIER_DATA_BASE_URL sandbox also rejected
+    def test_env_tradier_data_base_url_sandbox_rejected(self, caplog, monkeypatch):
+        import logging
+        mod = self._load()
+        monkeypatch.setenv("TRADIER_DATA_BASE_URL", "https://sandbox.tradier.com")
+        b = self._bare_broker()
+        with caplog.at_level(logging.WARNING, logger="ap.overnight_daily_validator"):
+            result = mod._resolve_market_data_base_url(b)
+        assert result == "https://api.tradier.com"
+        assert "OVERNIGHT_MARKET_DATA_SANDBOX_URL_IGNORED" in caplog.text
+
+    # Bonus: live value accepted without warning
+    def test_live_url_accepted_without_warning(self, caplog):
+        import logging
+        mod = self._load()
+        b = self._bare_broker(market_data_base_url="https://api.tradier.com")
+        with caplog.at_level(logging.WARNING, logger="ap.overnight_daily_validator"):
+            result = mod._resolve_market_data_base_url(b)
+        assert result == "https://api.tradier.com"
+        assert "OVERNIGHT_MARKET_DATA_SANDBOX_URL_IGNORED" not in caplog.text
+
+    # All sources sandbox → still falls back to hard-coded live URL
+    def test_all_sources_sandbox_falls_back_to_live(self, caplog, monkeypatch):
+        """If every configured source is sandbox, hard-coded live fallback is returned."""
+        import logging
+        mod = self._load()
+        monkeypatch.setenv("TRADIER_MARKET_DATA_BASE_URL", "https://sandbox.tradier.com")
+        monkeypatch.setenv("TRADIER_DATA_BASE_URL",        "https://sandbox.tradier.com")
+        b = self._bare_broker(
+            market_data_base_url="https://sandbox.tradier.com",
+            quote_base_url="https://sandbox.tradier.com",
+        )
+        with caplog.at_level(logging.WARNING, logger="ap.overnight_daily_validator"):
+            result = mod._resolve_market_data_base_url(b)
+        assert result == "https://api.tradier.com"
+        # All four sources should have been warned about
+        assert caplog.text.count("OVERNIGHT_MARKET_DATA_SANDBOX_URL_IGNORED") >= 4
+
+    # Source-level: warning key present in file
+    def test_source_contains_sandbox_ignored_warning_key(self):
+        from pathlib import Path
+        patched = Path("/home/claude/overnight_daily_validator_v3.py")
+        if not patched.exists():
+            patched = Path(__file__).resolve().parents[1] / "ap" / "overnight_daily_validator.py"
+        src = patched.read_text()
+        assert "OVERNIGHT_MARKET_DATA_SANDBOX_URL_IGNORED" in src
+        assert '"sandbox.tradier.com" in clean.lower()' in src
