@@ -520,9 +520,13 @@ class TestBugDNormalization:
 
 class TestPR66PaperLiveEntryMaxAge:
     """
-    PAPER entries must survive past 90s and cancel at 180s.
+    PAPER entries must survive past 90s and cancel at the configured paper ceiling.
     LIVE entries must still cancel at 90s.
     """
+
+    def _paper_max_age(self) -> int:
+        import ap.order_monitor as om
+        return om.PAPER_ENTRY_MAX_AGE_NORMAL
 
     def _make_monitor(self, client_mode: str):
         """Build a minimal APOrderMonitor with the given client_mode."""
@@ -567,7 +571,7 @@ class TestPR66PaperLiveEntryMaxAge:
         }
 
     def test_paper_order_survives_past_90s(self):
-        """PAPER order at age=91s must NOT be canceled (ceiling is 180s)."""
+        """PAPER order at age=91s must NOT be canceled before the paper ceiling."""
         monitor = self._make_monitor("PAPER")
         order = self._make_order(age_secs=91.0)
         canceled = monitor._check_stale_entry_cancel(
@@ -576,31 +580,32 @@ class TestPR66PaperLiveEntryMaxAge:
         # _handle_stale_entry must NOT have been called with action=cancel
         for call in monitor._handle_stale_entry.call_args_list:
             assert call.kwargs.get("action") != "cancel", (
-                "PAPER order at 91s must not be canceled (ceiling is 180s)"
+                "PAPER order at 91s must not be canceled before the configured ceiling"
             )
         # If it returned True via missed-move that's ok; what matters is
         # the max-age path didn't fire. If no cancel at all, assert passes.
         # (The repeg/missed-move path may or may not fire — not under test here.)
 
     def test_paper_order_canceled_at_180s(self):
-        """PAPER order at age=181s must be canceled with ENTRY_MAX_AGE_NORMAL_REACHED."""
+        """PAPER order above the configured ceiling must be canceled."""
+        paper_max_age = self._paper_max_age()
         monitor = self._make_monitor("PAPER")
-        order = self._make_order(age_secs=181.0)
+        order = self._make_order(age_secs=float(paper_max_age + 1))
         monitor._check_stale_entry_cancel(
-            order, "ORD-TEST-001", "SUBMITTED", order["contract"], 181.0
+            order, "ORD-TEST-001", "SUBMITTED", order["contract"], float(paper_max_age + 1)
         )
         # _handle_stale_entry must have been called with action="cancel"
         assert any(
             call.kwargs.get("action") == "cancel"
             for call in monitor._handle_stale_entry.call_args_list
-        ), "PAPER order at 181s must be canceled"
-        # emit_order_event must include max_age=180 and mode=PAPER
+        ), "PAPER order above the configured ceiling must be canceled"
+        # emit_order_event must include the configured paper max_age and mode=PAPER
         emit_calls = monitor._emit_order_event.call_args_list
         assert emit_calls, "emit_order_event must be called on max-age cancel"
         inputs = emit_calls[-1].kwargs.get("inputs", {})
         assert inputs.get("mode") == "PAPER", f"mode must be PAPER, got {inputs.get('mode')}"
-        assert inputs.get("max_age_seconds") == 180, (
-            f"max_age_seconds must be 180 for PAPER, got {inputs.get('max_age_seconds')}"
+        assert inputs.get("max_age_seconds") == paper_max_age, (
+            f"max_age_seconds must be {paper_max_age} for PAPER, got {inputs.get('max_age_seconds')}"
         )
         assert inputs.get("cancel_reason") == "ENTRY_MAX_AGE_NORMAL_REACHED"
 
@@ -625,10 +630,11 @@ class TestPR66PaperLiveEntryMaxAge:
 
     def test_metadata_fields_present(self):
         """All required PR66 metadata fields must appear in emit_order_event inputs."""
+        paper_max_age = self._paper_max_age()
         monitor = self._make_monitor("PAPER")
-        order = self._make_order(age_secs=181.0)
+        order = self._make_order(age_secs=float(paper_max_age + 1))
         monitor._check_stale_entry_cancel(
-            order, "ORD-TEST-001", "SUBMITTED", order["contract"], 181.0
+            order, "ORD-TEST-001", "SUBMITTED", order["contract"], float(paper_max_age + 1)
         )
         emit_calls = monitor._emit_order_event.call_args_list
         assert emit_calls, "emit_order_event must be called"
@@ -680,7 +686,7 @@ class TestPR66PaperLiveEntryMaxAge:
 
     def test_default_client_mode_is_live_strict(self):
         """Issue 1 safety net: APOrderMonitor() with no client_mode must default
-        to LIVE (90s ceiling), not PAPER (180s ceiling)."""
+        to LIVE (90s ceiling), not PAPER (the relaxed paper ceiling)."""
         from ap.order_monitor import APOrderMonitor
         from unittest.mock import MagicMock
         m = MagicMock()
@@ -705,4 +711,3 @@ class TestPR66PaperLiveEntryMaxAge:
                 'getattr(runner, "mode", "LIVE")' in src), (
             "ap/self_healing.py must pass client_mode=getattr(runner, 'mode', 'LIVE') to APOrderMonitor"
         )
-
