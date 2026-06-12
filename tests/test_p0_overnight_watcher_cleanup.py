@@ -540,7 +540,7 @@ def test_overnight_watch_false_cleans_order_and_records_source_and_proof(monkeyp
     assert "OVERNIGHT_WATCH_ARM_FAILED_CLEANUP_DONE" in caplog.text
 
 
-def test_overnight_watch_false_cleanup_failure_does_not_terminalize_source_or_proof(monkeypatch, caplog):
+def test_overnight_watch_false_cleanup_failure_marks_cleanup_failed_error_and_proof(monkeypatch, caplog):
     ledger = _FakeOpportunityLedger()
     entry_watcher = MagicMock()
     entry_watcher.watch.return_value = False
@@ -558,7 +558,13 @@ def test_overnight_watch_false_cleanup_failure_does_not_terminalize_source_or_pr
     assert result["errors"] == 1
     assert result["rejected"] == 0
     assert rejected_calls == []
-    assert error_calls == []
+    assert error_calls == [
+        (
+            "job-001",
+            "client-1",
+            "overnight_watch_arm_failed_cleanup_failed:overnight_watch_arm_failed:armed_false",
+        )
+    ]
     assert osm.expire_calls == [
         ("local-ord-1", "overnight_watch_arm_failed:armed_false")
     ]
@@ -572,8 +578,17 @@ def test_overnight_watch_false_cleanup_failure_does_not_terminalize_source_or_pr
             {"last_error": "overnight_watch_arm_failed:armed_false"},
         )
     ]
-    assert ("CANON-001", "client-1") not in ledger.rows
-    assert "source row/proof left non-terminal" in caplog.text
+    proof = ledger.rows[("CANON-001", "client-1")]
+    assert proof["opportunity_status"] == "INTERNAL_ERROR"
+    assert proof["miss_reason"] == (
+        "overnight_watch_arm_failed_cleanup_failed:overnight_watch_arm_failed:armed_false"
+    )
+    assert proof["metadata"]["overnight_watch_arm_cleanup_failed"] is True
+    assert proof["metadata"]["cleanup_method"] == "transition:EXPIRED"
+    assert proof["metadata"]["cleanup_success"] is False
+    assert proof["metadata"]["original_reason"] == "overnight_watch_arm_failed:armed_false"
+    assert "cleanup_success=False" in caplog.text
+    assert "overnight_watch_arm_failed_cleanup_failed" in caplog.text
 
 
 def test_shared_setup_does_not_create_repeated_local_orders_after_watch_arm_failure(monkeypatch):
@@ -635,6 +650,36 @@ def test_shared_setup_previous_session_failure_does_not_block_retry(monkeypatch)
     entry_watcher.watch.assert_called_once()
 
 
+def test_shared_setup_retryable_same_session_failure_does_not_block_retry(monkeypatch):
+    ledger = _FakeOpportunityLedger()
+    ledger.rows[("CANON-001", "client-1")] = {
+        "signal_id": "sig-001",
+        "canonical_signal_id": "CANON-001",
+        "client_id": "client-1",
+        "opportunity_status": "INTERNAL_ERROR",
+        "miss_stage": "DATA_NOT_READY",
+        "miss_reason": "overnight_watch_arm_retryable:data_not_ready",
+        "metadata": {
+            "overnight_watch_arm_failure": True,
+            "overnight_reeval_session_key": "2026-06-12",
+        },
+    }
+    entry_watcher = MagicMock()
+    entry_watcher.watch.return_value = True
+
+    result, osm, _, _ = _run_reeval(
+        monkeypatch,
+        entry_watcher,
+        source="ap_signals",
+        ledger=ledger,
+    )
+
+    assert result["armed"] == 1
+    assert result["skipped"] == 0
+    assert osm.create_calls == 1
+    entry_watcher.watch.assert_called_once()
+
+
 def test_overnight_watch_exception_cleans_order_marks_error_and_records_proof(monkeypatch, caplog):
     ledger = _FakeOpportunityLedger()
     entry_watcher = MagicMock()
@@ -664,7 +709,7 @@ def test_overnight_watch_exception_cleans_order_marks_error_and_records_proof(mo
     assert "OVERNIGHT_WATCH_ARM_EXCEPTION_CLEANUP_DONE" in caplog.text
 
 
-def test_overnight_watch_exception_cleanup_failure_does_not_terminalize_source_or_proof(monkeypatch, caplog):
+def test_overnight_watch_exception_cleanup_failure_marks_cleanup_failed_error_and_proof(monkeypatch, caplog):
     ledger = _FakeOpportunityLedger()
     entry_watcher = MagicMock()
     entry_watcher.watch.side_effect = RuntimeError("watcher boom")
@@ -680,12 +725,27 @@ def test_overnight_watch_exception_cleanup_failure_does_not_terminalize_source_o
 
     assert result["errors"] == 1
     assert rejected_calls == []
-    assert error_calls == []
+    assert error_calls == [
+        (
+            "job-001",
+            "client-1",
+            "overnight_watch_arm_failed_cleanup_failed:overnight_watch_arm_failed:exception:watcher boom",
+        )
+    ]
     assert osm.expire_calls == [
         ("local-ord-1", "overnight_watch_arm_failed:exception:watcher boom")
     ]
-    assert ("CANON-001", "client-1") not in ledger.rows
-    assert "source row/proof left non-terminal" in caplog.text
+    proof = ledger.rows[("CANON-001", "client-1")]
+    assert proof["opportunity_status"] == "INTERNAL_ERROR"
+    assert proof["miss_reason"] == (
+        "overnight_watch_arm_failed_cleanup_failed:"
+        "overnight_watch_arm_failed:exception:watcher boom"
+    )
+    assert proof["metadata"]["overnight_watch_arm_cleanup_failed"] is True
+    assert proof["metadata"]["cleanup_method"] == "transition:EXPIRED"
+    assert proof["metadata"]["cleanup_success"] is False
+    assert proof["metadata"]["original_reason"] == "overnight_watch_arm_failed:exception:watcher boom"
+    assert "cleanup_success=False" in caplog.text
 
 
 def test_hard_70_floor_unchanged(monkeypatch):

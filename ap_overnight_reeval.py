@@ -290,6 +290,19 @@ def _overnight_reeval_session_key(now: Optional[datetime] = None) -> str:
     return now.date().isoformat()
 
 
+def _watch_arm_cleanup_failed_reason(original_reason: str) -> str:
+    original_reason = str(original_reason or "unknown")
+    return f"overnight_watch_arm_failed_cleanup_failed:{original_reason}"
+
+
+def _is_terminal_watch_arm_failure_reason(reason: str) -> bool:
+    reason = str(reason or "")
+    return (
+        reason.startswith("overnight_watch_arm_failed:")
+        or reason.startswith("overnight_watch_arm_failed_cleanup_failed:")
+    )
+
+
 def _get_client_opportunity_row(signal_id: str, client_id: str, signal: dict) -> tuple[str, Optional[dict]]:
     canonical_signal_id = _resolve_canonical_signal_id(signal_id, signal)
     if not canonical_signal_id or not client_id:
@@ -342,7 +355,7 @@ def _shared_watch_arm_failure_already_recorded(
     if _recorded_session != _session_key:
         return False
 
-    if _status == "MISSED" and _stage == "WATCHER_ARM" and _reason.startswith("overnight_watch_arm_failed:"):
+    if _status == "MISSED" and _stage == "WATCHER_ARM" and _is_terminal_watch_arm_failure_reason(_reason):
         log.info(
             "[%s] overnight_reeval: shared setup already has same-session WATCHER_ARM proof "
             "for canonical_signal_id=%s session_key=%s — skipping repeat local order creation",
@@ -352,7 +365,7 @@ def _shared_watch_arm_failure_already_recorded(
         )
         return True
 
-    if _status == "INTERNAL_ERROR" and _reason.startswith("overnight_watch_arm_failed:"):
+    if _status == "INTERNAL_ERROR" and _is_terminal_watch_arm_failure_reason(_reason):
         log.info(
             "[%s] overnight_reeval: shared setup already has same-session INTERNAL_ERROR arm-failure proof "
             "for canonical_signal_id=%s session_key=%s — skipping repeat local order creation",
@@ -375,6 +388,10 @@ def _record_watch_arm_failure_proof(
     job_id,
     is_exception: bool,
     session_key: Optional[str] = None,
+    cleanup_method: Optional[str] = None,
+    cleanup_success: Optional[bool] = None,
+    cleanup_failed: bool = False,
+    original_reason: Optional[str] = None,
 ) -> None:
     try:
         from ap.opportunity_ledger import (
@@ -399,6 +416,14 @@ def _record_watch_arm_failure_proof(
             ),
             "overnight_reeval_session_key": session_key or _overnight_reeval_session_key(),
         }
+        if cleanup_method is not None:
+            _extra_meta["cleanup_method"] = str(cleanup_method)
+        if cleanup_success is not None:
+            _extra_meta["cleanup_success"] = bool(cleanup_success)
+        if cleanup_failed:
+            _extra_meta["overnight_watch_arm_cleanup_failed"] = True
+        if original_reason is not None:
+            _extra_meta["original_reason"] = str(original_reason)
         if is_exception:
             mark_internal_error(
                 signal_id,
@@ -1043,15 +1068,33 @@ def run_overnight_reeval(
                         done_event="OVERNIGHT_WATCH_ARM_FAILED_CLEANUP_DONE",
                     )
                     if not _cleanup_success:
-                        log.error(
+                        _cleanup_failed_reason = _watch_arm_cleanup_failed_reason(_full_error)
+                        log.critical(
                             "[%s] overnight_reeval: watch arm failed but local ENTRY cleanup failed "
                             "| local_order_id=%s cleanup_method=%s reason=%s "
-                            "| source row/proof left non-terminal for retry/manual repair",
+                            "| cleanup_success=%s cleanup_failed_reason=%s",
                             ticker,
                             local_order_id,
                             _cleanup_method,
                             _full_error,
+                            _cleanup_success,
+                            _cleanup_failed_reason,
                         )
+                        _record_watch_arm_failure_proof(
+                            signal_id=signal_id,
+                            client_id=client_id,
+                            signal=signal,
+                            reason=_cleanup_failed_reason,
+                            local_order_id=str(local_order_id),
+                            job_id=job_id,
+                            is_exception=True,
+                            session_key=session_key,
+                            cleanup_method=_cleanup_method,
+                            cleanup_success=False,
+                            cleanup_failed=True,
+                            original_reason=_full_error,
+                        )
+                        _mark_job_error(job_id, client_id, _cleanup_failed_reason)
                         result["errors"] += 1
                         continue
                     _record_watch_arm_failure_proof(
@@ -1090,15 +1133,33 @@ def run_overnight_reeval(
                     done_event="OVERNIGHT_WATCH_ARM_EXCEPTION_CLEANUP_DONE",
                 )
                 if not _cleanup_success:
-                    log.error(
+                    _cleanup_failed_reason = _watch_arm_cleanup_failed_reason(_full_error)
+                    log.critical(
                         "[%s] overnight_reeval: entry_watcher.watch exception and local ENTRY cleanup failed "
                         "| local_order_id=%s cleanup_method=%s reason=%s "
-                        "| source row/proof left non-terminal for retry/manual repair",
+                        "| cleanup_success=%s cleanup_failed_reason=%s",
                         ticker,
                         local_order_id,
                         _cleanup_method,
                         _full_error,
+                        _cleanup_success,
+                        _cleanup_failed_reason,
                     )
+                    _record_watch_arm_failure_proof(
+                        signal_id=signal_id,
+                        client_id=client_id,
+                        signal=signal,
+                        reason=_cleanup_failed_reason,
+                        local_order_id=str(local_order_id),
+                        job_id=job_id,
+                        is_exception=True,
+                        session_key=session_key,
+                        cleanup_method=_cleanup_method,
+                        cleanup_success=False,
+                        cleanup_failed=True,
+                        original_reason=_full_error,
+                    )
+                    _mark_job_error(job_id, client_id, _cleanup_failed_reason)
                     result["errors"] += 1
                     continue
                 _record_watch_arm_failure_proof(
