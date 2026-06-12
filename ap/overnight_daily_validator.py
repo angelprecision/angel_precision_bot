@@ -37,6 +37,39 @@ log = logging.getLogger("ap.overnight_daily_validator")
 OVERNIGHT_DAILY_FAIL_OPEN = os.getenv("OVERNIGHT_DAILY_FAIL_OPEN", "0").strip().lower() in {"1", "true", "yes", "on"}
 
 
+# ---------------------------------------------------------------------------
+# PR #111 amend: market-data base URL resolution.
+# Overnight validation is market-data work, NOT order submission.
+# Must always use the live endpoint regardless of runtime execution mode.
+# Resolution order:
+#   1. broker.market_data_base_url
+#   2. broker.quote_base_url
+#   3. broker.cfg.market_data_base_url
+#   4. env TRADIER_MARKET_DATA_BASE_URL
+#   5. env TRADIER_DATA_BASE_URL
+#   6. https://api.tradier.com  — hard-coded live market-data fallback
+# ---------------------------------------------------------------------------
+_LIVE_MARKET_DATA_BASE_URL = "https://api.tradier.com"
+
+
+def _resolve_market_data_base_url(broker) -> str:
+    """Return live Tradier market-data base URL. Never returns sandbox."""
+    for attr in ("market_data_base_url", "quote_base_url"):
+        v = getattr(broker, attr, None)
+        if v and isinstance(v, str) and v.strip():
+            return v.strip().rstrip("/")
+    cfg = getattr(broker, "cfg", None)
+    if cfg is not None:
+        v = getattr(cfg, "market_data_base_url", None)
+        if v and isinstance(v, str) and v.strip():
+            return v.strip().rstrip("/")
+    for env_key in ("TRADIER_MARKET_DATA_BASE_URL", "TRADIER_DATA_BASE_URL"):
+        v = os.getenv(env_key, "").strip()
+        if v:
+            return v.rstrip("/")
+    return _LIVE_MARKET_DATA_BASE_URL
+
+
 class InvalidationReason:
     PRIOR_HIGH_BREACHED = "INVALIDATED_PRIOR_HIGH_BREACHED"
     PRIOR_LOW_BREACHED = "INVALIDATED_PRIOR_LOW_BREACHED"
@@ -85,11 +118,8 @@ def _fetch_intraday_bars(ticker: str, broker, start_str: str, end_str: str) -> l
     Returns list of bar dicts (may be empty). Never raises.
     """
     try:
-        base_url = (
-            getattr(broker, "base_url", None)
-            or getattr(getattr(broker, "cfg", None), "base_url", None)
-            or "https://sandbox.tradier.com"
-        )
+        # PR #111 amend: live market-data only.
+        base_url = _resolve_market_data_base_url(broker)
         resp = broker.session.get(
             f"{base_url}/v1/markets/timesales",
             params={
@@ -174,11 +204,8 @@ def fetch_market_snapshot(ticker: str, broker) -> Optional[MarketSnapshot]:
     # ── Step 1: Quote endpoint — last_price only ──────────────────────────────
     last_price = 0.0
     try:
-        base_url = (
-            getattr(broker, "base_url", None)
-            or getattr(getattr(broker, "cfg", None), "base_url", None)
-            or "https://sandbox.tradier.com"
-        )
+        # PR #111 amend: live market-data only.
+        base_url = _resolve_market_data_base_url(broker)
         qresp = broker.session.get(
             f"{base_url}/v1/markets/quotes",
             params={"symbols": ticker, "greeks": "false"},
