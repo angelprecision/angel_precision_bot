@@ -1081,10 +1081,22 @@ class APMasterControl:
         # Component 1: broker-proof submitted-but-unfilled orders.
         # PR #121: request the diagnostic dict so we can surface counted/
         # ignored bucket detail when blocking with capital_limit_no_remaining.
+        #
+        # PR #121 amend: if caller did not pass runtime_execution_mode, fall
+        # back to self._current_mode().lower(). This protects every call site
+        # — including legacy ones not yet updated — from under-counting real
+        # broker-submitted pending exposure due to a NULL/empty mode filter.
+        _resolved_runtime_mode = runtime_execution_mode
+        if not _resolved_runtime_mode:
+            try:
+                _resolved_runtime_mode = str(self._current_mode() or '').lower() or None
+            except Exception:
+                _resolved_runtime_mode = None
+
         _diag = self._pending_orders_capital(
             client_id,
             exclude_local_order_id=exclude_local_order_id,
-            runtime_execution_mode=runtime_execution_mode,
+            runtime_execution_mode=_resolved_runtime_mode,
             with_diagnostics=True,
         )
         if _diag is None:
@@ -1140,15 +1152,25 @@ class APMasterControl:
         client_id: str,
         *,
         exclude_local_order_id: Optional[str] = None,
+        runtime_execution_mode: Optional[str] = None,
     ) -> Optional[float]:
         """Return total pending ENTRY dollar exposure (for capital-gate math).
 
         Thin wrapper over _get_pending_capital_breakdown that preserves the
         float-returning contract expected by all existing callers.
+
+        PR #121 amend: runtime_execution_mode is forwarded to the breakdown
+        so the underlying SQL filters orders.execution_mode = runtime. When
+        omitted, the breakdown helper defaults runtime_execution_mode to
+        self._current_mode().lower() so existing callers do not under-count
+        broker-submitted pending orders for the active runtime.
+
         Returns None on LIVE fail-closed when DB is unavailable.
         """
         bd = self._get_pending_capital_breakdown(
-            snap, client_id, exclude_local_order_id=exclude_local_order_id,
+            snap, client_id,
+            exclude_local_order_id=exclude_local_order_id,
+            runtime_execution_mode=runtime_execution_mode,
         )
         if bd is None:
             return None
@@ -1437,7 +1459,15 @@ class APMasterControl:
         #
         # Outside bootstrap, behaviour is unchanged: the static estimate
         # still gates pre-selection to avoid wasted selector work.
-        pending_capital_real = self._pending_capital_from_snapshot_or_db(snap, client_id)
+        # PR #121 amend: explicit runtime_execution_mode so the broker-proof
+        # SQL filter excludes wrong-mode and NULL-mode rows. current_mode is
+        # 'LIVE' / 'PAPER' / 'READ_ONLY' — lowercased to match the
+        # orders.execution_mode value space ('live' / 'paper' / 'unknown').
+        pending_capital_real = self._pending_capital_from_snapshot_or_db(
+            snap,
+            client_id,
+            runtime_execution_mode=str(current_mode or '').lower(),
+        )
         if pending_capital_real is None:
             if current_mode == "LIVE" and self.pending_capital_fail_closed_live:
                 return self._block(
@@ -2662,8 +2692,13 @@ class APMasterControl:
             _lo = _plan_metadata.get("local_order_id")
             if _lo:
                 _exclude_local_order_id = str(_lo)
+        # PR #121 amend: revalidate_exposure runs the same capital math as
+        # evaluate() but after the selector. Pass runtime_execution_mode so
+        # the broker-proof pending sum matches what the gate computed earlier.
         pending_cap = self._pending_capital_from_snapshot_or_db(
-            snap, client_id, exclude_local_order_id=_exclude_local_order_id,
+            snap, client_id,
+            exclude_local_order_id=_exclude_local_order_id,
+            runtime_execution_mode=str(self._current_mode() or '').lower(),
         )
         if pending_cap is None:
             if self._is_live_mode() and self.pending_capital_fail_closed_live:
