@@ -1905,6 +1905,39 @@ def _mark_job_rejected(job_id, client_id: str, reason: str) -> None:
         log.debug("_mark_job_rejected[trade_queue] failed non-fatal: %s", e)
 
 
+def _mark_job_error(job_id, client_id: str, reason: str) -> None:
+    """Mark a WATCHING job errored in its original source table.
+
+    Shared ap_signals rows are not mutated; the per-client proof lives in the
+    opportunity ledger. trade_queue rows remain client-scoped and can be
+    terminally updated.
+    """
+    job_id_str = str(job_id)
+    if job_id_str.startswith("sup:"):
+        log.info(
+            "[%s] reeval errored shared setup %s — per-client error proof logged "
+            "(shared ap_signals row left WATCHING for other clients): %s",
+            client_id, job_id_str[4:], reason[:200],
+        )
+        return
+
+    try:
+        from ap.db import conn, run_with_retry
+
+        def _fn():
+            with conn() as c:
+                c.execute("""
+                    UPDATE trade_queue
+                    SET status = 'ERROR',
+                        last_error = %s,
+                        finished_ts = NOW()
+                    WHERE id = %s AND client_id = %s
+                """, (reason[:500], job_id, client_id))
+        run_with_retry(_fn)
+    except Exception as e:
+        log.debug("_mark_job_error[trade_queue] failed non-fatal: %s", e)
+
+
 def _mark_job_watching_armed(job_id, client_id: str, contract: str) -> None:
     """Record that a WATCHING job has been armed in the entry watcher.
 
