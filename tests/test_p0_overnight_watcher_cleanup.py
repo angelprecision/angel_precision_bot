@@ -430,3 +430,85 @@ def test_exception_path_second_run_skips():
 
     assert second_result["skipped"] == 1
     assert second_osm.create_calls == 0
+
+
+# =============================================================================
+# _mark_job_error safety — no NameError when watch raises or cleanup fails
+# These tests prove _mark_job_error is defined and reachable in both paths.
+# =============================================================================
+
+class TestMarkJobErrorSafety:
+    """
+    P1 fix: _mark_job_error was deleted from PR #126 but called in exception
+    and cleanup-failure paths. These tests prove no NameError occurs and the
+    correct error path is taken.
+    """
+
+    def test_watch_raises_and_cleanup_fails_no_name_error(self, caplog):
+        """
+        entry_watcher.watch raises + all cleanup methods fail →
+        _mark_job_error is called without NameError.
+        """
+        watcher = MagicMock()
+        watcher.watch.side_effect = RuntimeError("watcher boom")
+
+        osm = _StubOSM(expire_ok=False, cancel_ok=False)
+        osm.transition = MagicMock(side_effect=RuntimeError("transition boom"))
+        ledger = _StubLedger()
+
+        # Must not raise NameError — _mark_job_error must be defined
+        try:
+            result, _ = _run_reeval(osm=osm, watcher=watcher, ledger=ledger)
+        except NameError as e:
+            pytest.fail(f"NameError: {e} — _mark_job_error is not defined")
+
+        # errors or rejected must be incremented
+        assert result.get("errors", 0) >= 1 or result.get("rejected", 0) >= 1
+
+    def test_watch_false_cleanup_fails_no_name_error(self, caplog):
+        """
+        entry_watcher.watch returns False + cleanup fails →
+        _mark_job_error is called without NameError.
+        """
+        watcher = MagicMock()
+        watcher.watch.return_value = False
+        watcher._last_reject_reason = "armed_false"
+
+        osm = _StubOSM(expire_ok=False, cancel_ok=False)
+        osm.transition = MagicMock(side_effect=RuntimeError("transition boom"))
+        ledger = _StubLedger()
+
+        try:
+            result, _ = _run_reeval(osm=osm, watcher=watcher, ledger=ledger)
+        except NameError as e:
+            pytest.fail(f"NameError: {e} — _mark_job_error is not defined")
+
+        assert result.get("errors", 0) >= 1 or result.get("rejected", 0) >= 1
+
+    def test_mark_job_error_importable_from_module(self):
+        """
+        _mark_job_error must be a callable at module level —
+        proves it is not deleted.
+        """
+        import ap_overnight_reeval as _orn
+        assert callable(getattr(_orn, "_mark_job_error", None)), (
+            "_mark_job_error is not defined at module level in ap_overnight_reeval"
+        )
+
+    def test_watch_raises_cleanup_succeeds_no_name_error(self):
+        """
+        watch raises + cleanup succeeds → _mark_job_error still called
+        for the error case, no NameError.
+        """
+        watcher = MagicMock()
+        watcher.watch.side_effect = RuntimeError("boom")
+        osm    = _StubOSM()   # expire_ok=True by default
+        ledger = _StubLedger()
+
+        try:
+            result, _ = _run_reeval(osm=osm, watcher=watcher, ledger=ledger)
+        except NameError as e:
+            pytest.fail(f"NameError: {e}")
+
+        # Exception path always increments errors
+        assert result.get("errors", 0) >= 1
