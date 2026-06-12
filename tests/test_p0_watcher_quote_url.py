@@ -47,6 +47,13 @@ def test_paper_fail_closed_present():
     assert "PAPER_WATCHER_NO_MARKET_DATA_TOKEN" in body
     assert "return {}" in body
 
+def test_preflight_failure_message_present():
+    idx = EW_SRC.find("def _validate_market_data_preflight(")
+    end = EW_SRC.find("\n    def ", idx + 1)
+    body = EW_SRC[idx:end]
+    assert "PAPER_WATCHER_NO_MARKET_DATA_TOKEN" in body
+    assert "TRADIER_MARKET_DATA_TOKEN or TRADIER_DATA_TOKEN" in body
+
 def test_resolve_helper_default_is_live():
     """Hardcoded fallback must be api.tradier.com; sandbox guard must reject any sandbox URL."""
     idx = EW_SRC.find("def _resolve_watcher_quote_url(")
@@ -124,6 +131,11 @@ def _make_watcher(mode="PAPER", broker_base="https://sandbox.tradier.com",
         w.mode   = mode.upper()
         w._lock  = threading.Lock()
         w._pending = []
+        w._running = False
+        w._thread = None
+        w.on_trigger = None
+        w.require_on_trigger = True
+        w.order_state_machine = None
         return w
     except Exception:
         return None
@@ -173,6 +185,31 @@ def test_paper_no_token_returns_empty():
     w.broker.session.get.assert_not_called()
 
 
+def test_paper_no_token_start_fails_preflight_clearly():
+    w = _make_watcher(mode="PAPER", broker_base="https://sandbox.tradier.com")
+    if w is None:
+        pytest.skip("APEntryWatcher not importable in test env")
+    w.on_trigger = MagicMock()
+    env_clean = {
+        k: v for k, v in os.environ.items()
+        if k not in (
+            "TRADIER_MARKET_DATA_TOKEN",
+            "TRADIER_DATA_TOKEN",
+            "TRADIER_MARKET_DATA_BASE_URL",
+            "TRADIER_DATA_BASE_URL",
+        )
+    }
+    with patch.dict(os.environ, env_clean, clear=True), \
+         patch("ap_health_registry.HEALTH.ensure_registered") as ensure_registered, \
+         patch("ap_health_registry.HEALTH.set_status") as set_status:
+        with pytest.raises(RuntimeError, match="PAPER_WATCHER_NO_MARKET_DATA_TOKEN") as exc:
+            w.start()
+    assert "TRADIER_MARKET_DATA_TOKEN or TRADIER_DATA_TOKEN" in str(exc.value)
+    ensure_registered.assert_called_once()
+    set_status.assert_called_once()
+    assert w._running is False
+
+
 # ── Test 3: PAPER + market-data token → uses api.tradier.com ─────────────────
 
 def test_paper_with_token_uses_live_url():
@@ -194,6 +231,14 @@ def test_paper_with_token_uses_live_url():
     assert identity["watcher_sandbox_mode"] is False
     assert identity["watcher_quote_source"] == "tradier_live"
     assert "api.tradier.com" in identity["watcher_quote_base_url"]
+
+
+def test_paper_with_token_passes_preflight():
+    w = _make_watcher(mode="PAPER", broker_base="https://sandbox.tradier.com")
+    if w is None:
+        pytest.skip("APEntryWatcher not importable in test env")
+    with patch.dict(os.environ, {"TRADIER_MARKET_DATA_TOKEN": "live_data_tok"}, clear=True):
+        w._validate_market_data_preflight()
 
 
 # ── Test 4: LIVE + no token → broker.session fallback (acceptable) ───────────
@@ -224,6 +269,26 @@ def test_live_no_token_uses_broker_session():
         f"LIVE broker.session fallback must use api.tradier.com, got {call_url!r}"
     )
     assert "sandbox" not in call_url.lower()
+
+
+def test_fetch_quotes_success_populates_quote_age_ms():
+    w = _make_watcher(mode="PAPER", broker_base="https://sandbox.tradier.com")
+    if w is None:
+        pytest.skip("APEntryWatcher not importable in test env")
+
+    mock_resp = MagicMock()
+    mock_resp.json.return_value = {
+        "quotes": {"quote": [{"symbol": "SPY", "bid": 549.9, "ask": 550.1, "last": 550.0}]}
+    }
+
+    with patch.dict(os.environ, {"TRADIER_MARKET_DATA_TOKEN": "live_data_tok"}, clear=True), \
+         patch("requests.get", return_value=mock_resp) as requests_get:
+        result = w._fetch_quotes(["SPY"])
+
+    requests_get.assert_called_once()
+    assert result["SPY"]["quote_age_ms"] is not None
+    assert isinstance(result["SPY"]["quote_age_ms"], int)
+    assert result["SPY"]["quote_age_ms"] >= 0
 
 
 # ── Test 5: watcher_audit fields match actual quote source ───────────────────

@@ -186,6 +186,10 @@ def test_insert_has_quote_age_ms():
         'params must include payload.get("quote_age_ms")'
     )
 
+def test_trigger_audit_persists_quote_age_ms():
+    assert '"quote_age_ms":        quote_age_ms' in EW_SRC
+    assert 'reason_code="trigger_ready"' in EW_SRC
+
 def test_order_row_id_documented_nullable():
     """order_row_id is null from watcher context — documented near the INSERT."""
     # Find the INSERT itself (not just the function name which appears elsewhere)
@@ -209,3 +213,42 @@ def test_ap_lifecycle_root_has_fix():
         "ap_lifecycle.py (root, imported by watcher) must allow NONE→INVALIDATED"
     )
 
+def test_duplicate_ap_lifecycle_removed():
+    assert not (_REPO / "ap" / "lifecycle.py").exists(), (
+        "ap/lifecycle.py should be removed so runtime has one canonical ledger singleton"
+    )
+
+def test_build_payload_uses_watched_signal_quote_age_ms():
+    cls, _ = _load_watcher()
+    if cls is None:
+        pytest.skip("APEntryWatcher not importable")
+
+    watcher = cls.__new__(cls)
+    watcher.broker = MagicMock()
+    watcher.broker.base_url = "https://api.tradier.com"
+    watcher.broker.live_access_token = "live_tok"
+    watcher.broker.cfg = MagicMock()
+    watcher.broker.cfg.live_access_token = "live_tok"
+    watcher.mode = "PAPER"
+
+    watched = types.SimpleNamespace(
+        ticker="SPY",
+        score=91.0,
+        grade="A",
+        side="CALL",
+        signal_id="sig-1",
+        entry_trigger=550.0,
+        stop_level=547.5,
+        last_quote_bid=550.1,
+        last_quote_ask=550.3,
+        last_quote_age_ms=17,
+        signal={"timeframe": "1d", "pattern": "breakout", "plan_id": "plan-1"},
+    )
+    payload = watcher._build_watcher_audit_payload(
+        watched,
+        trigger_type="trigger",
+        reason_code="trigger_ready",
+        raw_reason="call_breach_confirmed",
+    )
+
+    assert payload["quote_age_ms"] == 17

@@ -384,6 +384,7 @@ class WatchedSignal:
         self.breach_price = 0.0
         self.last_quote_bid = 0.0
         self.last_quote_ask = 0.0
+        self.last_quote_age_ms: Optional[int] = None
         self._watcher_ref = None
         self._pending_audit: Optional[dict] = None  # audit payload staged inside check(), persisted by poll loop
 
@@ -800,6 +801,48 @@ class APEntryWatcher:
             "watcher_sandbox_mode":   bool(sandbox),
         }
 
+    def _coerce_quote_age_ms(self, value) -> Optional[int]:
+        try:
+            return max(0, int(round(float(value))))
+        except (TypeError, ValueError):
+            return None
+
+    def _validate_market_data_preflight(self) -> None:
+        base_url, md_token = self._resolve_watcher_quote_url()
+        if str(getattr(self, "mode", "PAPER")).upper() != "PAPER" or md_token:
+            return
+
+        failure_reason = (
+            "PAPER_WATCHER_NO_MARKET_DATA_TOKEN mode=PAPER "
+            f"base_url={base_url} "
+            "watcher quotes require live market data; "
+            "set TRADIER_MARKET_DATA_TOKEN or TRADIER_DATA_TOKEN."
+        )
+        try:
+            from ap_health_registry import (
+                HEALTH as _WH,
+                Criticality as _WC,
+                HealthStatus as _WS,
+            )
+            _WH.ensure_registered("ap_entry_watcher", _WC.HIGH, stale_after_s=45.0)
+            _WH.set_status(
+                "ap_entry_watcher",
+                _WS.FAILED,
+                reason=failure_reason,
+                metrics={
+                    "error_code": "PAPER_WATCHER_NO_MARKET_DATA_TOKEN",
+                    "execution_mode": "PAPER",
+                    "watcher_quote_base_url": base_url,
+                    "watcher_quote_source": "tradier_live",
+                    "watcher_sandbox_mode": False,
+                },
+            )
+        except Exception:
+            pass
+
+        log.critical("[watcher_quotes] %s", failure_reason)
+        raise RuntimeError(failure_reason)
+
     def _build_watcher_audit_payload(
         self,
         w=None,
@@ -845,6 +888,10 @@ class APEntryWatcher:
                 signal_entry_price = getattr(w, "entry_trigger", None)
             if stop_price is None:
                 stop_price = getattr(w, "stop_level", None)
+            if quote_age_ms is None:
+                quote_age_ms = self._coerce_quote_age_ms(
+                    getattr(w, "last_quote_age_ms", None)
+                )
             if not current_bid and not current_ask:
                 current_bid = float(getattr(w, "last_quote_bid", 0) or 0)
                 current_ask = float(getattr(w, "last_quote_ask", 0) or 0)
@@ -1256,6 +1303,7 @@ class APEntryWatcher:
 
             bid = float(quote.get("bid", 0) or 0)
             ask = float(quote.get("ask", 0) or 0)
+            w.last_quote_age_ms = self._coerce_quote_age_ms(quote.get("quote_age_ms"))
             if bid == 0 and ask == 0:
                 last = float(quote.get("last", 0) or 0)
                 bid = ask = last
@@ -1363,6 +1411,7 @@ class APEntryWatcher:
                     w.rearm_count += 1
                     w.last_quote_bid = bid
                     w.last_quote_ask = ask
+                    w.last_quote_age_ms = self._coerce_quote_age_ms(quote.get("quote_age_ms"))
                     rearmed_signals.append((w, bid, ask, mid, reclaim_threshold))
 
         # Max-attempts expiry: callbacks + pending cleanup.
@@ -2066,6 +2115,7 @@ class APEntryWatcher:
         elif trigger and trigger > 0:
             try:
                 quote = self._get_quote(ticker)
+                quote_age_ms = self._coerce_quote_age_ms(quote.get("quote_age_ms"))
                 bid = float(quote.get("bid") or 0)
                 ask = float(quote.get("ask") or 0)
                 mid = (bid + ask) / 2 if bid > 0 and ask > 0 else max(bid, ask)
@@ -2119,6 +2169,7 @@ class APEntryWatcher:
                             current_bid=bid,
                             current_ask=ask,
                             current_mid=mid,
+                            quote_age_ms=quote_age_ms,
                             arm_price=mid,
                             arm_condition=(
                                 f"drift_{pct_from_trigger*100:+.2f}pct"
@@ -2164,6 +2215,7 @@ class APEntryWatcher:
                             current_bid=bid,
                             current_ask=ask,
                             current_mid=mid,
+                            quote_age_ms=quote_age_ms,
                             arm_price=mid,
                             arm_condition=f"mid_{mid:.4f}_wrong_side_of_stop_{stop:.4f}",
                             stop_condition=f"stop_{stop:.4f}" if stop and stop > 0 else "",
@@ -2279,6 +2331,7 @@ class APEntryWatcher:
             if self.require_on_trigger:
                 raise RuntimeError(msg)
             log.warning(msg)
+        self._validate_market_data_preflight()
         self._running = True
         self._thread = threading.Thread(
             target=self._poll_loop,
@@ -2506,6 +2559,7 @@ class APEntryWatcher:
 
             bid = float(quote.get("bid") or 0)
             ask = float(quote.get("ask") or 0)
+            w.last_quote_age_ms = self._coerce_quote_age_ms(quote.get("quote_age_ms"))
             if bid == 0 and ask == 0:
                 last = float(quote.get("last") or 0)
                 bid = ask = last
@@ -2680,6 +2734,7 @@ class APEntryWatcher:
 
                 bid = float(quote.get("bid", 0) or 0)
                 ask = float(quote.get("ask", 0) or 0)
+                w.last_quote_age_ms = self._coerce_quote_age_ms(quote.get("quote_age_ms"))
                 if bid == 0 and ask == 0:
                     last = float(quote.get("last", 0) or 0)
                     bid = ask = last
@@ -2713,6 +2768,25 @@ class APEntryWatcher:
             _ticker = str(w.ticker or "")
             if action == "trigger":
                 # Signal breached — record TRIGGER_READY before firing callback.
+                _trigger_audit = self._build_watcher_audit_payload(
+                    w,
+                    trigger_type="trigger",
+                    current_bid=float(getattr(w, "last_quote_bid", 0) or 0),
+                    current_ask=float(getattr(w, "last_quote_ask", 0) or 0),
+                    reason_code="trigger_ready",
+                    raw_reason=(
+                        f"{str(getattr(w, 'side', '')).lower()}_breach_confirmed"
+                        f"_after_{int(getattr(w, 'breach_count', 0) or 0)}_polls"
+                    ),
+                    extra={
+                        "breach_count": int(getattr(w, "breach_count", 0) or 0),
+                        "queue_status": str((getattr(w, "signal", {}) or {}).get("queue_status") or ""),
+                    },
+                )
+                self._persist_watcher_audit(
+                    (getattr(w, "signal", {}) or {}).get("local_order_id"),
+                    _trigger_audit,
+                )
                 if _sig_id and _ticker:
                     _ew_record(_sig_id, _ticker, "TRIGGER_READY",
                                "trigger_breached_entry_submitted",
@@ -2815,6 +2889,7 @@ class APEntryWatcher:
             # Paper execution uses sandbox for orders but watcher quote
             # decisions must evaluate against real-time market prices.
             base_url, md_token = self._resolve_watcher_quote_url()
+            _quote_started = time.perf_counter()
             if md_token:
                 import requests as _req
                 resp = _req.get(
@@ -2855,15 +2930,19 @@ class APEntryWatcher:
                     headers={"Accept": "application/json"},
                     timeout=5,
                 )
+            quote_age_ms = max(0, int(round((time.perf_counter() - _quote_started) * 1000.0)))
             data = resp.json()
             quotes_raw = data.get("quotes", {}).get("quote", [])
             if isinstance(quotes_raw, dict):
                 quotes_raw = [quotes_raw]
-            return {
-                str(q.get("symbol", "")).upper(): q
-                for q in quotes_raw
-                if q.get("symbol")
-            }
+            normalized_quotes = {}
+            for q in quotes_raw:
+                if not q.get("symbol"):
+                    continue
+                _quote = dict(q)
+                _quote["quote_age_ms"] = quote_age_ms
+                normalized_quotes[str(q.get("symbol", "")).upper()] = _quote
+            return normalized_quotes
         except Exception as exc:
             log.warning("Tradier quote fetch failed: %s", exc)
             return {}
