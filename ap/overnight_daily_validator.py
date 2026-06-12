@@ -53,20 +53,54 @@ _LIVE_MARKET_DATA_BASE_URL = "https://api.tradier.com"
 
 
 def _resolve_market_data_base_url(broker) -> str:
-    """Return live Tradier market-data base URL. Never returns sandbox."""
+    """Return the live Tradier market-data base URL for this broker.
+
+    Every candidate URL is sanitised before it is returned. If a candidate
+    contains "sandbox.tradier.com" it is skipped with a warning and the
+    resolver falls through to the next candidate. This prevents a
+    misconfigured broker attribute or env var from silently routing overnight
+    validation to stale sandbox market data.
+    """
+
+    def _accept(url: str, source: str) -> "str | None":
+        clean = url.strip().rstrip("/")
+        if not clean:
+            return None
+        if "sandbox.tradier.com" in clean.lower():
+            log.warning(
+                "OVERNIGHT_MARKET_DATA_SANDBOX_URL_IGNORED source=%s value=%s"
+                " -- using live fallback instead",
+                source, clean,
+            )
+            return None
+        return clean
+
+    # 1. broker.market_data_base_url / broker.quote_base_url
     for attr in ("market_data_base_url", "quote_base_url"):
-        v = getattr(broker, attr, None)
-        if v and isinstance(v, str) and v.strip():
-            return v.strip().rstrip("/")
+        raw = getattr(broker, attr, None)
+        if raw and isinstance(raw, str):
+            accepted = _accept(raw, f"broker.{attr}")
+            if accepted:
+                return accepted
+
+    # 2. broker.cfg.market_data_base_url
     cfg = getattr(broker, "cfg", None)
     if cfg is not None:
-        v = getattr(cfg, "market_data_base_url", None)
-        if v and isinstance(v, str) and v.strip():
-            return v.strip().rstrip("/")
+        raw = getattr(cfg, "market_data_base_url", None)
+        if raw and isinstance(raw, str):
+            accepted = _accept(raw, "broker.cfg.market_data_base_url")
+            if accepted:
+                return accepted
+
+    # 3. env overrides
     for env_key in ("TRADIER_MARKET_DATA_BASE_URL", "TRADIER_DATA_BASE_URL"):
-        v = os.getenv(env_key, "").strip()
-        if v:
-            return v.rstrip("/")
+        raw = os.getenv(env_key, "").strip()
+        if raw:
+            accepted = _accept(raw, f"env.{env_key}")
+            if accepted:
+                return accepted
+
+    # 4. Hard-coded live fallback
     return _LIVE_MARKET_DATA_BASE_URL
 
 
