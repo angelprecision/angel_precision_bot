@@ -384,7 +384,10 @@ def test_pending_trigger_watchdog_preserves_active_watcher_owned_order(monkeypat
     assert osm.expire_calls == []
     assert osm.transition_calls == []
     assert "PENDING_TRIGGER_WATCHDOG_SEEN" in caplog.text
-    assert "watcher_owned=True" in caplog.text
+    assert "watcher_owner_state=True" in caplog.text
+    assert "ownership_check_available=True" in caplog.text
+    assert "ownership_check_error=None" in caplog.text
+    assert "cleanup_action=preserve_watcher_owned" in caplog.text
     assert "PENDING_TRIGGER_ORPHAN_EXPIRED" not in caplog.text
 
 
@@ -421,8 +424,79 @@ def test_pending_trigger_watchdog_expires_orphan_without_watcher_ownership(monke
         "PENDING_TRIGGER_ORPHAN_EXPIRED: no_broker_order_id no_submitted_ts age="
     )
     assert osm.orders["pending-1"]["status"] == "EXPIRED"
-    assert "watcher_owned=False" in caplog.text
+    assert "watcher_owner_state=False" in caplog.text
+    assert "ownership_check_available=True" in caplog.text
+    assert "ownership_check_error=None" in caplog.text
     assert "PENDING_TRIGGER_ORPHAN_EXPIRED" in caplog.text
+
+
+def test_pending_trigger_watchdog_preserves_order_when_entry_watcher_missing(monkeypatch, caplog):
+    from ap import order_monitor as om_mod
+
+    monkeypatch.setattr(om_mod, "PENDING_TRIGGER_CLEANUP_ENABLED", True)
+    monkeypatch.setattr(om_mod, "PENDING_TRIGGER_MAX_AGE_SECONDS", 60)
+    monkeypatch.setattr(om_mod, "PENDING_TRIGGER_CLEANUP_DRY_RUN", False)
+
+    osm = _FakeOrderStateMachine()
+    monitor = om_mod.APOrderMonitor(
+        client_id="client-1",
+        broker=MagicMock(),
+        order_state_machine=osm,
+        position_manager=MagicMock(),
+        entry_watcher=None,
+    )
+    monitor._emit_order_event = MagicMock()
+    monitor._get_active_entry_orders = MagicMock(
+        return_value=[_make_pending_trigger_order(age_seconds=120)]
+    )
+
+    caplog.set_level(logging.INFO, logger="ap.order_monitor")
+    monitor._check_entry_orders()
+
+    assert osm.expire_calls == []
+    assert osm.transition_calls == []
+    assert "PENDING_TRIGGER_ORPHAN_OWNERSHIP_UNKNOWN" in caplog.text
+    assert "watcher_owner_state=unknown" in caplog.text
+    assert "ownership_check_available=False" in caplog.text
+    assert "ownership_check_error=entry_watcher_missing" in caplog.text
+    assert "cleanup_action=preserve_ownership_unknown" in caplog.text
+    assert "PENDING_TRIGGER_ORPHAN_EXPIRED" not in caplog.text
+
+
+def test_pending_trigger_watchdog_preserves_order_when_ownership_check_raises(monkeypatch, caplog):
+    from ap import order_monitor as om_mod
+
+    monkeypatch.setattr(om_mod, "PENDING_TRIGGER_CLEANUP_ENABLED", True)
+    monkeypatch.setattr(om_mod, "PENDING_TRIGGER_MAX_AGE_SECONDS", 60)
+    monkeypatch.setattr(om_mod, "PENDING_TRIGGER_CLEANUP_DRY_RUN", False)
+
+    watcher = MagicMock()
+    watcher.has_order.side_effect = RuntimeError("watcher registry unavailable")
+    osm = _FakeOrderStateMachine()
+    monitor = om_mod.APOrderMonitor(
+        client_id="client-1",
+        broker=MagicMock(),
+        order_state_machine=osm,
+        position_manager=MagicMock(),
+        entry_watcher=watcher,
+    )
+    monitor._emit_order_event = MagicMock()
+    monitor._get_active_entry_orders = MagicMock(
+        return_value=[_make_pending_trigger_order(age_seconds=120)]
+    )
+
+    caplog.set_level(logging.INFO, logger="ap.order_monitor")
+    monitor._check_entry_orders()
+
+    watcher.has_order.assert_called_once_with("pending-1")
+    assert osm.expire_calls == []
+    assert osm.transition_calls == []
+    assert "PENDING_TRIGGER_ORPHAN_OWNERSHIP_UNKNOWN" in caplog.text
+    assert "watcher_owner_state=unknown" in caplog.text
+    assert "ownership_check_available=True" in caplog.text
+    assert "ownership_check_error=RuntimeError: watcher registry unavailable" in caplog.text
+    assert "cleanup_action=preserve_ownership_unknown" in caplog.text
+    assert "PENDING_TRIGGER_ORPHAN_EXPIRED" not in caplog.text
 
 
 def test_overnight_watch_false_cleans_order_and_records_source_and_proof(monkeypatch, caplog):
