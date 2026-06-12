@@ -678,6 +678,27 @@ class APEntryWatcher:
     def _dedup_key_for_signal(self, signal: dict) -> str:
         return str(signal.get("signal_id") or "").strip()
 
+    def has_order(self, local_order_id: Optional[str]) -> bool:
+        """Return True when this watcher currently owns the local ENTRY order.
+
+        PENDING_TRIGGER is the valid steady-state for an armed watcher-held
+        order. OrderMonitor uses this proof to distinguish live watcher-owned
+        rows from true orphaned ghosts after a restart or arm failure.
+        """
+        local_order_id = str(local_order_id or "").strip()
+        if not local_order_id:
+            return False
+
+        with self._lock:
+            for watched in self._pending:
+                _sig = getattr(watched, "signal", {}) or {}
+                _owned_id = str(_sig.get("local_order_id") or "").strip()
+                if _owned_id != local_order_id:
+                    continue
+                if watched.is_active or getattr(watched, "rearm_mode", False):
+                    return True
+        return False
+
     def _validate_local_order_id(self, local_order_id: Optional[str]) -> bool:
         """Best-effort OSM pre-arm validation.
 

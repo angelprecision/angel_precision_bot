@@ -226,6 +226,7 @@ class APOrderMonitor:
         order_state_machine,
         position_manager,
         exit_engine=None,
+        entry_watcher=None,
         alert_fn=None,
         # PR66: "PAPER" or "LIVE". Default is "LIVE" so any call site that
         # forgets to pass client_mode uses the strict 90s ceiling rather than
@@ -237,6 +238,7 @@ class APOrderMonitor:
         self.osm         = order_state_machine
         self.pm          = position_manager
         self.exit_engine = exit_engine
+        self.entry_watcher = entry_watcher
         self.alert_fn    = alert_fn
         # PR66: store mode for per-mode max-age selection.
         # "or LIVE" guards against explicit None/empty being passed — fail safe.
@@ -602,38 +604,62 @@ class APOrderMonitor:
         broker_oid,
         submitted_ts,
     ) -> None:
-        _seen_msg = (
-            "[%s] PENDING_TRIGGER_WATCHDOG_SEEN | %s | %s | age=%.0fs "
-            "| broker_order_id=%s | submitted_ts=%s | cleanup_enabled=%s | dry_run=%s"
-        )
+        if age_secs <= PENDING_TRIGGER_MAX_AGE_SECONDS:
+            return
+
         _submitted_repr = submitted_ts.isoformat() if submitted_ts else "None"
+        _watcher_owned = self._watcher_owns_pending_trigger(local_id)
+
         if broker_oid:
             log.critical(
-                _seen_msg + " | action=skip_broker_order_id_present",
+                "[%s] PENDING_TRIGGER_WATCHDOG_SEEN | %s | %s | age=%.0fs "
+                "| broker_order_id=%s | submitted_ts=%s | watcher_owned=%s "
+                "| cleanup_enabled=%s | dry_run=%s | action=skip_broker_order_id_present",
                 self.client_id,
                 contract,
                 local_id,
                 age_secs,
                 broker_oid,
                 _submitted_repr,
+                _watcher_owned,
+                PENDING_TRIGGER_CLEANUP_ENABLED,
+                PENDING_TRIGGER_CLEANUP_DRY_RUN,
+            )
+            return
+
+        if submitted_ts:
+            log.info(
+                "[%s] PENDING_TRIGGER_WATCHDOG_SEEN | %s | %s | age=%.0fs "
+                "| broker_order_id=%s | submitted_ts=%s | watcher_owned=%s "
+                "| cleanup_enabled=%s | dry_run=%s | action=skip_submitted_ts_present",
+                self.client_id,
+                contract,
+                local_id,
+                age_secs,
+                "None",
+                _submitted_repr,
+                _watcher_owned,
                 PENDING_TRIGGER_CLEANUP_ENABLED,
                 PENDING_TRIGGER_CLEANUP_DRY_RUN,
             )
             return
 
         log.info(
-            _seen_msg,
+            "[%s] PENDING_TRIGGER_WATCHDOG_SEEN | %s | %s | age=%.0fs "
+            "| broker_order_id=%s | submitted_ts=%s | watcher_owned=%s "
+            "| cleanup_enabled=%s | dry_run=%s",
             self.client_id,
             contract,
             local_id,
             age_secs,
-            broker_oid or "None",
+            "None",
             _submitted_repr,
+            _watcher_owned,
             PENDING_TRIGGER_CLEANUP_ENABLED,
             PENDING_TRIGGER_CLEANUP_DRY_RUN,
         )
 
-        if submitted_ts or age_secs <= PENDING_TRIGGER_MAX_AGE_SECONDS:
+        if _watcher_owned:
             return
         if not PENDING_TRIGGER_CLEANUP_ENABLED:
             return
@@ -701,6 +727,25 @@ class APOrderMonitor:
             cleanup_success,
             reason,
         )
+
+    def _watcher_owns_pending_trigger(self, local_order_id: str) -> bool:
+        watcher = getattr(self, "entry_watcher", None)
+        if watcher is None:
+            return False
+
+        has_order = getattr(watcher, "has_order", None)
+        if callable(has_order):
+            try:
+                return bool(has_order(local_order_id))
+            except Exception as exc:
+                log.warning(
+                    "[%s] PENDING_TRIGGER watcher ownership check failed | %s | error=%s",
+                    self.client_id,
+                    local_order_id,
+                    exc,
+                )
+                return False
+        return False
 
     def _check_exit_orders(self):
         orders = self._get_active_exit_orders()

@@ -10,8 +10,6 @@ from pathlib import Path
 from unittest.mock import MagicMock
 from zoneinfo import ZoneInfo
 
-import pytest
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 os.environ.setdefault("DATABASE_URL", "postgresql://test:test@localhost/test")
 sys.path.insert(0, str(REPO_ROOT))
@@ -22,11 +20,13 @@ FIXED_ET = datetime(2026, 6, 12, 9, 15, tzinfo=ZoneInfo("America/New_York"))
 class _FakeOrderStateMachine:
     def __init__(self):
         self.orders: dict[str, dict] = {}
+        self.create_calls = 0
         self.expire_calls: list[tuple[str, str]] = []
         self.cancel_calls: list[tuple[str, str]] = []
         self.transition_calls: list[tuple[str, str, dict]] = []
 
     def create_entry_order(self, plan, initial_status="CREATED", execution_mode=None):
+        self.create_calls += 1
         local_order_id = "local-ord-1"
         self.orders[local_order_id] = {
             "status": initial_status,
@@ -58,7 +58,139 @@ class _FakeOrderStateMachine:
         return True
 
 
-def _install_reeval_stubs(monkeypatch):
+class _FakeOpportunityLedger(types.ModuleType):
+    class _Query:
+        def __init__(self, storage: dict[tuple[str, str], dict]):
+            self._storage = storage
+            self._filters: dict[str, str] = {}
+
+        def select(self, *_args, **_kwargs):
+            return self
+
+        def eq(self, key: str, value: str):
+            self._filters[key] = value
+            return self
+
+        def limit(self, _n: int):
+            return self
+
+        def execute(self):
+            key = (
+                self._filters.get("canonical_signal_id"),
+                self._filters.get("client_id"),
+            )
+            row = self._storage.get(key)
+            return types.SimpleNamespace(data=[dict(row)] if row else [])
+
+    class _SB:
+        def __init__(self, storage: dict[tuple[str, str], dict]):
+            self._storage = storage
+
+        def table(self, name: str):
+            assert name == "client_signal_opportunities"
+            return _FakeOpportunityLedger._Query(self._storage)
+
+    def __init__(self):
+        super().__init__("ap.opportunity_ledger")
+        self.rows: dict[tuple[str, str], dict] = {}
+        self.invalidated_calls: list[dict] = []
+        self.internal_error_calls: list[dict] = []
+
+    def _get_sb(self):
+        return self._SB(self.rows)
+
+    def create_opportunities(
+        self,
+        signal_id: str,
+        client_ids: list[str],
+        payload: dict,
+        canonical_signal_id: str | None = None,
+        sb=None,
+    ) -> int:
+        canonical = canonical_signal_id or payload.get("canonical_signal_id") or signal_id
+        for client_id in client_ids:
+            self.rows.setdefault(
+                (canonical, client_id),
+                {
+                    "signal_id": signal_id,
+                    "canonical_signal_id": canonical,
+                    "client_id": client_id,
+                    "opportunity_status": "CREATED",
+                    "miss_stage": None,
+                    "miss_reason": None,
+                    "metadata": {},
+                },
+            )
+        return len(client_ids)
+
+    def mark_watcher_invalidated(
+        self,
+        signal_id: str,
+        client_id: str,
+        reason: str,
+        *,
+        canonical_signal_id: str | None = None,
+        order_local_id: str | None = None,
+        extra_meta: dict | None = None,
+        **_kwargs,
+    ) -> bool:
+        canonical = canonical_signal_id or signal_id
+        row = self.rows.setdefault(
+            (canonical, client_id),
+            {
+                "signal_id": signal_id,
+                "canonical_signal_id": canonical,
+                "client_id": client_id,
+                "metadata": {},
+            },
+        )
+        row.update(
+            {
+                "opportunity_status": "MISSED",
+                "miss_stage": "WATCHER_ARM",
+                "miss_reason": reason,
+                "order_local_id": order_local_id,
+                "metadata": {**(row.get("metadata") or {}), **(extra_meta or {})},
+            }
+        )
+        self.invalidated_calls.append(dict(row))
+        return True
+
+    def mark_internal_error(
+        self,
+        signal_id: str,
+        client_id: str,
+        miss_reason: str,
+        *,
+        canonical_signal_id: str | None = None,
+        order_local_id: str | None = None,
+        extra_meta: dict | None = None,
+        **_kwargs,
+    ) -> bool:
+        canonical = canonical_signal_id or signal_id
+        row = self.rows.setdefault(
+            (canonical, client_id),
+            {
+                "signal_id": signal_id,
+                "canonical_signal_id": canonical,
+                "client_id": client_id,
+                "metadata": {},
+            },
+        )
+        row.update(
+            {
+                "opportunity_status": "INTERNAL_ERROR",
+                "miss_stage": "INTERNAL_ERROR",
+                "miss_reason": miss_reason,
+                "order_local_id": order_local_id,
+                "metadata": {**(row.get("metadata") or {}), **(extra_meta or {})},
+            }
+        )
+        self.internal_error_calls.append(dict(row))
+        return True
+
+
+def _install_reeval_stubs(monkeypatch, ledger: _FakeOpportunityLedger | None = None):
     fake_validator = types.ModuleType("ap.overnight_daily_validator")
     fake_validator.fetch_market_snapshot = lambda ticker, broker: {"last": 100.0}
     fake_validator.validate_overnight_daily_signal = (
@@ -79,6 +211,9 @@ def _install_reeval_stubs(monkeypatch):
     fake_auth.LIVE_AUTHORIZATION_GATE_UNAVAILABLE = "LIVE_AUTHORIZATION_GATE_UNAVAILABLE"
     fake_auth.execution_mode_for_broker = lambda broker: "PAPER"
     monkeypatch.setitem(sys.modules, "ap.authorization", fake_auth)
+
+    if ledger is not None:
+        monkeypatch.setitem(sys.modules, "ap.opportunity_ledger", ledger)
 
 
 def _make_plan():
@@ -107,6 +242,7 @@ def _make_plan():
 def _make_signal():
     return {
         "signal_id": "sig-001",
+        "canonical_signal_id": "CANON-001",
         "ticker": "AAPL",
         "symbol": "AAPL",
         "side": "CALL",
@@ -119,15 +255,51 @@ def _make_signal():
     }
 
 
-def _run_reeval(monkeypatch, entry_watcher):
+def _make_job(source: str) -> dict:
+    signal = _make_signal()
+    if source == "ap_signals":
+        return {
+            "id": "sup:sig-001",
+            "signal_id": signal["signal_id"],
+            "payload": signal,
+            "_source": "ap_signals",
+        }
+    return {
+        "id": "job-001",
+        "signal_id": signal["signal_id"],
+        "payload": signal,
+        "_source": "trade_queue",
+    }
+
+
+def _run_reeval(
+    monkeypatch,
+    entry_watcher,
+    *,
+    source: str = "trade_queue",
+    ledger: _FakeOpportunityLedger | None = None,
+):
     import ap_overnight_reeval as ov
 
-    _install_reeval_stubs(monkeypatch)
+    _install_reeval_stubs(monkeypatch, ledger=ledger)
     monkeypatch.setattr(ov, "_et_now", lambda: FIXED_ET)
     monkeypatch.setattr(
         ov,
         "_fetch_watching_signals",
-        lambda client_id: [{"id": "job-001", "signal_id": "sig-001", "payload": _make_signal()}],
+        lambda client_id: [_make_job(source)],
+    )
+
+    rejected_calls: list[tuple[str, str, str]] = []
+    error_calls: list[tuple[str, str, str]] = []
+    monkeypatch.setattr(
+        ov,
+        "_mark_job_rejected",
+        lambda job_id, client_id, reason: rejected_calls.append((str(job_id), client_id, reason)),
+    )
+    monkeypatch.setattr(
+        ov,
+        "_mark_job_error",
+        lambda job_id, client_id, reason: error_calls.append((str(job_id), client_id, reason)),
     )
 
     broker = MagicMock()
@@ -157,7 +329,7 @@ def _run_reeval(monkeypatch, entry_watcher):
         entry_watcher=entry_watcher,
         force=True,
     )
-    return result, osm
+    return result, osm, rejected_calls, error_calls
 
 
 def _make_pending_trigger_order(*, age_seconds: int) -> dict:
@@ -183,52 +355,22 @@ def _make_pending_trigger_order(*, age_seconds: int) -> dict:
     }
 
 
-def test_overnight_watch_returns_false_expires_pending_order(monkeypatch, caplog):
-    entry_watcher = MagicMock()
-    entry_watcher.watch.return_value = False
-    entry_watcher._last_reject_reason = "armed_false"
-
-    caplog.set_level(logging.INFO, logger="ap.overnight_reeval")
-    result, osm = _run_reeval(monkeypatch, entry_watcher)
-
-    assert result["errors"] == 1
-    assert osm.expire_calls == [
-        ("local-ord-1", "overnight_watch_arm_failed:armed_false")
-    ]
-    assert osm.orders["local-ord-1"]["status"] == "EXPIRED"
-    assert "OVERNIGHT_WATCH_ARM_FAILED_CLEANUP_START" in caplog.text
-    assert "OVERNIGHT_WATCH_ARM_FAILED_CLEANUP_DONE" in caplog.text
-
-
-def test_overnight_watch_raises_expires_pending_order(monkeypatch, caplog):
-    entry_watcher = MagicMock()
-    entry_watcher.watch.side_effect = RuntimeError("watcher boom")
-
-    caplog.set_level(logging.INFO, logger="ap.overnight_reeval")
-    result, osm = _run_reeval(monkeypatch, entry_watcher)
-
-    assert result["errors"] == 1
-    assert len(osm.expire_calls) == 1
-    local_order_id, reason = osm.expire_calls[0]
-    assert local_order_id == "local-ord-1"
-    assert reason == "overnight_watch_arm_failed:exception:watcher boom"
-    assert osm.orders["local-ord-1"]["status"] == "EXPIRED"
-    assert "OVERNIGHT_WATCH_ARM_EXCEPTION_CLEANUP_DONE" in caplog.text
-
-
-def test_pending_trigger_watchdog_expires_orphan(monkeypatch, caplog):
+def test_pending_trigger_watchdog_preserves_active_watcher_owned_order(monkeypatch, caplog):
     from ap import order_monitor as om_mod
 
     monkeypatch.setattr(om_mod, "PENDING_TRIGGER_CLEANUP_ENABLED", True)
     monkeypatch.setattr(om_mod, "PENDING_TRIGGER_MAX_AGE_SECONDS", 60)
     monkeypatch.setattr(om_mod, "PENDING_TRIGGER_CLEANUP_DRY_RUN", False)
 
+    watcher = MagicMock()
+    watcher.has_order.return_value = True
     osm = _FakeOrderStateMachine()
     monitor = om_mod.APOrderMonitor(
         client_id="client-1",
         broker=MagicMock(),
         order_state_machine=osm,
         position_manager=MagicMock(),
+        entry_watcher=watcher,
     )
     monitor._emit_order_event = MagicMock()
     monitor._get_active_entry_orders = MagicMock(
@@ -238,6 +380,40 @@ def test_pending_trigger_watchdog_expires_orphan(monkeypatch, caplog):
     caplog.set_level(logging.INFO, logger="ap.order_monitor")
     monitor._check_entry_orders()
 
+    watcher.has_order.assert_called_once_with("pending-1")
+    assert osm.expire_calls == []
+    assert osm.transition_calls == []
+    assert "PENDING_TRIGGER_WATCHDOG_SEEN" in caplog.text
+    assert "watcher_owned=True" in caplog.text
+    assert "PENDING_TRIGGER_ORPHAN_EXPIRED" not in caplog.text
+
+
+def test_pending_trigger_watchdog_expires_orphan_without_watcher_ownership(monkeypatch, caplog):
+    from ap import order_monitor as om_mod
+
+    monkeypatch.setattr(om_mod, "PENDING_TRIGGER_CLEANUP_ENABLED", True)
+    monkeypatch.setattr(om_mod, "PENDING_TRIGGER_MAX_AGE_SECONDS", 60)
+    monkeypatch.setattr(om_mod, "PENDING_TRIGGER_CLEANUP_DRY_RUN", False)
+
+    watcher = MagicMock()
+    watcher.has_order.return_value = False
+    osm = _FakeOrderStateMachine()
+    monitor = om_mod.APOrderMonitor(
+        client_id="client-1",
+        broker=MagicMock(),
+        order_state_machine=osm,
+        position_manager=MagicMock(),
+        entry_watcher=watcher,
+    )
+    monitor._emit_order_event = MagicMock()
+    monitor._get_active_entry_orders = MagicMock(
+        return_value=[_make_pending_trigger_order(age_seconds=120)]
+    )
+
+    caplog.set_level(logging.INFO, logger="ap.order_monitor")
+    monitor._check_entry_orders()
+
+    watcher.has_order.assert_called_once_with("pending-1")
     assert len(osm.expire_calls) == 1
     local_order_id, reason = osm.expire_calls[0]
     assert local_order_id == "pending-1"
@@ -245,36 +421,97 @@ def test_pending_trigger_watchdog_expires_orphan(monkeypatch, caplog):
         "PENDING_TRIGGER_ORPHAN_EXPIRED: no_broker_order_id no_submitted_ts age="
     )
     assert osm.orders["pending-1"]["status"] == "EXPIRED"
-    assert "PENDING_TRIGGER_WATCHDOG_SEEN" in caplog.text
+    assert "watcher_owned=False" in caplog.text
     assert "PENDING_TRIGGER_ORPHAN_EXPIRED" in caplog.text
 
 
-def test_pending_trigger_watchdog_does_not_touch_recent_order(monkeypatch, caplog):
-    from ap import order_monitor as om_mod
+def test_overnight_watch_false_cleans_order_and_records_source_and_proof(monkeypatch, caplog):
+    ledger = _FakeOpportunityLedger()
+    entry_watcher = MagicMock()
+    entry_watcher.watch.return_value = False
+    entry_watcher._last_reject_reason = "armed_false"
 
-    monkeypatch.setattr(om_mod, "PENDING_TRIGGER_CLEANUP_ENABLED", True)
-    monkeypatch.setattr(om_mod, "PENDING_TRIGGER_MAX_AGE_SECONDS", 300)
-    monkeypatch.setattr(om_mod, "PENDING_TRIGGER_CLEANUP_DRY_RUN", False)
-
-    osm = _FakeOrderStateMachine()
-    monitor = om_mod.APOrderMonitor(
-        client_id="client-1",
-        broker=MagicMock(),
-        order_state_machine=osm,
-        position_manager=MagicMock(),
-    )
-    monitor._emit_order_event = MagicMock()
-    monitor._get_active_entry_orders = MagicMock(
-        return_value=[_make_pending_trigger_order(age_seconds=45)]
+    caplog.set_level(logging.INFO, logger="ap.overnight_reeval")
+    result, osm, rejected_calls, error_calls = _run_reeval(
+        monkeypatch,
+        entry_watcher,
+        source="trade_queue",
+        ledger=ledger,
     )
 
-    caplog.set_level(logging.INFO, logger="ap.order_monitor")
-    monitor._check_entry_orders()
+    assert result["rejected"] == 1
+    assert result["errors"] == 0
+    assert error_calls == []
+    assert rejected_calls == [
+        ("job-001", "client-1", "overnight_watch_arm_failed:armed_false")
+    ]
+    assert osm.expire_calls == [
+        ("local-ord-1", "overnight_watch_arm_failed:armed_false")
+    ]
+    proof = ledger.rows[("CANON-001", "client-1")]
+    assert proof["opportunity_status"] == "MISSED"
+    assert proof["miss_stage"] == "WATCHER_ARM"
+    assert proof["miss_reason"] == "overnight_watch_arm_failed:armed_false"
+    assert proof["metadata"]["overnight_watch_arm_failure"] is True
+    assert proof["metadata"]["overnight_source_table"] == "trade_queue"
+    assert "OVERNIGHT_WATCH_ARM_FAILED_CLEANUP_DONE" in caplog.text
 
-    assert osm.expire_calls == []
-    assert osm.transition_calls == []
-    assert "PENDING_TRIGGER_WATCHDOG_SEEN" in caplog.text
-    assert "PENDING_TRIGGER_ORPHAN_EXPIRED" not in caplog.text
+
+def test_shared_setup_does_not_create_repeated_local_orders_after_watch_arm_failure(monkeypatch):
+    ledger = _FakeOpportunityLedger()
+    entry_watcher = MagicMock()
+    entry_watcher.watch.return_value = False
+    entry_watcher._last_reject_reason = "armed_false"
+
+    first_result, first_osm, _, _ = _run_reeval(
+        monkeypatch,
+        entry_watcher,
+        source="ap_signals",
+        ledger=ledger,
+    )
+    assert first_result["rejected"] == 1
+    assert first_osm.create_calls == 1
+    assert ledger.rows[("CANON-001", "client-1")]["opportunity_status"] == "MISSED"
+
+    second_result, second_osm, _, _ = _run_reeval(
+        monkeypatch,
+        entry_watcher,
+        source="ap_signals",
+        ledger=ledger,
+    )
+    assert second_result["skipped"] == 1
+    assert second_osm.create_calls == 0
+    assert entry_watcher.watch.call_count == 1, (
+        "shared setup must not re-arm after a recorded per-client watch-arm failure"
+    )
+
+
+def test_overnight_watch_exception_cleans_order_marks_error_and_records_proof(monkeypatch, caplog):
+    ledger = _FakeOpportunityLedger()
+    entry_watcher = MagicMock()
+    entry_watcher.watch.side_effect = RuntimeError("watcher boom")
+
+    caplog.set_level(logging.INFO, logger="ap.overnight_reeval")
+    result, osm, rejected_calls, error_calls = _run_reeval(
+        monkeypatch,
+        entry_watcher,
+        source="trade_queue",
+        ledger=ledger,
+    )
+
+    assert result["errors"] == 1
+    assert rejected_calls == []
+    assert error_calls == [
+        ("job-001", "client-1", "overnight_watch_arm_failed:exception:watcher boom")
+    ]
+    assert osm.expire_calls == [
+        ("local-ord-1", "overnight_watch_arm_failed:exception:watcher boom")
+    ]
+    proof = ledger.rows[("CANON-001", "client-1")]
+    assert proof["opportunity_status"] == "INTERNAL_ERROR"
+    assert proof["miss_reason"] == "overnight_watch_arm_failed:exception:watcher boom"
+    assert proof["metadata"]["overnight_source_table"] == "trade_queue"
+    assert "OVERNIGHT_WATCH_ARM_EXCEPTION_CLEANUP_DONE" in caplog.text
 
 
 def test_hard_70_floor_unchanged(monkeypatch):
