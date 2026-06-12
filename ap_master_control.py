@@ -2851,7 +2851,16 @@ class APMasterControl:
         )
         return ControlDecision(ok=True, stage="revalidated", signal_id=signal_id, ticker=ticker, client_id=client_id)
 
-    def _block(self, signal_id, ticker, client_id, stage, reason, reason_code: str = "") -> ControlDecision:
+    def _block(self, signal_id, ticker, client_id, stage, reason, reason_code: str = "",
+               meta: Optional[dict] = None) -> ControlDecision:
+        """
+        Centralized block emitter.
+
+        PR #121: meta is an optional dict carried as `context` into the
+        decision event. Used by capital_limit_no_remaining to surface
+        counted_order_ids / ignored_reserved_cost_by_status / etc into
+        result_json so operators can audit pending-exposure rejections.
+        """
         reason_code = reason_code or self._reason_code_from_block(stage, reason)
         log.info("[%s] BLOCKED | stage=%s | reason=%s | reason_code=%s", ticker, stage, reason, reason_code)
         try:
@@ -2868,6 +2877,7 @@ class APMasterControl:
                     strategy_version=self.strategy_version,
                     config_hash=self.config_hash,
                     git_commit=self.git_commit,
+                    context=(meta or None),
                 )
         except Exception as e:
             log.debug("Decision event emit failed (non-critical): %s", e)
