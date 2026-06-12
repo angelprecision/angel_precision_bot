@@ -222,6 +222,46 @@ _TERMINAL_QUEUE_STATUSES = {
 }
 
 
+def _derive_last_error(result: dict | None) -> str | None:
+    """
+    Derive a human-readable last_error string from a result dict.
+
+    PR #120 — Queue Rejection Honesty.
+
+    Rules (applied in order):
+      1. result missing or not a dict          → None
+      2. strip whitespace; ignore empty strings
+      3. stage + reason present                → "{stage}:{reason}"
+      4. reason only                           → "{reason}"
+      5. stage only                            → "{stage}"
+      6. reason_code only (no stage/reason)    → "{reason_code}"
+      7. nothing useful                        → None
+
+    Callers must strip their own values before passing; this function
+    also strips defensively.  Empty strings are treated as absent.
+    Does not raise.  Does not log.
+    """
+    if not isinstance(result, dict):
+        return None
+
+    def _s(key: str) -> str:
+        return str(result.get(key) or "").strip()
+
+    stage       = _s("stage")
+    reason      = _s("reason")
+    reason_code = _s("reason_code")
+
+    if stage and reason:
+        return f"{stage}:{reason}"
+    if reason:
+        return reason
+    if stage:
+        return stage
+    if reason_code and not stage and not reason:
+        return reason_code
+    return None
+
+
 def _mark_job(
     job_id: int,
     status: str,
@@ -235,8 +275,22 @@ def _mark_job(
     WATCHING is intentionally non-terminal: the entry watcher owns the trigger
     and later broker submission path. Marking finished_ts on WATCHING can make
     a live watched job look complete before any broker order fires.
+
+    PR #120 — last_error honesty:
+    - Explicit error= always wins.
+    - For TERMINAL statuses with no explicit error, derive last_error from
+      result_json (stage/reason/reason_code) so REJECTED rows are never null.
+    - For NON-TERMINAL statuses with no explicit error, preserve the existing
+      last_error in the DB rather than overwriting with NULL.
     """
     terminal = str(status).upper() in _TERMINAL_QUEUE_STATUSES
+
+    # Derive last_error for terminal statuses when caller did not supply error=.
+    # Explicit error always wins.  Non-terminal statuses never derive last_error
+    # from result_json — they preserve whatever last_error already exists in DB.
+    derived_error: str | None = error
+    if terminal and not derived_error:
+        derived_error = _derive_last_error(result)
 
     def _fn():
         with _conn()() as c:
@@ -246,14 +300,25 @@ def _mark_job(
                 SET status=%s,
                     finished_ts=CASE WHEN %s THEN NOW() ELSE finished_ts END,
                     result_json=%s,
-                    last_error=%s
+                    last_error=CASE
+                        WHEN %s IS NOT NULL THEN %s
+                        WHEN %s            THEN %s
+                        ELSE last_error
+                    END
                 WHERE id=%s
                 """,
                 (
                     status,
                     terminal,
                     _json_dumps(result) if result is not None else None,
-                    error,
+                    # last_error CASE params:
+                    #   param 4+5: explicit/derived error present → write it
+                    #   param 6+7: terminal with no error → write NULL (nothing to derive)
+                    #   ELSE:      non-terminal, no error → preserve existing last_error
+                    derived_error,        # WHEN derived_error IS NOT NULL
+                    derived_error,        # THEN derived_error
+                    terminal,             # WHEN terminal (and derived_error IS NULL)
+                    None,                 # THEN NULL  (terminal with no reason — honest null)
                     job_id,
                 ),
             )
