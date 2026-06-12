@@ -278,3 +278,191 @@ def test_ac6_prior_day_calc_unchanged():
     assert v2.valid
     assert v2.prior_high == 480.0
     assert v2.prior_low  == 465.0
+
+
+# =============================================================================
+# PR #111 amend — live market-data URL regression tests
+#
+# Required:
+#   1. When broker has no base_url / cfg.base_url, _fetch_intraday_bars()
+#      calls https://api.tradier.com/v1/markets/timesales (not sandbox).
+#   2. Paper/sandbox runtime broker objects still use live market-data URL
+#      for overnight validation calls.
+# =============================================================================
+
+def _load_v2():
+    """Load the amended overnight_daily_validator from the patched local copy."""
+    import importlib.util, sys
+    from pathlib import Path
+    # Prefer the local patched file written by the patch script.
+    patched = Path("/home/claude/overnight_daily_validator_v2.py")
+    if not patched.exists():
+        # Fall back to the repo path (running in CI on the branch)
+        patched = Path(__file__).resolve().parents[1] / "ap" / "overnight_daily_validator.py"
+    spec = importlib.util.spec_from_file_location("ap.overnight_daily_validator_v2", patched)
+    mod  = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class TestLiveMarketDataURL:
+    """Spec: overnight validation must never call sandbox.tradier.com."""
+
+    def _broker_no_base_url(self, captured_urls):
+        """Broker stub with NO base_url, market_data_base_url, or cfg.
+        Captures URLs called via broker.session.get."""
+        import unittest.mock as mock
+
+        broker = mock.MagicMock()
+        # Explicitly unset every attribute the resolver checks
+        del broker.market_data_base_url
+        del broker.quote_base_url
+        del broker.cfg
+        # base_url intentionally absent / None
+        broker.base_url = None
+
+        def _get(url, **kw):
+            captured_urls.append(url)
+            resp = mock.MagicMock()
+            resp.status_code = 200
+            # Return empty series / quote so function exits cleanly
+            if "timesales" in url:
+                resp.json.return_value = {"series": None}
+            else:
+                resp.json.return_value = {"quotes": {"quote": {}}}
+            return resp
+
+        broker.session.get.side_effect = _get
+        return broker
+
+    def _broker_paper_sandbox(self, captured_urls):
+        """Broker stub that looks like a paper/sandbox execution broker.
+        base_url is sandbox — this is intentionally a paper broker.
+        The resolver must NOT propagate this URL to market-data calls.
+        """
+        import unittest.mock as mock
+
+        broker = mock.MagicMock()
+        # Paper broker has sandbox base_url for ORDER SUBMISSION
+        broker.base_url = "https://sandbox.tradier.com"
+        # But has NO market_data_base_url / quote_base_url set
+        del broker.market_data_base_url
+        del broker.quote_base_url
+        del broker.cfg
+
+        def _get(url, **kw):
+            captured_urls.append(url)
+            resp = mock.MagicMock()
+            resp.status_code = 200
+            if "timesales" in url:
+                resp.json.return_value = {"series": None}
+            else:
+                resp.json.return_value = {"quotes": {"quote": {}}}
+            return resp
+
+        broker.session.get.side_effect = _get
+        return broker
+
+    def test_no_base_url_broker_uses_api_tradier_com(self):
+        """Required test 1: no base_url/cfg → calls api.tradier.com, not sandbox."""
+        mod = _load_v2()
+        captured = []
+        broker = self._broker_no_base_url(captured)
+
+        # Confirm the resolver returns the live endpoint
+        resolved = mod._resolve_market_data_base_url(broker)
+        assert resolved == "https://api.tradier.com", (
+            f"Expected https://api.tradier.com, got {resolved!r}"
+        )
+
+        # Call _fetch_intraday_bars and confirm the URL hit
+        mod._fetch_intraday_bars("NVDA", broker, "2026-06-11T09:30:00", "2026-06-11T10:00:00")
+        timesales_urls = [u for u in captured if "timesales" in u]
+        assert len(timesales_urls) >= 1
+        for url in timesales_urls:
+            assert "api.tradier.com" in url, (
+                f"Expected api.tradier.com in URL, got {url!r}"
+            )
+            assert "sandbox" not in url, (
+                f"sandbox.tradier.com must NOT be called for market-data, got {url!r}"
+            )
+
+    def test_paper_sandbox_broker_still_uses_live_market_data_url(self):
+        """Required test 2: paper broker (sandbox base_url) → live market-data URL."""
+        mod = _load_v2()
+        captured = []
+        broker = self._broker_paper_sandbox(captured)
+
+        # The resolver must NOT use broker.base_url (sandbox) for market data.
+        # market_data_base_url / quote_base_url not set → falls through to live.
+        resolved = mod._resolve_market_data_base_url(broker)
+        assert resolved == "https://api.tradier.com", (
+            f"Paper broker should resolve to api.tradier.com, got {resolved!r}"
+        )
+        assert "sandbox" not in resolved
+
+        # Confirm actual HTTP calls go to live endpoint
+        mod._fetch_intraday_bars("SPY", broker, "2026-06-11T09:30:00", "2026-06-11T10:00:00")
+        timesales_urls = [u for u in captured if "timesales" in u]
+        assert len(timesales_urls) >= 1
+        for url in timesales_urls:
+            assert "sandbox" not in url, (
+                f"Paper broker must NOT use sandbox for market-data validation: {url!r}"
+            )
+            assert "api.tradier.com" in url
+
+    def test_broker_with_market_data_base_url_uses_it(self):
+        """broker.market_data_base_url is respected (priority 1)."""
+        mod = _load_v2()
+        import unittest.mock as mock
+        broker = mock.MagicMock()
+        broker.market_data_base_url = "https://api.tradier.com"
+        del broker.quote_base_url
+        del broker.cfg
+        resolved = mod._resolve_market_data_base_url(broker)
+        assert resolved == "https://api.tradier.com"
+
+    def test_broker_with_quote_base_url_uses_it(self):
+        """broker.quote_base_url is respected (priority 2, PR #118 pattern)."""
+        mod = _load_v2()
+        import unittest.mock as mock
+        broker = mock.MagicMock()
+        del broker.market_data_base_url
+        broker.quote_base_url = "https://api.tradier.com"
+        del broker.cfg
+        resolved = mod._resolve_market_data_base_url(broker)
+        assert resolved == "https://api.tradier.com"
+
+    def test_env_tradier_data_base_url_respected(self, monkeypatch):
+        """env TRADIER_DATA_BASE_URL is used when broker has no explicit URL."""
+        mod = _load_v2()
+        import unittest.mock as mock
+        monkeypatch.setenv("TRADIER_DATA_BASE_URL", "https://api.tradier.com")
+        broker = mock.MagicMock()
+        del broker.market_data_base_url
+        del broker.quote_base_url
+        del broker.cfg
+        broker.base_url = None
+        resolved = mod._resolve_market_data_base_url(broker)
+        assert resolved == "https://api.tradier.com"
+        assert "sandbox" not in resolved
+
+    def test_source_has_no_sandbox_fallback_string(self):
+        """Source-level: https://sandbox.tradier.com must not appear as a URL
+        in the production code (only comments allowed)."""
+        from pathlib import Path
+        patched = Path("/home/claude/overnight_daily_validator_v2.py")
+        if not patched.exists():
+            patched = Path(__file__).resolve().parents[1] / "ap" / "overnight_daily_validator.py"
+        src = patched.read_text()
+        # Count actual string literals with sandbox URL
+        import ast
+        tree = ast.parse(src)
+        sandbox_literals = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                if "sandbox.tradier.com" in node.value:
+                    sandbox_literals.append(node.value)
+        assert len(sandbox_literals) == 0, (
+            f"Found sandbox.tradier.com in string literals: {sandbox_literals}"
+        )
