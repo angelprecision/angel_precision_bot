@@ -18,9 +18,10 @@ FIXED_ET = datetime(2026, 6, 12, 9, 15, tzinfo=ZoneInfo("America/New_York"))
 
 
 class _FakeOrderStateMachine:
-    def __init__(self):
+    def __init__(self, *, cleanup_succeeds: bool = True):
         self.orders: dict[str, dict] = {}
         self.create_calls = 0
+        self.cleanup_succeeds = cleanup_succeeds
         self.expire_calls: list[tuple[str, str]] = []
         self.cancel_calls: list[tuple[str, str]] = []
         self.transition_calls: list[tuple[str, str, dict]] = []
@@ -41,18 +42,24 @@ class _FakeOrderStateMachine:
 
     def expire_pending_entry(self, local_order_id: str, *, reason: str = "") -> bool:
         self.expire_calls.append((local_order_id, reason))
+        if not self.cleanup_succeeds:
+            return False
         self.orders.setdefault(local_order_id, {})["status"] = "EXPIRED"
         self.orders[local_order_id]["last_error"] = reason
         return True
 
     def cancel_pending_entry(self, local_order_id: str, *, reason: str = "") -> bool:
         self.cancel_calls.append((local_order_id, reason))
+        if not self.cleanup_succeeds:
+            return False
         self.orders.setdefault(local_order_id, {})["status"] = "CANCELED"
         self.orders[local_order_id]["last_error"] = reason
         return True
 
     def transition(self, local_order_id: str, new_status: str, **kwargs) -> bool:
         self.transition_calls.append((local_order_id, new_status, kwargs))
+        if not self.cleanup_succeeds:
+            return False
         self.orders.setdefault(local_order_id, {})["status"] = new_status
         self.orders[local_order_id].update(kwargs)
         return True
@@ -278,6 +285,7 @@ def _run_reeval(
     *,
     source: str = "trade_queue",
     ledger: _FakeOpportunityLedger | None = None,
+    cleanup_succeeds: bool = True,
 ):
     import ap_overnight_reeval as ov
 
@@ -319,7 +327,7 @@ def _run_reeval(
     contract_selector = MagicMock()
     contract_selector.select.return_value = "AAPL260619C00100000"
 
-    osm = _FakeOrderStateMachine()
+    osm = _FakeOrderStateMachine(cleanup_succeeds=cleanup_succeeds)
     result = ov.run_overnight_reeval(
         client_id="client-1",
         broker=broker,
@@ -528,7 +536,44 @@ def test_overnight_watch_false_cleans_order_and_records_source_and_proof(monkeyp
     assert proof["miss_reason"] == "overnight_watch_arm_failed:armed_false"
     assert proof["metadata"]["overnight_watch_arm_failure"] is True
     assert proof["metadata"]["overnight_source_table"] == "trade_queue"
+    assert proof["metadata"]["overnight_reeval_session_key"] == "2026-06-12"
     assert "OVERNIGHT_WATCH_ARM_FAILED_CLEANUP_DONE" in caplog.text
+
+
+def test_overnight_watch_false_cleanup_failure_does_not_terminalize_source_or_proof(monkeypatch, caplog):
+    ledger = _FakeOpportunityLedger()
+    entry_watcher = MagicMock()
+    entry_watcher.watch.return_value = False
+    entry_watcher._last_reject_reason = "armed_false"
+
+    caplog.set_level(logging.INFO, logger="ap.overnight_reeval")
+    result, osm, rejected_calls, error_calls = _run_reeval(
+        monkeypatch,
+        entry_watcher,
+        source="trade_queue",
+        ledger=ledger,
+        cleanup_succeeds=False,
+    )
+
+    assert result["errors"] == 1
+    assert result["rejected"] == 0
+    assert rejected_calls == []
+    assert error_calls == []
+    assert osm.expire_calls == [
+        ("local-ord-1", "overnight_watch_arm_failed:armed_false")
+    ]
+    assert osm.cancel_calls == [
+        ("local-ord-1", "overnight_watch_arm_failed:armed_false")
+    ]
+    assert osm.transition_calls == [
+        (
+            "local-ord-1",
+            "EXPIRED",
+            {"last_error": "overnight_watch_arm_failed:armed_false"},
+        )
+    ]
+    assert ("CANON-001", "client-1") not in ledger.rows
+    assert "source row/proof left non-terminal" in caplog.text
 
 
 def test_shared_setup_does_not_create_repeated_local_orders_after_watch_arm_failure(monkeypatch):
@@ -560,6 +605,36 @@ def test_shared_setup_does_not_create_repeated_local_orders_after_watch_arm_fail
     )
 
 
+def test_shared_setup_previous_session_failure_does_not_block_retry(monkeypatch):
+    ledger = _FakeOpportunityLedger()
+    ledger.rows[("CANON-001", "client-1")] = {
+        "signal_id": "sig-001",
+        "canonical_signal_id": "CANON-001",
+        "client_id": "client-1",
+        "opportunity_status": "MISSED",
+        "miss_stage": "WATCHER_ARM",
+        "miss_reason": "overnight_watch_arm_failed:old_failure",
+        "metadata": {
+            "overnight_watch_arm_failure": True,
+            "overnight_reeval_session_key": "2026-06-11",
+        },
+    }
+    entry_watcher = MagicMock()
+    entry_watcher.watch.return_value = True
+
+    result, osm, _, _ = _run_reeval(
+        monkeypatch,
+        entry_watcher,
+        source="ap_signals",
+        ledger=ledger,
+    )
+
+    assert result["armed"] == 1
+    assert result["skipped"] == 0
+    assert osm.create_calls == 1
+    entry_watcher.watch.assert_called_once()
+
+
 def test_overnight_watch_exception_cleans_order_marks_error_and_records_proof(monkeypatch, caplog):
     ledger = _FakeOpportunityLedger()
     entry_watcher = MagicMock()
@@ -585,7 +660,32 @@ def test_overnight_watch_exception_cleans_order_marks_error_and_records_proof(mo
     assert proof["opportunity_status"] == "INTERNAL_ERROR"
     assert proof["miss_reason"] == "overnight_watch_arm_failed:exception:watcher boom"
     assert proof["metadata"]["overnight_source_table"] == "trade_queue"
+    assert proof["metadata"]["overnight_reeval_session_key"] == "2026-06-12"
     assert "OVERNIGHT_WATCH_ARM_EXCEPTION_CLEANUP_DONE" in caplog.text
+
+
+def test_overnight_watch_exception_cleanup_failure_does_not_terminalize_source_or_proof(monkeypatch, caplog):
+    ledger = _FakeOpportunityLedger()
+    entry_watcher = MagicMock()
+    entry_watcher.watch.side_effect = RuntimeError("watcher boom")
+
+    caplog.set_level(logging.INFO, logger="ap.overnight_reeval")
+    result, osm, rejected_calls, error_calls = _run_reeval(
+        monkeypatch,
+        entry_watcher,
+        source="trade_queue",
+        ledger=ledger,
+        cleanup_succeeds=False,
+    )
+
+    assert result["errors"] == 1
+    assert rejected_calls == []
+    assert error_calls == []
+    assert osm.expire_calls == [
+        ("local-ord-1", "overnight_watch_arm_failed:exception:watcher boom")
+    ]
+    assert ("CANON-001", "client-1") not in ledger.rows
+    assert "source row/proof left non-terminal" in caplog.text
 
 
 def test_hard_70_floor_unchanged(monkeypatch):

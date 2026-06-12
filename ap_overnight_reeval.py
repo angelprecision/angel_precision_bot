@@ -285,6 +285,11 @@ def _resolve_canonical_signal_id(signal_id: str, signal: dict) -> str:
         return str((signal or {}).get("canonical_signal_id") or signal_id or "")
 
 
+def _overnight_reeval_session_key(now: Optional[datetime] = None) -> str:
+    now = now or _et_now()
+    return now.date().isoformat()
+
+
 def _get_client_opportunity_row(signal_id: str, client_id: str, signal: dict) -> tuple[str, Optional[dict]]:
     canonical_signal_id = _resolve_canonical_signal_id(signal_id, signal)
     if not canonical_signal_id or not client_id:
@@ -317,7 +322,13 @@ def _get_client_opportunity_row(signal_id: str, client_id: str, signal: dict) ->
     return canonical_signal_id, None
 
 
-def _shared_watch_arm_failure_already_recorded(signal_id: str, client_id: str, signal: dict) -> bool:
+def _shared_watch_arm_failure_already_recorded(
+    signal_id: str,
+    client_id: str,
+    signal: dict,
+    *,
+    session_key: Optional[str] = None,
+) -> bool:
     canonical_signal_id, row = _get_client_opportunity_row(signal_id, client_id, signal)
     if not row:
         return False
@@ -325,22 +336,29 @@ def _shared_watch_arm_failure_already_recorded(signal_id: str, client_id: str, s
     _status = str(row.get("opportunity_status") or "").upper()
     _stage = str(row.get("miss_stage") or "").upper()
     _reason = str(row.get("miss_reason") or "")
+    _metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+    _session_key = session_key or _overnight_reeval_session_key()
+    _recorded_session = str(_metadata.get("overnight_reeval_session_key") or "")
+    if _recorded_session != _session_key:
+        return False
 
     if _status == "MISSED" and _stage == "WATCHER_ARM" and _reason.startswith("overnight_watch_arm_failed:"):
         log.info(
-            "[%s] overnight_reeval: shared setup already has WATCHER_ARM proof "
-            "for canonical_signal_id=%s — skipping repeat local order creation",
+            "[%s] overnight_reeval: shared setup already has same-session WATCHER_ARM proof "
+            "for canonical_signal_id=%s session_key=%s — skipping repeat local order creation",
             client_id,
             canonical_signal_id,
+            _session_key,
         )
         return True
 
     if _status == "INTERNAL_ERROR" and _reason.startswith("overnight_watch_arm_failed:"):
         log.info(
-            "[%s] overnight_reeval: shared setup already has INTERNAL_ERROR arm-failure proof "
-            "for canonical_signal_id=%s — skipping repeat local order creation",
+            "[%s] overnight_reeval: shared setup already has same-session INTERNAL_ERROR arm-failure proof "
+            "for canonical_signal_id=%s session_key=%s — skipping repeat local order creation",
             client_id,
             canonical_signal_id,
+            _session_key,
         )
         return True
 
@@ -356,6 +374,7 @@ def _record_watch_arm_failure_proof(
     local_order_id: str,
     job_id,
     is_exception: bool,
+    session_key: Optional[str] = None,
 ) -> None:
     try:
         from ap.opportunity_ledger import (
@@ -378,6 +397,7 @@ def _record_watch_arm_failure_proof(
             "overnight_source_table": (
                 "ap_signals" if str(job_id).startswith("sup:") else "trade_queue"
             ),
+            "overnight_reeval_session_key": session_key or _overnight_reeval_session_key(),
         }
         if is_exception:
             mark_internal_error(
@@ -460,6 +480,7 @@ def run_overnight_reeval(
 
     # Guard: only run on trading days, 9:00-9:29 AM ET window (unless force=True)
     now_et = _et_now()
+    session_key = _overnight_reeval_session_key(now_et)
     if not force:
         if not _is_trading_day(now_et):
             log.info("[%s] overnight_reeval: skipping — not a trading day", client_id)
@@ -530,7 +551,7 @@ def run_overnight_reeval(
                 continue
 
             if job_source == "ap_signals" and _shared_watch_arm_failure_already_recorded(
-                signal_id, client_id, signal
+                signal_id, client_id, signal, session_key=session_key
             ):
                 result["skipped"] = result.get("skipped", 0) + 1
                 continue
@@ -1008,7 +1029,7 @@ def run_overnight_reeval(
                         "| contract=%s reason=%s",
                         ticker, _arm_label, _reject_reason,
                     )
-                    _cleanup_overnight_watch_arm_failure(
+                    _cleanup_success, _cleanup_method = _cleanup_overnight_watch_arm_failure(
                         order_state_machine=order_state_machine,
                         client_id=client_id,
                         signal_id=signal_id,
@@ -1021,6 +1042,18 @@ def run_overnight_reeval(
                         reason=_full_error,
                         done_event="OVERNIGHT_WATCH_ARM_FAILED_CLEANUP_DONE",
                     )
+                    if not _cleanup_success:
+                        log.error(
+                            "[%s] overnight_reeval: watch arm failed but local ENTRY cleanup failed "
+                            "| local_order_id=%s cleanup_method=%s reason=%s "
+                            "| source row/proof left non-terminal for retry/manual repair",
+                            ticker,
+                            local_order_id,
+                            _cleanup_method,
+                            _full_error,
+                        )
+                        result["errors"] += 1
+                        continue
                     _record_watch_arm_failure_proof(
                         signal_id=signal_id,
                         client_id=client_id,
@@ -1029,6 +1062,7 @@ def run_overnight_reeval(
                         local_order_id=str(local_order_id),
                         job_id=job_id,
                         is_exception=False,
+                        session_key=session_key,
                     )
                     _mark_job_rejected(job_id, client_id, _full_error)
                     if _lifecycle_ok:
@@ -1042,7 +1076,7 @@ def run_overnight_reeval(
                     result["rejected"] += 1
             except Exception as ew_exc:
                 _full_error = f"overnight_watch_arm_failed:exception:{ew_exc}"
-                _cleanup_overnight_watch_arm_failure(
+                _cleanup_success, _cleanup_method = _cleanup_overnight_watch_arm_failure(
                     order_state_machine=order_state_machine,
                     client_id=client_id,
                     signal_id=signal_id,
@@ -1055,6 +1089,18 @@ def run_overnight_reeval(
                     reason=_full_error,
                     done_event="OVERNIGHT_WATCH_ARM_EXCEPTION_CLEANUP_DONE",
                 )
+                if not _cleanup_success:
+                    log.error(
+                        "[%s] overnight_reeval: entry_watcher.watch exception and local ENTRY cleanup failed "
+                        "| local_order_id=%s cleanup_method=%s reason=%s "
+                        "| source row/proof left non-terminal for retry/manual repair",
+                        ticker,
+                        local_order_id,
+                        _cleanup_method,
+                        _full_error,
+                    )
+                    result["errors"] += 1
+                    continue
                 _record_watch_arm_failure_proof(
                     signal_id=signal_id,
                     client_id=client_id,
@@ -1063,6 +1109,7 @@ def run_overnight_reeval(
                     local_order_id=str(local_order_id),
                     job_id=job_id,
                     is_exception=True,
+                    session_key=session_key,
                 )
                 _mark_job_error(job_id, client_id, _full_error)
                 log.error("[%s] overnight_reeval: entry_watcher.watch failed: %s", ticker, ew_exc)
