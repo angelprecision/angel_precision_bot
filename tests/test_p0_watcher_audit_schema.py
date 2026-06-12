@@ -82,7 +82,7 @@ def test_fetch_quotes_uses_resolve_helper():
     idx = EW_SRC.find("def _fetch_quotes(")
     end = EW_SRC.find("\n    def ", idx + 1)
     body = EW_SRC[idx:end]
-    assert "_resolve_watcher_quote_url()" in body
+    assert "_resolve_watcher_quote_transport()" in body
     assert "sandbox.tradier.com" not in body
 
 def test_paper_fail_closed_present():
@@ -90,6 +90,7 @@ def test_paper_fail_closed_present():
     end = EW_SRC.find("\n    def ", idx + 1)
     body = EW_SRC[idx:end]
     assert "PAPER_WATCHER_NO_MARKET_DATA_TOKEN" in body
+    assert "raise RuntimeError" in body
 
 
 # ── Behavioral: APEntryWatcher + watcher_decision_audit ──────────────────────
@@ -162,8 +163,8 @@ def test_paper_no_token_fail_closed():
         for k in ("TRADIER_MARKET_DATA_TOKEN","TRADIER_DATA_TOKEN",
                   "TRADIER_MARKET_DATA_BASE_URL","TRADIER_DATA_BASE_URL"):
             os.environ.pop(k, None)
-        result = w._fetch_quotes(["SPY"])
-    assert result == {}
+        with pytest.raises(RuntimeError, match="PAPER_WATCHER_NO_MARKET_DATA_TOKEN"):
+            w._fetch_quotes(["SPY"])
     w.broker.session.get.assert_not_called()
 
 def test_watcher_decision_audit_params_use_text_client_id():
@@ -252,3 +253,5 @@ def test_build_payload_uses_watched_signal_quote_age_ms():
     )
 
     assert payload["quote_age_ms"] == 17
+    assert payload["watcher_quote_token_source"] == "broker.live_access_token"
+    assert payload["quote_fetch_status"] == "not_fetched"
