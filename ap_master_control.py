@@ -230,8 +230,10 @@ def _score_allows_entry(
 # Canonical active ENTRY order states that reserve capital / represent pending exposure.
 # Keep this aligned with APOrderStateMachine.PENDING_ENTRY_STATUSES and
 # APPositionManager._PENDING_ENTRY_STATUSES. Master Control prefers
-# position_manager.snapshot()["pending_entry_capital"], but this fallback must
-# use the same canonical lifecycle so fallback risk math cannot drift.
+# position_manager.snapshot()["filled_unreconciled_entry_capital"] and falls
+# back to snapshot()["pending_entry_capital"] only for legacy compatibility.
+# The broker-proof submitted-order path below must still use the same canonical
+# lifecycle so fallback risk math cannot drift.
 try:
     from ap.order_state_machine import PENDING_ENTRY_STATUSES as _OSM_PENDING_ENTRY_STATUSES
 except Exception:
@@ -877,7 +879,6 @@ class APMasterControl:
             from ap.db import conn, run_with_retry
             import os as _os
 
-            statuses = tuple(sorted(_ENTRY_CAPITAL_RESERVED_STATUSES))
             _phantom_grace_sec = int(_os.getenv("PENDING_ENTRY_PHANTOM_GRACE_SEC", "30"))
 
             # PR E / FIX-1: optional exclusion of one specific local_order_id
@@ -888,18 +889,6 @@ class APMasterControl:
             if exclude_local_order_id:
                 _exclude_clause = " AND local_order_id != %s"
                 _exclude_params = (str(exclude_local_order_id),)
-
-            # PR #121: broker-proof predicate with execution_mode filter and
-            # explicit ignore-buckets. Active broker statuses now match the
-            # spec exactly: SUBMITTED, ACCEPTED, OPEN, PARTIALLY_FILLED,
-            # PENDING_SUBMIT, PARTIAL_FILL, ACKNOWLEDGED. PENDING_TRIGGER and
-            # CREATED rows without a broker handshake are excluded — they
-            # represent watcher/local-only intent, not real exposure.
-            _ACTIVE_BROKER_STATUSES = (
-                'SUBMITTED', 'ACCEPTED', 'OPEN',
-                'PARTIALLY_FILLED', 'PARTIAL_FILL',
-                'PENDING_SUBMIT', 'ACKNOWLEDGED',
-            )
 
             # Resolve the runtime execution_mode for THIS client. Required so
             # historical mode='paper' rows do not count when client is now
@@ -930,7 +919,11 @@ class APMasterControl:
                         FROM orders
                         WHERE client_id = %s
                           AND kind = 'ENTRY'
-                          AND UPPER(COALESCE(status, '')) = ANY(%s)
+                          AND UPPER(COALESCE(status, '')) IN (
+                              'SUBMITTED', 'ACCEPTED', 'OPEN',
+                              'PARTIALLY_FILLED', 'PARTIAL_FILL',
+                              'PENDING_SUBMIT', 'ACKNOWLEDGED'
+                          )
                           AND (
                             (broker_order_id IS NOT NULL AND broker_order_id <> '')
                             OR submitted_ts IS NOT NULL
@@ -944,7 +937,6 @@ class APMasterControl:
                         """ + _exclude_clause,
                         (
                             client_id,
-                            list(_ACTIVE_BROKER_STATUSES),
                             _rmode or '',
                             '%watcher_invalidated%',
                             '%STARTUP_CLEANUP_CANCELED_STALE_ORPHAN%',
@@ -978,7 +970,11 @@ class APMasterControl:
                               SELECT local_order_id FROM orders
                               WHERE client_id = %s
                                 AND kind = 'ENTRY'
-                                AND UPPER(COALESCE(status, '')) = ANY(%s)
+                                AND UPPER(COALESCE(status, '')) IN (
+                                    'SUBMITTED', 'ACCEPTED', 'OPEN',
+                                    'PARTIALLY_FILLED', 'PARTIAL_FILL',
+                                    'PENDING_SUBMIT', 'ACKNOWLEDGED'
+                                )
                                 AND (
                                   (broker_order_id IS NOT NULL AND broker_order_id <> '')
                                   OR submitted_ts IS NOT NULL
@@ -991,7 +987,6 @@ class APMasterControl:
                         (
                             client_id,
                             client_id,
-                            list(_ACTIVE_BROKER_STATUSES),
                             _rmode or '',
                         ),
                     )
@@ -1044,7 +1039,11 @@ class APMasterControl:
                         'ignored_reserved_cost_by_status':  ignored_reserved_cost_by_status,
                         'ignored_order_ids_by_status':      ignored_order_ids_by_status,
                         'runtime_execution_mode':           _rmode,
-                        'active_broker_statuses':           list(_ACTIVE_BROKER_STATUSES),
+                        'active_broker_statuses': [
+                            'SUBMITTED', 'ACCEPTED', 'OPEN',
+                            'PARTIALLY_FILLED', 'PARTIAL_FILL',
+                            'PENDING_SUBMIT', 'ACKNOWLEDGED',
+                        ],
                     }
 
             return run_with_retry(_fn)
@@ -1071,7 +1070,7 @@ class APMasterControl:
 
         Keys:
           pending_submitted_entry_exposure  — broker-proof unfilled submitted orders
-          filled_unreconciled_exposure      — fill-truth unreconciled fills (snap)
+          filled_unreconciled_entry_capital — fill-truth unreconciled fills (snap)
           pending_total_capital_reserved    — sum of both (use for cap math)
 
         Returns None on LIVE fail-closed when DB is unavailable.
@@ -1119,15 +1118,24 @@ class APMasterControl:
 
         # Component 2: fill-truth unreconciled fills (position_manager snapshot)
         filled_unreconciled = 0.0
-        if isinstance(snap, dict) and snap.get("pending_entry_capital") is not None:
+        _filled_key = None
+        _filled_value = None
+        if isinstance(snap, dict):
+            if snap.get("filled_unreconciled_entry_capital") is not None:
+                _filled_key = "filled_unreconciled_entry_capital"
+                _filled_value = snap.get("filled_unreconciled_entry_capital")
+            elif snap.get("pending_entry_capital") is not None:
+                _filled_key = "pending_entry_capital"
+                _filled_value = snap.get("pending_entry_capital")
+        if _filled_key is not None:
             try:
-                filled_unreconciled = float(snap.get("pending_entry_capital") or 0.0)
+                filled_unreconciled = float(_filled_value or 0.0)
             except Exception as e:
                 self._alert_degraded(
-                    "SNAPSHOT_PENDING_ENTRY_CAPITAL_INVALID",
+                    "SNAPSHOT_FILLED_UNRECONCILED_ENTRY_CAPITAL_INVALID",
                     severity="CRITICAL" if self._is_live_mode() else "WARNING",
                     client_id=client_id,
-                    details={"value": repr(snap.get("pending_entry_capital")), "error": str(e)},
+                    details={"field": _filled_key, "value": repr(_filled_value), "error": str(e)},
                 )
                 if self._is_live_mode() and self.pending_capital_fail_closed_live:
                     return None
@@ -1135,16 +1143,54 @@ class APMasterControl:
         # Merge: keep all diagnostic fields so callers can surface them.
         return {
             "pending_submitted_entry_exposure": pending_submitted,
-            "filled_unreconciled_exposure":     filled_unreconciled,
+            "filled_unreconciled_entry_capital": filled_unreconciled,
+            "filled_unreconciled_exposure":      filled_unreconciled,
             "pending_total_capital_reserved":   pending_submitted + filled_unreconciled,
             "counted_order_ids":                _diag.get("counted_order_ids", []),
             "counted_order_statuses":           _diag.get("counted_order_statuses", []),
             "counted_broker_order_ids":         _diag.get("counted_broker_order_ids", []),
             "ignored_reserved_cost_by_status":  _diag.get("ignored_reserved_cost_by_status", {}),
             "ignored_order_ids_by_status":      _diag.get("ignored_order_ids_by_status", {}),
+            "ignored_already_reconciled_fill_capital": float(
+                (snap or {}).get("ignored_already_reconciled_fill_capital") or 0.0
+            ),
+            "capital_deployed": float((snap or {}).get("capital_deployed") or 0.0),
+            "position_capital_deployed": float(
+                (snap or {}).get("position_capital_deployed")
+                or (snap or {}).get("capital_deployed")
+                or 0.0
+            ),
+            "open_position_ids": list((snap or {}).get("open_position_ids") or []),
             "runtime_execution_mode":           _diag.get("runtime_execution_mode"),
             "active_broker_statuses":           _diag.get("active_broker_statuses", []),
         }
+
+    def _log_capital_breakdown_proof(
+        self,
+        *,
+        ticker: str,
+        breakdown: dict[str, Any],
+    ) -> None:
+        if not isinstance(breakdown, dict):
+            return
+        log.info(
+            "[%s] CAPITAL_BREAKDOWN_PROOF "
+            "capital_deployed=%.0f position_capital_deployed=%.0f "
+            "pending_submitted_entry_exposure=%.0f filled_unreconciled_entry_capital=%.0f "
+            "ignored_already_reconciled_fill_capital=%.0f "
+            "counted_order_ids=%s ignored_order_ids_by_status=%s "
+            "open_position_ids=%s runtime_execution_mode=%s",
+            ticker,
+            float(breakdown.get("capital_deployed", 0.0) or 0.0),
+            float(breakdown.get("position_capital_deployed", 0.0) or 0.0),
+            float(breakdown.get("pending_submitted_entry_exposure", 0.0) or 0.0),
+            float(breakdown.get("filled_unreconciled_entry_capital", 0.0) or 0.0),
+            float(breakdown.get("ignored_already_reconciled_fill_capital", 0.0) or 0.0),
+            breakdown.get("counted_order_ids", []),
+            breakdown.get("ignored_order_ids_by_status", {}),
+            breakdown.get("open_position_ids", []),
+            breakdown.get("runtime_execution_mode"),
+        )
 
     def _pending_capital_from_snapshot_or_db(
         self,
@@ -1531,18 +1577,19 @@ class APMasterControl:
                 _pending_submitted_real = float(
                     _bd_eval.get("pending_submitted_entry_exposure", 0.0)
                 )
-                _filled_unreconciled    = float(
-                    _bd_eval.get("filled_unreconciled_exposure", 0.0)
+                _filled_unreconciled_entry_capital = float(
+                    _bd_eval.get("filled_unreconciled_entry_capital", 0.0)
                 )
                 _pending_total_real     = float(
                     _bd_eval.get("pending_total_capital_reserved", pending_capital_real)
                 )
+                self._log_capital_breakdown_proof(ticker=ticker, breakdown=_bd_eval)
 
                 log.warning(
                     "[%s] SMALL_ACCOUNT_CONTRACT_UNAFFORDABLE "
                     "client_email=%s execution_mode=%s client_cap=%.0f "
                     "capital_deployed=%.0f pending_submitted_entry_exposure=%.0f "
-                    "filled_unreconciled_exposure=%.0f "
+                    "filled_unreconciled_entry_capital=%.0f "
                     "pending_total_capital_reserved=%.0f "
                     "remaining_capital=%.0f "
                     "counted_order_ids=%s ignored_buckets=%s "
@@ -1552,7 +1599,7 @@ class APMasterControl:
                     max_capital,
                     float(snap.get("capital_deployed", 0)),
                     _pending_submitted_real,
-                    _filled_unreconciled,
+                    _filled_unreconciled_entry_capital,
                     _pending_total_real,
                     remaining_capital_for_this_trade,
                     _bd_eval.get("counted_order_ids", []),
@@ -1565,15 +1612,24 @@ class APMasterControl:
                     "execution_mode":                     str(current_mode or '').lower(),
                     "client_cap":                         float(max_capital),
                     "deployed_exposure":                  float(snap.get("capital_deployed", 0)),
+                    "position_capital_deployed":          float(
+                        snap.get("position_capital_deployed", snap.get("capital_deployed", 0))
+                    ),
                     "pending_submitted_entry_exposure":   _pending_submitted_real,
-                    "filled_unreconciled_exposure":       _filled_unreconciled,
+                    "filled_unreconciled_entry_capital":  _filled_unreconciled_entry_capital,
+                    "filled_unreconciled_exposure":       _filled_unreconciled_entry_capital,
                     "pending_total_capital_reserved":     _pending_total_real,
+                    "ignored_already_reconciled_fill_capital": float(
+                        _bd_eval.get("ignored_already_reconciled_fill_capital", 0.0)
+                    ),
                     "remaining_capital":                  float(remaining_capital_for_this_trade),
                     "counted_order_ids":                  _bd_eval.get("counted_order_ids", []),
                     "counted_order_statuses":             _bd_eval.get("counted_order_statuses", []),
                     "counted_broker_order_ids":           _bd_eval.get("counted_broker_order_ids", []),
                     "ignored_reserved_cost_by_status":    _bd_eval.get("ignored_reserved_cost_by_status", {}),
                     "ignored_order_ids_by_status":        _bd_eval.get("ignored_order_ids_by_status", {}),
+                    "open_position_ids":                  _bd_eval.get("open_position_ids", []),
+                    "runtime_execution_mode":             _bd_eval.get("runtime_execution_mode"),
                     "active_broker_statuses":             _bd_eval.get("active_broker_statuses", []),
                 }
 
@@ -1582,7 +1638,6 @@ class APMasterControl:
                     f"capital_limit_no_remaining "
                     f"client_cap=${max_capital:.0f} "
                     f"deployed=${snap['capital_deployed']:.0f} "
-                    f"pending_submitted=${_pending_submitted_real:.0f} "
                     f"pending_total=${_pending_total_real:.0f} "
                     f"remaining=${remaining_capital_for_this_trade:.0f}",
                     reason_code="CAPITAL_LIMIT_NO_REMAINING",
@@ -2410,14 +2465,19 @@ class APMasterControl:
         return {
             "open_count": 0,
             "open_tickers": set(),
+            "open_position_ids": [],
             "calls_open": 0,
             "puts_open": 0,
             "capital_deployed": 0.0,
+            "position_capital_deployed": 0.0,
+            "pending_entry_capital": 0.0,
+            "filled_unreconciled_entry_capital": 0.0,
             "pending_entries": 0,
             "entry_attempt_lock_count":    0,
             "entry_attempt_reserved_cost": 0.0,
             "filled_unreconciled_calls":   0,
             "filled_unreconciled_puts":    0,
+            "ignored_already_reconciled_fill_capital": 0.0,
             "watcher_count":  0,
             "pending_exits":  0,
             "trades_today": 0,
@@ -2462,14 +2522,19 @@ class APMasterControl:
                     raise TypeError(f"snapshot() returned {type(snap).__name__}, expected dict")
                 snap.setdefault("open_count", 0)
                 snap.setdefault("open_tickers", set())
+                snap.setdefault("open_position_ids", [])
                 snap.setdefault("calls_open", 0)
                 snap.setdefault("puts_open", 0)
                 snap.setdefault("capital_deployed", 0.0)
+                snap.setdefault("position_capital_deployed", snap.get("capital_deployed", 0.0))
+                snap.setdefault("pending_entry_capital", 0.0)
+                snap.setdefault("filled_unreconciled_entry_capital", snap.get("pending_entry_capital", 0.0))
                 snap.setdefault("pending_entries", 0)
                 snap.setdefault("entry_attempt_lock_count",    0)
                 snap.setdefault("entry_attempt_reserved_cost", 0.0)
                 snap.setdefault("filled_unreconciled_calls",   0)
                 snap.setdefault("filled_unreconciled_puts",    0)
+                snap.setdefault("ignored_already_reconciled_fill_capital", 0.0)
                 snap.setdefault("watcher_count",  0)
                 snap.setdefault("pending_exits",  0)
                 snap.setdefault("trades_today", 0)

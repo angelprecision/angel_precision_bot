@@ -94,6 +94,55 @@ _PENDING_EXIT_STATUSES = (
 )
 
 
+def _filled_entry_row_cost(row: dict) -> float:
+    fill_price = row.get("fill_price")
+    filled_qty = int(row.get("filled_qty") or 0)
+    reserved_cost = row.get("reserved_cost")
+    if fill_price is not None and filled_qty > 0:
+        return float(fill_price) * filled_qty * 100
+    if filled_qty > 0 and reserved_cost is not None:
+        return float(reserved_cost or 0.0)
+    return 0.0
+
+
+def _summarize_fill_truth_rows(fill_rows: list[dict], open_position_ids: set[str]) -> dict[str, float | int]:
+    normalized_open_ids = {
+        str(position_id).strip()
+        for position_id in (open_position_ids or set())
+        if str(position_id).strip()
+    }
+    filled_unreconciled_entry_capital = 0.0
+    ignored_already_reconciled_fill_capital = 0.0
+    pending_entries = 0
+    filled_unreconciled_calls = 0
+    filled_unreconciled_puts = 0
+
+    for row in fill_rows or []:
+        row_cost = _filled_entry_row_cost(row)
+        position_id = str(row.get("position_id") or "").strip()
+        if position_id:
+            if position_id in normalized_open_ids:
+                ignored_already_reconciled_fill_capital += row_cost
+            continue
+
+        pending_entries += 1
+        filled_unreconciled_entry_capital += row_cost
+
+        direction = str(row.get("direction") or "").upper().strip()
+        if direction == "CALL":
+            filled_unreconciled_calls += 1
+        elif direction == "PUT":
+            filled_unreconciled_puts += 1
+
+    return {
+        "pending_entries": pending_entries,
+        "filled_unreconciled_calls": filled_unreconciled_calls,
+        "filled_unreconciled_puts": filled_unreconciled_puts,
+        "filled_unreconciled_entry_capital": filled_unreconciled_entry_capital,
+        "ignored_already_reconciled_fill_capital": ignored_already_reconciled_fill_capital,
+    }
+
+
 class APPositionManager:
     """Client-scoped position + order truth layer backed by Postgres."""
 
@@ -1178,6 +1227,7 @@ class APPositionManager:
                     (start_utc, end_utc, start_utc, end_utc, self.client_id),
                 )
                 summary = c.fetchone() or {}
+                position_capital_deployed = float(summary.get("capital_deployed") or 0.0)
 
                 # PR: sizing-bootstrap-fix
                 # total_trades = durable count of confirmed broker fills for
@@ -1265,6 +1315,7 @@ class APPositionManager:
                         'CANCELED', 'CANCELLED', 'EXPIRED', 'REJECTED',
                         'ERROR', 'FAILED', 'CLOSED'
                       )
+                      AND UPPER(COALESCE(contract, '')) NOT LIKE 'DEFERRED:%%'
                       AND (position_id IS NULL OR position_id = '')
                     """,
                     (*_mode_params, _wrong_mode_val, *_mode_params, *_mode_params, self.client_id),
@@ -1286,7 +1337,7 @@ class APPositionManager:
                 # Entry-attempt lock: in-flight broker submits (duplicate-submit
                 # protection only; NOT counted as position slots or real exposure).
                 c.execute(
-                    """
+                    f"""
                     SELECT COUNT(*) AS n,
                            COALESCE(SUM(
                                COALESCE(NULLIF(reserved_cost, 0),
@@ -1296,7 +1347,12 @@ class APPositionManager:
                            ), 0) AS reserved
                     FROM orders
                     WHERE client_id = %s AND kind = 'ENTRY'
-                      AND UPPER(COALESCE(status, '')) IN ('CREATED', 'SUBMITTED', 'ACKNOWLEDGED')
+                      AND {_mode_predicate}
+                      AND UPPER(COALESCE(status, '')) IN (
+                        'CREATED', 'SUBMITTED', 'ACKNOWLEDGED', 'PENDING',
+                        'OPEN', 'ACCEPTED', 'PARTIAL_FILL',
+                        'PARTIALLY_FILLED', 'PENDING_SUBMIT'
+                      )
                       AND (
                         (broker_order_id IS NOT NULL AND broker_order_id <> '')
                         OR submitted_ts IS NOT NULL
@@ -1309,7 +1365,7 @@ class APPositionManager:
                         'ERROR', 'FAILED', 'CLOSED'
                       )
                     """,
-                    (self.client_id,),
+                    (self.client_id, *_mode_params),
                 )
                 _lock_row = c.fetchone() or {}
                 entry_attempt_lock_count    = int(_lock_row.get("n") or 0)
@@ -1347,6 +1403,11 @@ class APPositionManager:
 
                 opens = [p for p in active if p.get("status") == PositionStatus.OPEN]
                 closing = [p for p in active if p.get("status") == PositionStatus.CLOSING]
+                open_position_ids = [
+                    str(p["id"])
+                    for p in active
+                    if p.get("id")
+                ]
 
                 # real_deployed_capital: fill-truth cost of confirmed positions.
                 # Uses fill_price * filled_qty * 100 (broker-confirmed fill).
@@ -1372,21 +1433,70 @@ class APPositionManager:
                             COALESCE(filled_qty, 0) > 0
                             OR fill_price IS NOT NULL
                             OR UPPER(COALESCE(status,'')) IN (
-                                'PARTIAL_FILL','PARTIALLY_FILLED','FILLED','OPEN'
+                                'PARTIAL_FILL', 'PARTIALLY_FILLED', 'FILLED', 'OPEN'
                             )
                           )
-                          AND UPPER(COALESCE(status,''))
-                              NOT IN ('CANCELLED','CANCELED','REJECTED','ERROR',
-                                      'FAILED','CLOSED')
+                          AND UPPER(COALESCE(status,'')) NOT IN (
+                              'CANCELED', 'CANCELLED', 'EXPIRED', 'REJECTED',
+                              'ERROR', 'FAILED', 'CLOSED'
+                          )
+                          AND UPPER(COALESCE(contract, '')) NOT LIKE 'DEFERRED:%%'
+                          AND (position_id IS NULL OR position_id = '')
                         """,
                         (self.client_id, *_mode_params),
                     )
                     _cap_row = c.fetchone() or {}
-                    pending_entry_capital = float(_cap_row.get("cap") or 0.0)
+                    filled_unreconciled_entry_capital = float(_cap_row.get("cap") or 0.0)
                 except Exception as _pec_err:
-                    log.warning("[%s] pending_entry_capital query failed (non-fatal): %s",
+                    log.warning("[%s] filled_unreconciled_entry_capital query failed (non-fatal): %s",
                                 self.client_id, _pec_err)
-                    pending_entry_capital = None
+                    filled_unreconciled_entry_capital = None
+
+                try:
+                    c.execute(
+                        f"""
+                        SELECT
+                            position_id,
+                            direction,
+                            fill_price,
+                            filled_qty,
+                            reserved_cost
+                        FROM orders
+                        WHERE client_id = %s
+                          AND kind = 'ENTRY'
+                          AND {_mode_predicate}
+                          AND (
+                            COALESCE(filled_qty, 0) > 0
+                            OR fill_price IS NOT NULL
+                            OR UPPER(COALESCE(status,'')) IN (
+                                'PARTIAL_FILL', 'PARTIALLY_FILLED', 'FILLED', 'OPEN'
+                            )
+                          )
+                          AND UPPER(COALESCE(status,'')) NOT IN (
+                              'CANCELED', 'CANCELLED', 'EXPIRED', 'REJECTED',
+                              'ERROR', 'FAILED', 'CLOSED'
+                          )
+                          AND UPPER(COALESCE(contract, '')) NOT LIKE 'DEFERRED:%%'
+                        """,
+                        (self.client_id, *_mode_params),
+                    )
+                    _fill_rows = c.fetchall() or []
+                    _fill_summary = _summarize_fill_truth_rows(
+                        _fill_rows,
+                        set(open_position_ids),
+                    )
+                    ignored_already_reconciled_fill_capital = float(
+                        _fill_summary.get("ignored_already_reconciled_fill_capital") or 0.0
+                    )
+                except Exception as _fill_summary_err:
+                    log.warning(
+                        "[%s] ignored_already_reconciled_fill_capital query failed (non-fatal): %s",
+                        self.client_id,
+                        _fill_summary_err,
+                    )
+                    ignored_already_reconciled_fill_capital = 0.0
+
+                pending_entry_capital = filled_unreconciled_entry_capital
 
                 return {
                     "snapshot_ts":        datetime.now(timezone.utc).isoformat(),
@@ -1397,15 +1507,19 @@ class APPositionManager:
                     "active_count":       len(active),
                     "session_day":        session_day,
                     "open_tickers":       {p["underlying"] for p in active},
+                    "open_position_ids":  open_position_ids,
                     "calls_open":         sum(1 for p in active if p.get("direction") == "CALL"),
                     "puts_open":          sum(1 for p in active if p.get("direction") == "PUT"),
-                    "capital_deployed":   float(summary.get("capital_deployed") or 0),
+                    "capital_deployed":   position_capital_deployed,
+                    "position_capital_deployed": position_capital_deployed,
                     "pending_entry_capital": pending_entry_capital,
+                    "filled_unreconciled_entry_capital": filled_unreconciled_entry_capital,
                     "pending_entries":           pending_entries,
                     "filled_unreconciled_calls":  filled_unreconciled_calls,
                     "filled_unreconciled_puts":   filled_unreconciled_puts,
                     "entry_attempt_lock_count":    entry_attempt_lock_count,
                     "entry_attempt_reserved_cost": entry_attempt_reserved_cost,
+                    "ignored_already_reconciled_fill_capital": ignored_already_reconciled_fill_capital,
                     "watcher_count":      watcher_count,
                     "pending_exits":      pending_exits,
                     "trades_today":       int(summary.get("trades_today") or 0),
