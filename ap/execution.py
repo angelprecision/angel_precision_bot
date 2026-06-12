@@ -188,6 +188,27 @@ def _compute_paper_marketable_limit(submit_ask: float) -> tuple[float, float]:
     return paper_limit, round(cushion, 2)
 
 
+def _reconcile_final_order_reservation(
+    client_id: str,
+    *,
+    qty: int,
+    submit_limit: float,
+    reserved_cost: float,
+    equity: float,
+) -> tuple[bool, float, float]:
+    """Ensure the reservation covers the actual submit-time limit exposure."""
+    final_order_cost = float(submit_limit) * OPT_MULTIPLIER * int(qty)
+    current_reserved = float(reserved_cost)
+    if final_order_cost <= current_reserved:
+        return True, current_reserved, float(final_order_cost)
+
+    reserve_delta = float(final_order_cost - current_reserved)
+    if not reserve_equity_if_available(client_id, reserve_delta, equity):
+        return False, current_reserved, float(final_order_cost)
+
+    return True, float(final_order_cost), float(final_order_cost)
+
+
 # ─── PHASE 4: account-equity-based sizing ─────────────────────────────────
 # Prior sizing was BASE_POSITION_PCT (0.02 = 2%) capped by MAX_POSITION_COST
 # = $1000. With a $100K account that gave 1 contract on a $3 premium because
@@ -1287,6 +1308,47 @@ def process_signal(broker, client_id: str, signal_payload: dict) -> dict:
             paper_market_order = False
             paper_submitted_type = "limit"
 
+        reservation_ok, reserved_cost, final_order_cost = _reconcile_final_order_reservation(
+            client_id,
+            qty=int(qty),
+            submit_limit=float(submit_limit),
+            reserved_cost=float(reserved_cost),
+            equity=float(equity),
+        )
+        if not reservation_ok:
+            release_equity(client_id, reserved_cost)
+            release_symbol_lock(client_id, symbol)
+            reserved = False
+            locked = False
+            reserve_delta = float(final_order_cost - reserved_cost)
+            log.warning(
+                "[%s] FINAL_CONTRACT_UNAFFORDABLE symbol=%s contract=%s "
+                "reserved_cost=%.2f final_order_cost=%.2f reserve_delta=%.2f",
+                client_id, symbol, contract,
+                float(reserved_cost), float(final_order_cost), reserve_delta,
+            )
+            audit(client_id, "WARNING", "FINAL_CONTRACT_UNAFFORDABLE", {
+                "symbol": symbol,
+                "contract": contract,
+                "qty": int(qty),
+                "submit_limit": float(submit_limit),
+                "reserved_cost": float(reserved_cost),
+                "final_order_cost": float(final_order_cost),
+                "reserve_delta": reserve_delta,
+                "position_budget": float(position_budget),
+            })
+            return {
+                "ok": False,
+                "error": "insufficient_available_equity",
+                "reason_code": "FINAL_CONTRACT_UNAFFORDABLE",
+                "symbol": symbol,
+                "contract": contract,
+                "qty": int(qty),
+                "submit_limit": float(submit_limit),
+                "reserved_cost": float(reserved_cost),
+                "final_order_cost": float(final_order_cost),
+                "reserve_delta": reserve_delta,
+            }
 
         local_order_id = new_local_order_id()
         # AUDIT PHASE-2: persist meta so admission ordering (score) and re-peg
