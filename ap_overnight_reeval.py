@@ -36,7 +36,7 @@ import logging
 import os
 import time
 from datetime import date, datetime, timezone, timedelta
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Mapping, Optional
 
 log = logging.getLogger("ap.overnight_reeval")
 
@@ -132,6 +132,602 @@ def _signal_date(signal: dict) -> Optional[date]:
     return None
 
 
+def _normalize_overnight_canonical_signal_id(signal_id: Any, signal: Optional[Mapping[str, Any]] = None) -> str:
+    """Return the setup canonical id used for per-client overnight idempotency."""
+    try:
+        from ap_canonical_signal import build_canonical_signal_id
+        canonical = build_canonical_signal_id(signal_id, signal)
+    except Exception:
+        canonical = str(signal_id or "")
+    if canonical.startswith("REEVAL:"):
+        parts = canonical.split(":")
+        if len(parts) >= 2 and parts[1]:
+            return parts[1]
+    return canonical or str(signal_id or "")
+
+
+def _overnight_setup_identity(signal: Mapping[str, Any], *, entry_trigger: Any = None) -> str:
+    """Stable setup fingerprint within a canonical signal/session."""
+    ticker = str(signal.get("ticker") or signal.get("symbol") or "").upper().strip()
+    side = str(signal.get("side") or signal.get("direction") or "").upper().strip()
+    timeframe = str(signal.get("timeframe") or "1d").lower().strip()
+    pattern = str(signal.get("pattern") or signal.get("pattern_id") or "").strip()
+    trigger = entry_trigger
+    if trigger is None:
+        trigger = signal.get("entry_trigger") or signal.get("trigger_price") or signal.get("entry_price")
+    try:
+        trigger_key = f"{float(trigger):.4f}"
+    except (TypeError, ValueError):
+        trigger_key = ""
+    return "|".join((ticker, side, timeframe, pattern, trigger_key))
+
+
+def _overnight_arm_key(
+    *,
+    client_id: str,
+    canonical_signal_id: str,
+    setup_identity: str,
+    session_date: str,
+) -> str:
+    return f"{client_id}|{canonical_signal_id}|{setup_identity}|{session_date}"
+
+
+def _extract_local_order_id(job: Mapping[str, Any], signal: Mapping[str, Any]) -> str:
+    for src in (job, signal):
+        for key in ("local_order_id", "order_local_id", "entry_local_order_id"):
+            val = src.get(key)
+            if val:
+                return str(val)
+        meta = src.get("metadata") or src.get("meta") or {}
+        if isinstance(meta, Mapping):
+            for key in ("local_order_id", "order_local_id", "entry_local_order_id"):
+                val = meta.get(key)
+                if val:
+                    return str(val)
+    for key in ("payload", "result", "result_json"):
+        nested = job.get(key)
+        if isinstance(nested, Mapping):
+            val = _extract_local_order_id(nested, nested)
+            if val:
+                return val
+    return ""
+
+
+def _extract_broker_order_id(job: Mapping[str, Any], signal: Mapping[str, Any], order: Optional[Mapping[str, Any]] = None) -> str:
+    for src in (order or {}, job, signal):
+        for key in ("broker_order_id", "entry_broker_order_id"):
+            val = src.get(key)
+            if val:
+                return str(val)
+        meta = src.get("metadata") or src.get("meta") or {}
+        if isinstance(meta, Mapping):
+            val = meta.get("broker_order_id") or meta.get("entry_broker_order_id")
+            if val:
+                return str(val)
+    return ""
+
+
+def _watcher_owns_order(entry_watcher, local_order_id: str) -> Optional[bool]:
+    if not local_order_id or entry_watcher is None or not hasattr(entry_watcher, "has_order"):
+        return None
+    try:
+        return bool(entry_watcher.has_order(local_order_id))
+    except Exception:
+        return None
+
+
+def _get_local_order(order_state_machine, local_order_id: str) -> Optional[dict]:
+    if not local_order_id or order_state_machine is None:
+        return None
+    for method_name in ("get_order", "_get_order"):
+        method = getattr(order_state_machine, method_name, None)
+        if not callable(method):
+            continue
+        try:
+            order = method(local_order_id)
+            return dict(order) if order else None
+        except Exception:
+            return None
+    return None
+
+
+def _order_metadata(order: Mapping[str, Any]) -> dict:
+    meta = order.get("meta") or order.get("metadata") or {}
+    return dict(meta) if isinstance(meta, Mapping) else {}
+
+
+def _is_viable_entry_order(order: Optional[Mapping[str, Any]]) -> bool:
+    if not order:
+        return False
+    if str(order.get("kind") or "ENTRY").upper() != "ENTRY":
+        return False
+    status = str(order.get("status") or "").upper()
+    terminal = {"CANCELED", "CANCELLED", "EXPIRED", "REJECTED", "ERROR", "FAILED", "CLOSED"}
+    return bool(status and status not in terminal)
+
+
+def _order_matches_overnight_setup(
+    order: Mapping[str, Any],
+    *,
+    canonical_signal_id: str,
+    arm_key: str,
+    session_date: str,
+    setup_identity: str,
+) -> bool:
+    meta = _order_metadata(order)
+    if meta.get("overnight_arm_key") == arm_key:
+        return True
+    if (
+        meta.get("overnight_canonical_signal_id") == canonical_signal_id
+        and meta.get("overnight_session_date") == session_date
+        and meta.get("overnight_setup_identity") == setup_identity
+    ):
+        return True
+    order_canonical = order.get("canonical_signal_id") or meta.get("canonical_signal_id")
+    return bool(
+        order_canonical
+        and str(order_canonical) == canonical_signal_id
+        and meta.get("overnight_session_date") == session_date
+    )
+
+
+def _find_live_watcher_owned_entry_for_setup(
+    *,
+    order_state_machine,
+    entry_watcher,
+    canonical_signal_id: str,
+    arm_key: str,
+    session_date: str,
+    setup_identity: str,
+) -> str:
+    method = getattr(order_state_machine, "get_active_entry_orders", None)
+    if not callable(method):
+        return ""
+    try:
+        orders = method() or []
+    except Exception:
+        return ""
+    for order in orders:
+        row = dict(order or {})
+        local_order_id = str(row.get("local_order_id") or "")
+        if not local_order_id or not _is_viable_entry_order(row):
+            continue
+        if not _order_matches_overnight_setup(
+            row,
+            canonical_signal_id=canonical_signal_id,
+            arm_key=arm_key,
+            session_date=session_date,
+            setup_identity=setup_identity,
+        ):
+            continue
+        if _watcher_owns_order(entry_watcher, local_order_id) is True:
+            return local_order_id
+    return ""
+
+
+def _has_submitted_broker_order(job: Mapping[str, Any], signal: Mapping[str, Any], order: Optional[Mapping[str, Any]]) -> bool:
+    if _extract_broker_order_id(job, signal, order):
+        return True
+    for src in (order or {}, job, signal):
+        if src.get("submitted_ts"):
+            return True
+        meta = src.get("metadata") or src.get("meta") or {}
+        if isinstance(meta, Mapping) and meta.get("submitted_ts"):
+            return True
+    return False
+
+
+def _has_open_or_closing_position(position_manager, *, local_order_id: str, broker_order_id: str, ticker: str) -> bool:
+    if position_manager is None:
+        return False
+    checks = (
+        ("get_position_by_local_order", local_order_id),
+        ("get_position_by_broker_order", broker_order_id),
+    )
+    for method_name, value in checks:
+        if not value:
+            continue
+        method = getattr(position_manager, method_name, None)
+        if not callable(method):
+            continue
+        try:
+            pos = method(value)
+            if pos and str(pos.get("status") or "").upper() in {"OPEN", "CLOSING", "PARTIAL", "ACTIVE"}:
+                return True
+        except Exception:
+            return True
+    method = getattr(position_manager, "get_active_positions", None)
+    if callable(method):
+        try:
+            for pos in method() or []:
+                status = str(pos.get("status") or "").upper()
+                underlying = str(pos.get("underlying") or pos.get("symbol") or pos.get("ticker") or "").upper()
+                if status in {"OPEN", "CLOSING", "PARTIAL", "ACTIVE"} and ticker.upper() and ticker.upper() in underlying:
+                    return True
+        except Exception:
+            return True
+    return False
+
+
+def _parse_dateish(value: Any) -> Optional[date]:
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    text = str(value)
+    if len(text) >= 10:
+        try:
+            return date.fromisoformat(text[:10])
+        except ValueError:
+            return None
+    return None
+
+
+def _has_stale_watching_repair_evidence(job: Mapping[str, Any], signal: Mapping[str, Any], *, local_order_id: str, session_date: str) -> bool:
+    if local_order_id:
+        return True
+    last_error = str(job.get("last_error") or "")
+    status = str(job.get("status") or "").upper()
+    if (
+        status == "WATCHING"
+        and last_error == "after_hours_deferred:awaiting_overnight_reeval"
+        and not job.get("started_ts")
+        and not _extract_broker_order_id(job, signal, None)
+        and not _has_submitted_broker_order(job, signal, None)
+    ):
+        return False
+    if "armed:" in last_error or "watch_arm" in last_error.lower():
+        return True
+    if job.get("started_ts"):
+        return True
+    for src in (job.get("result_json"), job.get("metadata"), job.get("meta"), signal.get("metadata"), signal.get("meta")):
+        if not isinstance(src, Mapping):
+            continue
+        if any(src.get(key) for key in ("local_order_id", "order_local_id", "entry_local_order_id")):
+            return True
+        if any(src.get(key) for key in ("watcher_arm_audit", "overnight_arm_key", "watcher_quote_base_url")):
+            return True
+    return False
+
+
+def _get_sb_client_best_effort():
+    try:
+        from ap.queue import _get_sb_client
+        return _get_sb_client()
+    except Exception:
+        return None
+
+
+def _get_overnight_arm_proof(
+    *,
+    client_id: str,
+    canonical_signal_id: str,
+    arm_key: str,
+    session_date: str,
+    setup_identity: str,
+    sb=None,
+) -> Optional[dict]:
+    sb = sb or _get_sb_client_best_effort()
+    if not sb or not canonical_signal_id or not client_id:
+        return None
+    try:
+        rows = (
+            sb.table("client_signal_opportunities")
+            .select("opportunity_status,order_local_id,broker_order_id,metadata,updated_at")
+            .eq("canonical_signal_id", canonical_signal_id)
+            .eq("client_id", client_id)
+            .limit(1)
+            .execute()
+            .data
+            or []
+        )
+    except Exception:
+        return None
+    if not rows:
+        return None
+    row = dict(rows[0] or {})
+    metadata = row.get("metadata") if isinstance(row.get("metadata"), Mapping) else {}
+    if not metadata:
+        return None
+    same_key = metadata.get("overnight_arm_key") == arm_key
+    same_session_setup = (
+        metadata.get("overnight_session_date") == session_date
+        and metadata.get("overnight_setup_identity") == setup_identity
+    )
+    if not (same_key or same_session_setup):
+        return None
+    return {
+        **row,
+        "metadata": dict(metadata),
+        "local_order_id": row.get("order_local_id") or metadata.get("local_order_id") or "",
+        "retryable": bool(metadata.get("overnight_arm_retryable")),
+        "arm_state": metadata.get("overnight_arm_state") or row.get("opportunity_status") or "",
+        "reason": metadata.get("overnight_arm_reason") or "",
+    }
+
+
+def _record_overnight_arm_proof(
+    *,
+    signal_id: str,
+    client_id: str,
+    canonical_signal_id: str,
+    signal: Mapping[str, Any],
+    local_order_id: str = "",
+    broker_order_id: str = "",
+    arm_key: str,
+    session_date: str,
+    setup_identity: str,
+    state: str,
+    reason: str,
+    decision: str,
+    retryable: bool = False,
+    extra_meta: "dict | None" = None,
+) -> bool:
+    # Base metadata — always written
+    _base_meta = {
+        "overnight_arm_key":        arm_key,
+        "overnight_session_date":    session_date,
+        "overnight_setup_identity":  setup_identity,
+        "overnight_arm_state":       state,
+        "overnight_arm_reason":      reason,
+        "overnight_arm_decision":    decision,
+        "overnight_arm_retryable":   bool(retryable),
+        "local_order_id":            str(local_order_id or ""),
+    }
+    # Caller-supplied extra fields (cleanup_method, cleanup_success,
+    # overnight_watch_arm_failure, overnight_source_table, etc.) merged last
+    # so they cannot silently drop required fields.
+    if extra_meta:
+        _base_meta.update(extra_meta)
+    extra_meta_final = _base_meta
+    try:
+        from ap.opportunity_ledger import (
+            create_opportunities,
+            update_opportunity,
+            WATCHER_ARMED,
+            MISSED,
+            STAGE_WATCHER_ARM,
+        )
+        create_opportunities(
+            signal_id,
+            [client_id],
+            dict(signal or {}),
+            canonical_signal_id=canonical_signal_id,
+        )
+        status = WATCHER_ARMED if state == "ARMED" else MISSED
+        return bool(update_opportunity(
+            signal_id,
+            client_id,
+            status,
+            canonical_signal_id=canonical_signal_id,
+            miss_stage=None if state == "ARMED" else STAGE_WATCHER_ARM,
+            miss_reason=None if state == "ARMED" else reason,
+            order_local_id=str(local_order_id or "") or None,
+            broker_order_id=str(broker_order_id or "") or None,
+            extra_meta=extra_meta_final,
+        ))
+    except Exception as exc:
+        log.warning(
+            "OVERNIGHT_ARM_IDEMPOTENCY_PROOF_WRITE_FAILED | "
+            "client_id=%s canonical_signal_id=%s source_signal_id=%s session_date=%s reason=%s error=%s",
+            client_id, canonical_signal_id, signal_id, session_date, reason, exc,
+        )
+        return False
+
+
+def _log_overnight_idempotency_proof(
+    *,
+    event: str,
+    client_id: str,
+    canonical_signal_id: str,
+    source_signal_id: str,
+    session_date: str,
+    local_order_id: str,
+    ticker: str,
+    side: str,
+    reason: str,
+    decision: str,
+    **extra,
+) -> None:
+    log.info(
+        "%s | client_id=%s canonical_signal_id=%s source_signal_id=%s "
+        "session_date=%s local_order_id=%s ticker=%s side=%s reason=%s decision=%s extra=%s",
+        event, client_id, canonical_signal_id, source_signal_id,
+        session_date, local_order_id, ticker, side, reason, decision, extra,
+    )
+
+
+def _same_session_rearm_skip_decision(
+    *,
+    client_id: str,
+    signal_id: str,
+    canonical_signal_id: str,
+    arm_key: str,
+    session_date: str,
+    setup_identity: str,
+    ticker: str,
+    side: str,
+    entry_watcher,
+    order_state_machine,
+) -> tuple[bool, str, str]:
+    proof = _get_overnight_arm_proof(
+        client_id=client_id,
+        canonical_signal_id=canonical_signal_id,
+        arm_key=arm_key,
+        session_date=session_date,
+        setup_identity=setup_identity,
+    )
+    local_order_id = str((proof or {}).get("local_order_id") or "")
+    watcher_owner = _watcher_owns_order(entry_watcher, local_order_id)
+    order = _get_local_order(order_state_machine, local_order_id)
+    live_local_entry = bool(watcher_owner is True and _is_viable_entry_order(order))
+    arm_state = str((proof or {}).get("arm_state") or "").upper()
+    retryable = bool((proof or {}).get("retryable"))
+
+    if live_local_entry:
+        reason = "same_session_live_watcher_owned_entry"
+        _log_overnight_idempotency_proof(
+            event="OVERNIGHT_ARM_IDEMPOTENCY_PROOF",
+            client_id=client_id, canonical_signal_id=canonical_signal_id,
+            source_signal_id=signal_id, session_date=session_date,
+            local_order_id=local_order_id, ticker=ticker, side=side,
+            reason=reason, decision="SKIP_DUPLICATE",
+            watcher_owner=watcher_owner, arm_state=arm_state,
+        )
+        return True, reason, local_order_id
+
+    active_local_order_id = _find_live_watcher_owned_entry_for_setup(
+        order_state_machine=order_state_machine,
+        entry_watcher=entry_watcher,
+        canonical_signal_id=canonical_signal_id,
+        arm_key=arm_key,
+        session_date=session_date,
+        setup_identity=setup_identity,
+    )
+    if active_local_order_id:
+        reason = "same_session_live_watcher_owned_entry_without_ledger"
+        _log_overnight_idempotency_proof(
+            event="OVERNIGHT_ARM_IDEMPOTENCY_PROOF",
+            client_id=client_id, canonical_signal_id=canonical_signal_id,
+            source_signal_id=signal_id, session_date=session_date,
+            local_order_id=active_local_order_id, ticker=ticker, side=side,
+            reason=reason, decision="SKIP_DUPLICATE",
+        )
+        return True, reason, active_local_order_id
+
+    if proof and not retryable and arm_state in {"ARMED", "WATCHER_ARMED", "TERMINAL", "MISSED", "EXPIRED", "CANCELED", "INTERNAL_ERROR", "WATCH_ARM_FAILED"}:
+        reason = f"same_session_terminal_or_armed_proof:{arm_state or 'unknown'}"
+        _log_overnight_idempotency_proof(
+            event="OVERNIGHT_ARM_IDEMPOTENCY_PROOF",
+            client_id=client_id, canonical_signal_id=canonical_signal_id,
+            source_signal_id=signal_id, session_date=session_date,
+            local_order_id=local_order_id, ticker=ticker, side=side,
+            reason=reason, decision="SKIP_DUPLICATE",
+            watcher_owner=watcher_owner, arm_state=arm_state,
+        )
+        return True, reason, local_order_id
+
+    reason = "no_same_session_arm_proof" if not proof else "same_session_proof_retryable"
+    _log_overnight_idempotency_proof(
+        event="OVERNIGHT_ARM_IDEMPOTENCY_PROOF",
+        client_id=client_id, canonical_signal_id=canonical_signal_id,
+        source_signal_id=signal_id, session_date=session_date,
+        local_order_id=local_order_id, ticker=ticker, side=side,
+        reason=reason, decision="ALLOW_ARM",
+        watcher_owner=watcher_owner, arm_state=arm_state,
+        retryable=retryable,
+    )
+    return False, reason, local_order_id
+
+
+def _repair_stale_trade_queue_watching(
+    *,
+    job: Mapping[str, Any],
+    signal: Mapping[str, Any],
+    client_id: str,
+    signal_id: str,
+    canonical_signal_id: str,
+    session_date: str,
+    setup_identity: str,
+    arm_key: str,
+    ticker: str,
+    side: str,
+    entry_watcher,
+    order_state_machine,
+    position_manager,
+) -> bool:
+    if str(job.get("_source") or "") != "trade_queue":
+        return False
+    local_order_id = _extract_local_order_id(job, signal)
+    if not _has_stale_watching_repair_evidence(job, signal, local_order_id=local_order_id, session_date=session_date):
+        return False
+
+    watcher_owner = _watcher_owns_order(entry_watcher, local_order_id)
+    if watcher_owner is True:
+        _log_overnight_idempotency_proof(
+            event="STALE_WATCHING_REPAIR_PROOF",
+            client_id=client_id, canonical_signal_id=canonical_signal_id,
+            source_signal_id=signal_id, session_date=session_date,
+            local_order_id=local_order_id, ticker=ticker, side=side,
+            reason="watcher_owns_local_order", decision="PRESERVE",
+        )
+        return False
+    if watcher_owner is None and local_order_id:
+        _log_overnight_idempotency_proof(
+            event="STALE_WATCHING_REPAIR_PROOF",
+            client_id=client_id, canonical_signal_id=canonical_signal_id,
+            source_signal_id=signal_id, session_date=session_date,
+            local_order_id=local_order_id, ticker=ticker, side=side,
+            reason="watcher_ownership_unknown", decision="PRESERVE",
+        )
+        return False
+
+    order = _get_local_order(order_state_machine, local_order_id)
+    if _is_viable_entry_order(order):
+        _log_overnight_idempotency_proof(
+            event="STALE_WATCHING_REPAIR_PROOF",
+            client_id=client_id, canonical_signal_id=canonical_signal_id,
+            source_signal_id=signal_id, session_date=session_date,
+            local_order_id=local_order_id, ticker=ticker, side=side,
+            reason="viable_local_entry_exists", decision="PRESERVE",
+        )
+        return False
+
+    broker_order_id = _extract_broker_order_id(job, signal, order)
+    if _has_submitted_broker_order(job, signal, order):
+        _log_overnight_idempotency_proof(
+            event="STALE_WATCHING_REPAIR_PROOF",
+            client_id=client_id, canonical_signal_id=canonical_signal_id,
+            source_signal_id=signal_id, session_date=session_date,
+            local_order_id=local_order_id, ticker=ticker, side=side,
+            reason="submitted_broker_order_exists", decision="PRESERVE",
+            broker_order_id=broker_order_id,
+        )
+        return False
+
+    if _has_open_or_closing_position(
+        position_manager,
+        local_order_id=local_order_id,
+        broker_order_id=broker_order_id,
+        ticker=ticker,
+    ):
+        _log_overnight_idempotency_proof(
+            event="STALE_WATCHING_REPAIR_PROOF",
+            client_id=client_id, canonical_signal_id=canonical_signal_id,
+            source_signal_id=signal_id, session_date=session_date,
+            local_order_id=local_order_id, ticker=ticker, side=side,
+            reason="open_or_closing_position_exists", decision="PRESERVE",
+        )
+        return False
+
+    reason = "STALE_WATCHING_REPAIRED:no_watcher_no_order_no_broker_no_position"
+    _mark_job_rejected(job.get("id"), client_id, reason)
+    _record_overnight_arm_proof(
+        signal_id=signal_id,
+        client_id=client_id,
+        canonical_signal_id=canonical_signal_id,
+        signal=signal,
+        local_order_id=local_order_id,
+        arm_key=arm_key,
+        session_date=session_date,
+        setup_identity=setup_identity,
+        state="TERMINAL",
+        reason=reason,
+        decision="REPAIRED",
+        retryable=False,
+    )
+    _log_overnight_idempotency_proof(
+        event="STALE_WATCHING_REPAIR_PROOF",
+        client_id=client_id, canonical_signal_id=canonical_signal_id,
+        source_signal_id=signal_id, session_date=session_date,
+        local_order_id=local_order_id, ticker=ticker, side=side,
+        reason=reason, decision="REPAIRED",
+    )
+    return True
+
+
 def _log_overnight_watch_cleanup(
     event: str,
     *,
@@ -156,18 +752,9 @@ def _log_overnight_watch_cleanup(
         "%s client_id=%s signal_id=%s ticker=%s side=%s local_order_id=%s "
         "contract=%s contract_deferred=%s entry_trigger=%s cleanup_method=%s "
         "cleanup_success=%s reason=%s",
-        event,
-        client_id,
-        signal_id,
-        ticker,
-        side,
-        local_order_id,
-        contract,
-        contract_deferred,
-        _entry_trigger,
-        cleanup_method,
-        cleanup_success,
-        reason,
+        event, client_id, signal_id, ticker, side, local_order_id,
+        contract, contract_deferred, _entry_trigger,
+        cleanup_method, cleanup_success, reason,
     )
 
 
@@ -184,273 +771,79 @@ def _cleanup_overnight_watch_arm_failure(
     entry_trigger,
     reason: str,
     done_event: str,
-) -> tuple[bool, str]:
+) -> tuple:
+    """
+    Clean up a local ENTRY order left in PENDING_TRIGGER when watcher arm fails.
+    Mirrors the queue.py cleanup pattern:
+      expire_pending_entry → cancel_pending_entry → transition(EXPIRED)
+    Returns (cleanup_success: bool, cleanup_method: str).
+    """
     _log_overnight_watch_cleanup(
         "OVERNIGHT_WATCH_ARM_FAILED_CLEANUP_START",
         level="warning",
-        client_id=client_id,
-        signal_id=signal_id,
-        ticker=ticker,
-        side=side,
-        local_order_id=local_order_id,
-        contract=contract,
-        contract_deferred=contract_deferred,
+        client_id=client_id, signal_id=signal_id,
+        ticker=ticker, side=side, local_order_id=local_order_id,
+        contract=contract, contract_deferred=contract_deferred,
         entry_trigger=entry_trigger,
-        cleanup_method="pending",
-        cleanup_success=False,
-        reason=reason,
+        cleanup_method="pending", cleanup_success=False, reason=reason,
     )
-
     cleanup_method = "none"
     cleanup_success = False
-
     if local_order_id:
         if hasattr(order_state_machine, "expire_pending_entry"):
             cleanup_method = "expire_pending_entry"
             try:
                 cleanup_success = bool(
-                    order_state_machine.expire_pending_entry(
-                        local_order_id,
-                        reason=reason,
-                    )
+                    order_state_machine.expire_pending_entry(local_order_id, reason=reason)
                 )
-            except Exception as exp_exc:
+            except Exception as _exp_exc:
                 log.error(
                     "[%s] overnight_reeval: expire_pending_entry cleanup failed "
                     "| local_order_id=%s reason=%s error=%s",
-                    ticker, local_order_id, reason, exp_exc,
+                    ticker, local_order_id, reason, _exp_exc,
                 )
                 cleanup_success = False
-
         if not cleanup_success and hasattr(order_state_machine, "cancel_pending_entry"):
             cleanup_method = "cancel_pending_entry"
             try:
                 cleanup_success = bool(
-                    order_state_machine.cancel_pending_entry(
-                        local_order_id,
-                        reason=reason,
-                    )
+                    order_state_machine.cancel_pending_entry(local_order_id, reason=reason)
                 )
-            except Exception as cancel_exc:
+            except Exception as _cxl_exc:
                 log.error(
                     "[%s] overnight_reeval: cancel_pending_entry cleanup failed "
                     "| local_order_id=%s reason=%s error=%s",
-                    ticker, local_order_id, reason, cancel_exc,
+                    ticker, local_order_id, reason, _cxl_exc,
                 )
                 cleanup_success = False
-
-        if not cleanup_success and hasattr(order_state_machine, "transition"):
+        if not cleanup_success:
             cleanup_method = "transition:EXPIRED"
             try:
-                cleanup_success = bool(
-                    order_state_machine.transition(
-                        local_order_id,
-                        "EXPIRED",
-                        last_error=reason,
-                    )
+                order_state_machine.transition(
+                    local_order_id, "EXPIRED", last_error=reason
                 )
-            except Exception as trans_exc:
+                cleanup_success = True
+            except Exception as _tr_exc:
                 log.error(
-                    "[%s] overnight_reeval: transition(EXPIRED) cleanup failed "
+                    "[%s] overnight_reeval: transition EXPIRED cleanup failed "
                     "| local_order_id=%s reason=%s error=%s",
-                    ticker, local_order_id, reason, trans_exc,
+                    ticker, local_order_id, reason, _tr_exc,
                 )
                 cleanup_success = False
-    else:
-        cleanup_method = "missing_local_order_id"
-
     _log_overnight_watch_cleanup(
         done_event,
-        level="info" if cleanup_success else "error",
-        client_id=client_id,
-        signal_id=signal_id,
-        ticker=ticker,
-        side=side,
-        local_order_id=local_order_id,
-        contract=contract,
-        contract_deferred=contract_deferred,
+        level="warning" if cleanup_success else "error",
+        client_id=client_id, signal_id=signal_id,
+        ticker=ticker, side=side, local_order_id=local_order_id,
+        contract=contract, contract_deferred=contract_deferred,
         entry_trigger=entry_trigger,
-        cleanup_method=cleanup_method,
-        cleanup_success=cleanup_success,
-        reason=reason,
+        cleanup_method=cleanup_method, cleanup_success=cleanup_success, reason=reason,
     )
     return cleanup_success, cleanup_method
 
 
-def _resolve_canonical_signal_id(signal_id: str, signal: dict) -> str:
-    try:
-        from ap_canonical_signal import build_canonical_signal_id
-        return build_canonical_signal_id(signal_id, signal) or str(signal_id or "")
-    except Exception:
-        return str((signal or {}).get("canonical_signal_id") or signal_id or "")
-
-
-def _overnight_reeval_session_key(now: Optional[datetime] = None) -> str:
-    now = now or _et_now()
-    return now.date().isoformat()
-
-
 def _watch_arm_cleanup_failed_reason(original_reason: str) -> str:
-    original_reason = str(original_reason or "unknown")
     return f"overnight_watch_arm_failed_cleanup_failed:{original_reason}"
-
-
-def _is_terminal_watch_arm_failure_reason(reason: str) -> bool:
-    reason = str(reason or "")
-    return (
-        reason.startswith("overnight_watch_arm_failed:")
-        or reason.startswith("overnight_watch_arm_failed_cleanup_failed:")
-    )
-
-
-def _get_client_opportunity_row(signal_id: str, client_id: str, signal: dict) -> tuple[str, Optional[dict]]:
-    canonical_signal_id = _resolve_canonical_signal_id(signal_id, signal)
-    if not canonical_signal_id or not client_id:
-        return canonical_signal_id, None
-
-    try:
-        from ap.opportunity_ledger import _get_sb
-        sb = _get_sb()
-        if not sb:
-            return canonical_signal_id, None
-        res = (
-            sb.table("client_signal_opportunities")
-            .select("opportunity_status, miss_stage, miss_reason, metadata")
-            .eq("canonical_signal_id", canonical_signal_id)
-            .eq("client_id", client_id)
-            .limit(1)
-            .execute()
-        )
-        rows = getattr(res, "data", None) or []
-        if rows:
-            row = rows[0] if isinstance(rows[0], dict) else dict(rows[0])
-            return canonical_signal_id, row
-    except Exception as exc:
-        log.debug(
-            "[%s] overnight_reeval: client opportunity lookup failed for %s: %s",
-            client_id,
-            canonical_signal_id,
-            exc,
-        )
-    return canonical_signal_id, None
-
-
-def _shared_watch_arm_failure_already_recorded(
-    signal_id: str,
-    client_id: str,
-    signal: dict,
-    *,
-    session_key: Optional[str] = None,
-) -> bool:
-    canonical_signal_id, row = _get_client_opportunity_row(signal_id, client_id, signal)
-    if not row:
-        return False
-
-    _status = str(row.get("opportunity_status") or "").upper()
-    _stage = str(row.get("miss_stage") or "").upper()
-    _reason = str(row.get("miss_reason") or "")
-    _metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
-    _session_key = session_key or _overnight_reeval_session_key()
-    _recorded_session = str(_metadata.get("overnight_reeval_session_key") or "")
-    if _recorded_session != _session_key:
-        return False
-
-    if _status == "MISSED" and _stage == "WATCHER_ARM" and _is_terminal_watch_arm_failure_reason(_reason):
-        log.info(
-            "[%s] overnight_reeval: shared setup already has same-session WATCHER_ARM proof "
-            "for canonical_signal_id=%s session_key=%s — skipping repeat local order creation",
-            client_id,
-            canonical_signal_id,
-            _session_key,
-        )
-        return True
-
-    if _status == "INTERNAL_ERROR" and _is_terminal_watch_arm_failure_reason(_reason):
-        log.info(
-            "[%s] overnight_reeval: shared setup already has same-session INTERNAL_ERROR arm-failure proof "
-            "for canonical_signal_id=%s session_key=%s — skipping repeat local order creation",
-            client_id,
-            canonical_signal_id,
-            _session_key,
-        )
-        return True
-
-    return False
-
-
-def _record_watch_arm_failure_proof(
-    *,
-    signal_id: str,
-    client_id: str,
-    signal: dict,
-    reason: str,
-    local_order_id: str,
-    job_id,
-    is_exception: bool,
-    session_key: Optional[str] = None,
-    cleanup_method: Optional[str] = None,
-    cleanup_success: Optional[bool] = None,
-    cleanup_failed: bool = False,
-    original_reason: Optional[str] = None,
-) -> None:
-    try:
-        from ap.opportunity_ledger import (
-            create_opportunities,
-            mark_internal_error,
-            mark_watcher_invalidated,
-        )
-        canonical_signal_id = _resolve_canonical_signal_id(signal_id, signal)
-        _payload = dict(signal or {})
-        _payload.setdefault("signal_id", signal_id)
-        create_opportunities(
-            signal_id,
-            [client_id],
-            _payload,
-            canonical_signal_id=canonical_signal_id,
-        )
-        _extra_meta = {
-            "overnight_watch_arm_failure": True,
-            "overnight_source_job_id": str(job_id),
-            "overnight_source_table": (
-                "ap_signals" if str(job_id).startswith("sup:") else "trade_queue"
-            ),
-            "overnight_reeval_session_key": session_key or _overnight_reeval_session_key(),
-        }
-        if cleanup_method is not None:
-            _extra_meta["cleanup_method"] = str(cleanup_method)
-        if cleanup_success is not None:
-            _extra_meta["cleanup_success"] = bool(cleanup_success)
-        if cleanup_failed:
-            _extra_meta["overnight_watch_arm_cleanup_failed"] = True
-        if original_reason is not None:
-            _extra_meta["original_reason"] = str(original_reason)
-        if is_exception:
-            mark_internal_error(
-                signal_id,
-                client_id,
-                reason,
-                canonical_signal_id=canonical_signal_id,
-                order_local_id=str(local_order_id or ""),
-                extra_meta=_extra_meta,
-            )
-        else:
-            mark_watcher_invalidated(
-                signal_id,
-                client_id,
-                reason,
-                canonical_signal_id=canonical_signal_id,
-                order_local_id=str(local_order_id or ""),
-                extra_meta=_extra_meta,
-            )
-    except Exception as exc:
-        log.warning(
-            "[%s] overnight_reeval: failed to persist watch-arm failure proof "
-            "signal=%s local_order_id=%s error=%s",
-            client_id,
-            signal_id,
-            local_order_id,
-            exc,
-        )
 
 
 def run_overnight_reeval(
@@ -505,7 +898,6 @@ def run_overnight_reeval(
 
     # Guard: only run on trading days, 9:00-9:29 AM ET window (unless force=True)
     now_et = _et_now()
-    session_key = _overnight_reeval_session_key(now_et)
     if not force:
         if not _is_trading_day(now_et):
             log.info("[%s] overnight_reeval: skipping — not a trading day", client_id)
@@ -527,6 +919,7 @@ def run_overnight_reeval(
     log.info("[%s] overnight_reeval: found %d WATCHING signals to reeval", client_id, len(watching_signals))
 
     today = now_et.date()
+    session_date = today.isoformat()
     for job in watching_signals:
         result["processed"] += 1
         job_id = job["id"]
@@ -534,11 +927,36 @@ def run_overnight_reeval(
         if isinstance(signal, str):
             import json; signal = json.loads(signal)
         signal_id = job.get("signal_id") or signal.get("signal_id", "")
-        job_source = job.get("_source") or ("ap_signals" if str(job_id).startswith("sup:") else "trade_queue")
         ticker = signal.get("ticker") or signal.get("symbol", "?")
         side = (signal.get("side") or "").upper()
+        canonical_signal_id = _normalize_overnight_canonical_signal_id(signal_id, signal)
+        setup_identity = _overnight_setup_identity(signal)
+        arm_key = _overnight_arm_key(
+            client_id=client_id,
+            canonical_signal_id=canonical_signal_id,
+            setup_identity=setup_identity,
+            session_date=session_date,
+        )
 
         try:
+            if _repair_stale_trade_queue_watching(
+                job=job,
+                signal=signal,
+                client_id=client_id,
+                signal_id=signal_id,
+                canonical_signal_id=canonical_signal_id,
+                session_date=session_date,
+                setup_identity=setup_identity,
+                arm_key=arm_key,
+                ticker=ticker,
+                side=side,
+                entry_watcher=entry_watcher,
+                order_state_machine=order_state_machine,
+                position_manager=position_manager,
+            ):
+                result["rejected"] += 1
+                continue
+
             # Age check: skip stale signals
             sig_date = _signal_date(signal)
             if sig_date:
@@ -573,12 +991,6 @@ def run_overnight_reeval(
                 )
                 _mark_job_rejected(job_id, client_id, f"intraday_timeframe_rejected:{_sig_tf}")
                 result["rejected"] += 1
-                continue
-
-            if job_source == "ap_signals" and _shared_watch_arm_failure_already_recorded(
-                signal_id, client_id, signal, session_key=session_key
-            ):
-                result["skipped"] = result.get("skipped", 0) + 1
                 continue
 
             # Step 1: Fetch prior-day levels from broker
@@ -638,6 +1050,43 @@ def run_overnight_reeval(
             )
             if entry_trigger:
                 signal["entry_trigger"] = entry_trigger
+            setup_identity = _overnight_setup_identity(signal, entry_trigger=entry_trigger)
+            arm_key = _overnight_arm_key(
+                client_id=client_id,
+                canonical_signal_id=canonical_signal_id,
+                setup_identity=setup_identity,
+                session_date=session_date,
+            )
+
+            skip_duplicate, skip_reason, skip_local_order_id = _same_session_rearm_skip_decision(
+                client_id=client_id,
+                signal_id=signal_id,
+                canonical_signal_id=canonical_signal_id,
+                arm_key=arm_key,
+                session_date=session_date,
+                setup_identity=setup_identity,
+                ticker=ticker,
+                side=side,
+                entry_watcher=entry_watcher,
+                order_state_machine=order_state_machine,
+            )
+            if skip_duplicate:
+                _log_overnight_idempotency_proof(
+                    event="OVERNIGHT_REARM_SKIP_PROOF",
+                    client_id=client_id,
+                    canonical_signal_id=canonical_signal_id,
+                    source_signal_id=signal_id,
+                    session_date=session_date,
+                    local_order_id=skip_local_order_id,
+                    ticker=ticker,
+                    side=side,
+                    reason=skip_reason,
+                    decision="SKIP_DUPLICATE_REARM",
+                    setup_identity=setup_identity,
+                    arm_key=arm_key,
+                )
+                result["skipped"] = result.get("skipped", 0) + 1
+                continue
 
             # Step 3: Overnight daily structure validation
             # Fetch a fresh market snapshot (pre-market quote)
@@ -942,6 +1391,18 @@ def run_overnight_reeval(
             # For deferred contracts: ensure contract_symbol is NOT set to the
             # ticker symbol — store as DEFERRED so orders table is clean and
             # the execution core knows to select live at breach time.
+            try:
+                if not hasattr(decision.plan, "metadata") or decision.plan.metadata is None:
+                    decision.plan.metadata = {}
+                decision.plan.metadata.update({
+                    "overnight_arm_key": arm_key,
+                    "overnight_session_date": session_date,
+                    "overnight_setup_identity": setup_identity,
+                    "overnight_canonical_signal_id": canonical_signal_id,
+                    "source_signal_id": signal_id,
+                })
+            except Exception:
+                pass
             if contract_deferred:
                 try:
                     if not getattr(decision.plan, "contract_symbol", None) or \
@@ -1020,6 +1481,34 @@ def run_overnight_reeval(
                     # Second call removed — duplicate transition on same local_order_id.
 
                     _mark_job_watching_armed(job_id, client_id, _arm_label)
+                    _record_overnight_arm_proof(
+                        signal_id=signal_id,
+                        client_id=client_id,
+                        canonical_signal_id=canonical_signal_id,
+                        signal=signal,
+                        local_order_id=str(local_order_id),
+                        arm_key=arm_key,
+                        session_date=session_date,
+                        setup_identity=setup_identity,
+                        state="ARMED",
+                        reason="armed_in_entry_watcher",
+                        decision="ARMED",
+                        retryable=False,
+                    )
+                    _log_overnight_idempotency_proof(
+                        event="OVERNIGHT_ARM_IDEMPOTENCY_PROOF",
+                        client_id=client_id,
+                        canonical_signal_id=canonical_signal_id,
+                        source_signal_id=signal_id,
+                        session_date=session_date,
+                        local_order_id=str(local_order_id),
+                        ticker=ticker,
+                        side=side,
+                        reason="armed_in_entry_watcher",
+                        decision="ARMED",
+                        setup_identity=setup_identity,
+                        arm_key=arm_key,
+                    )
                     log.info(
                         "[%s] ✅ ARMED — contract=%s entry_trigger=%.4f contract_deferred=%s",
                         ticker, _arm_label, entry_trigger or 0, contract_deferred,
@@ -1044,6 +1533,7 @@ def run_overnight_reeval(
                             pass
                     result["armed"] += 1
                 else:
+                    # ── arm=False: cleanup ghost + write WATCH_ARM_FAILED proof ──
                     _reject_reason = str(
                         getattr(entry_watcher, "_last_reject_reason", None)
                         or "watch_returned_false"
@@ -1056,59 +1546,46 @@ def run_overnight_reeval(
                     )
                     _cleanup_success, _cleanup_method = _cleanup_overnight_watch_arm_failure(
                         order_state_machine=order_state_machine,
-                        client_id=client_id,
-                        signal_id=signal_id,
-                        ticker=ticker,
-                        side=side,
+                        client_id=client_id, signal_id=signal_id,
+                        ticker=ticker, side=side,
                         local_order_id=str(local_order_id),
-                        contract=_arm_label,
-                        contract_deferred=contract_deferred,
-                        entry_trigger=entry_trigger,
-                        reason=_full_error,
+                        contract=_arm_label, contract_deferred=contract_deferred,
+                        entry_trigger=entry_trigger, reason=_full_error,
                         done_event="OVERNIGHT_WATCH_ARM_FAILED_CLEANUP_DONE",
                     )
+                    _arm_failed_meta = {
+                        "overnight_watch_arm_failure": True,
+                        "overnight_arm_state": "WATCH_ARM_FAILED",
+                        "overnight_arm_decision": "SKIP_FUTURE_REARM",
+                        "overnight_arm_retryable": False,
+                        "overnight_source_table": (
+                            "ap_signals" if str(job_id).startswith("sup:") else "trade_queue"
+                        ),
+                        "overnight_reeval_session_key": session_date,
+                        "cleanup_method": _cleanup_method,
+                        "cleanup_success": _cleanup_success,
+                    }
                     if not _cleanup_success:
-                        _cleanup_failed_reason = _watch_arm_cleanup_failed_reason(_full_error)
-                        log.critical(
-                            "[%s] OVERNIGHT_WATCH_ARM_FAILED_CLEANUP_FAILED | "
-                            "watch arm failed but local ENTRY cleanup failed "
-                            "| local_order_id=%s cleanup_method=%s reason=%s "
-                            "| cleanup_success=%s cleanup_failed_reason=%s",
-                            ticker,
-                            local_order_id,
-                            _cleanup_method,
-                            _full_error,
-                            _cleanup_success,
-                            _cleanup_failed_reason,
-                        )
-                        _record_watch_arm_failure_proof(
-                            signal_id=signal_id,
-                            client_id=client_id,
-                            signal=signal,
-                            reason=_cleanup_failed_reason,
-                            local_order_id=str(local_order_id),
-                            job_id=job_id,
-                            is_exception=True,
-                            session_key=session_key,
-                            cleanup_method=_cleanup_method,
-                            cleanup_success=False,
-                            cleanup_failed=True,
-                            original_reason=_full_error,
-                        )
-                        _mark_job_error(job_id, client_id, _cleanup_failed_reason)
-                        result["errors"] += 1
-                        continue
-                    _record_watch_arm_failure_proof(
+                        _arm_failed_meta["overnight_watch_arm_cleanup_failed"] = True
+                        _arm_failed_meta["original_reason"] = _full_error
+                        _arm_failed_meta["cleanup_method"] = _cleanup_method
+                    # Write durable WATCH_ARM_FAILED proof so idempotency gate
+                    # skips this setup on next same-session reeval run.
+                    _record_overnight_arm_proof(
                         signal_id=signal_id,
                         client_id=client_id,
+                        canonical_signal_id=canonical_signal_id,
                         signal=signal,
-                        reason=_full_error,
                         local_order_id=str(local_order_id),
-                        job_id=job_id,
-                        is_exception=False,
-                        session_key=session_key,
+                        arm_key=arm_key,
+                        session_date=session_date,
+                        setup_identity=setup_identity,
+                        state="WATCH_ARM_FAILED",
+                        reason=_full_error,
+                        decision="SKIP_FUTURE_REARM",
+                        retryable=False,
+                        extra_meta=_arm_failed_meta,
                     )
-                    _mark_job_rejected(job_id, client_id, _full_error)
                     if _lifecycle_ok:
                         try:
                             _sig_rejected(signal_id, ticker, _LO.WATCHER,
@@ -1117,65 +1594,61 @@ def run_overnight_reeval(
                                           contract=_arm_label)
                         except Exception:
                             pass
-                    result["rejected"] += 1
+                    if not _cleanup_success:
+                        _mark_job_error(job_id, client_id,
+                                        _watch_arm_cleanup_failed_reason(_full_error))
+                        result["errors"] += 1
+                    else:
+                        _mark_job_rejected(job_id, client_id, _full_error)
+                        result["rejected"] += 1
             except Exception as ew_exc:
+                # ── exception path: same cleanup + proof ─────────────────────
                 _full_error = f"overnight_watch_arm_failed:exception:{ew_exc}"
+                log.error("[%s] overnight_reeval: entry_watcher.watch failed: %s", ticker, ew_exc)
                 _cleanup_success, _cleanup_method = _cleanup_overnight_watch_arm_failure(
                     order_state_machine=order_state_machine,
-                    client_id=client_id,
-                    signal_id=signal_id,
-                    ticker=ticker,
-                    side=side,
+                    client_id=client_id, signal_id=signal_id,
+                    ticker=ticker, side=side,
                     local_order_id=str(local_order_id),
-                    contract=_arm_label,
-                    contract_deferred=contract_deferred,
-                    entry_trigger=entry_trigger,
-                    reason=_full_error,
+                    contract=_arm_label, contract_deferred=contract_deferred,
+                    entry_trigger=entry_trigger, reason=_full_error,
                     done_event="OVERNIGHT_WATCH_ARM_EXCEPTION_CLEANUP_DONE",
                 )
+                _arm_exc_meta = {
+                    "overnight_watch_arm_failure": True,
+                    "overnight_arm_state": "WATCH_ARM_FAILED",
+                    "overnight_arm_decision": "SKIP_FUTURE_REARM",
+                    "overnight_arm_retryable": False,
+                    "overnight_source_table": (
+                        "ap_signals" if str(job_id).startswith("sup:") else "trade_queue"
+                    ),
+                    "overnight_reeval_session_key": session_date,
+                    "cleanup_method": _cleanup_method,
+                    "cleanup_success": _cleanup_success,
+                }
                 if not _cleanup_success:
-                    _cleanup_failed_reason = _watch_arm_cleanup_failed_reason(_full_error)
-                    log.critical(
-                        "[%s] OVERNIGHT_WATCH_ARM_FAILED_CLEANUP_FAILED | "
-                        "entry_watcher.watch exception and local ENTRY cleanup failed "
-                        "| local_order_id=%s cleanup_method=%s reason=%s "
-                        "| cleanup_success=%s cleanup_failed_reason=%s",
-                        ticker,
-                        local_order_id,
-                        _cleanup_method,
-                        _full_error,
-                        _cleanup_success,
-                        _cleanup_failed_reason,
-                    )
-                    _record_watch_arm_failure_proof(
-                        signal_id=signal_id,
-                        client_id=client_id,
-                        signal=signal,
-                        reason=_cleanup_failed_reason,
-                        local_order_id=str(local_order_id),
-                        job_id=job_id,
-                        is_exception=True,
-                        session_key=session_key,
-                        cleanup_method=_cleanup_method,
-                        cleanup_success=False,
-                        cleanup_failed=True,
-                        original_reason=_full_error,
-                    )
-                    _mark_job_error(job_id, client_id, _cleanup_failed_reason)
-                    result["errors"] += 1
-                    continue
-                _record_watch_arm_failure_proof(
+                    _arm_exc_meta["overnight_watch_arm_cleanup_failed"] = True
+                    _arm_exc_meta["original_reason"] = _full_error
+                _record_overnight_arm_proof(
                     signal_id=signal_id,
                     client_id=client_id,
+                    canonical_signal_id=canonical_signal_id,
                     signal=signal,
-                    reason=_full_error,
                     local_order_id=str(local_order_id),
-                    job_id=job_id,
-                    is_exception=True,
-                    session_key=session_key,
+                    arm_key=arm_key,
+                    session_date=session_date,
+                    setup_identity=setup_identity,
+                    state="WATCH_ARM_FAILED",
+                    reason=_full_error,
+                    decision="SKIP_FUTURE_REARM",
+                    retryable=False,
+                    extra_meta=_arm_exc_meta,
                 )
-                _mark_job_error(job_id, client_id, _full_error)
-                log.error("[%s] overnight_reeval: entry_watcher.watch failed: %s", ticker, ew_exc)
+                if not _cleanup_success:
+                    _mark_job_error(job_id, client_id,
+                                    _watch_arm_cleanup_failed_reason(_full_error))
+                else:
+                    _mark_job_error(job_id, client_id, _full_error)
                 result["errors"] += 1
 
         except Exception as outer_exc:
@@ -1213,7 +1686,8 @@ def _fetch_watching_signals(client_id: str) -> list:
         def _fn():
             with conn() as c:
                 c.execute("""
-                    SELECT id, signal_id, payload, created_ts
+                    SELECT id, signal_id, payload, created_ts, started_ts,
+                           last_error, result_json
                     FROM trade_queue
                     WHERE client_id = %s
                       AND status = 'WATCHING'
@@ -1228,6 +1702,11 @@ def _fetch_watching_signals(client_id: str) -> list:
             if isinstance(d.get("payload"), str):
                 try:
                     d["payload"] = _j.loads(d["payload"])
+                except Exception:
+                    pass
+            if isinstance(d.get("result_json"), str):
+                try:
+                    d["result_json"] = _j.loads(d["result_json"])
                 except Exception:
                     pass
             d["_source"] = "trade_queue"
@@ -1424,39 +1903,6 @@ def _mark_job_rejected(job_id, client_id: str, reason: str) -> None:
         run_with_retry(_fn)
     except Exception as e:
         log.debug("_mark_job_rejected[trade_queue] failed non-fatal: %s", e)
-
-
-def _mark_job_error(job_id, client_id: str, reason: str) -> None:
-    """Mark a WATCHING job errored in its original source table.
-
-    Shared ap_signals rows are not mutated; the per-client proof lives in the
-    opportunity ledger. trade_queue rows remain client-scoped and can be
-    terminally updated.
-    """
-    job_id_str = str(job_id)
-    if job_id_str.startswith("sup:"):
-        log.info(
-            "[%s] reeval errored shared setup %s — per-client error proof logged "
-            "(shared ap_signals row left WATCHING for other clients): %s",
-            client_id, job_id_str[4:], reason[:200],
-        )
-        return
-
-    try:
-        from ap.db import conn, run_with_retry
-
-        def _fn():
-            with conn() as c:
-                c.execute("""
-                    UPDATE trade_queue
-                    SET status = 'ERROR',
-                        last_error = %s,
-                        finished_ts = NOW()
-                    WHERE id = %s AND client_id = %s
-                """, (reason[:500], job_id, client_id))
-        run_with_retry(_fn)
-    except Exception as e:
-        log.debug("_mark_job_error[trade_queue] failed non-fatal: %s", e)
 
 
 def _mark_job_watching_armed(job_id, client_id: str, contract: str) -> None:
