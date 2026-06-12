@@ -132,6 +132,151 @@ def _signal_date(signal: dict) -> Optional[date]:
     return None
 
 
+def _log_overnight_watch_cleanup(
+    event: str,
+    *,
+    level: str,
+    client_id: str,
+    signal_id: str,
+    ticker: str,
+    side: str,
+    local_order_id: str,
+    contract: str,
+    contract_deferred: bool,
+    entry_trigger,
+    cleanup_method: str,
+    cleanup_success: bool,
+    reason: str,
+) -> None:
+    try:
+        _entry_trigger = "None" if entry_trigger is None else f"{float(entry_trigger):.4f}"
+    except Exception:
+        _entry_trigger = str(entry_trigger)
+    getattr(log, level)(
+        "%s client_id=%s signal_id=%s ticker=%s side=%s local_order_id=%s "
+        "contract=%s contract_deferred=%s entry_trigger=%s cleanup_method=%s "
+        "cleanup_success=%s reason=%s",
+        event,
+        client_id,
+        signal_id,
+        ticker,
+        side,
+        local_order_id,
+        contract,
+        contract_deferred,
+        _entry_trigger,
+        cleanup_method,
+        cleanup_success,
+        reason,
+    )
+
+
+def _cleanup_overnight_watch_arm_failure(
+    *,
+    order_state_machine,
+    client_id: str,
+    signal_id: str,
+    ticker: str,
+    side: str,
+    local_order_id: str,
+    contract: str,
+    contract_deferred: bool,
+    entry_trigger,
+    reason: str,
+    done_event: str,
+) -> tuple[bool, str]:
+    _log_overnight_watch_cleanup(
+        "OVERNIGHT_WATCH_ARM_FAILED_CLEANUP_START",
+        level="warning",
+        client_id=client_id,
+        signal_id=signal_id,
+        ticker=ticker,
+        side=side,
+        local_order_id=local_order_id,
+        contract=contract,
+        contract_deferred=contract_deferred,
+        entry_trigger=entry_trigger,
+        cleanup_method="pending",
+        cleanup_success=False,
+        reason=reason,
+    )
+
+    cleanup_method = "none"
+    cleanup_success = False
+
+    if local_order_id:
+        if hasattr(order_state_machine, "expire_pending_entry"):
+            cleanup_method = "expire_pending_entry"
+            try:
+                cleanup_success = bool(
+                    order_state_machine.expire_pending_entry(
+                        local_order_id,
+                        reason=reason,
+                    )
+                )
+            except Exception as exp_exc:
+                log.error(
+                    "[%s] overnight_reeval: expire_pending_entry cleanup failed "
+                    "| local_order_id=%s reason=%s error=%s",
+                    ticker, local_order_id, reason, exp_exc,
+                )
+                cleanup_success = False
+
+        if not cleanup_success and hasattr(order_state_machine, "cancel_pending_entry"):
+            cleanup_method = "cancel_pending_entry"
+            try:
+                cleanup_success = bool(
+                    order_state_machine.cancel_pending_entry(
+                        local_order_id,
+                        reason=reason,
+                    )
+                )
+            except Exception as cancel_exc:
+                log.error(
+                    "[%s] overnight_reeval: cancel_pending_entry cleanup failed "
+                    "| local_order_id=%s reason=%s error=%s",
+                    ticker, local_order_id, reason, cancel_exc,
+                )
+                cleanup_success = False
+
+        if not cleanup_success and hasattr(order_state_machine, "transition"):
+            cleanup_method = "transition:EXPIRED"
+            try:
+                cleanup_success = bool(
+                    order_state_machine.transition(
+                        local_order_id,
+                        "EXPIRED",
+                        last_error=reason,
+                    )
+                )
+            except Exception as trans_exc:
+                log.error(
+                    "[%s] overnight_reeval: transition(EXPIRED) cleanup failed "
+                    "| local_order_id=%s reason=%s error=%s",
+                    ticker, local_order_id, reason, trans_exc,
+                )
+                cleanup_success = False
+    else:
+        cleanup_method = "missing_local_order_id"
+
+    _log_overnight_watch_cleanup(
+        done_event,
+        level="info" if cleanup_success else "error",
+        client_id=client_id,
+        signal_id=signal_id,
+        ticker=ticker,
+        side=side,
+        local_order_id=local_order_id,
+        contract=contract,
+        contract_deferred=contract_deferred,
+        entry_trigger=entry_trigger,
+        cleanup_method=cleanup_method,
+        cleanup_success=cleanup_success,
+        reason=reason,
+    )
+    return cleanup_success, cleanup_method
+
+
 def run_overnight_reeval(
     *,
     client_id: str,
@@ -715,18 +860,53 @@ def run_overnight_reeval(
                             pass
                     result["armed"] += 1
                 else:
-                    log.error("[%s] overnight_reeval: entry_watcher.watch() returned False | contract=%s",
-                              ticker, _contract_sym)
+                    _reject_reason = str(
+                        getattr(entry_watcher, "_last_reject_reason", None)
+                        or "watch_returned_false"
+                    )
+                    _full_error = f"overnight_watch_arm_failed:{_reject_reason}"
+                    log.error(
+                        "[%s] overnight_reeval: entry_watcher.watch() returned False "
+                        "| contract=%s reason=%s",
+                        ticker, _arm_label, _reject_reason,
+                    )
+                    _cleanup_overnight_watch_arm_failure(
+                        order_state_machine=order_state_machine,
+                        client_id=client_id,
+                        signal_id=signal_id,
+                        ticker=ticker,
+                        side=side,
+                        local_order_id=str(local_order_id),
+                        contract=_arm_label,
+                        contract_deferred=contract_deferred,
+                        entry_trigger=entry_trigger,
+                        reason=_full_error,
+                        done_event="OVERNIGHT_WATCH_ARM_FAILED_CLEANUP_DONE",
+                    )
                     if _lifecycle_ok:
                         try:
                             _sig_rejected(signal_id, ticker, _LO.WATCHER,
                                           "entry_watcher.watch() returned False",
                                           _RC.EXECUTION, "WATCHER_ARM_FAILED", _RS.WARNING,
-                                          contract=_contract_sym)
+                                          contract=_arm_label)
                         except Exception:
                             pass
                     result["errors"] += 1
             except Exception as ew_exc:
+                _full_error = f"overnight_watch_arm_failed:exception:{ew_exc}"
+                _cleanup_overnight_watch_arm_failure(
+                    order_state_machine=order_state_machine,
+                    client_id=client_id,
+                    signal_id=signal_id,
+                    ticker=ticker,
+                    side=side,
+                    local_order_id=str(local_order_id),
+                    contract=_arm_label,
+                    contract_deferred=contract_deferred,
+                    entry_trigger=entry_trigger,
+                    reason=_full_error,
+                    done_event="OVERNIGHT_WATCH_ARM_EXCEPTION_CLEANUP_DONE",
+                )
                 log.error("[%s] overnight_reeval: entry_watcher.watch failed: %s", ticker, ew_exc)
                 result["errors"] += 1
 

@@ -166,6 +166,13 @@ POLL_INTERVAL = int(os.getenv("ORDER_MONITOR_POLL", "60"))  # seconds (entry che
 # H4: exits run on this faster cadence (account risk). Keep >= a few seconds
 # to avoid hammering the broker; 15s + 45s timeout => hung exit caught fast.
 EXIT_CHECK_INTERVAL = int(os.getenv("ORDER_MONITOR_EXIT_POLL", "15"))  # seconds
+PENDING_TRIGGER_CLEANUP_ENABLED = os.getenv(
+    "PENDING_TRIGGER_CLEANUP_ENABLED", "1"
+).strip().lower() in ("1", "true", "yes")
+PENDING_TRIGGER_MAX_AGE_SECONDS = int(os.getenv("PENDING_TRIGGER_MAX_AGE_SECONDS", "5400"))
+PENDING_TRIGGER_CLEANUP_DRY_RUN = os.getenv(
+    "PENDING_TRIGGER_CLEANUP_DRY_RUN", "0"
+).strip().lower() in ("1", "true", "yes")
 
 # Watchdog ownership controls.
 # Default is intentionally passive for POSITION lifecycle (that authority
@@ -255,6 +262,9 @@ class APOrderMonitor:
             "missed_move_price_mult": float(os.getenv("MISSED_MOVE_PRICE_MULT", "1.07")),
             "entry_limit_max_age_seconds": ENTRY_LIMIT_MAX_AGE_SECONDS,
             "allow_entry_cancel_in_watchdog": ALLOW_ENTRY_CANCEL_IN_WATCHDOG,
+            "pending_trigger_cleanup_enabled": PENDING_TRIGGER_CLEANUP_ENABLED,
+            "pending_trigger_max_age_seconds": PENDING_TRIGGER_MAX_AGE_SECONDS,
+            "pending_trigger_cleanup_dry_run": PENDING_TRIGGER_CLEANUP_DRY_RUN,
         })
 
     def _emit_order_event(
@@ -481,6 +491,16 @@ class APOrderMonitor:
                     except Exception as _e:
                         log.debug("[%s] lost-handoff systemic check failed: %s", self.client_id, _e)
 
+            elif status == "PENDING_TRIGGER":
+                self._check_pending_trigger_order(
+                    order=order,
+                    local_id=local_id,
+                    contract=contract,
+                    age_secs=age_secs,
+                    broker_oid=broker_oid,
+                    submitted_ts=submitted_ts,
+                )
+
             elif status == "SUBMITTED":
                 ref_ts = submitted_ts or created_ts
                 age_secs = (now - ref_ts).total_seconds()
@@ -571,6 +591,116 @@ class APOrderMonitor:
                         f"| {local_id} | {age_secs:.0f}s > {TIMEOUT_PARTIAL_FILL}s "
                         f"| Manual review required"
                     )
+
+    def _check_pending_trigger_order(
+        self,
+        *,
+        order: dict,
+        local_id: str,
+        contract: str,
+        age_secs: float,
+        broker_oid,
+        submitted_ts,
+    ) -> None:
+        _seen_msg = (
+            "[%s] PENDING_TRIGGER_WATCHDOG_SEEN | %s | %s | age=%.0fs "
+            "| broker_order_id=%s | submitted_ts=%s | cleanup_enabled=%s | dry_run=%s"
+        )
+        _submitted_repr = submitted_ts.isoformat() if submitted_ts else "None"
+        if broker_oid:
+            log.critical(
+                _seen_msg + " | action=skip_broker_order_id_present",
+                self.client_id,
+                contract,
+                local_id,
+                age_secs,
+                broker_oid,
+                _submitted_repr,
+                PENDING_TRIGGER_CLEANUP_ENABLED,
+                PENDING_TRIGGER_CLEANUP_DRY_RUN,
+            )
+            return
+
+        log.info(
+            _seen_msg,
+            self.client_id,
+            contract,
+            local_id,
+            age_secs,
+            broker_oid or "None",
+            _submitted_repr,
+            PENDING_TRIGGER_CLEANUP_ENABLED,
+            PENDING_TRIGGER_CLEANUP_DRY_RUN,
+        )
+
+        if submitted_ts or age_secs <= PENDING_TRIGGER_MAX_AGE_SECONDS:
+            return
+        if not PENDING_TRIGGER_CLEANUP_ENABLED:
+            return
+
+        reason = (
+            "PENDING_TRIGGER_ORPHAN_EXPIRED: no_broker_order_id "
+            f"no_submitted_ts age={age_secs:.0f}s"
+        )
+
+        if PENDING_TRIGGER_CLEANUP_DRY_RUN:
+            log.warning(
+                "[%s] PENDING_TRIGGER_ORPHAN_DRY_RUN | %s | %s | age=%.0fs "
+                "| cleanup_method=dry_run | cleanup_success=%s | reason=%s",
+                self.client_id,
+                contract,
+                local_id,
+                age_secs,
+                False,
+                reason,
+            )
+            return
+
+        cleanup_method = "expire_pending_entry"
+        cleanup_success = False
+
+        if hasattr(self.osm, "expire_pending_entry"):
+            try:
+                cleanup_success = bool(
+                    self.osm.expire_pending_entry(local_id, reason=reason)
+                )
+            except Exception as exc:
+                log.error(
+                    "[%s] PENDING_TRIGGER expire_pending_entry failed | %s | %s | error=%s",
+                    self.client_id,
+                    contract,
+                    local_id,
+                    exc,
+                )
+                cleanup_success = False
+
+        if not cleanup_success and hasattr(self.osm, "transition"):
+            cleanup_method = "transition:EXPIRED"
+            try:
+                cleanup_success = bool(
+                    self.osm.transition(local_id, "EXPIRED", last_error=reason)
+                )
+            except Exception as exc:
+                log.error(
+                    "[%s] PENDING_TRIGGER transition(EXPIRED) failed | %s | %s | error=%s",
+                    self.client_id,
+                    contract,
+                    local_id,
+                    exc,
+                )
+                cleanup_success = False
+
+        getattr(log, "info" if cleanup_success else "error")(
+            "[%s] PENDING_TRIGGER_ORPHAN_EXPIRED | %s | %s | age=%.0fs "
+            "| cleanup_method=%s | cleanup_success=%s | reason=%s",
+            self.client_id,
+            contract,
+            local_id,
+            age_secs,
+            cleanup_method,
+            cleanup_success,
+            reason,
+        )
 
     def _check_exit_orders(self):
         orders = self._get_active_exit_orders()
@@ -2127,7 +2257,7 @@ class APOrderMonitor:
                     FROM orders
                     WHERE client_id=%s
                       AND kind='ENTRY'
-                      AND status IN ('CREATED','SUBMITTED','ACKNOWLEDGED','PARTIAL_FILL')
+                      AND status IN ('CREATED','PENDING_TRIGGER','SUBMITTED','ACKNOWLEDGED','PARTIAL_FILL')
                     ORDER BY created_ts ASC
                     """,
                     (self.client_id,),
