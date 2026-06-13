@@ -3952,6 +3952,181 @@ def execution_health():
         return jsonify({"ok": False, "error": str(e)}), 200
 
 
+@app.get("/admin/trade_flow_status")
+@require_hmac
+def admin_trade_flow_status():
+    """Per-client trade flow status — answers "are trades actually flowing?".
+
+    Returns one row per active client showing:
+      - runner alive / initialized / entries_allowed flags
+      - count of orders by status in last 24h
+      - last_signal_at, last_watching_at, last_submitted_at, last_filled_at
+      - last_error from most recent ENTRY in last 24h
+      - watcher_quote_source from most recent paper ENTRY (sandbox vs live)
+      - execution_mode and pod info
+
+    Designed for Monday-morning ops check. If any client shows zero
+    WATCHING/SUBMITTED rows after market open, this endpoint tells you
+    which one and what the last_error was — without grep through logs.
+
+    Output: JSON {"clients": {email: {...}}, "service": {...}}
+    HTTP 200 always (it's a status endpoint, not a health gate).
+    """
+    try:
+        from client_runner import _active_runners, _registry_lock
+        from ap.db import conn, run_with_retry
+        import os as _os
+
+        # 1. Snapshot active runners
+        runner_info = {}
+        with _registry_lock:
+            for email, runner in list(_active_runners.items()):
+                runner_info[email] = {
+                    "alive":            runner.is_alive(),
+                    "initialized":      runner.initialized.is_set(),
+                    "stopping":         runner.stopping.is_set(),
+                    "failed":           runner.failed.is_set(),
+                    "degraded":         runner.degraded.is_set(),
+                    "entries_allowed":  runner.entries_allowed.is_set(),
+                    "mode":             getattr(runner, "mode", "UNKNOWN"),
+                    "degraded_reasons": sorted(getattr(runner, "degraded_reasons", set())),
+                }
+        emails = list(runner_info.keys())
+
+        # 2. Per-client order activity in last 24h
+        order_stats: dict = {e: {
+            "by_status": {}, "last_signal_at": None,
+            "last_watching_at": None, "last_submitted_at": None,
+            "last_filled_at": None, "last_canceled_at": None,
+            "last_error": None,
+            "last_watcher_quote_source": None,
+        } for e in emails}
+
+        if emails:
+            def _q():
+                rows = []
+                with conn() as c:
+                    # Status counts
+                    c.execute("""
+                        SELECT client_id, UPPER(COALESCE(status,'')) as st, COUNT(*) as cnt
+                        FROM public.orders
+                        WHERE kind = 'ENTRY'
+                          AND created_ts >= NOW() - INTERVAL '24 hours'
+                          AND client_id = ANY(%s)
+                        GROUP BY client_id, st
+                    """, (emails,))
+                    rows.append(("by_status", c.fetchall() or []))
+                    # Last timestamp by status
+                    c.execute("""
+                        SELECT client_id, UPPER(COALESCE(status,'')) as st, MAX(created_ts) as ts
+                        FROM public.orders
+                        WHERE kind = 'ENTRY'
+                          AND created_ts >= NOW() - INTERVAL '24 hours'
+                          AND client_id = ANY(%s)
+                        GROUP BY client_id, st
+                    """, (emails,))
+                    rows.append(("last_by_status", c.fetchall() or []))
+                    # Last error + quote source from most recent entry
+                    c.execute("""
+                        SELECT DISTINCT ON (client_id)
+                            client_id, last_error, execution_mode,
+                            meta->'watcher_audit'->>'watcher_quote_source' as qsrc,
+                            created_ts
+                        FROM public.orders
+                        WHERE kind = 'ENTRY'
+                          AND created_ts >= NOW() - INTERVAL '24 hours'
+                          AND client_id = ANY(%s)
+                        ORDER BY client_id, created_ts DESC
+                    """, (emails,))
+                    rows.append(("last_entry_detail", c.fetchall() or []))
+                return rows
+            try:
+                results = run_with_retry(_q)
+            except Exception as _qe:
+                results = []
+                log.warning("trade_flow_status query failed: %s", _qe)
+            for kind, rows in results:
+                for row in rows:
+                    cid = row["client_id"]
+                    if cid not in order_stats:
+                        continue
+                    if kind == "by_status":
+                        order_stats[cid]["by_status"][row["st"]] = int(row["cnt"])
+                    elif kind == "last_by_status":
+                        ts = row["ts"]
+                        ts_str = ts.isoformat() if ts else None
+                        st = row["st"]
+                        if st in ("WATCHING",):
+                            order_stats[cid]["last_watching_at"] = ts_str
+                        elif st in ("SUBMITTED", "ACCEPTED", "OPEN", "PENDING_SUBMIT"):
+                            current = order_stats[cid]["last_submitted_at"]
+                            if not current or (ts_str and ts_str > current):
+                                order_stats[cid]["last_submitted_at"] = ts_str
+                        elif st in ("FILLED", "PARTIALLY_FILLED"):
+                            order_stats[cid]["last_filled_at"] = ts_str
+                        elif st in ("CANCELED", "CANCELLED"):
+                            order_stats[cid]["last_canceled_at"] = ts_str
+                        # Track most recent signal regardless of status
+                        current = order_stats[cid]["last_signal_at"]
+                        if not current or (ts_str and ts_str > current):
+                            order_stats[cid]["last_signal_at"] = ts_str
+                    elif kind == "last_entry_detail":
+                        order_stats[cid]["last_error"] = row.get("last_error")
+                        order_stats[cid]["last_watcher_quote_source"] = row.get("qsrc")
+                        order_stats[cid]["execution_mode_observed"] = row.get("execution_mode")
+
+        # 3. Per-client roll-up
+        clients = {}
+        for email in emails:
+            info = runner_info[email]
+            stats = order_stats[email]
+            # Trade-flow health heuristic:
+            #   - runner alive + initialized + entries_allowed = green
+            #   - else yellow / red depending on which flag is off
+            if not info["alive"]:
+                tf_health = "red:runner_dead"
+            elif info["failed"]:
+                tf_health = "red:runner_failed"
+            elif not info["initialized"]:
+                tf_health = "yellow:initializing"
+            elif not info["entries_allowed"]:
+                tf_health = "yellow:entries_blocked"
+            elif info["degraded"]:
+                tf_health = "yellow:degraded"
+            else:
+                tf_health = "green"
+
+            clients[email] = {
+                "runner":      info,
+                "orders_24h":  stats,
+                "trade_flow_health": tf_health,
+            }
+
+        # 4. Service-level summary
+        any_green   = any(c["trade_flow_health"] == "green" for c in clients.values())
+        any_filled  = any(c["orders_24h"]["last_filled_at"] for c in clients.values())
+        any_watching = any(
+            c["orders_24h"]["last_watching_at"] for c in clients.values()
+        )
+
+        return jsonify({
+            "ok": True,
+            "service": {
+                "bot_mode":  _os.getenv("BOT_MODE", "?"),
+                "pod_id":    _os.getenv("POD_ID", ""),
+                "instance":  _os.getenv("BOT_INSTANCE_ID", ""),
+                "client_count": len(emails),
+                "any_runner_green":     any_green,
+                "any_recent_fill":      any_filled,
+                "any_recent_watching":  any_watching,
+            },
+            "clients": clients,
+        })
+    except Exception as e:
+        log.error("trade_flow_status failed: %s", e)
+        return jsonify({"ok": False, "error": str(e)}), 200
+
+
 @app.get("/scanner/health")
 @require_hmac
 def scanner_health():
