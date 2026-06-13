@@ -14,8 +14,10 @@ Verifies:
 """
 from __future__ import annotations
 
-from types import SimpleNamespace
+from contextlib import contextmanager
+from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, patch
+import time
 import pytest
 
 
@@ -43,6 +45,25 @@ def _row(**kw):
     return r
 
 
+@contextmanager
+def _patch_ap_db(fake_conn, *, run_with_retry=None):
+    """Inject a lightweight ap.db module so tests do not import real Postgres."""
+    import sys
+
+    fake_mod = ModuleType("ap.db")
+    fake_mod.conn = lambda: fake_conn
+    fake_mod.run_with_retry = run_with_retry or (lambda f, *a, **k: f())
+    original = sys.modules.get("ap.db")
+    sys.modules["ap.db"] = fake_mod
+    try:
+        yield fake_mod
+    finally:
+        if original is not None:
+            sys.modules["ap.db"] = original
+        else:
+            sys.modules.pop("ap.db", None)
+
+
 # =============================================================================
 # Test 1: only prior REJECTED row → NOT a duplicate
 # =============================================================================
@@ -60,8 +81,7 @@ def test_prior_rejected_duplicate_does_not_block():
     fake_conn.__enter__ = MagicMock(return_value=fake_cursor)
     fake_conn.__exit__ = MagicMock(return_value=False)
 
-    with patch("ap.db.conn", return_value=fake_conn), \
-         patch("ap.db.run_with_retry", side_effect=lambda f, *a, **k: f()):
+    with _patch_ap_db(fake_conn):
         is_dup, source, detail = mc._has_durable_duplicate_signal(
             client_id="jason@example.com",
             signal_id="sig-abc",
@@ -86,8 +106,7 @@ def test_active_watching_trade_queue_blocks():
     fake_conn.__enter__ = MagicMock(return_value=fake_cursor)
     fake_conn.__exit__ = MagicMock(return_value=False)
 
-    with patch("ap.db.conn", return_value=fake_conn), \
-         patch("ap.db.run_with_retry", side_effect=lambda f, *a, **k: f()):
+    with _patch_ap_db(fake_conn):
         is_dup, source, detail = mc._has_durable_duplicate_signal(
             client_id="jason@example.com",
             signal_id="sig-abc",
@@ -112,8 +131,7 @@ def test_different_clients_no_cross_block():
     fake_conn.__enter__ = MagicMock(return_value=fake_cursor)
     fake_conn.__exit__ = MagicMock(return_value=False)
 
-    with patch("ap.db.conn", return_value=fake_conn), \
-         patch("ap.db.run_with_retry", side_effect=lambda f, *a, **k: f()):
+    with _patch_ap_db(fake_conn):
         is_dup, _, _ = mc._has_durable_duplicate_signal(
             client_id="jason@example.com",
             signal_id="sig-abc",
@@ -145,8 +163,7 @@ def test_active_entry_order_blocks():
     fake_conn.__enter__ = MagicMock(return_value=fake_cursor)
     fake_conn.__exit__ = MagicMock(return_value=False)
 
-    with patch("ap.db.conn", return_value=fake_conn), \
-         patch("ap.db.run_with_retry", side_effect=lambda f, *a, **k: f()):
+    with _patch_ap_db(fake_conn):
         is_dup, source, detail = mc._has_durable_duplicate_signal(
             client_id="jason@example.com",
             signal_id="sig-abc",
@@ -165,9 +182,10 @@ def test_db_failure_returns_check_unavailable():
     mc, _ = _make_mc()
 
     # Simulate run_with_retry raising
-    with patch("ap.db.conn", return_value=MagicMock()), \
-         patch("ap.db.run_with_retry",
-               side_effect=Exception("connection refused")):
+    with _patch_ap_db(
+        MagicMock(),
+        run_with_retry=lambda f, *a, **k: (_ for _ in ()).throw(Exception("connection refused")),
+    ):
         is_dup, source, detail = mc._has_durable_duplicate_signal(
             client_id="jason@example.com",
             signal_id="sig-abc",
@@ -216,8 +234,7 @@ def test_current_queue_id_excludes_self():
     fake_conn.__enter__ = MagicMock(return_value=fake_cursor)
     fake_conn.__exit__ = MagicMock(return_value=False)
 
-    with patch("ap.db.conn", return_value=fake_conn), \
-         patch("ap.db.run_with_retry", side_effect=lambda f, *a, **k: f()):
+    with _patch_ap_db(fake_conn):
         mc._has_durable_duplicate_signal(
             client_id="jason@example.com",
             signal_id="sig-abc",
@@ -251,8 +268,7 @@ def test_position_check_tolerates_missing_column():
     fake_conn.__enter__ = MagicMock(return_value=fake_cursor)
     fake_conn.__exit__ = MagicMock(return_value=False)
 
-    with patch("ap.db.conn", return_value=fake_conn), \
-         patch("ap.db.run_with_retry", side_effect=lambda f, *a, **k: f()):
+    with _patch_ap_db(fake_conn):
         is_dup, source, _ = mc._has_durable_duplicate_signal(
             client_id="jason@example.com",
             signal_id="sig-abc",
@@ -278,8 +294,7 @@ def test_only_terminal_orders_does_not_block():
     fake_conn.__enter__ = MagicMock(return_value=fake_cursor)
     fake_conn.__exit__ = MagicMock(return_value=False)
 
-    with patch("ap.db.conn", return_value=fake_conn), \
-         patch("ap.db.run_with_retry", side_effect=lambda f, *a, **k: f()):
+    with _patch_ap_db(fake_conn):
         is_dup, _, _ = mc._has_durable_duplicate_signal(
             client_id="jason@example.com",
             signal_id="sig-abc",
@@ -312,8 +327,7 @@ def test_open_position_blocks():
     fake_conn.__enter__ = MagicMock(return_value=fake_cursor)
     fake_conn.__exit__ = MagicMock(return_value=False)
 
-    with patch("ap.db.conn", return_value=fake_conn), \
-         patch("ap.db.run_with_retry", side_effect=lambda f, *a, **k: f()):
+    with _patch_ap_db(fake_conn):
         is_dup, source, detail = mc._has_durable_duplicate_signal(
             client_id="jason@example.com",
             signal_id="sig-abc",
@@ -341,8 +355,7 @@ def test_current_queue_id_excludes_self_no_block():
     fake_conn.__enter__ = MagicMock(return_value=fake_cursor)
     fake_conn.__exit__ = MagicMock(return_value=False)
 
-    with patch("ap.db.conn", return_value=fake_conn), \
-         patch("ap.db.run_with_retry", side_effect=lambda f, *a, **k: f()):
+    with _patch_ap_db(fake_conn):
         is_dup, source, _ = mc._has_durable_duplicate_signal(
             client_id="jason@example.com",
             signal_id="sig-abc",
@@ -371,8 +384,7 @@ def test_absent_queue_id_does_block_on_active_row():
     fake_conn.__enter__ = MagicMock(return_value=fake_cursor)
     fake_conn.__exit__ = MagicMock(return_value=False)
 
-    with patch("ap.db.conn", return_value=fake_conn), \
-         patch("ap.db.run_with_retry", side_effect=lambda f, *a, **k: f()):
+    with _patch_ap_db(fake_conn):
         is_dup, source, detail = mc._has_durable_duplicate_signal(
             client_id="jason@example.com",
             signal_id="sig-abc",
@@ -400,7 +412,7 @@ def test_queue_dispatch_passes_queue_id_into_evaluate():
 
     # Mock the master_control: capture what payload it receives
     received_payloads = []
-    mc = MagicMock()
+    mc = SimpleNamespace(mode="PAPER", _equity_cache_ts=time.time())
 
     def fake_evaluate(payload, client_id):
         received_payloads.append(dict(payload))
@@ -450,7 +462,7 @@ def test_queue_dispatch_does_not_mutate_caller_payload():
     sys.modules.setdefault("ap.observability", MagicMock())
     from ap import queue as queue_mod
 
-    mc = MagicMock()
+    mc = SimpleNamespace(mode="PAPER", _equity_cache_ts=time.time())
     mc.evaluate = MagicMock(return_value=MagicMock(
         ok=False, stage="test", reason="test_stop",
     ))
