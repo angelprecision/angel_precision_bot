@@ -105,7 +105,12 @@ log.info("SECRET_FINGERPRINTS_SHA8=%s", _SECRET_FP_SUMMARY)
 
 # Rate limiting (per worker - upgrade to Redis later)
 _RATE = defaultdict(lambda: deque())
-RATE_LIMIT_PER_MIN = int(os.getenv("RATE_LIMIT_PER_MIN", "60"))
+# Rate limit applied per (route, client_id, IP) bucket over a 60s window.
+# Default 240/min = 4/sec accommodates scanner burst at market open without
+# excessive headroom. Override via env per deployment if needed.
+RATE_LIMIT_PER_MIN = int(os.getenv("RATE_LIMIT_PER_MIN", "240"))
+# Retry-After hint returned with 429. Scanner uses this to pace retries.
+RATE_LIMIT_RETRY_AFTER_SEC = float(os.getenv("RATE_LIMIT_RETRY_AFTER_SEC", "2.0"))
 
 # Idempotency cache (per worker - upgrade to Redis later)
 _IDEMP = {}
@@ -976,7 +981,18 @@ def create_app() -> Flask:
             return jsonify({"ok": False, "error": "missing_client_id", "hint": hint}), 400
 
         if _rate_limited(f"signal:{client_id}:{ip}"):
-            return jsonify({"ok": False, "error": "rate_limited"}), 429
+            log.warning(
+                "SIGNAL_RATE_LIMITED bucket=signal client_id=%s ip=%s "
+                "limit_per_min=%s retry_after=%.1fs",
+                client_id, ip, RATE_LIMIT_PER_MIN, RATE_LIMIT_RETRY_AFTER_SEC,
+            )
+            resp = jsonify({
+                "ok": False,
+                "error": "rate_limited",
+                "retry_after_sec": RATE_LIMIT_RETRY_AFTER_SEC,
+            })
+            resp.headers["Retry-After"] = str(int(RATE_LIMIT_RETRY_AFTER_SEC) or 1)
+            return resp, 429
 
         try:
             _validate_active_client(client_id)
@@ -1064,7 +1080,18 @@ def create_app() -> Flask:
             return jsonify({"ok": False, "error": "missing_client_id", "hint": hint}), 400
 
         if _rate_limited(f"scanner:{client_id}:{ip}"):
-            return jsonify({"ok": False, "error": "rate_limited"}), 429
+            log.warning(
+                "SCANNER_RATE_LIMITED bucket=scanner client_id=%s ip=%s "
+                "limit_per_min=%s retry_after=%.1fs",
+                client_id, ip, RATE_LIMIT_PER_MIN, RATE_LIMIT_RETRY_AFTER_SEC,
+            )
+            resp = jsonify({
+                "ok": False,
+                "error": "rate_limited",
+                "retry_after_sec": RATE_LIMIT_RETRY_AFTER_SEC,
+            })
+            resp.headers["Retry-After"] = str(int(RATE_LIMIT_RETRY_AFTER_SEC) or 1)
+            return resp, 429
 
         try:
             _validate_active_client(client_id)
