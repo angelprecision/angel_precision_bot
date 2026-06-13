@@ -321,3 +321,157 @@ def test_open_position_blocks():
     assert is_dup is True
     assert source == "positions"
     assert "OPEN" in detail
+
+
+# =============================================================================
+# Integration tests — queue.py → master_control.evaluate seam
+# Verify queue.py injects _queue_id and the guard excludes the current row.
+# =============================================================================
+
+def test_current_queue_id_excludes_self_no_block():
+    """The current row in PROCESSING for this job_id must NOT cause a self-block.
+    The SQL filter `id <> %s` excludes it."""
+    mc, _ = _make_mc()
+
+    # Simulate: trade_queue query returns NO active rows because the current
+    # row's id matches and is excluded. The other two queries also return None.
+    fake_cursor = MagicMock()
+    fake_cursor.fetchone.side_effect = [None, None, None]
+    fake_conn = MagicMock()
+    fake_conn.__enter__ = MagicMock(return_value=fake_cursor)
+    fake_conn.__exit__ = MagicMock(return_value=False)
+
+    with patch("ap.db.conn", return_value=fake_conn), \
+         patch("ap.db.run_with_retry", side_effect=lambda f, *a, **k: f()):
+        is_dup, source, _ = mc._has_durable_duplicate_signal(
+            client_id="jason@example.com",
+            signal_id="sig-abc",
+            current_queue_id=12345,
+        )
+
+    assert is_dup is False, "current row in PROCESSING must not self-block"
+    # Confirm the trade_queue SQL used `id <> %s` and the param was passed
+    first_sql = fake_cursor.execute.call_args_list[0].args[0]
+    first_params = fake_cursor.execute.call_args_list[0].args[1]
+    assert "id <> %s" in first_sql
+    assert 12345 in first_params
+
+
+def test_absent_queue_id_does_block_on_active_row():
+    """If _queue_id is absent and a matching active row exists, it blocks.
+    This proves the SQL still finds active rows when no exclusion is given."""
+    mc, _ = _make_mc()
+
+    fake_cursor = MagicMock()
+    # trade_queue: hit — without queue_id exclusion the helper sees the active row
+    fake_cursor.fetchone.side_effect = [
+        _row(id=42, status="WATCHING"),
+    ]
+    fake_conn = MagicMock()
+    fake_conn.__enter__ = MagicMock(return_value=fake_cursor)
+    fake_conn.__exit__ = MagicMock(return_value=False)
+
+    with patch("ap.db.conn", return_value=fake_conn), \
+         patch("ap.db.run_with_retry", side_effect=lambda f, *a, **k: f()):
+        is_dup, source, detail = mc._has_durable_duplicate_signal(
+            client_id="jason@example.com",
+            signal_id="sig-abc",
+            current_queue_id=None,
+        )
+
+    assert is_dup is True
+    assert source == "trade_queue"
+    # SQL must NOT contain id <> when current_queue_id is None
+    first_sql = fake_cursor.execute.call_args_list[0].args[0]
+    assert "id <> %s" not in first_sql
+
+
+def test_queue_dispatch_passes_queue_id_into_evaluate():
+    """queue._dispatch must inject _queue_id into the payload before calling
+    master_control.evaluate. This is the contract that makes the helper
+    work end-to-end."""
+    from unittest.mock import MagicMock, patch
+    import sys
+
+    # Stub the heavy imports queue.py needs at import time
+    sys.modules.setdefault("ap.logger", MagicMock())
+    sys.modules.setdefault("ap.observability", MagicMock())
+    from ap import queue as queue_mod
+
+    # Mock the master_control: capture what payload it receives
+    received_payloads = []
+    mc = MagicMock()
+
+    def fake_evaluate(payload, client_id):
+        received_payloads.append(dict(payload))
+        # Return a non-ok decision so dispatch short-circuits after MC.evaluate
+        return MagicMock(ok=False, stage="test", reason="test_stop")
+    mc.evaluate = fake_evaluate
+
+    contract_selector = MagicMock()
+    osm = MagicMock()
+    watcher = MagicMock()
+
+    # Patch the helpers that _dispatch calls when decision is not ok
+    with patch.object(queue_mod, "_mark_job", return_value=None), \
+         patch.object(queue_mod, "_log_rejection_to_db", return_value=None):
+        queue_mod._dispatch(
+            job_id=98765,
+            client_id="jason@example.com",
+            signal_id="sig-abc",
+            payload={"ticker": "NVDA", "signal_id": "sig-abc",
+                     "score": 75.0, "side": "CALL", "timeframe": "1d"},
+            master_control=mc,
+            contract_selector=contract_selector,
+            order_state_machine=osm,
+            entry_watcher=watcher,
+        )
+
+    assert len(received_payloads) >= 1, "master_control.evaluate was never called"
+    p = received_payloads[0]
+    assert "_queue_id" in p, (
+        f"queue dispatch did NOT inject _queue_id into MC payload. "
+        f"Got keys: {list(p.keys())}"
+    )
+    assert p["_queue_id"] == 98765, (
+        f"_queue_id must be the actual job_id (98765), got {p['_queue_id']!r}"
+    )
+    # And the original payload's keys are still there (shallow copy preserved)
+    assert p.get("ticker") == "NVDA"
+    assert p.get("signal_id") == "sig-abc"
+
+
+def test_queue_dispatch_does_not_mutate_caller_payload():
+    """The shallow copy must protect the caller — original payload dict must
+    not have _queue_id injected into it."""
+    from unittest.mock import MagicMock, patch
+    import sys
+    sys.modules.setdefault("ap.logger", MagicMock())
+    sys.modules.setdefault("ap.observability", MagicMock())
+    from ap import queue as queue_mod
+
+    mc = MagicMock()
+    mc.evaluate = MagicMock(return_value=MagicMock(
+        ok=False, stage="test", reason="test_stop",
+    ))
+
+    caller_payload = {"ticker": "NVDA", "signal_id": "sig-abc",
+                       "score": 75.0, "side": "CALL", "timeframe": "1d"}
+
+    with patch.object(queue_mod, "_mark_job", return_value=None), \
+         patch.object(queue_mod, "_log_rejection_to_db", return_value=None):
+        queue_mod._dispatch(
+            job_id=1234,
+            client_id="jason@example.com",
+            signal_id="sig-abc",
+            payload=caller_payload,
+            master_control=mc,
+            contract_selector=MagicMock(),
+            order_state_machine=MagicMock(),
+            entry_watcher=MagicMock(),
+        )
+
+    # Caller payload must NOT have _queue_id (proves shallow copy was used)
+    assert "_queue_id" not in caller_payload, (
+        f"caller payload was mutated! _queue_id leaked into it: {caller_payload}"
+    )
