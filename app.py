@@ -4006,7 +4006,7 @@ def admin_trade_flow_status():
             def _q():
                 rows = []
                 with conn() as c:
-                    # Status counts
+                    # Status counts (last 24h)
                     c.execute("""
                         SELECT client_id, UPPER(COALESCE(status,'')) as st, COUNT(*) as cnt
                         FROM public.orders
@@ -4016,17 +4016,71 @@ def admin_trade_flow_status():
                         GROUP BY client_id, st
                     """, (emails,))
                     rows.append(("by_status", c.fetchall() or []))
-                    # Last timestamp by status
+                    # Last *signal* timestamp — anything we saw in the window
                     c.execute("""
-                        SELECT client_id, UPPER(COALESCE(status,'')) as st, MAX(created_ts) as ts
+                        SELECT client_id, MAX(created_ts) as ts
                         FROM public.orders
                         WHERE kind = 'ENTRY'
                           AND created_ts >= NOW() - INTERVAL '24 hours'
                           AND client_id = ANY(%s)
-                        GROUP BY client_id, st
+                        GROUP BY client_id
                     """, (emails,))
-                    rows.append(("last_by_status", c.fetchall() or []))
-                    # Last error + quote source from most recent entry
+                    rows.append(("last_signal", c.fetchall() or []))
+                    # Last *watching* timestamp — WATCHING + PENDING_TRIGGER count
+                    # as watcher activity. PENDING_TRIGGER means the OSM order
+                    # exists and the watcher owns it for breach detection.
+                    # We use COALESCE(updated_ts, created_ts) — most recent
+                    # arm/state change wins, not just when the row was created.
+                    c.execute("""
+                        SELECT client_id, MAX(COALESCE(updated_ts, created_ts)) as ts
+                        FROM public.orders
+                        WHERE kind = 'ENTRY'
+                          AND UPPER(COALESCE(status,'')) IN ('WATCHING','PENDING_TRIGGER')
+                          AND COALESCE(updated_ts, created_ts) >= NOW() - INTERVAL '24 hours'
+                          AND client_id = ANY(%s)
+                        GROUP BY client_id
+                    """, (emails,))
+                    rows.append(("last_watching", c.fetchall() or []))
+                    # Last *submitted* — uses submitted_ts (set at OSM transition
+                    # to SUBMITTED). Fallback to updated_ts then created_ts.
+                    c.execute("""
+                        SELECT client_id, MAX(COALESCE(submitted_ts, updated_ts, created_ts)) as ts
+                        FROM public.orders
+                        WHERE kind = 'ENTRY'
+                          AND UPPER(COALESCE(status,'')) IN
+                              ('SUBMITTED','ACCEPTED','OPEN','PENDING_SUBMIT',
+                               'ACKNOWLEDGED','PARTIAL_FILL','PARTIALLY_FILLED')
+                          AND COALESCE(submitted_ts, updated_ts, created_ts) >= NOW() - INTERVAL '24 hours'
+                          AND client_id = ANY(%s)
+                        GROUP BY client_id
+                    """, (emails,))
+                    rows.append(("last_submitted", c.fetchall() or []))
+                    # Last *filled* — uses filled_ts (set at OSM transition to
+                    # FILLED). Fallback to updated_ts then created_ts so we
+                    # never miss a fill just because the column was unset.
+                    c.execute("""
+                        SELECT client_id, MAX(COALESCE(filled_ts, updated_ts, created_ts)) as ts
+                        FROM public.orders
+                        WHERE kind = 'ENTRY'
+                          AND UPPER(COALESCE(status,'')) IN ('FILLED','PARTIALLY_FILLED','PARTIAL_FILL')
+                          AND COALESCE(filled_ts, updated_ts, created_ts) >= NOW() - INTERVAL '24 hours'
+                          AND client_id = ANY(%s)
+                        GROUP BY client_id
+                    """, (emails,))
+                    rows.append(("last_filled", c.fetchall() or []))
+                    # Last *canceled* — updated_ts is when the cancellation
+                    # transition happened; fall back to created_ts otherwise.
+                    c.execute("""
+                        SELECT client_id, MAX(COALESCE(updated_ts, created_ts)) as ts
+                        FROM public.orders
+                        WHERE kind = 'ENTRY'
+                          AND UPPER(COALESCE(status,'')) IN ('CANCELED','CANCELLED','EXPIRED','ERROR','REJECTED')
+                          AND COALESCE(updated_ts, created_ts) >= NOW() - INTERVAL '24 hours'
+                          AND client_id = ANY(%s)
+                        GROUP BY client_id
+                    """, (emails,))
+                    rows.append(("last_canceled", c.fetchall() or []))
+                    # Last error + quote source from most recent ENTRY
                     c.execute("""
                         SELECT DISTINCT ON (client_id)
                             client_id, last_error, execution_mode,
@@ -4045,6 +4099,14 @@ def admin_trade_flow_status():
             except Exception as _qe:
                 results = []
                 log.warning("trade_flow_status query failed: %s", _qe)
+            # Each SQL query returns one row per client with a MAX(ts) — simple.
+            _bucket_to_field = {
+                "last_signal":    "last_signal_at",
+                "last_watching":  "last_watching_at",
+                "last_submitted": "last_submitted_at",
+                "last_filled":    "last_filled_at",
+                "last_canceled":  "last_canceled_at",
+            }
             for kind, rows in results:
                 for row in rows:
                     cid = row["client_id"]
@@ -4052,24 +4114,10 @@ def admin_trade_flow_status():
                         continue
                     if kind == "by_status":
                         order_stats[cid]["by_status"][row["st"]] = int(row["cnt"])
-                    elif kind == "last_by_status":
-                        ts = row["ts"]
+                    elif kind in _bucket_to_field:
+                        ts = row.get("ts")
                         ts_str = ts.isoformat() if ts else None
-                        st = row["st"]
-                        if st in ("WATCHING",):
-                            order_stats[cid]["last_watching_at"] = ts_str
-                        elif st in ("SUBMITTED", "ACCEPTED", "OPEN", "PENDING_SUBMIT"):
-                            current = order_stats[cid]["last_submitted_at"]
-                            if not current or (ts_str and ts_str > current):
-                                order_stats[cid]["last_submitted_at"] = ts_str
-                        elif st in ("FILLED", "PARTIALLY_FILLED"):
-                            order_stats[cid]["last_filled_at"] = ts_str
-                        elif st in ("CANCELED", "CANCELLED"):
-                            order_stats[cid]["last_canceled_at"] = ts_str
-                        # Track most recent signal regardless of status
-                        current = order_stats[cid]["last_signal_at"]
-                        if not current or (ts_str and ts_str > current):
-                            order_stats[cid]["last_signal_at"] = ts_str
+                        order_stats[cid][_bucket_to_field[kind]] = ts_str
                     elif kind == "last_entry_detail":
                         order_stats[cid]["last_error"] = row.get("last_error")
                         order_stats[cid]["last_watcher_quote_source"] = row.get("qsrc")
@@ -4081,8 +4129,11 @@ def admin_trade_flow_status():
             info = runner_info[email]
             stats = order_stats[email]
             # Trade-flow health heuristic:
-            #   - runner alive + initialized + entries_allowed = green
-            #   - else yellow / red depending on which flag is off
+            # Runner flags are *necessary* but not *sufficient* for green.
+            # A runner can be alive+initialized+entries_allowed and still be
+            # silently producing zero output — that is the exact failure mode
+            # we lost trades to last week. Health must reflect actual order
+            # activity, not just runner liveness.
             if not info["alive"]:
                 tf_health = "red:runner_dead"
             elif info["failed"]:
@@ -4094,7 +4145,23 @@ def admin_trade_flow_status():
             elif info["degraded"]:
                 tf_health = "yellow:degraded"
             else:
-                tf_health = "green"
+                # Runner is healthy — now check whether trades are actually moving.
+                _has_signal    = bool(stats.get("last_signal_at"))
+                _has_watching  = bool(stats.get("last_watching_at"))
+                _has_submitted = bool(stats.get("last_submitted_at"))
+                _has_filled    = bool(stats.get("last_filled_at"))
+                _has_active    = _has_watching or _has_submitted or _has_filled
+                if not _has_signal and not _has_active:
+                    # No ENTRY activity at all in last 24h. Could be expected
+                    # off-hours, but on a trading session this is the alarm.
+                    tf_health = "yellow:no_recent_order_flow"
+                elif _has_signal and not _has_active:
+                    # Signal arrived but nothing armed/submitted/filled — the
+                    # pipeline accepted it then dropped it. This is the silent
+                    # failure we need to catch.
+                    tf_health = "yellow:no_active_flow"
+                else:
+                    tf_health = "green"
 
             clients[email] = {
                 "runner":      info,
