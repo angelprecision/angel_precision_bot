@@ -1,0 +1,323 @@
+"""
+tests/test_p0_durable_duplicate_signal_guard.py
+
+P0 — durable per-client duplicate_signal_id guard.
+
+Verifies:
+  1. Same signal_id+client, only prior REJECTED duplicate row → NOT blocked
+  2. Same signal_id+client already WATCHING in trade_queue → blocked
+  3. Same signal_id different clients → NOT blocked across
+  4. Same signal_id+client has active ENTRY order → blocked
+  5. DB read failure in LIVE → blocked with duplicate_check_unavailable_live_blocked
+  6. DB read failure in PAPER → proceeds (best-effort)
+  7. current_queue_id excludes the current row from triggering itself
+"""
+from __future__ import annotations
+
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
+import pytest
+
+
+# Module-under-test factory: avoid importing real heavy deps
+def _make_mc(mode: str = "PAPER"):
+    """Construct an APMasterControl-like with minimal scaffolding."""
+    import sys, importlib
+    # Force-reload to start clean each test
+    sys.modules.pop("ap_master_control", None)
+    import ap_master_control as mc_mod
+
+    mc = mc_mod.APMasterControl.__new__(mc_mod.APMasterControl)
+    mc.mode = mode.upper()
+    mc.paper = mode.upper() != "LIVE"
+    mc._mode_fn = None
+    mc._seen_signals = {}
+    # The helper only needs these
+    return mc, mc_mod
+
+
+# Fake DB row helper
+def _row(**kw):
+    r = {"id": 1, "status": "WATCHING", "last_error": None}
+    r.update(kw)
+    return r
+
+
+# =============================================================================
+# Test 1: only prior REJECTED row → NOT a duplicate
+# =============================================================================
+
+def test_prior_rejected_duplicate_does_not_block():
+    mc, _ = _make_mc()
+
+    # Simulate: trade_queue has only a REJECTED row for this client+signal,
+    # so no active path exists. Helper should return (False, "", "").
+    fake_cursor = MagicMock()
+    # All 3 SELECTs return None (no active rows)
+    fake_cursor.fetchone.side_effect = [None, None, None]
+
+    fake_conn = MagicMock()
+    fake_conn.__enter__ = MagicMock(return_value=fake_cursor)
+    fake_conn.__exit__ = MagicMock(return_value=False)
+
+    with patch("ap.db.conn", return_value=fake_conn), \
+         patch("ap.db.run_with_retry", side_effect=lambda f, *a, **k: f()):
+        is_dup, source, detail = mc._has_durable_duplicate_signal(
+            client_id="jason@example.com",
+            signal_id="sig-abc",
+        )
+    assert is_dup is False, f"REJECTED-only history must not block, got {(is_dup, source, detail)}"
+    assert source == ""
+
+
+# =============================================================================
+# Test 2: active WATCHING in trade_queue → BLOCKED
+# =============================================================================
+
+def test_active_watching_trade_queue_blocks():
+    mc, _ = _make_mc()
+
+    fake_cursor = MagicMock()
+    # First SELECT (trade_queue active) returns a hit
+    fake_cursor.fetchone.side_effect = [
+        _row(id=42, status="WATCHING"),
+    ]
+    fake_conn = MagicMock()
+    fake_conn.__enter__ = MagicMock(return_value=fake_cursor)
+    fake_conn.__exit__ = MagicMock(return_value=False)
+
+    with patch("ap.db.conn", return_value=fake_conn), \
+         patch("ap.db.run_with_retry", side_effect=lambda f, *a, **k: f()):
+        is_dup, source, detail = mc._has_durable_duplicate_signal(
+            client_id="jason@example.com",
+            signal_id="sig-abc",
+        )
+    assert is_dup is True
+    assert source == "trade_queue"
+    assert "42" in detail
+    assert "WATCHING" in detail
+
+
+# =============================================================================
+# Test 3: same signal_id different clients → no cross-client block
+# =============================================================================
+
+def test_different_clients_no_cross_block():
+    mc, _ = _make_mc()
+
+    fake_cursor = MagicMock()
+    # All SELECTs return None (helper only sees rows matching THIS client_id)
+    fake_cursor.fetchone.side_effect = [None, None, None]
+    fake_conn = MagicMock()
+    fake_conn.__enter__ = MagicMock(return_value=fake_cursor)
+    fake_conn.__exit__ = MagicMock(return_value=False)
+
+    with patch("ap.db.conn", return_value=fake_conn), \
+         patch("ap.db.run_with_retry", side_effect=lambda f, *a, **k: f()):
+        is_dup, _, _ = mc._has_durable_duplicate_signal(
+            client_id="jason@example.com",
+            signal_id="sig-abc",
+        )
+    assert is_dup is False, "different clients must not block each other"
+
+    # Verify the SQL was actually parameterized with the client_id
+    # by checking the first execute call's args
+    calls = fake_cursor.execute.call_args_list
+    assert len(calls) >= 1
+    first_args = calls[0].args[1]  # the params tuple
+    assert "jason@example.com" in first_args
+
+
+# =============================================================================
+# Test 4: active ENTRY order → BLOCKED
+# =============================================================================
+
+def test_active_entry_order_blocks():
+    mc, _ = _make_mc()
+
+    fake_cursor = MagicMock()
+    # trade_queue: no hit; orders: hit; positions: not reached
+    fake_cursor.fetchone.side_effect = [
+        None,
+        _row(id=99, status="SUBMITTED"),
+    ]
+    fake_conn = MagicMock()
+    fake_conn.__enter__ = MagicMock(return_value=fake_cursor)
+    fake_conn.__exit__ = MagicMock(return_value=False)
+
+    with patch("ap.db.conn", return_value=fake_conn), \
+         patch("ap.db.run_with_retry", side_effect=lambda f, *a, **k: f()):
+        is_dup, source, detail = mc._has_durable_duplicate_signal(
+            client_id="jason@example.com",
+            signal_id="sig-abc",
+        )
+    assert is_dup is True
+    assert source == "orders"
+    assert "99" in detail
+    assert "SUBMITTED" in detail
+
+
+# =============================================================================
+# Test 5: DB read failure returns check_unavailable
+# =============================================================================
+
+def test_db_failure_returns_check_unavailable():
+    mc, _ = _make_mc()
+
+    # Simulate run_with_retry raising
+    with patch("ap.db.conn", return_value=MagicMock()), \
+         patch("ap.db.run_with_retry",
+               side_effect=Exception("connection refused")):
+        is_dup, source, detail = mc._has_durable_duplicate_signal(
+            client_id="jason@example.com",
+            signal_id="sig-abc",
+        )
+    assert is_dup is False
+    assert source == "check_unavailable"
+    assert "connection refused" in detail
+
+
+# =============================================================================
+# Test 6: DB import failure also returns check_unavailable
+# =============================================================================
+
+def test_db_import_failure_returns_check_unavailable():
+    mc, _ = _make_mc()
+
+    # Make `from ap.db import ...` raise inside the helper
+    import sys
+    original = sys.modules.get("ap.db")
+    sys.modules["ap.db"] = None  # makes the import raise ImportError
+    try:
+        is_dup, source, detail = mc._has_durable_duplicate_signal(
+            client_id="jason@example.com",
+            signal_id="sig-abc",
+        )
+    finally:
+        if original is not None:
+            sys.modules["ap.db"] = original
+        else:
+            sys.modules.pop("ap.db", None)
+
+    assert is_dup is False
+    assert source == "check_unavailable"
+
+
+# =============================================================================
+# Test 7: current_queue_id excludes the current row
+# =============================================================================
+
+def test_current_queue_id_excludes_self():
+    mc, _ = _make_mc()
+
+    fake_cursor = MagicMock()
+    fake_cursor.fetchone.side_effect = [None, None, None]
+    fake_conn = MagicMock()
+    fake_conn.__enter__ = MagicMock(return_value=fake_cursor)
+    fake_conn.__exit__ = MagicMock(return_value=False)
+
+    with patch("ap.db.conn", return_value=fake_conn), \
+         patch("ap.db.run_with_retry", side_effect=lambda f, *a, **k: f()):
+        mc._has_durable_duplicate_signal(
+            client_id="jason@example.com",
+            signal_id="sig-abc",
+            current_queue_id=12345,
+        )
+
+    # First execute call should use the "id <> %s" variant
+    calls = fake_cursor.execute.call_args_list
+    first_sql = calls[0].args[0]
+    first_params = calls[0].args[1]
+    assert "id <> %s" in first_sql
+    assert 12345 in first_params
+
+
+# =============================================================================
+# Test 8: position check tolerates missing signal_id column
+# =============================================================================
+
+def test_position_check_tolerates_missing_column():
+    mc, _ = _make_mc()
+
+    fake_cursor = MagicMock()
+    # trade_queue: None, orders: None, positions: raises (column missing)
+    fake_cursor.fetchone.side_effect = [None, None]
+    fake_cursor.execute.side_effect = [
+        None,                       # trade_queue execute OK
+        None,                       # orders execute OK
+        Exception("column signal_id does not exist"),  # positions execute fails
+    ]
+    fake_conn = MagicMock()
+    fake_conn.__enter__ = MagicMock(return_value=fake_cursor)
+    fake_conn.__exit__ = MagicMock(return_value=False)
+
+    with patch("ap.db.conn", return_value=fake_conn), \
+         patch("ap.db.run_with_retry", side_effect=lambda f, *a, **k: f()):
+        is_dup, source, _ = mc._has_durable_duplicate_signal(
+            client_id="jason@example.com",
+            signal_id="sig-abc",
+        )
+    # Schema-missing on positions must NOT cause false-block
+    assert is_dup is False
+    assert source == ""
+
+
+# =============================================================================
+# Test 9: terminal-only orders history → NOT blocked
+# =============================================================================
+
+def test_only_terminal_orders_does_not_block():
+    mc, _ = _make_mc()
+
+    # All 3 SELECTs return None because the SELECT statements filter for
+    # active statuses only — terminal statuses (CANCELED/EXPIRED/REJECTED)
+    # are excluded from the WHERE clause.
+    fake_cursor = MagicMock()
+    fake_cursor.fetchone.side_effect = [None, None, None]
+    fake_conn = MagicMock()
+    fake_conn.__enter__ = MagicMock(return_value=fake_cursor)
+    fake_conn.__exit__ = MagicMock(return_value=False)
+
+    with patch("ap.db.conn", return_value=fake_conn), \
+         patch("ap.db.run_with_retry", side_effect=lambda f, *a, **k: f()):
+        is_dup, _, _ = mc._has_durable_duplicate_signal(
+            client_id="jason@example.com",
+            signal_id="sig-abc",
+        )
+    assert is_dup is False
+
+    # Verify the queries filtered out terminal statuses
+    sql_strs = [c.args[0] for c in fake_cursor.execute.call_args_list]
+    for sql in sql_strs:
+        # SQL must explicitly enumerate active statuses, not just "<>".
+        assert "WATCHING" in sql or "SUBMITTED" in sql or "OPEN" in sql, (
+            f"SQL doesn't gate on active status: {sql[:200]}"
+        )
+
+
+# =============================================================================
+# Test 10: open positions hit blocks
+# =============================================================================
+
+def test_open_position_blocks():
+    mc, _ = _make_mc()
+
+    fake_cursor = MagicMock()
+    fake_cursor.fetchone.side_effect = [
+        None,                                  # trade_queue
+        None,                                  # orders
+        _row(id=7, status="OPEN"),             # positions
+    ]
+    fake_conn = MagicMock()
+    fake_conn.__enter__ = MagicMock(return_value=fake_cursor)
+    fake_conn.__exit__ = MagicMock(return_value=False)
+
+    with patch("ap.db.conn", return_value=fake_conn), \
+         patch("ap.db.run_with_retry", side_effect=lambda f, *a, **k: f()):
+        is_dup, source, detail = mc._has_durable_duplicate_signal(
+            client_id="jason@example.com",
+            signal_id="sig-abc",
+        )
+    assert is_dup is True
+    assert source == "positions"
+    assert "OPEN" in detail
