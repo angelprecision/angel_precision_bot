@@ -544,6 +544,132 @@ class APMasterControl:
         if alert_fn:
             self._alert_fn = alert_fn
 
+    def _has_durable_duplicate_signal(
+        self,
+        client_id: str,
+        signal_id: str,
+        current_queue_id: Optional[int] = None,
+    ) -> tuple[bool, str, str]:
+        """Return (is_duplicate, source, detail) checking durable DB state.
+
+        Returns (True, source, detail) when same client_id+signal_id has any
+        of the following provably-active rows in Postgres:
+          - trade_queue row in active status (NEW/PROCESSING/WATCHING/
+            PENDING_TRIGGER/DEFERRED) excluding current_queue_id
+          - orders row with kind='ENTRY' in non-terminal status
+            (CREATED/PENDING_TRIGGER/SUBMITTED/ACCEPTED/ACKNOWLEDGED/OPEN/
+             PARTIAL_FILL/PARTIALLY_FILLED/FILLED)
+          - open positions row (if signal_id linkage exists)
+
+        Returns (False, "", "") when only matching rows are:
+          - the current row being re-evaluated (excluded by current_queue_id)
+          - terminal failures (REJECTED, ERROR, EXPIRED, CANCELED)
+          - prior duplicate-rejection rows (last_error containing
+            'duplicate_signal_id')
+
+        Returns (False, "check_unavailable", reason) when the DB read itself
+        fails. Caller decides whether LIVE should fail-closed via separate
+        duplicate_check_unavailable_live_blocked code path.
+
+        This is the durable replacement for the volatile self._seen_signals
+        check, which retains in-memory state across runs that may not match
+        the durable DB truth (e.g. after restart, after retry, after recovery).
+        """
+        try:
+            from ap.db import conn, run_with_retry
+        except Exception as _imp_exc:
+            return (False, "check_unavailable", f"db_import_failed:{_imp_exc}")
+
+        def _check():
+            with conn() as c:
+                # 1) Active trade_queue row for same client+signal,
+                #    excluding the current row being evaluated.
+                if current_queue_id is not None:
+                    c.execute(
+                        """
+                        SELECT id, status, last_error
+                        FROM public.trade_queue
+                        WHERE client_id = %s
+                          AND signal_id = %s
+                          AND id <> %s
+                          AND UPPER(COALESCE(status, '')) IN
+                              ('NEW','PROCESSING','WATCHING','PENDING_TRIGGER','DEFERRED')
+                        LIMIT 1
+                        """,
+                        (client_id, signal_id, current_queue_id),
+                    )
+                else:
+                    c.execute(
+                        """
+                        SELECT id, status, last_error
+                        FROM public.trade_queue
+                        WHERE client_id = %s
+                          AND signal_id = %s
+                          AND UPPER(COALESCE(status, '')) IN
+                              ('NEW','PROCESSING','WATCHING','PENDING_TRIGGER','DEFERRED')
+                        LIMIT 1
+                        """,
+                        (client_id, signal_id),
+                    )
+                row = c.fetchone()
+                if row:
+                    return ("trade_queue",
+                            f"id={row['id']} status={row['status']}")
+
+                # 2) Non-terminal ENTRY order for same client+signal.
+                c.execute(
+                    """
+                    SELECT id, status
+                    FROM public.orders
+                    WHERE client_id = %s
+                      AND signal_id = %s
+                      AND kind = 'ENTRY'
+                      AND UPPER(COALESCE(status, '')) IN
+                          ('CREATED','PENDING_TRIGGER','SUBMITTED','ACCEPTED',
+                           'ACKNOWLEDGED','OPEN','PARTIAL_FILL',
+                           'PARTIALLY_FILLED','FILLED')
+                    LIMIT 1
+                    """,
+                    (client_id, signal_id),
+                )
+                row = c.fetchone()
+                if row:
+                    return ("orders",
+                            f"id={row['id']} status={row['status']}")
+
+                # 3) Open position linked to same signal_id, if linkage exists.
+                try:
+                    c.execute(
+                        """
+                        SELECT id, status
+                        FROM public.positions
+                        WHERE client_id = %s
+                          AND signal_id = %s
+                          AND UPPER(COALESCE(status, '')) IN ('OPEN','CLOSING','PARTIAL')
+                        LIMIT 1
+                        """,
+                        (client_id, signal_id),
+                    )
+                    row = c.fetchone()
+                    if row:
+                        return ("positions",
+                                f"id={row['id']} status={row['status']}")
+                except Exception:
+                    # signal_id column may not exist on positions in some
+                    # schema versions — silently skip rather than false-block.
+                    pass
+
+                return ("", "")
+
+        try:
+            source, detail = run_with_retry(_check)
+        except Exception as _q_exc:
+            return (False, "check_unavailable", f"db_query_failed:{_q_exc}")
+
+        if source:
+            return (True, source, detail)
+        return (False, "", "")
+
     def _current_mode(self) -> str:
         try:
             return (self._mode_fn() if self._mode_fn else self.mode).upper()
@@ -1407,8 +1533,64 @@ class APMasterControl:
         _now_ts = time.time()
         if len(self._seen_signals) > 500:
             self._seen_signals = {k: v for k, v in self._seen_signals.items() if _now_ts - v < 1800}
+
+        # Durable per-client duplicate check.
+        # _seen_signals is a fast in-memory HINT only — unsafe as sole
+        # authority because process restart wipes it, it can flag a signal as
+        # duplicate before the queue row reached a durable accepted state
+        # (false positive on retry/recovery), and it persists for 30 min even
+        # when no active path exists. Block only when DB proves the same
+        # client already has an active path. Terminal REJECTED/ERROR/EXPIRED/
+        # CANCELED rows do NOT count.
+        _current_qid = None
+        try:
+            _qid_raw = signal.get("_queue_id")
+            _current_qid = int(_qid_raw) if _qid_raw is not None else None
+        except (TypeError, ValueError):
+            _current_qid = None
+
+        _dur_dup, _dur_source, _dur_detail = self._has_durable_duplicate_signal(
+            client_id=client_id,
+            signal_id=signal_id,
+            current_queue_id=_current_qid,
+        )
+        if _dur_dup:
+            log.warning(
+                "durable_duplicate_signal_id client_id=%s signal_id=%s "
+                "source=%s detail=%s",
+                client_id, signal_id, _dur_source, _dur_detail,
+            )
+            return self._block(
+                signal_id, ticker, client_id,
+                "blocked_system",
+                f"duplicate_signal_id (durable:{_dur_source})",
+            )
+
+        # DB read failure: LIVE fails closed with distinct reason; PAPER
+        # proceeds (no capital risk).
+        if _dur_source == "check_unavailable":
+            log.error(
+                "duplicate_check_unavailable client_id=%s signal_id=%s detail=%s",
+                client_id, signal_id, _dur_detail,
+            )
+            if current_mode == "LIVE":
+                return self._block(
+                    signal_id, ticker, client_id,
+                    "blocked_system",
+                    f"duplicate_check_unavailable_live_blocked ({_dur_detail})",
+                )
+
+        # Memory hint disagreed with durable truth: log it and proceed.
         if signal_key in self._seen_signals:
-            return self._block(signal_id, ticker, client_id, "blocked_system", "duplicate_signal_id")
+            log.info(
+                "duplicate_memory_ignored_no_durable_active_path "
+                "client_id=%s signal_id=%s",
+                client_id, signal_id,
+            )
+
+        # Setup-level dedup unchanged — same-ticker/direction within 30 min
+        # is intentionally per-process. Durable per-client setup dedup is a
+        # separate concern from per-signal_id and is out of scope.
         if setup_key in self._seen_signals and (_now_ts - self._seen_signals[setup_key]) < 1800:
             return self._block(signal_id, ticker, client_id, "blocked_system", f"duplicate_setup ({ticker} {direction_raw} {timeframe_raw})")
 
