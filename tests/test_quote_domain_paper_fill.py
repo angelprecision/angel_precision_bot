@@ -10,6 +10,7 @@ Run: DATABASE_URL=postgresql://test:test@localhost/test python3 -m pytest tests/
 """
 import os
 import importlib
+import sys
 import pytest
 
 
@@ -17,6 +18,17 @@ def _load_exec(cushion_pct="0.10", max_cushion="0.20", fill_mode="marketable_lim
     os.environ["PAPER_ENTRY_SLIPPAGE_CUSHION_PCT"] = cushion_pct
     os.environ["PAPER_ENTRY_MAX_CUSHION_DOLLARS"] = max_cushion
     os.environ["PAPER_ENTRY_FILL_MODE"] = fill_mode
+    for mod_name in (
+        "ap.execution",
+        "ap.logger",
+        "ap.config",
+        "ap.db",
+        "ap.utils",
+        "ap.state",
+        "ap.contract_selection",
+        "ap.contract_quote_revalidator",
+    ):
+        sys.modules.pop(mod_name, None)
     import ap.execution as ex
     importlib.reload(ex)
     return ex
@@ -158,51 +170,44 @@ class TestSubmitOrderTypeGuard:
 
 
 class TestWatcherQuoteIdentity:
-    def test_watcher_sandbox(self):
+    def _make_watcher(self, broker_base="https://sandbox.tradier.com", mode="PAPER"):
         import ap_entry_watcher as w
         importlib.reload(w)
+        watcher = w.APEntryWatcher.__new__(w.APEntryWatcher)
+        watcher.broker = FakeBroker(broker_base)
+        watcher.mode = mode
+        return watcher, w
 
-        class Stub:
-            pass
-        stub = Stub()
-        stub.broker = FakeBroker("https://sandbox.tradier.com")
-        ident = w.APEntryWatcher._watcher_quote_identity(stub)
-        assert ident["watcher_quote_source"] == "tradier_sandbox"
-        assert ident["watcher_sandbox_mode"] is True
-
-    def test_watcher_live(self):
-        import ap_entry_watcher as w
-        importlib.reload(w)
-
-        class Stub:
-            pass
-        stub = Stub()
-        stub.broker = FakeBroker("https://api.tradier.com")
-        ident = w.APEntryWatcher._watcher_quote_identity(stub)
+    def test_watcher_paper_uses_live_market_data_identity(self):
+        watcher, _ = self._make_watcher("https://sandbox.tradier.com", mode="PAPER")
+        ident = watcher._watcher_quote_identity()
         assert ident["watcher_quote_source"] == "tradier_live"
         assert ident["watcher_sandbox_mode"] is False
+        assert ident["watcher_quote_base_url"] == "https://api.tradier.com"
+
+    def test_watcher_live(self):
+        watcher, _ = self._make_watcher("https://api.tradier.com", mode="LIVE")
+        ident = watcher._watcher_quote_identity()
+        assert ident["watcher_quote_source"] == "tradier_live"
+        assert ident["watcher_sandbox_mode"] is False
+        assert ident["watcher_quote_base_url"] == "https://api.tradier.com"
 
     def test_watcher_fallback_matches_fetch_quotes(self):
-        """POINT 3: when base_url can't be read, _watcher_quote_identity must
-        fall back to the SAME default as _fetch_quotes (sandbox), not 'unknown'.
-        Otherwise the audit mislabels a quote the watcher actually fetched from
-        sandbox."""
+        """When broker URL is unavailable, watcher quotes still default to live."""
         import ap_entry_watcher as w
         importlib.reload(w)
 
         class NoUrlBroker:
-            pass  # no base_url, no cfg → triggers the final fallback
+            cfg = type("Cfg", (), {"base_url": ""})()
+            live_access_token = None
 
-        class Stub:
-            pass
-        stub = Stub()
-        stub.broker = NoUrlBroker()
-        ident = w.APEntryWatcher._watcher_quote_identity(stub)
-        # _fetch_quotes would query https://sandbox.tradier.com in this case,
-        # so the audit must say sandbox — never 'unknown'.
-        assert ident["watcher_quote_base_url"] == "https://sandbox.tradier.com"
-        assert ident["watcher_quote_source"] == "tradier_sandbox"
-        assert ident["watcher_sandbox_mode"] is True
+        watcher = w.APEntryWatcher.__new__(w.APEntryWatcher)
+        watcher.broker = NoUrlBroker()
+        watcher.mode = "PAPER"
+        ident = watcher._watcher_quote_identity()
+        assert ident["watcher_quote_base_url"] == "https://api.tradier.com"
+        assert ident["watcher_quote_source"] == "tradier_live"
+        assert ident["watcher_sandbox_mode"] is False
 
 
 # ── REVIEW-POINT TESTS (points 2, 3, 4 from the merge review) ────────────────

@@ -756,6 +756,49 @@ class APEntryWatcher:
     # _persist_watcher_audit: best-effort OSM meta merge. Never raises.
     #   Logs with persisted=false when local_order_id is absent or order not found.
 
+    def _resolve_watcher_quote_transport(self) -> dict:
+        """Resolve the watcher quote transport without leaking credentials."""
+        import os as _os
+        _LIVE_QUOTE_URL = "https://api.tradier.com"
+        base_url = str(
+            _os.getenv("TRADIER_MARKET_DATA_BASE_URL")
+            or _os.getenv("TRADIER_DATA_BASE_URL")
+            or _LIVE_QUOTE_URL
+        ).rstrip("/")
+        if "sandbox.tradier.com" in base_url.lower():
+            log.error(
+                "[watcher_quotes] WATCHER_QUOTE_URL_SANDBOX_GUARD_TRIGGERED "
+                "resolved_url=%s — sandbox URL must not be used for watcher "
+                "quote/trigger/stop/invalidation decisions. "
+                "Forcing https://api.tradier.com. "
+                "Set TRADIER_MARKET_DATA_BASE_URL=https://api.tradier.com to silence.",
+                base_url,
+            )
+            base_url = _LIVE_QUOTE_URL
+
+        token = None
+        token_source_name = "missing"
+        if _os.getenv("TRADIER_MARKET_DATA_TOKEN"):
+            token = _os.getenv("TRADIER_MARKET_DATA_TOKEN")
+            token_source_name = "TRADIER_MARKET_DATA_TOKEN"
+        elif _os.getenv("TRADIER_DATA_TOKEN"):
+            token = _os.getenv("TRADIER_DATA_TOKEN")
+            token_source_name = "TRADIER_DATA_TOKEN"
+        elif getattr(self.broker, "live_access_token", None):
+            token = getattr(self.broker, "live_access_token", None)
+            token_source_name = "broker.live_access_token"
+        elif getattr(getattr(self.broker, "cfg", None), "live_access_token", None):
+            token = getattr(getattr(self.broker, "cfg", None), "live_access_token", None)
+            token_source_name = "broker.cfg.live_access_token"
+
+        return {
+            "watcher_quote_source": "tradier_live",
+            "watcher_quote_base_url": base_url,
+            "watcher_sandbox_mode": False,
+            "watcher_quote_token_source": token_source_name,
+            "token": token or None,
+        }
+
     def _resolve_watcher_quote_url(self) -> tuple:
         """
         Resolve (base_url, token) for watcher QUOTE fetches.
@@ -779,32 +822,30 @@ class APEntryWatcher:
 
         Never returns sandbox.tradier.com as the quote URL.
         """
-        import os as _os
-        _LIVE_QUOTE_URL = "https://api.tradier.com"
-        base_url = str(
-            _os.getenv("TRADIER_MARKET_DATA_BASE_URL")
-            or _os.getenv("TRADIER_DATA_BASE_URL")
-            or _LIVE_QUOTE_URL
-        ).rstrip("/")
-        # Sandbox guard: if the resolved URL is sandbox (misconfigured env or
-        # env reset), force to live market data and log a hard error.
-        if "sandbox.tradier.com" in base_url.lower():
-            log.error(
-                "[watcher_quotes] WATCHER_QUOTE_URL_SANDBOX_GUARD_TRIGGERED "
-                "resolved_url=%s — sandbox URL must not be used for watcher "
-                "quote/trigger/stop/invalidation decisions. "
-                "Forcing https://api.tradier.com. "
-                "Set TRADIER_MARKET_DATA_BASE_URL=https://api.tradier.com to silence.",
-                base_url,
-            )
-            base_url = _LIVE_QUOTE_URL
-        token = (
-            _os.getenv("TRADIER_MARKET_DATA_TOKEN")
-            or _os.getenv("TRADIER_DATA_TOKEN")
-            or getattr(self.broker, "live_access_token", None)
-            or getattr(getattr(self.broker, "cfg", None), "live_access_token", None)
-        )
-        return base_url, token or None
+        transport = self._resolve_watcher_quote_transport()
+        return transport["watcher_quote_base_url"], transport["token"]
+
+    def _set_last_quote_fetch_proof(self, **proof) -> dict:
+        current = dict(getattr(self, "_last_quote_fetch_proof", {}) or {})
+        current.update(proof)
+        self._last_quote_fetch_proof = current
+        return current
+
+    def _current_watcher_quote_proof(self) -> dict:
+        transport = self._resolve_watcher_quote_transport()
+        proof = dict(getattr(self, "_last_quote_fetch_proof", {}) or {})
+        return {
+            "watcher_quote_source": proof.get("watcher_quote_source", transport["watcher_quote_source"]),
+            "watcher_quote_base_url": proof.get("watcher_quote_base_url", transport["watcher_quote_base_url"]),
+            "watcher_sandbox_mode": bool(
+                proof.get("watcher_sandbox_mode", transport["watcher_sandbox_mode"])
+            ),
+            "watcher_quote_token_source": proof.get(
+                "watcher_quote_token_source",
+                transport["watcher_quote_token_source"],
+            ),
+            "quote_fetch_status": proof.get("quote_fetch_status", "not_fetched"),
+        }
 
     def _watcher_quote_identity(self) -> dict:
         """Return the ACTUAL quote source/base_url/sandbox flag the watcher uses.
@@ -813,14 +854,7 @@ class APEntryWatcher:
         _fetch_quotes() uses — so watcher_audit rows always match reality.
         Paper execution_mode no longer implies sandbox quotes.
         """
-        base_url, _ = self._resolve_watcher_quote_url()
-        sandbox = "sandbox" in base_url.lower()
-        source  = "tradier_sandbox" if sandbox else "tradier_live"
-        return {
-            "watcher_quote_source":   source,
-            "watcher_quote_base_url": base_url,
-            "watcher_sandbox_mode":   bool(sandbox),
-        }
+        return self._current_watcher_quote_proof()
 
     def _coerce_quote_age_ms(self, value) -> Optional[int]:
         try:
@@ -829,7 +863,9 @@ class APEntryWatcher:
             return None
 
     def _validate_market_data_preflight(self) -> None:
-        base_url, md_token = self._resolve_watcher_quote_url()
+        transport = self._resolve_watcher_quote_transport()
+        base_url = transport["watcher_quote_base_url"]
+        md_token = transport["token"]
         if str(getattr(self, "mode", "PAPER")).upper() != "PAPER" or md_token:
             return
 
@@ -856,6 +892,7 @@ class APEntryWatcher:
                     "watcher_quote_base_url": base_url,
                     "watcher_quote_source": "tradier_live",
                     "watcher_sandbox_mode": False,
+                    "watcher_quote_token_source": transport["watcher_quote_token_source"],
                 },
             )
         except Exception:
@@ -968,7 +1005,7 @@ class APEntryWatcher:
             # used (read off self.broker, never assumed). This lets us prove
             # whether the watcher evaluated against sandbox or live quotes —
             # the core question behind the paper no-fill investigation.
-            **self._watcher_quote_identity(),
+            **self._current_watcher_quote_proof(),
         }
         if extra:
             # Never allow extra to overwrite protected order fields
@@ -2909,7 +2946,17 @@ class APEntryWatcher:
             # PR P0-WATCHER-QUOTES: always use live market-data URL/token.
             # Paper execution uses sandbox for orders but watcher quote
             # decisions must evaluate against real-time market prices.
-            base_url, md_token = self._resolve_watcher_quote_url()
+            transport = self._resolve_watcher_quote_transport()
+            base_url = transport["watcher_quote_base_url"]
+            md_token = transport["token"]
+            token_source_name = transport["watcher_quote_token_source"]
+            self._set_last_quote_fetch_proof(
+                watcher_quote_source=transport["watcher_quote_source"],
+                watcher_quote_base_url=base_url,
+                watcher_sandbox_mode=transport["watcher_sandbox_mode"],
+                watcher_quote_token_source=token_source_name,
+                quote_fetch_status="started",
+            )
             _quote_started = time.perf_counter()
             if md_token:
                 import requests as _req
@@ -2922,28 +2969,39 @@ class APEntryWatcher:
                     },
                     timeout=5,
                 )
+                self._set_last_quote_fetch_proof(
+                    watcher_quote_token_source=token_source_name,
+                    quote_fetch_status="requested_via_direct_market_data_token",
+                )
             else:
                 _is_paper = str(getattr(self, "mode", "PAPER")).upper() == "PAPER"
                 if _is_paper:
-                    # PAPER + no live market-data token: fail closed.
+                    # PAPER + no live market-data token: hard fail.
                     # broker.session holds sandbox execution credentials;
                     # using them against api.tradier.com would fail auth.
-                    # Return empty so watcher treats this as quote_unavailable
-                    # and retries later rather than making a broken API call.
-                    log.error(
+                    msg = (
                         "[watcher_quotes] PAPER_WATCHER_NO_MARKET_DATA_TOKEN "
-                        "mode=PAPER base_url=%s — watcher quotes cannot run without "
-                        "TRADIER_MARKET_DATA_TOKEN. Returning empty (quote_unavailable). "
-                        "Set TRADIER_MARKET_DATA_TOKEN on Render to fix.",
-                        base_url,
+                        f"mode=PAPER base_url={base_url} token_source={token_source_name} "
+                        "— watcher quotes cannot run without live market-data credentials. "
+                        "Set TRADIER_MARKET_DATA_TOKEN or TRADIER_DATA_TOKEN."
                     )
-                    return {}
+                    self._set_last_quote_fetch_proof(
+                        watcher_quote_token_source=token_source_name,
+                        quote_fetch_status="market_data_token_missing",
+                    )
+                    log.critical("%s", msg)
+                    raise RuntimeError(msg)
                 # LIVE clients: execution token typically has market-data access.
                 # Use broker.session with the live URL (safe for live mode only).
+                token_source_name = "broker.session_live_execution_token"
                 log.warning(
                     "[watcher_quotes] No TRADIER_MARKET_DATA_TOKEN configured — "
                     "falling back to live broker session with %s (LIVE mode only).",
                     base_url,
+                )
+                self._set_last_quote_fetch_proof(
+                    watcher_quote_token_source=token_source_name,
+                    quote_fetch_status="requested_via_live_broker_session",
                 )
                 resp = self.broker.session.get(
                     f"{base_url}/v1/markets/quotes",
@@ -2951,19 +3009,35 @@ class APEntryWatcher:
                     headers={"Accept": "application/json"},
                     timeout=5,
                 )
+            if hasattr(resp, "raise_for_status"):
+                resp.raise_for_status()
             quote_age_ms = max(0, int(round((time.perf_counter() - _quote_started) * 1000.0)))
             data = resp.json()
             quotes_raw = data.get("quotes", {}).get("quote", [])
             if isinstance(quotes_raw, dict):
                 quotes_raw = [quotes_raw]
+            self._set_last_quote_fetch_proof(
+                watcher_quote_token_source=token_source_name,
+                quote_fetch_status="success",
+            )
             normalized_quotes = {}
             for q in quotes_raw:
                 if not q.get("symbol"):
                     continue
                 _quote = dict(q)
                 _quote["quote_age_ms"] = quote_age_ms
+                _quote["quote_fetch_status"] = "success"
                 normalized_quotes[str(q.get("symbol", "")).upper()] = _quote
             return normalized_quotes
         except Exception as exc:
+            _existing_fetch_status = str(
+                (getattr(self, "_last_quote_fetch_proof", {}) or {}).get("quote_fetch_status") or ""
+            )
+            if _existing_fetch_status not in {"market_data_token_missing"}:
+                self._set_last_quote_fetch_proof(
+                    quote_fetch_status=f"error:{type(exc).__name__}",
+                )
             log.warning("Tradier quote fetch failed: %s", exc)
+            if isinstance(exc, RuntimeError) and "PAPER_WATCHER_NO_MARKET_DATA_TOKEN" in str(exc):
+                raise
             return {}

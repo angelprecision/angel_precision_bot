@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, patch
 
 _REPO  = Path(__file__).resolve().parents[1]
 EW_SRC = (_REPO / "ap_entry_watcher.py").read_text()
+APP_SRC = (_REPO / "app.py").read_text()
 
 
 # ── Source checks ─────────────────────────────────────────────────────────────
@@ -25,16 +26,16 @@ def test_fetch_quotes_uses_resolve_helper():
     idx = EW_SRC.find("def _fetch_quotes(")
     end = EW_SRC.find("\n    def ", idx + 1)
     body = EW_SRC[idx:end]
-    assert "_resolve_watcher_quote_url()" in body
+    assert "_resolve_watcher_quote_transport()" in body
 
 def test_watcher_quote_identity_uses_resolve_helper():
     idx = EW_SRC.find("def _watcher_quote_identity(")
     end = EW_SRC.find("\n    def ", idx + 1)
     body = EW_SRC[idx:end]
-    assert "_resolve_watcher_quote_url()" in body
+    assert "_current_watcher_quote_proof()" in body
 
 def test_sandbox_guard_present():
-    idx = EW_SRC.find("def _resolve_watcher_quote_url(")
+    idx = EW_SRC.find("def _resolve_watcher_quote_transport(")
     end = EW_SRC.find("\n    def ", idx + 1)
     body = EW_SRC[idx:end]
     assert "WATCHER_QUOTE_URL_SANDBOX_GUARD_TRIGGERED" in body
@@ -45,7 +46,7 @@ def test_paper_fail_closed_present():
     end = EW_SRC.find("\n    def ", idx + 1)
     body = EW_SRC[idx:end]
     assert "PAPER_WATCHER_NO_MARKET_DATA_TOKEN" in body
-    assert "return {}" in body
+    assert "raise RuntimeError" in body
 
 def test_preflight_failure_message_present():
     idx = EW_SRC.find("def _validate_market_data_preflight(")
@@ -56,7 +57,7 @@ def test_preflight_failure_message_present():
 
 def test_resolve_helper_default_is_live():
     """Hardcoded fallback must be api.tradier.com; sandbox guard must reject any sandbox URL."""
-    idx = EW_SRC.find("def _resolve_watcher_quote_url(")
+    idx = EW_SRC.find("def _resolve_watcher_quote_transport(")
     end = EW_SRC.find("\n    def ", idx + 1)
     body = EW_SRC[idx:end]
     # Default fallback must be api.tradier.com
@@ -69,8 +70,22 @@ def test_resolve_helper_default_is_live():
     # The guard must never RETURN sandbox — verified by test_sandbox_env_forced_to_live
 
 def test_audit_fields_still_present():
-    for field in ["watcher_quote_source", "watcher_quote_base_url", "watcher_sandbox_mode"]:
+    for field in [
+        "watcher_quote_source",
+        "watcher_quote_base_url",
+        "watcher_sandbox_mode",
+        "watcher_quote_token_source",
+        "quote_fetch_status",
+    ]:
         assert field in EW_SRC, f"watcher_audit field missing: {field}"
+
+
+def test_paper_order_route_still_uses_tradier_base_url():
+    idx = APP_SRC.find("def build_broker()")
+    end = APP_SRC.find("\ndef ", idx + 1)
+    body = APP_SRC[idx:end]
+    assert 'os.getenv("TRADIER_BASE_URL", "https://sandbox.tradier.com")' in body
+    assert "TRADIER_MARKET_DATA_BASE_URL" not in body
 
 
 # ── Behavioral: stub APEntryWatcher ──────────────────────────────────────────
@@ -162,11 +177,11 @@ def test_sandbox_env_forced_to_live():
     assert "api.tradier.com" in base_url
 
 
-# ── Test 2: PAPER + no token → empty dict (fail closed) ──────────────────────
+# ── Test 2: PAPER + no token → hard failure (fail closed) ────────────────────
 
-def test_paper_no_token_returns_empty():
+def test_paper_no_token_raises_hard_failure():
     """
-    PAPER client with no market-data token must return {} (fail closed),
+    PAPER client with no market-data token must fail explicitly,
     not fall back to broker.session with sandbox credentials.
     """
     w = _make_watcher(mode="PAPER", broker_base="https://sandbox.tradier.com")
@@ -176,13 +191,14 @@ def test_paper_no_token_returns_empty():
                  if k not in ("TRADIER_MARKET_DATA_TOKEN","TRADIER_DATA_TOKEN",
                               "TRADIER_MARKET_DATA_BASE_URL","TRADIER_DATA_BASE_URL")}
     with patch.dict(os.environ, env_clean, clear=True):
-        result = w._fetch_quotes(["SPY"])
-    assert result == {}, (
-        "PAPER watcher with no market-data token must return {} (fail closed), "
-        f"got {result!r}"
-    )
+        with pytest.raises(RuntimeError, match="PAPER_WATCHER_NO_MARKET_DATA_TOKEN"):
+            w._fetch_quotes(["SPY"])
     # broker.session.get must NOT have been called
     w.broker.session.get.assert_not_called()
+    proof = w._current_watcher_quote_proof()
+    assert proof["watcher_quote_base_url"] == "https://api.tradier.com"
+    assert proof["watcher_sandbox_mode"] is False
+    assert proof["quote_fetch_status"] == "market_data_token_missing"
 
 
 def test_paper_no_token_start_fails_preflight_clearly():
@@ -241,6 +257,20 @@ def test_paper_with_token_passes_preflight():
         w._validate_market_data_preflight()
 
 
+def test_paper_with_allowed_live_credential_passes_preflight():
+    w = _make_watcher(
+        mode="PAPER",
+        broker_base="https://sandbox.tradier.com",
+        live_access_token="allowed_live_tok",
+    )
+    if w is None:
+        pytest.skip("APEntryWatcher not importable in test env")
+    with patch.dict(os.environ, {}, clear=True):
+        w._validate_market_data_preflight()
+        proof = w._current_watcher_quote_proof()
+    assert proof["watcher_quote_token_source"] == "broker.live_access_token"
+
+
 # ── Test 4: LIVE + no token → broker.session fallback (acceptable) ───────────
 
 def test_live_no_token_uses_broker_session():
@@ -289,6 +319,10 @@ def test_fetch_quotes_success_populates_quote_age_ms():
     assert result["SPY"]["quote_age_ms"] is not None
     assert isinstance(result["SPY"]["quote_age_ms"], int)
     assert result["SPY"]["quote_age_ms"] >= 0
+    assert result["SPY"]["quote_fetch_status"] == "success"
+    proof = w._current_watcher_quote_proof()
+    assert proof["watcher_quote_token_source"] == "TRADIER_MARKET_DATA_TOKEN"
+    assert proof["quote_fetch_status"] == "success"
 
 
 # ── Test 5: watcher_audit fields match actual quote source ───────────────────
@@ -305,3 +339,43 @@ def test_watcher_audit_matches_quote_source():
     assert identity["watcher_quote_base_url"] == base_url
     assert identity["watcher_sandbox_mode"] is False
     assert identity["watcher_quote_source"] == "tradier_live"
+
+
+def test_watcher_audit_payload_includes_quote_token_source_and_fetch_status():
+    w = _make_watcher(mode="PAPER")
+    if w is None:
+        pytest.skip("APEntryWatcher not importable in test env")
+
+    mock_resp = MagicMock()
+    mock_resp.json.return_value = {
+        "quotes": {"quote": [{"symbol": "SPY", "bid": 549.9, "ask": 550.1, "last": 550.0}]}
+    }
+    watched = types.SimpleNamespace(
+        ticker="SPY",
+        score=91.0,
+        grade="A",
+        side="CALL",
+        signal_id="sig-1",
+        entry_trigger=550.0,
+        stop_level=547.5,
+        last_quote_bid=550.1,
+        last_quote_ask=550.3,
+        last_quote_age_ms=17,
+        signal={"timeframe": "1d", "pattern": "breakout", "plan_id": "plan-1"},
+    )
+
+    with patch.dict(os.environ, {"TRADIER_MARKET_DATA_TOKEN": "live_data_tok"}, clear=True), \
+         patch("requests.get", return_value=mock_resp):
+        w._fetch_quotes(["SPY"])
+        payload = w._build_watcher_audit_payload(
+            watched,
+            trigger_type="trigger",
+            reason_code="trigger_ready",
+            raw_reason="call_breach_confirmed",
+        )
+
+    assert payload["watcher_quote_source"] == "tradier_live"
+    assert payload["watcher_sandbox_mode"] is False
+    assert payload["watcher_quote_base_url"] == "https://api.tradier.com"
+    assert payload["watcher_quote_token_source"] == "TRADIER_MARKET_DATA_TOKEN"
+    assert payload["quote_fetch_status"] == "success"
