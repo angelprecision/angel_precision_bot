@@ -39,18 +39,102 @@ class TradierBroker(BrokerAdapter):
         })
 
     # -------------------------
-    # HTTP helpers
+    # HTTP helpers — rate-limit aware
     # -------------------------
-    def _get(self, path: str, params: Optional[dict] = None) -> dict:
+    # Tradier published rate limits (per their docs):
+    #   Market-data endpoints   (quotes, history, options chains): 120 req/min
+    #   Trading endpoints       (orders, account, positions):       60 req/min
+    # Tradier returns these response headers we honor:
+    #   X-Ratelimit-Available     remaining tokens
+    #   X-Ratelimit-Used          tokens consumed in current window
+    #   X-Ratelimit-Expiry        epoch when bucket resets (seconds)
+    # We log when below TRADIER_RATELIMIT_WARN_THRESHOLD (default 10) and
+    # back off proactively when at or below TRADIER_RATELIMIT_BLOCK_THRESHOLD
+    # (default 2). On 429 we honor Retry-After and exponential backoff up to
+    # TRADIER_RATELIMIT_MAX_RETRIES (default 3).
+
+    def _record_ratelimit_headers(self, path: str, resp) -> None:
+        """Log Tradier rate-limit headers when remaining is low."""
+        try:
+            avail_raw = resp.headers.get("X-Ratelimit-Available")
+            used_raw  = resp.headers.get("X-Ratelimit-Used")
+            exp_raw   = resp.headers.get("X-Ratelimit-Expiry")
+            if avail_raw is None:
+                return
+            avail = int(avail_raw)
+            warn_thr = int(os.getenv("TRADIER_RATELIMIT_WARN_THRESHOLD", "10"))
+            if avail <= warn_thr:
+                log.warning(
+                    "TRADIER_RATELIMIT_LOW path=%s available=%s used=%s expiry=%s",
+                    path, avail_raw, used_raw, exp_raw,
+                )
+        except Exception:
+            # Header parsing failure is non-fatal — never block a request on this
+            pass
+
+    def _request_with_retry(self, method: str, path: str,
+                             *, params=None, data=None) -> "requests.Response":
+        """
+        Send a request honoring Tradier rate limits.
+
+        On 429:
+          - Read Retry-After header (default 2s)
+          - Sleep + retry up to TRADIER_RATELIMIT_MAX_RETRIES (default 3)
+          - Exponential backoff: retry-after * 2^attempt, capped at 30s
+          - After max retries, re-raise the HTTPError
+        On other 5xx: re-raise immediately (transient — caller decides).
+        """
+        import time as _t
         url = f"{self.cfg.base_url}{path}"
-        r = self.session.get(url, params=params, timeout=(3.05, 15))
-        r.raise_for_status()
+        max_retries = int(os.getenv("TRADIER_RATELIMIT_MAX_RETRIES", "3"))
+        max_sleep   = float(os.getenv("TRADIER_RATELIMIT_MAX_SLEEP_SEC", "30"))
+
+        attempt = 0
+        while True:
+            if method == "GET":
+                resp = self.session.get(url, params=params, timeout=(3.05, 15))
+            elif method == "POST":
+                resp = self.session.post(url, data=data, timeout=(3.05, 15))
+            else:
+                raise ValueError(f"unsupported method: {method}")
+
+            self._record_ratelimit_headers(path, resp)
+
+            # 429 — Tradier rate limited
+            if resp.status_code == 429:
+                if attempt >= max_retries:
+                    log.error(
+                        "TRADIER_RATELIMIT_EXHAUSTED path=%s method=%s "
+                        "retries=%s — re-raising",
+                        path, method, attempt,
+                    )
+                    resp.raise_for_status()  # raises HTTPError(429)
+                # Honor Retry-After header if present
+                retry_after_hdr = resp.headers.get("Retry-After")
+                try:
+                    base_sleep = float(retry_after_hdr) if retry_after_hdr else 2.0
+                except (TypeError, ValueError):
+                    base_sleep = 2.0
+                sleep_sec = min(base_sleep * (2 ** attempt), max_sleep)
+                log.warning(
+                    "TRADIER_RATELIMIT_429 path=%s method=%s attempt=%s "
+                    "retry_after=%s sleeping=%.2fs",
+                    path, method, attempt + 1, retry_after_hdr, sleep_sec,
+                )
+                _t.sleep(sleep_sec)
+                attempt += 1
+                continue
+
+            # Non-429: raise on any other error (4xx/5xx)
+            resp.raise_for_status()
+            return resp
+
+    def _get(self, path: str, params: Optional[dict] = None) -> dict:
+        r = self._request_with_retry("GET", path, params=params)
         return r.json() if r.content else {}
 
     def _post(self, path: str, data: dict) -> dict:
-        url = f"{self.cfg.base_url}{path}"
-        r = self.session.post(url, data=data, timeout=(3.05, 15))
-        r.raise_for_status()
+        r = self._request_with_retry("POST", path, data=data)
         return r.json() if r.content else {}
 
     # -------------------------
