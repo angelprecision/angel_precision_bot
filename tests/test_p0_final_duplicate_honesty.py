@@ -15,7 +15,8 @@ Verifies that after PR #134:
 """
 from __future__ import annotations
 
-from types import SimpleNamespace
+from contextlib import contextmanager
+from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, patch
 import pytest
 
@@ -23,6 +24,25 @@ import pytest
 # =============================================================================
 # Test 1: Memory-only duplicate signal — NOT blocked
 # =============================================================================
+
+
+@contextmanager
+def _patch_ap_db(fake_conn, *, run_with_retry=None):
+    """Inject a lightweight ap.db module so tests do not import real Postgres."""
+    import sys
+
+    fake_mod = ModuleType("ap.db")
+    fake_mod.conn = lambda: fake_conn
+    fake_mod.run_with_retry = run_with_retry or (lambda f, *a, **k: f())
+    original = sys.modules.get("ap.db")
+    sys.modules["ap.db"] = fake_mod
+    try:
+        yield fake_mod
+    finally:
+        if original is not None:
+            sys.modules["ap.db"] = original
+        else:
+            sys.modules.pop("ap.db", None)
 
 def test_memory_only_duplicate_does_not_block():
     """Put signal_key into self._seen_signals.
@@ -95,8 +115,7 @@ def test_durable_trade_queue_duplicate_blocks_with_structured_reason():
     fake_conn.__enter__ = MagicMock(return_value=fake_cursor)
     fake_conn.__exit__ = MagicMock(return_value=False)
 
-    with patch("ap.db.conn", return_value=fake_conn), \
-         patch("ap.db.run_with_retry", side_effect=lambda f, *a, **k: f()):
+    with _patch_ap_db(fake_conn):
         is_dup, source, detail = mc._has_durable_duplicate_signal(
             client_id="jason@example.com",
             signal_id="sig-dur-tq",
