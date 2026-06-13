@@ -258,7 +258,10 @@ def test_different_direction_not_blocked_by_reentry():
 # 6. Duplicate signal_id blocked
 # ---------------------------------------------------------------------------
 
-def test_duplicate_signal_id_blocked():
+def test_duplicate_signal_id_gate_removed():
+    """P0 Final Duplicate Honesty: quality_mode no longer blocks on
+    duplicate signal_id. Master_control._has_durable_duplicate_signal is
+    the sole authority. Quality_mode must allow same signal_id through."""
     qm = _reload_qm()
     client = "dup_client@ap.com"
 
@@ -266,16 +269,21 @@ def test_duplicate_signal_id_blocked():
                client_id=client, score_override=75.0)
     assert v1.allowed
 
+    # Same signal_id, different symbol — quality_mode used to block. After
+    # PR #134 it must NOT block; master_control will gate via durable check.
     v2 = _call(qm, _signal(score=75.0, symbol="AMZN", signal_id="dup-sig-999"),
                client_id=client, score_override=75.0)
-    assert not v2.allowed
-    assert v2.log_code == "QUALITY_MODE_BLOCKED_REENTRY"
-
+    assert v2.allowed, (
+        "quality_mode must NOT block on duplicate signal_id — that gate "
+        "was removed. Got blocked_by="
+        f"{v2.quality_mode_result.get('blocked_by') if v2.quality_mode_result else None}"
+    )
+    # And the result must NOT carry blocked_by=duplicate_signal_id
     r = v2.quality_mode_result
-    _assert_result_shape(r, context="dup_signal_id")
-    assert r["approved"] is False
-    assert r["blocked_by"] == "duplicate_signal_id"
-    assert "signal_id" in v2.quality_mode_reason.lower()
+    if r is not None:
+        assert r.get("blocked_by") != "duplicate_signal_id", (
+            "quality_mode_result must not surface blocked_by=duplicate_signal_id"
+        )
 
 
 # ---------------------------------------------------------------------------

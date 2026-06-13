@@ -274,7 +274,8 @@ _GATE_NAMES = [
     "max_positions",
     "b_tier_daily_cap",
     "reentry_cooldown",
-    "duplicate_signal_id",
+    # NOTE: "duplicate_signal_id" gate was removed — see master_control for
+    # the durable per-client duplicate check.
     "duplicate_plan_id",
 ]
 
@@ -531,27 +532,19 @@ def check(
                     extra_meta={"cooldown_remaining_s": int(remaining)},
                 )
 
-    # ── GATE 9: Duplicate signal_id ───────────────────────────────────────
-    gates_applied.append("duplicate_signal_id")
-    if signal_id:
-        with _state_lock:
-            if signal_id in state.seen_signal_ids:
-                reason = f"duplicate signal_id={signal_id}"
-                log.warning(
-                    "QUALITY_MODE_BLOCKED_REENTRY | client=%s symbol=%s "
-                    "duplicate signal_id=%s",
-                    client_id, symbol, signal_id,
-                )
-                return _blocked_verdict(
-                    log_code="QUALITY_MODE_BLOCKED_REENTRY",
-                    reason=reason,
-                    blocked_by="duplicate_signal_id",
-                    score=score, score_min=score_min, tier=tier,
-                    gate_status="BLOCKED_DUPLICATE",
-                    gates_applied=list(gates_applied),
-                    symbol=symbol, direction=direction, timeframe=timeframe, pattern=pattern,
-                    extra_meta={"signal_id": signal_id},
-                )
+    # ── GATE 9: Duplicate signal_id — REMOVED (P0 Final Duplicate Honesty) ──
+    # The previous in-memory state.seen_signal_ids gate was removed because:
+    #   - It was process-local (not durable)
+    #   - It emitted the bare reason "duplicate_signal_id" (no source detail)
+    #   - It blocked replayed/requeued signals that had no active path
+    #   - It conflicted with the durable per-client guard in
+    #     master_control._has_durable_duplicate_signal() (PR #133)
+    # Master_control is now the sole authority for duplicate_signal_id
+    # decisions. It always emits structured reasons like
+    #   duplicate_signal_id (durable:trade_queue|orders|positions)
+    # or the distinct duplicate_check_unavailable_live_blocked on DB outage.
+    # Gate 10 (duplicate_plan_id) is preserved — different concern, different
+    # field, and not covered by the MC durable guard.
 
     # ── GATE 10: Duplicate plan_id ────────────────────────────────────────
     gates_applied.append("duplicate_plan_id")
@@ -578,8 +571,9 @@ def check(
     # ── ALL GATES PASSED — commit state and approve ───────────────────────
     with _state_lock:
         state.reentry_ts[reentry_key] = now
-        if signal_id:
-            state.seen_signal_ids[signal_id] = True
+        # state.seen_signal_ids commit removed with Gate 9.
+        # Master_control._has_durable_duplicate_signal is the only source of
+        # truth for duplicate_signal_id decisions.
         if plan_id:
             state.seen_plan_ids[plan_id] = True
         if tier == "B":
