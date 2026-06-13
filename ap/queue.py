@@ -636,8 +636,16 @@ def _dispatch(
         log.debug("[%s] Equity cache fresh (%.0fs old) — skipping broker call", ticker, time.time() - _eq_last_ts)
 
     # ── 1. MASTER CONTROL (initial gate, placeholder estimate) ────────────────
+    # Inject _queue_id so the durable duplicate guard in master_control can
+    # exclude THIS row from "is there an active trade_queue row for the same
+    # client+signal" check. Without this, the guard would see the current
+    # PROCESSING row and reject every dispatched job as
+    # duplicate_signal_id (durable:trade_queue). Shallow copy preserves the
+    # caller's payload — we never mutate the incoming dict.
+    payload_for_mc = dict(payload or {})
+    payload_for_mc["_queue_id"] = job_id
     try:
-        decision = master_control.evaluate(payload, client_id=client_id)
+        decision = master_control.evaluate(payload_for_mc, client_id=client_id)
     except Exception as e:
         log.error(f"[{ticker}] master_control.evaluate() failed: {e}")
         _mark_job(job_id, "ERROR", error=f"master_control_error: {e}")
