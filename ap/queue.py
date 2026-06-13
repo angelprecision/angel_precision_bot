@@ -39,6 +39,7 @@ import uuid
 from typing import Any, Optional
 
 from ap.state import update_state
+from ap.trade_flow_proof import emit_trade_flow_proof
 
 def _conn():
     from ap.db import conn
@@ -195,13 +196,45 @@ def enqueue_signal(
         rowcount = _run_with_retry(_ins)
         if rowcount == 0:
             log.debug(f"Duplicate ignored: {signal_id}")
+            emit_trade_flow_proof(
+                "queue_enqueue",
+                client_id=client_id,
+                signal_id=signal_id,
+                ticker=payload.get("ticker") or payload.get("symbol"),
+                status="duplicate",
+                reason="idempotency_conflict",
+                idempotency_key=idempotency_key,
+                score=payload.get("score"),
+                side=payload.get("side") or payload.get("direction"),
+                timeframe=payload.get("timeframe"),
+            )
             return False
         log.info(f"✅ Enqueued: {signal_id} client={client_id}")
+        emit_trade_flow_proof(
+            "queue_enqueue",
+            client_id=client_id,
+            signal_id=signal_id,
+            ticker=payload.get("ticker") or payload.get("symbol"),
+            status="inserted",
+            idempotency_key=idempotency_key,
+            score=payload.get("score"),
+            side=payload.get("side") or payload.get("direction"),
+            timeframe=payload.get("timeframe"),
+        )
         return True
     except Exception as e:
         msg = str(e).lower()
         if "unique" in msg or "conflict" in msg:
             log.debug(f"Duplicate ignored (exception path): {signal_id}")
+            emit_trade_flow_proof(
+                "queue_enqueue",
+                client_id=client_id,
+                signal_id=signal_id,
+                ticker=payload.get("ticker") or payload.get("symbol"),
+                status="duplicate",
+                reason="idempotency_conflict_exception",
+                idempotency_key=idempotency_key,
+            )
             return False
         raise
 
@@ -555,6 +588,17 @@ def _dispatch(
       5. breach → entry_watcher  |  immediate → SUBMITTED transition
     """
     ticker = payload.get("ticker") or payload.get("symbol", "?")
+    emit_trade_flow_proof(
+        "queue_dispatch_start",
+        client_id=client_id,
+        signal_id=signal_id,
+        ticker=ticker,
+        status="started",
+        job_id=job_id,
+        score=payload.get("score"),
+        side=payload.get("side") or payload.get("direction"),
+        timeframe=payload.get("timeframe"),
+    )
 
     # Resolve canonical_signal_id — primary idempotency key for opportunity ledger.
     # PR79 build_canonical_signal_id prevents REEVAL suffix variants from
@@ -580,6 +624,15 @@ def _dispatch(
         from ap.restart_guard import should_skip_on_restart
         if should_skip_on_restart(payload):
             log.warning("[%s] RESTART GUARD — overnight signal blocked", ticker)
+            emit_trade_flow_proof(
+                "restart_guard",
+                client_id=client_id,
+                signal_id=signal_id,
+                ticker=ticker,
+                status="blocked",
+                reason="restart_guard:overnight_skip",
+                job_id=job_id,
+            )
             _mark_job(job_id, "REJECTED", error="restart_guard:overnight_skip")
             try:
                 from ap.rejection_feed import post_master_control_block
@@ -618,17 +671,47 @@ def _dispatch(
                 else:
                     if live_mode:
                         log.error("[%s] LIVE: broker returned zero/null equity — rejecting (fail closed)", ticker)
+                        emit_trade_flow_proof(
+                            "equity_refresh",
+                            client_id=client_id,
+                            signal_id=signal_id,
+                            ticker=ticker,
+                            status="blocked",
+                            reason="live_equity_unavailable:broker_returned_zero",
+                            execution_mode="LIVE",
+                            job_id=job_id,
+                        )
                         _mark_job(job_id, "REJECTED", error="live_equity_unavailable:broker_returned_zero")
                         return
                     log.warning("[%s] PAPER: equity refresh returned zero — using last known value", ticker)
             else:
                 if live_mode:
                     log.error("[%s] LIVE: no broker equity method — rejecting (fail closed)", ticker)
+                    emit_trade_flow_proof(
+                        "equity_refresh",
+                        client_id=client_id,
+                        signal_id=signal_id,
+                        ticker=ticker,
+                        status="blocked",
+                        reason="live_equity_unavailable:no_broker_method",
+                        execution_mode="LIVE",
+                        job_id=job_id,
+                    )
                     _mark_job(job_id, "REJECTED", error="live_equity_unavailable:no_broker_method")
                     return
         except Exception as _eq_exc:
             if live_mode:
                 log.error("[%s] LIVE: equity refresh error %s — rejecting (fail closed)", ticker, _eq_exc)
+                emit_trade_flow_proof(
+                    "equity_refresh",
+                    client_id=client_id,
+                    signal_id=signal_id,
+                    ticker=ticker,
+                    status="blocked",
+                    reason=f"live_equity_unavailable:{_eq_exc}",
+                    execution_mode="LIVE",
+                    job_id=job_id,
+                )
                 _mark_job(job_id, "REJECTED", error=f"live_equity_unavailable:{_eq_exc}")
                 return
             log.warning("[%s] PAPER: equity refresh error %s — continuing with cached value", ticker, _eq_exc)
@@ -640,11 +723,33 @@ def _dispatch(
         decision = master_control.evaluate(payload, client_id=client_id)
     except Exception as e:
         log.error(f"[{ticker}] master_control.evaluate() failed: {e}")
+        emit_trade_flow_proof(
+            "master_control",
+            client_id=client_id,
+            signal_id=signal_id,
+            ticker=ticker,
+            status="error",
+            reason=f"master_control_error:{e}",
+            job_id=job_id,
+            execution_mode="LIVE" if live_mode else "PAPER",
+        )
         _mark_job(job_id, "ERROR", error=f"master_control_error: {e}")
         return
 
     if not decision.ok:
         log.info(f"[{ticker}] BLOCKED | stage={decision.stage} reason={decision.reason}")
+        emit_trade_flow_proof(
+            "master_control",
+            client_id=client_id,
+            signal_id=signal_id,
+            ticker=ticker,
+            status="blocked",
+            reason=decision.reason,
+            job_id=job_id,
+            execution_mode="LIVE" if live_mode else "PAPER",
+            decision_stage=decision.stage,
+            score=payload.get("score"),
+        )
 
 
         # PR1 + Amendment §4: map MC reason to canonical miss stage instead
@@ -720,6 +825,19 @@ def _dispatch(
         return
 
     plan = decision.plan
+    emit_trade_flow_proof(
+        "master_control",
+        client_id=client_id,
+        signal_id=signal_id,
+        ticker=ticker,
+        status="approved",
+        job_id=job_id,
+        execution_mode="LIVE" if live_mode else "PAPER",
+        plan_id=getattr(plan, "plan_id", None),
+        score=payload.get("score"),
+        contracts=getattr(plan, "contracts", None),
+        max_position_usd=getattr(plan, "max_position_usd", None),
+    )
 
     # ── 1-1 PAIR MANAGER — register signal so opposite side cancels on fill ──
     try:
@@ -814,6 +932,16 @@ def _dispatch(
                     job_id, "ERROR",
                     error="ap_signals_write_failed:after_hours_deferred",
                 )
+                emit_trade_flow_proof(
+                    "after_hours_deferred",
+                    client_id=client_id,
+                    signal_id=signal_id,
+                    ticker=ticker,
+                    status="error",
+                    reason="ap_signals_write_failed:after_hours_deferred",
+                    job_id=job_id,
+                    execution_mode="LIVE" if live_mode else "PAPER",
+                )
                 return
             # Status: WATCHING — signal is valid, awaiting 9 AM overnight reeval to arm.
             # The overnight reeval queries WHERE status='WATCHING' to find these signals.
@@ -821,6 +949,17 @@ def _dispatch(
             # The overnight reeval at 9 AM will run contract selection with live quotes and
             # arm the entry watcher. This is the correct overnight pipeline for daily scanner signals.
             _mark_job(job_id, "WATCHING", error="after_hours_deferred:awaiting_overnight_reeval")
+            emit_trade_flow_proof(
+                "after_hours_deferred",
+                client_id=client_id,
+                signal_id=signal_id,
+                ticker=ticker,
+                status="watching",
+                reason="after_hours_deferred:awaiting_overnight_reeval",
+                job_id=job_id,
+                execution_mode="LIVE" if live_mode else "PAPER",
+                timeframe=_sig_timeframe,
+            )
             return
     except Exception as _mkt_err:
         log.warning("[%s] Market hours check failed: %s — proceeding", ticker, _mkt_err)
@@ -830,6 +969,17 @@ def _dispatch(
             selected = contract_selector.select(plan)
             if selected is None:
                 log.warning(f"[{ticker}] Contract selection failed -- no suitable contract")
+                emit_trade_flow_proof(
+                    "contract_selection",
+                    client_id=client_id,
+                    signal_id=signal_id,
+                    ticker=ticker,
+                    status="blocked",
+                    reason="no_contract_found",
+                    job_id=job_id,
+                    execution_mode="LIVE" if live_mode else "PAPER",
+                    plan_id=getattr(plan, "plan_id", None),
+                )
                 trace_gate(str(payload.get("signal_id","")), ticker, "QUALITY_FILTER", "REJECT",
                            reason="no_eligible_contracts", score=float(payload.get("score") or 0))
                 _mark_job(job_id, "REJECTED",
@@ -854,6 +1004,20 @@ def _dispatch(
                 f"@ ${selected.mid:.2f} x{plan.contracts} "
                 f"cost=${plan.max_position_usd:.0f}"
             )
+            emit_trade_flow_proof(
+                "contract_selection",
+                client_id=client_id,
+                signal_id=signal_id,
+                ticker=ticker,
+                status="selected",
+                job_id=job_id,
+                execution_mode="LIVE" if live_mode else "PAPER",
+                plan_id=getattr(plan, "plan_id", None),
+                contract_symbol=getattr(selected, "contract_symbol", None),
+                mid=getattr(selected, "mid", None),
+                contracts=getattr(plan, "contracts", None),
+                max_position_usd=getattr(plan, "max_position_usd", None),
+            )
             # Item 3 (review fix) — stash candidate_audit on plan.metadata so
             # execution_core can persist it into orders.meta for the preselected
             # (non-deferred) queue path. Without this stash, only breach-time
@@ -869,6 +1033,17 @@ def _dispatch(
                 pass
         except Exception as e:
             log.error(f"[{ticker}] contract_selector.select() raised: {e}")
+            emit_trade_flow_proof(
+                "contract_selection",
+                client_id=client_id,
+                signal_id=signal_id,
+                ticker=ticker,
+                status="error",
+                reason=f"contract_selector_error:{e}",
+                job_id=job_id,
+                execution_mode="LIVE" if live_mode else "PAPER",
+                plan_id=getattr(plan, "plan_id", None),
+            )
             _mark_job(job_id, "ERROR", error=f"contract_selector_error: {e}")
             return
     else:
@@ -880,6 +1055,19 @@ def _dispatch(
         log.warning(
             f"[{ticker}] BLOCKED at re-validation (real premium) | "
             f"reason={revalidation.reason}"
+        )
+        emit_trade_flow_proof(
+            "revalidation",
+            client_id=client_id,
+            signal_id=signal_id,
+            ticker=ticker,
+            status="blocked",
+            reason=revalidation.reason,
+            job_id=job_id,
+            execution_mode="LIVE" if live_mode else "PAPER",
+            plan_id=getattr(plan, "plan_id", None),
+            contracts=getattr(plan, "contracts", None),
+            max_position_usd=getattr(plan, "max_position_usd", None),
         )
         try:
             from ap.opportunity_ledger import mark_missed, STAGE_CLIENT_PREFLIGHT
@@ -893,6 +1081,18 @@ def _dispatch(
                   error=(f"revalidation:{revalidation.reason}"
                          if revalidation.reason else "revalidation:block"))
         return
+    emit_trade_flow_proof(
+        "revalidation",
+        client_id=client_id,
+        signal_id=signal_id,
+        ticker=ticker,
+        status="approved",
+        job_id=job_id,
+        execution_mode="LIVE" if live_mode else "PAPER",
+        plan_id=getattr(plan, "plan_id", None),
+        contracts=getattr(plan, "contracts", None),
+        max_position_usd=getattr(plan, "max_position_usd", None),
+    )
 
     # ── 4. ROUTE -- BREACH vs IMMEDIATE (resolved BEFORE OSM create) ──────────
     # PR F / queue truth hardening: route resolution AND the 3:15 PM ET
@@ -940,6 +1140,17 @@ def _dispatch(
 
     if trigger_type == "breach" and not entry_watcher:
         log.critical("[%s] ENTRY WATCHER MISSING — cannot arm breach entry", ticker)
+        emit_trade_flow_proof(
+            "route",
+            client_id=client_id,
+            signal_id=signal_id,
+            ticker=ticker,
+            status="blocked",
+            reason="entry_watcher_missing",
+            job_id=job_id,
+            execution_mode="LIVE" if live_mode else "PAPER",
+            route="breach",
+        )
         _mark_job(job_id, "REJECTED", error="entry_watcher_missing")
         try:
             from ap.rejection_feed import post_master_control_block
@@ -967,6 +1178,17 @@ def _dispatch(
         log.warning(
             "[%s] ENTRY BLOCKED — too late in session (%02d:%02d ET, cutoff 15:15)",
             ticker, _now_et_cut.hour, _now_et_cut.minute,
+        )
+        emit_trade_flow_proof(
+            "route",
+            client_id=client_id,
+            signal_id=signal_id,
+            ticker=ticker,
+            status="blocked",
+            reason="entry_cutoff:too_late_in_session",
+            job_id=job_id,
+            execution_mode="LIVE" if live_mode else "PAPER",
+            route="breach",
         )
         _mark_job(job_id, "REJECTED", error="entry_cutoff: too_late_in_session")
         return
@@ -1030,6 +1252,17 @@ def _dispatch(
                           result={"stage": "live_authorization",
                                   "reason": _gate_reason},
                           error=f"live_authorization:{_gate_reason}")
+                emit_trade_flow_proof(
+                    "live_authorization",
+                    client_id=client_id,
+                    signal_id=signal_id,
+                    ticker=ticker,
+                    status="blocked",
+                    reason=_gate_reason,
+                    job_id=job_id,
+                    execution_mode="LIVE" if live_mode else "PAPER",
+                    route=trigger_type,
+                )
                 # Permanent structured rejection record — operator dashboard reads
                 # this to show WHY no trade was created.
                 _log_rejection_to_db(
@@ -1222,6 +1455,21 @@ def _dispatch(
             f"[{ticker}] Entry order created: {local_order_id} "
             f"contract={getattr(plan, 'contract_symbol', '?')}"
         )
+        emit_trade_flow_proof(
+            "order_create",
+            client_id=client_id,
+            signal_id=signal_id,
+            ticker=ticker,
+            status="created",
+            job_id=job_id,
+            execution_mode=_entry_exec_mode,
+            route=trigger_type,
+            plan_id=getattr(plan, "plan_id", None),
+            local_order_id=local_order_id,
+            contract_symbol=getattr(plan, "contract_symbol", None),
+            contracts=getattr(plan, "contracts", None),
+            max_position_usd=getattr(plan, "max_position_usd", None),
+        )
         # PR1: ORDER_CREATED — only mark AFTER create_entry_order() returns
         # local_order_id. Status was PREFLIGHT_PASSED before this point.
         try:
@@ -1232,6 +1480,18 @@ def _dispatch(
         except Exception: pass
     except Exception as e:
         log.error(f"[{ticker}] create_entry_order() failed: {e}")
+        emit_trade_flow_proof(
+            "order_create",
+            client_id=client_id,
+            signal_id=signal_id,
+            ticker=ticker,
+            status="error",
+            reason=f"order_create_error:{e}",
+            job_id=job_id,
+            execution_mode="LIVE" if live_mode else "PAPER",
+            route=trigger_type,
+            plan_id=getattr(plan, "plan_id", None),
+        )
         # Amendment §7: persist the failure to the opportunity ledger so the
         # row does not remain permanently at PREFLIGHT_PASSED.
         try:
@@ -1272,6 +1532,19 @@ def _dispatch(
                     "[%s] WATCH_ARM_ABORTED — could not mark order PENDING_TRIGGER | local=%s",
                     ticker, local_order_id,
                 )
+                emit_trade_flow_proof(
+                    "watcher_arm",
+                    client_id=client_id,
+                    signal_id=signal_id,
+                    ticker=ticker,
+                    status="error",
+                    reason="pending_trigger_transition_failed",
+                    job_id=job_id,
+                    execution_mode="LIVE" if live_mode else "PAPER",
+                    route="breach",
+                    plan_id=getattr(plan, "plan_id", None),
+                    local_order_id=local_order_id,
+                )
                 _mark_job(job_id, "ERROR", error="pending_trigger_transition_failed")
                 return
 
@@ -1288,6 +1561,20 @@ def _dispatch(
                 log.warning(
                     "[%s] WATCH_ARM_FAILED | local=%s | reason=%s",
                     ticker, local_order_id, _reject_reason,
+                )
+                emit_trade_flow_proof(
+                    "watcher_arm",
+                    client_id=client_id,
+                    signal_id=signal_id,
+                    ticker=ticker,
+                    status="blocked",
+                    reason=_full_error,
+                    job_id=job_id,
+                    execution_mode="LIVE" if live_mode else "PAPER",
+                    route="breach",
+                    plan_id=getattr(plan, "plan_id", None),
+                    local_order_id=local_order_id,
+                    contract_symbol=getattr(plan, "contract_symbol", None),
                 )
 
                 # =============================================================
@@ -1421,6 +1708,21 @@ def _dispatch(
                 f"[{ticker}] Handed to entry watcher | "
                 f"trigger=${getattr(plan, 'trigger_price', '?')}"
             )
+            emit_trade_flow_proof(
+                "watcher_arm",
+                client_id=client_id,
+                signal_id=signal_id,
+                ticker=ticker,
+                status="armed",
+                job_id=job_id,
+                execution_mode="LIVE" if live_mode else "PAPER",
+                route="breach",
+                plan_id=getattr(plan, "plan_id", None),
+                local_order_id=local_order_id,
+                contract_symbol=getattr(plan, "contract_symbol", None),
+                trigger_price=getattr(plan, "trigger_price", None),
+                needs_contract_selection=bool(getattr(plan, "_needs_contract_selection", False)),
+            )
             # Amendment §3: WATCHER_ARMED ledger update.
             try:
                 from ap.opportunity_ledger import mark_watcher_armed
@@ -1441,6 +1743,19 @@ def _dispatch(
                               "needs_contract_selection": bool(getattr(plan, "_needs_contract_selection", False))})
         except Exception as e:
             log.error(f"[{ticker}] entry_watcher.watch() failed: {e}", exc_info=True)
+            emit_trade_flow_proof(
+                "watcher_arm",
+                client_id=client_id,
+                signal_id=signal_id,
+                ticker=ticker,
+                status="error",
+                reason=f"watcher_error:{e}",
+                job_id=job_id,
+                execution_mode="LIVE" if live_mode else "PAPER",
+                route="breach",
+                plan_id=getattr(plan, "plan_id", None),
+                local_order_id=locals().get("local_order_id"),
+            )
             try:
                 if hasattr(order_state_machine, "expire_pending_entry"):
                     order_state_machine.expire_pending_entry(local_order_id, reason=f"watcher_error:{e}")
@@ -1496,6 +1811,21 @@ def _dispatch(
                     "[%s] Immediate submit failed safely | local=%s error=%s",
                     ticker, local_order_id, submit_res.get("error"),
                 )
+                emit_trade_flow_proof(
+                    "broker_submit",
+                    client_id=client_id,
+                    signal_id=signal_id,
+                    ticker=ticker,
+                    status="error",
+                    reason=submit_res.get("error"),
+                    job_id=job_id,
+                    execution_mode="LIVE" if live_mode else "PAPER",
+                    route="immediate",
+                    plan_id=getattr(plan, "plan_id", None),
+                    local_order_id=local_order_id,
+                    broker_order_id=submit_res.get("broker_order_id"),
+                    split_brain=submit_res.get("split_brain"),
+                )
                 # Amendment §3: persist broker-submit failure to ledger.
                 try:
                     from ap.opportunity_ledger import (
@@ -1515,6 +1845,20 @@ def _dispatch(
             log.info(
                 "[%s] Order submitted immediately after broker acceptance | local=%s broker=%s",
                 ticker, local_order_id, submit_res.get("broker_order_id"),
+            )
+            emit_trade_flow_proof(
+                "broker_submit",
+                client_id=client_id,
+                signal_id=signal_id,
+                ticker=ticker,
+                status="submitted",
+                job_id=job_id,
+                execution_mode="LIVE" if live_mode else "PAPER",
+                route="immediate",
+                plan_id=getattr(plan, "plan_id", None),
+                local_order_id=local_order_id,
+                broker_order_id=submit_res.get("broker_order_id"),
+                split_brain=submit_res.get("split_brain"),
             )
             # Amendment §3: BROKER_SUBMITTED ledger update.
             try:
