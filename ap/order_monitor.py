@@ -166,6 +166,13 @@ POLL_INTERVAL = int(os.getenv("ORDER_MONITOR_POLL", "60"))  # seconds (entry che
 # H4: exits run on this faster cadence (account risk). Keep >= a few seconds
 # to avoid hammering the broker; 15s + 45s timeout => hung exit caught fast.
 EXIT_CHECK_INTERVAL = int(os.getenv("ORDER_MONITOR_EXIT_POLL", "15"))  # seconds
+PENDING_TRIGGER_CLEANUP_ENABLED = os.getenv(
+    "PENDING_TRIGGER_CLEANUP_ENABLED", "1"
+).strip().lower() in ("1", "true", "yes")
+PENDING_TRIGGER_MAX_AGE_SECONDS = int(os.getenv("PENDING_TRIGGER_MAX_AGE_SECONDS", "5400"))
+PENDING_TRIGGER_CLEANUP_DRY_RUN = os.getenv(
+    "PENDING_TRIGGER_CLEANUP_DRY_RUN", "0"
+).strip().lower() in ("1", "true", "yes")
 
 # Watchdog ownership controls.
 # Default is intentionally passive for POSITION lifecycle (that authority
@@ -219,6 +226,7 @@ class APOrderMonitor:
         order_state_machine,
         position_manager,
         exit_engine=None,
+        entry_watcher=None,
         alert_fn=None,
         # PR66: "PAPER" or "LIVE". Default is "LIVE" so any call site that
         # forgets to pass client_mode uses the strict 90s ceiling rather than
@@ -230,6 +238,7 @@ class APOrderMonitor:
         self.osm         = order_state_machine
         self.pm          = position_manager
         self.exit_engine = exit_engine
+        self.entry_watcher = entry_watcher
         self.alert_fn    = alert_fn
         # PR66: store mode for per-mode max-age selection.
         # "or LIVE" guards against explicit None/empty being passed — fail safe.
@@ -255,6 +264,9 @@ class APOrderMonitor:
             "missed_move_price_mult": float(os.getenv("MISSED_MOVE_PRICE_MULT", "1.07")),
             "entry_limit_max_age_seconds": ENTRY_LIMIT_MAX_AGE_SECONDS,
             "allow_entry_cancel_in_watchdog": ALLOW_ENTRY_CANCEL_IN_WATCHDOG,
+            "pending_trigger_cleanup_enabled": PENDING_TRIGGER_CLEANUP_ENABLED,
+            "pending_trigger_max_age_seconds": PENDING_TRIGGER_MAX_AGE_SECONDS,
+            "pending_trigger_cleanup_dry_run": PENDING_TRIGGER_CLEANUP_DRY_RUN,
         })
 
     def _emit_order_event(
@@ -481,6 +493,16 @@ class APOrderMonitor:
                     except Exception as _e:
                         log.debug("[%s] lost-handoff systemic check failed: %s", self.client_id, _e)
 
+            elif status == "PENDING_TRIGGER":
+                self._check_pending_trigger_order(
+                    order=order,
+                    local_id=local_id,
+                    contract=contract,
+                    age_secs=age_secs,
+                    broker_oid=broker_oid,
+                    submitted_ts=submitted_ts,
+                )
+
             elif status == "SUBMITTED":
                 ref_ts = submitted_ts or created_ts
                 age_secs = (now - ref_ts).total_seconds()
@@ -571,6 +593,259 @@ class APOrderMonitor:
                         f"| {local_id} | {age_secs:.0f}s > {TIMEOUT_PARTIAL_FILL}s "
                         f"| Manual review required"
                     )
+
+    def _check_pending_trigger_order(
+        self,
+        *,
+        order: dict,
+        local_id: str,
+        contract: str,
+        age_secs: float,
+        broker_oid,
+        submitted_ts,
+    ) -> None:
+        if age_secs <= PENDING_TRIGGER_MAX_AGE_SECONDS:
+            return
+
+        _submitted_repr = submitted_ts.isoformat() if submitted_ts else "None"
+        (
+            _watcher_owner_state,
+            _ownership_check_available,
+            _ownership_check_error,
+        ) = self._pending_trigger_watcher_owner_state(local_id)
+        _owner_state_repr = (
+            "unknown" if _watcher_owner_state is None else str(_watcher_owner_state)
+        )
+        _ownership_error_repr = _ownership_check_error or "None"
+
+        if broker_oid:
+            self._log_pending_trigger_watchdog_seen(
+                level="critical",
+                contract=contract,
+                local_id=local_id,
+                age_secs=age_secs,
+                broker_order_id=broker_oid,
+                submitted_ts_repr=_submitted_repr,
+                watcher_owner_state=_owner_state_repr,
+                ownership_check_available=_ownership_check_available,
+                ownership_check_error=_ownership_error_repr,
+                cleanup_action="skip_broker_order_id_present",
+            )
+            return
+
+        if submitted_ts:
+            self._log_pending_trigger_watchdog_seen(
+                level="info",
+                contract=contract,
+                local_id=local_id,
+                age_secs=age_secs,
+                broker_order_id="None",
+                submitted_ts_repr=_submitted_repr,
+                watcher_owner_state=_owner_state_repr,
+                ownership_check_available=_ownership_check_available,
+                ownership_check_error=_ownership_error_repr,
+                cleanup_action="skip_submitted_ts_present",
+            )
+            return
+
+        if _watcher_owner_state is True:
+            self._log_pending_trigger_watchdog_seen(
+                level="info",
+                contract=contract,
+                local_id=local_id,
+                age_secs=age_secs,
+                broker_order_id="None",
+                submitted_ts_repr=_submitted_repr,
+                watcher_owner_state=_owner_state_repr,
+                ownership_check_available=_ownership_check_available,
+                ownership_check_error=_ownership_error_repr,
+                cleanup_action="preserve_watcher_owned",
+            )
+            return
+
+        if _watcher_owner_state is None:
+            _unknown_action = (
+                "dry_run_only" if PENDING_TRIGGER_CLEANUP_DRY_RUN
+                else "preserve_ownership_unknown"
+            )
+            self._log_pending_trigger_watchdog_seen(
+                level="warning",
+                contract=contract,
+                local_id=local_id,
+                age_secs=age_secs,
+                broker_order_id="None",
+                submitted_ts_repr=_submitted_repr,
+                watcher_owner_state=_owner_state_repr,
+                ownership_check_available=_ownership_check_available,
+                ownership_check_error=_ownership_error_repr,
+                cleanup_action=_unknown_action,
+            )
+            log.warning(
+                "[%s] PENDING_TRIGGER_ORPHAN_OWNERSHIP_UNKNOWN | %s | %s | age=%.0fs "
+                "| watcher_owner_state=%s | ownership_check_available=%s "
+                "| ownership_check_error=%s | cleanup_action=%s",
+                self.client_id,
+                contract,
+                local_id,
+                age_secs,
+                _owner_state_repr,
+                _ownership_check_available,
+                _ownership_error_repr,
+                _unknown_action,
+            )
+            return
+
+        self._log_pending_trigger_watchdog_seen(
+            level="info",
+            contract=contract,
+            local_id=local_id,
+            age_secs=age_secs,
+            broker_order_id="None",
+            submitted_ts_repr=_submitted_repr,
+            watcher_owner_state=_owner_state_repr,
+            ownership_check_available=_ownership_check_available,
+            ownership_check_error=_ownership_error_repr,
+            cleanup_action=(
+                "cleanup_disabled"
+                if not PENDING_TRIGGER_CLEANUP_ENABLED
+                else (
+                    "dry_run_only"
+                    if PENDING_TRIGGER_CLEANUP_DRY_RUN
+                    else "expire_orphan_candidate"
+                )
+            ),
+        )
+
+        if not PENDING_TRIGGER_CLEANUP_ENABLED:
+            return
+
+        reason = (
+            "PENDING_TRIGGER_ORPHAN_EXPIRED: no_broker_order_id "
+            f"no_submitted_ts age={age_secs:.0f}s"
+        )
+
+        if PENDING_TRIGGER_CLEANUP_DRY_RUN:
+            log.warning(
+                "[%s] PENDING_TRIGGER_ORPHAN_DRY_RUN | %s | %s | age=%.0fs "
+                "| watcher_owner_state=%s | ownership_check_available=%s "
+                "| ownership_check_error=%s | cleanup_action=%s "
+                "| cleanup_method=dry_run | cleanup_success=%s | reason=%s",
+                self.client_id,
+                contract,
+                local_id,
+                age_secs,
+                _owner_state_repr,
+                _ownership_check_available,
+                _ownership_error_repr,
+                "dry_run_only",
+                False,
+                reason,
+            )
+            return
+
+        cleanup_method = "expire_pending_entry"
+        cleanup_action = "expire_pending_entry"
+        cleanup_success = False
+
+        if hasattr(self.osm, "expire_pending_entry"):
+            try:
+                cleanup_success = bool(
+                    self.osm.expire_pending_entry(local_id, reason=reason)
+                )
+            except Exception as exc:
+                log.error(
+                    "[%s] PENDING_TRIGGER expire_pending_entry failed | %s | %s | error=%s",
+                    self.client_id,
+                    contract,
+                    local_id,
+                    exc,
+                )
+                cleanup_success = False
+
+        if not cleanup_success and hasattr(self.osm, "transition"):
+            cleanup_method = "transition:EXPIRED"
+            cleanup_action = "transition_expired"
+            try:
+                cleanup_success = bool(
+                    self.osm.transition(local_id, "EXPIRED", last_error=reason)
+                )
+            except Exception as exc:
+                log.error(
+                    "[%s] PENDING_TRIGGER transition(EXPIRED) failed | %s | %s | error=%s",
+                    self.client_id,
+                    contract,
+                    local_id,
+                    exc,
+                )
+                cleanup_success = False
+
+        getattr(log, "info" if cleanup_success else "error")(
+            "[%s] PENDING_TRIGGER_ORPHAN_EXPIRED | %s | %s | age=%.0fs "
+            "| watcher_owner_state=%s | ownership_check_available=%s "
+            "| ownership_check_error=%s | cleanup_action=%s "
+            "| cleanup_method=%s | cleanup_success=%s | reason=%s",
+            self.client_id,
+            contract,
+            local_id,
+            age_secs,
+            _owner_state_repr,
+            _ownership_check_available,
+            _ownership_error_repr,
+            cleanup_action,
+            cleanup_method,
+            cleanup_success,
+            reason,
+        )
+
+    def _log_pending_trigger_watchdog_seen(
+        self,
+        *,
+        level: str,
+        contract: str,
+        local_id: str,
+        age_secs: float,
+        broker_order_id: str,
+        submitted_ts_repr: str,
+        watcher_owner_state: str,
+        ownership_check_available: bool,
+        ownership_check_error: str,
+        cleanup_action: str,
+    ) -> None:
+        getattr(log, level)(
+            "[%s] PENDING_TRIGGER_WATCHDOG_SEEN | %s | %s | age=%.0fs "
+            "| broker_order_id=%s | submitted_ts=%s | watcher_owner_state=%s "
+            "| ownership_check_available=%s | ownership_check_error=%s "
+            "| cleanup_enabled=%s | dry_run=%s | cleanup_action=%s",
+            self.client_id,
+            contract,
+            local_id,
+            age_secs,
+            broker_order_id,
+            submitted_ts_repr,
+            watcher_owner_state,
+            ownership_check_available,
+            ownership_check_error,
+            PENDING_TRIGGER_CLEANUP_ENABLED,
+            PENDING_TRIGGER_CLEANUP_DRY_RUN,
+            cleanup_action,
+        )
+
+    def _pending_trigger_watcher_owner_state(
+        self,
+        local_order_id: str,
+    ) -> tuple[Optional[bool], bool, Optional[str]]:
+        watcher = getattr(self, "entry_watcher", None)
+        if watcher is None:
+            return None, False, "entry_watcher_missing"
+
+        has_order = getattr(watcher, "has_order", None)
+        if not callable(has_order):
+            return None, False, "has_order_unavailable"
+
+        try:
+            return bool(has_order(local_order_id)), True, None
+        except Exception as exc:
+            return None, True, f"{type(exc).__name__}: {exc}"
 
     def _check_exit_orders(self):
         orders = self._get_active_exit_orders()
@@ -2127,7 +2402,7 @@ class APOrderMonitor:
                     FROM orders
                     WHERE client_id=%s
                       AND kind='ENTRY'
-                      AND status IN ('CREATED','SUBMITTED','ACKNOWLEDGED','PARTIAL_FILL')
+                      AND status IN ('CREATED','PENDING_TRIGGER','SUBMITTED','ACKNOWLEDGED','PARTIAL_FILL')
                     ORDER BY created_ts ASC
                     """,
                     (self.client_id,),
