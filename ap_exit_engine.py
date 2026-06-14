@@ -3294,9 +3294,16 @@ class APExitEngine:
         _empty = {"bid": 0.0, "ask": 0.0, "mid": 0.0, "last": 0.0}
         try:
             import requests as _req
-            base = getattr(self.broker, "base_url", None)
-            token = (getattr(self.broker, "access_token", None)
-                     or getattr(self.broker, "_access_token", None))
+            _cfg = getattr(self.broker, "cfg", None)
+            base = (
+                getattr(self.broker, "base_url", None)
+                or getattr(_cfg, "base_url", None)
+            )
+            token = (
+                getattr(self.broker, "access_token", None)
+                or getattr(self.broker, "_access_token", None)
+                or getattr(_cfg, "access_token", None)
+            )
             if not base:
                 log.warning(
                     "[exit_eng] BROKER_QUOTE_BASE_URL_MISSING client=%s sym=%s "

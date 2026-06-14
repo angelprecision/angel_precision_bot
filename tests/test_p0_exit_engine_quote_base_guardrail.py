@@ -27,10 +27,12 @@ class _Engine:
 
 
 class _Broker:
-    def __init__(self, *, base_url=None, access_token=None, shadow_token=None):
+    def __init__(self, *, base_url=None, access_token=None, shadow_token=None, use_cfg=False):
         self.base_url = base_url
         self.access_token = access_token
         self._access_token = shadow_token
+        if use_cfg:
+            self.cfg = type("Cfg", (), {"base_url": base_url, "access_token": access_token})()
 
 
 def test_source_does_not_hardcode_live_fallback():
@@ -101,6 +103,33 @@ def test_valid_broker_uses_own_base_url(monkeypatch):
     assert out["bid"] == 1.0
     assert out["ask"] == 1.2
     assert out["mid"] == 1.1
+
+
+def test_cfg_fallback_matches_real_tradier_broker_shape(monkeypatch):
+    fn = _extract_fetch_broker_quote()
+    seen = {}
+
+    class _Resp:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {"quotes": {"quote": {"bid": 2.0, "ask": 2.4, "mark": 2.2, "last": 2.2}}}
+
+    def _fake_get(url, **kwargs):
+        seen["url"] = url
+        seen["kwargs"] = kwargs
+        return _Resp()
+
+    import requests
+    monkeypatch.setattr(requests, "get", _fake_get)
+
+    eng = _Engine(_Broker(base_url="https://api.tradier.com", access_token="tok", use_cfg=True))
+    eng.broker.base_url = None
+    eng.broker.access_token = None
+    out = fn(eng, "SPY260620C00500000")
+    assert seen["url"] == "https://api.tradier.com/v1/markets/quotes"
+    assert out["bid"] == 2.0
 
 
 def test_network_error_is_non_fatal(monkeypatch):
