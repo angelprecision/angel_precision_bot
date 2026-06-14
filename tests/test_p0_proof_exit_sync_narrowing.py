@@ -28,7 +28,7 @@ def test_fallback_updates_single_row_via_subquery():
 
 def test_fallback_only_targets_unresolved_orphans():
     body = _sync_exit_price_body()
-    assert "position_id IS NULL" in body
+    assert "(position_id IS NULL OR position_id = '')" in body
     assert "exit_option_price IS NULL" in body
 
 
@@ -40,3 +40,10 @@ def test_legacy_loss_filter_removed():
 def test_warning_message_describes_primary_and_fallback_paths():
     body = _sync_exit_price_body()
     assert "primary by position_id=%s and narrowed fallback both empty" in body
+
+
+def test_rowcount_uses_execute_result_when_available():
+    body = _sync_exit_price_body()
+    assert 'primary_rowcount = getattr(cur, "rowcount", getattr(c, "rowcount", 0))' in body
+    assert 'return getattr(cur2, "rowcount", getattr(c, "rowcount", 0))' in body
+    assert "return primary_rowcount" in body
