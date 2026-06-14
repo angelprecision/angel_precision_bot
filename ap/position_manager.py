@@ -1227,16 +1227,17 @@ class APPositionManager:
                     return False, "position_not_found"
 
                 current_status = str(pos.get("status") or "").upper()
-                if PositionStatus.is_terminal(current_status):
-                    return True, f"already_terminal:{current_status}"
-
                 has = self._has_position_column
-                sets, vals = ["status=%s", "updated_at=NOW()"], [PositionStatus.EXPIRED]
+                sets, vals = ["updated_at=NOW()"], []
 
                 def _add(col, val):
                     if has(col):
                         sets.append(f"{col}=%s")
                         vals.append(val)
+
+                if not PositionStatus.is_terminal(current_status):
+                    sets.insert(0, "status=%s")
+                    vals.insert(0, PositionStatus.EXPIRED)
 
                 _add("quantity_remaining", 0)
                 _add("exit_ts", ts)
@@ -1251,7 +1252,12 @@ class APPositionManager:
                     "WHERE id=%s AND client_id=%s",
                     tuple(vals),
                 )
-                return True, "expired"
+                detail = (
+                    "expired"
+                    if not PositionStatus.is_terminal(current_status)
+                    else f"already_terminal_repaired_remaining:{current_status}"
+                )
+                return True, detail
 
         ok, detail = run_with_retry(_fn)
         if ok:

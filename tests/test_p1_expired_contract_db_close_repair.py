@@ -23,6 +23,16 @@ def test_close_expired_position_marks_terminal_without_fake_fill():
     assert "filled_qty =" not in stripped
 
 
+def test_close_expired_position_repairs_terminal_stale_quantity():
+    start = PM_SRC.find("def close_expired_position(")
+    end = PM_SRC.find("\n    def ", start + 1)
+    body = PM_SRC[start:end]
+    assert "already_terminal_repaired_remaining:" in body
+    assert 'if not PositionStatus.is_terminal(current_status):' in body
+    assert '_add("quantity_remaining", 0)' in body
+    assert 'return True, f"already_terminal:{current_status}"' not in body
+
+
 def test_exit_engine_calls_db_repair_after_local_cleanup():
     idx = EE_SRC.find("def _check_all_positions(")
     end = EE_SRC.find("\n    def ", idx + 1)
