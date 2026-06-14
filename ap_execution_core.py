@@ -32,6 +32,7 @@ from ap_tier_engine          import APShadowTracker
 from ap_proof_logger         import APProofLogger, funnel
 from ap_signal_store         import APSignalStore
 from ap_signal_tracker       import APSignalTracker
+from ap.trade_flow_proof     import emit_trade_flow_proof
 
 # Intelligence outcome feedback — optional, fails silently if bridge not deployed
 try:
@@ -619,6 +620,16 @@ class APExecutionCore:
             ticker,
             trigger_price_for_log,
         )
+        emit_trade_flow_proof(
+            "breach_trigger",
+            client_id=self.email,
+            signal_id=signal_id,
+            ticker=ticker,
+            status="confirmed",
+            local_order_id=sig.get("local_order_id"),
+            trigger_price=trigger_price_for_log,
+            execution_mode="PAPER" if self.paper else "LIVE",
+        )
 
         if signal_id:
             self.store.update_status(signal_id, "triggered", timestamp_flag="triggered_at")
@@ -626,12 +637,31 @@ class APExecutionCore:
 
         # 1) Revalidate only. Never re-run selection/sizing logic here.
         if not self._breach_risk_check(watched):
+            emit_trade_flow_proof(
+                "breach_risk_check",
+                client_id=self.email,
+                signal_id=signal_id,
+                ticker=ticker,
+                status="blocked",
+                reason="breach_risk_check_failed",
+                local_order_id=sig.get("local_order_id"),
+                execution_mode="PAPER" if self.paper else "LIVE",
+            )
             funnel.inc("master_control_blocked")
             return
 
         # 2) Require OSM + existing queue-created local order id.
         if self.order_state_machine is None:
             log.critical("[%s] PRODUCTION_ENTRY_BLOCK — order_state_machine missing at breach", ticker)
+            emit_trade_flow_proof(
+                "breach_submit_precheck",
+                client_id=self.email,
+                signal_id=signal_id,
+                ticker=ticker,
+                status="blocked",
+                reason="order_state_machine_missing_at_breach",
+                execution_mode="PAPER" if self.paper else "LIVE",
+            )
             funnel.inc("order_failed")
             if signal_id:
                 self.store.update_signal_fields(signal_id, {
@@ -643,6 +673,15 @@ class APExecutionCore:
         queue_local_order_id = str(sig.get("local_order_id") or "").strip()
         if not queue_local_order_id:
             log.critical("[%s] PRODUCTION_ENTRY_BLOCK — local_order_id missing from watcher signal", ticker)
+            emit_trade_flow_proof(
+                "breach_submit_precheck",
+                client_id=self.email,
+                signal_id=signal_id,
+                ticker=ticker,
+                status="blocked",
+                reason="local_order_id_missing_at_breach",
+                execution_mode="PAPER" if self.paper else "LIVE",
+            )
             funnel.inc("order_failed")
             if signal_id:
                 self.store.update_signal_fields(signal_id, {
@@ -653,6 +692,16 @@ class APExecutionCore:
 
         if not hasattr(self.order_state_machine, "submit_existing_entry"):
             log.critical("[%s] PRODUCTION_ENTRY_BLOCK — OSM missing submit_existing_entry", ticker)
+            emit_trade_flow_proof(
+                "breach_submit_precheck",
+                client_id=self.email,
+                signal_id=signal_id,
+                ticker=ticker,
+                status="blocked",
+                reason="osm_missing_submit_existing_entry",
+                local_order_id=queue_local_order_id,
+                execution_mode="PAPER" if self.paper else "LIVE",
+            )
             funnel.inc("order_failed")
             if signal_id:
                 self.store.update_signal_fields(signal_id, {
@@ -665,6 +714,16 @@ class APExecutionCore:
         approved_plan = self._recover_plan_for_revalidation(watched)
         if approved_plan is None:
             log.critical("[%s] PRODUCTION_ENTRY_BLOCK — approved plan missing after breach revalidation", ticker)
+            emit_trade_flow_proof(
+                "breach_submit_precheck",
+                client_id=self.email,
+                signal_id=signal_id,
+                ticker=ticker,
+                status="blocked",
+                reason="approved_plan_missing_after_revalidation",
+                local_order_id=queue_local_order_id,
+                execution_mode="PAPER" if self.paper else "LIVE",
+            )
             funnel.inc("order_failed")
             if signal_id:
                 self.store.update_signal_fields(signal_id, {
@@ -695,6 +754,16 @@ class APExecutionCore:
                     "contract_selector wired into execution core",
                     ticker,
                 )
+                emit_trade_flow_proof(
+                    "breach_contract_selection",
+                    client_id=self.email,
+                    signal_id=signal_id,
+                    ticker=ticker,
+                    status="blocked",
+                    reason="contract_deferred_no_selector",
+                    local_order_id=queue_local_order_id,
+                    execution_mode="PAPER" if self.paper else "LIVE",
+                )
                 funnel.inc("order_failed")
                 if signal_id:
                     self.store.update_signal_fields(signal_id, {
@@ -718,6 +787,16 @@ class APExecutionCore:
                         "returned no contract",
                         ticker,
                     )
+                    emit_trade_flow_proof(
+                        "breach_contract_selection",
+                        client_id=self.email,
+                        signal_id=signal_id,
+                        ticker=ticker,
+                        status="blocked",
+                        reason="breach_time_contract_selection_no_result",
+                        local_order_id=queue_local_order_id,
+                        execution_mode="PAPER" if self.paper else "LIVE",
+                    )
                     funnel.inc("order_failed")
                     if signal_id:
                         self.store.update_signal_fields(signal_id, {
@@ -729,6 +808,17 @@ class APExecutionCore:
                     log.critical(
                         "[%s] PRODUCTION_ENTRY_BLOCK — contract selector left placeholder unresolved: %s",
                         ticker, _live_contract,
+                    )
+                    emit_trade_flow_proof(
+                        "breach_contract_selection",
+                        client_id=self.email,
+                        signal_id=signal_id,
+                        ticker=ticker,
+                        status="blocked",
+                        reason=f"deferred_unresolved_at_breach:{_live_contract}",
+                        local_order_id=queue_local_order_id,
+                        execution_mode="PAPER" if self.paper else "LIVE",
+                        contract_symbol=_live_contract,
                     )
                     funnel.inc("order_failed")
                     if signal_id:
@@ -743,6 +833,18 @@ class APExecutionCore:
                     float(getattr(approved_plan, "limit_price", 0) or 0),
                     int(getattr(approved_plan, "contracts", 1) or 1),
                 )
+                emit_trade_flow_proof(
+                    "breach_contract_selection",
+                    client_id=self.email,
+                    signal_id=signal_id,
+                    ticker=ticker,
+                    status="selected",
+                    local_order_id=queue_local_order_id,
+                    execution_mode="PAPER" if self.paper else "LIVE",
+                    contract_symbol=_live_contract,
+                    limit_price=getattr(approved_plan, "limit_price", None),
+                    contracts=getattr(approved_plan, "contracts", None),
+                )
                 # Item 3 — capture the selector candidate audit (EVIDENCE ONLY).
                 # Persisted into orders.meta after a successful submit below.
                 try:
@@ -754,6 +856,16 @@ class APExecutionCore:
                     "[%s] PRODUCTION_ENTRY_BLOCK — breach-time contract selection "
                     "error: %s",
                     ticker, _cs_err,
+                )
+                emit_trade_flow_proof(
+                    "breach_contract_selection",
+                    client_id=self.email,
+                    signal_id=signal_id,
+                    ticker=ticker,
+                    status="error",
+                    reason=f"breach_time_contract_selection_error:{_cs_err}",
+                    local_order_id=queue_local_order_id,
+                    execution_mode="PAPER" if self.paper else "LIVE",
                 )
                 funnel.inc("order_failed")
                 if signal_id:
@@ -848,6 +960,19 @@ class APExecutionCore:
                 "contract=%s reason=%s refresh_ok=%s submit_ask=%s | blocking submit",
                 ticker, approved_contract, _refresh_reason, _refresh_ok, _submit_ask,
             )
+            emit_trade_flow_proof(
+                "breach_pricing",
+                client_id=self.email,
+                signal_id=signal_id,
+                ticker=ticker,
+                status="blocked",
+                reason=f"breach_quote_refresh_failed:{_refresh_reason}",
+                local_order_id=queue_local_order_id,
+                execution_mode="PAPER" if self.paper else "LIVE",
+                contract_symbol=approved_contract,
+                quote_age_ms=_quote_age_ms,
+                refresh_ok=_refresh_ok,
+            )
             funnel.inc("order_failed")
             if signal_id:
                 self.store.update_signal_fields(signal_id, {
@@ -865,6 +990,20 @@ class APExecutionCore:
                 "[%s] ENTRY_PRICING_BLOCK — spread too wide at breach "
                 "contract=%s spread_pct=%.3f max=%.3f | blocking submit",
                 ticker, approved_contract, _spread_pct, _max_spread,
+            )
+            emit_trade_flow_proof(
+                "breach_pricing",
+                client_id=self.email,
+                signal_id=signal_id,
+                ticker=ticker,
+                status="blocked",
+                reason=f"breach_spread_too_wide:{_spread_pct:.3f}",
+                local_order_id=queue_local_order_id,
+                execution_mode="PAPER" if self.paper else "LIVE",
+                contract_symbol=approved_contract,
+                spread_pct=_spread_pct,
+                max_spread=_max_spread,
+                quote_age_ms=_quote_age_ms,
             )
             funnel.inc("order_failed")
             if signal_id:
@@ -884,6 +1023,22 @@ class APExecutionCore:
                 "contract=%s plan_limit=%.2f submit_ask=%.2f drift=%.1f%% max=%.1f%% | blocking",
                 ticker, approved_contract, _plan_limit, _submit_ask,
                 _drift_pct * 100, ENTRY_MAX_PRICE_DRIFT_PCT_FROM_PLAN * 100,
+            )
+            emit_trade_flow_proof(
+                "breach_pricing",
+                client_id=self.email,
+                signal_id=signal_id,
+                ticker=ticker,
+                status="blocked",
+                reason="breach_entry_price_drift_too_high",
+                local_order_id=queue_local_order_id,
+                execution_mode="PAPER" if self.paper else "LIVE",
+                contract_symbol=approved_contract,
+                plan_limit=_plan_limit,
+                submit_ask=_submit_ask,
+                drift_pct=_drift_pct,
+                max_drift_pct=ENTRY_MAX_PRICE_DRIFT_PCT_FROM_PLAN,
+                quote_age_ms=_quote_age_ms,
             )
             funnel.inc("order_failed")
             if signal_id:
@@ -1154,6 +1309,22 @@ class APExecutionCore:
         if submit_res.get("ok"):
             local_order_id = submit_res.get("local_order_id")
             broker_order_id = submit_res.get("broker_order_id")
+            emit_trade_flow_proof(
+                "broker_submit",
+                client_id=self.email,
+                signal_id=signal_id,
+                ticker=ticker,
+                status="submitted",
+                local_order_id=local_order_id,
+                broker_order_id=broker_order_id,
+                execution_mode="PAPER" if self.paper else "LIVE",
+                route="breach",
+                contract_symbol=approved_contract,
+                quantity=approved_qty,
+                limit_price=submit_limit,
+                quote_age_ms=_quote_age_ms,
+                split_brain=submit_res.get("split_brain"),
+            )
             # P0: persist entry pricing audit into orders.meta (best-effort).
             if local_order_id and hasattr(self.order_state_machine, "update_order_meta"):
                 try:
@@ -1216,6 +1387,23 @@ class APExecutionCore:
             ticker,
             submit_res.get("local_order_id") or queue_local_order_id,
             submit_res.get("error"),
+        )
+        emit_trade_flow_proof(
+            "broker_submit",
+            client_id=self.email,
+            signal_id=signal_id,
+            ticker=ticker,
+            status="error",
+            reason=submit_res.get("error"),
+            local_order_id=submit_res.get("local_order_id") or queue_local_order_id,
+            broker_order_id=submit_res.get("broker_order_id"),
+            execution_mode="PAPER" if self.paper else "LIVE",
+            route="breach",
+            contract_symbol=approved_contract,
+            quantity=approved_qty,
+            limit_price=submit_limit,
+            quote_age_ms=_quote_age_ms,
+            split_brain=submit_res.get("split_brain"),
         )
         funnel.inc("order_failed")
         if signal_id:
@@ -2071,4 +2259,3 @@ class APExecutionCore:
     # =========================================================================
     # POSITION SIZING — AGGRESSIVE RISK CURVE
     # =========================================================================
-
