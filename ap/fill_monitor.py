@@ -1550,8 +1550,8 @@ def _sync_exit_price(order: dict, result: dict):
                         f"UPDATE proof_trades SET {set_clause} WHERE position_id = %s",
                         params,
                     )
-                    # Fallback: match by ticker + client + recent close time
-                    # This catches manually-seeded positions where position_id is not in proof_trades
+                    # Fallback: repair ONE unresolved orphan row only.
+                    # Primary position_id match remains the source of truth.
                     if getattr(c, "rowcount", 0) == 0 and client_id and ticker:
                         params2 = [exit_px]
                         set2 = "exit_option_price = %s"
@@ -1561,10 +1561,16 @@ def _sync_exit_price(order: dict, result: dict):
                         params2 += [client_id, ticker]
                         c.execute(
                             f"UPDATE proof_trades SET {set2} "
-                            "WHERE client_email = %s "
-                            "AND ticker = %s "
-                            "AND closed_at >= NOW() - INTERVAL '60 minutes' "
-                            "AND win = FALSE",  # only correct records that show as losses
+                            "WHERE id = ("
+                            "  SELECT id FROM proof_trades "
+                            "  WHERE client_email = %s "
+                            "    AND ticker = %s "
+                            "    AND closed_at >= NOW() - INTERVAL '60 minutes' "
+                            "    AND position_id IS NULL "
+                            "    AND exit_option_price IS NULL "
+                            "  ORDER BY closed_at DESC "
+                            "  LIMIT 1"
+                            ")",
                             params2,
                         )
                     return getattr(c, "rowcount", 0)
@@ -1577,7 +1583,12 @@ def _sync_exit_price(order: dict, result: dict):
                     win,
                 )
             else:
-                log.warning("[%s] EXIT PRICE SYNC: proof_trades row not found for pos_id=%s", client_id, pos_id)
+                log.warning(
+                    "[%s] EXIT PRICE SYNC: no eligible row found "
+                    "(primary by position_id=%s and narrowed fallback both empty)",
+                    client_id,
+                    pos_id,
+                )
         except Exception as db_exc:
             log.debug("[%s] proof_trades exit sync DB error (non-critical): %s", client_id, db_exc)
 
