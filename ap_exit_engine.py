@@ -1228,6 +1228,7 @@ class APExitEngine:
         self.broker        = broker
         self._quote_broker = data_broker or broker
         self._email        = email
+        self._position_manager = None
         # PR-B / FIX-4: master_control is now accepted at construction
         # time so the post-assignment window (where exit_eng existed but
         # had no master_control reference) is closed. The execution core
@@ -2974,6 +2975,7 @@ class APExitEngine:
 
     def seed_from_db(self, position_manager):
         """Re-hydrate in-memory positions from DB on startup."""
+        self._position_manager = position_manager
         try:
             rows = position_manager.get_active_positions()
             if not rows:
@@ -3700,7 +3702,11 @@ class APExitEngine:
                 log.info("[exit_eng] Removed %d expired contract(s) from engine", len(to_remove))
 
         if expired_for_db_cleanup:
-            _pm = getattr(self, "position_manager", None) or getattr(getattr(self, "master_control", None), "pm", None)
+            _pm = (
+                getattr(self, "_position_manager", None)
+                or getattr(self, "position_manager", None)
+                or getattr(getattr(self, "master_control", None), "pm", None)
+            )
             if _pm is None:
                 log.warning(
                     "[exit_eng] EXPIRED_CONTRACT_DB_REPAIR_SKIPPED client=%s count=%d reason=no_position_manager",
