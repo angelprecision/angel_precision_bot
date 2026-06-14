@@ -3662,6 +3662,7 @@ class APExitEngine:
         # Previously this block iterated and reassigned self._positions without
         # the lock — a concurrent add_position or fill callback could corrupt
         # the list or silently drop a newly added position.
+        expired_for_db_cleanup = []
         with self._lock:
             to_remove = []
             for pos in self._positions:
@@ -3686,6 +3687,7 @@ class APExitEngine:
                         )
                         pos.closed       = True
                         pos.close_reason = "expired_contract_local_cleanup"
+                        expired_for_db_cleanup.append((str(getattr(pos, "position_id", "") or ""), sym))
                         to_remove.append(pos)
                 except Exception as _exp_err:
                     log.debug("[exit_eng] Expired-contract cleanup check failed for %s: %s", sym, _exp_err)
@@ -3696,6 +3698,35 @@ class APExitEngine:
                 for _ep in to_remove:
                     self._positions_by_id.pop(_ep.position_id, None)
                 log.info("[exit_eng] Removed %d expired contract(s) from engine", len(to_remove))
+
+        if expired_for_db_cleanup:
+            _pm = getattr(self, "position_manager", None) or getattr(getattr(self, "master_control", None), "pm", None)
+            if _pm is None:
+                log.warning(
+                    "[exit_eng] EXPIRED_CONTRACT_DB_REPAIR_SKIPPED client=%s count=%d reason=no_position_manager",
+                    self._email or "default",
+                    len(expired_for_db_cleanup),
+                )
+            else:
+                for _pos_id, _sym in expired_for_db_cleanup:
+                    if not _pos_id:
+                        continue
+                    try:
+                        _pm.close_expired_position(
+                            position_id=_pos_id,
+                            reason="expired_contract_local_cleanup",
+                            exit_reason="expired_contract",
+                            close_source="expired_contract_cleanup",
+                            close_confidence="SYSTEM",
+                        )
+                    except Exception as _db_exp_exc:
+                        log.warning(
+                            "[exit_eng] EXPIRED_CONTRACT_DB_REPAIR_FAILED client=%s pos=%s sym=%s err=%s",
+                            self._email or "default",
+                            _pos_id,
+                            _sym,
+                            _db_exp_exc,
+                        )
 
         try:
             self._run_sentinels()
