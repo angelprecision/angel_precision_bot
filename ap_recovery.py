@@ -650,11 +650,7 @@ class APStartupRecovery:
                                AND o.signal_id = trade_queue.signal_id
                                AND o.kind = 'ENTRY'
                                AND o.status = 'PENDING_TRIGGER'
-                               AND (
-                                     o.broker_order_id IS NULL
-                                  OR TRIM(COALESCE(o.broker_order_id, '')) = ''
-                                  OR UPPER(TRIM(COALESCE(o.broker_order_id, ''))) IN ('N/A', 'NA', 'NONE', 'NULL')
-                               )
+                               AND o.broker_order_id IS NULL
                                AND o.submitted_ts IS NULL
                                AND o.filled_ts IS NULL
                            )
@@ -686,11 +682,7 @@ class APStartupRecovery:
                       AND kind = 'ENTRY'
                       AND status = 'PENDING_TRIGGER'
                       AND created_ts >= %s
-                      AND (
-                            broker_order_id IS NULL
-                         OR TRIM(COALESCE(broker_order_id, '')) = ''
-                         OR UPPER(TRIM(COALESCE(broker_order_id, ''))) IN ('N/A', 'NA', 'NONE', 'NULL')
-                      )
+                      AND broker_order_id IS NULL
                       AND submitted_ts IS NULL
                       AND filled_ts IS NULL
                     ORDER BY created_ts ASC
