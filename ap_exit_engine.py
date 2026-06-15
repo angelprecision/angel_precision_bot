@@ -3286,14 +3286,40 @@ class APExitEngine:
         Fetch live bid/ask/mark for an option symbol from Tradier quotes API.
         Returns dict with keys: bid, ask, mid, last. All default 0.0 on failure.
         Never raises — exits must not crash on a missing quote.
+
+        Money-safety invariant: never guess a broker host. If the broker
+        instance cannot prove its quote base URL or token, fail closed and
+        return an empty quote instead of implicitly routing to live Tradier.
         """
         _empty = {"bid": 0.0, "ask": 0.0, "mid": 0.0, "last": 0.0}
         try:
             import requests as _req
-            base = getattr(self.broker, "base_url", None) or "https://api.tradier.com"
-            token = (getattr(self.broker, "access_token", None)
-                     or getattr(self.broker, "_access_token", None))
+            _cfg = getattr(self.broker, "cfg", None)
+            base = (
+                getattr(self.broker, "base_url", None)
+                or getattr(_cfg, "base_url", None)
+            )
+            token = (
+                getattr(self.broker, "access_token", None)
+                or getattr(self.broker, "_access_token", None)
+                or getattr(_cfg, "access_token", None)
+            )
+            if not base:
+                log.warning(
+                    "[exit_eng] BROKER_QUOTE_BASE_URL_MISSING client=%s sym=%s "
+                    "— refusing implicit live Tradier fallback; returning empty quote",
+                    getattr(self, "_email", "") or "unknown",
+                    sym,
+                )
+                return _empty
             if not token:
+                log.warning(
+                    "[exit_eng] BROKER_QUOTE_TOKEN_MISSING client=%s sym=%s base=%s "
+                    "— returning empty quote",
+                    getattr(self, "_email", "") or "unknown",
+                    sym,
+                    base,
+                )
                 return _empty
             resp = _req.get(
                 f"{base}/v1/markets/quotes",
