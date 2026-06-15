@@ -11,7 +11,7 @@ Verifies:
   5. Re-arm succeeds → order is NOT canceled
   6. Re-arm fails → order IS canceled with LOST_HANDOFF_90S
   7. Deferred contract preserves metadata.contract_deferred=True on re-arm
-  8. result_json.auto_rearm_attempted is persisted
+  8. meta.auto_rearm_attempted is persisted (orders.meta JSONB)
 
 These tests instantiate APOrderMonitor with mocked entry_watcher and DB so we
 exercise the real code paths added in this PR. They do NOT touch broker,
@@ -241,10 +241,10 @@ def test_ownership_probe_returns_false_when_watcher_does_not_own():
 
 
 # =============================================================================
-# Test 5: persist auto_rearm to orders.result_json
+# Test 5: persist auto_rearm to orders.meta (JSONB)
 # =============================================================================
 
-def test_record_lost_handoff_rearm_persists_to_db():
+def test_record_lost_handoff_rearm_persists_to_meta_jsonb():
     monitor, _ = _make_monitor()
 
     captured = {}
@@ -270,8 +270,11 @@ def test_record_lost_handoff_rearm_persists_to_db():
             reason="lost_handoff_recovery",
         )
 
-    # SQL should update orders.result_json with our payload
-    assert "result_json" in captured.get("sql", "")
+    # SQL must update orders.meta (JSONB), NOT result_json (column does not exist)
+    sql = captured.get("sql", "")
+    assert "SET meta" in sql, f"persistence must target orders.meta, got: {sql!r}"
+    assert "COALESCE(meta" in sql, "must use COALESCE(meta, ...) || payload merge"
+    assert "result_json" not in sql, "must NOT reference result_json — column does not exist"
     assert "abc-local" in captured.get("params", ())
     # Payload JSON should include auto_rearm_attempted
     import json as _json
