@@ -1193,6 +1193,90 @@ class APPositionManager:
         )
         return False
 
+    def close_expired_position(
+        self,
+        *,
+        position_id: str,
+        expired_ts: Optional[str] = None,
+        close_source: str = "expired_contract_cleanup",
+        close_confidence: str = "SYSTEM",
+        exit_reason: str = "expired_contract",
+        reason: str = "expired_contract_local_cleanup",
+    ) -> bool:
+        """
+        Terminal cleanup for a contract that has expired out of the market.
+
+        This is separate from close_position_from_exit_fill(): there is no
+        broker-confirmed fill price here, so we must not fabricate realized
+        P&L or proof-trade fill data just to make the row non-active.
+        """
+        if not position_id:
+            log.warning("[%s] close_expired_position blocked | missing position_id", self.client_id)
+            return False
+
+        ts = expired_ts or now_utc_iso()
+
+        def _fn():
+            with conn() as c:
+                c.execute(
+                    "SELECT * FROM positions WHERE id=%s AND client_id=%s FOR UPDATE",
+                    (position_id, self.client_id),
+                )
+                pos = c.fetchone()
+                if not pos:
+                    return False, "position_not_found"
+
+                current_status = str(pos.get("status") or "").upper()
+                has = self._has_position_column
+                sets, vals = ["updated_at=NOW()"], []
+
+                def _add(col, val):
+                    if has(col):
+                        sets.append(f"{col}=%s")
+                        vals.append(val)
+
+                if not PositionStatus.is_terminal(current_status):
+                    sets.insert(0, "status=%s")
+                    vals.insert(0, PositionStatus.EXPIRED)
+
+                _add("quantity_remaining", 0)
+                _add("exit_ts", ts)
+                _add("close_source", close_source)
+                _add("close_confidence", close_confidence)
+                _add("exit_reason", exit_reason)
+                _add("close_reason", reason)
+
+                vals.extend([position_id, self.client_id])
+                c.execute(
+                    f"UPDATE positions SET {', '.join(sets)} "
+                    "WHERE id=%s AND client_id=%s",
+                    tuple(vals),
+                )
+                detail = (
+                    "expired"
+                    if not PositionStatus.is_terminal(current_status)
+                    else f"already_terminal_repaired_remaining:{current_status}"
+                )
+                return True, detail
+
+        ok, detail = run_with_retry(_fn)
+        if ok:
+            log.info(
+                "[%s] POSITION EXPIRED | id=%s reason=%s detail=%s",
+                self.client_id,
+                position_id,
+                reason,
+                detail,
+            )
+        else:
+            log.warning(
+                "[%s] close_expired_position failed | pos=%s detail=%s",
+                self.client_id,
+                position_id,
+                detail,
+            )
+        return ok
+
     def mark_closing(self, position_id: str):
         current = self.get_position(position_id)
         if not current or PositionStatus.is_terminal(current.get("status", "")):
