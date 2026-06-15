@@ -1414,11 +1414,40 @@ def _dispatch(
                 pending_ok = False
 
             if not pending_ok:
+                _handoff_reason = "pending_trigger_transition_failed"
+                _cleanup_method = "not_attempted"
+                _cleanup_ok = False
+                try:
+                    _expire_fn = getattr(order_state_machine, "expire_pending_entry", None)
+                    if callable(_expire_fn):
+                        _cleanup_method = "expire_pending_entry"
+                        _cleanup_ok = bool(_expire_fn(local_order_id, reason=_handoff_reason))
+
+                    if not _cleanup_ok:
+                        _cancel_fn = getattr(order_state_machine, "cancel_pending_entry", None)
+                        if callable(_cancel_fn):
+                            _cleanup_method = "cancel_pending_entry"
+                            _cleanup_ok = bool(_cancel_fn(local_order_id, reason=_handoff_reason))
+
+                    if not _cleanup_ok:
+                        _cleanup_method = "transition_ERROR"
+                        _cleanup_ok = bool(
+                            order_state_machine.transition(
+                                local_order_id, "ERROR", last_error=_handoff_reason,
+                            )
+                        )
+                except Exception as _cleanup_exc:
+                    log.error(
+                        "[%s] WATCH_ARM_ABORTED cleanup failed | local=%s method=%s error=%s",
+                        ticker, local_order_id, _cleanup_method, _cleanup_exc, exc_info=True,
+                    )
+
                 log.critical(
-                    "[%s] WATCH_ARM_ABORTED — could not mark order PENDING_TRIGGER | local=%s",
-                    ticker, local_order_id,
+                    "[%s] WATCH_ARM_ABORTED_PENDING_TRIGGER_TRANSITION_FAILED | local=%s "
+                    "| cleanup_method=%s cleanup_ok=%s",
+                    ticker, local_order_id, _cleanup_method, _cleanup_ok,
                 )
-                _mark_job(job_id, "ERROR", error="pending_trigger_transition_failed")
+                _mark_job(job_id, "ERROR", error=_handoff_reason)
                 return
 
             # Register with watcher — no broker submit yet. The watcher returns
