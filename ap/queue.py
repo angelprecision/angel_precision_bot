@@ -221,6 +221,21 @@ _TERMINAL_QUEUE_STATUSES = {
     "DONE",
 }
 
+_MANUAL_RESTART_GUARD_BYPASS_ERRORS = frozenset({
+    "manual_requeue_after_overnight_reeval_timeout",
+    "manual_rescue_current_session",
+})
+
+
+def _manual_restart_guard_bypass_enabled(
+    *,
+    job_last_error: str | None = None,
+    job_result: dict | None = None,
+) -> bool:
+    if isinstance(job_result, dict) and bool(job_result.get("manual_rescue")):
+        return True
+    return str(job_last_error or "").strip() in _MANUAL_RESTART_GUARD_BYPASS_ERRORS
+
 
 def _derive_last_error(result: dict | None) -> str | None:
     """
@@ -390,7 +405,7 @@ def _claim_one_job(client_id: str = "default") -> Optional[dict]:
                        started_ts = NOW()
                 FROM   next_job
                 WHERE  tq.id = next_job.id
-                RETURNING tq.id, tq.client_id, tq.signal_id, tq.payload
+                RETURNING tq.id, tq.client_id, tq.signal_id, tq.payload, tq.last_error, tq.result_json
                 """,
                 (client_id,),
             )
@@ -536,6 +551,8 @@ def _dispatch(
     signal_id: str,
     payload: dict,
     *,
+    job_last_error: str | None = None,
+    job_result: dict | None = None,
     master_control,
     contract_selector,
     order_state_machine,
@@ -578,7 +595,12 @@ def _dispatch(
     # Pre-market restarts are allowed through for morning revalidation.
     try:
         from ap.restart_guard import should_skip_on_restart
-        if should_skip_on_restart(payload):
+        _restart_skip = bool(should_skip_on_restart(payload))
+        _manual_rescue_bypass = _manual_restart_guard_bypass_enabled(
+            job_last_error=job_last_error,
+            job_result=job_result,
+        )
+        if _restart_skip and not _manual_rescue_bypass:
             log.warning("[%s] RESTART GUARD — overnight signal blocked", ticker)
             _mark_job(job_id, "REJECTED", error="restart_guard:overnight_skip")
             try:
@@ -594,6 +616,14 @@ def _dispatch(
             except Exception:
                 pass
             return
+        if _restart_skip and _manual_rescue_bypass:
+            log.warning(
+                "[%s] RESTART GUARD BYPASS — continuing manual rescue row | signal_id=%s job_id=%s last_error=%s",
+                ticker,
+                signal_id,
+                job_id,
+                job_last_error,
+            )
     except ImportError:
         pass  # restart_guard not yet deployed — skip silently
 
@@ -1676,8 +1706,13 @@ def worker_loop(
                 continue
 
             if master_control is not None:
+                _job_result = None
+                if isinstance(job.get("result_json"), dict):
+                    _job_result = dict(job.get("result_json") or {})
                 _dispatch(
                     job_id, job_cid, signal_id, payload,
+                    job_last_error=job.get("last_error"),
+                    job_result=_job_result,
                     master_control=master_control,
                     contract_selector=contract_selector,
                     order_state_machine=order_state_machine,
