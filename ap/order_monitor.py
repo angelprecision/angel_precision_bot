@@ -1085,7 +1085,7 @@ class APOrderMonitor:
         succeeded: bool,
         reason: str,
     ) -> None:
-        """Persist auto-rearm attempt on the orders row's result_json so we
+        """Persist auto-rearm attempt on the orders row's meta (JSONB) so we
         never re-arm the same order twice across watchdog cycles."""
         if not local_order_id:
             return
