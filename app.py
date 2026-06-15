@@ -2836,6 +2836,83 @@ def create_app() -> Flask:
                 results[email] = {"ok": False, "error": str(e)}
         return jsonify({"ok": True, "results": results})
 
+    @app.post("/admin/operator/manual-rescue-restart-guard")
+    @_require_admin
+    def manual_rescue_restart_guard():
+        """
+        Requeue overnight-like rows for a same-session manual rescue.
+
+        Scope is intentionally narrow:
+          - current lookback window only
+          - status IN (NEW, REJECTED, ERROR)
+          - overnight-like payloads only
+          - existing markers only (restart_guard block / manual requeue / prior rescue)
+
+        This does NOT bypass any downstream entry validation. It only marks rows
+        so ap.queue can skip restart_guard:overnight_skip for the rescued pass.
+        """
+        body = request.get_json(silent=True) or {}
+        lookback_hours = int(body.get("hours") or 48)
+
+        try:
+            from ap.db import conn, run_with_retry
+
+            def _rescue():
+                with conn() as c:
+                    c.execute(
+                        """
+                        WITH rescued AS (
+                            UPDATE trade_queue
+                            SET    status = 'NEW',
+                                   started_ts = NULL,
+                                   finished_ts = NULL,
+                                   last_error = 'manual_rescue_current_session',
+                                   result_json = COALESCE(result_json, '{}'::jsonb) || jsonb_build_object(
+                                       'manual_rescue', true,
+                                       'manual_rescue_actor', 'operator_dashboard',
+                                       'manual_rescue_ts', NOW()::text,
+                                       'manual_rescue_previous_error', COALESCE(last_error, '')
+                                   )
+                            WHERE  status IN ('NEW', 'REJECTED', 'ERROR')
+                              AND  created_ts >= NOW() - (%s || ' hours')::interval
+                              AND (
+                                     COALESCE(payload->>'timeframe', '') IN ('1d', 'daily', 'overnight')
+                                  OR payload ? 'prior_day_high'
+                                  OR payload ? 'prior_day_low'
+                              )
+                              AND (
+                                     last_error IN (
+                                         'restart_guard:overnight_skip',
+                                         'manual_requeue_after_overnight_reeval_timeout',
+                                         'manual_rescue_current_session'
+                                     )
+                                  OR COALESCE(result_json->>'manual_rescue', 'false') = 'true'
+                              )
+                            RETURNING id, client_id, signal_id
+                        )
+                        SELECT COUNT(*)::int AS n FROM rescued
+                        """,
+                        (str(lookback_hours),),
+                    )
+                    row = c.fetchone() or {"n": 0}
+                    return int(row["n"] if isinstance(row, dict) else row[0])
+
+            rescued = run_with_retry(_rescue)
+            admin_log.warning(
+                "MANUAL_RESCUE_RESTART_GUARD rows=%s lookback_hours=%s ip=%s",
+                rescued,
+                lookback_hours,
+                _admin_client_ip(),
+            )
+            return jsonify({
+                "ok": True,
+                "rescued": int(rescued or 0),
+                "lookback_hours": lookback_hours,
+            })
+        except Exception as e:
+            admin_log.error("manual_rescue_restart_guard failed: %s", e, exc_info=True)
+            return jsonify({"ok": False, "error": str(e)}), 500
+
     @app.post("/admin/overnight_reeval")
     @require_hmac
     def admin_overnight_reeval():
