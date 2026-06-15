@@ -499,7 +499,22 @@ class APOrderMonitor:
                     _rearm_attempted = False
                     _rearm_succeeded = False
                     _rearm_reason = None
-                    _already_attempted = bool(order.get("result_json", {}).get("auto_rearm_attempted") if isinstance(order.get("result_json"), dict) else False)
+                    # Read prior re-arm attempts from orders.meta (JSONB).
+                    # meta may arrive as dict (psycopg2 JSONB) or str (raw JSON);
+                    # handle both shapes defensively.
+                    _meta_raw = order.get("meta")
+                    if isinstance(_meta_raw, dict):
+                        _already_attempted = bool(_meta_raw.get("auto_rearm_attempted"))
+                    elif isinstance(_meta_raw, str) and _meta_raw:
+                        try:
+                            import json as _json_check
+                            _already_attempted = bool(
+                                _json_check.loads(_meta_raw).get("auto_rearm_attempted")
+                            )
+                        except Exception:
+                            _already_attempted = False
+                    else:
+                        _already_attempted = False
                     if _already_attempted:
                         _rearm_reason = "already_attempted_in_prior_cycle"
                         log.info(
@@ -1070,7 +1085,7 @@ class APOrderMonitor:
         succeeded: bool,
         reason: str,
     ) -> None:
-        """Persist auto-rearm attempt on the orders row's result_json so we
+        """Persist auto-rearm attempt on the orders row's meta (JSONB) so we
         never re-arm the same order twice across watchdog cycles."""
         if not local_order_id:
             return
@@ -1087,9 +1102,9 @@ class APOrderMonitor:
                     c.execute(
                         """
                         UPDATE orders
-                        SET result_json = COALESCE(result_json, '{}'::jsonb)
+                        SET meta       = COALESCE(meta, '{}'::jsonb)
                                           || %s::jsonb,
-                            updated_ts  = NOW()
+                            updated_ts = NOW()
                         WHERE local_order_id = %s
                           AND client_id = %s
                         """,
