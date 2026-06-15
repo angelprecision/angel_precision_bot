@@ -946,6 +946,73 @@ def _dispatch(
             )
         trigger_type = "breach"
 
+    # ── PR #143: PAPER recovery-rescued immediate-entry promotion ─────────
+    # When recovery rescued a stale WATCHING signal back to NEW, the trigger
+    # event already happened (or the bot missed it). For PAPER mode we allow
+    # the signal to submit immediately after the normal quality gates pass:
+    #     - score floor (master_control already enforced above)
+    #     - contract selected (verified below before promotion)
+    #     - revalidation (master_control already enforced above)
+    #     - duplicate guard (master_control already enforced above)
+    #     - within entry cutoff (cutoff guard runs after this block, BEFORE
+    #       the OSM create — the cutoff still applies)
+    # LIVE rows are NEVER promoted — LIVE always waits for breach confirmation.
+    # Forced-breach signals are also never promoted — explicit operator override.
+    #
+    # The promotion only flips trigger_type. The existing immediate-execution
+    # branch at the bottom of _dispatch runs the actual submit, which goes
+    # through submit_existing_entry → OSM → broker_submit. No bypass of any
+    # quality gate, capital check, or compliance step.
+    if (
+        trigger_type == "breach"
+        and not forced_breach
+        and not live_mode
+        and bool(payload.get("recovery_rescue"))
+    ):
+        # PAPER recovery row — verify a real contract is selected before
+        # promotion. If selection deferred or produced a placeholder, fall
+        # through to the normal breach path so the watcher can re-select
+        # at breach time.
+        _rec_contract = str(getattr(plan, "contract_symbol", "") or "").strip()
+        _rec_contracts_qty = 0
+        try:
+            _rec_contracts_qty = int(getattr(plan, "contracts", 0) or 0)
+        except (TypeError, ValueError):
+            _rec_contracts_qty = 0
+        _rec_limit = 0.0
+        try:
+            _rec_limit = float(getattr(plan, "limit_price", 0) or 0)
+        except (TypeError, ValueError):
+            _rec_limit = 0.0
+        _rec_deferred = (
+            not _rec_contract
+            or _rec_contract.upper().startswith("DEFERRED:")
+        )
+        if _rec_deferred or _rec_contracts_qty <= 0 or _rec_limit <= 0:
+            log.info(
+                "[%s] PAPER_RECOVERY_IMMEDIATE_SKIP — contract not ready "
+                "(contract=%r contracts=%s limit=%s) — falling back to breach path",
+                ticker, _rec_contract, _rec_contracts_qty, _rec_limit,
+            )
+        else:
+            log.warning(
+                "[%s] PAPER_RECOVERY_IMMEDIATE_PROMOTE — paper recovery row "
+                "passes all gates with real contract (%s qty=%s limit=$%.2f); "
+                "promoting trigger_type breach→immediate (LIVE never promoted)",
+                ticker, _rec_contract, _rec_contracts_qty, _rec_limit,
+            )
+            trigger_type = "immediate"
+            # Persist the promotion decision on plan.metadata so the immediate
+            # submit path can reference it in any downstream audit.
+            try:
+                if hasattr(plan, "metadata") and isinstance(plan.metadata, dict):
+                    plan.metadata["paper_recovery_immediate"] = True
+                    plan.metadata["paper_recovery_immediate_reason"] = (
+                        "recovery_rescued_signal_paper_mode_all_gates_passed"
+                    )
+            except Exception:
+                pass
+
     if trigger_type == "breach" and not entry_watcher:
         log.critical("[%s] ENTRY WATCHER MISSING — cannot arm breach entry", ticker)
         _mark_job(job_id, "REJECTED", error="entry_watcher_missing")
