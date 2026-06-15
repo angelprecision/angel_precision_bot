@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import sys
 import types
 from unittest.mock import MagicMock
+
+import ap_execution_core as core_mod
+from ap_entry_watcher import WatchedSignal
 
 
 def _run_deferred_breach_branch(
@@ -126,3 +130,90 @@ def test_deferred_breach_selector_error_terminalizes_order_with_last_error():
     result["osm"].transition.assert_called_once()
     _, transition_kwargs = result["osm"].transition.call_args
     assert "breach_time_contract_selection_error:chain timeout" == transition_kwargs["last_error"]
+
+
+def test_trigger_ready_deferred_quote_refresh_failure_expires_order_with_last_error(monkeypatch):
+    plan = types.SimpleNamespace(
+        contract_symbol="DEFERRED:AVGO",
+        limit_price=3.10,
+        contracts=1,
+        max_position_usd=310.0,
+        metadata={"contract_deferred": True},
+        trigger_price=210.0,
+        side="CALL",
+    )
+    selected = types.SimpleNamespace(
+        contract_symbol="AVGO260619C00450000",
+        execution_price_per_share=3.25,
+        ask=3.25,
+        mid=3.20,
+        affordable_contracts=2,
+        premium_per_contract=325.0,
+    )
+
+    core = core_mod.APExecutionCore.__new__(core_mod.APExecutionCore)
+    core.paper = True
+    core.broker = types.SimpleNamespace(
+        cfg=types.SimpleNamespace(base_url="https://api.tradier.com")
+    )
+    core.store = MagicMock()
+    core.order_state_machine = MagicMock()
+    core.order_state_machine.expire_pending_entry.return_value = True
+    core.contract_selector = MagicMock()
+    core.contract_selector.select.return_value = selected
+    core._breach_risk_check = MagicMock(return_value=True)
+    core._recover_plan_for_revalidation = MagicMock(return_value=plan)
+    core._alert_degraded = MagicMock()
+    core._cleanup_pending_entry_order = types.MethodType(
+        core_mod.APExecutionCore._cleanup_pending_entry_order,
+        core,
+    )
+
+    fake_execution_mod = types.ModuleType("ap.execution")
+    fake_execution_mod._refresh_ask_at_submit = lambda broker, contract: (
+        0.0,
+        11,
+        False,
+        "no_quote",
+        {
+            "submit_bid": None,
+            "submit_ask": None,
+            "submit_last": None,
+            "submit_mid": None,
+            "spread_pct": None,
+        },
+    )
+    monkeypatch.setitem(sys.modules, "ap.execution", fake_execution_mod)
+
+    watched = WatchedSignal(
+        {
+            "ticker": "AVGO",
+            "side": "CALL",
+            "entry_price": 210.0,
+            "stop_price": 205.0,
+            "target_price": 220.0,
+            "signal_id": "sig-avgo-1",
+            "local_order_id": "local-avgo-1",
+            "client_id": "jasoncosby1@gmail.com",
+            "contract_deferred": True,
+            "score": 78,
+        },
+        overnight=True,
+    )
+    watched.trigger_price = 210.25
+
+    core_mod.APExecutionCore._on_entry_trigger(core, watched)
+
+    core.contract_selector.select.assert_called_once_with(plan)
+    core.order_state_machine.submit_existing_entry.assert_not_called()
+    core.order_state_machine.expire_pending_entry.assert_called_once_with(
+        "local-avgo-1",
+        reason="breach_quote_refresh_failed:no_quote",
+    )
+    core.store.update_signal_fields.assert_any_call(
+        "sig-avgo-1",
+        {
+            "decision_status": "blocked_at_breach",
+            "context_notes": "breach_quote_refresh_failed:no_quote",
+        },
+    )

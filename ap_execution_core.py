@@ -653,12 +653,40 @@ class APExecutionCore:
 
         if not hasattr(self.order_state_machine, "submit_existing_entry"):
             log.critical("[%s] PRODUCTION_ENTRY_BLOCK — OSM missing submit_existing_entry", ticker)
+            _reason = "osm_missing_submit_existing_entry"
             funnel.inc("order_failed")
             if signal_id:
                 self.store.update_signal_fields(signal_id, {
                     "decision_status": "blocked_at_breach",
-                    "context_notes": "osm_missing_submit_existing_entry",
+                    "context_notes": _reason,
                 })
+            self._cleanup_pending_entry_order(watched, action="expire", reason=_reason)
+            return
+
+        def _terminalize_breach_failure(
+            reason: str,
+            *,
+            cleanup_action: str = "expire",
+            meta_patch: dict | None = None,
+            decision_status: str = "blocked_at_breach",
+            context_notes: str | None = None,
+            funnel_key: str = "order_failed",
+        ) -> None:
+            if funnel_key:
+                funnel.inc(funnel_key)
+            if signal_id:
+                self.store.update_signal_fields(signal_id, {
+                    "decision_status": decision_status,
+                    "context_notes": context_notes or reason,
+                })
+            if queue_local_order_id and self.order_state_machine is not None and meta_patch:
+                try:
+                    update_meta = getattr(self.order_state_machine, "update_order_meta", None)
+                    if callable(update_meta):
+                        update_meta(queue_local_order_id, meta_patch)
+                except Exception as _meta_exc:
+                    log.warning("[%s] breach failure meta persist failed: %s", ticker, _meta_exc)
+            self._cleanup_pending_entry_order(watched, action=cleanup_action, reason=reason)
             return
 
         def _terminalize_deferred_breach_failure(reason: str, *, extra_meta: dict | None = None) -> None:
@@ -668,9 +696,6 @@ class APExecutionCore:
               a trigger_ready deferred order must either submit with a real
               contract, or end terminal with last_error populated.
             """
-            if not queue_local_order_id or self.order_state_machine is None:
-                return
-
             meta_patch = {
                 "deferred_breach_failure": True,
                 "deferred_breach_reason": reason,
@@ -678,42 +703,19 @@ class APExecutionCore:
             }
             if extra_meta:
                 meta_patch.update(extra_meta)
-
-            try:
-                update_meta = getattr(self.order_state_machine, "update_order_meta", None)
-                if callable(update_meta):
-                    update_meta(queue_local_order_id, meta_patch)
-            except Exception as _meta_exc:
-                log.warning("[%s] deferred breach failure meta persist failed: %s", ticker, _meta_exc)
-
-            try:
-                transitioned = bool(self.order_state_machine.transition(
-                    queue_local_order_id,
-                    "ERROR",
-                    last_error=reason,
-                ))
-                if transitioned:
-                    return
-            except Exception as _transition_exc:
-                log.warning("[%s] deferred breach failure ERROR transition failed: %s", ticker, _transition_exc)
-
-            try:
-                expire_fn = getattr(self.order_state_machine, "expire_pending_entry", None)
-                if callable(expire_fn):
-                    expire_fn(queue_local_order_id, reason=reason)
-            except Exception as _expire_exc:
-                log.error("[%s] deferred breach failure expire_pending_entry failed: %s", ticker, _expire_exc)
+            _terminalize_breach_failure(
+                reason,
+                cleanup_action="expire",
+                meta_patch=meta_patch,
+                context_notes=reason,
+            )
+            return
 
         # 3) Recover the already-approved queue/OSM plan.
         approved_plan = self._recover_plan_for_revalidation(watched)
         if approved_plan is None:
             log.critical("[%s] PRODUCTION_ENTRY_BLOCK — approved plan missing after breach revalidation", ticker)
-            funnel.inc("order_failed")
-            if signal_id:
-                self.store.update_signal_fields(signal_id, {
-                    "decision_status": "blocked_at_breach",
-                    "context_notes": "approved_plan_missing_after_revalidation",
-                })
+            _terminalize_breach_failure("approved_plan_missing_after_revalidation")
             return
 
         # 3b) Breach-time contract selection for overnight deferred signals.
@@ -747,12 +749,6 @@ class APExecutionCore:
                     "contract_selector wired into execution core",
                     ticker,
                 )
-                funnel.inc("order_failed")
-                if signal_id:
-                    self.store.update_signal_fields(signal_id, {
-                        "decision_status": "blocked_at_breach",
-                    "context_notes": "contract_deferred_no_selector",
-                })
                 return
             try:
                 log.info(
@@ -806,12 +802,6 @@ class APExecutionCore:
                         "returned no contract",
                         ticker,
                     )
-                    funnel.inc("order_failed")
-                    if signal_id:
-                        self.store.update_signal_fields(signal_id, {
-                            "decision_status": "blocked_at_breach",
-                            "context_notes": "breach_time_contract_selection_no_result",
-                        })
                     return
                 if _live_contract.upper().startswith("DEFERRED:"):
                     _reason = f"deferred_unresolved_at_breach:{_live_contract}"
@@ -831,12 +821,6 @@ class APExecutionCore:
                         "[%s] PRODUCTION_ENTRY_BLOCK — contract selector left placeholder unresolved: %s",
                         ticker, _live_contract,
                     )
-                    funnel.inc("order_failed")
-                    if signal_id:
-                        self.store.update_signal_fields(signal_id, {
-                            "decision_status": "blocked_at_breach",
-                            "context_notes": f"deferred_unresolved_at_breach:{_live_contract}",
-                        })
                     return
                 log.info(
                     "[%s] DEFERRED_BREACH_CONTRACT_SELECTED — contract=%s limit=%.2f qty=%s",
@@ -872,12 +856,6 @@ class APExecutionCore:
                     "error: %s",
                     ticker, _cs_err,
                 )
-                funnel.inc("order_failed")
-                if signal_id:
-                    self.store.update_signal_fields(signal_id, {
-                        "decision_status": "blocked_at_breach",
-                        "context_notes": f"breach_time_contract_selection_error:{_cs_err}",
-                    })
                 return
 
         # 4) Require the approved plan to carry a valid limit price (used as
@@ -891,12 +869,7 @@ class APExecutionCore:
 
         if _plan_limit <= 0:
             log.critical("[%s] PRODUCTION_ENTRY_BLOCK — approved plan missing valid limit_price", ticker)
-            funnel.inc("order_failed")
-            if signal_id:
-                self.store.update_signal_fields(signal_id, {
-                    "decision_status": "blocked_at_breach",
-                    "context_notes": "approved_plan_missing_limit_price",
-                })
+            _terminalize_breach_failure("approved_plan_missing_limit_price")
             return
 
         # Optional hard guards: require contract + nonzero qty from the approved plan.
@@ -908,22 +881,12 @@ class APExecutionCore:
 
         if not approved_contract:
             log.critical("[%s] PRODUCTION_ENTRY_BLOCK — approved plan missing contract_symbol", ticker)
-            funnel.inc("order_failed")
-            if signal_id:
-                self.store.update_signal_fields(signal_id, {
-                    "decision_status": "blocked_at_breach",
-                    "context_notes": "approved_plan_missing_contract_symbol",
-                })
+            _terminalize_breach_failure("approved_plan_missing_contract_symbol")
             return
 
         if approved_qty <= 0:
             log.critical("[%s] PRODUCTION_ENTRY_BLOCK — approved plan has invalid contracts=%s", ticker, approved_qty)
-            funnel.inc("order_failed")
-            if signal_id:
-                self.store.update_signal_fields(signal_id, {
-                    "decision_status": "blocked_at_breach",
-                    "context_notes": f"approved_plan_invalid_contracts={approved_qty}",
-                })
+            _terminalize_breach_failure(f"approved_plan_invalid_contracts={approved_qty}")
             return
 
         # 4b) P0 FIX: refresh the option contract ask immediately before submit.
@@ -965,12 +928,7 @@ class APExecutionCore:
                 "contract=%s reason=%s refresh_ok=%s submit_ask=%s | blocking submit",
                 ticker, approved_contract, _refresh_reason, _refresh_ok, _submit_ask,
             )
-            funnel.inc("order_failed")
-            if signal_id:
-                self.store.update_signal_fields(signal_id, {
-                    "decision_status": "blocked_at_breach",
-                    "context_notes": f"breach_quote_refresh_failed:{_refresh_reason}",
-                })
+            _terminalize_breach_failure(f"breach_quote_refresh_failed:{_refresh_reason}")
             return
 
         # Spread sanity guard (wide spread = illiquid contract, skip).
@@ -983,12 +941,7 @@ class APExecutionCore:
                 "contract=%s spread_pct=%.3f max=%.3f | blocking submit",
                 ticker, approved_contract, _spread_pct, _max_spread,
             )
-            funnel.inc("order_failed")
-            if signal_id:
-                self.store.update_signal_fields(signal_id, {
-                    "decision_status": "blocked_at_breach",
-                    "context_notes": f"breach_spread_too_wide:{_spread_pct:.3f}",
-                })
+            _terminalize_breach_failure(f"breach_spread_too_wide:{_spread_pct:.3f}")
             return
 
         # Drift guard: if the current ask has run more than ENTRY_MAX_PRICE_DRIFT_PCT_FROM_PLAN
@@ -1002,16 +955,13 @@ class APExecutionCore:
                 ticker, approved_contract, _plan_limit, _submit_ask,
                 _drift_pct * 100, ENTRY_MAX_PRICE_DRIFT_PCT_FROM_PLAN * 100,
             )
-            funnel.inc("order_failed")
-            if signal_id:
-                self.store.update_signal_fields(signal_id, {
-                    "decision_status": "blocked_at_breach",
-                    "context_notes": (
-                        f"breach_entry_price_drift_too_high:"
-                        f"plan={_plan_limit:.2f} ask={_submit_ask:.2f} "
-                        f"drift={_drift_pct*100:.1f}%"
-                    ),
-                })
+            _terminalize_breach_failure(
+                (
+                    f"breach_entry_price_drift_too_high:"
+                    f"plan={_plan_limit:.2f} ask={_submit_ask:.2f} "
+                    f"drift={_drift_pct*100:.1f}%"
+                )
+            )
             return
 
         # Compute the broker-submitted limit: ask + mode-appropriate crossing pennies.
@@ -1144,6 +1094,11 @@ class APExecutionCore:
                             queue_local_order_id, {"entry_confirmation": _confirm_meta})
                     except Exception:
                         pass
+                self._cleanup_pending_entry_order(
+                    watched,
+                    action="expire",
+                    reason=_fail_reason,
+                )
                 # PR81 Final Amendment v2 §3: ENTRY_CONFIRMATION_FAILED ledger write.
                 try:
                     from ap.opportunity_ledger import (
@@ -1209,6 +1164,11 @@ class APExecutionCore:
                         )
                     except Exception:
                         pass
+                self._cleanup_pending_entry_order(
+                    watched,
+                    action="expire",
+                    reason="entry_confirm_module_missing",
+                )
                 # PR81 Final Amendment v2 §3: ENTRY_CONFIRMATION_FAILED ledger write.
                 try:
                     from ap.opportunity_ledger import (
@@ -1240,12 +1200,11 @@ class APExecutionCore:
         except Exception as _ec_err:
             # Fail-closed for confirmation errors — block the submit
             log.error("[%s] ENTRY_CONFIRM_ERROR — failing closed: %s", ticker, _ec_err)
-            funnel.inc("entry_confirm_blocked")
-            if signal_id:
-                self.store.update_signal_fields(signal_id, {
-                    "decision_status": "blocked_at_breach",
-                    "context_notes":   f"entry_confirm_error: {_ec_err}",
-                })
+            _terminalize_breach_failure(
+                f"entry_confirm_error:{_ec_err}",
+                cleanup_action="expire",
+                funnel_key="entry_confirm_blocked",
+            )
             # PR81 Final Amendment v2 §3: ENTRY_CONFIRMATION_FAILED ledger write.
             try:
                 from ap.opportunity_ledger import (
