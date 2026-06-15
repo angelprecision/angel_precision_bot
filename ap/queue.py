@@ -34,6 +34,7 @@ import logging
 import copy
 from ap.trace import trace_gate
 import os
+import threading
 import time
 import uuid
 from typing import Any, Optional
@@ -77,6 +78,28 @@ def _is_regular_session_et(dt=None) -> bool:
 POLL_INTERVAL         = float(os.getenv("QUEUE_POLL_INTERVAL", "1.0"))
 PROCESSING_STALE_SECS = int(os.getenv("PROCESSING_STALE_SECS", "120"))
 ALLOW_IMMEDIATE_EXECUTION = os.getenv("ALLOW_IMMEDIATE_EXECUTION", "0").lower() in {"1", "true", "yes", "on"}
+
+# ── PR #143 amendment: per-client PAPER_RECOVERY_IMMEDIATE_PROMOTE audit counter ──
+# Process-local dict {client_id: count} incremented every time a paper recovery
+# row is promoted breach→immediate. Consulted by /admin/trade_flow_status and
+# exists to make the LIVE-protection invariant provable from a single source:
+# if any LIVE client_id ever appears in this dict, that is a bug, not normal
+# flow. Counter resets on process restart (intentional — restart = fresh audit
+# window). A durable per-row audit also writes to ap_signals.context_notes below.
+_PAPER_RECOVERY_IMMEDIATE_COUNTS: dict[str, int] = {}
+_PAPER_RECOVERY_IMMEDIATE_LOCK = threading.Lock()
+
+
+def get_paper_recovery_immediate_counts() -> dict[str, int]:
+    """Return a snapshot of the per-client paper-recovery-immediate counter.
+
+    Callers (e.g. /admin/trade_flow_status) should treat this as read-only.
+    The counter is process-local so a multi-pod deployment will return
+    per-pod counts; aggregate across pods via the ap_signals durable audit
+    instead.
+    """
+    with _PAPER_RECOVERY_IMMEDIATE_LOCK:
+        return dict(_PAPER_RECOVERY_IMMEDIATE_COUNTS)
 
 # PR F / queue truth hardening: ALLOW_IMMEDIATE_EXECUTION is a money-affecting
 # kill switch — it disables the breach-watch path and lets queue.py submit
@@ -995,11 +1018,28 @@ def _dispatch(
                 ticker, _rec_contract, _rec_contracts_qty, _rec_limit,
             )
         else:
+            # Increment per-client counter under lock — single source of truth
+            # for the audit invariant: no LIVE client_id may ever appear here.
+            with _PAPER_RECOVERY_IMMEDIATE_LOCK:
+                _PAPER_RECOVERY_IMMEDIATE_COUNTS[client_id] = (
+                    _PAPER_RECOVERY_IMMEDIATE_COUNTS.get(client_id, 0) + 1
+                )
+                _client_count_after = _PAPER_RECOVERY_IMMEDIATE_COUNTS[client_id]
+
+            # Mode label from master_control — same source of truth used by
+            # the LIVE/PAPER gate above, NOT BOT_MODE env (which could
+            # disagree in a misconfig).
+            _mc_mode_label = str(getattr(master_control, "mode", "PAPER") or "PAPER").upper()
+
             log.warning(
-                "[%s] PAPER_RECOVERY_IMMEDIATE_PROMOTE — paper recovery row "
-                "passes all gates with real contract (%s qty=%s limit=$%.2f); "
-                "promoting trigger_type breach→immediate (LIVE never promoted)",
-                ticker, _rec_contract, _rec_contracts_qty, _rec_limit,
+                "[%s] PAPER_RECOVERY_IMMEDIATE_PROMOTE | client_id=%s "
+                "bot_mode=%s contract=%s qty=%s limit=$%.2f signal_id=%s "
+                "client_count_after=%d | promoting trigger_type breach→immediate "
+                "(LIVE clients are never promoted; this counter must never "
+                "include any LIVE client_id)",
+                ticker, client_id, _mc_mode_label,
+                _rec_contract, _rec_contracts_qty, _rec_limit,
+                signal_id, _client_count_after,
             )
             trigger_type = "immediate"
             # Persist the promotion decision on plan.metadata so the immediate
@@ -1010,8 +1050,39 @@ def _dispatch(
                     plan.metadata["paper_recovery_immediate_reason"] = (
                         "recovery_rescued_signal_paper_mode_all_gates_passed"
                     )
+                    plan.metadata["paper_recovery_immediate_count_after"] = (
+                        int(_client_count_after)
+                    )
+                    plan.metadata["paper_recovery_immediate_mode_observed"] = (
+                        _mc_mode_label
+                    )
             except Exception:
                 pass
+
+            # Durable per-row audit in ap_signals.context_notes — proves
+            # from DB (not just logs) which client_id ever saw a promotion.
+            # ap_signals already has a row for this signal from earlier in
+            # dispatch; we only update context_notes. Audit is best-effort —
+            # if the table is unavailable, log at debug and proceed.
+            try:
+                _sb = _get_sb_client()
+                if _sb is not None:
+                    _audit_blob = (
+                        f"paper_recovery_immediate_promoted="
+                        f"client={client_id};bot_mode={_mc_mode_label};"
+                        f"contract={_rec_contract};qty={_rec_contracts_qty};"
+                        f"limit={_rec_limit:.2f};"
+                        f"client_count_after={_client_count_after}"
+                    )
+                    _sb.table("ap_signals").update({
+                        "context_notes": _audit_blob,
+                    }).eq("signal_id", signal_id).execute()
+            except Exception as _audit_exc:
+                log.debug(
+                    "[%s] PAPER_RECOVERY_IMMEDIATE_AUDIT_WRITE_FAILED "
+                    "client_id=%s signal_id=%s error=%s",
+                    ticker, client_id, signal_id, _audit_exc,
+                )
 
     if trigger_type == "breach" and not entry_watcher:
         log.critical("[%s] ENTRY WATCHER MISSING — cannot arm breach entry", ticker)
