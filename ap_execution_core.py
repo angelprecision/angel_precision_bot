@@ -661,6 +661,49 @@ class APExecutionCore:
                 })
             return
 
+        def _terminalize_deferred_breach_failure(reason: str, *, extra_meta: dict | None = None) -> None:
+            """Best-effort cleanup for deferred breach failures.
+
+            Acceptance contract:
+              a trigger_ready deferred order must either submit with a real
+              contract, or end terminal with last_error populated.
+            """
+            if not queue_local_order_id or self.order_state_machine is None:
+                return
+
+            meta_patch = {
+                "deferred_breach_failure": True,
+                "deferred_breach_reason": reason,
+                "local_order_id": queue_local_order_id,
+            }
+            if extra_meta:
+                meta_patch.update(extra_meta)
+
+            try:
+                update_meta = getattr(self.order_state_machine, "update_order_meta", None)
+                if callable(update_meta):
+                    update_meta(queue_local_order_id, meta_patch)
+            except Exception as _meta_exc:
+                log.warning("[%s] deferred breach failure meta persist failed: %s", ticker, _meta_exc)
+
+            try:
+                transitioned = bool(self.order_state_machine.transition(
+                    queue_local_order_id,
+                    "ERROR",
+                    last_error=reason,
+                ))
+                if transitioned:
+                    return
+            except Exception as _transition_exc:
+                log.warning("[%s] deferred breach failure ERROR transition failed: %s", ticker, _transition_exc)
+
+            try:
+                expire_fn = getattr(self.order_state_machine, "expire_pending_entry", None)
+                if callable(expire_fn):
+                    expire_fn(queue_local_order_id, reason=reason)
+            except Exception as _expire_exc:
+                log.error("[%s] deferred breach failure expire_pending_entry failed: %s", ticker, _expire_exc)
+
         # 3) Recover the already-approved queue/OSM plan.
         approved_plan = self._recover_plan_for_revalidation(watched)
         if approved_plan is None:
@@ -690,6 +733,15 @@ class APExecutionCore:
         )
         if _deferred:
             if self.contract_selector is None:
+                _reason = "contract_deferred_no_selector"
+                log.critical(
+                    "[%s] DEFERRED_BREACH_CONTRACT_FAILED — %s",
+                    ticker, _reason,
+                )
+                _terminalize_deferred_breach_failure(
+                    _reason,
+                    extra_meta={"failure_stage": "deferred_contract_selection"},
+                )
                 log.critical(
                     "[%s] PRODUCTION_ENTRY_BLOCK — contract_deferred=True but no "
                     "contract_selector wired into execution core",
@@ -699,8 +751,8 @@ class APExecutionCore:
                 if signal_id:
                     self.store.update_signal_fields(signal_id, {
                         "decision_status": "blocked_at_breach",
-                        "context_notes": "contract_deferred_no_selector",
-                    })
+                    "context_notes": "contract_deferred_no_selector",
+                })
                 return
             try:
                 log.info(
@@ -711,8 +763,44 @@ class APExecutionCore:
                     getattr(approved_plan, "side", "?"),
                 )
                 _sel = self.contract_selector.select(approved_plan)
+                _sel_contract = str(getattr(_sel, "contract_symbol", "") or "").strip()
                 _live_contract = str(getattr(approved_plan, "contract_symbol", "") or "").strip()
+                _plan_is_placeholder = (not _live_contract) or _live_contract.upper().startswith("DEFERRED:")
+                _sel_is_real = bool(_sel_contract) and not _sel_contract.upper().startswith("DEFERRED:")
+
+                if _sel_is_real and _plan_is_placeholder:
+                    try:
+                        approved_plan.contract_symbol = _sel_contract
+                        _sel_price = (
+                            getattr(_sel, "execution_price_per_share", None)
+                            or getattr(_sel, "ask", None)
+                            or getattr(_sel, "mid", None)
+                        )
+                        if _sel_price:
+                            approved_plan.limit_price = float(_sel_price)
+                        _sel_qty = int(getattr(_sel, "affordable_contracts", 0) or 0)
+                        if _sel_qty > 0:
+                            approved_plan.contracts = _sel_qty
+                            _prem_per_contract = float(getattr(_sel, "premium_per_contract", 0) or 0)
+                            if _prem_per_contract > 0:
+                                approved_plan.max_position_usd = _sel_qty * _prem_per_contract
+                        _live_contract = str(getattr(approved_plan, "contract_symbol", "") or "").strip()
+                    except Exception as _copy_exc:
+                        log.warning("[%s] deferred breach selected contract copy failed: %s", ticker, _copy_exc)
+
                 if not _sel or not _live_contract:
+                    _reason = "breach_time_contract_selection_no_result"
+                    log.critical(
+                        "[%s] DEFERRED_BREACH_CONTRACT_FAILED — %s",
+                        ticker, _reason,
+                    )
+                    _terminalize_deferred_breach_failure(
+                        _reason,
+                        extra_meta={
+                            "failure_stage": "deferred_contract_selection",
+                            "selected_contract": _sel_contract or None,
+                        },
+                    )
                     log.critical(
                         "[%s] PRODUCTION_ENTRY_BLOCK — breach-time contract selection "
                         "returned no contract",
@@ -726,6 +814,19 @@ class APExecutionCore:
                         })
                     return
                 if _live_contract.upper().startswith("DEFERRED:"):
+                    _reason = f"deferred_unresolved_at_breach:{_live_contract}"
+                    log.critical(
+                        "[%s] DEFERRED_BREACH_CONTRACT_FAILED — %s",
+                        ticker, _reason,
+                    )
+                    _terminalize_deferred_breach_failure(
+                        _reason,
+                        extra_meta={
+                            "failure_stage": "deferred_contract_selection",
+                            "selected_contract": _sel_contract or None,
+                            "approved_contract": _live_contract,
+                        },
+                    )
                     log.critical(
                         "[%s] PRODUCTION_ENTRY_BLOCK — contract selector left placeholder unresolved: %s",
                         ticker, _live_contract,
@@ -737,6 +838,13 @@ class APExecutionCore:
                             "context_notes": f"deferred_unresolved_at_breach:{_live_contract}",
                         })
                     return
+                log.info(
+                    "[%s] DEFERRED_BREACH_CONTRACT_SELECTED — contract=%s limit=%.2f qty=%s",
+                    ticker,
+                    _live_contract,
+                    float(getattr(approved_plan, "limit_price", 0) or 0),
+                    int(getattr(approved_plan, "contracts", 0) or 0),
+                )
                 log.info(
                     "[%s] Breach-time contract selected: %s @ $%.2f x%s",
                     ticker, _live_contract,
@@ -750,6 +858,15 @@ class APExecutionCore:
                 except Exception:
                     _candidate_audit = None
             except Exception as _cs_err:
+                _reason = f"breach_time_contract_selection_error:{_cs_err}"
+                log.critical(
+                    "[%s] DEFERRED_BREACH_CONTRACT_FAILED — %s",
+                    ticker, _reason,
+                )
+                _terminalize_deferred_breach_failure(
+                    _reason,
+                    extra_meta={"failure_stage": "deferred_contract_selection"},
+                )
                 log.critical(
                     "[%s] PRODUCTION_ENTRY_BLOCK — breach-time contract selection "
                     "error: %s",
@@ -947,6 +1064,15 @@ class APExecutionCore:
             _drift_pct * 100,
             approved_qty,
         )
+        if _deferred:
+            log.info(
+                "[%s] DEFERRED_BREACH_SUBMIT_ATTEMPT — local=%s contract=%s qty=%s limit=%.2f",
+                ticker,
+                queue_local_order_id,
+                approved_contract,
+                approved_qty,
+                submit_limit,
+            )
 
         # ── P0 follow-up: Entry Confirmation Preflight ──────────────────────────
         # Runs AFTER live ask refresh (live quote available), BEFORE broker submit.
@@ -2071,4 +2197,3 @@ class APExecutionCore:
     # =========================================================================
     # POSITION SIZING — AGGRESSIVE RISK CURVE
     # =========================================================================
-
