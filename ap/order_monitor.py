@@ -81,7 +81,10 @@ def _cached_broker_order_status(broker_order_id: str, fetch_fn) -> Optional[str]
 # showed orders sitting in CREATED for 120s+ without ever submitting (the
 # LOST_HANDOFF failure mode). 30s is enough for a legitimate OSM handoff;
 # anything beyond that is a watcher fall-off.
-TIMEOUT_CREATED       = int(os.getenv("ORDER_TIMEOUT_CREATED",       "30"))    # 30s — CREATED = never reached broker
+# PR #141: bumped 30→90 to absorb startup recovery bursts and overnight-rescue
+# batches. The watchdog now performs a single ownership re-arm BEFORE cancel,
+# so 90s is the time until LOST_HANDOFF_90S is declared after re-arm failure.
+TIMEOUT_CREATED       = int(os.getenv("ORDER_TIMEOUT_CREATED",       "90"))    # 90s — CREATED = never reached broker
 TIMEOUT_CREATED_NO_BROKER_WARN = int(os.getenv("ORDER_TIMEOUT_CREATED_NO_BROKER_WARN", "10"))  # fast diagnostic — alert at 10s, cancel at 30s
 TIMEOUT_SUBMITTED     = int(os.getenv("ORDER_TIMEOUT_SUBMITTED",     "300"))   # 5 min
 # Entry ACKNOWLEDGED timeout: an options scalp limit that sits acknowledged-
@@ -464,24 +467,86 @@ class APOrderMonitor:
                     )
 
                 if age_secs > TIMEOUT_CREATED:
-                    # P1 ENTRY FIX (2026-05-21): TIMEOUT_CREATED tightened from
-                    # 120s -> 30s. Reason code is now LOST_HANDOFF_30S.
-                    # Systemic-rate guard: 3 in 5 minutes for the same client_id
-                    # halts new entry arms until the operator clears it.
+                    # P0 PR #141 — ENTRY HANDOFF RELIABILITY.
+                    # Before declaring LOST_HANDOFF, perform ONE ownership
+                    # re-arm attempt. Sequence:
+                    #   1. probe watcher: does it already own this local_order_id?
+                    #      (race resolved itself; just keep waiting one more cycle)
+                    #   2. if not owned, rebuild a plan from the order row and
+                    #      call entry_watcher.watch(plan, local_order_id) once
+                    #   3. on success, leave the order in CREATED; the very
+                    #      next watcher tick will transition it to PENDING_TRIGGER
+                    #   4. on failure, fall through to LOST_HANDOFF_90S cancel
+                    # This protects valid trades from being killed by transient
+                    # startup/restart races where the order existed but no
+                    # watcher had attached yet.
                     _sig_id = order.get("signal_id") or "?"
                     _plan_id = order.get("plan_id") or "?"
+
+                    _already_owned, _probe_ok, _probe_err = self._pending_trigger_watcher_owner_state(local_id)
+                    if _already_owned is True:
+                        # Watcher claims ownership — the race resolved on its own.
+                        # Skip cancel this cycle; let the watcher transition it.
+                        log.info(
+                            "[%s] LOST_HANDOFF_OWNERSHIP_CONFIRMED | local=%s "
+                            "contract=%s age=%.0fs — watcher already owns; "
+                            "skipping cancel",
+                            self.client_id, local_id, contract, age_secs,
+                        )
+                        continue
+
+                    # Attempt single auto re-arm before cancel.
+                    _rearm_attempted = False
+                    _rearm_succeeded = False
+                    _rearm_reason = None
+                    _already_attempted = bool(order.get("result_json", {}).get("auto_rearm_attempted") if isinstance(order.get("result_json"), dict) else False)
+                    if _already_attempted:
+                        _rearm_reason = "already_attempted_in_prior_cycle"
+                        log.info(
+                            "[%s] LOST_HANDOFF_REARM_SKIP | local=%s contract=%s — "
+                            "auto re-arm already attempted previously",
+                            self.client_id, local_id, contract,
+                        )
+                    else:
+                        _rearm_attempted, _rearm_succeeded, _rearm_reason = (
+                            self._attempt_lost_handoff_rearm(order, local_id, contract)
+                        )
+
+                    if _rearm_succeeded:
+                        # Trade survives. Persist the attempt so we never
+                        # re-arm the same order twice, and skip cancel.
+                        log.info(
+                            "[%s] LOST_HANDOFF_REARM_OK | local=%s contract=%s "
+                            "age=%.0fs signal_id=%s — watcher re-armed, keeping order",
+                            self.client_id, local_id, contract, age_secs, _sig_id,
+                        )
+                        self._record_lost_handoff_rearm(
+                            local_id, attempted=True, succeeded=True,
+                            reason=_rearm_reason or "lost_handoff_recovery",
+                        )
+                        continue
+
+                    # Re-arm not attempted, or attempted and failed.
+                    # Now we honestly declare LOST_HANDOFF and cancel.
                     _enriched_reason = (
-                        f"LOST_HANDOFF_30S: CREATED for {age_secs:.0f}s > {TIMEOUT_CREATED}s — "
+                        f"LOST_HANDOFF_90S: CREATED for {age_secs:.0f}s > {TIMEOUT_CREATED}s — "
                         f"never submitted (signal_id={_sig_id} plan_id={_plan_id} "
                         f"broker_order_id={broker_oid or 'null'}); "
-                        f"watcher likely fell off or on_trigger never fired"
+                        f"auto_rearm_attempted={_rearm_attempted} reason={_rearm_reason}"
                     )
                     log.warning(
-                        "[%s] LOST_HANDOFF_30S | local=%s contract=%s age=%.0fs "
-                        "signal_id=%s plan_id=%s broker_oid=%s",
+                        "[%s] LOST_HANDOFF_90S | local=%s contract=%s age=%.0fs "
+                        "signal_id=%s plan_id=%s broker_oid=%s rearm_attempted=%s "
+                        "rearm_reason=%s",
                         self.client_id, local_id, contract, age_secs,
                         _sig_id, _plan_id, broker_oid or "null",
+                        _rearm_attempted, _rearm_reason,
                     )
+                    if _rearm_attempted:
+                        self._record_lost_handoff_rearm(
+                            local_id, attempted=True, succeeded=False,
+                            reason=_rearm_reason or "lost_handoff_recovery",
+                        )
                     self._handle_stale_entry(
                         local_id, status, contract, age_secs,
                         action="cancel",
@@ -846,6 +911,200 @@ class APOrderMonitor:
             return bool(has_order(local_order_id)), True, None
         except Exception as exc:
             return None, True, f"{type(exc).__name__}: {exc}"
+
+    def _attempt_lost_handoff_rearm(
+        self,
+        order: dict,
+        local_order_id: str,
+        contract: str,
+    ) -> tuple[bool, bool, Optional[str]]:
+        """Single watcher re-arm attempt for a CREATED order whose ownership was lost.
+
+        Returns (attempted, succeeded, reason).
+
+        Sequence:
+          1. resolve entry_watcher (None → not attempted)
+          2. rebuild a minimal plan from the order row (same path as recovery)
+          3. call entry_watcher.watch(plan, local_order_id) exactly once
+          4. on success, the next watcher poll will transition the order to
+             PENDING_TRIGGER; we leave the order row alone.
+
+        This NEVER bypasses the watcher's own quality gates — watch() applies
+        the same stop-above-mid, contract-validity, and quote-availability
+        checks it would for a fresh arm.
+        """
+        watcher = getattr(self, "entry_watcher", None)
+        if watcher is None:
+            return (False, False, "entry_watcher_missing")
+        if not callable(getattr(watcher, "watch", None)):
+            return (False, False, "watcher_watch_unavailable")
+
+        plan = self._build_lost_handoff_plan_from_order(order)
+        if plan is None:
+            return (False, False, "plan_rebuild_failed")
+
+        try:
+            armed = bool(watcher.watch(plan, local_order_id))
+        except Exception as exc:
+            log.error(
+                "[%s] LOST_HANDOFF_REARM_EXCEPTION | local=%s contract=%s error=%s",
+                self.client_id, local_order_id, contract, exc,
+            )
+            return (True, False, f"watch_exception:{type(exc).__name__}")
+
+        if not armed:
+            return (True, False, getattr(watcher, "_last_reject_reason", "watch_returned_false"))
+        return (True, True, "lost_handoff_recovery")
+
+    def _build_lost_handoff_plan_from_order(self, order: dict):
+        """Rebuild a minimal watcher plan from an orders row.
+
+        Mirrors APStartupRecovery._build_recovery_plan_from_order so that
+        the in-flight handoff re-arm uses the exact same plan shape the
+        startup-reseed path produces. If the order lacks ticker or
+        trigger_price, returns None — caller will fall through to cancel.
+        """
+        try:
+            import types as _types
+            meta_raw = order.get("meta")
+            if isinstance(meta_raw, dict):
+                meta = meta_raw
+            elif isinstance(meta_raw, str):
+                try:
+                    import json as _json
+                    meta = _json.loads(meta_raw) if meta_raw else {}
+                except Exception:
+                    meta = {}
+            else:
+                meta = {}
+
+            ticker = str(
+                order.get("symbol")
+                or meta.get("symbol")
+                or meta.get("ticker")
+                or ""
+            ).upper()
+            if not ticker:
+                return None
+
+            trigger = (
+                order.get("trigger_price")
+                if order.get("trigger_price") is not None
+                else meta.get("signal_entry_price")
+            )
+            try:
+                trigger = float(trigger) if trigger is not None else 0.0
+            except (TypeError, ValueError):
+                trigger = 0.0
+            if trigger <= 0:
+                return None
+
+            contract = (
+                order.get("contract")
+                or meta.get("selected_contract")
+                or meta.get("contract_symbol")
+                or ""
+            )
+            direction = str(
+                order.get("direction")
+                or meta.get("direction")
+                or meta.get("side")
+                or "CALL"
+            ).upper()
+            stop = (
+                order.get("stop_underlying")
+                if order.get("stop_underlying") is not None
+                else meta.get("stop_underlying")
+            )
+            target = (
+                order.get("target_underlying")
+                if order.get("target_underlying") is not None
+                else meta.get("target_underlying")
+            )
+
+            plan = _types.SimpleNamespace(
+                signal_id=str(
+                    order.get("signal_id")
+                    or meta.get("signal_id")
+                    or order.get("local_order_id")
+                    or ""
+                ),
+                plan_id=str(order.get("plan_id") or meta.get("plan_id") or ""),
+                ticker=ticker,
+                symbol=ticker,
+                direction=direction,
+                side=direction,
+                trigger_price=trigger,
+                stop_underlying=stop,
+                target_underlying=target,
+                contract_symbol=str(contract or ""),
+                contracts=int(order.get("qty") or meta.get("contracts") or 0) or 1,
+                tier=str(order.get("tier") or meta.get("tier") or "B"),
+                score=float(order.get("score") or meta.get("score") or 0) or 0.0,
+                timeframe=str(meta.get("timeframe") or "1d"),
+                pattern=str(meta.get("pattern") or ""),
+                limit_price=float(order.get("limit_price") or 0) or None,
+                metadata=dict(meta) if isinstance(meta, dict) else {},
+            )
+            # Preserve deferred-contract behavior — see PR #140.
+            if str(plan.contract_symbol).upper().startswith("DEFERRED:"):
+                try:
+                    if not isinstance(plan.metadata, dict):
+                        plan.metadata = {}
+                    plan.metadata["contract_deferred"] = True
+                except Exception:
+                    pass
+            return plan
+        except Exception as exc:
+            log.warning(
+                "[%s] LOST_HANDOFF_PLAN_REBUILD_FAILED | local=%s error=%s",
+                self.client_id, order.get("local_order_id"), exc,
+            )
+            return None
+
+    def _record_lost_handoff_rearm(
+        self,
+        local_order_id: str,
+        *,
+        attempted: bool,
+        succeeded: bool,
+        reason: str,
+    ) -> None:
+        """Persist auto-rearm attempt on the orders row's result_json so we
+        never re-arm the same order twice across watchdog cycles."""
+        if not local_order_id:
+            return
+        try:
+            from ap.db import run_with_retry, conn
+            payload = {
+                "auto_rearm_attempted": attempted,
+                "auto_rearm_succeeded": succeeded,
+                "auto_rearm_reason": reason,
+            }
+
+            def _persist():
+                with conn() as c:
+                    c.execute(
+                        """
+                        UPDATE orders
+                        SET result_json = COALESCE(result_json, '{}'::jsonb)
+                                          || %s::jsonb,
+                            updated_ts  = NOW()
+                        WHERE local_order_id = %s
+                          AND client_id = %s
+                        """,
+                        (
+                            __import__("json").dumps(payload),
+                            local_order_id,
+                            self.client_id,
+                        ),
+                    )
+            run_with_retry(_persist)
+        except Exception as exc:
+            log.warning(
+                "[%s] LOST_HANDOFF_REARM_PERSIST_FAILED | local=%s error=%s",
+                self.client_id, local_order_id, exc,
+            )
 
     def _check_exit_orders(self):
         orders = self._get_active_exit_orders()
