@@ -1546,28 +1546,36 @@ def _sync_exit_price(order: dict, result: dict):
                         set_clause += ", option_pnl_pct = %s, win = %s"
                         params += [opt_pnl_pct, win]
                     params += [str(pos_id)]
-                    c.execute(
+                    cur = c.execute(
                         f"UPDATE proof_trades SET {set_clause} WHERE position_id = %s",
                         params,
                     )
-                    # Fallback: match by ticker + client + recent close time
-                    # This catches manually-seeded positions where position_id is not in proof_trades
-                    if getattr(c, "rowcount", 0) == 0 and client_id and ticker:
+                    primary_rowcount = getattr(cur, "rowcount", getattr(c, "rowcount", 0))
+                    # Fallback: repair ONE unresolved orphan row only.
+                    # Primary position_id match remains the source of truth.
+                    if primary_rowcount == 0 and client_id and ticker:
                         params2 = [exit_px]
                         set2 = "exit_option_price = %s"
                         if opt_pnl_pct is not None:
                             set2 += ", option_pnl_pct = %s, win = %s"
                             params2 += [opt_pnl_pct, win]
                         params2 += [client_id, ticker]
-                        c.execute(
+                        cur2 = c.execute(
                             f"UPDATE proof_trades SET {set2} "
-                            "WHERE client_email = %s "
-                            "AND ticker = %s "
-                            "AND closed_at >= NOW() - INTERVAL '60 minutes' "
-                            "AND win = FALSE",  # only correct records that show as losses
+                            "WHERE id = ("
+                            "  SELECT id FROM proof_trades "
+                            "  WHERE client_email = %s "
+                            "    AND ticker = %s "
+                            "    AND closed_at >= NOW() - INTERVAL '60 minutes' "
+                            "    AND (position_id IS NULL OR position_id = '') "
+                            "    AND exit_option_price IS NULL "
+                            "  ORDER BY closed_at DESC "
+                            "  LIMIT 1"
+                            ")",
                             params2,
                         )
-                    return getattr(c, "rowcount", 0)
+                        return getattr(cur2, "rowcount", getattr(c, "rowcount", 0))
+                    return primary_rowcount
             updated = run_with_retry(_update_proof) or 0
             if updated:
                 log.info(
@@ -1577,7 +1585,12 @@ def _sync_exit_price(order: dict, result: dict):
                     win,
                 )
             else:
-                log.warning("[%s] EXIT PRICE SYNC: proof_trades row not found for pos_id=%s", client_id, pos_id)
+                log.warning(
+                    "[%s] EXIT PRICE SYNC: no eligible row found "
+                    "(primary by position_id=%s and narrowed fallback both empty)",
+                    client_id,
+                    pos_id,
+                )
         except Exception as db_exc:
             log.debug("[%s] proof_trades exit sync DB error (non-critical): %s", client_id, db_exc)
 
