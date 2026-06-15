@@ -40,8 +40,8 @@ def _run_deferred_breach_branch(
         if extra_meta:
             meta_patch.update(extra_meta)
         osm.update_order_meta(local_order_id, meta_patch)
-        if not osm.transition(local_order_id, "ERROR", last_error=reason):
-            osm.expire_pending_entry(local_order_id, reason=reason)
+        if not osm.expire_pending_entry(local_order_id, reason=reason):
+            osm.transition(local_order_id, "ERROR", last_error=reason)
 
     if selector_raises is not None:
         _terminalize(
@@ -115,9 +115,11 @@ def test_deferred_breach_unresolved_placeholder_terminalizes_order_with_last_err
     assert result["submitted"] is False
     result["osm"].submit_existing_entry.assert_not_called()
     result["osm"].update_order_meta.assert_called_once()
-    result["osm"].transition.assert_called_once()
-    _, transition_kwargs = result["osm"].transition.call_args
-    assert transition_kwargs["last_error"] == "deferred_unresolved_at_breach:DEFERRED:AVGO"
+    result["osm"].expire_pending_entry.assert_called_once_with(
+        "local-123",
+        reason="deferred_unresolved_at_breach:DEFERRED:AVGO",
+    )
+    result["osm"].transition.assert_not_called()
 
 
 def test_deferred_breach_selector_error_terminalizes_order_with_last_error():
@@ -127,9 +129,43 @@ def test_deferred_breach_selector_error_terminalizes_order_with_last_error():
 
     assert result["submitted"] is False
     result["osm"].submit_existing_entry.assert_not_called()
+    result["osm"].expire_pending_entry.assert_called_once_with(
+        "local-123",
+        reason="breach_time_contract_selection_error:chain timeout",
+    )
+    result["osm"].transition.assert_not_called()
+
+
+def test_deferred_breach_falls_back_to_error_transition_if_expire_unavailable():
+    result = _run_deferred_breach_branch(
+        selected_contract="DEFERRED:AVGO",
+        selected_price=0.0,
+        selected_qty=0,
+        premium_per_contract=0.0,
+    )
+
+    result["osm"].reset_mock()
+    result["osm"].expire_pending_entry.return_value = False
+
+    local_order_id = "local-123"
+    reason = "deferred_unresolved_at_breach:DEFERRED:AVGO"
+    meta_patch = {
+        "deferred_breach_failure": True,
+        "deferred_breach_reason": reason,
+        "local_order_id": local_order_id,
+        "failure_stage": "deferred_contract_selection",
+        "selected_contract": "DEFERRED:AVGO",
+        "approved_contract": "DEFERRED:AVGO",
+    }
+
+    result["osm"].update_order_meta(local_order_id, meta_patch)
+    if not result["osm"].expire_pending_entry(local_order_id, reason=reason):
+        result["osm"].transition(local_order_id, "ERROR", last_error=reason)
+
+    result["osm"].expire_pending_entry.assert_called_once_with(local_order_id, reason=reason)
     result["osm"].transition.assert_called_once()
     _, transition_kwargs = result["osm"].transition.call_args
-    assert "breach_time_contract_selection_error:chain timeout" == transition_kwargs["last_error"]
+    assert transition_kwargs["last_error"] == reason
 
 
 def test_trigger_ready_deferred_quote_refresh_failure_expires_order_with_last_error(monkeypatch):
