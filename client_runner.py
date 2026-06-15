@@ -2398,6 +2398,7 @@ class ClientRunner(threading.Thread):
                 pm=self.position_manager,
                 master_control=self.master_control,
                 exit_engine=exit_eng,
+                entry_watcher=getattr(getattr(self, "core", None), "entry_watcher", None),
             )
             return recovery.run()
 
