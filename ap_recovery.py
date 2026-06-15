@@ -27,9 +27,11 @@ Usage:
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import time
+import types
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 
@@ -59,6 +61,7 @@ class APStartupRecovery:
         pm,               # APPositionManager
         master_control,   # APMasterControl
         exit_engine=None, # APExitEngine (optional — needed for exit re-attachment)
+        entry_watcher=None,  # APEntryWatcher (optional — needed for watcher reseed)
     ):
         self.client_id     = client_id
         self.broker        = broker
@@ -66,6 +69,7 @@ class APStartupRecovery:
         self.pm            = pm
         self.mc            = master_control
         self.exit_engine   = exit_engine
+        self.entry_watcher = entry_watcher
 
     # ──────────────────────────────────────────────────────────────────────────
     # Entry point
@@ -519,6 +523,81 @@ class APStartupRecovery:
     #    the watcher is in-memory; it loses state on restart.
     # ──────────────────────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _coerce_order_meta(raw_meta) -> dict:
+        if isinstance(raw_meta, dict):
+            return dict(raw_meta)
+        if isinstance(raw_meta, str) and raw_meta.strip():
+            try:
+                parsed = json.loads(raw_meta)
+                if isinstance(parsed, dict):
+                    return parsed
+            except Exception:
+                return {}
+        return {}
+
+    def _build_recovery_plan_from_order(self, order: dict):
+        meta = self._coerce_order_meta(order.get("meta"))
+
+        contract = (
+            order.get("contract")
+            or meta.get("selected_contract")
+            or meta.get("contract_symbol")
+            or ""
+        )
+        direction = str(
+            order.get("direction")
+            or meta.get("direction")
+            or meta.get("side")
+            or "CALL"
+        ).upper()
+        ticker = str(
+            order.get("symbol")
+            or meta.get("symbol")
+            or meta.get("ticker")
+            or ""
+        ).upper()
+        trigger = (
+            order.get("trigger_price")
+            if order.get("trigger_price") is not None
+            else meta.get("signal_entry_price")
+        )
+        stop = (
+            order.get("stop_underlying")
+            if order.get("stop_underlying") is not None
+            else meta.get("stop_underlying")
+        )
+        target = (
+            order.get("target_underlying")
+            if order.get("target_underlying") is not None
+            else meta.get("target_underlying")
+        )
+
+        return types.SimpleNamespace(
+            signal_id=str(
+                order.get("signal_id")
+                or meta.get("signal_id")
+                or order.get("local_order_id")
+                or ""
+            ),
+            plan_id=str(order.get("plan_id") or meta.get("plan_id") or ""),
+            ticker=ticker,
+            side=direction,
+            direction=direction,
+            score=float(order.get("score") or meta.get("score") or 65.0),
+            tier=str(order.get("tier") or meta.get("tier") or "B"),
+            trigger_price=float(trigger or 0) if trigger is not None else None,
+            stop_underlying=float(stop or 0) if stop is not None else None,
+            target_underlying=float(target or 0) if target is not None else None,
+            contract_symbol=str(contract or ""),
+            pattern=str(order.get("pattern") or meta.get("pattern") or ""),
+            timeframe=str(order.get("timeframe") or meta.get("timeframe") or "1d"),
+            prior_day_high=meta.get("prior_day_high"),
+            prior_day_low=meta.get("prior_day_low"),
+            strategy_type=str(meta.get("strategy_type") or ""),
+            metadata=dict(meta),
+        )
+
     def _reseed_watchers(self, result: dict):
         """
         Reset WATCHING signals back to NEW so the queue worker re-processes
@@ -548,15 +627,133 @@ class APStartupRecovery:
                     WHERE  client_id  = %s
                       AND  status     = 'WATCHING'
                       AND  created_ts >= %s
+                      AND  NOT EXISTS (
+                             SELECT 1
+                             FROM orders o
+                             WHERE o.client_id = trade_queue.client_id
+                               AND o.signal_id = trade_queue.signal_id
+                               AND o.kind = 'ENTRY'
+                               AND o.status = 'PENDING_TRIGGER'
+                               AND (
+                                     o.broker_order_id IS NULL
+                                  OR TRIM(COALESCE(o.broker_order_id, '')) = ''
+                                  OR UPPER(TRIM(COALESCE(o.broker_order_id, ''))) IN ('N/A', 'NA', 'NONE', 'NULL')
+                               )
+                               AND o.submitted_ts IS NULL
+                               AND o.filled_ts IS NULL
+                           )
                     """,
                     (self.client_id, cutoff_utc),
                 )
                 return c.rowcount
 
+        def _load_orphaned_pending_trigger_orders():
+            with conn() as c:
+                c.execute(
+                    """
+                    SELECT local_order_id,
+                           signal_id,
+                           plan_id,
+                           symbol,
+                           contract,
+                           direction,
+                           score,
+                           tier,
+                           trigger_price,
+                           stop_underlying,
+                           target_underlying,
+                           pattern,
+                           timeframe,
+                           meta
+                    FROM orders
+                    WHERE client_id = %s
+                      AND kind = 'ENTRY'
+                      AND status = 'PENDING_TRIGGER'
+                      AND created_ts >= %s
+                      AND (
+                            broker_order_id IS NULL
+                         OR TRIM(COALESCE(broker_order_id, '')) = ''
+                         OR UPPER(TRIM(COALESCE(broker_order_id, ''))) IN ('N/A', 'NA', 'NONE', 'NULL')
+                      )
+                      AND submitted_ts IS NULL
+                      AND filled_ts IS NULL
+                    ORDER BY created_ts ASC
+                    """,
+                    (self.client_id, cutoff_utc),
+                )
+                return c.fetchall()
+
         count = run_with_retry(_reset) or 0
-        result["watchers_requeued"] = count
+        rearmed = 0
+        if self.entry_watcher is None:
+            log.warning(
+                "[%s] RECOVERY: entry_watcher missing — cannot reseed orphaned PENDING_TRIGGER orders",
+                self.client_id,
+            )
+        else:
+            rows = run_with_retry(_load_orphaned_pending_trigger_orders) or []
+            for row in rows:
+                order = dict(row or {})
+                local_order_id = str(order.get("local_order_id") or "").strip()
+                if not local_order_id:
+                    continue
+                try:
+                    if hasattr(self.entry_watcher, "has_order") and self.entry_watcher.has_order(local_order_id):
+                        log.info(
+                            "[%s] RECOVERY: watcher already owns local_order_id=%s — skipping duplicate reseed",
+                            self.client_id, local_order_id,
+                        )
+                        continue
+                except Exception as exc:
+                    log.warning(
+                        "[%s] RECOVERY: watcher ownership check failed for local_order_id=%s: %s",
+                        self.client_id, local_order_id, exc,
+                    )
+
+                plan = self._build_recovery_plan_from_order(order)
+                if not getattr(plan, "ticker", "") or getattr(plan, "trigger_price", None) in (None, 0, 0.0):
+                    log.warning(
+                        "[%s] RECOVERY: cannot reseed local_order_id=%s — missing ticker or trigger_price",
+                        self.client_id, local_order_id,
+                    )
+                    continue
+                if str(getattr(plan, "contract_symbol", "") or "").upper().startswith("DEFERRED:"):
+                    try:
+                        if not hasattr(plan, "metadata") or plan.metadata is None:
+                            plan.metadata = {}
+                        plan.metadata["contract_deferred"] = True
+                    except Exception:
+                        pass
+                try:
+                    armed = bool(self.entry_watcher.watch(plan, local_order_id))
+                except Exception as exc:
+                    log.error(
+                        "[%s] RECOVERY: watcher reseed exception | local_order_id=%s signal_id=%s error=%s",
+                        self.client_id, local_order_id, order.get("signal_id"), exc,
+                    )
+                    continue
+                if armed:
+                    rearmed += 1
+                    log.info(
+                        "[%s] RECOVERY: watcher re-armed | local_order_id=%s signal_id=%s contract=%s trigger=%s",
+                        self.client_id,
+                        local_order_id,
+                        order.get("signal_id"),
+                        getattr(plan, "contract_symbol", ""),
+                        getattr(plan, "trigger_price", None),
+                    )
+                else:
+                    log.warning(
+                        "[%s] RECOVERY: watcher reseed failed | local_order_id=%s signal_id=%s reason=%s",
+                        self.client_id,
+                        local_order_id,
+                        order.get("signal_id"),
+                        getattr(self.entry_watcher, "_last_reject_reason", None),
+                    )
+
+        result["watchers_requeued"] = count + rearmed
         log.info(
-            "[%s] RECOVERY: %d WATCHING signals reset to NEW for watcher reseed "
-            "(lookback=%dh cutoff=%s)",
-            self.client_id, count, _lookback_hours, cutoff_utc[:19],
+            "[%s] RECOVERY: %d WATCHING signals reset to NEW and %d orphaned PENDING_TRIGGER orders re-armed "
+            "for watcher reseed (lookback=%dh cutoff=%s)",
+            self.client_id, count, rearmed, _lookback_hours, cutoff_utc[:19],
         )
