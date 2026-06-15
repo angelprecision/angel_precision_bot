@@ -619,11 +619,26 @@ class APStartupRecovery:
         cutoff_utc = (now_et.astimezone(timezone.utc) - timedelta(hours=_lookback_hours)).isoformat()
 
         def _reset():
+            # PR #143: tag rescued rows in payload.recovery_rescue so the
+            # queue dispatch can recognize them as eligible for PAPER
+            # immediate-entry submission after contract selection.
+            # Payload is a JSONB column — merge via || so the existing
+            # signal_id, ticker, score, etc. are preserved verbatim.
+            # The marker is also stamped with a UTC timestamp + the lookback
+            # window for audit. LIVE clients are not exempted in this query;
+            # the LIVE/PAPER gate lives in queue._dispatch so the LIVE path
+            # ignores the marker.
             with conn() as c:
+                _marker_payload = (
+                    '{"recovery_rescue":true,'
+                    '"recovery_rescue_ts":"' + now_et.astimezone(timezone.utc).isoformat() + '",'
+                    '"recovery_rescue_lookback_hours":' + str(int(_lookback_hours)) + '}'
+                )
                 c.execute(
                     """
                     UPDATE trade_queue
-                    SET    status = 'NEW'
+                    SET    status  = 'NEW',
+                           payload = COALESCE(payload, '{}'::jsonb) || %s::jsonb
                     WHERE  client_id  = %s
                       AND  status     = 'WATCHING'
                       AND  created_ts >= %s
@@ -639,7 +654,7 @@ class APStartupRecovery:
                                AND o.filled_ts IS NULL
                            )
                     """,
-                    (self.client_id, cutoff_utc),
+                    (_marker_payload, self.client_id, cutoff_utc),
                 )
                 return c.rowcount
 
