@@ -893,10 +893,41 @@ def _dispatch(
                 log.warning(f"[{ticker}] Contract selection failed -- no suitable contract")
                 trace_gate(str(payload.get("signal_id","")), ticker, "QUALITY_FILTER", "REJECT",
                            reason="no_eligible_contracts", score=float(payload.get("score") or 0))
-                _mark_job(job_id, "REJECTED",
-                          result={"stage": "contract_selection",
-                                  "reason": "no_contract_found",
-                                  "ticker": ticker})
+
+                # PR #149 — Selector Reason Honesty.
+                # Ask the selector for the most specific REJECT it captured
+                # during this call (OI_TOO_LOW, NO_CHAIN_DATA, SPREAD_TOO_WIDE,
+                # NO_AFFORDABLE_CONTRACT, etc). Keep umbrella stage as
+                # "contract_selection" so downstream stage-filters and the
+                # PR #120 _derive_last_error path continue to work, but write
+                # the specific reason into result_json.reason and reason_code
+                # so last_error becomes e.g. "contract_selection:OI_TOO_LOW"
+                # instead of the umbrella "contract_selection:no_contract_found".
+                # Fallback: if no specific reason was captured, preserve the
+                # legacy "no_contract_found" label exactly.
+                _sel_result: dict = {"stage": "contract_selection", "ticker": ticker}
+                try:
+                    _get_failure = getattr(contract_selector, "get_last_failure", None)
+                    _failure = _get_failure() if callable(_get_failure) else None
+                except Exception:
+                    _failure = None
+                if isinstance(_failure, dict) and str(_failure.get("reason_code") or "").strip():
+                    _reason_code = str(_failure["reason_code"]).strip()
+                    _sel_result["reason"]         = _reason_code
+                    _sel_result["reason_code"]    = _reason_code
+                    _explanation = str(_failure.get("explanation") or "").strip()
+                    if _explanation:
+                        _sel_result["details"] = _explanation
+                    _selector_stage = str(_failure.get("stage") or "").strip()
+                    if _selector_stage:
+                        # Preserve the underlying selector stage (e.g.
+                        # "quality_summary", "affordability_gate") for
+                        # diagnosis without changing the umbrella stage.
+                        _sel_result["selector_stage"] = _selector_stage
+                else:
+                    _sel_result["reason"] = "no_contract_found"
+
+                _mark_job(job_id, "REJECTED", result=_sel_result)
                 try:
                     from ap.rejection_feed import post_no_contracts
                     post_no_contracts(
