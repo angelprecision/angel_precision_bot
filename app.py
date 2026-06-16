@@ -586,6 +586,65 @@ def _ghost_build_sql_and_params(
     return sql, params, lookback_hours
 
 
+# =============================================================================
+# ADMIN AUTH INFRASTRUCTURE (HOISTED — must be defined BEFORE create_app)
+# =============================================================================
+# These names are HOISTED above create_app() because create_app() contains
+# @_require_admin decorator usages (e.g. /admin/operator/manual-rescue-restart-guard
+# around L2840). Module-level `app = create_app()` runs at import time; if the
+# decorator is defined AFTER create_app() in source order, the decorator lookup
+# inside create_app() fails with NameError and the pod refuses to start.
+#
+# This is a pure structural relocation — code is identical to the previous
+# below-create_app() block. Do NOT add new logic here; behavior must match
+# the prior block exactly so route auth semantics are unchanged.
+# =============================================================================
+import os as _os_admin
+import hmac as _hmac_admin
+import logging as _logging_admin
+from functools import wraps as _admin_wraps
+
+admin_log = _logging_admin.getLogger("admin.controls")
+
+ADMIN_API_KEY = _os_admin.getenv("ADMIN_API_KEY", "")
+ALLOWED_ADMIN_IPS = {
+    ip.strip()
+    for ip in _os_admin.getenv("ALLOWED_ADMIN_IPS", "").split(",")
+    if ip.strip()
+}
+
+
+def _admin_client_ip() -> str:
+    return request.headers.get(
+        "X-Forwarded-For",
+        request.remote_addr or "",
+    ).split(",")[0].strip()
+
+
+def _require_admin(fn):
+    # _require_admin = HOISTED — see banner above
+    @_admin_wraps(fn)
+    def _wrap(*a, **kw):
+        if not ADMIN_API_KEY:
+            return jsonify({"ok": False, "error": "ADMIN_API_KEY not configured"}), 503
+
+        ip = _admin_client_ip()
+
+        if ALLOWED_ADMIN_IPS and ip not in ALLOWED_ADMIN_IPS:
+            admin_log.critical("ADMIN_DENIED_IP path=%s ip=%s", request.path, ip)
+            return jsonify({"ok": False, "error": "forbidden_ip"}), 403
+
+        supplied = request.headers.get("X-Admin-Key", "")
+
+        if not _hmac_admin.compare_digest(supplied, ADMIN_API_KEY):
+            admin_log.critical("ADMIN_AUTH_FAIL path=%s ip=%s", request.path, ip)
+            return jsonify({"ok": False, "error": "unauthorized"}), 401
+
+        return fn(*a, **kw)
+
+    return _wrap
+
+
 def create_app() -> Flask:
     app = Flask(__name__)
     app.config["MAX_CONTENT_LENGTH"] = MAX_CONTENT_LENGTH
@@ -3143,49 +3202,13 @@ app = create_app()
 # These routes are registered after create_app() so the existing stable app body
 # remains untouched while still exposing fleet-level quote-monitor telemetry and
 # manual emergency flatten controls.
-import os as _os_admin
-import hmac as _hmac_admin
-import logging as _logging_admin
-from functools import wraps as _admin_wraps
-
-admin_log = _logging_admin.getLogger("admin.controls")
-
-ADMIN_API_KEY = _os_admin.getenv("ADMIN_API_KEY", "")
-ALLOWED_ADMIN_IPS = {
-    ip.strip()
-    for ip in _os_admin.getenv("ALLOWED_ADMIN_IPS", "").split(",")
-    if ip.strip()
-}
-
-
-def _admin_client_ip() -> str:
-    return request.headers.get(
-        "X-Forwarded-For",
-        request.remote_addr or "",
-    ).split(",")[0].strip()
-
-
-def _require_admin(fn):
-    @_admin_wraps(fn)
-    def _wrap(*a, **kw):
-        if not ADMIN_API_KEY:
-            return jsonify({"ok": False, "error": "ADMIN_API_KEY not configured"}), 503
-
-        ip = _admin_client_ip()
-
-        if ALLOWED_ADMIN_IPS and ip not in ALLOWED_ADMIN_IPS:
-            admin_log.critical("ADMIN_DENIED_IP path=%s ip=%s", request.path, ip)
-            return jsonify({"ok": False, "error": "forbidden_ip"}), 403
-
-        supplied = request.headers.get("X-Admin-Key", "")
-
-        if not _hmac_admin.compare_digest(supplied, ADMIN_API_KEY):
-            admin_log.critical("ADMIN_AUTH_FAIL path=%s ip=%s", request.path, ip)
-            return jsonify({"ok": False, "error": "unauthorized"}), 401
-
-        return fn(*a, **kw)
-
-    return _wrap
+#
+# P0 startup-order fix: the admin decorator infrastructure (_os_admin,
+# _hmac_admin, _admin_wraps, admin_log, ADMIN_API_KEY, ALLOWED_ADMIN_IPS,
+# _admin_client_ip, _require_admin) was MOVED to be defined BEFORE
+# create_app() so that @_require_admin usages inside create_app() resolve
+# at app-construction time. See module-level block above (search for
+# "_require_admin = HOISTED").
 
 
 def _iter_client_runners():
