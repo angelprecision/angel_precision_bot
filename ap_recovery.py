@@ -690,7 +690,42 @@ class APStartupRecovery:
                 )
                 return c.fetchall()
 
-        count = run_with_retry(_reset) or 0
+        # ── PR #143 regression fix: LIVE never replays WATCHING rows ─────
+        # The _reset() block above resets WATCHING → NEW and tags rows with
+        # payload.recovery_rescue=true. PR #143 used this for paper-mode
+        # immediate-entry recovery. On 2026-06-16 Jason's LIVE pod replayed
+        # 23 WATCHING rows through MC/contract_selector with current (post-
+        # trigger) market data. The selector's earnings/IV/chain gates
+        # rejected all 23 with contract_selection:no_contract_found. Zero
+        # live trades. LIVE must NEVER replay stale signals through the
+        # selector — it can only reattach watcher ownership to current-
+        # session WATCHING/PENDING_TRIGGER rows.
+        #
+        # Detection: read mc.mode (canonical mode source per execution_core
+        # PR-B / FIX-3). Default to PAPER on lookup failure to preserve PR
+        # #143 paper behavior — never silently fall into LIVE replay if mc
+        # is mis-shaped.
+        _mc_mode = "PAPER"
+        try:
+            _mc_mode = str(getattr(self.mc, "mode", "PAPER") or "PAPER").upper()
+        except Exception:
+            _mc_mode = "PAPER"
+        _is_live = (_mc_mode == "LIVE")
+
+        if _is_live:
+            # Audit-required log; emitted before any DB write so it's
+            # visible even if downstream paths fail.
+            log.warning(
+                "LIVE_RECOVERY_REPLAY_SKIPPED client_id=%s mode=%s "
+                "reason=live_no_replay_policy lookback_hours=%d cutoff=%s "
+                "| WATCHING rows are NOT reset for LIVE clients; only "
+                "orphaned PENDING_TRIGGER watcher reattachment will run",
+                self.client_id, _mc_mode, _lookback_hours, cutoff_utc[:19],
+            )
+            count = 0  # No WATCHING rows reset for LIVE.
+        else:
+            count = run_with_retry(_reset) or 0
+
         rearmed = 0
         if self.entry_watcher is None:
             log.warning(
