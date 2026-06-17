@@ -445,6 +445,15 @@ class APContractSelectionEngine:
         self.iv_filter      = iv_filter
         self.mutate_plan    = bool(mutate_plan)
 
+        # PR #149 — Selector Reason Honesty.
+        # Records the most recent REJECT event emitted during a single select()
+        # call so the queue can surface the actual blocker (e.g. OI_TOO_LOW)
+        # instead of the umbrella label "no_contract_found".
+        #   Shape: {"stage": str, "reason_code": str, "explanation": str} | None
+        # Reset to None at the top of every select() invocation.
+        # Never affects selection — observability only.
+        self._last_failure: Optional[dict] = None
+
         self.strategy_version = os.getenv("AP_STRATEGY_VERSION", "ap_live_beta")
         self.git_commit       = get_git_commit()
         self.config_hash = make_config_hash({
@@ -503,6 +512,21 @@ class APContractSelectionEngine:
         context: Optional[dict] = None,
     ) -> None:
         """Emit a structured observability event for every contract selection decision."""
+        # PR #149 — Selector Reason Honesty.
+        # Capture the most recent REJECT into self._last_failure so the queue
+        # can read the specific blocker after select() returns None. Always
+        # overwrites: by the time select() returns None, the last REJECT
+        # emitted is the actual terminating blocker. Errors here must not
+        # affect emit behavior — wrapped defensively. Observability only.
+        try:
+            if str(decision).upper() == "REJECT":
+                self._last_failure = {
+                    "stage":       str(stage or ""),
+                    "reason_code": str(reason_code or "") or "UNKNOWN_REJECTION",
+                    "explanation": str(explanation or ""),
+                }
+        except Exception:
+            pass
         try:
             _sig_id    = _safe_plan_attr(plan, "signal_id") or ""
             _client_id = _safe_plan_attr(plan, "client_id") or "default"
@@ -529,11 +553,43 @@ class APContractSelectionEngine:
             log.debug("Selector observability emit failed (non-critical): %s", e)
 
     # =========================================================================
+    # PR #149 — PUBLIC: get_last_failure()
+    # =========================================================================
+    def get_last_failure(self) -> Optional[dict]:
+        """
+        Return the most recent REJECT captured during the last select() call,
+        or None if select() either succeeded or was never run.
+
+        Shape:
+            {"stage": "<selector stage>", "reason_code": "<canonical code>",
+             "explanation": "<human-readable detail>"}
+
+        Used by ap/queue.py to surface the *actual* blocker (e.g. OI_TOO_LOW,
+        NO_CHAIN_DATA, SPREAD_TOO_WIDE, NO_AFFORDABLE_CONTRACT) instead of
+        the umbrella label "no_contract_found".
+
+        Observability only. Never affects selection. Never raises.
+        """
+        try:
+            if isinstance(self._last_failure, dict):
+                # Defensive copy so callers can't mutate selector state.
+                return dict(self._last_failure)
+        except Exception:
+            pass
+        return None
+
+    # =========================================================================
     # PUBLIC -- select(plan) → SelectedContract | None
     # =========================================================================
 
 
     def select(self, plan) -> Optional[SelectedContract]:
+        # PR #149 — Selector Reason Honesty.
+        # Reset failure capture at the start of every invocation so that
+        # get_last_failure() reflects ONLY this call's most recent REJECT,
+        # never a stale value from a prior select(). Observability only.
+        self._last_failure = None
+
         ticker    = _safe_plan_attr(plan, "ticker")
         direction = str(_safe_plan_attr(plan, "side", "") or "").upper()
         budget    = float(_safe_plan_attr(plan, "max_position_usd", 0) or 0)
