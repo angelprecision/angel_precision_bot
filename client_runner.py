@@ -1923,10 +1923,6 @@ class ClientRunner(threading.Thread):
         self.data_broker = data_broker
         self.databroker = data_broker
 
-        # NOTE: data_token kept for the manifest call below (preserves the
-        # data_broker_is_dedicated=bool(data_token) shape used previously).
-        data_token = data_token_source if data_broker_is_dedicated else ""
-
         earnings_guard = APEarningsGuard(
             broker=data_broker,
             blackout_days=int(os.getenv("EARNINGS_BLACKOUT_DAYS", "3")),
@@ -1988,7 +1984,7 @@ class ClientRunner(threading.Thread):
         self._register_exit_engine(exit_eng)
         self._run_startup_recovery(broker, exit_eng)
         self._seed_exit_engine_from_db(exit_eng)
-        self._start_position_quote_monitor(data_broker if data_token else broker, exit_eng)
+        self._start_position_quote_monitor(data_broker if data_broker_is_dedicated else broker, exit_eng)
         # PR D / FIX-3 (BUG-CR-2): post-QPM quote refresh in LIVE.
         # The first refresh inside _seed_exit_engine_from_db runs BEFORE
         # QPM is attached. If that refresh fails (Render cold-start
@@ -2045,7 +2041,7 @@ class ClientRunner(threading.Thread):
             max_loss=max_loss,
             throttle_threshold=throttle_threshold,
             stop_threshold=stop_threshold,
-            data_broker_is_dedicated=bool(data_token),
+            data_broker_is_dedicated=data_broker_is_dedicated,
             exit_eng=exit_eng,
             mc_score_floor=_mc_score_floor,
             mc_ctx_floor=_mc_ctx_floor,
