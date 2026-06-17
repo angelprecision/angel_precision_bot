@@ -784,42 +784,148 @@ class APExecutionCore:
                     except Exception as _copy_exc:
                         log.warning("[%s] deferred breach selected contract copy failed: %s", ticker, _copy_exc)
 
+                # ── P0 (hotfix/deferred-breach-selector-reasons, amended): ────
+                # Shared helper — builds the selector audit dict and extracts
+                # the canonical reason_code/stage from get_last_failure() for
+                # use by BOTH deferred-breach failure paths below.
+                # get_last_failure() is observability-only and never raises.
+                # After a failed select() it holds the last REJECT emitted.
+                # After a successful select() that failed to copy (unresolved
+                # DEFERRED: placeholder) it is None — the caller must supply
+                # an override_reason_code in that case.
+                def _build_deferred_selector_audit(
+                    *,
+                    override_reason_code: str | None = None,
+                    override_stage: str | None = None,
+                ) -> tuple[str, dict]:
+                    """
+                    Returns (last_error_string, deferred_selector_audit_dict).
+                    Reads selector.get_last_failure() and merges with any
+                    caller-supplied override values.
+                    override_reason_code is used when the selector succeeded
+                    but post-selection validation failed (DEFERRED unresolved).
+                    """
+                    _sf = None
+                    _rc = None
+                    _st = None
+                    _ex = None
+                    try:
+                        if hasattr(self.contract_selector, "get_last_failure"):
+                            _sf = self.contract_selector.get_last_failure()
+                        if isinstance(_sf, dict):
+                            _rc = _sf.get("reason_code") or None
+                            _st = _sf.get("stage") or None
+                            _ex = _sf.get("explanation") or None
+                    except Exception as _gf_exc:
+                        log.debug(
+                            "[%s] get_last_failure() read failed (non-fatal): %s",
+                            ticker, _gf_exc,
+                        )
+                    # Override takes precedence when the selector itself succeeded
+                    # (no REJECT emitted) but downstream validation failed.
+                    if override_reason_code:
+                        _rc = override_reason_code
+                    if override_stage:
+                        _st = override_stage
+
+                    _error = (
+                        f"breach_time_contract_selection:{_rc}"
+                        if _rc
+                        else "breach_time_contract_selection_no_result"
+                    )
+                    import datetime as _dt
+                    _audit: dict = {
+                        "reason_code":         _rc,
+                        "stage":               _st,
+                        "explanation":         _ex,
+                        "budget":              float(getattr(approved_plan, "max_position_usd", 0) or 0),
+                        "ticker":              ticker,
+                        "side":                str(getattr(approved_plan, "side", "") or ""),
+                        "execution_mode":      str(getattr(approved_plan, "execution_mode", "") or ""),
+                        "contract_before":     _contract_sym_raw or None,
+                        "selected_contract":   _sel_contract or None,
+                        "timestamp":           _dt.datetime.now(_dt.timezone.utc).isoformat(),
+                        "raw_selector_reason": (
+                            _sf.get("raw_reason") if isinstance(_sf, dict) else None
+                        ),
+                    }
+                    return _error, _audit
+
+                # Path A: selector returned None OR live contract is still empty
+                # after copy-back. The selector's REJECT is the blocker.
                 if not _sel or not _live_contract:
-                    _reason = "breach_time_contract_selection_no_result"
+                    _reason, _deferred_selector_audit = _build_deferred_selector_audit()
                     log.critical(
-                        "[%s] DEFERRED_BREACH_CONTRACT_FAILED — %s",
-                        ticker, _reason,
+                        "DEFERRED_BREACH_CONTRACT_SELECTION_FAILED "
+                        "client=%s symbol=%s side=%s execution_mode=%s "
+                        "budget=%.2f reason=%s stage=%s order_id=%s signal_id=%s",
+                        self.client_id,
+                        ticker,
+                        str(getattr(approved_plan, "side", "") or ""),
+                        str(getattr(approved_plan, "execution_mode", "") or ""),
+                        float(getattr(approved_plan, "max_position_usd", 0) or 0),
+                        _reason,
+                        _deferred_selector_audit.get("stage") or "unknown",
+                        queue_local_order_id or "",
+                        str(getattr(approved_plan, "signal_id", "") or ""),
                     )
                     _terminalize_deferred_breach_failure(
                         _reason,
                         extra_meta={
-                            "failure_stage": "deferred_contract_selection",
-                            "selected_contract": _sel_contract or None,
+                            "failure_stage":           "deferred_contract_selection",
+                            "selected_contract":       _sel_contract or None,
+                            "deferred_selector_audit": _deferred_selector_audit,
                         },
                     )
                     log.critical(
                         "[%s] PRODUCTION_ENTRY_BLOCK — breach-time contract selection "
-                        "returned no contract",
-                        ticker,
+                        "returned no contract (reason=%s stage=%s budget=%.2f)",
+                        ticker, _reason,
+                        _deferred_selector_audit.get("stage") or "unknown",
+                        float(getattr(approved_plan, "max_position_usd", 0) or 0),
                     )
                     return
+
+                # Path B: selector returned a result but the plan copy-back failed
+                # or the selector wrote a DEFERRED: placeholder — unresolved.
+                # The selector itself did not emit a REJECT (it returned a value),
+                # so get_last_failure() is None; supply override reason code.
                 if _live_contract.upper().startswith("DEFERRED:"):
-                    _reason = f"deferred_unresolved_at_breach:{_live_contract}"
+                    _reason, _deferred_selector_audit = _build_deferred_selector_audit(
+                        override_reason_code="DEFERRED_UNRESOLVED_AT_BREACH",
+                        override_stage="deferred_copy_back",
+                    )
+                    # Embed the unresolved placeholder in the reason string so
+                    # the order row records which contract was stuck.
+                    _reason = f"breach_time_contract_selection:DEFERRED_UNRESOLVED_AT_BREACH:{_live_contract}"
+                    _deferred_selector_audit["unresolved_placeholder"] = _live_contract
                     log.critical(
-                        "[%s] DEFERRED_BREACH_CONTRACT_FAILED — %s",
-                        ticker, _reason,
+                        "DEFERRED_BREACH_CONTRACT_SELECTION_FAILED "
+                        "client=%s symbol=%s side=%s execution_mode=%s "
+                        "budget=%.2f reason=%s stage=%s order_id=%s signal_id=%s",
+                        self.client_id,
+                        ticker,
+                        str(getattr(approved_plan, "side", "") or ""),
+                        str(getattr(approved_plan, "execution_mode", "") or ""),
+                        float(getattr(approved_plan, "max_position_usd", 0) or 0),
+                        _reason,
+                        _deferred_selector_audit.get("stage") or "unknown",
+                        queue_local_order_id or "",
+                        str(getattr(approved_plan, "signal_id", "") or ""),
                     )
                     _terminalize_deferred_breach_failure(
                         _reason,
                         extra_meta={
-                            "failure_stage": "deferred_contract_selection",
-                            "selected_contract": _sel_contract or None,
-                            "approved_contract": _live_contract,
+                            "failure_stage":           "deferred_contract_selection",
+                            "selected_contract":       _sel_contract or None,
+                            "approved_contract":       _live_contract,
+                            "deferred_selector_audit": _deferred_selector_audit,
                         },
                     )
                     log.critical(
-                        "[%s] PRODUCTION_ENTRY_BLOCK — contract selector left placeholder unresolved: %s",
-                        ticker, _live_contract,
+                        "[%s] PRODUCTION_ENTRY_BLOCK — contract selector left placeholder "
+                        "unresolved: %s (reason=%s)",
+                        ticker, _live_contract, _reason,
                     )
                     return
                 log.info(
