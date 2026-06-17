@@ -1686,17 +1686,22 @@ class ClientRunner(threading.Thread):
         # Risk profile fields override anything from the clients table.
         _rp = getattr(self, "_risk_profile", {}) or {}
         _rp_field_map = {
-            "max_capital_pct":   "max_capital_pct",
-            "max_sector_pct":    "max_sector_pct",
-            "max_ticker_pct":    "max_ticker_pct",
-            "max_calls":         "max_calls",
-            "max_puts":          "max_puts",
-            "score_floor":       "score_floor",
-            "context_floor":     "context_floor",
-            "max_positions":     "max_concurrent_positions",  # map to clients table key
-            "daily_max_loss_pct":"daily_max_loss_pct",
-            "entries_enabled":   "entries_enabled",
+            "max_capital_pct":        "max_capital_pct",
+            "max_sector_pct":         "max_sector_pct",
+            "max_ticker_pct":         "max_ticker_pct",
+            "max_calls":              "max_calls",
+            "max_puts":               "max_puts",
+            "score_floor":            "score_floor",
+            "context_floor":          "context_floor",
+            "max_positions":          "max_concurrent_positions",  # map to clients table key
+            "daily_max_loss_pct":     "daily_max_loss_pct",
+            "entries_enabled":        "entries_enabled",
             "daily_profit_target_usd": "daily_profit_target_usd",
+            # PR #155 — split-cap fields. These map directly (same key in both
+            # client_risk_profiles and client_cfg). NULL in the risk profile
+            # means "use the backward-compat fallback in APMasterControl".
+            "max_position_pct":       "max_position_pct",
+            "max_total_capital_pct":  "max_total_capital_pct",
         }
         _risk_profile_source = "GLOBAL_ENV_DEFAULT"
         for _rp_key, _cfg_key in _rp_field_map.items():
@@ -1802,6 +1807,21 @@ class ClientRunner(threading.Thread):
         _mc_max_puts    = self._cfg_or_env(client_cfg, "max_puts",        "MAX_PUTS",        "10",   int)
         _mc_score_floor = self._cfg_or_env(client_cfg, "score_floor",     "SCORE_FLOOR",     "65",   float)
         _mc_ctx_floor   = self._cfg_or_env(client_cfg, "context_floor",   "CONTEXT_FLOOR",   "0.0",  float)
+
+        # PR #155 — split per-position cap from total portfolio exposure cap.
+        # max_position_pct: per-trade budget as fraction of equity.
+        #   Falls back to max_capital_pct if column is NULL (backward compat).
+        # max_total_capital_pct: total portfolio exposure cap.
+        #   Falls back to DEFAULT_MAX_TOTAL_CAPITAL_PCT env (default 0.40).
+        # Both fields are hydrated from client_risk_profiles via _rp_field_map
+        # above before _cfg_or_env reads them. NULL in the risk profile means
+        # "let APMasterControl.__init__ resolve the fallback".
+        _mc_position_pct = self._cfg_or_env(
+            client_cfg, "max_position_pct", "DEFAULT_MAX_POSITION_PCT", None, float
+        )
+        _mc_total_capital_pct = self._cfg_or_env(
+            client_cfg, "max_total_capital_pct", "DEFAULT_MAX_TOTAL_CAPITAL_PCT", None, float
+        )
         # H8: daily profit target (USD). NULL/0 = disabled. Per-client only —
         # no global env default, since a blanket target across all clients
         # would be wrong (different account sizes/goals).
@@ -1838,6 +1858,8 @@ class ClientRunner(threading.Thread):
             max_daily_loss=max_loss,
             daily_profit_target_usd=_mc_daily_target,
             account_equity=equity,
+            max_position_pct=_mc_position_pct,
+            max_total_capital_pct=_mc_total_capital_pct,
             position_manager=self.position_manager,
             position_sizer=position_sizer,
             supabase_client=sb,

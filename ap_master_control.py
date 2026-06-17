@@ -420,19 +420,61 @@ class APMasterControl:
         max_snapshot_age_sec: float = 15.0,
         require_snapshot_freshness_live: bool = True,
         pending_capital_fail_closed_live: bool = True,
+        # PR #155 — split per-position cap from total exposure cap.
+        # max_position_pct: per-trade budget as fraction of equity.
+        #   If not supplied, falls back to max_capital_pct for backward compat.
+        # max_total_capital_pct: total portfolio exposure cap as fraction of equity.
+        #   If not supplied, uses DEFAULT_MAX_TOTAL_CAPITAL_PCT env/default.
+        #   Must not be lower than max_position_pct (enforced at init).
+        #   Never silently made unlimited — minimum floor enforced.
+        max_position_pct: float | None = None,
+        max_total_capital_pct: float | None = None,
     ):
         self.mode = mode.upper()
         self.paper = self.mode != "LIVE"
         self.score_floor = score_floor
         self.context_floor = context_floor
         self.max_positions = max_positions
-        self.max_capital_pct = max_capital_pct
+        self.max_capital_pct = max_capital_pct  # preserved for backward compat
         self.max_sector_pct = max_sector_pct
         self.max_ticker_pct = max_ticker_pct
         self.max_calls = max_calls
         self.max_puts = max_puts
         self.max_trades_today = max_trades_today
         self.max_daily_loss = max_daily_loss
+
+        # PR #155 — split per-position cap from total portfolio exposure cap.
+        # Backward compatibility:
+        #   max_position_pct  → falls back to max_capital_pct if not set
+        #   max_total_capital_pct → falls back to DEFAULT_MAX_TOTAL_CAPITAL_PCT
+        #                           env/hardcoded, never left unlimited
+        _DEFAULT_MAX_POSITION_PCT = float(os.getenv("DEFAULT_MAX_POSITION_PCT", "0.10"))
+        _DEFAULT_MAX_TOTAL_CAPITAL_PCT = float(os.getenv("DEFAULT_MAX_TOTAL_CAPITAL_PCT", "0.40"))
+
+        # Per-trade budget cap
+        if max_position_pct is not None:
+            self.max_position_pct = float(max_position_pct)
+        else:
+            # Legacy path: treat max_capital_pct as both caps, but apply the
+            # known per-trade default when max_capital_pct is its own default.
+            # If the caller explicitly set max_capital_pct to something < default
+            # (e.g. 0.10 for Jason), honour it as the per-position cap.
+            self.max_position_pct = float(max_capital_pct)
+
+        # Total portfolio exposure cap — never unlimited
+        if max_total_capital_pct is not None:
+            self.max_total_capital_pct = float(max_total_capital_pct)
+        else:
+            self.max_total_capital_pct = _DEFAULT_MAX_TOTAL_CAPITAL_PCT
+
+        # Safety: total cap must be >= per-position cap (otherwise every trade blocks)
+        if self.max_total_capital_pct < self.max_position_pct:
+            log.warning(
+                "[%s] APMasterControl: max_total_capital_pct=%.2f < max_position_pct=%.2f "
+                "— clamping total cap to per-position cap to avoid permanent block",
+                client_id, self.max_total_capital_pct, self.max_position_pct,
+            )
+            self.max_total_capital_pct = self.max_position_pct
         # H8: once realized P&L for the session reaches this dollar target,
         # block NEW entries for the rest of the day so the bot does not give
         # back a green day chasing more trades. 0.0 = disabled (unlimited).
@@ -1721,16 +1763,81 @@ class APMasterControl:
         # (account_equity, max_daily_loss) under _equity_lock here.
         # Use the local variables for ALL subsequent risk math below.
         account_equity, max_daily_loss = self._equity_snapshot()
-        max_capital = account_equity * self.max_capital_pct
+        # PR #155 — split per-position cap from total portfolio exposure cap.
+        #
+        # OLD (single cap):
+        #   max_capital = equity * max_capital_pct   (acts as BOTH per-trade AND total)
+        #   remaining   = max_capital - deployed - pending
+        #
+        # NEW (split caps):
+        #   per_trade_budget       = equity * max_position_pct
+        #   total_capital_cap      = equity * max_total_capital_pct
+        #   current_total_exposure = capital_deployed + pending_capital
+        #   remaining_total_cap    = total_capital_cap - current_total_exposure
+        #   selector_budget        = min(per_trade_budget, remaining_total_cap)
+        #
+        # Existing exposure only shrinks selector_budget when the TOTAL
+        # portfolio exposure cap is near full — not on every new trade.
+        # Backward compat: when max_position_pct == max_total_capital_pct
+        # (legacy single-value path), behaviour is identical to the old formula.
+        #
+        # Block reasons emitted below:
+        #   capital_limit_total_exposure_cap_reached — total cap at/over limit
+        #   capital_limit_no_remaining               — selector_budget <= 0
 
-        # Remaining capital the selector is allowed to spend on this trade.
-        # Floor at 0 — a negative remaining means the account is already at
-        # or above its cap; no new entry can be approved regardless of
-        # static estimates.
+        per_trade_budget       = account_equity * self.max_position_pct
+        total_capital_cap      = account_equity * self.max_total_capital_pct
+        current_total_exposure = snap["capital_deployed"] + pending_capital_real
+        remaining_total_cap    = total_capital_cap - current_total_exposure
+
+        # Hard block: total portfolio exposure cap is at or over limit.
+        # This is a separate, earlier block so the reason code is unambiguous.
+        if remaining_total_cap <= 0.0:
+            _block_meta_total = {
+                "client_id":                 client_id,
+                "execution_mode":            str(current_mode or "").lower(),
+                "account_equity":            float(account_equity),
+                "max_position_pct":          float(self.max_position_pct),
+                "max_total_capital_pct":     float(self.max_total_capital_pct),
+                "per_trade_budget":          float(per_trade_budget),
+                "total_capital_cap":         float(total_capital_cap),
+                "capital_deployed":          float(snap.get("capital_deployed", 0)),
+                "pending_capital":           float(pending_capital_real),
+                "current_total_exposure":    float(current_total_exposure),
+                "remaining_total_cap":       float(remaining_total_cap),
+                "selector_budget":           0.0,
+                "legacy_max_capital_pct":    float(self.max_capital_pct),
+            }
+            log.warning(
+                "[%s] CAPITAL_LIMIT_TOTAL_EXPOSURE_CAP_REACHED "
+                "client=%s execution_mode=%s equity=%.0f "
+                "total_capital_cap=%.0f current_total_exposure=%.0f "
+                "remaining_total_cap=%.0f per_trade_budget=%.0f",
+                ticker, client_id, current_mode, account_equity,
+                total_capital_cap, current_total_exposure,
+                remaining_total_cap, per_trade_budget,
+            )
+            return self._block(
+                signal_id, ticker, client_id, "blocked_risk",
+                f"capital_limit_total_exposure_cap_reached "
+                f"total_cap=${total_capital_cap:.0f} "
+                f"exposure=${current_total_exposure:.0f} "
+                f"remaining=${remaining_total_cap:.0f}",
+                reason_code="CAPITAL_LIMIT_TOTAL_EXPOSURE_CAP_REACHED",
+                meta=_block_meta_total,
+            )
+
+        # selector_budget = tighter of: per-trade cap vs remaining total capacity.
+        # Floor at 0 — negative means cap already exceeded.
         remaining_capital_for_this_trade = max(
             0.0,
-            max_capital - snap["capital_deployed"] - pending_capital_real,
+            min(per_trade_budget, remaining_total_cap),
         )
+
+        # Keep max_capital as an alias for downstream code that reads it
+        # (logging, sizing_context, revalidate_exposure). Set to per_trade_budget
+        # so those paths see the per-trade limit, not the total portfolio cap.
+        max_capital = per_trade_budget
 
         # Two pre-block strategies:
         #   - LIVE  (bootstrap OR post-bootstrap): use the affordability
@@ -2422,6 +2529,15 @@ class APMasterControl:
                         else None
                     ),
                     "affordability_flow":  bool(_use_affordability_flow),
+                    # PR #155 — split-cap fields for full capital math audit.
+                    "max_position_pct":        float(self.max_position_pct),
+                    "max_total_capital_pct":   float(self.max_total_capital_pct),
+                    "per_trade_budget":        float(per_trade_budget),
+                    "total_capital_cap":       float(total_capital_cap),
+                    "current_total_exposure":  float(current_total_exposure),
+                    "remaining_total_cap":     float(remaining_total_cap),
+                    "selector_budget":         float(remaining_capital_for_this_trade),
+                    "legacy_max_capital_pct":  float(self.max_capital_pct),
                 },
                 "snapshot_at_eval": {
                     "open_count": snap["open_count"],
@@ -2973,9 +3089,33 @@ class APMasterControl:
                     reason_code="PENDING_CAPITAL_UNAVAILABLE",
                 )
             pending_cap = 0.0
-        proj_total = snap["capital_deployed"] + pending_cap + real_cost
-        max_capital = equity * self.max_capital_pct
-        pct_used = proj_total / equity * 100 if equity > 0 else 0
+        # PR #155 — split-cap revalidate_exposure: two independent gates.
+        #
+        # Gate 1 — per-position cap:
+        #   Fires when: real_cost > per_trade_budget
+        #   Resize headroom: per_trade_budget  (independent of deployed/pending)
+        #   Reason: ACTUAL_CONTRACT_COST_EXCEEDS_PER_POSITION_CAP
+        #
+        # Gate 2 — total exposure cap:
+        #   Fires when: projected_total_exposure > total_capital_cap
+        #   Resize headroom: remaining_total_capacity = total_cap - deployed - pending
+        #   Reason: CAPITAL_LIMIT_TOTAL_EXPOSURE_CAP_REACHED (at/over limit)
+        #            ACTUAL_CONTRACT_COST_EXCEEDS_REMAINING_TOTAL_CAPACITY (near limit)
+        #
+        # CRITICAL: do NOT compare projected_total_exposure to per_trade_budget.
+        # That apples-vs-oranges comparison is what produced the false block on
+        # second trades (proj_total=366 > per_trade_cap=198 when deployed=183,
+        # real_cost=183) and the $15 resize bug (_remaining = 198 - 183 = 15).
+
+        per_trade_budget         = equity * self.max_position_pct
+        total_capital_cap        = equity * self.max_total_capital_pct
+        current_total_exposure   = snap["capital_deployed"] + pending_cap   # excludes new real_cost
+        projected_total_exposure = current_total_exposure + real_cost        # includes new real_cost
+        remaining_total_capacity = total_capital_cap - current_total_exposure
+        # max_capital alias for _log_capital_utilization (expects a single limit field).
+        # Set to per_trade_budget — the primary per-position cap.
+        max_capital = per_trade_budget
+        pct_used = projected_total_exposure / equity * 100 if equity > 0 else 0
 
         sector = self.SECTOR_MAP.get(ticker.upper(), "other")
         sector_deployed = self._sector_capital_deployed(snap["open_positions"] + snap["closing_positions"], sector)
@@ -2995,7 +3135,7 @@ class APMasterControl:
                 deployed=snap["capital_deployed"],
                 pending=pending_cap,
                 new_cost=real_cost,
-                projected=proj_total,
+                projected=projected_total_exposure,
                 limit=max_capital,
                 pct_used=pct_used,
                 sector=sector,
@@ -3009,107 +3149,174 @@ class APMasterControl:
                 block_reason=block_reason,
             )
 
-        if proj_total > max_capital:
-            # PR P0 paper+live affordable resize: if the selected contract is
-            # real and the original quantity exceeds the remaining capital,
-            # resize the quantity for either execution mode before blocking.
-            _resized_for_affordable_qty = False
-            if plan.contracts > 0 and real_cost > 0:
-                _original_qty    = int(plan.contracts)
-                _cost_per_contract = real_cost / _original_qty   # already × 100
-                _remaining_now   = max_capital - snap["capital_deployed"] - pending_cap
-                _computed_qty    = (
-                    int(_remaining_now // _cost_per_contract)
-                    if _cost_per_contract > 0 else 0
-                )
-                _candidate_limit = _cost_per_contract / 100.0    # option premium per share
+        # ── PR #155 split-cap revalidate_exposure ─────────────────────────────
+        # Two independent gates, each with the correct headroom and reason code.
+        # Do NOT compare projected_total_exposure to per_trade_budget — that is
+        # the apples-vs-oranges bug that caused the false-block on second trades.
+        #
+        # Gate 1 — per-position cap:
+        #   Question: does this one trade cost more than the per-trade budget?
+        #   Headroom for resize: per_trade_budget
+        #   Reason code: ACTUAL_CONTRACT_COST_EXCEEDS_PER_POSITION_CAP
+        #
+        # Gate 2 — total exposure cap:
+        #   Question: does adding this trade push total portfolio exposure over the cap?
+        #   Headroom for resize: remaining_total_capacity = total_cap - deployed - pending
+        #   Reason code: ACTUAL_CONTRACT_COST_EXCEEDS_REMAINING_TOTAL_CAPACITY
+        #
+        # Resize uses the headroom appropriate to the gate that fired.
+        # A trade can be resized by Gate 1 and then still fail Gate 2 (edge case:
+        # resized trade fits per-trade budget but total cap is almost full).
+        # ─────────────────────────────────────────────────────────────────────
 
-                if _computed_qty >= 1:
-                    # Resize is viable — adjust plan before continuing
-                    _final_qty            = min(_original_qty, _computed_qty)
-                    plan.contracts        = _final_qty
-                    plan.max_position_usd = float(_final_qty * _cost_per_contract)
+        # ── Gate 1: per-position cap ────────────────────────────────────────
+        _resized_for_affordable_qty = False
+        if real_cost > per_trade_budget:
+            if plan.contracts > 0 and real_cost > 0:
+                _original_qty_g1      = int(plan.contracts)
+                _cost_per_contract_g1 = real_cost / _original_qty_g1
+                # Resize headroom is per_trade_budget — the single-trade limit.
+                # This is independent of how much is already deployed.
+                _remaining_g1         = per_trade_budget
+                _computed_qty_g1      = (
+                    int(_remaining_g1 // _cost_per_contract_g1)
+                    if _cost_per_contract_g1 > 0 else 0
+                )
+                _candidate_limit_g1   = _cost_per_contract_g1 / 100.0
+
+                if _computed_qty_g1 >= 1:
+                    _final_qty_g1         = min(_original_qty_g1, _computed_qty_g1)
+                    plan.contracts        = _final_qty_g1
+                    plan.max_position_usd = float(_final_qty_g1 * _cost_per_contract_g1)
                     real_cost             = plan.max_position_usd
-                    proj_total            = snap["capital_deployed"] + pending_cap + real_cost
-                    pct_used              = proj_total / equity * 100 if equity > 0 else 0
-                    # Recompute sector/ticker projections with resized real_cost
-                    # so downstream cap checks don't use the original paper qty cost.
+                    projected_total_exposure = current_total_exposure + real_cost
+                    pct_used              = projected_total_exposure / equity * 100 if equity > 0 else 0
                     proj_sector           = sector_deployed + real_cost
                     proj_ticker           = ticker_deployed + real_cost
                     _resized_for_affordable_qty = True
-                    _bd_resize = self._get_pending_capital_breakdown(snap, client_id) or {}
+                    _bd_g1 = self._get_pending_capital_breakdown(snap, client_id) or {}
                     log.info(
-                        "[%s] SMALL_ACCOUNT_AFFORDABLE_QTY_RESIZE "
-                        "client_email=%s execution_mode=%s client_cap=%.0f "
-                        "capital_deployed=%.0f pending_submitted_entry_exposure=%.0f "
+                        "[%s] SMALL_ACCOUNT_AFFORDABLE_QTY_RESIZE gate=per_position_cap "
+                        "client_email=%s execution_mode=%s "
+                        "per_trade_budget=%.0f total_capital_cap=%.0f "
+                        "current_total_exposure=%.0f remaining_total_capacity=%.0f "
+                        "capital_deployed=%.0f pending=%.0f "
+                        "pending_submitted_entry_exposure=%.0f "
                         "filled_unreconciled_exposure=%.0f "
-                        "pending_total_capital_reserved=%.0f "
-                        "remaining_capital=%.0f "
                         "candidate_limit=%.4f computed_qty=%d original_qty=%d "
-                        "final_qty=%d resized_for_affordable_qty=true",
-                        ticker, client_id, execution_mode, max_capital,
-                        float(snap.get("capital_deployed", 0)),
-                        _bd_resize.get("pending_submitted_entry_exposure", 0.0),
-                        _bd_resize.get("filled_unreconciled_exposure", 0.0),
-                        _bd_resize.get("pending_total_capital_reserved", pending_cap),
-                        _remaining_now, _candidate_limit,
-                        _computed_qty, _original_qty, _final_qty,
+                        "final_qty=%d",
+                        ticker, client_id, execution_mode,
+                        per_trade_budget, total_capital_cap,
+                        current_total_exposure, remaining_total_capacity,
+                        float(snap.get("capital_deployed", 0)), pending_cap,
+                        _bd_g1.get("pending_submitted_entry_exposure", 0.0),
+                        _bd_g1.get("filled_unreconciled_exposure", 0.0),
+                        _candidate_limit_g1, _computed_qty_g1, _original_qty_g1, _final_qty_g1,
                     )
                 else:
-                    _bd_unafford = self._get_pending_capital_breakdown(snap, client_id) or {}
-                    log.warning(
-                        "[%s] SMALL_ACCOUNT_CONTRACT_UNAFFORDABLE "
-                        "client_email=%s execution_mode=%s client_cap=%.0f "
-                        "capital_deployed=%.0f pending_submitted_entry_exposure=%.0f "
-                        "filled_unreconciled_exposure=%.0f "
-                        "pending_total_capital_reserved=%.0f "
-                        "remaining_capital=%.0f "
-                        "candidate_limit=%.4f computed_qty=%d original_qty=%d "
-                        "final_qty=0 reason=capital_limit_contract_unaffordable",
-                        ticker, client_id, execution_mode, max_capital,
-                        float(snap.get("capital_deployed", 0)),
-                        _bd_unafford.get("pending_submitted_entry_exposure", 0.0),
-                        _bd_unafford.get("filled_unreconciled_exposure", 0.0),
-                        _bd_unafford.get("pending_total_capital_reserved", pending_cap),
-                        _remaining_now, _candidate_limit, _computed_qty, _original_qty,
-                    )
+                    _bd_g1 = self._get_pending_capital_breakdown(snap, client_id) or {}
                     reason = (
-                        f"capital_limit_contract_unaffordable "
+                        f"ACTUAL_CONTRACT_COST_EXCEEDS_PER_POSITION_CAP "
                         f"client_email={client_id} execution_mode={execution_mode} "
-                        f"client_cap=${max_capital:.0f} "
+                        f"real_cost=${real_cost:.0f} per_trade_budget=${per_trade_budget:.0f} "
+                        f"total_capital_cap=${total_capital_cap:.0f} "
+                        f"current_total_exposure=${current_total_exposure:.0f} "
+                        f"remaining_total_capacity=${remaining_total_capacity:.0f} "
                         f"capital_deployed=${snap['capital_deployed']:.0f} "
-                        f"pending_submitted_entry_exposure=$"
-                        f"{_bd_unafford.get('pending_submitted_entry_exposure', 0.0):.0f} "
-                        f"filled_unreconciled_exposure=$"
-                        f"{_bd_unafford.get('filled_unreconciled_exposure', 0.0):.0f} "
-                        f"pending_total_capital_reserved=$"
-                        f"{_bd_unafford.get('pending_total_capital_reserved', pending_cap):.0f} "
-                        f"remaining_capital=${_remaining_now:.0f} "
-                        f"candidate_limit={_candidate_limit:.4f} "
-                        f"computed_qty={_computed_qty} original_qty={_original_qty} final_qty=0 "
-                        f"reason_code=CAPITAL_LIMIT_CONTRACT_UNAFFORDABLE"
+                        f"pending=${pending_cap:.0f} "
+                        f"pending_submitted_entry_exposure="
+                        f"${_bd_g1.get('pending_submitted_entry_exposure', 0.0):.0f} "
+                        f"candidate_limit={_candidate_limit_g1:.4f} "
+                        f"computed_qty={_computed_qty_g1} original_qty={_original_qty_g1}"
+                    )
+                    log.warning(
+                        "[%s] SMALL_ACCOUNT_CONTRACT_UNAFFORDABLE gate=per_position_cap "
+                        "real_cost=%.0f per_trade_budget=%.0f computed_qty=%d",
+                        ticker, real_cost, per_trade_budget, _computed_qty_g1,
                     )
                     _log_revalidation(True, reason)
                     return self._block(
                         signal_id, ticker, client_id, "blocked_risk", reason,
-                        reason_code="CAPITAL_LIMIT_CONTRACT_UNAFFORDABLE",
+                        reason_code="ACTUAL_CONTRACT_COST_EXCEEDS_PER_POSITION_CAP",
                     )
 
-            if proj_total > max_capital and not _resized_for_affordable_qty:
-                reason = f"capital_limit: ${proj_total:.0f} > ${max_capital:.0f}"
-                _log_revalidation(True, reason)
-                return self._block(
-                    signal_id,
-                    ticker,
-                    client_id,
-                    "blocked_risk",
-                    f"ACTUAL_CONTRACT_COST_EXCEEDS_CLIENT_CAPITAL_LIMIT "
-                    f"execution_mode={execution_mode} "
-                    f"(${proj_total:.0f} > ${max_capital:.0f} | "
-                    f"deployed=${snap['capital_deployed']:.0f} pending=${pending_cap:.0f} "
-                    f"real_cost=${real_cost:.0f})",
-                    reason_code="ACTUAL_CONTRACT_COST_EXCEEDS_CLIENT_CAPITAL_LIMIT",
+        # ── Gate 2: total exposure cap ──────────────────────────────────────
+        if projected_total_exposure > total_capital_cap:
+            if plan.contracts > 0 and real_cost > 0:
+                _original_qty_g2      = int(plan.contracts)
+                _cost_per_contract_g2 = real_cost / _original_qty_g2
+                # Resize headroom is remaining_total_capacity — how much portfolio
+                # room is left before hitting the total exposure ceiling.
+                _remaining_g2         = max(0.0, remaining_total_capacity)
+                _computed_qty_g2      = (
+                    int(_remaining_g2 // _cost_per_contract_g2)
+                    if _cost_per_contract_g2 > 0 else 0
                 )
+                _candidate_limit_g2   = _cost_per_contract_g2 / 100.0
+
+                if _computed_qty_g2 >= 1:
+                    _final_qty_g2         = min(_original_qty_g2, _computed_qty_g2)
+                    plan.contracts        = _final_qty_g2
+                    plan.max_position_usd = float(_final_qty_g2 * _cost_per_contract_g2)
+                    real_cost             = plan.max_position_usd
+                    projected_total_exposure = current_total_exposure + real_cost
+                    pct_used              = projected_total_exposure / equity * 100 if equity > 0 else 0
+                    proj_sector           = sector_deployed + real_cost
+                    proj_ticker           = ticker_deployed + real_cost
+                    _resized_for_affordable_qty = True
+                    _bd_g2 = self._get_pending_capital_breakdown(snap, client_id) or {}
+                    log.info(
+                        "[%s] SMALL_ACCOUNT_AFFORDABLE_QTY_RESIZE gate=total_exposure_cap "
+                        "client_email=%s execution_mode=%s "
+                        "per_trade_budget=%.0f total_capital_cap=%.0f "
+                        "current_total_exposure=%.0f remaining_total_capacity=%.0f "
+                        "capital_deployed=%.0f pending=%.0f "
+                        "pending_submitted_entry_exposure=%.0f "
+                        "filled_unreconciled_exposure=%.0f "
+                        "candidate_limit=%.4f computed_qty=%d original_qty=%d "
+                        "final_qty=%d",
+                        ticker, client_id, execution_mode,
+                        per_trade_budget, total_capital_cap,
+                        current_total_exposure, remaining_total_capacity,
+                        float(snap.get("capital_deployed", 0)), pending_cap,
+                        _bd_g2.get("pending_submitted_entry_exposure", 0.0),
+                        _bd_g2.get("filled_unreconciled_exposure", 0.0),
+                        _candidate_limit_g2, _computed_qty_g2, _original_qty_g2, _final_qty_g2,
+                    )
+                else:
+                    _bd_g2 = self._get_pending_capital_breakdown(snap, client_id) or {}
+                    _is_total_cap_reached = remaining_total_capacity <= 0.0
+                    reason = (
+                        f"{'CAPITAL_LIMIT_TOTAL_EXPOSURE_CAP_REACHED' if _is_total_cap_reached else 'ACTUAL_CONTRACT_COST_EXCEEDS_REMAINING_TOTAL_CAPACITY'} "
+                        f"client_email={client_id} execution_mode={execution_mode} "
+                        f"projected_total_exposure=${projected_total_exposure:.0f} "
+                        f"total_capital_cap=${total_capital_cap:.0f} "
+                        f"per_trade_budget=${per_trade_budget:.0f} "
+                        f"current_total_exposure=${current_total_exposure:.0f} "
+                        f"remaining_total_capacity=${remaining_total_capacity:.0f} "
+                        f"real_cost=${real_cost:.0f} "
+                        f"capital_deployed=${snap['capital_deployed']:.0f} "
+                        f"pending=${pending_cap:.0f} "
+                        f"pending_submitted_entry_exposure="
+                        f"${_bd_g2.get('pending_submitted_entry_exposure', 0.0):.0f} "
+                        f"computed_qty={_computed_qty_g2} original_qty={_original_qty_g2}"
+                    )
+                    reason_code = (
+                        "CAPITAL_LIMIT_TOTAL_EXPOSURE_CAP_REACHED"
+                        if _is_total_cap_reached
+                        else "ACTUAL_CONTRACT_COST_EXCEEDS_REMAINING_TOTAL_CAPACITY"
+                    )
+                    log.warning(
+                        "[%s] TOTAL_EXPOSURE_CAP_BLOCK gate=total_exposure_cap "
+                        "projected_total=%.0f total_cap=%.0f remaining=%.0f computed_qty=%d",
+                        ticker, projected_total_exposure, total_capital_cap,
+                        remaining_total_capacity, _computed_qty_g2,
+                    )
+                    _log_revalidation(True, reason)
+                    return self._block(
+                        signal_id, ticker, client_id, "blocked_risk", reason,
+                        reason_code=reason_code,
+                    )
 
         if proj_sector > max_sector:
             reason = f"sector_cap_{sector}: ${proj_sector:.0f} > ${max_sector:.0f}"
@@ -3135,11 +3342,16 @@ class APMasterControl:
 
         _log_revalidation(False, "")
         log.info(
-            "[%s] Re-validation passed | real_cost=$%.0f total_proj=$%.0f/%.0f sector_%s=$%.0f/%.0f ticker=$%.0f/%.0f",
+            "[%s] Re-validation passed | real_cost=$%.0f "
+            "projected_total=$%.0f/total_cap=$%.0f "
+            "per_trade_budget=$%.0f remaining_total_capacity=$%.0f "
+            "sector_%s=$%.0f/%.0f ticker=$%.0f/%.0f",
             ticker,
             real_cost,
-            proj_total,
-            max_capital,
+            projected_total_exposure,
+            total_capital_cap,
+            per_trade_budget,
+            remaining_total_capacity,
             sector,
             proj_sector,
             max_sector,
