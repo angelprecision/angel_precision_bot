@@ -645,6 +645,22 @@ def _require_admin(fn):
     return _wrap
 
 
+# =============================================================================
+# OVERNIGHT REEVAL ASYNC JOB STORE (HOISTED — must be defined BEFORE create_app)
+# =============================================================================
+# Stores async background reeval job state so /admin/overnight_reeval and
+# /admin/overnight_reeval/status can communicate. Process-local dict — fine
+# for the live pod (single process) and the paper pod (single process).
+# Multi-worker gunicorn would need a shared store; not in use today.
+#
+# Hoisted above create_app() for the same reason as _require_admin (see banner
+# above): create_app() registers endpoints that reference this name; module-
+# level `app = create_app()` runs at import time, so the name must be defined
+# beforehand.
+# =============================================================================
+_OVERNIGHT_REEVAL_JOBS: dict = {}
+
+
 def create_app() -> Flask:
     app = Flask(__name__)
     app.config["MAX_CONTENT_LENGTH"] = MAX_CONTENT_LENGTH
@@ -2975,25 +2991,164 @@ def create_app() -> Flask:
     @app.post("/admin/overnight_reeval")
     @require_hmac
     def admin_overnight_reeval():
-        """Manually trigger overnight daily signal reeval for all active runners.
-        Normally fires automatically at 9:00-9:45 AM ET.
-        Use this to trigger it manually (e.g. after a late deploy or for testing).
-        Pass {"force": true} to bypass the time-of-day guard.
+        """Manually trigger overnight daily signal reeval, bounded + batched.
+
+        Normally fires automatically at 9:00-9:45 AM ET. This endpoint supports
+        manual invocation with explicit bounds so a GitHub Action curl call
+        does not time out under load.
+
+        Request body (all optional):
+          - force (bool, default True): bypass time-of-day guard
+          - clients (list[str], default all): restrict to specific runner emails
+          - max_clients (int, default 5): hard cap on runners processed this call
+          - time_budget_seconds (int, default 60): wall-clock deadline; the
+            per-client loop short-circuits between clients once this is hit
+          - async_background (bool, default False): when true, spawn a daemon
+            thread, return job_id immediately, poll /admin/overnight_reeval/status
+          - offset (int, default 0): for pagination across multiple calls,
+            skip the first N runners from the active-runner registry
+
+        Sync response when bounded run finishes within budget:
+          {
+            "ok": true,
+            "mode": "sync",
+            "force": true,
+            "runners_eligible": N,
+            "runners_processed": K,
+            "runners_skipped_budget": M,
+            "next_offset": K,
+            "elapsed_seconds": S,
+            "total_armed": A,
+            "total_rejected": R,
+            "results": {...}
+          }
+
+        Async response (returns immediately):
+          {"ok": true, "mode": "async", "job_id": "...", "runners_queued": N}
         """
         try:
             from client_runner import _active_runners, _registry_lock
             from ap_overnight_reeval import run_overnight_reeval
+            import threading as _threading
+            import time as _time
+            import uuid as _uuid
 
             body = request.get_json(silent=True) or {}
-            force = bool(body.get("force", True))  # default force=True for manual calls
+            force        = bool(body.get("force", True))
+            clients_filter = body.get("clients") or None
+            if clients_filter is not None:
+                clients_filter = {str(e).strip().lower() for e in clients_filter if str(e).strip()}
+            max_clients          = int(body.get("max_clients", 5) or 5)
+            time_budget_seconds  = float(body.get("time_budget_seconds", 60) or 60)
+            async_background     = bool(body.get("async_background", False))
+            offset               = max(0, int(body.get("offset", 0) or 0))
 
-            results = {}
             with _registry_lock:
-                runners = list(_active_runners.items())
+                runners_all = list(_active_runners.items())
 
-            for email, runner in runners:
+            def _eligible(email_runner):
+                email, _runner = email_runner
+                if clients_filter is not None:
+                    return email.lower() in clients_filter
+                return True
+
+            runners_eligible = [er for er in runners_all if _eligible(er)]
+            runners_window   = runners_eligible[offset:offset + max_clients]
+
+            # ── Async path ──────────────────────────────────────────────────
+            if async_background:
+                job_id = str(_uuid.uuid4())
+                _OVERNIGHT_REEVAL_JOBS[job_id] = {
+                    "job_id":     job_id,
+                    "status":     "queued",
+                    "started_ts": _time.time(),
+                    "finished_ts": None,
+                    "force":      force,
+                    "runners_queued":    len(runners_window),
+                    "runners_processed": 0,
+                    "results":           {},
+                    "elapsed_seconds":   None,
+                }
+
+                def _run_bg():
+                    job = _OVERNIGHT_REEVAL_JOBS[job_id]
+                    job["status"] = "running"
+                    t0 = _time.time()
+                    try:
+                        for email, runner in runners_window:
+                            elapsed = _time.time() - t0
+                            if elapsed > time_budget_seconds:
+                                job["results"][email] = {
+                                    "skipped": "time_budget_exceeded",
+                                    "elapsed_seconds": round(elapsed, 1),
+                                }
+                                continue
+                            if not runner.is_alive():
+                                job["results"][email] = {"error": "runner not alive"}
+                                job["runners_processed"] += 1
+                                continue
+                            try:
+                                _core = runner.core
+                                result = run_overnight_reeval(
+                                    client_id=email,
+                                    broker=getattr(_core, "broker", None) if _core else None,
+                                    master_control=runner.master_control,
+                                    contract_selector=runner.contract_selector,
+                                    order_state_machine=runner.order_state_machine,
+                                    entry_watcher=getattr(_core, "entry_watcher", None) if _core else None,
+                                    position_manager=runner.position_manager,
+                                    exit_eng=getattr(_core, "exit_eng", None) if _core else None,
+                                    force=force,
+                                )
+                                runner._last_overnight_reeval_date = None
+                                job["results"][email] = result
+                                log.info(f"overnight_reeval[bg:{job_id}] [{email}]: {result}")
+                            except Exception as _bg_err:
+                                import traceback as _tb
+                                job["results"][email] = {
+                                    "error": str(_bg_err),
+                                    "traceback": _tb.format_exc()[-2000:],
+                                }
+                                log.error(
+                                    f"overnight_reeval[bg:{job_id}] [{email}] failed: {_bg_err}",
+                                    exc_info=True,
+                                )
+                            job["runners_processed"] += 1
+                    finally:
+                        job["status"]      = "done"
+                        job["finished_ts"] = _time.time()
+                        job["elapsed_seconds"] = round(job["finished_ts"] - t0, 1)
+
+                _threading.Thread(
+                    target=_run_bg, daemon=True,
+                    name=f"overnight_reeval_bg_{job_id[:8]}",
+                ).start()
+                return jsonify({
+                    "ok":              True,
+                    "mode":            "async",
+                    "job_id":          job_id,
+                    "runners_queued":  len(runners_window),
+                    "force":           force,
+                    "status_endpoint": f"/admin/overnight_reeval/status?job_id={job_id}",
+                })
+
+            # ── Sync path with time budget ──────────────────────────────────
+            results: dict = {}
+            t0 = _time.time()
+            processed = 0
+            skipped_budget = 0
+            for email, runner in runners_window:
+                elapsed = _time.time() - t0
+                if elapsed > time_budget_seconds:
+                    results[email] = {
+                        "skipped": "time_budget_exceeded",
+                        "elapsed_seconds": round(elapsed, 1),
+                    }
+                    skipped_budget += 1
+                    continue
                 if not runner.is_alive():
                     results[email] = {"error": "runner not alive"}
+                    processed += 1
                     continue
                 try:
                     _core = runner.core
@@ -3008,7 +3163,6 @@ def create_app() -> Flask:
                         exit_eng=getattr(_core, "exit_eng", None) if _core else None,
                         force=force,
                     )
-                    # Reset the daily gate so auto-run fires again tomorrow
                     runner._last_overnight_reeval_date = None
                     results[email] = result
                     log.info(f"overnight_reeval [{email}]: {result}")
@@ -3016,20 +3170,60 @@ def create_app() -> Flask:
                     import traceback as _tb
                     results[email] = {"error": str(e), "traceback": _tb.format_exc()[-2000:]}
                     log.error(f"overnight_reeval [{email}] failed: {e}", exc_info=True)
+                processed += 1
 
-            total_armed = sum(r.get("armed", 0) for r in results.values() if isinstance(r, dict))
+            elapsed_total = _time.time() - t0
+            total_armed    = sum(r.get("armed", 0)    for r in results.values() if isinstance(r, dict))
             total_rejected = sum(r.get("rejected", 0) for r in results.values() if isinstance(r, dict))
+            next_offset    = offset + processed + skipped_budget
+
             return jsonify({
-                "ok": True,
-                "force": force,
-                "runners": len(runners),
-                "total_armed": total_armed,
-                "total_rejected": total_rejected,
-                "results": results,
+                "ok":                      True,
+                "mode":                    "sync",
+                "force":                   force,
+                "runners_total":           len(runners_all),
+                "runners_eligible":        len(runners_eligible),
+                "runners_processed":       processed,
+                "runners_skipped_budget":  skipped_budget,
+                "offset":                  offset,
+                "next_offset":             next_offset,
+                "remaining_after_window":  max(0, len(runners_eligible) - next_offset),
+                "time_budget_seconds":     time_budget_seconds,
+                "elapsed_seconds":         round(elapsed_total, 2),
+                "total_armed":             total_armed,
+                "total_rejected":          total_rejected,
+                "results":                 results,
             })
         except Exception as e:
             log.error(f"overnight_reeval endpoint failed: {e}", exc_info=True)
             return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.get("/admin/overnight_reeval/status")
+    @require_hmac
+    def admin_overnight_reeval_status():
+        """Poll the status of an async overnight reeval job started via
+        /admin/overnight_reeval with {"async_background": true}."""
+        job_id = request.args.get("job_id", "").strip()
+        if not job_id:
+            return jsonify({"ok": False, "error": "job_id required"}), 400
+        job = _OVERNIGHT_REEVAL_JOBS.get(job_id)
+        if not job:
+            return jsonify({"ok": False, "error": "job_id_not_found"}), 404
+        # Best-effort cleanup of completed jobs older than 1 hour to bound memory
+        try:
+            import time as _time
+            now = _time.time()
+            stale = [
+                jid for jid, j in _OVERNIGHT_REEVAL_JOBS.items()
+                if j.get("status") == "done"
+                and j.get("finished_ts") is not None
+                and (now - j["finished_ts"]) > 3600
+            ]
+            for jid in stale:
+                _OVERNIGHT_REEVAL_JOBS.pop(jid, None)
+        except Exception:
+            pass
+        return jsonify({"ok": True, "job": job})
 
     @app.post("/admin/reseed_exit_engine")
     @require_hmac
