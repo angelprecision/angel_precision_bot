@@ -959,11 +959,22 @@ def run_overnight_reeval(
                 # with no intermediate PENDING_TRIGGER transition observable in
                 # the OSM event log. Atomic initial_status='PENDING_TRIGGER'
                 # eliminates the race entirely.
+                #
+                # P0 (hotfix/p0-preserve-overnight-sizing-meta):
+                # Pass decision.plan.metadata into OSM so sizing_context,
+                # contract_deferred, risk_profile_source, and snapshot_at_eval
+                # are persisted on the order row. Without this, overnight/deferred
+                # orders had null sizing_context — making budget debugging blind.
+                # OSM merges caller meta on top of its auto-meta (caller wins on
+                # conflict), so sizing_context is preserved without erasing OSM
+                # auto-fields like score, tier, signal_id, etc.
                 from ap.authorization import execution_mode_for_broker
+                _plan_meta = getattr(decision.plan, "metadata", None) or {}
                 local_order_id = order_state_machine.create_entry_order(
                     decision.plan,
                     initial_status="PENDING_TRIGGER",
                     execution_mode=execution_mode_for_broker(broker),
+                    meta=_plan_meta,
                 )
             except Exception as osm_exc:
                 log.error("[%s] overnight_reeval: OSM create_entry_order failed: %s", ticker, osm_exc)
