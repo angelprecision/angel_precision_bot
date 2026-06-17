@@ -420,6 +420,166 @@ def resolve_tradier_credentials(member: dict) -> dict:
     }
 
 
+# =============================================================================
+# PR #150 — Paper Selector Market-Data Transport Split
+# =============================================================================
+#
+# Splits market-data transport from execution transport for the contract
+# selector. PAPER clients execute orders against the sandbox broker (15-min
+# delayed quotes) but must source CHAIN / QUOTE / EARNINGS / IV data from a
+# live read-only Tradier endpoint so:
+#   - Strike selection uses real-time chains (not 15-min-stale chains).
+#   - Spread / liquidity gates evaluate against real quotes.
+#   - Earnings guard / IV filter run against live underlying data.
+#
+# The watcher (ap_entry_watcher._fetch_quotes) already implements this split
+# and fails closed on PAPER if no market-data token resolves. This helper
+# brings the contract selector / earnings guard / IV filter onto the SAME
+# transport with the SAME token-priority order, so a paper Render pod that
+# has TRADIER_MARKET_DATA_TOKEN configured for the watcher will automatically
+# have it for the selector too — and a misconfigured pod fails closed at
+# startup instead of silently picking strikes off stale sandbox chains.
+#
+# LIVE behavior is preserved exactly: if no market-data token resolves in
+# LIVE mode, data_broker falls back to the live execution broker (which
+# already has live market-data access via the live execution token), with
+# only a warning log. There is no LIVE submit-path change.
+#
+# Submit / cancel / order-status routing is NEVER touched by this helper.
+# Those continue to use the execution broker built from
+# resolve_tradier_credentials() — which is sandbox for paper and live for
+# live, by construction.
+# =============================================================================
+
+class PaperSelectorNoMarketDataTokenError(RuntimeError):
+    """Raised when PAPER mode runner has no live market-data token configured.
+
+    The selector cannot safely fall back to the sandbox execution broker for
+    market data because sandbox quotes are delayed up to ~15 minutes, and the
+    watcher (which uses live data) will then disagree with the selector on
+    every breach evaluation. Fail closed at startup rather than ship bad
+    paper trades.
+    """
+
+
+def resolve_market_data_transport(
+    *,
+    mode: str,
+    account_id: str,
+    execution_broker,
+    env=None,
+    broker_cls=None,
+    broker_config_cls=None,
+) -> dict:
+    """Resolve the market-data transport for the contract selector / guards.
+
+    Returns a dict:
+        {
+          "data_broker":            <TradierBroker | execution_broker>,
+          "base_url":               "<resolved base url>",
+          "token_source":           "TRADIER_MARKET_DATA_TOKEN"
+                                    | "TRADIER_DATA_TOKEN"
+                                    | "execution_broker_fallback_live",
+          "is_dedicated":           bool,
+          "execution_base_url":     "<execution broker base_url>",
+        }
+
+    Token priority (matches ap_entry_watcher._resolve_watcher_quote_transport):
+        1. TRADIER_MARKET_DATA_TOKEN
+        2. TRADIER_DATA_TOKEN
+
+    Base URL priority:
+        1. TRADIER_MARKET_DATA_BASE_URL
+        2. TRADIER_DATA_BASE_URL
+        3. https://api.tradier.com  (hardcoded live default — NEVER sandbox)
+
+    PAPER mode: raises PaperSelectorNoMarketDataTokenError if no token resolves.
+    LIVE mode:  returns execution_broker as data_broker if no token resolves.
+
+    `env`, `broker_cls`, `broker_config_cls` are dependency-injection seams
+    for unit tests — production callers pass None and the real env / classes
+    are used. This keeps the resolver fully testable without touching real
+    network / global env.
+    """
+    if env is None:
+        env = os.environ
+    if broker_cls is None:
+        from ap.brokers.tradier import TradierBroker as _Broker
+        broker_cls = _Broker
+    if broker_config_cls is None:
+        from ap.brokers.tradier import TradierConfig as _Cfg
+        broker_config_cls = _Cfg
+
+    mode_upper = str(mode or "").strip().upper()
+    is_paper = (mode_upper == "PAPER")
+
+    # ── Token resolution ──────────────────────────────────────────────────
+    mdt = (env.get("TRADIER_MARKET_DATA_TOKEN") or "").strip()
+    dt  = (env.get("TRADIER_DATA_TOKEN") or "").strip()
+    if mdt:
+        token, token_source = mdt, "TRADIER_MARKET_DATA_TOKEN"
+    elif dt:
+        token, token_source = dt, "TRADIER_DATA_TOKEN"
+    else:
+        token, token_source = "", "missing"
+
+    # ── Base URL resolution ───────────────────────────────────────────────
+    base_url = (
+        (env.get("TRADIER_MARKET_DATA_BASE_URL") or "").strip()
+        or (env.get("TRADIER_DATA_BASE_URL") or "").strip()
+        or "https://api.tradier.com"
+    )
+
+    # Hard guard: market-data base URL must never be sandbox. Sandbox quotes
+    # are delayed and using them as the selector's truth source defeats the
+    # entire purpose of the split. Force live and warn loudly.
+    if "sandbox" in base_url.lower():
+        logger.critical(
+            "PAPER_SELECTOR_MARKET_DATA_BASE_URL_SANDBOX_GUARD_TRIGGERED "
+            "resolved_url=%s — sandbox URL must not be used for selector "
+            "market data. Forcing https://api.tradier.com.",
+            base_url,
+        )
+        base_url = "https://api.tradier.com"
+
+    execution_base_url = getattr(getattr(execution_broker, "cfg", None), "base_url", "")
+
+    # ── PAPER: fail closed if no token resolved ───────────────────────────
+    if is_paper and not token:
+        raise PaperSelectorNoMarketDataTokenError(
+            "PAPER_SELECTOR_NO_MARKET_DATA_TOKEN mode=PAPER "
+            f"base_url={base_url} token_source={token_source} "
+            "— contract selector requires a live market-data token to avoid "
+            "picking strikes against 15-min-delayed sandbox chains. "
+            "Set TRADIER_MARKET_DATA_TOKEN (preferred) or TRADIER_DATA_TOKEN "
+            "on the paper Render pod."
+        )
+
+    # ── Build the data broker ─────────────────────────────────────────────
+    if token:
+        cfg = broker_config_cls(
+            base_url=base_url,
+            access_token=token,
+            account_id=account_id,
+        )
+        data_broker = broker_cls(cfg)
+        is_dedicated = True
+    else:
+        # LIVE-only path: live execution broker already has live market data.
+        data_broker = execution_broker
+        token_source = "execution_broker_fallback_live"
+        base_url = execution_base_url or base_url
+        is_dedicated = False
+
+    return {
+        "data_broker":        data_broker,
+        "base_url":           base_url,
+        "token_source":       token_source,
+        "is_dedicated":       is_dedicated,
+        "execution_base_url": execution_base_url,
+    }
+
+
 class ClientRunner(threading.Thread):
     """
     One daemon thread per client. The runner owns all per-client subsystems and
@@ -1708,18 +1868,64 @@ class ClientRunner(threading.Thread):
             )
         # ─────────────────────────────────────────────────────────────────────
 
-        data_token = os.getenv("TRADIER_DATA_TOKEN", "").strip()
-        data_base_url = os.getenv("TRADIER_DATA_BASE_URL", "https://api.tradier.com").strip()
-        if data_token:
-            data_broker_cfg = TradierConfig(base_url=data_base_url, access_token=data_token, account_id=self.account_id)
-            data_broker = TradierBroker(data_broker_cfg)
-            logger.info("[%s] Live data broker initialized | %s", self.email, data_base_url)
+        # ─────────────────────────────────────────────────────────────────
+        # PR #150 — Paper Selector Market-Data Transport Split
+        # Resolve the selector / earnings / IV data_broker from the SAME
+        # token priority the watcher uses:
+        #   TRADIER_MARKET_DATA_TOKEN → TRADIER_DATA_TOKEN
+        # PAPER fails closed if neither is set (cannot safely pick strikes
+        # off 15-min-delayed sandbox chains). LIVE falls back to the live
+        # execution broker, unchanged.
+        # ─────────────────────────────────────────────────────────────────
+        try:
+            _md_transport = resolve_market_data_transport(
+                mode=self.mode,
+                account_id=self.account_id,
+                execution_broker=broker,
+            )
+        except PaperSelectorNoMarketDataTokenError as _md_exc:
+            # Hard fail-closed. The runner does not start with the selector
+            # silently pointed at sandbox chains.
+            logger.critical("[%s] %s", self.email, _md_exc)
+            self._mark_failed(f"paper_selector_no_market_data_token:{_md_exc}")
+            return
+
+        data_broker = _md_transport["data_broker"]
+        data_base_url = _md_transport["base_url"]
+        data_token_source = _md_transport["token_source"]
+        data_broker_is_dedicated = _md_transport["is_dedicated"]
+        _exec_base_url = _md_transport["execution_base_url"] or self.base_url
+
+        # ── Required audit logs (PR #150 acceptance) ─────────────────────
+        # These two log lines are the operator's confirmation that the
+        # transport split is wired correctly. Operators grep Render logs
+        # for them after deploy.
+        _mode_upper = str(self.mode).strip().upper()
+        if _mode_upper == "PAPER":
+            logger.info(
+                "PAPER_MARKET_DATA_TRANSPORT_SELECTED client_id=%s "
+                "source=tradier_live base_url=%s token_source=%s",
+                self.email, data_base_url, data_token_source,
+            )
+            logger.info(
+                "PAPER_EXECUTION_TRANSPORT_SELECTED client_id=%s "
+                "source=tradier_sandbox base_url=%s",
+                self.email, _exec_base_url,
+            )
         else:
-            data_broker = broker
-            logger.warning("[%s] TRADIER_DATA_TOKEN not set -- using execution broker for data", self.email)
+            logger.info(
+                "[%s] Live data broker resolved | base_url=%s "
+                "token_source=%s dedicated=%s",
+                self.email, data_base_url, data_token_source,
+                data_broker_is_dedicated,
+            )
 
         self.data_broker = data_broker
         self.databroker = data_broker
+
+        # NOTE: data_token kept for the manifest call below (preserves the
+        # data_broker_is_dedicated=bool(data_token) shape used previously).
+        data_token = data_token_source if data_broker_is_dedicated else ""
 
         earnings_guard = APEarningsGuard(
             broker=data_broker,
