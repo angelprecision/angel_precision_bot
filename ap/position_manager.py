@@ -37,13 +37,16 @@ class PositionStatus:
     OPEN = "OPEN"
     CLOSING = "CLOSING"
     CLOSED = "CLOSED"
+    CLOSED_REPAIR = "CLOSED_REPAIR"
     EXPIRED = "EXPIRED"
     STOPPED = "STOPPED"
     TAKEN_PROFIT = "TAKEN_PROFIT"
     ERROR = "ERROR"
+    CANCELED = "CANCELED"
+    CANCELLED = "CANCELLED"
 
     ACTIVE = {OPEN, CLOSING}
-    TERMINAL = {CLOSED, EXPIRED, STOPPED, TAKEN_PROFIT, ERROR}
+    TERMINAL = {CLOSED, CLOSED_REPAIR, EXPIRED, STOPPED, TAKEN_PROFIT, ERROR, CANCELED, CANCELLED}
 
     @classmethod
     def is_terminal(cls, status: str) -> bool:
@@ -162,8 +165,84 @@ def _match_fill_row_to_active_position(fill_row: dict, active_position_indexes: 
     return None, ""
 
 
-def _summarize_fill_truth_rows(fill_rows: list[dict], active_positions: list[dict]) -> dict[str, float | int | list]:
+# Canonical set of status values that signal a position is fully settled.
+# Kept in sync with PositionStatus.TERMINAL for snapshot/exposure accounting.
+# CLOSED_REPAIR: reconciler repair path that terminally closes positions whose
+#   broker fill confirmed exit but the OSM close path ran a second time.
+# CANCELED/CANCELLED: both spellings appear in production due to broker
+#   response normalization differences.
+_TERMINAL_STATUS_SET = frozenset({
+    "CLOSED",
+    "CLOSED_REPAIR",
+    "EXPIRED",
+    "STOPPED",
+    "TAKEN_PROFIT",
+    "ERROR",
+    "CANCELED",
+    "CANCELLED",
+})
+
+
+def _is_position_row_terminal(p: dict) -> bool:
+    """Return True if a position row should be treated as terminal for the
+    purposes of exposure/snapshot accounting.
+
+    Two paths to terminal (OR logic — either is sufficient):
+      1. Status is in the canonical terminal set (primary check).
+      2. quantity_remaining = 0 AND exit_ts IS NOT NULL (defensive check).
+         Covers repair statuses, unknown variants, or rows where the status
+         field has an unexpected value but the position is economically settled.
+
+    Active statuses (OPEN, CLOSING, PARTIAL) are NOT considered terminal
+    unless path 2 fires — meaning a row with status=OPEN but qty_remaining=0
+    and an exit_ts is treated as defensively settled (edge case from partial
+    close reconciler bugs).
+    """
+    status_upper = str(p.get("status") or "").upper().strip()
+    if status_upper in _TERMINAL_STATUS_SET:
+        return True
+    # Defensive: settled by quantity_remaining=0 AND exit_ts present
+    qty_remaining = p.get("quantity_remaining")
+    exit_ts = p.get("exit_ts")
+    try:
+        qty_zero = int(qty_remaining if qty_remaining is not None else 1) == 0
+    except (TypeError, ValueError):
+        qty_zero = False
+    if qty_zero and exit_ts is not None and exit_ts != "":
+        return True
+    return False
+
+
+def _build_terminal_position_id_set(terminal_positions: list[dict]) -> set[str]:
+    """Return a set of lowercased position IDs for positions that are terminal.
+
+    Each position is evaluated by _is_position_row_terminal():
+      - status in _TERMINAL_STATUS_SET (expanded to include CLOSED_REPAIR,
+        CANCELED/CANCELLED, and other repair variants), OR
+      - quantity_remaining=0 AND exit_ts IS NOT NULL (defensive fallback for
+        unexpected status values on economically settled positions).
+    """
+    result: set[str] = set()
+    for p in terminal_positions or []:
+        if not _is_position_row_terminal(p):
+            continue
+        pid = str(p.get("id") or "").strip().lower()
+        if pid:
+            result.add(pid)
+    return result
+
+
+def _summarize_fill_truth_rows(
+    fill_rows: list[dict],
+    active_positions: list[dict],
+    *,
+    terminal_positions: list[dict] | None = None,
+    client_id: str = "",
+    execution_mode: str = "",
+) -> dict[str, float | int | list]:
     active_position_indexes = _active_position_match_indexes(active_positions or [])
+    terminal_position_id_set = _build_terminal_position_id_set(terminal_positions or [])
+
     filled_unreconciled_entry_capital = 0.0
     ignored_already_reconciled_fill_capital = 0.0
     ignored_already_reconciled_order_ids: list[str] = []
@@ -172,12 +251,69 @@ def _summarize_fill_truth_rows(fill_rows: list[dict], active_positions: list[dic
     filled_unreconciled_calls = 0
     filled_unreconciled_puts = 0
 
+    # P0: track terminal-linked fills we suppress
+    _terminal_ignored_order_ids: list[str] = []
+    _terminal_ignored_position_ids: list[str] = []
+    _terminal_ignored_capital: float = 0.0
+    # P0: track filled entries with a position_id that resolves to nothing
+    _missing_position_rows: list[dict] = []
+
+    # Build a set of all known position IDs (active + terminal) for resolution checks
+    _all_known_position_ids: set[str] = set()
+    for _p in (active_positions or []):
+        _pid = str(_p.get("id") or "").strip().lower()
+        if _pid:
+            _all_known_position_ids.add(_pid)
+    _all_known_position_ids |= terminal_position_id_set
+
     for row in fill_rows or []:
         row_cost = _filled_entry_row_cost(row)
+        order_id = _order_identifier(row)
+
+        # ── P0: terminal-linked-fill guard ──────────────────────────────────
+        # A FILLED ENTRY order linked to a TERMINAL (CLOSED/EXPIRED/etc.)
+        # position MUST NOT count as unreconciled exposure. The position already
+        # settled — it is done. Without this guard, a CLOSED position's fill
+        # keeps consuming capital headroom forever (Jason regression: BAC+WFC).
+        #
+        # Resolution priority:
+        #   1. position_id in row → check terminal set (definitive)
+        #   2. position_id in row but resolves to nothing → warn, count as
+        #      unreconciled (fail-closed: unknown state, assume live exposure)
+        #   3. No position_id → normal active-position match logic applies
+        row_position_id = str(row.get("position_id") or "").strip()
+        row_position_id_lower = row_position_id.lower()
+
+        if row_position_id:
+            # Has a position_id — check if it resolves to a terminal position
+            if row_position_id_lower in terminal_position_id_set:
+                # Definitively terminal — suppress this fill from exposure
+                _terminal_ignored_order_ids.append(order_id or str(row.get("id") or ""))
+                _terminal_ignored_position_ids.append(row_position_id)
+                _terminal_ignored_capital += row_cost
+                continue
+
+            # position_id present but not in active OR terminal — orphan warning
+            if row_position_id_lower not in _all_known_position_ids:
+                _missing_position_rows.append({
+                    "order_id": order_id or str(row.get("id") or ""),
+                    "position_id": row_position_id,
+                    "capital": row_cost,
+                })
+                # Fail-closed: count as unreconciled since we cannot confirm terminal
+                pending_entries += 1
+                filled_unreconciled_entry_capital += row_cost
+                direction = str(row.get("direction") or "").upper().strip()
+                if direction == "CALL":
+                    filled_unreconciled_calls += 1
+                elif direction == "PUT":
+                    filled_unreconciled_puts += 1
+                continue
+
+        # ── Standard active-position reconciliation check ───────────────────
         matched_position, match_key = _match_fill_row_to_active_position(row, active_position_indexes)
         if matched_position:
             ignored_already_reconciled_fill_capital += row_cost
-            order_id = _order_identifier(row)
             if order_id:
                 ignored_already_reconciled_order_ids.append(order_id)
             matched_position_id = str(matched_position.get("id") or "").strip()
@@ -201,6 +337,26 @@ def _summarize_fill_truth_rows(fill_rows: list[dict], active_positions: list[dic
         elif direction == "PUT":
             filled_unreconciled_puts += 1
 
+    # ── Structured logging for terminal-suppressed fills ────────────────────
+    if _terminal_ignored_order_ids:
+        log.info(
+            "SNAPSHOT_RECONCILED_TERMINAL_FILLED_IGNORED "
+            "client=%s execution_mode=%s order_ids=%s position_ids=%s ignored_capital=%.2f",
+            client_id, execution_mode,
+            _terminal_ignored_order_ids,
+            _terminal_ignored_position_ids,
+            _terminal_ignored_capital,
+        )
+
+    # ── Structured warning for fills with unresolvable position_id ──────────
+    for _mp in _missing_position_rows:
+        log.warning(
+            "SNAPSHOT_FILLED_ENTRY_MISSING_POSITION_COUNTS_UNRECONCILED "
+            "client=%s execution_mode=%s order_id=%s position_id=%s capital=%.2f",
+            client_id, execution_mode,
+            _mp["order_id"], _mp["position_id"], _mp["capital"],
+        )
+
     return {
         "pending_entries": pending_entries,
         "filled_unreconciled_calls": filled_unreconciled_calls,
@@ -209,6 +365,11 @@ def _summarize_fill_truth_rows(fill_rows: list[dict], active_positions: list[dic
         "ignored_already_reconciled_fill_capital": ignored_already_reconciled_fill_capital,
         "ignored_already_reconciled_order_ids": ignored_already_reconciled_order_ids,
         "ignored_reconciled_match_keys": ignored_reconciled_match_keys,
+        # P0 audit fields
+        "terminal_ignored_order_ids": _terminal_ignored_order_ids,
+        "terminal_ignored_position_ids": _terminal_ignored_position_ids,
+        "terminal_ignored_capital": _terminal_ignored_capital,
+        "missing_position_rows": _missing_position_rows,
     }
 
 
@@ -1363,6 +1524,43 @@ class APPositionManager:
                 )
                 active = c.fetchall()
 
+                # P0 (hotfix/p0-closed-filled-entry-exposure) — amended:
+                # Fetch terminal positions so _summarize_fill_truth_rows can
+                # suppress FILLED entry orders whose linked position already settled.
+                #
+                # Two terminal detection paths (OR logic):
+                #   1. UPPER(status) IN canonical terminal set — includes
+                #      CLOSED_REPAIR (reconciler repair path), CANCELED/CANCELLED
+                #      (broker spelling variants), and all original statuses.
+                #   2. COALESCE(quantity_remaining,0)=0 AND exit_ts IS NOT NULL —
+                #      defensive catch for unknown repair variants or positions
+                #      that are economically settled but carry an unexpected status.
+                #
+                # Fetch id, status, quantity_remaining, exit_ts so
+                # _is_position_row_terminal() can evaluate both conditions.
+                # Active rows (OPEN/CLOSING with qty>0 and no exit_ts) are
+                # excluded at the DB level by the WHERE clause, keeping the
+                # result set minimal.
+                c.execute(
+                    """
+                    SELECT id, status, quantity_remaining, exit_ts
+                    FROM positions
+                    WHERE client_id=%s
+                      AND (
+                        UPPER(COALESCE(status,'')) IN (
+                          'CLOSED','CLOSED_REPAIR','EXPIRED','STOPPED',
+                          'TAKEN_PROFIT','ERROR','CANCELED','CANCELLED'
+                        )
+                        OR (
+                          COALESCE(quantity_remaining, 0) = 0
+                          AND exit_ts IS NOT NULL
+                        )
+                      )
+                    """,
+                    (self.client_id,),
+                )
+                terminal_positions = c.fetchall() or []
+
                 c.execute(
                     """
                     SELECT
@@ -1643,6 +1841,9 @@ class APPositionManager:
                     _fill_summary = _summarize_fill_truth_rows(
                         _fill_rows,
                         active,
+                        terminal_positions=terminal_positions,
+                        client_id=self.client_id,
+                        execution_mode=_snap_mode or "",
                     )
                     pending_entries = int(_fill_summary.get("pending_entries") or 0)
                     filled_unreconciled_calls = int(_fill_summary.get("filled_unreconciled_calls") or 0)
@@ -1659,6 +1860,19 @@ class APPositionManager:
                     ignored_reconciled_match_keys = list(
                         _fill_summary.get("ignored_reconciled_match_keys") or []
                     )
+                    # P0 audit fields — terminal-linked fill suppression
+                    terminal_ignored_order_ids: list = list(
+                        _fill_summary.get("terminal_ignored_order_ids") or []
+                    )
+                    terminal_ignored_position_ids: list = list(
+                        _fill_summary.get("terminal_ignored_position_ids") or []
+                    )
+                    terminal_ignored_capital: float = float(
+                        _fill_summary.get("terminal_ignored_capital") or 0.0
+                    )
+                    missing_position_rows: list = list(
+                        _fill_summary.get("missing_position_rows") or []
+                    )
                 except Exception as _fill_summary_err:
                     log.warning(
                         "[%s] ignored_already_reconciled_fill_capital query failed (non-fatal): %s",
@@ -1668,6 +1882,11 @@ class APPositionManager:
                     ignored_already_reconciled_fill_capital = 0.0
                     ignored_already_reconciled_order_ids = []
                     ignored_reconciled_match_keys = []
+                    # P0 audit defaults on failure
+                    terminal_ignored_order_ids: list = []
+                    terminal_ignored_position_ids: list = []
+                    terminal_ignored_capital: float = 0.0
+                    missing_position_rows: list = []
 
                 pending_entry_capital = filled_unreconciled_entry_capital
 
@@ -1695,6 +1914,11 @@ class APPositionManager:
                     "ignored_already_reconciled_fill_capital": ignored_already_reconciled_fill_capital,
                     "ignored_already_reconciled_order_ids": ignored_already_reconciled_order_ids,
                     "ignored_reconciled_match_keys": ignored_reconciled_match_keys,
+                    # P0 (hotfix/p0-closed-filled-entry-exposure) audit fields
+                    "terminal_ignored_order_ids":    terminal_ignored_order_ids,
+                    "terminal_ignored_position_ids": terminal_ignored_position_ids,
+                    "terminal_ignored_capital":      terminal_ignored_capital,
+                    "missing_position_rows":         missing_position_rows,
                     "watcher_count":      watcher_count,
                     "pending_exits":      pending_exits,
                     "trades_today":       int(summary.get("trades_today") or 0),
