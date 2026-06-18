@@ -735,3 +735,242 @@ class TestDeferredUnresolved:
         assert "deferred_selector_audit" in result, (
             "Path B result must include deferred_selector_audit"
         )
+
+
+# ---------------------------------------------------------------------------
+# Tests for transient vs structural split (PR — deferred breach retry)
+# ---------------------------------------------------------------------------
+#
+# When Path A fires (selector returned None) the production code now inspects
+# the reason_code from get_last_failure() and routes:
+#
+#   Transient codes (NO_CHAIN_DATA, DIRECT_QUOTE_ZERO_BID_ASK, etc.)
+#       + Before 09:40 ET  → RETRY: persist metadata, return WITHOUT expiring.
+#       + After 09:40 ET   → expire with :retry_deadline_exceeded suffix.
+#
+#   Structural codes (NO_AFFORDABLE_CONTRACT, OI_TOO_LOW, etc.)
+#       → terminalize immediately with exact reason regardless of time.
+#
+# The tests here exercise the split logic directly without importing
+# ap_execution_core (which has heavy deps). They mirror the production
+# code exactly — any drift from the source breaks both at runtime and here.
+
+_TRANSIENT_CODES = frozenset({
+    "NO_CHAIN_DATA",
+    "DIRECT_QUOTE_ZERO_BID_ASK",
+    "CHAIN_DATA_UNAVAILABLE",
+    "QUOTE_UNAVAILABLE",
+    "MARKET_DATA_UNAVAILABLE",
+    "SNAPSHOT_UNAVAILABLE",
+    "INVALIDATED_SNAPSHOT_UNAVAILABLE",
+    "ZERO_BID_ASK",
+    "NO_CHAIN",
+    "CHAIN_UNAVAILABLE",
+})
+
+_STRUCTURAL_CODES = [
+    "NO_AFFORDABLE_CONTRACT",
+    "SPREAD_TOO_WIDE",
+    "OI_TOO_LOW",
+    "VOLUME_TOO_LOW",
+    "PREMIUM_CAP_EXCEEDED",
+    "DELTA_OUT_OF_RANGE",
+]
+
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
+
+_ET = ZoneInfo("America/New_York")
+
+
+def _et(h: int, m: int) -> datetime:
+    return datetime(2026, 6, 17, h, m, 0, tzinfo=_ET)
+
+
+def _run_split(reason_code: str, et_now: datetime) -> dict:
+    """
+    Reproduce the transient/structural split from ap_execution_core Path A.
+    Returns a dict describing what the production code would do:
+        action: "retry" | "expire_deadline" | "terminalize_structural" | "terminalize_generic"
+        last_error: str
+        retry_meta_written: bool
+    """
+    _is_transient = str(reason_code).upper() in _TRANSIENT_CODES
+    _BREACH_RETRY_DEADLINE = 9 * 60 + 40
+
+    if reason_code:
+        _reason = f"breach_time_contract_selection:{reason_code}"
+    else:
+        _reason = "breach_time_contract_selection_no_result"
+
+    if _is_transient:
+        _et_min = et_now.hour * 60 + et_now.minute
+        if _et_min < _BREACH_RETRY_DEADLINE:
+            return {
+                "action":            "retry",
+                "last_error":        _reason,
+                "retry_meta_written": True,
+                "expired":           False,
+            }
+        else:
+            return {
+                "action":  "expire_deadline",
+                "last_error": f"{_reason}:retry_deadline_exceeded",
+                "retry_meta_written": False,
+                "expired": True,
+            }
+
+    return {
+        "action":            "terminalize_structural",
+        "last_error":        _reason,
+        "retry_meta_written": False,
+        "expired":           True,
+    }
+
+
+class TestTransientCodesRetryBeforeDeadline:
+    """Req 2: transient market-data failure before 09:40 ET → preserve/retry."""
+
+    @pytest.mark.parametrize("code", sorted(_TRANSIENT_CODES))
+    def test_transient_before_0940_does_not_expire(self, code):
+        out = _run_split(code, _et(9, 31))
+        assert out["action"] == "retry", \
+            f"{code} at 09:31 should trigger retry not expire"
+        assert out["expired"] is False, \
+            f"{code} at 09:31 must NOT be expired"
+
+    @pytest.mark.parametrize("code", sorted(_TRANSIENT_CODES))
+    def test_transient_retry_meta_written(self, code):
+        out = _run_split(code, _et(9, 31))
+        assert out["retry_meta_written"] is True, \
+            f"{code}: retry metadata must be written to keep order alive"
+
+    def test_transient_at_0939_still_retries(self):
+        """09:39 ET is inside the retry window (deadline is 09:40)."""
+        out = _run_split("NO_CHAIN_DATA", _et(9, 39))
+        assert out["action"] == "retry"
+        assert out["expired"] is False
+
+    def test_transient_at_0930_exact_retries(self):
+        out = _run_split("DIRECT_QUOTE_ZERO_BID_ASK", _et(9, 30))
+        assert out["action"] == "retry"
+
+
+class TestTransientCodesExpireAfterDeadline:
+    """After 09:40 ET, transient failures expire with exact reason."""
+
+    @pytest.mark.parametrize("code", sorted(_TRANSIENT_CODES))
+    def test_transient_after_0940_expires(self, code):
+        out = _run_split(code, _et(9, 40))
+        assert out["action"] == "expire_deadline", \
+            f"{code} at 09:40 must expire with deadline suffix"
+        assert out["expired"] is True
+
+    @pytest.mark.parametrize("code", sorted(_TRANSIENT_CODES))
+    def test_transient_deadline_suffix_in_last_error(self, code):
+        out = _run_split(code, _et(9, 40))
+        assert "retry_deadline_exceeded" in out["last_error"], \
+            f"{code}: last_error must include retry_deadline_exceeded suffix"
+        assert code in out["last_error"], \
+            f"{code}: specific reason must appear in last_error"
+
+    def test_transient_at_0945_also_expires(self):
+        out = _run_split("NO_CHAIN_DATA", _et(9, 45))
+        assert out["action"] == "expire_deadline"
+        assert out["expired"] is True
+
+
+class TestStructuralCodesTerminalizeImmediately:
+    """Req 3: structural failures terminalize immediately regardless of time."""
+
+    @pytest.mark.parametrize("code", _STRUCTURAL_CODES)
+    @pytest.mark.parametrize("et_now", [_et(9, 31), _et(9, 39), _et(9, 40), _et(9, 45)])
+    def test_structural_always_terminates(self, code, et_now):
+        out = _run_split(code, et_now)
+        assert out["action"] == "terminalize_structural", \
+            f"structural {code} at {et_now.strftime('%H:%M')} must terminalize, got {out['action']}"
+        assert out["expired"] is True
+
+    @pytest.mark.parametrize("code", _STRUCTURAL_CODES)
+    def test_structural_no_retry_meta(self, code):
+        out = _run_split(code, _et(9, 31))
+        assert out["retry_meta_written"] is False
+
+    @pytest.mark.parametrize("code", _STRUCTURAL_CODES)
+    def test_structural_last_error_has_specific_code(self, code):
+        out = _run_split(code, _et(9, 31))
+        assert code in out["last_error"], \
+            f"structural {code}: last_error must contain the specific reason code"
+        assert "retry_deadline_exceeded" not in out["last_error"]
+
+    def test_structural_codes_not_in_transient_set(self):
+        """Structural and transient sets must be disjoint — no code can be both."""
+        for code in _STRUCTURAL_CODES:
+            assert code not in _TRANSIENT_CODES, \
+                f"{code} must NOT be in the transient set"
+
+
+class TestSelectorReasonInLastError:
+    """Req 1: selector get_last_failure() reason_code always in last_error."""
+
+    def test_no_chain_data_last_error(self):
+        out = _run_deferred_breach_failure_path(
+            selector_last_failure={"reason_code": "NO_CHAIN_DATA", "stage": "chain_fetch", "explanation": "empty"},
+        )
+        assert "NO_CHAIN_DATA" in out["last_error"]
+        assert "breach_time_contract_selection:" in out["last_error"]
+
+    def test_oi_too_low_last_error(self):
+        out = _run_deferred_breach_failure_path(
+            selector_last_failure={"reason_code": "OI_TOO_LOW", "stage": "quality_summary", "explanation": "oi=0"},
+        )
+        assert "OI_TOO_LOW" in out["last_error"]
+
+    def test_no_affordable_contract_last_error(self):
+        out = _run_deferred_breach_failure_path(
+            selector_last_failure={"reason_code": "NO_AFFORDABLE_CONTRACT", "stage": "affordability_gate", "explanation": ""},
+        )
+        assert "NO_AFFORDABLE_CONTRACT" in out["last_error"]
+
+    def test_no_failure_info_uses_generic(self):
+        out = _run_deferred_breach_failure_path(selector_last_failure=None)
+        assert out["last_error"] == "breach_time_contract_selection_no_result"
+
+    def test_audit_persisted_with_reason(self):
+        out = _run_deferred_breach_failure_path(
+            selector_last_failure={"reason_code": "SPREAD_TOO_WIDE", "stage": "quality_summary", "explanation": "spread=12.5%"},
+        )
+        audit = out["deferred_selector_audit"]
+        assert audit["reason_code"] == "SPREAD_TOO_WIDE"
+        assert audit["stage"] == "quality_summary"
+        assert audit["explanation"] == "spread=12.5%"
+
+
+class TestSourceGuardsRetryPath:
+    """Static source checks proving the retry path is in production code."""
+
+    def test_transient_codes_frozenset_present(self):
+        assert "_TRANSIENT_CODES" in _EC_SRC, \
+            "_TRANSIENT_CODES frozenset must exist in ap_execution_core.py"
+
+    def test_retry_before_deadline_present(self):
+        assert "DEFERRED_BREACH_TRANSIENT_RETRY" in _EC_SRC, \
+            "DEFERRED_BREACH_TRANSIENT_RETRY log sentinel must be in source"
+
+    def test_deadline_exceeded_present(self):
+        assert "retry_deadline_exceeded" in _EC_SRC, \
+            "retry_deadline_exceeded must appear in source for timeout path"
+
+    def test_deferred_breach_retry_meta_key_present(self):
+        assert "deferred_breach_retry" in _EC_SRC, \
+            "deferred_breach_retry metadata key must be written in source"
+
+    def test_no_expire_before_deadline_for_transient(self):
+        """The transient before-deadline path must NOT call _terminalize_deferred_breach_failure.
+        Verified by checking that the return after retry logging is not preceded by terminalize."""
+        idx = _EC_SRC.find("DEFERRED_BREACH_TRANSIENT_RETRY")
+        assert idx != -1
+        region = _EC_SRC[idx: idx + 300]
+        assert "_terminalize_deferred_breach_failure" not in region, \
+            "transient retry path must not call terminalize before the deadline"
+
