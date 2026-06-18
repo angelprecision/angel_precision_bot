@@ -2926,7 +2926,16 @@ class APEntryWatcher:
 
     def _poll_active_signals(self, open_protect_active: bool) -> None:
         with self._lock:
-            active = [w for w in self._pending if w.is_active]
+            # PR 158 P1 — RETRY_LATER watchers must not be trigger-polled.
+            # w.overnight=True means the overnight open-revalidation has NOT
+            # yet passed for this watcher. _revalidate_overnight_at_open() sets
+            # w.overnight=False only when the validator returns valid. Until
+            # that happens, the watcher must stay alive but cannot trigger —
+            # triggering against unvalidated overnight structure is incorrect.
+            # Excluding w.overnight=True here is the single gate that enforces
+            # this: no other code path in _poll_active_signals can trigger an
+            # overnight watcher whose revalidation is still pending.
+            active = [w for w in self._pending if w.is_active and not w.overnight]
 
         if not active:
             return
