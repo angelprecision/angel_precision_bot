@@ -3400,6 +3400,154 @@ def create_app() -> Flask:
             admin_log.error("release_after_hours_deferred failed: %s", e, exc_info=True)
             return jsonify({"ok": False, "error": str(e)}), 500
 
+    # ── PR feature/morning-handoff-audit ──────────────────────────────────────
+    # GET:  /admin/morning_handoff_audit?client_id=<email>&mode=live|paper
+    # POST: /admin/morning_handoff_audit  {"clients":[...], "mode":"live", "dry_run":false}
+    #
+    # Safety invariants:
+    #   NEVER calls broker.submit_order   NEVER creates new orders
+    #   NEVER changes contract/limit/qty  NEVER mutates terminal rows
+    #   NEVER duplicates watcher state for the same local_order_id
+    #   Idempotent: auditing the same row twice produces the same result.
+
+    @app.get("/admin/morning_handoff_audit")
+    @require_hmac
+    def admin_morning_handoff_audit_get():
+        """Classify and re-arm a single client's non-terminal ENTRY rows.
+
+        Query params:
+          client_id  (str, required)   — client email
+          mode       (str, default live) — live|paper
+          dry_run    (bool, default false) — classify but do not re-arm
+
+        Returns per-row classification and summary counts.
+        """
+        from client_runner import _active_runners, _registry_lock
+        from ap_morning_handoff_audit import run_morning_handoff_audit
+
+        client_id_req = request.args.get("client_id", "").strip().lower()
+        if not client_id_req:
+            return jsonify({"ok": False, "error": "client_id required"}), 400
+        mode    = str(request.args.get("mode", "live")).lower().strip()
+        dry_run = str(request.args.get("dry_run", "false")).lower() in ("1", "true", "yes")
+
+        with _registry_lock:
+            runner = _active_runners.get(client_id_req)
+
+        if runner is None:
+            return jsonify({"ok": False,
+                            "error": f"client_id not in active runners: {client_id_req}"}), 404
+
+        entry_watcher = getattr(runner, "entry_watcher", None) or getattr(
+            getattr(runner, "core", None), "entry_watcher", None
+        )
+        # OSM fallback chain: try order_state_machine first (canonical attr on
+        # ClientRunner), then osm (legacy alias), then core subobject paths.
+        osm = (
+            getattr(runner, "order_state_machine", None)
+            or getattr(runner, "osm", None)
+            or getattr(getattr(runner, "core", None), "order_state_machine", None)
+            or getattr(getattr(runner, "execution_core", None), "order_state_machine", None)
+        )
+        if osm is None:
+            log.warning(
+                "morning_handoff_audit GET: OSM not found for client %s — "
+                "re-arm metadata will not be persisted. "
+                "WATCHER_REARM_AUDIT_FAILED",
+                client_id_req,
+            )
+
+        try:
+            result = run_morning_handoff_audit(
+                client_id=client_id_req,
+                entry_watcher=entry_watcher,
+                osm=osm,
+                execution_mode=mode,
+                dry_run=dry_run,
+            )
+            return jsonify(result)
+        except Exception as exc:
+            log.error("morning_handoff_audit GET failed: %s", exc, exc_info=True)
+            return jsonify({"ok": False, "error": str(exc)}), 500
+
+    @app.post("/admin/morning_handoff_audit")
+    @require_hmac
+    def admin_morning_handoff_audit_post():
+        """Classify and re-arm ENTRY rows for one or more clients.
+
+        Request body:
+          clients  (list[str], optional) — emails to audit; default = all active runners
+          mode     (str, default "live") — live|paper
+          dry_run  (bool, default false) — classify but do not re-arm
+
+        Safety: NEVER calls broker.submit_order, NEVER creates orders,
+        NEVER mutates terminal rows, NEVER changes contract/limit/qty.
+        """
+        from client_runner import _active_runners, _registry_lock
+        from ap_morning_handoff_audit import run_morning_handoff_audit
+        import time as _time
+
+        body = request.get_json(silent=True) or {}
+        clients_filter = body.get("clients") or None
+        if clients_filter is not None:
+            clients_filter = {str(e).strip().lower() for e in clients_filter if str(e).strip()}
+        mode    = str(body.get("mode", "live")).lower().strip()
+        dry_run = bool(body.get("dry_run", False))
+
+        with _registry_lock:
+            runners_all = dict(_active_runners)
+
+        _t0 = _time.monotonic()
+        per_client_results = {}
+        errors = {}
+
+        for email, runner in runners_all.items():
+            if clients_filter is not None and email not in clients_filter:
+                continue
+            entry_watcher = getattr(runner, "entry_watcher", None) or getattr(
+                getattr(runner, "core", None), "entry_watcher", None
+            )
+            # OSM fallback chain: try order_state_machine first (canonical attr on
+            # ClientRunner), then osm (legacy alias), then core subobject paths.
+            osm = (
+                getattr(runner, "order_state_machine", None)
+                or getattr(runner, "osm", None)
+                or getattr(getattr(runner, "core", None), "order_state_machine", None)
+                or getattr(getattr(runner, "execution_core", None), "order_state_machine", None)
+            )
+            if osm is None:
+                log.warning(
+                    "morning_handoff_audit POST: OSM not found for client %s — "
+                    "re-arm metadata will not be persisted. "
+                    "WATCHER_REARM_AUDIT_FAILED",
+                    email,
+                )
+            try:
+                per_client_results[email] = run_morning_handoff_audit(
+                    client_id=email,
+                    entry_watcher=entry_watcher,
+                    osm=osm,
+                    execution_mode=mode,
+                    dry_run=dry_run,
+                )
+            except Exception as exc:
+                log.error(
+                    "morning_handoff_audit POST failed for %s: %s", email, exc, exc_info=True
+                )
+                errors[email] = str(exc)
+                per_client_results[email] = {"ok": False, "error": str(exc)}
+
+        elapsed = _time.monotonic() - _t0
+        return jsonify({
+            "ok":              len(errors) == 0,
+            "mode":            mode,
+            "dry_run":         dry_run,
+            "clients_audited": len(per_client_results),
+            "elapsed_seconds": round(elapsed, 2),
+            "results":         per_client_results,
+            "errors":          errors,
+        })
+
     @app.post("/admin/reseed_exit_engine")
     @require_hmac
     def reseed_exit_engine():

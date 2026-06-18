@@ -1718,7 +1718,8 @@ class APEntryWatcher:
                             _opps_to_drop.append(_opp)
                             _local_oid = (_opp.signal or {}).get("local_order_id")
                             _osm = self.order_state_machine
-                            if _local_oid and _osm and hasattr(_osm, "cancel_pending_entry"):
+                            _skip_cancel_recovery = bool(signal.get("__recovery_rearm"))
+                            if _local_oid and _osm and hasattr(_osm, "cancel_pending_entry") and not _skip_cancel_recovery:
                                 try:
                                     _cancel_ok = _osm.cancel_pending_entry(
                                         _local_oid,
@@ -1843,7 +1844,8 @@ class APEntryWatcher:
                             watched.score,
                         )
                         _local_oid = w.signal.get("local_order_id")
-                        if _local_oid and self.order_state_machine and hasattr(self.order_state_machine, "cancel_pending_entry"):
+                        _skip_cancel_dir_flip = bool(signal.get("__recovery_rearm"))
+                        if _local_oid and self.order_state_machine and hasattr(self.order_state_machine, "cancel_pending_entry") and not _skip_cancel_dir_flip:
                             try:
                                 _cancel_ok = self.order_state_machine.cancel_pending_entry(
                                     _local_oid, reason="direction_flip_watcher_cancel"
@@ -1952,7 +1954,7 @@ class APEntryWatcher:
                             watched.score,
                         )
                         _local_oid = w.signal.get("local_order_id")
-                        if _local_oid and self.order_state_machine and hasattr(self.order_state_machine, "cancel_pending_entry"):
+                        if _local_oid and self.order_state_machine and hasattr(self.order_state_machine, "cancel_pending_entry") and not bool(signal.get("__recovery_rearm")):
                             try:
                                 _cancel_ok = self.order_state_machine.cancel_pending_entry(
                                     _local_oid, reason="same_side_replace_watcher_cancel"
@@ -2058,11 +2060,35 @@ class APEntryWatcher:
         )
         return True
 
-    def watch(self, plan, local_order_id: str) -> bool:
-        """Plan-aware entrypoint called by queue/execution orchestration."""
+    def watch(
+        self,
+        plan,
+        local_order_id: str,
+        *,
+        recovery_rearm: bool = False,
+        no_cancel_on_reject: bool = False,
+    ) -> bool:
+        """Plan-aware entrypoint called by queue/execution orchestration.
+
+        recovery_rearm=True / no_cancel_on_reject=True — safe recovery mode:
+          Used by the morning handoff audit to re-arm watcher ownership for
+          DB rows that survived a process restart. In this mode:
+            - Staleness / drift / below-stop rejections are skipped entirely
+              (the row's contract, qty, limit_price, status are NOT changed)
+            - add_signal() cancel_pending_entry calls are suppressed
+            - The watch() cancel_pending_entry call at the end is suppressed
+            - Only watcher audit metadata is written
+          This guarantees that a row with a valid trigger can be re-owned by
+          the watcher without any risk of DB mutation or OSM state change.
+        """
         if plan is None:
             log.warning("watch() called with None plan -- skipping")
             return False
+
+        # Propagate recovery mode flag into signal_dict so add_signal()
+        # can suppress its own cancel_pending_entry calls.
+        _recovery_rearm    = bool(recovery_rearm)
+        _no_cancel_on_reject = bool(no_cancel_on_reject or recovery_rearm)
 
         signal_dict = {
             "signal_id": getattr(plan, "signal_id", str(uuid.uuid4())),
@@ -2098,6 +2124,10 @@ class APEntryWatcher:
         side = str(signal_dict.get("side", "CALL")).upper()
         ticker = str(signal_dict.get("ticker", "")).upper()
         stop = signal_dict.get("stop_price")
+
+        # Stamp the recovery flag so add_signal() suppresses cancel_pending_entry.
+        if _recovery_rearm:
+            signal_dict["__recovery_rearm"] = True
 
         # Queue-time staleness check is skipped for outside-session setups.
         # Those are revalidated at the regular-session open instead.
@@ -2151,7 +2181,14 @@ class APEntryWatcher:
                         self._last_reject_reason = (
                             f"option_premium_stale_{_opt_drift*100:+.1f}pct_above_signal"
                         )
-                        return False
+                        if _recovery_rearm:
+                            log.info(
+                                "[%s] recovery_rearm: suppressing option_premium_stale "
+                                "rejection — row preserved, no DB mutation",
+                                ticker,
+                            )
+                        else:
+                            return False
                     log.debug(
                         "[%s] Option premium OK | signal=$%.2f bid=$%.2f drift=%.1f%%",
                         ticker, _signal_option_price, _opt_bid, _opt_drift * 100,
@@ -2239,7 +2276,14 @@ class APEntryWatcher:
                         )
                         self._persist_watcher_audit(local_order_id, _drift_audit)
                         self._last_reject_reason = reason_code
-                        return False
+                        if _recovery_rearm:
+                            log.info(
+                                "[%s] recovery_rearm: suppressing arm_drift rejection "
+                                "— row preserved, no DB mutation",
+                                ticker,
+                            )
+                        else:
+                            return False
 
                     elif below_stop:
                         # Wrong-side-of-stop: price is temporarily on the wrong side.
@@ -2304,9 +2348,18 @@ class APEntryWatcher:
                             # Do NOT return False — fall through to add_signal()
                         else:
                             # Low-score / intraday / not eligible — permanent reject
+                            # In recovery_rearm mode, suppress the reject so the row
+                            # is re-owned by the watcher without any DB mutation.
                             self._persist_watcher_audit(local_order_id, _stop_audit)
                             self._last_reject_reason = reason_code
-                            return False
+                            if _recovery_rearm:
+                                log.info(
+                                    "[%s] recovery_rearm: suppressing arm_below_stop "
+                                    "rejection — row preserved, no DB mutation",
+                                    ticker,
+                                )
+                            else:
+                                return False
                     log.debug(
                         "[%s] Price check OK — $%.2f vs trigger $%.2f (%.1f%%)",
                         ticker,
@@ -2337,6 +2390,7 @@ class APEntryWatcher:
         finally:
             signal_dict.pop("__watcher_rearm_pending", None)
             signal_dict.pop("__watcher_rearm_reason", None)
+            signal_dict.pop("__recovery_rearm", None)
         if not ok:
             # add_signal already logged the audit for locked-path blocks (dedup/opposite/same-side).
             # Attempt a best-effort DB persist here using the full signal context available in watch().
@@ -2359,7 +2413,9 @@ class APEntryWatcher:
                 raw_reason=_blk_reject,
             )
             self._persist_watcher_audit(local_order_id, _blk_audit)
-        if not ok and local_order_id and self.order_state_machine is not None:
+        if not ok and local_order_id and self.order_state_machine is not None and not _no_cancel_on_reject:
+            # recovery_rearm / no_cancel_on_reject: suppress OSM cancel so the DB row
+            # is never mutated during a handoff audit re-arm. The caller owns recovery.
             cancel_fn = getattr(self.order_state_machine, "cancel_pending_entry", None)
             if callable(cancel_fn):
                 _reject = getattr(self, "_last_reject_reason", "") or "watcher_add_signal_blocked"
@@ -2376,6 +2432,13 @@ class APEntryWatcher:
                         "local_order_id=%s error=%s",
                         ticker, local_order_id, _osm_exc,
                     )
+        elif not ok and _no_cancel_on_reject:
+            log.info(
+                "[%s] recovery_rearm/no_cancel_on_reject: suppressing cancel_pending_entry "
+                "after watcher block | local_order_id=%s reason=%s",
+                ticker, local_order_id,
+                getattr(self, "_last_reject_reason", "") or "watcher_add_signal_blocked",
+            )
         return ok
 
     def start(self):
@@ -2569,6 +2632,97 @@ class APEntryWatcher:
                     continue
 
                 if not getattr(result, "valid", False):
+                    # ── PR — RETRY_LATER vs structural INVALIDATE split ────────
+                    # Reason codes that mean "data unavailable right now" must
+                    # NOT permanently invalidate the watcher. Missing bars /
+                    # snapshot at 9:30 ET is normal — Tradier timesales lag
+                    # 1-3 minutes after the bell. We retry until 9:40 ET then
+                    # expire honestly. Only genuine structural failures
+                    # (prior-day boundary breached, both sides breached, invalid
+                    # side) warrant permanent invalidation.
+                    _DATA_UNAVAILABLE_CODES = frozenset({
+                        "INVALIDATED_SNAPSHOT_UNAVAILABLE",
+                        "INVALIDATED_MISSING_PRIOR_LEVELS",
+                        # Legacy strings emitted before the enum was standardised:
+                        "SNAPSHOT_UNAVAILABLE",
+                        "MISSING_PRIOR_LEVELS",
+                    })
+                    _result_rc = str(getattr(result, "reason_code", "") or "")
+                    _is_data_unavailable = _result_rc in _DATA_UNAVAILABLE_CODES
+
+                    if _is_data_unavailable:
+                        # ── Data-unavailable path: RETRY_LATER or timeout ─────
+                        _now_et_rv = datetime.now(ET)
+                        _et_minutes_rv = _now_et_rv.hour * 60 + _now_et_rv.minute
+                        _RECHECK_DEADLINE = 9 * 60 + 40  # 09:40 ET
+
+                        if _et_minutes_rv < _RECHECK_DEADLINE:
+                            # Still within retry window — keep watching.
+                            # Do NOT set INVALIDATED. Do NOT release dedup key.
+                            # Do NOT call on_invalidate. Do NOT add to to_remove.
+                            w.signal["queue_status"] = OvernightWatchState.OPEN_RECHECK_PENDING
+                            _ov_retry_audit = self._build_watcher_audit_payload(
+                                w,
+                                trigger_type="overnight_revalidation",
+                                reason_code="overnight_open_data_unavailable_retry_later",
+                                raw_reason=_result_rc,
+                                extra={
+                                    "queue_status":   OvernightWatchState.OPEN_RECHECK_PENDING,
+                                    "et_now":         _now_et_rv.strftime("%H:%M:%S"),
+                                    "deadline_et":    "09:40",
+                                    "is_daily":       True,
+                                },
+                            )
+                            self._persist_watcher_audit(
+                                w.signal.get("local_order_id"), _ov_retry_audit,
+                            )
+                            log.warning(
+                                "[%s] MORNING_REEVAL_PREOPEN_RETRY_LATER | side=%s | "
+                                "reason=%s | et=%s | will retry until 09:40 ET",
+                                w.ticker, w.side, _result_rc,
+                                _now_et_rv.strftime("%H:%M:%S"),
+                            )
+                            # Keep watcher alive — do not add to to_remove.
+                            continue
+
+                        else:
+                            # Past 09:40 ET deadline — data never arrived.
+                            # Expire with an honest, durable reason.
+                            _ov_timeout_audit = self._build_watcher_audit_payload(
+                                w,
+                                trigger_type="overnight_revalidation",
+                                reason_code="overnight_open_recheck_data_timeout",
+                                raw_reason=(
+                                    f"data_unavailable_past_0940_et "
+                                    f"last_code={_result_rc} "
+                                    f"et={_now_et_rv.strftime('%H:%M:%S')}"
+                                ),
+                                extra={
+                                    "queue_status": str(w.signal.get("queue_status") or ""),
+                                    "et_now":       _now_et_rv.strftime("%H:%M:%S"),
+                                    "deadline_et":  "09:40",
+                                    "is_daily":     True,
+                                },
+                            )
+                            self._persist_watcher_audit(
+                                w.signal.get("local_order_id"), _ov_timeout_audit,
+                            )
+                            w.state = WatchState.EXPIRED
+                            w.signal["queue_status"] = OvernightWatchState.INVALIDATED
+                            w._release_dedup_key()
+                            log.warning(
+                                "[%s] MORNING_REEVAL_REJECTED_DATA_UNAVAILABLE_AFTER_OPEN | "
+                                "side=%s | reason=overnight_open_recheck_data_timeout | "
+                                "et=%s — data never arrived before 09:40 ET deadline",
+                                w.ticker, w.side, _now_et_rv.strftime("%H:%M:%S"),
+                            )
+                            to_remove.append(w)
+                            continue
+
+                    # ── Structural invalidation path (unchanged) ──────────────
+                    # PRIOR_HIGH_BREACHED, PRIOR_LOW_BREACHED, BOTH_SIDES_BREACHED,
+                    # INVALID_SIDE, EXPIRED_NO_TRIGGER — these are real failures
+                    # that mean the setup is no longer valid regardless of data.
                     _ov_inv_audit = self._build_watcher_audit_payload(
                         w,
                         trigger_type="overnight_revalidation",
@@ -2589,7 +2743,8 @@ class APEntryWatcher:
                     w.signal["queue_status"] = OvernightWatchState.INVALIDATED
                     w._release_dedup_key()
                     log.info(
-                        "[%s] OVERNIGHT_DAILY_INVALIDATED | side=%s | %s | %s",
+                        "[%s] MORNING_REEVAL_STUCK_ROW_PREVENTED structural INVALIDATE | "
+                        "side=%s | %s | %s",
                         w.ticker,
                         w.side,
                         getattr(result, "reason_code", "UNKNOWN"),
@@ -2771,7 +2926,16 @@ class APEntryWatcher:
 
     def _poll_active_signals(self, open_protect_active: bool) -> None:
         with self._lock:
-            active = [w for w in self._pending if w.is_active]
+            # PR 158 P1 — RETRY_LATER watchers must not be trigger-polled.
+            # w.overnight=True means the overnight open-revalidation has NOT
+            # yet passed for this watcher. _revalidate_overnight_at_open() sets
+            # w.overnight=False only when the validator returns valid. Until
+            # that happens, the watcher must stay alive but cannot trigger —
+            # triggering against unvalidated overnight structure is incorrect.
+            # Excluding w.overnight=True here is the single gate that enforces
+            # this: no other code path in _poll_active_signals can trigger an
+            # overnight watcher whose revalidation is still pending.
+            active = [w for w in self._pending if w.is_active and not w.overnight]
 
         if not active:
             return

@@ -2005,6 +2005,14 @@ class ClientRunner(threading.Thread):
 
         self._register_exit_engine(exit_eng)
         self._run_startup_recovery(broker, exit_eng)
+        # PR feature/morning-handoff-audit — automatic startup watcher re-arm.
+        # Called immediately after startup recovery so any valid non-terminal
+        # ENTRY rows in the DB (PENDING_TRIGGER, WATCHING, CREATED) are
+        # classified and re-armed before the poll loop starts.
+        # entry_watcher is guaranteed to exist here: _start_worker_thread
+        # would have already blocked on entry_watcher_missing if absent.
+        # Failures are logged but never crash the runner.
+        self._run_morning_handoff_audit_startup()
         self._seed_exit_engine_from_db(exit_eng)
         self._start_position_quote_monitor(data_broker if data_broker_is_dedicated else broker, exit_eng)
         # PR D / FIX-3 (BUG-CR-2): post-QPM quote refresh in LIVE.
@@ -2606,6 +2614,66 @@ class ClientRunner(threading.Thread):
             return cast(val)
         except (TypeError, ValueError):
             return cast(os.getenv(env_name, env_default))
+
+    def _run_morning_handoff_audit_startup(self) -> None:
+        """Run the morning handoff audit once at startup after watcher/OSM are ready.
+
+        Classifies all non-terminal ENTRY rows for this client/mode and
+        re-arms watcher ownership when evidence shows the row is valid.
+        Called automatically after _run_startup_recovery() so valid rows
+        from prior sessions are re-armed before the poll loop starts.
+
+        Safety invariants (enforced by run_morning_handoff_audit):
+          - NEVER calls broker.submit_order
+          - NEVER creates new ENTRY orders
+          - NEVER transitions to SUBMITTED
+          - NEVER mutates terminal rows or changes contract/limit_price/qty
+          - NEVER duplicates watcher state for the same local_order_id
+          - Live runner only audits live rows; paper runner only audits paper rows
+
+        Failures log WATCHER_REARM_AUDIT_FAILED and never crash the runner.
+        """
+        try:
+            from ap_morning_handoff_audit import run_morning_handoff_audit
+        except ImportError as _ie:
+            logger.warning(
+                "[%s] WATCHER_REARM_AUDIT_FAILED: import failed: %s", self.email, _ie
+            )
+            return
+
+        _entry_watcher = getattr(getattr(self, "core", None), "entry_watcher", None)
+        _osm           = getattr(self, "order_state_machine", None)
+        _exec_mode     = str(getattr(self, "mode", "PAPER") or "PAPER").lower()
+
+        if _entry_watcher is None or _osm is None:
+            logger.warning(
+                "[%s] WATCHER_REARM_AUDIT_FAILED: entry_watcher=%s osm=%s — "
+                "skipping startup audit (dependencies not ready)",
+                self.email,
+                "ok" if _entry_watcher else "MISSING",
+                "ok" if _osm else "MISSING",
+            )
+            return
+
+        try:
+            audit_result = run_morning_handoff_audit(
+                client_id=self.email,
+                entry_watcher=_entry_watcher,
+                osm=_osm,
+                execution_mode=_exec_mode,
+                dry_run=False,
+            )
+            if not audit_result.get("ok"):
+                logger.warning(
+                    "[%s] WATCHER_REARM_AUDIT_FAILED startup audit returned ok=False: %s",
+                    self.email,
+                    audit_result.get("errors"),
+                )
+        except Exception as _exc:
+            logger.error(
+                "[%s] WATCHER_REARM_AUDIT_FAILED startup audit raised exception: %s",
+                self.email, _exc,
+            )
 
     def _run_startup_recovery(self, broker, exit_eng):
         """Run startup recovery with a hard timeout to prevent blocking initialization.
