@@ -3225,6 +3225,171 @@ def create_app() -> Flask:
             pass
         return jsonify({"ok": True, "job": job})
 
+    # =========================================================================
+    # PR — Release deferred overnight rows after open (P0 morning release valve)
+    # =========================================================================
+    @app.post("/admin/release_after_hours_deferred")
+    @require_hmac
+    def release_after_hours_deferred():
+        """Release WATCHING rows stuck in `after_hours_deferred:awaiting_overnight_reeval`.
+
+        The morning reeval cron arms after-hours-deferred WATCHING rows for the
+        normal queue/selector/watcher path. When the reeval endpoint times out
+        (pre-PR #147) or its server-side job partially completes, some rows
+        stay parked at:
+            status     = 'WATCHING'
+            last_error = 'after_hours_deferred:awaiting_overnight_reeval'
+        Time then advances past the restart-guard window and those rows get
+        rejected as `restart_guard:overnight_skip` — never reaching contract
+        selection.
+
+        This endpoint is the explicit release valve. It does ONE thing:
+        clear `last_error` on still-deferred WATCHING rows so the existing
+        queue worker can pick them up on its next poll and run the normal
+        MC / contract_selector / watcher path against them.
+
+        Time-of-day guard: by default the endpoint refuses to run before
+        09:35 America/New_York (matches the operator pre-open / open-grace
+        window). Pass `{"force": true}` to override (mirrors the convention
+        of /admin/overnight_reeval).
+
+        Idempotent: re-running after all rows are released is a no-op
+        (the WHERE clause matches zero rows).
+
+        Body (all optional):
+            force       (bool, default False): bypass time-of-day guard
+            clients     (list[str]): restrict to specific client_ids
+            lookback_h  (int, default 36): only release rows created within
+                        the last N hours (defends against ancient rows)
+
+        Response:
+            {
+              "ok": true,
+              "released": N,
+              "force": <bool>,
+              "et_now": "HH:MM:SS",
+              "lookback_hours": 36,
+              "clients_filter": [...] or null
+            }
+
+        Returns 412 (Precondition Failed) if invoked before 09:35 ET without
+        force=true, so the caller knows the guard fired.
+        """
+        try:
+            body = request.get_json(silent=True) or {}
+            force          = bool(body.get("force", False))
+            _lh_raw        = body.get("lookback_h")
+            # 36h default when key missing/None. Any explicit number (incl
+            # 0 / negative) clamps to at least 1 — caller intent of "as
+            # small as possible" rather than silently falling back to 36.
+            lookback_h     = 36 if _lh_raw is None else max(1, int(_lh_raw))
+            clients_filter = body.get("clients") or None
+            if clients_filter is not None:
+                clients_filter = [
+                    str(e).strip().lower() for e in clients_filter if str(e).strip()
+                ] or None
+
+            # ── Time-of-day guard ─────────────────────────────────────────
+            # Anything earlier than 09:35 ET is pre-open or inside open-grace
+            # and the rows should LEGITIMATELY remain after_hours_deferred —
+            # the normal reeval flow is still expected to handle them.
+            # After 09:35 ET, deferred rows are the symptom we're treating.
+            from zoneinfo import ZoneInfo
+            from datetime import datetime as _dt
+            _et = _dt.now(ZoneInfo("America/New_York"))
+            _et_minutes = _et.hour * 60 + _et.minute
+            _gate_minutes = 9 * 60 + 35  # 09:35 ET
+            if not force and _et_minutes < _gate_minutes:
+                admin_log.info(
+                    "release_after_hours_deferred declined: pre-open "
+                    "et=%s gate=09:35 force=false",
+                    _et.strftime("%H:%M:%S"),
+                )
+                return jsonify({
+                    "ok": False,
+                    "released": 0,
+                    "reason": "pre_open_guard",
+                    "et_now": _et.strftime("%H:%M:%S"),
+                    "hint": "pass force=true to override",
+                }), 412
+
+            # ── The release UPDATE ────────────────────────────────────────
+            # Exactly what the agreed manual SQL did, gated to deferred-only
+            # rows so this is a no-op for everything else. The queue worker
+            # picks up `WATCHING + last_error IS NULL` rows naturally on
+            # the next poll cycle.
+            from ap.db import conn, run_with_retry
+
+            def _release():
+                with conn() as c:
+                    if clients_filter:
+                        c.execute(
+                            """
+                            UPDATE trade_queue
+                               SET last_error = NULL
+                             WHERE status = 'WATCHING'
+                               AND last_error = 'after_hours_deferred:awaiting_overnight_reeval'
+                               AND created_ts >= NOW() - (%s || ' hours')::interval
+                               AND client_id = ANY(%s)
+                            RETURNING id, client_id
+                            """,
+                            (str(lookback_h), clients_filter),
+                        )
+                    else:
+                        c.execute(
+                            """
+                            UPDATE trade_queue
+                               SET last_error = NULL
+                             WHERE status = 'WATCHING'
+                               AND last_error = 'after_hours_deferred:awaiting_overnight_reeval'
+                               AND created_ts >= NOW() - (%s || ' hours')::interval
+                            RETURNING id, client_id
+                            """,
+                            (str(lookback_h),),
+                        )
+                    rows = c.fetchall() or []
+                    return rows
+
+            released_rows = run_with_retry(_release) or []
+            released_count = len(released_rows)
+
+            # ── Per-client audit log (the MORNING_REEVAL_STUCK_ROW_PREVENTED
+            # signal from the spec). Aggregated by client_id so log volume
+            # stays sane regardless of row count.
+            from collections import Counter
+            by_client = Counter()
+            for r in released_rows:
+                cid = r.get("client_id") if isinstance(r, dict) else (r[1] if len(r) > 1 else None)
+                if cid:
+                    by_client[str(cid)] += 1
+            for cid, n in by_client.items():
+                admin_log.warning(
+                    "MORNING_REEVAL_STUCK_ROW_PREVENTED client_id=%s rows=%d "
+                    "et=%s lookback_h=%d force=%s ip=%s",
+                    cid, n, _et.strftime("%H:%M:%S"), lookback_h,
+                    force, _admin_client_ip(),
+                )
+
+            admin_log.warning(
+                "release_after_hours_deferred summary released=%d clients=%d "
+                "et=%s lookback_h=%d force=%s",
+                released_count, len(by_client),
+                _et.strftime("%H:%M:%S"), lookback_h, force,
+            )
+
+            return jsonify({
+                "ok": True,
+                "released": released_count,
+                "by_client": dict(by_client),
+                "force": force,
+                "et_now": _et.strftime("%H:%M:%S"),
+                "lookback_hours": lookback_h,
+                "clients_filter": clients_filter,
+            })
+        except Exception as e:
+            admin_log.error("release_after_hours_deferred failed: %s", e, exc_info=True)
+            return jsonify({"ok": False, "error": str(e)}), 500
+
     @app.post("/admin/reseed_exit_engine")
     @require_hmac
     def reseed_exit_engine():
