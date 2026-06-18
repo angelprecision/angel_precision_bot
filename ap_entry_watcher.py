@@ -2632,6 +2632,97 @@ class APEntryWatcher:
                     continue
 
                 if not getattr(result, "valid", False):
+                    # ── PR — RETRY_LATER vs structural INVALIDATE split ────────
+                    # Reason codes that mean "data unavailable right now" must
+                    # NOT permanently invalidate the watcher. Missing bars /
+                    # snapshot at 9:30 ET is normal — Tradier timesales lag
+                    # 1-3 minutes after the bell. We retry until 9:40 ET then
+                    # expire honestly. Only genuine structural failures
+                    # (prior-day boundary breached, both sides breached, invalid
+                    # side) warrant permanent invalidation.
+                    _DATA_UNAVAILABLE_CODES = frozenset({
+                        "INVALIDATED_SNAPSHOT_UNAVAILABLE",
+                        "INVALIDATED_MISSING_PRIOR_LEVELS",
+                        # Legacy strings emitted before the enum was standardised:
+                        "SNAPSHOT_UNAVAILABLE",
+                        "MISSING_PRIOR_LEVELS",
+                    })
+                    _result_rc = str(getattr(result, "reason_code", "") or "")
+                    _is_data_unavailable = _result_rc in _DATA_UNAVAILABLE_CODES
+
+                    if _is_data_unavailable:
+                        # ── Data-unavailable path: RETRY_LATER or timeout ─────
+                        _now_et_rv = datetime.now(ET)
+                        _et_minutes_rv = _now_et_rv.hour * 60 + _now_et_rv.minute
+                        _RECHECK_DEADLINE = 9 * 60 + 40  # 09:40 ET
+
+                        if _et_minutes_rv < _RECHECK_DEADLINE:
+                            # Still within retry window — keep watching.
+                            # Do NOT set INVALIDATED. Do NOT release dedup key.
+                            # Do NOT call on_invalidate. Do NOT add to to_remove.
+                            w.signal["queue_status"] = OvernightWatchState.OPEN_RECHECK_PENDING
+                            _ov_retry_audit = self._build_watcher_audit_payload(
+                                w,
+                                trigger_type="overnight_revalidation",
+                                reason_code="overnight_open_data_unavailable_retry_later",
+                                raw_reason=_result_rc,
+                                extra={
+                                    "queue_status":   OvernightWatchState.OPEN_RECHECK_PENDING,
+                                    "et_now":         _now_et_rv.strftime("%H:%M:%S"),
+                                    "deadline_et":    "09:40",
+                                    "is_daily":       True,
+                                },
+                            )
+                            self._persist_watcher_audit(
+                                w.signal.get("local_order_id"), _ov_retry_audit,
+                            )
+                            log.warning(
+                                "[%s] MORNING_REEVAL_PREOPEN_RETRY_LATER | side=%s | "
+                                "reason=%s | et=%s | will retry until 09:40 ET",
+                                w.ticker, w.side, _result_rc,
+                                _now_et_rv.strftime("%H:%M:%S"),
+                            )
+                            # Keep watcher alive — do not add to to_remove.
+                            continue
+
+                        else:
+                            # Past 09:40 ET deadline — data never arrived.
+                            # Expire with an honest, durable reason.
+                            _ov_timeout_audit = self._build_watcher_audit_payload(
+                                w,
+                                trigger_type="overnight_revalidation",
+                                reason_code="overnight_open_recheck_data_timeout",
+                                raw_reason=(
+                                    f"data_unavailable_past_0940_et "
+                                    f"last_code={_result_rc} "
+                                    f"et={_now_et_rv.strftime('%H:%M:%S')}"
+                                ),
+                                extra={
+                                    "queue_status": str(w.signal.get("queue_status") or ""),
+                                    "et_now":       _now_et_rv.strftime("%H:%M:%S"),
+                                    "deadline_et":  "09:40",
+                                    "is_daily":     True,
+                                },
+                            )
+                            self._persist_watcher_audit(
+                                w.signal.get("local_order_id"), _ov_timeout_audit,
+                            )
+                            w.state = WatchState.EXPIRED
+                            w.signal["queue_status"] = OvernightWatchState.INVALIDATED
+                            w._release_dedup_key()
+                            log.warning(
+                                "[%s] MORNING_REEVAL_REJECTED_DATA_UNAVAILABLE_AFTER_OPEN | "
+                                "side=%s | reason=overnight_open_recheck_data_timeout | "
+                                "et=%s — data never arrived before 09:40 ET deadline",
+                                w.ticker, w.side, _now_et_rv.strftime("%H:%M:%S"),
+                            )
+                            to_remove.append(w)
+                            continue
+
+                    # ── Structural invalidation path (unchanged) ──────────────
+                    # PRIOR_HIGH_BREACHED, PRIOR_LOW_BREACHED, BOTH_SIDES_BREACHED,
+                    # INVALID_SIDE, EXPIRED_NO_TRIGGER — these are real failures
+                    # that mean the setup is no longer valid regardless of data.
                     _ov_inv_audit = self._build_watcher_audit_payload(
                         w,
                         trigger_type="overnight_revalidation",
@@ -2652,7 +2743,8 @@ class APEntryWatcher:
                     w.signal["queue_status"] = OvernightWatchState.INVALIDATED
                     w._release_dedup_key()
                     log.info(
-                        "[%s] OVERNIGHT_DAILY_INVALIDATED | side=%s | %s | %s",
+                        "[%s] MORNING_REEVAL_STUCK_ROW_PREVENTED structural INVALIDATE | "
+                        "side=%s | %s | %s",
                         w.ticker,
                         w.side,
                         getattr(result, "reason_code", "UNKNOWN"),
