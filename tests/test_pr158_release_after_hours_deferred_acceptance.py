@@ -84,15 +84,18 @@ def _build_db() -> sqlite3.Connection:
     con.row_factory = sqlite3.Row
     con.execute("""
         CREATE TABLE trade_queue (
-            id         INTEGER PRIMARY KEY,
-            status     TEXT,
-            last_error TEXT,
-            client_id  TEXT,
-            created_ts TEXT
+            id          INTEGER PRIMARY KEY,
+            status      TEXT,
+            last_error  TEXT,
+            client_id   TEXT,
+            created_ts  TEXT,
+            started_ts  TEXT,
+            finished_ts TEXT
         )
     """)
     con.executemany(
-        "INSERT INTO trade_queue VALUES (?,?,?,?,?)", TEST_ROWS
+        "INSERT INTO trade_queue (id,status,last_error,client_id,created_ts,started_ts,finished_ts) VALUES (?,?,?,?,?,NULL,NULL)",
+        TEST_ROWS
     )
     con.commit()
     return con
@@ -110,7 +113,10 @@ def _run_release(con: sqlite3.Connection, lookback_h: int = 36,
         placeholders = ",".join("?" * len(clients))
         sql = f"""
             UPDATE trade_queue
-               SET last_error = NULL
+               SET status      = 'NEW',
+                   last_error  = NULL,
+                   started_ts  = NULL,
+                   finished_ts = NULL
              WHERE status = 'WATCHING'
                AND last_error = '{_TARGET_ERROR}'
                AND created_ts >= ?
@@ -120,7 +126,10 @@ def _run_release(con: sqlite3.Connection, lookback_h: int = 36,
     else:
         con.execute(f"""
             UPDATE trade_queue
-               SET last_error = NULL
+               SET status      = 'NEW',
+                   last_error  = NULL,
+                   started_ts  = NULL,
+                   finished_ts = NULL
              WHERE status = 'WATCHING'
                AND last_error = '{_TARGET_ERROR}'
                AND created_ts >= ?
@@ -128,7 +137,7 @@ def _run_release(con: sqlite3.Connection, lookback_h: int = 36,
 
     con.commit()
     touched = [r["id"] for r in con.execute(
-        "SELECT id FROM trade_queue WHERE last_error IS NULL"
+        "SELECT id FROM trade_queue WHERE status = 'NEW' AND last_error IS NULL"
     )]
     # Exclude row 12 which started with last_error IS NULL
     touched = [i for i in touched if i != 12]
@@ -234,28 +243,31 @@ class TestSqlWhereClauses:
         row = con.execute("SELECT last_error FROM trade_queue WHERE id=13").fetchone()
         assert row["last_error"] == _TARGET_ERROR
 
-    def test_set_clause_only_nulls_last_error_not_status(self):
-        """After release, status of released rows must remain 'WATCHING'.
-        Only last_error changes, nothing else."""
+    def test_set_clause_sets_status_new_and_clears_error_and_timestamps(self):
+        """After release, rows must be status='NEW', last_error=NULL,
+        started_ts=NULL, finished_ts=NULL so the queue worker claims them."""
         con = _build_db()
         _run_release(con)
         rows = con.execute(
-            "SELECT id, status, last_error FROM trade_queue WHERE id IN (1,8)"
+            "SELECT id, status, last_error, started_ts, finished_ts "
+            "FROM trade_queue WHERE id IN (1,8)"
         ).fetchall()
         for row in rows:
-            assert row["status"] == "WATCHING", \
-                f"row {row['id']}: status must remain WATCHING after release"
+            assert row["status"] == "NEW", \
+                f"row {row['id']}: status must be NEW after release (queue worker claims NEW)"
             assert row["last_error"] is None, \
-                f"row {row['id']}: last_error must be NULL after release"
+                f"row {row['id']}: last_error must be NULL"
+            assert row["started_ts"] is None, \
+                f"row {row['id']}: started_ts must be NULL"
+            assert row["finished_ts"] is None, \
+                f"row {row['id']}: finished_ts must be NULL"
 
     def test_idempotent_rerun_touches_zero_rows(self):
-        """Running the release twice: second run must touch zero new rows."""
+        """After first release, rows have status='NEW' (not 'WATCHING').
+        The WHERE clause requires status='WATCHING', so second run matches nothing."""
         con = _build_db()
         first = _run_release(con)
         assert len(first) > 0, "first run must release at least one row"
-        # After first run, all matching rows have last_error=NULL.
-        # A second run must find zero rows matching the WHERE clause
-        # (last_error = target_error no longer true for released rows).
         cutoff = (_NOW_UTC - timedelta(hours=36)).strftime("%Y-%m-%d %H:%M:%S")
         affected = con.execute(f"""
             SELECT COUNT(*) FROM trade_queue
@@ -362,16 +374,31 @@ class TestStaticSourceAnalysis:
             "endpoint must not contain DELETE"
 
     def test_set_clause_is_only_last_error_null(self):
-        """The only SET clause in any SQL is 'last_error = NULL'."""
+        """The SET clause must set exactly:
+            status='NEW', last_error=NULL, started_ts=NULL, finished_ts=NULL.
+        No other columns may appear."""
         src = _endpoint_source()
         set_clauses = re.findall(
             r'\bSET\b\s+(.+?)(?:\bWHERE\b|\Z)', src,
             re.IGNORECASE | re.DOTALL
         )
         for clause in set_clauses:
-            clause_clean = " ".join(clause.split()).strip().rstrip(",")
-            assert clause_clean.lower() == "last_error = null", \
-                f"SET clause must be exactly 'last_error = NULL', got: {clause_clean!r}"
+            clause_norm = " ".join(clause.split()).strip().rstrip(",").lower()
+            # Must contain all four required assignments
+            assert "status" in clause_norm and "'new'" in clause_norm, \
+                f"SET clause must include status='NEW': {clause_norm!r}"
+            assert "last_error" in clause_norm and "null" in clause_norm, \
+                f"SET clause must include last_error=NULL: {clause_norm!r}"
+            assert "started_ts" in clause_norm, \
+                f"SET clause must include started_ts=NULL: {clause_norm!r}"
+            assert "finished_ts" in clause_norm, \
+                f"SET clause must include finished_ts=NULL: {clause_norm!r}"
+            # Must NOT contain forbidden columns
+            for forbidden in ("payload", "broker_order_id", "result_json",
+                              "contract", "trigger_price", "qty", "limit_price",
+                              "score", "client_id", "signal_id"):
+                assert forbidden not in clause_norm, \
+                    f"SET clause must not modify {forbidden!r}: {clause_norm!r}"
 
     def test_only_update_sql_verb(self):
         """The only SQL verb in the function body is UPDATE. No SELECT, INSERT, DELETE."""
@@ -389,15 +416,20 @@ class TestStaticSourceAnalysis:
                 assert not re.search(r'\bDELETE\b', sql, re.IGNORECASE), \
                     f"SQL block must not contain DELETE: {sql[:100]!r}"
 
-    def test_status_column_not_in_set_clause(self):
-        """The status column must not appear in any SET clause."""
+    def test_status_set_to_new_not_watching(self):
+        """status IS in SET clause — but it must be set to 'NEW', never to
+        any other value. The WHERE clause still filters status='WATCHING'."""
         src = _endpoint_source()
         set_blocks = re.findall(
             r'\bSET\b(.+?)\bWHERE\b', src, re.IGNORECASE | re.DOTALL
         )
         for block in set_blocks:
-            assert "status" not in block.lower(), \
-                f"SET clause must not modify status column: {block!r}"
+            block_norm = " ".join(block.split()).lower()
+            if "status" in block_norm:
+                assert "'new'" in block_norm, \
+                    f"status in SET must be set to 'NEW', got: {block_norm!r}"
+                assert "'watching'" not in block_norm, \
+                    f"SET clause must not set status back to 'WATCHING'"
 
     def test_payload_not_in_set_clause(self):
         """The payload column must not appear in any SET clause."""

@@ -102,11 +102,14 @@ class TestUpdateShape:
         assert resp.status_code == 200
         sql, _ = rec["calls"][0]
         sql_u = " ".join(sql.split()).upper()
-        assert "SET LAST_ERROR = NULL" in sql_u
+        # All four required SET assignments must be present
+        assert "STATUS = 'NEW'" in sql_u
+        assert "LAST_ERROR = NULL" in sql_u
+        assert "STARTED_TS = NULL" in sql_u
+        assert "FINISHED_TS = NULL" in sql_u
         set_clause = sql_u.split("SET", 1)[1].split("WHERE", 1)[0]
-        for forbidden in ("STATUS ", "PAYLOAD", "STARTED_TS", "FINISHED_TS",
-                          "BROKER_ORDER_ID", "RESULT_JSON", "DIRECTION",
-                          "CONTRACT", "TRIGGER_PRICE", "SCORE"):
+        for forbidden in ("PAYLOAD", "BROKER_ORDER_ID", "RESULT_JSON", "DIRECTION",
+                          "CONTRACT", "TRIGGER_PRICE", "SCORE", "QTY", "LIMIT_PRICE"):
             assert forbidden not in set_clause, \
                 f"SET clause must not mention {forbidden!r}: {set_clause!r}"
 

@@ -3314,10 +3314,14 @@ def create_app() -> Flask:
                 }), 412
 
             # ── The release UPDATE ────────────────────────────────────────
-            # Exactly what the agreed manual SQL did, gated to deferred-only
-            # rows so this is a no-op for everything else. The queue worker
-            # picks up `WATCHING + last_error IS NULL` rows naturally on
-            # the next poll cycle.
+            # Sets status='NEW' so the queue worker's _claim_one_job()
+            # (which selects WHERE status='NEW') actually picks up the row
+            # on its next poll. Clearing last_error alone was insufficient —
+            # WATCHING rows are never claimed by the queue worker.
+            # Also resets started_ts and finished_ts so the row looks like a
+            # fresh submission to the claim CTE.
+            # Columns NOT touched: contract, qty, limit_price, trigger_price,
+            # score, payload, result_json, broker_order_id, client_id.
             from ap.db import conn, run_with_retry
 
             def _release():
@@ -3326,7 +3330,10 @@ def create_app() -> Flask:
                         c.execute(
                             """
                             UPDATE trade_queue
-                               SET last_error = NULL
+                               SET status      = 'NEW',
+                                   last_error  = NULL,
+                                   started_ts  = NULL,
+                                   finished_ts = NULL
                              WHERE status = 'WATCHING'
                                AND last_error = 'after_hours_deferred:awaiting_overnight_reeval'
                                AND created_ts >= NOW() - (%s || ' hours')::interval
@@ -3339,7 +3346,10 @@ def create_app() -> Flask:
                         c.execute(
                             """
                             UPDATE trade_queue
-                               SET last_error = NULL
+                               SET status      = 'NEW',
+                                   last_error  = NULL,
+                                   started_ts  = NULL,
+                                   finished_ts = NULL
                              WHERE status = 'WATCHING'
                                AND last_error = 'after_hours_deferred:awaiting_overnight_reeval'
                                AND created_ts >= NOW() - (%s || ' hours')::interval
