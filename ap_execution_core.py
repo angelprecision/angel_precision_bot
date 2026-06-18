@@ -135,6 +135,22 @@ class APExecutionCore:
             self.broker.data_broker = data_broker
         self.contract_selector = contract_selector  # wired for breach-time selection of deferred overnight signals
         self.email              = email
+
+        # P0 hotfix — APExecutionCore.client_id was never set, causing
+        # AttributeError at breach-time contract selection log calls.
+        # `email` IS the canonical client identity — it is the client_id
+        # (e.g. "jasoncosby1@gmail.com") passed from ClientRunner.
+        # We also set execution_mode as a stable alias of self.mode for
+        # use in breach-time logs that interpolate both attributes.
+        self.client_id    = email or os.getenv("SINGLE_CLIENT_EMAIL") or ""
+        # client_email: prefer the dedicated field if a subclass has set it
+        # separately; otherwise alias to client_id (same email address).
+        self.client_email = (
+            email
+            or os.getenv("SINGLE_CLIENT_EMAIL")
+            or ""
+        )
+        self.execution_mode = self.mode  # canonical alias for breach-time log fields
         self.position_manager   = position_manager
         self.order_state_machine = order_state_machine
         self._pos_lock = threading.Lock()
@@ -608,6 +624,27 @@ class APExecutionCore:
         ticker = watched.ticker
         signal_id = str(sig.get("signal_id", "") or "")
 
+        # P0 hotfix — resolve client identity from the signal dict first, then
+        # fall back to self.client_id (set in __init__), then self.email.
+        # This ensures breach-time logs never throw AttributeError and that
+        # the most-specific client identity (from the row/signal) is used even
+        # if self.client_id is somehow stale or missing.
+        _breach_client_id = (
+            str(sig.get("client_id") or sig.get("client_email") or "").strip()
+            or getattr(self, "client_id", None)
+            or self.email
+            or ""
+        )
+        if not _breach_client_id:
+            # Hard guard: log with ticker and write a sentinel last_error so
+            # the failure is diagnosable rather than an opaque AttributeError.
+            log.warning(
+                "[%s] BREACH_TIME_CONTRACT_SELECTION_FAILED "
+                "reason=missing_client_id — client identity cannot be resolved; "
+                "breach-time selection will continue but logs will be incomplete",
+                ticker,
+            )
+
         trigger_price = getattr(watched, "trigger_price", None)
         try:
             trigger_price_for_log = float(trigger_price or 0)
@@ -859,7 +896,7 @@ class APExecutionCore:
                         "DEFERRED_BREACH_CONTRACT_SELECTION_FAILED "
                         "client=%s symbol=%s side=%s execution_mode=%s "
                         "budget=%.2f reason=%s stage=%s order_id=%s signal_id=%s",
-                        self.client_id,
+                        _breach_client_id,
                         ticker,
                         str(getattr(approved_plan, "side", "") or ""),
                         str(getattr(approved_plan, "execution_mode", "") or ""),
@@ -868,6 +905,11 @@ class APExecutionCore:
                         _deferred_selector_audit.get("stage") or "unknown",
                         queue_local_order_id or "",
                         str(getattr(approved_plan, "signal_id", "") or ""),
+                    )
+                    log.critical(
+                        "BREACH_TIME_CONTRACT_SELECTION_FAILED "
+                        "client=%s ticker=%s reason=%s",
+                        _breach_client_id, ticker, _reason,
                     )
                     _terminalize_deferred_breach_failure(
                         _reason,
@@ -903,7 +945,7 @@ class APExecutionCore:
                         "DEFERRED_BREACH_CONTRACT_SELECTION_FAILED "
                         "client=%s symbol=%s side=%s execution_mode=%s "
                         "budget=%.2f reason=%s stage=%s order_id=%s signal_id=%s",
-                        self.client_id,
+                        _breach_client_id,
                         ticker,
                         str(getattr(approved_plan, "side", "") or ""),
                         str(getattr(approved_plan, "execution_mode", "") or ""),
@@ -923,6 +965,11 @@ class APExecutionCore:
                         },
                     )
                     log.critical(
+                        "BREACH_TIME_CONTRACT_SELECTION_FAILED "
+                        "client=%s ticker=%s reason=%s",
+                        _breach_client_id, ticker, _reason,
+                    )
+                    log.critical(
                         "[%s] PRODUCTION_ENTRY_BLOCK — contract selector left placeholder "
                         "unresolved: %s (reason=%s)",
                         ticker, _live_contract, _reason,
@@ -938,6 +985,20 @@ class APExecutionCore:
                 log.info(
                     "[%s] Breach-time contract selected: %s @ $%.2f x%s",
                     ticker, _live_contract,
+                    float(getattr(approved_plan, "limit_price", 0) or 0),
+                    int(getattr(approved_plan, "contracts", 1) or 1),
+                )
+                # Required structured log for ops confirmation that the existing
+                # PENDING_TRIGGER row was finalized in-place (not a new order).
+                log.info(
+                    "BREACH_TIME_CONTRACT_FINALIZED "
+                    "client=%s ticker=%s local_order_id=%s "
+                    "old_contract=%s new_contract=%s limit=%.4f qty=%s",
+                    _breach_client_id,
+                    ticker,
+                    queue_local_order_id or "",
+                    _contract_sym_raw or "DEFERRED:?",
+                    _live_contract,
                     float(getattr(approved_plan, "limit_price", 0) or 0),
                     int(getattr(approved_plan, "contracts", 1) or 1),
                 )
