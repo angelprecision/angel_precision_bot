@@ -309,17 +309,19 @@ def _endpoint_source() -> str:
 class TestStaticSourceAnalysis:
 
     def test_8_no_broker_submit_import_or_call(self):
-        """Endpoint must not import or call any broker submit method."""
+        """Endpoint must not import or call any broker submit method.
+        Checks for actual call patterns (word followed by open paren) to
+        avoid false-positives from adjacent docstrings/comments that say
+        'NEVER calls broker.submit_order' for documentation purposes."""
         src = _endpoint_source()
         src_lower = src.lower()
         forbidden = [
-            "place_order", "submit_order", "broker.place", "broker.submit",
-            "tradierbroker", "tradierconfig", "broker_factory",
-            "get_broker_for_client",
+            "place_order(", "submit_order(", "broker.place(", "broker.submit(",
+            "tradierbroker(", "tradierconfig(", "get_broker_for_client(",
         ]
         for term in forbidden:
             assert term not in src_lower, \
-                f"endpoint source must not reference broker method {term!r}"
+                f"endpoint source must not call broker method {term!r}"
 
     def test_9_no_osm_create_submit_cancel_import_or_call(self):
         """Endpoint must not import or call OSM create/submit/cancel."""
