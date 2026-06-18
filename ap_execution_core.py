@@ -869,6 +869,95 @@ class APExecutionCore:
                         queue_local_order_id or "",
                         str(getattr(approved_plan, "signal_id", "") or ""),
                     )
+
+                    # ── PR — Transient vs structural split ──────────────────
+                    # Transient reason codes mean the chain or quote data was
+                    # momentarily unavailable (Tradier timesales lags 1-3 min
+                    # after the bell). Do NOT expire before 09:40 ET — keep the
+                    # order in PENDING_TRIGGER and let the watcher re-trigger on
+                    # the next cycle when data is available.
+                    # Structural reason codes (no affordable contract, spread too
+                    # wide, OI too low, etc.) are genuine failures — terminalize
+                    # immediately with the exact reason so ops can diagnose.
+                    _TRANSIENT_CODES = frozenset({
+                        "NO_CHAIN_DATA",
+                        "DIRECT_QUOTE_ZERO_BID_ASK",
+                        "CHAIN_DATA_UNAVAILABLE",
+                        "QUOTE_UNAVAILABLE",
+                        "MARKET_DATA_UNAVAILABLE",
+                        "SNAPSHOT_UNAVAILABLE",
+                        "INVALIDATED_SNAPSHOT_UNAVAILABLE",
+                        "ZERO_BID_ASK",
+                        # Legacy / alias variants
+                        "NO_CHAIN",
+                        "CHAIN_UNAVAILABLE",
+                    })
+                    _rc_from_audit = _deferred_selector_audit.get("reason_code") or ""
+                    _is_transient  = str(_rc_from_audit).upper() in _TRANSIENT_CODES
+
+                    if _is_transient:
+                        # ── Transient: retry before 09:40 ET ────────────────
+                        import datetime as _dt
+                        _now_et = _dt.datetime.now(_dt.timezone.utc).astimezone(
+                            __import__("zoneinfo").ZoneInfo("America/New_York")
+                        )
+                        _et_min = _now_et.hour * 60 + _now_et.minute
+                        _BREACH_RETRY_DEADLINE = 9 * 60 + 40  # 09:40 ET
+
+                        if _et_min < _BREACH_RETRY_DEADLINE:
+                            # Keep order alive — persist retry metadata so the
+                            # next watcher trigger cycle can re-attempt selection.
+                            # Do NOT call _terminalize_deferred_breach_failure().
+                            _retry_meta = {
+                                "deferred_breach_retry":         True,
+                                "deferred_breach_retry_reason":  _rc_from_audit,
+                                "deferred_breach_retry_at_et":   _now_et.strftime("%H:%M:%S"),
+                                "deferred_breach_retry_deadline":"09:40",
+                                "deferred_selector_audit":       _deferred_selector_audit,
+                            }
+                            try:
+                                update_meta = getattr(
+                                    self.order_state_machine, "update_order_meta", None
+                                )
+                                if callable(update_meta):
+                                    update_meta(queue_local_order_id, _retry_meta)
+                            except Exception as _rm_exc:
+                                log.warning(
+                                    "[%s] deferred breach retry meta persist failed: %s",
+                                    ticker, _rm_exc,
+                                )
+                            log.warning(
+                                "[%s] DEFERRED_BREACH_TRANSIENT_RETRY | "
+                                "reason=%s et=%s deadline=09:40 — "
+                                "keeping PENDING_TRIGGER for next watcher cycle",
+                                ticker, _rc_from_audit, _now_et.strftime("%H:%M:%S"),
+                            )
+                            # Return without expiring — watcher remains active.
+                            return
+
+                        else:
+                            # Past retry deadline — transient data never recovered.
+                            # Expire with the specific transient reason so ops
+                            # can distinguish from structural failures.
+                            _reason = f"breach_time_contract_selection:{_rc_from_audit}:retry_deadline_exceeded"
+                            log.critical(
+                                "[%s] DEFERRED_BREACH_TRANSIENT_DEADLINE_EXCEEDED | "
+                                "reason=%s et=%s",
+                                ticker, _rc_from_audit, _now_et.strftime("%H:%M:%S"),
+                            )
+                            _terminalize_deferred_breach_failure(
+                                _reason,
+                                extra_meta={
+                                    "failure_stage":              "deferred_contract_selection_retry_timeout",
+                                    "selected_contract":          _sel_contract or None,
+                                    "deferred_selector_audit":    _deferred_selector_audit,
+                                    "deferred_breach_retry":      True,
+                                    "deferred_breach_retry_reason": _rc_from_audit,
+                                },
+                            )
+                            return
+
+                    # Structural failure — terminalize immediately with exact reason.
                     _terminalize_deferred_breach_failure(
                         _reason,
                         extra_meta={
