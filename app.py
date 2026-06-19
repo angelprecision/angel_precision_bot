@@ -3548,6 +3548,99 @@ def create_app() -> Flask:
             "errors":          errors,
         })
 
+    # ── PR feature/paper-rescue-restart-guard ─────────────────────────────────
+    # POST /admin/paper_rescue_restart_guard
+    #
+    # Converts REJECTED/restart_guard:overnight_skip queue rows back to
+    # WATCHING for paper clients, then calls morning_handoff_audit to
+    # re-arm watcher ownership.
+    #
+    # Hard safety:
+    #   PAPER ONLY — any live client_id causes immediate 400 abort.
+    #   NEVER calls broker.submit_order.
+    #   NEVER creates order rows.
+    #   NEVER touches live client rows.
+    #   DB write: UPDATE trade_queue SET status='WATCHING',
+    #             last_error='manual_paper_rescue_restart_guard_bypass'
+    #             WHERE status='REJECTED' AND last_error='restart_guard:overnight_skip'
+
+    @app.post("/admin/paper_rescue_restart_guard")
+    @require_hmac
+    def admin_paper_rescue_restart_guard():
+        """Convert restart_guard:overnight_skip rows to WATCHING for paper clients.
+
+        Request body (all optional):
+          clients      (list[str]) — paper client emails; default = all paper runners
+          lookback_h   (int, default 36) — hours back to search
+          dry_run      (bool, default false) — classify/count but do not convert
+
+        Returns per-client row counts and morning handoff audit summary.
+
+        PAPER ONLY. Returns 400 if any requested client is running in LIVE mode.
+        """
+        from client_runner import _active_runners, _registry_lock
+        from ap_paper_rescue_restart_guard import run_paper_rescue_restart_guard
+
+        body = request.get_json(silent=True) or {}
+        clients_filter = body.get("clients") or None
+        if clients_filter is not None:
+            clients_filter = {str(e).strip().lower() for e in clients_filter if str(e).strip()}
+        lookback_h = max(1, int(body.get("lookback_h", 36) or 36))
+        dry_run    = bool(body.get("dry_run", False))
+
+        with _registry_lock:
+            runners_all = dict(_active_runners)
+
+        # Collect paper runners — reject immediately if a live runner is in scope.
+        paper_runners: dict = {}
+        live_found:    list[str] = []
+
+        for email, runner in runners_all.items():
+            if clients_filter is not None and email not in clients_filter:
+                continue
+            mode = str(getattr(runner, "mode", "") or "").upper().strip()
+            if mode == "LIVE":
+                live_found.append(email)
+            else:
+                paper_runners[email] = runner
+
+        if live_found:
+            return jsonify({
+                "ok":    False,
+                "error": (
+                    f"paper_rescue_restart_guard is paper-only. "
+                    f"Live clients found in scope: {live_found}. "
+                    f"No rows were modified."
+                ),
+                "live_clients": live_found,
+            }), 400
+
+        # If caller requested specific clients that aren't in the registry, 404.
+        if clients_filter:
+            missing = clients_filter - set(runners_all.keys())
+            if missing:
+                return jsonify({
+                    "ok":     False,
+                    "error":  f"clients not found in active runners: {sorted(missing)}",
+                    "missing": sorted(missing),
+                }), 404
+
+        try:
+            result = run_paper_rescue_restart_guard(
+                paper_client_ids=list(paper_runners.keys()),
+                runners=paper_runners,
+                lookback_hours=lookback_h,
+                dry_run=dry_run,
+            )
+            return jsonify(result)
+        except ValueError as exc:
+            # Live client guard triggered inside the module (belt-and-suspenders)
+            log.error("paper_rescue_restart_guard rejected: %s", exc)
+            return jsonify({"ok": False, "error": str(exc)}), 400
+        except Exception as exc:
+            log.error("paper_rescue_restart_guard failed: %s", exc, exc_info=True)
+            return jsonify({"ok": False, "error": str(exc)}), 500
+
     @app.post("/admin/reseed_exit_engine")
     @require_hmac
     def reseed_exit_engine():
