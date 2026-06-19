@@ -586,81 +586,6 @@ def _ghost_build_sql_and_params(
     return sql, params, lookback_hours
 
 
-# =============================================================================
-# ADMIN AUTH INFRASTRUCTURE (HOISTED — must be defined BEFORE create_app)
-# =============================================================================
-# These names are HOISTED above create_app() because create_app() contains
-# @_require_admin decorator usages (e.g. /admin/operator/manual-rescue-restart-guard
-# around L2840). Module-level `app = create_app()` runs at import time; if the
-# decorator is defined AFTER create_app() in source order, the decorator lookup
-# inside create_app() fails with NameError and the pod refuses to start.
-#
-# This is a pure structural relocation — code is identical to the previous
-# below-create_app() block. Do NOT add new logic here; behavior must match
-# the prior block exactly so route auth semantics are unchanged.
-# =============================================================================
-import os as _os_admin
-import hmac as _hmac_admin
-import logging as _logging_admin
-from functools import wraps as _admin_wraps
-
-admin_log = _logging_admin.getLogger("admin.controls")
-
-ADMIN_API_KEY = _os_admin.getenv("ADMIN_API_KEY", "")
-ALLOWED_ADMIN_IPS = {
-    ip.strip()
-    for ip in _os_admin.getenv("ALLOWED_ADMIN_IPS", "").split(",")
-    if ip.strip()
-}
-
-
-def _admin_client_ip() -> str:
-    return request.headers.get(
-        "X-Forwarded-For",
-        request.remote_addr or "",
-    ).split(",")[0].strip()
-
-
-def _require_admin(fn):
-    # _require_admin = HOISTED — see banner above
-    @_admin_wraps(fn)
-    def _wrap(*a, **kw):
-        if not ADMIN_API_KEY:
-            return jsonify({"ok": False, "error": "ADMIN_API_KEY not configured"}), 503
-
-        ip = _admin_client_ip()
-
-        if ALLOWED_ADMIN_IPS and ip not in ALLOWED_ADMIN_IPS:
-            admin_log.critical("ADMIN_DENIED_IP path=%s ip=%s", request.path, ip)
-            return jsonify({"ok": False, "error": "forbidden_ip"}), 403
-
-        supplied = request.headers.get("X-Admin-Key", "")
-
-        if not _hmac_admin.compare_digest(supplied, ADMIN_API_KEY):
-            admin_log.critical("ADMIN_AUTH_FAIL path=%s ip=%s", request.path, ip)
-            return jsonify({"ok": False, "error": "unauthorized"}), 401
-
-        return fn(*a, **kw)
-
-    return _wrap
-
-
-# =============================================================================
-# OVERNIGHT REEVAL ASYNC JOB STORE (HOISTED — must be defined BEFORE create_app)
-# =============================================================================
-# Stores async background reeval job state so /admin/overnight_reeval and
-# /admin/overnight_reeval/status can communicate. Process-local dict — fine
-# for the live pod (single process) and the paper pod (single process).
-# Multi-worker gunicorn would need a shared store; not in use today.
-#
-# Hoisted above create_app() for the same reason as _require_admin (see banner
-# above): create_app() registers endpoints that reference this name; module-
-# level `app = create_app()` runs at import time, so the name must be defined
-# beforehand.
-# =============================================================================
-_OVERNIGHT_REEVAL_JOBS: dict = {}
-
-
 def create_app() -> Flask:
     app = Flask(__name__)
     app.config["MAX_CONTENT_LENGTH"] = MAX_CONTENT_LENGTH
@@ -2911,244 +2836,46 @@ def create_app() -> Flask:
                 results[email] = {"ok": False, "error": str(e)}
         return jsonify({"ok": True, "results": results})
 
-    @app.post("/admin/operator/manual-rescue-restart-guard")
-    @_require_admin
-    def manual_rescue_restart_guard():
-        """
-        Requeue overnight-like rows for a same-session manual rescue.
-
-        Scope is intentionally narrow:
-          - current lookback window only
-          - status IN (NEW, REJECTED, ERROR)
-          - overnight-like payloads only
-          - existing markers only (restart_guard block / manual requeue / prior rescue)
-
-        This does NOT bypass any downstream entry validation. It only marks rows
-        so ap.queue can skip restart_guard:overnight_skip for the rescued pass.
-        """
-        body = request.get_json(silent=True) or {}
-        lookback_hours = int(body.get("hours") or 48)
-
-        try:
-            from ap.db import conn, run_with_retry
-
-            def _rescue():
-                with conn() as c:
-                    c.execute(
-                        """
-                        WITH rescued AS (
-                            UPDATE trade_queue
-                            SET    status = 'NEW',
-                                   started_ts = NULL,
-                                   finished_ts = NULL,
-                                   last_error = 'manual_rescue_current_session',
-                                   result_json = COALESCE(result_json, '{}'::jsonb) || jsonb_build_object(
-                                       'manual_rescue', true,
-                                       'manual_rescue_actor', 'operator_dashboard',
-                                       'manual_rescue_ts', NOW()::text,
-                                       'manual_rescue_previous_error', COALESCE(last_error, '')
-                                   )
-                            WHERE  status IN ('NEW', 'REJECTED', 'ERROR')
-                              AND  created_ts >= NOW() - (%s || ' hours')::interval
-                              AND (
-                                     COALESCE(payload->>'timeframe', '') IN ('1d', 'daily', 'overnight')
-                                  OR payload ? 'prior_day_high'
-                                  OR payload ? 'prior_day_low'
-                              )
-                              AND (
-                                     last_error IN (
-                                         'restart_guard:overnight_skip',
-                                         'manual_requeue_after_overnight_reeval_timeout',
-                                         'manual_rescue_current_session'
-                                     )
-                                  OR COALESCE(result_json->>'manual_rescue', 'false') = 'true'
-                              )
-                            RETURNING id, client_id, signal_id
-                        )
-                        SELECT COUNT(*)::int AS n FROM rescued
-                        """,
-                        (str(lookback_hours),),
-                    )
-                    row = c.fetchone() or {"n": 0}
-                    return int(row["n"] if isinstance(row, dict) else row[0])
-
-            rescued = run_with_retry(_rescue)
-            admin_log.warning(
-                "MANUAL_RESCUE_RESTART_GUARD rows=%s lookback_hours=%s ip=%s",
-                rescued,
-                lookback_hours,
-                _admin_client_ip(),
-            )
-            return jsonify({
-                "ok": True,
-                "rescued": int(rescued or 0),
-                "lookback_hours": lookback_hours,
-            })
-        except Exception as e:
-            admin_log.error("manual_rescue_restart_guard failed: %s", e, exc_info=True)
-            return jsonify({"ok": False, "error": str(e)}), 500
-
     @app.post("/admin/overnight_reeval")
     @require_hmac
     def admin_overnight_reeval():
-        """Manually trigger overnight daily signal reeval, bounded + batched.
-
-        Normally fires automatically at 9:00-9:45 AM ET. This endpoint supports
-        manual invocation with explicit bounds so a GitHub Action curl call
-        does not time out under load.
-
-        Request body (all optional):
-          - force (bool, default True): bypass time-of-day guard
-          - clients (list[str], default all): restrict to specific runner emails
-          - max_clients (int, default 5): hard cap on runners processed this call
-          - time_budget_seconds (int, default 60): wall-clock deadline; the
-            per-client loop short-circuits between clients once this is hit
-          - async_background (bool, default False): when true, spawn a daemon
-            thread, return job_id immediately, poll /admin/overnight_reeval/status
-          - offset (int, default 0): for pagination across multiple calls,
-            skip the first N runners from the active-runner registry
-
-        Sync response when bounded run finishes within budget:
-          {
-            "ok": true,
-            "mode": "sync",
-            "force": true,
-            "runners_eligible": N,
-            "runners_processed": K,
-            "runners_skipped_budget": M,
-            "next_offset": K,
-            "elapsed_seconds": S,
-            "total_armed": A,
-            "total_rejected": R,
-            "results": {...}
-          }
-
-        Async response (returns immediately):
-          {"ok": true, "mode": "async", "job_id": "...", "runners_queued": N}
+        """Manually trigger overnight daily signal reeval for active runners.
+        Normally fires automatically at 9:00-9:45 AM ET.
+        Use this to trigger it manually (e.g. after a late deploy or for testing).
+        Pass {"force": true} to bypass the time-of-day guard.
         """
         try:
             from client_runner import _active_runners, _registry_lock
             from ap_overnight_reeval import run_overnight_reeval
-            import threading as _threading
+            from ap.morning_jobs import select_runner_items
             import time as _time
-            import uuid as _uuid
 
             body = request.get_json(silent=True) or {}
-            force        = bool(body.get("force", True))
-            clients_filter = body.get("clients") or None
-            if clients_filter is not None:
-                clients_filter = {str(e).strip().lower() for e in clients_filter if str(e).strip()}
-            max_clients          = int(body.get("max_clients", 5) or 5)
-            time_budget_seconds  = float(body.get("time_budget_seconds", 60) or 60)
-            async_background     = bool(body.get("async_background", False))
-            offset               = max(0, int(body.get("offset", 0) or 0))
+            force = bool(body.get("force", True))  # default force=True for manual calls
+            requested_clients = body.get("clients") or []
+            max_clients = int(body.get("max_clients") or 0) or None
+            time_budget_seconds = int(body.get("time_budget_seconds") or 0) or None
+            async_background = bool(body.get("async_background", False))
 
+            results = {}
             with _registry_lock:
-                runners_all = list(_active_runners.items())
+                runners = select_runner_items(
+                    dict(_active_runners),
+                    requested_clients=requested_clients,
+                    max_clients=max_clients,
+                )
 
-            def _eligible(email_runner):
-                email, _runner = email_runner
-                if clients_filter is not None:
-                    return email.lower() in clients_filter
-                return True
-
-            runners_eligible = [er for er in runners_all if _eligible(er)]
-            runners_window   = runners_eligible[offset:offset + max_clients]
-
-            # ── Async path ──────────────────────────────────────────────────
             if async_background:
-                job_id = str(_uuid.uuid4())
-                _OVERNIGHT_REEVAL_JOBS[job_id] = {
-                    "job_id":     job_id,
-                    "status":     "queued",
-                    "started_ts": _time.time(),
-                    "finished_ts": None,
-                    "force":      force,
-                    "runners_queued":    len(runners_window),
-                    "runners_processed": 0,
-                    "results":           {},
-                    "elapsed_seconds":   None,
-                }
+                log.warning("overnight_reeval async_background=true requested but not supported — running synchronously")
 
-                def _run_bg():
-                    job = _OVERNIGHT_REEVAL_JOBS[job_id]
-                    job["status"] = "running"
-                    t0 = _time.time()
-                    try:
-                        for email, runner in runners_window:
-                            elapsed = _time.time() - t0
-                            if elapsed > time_budget_seconds:
-                                job["results"][email] = {
-                                    "skipped": "time_budget_exceeded",
-                                    "elapsed_seconds": round(elapsed, 1),
-                                }
-                                continue
-                            if not runner.is_alive():
-                                job["results"][email] = {"error": "runner not alive"}
-                                job["runners_processed"] += 1
-                                continue
-                            try:
-                                _core = runner.core
-                                result = run_overnight_reeval(
-                                    client_id=email,
-                                    broker=getattr(_core, "broker", None) if _core else None,
-                                    master_control=runner.master_control,
-                                    contract_selector=runner.contract_selector,
-                                    order_state_machine=runner.order_state_machine,
-                                    entry_watcher=getattr(_core, "entry_watcher", None) if _core else None,
-                                    position_manager=runner.position_manager,
-                                    exit_eng=getattr(_core, "exit_eng", None) if _core else None,
-                                    force=force,
-                                )
-                                runner._last_overnight_reeval_date = None
-                                job["results"][email] = result
-                                log.info(f"overnight_reeval[bg:{job_id}] [{email}]: {result}")
-                            except Exception as _bg_err:
-                                import traceback as _tb
-                                job["results"][email] = {
-                                    "error": str(_bg_err),
-                                    "traceback": _tb.format_exc()[-2000:],
-                                }
-                                log.error(
-                                    f"overnight_reeval[bg:{job_id}] [{email}] failed: {_bg_err}",
-                                    exc_info=True,
-                                )
-                            job["runners_processed"] += 1
-                    finally:
-                        job["status"]      = "done"
-                        job["finished_ts"] = _time.time()
-                        job["elapsed_seconds"] = round(job["finished_ts"] - t0, 1)
+            deadline = (_time.monotonic() + time_budget_seconds) if time_budget_seconds else None
 
-                _threading.Thread(
-                    target=_run_bg, daemon=True,
-                    name=f"overnight_reeval_bg_{job_id[:8]}",
-                ).start()
-                return jsonify({
-                    "ok":              True,
-                    "mode":            "async",
-                    "job_id":          job_id,
-                    "runners_queued":  len(runners_window),
-                    "force":           force,
-                    "status_endpoint": f"/admin/overnight_reeval/status?job_id={job_id}",
-                })
-
-            # ── Sync path with time budget ──────────────────────────────────
-            results: dict = {}
-            t0 = _time.time()
-            processed = 0
-            skipped_budget = 0
-            for email, runner in runners_window:
-                elapsed = _time.time() - t0
-                if elapsed > time_budget_seconds:
-                    results[email] = {
-                        "skipped": "time_budget_exceeded",
-                        "elapsed_seconds": round(elapsed, 1),
-                    }
-                    skipped_budget += 1
+            for email, runner in runners:
+                if deadline is not None and _time.monotonic() >= deadline:
+                    results[email] = {"skipped": True, "reason": "time_budget_exceeded"}
                     continue
                 if not runner.is_alive():
                     results[email] = {"error": "runner not alive"}
-                    processed += 1
                     continue
                 try:
                     _core = runner.core
@@ -3163,6 +2890,7 @@ def create_app() -> Flask:
                         exit_eng=getattr(_core, "exit_eng", None) if _core else None,
                         force=force,
                     )
+                    # Reset the daily gate so auto-run fires again tomorrow
                     runner._last_overnight_reeval_date = None
                     results[email] = result
                     log.info(f"overnight_reeval [{email}]: {result}")
@@ -3170,476 +2898,146 @@ def create_app() -> Flask:
                     import traceback as _tb
                     results[email] = {"error": str(e), "traceback": _tb.format_exc()[-2000:]}
                     log.error(f"overnight_reeval [{email}] failed: {e}", exc_info=True)
-                processed += 1
 
-            elapsed_total = _time.time() - t0
-            total_armed    = sum(r.get("armed", 0)    for r in results.values() if isinstance(r, dict))
+            total_armed = sum(r.get("armed", 0) for r in results.values() if isinstance(r, dict))
             total_rejected = sum(r.get("rejected", 0) for r in results.values() if isinstance(r, dict))
-            next_offset    = offset + processed + skipped_budget
-
             return jsonify({
-                "ok":                      True,
-                "mode":                    "sync",
-                "force":                   force,
-                "runners_total":           len(runners_all),
-                "runners_eligible":        len(runners_eligible),
-                "runners_processed":       processed,
-                "runners_skipped_budget":  skipped_budget,
-                "offset":                  offset,
-                "next_offset":             next_offset,
-                "remaining_after_window":  max(0, len(runners_eligible) - next_offset),
-                "time_budget_seconds":     time_budget_seconds,
-                "elapsed_seconds":         round(elapsed_total, 2),
-                "total_armed":             total_armed,
-                "total_rejected":          total_rejected,
-                "results":                 results,
+                "ok": True,
+                "force": force,
+                "runners": len(runners),
+                "requested_clients": [str(x).strip() for x in requested_clients if str(x).strip()],
+                "max_clients": max_clients,
+                "time_budget_seconds": time_budget_seconds,
+                "async_background": False,
+                "total_armed": total_armed,
+                "total_rejected": total_rejected,
+                "results": results,
             })
         except Exception as e:
             log.error(f"overnight_reeval endpoint failed: {e}", exc_info=True)
             return jsonify({"ok": False, "error": str(e)}), 500
 
-    @app.get("/admin/overnight_reeval/status")
-    @require_hmac
-    def admin_overnight_reeval_status():
-        """Poll the status of an async overnight reeval job started via
-        /admin/overnight_reeval with {"async_background": true}."""
-        job_id = request.args.get("job_id", "").strip()
-        if not job_id:
-            return jsonify({"ok": False, "error": "job_id required"}), 400
-        job = _OVERNIGHT_REEVAL_JOBS.get(job_id)
-        if not job:
-            return jsonify({"ok": False, "error": "job_id_not_found"}), 404
-        # Best-effort cleanup of completed jobs older than 1 hour to bound memory
-        try:
-            import time as _time
-            now = _time.time()
-            stale = [
-                jid for jid, j in _OVERNIGHT_REEVAL_JOBS.items()
-                if j.get("status") == "done"
-                and j.get("finished_ts") is not None
-                and (now - j["finished_ts"]) > 3600
-            ]
-            for jid in stale:
-                _OVERNIGHT_REEVAL_JOBS.pop(jid, None)
-        except Exception:
-            pass
-        return jsonify({"ok": True, "job": job})
-
-    # =========================================================================
-    # PR — Release deferred overnight rows after open (P0 morning release valve)
-    # =========================================================================
-    @app.post("/admin/release_after_hours_deferred")
-    @require_hmac
-    def release_after_hours_deferred():
-        """Release WATCHING rows stuck in `after_hours_deferred:awaiting_overnight_reeval`.
-
-        The morning reeval cron arms after-hours-deferred WATCHING rows for the
-        normal queue/selector/watcher path. When the reeval endpoint times out
-        (pre-PR #147) or its server-side job partially completes, some rows
-        stay parked at:
-            status     = 'WATCHING'
-            last_error = 'after_hours_deferred:awaiting_overnight_reeval'
-        Time then advances past the restart-guard window and those rows get
-        rejected as `restart_guard:overnight_skip` — never reaching contract
-        selection.
-
-        This endpoint is the explicit release valve. It does ONE thing:
-        clear `last_error` on still-deferred WATCHING rows so the existing
-        queue worker can pick them up on its next poll and run the normal
-        MC / contract_selector / watcher path against them.
-
-        Time-of-day guard: by default the endpoint refuses to run before
-        09:35 America/New_York (matches the operator pre-open / open-grace
-        window). Pass `{"force": true}` to override (mirrors the convention
-        of /admin/overnight_reeval).
-
-        Idempotent: re-running after all rows are released is a no-op
-        (the WHERE clause matches zero rows).
-
-        Body (all optional):
-            force       (bool, default False): bypass time-of-day guard
-            clients     (list[str]): restrict to specific client_ids
-            lookback_h  (int, default 36): only release rows created within
-                        the last N hours (defends against ancient rows)
-
-        Response:
-            {
-              "ok": true,
-              "released": N,
-              "force": <bool>,
-              "et_now": "HH:MM:SS",
-              "lookback_hours": 36,
-              "clients_filter": [...] or null
-            }
-
-        Returns 412 (Precondition Failed) if invoked before 09:35 ET without
-        force=true, so the caller knows the guard fired.
-        """
-        try:
-            body = request.get_json(silent=True) or {}
-            force          = bool(body.get("force", False))
-            _lh_raw        = body.get("lookback_h")
-            # 36h default when key missing/None. Any explicit number (incl
-            # 0 / negative) clamps to at least 1 — caller intent of "as
-            # small as possible" rather than silently falling back to 36.
-            lookback_h     = 36 if _lh_raw is None else max(1, int(_lh_raw))
-            clients_filter = body.get("clients") or None
-            if clients_filter is not None:
-                clients_filter = [
-                    str(e).strip().lower() for e in clients_filter if str(e).strip()
-                ] or None
-
-            # ── Time-of-day guard ─────────────────────────────────────────
-            # Anything earlier than 09:35 ET is pre-open or inside open-grace
-            # and the rows should LEGITIMATELY remain after_hours_deferred —
-            # the normal reeval flow is still expected to handle them.
-            # After 09:35 ET, deferred rows are the symptom we're treating.
-            from zoneinfo import ZoneInfo
-            from datetime import datetime as _dt
-            _et = _dt.now(ZoneInfo("America/New_York"))
-            _et_minutes = _et.hour * 60 + _et.minute
-            _gate_minutes = 9 * 60 + 35  # 09:35 ET
-            if not force and _et_minutes < _gate_minutes:
-                admin_log.info(
-                    "release_after_hours_deferred declined: pre-open "
-                    "et=%s gate=09:35 force=false",
-                    _et.strftime("%H:%M:%S"),
-                )
-                return jsonify({
-                    "ok": False,
-                    "released": 0,
-                    "reason": "pre_open_guard",
-                    "et_now": _et.strftime("%H:%M:%S"),
-                    "hint": "pass force=true to override",
-                }), 412
-
-            # ── The release UPDATE ────────────────────────────────────────
-            # Sets status='NEW' so the queue worker's _claim_one_job()
-            # (which selects WHERE status='NEW') actually picks up the row
-            # on its next poll. Clearing last_error alone was insufficient —
-            # WATCHING rows are never claimed by the queue worker.
-            # Also resets started_ts and finished_ts so the row looks like a
-            # fresh submission to the claim CTE.
-            # Columns NOT touched: contract, qty, limit_price, trigger_price,
-            # score, payload, result_json, broker_order_id, client_id.
-            from ap.db import conn, run_with_retry
-
-            def _release():
-                with conn() as c:
-                    if clients_filter:
-                        c.execute(
-                            """
-                            UPDATE trade_queue
-                               SET status      = 'NEW',
-                                   last_error  = NULL,
-                                   started_ts  = NULL,
-                                   finished_ts = NULL
-                             WHERE status = 'WATCHING'
-                               AND last_error = 'after_hours_deferred:awaiting_overnight_reeval'
-                               AND created_ts >= NOW() - (%s || ' hours')::interval
-                               AND client_id = ANY(%s)
-                            RETURNING id, client_id
-                            """,
-                            (str(lookback_h), clients_filter),
-                        )
-                    else:
-                        c.execute(
-                            """
-                            UPDATE trade_queue
-                               SET status      = 'NEW',
-                                   last_error  = NULL,
-                                   started_ts  = NULL,
-                                   finished_ts = NULL
-                             WHERE status = 'WATCHING'
-                               AND last_error = 'after_hours_deferred:awaiting_overnight_reeval'
-                               AND created_ts >= NOW() - (%s || ' hours')::interval
-                            RETURNING id, client_id
-                            """,
-                            (str(lookback_h),),
-                        )
-                    rows = c.fetchall() or []
-                    return rows
-
-            released_rows = run_with_retry(_release) or []
-            released_count = len(released_rows)
-
-            # ── Per-client audit log (the MORNING_REEVAL_STUCK_ROW_PREVENTED
-            # signal from the spec). Aggregated by client_id so log volume
-            # stays sane regardless of row count.
-            from collections import Counter
-            by_client = Counter()
-            for r in released_rows:
-                cid = r.get("client_id") if isinstance(r, dict) else (r[1] if len(r) > 1 else None)
-                if cid:
-                    by_client[str(cid)] += 1
-            for cid, n in by_client.items():
-                admin_log.warning(
-                    "MORNING_REEVAL_STUCK_ROW_PREVENTED client_id=%s rows=%d "
-                    "et=%s lookback_h=%d force=%s ip=%s",
-                    cid, n, _et.strftime("%H:%M:%S"), lookback_h,
-                    force, _admin_client_ip(),
-                )
-
-            admin_log.warning(
-                "release_after_hours_deferred summary released=%d clients=%d "
-                "et=%s lookback_h=%d force=%s",
-                released_count, len(by_client),
-                _et.strftime("%H:%M:%S"), lookback_h, force,
-            )
-
-            return jsonify({
-                "ok": True,
-                "released": released_count,
-                "by_client": dict(by_client),
-                "force": force,
-                "et_now": _et.strftime("%H:%M:%S"),
-                "lookback_hours": lookback_h,
-                "clients_filter": clients_filter,
-            })
-        except Exception as e:
-            admin_log.error("release_after_hours_deferred failed: %s", e, exc_info=True)
-            return jsonify({"ok": False, "error": str(e)}), 500
-
-    # ── PR feature/morning-handoff-audit ──────────────────────────────────────
-    # GET:  /admin/morning_handoff_audit?client_id=<email>&mode=live|paper
-    # POST: /admin/morning_handoff_audit  {"clients":[...], "mode":"live", "dry_run":false}
-    #
-    # Safety invariants:
-    #   NEVER calls broker.submit_order   NEVER creates new orders
-    #   NEVER changes contract/limit/qty  NEVER mutates terminal rows
-    #   NEVER duplicates watcher state for the same local_order_id
-    #   Idempotent: auditing the same row twice produces the same result.
-
-    @app.get("/admin/morning_handoff_audit")
-    @require_hmac
-    def admin_morning_handoff_audit_get():
-        """Classify and re-arm a single client's non-terminal ENTRY rows.
-
-        Query params:
-          client_id  (str, required)   — client email
-          mode       (str, default live) — live|paper
-          dry_run    (bool, default false) — classify but do not re-arm
-
-        Returns per-row classification and summary counts.
-        """
-        from client_runner import _active_runners, _registry_lock
-        from ap_morning_handoff_audit import run_morning_handoff_audit
-
-        client_id_req = request.args.get("client_id", "").strip().lower()
-        if not client_id_req:
-            return jsonify({"ok": False, "error": "client_id required"}), 400
-        mode    = str(request.args.get("mode", "live")).lower().strip()
-        dry_run = str(request.args.get("dry_run", "false")).lower() in ("1", "true", "yes")
-
-        with _registry_lock:
-            runner = _active_runners.get(client_id_req)
-
-        if runner is None:
-            return jsonify({"ok": False,
-                            "error": f"client_id not in active runners: {client_id_req}"}), 404
-
-        entry_watcher = getattr(runner, "entry_watcher", None) or getattr(
-            getattr(runner, "core", None), "entry_watcher", None
-        )
-        # OSM fallback chain: try order_state_machine first (canonical attr on
-        # ClientRunner), then osm (legacy alias), then core subobject paths.
-        osm = (
-            getattr(runner, "order_state_machine", None)
-            or getattr(runner, "osm", None)
-            or getattr(getattr(runner, "core", None), "order_state_machine", None)
-            or getattr(getattr(runner, "execution_core", None), "order_state_machine", None)
-        )
-        if osm is None:
-            log.warning(
-                "morning_handoff_audit GET: OSM not found for client %s — "
-                "re-arm metadata will not be persisted. "
-                "WATCHER_REARM_AUDIT_FAILED",
-                client_id_req,
-            )
-
-        try:
-            result = run_morning_handoff_audit(
-                client_id=client_id_req,
-                entry_watcher=entry_watcher,
-                osm=osm,
-                execution_mode=mode,
-                dry_run=dry_run,
-            )
-            return jsonify(result)
-        except Exception as exc:
-            log.error("morning_handoff_audit GET failed: %s", exc, exc_info=True)
-            return jsonify({"ok": False, "error": str(exc)}), 500
-
     @app.post("/admin/morning_handoff_audit")
     @require_hmac
-    def admin_morning_handoff_audit_post():
-        """Classify and re-arm ENTRY rows for one or more clients.
+    def admin_morning_handoff_audit():
+        """Jason/live morning recovery helper.
 
-        Request body:
-          clients  (list[str], optional) — emails to audit; default = all active runners
-          mode     (str, default "live") — live|paper
-          dry_run  (bool, default false) — classify but do not re-arm
-
-        Safety: NEVER calls broker.submit_order, NEVER creates orders,
-        NEVER mutates terminal rows, NEVER changes contract/limit/qty.
+        Safe scope:
+          - one client only
+          - no direct broker submit/cancel
+          - no direct order-state mutation here
+          - reuses startup recovery's watcher reseed logic
         """
-        from client_runner import _active_runners, _registry_lock
-        from ap_morning_handoff_audit import run_morning_handoff_audit
-        import time as _time
-
-        body = request.get_json(silent=True) or {}
-        clients_filter = body.get("clients") or None
-        if clients_filter is not None:
-            clients_filter = {str(e).strip().lower() for e in clients_filter if str(e).strip()}
-        mode    = str(body.get("mode", "live")).lower().strip()
-        dry_run = bool(body.get("dry_run", False))
-
-        with _registry_lock:
-            runners_all = dict(_active_runners)
-
-        _t0 = _time.monotonic()
-        per_client_results = {}
-        errors = {}
-
-        for email, runner in runners_all.items():
-            if clients_filter is not None and email not in clients_filter:
-                continue
-            entry_watcher = getattr(runner, "entry_watcher", None) or getattr(
-                getattr(runner, "core", None), "entry_watcher", None
-            )
-            # OSM fallback chain: try order_state_machine first (canonical attr on
-            # ClientRunner), then osm (legacy alias), then core subobject paths.
-            osm = (
-                getattr(runner, "order_state_machine", None)
-                or getattr(runner, "osm", None)
-                or getattr(getattr(runner, "core", None), "order_state_machine", None)
-                or getattr(getattr(runner, "execution_core", None), "order_state_machine", None)
-            )
-            if osm is None:
-                log.warning(
-                    "morning_handoff_audit POST: OSM not found for client %s — "
-                    "re-arm metadata will not be persisted. "
-                    "WATCHER_REARM_AUDIT_FAILED",
-                    email,
-                )
-            try:
-                per_client_results[email] = run_morning_handoff_audit(
-                    client_id=email,
-                    entry_watcher=entry_watcher,
-                    osm=osm,
-                    execution_mode=mode,
-                    dry_run=dry_run,
-                )
-            except Exception as exc:
-                log.error(
-                    "morning_handoff_audit POST failed for %s: %s", email, exc, exc_info=True
-                )
-                errors[email] = str(exc)
-                per_client_results[email] = {"ok": False, "error": str(exc)}
-
-        elapsed = _time.monotonic() - _t0
-        return jsonify({
-            "ok":              len(errors) == 0,
-            "mode":            mode,
-            "dry_run":         dry_run,
-            "clients_audited": len(per_client_results),
-            "elapsed_seconds": round(elapsed, 2),
-            "results":         per_client_results,
-            "errors":          errors,
-        })
-
-    # ── PR feature/paper-rescue-restart-guard ─────────────────────────────────
-    # POST /admin/paper_rescue_restart_guard
-    #
-    # Converts REJECTED/restart_guard:overnight_skip queue rows back to
-    # WATCHING for paper clients, then calls morning_handoff_audit to
-    # re-arm watcher ownership.
-    #
-    # Hard safety:
-    #   PAPER ONLY — any live client_id causes immediate 400 abort.
-    #   NEVER calls broker.submit_order.
-    #   NEVER creates order rows.
-    #   NEVER touches live client rows.
-    #   DB write: UPDATE trade_queue SET status='WATCHING',
-    #             last_error='manual_paper_rescue_restart_guard_bypass'
-    #             WHERE status='REJECTED' AND last_error='restart_guard:overnight_skip'
-
-    @app.post("/admin/paper_rescue_restart_guard")
-    @require_hmac
-    def admin_paper_rescue_restart_guard():
-        """Convert restart_guard:overnight_skip rows to WATCHING for paper clients.
-
-        Request body (all optional):
-          clients      (list[str]) — paper client emails; default = all paper runners
-          lookback_h   (int, default 36) — hours back to search
-          dry_run      (bool, default false) — classify/count but do not convert
-
-        Returns per-client row counts and morning handoff audit summary.
-
-        PAPER ONLY. Returns 400 if any requested client is running in LIVE mode.
-        """
-        from client_runner import _active_runners, _registry_lock
-        from ap_paper_rescue_restart_guard import run_paper_rescue_restart_guard
-
-        body = request.get_json(silent=True) or {}
-        clients_filter = body.get("clients") or None
-        if clients_filter is not None:
-            clients_filter = {str(e).strip().lower() for e in clients_filter if str(e).strip()}
-        lookback_h = max(1, int(body.get("lookback_h", 36) or 36))
-        dry_run    = bool(body.get("dry_run", False))
-
-        with _registry_lock:
-            runners_all = dict(_active_runners)
-
-        # Collect paper runners — reject immediately if a live runner is in scope.
-        paper_runners: dict = {}
-        live_found:    list[str] = []
-
-        for email, runner in runners_all.items():
-            if clients_filter is not None and email not in clients_filter:
-                continue
-            mode = str(getattr(runner, "mode", "") or "").upper().strip()
-            if mode == "LIVE":
-                live_found.append(email)
-            else:
-                paper_runners[email] = runner
-
-        if live_found:
-            return jsonify({
-                "ok":    False,
-                "error": (
-                    f"paper_rescue_restart_guard is paper-only. "
-                    f"Live clients found in scope: {live_found}. "
-                    f"No rows were modified."
-                ),
-                "live_clients": live_found,
-            }), 400
-
-        # If caller requested specific clients that aren't in the registry, 404.
-        if clients_filter:
-            missing = clients_filter - set(runners_all.keys())
-            if missing:
-                return jsonify({
-                    "ok":     False,
-                    "error":  f"clients not found in active runners: {sorted(missing)}",
-                    "missing": sorted(missing),
-                }), 404
-
         try:
-            result = run_paper_rescue_restart_guard(
-                paper_client_ids=list(paper_runners.keys()),
-                runners=paper_runners,
-                lookback_hours=lookback_h,
-                dry_run=dry_run,
+            from client_runner import _active_runners, _registry_lock
+            from ap_recovery import APStartupRecovery
+            from ap.db import conn, run_with_retry
+
+            body = request.get_json(silent=True) or {}
+            client_id = str(body.get("client_id") or "").strip()
+            execution_mode = str(body.get("execution_mode") or "").strip().lower()
+            dry_run = bool(body.get("dry_run", False))
+
+            if not client_id:
+                return jsonify({"ok": False, "error": "client_id required"}), 400
+            if execution_mode and execution_mode not in ("live", "paper"):
+                return jsonify({"ok": False, "error": "execution_mode must be live or paper"}), 400
+
+            with _registry_lock:
+                runner = _active_runners.get(client_id)
+
+            if runner is None:
+                return jsonify({"ok": False, "error": f"runner not found for {client_id}"}), 404
+            if not runner.is_alive():
+                return jsonify({"ok": False, "error": f"runner not alive for {client_id}"}), 503
+
+            actual_mode = str(getattr(runner.master_control, "mode", "UNKNOWN")).strip().lower()
+            if execution_mode and actual_mode != execution_mode:
+                return jsonify({
+                    "ok": False,
+                    "error": "execution_mode_mismatch",
+                    "requested_execution_mode": execution_mode,
+                    "actual_execution_mode": actual_mode,
+                }), 409
+
+            def _snapshot():
+                with conn() as c:
+                    c.execute(
+                        """
+                        SELECT
+                            COALESCE(SUM(CASE WHEN status = 'WATCHING' THEN 1 ELSE 0 END), 0)::int AS watching_rows,
+                            COALESCE(SUM(CASE WHEN status = 'NEW' THEN 1 ELSE 0 END), 0)::int AS new_rows
+                        FROM trade_queue
+                        WHERE client_id = %s
+                        """,
+                        (client_id,),
+                    )
+                    tq_row = c.fetchone()
+                    tq_cols = [d[0] for d in getattr(c, "description", [])]
+                    c.execute(
+                        """
+                        SELECT
+                            COALESCE(SUM(CASE WHEN status = 'PENDING_TRIGGER' THEN 1 ELSE 0 END), 0)::int AS pending_trigger_rows
+                        FROM orders
+                        WHERE client_id = %s
+                          AND kind = 'ENTRY'
+                        """,
+                        (client_id,),
+                    )
+                    orders_row = c.fetchone()
+                    orders_cols = [d[0] for d in getattr(c, "description", [])]
+                    tq = dict(tq_row or {}) if isinstance(tq_row, dict) else dict(zip(tq_cols, tq_row or ()))
+                    orders = (
+                        dict(orders_row or {})
+                        if isinstance(orders_row, dict)
+                        else dict(zip(orders_cols, orders_row or ()))
+                    )
+                    tq.update(orders)
+                    return tq
+
+            before = run_with_retry(_snapshot) or {}
+            recovery_result = {
+                "client_id": client_id,
+                "watchers_requeued": 0,
+                "errors": [],
+            }
+
+            if not dry_run:
+                core = getattr(runner, "core", None)
+                recovery = APStartupRecovery(
+                    client_id=client_id,
+                    broker=getattr(core, "broker", None) if core else None,
+                    osm=runner.order_state_machine,
+                    pm=runner.position_manager,
+                    master_control=runner.master_control,
+                    exit_engine=getattr(core, "exit_eng", None) if core else None,
+                    entry_watcher=getattr(core, "entry_watcher", None) if core else None,
+                )
+                recovery._reseed_watchers(recovery_result)
+
+            after = run_with_retry(_snapshot) or {}
+            log.info(
+                "morning_handoff_audit client=%s execution_mode=%s dry_run=%s watchers_requeued=%s before=%s after=%s",
+                client_id,
+                actual_mode,
+                dry_run,
+                recovery_result.get("watchers_requeued", 0),
+                before,
+                after,
             )
-            return jsonify(result)
-        except ValueError as exc:
-            # Live client guard triggered inside the module (belt-and-suspenders)
-            log.error("paper_rescue_restart_guard rejected: %s", exc)
-            return jsonify({"ok": False, "error": str(exc)}), 400
-        except Exception as exc:
-            log.error("paper_rescue_restart_guard failed: %s", exc, exc_info=True)
-            return jsonify({"ok": False, "error": str(exc)}), 500
+            return jsonify({
+                "ok": True,
+                "client_id": client_id,
+                "execution_mode": actual_mode,
+                "dry_run": dry_run,
+                "watchers_requeued": int(recovery_result.get("watchers_requeued", 0) or 0),
+                "errors": list(recovery_result.get("errors") or []),
+                "before": before,
+                "after": after,
+            })
+        except Exception as e:
+            log.error("morning_handoff_audit endpoint failed: %s", e, exc_info=True)
+            return jsonify({"ok": False, "error": str(e)}), 500
 
     @app.post("/admin/reseed_exit_engine")
     @require_hmac
@@ -3812,13 +3210,49 @@ app = create_app()
 # These routes are registered after create_app() so the existing stable app body
 # remains untouched while still exposing fleet-level quote-monitor telemetry and
 # manual emergency flatten controls.
-#
-# P0 startup-order fix: the admin decorator infrastructure (_os_admin,
-# _hmac_admin, _admin_wraps, admin_log, ADMIN_API_KEY, ALLOWED_ADMIN_IPS,
-# _admin_client_ip, _require_admin) was MOVED to be defined BEFORE
-# create_app() so that @_require_admin usages inside create_app() resolve
-# at app-construction time. See module-level block above (search for
-# "_require_admin = HOISTED").
+import os as _os_admin
+import hmac as _hmac_admin
+import logging as _logging_admin
+from functools import wraps as _admin_wraps
+
+admin_log = _logging_admin.getLogger("admin.controls")
+
+ADMIN_API_KEY = _os_admin.getenv("ADMIN_API_KEY", "")
+ALLOWED_ADMIN_IPS = {
+    ip.strip()
+    for ip in _os_admin.getenv("ALLOWED_ADMIN_IPS", "").split(",")
+    if ip.strip()
+}
+
+
+def _admin_client_ip() -> str:
+    return request.headers.get(
+        "X-Forwarded-For",
+        request.remote_addr or "",
+    ).split(",")[0].strip()
+
+
+def _require_admin(fn):
+    @_admin_wraps(fn)
+    def _wrap(*a, **kw):
+        if not ADMIN_API_KEY:
+            return jsonify({"ok": False, "error": "ADMIN_API_KEY not configured"}), 503
+
+        ip = _admin_client_ip()
+
+        if ALLOWED_ADMIN_IPS and ip not in ALLOWED_ADMIN_IPS:
+            admin_log.critical("ADMIN_DENIED_IP path=%s ip=%s", request.path, ip)
+            return jsonify({"ok": False, "error": "forbidden_ip"}), 403
+
+        supplied = request.headers.get("X-Admin-Key", "")
+
+        if not _hmac_admin.compare_digest(supplied, ADMIN_API_KEY):
+            admin_log.critical("ADMIN_AUTH_FAIL path=%s ip=%s", request.path, ip)
+            return jsonify({"ok": False, "error": "unauthorized"}), 401
+
+        return fn(*a, **kw)
+
+    return _wrap
 
 
 def _iter_client_runners():
