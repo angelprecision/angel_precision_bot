@@ -356,6 +356,82 @@ class APExecutionCore:
             )
             return None
 
+    # ── Diagnostic-only helper (PR hotfix/breach-block-diagnostics) ──────────
+    # Emits a single structured log line for every silent block / exception
+    # path in _breach_risk_check and _on_entry_trigger. The bot is working;
+    # this PR adds zero behavior changes. Operators grep Render logs for
+    # BREACH_RISK_CHECK_BLOCKED / BREACH_RISK_CHECK_EXCEPTION /
+    # WATCHER_ON_TRIGGER_RETURNED / WATCHER_ON_TRIGGER_EXCEPTION /
+    # ENTRY_TRIGGER_BLOCKED_RETURN to diagnose stuck PENDING_TRIGGER rows.
+    def _emit_breach_diag(
+        self,
+        event: str,
+        *,
+        watched: "WatchedSignal",
+        reason: str,
+        positions_open: object = "n/a",
+        pending_entries: object = "n/a",
+        max_positions: object = "n/a",
+        current_total_exposure: object = "n/a",
+        remaining_total_cap: object = "n/a",
+        mc_block_reason: str = "",
+        exception_type: str = "",
+        exception_message: str = "",
+        level: str = "warning",
+    ) -> None:
+        """Emit one structured diagnostic line. Never raises.
+
+        Field set is fixed across emissions so log-grep stays stable:
+        client_id, local_order_id, signal_id, symbol, contract, reason,
+        positions_open, pending_entries, max_positions, current_total_exposure,
+        remaining_total_cap, mc_block_reason, exception_type, exception_message,
+        execution_mode.
+        """
+        try:
+            sig             = getattr(watched, "signal", {}) or {}
+            client_id_val   = (
+                getattr(self, "client_id", None)
+                or getattr(self, "email", None)
+                or sig.get("client_email")
+                or "n/a"
+            )
+            local_order_id  = sig.get("local_order_id") or "n/a"
+            signal_id       = sig.get("signal_id") or "n/a"
+            symbol          = getattr(watched, "ticker", None) or sig.get("ticker") or "n/a"
+            contract        = (
+                (sig.get("plan") or {}).get("contract_symbol")
+                or sig.get("contract_symbol")
+                or sig.get("contract")
+                or "n/a"
+            )
+            execution_mode  = getattr(self, "mode", "n/a")
+
+            msg = (
+                f"{event} client_id={client_id_val} local_order_id={local_order_id} "
+                f"signal_id={signal_id} symbol={symbol} contract={contract} "
+                f"reason={reason} execution_mode={execution_mode} "
+                f"positions_open={positions_open} pending_entries={pending_entries} "
+                f"max_positions={max_positions} "
+                f"current_total_exposure={current_total_exposure} "
+                f"remaining_total_cap={remaining_total_cap} "
+                f"mc_block_reason={mc_block_reason or 'n/a'} "
+                f"exception_type={exception_type or 'n/a'} "
+                f"exception_message={(exception_message or 'n/a')[:200]}"
+            )
+            if level == "critical":
+                log.critical(msg)
+            elif level == "error":
+                log.error(msg)
+            elif level == "info":
+                log.info(msg)
+            else:
+                log.warning(msg)
+        except Exception:  # pragma: no cover — never let diagnostics break flow
+            try:
+                log.warning("BREACH_DIAG_EMIT_FAILED event=%s", event)
+            except Exception:
+                pass
+
     def _breach_risk_check(self, watched: WatchedSignal) -> bool:
         """
         Lightweight breach-time safety check.
@@ -376,6 +452,13 @@ class APExecutionCore:
                     "decision_status": "blocked_at_breach",
                     "context_notes": "kill_switch_active_at_breach",
                 })
+            self._emit_breach_diag(
+                "BREACH_RISK_CHECK_BLOCKED",
+                watched=watched,
+                reason="kill_switch_active",
+                max_positions=getattr(self, "_max_positions", "n/a"),
+                level="critical",
+            )
             return False
 
         if self.master_control is not None:
@@ -388,9 +471,25 @@ class APExecutionCore:
                             "decision_status": "blocked_at_breach",
                             "context_notes": "master_control_kill_switch_active_at_breach",
                         })
+                    self._emit_breach_diag(
+                        "BREACH_RISK_CHECK_BLOCKED",
+                        watched=watched,
+                        reason="master_control_kill_switch_active",
+                        max_positions=getattr(self, "_max_positions", "n/a"),
+                        level="critical",
+                    )
                     return False
             except Exception as exc:
                 log.warning("[%s] Kill-switch check failed at breach: %s", ticker, exc)
+                self._emit_breach_diag(
+                    "BREACH_RISK_CHECK_EXCEPTION",
+                    watched=watched,
+                    reason="kill_switch_check_exception",
+                    max_positions=getattr(self, "_max_positions", "n/a"),
+                    exception_type=type(exc).__name__,
+                    exception_message=str(exc),
+                    level="warning",
+                )
 
         open_count = self._current_open_position_count()
         pending_entries = self._current_pending_entry_count()
@@ -413,6 +512,15 @@ class APExecutionCore:
                 self._cleanup_pending_entry_order(watched, action="cancel", reason="positions_full_at_breach")
             except Exception as _clean_err:
                 log.error("[%s] Failed to cleanup pending entry order: %s", ticker, _clean_err)
+            self._emit_breach_diag(
+                "BREACH_RISK_CHECK_BLOCKED",
+                watched=watched,
+                reason="positions_full_at_breach",
+                positions_open=open_count,
+                pending_entries=pending_entries,
+                max_positions=self._max_positions,
+                level="info",
+            )
             return False
 
         approved_plan = self._recover_plan_for_revalidation(watched)
@@ -429,8 +537,16 @@ class APExecutionCore:
                         "context_notes": msg,
                     })
                 _sector = sig.get("sector") or sig.get("correlation_bucket") or ticker
+                self._emit_breach_diag(
+                    "BREACH_RISK_CHECK_BLOCKED",
+                    watched=watched,
+                    reason="approved_plan_missing_at_breach_revalidation",
+                    positions_open=open_count,
+                    pending_entries=pending_entries,
+                    max_positions=self._max_positions,
+                    level="critical",
+                )
                 return False
-
             log.critical(
                 "[%s] PAPER BREACH WARNING — _approved_plan missing; continuing without exposure revalidation",
                 ticker,
@@ -455,6 +571,31 @@ class APExecutionCore:
                             "context_notes": f"exposure_revalidation={reason}",
                         })
                     _sector = sig.get("sector") or sig.get("correlation_bucket") or ticker
+                    # Best-effort capacity numbers for diagnostics
+                    _cur_total_exp = (
+                        getattr(reval, "current_total_exposure", None)
+                        if hasattr(reval, "current_total_exposure") else "n/a"
+                    )
+                    _rem_total_cap = (
+                        getattr(reval, "remaining_total_cap", None)
+                        if hasattr(reval, "remaining_total_cap") else "n/a"
+                    )
+                    self._emit_breach_diag(
+                        "BREACH_RISK_CHECK_BLOCKED",
+                        watched=watched,
+                        reason="exposure_revalidation_blocked",
+                        positions_open=open_count,
+                        pending_entries=pending_entries,
+                        max_positions=self._max_positions,
+                        current_total_exposure=(
+                            _cur_total_exp if _cur_total_exp is not None else "n/a"
+                        ),
+                        remaining_total_cap=(
+                            _rem_total_cap if _rem_total_cap is not None else "n/a"
+                        ),
+                        mc_block_reason=str(reason),
+                        level="warning",
+                    )
                     return False
             except Exception as exc:
                 if self.mode == "LIVE":
@@ -468,8 +609,30 @@ class APExecutionCore:
                             "context_notes": f"exposure_revalidation_error={exc}",
                         })
                     _sector = sig.get("sector") or sig.get("correlation_bucket") or ticker
+                    self._emit_breach_diag(
+                        "BREACH_RISK_CHECK_EXCEPTION",
+                        watched=watched,
+                        reason="exposure_revalidation_error_live",
+                        positions_open=open_count,
+                        pending_entries=pending_entries,
+                        max_positions=self._max_positions,
+                        exception_type=type(exc).__name__,
+                        exception_message=str(exc),
+                        level="critical",
+                    )
                     return False
                 log.warning("[%s] PAPER breach exposure revalidation failed open: %s", ticker, exc)
+                self._emit_breach_diag(
+                    "BREACH_RISK_CHECK_EXCEPTION",
+                    watched=watched,
+                    reason="exposure_revalidation_error_paper_fail_open",
+                    positions_open=open_count,
+                    pending_entries=pending_entries,
+                    max_positions=self._max_positions,
+                    exception_type=type(exc).__name__,
+                    exception_message=str(exc),
+                    level="warning",
+                )
 
         return True
 
@@ -664,6 +827,13 @@ class APExecutionCore:
         # 1) Revalidate only. Never re-run selection/sizing logic here.
         if not self._breach_risk_check(watched):
             funnel.inc("master_control_blocked")
+            self._emit_breach_diag(
+                "ENTRY_TRIGGER_BLOCKED_RETURN",
+                watched=watched,
+                reason="breach_risk_check_false",
+                max_positions=getattr(self, "_max_positions", "n/a"),
+                level="info",
+            )
             return
 
         # 2) Require OSM + existing queue-created local order id.
