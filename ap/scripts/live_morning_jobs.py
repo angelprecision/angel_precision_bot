@@ -9,15 +9,13 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from ap.morning_jobs import (
-    DEFAULT_EXECUTION_MODE,
     DEFAULT_LIVE_CLIENT,
-    MORNING_HANDOFF_AUDIT_ENDPOINT,
+    DEFAULT_PAPER_CLIENTS,
     MORNING_HANDOFF_BACKUP_JOB,
     MORNING_HANDOFF_PRIMARY_JOB,
-    OVERNIGHT_REEVAL_ENDPOINT,
-    OVERNIGHT_REEVAL_JOB,
-    build_morning_handoff_payload,
-    build_overnight_reeval_payload,
+    MORNING_RECOVERY_JOB,
+    OVERNIGHT_REEVAL_BATCH_JOB,
+    build_job_calls,
     call_admin_endpoint,
     should_run_now,
 )
@@ -39,20 +37,24 @@ def _resolve_job_from_env() -> str:
     raise SystemExit("MORNING_JOB env required")
 
 
-def _build_job_config(job_name: str) -> tuple[str, dict]:
-    if job_name == OVERNIGHT_REEVAL_JOB:
-        return OVERNIGHT_REEVAL_ENDPOINT, build_overnight_reeval_payload()
-    if job_name in (MORNING_HANDOFF_PRIMARY_JOB, MORNING_HANDOFF_BACKUP_JOB):
-        return MORNING_HANDOFF_AUDIT_ENDPOINT, build_morning_handoff_payload()
-    raise SystemExit(f"unsupported MORNING_JOB={job_name!r}")
+def _resolve_paper_clients() -> list[str]:
+    raw = str(
+        os.getenv(
+            "MORNING_JOB_PAPER_CLIENTS",
+            ",".join(DEFAULT_PAPER_CLIENTS),
+        )
+        or ""
+    ).strip()
+    return [item.strip() for item in raw.split(",") if item.strip()]
 
 
 def main() -> int:
     bot_url = str(os.getenv("BOT_URL", "") or "").strip()
     signing_secret = str(os.getenv("SIGNING_SECRET", "") or "").strip()
-    client_id = str(os.getenv("MORNING_JOB_CLIENT_ID", DEFAULT_LIVE_CLIENT) or "").strip()
-    execution_mode = str(os.getenv("MORNING_JOB_EXECUTION_MODE", DEFAULT_EXECUTION_MODE) or "").strip().lower()
+    live_client = str(os.getenv("MORNING_JOB_LIVE_CLIENT", DEFAULT_LIVE_CLIENT) or "").strip()
+    paper_clients = _resolve_paper_clients()
     timeout_seconds = int(os.getenv("MORNING_JOB_TIMEOUT_SECONDS", "180"))
+    tolerance_minutes = int(os.getenv("MORNING_JOB_WINDOW_TOLERANCE_MINUTES", "45"))
     force_window = str(os.getenv("MORNING_JOB_FORCE_WINDOW", "0")).strip().lower() in {"1", "true", "yes"}
 
     if not bot_url:
@@ -61,41 +63,63 @@ def main() -> int:
         raise SystemExit("SIGNING_SECRET env required")
 
     job_name = _resolve_job_from_env()
+    if job_name not in {
+        OVERNIGHT_REEVAL_BATCH_JOB,
+        MORNING_HANDOFF_PRIMARY_JOB,
+        MORNING_HANDOFF_BACKUP_JOB,
+        MORNING_RECOVERY_JOB,
+    }:
+        raise SystemExit(f"unsupported MORNING_JOB={job_name!r}")
+
     now_et = datetime.now(ET)
-    if not force_window and not should_run_now(job_name, now=now_et):
+    if not force_window and not should_run_now(job_name, now=now_et, tolerance_minutes=tolerance_minutes):
         log.info(
-            "job=%s client=%s execution_mode=%s success=true skipped=true reason=outside_expected_window now_et=%s",
+            "job=%s success=true skipped=true reason=outside_expected_window tolerance_minutes=%s now_et=%s",
             job_name,
-            client_id,
-            execution_mode,
+            tolerance_minutes,
             now_et.isoformat(),
         )
         return 0
 
-    endpoint, payload = _build_job_config(job_name)
-    if job_name == OVERNIGHT_REEVAL_JOB:
-        payload = build_overnight_reeval_payload(client_id=client_id)
-    else:
-        payload = build_morning_handoff_payload(
-            client_id=client_id,
-            execution_mode=execution_mode,
-            dry_run=False,
+    results = []
+    failures = 0
+    for call in build_job_calls(
+        job_name,
+        live_client=live_client,
+        paper_clients=paper_clients,
+    ):
+        result = call_admin_endpoint(
+            bot_url=bot_url,
+            endpoint=call.endpoint,
+            secret=signing_secret,
+            payload=call.payload,
+            job_name=call.job_name,
+            client_scope=call.client_scope,
+            execution_mode=call.execution_mode,
+            timeout_seconds=timeout_seconds,
+            now=now_et,
         )
+        results.append(
+            {
+                "job_name": call.job_name,
+                "endpoint": call.endpoint,
+                "client_scope": call.client_scope,
+                "execution_mode": call.execution_mode,
+                **result,
+            }
+        )
+        if not result.get("ok"):
+            failures += 1
 
-    result = call_admin_endpoint(
-        bot_url=bot_url,
-        endpoint=endpoint,
-        secret=signing_secret,
-        payload=payload,
-        job_name=job_name,
-        client_id=client_id,
-        execution_mode=execution_mode,
-        timeout_seconds=timeout_seconds,
-        now=now_et,
-    )
-
-    print(json.dumps(result, default=str))
-    return 0 if result.get("ok") else 1
+    summary = {
+        "ok": failures == 0,
+        "job": job_name,
+        "executed": len(results),
+        "failures": failures,
+        "results": results,
+    }
+    print(json.dumps(summary, default=str))
+    return 0 if failures == 0 else 1
 
 
 if __name__ == "__main__":
