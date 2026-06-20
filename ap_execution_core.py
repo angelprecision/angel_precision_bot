@@ -918,10 +918,72 @@ class APExecutionCore:
             )
             return
 
+        # ── PR3 (no-silent-deferred-trigger-exits): canonical terminal outcome ──
+        # Every triggered deferred row MUST leave exactly one explicit terminal
+        # outcome from this taxonomy so no trigger returns silently. This is
+        # observability only — it records the outcome that the existing code
+        # paths already produce; it does not change any decision or order action.
+        #
+        # Outcomes:
+        #   BREACH_CONTRACT_SELECTED       real OCC contract chosen, proceeding
+        #   BREACH_RISK_CHECK_BLOCKED      _breach_risk_check returned False
+        #   BREACH_SELECTOR_RETURNED_NONE  selector.select() returned None
+        #   BREACH_SELECTOR_EXCEPTION      selector.select() raised
+        #   BREACH_SUBMISSION_SKIPPED      passed selection but submit not attempted
+        #   BREACH_BROKER_SUBMITTED        order handed to broker submit path
+        #   NO_VALID_PLAYBOOK_DTE_CONTRACT no survivor in any evaluated DTE bucket
+        #   UNTRADEABLE_FOR_ACCOUNT_SIZE   quality contract exists but exceeds budget
+        #   DATA_MISSING_OI_VOLUME         chain returned with zero OI/volume fields
+        #
+        # _deferred_outcome["emitted"] is the sentinel the post-trigger guard checks.
+        _deferred_outcome = {"emitted": False, "outcome": None}
+
+        def _emit_deferred_outcome(
+            outcome: str,
+            *,
+            reason: str = "",
+            contract: str = "",
+            broker_order_id: str = "",
+            extra: dict | None = None,
+        ) -> None:
+            """Emit one canonical terminal outcome for a triggered deferred row.
+            Never raises. Always includes local_order_id + signal_id so the event
+            joins back to the order row (the linkage that was missing before)."""
+            _deferred_outcome["emitted"] = True
+            _deferred_outcome["outcome"] = outcome
+            try:
+                payload = {
+                    "outcome": outcome,
+                    "local_order_id": queue_local_order_id or "",
+                    "signal_id": signal_id or "",
+                    "symbol": ticker,
+                    "execution_mode": getattr(self, "mode", "n/a"),
+                    "reason": reason or "",
+                    "contract": contract or "",
+                    "broker_order_id": broker_order_id or "",
+                }
+                if extra:
+                    for _k, _v in extra.items():
+                        payload[_k] = _v
+                _fields = " ".join(f"{k}={v}" for k, v in payload.items())
+                if outcome in ("BREACH_CONTRACT_SELECTED", "BREACH_BROKER_SUBMITTED"):
+                    log.info("DEFERRED_TRIGGER_OUTCOME %s", _fields)
+                else:
+                    log.warning("DEFERRED_TRIGGER_OUTCOME %s", _fields)
+            except Exception:
+                try:
+                    log.warning("DEFERRED_TRIGGER_OUTCOME_EMIT_FAILED outcome=%s", outcome)
+                except Exception:
+                    pass
+
         # 3) Recover the already-approved queue/OSM plan.
         approved_plan = self._recover_plan_for_revalidation(watched)
         if approved_plan is None:
             log.critical("[%s] PRODUCTION_ENTRY_BLOCK — approved plan missing after breach revalidation", ticker)
+            _emit_deferred_outcome(
+                "BREACH_SELECTOR_RETURNED_NONE",
+                reason="approved_plan_missing_after_revalidation",
+            )
             _terminalize_breach_failure("approved_plan_missing_after_revalidation")
             return
 
@@ -946,6 +1008,10 @@ class APExecutionCore:
                 log.critical(
                     "[%s] DEFERRED_BREACH_CONTRACT_FAILED — %s",
                     ticker, _reason,
+                )
+                _emit_deferred_outcome(
+                    "BREACH_SELECTOR_RETURNED_NONE",
+                    reason=_reason,
                 )
                 _terminalize_deferred_breach_failure(
                     _reason,
@@ -1081,6 +1147,15 @@ class APExecutionCore:
                         "client=%s ticker=%s reason=%s",
                         _breach_client_id, ticker, _reason,
                     )
+                    _emit_deferred_outcome(
+                        (
+                            "DATA_MISSING_OI_VOLUME"
+                            if "vol0_oi0" in str(_reason)
+                            else "BREACH_SELECTOR_RETURNED_NONE"
+                        ),
+                        reason=_reason,
+                        extra={"stage": _deferred_selector_audit.get("stage") or "unknown"},
+                    )
                     _terminalize_deferred_breach_failure(
                         _reason,
                         extra_meta={
@@ -1125,6 +1200,12 @@ class APExecutionCore:
                         queue_local_order_id or "",
                         str(getattr(approved_plan, "signal_id", "") or ""),
                     )
+                    _emit_deferred_outcome(
+                        "BREACH_SELECTOR_RETURNED_NONE",
+                        reason=_reason,
+                        contract=_live_contract,
+                        extra={"stage": "deferred_copy_back"},
+                    )
                     _terminalize_deferred_breach_failure(
                         _reason,
                         extra_meta={
@@ -1145,6 +1226,14 @@ class APExecutionCore:
                         ticker, _live_contract, _reason,
                     )
                     return
+                _emit_deferred_outcome(
+                    "BREACH_CONTRACT_SELECTED",
+                    contract=_live_contract,
+                    extra={
+                        "limit_price": float(getattr(approved_plan, "limit_price", 0) or 0),
+                        "qty": int(getattr(approved_plan, "contracts", 0) or 0),
+                    },
+                )
                 log.info(
                     "[%s] DEFERRED_BREACH_CONTRACT_SELECTED — contract=%s limit=%.2f qty=%s",
                     ticker,
@@ -1183,6 +1272,11 @@ class APExecutionCore:
                 log.critical(
                     "[%s] DEFERRED_BREACH_CONTRACT_FAILED — %s",
                     ticker, _reason,
+                )
+                _emit_deferred_outcome(
+                    "BREACH_SELECTOR_EXCEPTION",
+                    reason=_reason,
+                    extra={"exception_type": type(_cs_err).__name__},
                 )
                 _terminalize_deferred_breach_failure(
                     _reason,
@@ -1631,6 +1725,11 @@ class APExecutionCore:
                 approved_contract,
                 submit_limit,
             )
+            _emit_deferred_outcome(
+                "BREACH_BROKER_SUBMITTED",
+                contract=str(approved_contract or ""),
+                broker_order_id=str(broker_order_id or ""),
+            )
             return
 
         log.error(
@@ -1638,6 +1737,11 @@ class APExecutionCore:
             ticker,
             submit_res.get("local_order_id") or queue_local_order_id,
             submit_res.get("error"),
+        )
+        _emit_deferred_outcome(
+            "BREACH_SUBMISSION_SKIPPED",
+            reason=f"osm_submit_existing_entry_failed:{submit_res.get('error')}",
+            contract=str(approved_contract or ""),
         )
         funnel.inc("order_failed")
         if signal_id:
