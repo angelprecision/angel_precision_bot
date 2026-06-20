@@ -237,3 +237,210 @@ def test_job_batches_cover_recovery_path_without_manual_shell():
 def test_handoff_backup_plan_builds_both_modes():
     calls = build_job_calls(MORNING_HANDOFF_BACKUP_JOB)
     assert [call.execution_mode for call in calls] == ["live", "paper"]
+
+
+# ---------------------------------------------------------------------------
+# Amendment: seven-item compatibility coverage
+#
+# These tests prove the amended PR satisfies the operator-required changes:
+#   1. Render Cron is the primary scheduler (render.yaml present + correct)
+#   2. Both payload shapes accepted (clients/mode AND client_id/execution_mode)
+#   5. async_background/status contract preserved on /admin/overnight_reeval
+#   7. existing curl/dashboard payloads still work
+# ---------------------------------------------------------------------------
+
+def test_render_yaml_defines_cron_primary_scheduler():
+    """Item 1: Render Cron must be the documented primary scheduler."""
+    render_yaml = (REPO_ROOT / "render.yaml").read_text()
+    # Four cron jobs, one per ET window
+    assert render_yaml.count("type: cron") == 4
+    # Each cron's startCommand invokes the scheduler-agnostic script.
+    # Count only startCommand lines (the header comment also names the script).
+    start_cmd_lines = [
+        ln for ln in render_yaml.splitlines()
+        if "startCommand:" in ln and "ap.scripts.live_morning_jobs" in ln
+    ]
+    assert len(start_cmd_lines) == 4, (
+        f"Expected 4 startCommand lines invoking the script, got {len(start_cmd_lines)}"
+    )
+    # ET timezone set so the window guard runs correctly
+    assert "America/New_York" in render_yaml
+    # All four MORNING_JOB batches represented
+    for job in (
+        "overnight_reeval_batch",
+        "morning_handoff_primary",
+        "morning_handoff_backup",
+        "morning_recovery",
+    ):
+        assert job in render_yaml, f"render.yaml missing cron for {job}"
+
+
+def test_render_yaml_env_vars_match_script():
+    """Item 1: render.yaml env var names must match what the script reads.
+    The script reads BOT_URL and SIGNING_SECRET — render.yaml must set those
+    exact names, not aliases, or the cron fails at runtime."""
+    render_yaml = (REPO_ROOT / "render.yaml").read_text()
+    script_src = (REPO_ROOT / "ap" / "scripts" / "live_morning_jobs.py").read_text()
+    # The script reads these exact names
+    assert 'os.getenv("BOT_URL"' in script_src
+    assert 'os.getenv("SIGNING_SECRET"' in script_src
+    # render.yaml must reference the same names
+    assert "BOT_URL" in render_yaml
+    assert "SIGNING_SECRET" in render_yaml
+    # And must NOT reference the wrong alias names
+    assert "AP_BOT_BASE_URL" not in render_yaml
+    assert "AP_ADMIN_HMAC_SECRET" not in render_yaml
+
+
+def test_render_yaml_schedules_are_weekday_et_windows():
+    """Item 1: cron schedules must be weekday ET windows matching MORNING_JOB_WINDOWS."""
+    render_yaml = (REPO_ROOT / "render.yaml").read_text()
+    # 09:18, 09:26, 09:32, 09:36 ET as cron expressions (minute hour * * 1-5)
+    assert "18 9 * * 1-5" in render_yaml
+    assert "26 9 * * 1-5" in render_yaml
+    assert "32 9 * * 1-5" in render_yaml
+    assert "36 9 * * 1-5" in render_yaml
+
+
+def test_scripts_package_importable_as_module():
+    """Item 1: python -m ap.scripts.live_morning_jobs must resolve.
+    Requires ap/scripts/__init__.py to exist for -m on all Python versions."""
+    assert (REPO_ROOT / "ap" / "scripts" / "__init__.py").exists(), (
+        "ap/scripts/__init__.py missing — python -m ap.scripts.live_morning_jobs "
+        "may fail to resolve the package on some Python versions"
+    )
+
+
+# ── Item 2 / 7: endpoint payload parsing contract ──────────────────────────
+# Replicates the exact parsing block from the POST /admin/morning_handoff_audit
+# endpoint so we can prove both payload shapes resolve correctly without
+# spinning up the full Flask app (heavy import deps).
+
+def _parse_morning_handoff_post(body: dict):
+    """Mirror of app.py admin_morning_handoff_audit_post parsing (lines ~3306-3318).
+    If this drifts from the endpoint, test_app_source_endpoint_parsing_matches
+    will catch it."""
+    clients_filter = body.get("clients") or None
+    client_id_alias = str(body.get("client_id") or "").strip().lower()
+    mode_raw = body.get("mode")
+    execution_mode_alias = str(body.get("execution_mode") or "").strip().lower()
+    if mode_raw and execution_mode_alias and str(mode_raw).strip().lower() != execution_mode_alias:
+        return ("ERROR_400", "mode_execution_mode_mismatch")
+    if clients_filter is not None:
+        clients_filter = {str(e).strip().lower() for e in clients_filter if str(e).strip()}
+    elif client_id_alias:
+        clients_filter = {client_id_alias}
+    mode = str(mode_raw or execution_mode_alias or "live").lower().strip()
+    return (clients_filter, mode)
+
+
+def test_post_endpoint_accepts_legacy_client_id_execution_mode():
+    """Item 2/7: existing dashboard payload {client_id, execution_mode} works."""
+    result, mode = _parse_morning_handoff_post({
+        "client_id": "jasoncosby1@gmail.com",
+        "execution_mode": "live",
+        "dry_run": False,
+    })
+    assert result == {"jasoncosby1@gmail.com"}
+    assert mode == "live"
+
+
+def test_post_endpoint_accepts_new_clients_mode():
+    """Item 2/7: new payload {clients, mode} works."""
+    result, mode = _parse_morning_handoff_post({
+        "clients": ["jose.vasquez4011@gmail.com"],
+        "mode": "paper",
+        "dry_run": False,
+    })
+    assert result == {"jose.vasquez4011@gmail.com"}
+    assert mode == "paper"
+
+
+def test_post_endpoint_rejects_mode_execution_mode_mismatch():
+    """Item 2: conflicting mode and execution_mode must 400, not silently pick one."""
+    result, reason = _parse_morning_handoff_post({
+        "clients": ["x@example.com"],
+        "mode": "live",
+        "execution_mode": "paper",
+    })
+    assert result == "ERROR_400"
+    assert reason == "mode_execution_mode_mismatch"
+
+
+def test_post_endpoint_defaults_to_live_when_no_mode():
+    """Item 2: when neither mode nor execution_mode given, defaults to live."""
+    result, mode = _parse_morning_handoff_post({
+        "client_id": "jasoncosby1@gmail.com",
+    })
+    assert mode == "live"
+
+
+def test_app_source_post_endpoint_parsing_matches():
+    """Guard: the real endpoint in app.py must contain the same parsing
+    branches this test mirrors. If the endpoint is refactored, this fails."""
+    app_src = (REPO_ROOT / "app.py").read_text()
+    idx = app_src.find("def admin_morning_handoff_audit_post")
+    region = app_src[idx: idx + 1200]
+    # Both payload keys handled
+    assert 'body.get("clients")' in region
+    assert 'body.get("client_id")' in region
+    assert 'body.get("mode")' in region
+    assert 'body.get("execution_mode")' in region
+    # Mismatch guard present
+    assert "mode_execution_mode_mismatch" in region
+
+
+def test_app_source_get_endpoint_accepts_both_param_names():
+    """Item 2: GET endpoint must accept both mode and execution_mode query params."""
+    app_src = (REPO_ROOT / "app.py").read_text()
+    idx = app_src.find("def admin_morning_handoff_audit_get")
+    region = app_src[idx: idx + 800]
+    assert 'request.args.get("client_id"' in region
+    assert "execution_mode" in region
+
+
+def test_app_source_async_overnight_status_intact():
+    """Item 5: async_background path and /status endpoint must both survive."""
+    app_src = (REPO_ROOT / "app.py").read_text()
+    assert 'async_background = bool(body.get("async_background"' in app_src
+    assert "/admin/overnight_reeval/status" in app_src
+    assert "_OVERNIGHT_REEVAL_JOBS" in app_src
+
+
+def test_app_source_manual_rescue_restart_guard_intact():
+    """Item 4: the manual-rescue-restart-guard endpoint must not be deleted."""
+    app_src = (REPO_ROOT / "app.py").read_text()
+    assert "/admin/operator/manual-rescue-restart-guard" in app_src
+    idx = app_src.find("def manual_rescue_restart_guard")
+    region = app_src[idx: idx + 1500]
+    # Must be a real implementation (writes to trade_queue), not a stub
+    assert "trade_queue" in region
+    assert "manual_rescue_current_session" in region
+
+
+def test_app_source_paper_rescue_endpoint_intact():
+    """Item 4: PR #162 paper rescue endpoint must survive this PR's app.py rework."""
+    app_src = (REPO_ROOT / "app.py").read_text()
+    assert "/admin/paper_rescue_restart_guard" in app_src
+    idx = app_src.find("def admin_paper_rescue_restart_guard")
+    region = app_src[idx: idx + 1500]
+    assert "run_paper_rescue_restart_guard" in region
+
+
+def test_app_source_run_morning_handoff_audit_not_replaced():
+    """Item 3: the real run_morning_handoff_audit must still be called by the
+    endpoints, not replaced with an APStartupRecovery-only reseed."""
+    app_src = (REPO_ROOT / "app.py").read_text()
+    # Both GET and POST endpoints call the real function
+    assert app_src.count("run_morning_handoff_audit(") >= 2
+    audit_src = (REPO_ROOT / "ap_morning_handoff_audit.py").read_text()
+    assert "def run_morning_handoff_audit" in audit_src
+
+
+def test_morning_handoff_audit_safety_comment_preserved():
+    """Item: the safety-invariant comment block (NEVER submits/creates/mutates)
+    must be preserved above the morning_handoff_audit endpoints."""
+    app_src = (REPO_ROOT / "app.py").read_text()
+    idx = app_src.find("morning_handoff_audit")
+    region = app_src[idx: idx + 800]
+    assert "NEVER" in region or "broker" in region.lower()

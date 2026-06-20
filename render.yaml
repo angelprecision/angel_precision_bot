@@ -1,0 +1,93 @@
+# render.yaml — Render Cron is the PRIMARY scheduler for market-open morning jobs.
+#
+# GitHub Actions (.github/workflows/overnight-reeval.yml) is the BACKUP only.
+# Both invoke the same scheduler-agnostic unit of work:
+#     python -m ap.scripts.live_morning_jobs
+# which reads MORNING_JOB from env and calls the bot admin endpoints with HMAC.
+#
+# Each cron sets MORNING_JOB and TZ=America/New_York so the ET-window guard in
+# should_run_now() runs the correct batch. The script short-circuits if invoked
+# outside its ET window (wide tolerance so a late scheduler start still runs).
+#
+# Idempotency is enforced at the admin-endpoint layer (DB run keys / status
+# transitions) — Render Cron, GitHub Actions backup, and operator manual
+# triggers can all fire without double-execution.
+#
+# Job windows (ET):
+#   09:18  overnight_reeval_batch     (live + paper overnight reeval)
+#   09:26  morning_handoff_primary    (live + paper handoff audit, attempt 1)
+#   09:32  morning_handoff_backup     (live + paper handoff audit, attempt 2)
+#   09:36  morning_recovery           (release_after_hours_deferred + paper rescue)
+#
+# Secrets (set in Render dashboard, NOT committed):
+#   SIGNING_SECRET   — HMAC signing secret shared with the bot pod
+#   BOT_URL        — bot admin base URL (live pod)
+#
+# NOTE: this file documents the cron services. Render applies it on deploy.
+# If you maintain Render services via the dashboard instead of blueprint sync,
+# replicate these four cron jobs there with the same schedules and env.
+
+services:
+  - type: cron
+    name: ap-morning-overnight-reeval
+    runtime: python
+    schedule: "18 9 * * 1-5"   # 09:18 ET (TZ set below)
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python -m ap.scripts.live_morning_jobs"
+    envVars:
+      - key: TZ
+        value: America/New_York
+      - key: MORNING_JOB
+        value: overnight_reeval_batch
+      - key: SIGNING_SECRET
+        sync: false
+      - key: BOT_URL
+        sync: false
+
+  - type: cron
+    name: ap-morning-handoff-primary
+    runtime: python
+    schedule: "26 9 * * 1-5"   # 09:26 ET
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python -m ap.scripts.live_morning_jobs"
+    envVars:
+      - key: TZ
+        value: America/New_York
+      - key: MORNING_JOB
+        value: morning_handoff_primary
+      - key: SIGNING_SECRET
+        sync: false
+      - key: BOT_URL
+        sync: false
+
+  - type: cron
+    name: ap-morning-handoff-backup
+    runtime: python
+    schedule: "32 9 * * 1-5"   # 09:32 ET
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python -m ap.scripts.live_morning_jobs"
+    envVars:
+      - key: TZ
+        value: America/New_York
+      - key: MORNING_JOB
+        value: morning_handoff_backup
+      - key: SIGNING_SECRET
+        sync: false
+      - key: BOT_URL
+        sync: false
+
+  - type: cron
+    name: ap-morning-recovery
+    runtime: python
+    schedule: "36 9 * * 1-5"   # 09:36 ET
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python -m ap.scripts.live_morning_jobs"
+    envVars:
+      - key: TZ
+        value: America/New_York
+      - key: MORNING_JOB
+        value: morning_recovery
+      - key: SIGNING_SECRET
+        sync: false
+      - key: BOT_URL
+        sync: false

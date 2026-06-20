@@ -3248,6 +3248,18 @@ def create_app() -> Flask:
             admin_log.error("release_after_hours_deferred failed: %s", e, exc_info=True)
             return jsonify({"ok": False, "error": str(e)}), 500
 
+    # ── PR feature/morning-handoff-audit ──────────────────────────────────────
+    # GET:  /admin/morning_handoff_audit?client_id=<email>&mode=live|paper
+    # POST: /admin/morning_handoff_audit  {"clients":[...], "mode":"live", "dry_run":false}
+    #       Also accepts legacy payload {"client_id":..., "execution_mode":...} for
+    #       backward compatibility with existing operator curl / dashboard scripts.
+    #
+    # Safety invariants:
+    #   NEVER calls broker.submit_order   NEVER creates new orders
+    #   NEVER changes contract/limit/qty  NEVER mutates terminal rows
+    #   NEVER duplicates watcher state for the same local_order_id
+    #   Idempotent: auditing the same row twice produces the same result.
+
     @app.get("/admin/morning_handoff_audit")
     @require_hmac
     def admin_morning_handoff_audit_get():
