@@ -1,5 +1,14 @@
 -- Idempotency run-lock for market-open morning jobs.
 --
+-- ⚠ DEPLOY REQUIREMENT: This migration MUST be applied on Supabase before the
+-- run-lock provides duplicate-Render/GHA protection. See
+-- DEPLOY_morning_jobs_automation.md. If the table is absent, the run-lock helper
+-- FAILS OPEN (jobs still run, but cross-scheduler dedup on morning_handoff_audit
+-- is inactive until the table exists).
+--
+-- Apply:  psql "$DATABASE_URL" -f migrations/2026_06_20_handoff_run_locks.sql
+-- Verify: \d public.handoff_run_locks
+--
 -- Render Cron (primary), the GitHub Actions backup, and operator manual
 -- triggers can all fire the same job window. This table enforces single
 -- execution server-side: the first caller to INSERT a given run_key wins;

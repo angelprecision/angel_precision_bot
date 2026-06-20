@@ -214,3 +214,28 @@ class TestSourceGuards:
         idx = app_src.find("def admin_morning_handoff_audit_post")
         region = app_src[idx: idx + 4000]
         assert "if not dry_run" in region
+
+
+# ---------------------------------------------------------------------------
+# Deploy-requirement documentation guards
+# ---------------------------------------------------------------------------
+
+class TestDeployDocs:
+    def test_deploy_doc_exists(self):
+        doc = _REPO / "DEPLOY_morning_jobs_automation.md"
+        assert doc.exists(), "DEPLOY_morning_jobs_automation.md must document the migration requirement"
+
+    def test_deploy_doc_names_migration(self):
+        doc = (_REPO / "DEPLOY_morning_jobs_automation.md").read_text()
+        assert "2026_06_20_handoff_run_locks.sql" in doc
+        assert "fails open" in doc.lower() or "fail open" in doc.lower()
+
+    def test_deploy_doc_covers_env_and_live_flag(self):
+        doc = (_REPO / "DEPLOY_morning_jobs_automation.md").read_text()
+        assert "BOT_URL" in doc and "SIGNING_SECRET" in doc
+        assert "ENABLE_LIVE_AUTO_RELEASE_AFTER_OPEN" in doc
+
+    def test_migration_header_warns_deploy_requirement(self):
+        sql = (_REPO / "migrations" / "2026_06_20_handoff_run_locks.sql").read_text()
+        assert "DEPLOY REQUIREMENT" in sql
+        assert "FAILS OPEN" in sql or "fails open" in sql.lower()
