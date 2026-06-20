@@ -3329,6 +3329,42 @@ def create_app() -> Flask:
         mode = str(mode_raw or execution_mode_alias or "live").lower().strip()
         dry_run = bool(body.get("dry_run", False))
 
+        # ── Server-side idempotency run-lock ──────────────────────────────
+        # Render Cron (primary), GitHub Actions backup, and operator manual
+        # triggers can all hit this window. The run-lock enforces single
+        # execution at the DB layer. Scheduler passes run_lock_scope + the
+        # triggered_by tag; if omitted (e.g. an ad-hoc operator curl), the
+        # lock is keyed on the resolved client filter so behavior is still safe.
+        # dry_run never takes a lock (it must always be runnable for inspection).
+        _run_lock_key = None
+        if not dry_run and body.get("use_run_lock", True):
+            from ap_handoff_run_lock import (
+                build_run_key, try_acquire_run_lock,
+            )
+            _scope = str(
+                body.get("run_lock_scope")
+                or (",".join(sorted(clients_filter)) if clients_filter else "all_runners")
+            )
+            _triggered_by = str(body.get("triggered_by") or "unknown")
+            _run_lock_key = build_run_key(
+                job_name="morning_handoff_audit",
+                execution_mode=mode,
+                client_scope=_scope,
+            )
+            if not try_acquire_run_lock(
+                _run_lock_key,
+                job_name="morning_handoff_audit",
+                execution_mode=mode,
+                client_scope=_scope,
+                triggered_by=_triggered_by,
+            ):
+                return jsonify({
+                    "ok": True,
+                    "skipped": "run_lock_held",
+                    "run_key": _run_lock_key,
+                    "mode": mode,
+                }), 200
+
         with _registry_lock:
             runners_all = dict(_active_runners)
 
@@ -3369,6 +3405,22 @@ def create_app() -> Flask:
                 per_client_results[email] = {"ok": False, "error": str(exc)}
 
         elapsed = _time.monotonic() - _t0
+
+        # Release the run-lock with terminal status so the window is auditable.
+        if _run_lock_key is not None:
+            from ap_handoff_run_lock import (
+                mark_run_lock_completed, mark_run_lock_failed,
+            )
+            _summary = {
+                "clients_audited": len(per_client_results),
+                "errors": len(errors),
+                "elapsed_seconds": round(elapsed, 2),
+            }
+            if errors:
+                mark_run_lock_failed(_run_lock_key, f"{len(errors)} client error(s)")
+            else:
+                mark_run_lock_completed(_run_lock_key, _summary)
+
         return jsonify({
             "ok": len(errors) == 0,
             "mode": mode,
@@ -3377,6 +3429,7 @@ def create_app() -> Flask:
             "elapsed_seconds": round(elapsed, 2),
             "results": per_client_results,
             "errors": errors,
+            "run_key": _run_lock_key,
         })
 
     @app.post("/admin/paper_rescue_restart_guard")

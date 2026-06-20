@@ -2122,7 +2122,7 @@ class TestAdminEndpointOsmLookup:
     def test_post_endpoint_tries_order_state_machine_first(self):
         """POST endpoint must try runner.order_state_machine before runner.osm."""
         idx_post = _APP_SRC.find("def admin_morning_handoff_audit_post")
-        region   = _APP_SRC[idx_post: idx_post + 2500]
+        region   = _APP_SRC[idx_post: idx_post + 4000]
         osm_idx           = region.find("order_state_machine")
         osm_legacy_idx    = region.find('"osm"')
         assert osm_idx != -1, "POST endpoint must reference order_state_machine"
@@ -2144,7 +2144,7 @@ class TestAdminEndpointOsmLookup:
     def test_post_endpoint_has_four_fallback_paths(self):
         """POST endpoint must have all four OSM resolution paths."""
         idx_post = _APP_SRC.find("def admin_morning_handoff_audit_post")
-        region   = _APP_SRC[idx_post: idx_post + 2500]
+        region   = _APP_SRC[idx_post: idx_post + 4000]
         assert "order_state_machine" in region
         assert '"osm"' in region
         assert "execution_core" in region
@@ -2157,7 +2157,7 @@ class TestAdminEndpointOsmLookup:
             "GET endpoint must log WATCHER_REARM_AUDIT_FAILED when OSM is None"
         )
         idx_post = _APP_SRC.find("def admin_morning_handoff_audit_post")
-        region2  = _APP_SRC[idx_post: idx_post + 3000]
+        region2  = _APP_SRC[idx_post: idx_post + 4000]
         assert "WATCHER_REARM_AUDIT_FAILED" in region2, (
             "POST endpoint must log WATCHER_REARM_AUDIT_FAILED when OSM is None"
         )

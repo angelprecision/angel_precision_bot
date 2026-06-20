@@ -2,23 +2,31 @@ name: Backup Morning Jobs
 
 on:
   schedule:
-    # GitHub Actions is the backup scheduler here. Render Cron is still the
-    # better primary mechanism, but this workflow uses a wide ET guard so late
-    # scheduled starts still run instead of silently skipping.
-    - cron: "18 13 * * 1-5"
-    - cron: "18 14 * * 1-5"
-    - cron: "25 13 * * 1-5"
-    - cron: "25 14 * * 1-5"
-    - cron: "31 13 * * 1-5"
-    - cron: "31 14 * * 1-5"
-    - cron: "37 13 * * 1-5"
-    - cron: "37 14 * * 1-5"
+    # GitHub Actions is the BACKUP ONLY. Render Cron (render.yaml) is the
+    # primary scheduler and runs the four batches at 09:18/09:26/09:32/09:36 ET.
+    #
+    # This backup runs ONCE, at a LATER recovery window (09:50 ET), well after
+    # the last Render primary job (09:36 ET). It runs morning_recovery — the
+    # idempotent catch-all batch — so it cannot race the Render primary windows.
+    #
+    # DST-safe dual UTC entries (Render uses UTC; GitHub Actions also uses UTC):
+    #   09:50 EDT = 13:50 UTC
+    #   09:50 EST = 14:50 UTC
+    # The script's should_run_now() ET-window guard runs only the season-correct
+    # tick and skips the other.
+    #
+    # Idempotency is enforced server-side via the admin endpoints' DB run-lock
+    # (handoff_run_locks table — see app.py). Even if a Render job and this
+    # backup both target morning_recovery, only one acquires the lock; the other
+    # records skip_locked. job_window_key is NOT relied on as idempotency.
+    - cron: "50 13 * * 1-5"   # 13:50 UTC = 09:50 EDT
+    - cron: "50 14 * * 1-5"   # 14:50 UTC = 09:50 EST
   workflow_dispatch:
     inputs:
       job:
         description: "Morning automation batch to run"
         required: true
-        default: "overnight_reeval_batch"
+        default: "morning_recovery"
         type: choice
         options:
           - overnight_reeval_batch
@@ -45,11 +53,9 @@ jobs:
         id: cfg
         run: |
           JOB=""
+          # Backup runs the idempotent recovery batch at the later 09:50 ET window.
           case "${{ github.event.schedule }}" in
-            "18 13 * * 1-5"|"18 14 * * 1-5") JOB="overnight_reeval_batch" ;;
-            "25 13 * * 1-5"|"25 14 * * 1-5") JOB="morning_handoff_primary" ;;
-            "31 13 * * 1-5"|"31 14 * * 1-5") JOB="morning_handoff_backup" ;;
-            "37 13 * * 1-5"|"37 14 * * 1-5") JOB="morning_recovery" ;;
+            "50 13 * * 1-5"|"50 14 * * 1-5") JOB="morning_recovery" ;;
           esac
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             JOB="${{ github.event.inputs.job }}"
@@ -67,4 +73,4 @@ jobs:
           MORNING_JOB_TIMEOUT_SECONDS: "180"
           MORNING_JOB_WINDOW_TOLERANCE_MINUTES: "45"
         run: |
-          python3 ap/scripts/live_morning_jobs.py
+          python3 -m ap.scripts.live_morning_jobs

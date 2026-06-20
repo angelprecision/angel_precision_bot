@@ -186,10 +186,35 @@ def test_workflow_targets_live_and_paper_batches():
     workflow = (REPO_ROOT / ".github" / "workflows" / "overnight-reeval.yml").read_text()
     assert "MORNING_JOB_LIVE_CLIENT: jasoncosby1@gmail.com" in workflow
     assert "MORNING_JOB_PAPER_CLIENTS: jose.vasquez4011@gmail.com,tradefluencehq@gmail.com" in workflow
-    assert "18 13 * * 1-5" in workflow
-    assert "25 13 * * 1-5" in workflow
-    assert "31 13 * * 1-5" in workflow
-    assert "37 13 * * 1-5" in workflow
+    # Backup runs ONCE at the later 09:50 ET recovery window (DST-safe UTC pair),
+    # NOT at the primary windows. This proves it is a true backup, not a
+    # duplicate primary scheduler.
+    assert "50 13 * * 1-5" in workflow   # 09:50 EDT
+    assert "50 14 * * 1-5" in workflow   # 09:50 EST
+    # The primary windows must NOT appear in the backup workflow schedule
+    assert "18 13 * * 1-5" not in workflow
+    assert "26 13 * * 1-5" not in workflow
+
+
+def test_workflow_uses_module_invocation_not_path():
+    """Item 2: backup must invoke via -m to avoid ModuleNotFoundError."""
+    workflow = (REPO_ROOT / ".github" / "workflows" / "overnight-reeval.yml").read_text()
+    assert "python3 -m ap.scripts.live_morning_jobs" in workflow
+    assert "python3 ap/scripts/live_morning_jobs.py" not in workflow
+
+
+def test_workflow_is_backup_only_not_duplicate_primary():
+    """Item 3: GHA must run at a later recovery window only, not the primary windows."""
+    workflow = (REPO_ROOT / ".github" / "workflows" / "overnight-reeval.yml").read_text()
+    # Exactly two scheduled cron entries (the DST pair for one recovery window)
+    sched_lines = [
+        ln for ln in workflow.splitlines()
+        if ln.strip().startswith("- cron:")
+    ]
+    assert len(sched_lines) == 2, (
+        f"Backup must have exactly 2 cron entries (DST pair, one window); "
+        f"got {len(sched_lines)}: {sched_lines}"
+    )
 
 
 def test_app_source_restores_existing_admin_endpoints_and_handoff_contract():
@@ -234,6 +259,45 @@ def test_job_batches_cover_recovery_path_without_manual_shell():
     assert calls[1].payload["clients"] == list(DEFAULT_PAPER_CLIENTS)
 
 
+def test_recovery_release_is_paper_only_by_default():
+    """Item 3: release_after_hours_deferred must NOT auto-release live rows by
+    default. Without ENABLE_LIVE_AUTO_RELEASE_AFTER_OPEN, the release is scoped
+    to paper clients only."""
+    import os
+    old = os.environ.pop("ENABLE_LIVE_AUTO_RELEASE_AFTER_OPEN", None)
+    try:
+        calls = build_job_calls(MORNING_RECOVERY_JOB)
+        release_call = calls[0]
+        # The live client must NOT be in the release scope
+        assert DEFAULT_LIVE_CLIENT not in release_call.payload["clients"], (
+            "release_after_hours_deferred must not include the live client by default"
+        )
+        # Only paper clients
+        assert release_call.payload["clients"] == list(DEFAULT_PAPER_CLIENTS)
+        assert release_call.execution_mode == "paper"
+    finally:
+        if old is not None:
+            os.environ["ENABLE_LIVE_AUTO_RELEASE_AFTER_OPEN"] = old
+
+
+def test_recovery_release_includes_live_only_when_flag_set():
+    """Item 3: live release happens only when ENABLE_LIVE_AUTO_RELEASE_AFTER_OPEN=true."""
+    import os
+    old = os.environ.get("ENABLE_LIVE_AUTO_RELEASE_AFTER_OPEN")
+    os.environ["ENABLE_LIVE_AUTO_RELEASE_AFTER_OPEN"] = "true"
+    try:
+        calls = build_job_calls(MORNING_RECOVERY_JOB)
+        release_call = calls[0]
+        # Now the live client IS included
+        assert DEFAULT_LIVE_CLIENT in release_call.payload["clients"]
+        assert release_call.execution_mode == "mixed"
+    finally:
+        if old is None:
+            os.environ.pop("ENABLE_LIVE_AUTO_RELEASE_AFTER_OPEN", None)
+        else:
+            os.environ["ENABLE_LIVE_AUTO_RELEASE_AFTER_OPEN"] = old
+
+
 def test_handoff_backup_plan_builds_both_modes():
     calls = build_job_calls(MORNING_HANDOFF_BACKUP_JOB)
     assert [call.execution_mode for call in calls] == ["live", "paper"]
@@ -250,21 +314,19 @@ def test_handoff_backup_plan_builds_both_modes():
 # ---------------------------------------------------------------------------
 
 def test_render_yaml_defines_cron_primary_scheduler():
-    """Item 1: Render Cron must be the documented primary scheduler."""
+    """Item 1: Render Cron must be the documented primary scheduler.
+    8 cron services = 4 ET windows × 2 DST-safe UTC entries each."""
     render_yaml = (REPO_ROOT / "render.yaml").read_text()
-    # Four cron jobs, one per ET window
-    assert render_yaml.count("type: cron") == 4
+    # 4 windows × 2 DST entries (EDT + EST) = 8 cron services
+    assert render_yaml.count("type: cron") == 8
     # Each cron's startCommand invokes the scheduler-agnostic script.
-    # Count only startCommand lines (the header comment also names the script).
     start_cmd_lines = [
         ln for ln in render_yaml.splitlines()
         if "startCommand:" in ln and "ap.scripts.live_morning_jobs" in ln
     ]
-    assert len(start_cmd_lines) == 4, (
-        f"Expected 4 startCommand lines invoking the script, got {len(start_cmd_lines)}"
+    assert len(start_cmd_lines) == 8, (
+        f"Expected 8 startCommand lines invoking the script, got {len(start_cmd_lines)}"
     )
-    # ET timezone set so the window guard runs correctly
-    assert "America/New_York" in render_yaml
     # All four MORNING_JOB batches represented
     for job in (
         "overnight_reeval_batch",
@@ -292,14 +354,39 @@ def test_render_yaml_env_vars_match_script():
     assert "AP_ADMIN_HMAC_SECRET" not in render_yaml
 
 
-def test_render_yaml_schedules_are_weekday_et_windows():
-    """Item 1: cron schedules must be weekday ET windows matching MORNING_JOB_WINDOWS."""
+def test_render_yaml_schedules_are_dst_safe_utc():
+    """Item 1/4: Render uses UTC, not TZ-local. Schedules MUST be UTC with
+    DST-safe dual entries (EDT=UTC-4, EST=UTC-5) for each ET window.
+
+    Target ET   EDT (UTC)   EST (UTC)
+    09:18 ET    13:18       14:18
+    09:26 ET    13:26       14:26
+    09:32 ET    13:32       14:32
+    09:36 ET    13:36       14:36
+    """
     render_yaml = (REPO_ROOT / "render.yaml").read_text()
-    # 09:18, 09:26, 09:32, 09:36 ET as cron expressions (minute hour * * 1-5)
-    assert "18 9 * * 1-5" in render_yaml
-    assert "26 9 * * 1-5" in render_yaml
-    assert "32 9 * * 1-5" in render_yaml
-    assert "36 9 * * 1-5" in render_yaml
+    # EDT (UTC-4) entries
+    for expr in ("18 13 * * 1-5", "26 13 * * 1-5", "32 13 * * 1-5", "36 13 * * 1-5"):
+        assert expr in render_yaml, f"missing EDT schedule {expr}"
+    # EST (UTC-5) entries
+    for expr in ("18 14 * * 1-5", "26 14 * * 1-5", "32 14 * * 1-5", "36 14 * * 1-5"):
+        assert expr in render_yaml, f"missing EST schedule {expr}"
+    # The TZ-naive (wrong) 09:xx schedules must NOT appear as cron schedule lines
+    schedule_lines = [
+        ln for ln in render_yaml.splitlines() if "schedule:" in ln
+    ]
+    for sl in schedule_lines:
+        assert " 9 * * 1-5" not in sl, (
+            f"render.yaml must NOT use TZ-naive 09:xx schedule — Render cron is UTC: {sl}"
+        )
+
+
+def test_render_yaml_documents_utc_not_tz_local():
+    """Item 4: render.yaml must document that Render cron is UTC, not TZ-local."""
+    render_yaml = (REPO_ROOT / "render.yaml").read_text()
+    assert "UTC" in render_yaml
+    # Must explain TZ does not affect scheduling
+    assert "TZ" in render_yaml
 
 
 def test_scripts_package_importable_as_module():
