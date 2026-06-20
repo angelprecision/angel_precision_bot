@@ -1,79 +1,76 @@
-name: Overnight Reeval
+name: Backup Morning Jobs
 
 on:
   schedule:
-    # 9:03 AM ET (13:03 UTC EDT / 14:03 UTC EST) — primary
-    # GitHub Actions cron can be delayed 5-30 min on high-traffic minutes.
-    # All scheduled runs use force=true so a delayed runner never gets
-    # blocked by the bot's 9:00-9:45 AM ET window guard.
-    - cron: "3 13 * * 1-5"
-    # 9:11 AM ET backup
-    - cron: "11 13 * * 1-5"
-    # 9:19 AM ET final safety net
-    - cron: "19 13 * * 1-5"
-    # 9:33 AM ET extra net — catches GitHub delays past 9:30
-    - cron: "33 13 * * 1-5"
+    # GitHub Actions is the BACKUP ONLY. Render Cron (render.yaml) is the
+    # primary scheduler and runs the four batches at 09:18/09:26/09:32/09:36 ET.
+    #
+    # This backup runs ONCE, at a LATER recovery window (09:50 ET), well after
+    # the last Render primary job (09:36 ET). It runs morning_recovery — the
+    # idempotent catch-all batch — so it cannot race the Render primary windows.
+    #
+    # DST-safe dual UTC entries (Render uses UTC; GitHub Actions also uses UTC):
+    #   09:50 EDT = 13:50 UTC
+    #   09:50 EST = 14:50 UTC
+    # The script's should_run_now() ET-window guard runs only the season-correct
+    # tick and skips the other.
+    #
+    # Idempotency is enforced server-side via the admin endpoints' DB run-lock
+    # (handoff_run_locks table — see app.py). Even if a Render job and this
+    # backup both target morning_recovery, only one acquires the lock; the other
+    # records skip_locked. job_window_key is NOT relied on as idempotency.
+    - cron: "50 13 * * 1-5"   # 13:50 UTC = 09:50 EDT
+    - cron: "50 14 * * 1-5"   # 14:50 UTC = 09:50 EST
   workflow_dispatch:
     inputs:
-      force:
-        description: 'Force reeval regardless of time/day (true/false)'
-        required: false
-        default: 'false'
+      job:
+        description: "Morning automation batch to run"
+        required: true
+        default: "morning_recovery"
+        type: choice
+        options:
+          - overnight_reeval_batch
+          - morning_handoff_primary
+          - morning_handoff_backup
+          - morning_recovery
+
+concurrency:
+  group: backup-morning-jobs-${{ github.event.schedule || github.event.inputs.job }}
+  cancel-in-progress: false
 
 jobs:
-  trigger-overnight-reeval:
+  backup-morning-jobs:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
-
+    timeout-minutes: 10
     steps:
-      - name: Trigger overnight reeval (HMAC signed)
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Resolve scheduled batch
+        id: cfg
         run: |
-          # Scheduled runs always force=true — GitHub Actions delays can push
-          # the run past the bot's time window, causing silent skips.
-          # force=true bypasses the window guard so delayed runs still fire.
-          IS_SCHEDULED="${{ github.event_name == 'schedule' }}"
-          if [ "$IS_SCHEDULED" = "true" ]; then
-            FORCE_FLAG="true"
-          else
-            FORCE_FLAG="${{ github.event.inputs.force || 'false' }}"
+          JOB=""
+          # Backup runs the idempotent recovery batch at the later 09:50 ET window.
+          case "${{ github.event.schedule }}" in
+            "50 13 * * 1-5"|"50 14 * * 1-5") JOB="morning_recovery" ;;
+          esac
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            JOB="${{ github.event.inputs.job }}"
           fi
+          echo "job=$JOB" >> "$GITHUB_OUTPUT"
+          echo "Resolved job=$JOB"
 
-          BODY="{\"force\": ${FORCE_FLAG}}"
-
-          TS=$(date +%s)
-          BOT_URL="${{ secrets.AP_BOT_URL }}"
-          SIGNING_SECRET="${{ secrets.AP_SIGNING_SECRET }}"
-
-          SIG=$(printf "%s.%s" "$TS" "$BODY" | \
-            openssl dgst -sha256 -hmac "$SIGNING_SECRET" -hex | \
-            sed 's/^.* //')
-
-          echo "Triggering overnight reeval at $(date -u) | bot=$BOT_URL | force=$FORCE_FLAG"
-
-          HTTP_CODE=$(curl -s -o /tmp/response.txt -w "%{http_code}" \
-            --retry 3 \
-            --retry-delay 10 \
-            --retry-all-errors \
-            --max-time 90 \
-            -X POST "${BOT_URL}/admin/overnight_reeval" \
-            -H "Content-Type: application/json" \
-            -H "X-AP-Timestamp: $TS" \
-            -H "X-AP-Signature: $SIG" \
-            -d "$BODY")
-
-          echo "HTTP $HTTP_CODE"
-          cat /tmp/response.txt
-          echo ""
-
-          if [ "$HTTP_CODE" != "200" ]; then
-            echo "::error::Overnight reeval returned HTTP $HTTP_CODE"
-            exit 1
-          fi
-
-          ARMED=$(cat /tmp/response.txt | python3 -c \
-            "import sys,json; d=json.load(sys.stdin); print(d.get('armed', d.get('total_armed', 0)))" \
-            2>/dev/null || echo "?")
-          DEFERRED=$(cat /tmp/response.txt | python3 -c \
-            "import sys,json; d=json.load(sys.stdin); print(d.get('deferred_contract',0))" \
-            2>/dev/null || echo "0")
-          echo "✅ Overnight reeval complete — $ARMED watcher(s) armed | $DEFERRED contract(s) deferred to breach"
+      - name: Run backup morning automation
+        env:
+          BOT_URL: ${{ secrets.AP_BOT_URL }}
+          SIGNING_SECRET: ${{ secrets.AP_SIGNING_SECRET }}
+          MORNING_JOB: ${{ steps.cfg.outputs.job }}
+          MORNING_JOB_LIVE_CLIENT: jasoncosby1@gmail.com
+          MORNING_JOB_PAPER_CLIENTS: jose.vasquez4011@gmail.com,tradefluencehq@gmail.com
+          MORNING_JOB_TIMEOUT_SECONDS: "180"
+          MORNING_JOB_WINDOW_TOLERANCE_MINUTES: "45"
+        run: |
+          python3 -m ap.scripts.live_morning_jobs
