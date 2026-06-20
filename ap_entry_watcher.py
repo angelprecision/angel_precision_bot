@@ -3023,6 +3023,30 @@ class APEntryWatcher:
                     try:
                         self.on_trigger(w)
                         w._trigger_attempts = 0   # reset on success
+                        # Diagnostic-only — proves the callback ran cleanly.
+                        # Pair with BREACH_RISK_CHECK_BLOCKED / ENTRY_TRIGGER_BLOCKED_RETURN
+                        # to determine whether a watcher trigger was consumed but blocked.
+                        try:
+                            _sig = getattr(w, "signal", {}) or {}
+                            log.info(
+                                "WATCHER_ON_TRIGGER_RETURNED "
+                                "client_id=%s local_order_id=%s signal_id=%s "
+                                "symbol=%s contract=%s callback_wired=true "
+                                "attempt=%d outcome=returned",
+                                _sig.get("client_email") or "n/a",
+                                _sig.get("local_order_id") or "n/a",
+                                _sig.get("signal_id") or "n/a",
+                                w.ticker,
+                                (
+                                    (_sig.get("plan") or {}).get("contract_symbol")
+                                    or _sig.get("contract_symbol")
+                                    or _sig.get("contract")
+                                    or "n/a"
+                                ),
+                                _trigger_attempts + 1,
+                            )
+                        except Exception:
+                            pass
                     except Exception as exc:
                         _trigger_attempts += 1
                         w._trigger_attempts = _trigger_attempts
@@ -3030,6 +3054,31 @@ class APEntryWatcher:
                             "[%s] on_trigger callback failed (attempt %d/3): %s",
                             w.ticker, _trigger_attempts, exc, exc_info=True,
                         )
+                        # Diagnostic-only — structured pairing line for the exception.
+                        try:
+                            _sig = getattr(w, "signal", {}) or {}
+                            log.error(
+                                "WATCHER_ON_TRIGGER_EXCEPTION "
+                                "client_id=%s local_order_id=%s signal_id=%s "
+                                "symbol=%s contract=%s callback_wired=true "
+                                "attempt=%d outcome=exception "
+                                "exception_type=%s exception_message=%s",
+                                _sig.get("client_email") or "n/a",
+                                _sig.get("local_order_id") or "n/a",
+                                _sig.get("signal_id") or "n/a",
+                                w.ticker,
+                                (
+                                    (_sig.get("plan") or {}).get("contract_symbol")
+                                    or _sig.get("contract_symbol")
+                                    or _sig.get("contract")
+                                    or "n/a"
+                                ),
+                                _trigger_attempts,
+                                type(exc).__name__,
+                                str(exc)[:200],
+                            )
+                        except Exception:
+                            pass
                         if _trigger_attempts < 3:
                             # Do NOT release dedup key — keep watcher armed for next poll
                             log.warning(
