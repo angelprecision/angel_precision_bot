@@ -1,32 +1,39 @@
-name: Live Morning Jobs
+name: Backup Morning Jobs
 
 on:
   schedule:
-    # Dual UTC schedules so the workflow keeps the intended Eastern-time jobs
-    # across DST. The script itself guards the exact ET window and skips the
-    # wrong-season invocation.
+    # GitHub Actions is the backup scheduler here. Render Cron is still the
+    # better primary mechanism, but this workflow uses a wide ET guard so late
+    # scheduled starts still run instead of silently skipping.
     - cron: "18 13 * * 1-5"
     - cron: "18 14 * * 1-5"
     - cron: "25 13 * * 1-5"
     - cron: "25 14 * * 1-5"
     - cron: "31 13 * * 1-5"
     - cron: "31 14 * * 1-5"
+    - cron: "37 13 * * 1-5"
+    - cron: "37 14 * * 1-5"
   workflow_dispatch:
     inputs:
       job:
-        description: "Job to run"
+        description: "Morning automation batch to run"
         required: true
-        default: "overnight_reeval"
+        default: "overnight_reeval_batch"
         type: choice
         options:
-          - overnight_reeval
+          - overnight_reeval_batch
           - morning_handoff_primary
           - morning_handoff_backup
+          - morning_recovery
+
+concurrency:
+  group: backup-morning-jobs-${{ github.event.schedule || github.event.inputs.job }}
+  cancel-in-progress: false
 
 jobs:
-  live-morning-jobs:
+  backup-morning-jobs:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
 
@@ -34,14 +41,15 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Resolve scheduled job
+      - name: Resolve scheduled batch
         id: cfg
         run: |
           JOB=""
           case "${{ github.event.schedule }}" in
-            "18 13 * * 1-5"|"18 14 * * 1-5") JOB="overnight_reeval" ;;
+            "18 13 * * 1-5"|"18 14 * * 1-5") JOB="overnight_reeval_batch" ;;
             "25 13 * * 1-5"|"25 14 * * 1-5") JOB="morning_handoff_primary" ;;
             "31 13 * * 1-5"|"31 14 * * 1-5") JOB="morning_handoff_backup" ;;
+            "37 13 * * 1-5"|"37 14 * * 1-5") JOB="morning_recovery" ;;
           esac
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             JOB="${{ github.event.inputs.job }}"
@@ -49,13 +57,14 @@ jobs:
           echo "job=$JOB" >> "$GITHUB_OUTPUT"
           echo "Resolved job=$JOB"
 
-      - name: Run live morning job
+      - name: Run backup morning automation
         env:
           BOT_URL: ${{ secrets.AP_BOT_URL }}
           SIGNING_SECRET: ${{ secrets.AP_SIGNING_SECRET }}
           MORNING_JOB: ${{ steps.cfg.outputs.job }}
-          MORNING_JOB_CLIENT_ID: jasoncosby1@gmail.com
-          MORNING_JOB_EXECUTION_MODE: live
+          MORNING_JOB_LIVE_CLIENT: jasoncosby1@gmail.com
+          MORNING_JOB_PAPER_CLIENTS: jose.vasquez4011@gmail.com,tradefluencehq@gmail.com
           MORNING_JOB_TIMEOUT_SECONDS: "180"
+          MORNING_JOB_WINDOW_TOLERANCE_MINUTES: "45"
         run: |
           python3 ap/scripts/live_morning_jobs.py
