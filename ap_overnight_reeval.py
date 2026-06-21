@@ -140,14 +140,18 @@ _PRIOR_LEVEL_CACHE_ENABLED = os.getenv("PRIOR_LEVEL_CACHE_FALLBACK", "0").strip(
 _PRIOR_LEVEL_CACHE: dict[str, dict] = {}
 
 
-def _cache_prior_levels(ticker: str, session_date: date, high, low, close=None) -> None:
+def _cache_prior_levels(ticker: str, broker_session_date: date, high, low, close=None) -> None:
     """Stamp and store prior-day levels for a ticker keyed by trading session.
-    Best-effort; never raises."""
+
+    `broker_session_date` MUST be the broker-provided prior_day_date that the
+    caller has already verified equals the expected prior trading session. We
+    never stamp with a locally-computed date — see the call site in the re-arm
+    loop. Best-effort; never raises."""
     try:
         if high is None and low is None:
             return
         _PRIOR_LEVEL_CACHE[(ticker or "").upper()] = {
-            "session_date": session_date.isoformat(),
+            "session_date": broker_session_date.isoformat(),
             "prior_day_high": high,
             "prior_day_low": low,
             "prior_day_close": close,
@@ -661,20 +665,46 @@ def run_overnight_reeval(
 
             # ── PR4: session-stamped cache write + freshness-guarded fallback ──
             # DEFAULT OFF (PRIOR_LEVEL_CACHE_FALLBACK). When on:
-            #   (a) if the fresh fetch produced levels, cache them stamped with
-            #       the actual prior trading session;
+            #   (a) cache the fresh levels ONLY if the broker's own returned
+            #       prior_day_date equals the expected prior trading session.
+            #       (review amendment) We stamp with the BROKER-PROVIDED date,
+            #       never a locally-computed one, and refuse to cache a bar whose
+            #       broker date is stale/lagged (holiday gap, data lag) — so a
+            #       stale bar can never later look "fresh".
             #   (b) if the fresh fetch (and signal) produced null, fall back to a
-            #       cached level ONLY if its stamped session matches the actual
-            #       prior trading session — never a stale weekend/holiday/halt.
+            #       cached level ONLY if its stamped (broker) session matches the
+            #       expected prior trading session.
             _prior_levels_source = "fresh"
             if _PRIOR_LEVEL_CACHE_ENABLED:
                 _expected_session = _prior_trading_session_date(_et_now())
-                if prior_day_high is not None or prior_day_low is not None:
-                    _cache_prior_levels(
-                        ticker, _expected_session,
-                        prior_day_high, prior_day_low,
-                        prior_levels.get("prior_day_close"),
-                    )
+                _broker_date_raw = prior_levels.get("prior_day_date")
+                _broker_session = None
+                if _broker_date_raw:
+                    try:
+                        _broker_session = date.fromisoformat(str(_broker_date_raw)[:10])
+                    except Exception:
+                        _broker_session = None
+
+                _have_fresh = (prior_day_high is not None or prior_day_low is not None)
+                if _have_fresh:
+                    # Only cache when the BROKER's date matches the expected prior
+                    # trading session. Otherwise refuse — do not cache a possibly
+                    # stale/lagged/holiday bar.
+                    if _broker_session is not None and _broker_session == _expected_session:
+                        _cache_prior_levels(
+                            ticker, _broker_session,
+                            prior_day_high, prior_day_low,
+                            prior_levels.get("prior_day_close"),
+                        )
+                    else:
+                        log.warning(
+                            "[%s] PRIOR_LEVEL_CACHE_REFUSED signal=%s broker_date=%s "
+                            "expected_session=%s — not caching (date mismatch or "
+                            "missing broker date; avoids stale-looking-fresh)",
+                            ticker, signal_id,
+                            (_broker_session.isoformat() if _broker_session else _broker_date_raw),
+                            _expected_session.isoformat(),
+                        )
                 else:
                     _cached = _get_cached_prior_levels(ticker, _expected_session)
                     if _cached:
@@ -687,7 +717,7 @@ def run_overnight_reeval(
                         _prior_levels_source = "cache"
                         log.warning(
                             "[%s] PRIOR_LEVEL_CACHE_FALLBACK_USED signal=%s session=%s "
-                            "high=%s low=%s — fresh fetch null, using session-matched cache",
+                            "high=%s low=%s — fresh fetch null, using broker-session-matched cache",
                             ticker, signal_id, _expected_session.isoformat(),
                             prior_day_high, prior_day_low,
                         )

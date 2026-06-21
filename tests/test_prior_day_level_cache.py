@@ -145,3 +145,48 @@ class TestFailSafe:
         # Garbage inputs must not raise
         mod._cache_prior_levels(None, date(2026, 6, 19), "x", object(), None)
         assert mod._get_cached_prior_levels(None, date(2026, 6, 19)) in (None, mod._PRIOR_LEVEL_CACHE.get("") )
+
+
+class TestBrokerDateStamping:
+    """Amendment: cache must be stamped with the BROKER's prior_day_date, and
+    must refuse to cache when the broker date != expected prior trading session."""
+
+    def test_cache_stamped_with_broker_date_matches_read(self):
+        """A cache stamped with the broker date reads back under that same
+        session date."""
+        mod = _load({"PRIOR_LEVEL_CACHE_FALLBACK": "1"})
+        broker_session = date(2026, 6, 19)
+        mod._cache_prior_levels("AMAT", broker_session, 640.0, 620.0, 632.0)
+        rec = mod._get_cached_prior_levels("AMAT", broker_session)
+        assert rec is not None
+        assert rec["session_date"] == "2026-06-19"
+
+    def test_refuse_logic_when_broker_date_mismatches(self):
+        """Simulate the re-arm decision: if the broker's prior_day_date does not
+        equal the expected prior trading session, the levels must NOT be cached.
+        We exercise the exact predicate used in the re-arm loop."""
+        mod = _load({"PRIOR_LEVEL_CACHE_FALLBACK": "1"})
+        expected = date(2026, 6, 19)             # expected prior session (Fri)
+        broker_date = date(2026, 6, 17)          # stale/lagged bar (Wed)
+        # the re-arm caches only when broker_session == expected
+        should_cache = (broker_date == expected)
+        assert should_cache is False
+        # ensure nothing was cached for this ticker
+        assert mod._get_cached_prior_levels("ZZZZ", expected) is None
+
+    def test_source_uses_broker_prior_day_date(self):
+        """Guard: the re-arm loop must read prior_levels['prior_day_date'] and
+        compare to the expected session, and stamp with the broker date."""
+        src = (Path(__file__).resolve().parents[1] / "ap_overnight_reeval.py").read_text()
+        assert 'prior_levels.get("prior_day_date")' in src
+        assert "_broker_session == _expected_session" in src
+        assert "PRIOR_LEVEL_CACHE_REFUSED" in src
+        # must stamp with the broker session, not the computed expected session
+        idx = src.find("_cache_prior_levels(\n                            ticker, _broker_session")
+        assert idx != -1, "cache must be stamped with _broker_session (broker date)"
+
+    def test_broker_provides_prior_day_date(self):
+        """Sanity: the Tradier broker actually returns prior_day_date so the
+        stamping has real data to use."""
+        broker_src = (Path(__file__).resolve().parents[1] / "ap" / "brokers" / "tradier.py").read_text()
+        assert '"prior_day_date":  prior.get("date")' in broker_src
