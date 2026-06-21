@@ -111,6 +111,70 @@ def _is_trading_day(dt: datetime) -> bool:
     return dt.weekday() < 5  # Mon-Fri
 
 
+def _prior_trading_session_date(ref: Optional[datetime] = None) -> date:
+    """Return the date of the prior *trading* session relative to ref (ET).
+
+    Walks back at least one day and skips weekends, so on a Monday morning the
+    prior trading session is the preceding Friday. This is the session a cached
+    prior-day high/low MUST match to be considered fresh.
+
+    NOTE: this does not model market holidays. A cached level whose stamped
+    session is a holiday-shifted day will simply fail the equality guard and be
+    treated as stale (fail-safe), which is the conservative behavior we want.
+    """
+    d = (ref or _et_now()).date()
+    d = d - timedelta(days=1)
+    while d.weekday() >= 5:  # Sat/Sun
+        d = d - timedelta(days=1)
+    return d
+
+
+# ── PR4 (prior-day-level cache fallback) ─────────────────────────────────────
+# DEFAULT OFF. When PRIOR_LEVEL_CACHE_FALLBACK != "1", the re-arm path behaves
+# exactly as before. When enabled, prior-day H/L successfully fetched at re-arm
+# are cached stamped with the trading session they represent, and a later re-arm
+# whose fresh fetch returns null may fall back to that cache ONLY if the stamped
+# session matches the actual prior trading session (no stale weekend/holiday/halt
+# levels). Cache is process-local and best-effort — purely a resilience layer.
+_PRIOR_LEVEL_CACHE_ENABLED = os.getenv("PRIOR_LEVEL_CACHE_FALLBACK", "0").strip() in ("1", "true", "yes")
+_PRIOR_LEVEL_CACHE: dict[str, dict] = {}
+
+
+def _cache_prior_levels(ticker: str, broker_session_date: date, high, low, close=None) -> None:
+    """Stamp and store prior-day levels for a ticker keyed by trading session.
+
+    `broker_session_date` MUST be the broker-provided prior_day_date that the
+    caller has already verified equals the expected prior trading session. We
+    never stamp with a locally-computed date — see the call site in the re-arm
+    loop. Best-effort; never raises."""
+    try:
+        if high is None and low is None:
+            return
+        _PRIOR_LEVEL_CACHE[(ticker or "").upper()] = {
+            "session_date": broker_session_date.isoformat(),
+            "prior_day_high": high,
+            "prior_day_low": low,
+            "prior_day_close": close,
+        }
+    except Exception:
+        pass
+
+
+def _get_cached_prior_levels(ticker: str, expected_session: date) -> Optional[dict]:
+    """Return cached prior-day levels for ticker ONLY if the stamped session
+    matches expected_session (the actual prior trading session). Otherwise None
+    (stale → fail-safe). Never raises."""
+    try:
+        rec = _PRIOR_LEVEL_CACHE.get((ticker or "").upper())
+        if not rec:
+            return None
+        if rec.get("session_date") != expected_session.isoformat():
+            return None  # stale: wrong session, do not use
+        return rec
+    except Exception:
+        return None
+
+
 def _signal_date(signal: dict) -> Optional[date]:
     """Extract the date the signal was generated (not when we process it).
     Falls back to parsing the signal_id itself (format: YYYY-MM-DD:...).
@@ -599,9 +663,78 @@ def run_overnight_reeval(
                 None
             )
 
+            # ── PR4: session-validated fresh + cache fallback ──────────────────
+            # DEFAULT OFF (PRIOR_LEVEL_CACHE_FALLBACK). When on:
+            #   (a) FRESH levels are only valid for use AND cache when the broker's
+            #       own returned prior_day_date equals the expected prior trading
+            #       session. (amendment) On mismatch/missing broker date we FAIL
+            #       CLOSED on the fresh values themselves — clear them — so a
+            #       stale/lagged/holiday bar can never arm a trade, not just never
+            #       be cached.
+            #   (b) if fresh is null or was invalidated, fall back to a cached
+            #       level ONLY if its stamped (broker) session matches the
+            #       expected prior trading session.
+            _prior_levels_source = "fresh"
+            if _PRIOR_LEVEL_CACHE_ENABLED:
+                _expected_session = _prior_trading_session_date(_et_now())
+                _broker_date_raw = prior_levels.get("prior_day_date")
+                _broker_session = None
+                if _broker_date_raw:
+                    try:
+                        _broker_session = date.fromisoformat(str(_broker_date_raw)[:10])
+                    except Exception:
+                        _broker_session = None
+
+                _have_fresh = (prior_day_high is not None or prior_day_low is not None)
+                _session_ok = (_broker_session is not None and _broker_session == _expected_session)
+
+                if _have_fresh and _session_ok:
+                    # Correct-session fresh data: use it AND cache it.
+                    _cache_prior_levels(
+                        ticker, _broker_session,
+                        prior_day_high, prior_day_low,
+                        prior_levels.get("prior_day_close"),
+                    )
+                elif _have_fresh and not _session_ok:
+                    # FAIL CLOSED: broker date missing or wrong session. Do NOT
+                    # use these levels directly and do NOT cache them — discard.
+                    log.warning(
+                        "[%s] PRIOR_LEVEL_SESSION_MISMATCH signal=%s broker_date=%s "
+                        "expected_session=%s — discarding fresh levels (stale/lagged)",
+                        ticker, signal_id,
+                        (_broker_session.isoformat() if _broker_session else _broker_date_raw),
+                        _expected_session.isoformat(),
+                    )
+                    prior_day_high = None
+                    prior_day_low = None
+                    # Only clear prior_day_close if it came from this same stale
+                    # broker fetch (don't discard a trusted pre-existing value).
+                    if prior_levels.get("prior_day_close") is not None:
+                        prior_levels = dict(prior_levels)
+                        prior_levels["prior_day_close"] = None
+
+                # Single cache fallback: whenever we have no usable fresh value
+                # (null fetch, or fresh just discarded on session mismatch), try
+                # the session-matched cache. If the cache is wrong-session or
+                # absent, levels stay None and the existing fail-safe
+                # (INVALIDATED_MISSING_PRIOR_LEVELS) runs below.
+                if prior_day_high is None and prior_day_low is None:
+                    _cached = _get_cached_prior_levels(ticker, _expected_session)
+                    if _cached:
+                        prior_day_high = float(_cached.get("prior_day_high") or 0) or None
+                        prior_day_low = float(_cached.get("prior_day_low") or 0) or None
+                        _prior_levels_source = "cache"
+                        log.warning(
+                            "[%s] PRIOR_LEVEL_CACHE_FALLBACK_USED signal=%s session=%s "
+                            "high=%s low=%s — using broker-session-matched cache",
+                            ticker, signal_id, _expected_session.isoformat(),
+                            prior_day_high, prior_day_low,
+                        )
+
             # Enrich signal with fetched levels for watcher and validator
             signal["prior_day_high"] = prior_day_high
             signal["prior_day_low"] = prior_day_low
+            signal["prior_levels_source"] = _prior_levels_source
             if prior_levels.get("prior_day_close"):
                 signal["prior_day_close"] = prior_levels["prior_day_close"]
 
