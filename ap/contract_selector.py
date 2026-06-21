@@ -613,20 +613,6 @@ class APContractSelectionEngine:
         # never a stale value from a prior select(). Observability only.
         self._last_failure = None
 
-        # ── PR1 (deferred-dte-ladder) ────────────────────────────────────────
-        # Route eligible plans through the DTE-bucket ladder, but ONLY when:
-        #   - the flag is enabled, AND
-        #   - this is not already a ladder sub-call (expiration_override is None).
-        # A ladder sub-call passes an explicit expiration_override and falls
-        # through to the normal single-expiration path below. When the flag is
-        # off, expiration_override is always None and behavior is unchanged.
-        if (
-            self.dte_ladder_enabled
-            and expiration_override is None
-            and self._is_ladder_eligible(plan)
-        ):
-            return self._select_with_dte_ladder(plan)
-
         ticker    = _safe_plan_attr(plan, "ticker")
         direction = str(_safe_plan_attr(plan, "side", "") or "").upper()
         budget    = float(_safe_plan_attr(plan, "max_position_usd", 0) or 0)
@@ -724,6 +710,31 @@ class APContractSelectionEngine:
                 )
                 if not fail_open:
                     return None
+
+        # ── PR1 (deferred-dte-ladder) ────────────────────────────────────────
+        # Route eligible plans through the DTE-bucket ladder, but ONLY when:
+        #   - the flag is enabled, AND
+        #   - this is not already a ladder sub-call (expiration_override is None).
+        #
+        # AMENDMENT: the ladder gate is intentionally placed AFTER the terminal
+        # non-DTE gates above (INVALID_PLAN, UNSUPPORTED_INDEX_MAPPING,
+        # EARNINGS_LOCKOUT / EARNINGS_GUARD_ERROR). Those gates are ticker-level —
+        # they give the same verdict regardless of expiration — so they must
+        # short-circuit with their TRUE reason before the ladder runs. This
+        # prevents the ladder from probing every DTE bucket and then overwriting
+        # _last_failure with NO_VALID_PLAYBOOK_DTE_CONTRACT, which would mask a
+        # real EARNINGS_LOCKOUT or invalid-plan rejection. Running them once here
+        # is also cheaper than re-running them inside every ladder sub-call.
+        #
+        # A ladder sub-call passes an explicit expiration_override and falls
+        # through to the normal single-expiration path below. When the flag is
+        # off, expiration_override is always None and behavior is unchanged.
+        if (
+            self.dte_ladder_enabled
+            and expiration_override is None
+            and self._is_ladder_eligible(plan)
+        ):
+            return self._select_with_dte_ladder(plan)
 
         # ── A. FETCH CHAIN ────────────────────────────────────────────────────
         try:
@@ -1774,6 +1785,17 @@ class APContractSelectionEngine:
             audit["bucket_order"] = order
             today = date.today()
 
+            # Terminal non-DTE reason codes that the ladder must NEVER overwrite
+            # with NO_VALID_PLAYBOOK_DTE_CONTRACT (amendment). If a sub-call
+            # rejected for one of these ticker-level reasons, that is the true,
+            # authoritative cause and the same verdict holds for every DTE.
+            _TERMINAL_NON_DTE = {
+                "EARNINGS_LOCKOUT", "EARNINGS_GUARD_ERROR",
+                "INVALID_PLAN", "UNSUPPORTED_INDEX_MAPPING",
+                "NO_CHAIN_DATA",
+            }
+            _preserved_terminal = None
+
             for bucket_name in order:
                 exps = buckets.get(bucket_name, [])[: self.dte_ladder_probe_per_bucket]
                 bucket_rec = {"bucket": bucket_name, "expirations_probed": [], "survivor": False}
@@ -1783,6 +1805,15 @@ class APContractSelectionEngine:
                     except Exception:
                         _dte = None
                     result = self.select(plan, expiration_override=exp)
+                    # Capture a terminal non-DTE rejection from this sub-call so
+                    # the ladder can preserve it rather than masking it.
+                    _sub_fail = self._last_failure
+                    if (
+                        result is None
+                        and isinstance(_sub_fail, dict)
+                        and _sub_fail.get("reason_code") in _TERMINAL_NON_DTE
+                    ):
+                        _preserved_terminal = dict(_sub_fail)
                     bucket_rec["expirations_probed"].append({"exp": exp, "dte": _dte, "hit": result is not None})
                     if result is not None:
                         bucket_rec["survivor"] = True
@@ -1797,9 +1828,23 @@ class APContractSelectionEngine:
                         )
                         return result
                 audit["buckets_attempted"].append(bucket_rec)
+                # If a terminal non-DTE reason was hit, stop laddering — probing
+                # further buckets is pointless (the verdict is ticker-level) and
+                # risks masking the true reason.
+                if _preserved_terminal is not None:
+                    break
 
-            # All buckets exhausted with zero quality survivors.
+            # All buckets exhausted (or short-circuited on a terminal non-DTE
+            # reason). Preserve a terminal non-DTE reason if one was seen;
+            # otherwise record the DTE-ladder exhaustion reason.
             self._last_dte_ladder_audit = audit
+            if _preserved_terminal is not None:
+                self._last_failure = _preserved_terminal
+                log.warning(
+                    "[%s] DTE_LADDER_TERMINAL_NON_DTE preserved reason=%s — not masking with NO_VALID_PLAYBOOK_DTE_CONTRACT",
+                    ticker, _preserved_terminal.get("reason_code"),
+                )
+                return None
             self._last_failure = {
                 "stage": "dte_ladder",
                 "reason_code": "NO_VALID_PLAYBOOK_DTE_CONTRACT",

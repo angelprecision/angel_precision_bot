@@ -267,3 +267,85 @@ class TestLadderRouting:
         assert result is not None
         # legacy fallback passes empty-string override (=> _pick_expiration path)
         assert legacy_called["override"] == ""
+
+
+class TestAmendmentGateOrdering:
+    """Amendment: run terminal non-DTE gates before the ladder; never overwrite
+    EARNINGS_LOCKOUT / invalid-plan reasons with NO_VALID_PLAYBOOK_DTE_CONTRACT."""
+
+    def test_ladder_gate_after_earnings_in_source(self):
+        """The ladder delegation must appear AFTER the earnings gate and the
+        INVALID_PLAN gate in source order."""
+        invalid_plan = _SRC.find('reason_code="INVALID_PLAN"')
+        earnings = _SRC.find('reason_code="EARNINGS_LOCKOUT"')
+        ladder_gate = _SRC.find("return self._select_with_dte_ladder(plan)")
+        assert invalid_plan != -1 and earnings != -1 and ladder_gate != -1
+        assert ladder_gate > invalid_plan, "ladder must run after INVALID_PLAN gate"
+        assert ladder_gate > earnings, "ladder must run after EARNINGS gate"
+
+    def test_terminal_non_dte_preserved_set_present(self):
+        assert "_TERMINAL_NON_DTE" in _SRC
+        for code in ("EARNINGS_LOCKOUT", "INVALID_PLAN"):
+            idx = _SRC.find("_TERMINAL_NON_DTE = {")
+            block = _SRC[idx: idx + 250]
+            assert code in block
+
+    def test_ladder_preserves_earnings_reason(self):
+        """If a sub-call rejects with EARNINGS_LOCKOUT, the ladder must preserve
+        that reason, NOT overwrite with NO_VALID_PLAYBOOK_DTE_CONTRACT."""
+        mod = _load_selector({"DEFERRED_DTE_LADDER": "1"})
+        sel = object.__new__(mod.APContractSelectionEngine)
+        sel.dte_ladder_enabled = True
+        sel.dte_bucket_a_max = 2
+        sel.dte_bucket_b_max = 7
+        sel.dte_ladder_probe_per_bucket = 2
+        sel._last_failure = None
+        sel._last_dte_ladder_audit = None
+
+        today = date.today()
+        a_exp = _next_weekday(today, 1)
+        sel._fetch_expirations_list = MagicMock(return_value=[a_exp])
+
+        def _fake_select(plan, *, expiration_override=None):
+            # simulate the earnings gate firing inside the sub-call
+            sel._last_failure = {
+                "stage": "earnings_gate",
+                "reason_code": "EARNINGS_LOCKOUT",
+                "explanation": "Blocked by EarningsGuard",
+            }
+            return None
+        sel.select = _fake_select
+
+        result = sel._select_with_dte_ladder(_make_plan(timeframe="1d"))
+        assert result is None
+        # the true reason must survive
+        assert sel._last_failure["reason_code"] == "EARNINGS_LOCKOUT"
+
+    def test_ladder_records_no_dte_reason_when_no_terminal(self):
+        """When sub-calls fail for ordinary (non-terminal) reasons, the ladder
+        still records NO_VALID_PLAYBOOK_DTE_CONTRACT on exhaustion."""
+        mod = _load_selector({"DEFERRED_DTE_LADDER": "1"})
+        sel = object.__new__(mod.APContractSelectionEngine)
+        sel.dte_ladder_enabled = True
+        sel.dte_bucket_a_max = 2
+        sel.dte_bucket_b_max = 7
+        sel.dte_ladder_probe_per_bucket = 2
+        sel._last_failure = None
+        sel._last_dte_ladder_audit = None
+
+        today = date.today()
+        a_exp = _next_weekday(today, 1)
+        sel._fetch_expirations_list = MagicMock(return_value=[a_exp])
+
+        def _fake_select(plan, *, expiration_override=None):
+            sel._last_failure = {
+                "stage": "quality_summary",
+                "reason_code": "OI_TOO_LOW",
+                "explanation": "illiquid",
+            }
+            return None
+        sel.select = _fake_select
+
+        result = sel._select_with_dte_ladder(_make_plan(timeframe="1d"))
+        assert result is None
+        assert sel._last_failure["reason_code"] == "NO_VALID_PLAYBOOK_DTE_CONTRACT"
