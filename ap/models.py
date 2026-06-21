@@ -39,6 +39,10 @@ class Signal(BaseModel):
         if data.get("ev_score") is None:
             data["ev_score"] = data.get("score", 65.0)
 
+        # Preserve explicit timeframe when provided; otherwise default to 1d.
+        if not data.get("timeframe"):
+            data["timeframe"] = "1d"
+
         # Maintain side/direction compatibility for scanner payloads.
         if not data.get("direction") and data.get("side"):
             data["direction"] = data["side"]
