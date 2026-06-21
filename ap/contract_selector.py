@@ -445,6 +445,22 @@ class APContractSelectionEngine:
         self.iv_filter      = iv_filter
         self.mutate_plan    = bool(mutate_plan)
 
+        # ── PR1 (deferred-dte-ladder): DTE-bucket selection policy ────────────
+        # DEFAULT OFF. When DEFERRED_DTE_LADDER != "1", select() behaves exactly
+        # as before (single _pick_expiration). When enabled, eligible plans are
+        # routed through _select_with_dte_ladder, which evaluates expirations by
+        # DTE bucket in playbook-preferred order and only falls to 8+ DTE when
+        # nearer buckets yield zero quality survivors. Quality gates are NEVER
+        # loosened — the ladder only changes WHICH expiration is evaluated first.
+        self.dte_ladder_enabled = os.getenv("DEFERRED_DTE_LADDER", "0").strip() in ("1", "true", "yes")
+        # Bucket boundaries (inclusive upper, DTE). A=near, B=adjacent, C=fallback.
+        self.dte_bucket_a_max = int(os.getenv("DTE_BUCKET_A_MAX", "2"))   # 0–2 DTE
+        self.dte_bucket_b_max = int(os.getenv("DTE_BUCKET_B_MAX", "7"))   # 3–7 DTE
+        # Max expirations to probe per bucket (bounds Tradier calls per breach).
+        self.dte_ladder_probe_per_bucket = int(os.getenv("DTE_LADDER_PROBE_PER_BUCKET", "2"))
+        # Records the last ladder run for diagnostics (observability only).
+        self._last_dte_ladder_audit: Optional[dict] = None
+
         # PR #149 — Selector Reason Honesty.
         # Records the most recent REJECT event emitted during a single select()
         # call so the queue can surface the actual blocker (e.g. OI_TOO_LOW)
@@ -578,17 +594,38 @@ class APContractSelectionEngine:
             pass
         return None
 
-    # =========================================================================
-    # PUBLIC -- select(plan) → SelectedContract | None
-    # =========================================================================
+    def get_last_dte_ladder_audit(self) -> Optional[dict]:
+        """Return the audit from the most recent DTE-ladder run (buckets tried,
+        survivors per bucket, selected bucket/DTE/expiration), or None if the
+        ladder was not used. Observability only. Never raises."""
+        try:
+            if isinstance(self._last_dte_ladder_audit, dict):
+                return dict(self._last_dte_ladder_audit)
+        except Exception:
+            pass
+        return None
 
 
-    def select(self, plan) -> Optional[SelectedContract]:
+    def select(self, plan, *, expiration_override: Optional[str] = None) -> Optional[SelectedContract]:
         # PR #149 — Selector Reason Honesty.
         # Reset failure capture at the start of every invocation so that
         # get_last_failure() reflects ONLY this call's most recent REJECT,
         # never a stale value from a prior select(). Observability only.
         self._last_failure = None
+
+        # ── PR1 (deferred-dte-ladder) ────────────────────────────────────────
+        # Route eligible plans through the DTE-bucket ladder, but ONLY when:
+        #   - the flag is enabled, AND
+        #   - this is not already a ladder sub-call (expiration_override is None).
+        # A ladder sub-call passes an explicit expiration_override and falls
+        # through to the normal single-expiration path below. When the flag is
+        # off, expiration_override is always None and behavior is unchanged.
+        if (
+            self.dte_ladder_enabled
+            and expiration_override is None
+            and self._is_ladder_eligible(plan)
+        ):
+            return self._select_with_dte_ladder(plan)
 
         ticker    = _safe_plan_attr(plan, "ticker")
         direction = str(_safe_plan_attr(plan, "side", "") or "").upper()
@@ -690,7 +727,9 @@ class APContractSelectionEngine:
 
         # ── A. FETCH CHAIN ────────────────────────────────────────────────────
         try:
-            chain, underlying_price = self._fetch_chain_with_price(ticker, direction)
+            chain, underlying_price = self._fetch_chain_with_price(
+                ticker, direction, expiration_override=expiration_override
+            )
         except Exception as e:
             log.error("[%s] chain fetch failed: %s", ticker, e)
             self._emit_selector_event(
@@ -1524,15 +1563,15 @@ class APContractSelectionEngine:
     # PRIVATE -- CHAIN FETCH
     # =========================================================================
 
-    def _fetch_chain_with_price(self, ticker: str, direction: str) -> tuple[list[dict], Optional[float]]:
+    def _fetch_chain_with_price(self, ticker: str, direction: str, *, expiration_override: Optional[str] = None) -> tuple[list[dict], Optional[float]]:
         option_type = direction.lower()
-        return self._fetch_tradier_chain(ticker, option_type)
+        return self._fetch_tradier_chain(ticker, option_type, expiration_override=expiration_override)
 
     def _fetch_chain(self, ticker: str, direction: str) -> list[dict]:
         chain, _ = self._fetch_chain_with_price(ticker, direction)
         return chain
 
-    def _fetch_tradier_chain(self, ticker: str, option_type: str) -> tuple[list[dict], Optional[float]]:
+    def _fetch_tradier_chain(self, ticker: str, option_type: str, *, expiration_override: Optional[str] = None) -> tuple[list[dict], Optional[float]]:
         """Direct Tradier API call for option chain. Returns (chain, underlying_price)."""
         import requests
         # Use broker's pooled session if available (connection reuse, keep-alive).
@@ -1581,8 +1620,14 @@ class APContractSelectionEngine:
         if not dates:
             return [], underlying_price
 
-        # 3. Pick best expiration
-        target_exp = self._pick_expiration(dates)
+        # 3. Pick best expiration (or honor an explicit override from the ladder)
+        if expiration_override:
+            target_exp = expiration_override if expiration_override in dates else None
+            if target_exp is None:
+                # Override not in the live expirations list — nothing to fetch.
+                return [], underlying_price
+        else:
+            target_exp = self._pick_expiration(dates)
         if not target_exp:
             return [], underlying_price
 
@@ -1610,6 +1655,174 @@ class APContractSelectionEngine:
 
         filtered = [o for o in options if o.get("option_type", "").lower() == option_type]
         return filtered, underlying_price
+
+    # =========================================================================
+    # PR1 — DTE-BUCKET LADDER (flag-gated, default off)
+    # =========================================================================
+
+    def _is_ladder_eligible(self, plan) -> bool:
+        """Whether this plan should use the DTE ladder.
+
+        The ladder targets short-dated Strat setups where landing in 8+ DTE is
+        wrong. We DO NOT hard-force 0DTE — the ladder prefers near expirations
+        but falls back. Eligibility is intentionally broad (any plan) so the
+        flag alone controls rollout; timeframe only shapes the bucket ORDER, not
+        whether the ladder runs. Returns True whenever the flag let us in.
+        """
+        return True
+
+    def _preferred_bucket_order(self, plan) -> list[str]:
+        """Playbook/timeframe-derived DTE bucket order.
+
+        The playbook CSV carries no explicit DTE column, so the preferred bucket
+        is derived from timeframe. Short-dated daily Strat setups prefer the
+        nearest liquid expiration first, then adjacent, then 8+ only as last
+        resort. This does NOT hard-force 0DTE — it only orders the ladder.
+        """
+        timeframe = str(_safe_plan_attr(plan, "timeframe", "") or "").lower()
+        # 1d / daily / intraday short-dated → near-first ladder.
+        # Any longer/unknown timeframe uses the same near-first order by default;
+        # the fallback rungs guarantee a quality contract is still found if the
+        # near buckets are empty.
+        if timeframe in ("1d", "daily", "1day", "d", "60m", "1h", "30m", "15m", "5m", "0dte"):
+            return ["A", "B", "C"]
+        # Default: still near-first (safe — ladder falls back if empty).
+        return ["A", "B", "C"]
+
+    def _fetch_expirations_list(self, ticker: str) -> list[str]:
+        """Fetch the raw expirations list for the ticker (live data broker).
+        Returns [] on any failure (caller falls back gracefully)."""
+        import requests
+        _session = getattr(self.data_broker, "session", None) or requests
+        cfg      = getattr(self.data_broker, "cfg", None)
+        base_url = (getattr(cfg, "base_url", None)
+                    or getattr(self.data_broker, "base_url", "https://sandbox.tradier.com"))
+        token = (getattr(cfg, "access_token", None)
+                 or getattr(cfg, "token", None)
+                 or getattr(self.data_broker, "access_token", None)
+                 or getattr(self.data_broker, "token", "")) or ""
+        headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+        try:
+            resp = _session.get(
+                f"{base_url}/v1/markets/options/expirations",
+                params={"symbol": ticker, "includeAllRoots": "true"},
+                headers=headers, timeout=10,
+            )
+            if resp.status_code != 200:
+                return []
+            return resp.json().get("expirations", {}).get("date", []) or []
+        except Exception:
+            return []
+
+    def _bucket_expirations(self, dates: list[str]) -> dict[str, list[str]]:
+        """Group expirations into DTE buckets A (0–a), B (a+1–b), C (b+1+).
+        Each bucket's list is sorted nearest-first. Weekends skipped."""
+        today = date.today()
+        buckets: dict[str, list[tuple[int, str]]] = {"A": [], "B": [], "C": []}
+        for d_str in dates:
+            try:
+                d = date.fromisoformat(d_str)
+            except Exception:
+                continue
+            if d.weekday() >= 5:
+                continue
+            dte = (d - today).days
+            if dte < 0:
+                continue
+            if dte <= self.dte_bucket_a_max:
+                buckets["A"].append((dte, d_str))
+            elif dte <= self.dte_bucket_b_max:
+                buckets["B"].append((dte, d_str))
+            else:
+                buckets["C"].append((dte, d_str))
+        # nearest-first within each bucket
+        return {k: [d for _, d in sorted(v)] for k, v in buckets.items()}
+
+    def _select_with_dte_ladder(self, plan) -> Optional["SelectedContract"]:
+        """Evaluate expirations by DTE bucket in playbook-preferred order.
+
+        For each bucket (A→B→C by default), probe its expirations nearest-first
+        (up to dte_ladder_probe_per_bucket) and return the FIRST expiration that
+        yields a quality survivor. Quality gates are unchanged — this only
+        controls which expiration select() evaluates. Records a full audit of
+        buckets attempted / survivors per bucket for diagnostics.
+
+        Returns the selected contract, or None (records NO_VALID_PLAYBOOK_DTE_CONTRACT).
+        """
+        ticker = _safe_plan_attr(plan, "ticker")
+        audit: dict = {
+            "ladder": True,
+            "ticker": ticker,
+            "timeframe": str(_safe_plan_attr(plan, "timeframe", "") or ""),
+            "bucket_order": [],
+            "buckets_attempted": [],
+            "selected_bucket": None,
+            "selected_dte": None,
+            "selected_expiration": None,
+        }
+        try:
+            dates = self._fetch_expirations_list(ticker)
+            if not dates:
+                # No expirations data — fall back to the legacy single-shot path
+                # so we never regress to "no result" purely from a list-fetch miss.
+                audit["fallback"] = "no_expirations_list_legacy_single_shot"
+                self._last_dte_ladder_audit = audit
+                return self.select(plan, expiration_override="")  # "" => legacy pick
+
+            buckets = self._bucket_expirations(dates)
+            order = self._preferred_bucket_order(plan)
+            audit["bucket_order"] = order
+            today = date.today()
+
+            for bucket_name in order:
+                exps = buckets.get(bucket_name, [])[: self.dte_ladder_probe_per_bucket]
+                bucket_rec = {"bucket": bucket_name, "expirations_probed": [], "survivor": False}
+                for exp in exps:
+                    try:
+                        _dte = (date.fromisoformat(exp) - today).days
+                    except Exception:
+                        _dte = None
+                    result = self.select(plan, expiration_override=exp)
+                    bucket_rec["expirations_probed"].append({"exp": exp, "dte": _dte, "hit": result is not None})
+                    if result is not None:
+                        bucket_rec["survivor"] = True
+                        audit["buckets_attempted"].append(bucket_rec)
+                        audit["selected_bucket"] = bucket_name
+                        audit["selected_dte"] = _dte
+                        audit["selected_expiration"] = exp
+                        self._last_dte_ladder_audit = audit
+                        log.info(
+                            "[%s] DTE_LADDER_SELECTED bucket=%s dte=%s exp=%s",
+                            ticker, bucket_name, _dte, exp,
+                        )
+                        return result
+                audit["buckets_attempted"].append(bucket_rec)
+
+            # All buckets exhausted with zero quality survivors.
+            self._last_dte_ladder_audit = audit
+            self._last_failure = {
+                "stage": "dte_ladder",
+                "reason_code": "NO_VALID_PLAYBOOK_DTE_CONTRACT",
+                "explanation": (
+                    "No quality survivor in any evaluated DTE bucket "
+                    f"(order={order}, buckets={ {k: len(v) for k, v in buckets.items()} })"
+                ),
+            }
+            log.warning(
+                "[%s] DTE_LADDER_NO_SURVIVOR order=%s buckets=%s",
+                ticker, order, {k: len(v) for k, v in buckets.items()},
+            )
+            return None
+        except Exception as exc:
+            # Ladder must never harm the flow — on any unexpected error, fall
+            # back to the legacy single-shot selection.
+            log.warning("[%s] DTE_LADDER_ERROR falling back to legacy: %s", ticker, exc)
+            audit["fallback"] = f"ladder_error_legacy_single_shot:{exc}"
+            self._last_dte_ladder_audit = audit
+            try:
+                return self.select(plan, expiration_override="")
+            except Exception:
+                return None
 
     def _pick_expiration(self, dates: list[str]) -> Optional[str]:
         today = date.today()
