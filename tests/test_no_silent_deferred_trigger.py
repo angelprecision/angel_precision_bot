@@ -24,7 +24,6 @@ _EC   = (_REPO / "ap_execution_core.py").read_text()
 
 
 CANONICAL_OUTCOMES = {
-    "BREACH_CONTRACT_SELECTED",
     "BREACH_RISK_CHECK_BLOCKED",
     "BREACH_SELECTOR_RETURNED_NONE",
     "BREACH_SELECTOR_EXCEPTION",
@@ -34,6 +33,9 @@ CANONICAL_OUTCOMES = {
     "UNTRADEABLE_FOR_ACCOUNT_SIZE",
     "DATA_MISSING_OI_VOLUME",
 }
+
+# BREACH_CONTRACT_SELECTED is PROGRESS, not terminal.
+PROGRESS_OUTCOMES = {"BREACH_CONTRACT_SELECTED"}
 
 
 class TestEmitterExists:
@@ -47,13 +49,13 @@ class TestEmitterExists:
         """Every emission must carry local_order_id + signal_id so the event
         joins back to the order row (the linkage missing before PR3)."""
         idx = _EC.find("def _emit_deferred_outcome(")
-        body = _EC[idx: idx + 2400]
+        body = _EC[idx: _EC.find("# 3) Recover", idx)]
         assert '"local_order_id": queue_local_order_id' in body
         assert '"signal_id": signal_id' in body
 
     def test_emitter_never_raises(self):
         idx = _EC.find("def _emit_deferred_outcome(")
-        body = _EC[idx: idx + 2400]
+        body = _EC[idx: _EC.find("# 3) Recover", idx)]
         assert "except Exception:" in body
         assert "DEFERRED_TRIGGER_OUTCOME_EMIT_FAILED" in body
 
@@ -73,12 +75,47 @@ class TestTerminalPathsWired:
         region = _EC[idx: idx + 600]
         assert "BREACH_SELECTOR_EXCEPTION" in region
 
-    def test_contract_selected_path_emits(self):
-        assert "BREACH_CONTRACT_SELECTED" in _EC
+    def test_contract_selected_is_progress_not_terminal(self):
+        """BREACH_CONTRACT_SELECTED must go through the PROGRESS channel
+        (_emit_deferred_progress), NOT the terminal _emit_deferred_outcome —
+        otherwise it consumes the exactly-once terminal slot and blocks the real
+        terminal outcome (BREACH_BROKER_SUBMITTED)."""
+        idx = _EC.find('"BREACH_CONTRACT_SELECTED"')
+        # find the emission call (not the comment/taxonomy)
+        # the call site must be _emit_deferred_progress
+        call_idx = _EC.find('_emit_deferred_progress(\n                    "BREACH_CONTRACT_SELECTED"')
+        assert call_idx != -1, "BREACH_CONTRACT_SELECTED must be emitted via _emit_deferred_progress"
+
+    def test_progress_channel_does_not_set_terminal_sentinel(self):
+        """_emit_deferred_progress must NOT set the exactly-once terminal slot."""
+        idx = _EC.find("def _emit_deferred_progress(")
+        end = _EC.find("def _emit_deferred_outcome(", idx)
+        body = _EC[idx:end]
+        assert '_deferred_outcome["emitted"] = True' not in body
+
+    def test_terminal_channel_rejects_non_terminal_codes(self):
+        """_emit_deferred_outcome must reject non-terminal codes (route them to
+        progress) so they never consume the terminal slot."""
+        idx = _EC.find("def _emit_deferred_outcome(")
+        end = _EC.find("# 3) Recover", idx)
+        body = _EC[idx:end]
+        assert "_TERMINAL_DEFERRED_OUTCOMES" in body
+        assert "if outcome not in _TERMINAL_DEFERRED_OUTCOMES:" in body
+
+    def test_contract_selected_not_in_terminal_set(self):
+        idx = _EC.find("_TERMINAL_DEFERRED_OUTCOMES = frozenset({")
+        end = _EC.find("})", idx)
+        block = _EC[idx:end]
+        assert "BREACH_CONTRACT_SELECTED" not in block
+
+    def test_broker_submitted_in_terminal_set(self):
+        idx = _EC.find("_TERMINAL_DEFERRED_OUTCOMES = frozenset({")
+        end = _EC.find("})", idx)
+        block = _EC[idx:end]
+        assert "BREACH_BROKER_SUBMITTED" in block
 
     def test_broker_submitted_path_emits(self):
         # On successful submit, must emit BREACH_BROKER_SUBMITTED with broker id.
-        # The emission call passes broker_order_id= on the following lines.
         assert "broker_order_id=str(broker_order_id" in _EC, (
             "BREACH_BROKER_SUBMITTED emission must pass the real broker_order_id"
         )
@@ -94,32 +131,29 @@ class TestTerminalPathsWired:
     def test_data_missing_uses_vol0_oi0_signal(self):
         """DATA_MISSING_OI_VOLUME must be chosen when the reason carries
         the vol0_oi0 chain-data signature. Find the emission conditional
-        (second occurrence), not the taxonomy comment (first)."""
-        first = _EC.find("DATA_MISSING_OI_VOLUME")
-        idx = _EC.find("DATA_MISSING_OI_VOLUME", first + 1)
-        assert idx != -1, "DATA_MISSING_OI_VOLUME emission not found"
-        region = _EC[idx: idx + 120]
-        assert "vol0_oi0" in region
+        (the one adjacent to vol0_oi0), not the taxonomy set/comment."""
+        idx = _EC.find('"vol0_oi0" in str(_reason)')
+        assert idx != -1, "DATA_MISSING_OI_VOLUME vol0_oi0 conditional not found"
+        region = _EC[idx - 120: idx + 40]
+        assert "DATA_MISSING_OI_VOLUME" in region
 
 
 class TestOutcomeTaxonomyComplete:
-    def test_all_canonical_outcomes_present_in_source(self):
-        missing = {o for o in CANONICAL_OUTCOMES if o not in _EC}
+    def test_all_terminal_outcomes_present_in_source(self):
         # NO_VALID_PLAYBOOK_DTE_CONTRACT and UNTRADEABLE_FOR_ACCOUNT_SIZE are
-        # emitted by PR1/PR2 respectively; PR3 documents them in the taxonomy
-        # comment so the taxonomy is complete even before those land.
+        # emitted by PR1/PR2; PR3 documents them in the terminal set so the
+        # taxonomy is complete even before those land.
         assert "NO_VALID_PLAYBOOK_DTE_CONTRACT" in _EC
         assert "UNTRADEABLE_FOR_ACCOUNT_SIZE" in _EC
-        # The actively-emitted PR3 outcomes must all be present:
+        # The actively-emitted PR3 TERMINAL outcomes must all be present:
         for o in (
-            "BREACH_CONTRACT_SELECTED",
             "BREACH_SELECTOR_RETURNED_NONE",
             "BREACH_SELECTOR_EXCEPTION",
             "BREACH_SUBMISSION_SKIPPED",
             "BREACH_BROKER_SUBMITTED",
             "DATA_MISSING_OI_VOLUME",
         ):
-            assert o in _EC, f"missing actively-emitted outcome {o}"
+            assert o in _EC, f"missing actively-emitted terminal outcome {o}"
 
 
 class TestNoBehaviorChange:
@@ -127,7 +161,7 @@ class TestNoBehaviorChange:
 
     def test_emitter_does_not_submit_or_cancel(self):
         idx = _EC.find("def _emit_deferred_outcome(")
-        body = _EC[idx: idx + 2400]
+        body = _EC[idx: _EC.find("# 3) Recover", idx)]
         assert "submit_order" not in body
         assert "submit_existing_entry" not in body
         assert "cancel_pending_entry" not in body
@@ -135,7 +169,7 @@ class TestNoBehaviorChange:
 
     def test_emitter_only_logs_and_sets_sentinel(self):
         idx = _EC.find("def _emit_deferred_outcome(")
-        body = _EC[idx: idx + 2400]
+        body = _EC[idx: _EC.find("# 3) Recover", idx)]
         # The only state it mutates is the local sentinel dict
         assert '_deferred_outcome["emitted"] = True' in body
 
@@ -146,14 +180,14 @@ class TestAmendmentGuards:
     def test_emitter_is_deferred_guarded(self):
         """Emitter must no-op unless the trigger is a deferred entry."""
         idx = _EC.find("def _emit_deferred_outcome(")
-        body = _EC[idx: idx + 2400]
+        body = _EC[idx: _EC.find("# 3) Recover", idx)]
         assert 'if not _deferred_outcome.get("is_deferred"):' in body
         assert "return" in body
 
     def test_emitter_exactly_once(self):
         """First emission wins; later calls ignored (no double terminal)."""
         idx = _EC.find("def _emit_deferred_outcome(")
-        body = _EC[idx: idx + 2400]
+        body = _EC[idx: _EC.find("# 3) Recover", idx)]
         assert 'if _deferred_outcome.get("emitted"):' in body
 
     def test_sentinel_has_is_deferred(self):

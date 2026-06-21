@@ -919,24 +919,72 @@ class APExecutionCore:
             return
 
         # ── PR3 (no-silent-deferred-trigger-exits): canonical terminal outcome ──
-        # Every triggered deferred row MUST leave exactly one explicit terminal
-        # outcome from this taxonomy so no trigger returns silently. This is
-        # observability only — it records the outcome that the existing code
-        # paths already produce; it does not change any decision or order action.
+        # Every triggered deferred row MUST leave exactly one explicit TERMINAL
+        # outcome so no trigger returns silently. Observability only — it records
+        # the outcome the existing code paths already produce; it changes no
+        # decision or order action.
         #
-        # Outcomes:
-        #   BREACH_CONTRACT_SELECTED       real OCC contract chosen, proceeding
+        # IMPORTANT (review amendment): "contract selected" is PROGRESS, not a
+        # terminal state. The real terminal outcome of a successful deferred
+        # entry is BREACH_BROKER_SUBMITTED (or BREACH_SUBMISSION_SKIPPED on a
+        # submit failure). So contract-selected is emitted on a SEPARATE,
+        # non-terminal channel that does NOT consume the exactly-once terminal
+        # slot — otherwise it would block the true terminal outcome that follows.
+        #
+        # TERMINAL outcomes (exactly one per triggered deferred row):
         #   BREACH_RISK_CHECK_BLOCKED      _breach_risk_check returned False
         #   BREACH_SELECTOR_RETURNED_NONE  selector.select() returned None
         #   BREACH_SELECTOR_EXCEPTION      selector.select() raised
-        #   BREACH_SUBMISSION_SKIPPED      passed selection but submit not attempted
+        #   BREACH_SUBMISSION_SKIPPED      submit attempted, OSM returned not-ok
         #   BREACH_BROKER_SUBMITTED        order handed to broker submit path
         #   NO_VALID_PLAYBOOK_DTE_CONTRACT no survivor in any evaluated DTE bucket
         #   UNTRADEABLE_FOR_ACCOUNT_SIZE   quality contract exists but exceeds budget
         #   DATA_MISSING_OI_VOLUME         chain returned with zero OI/volume fields
         #
+        # PROGRESS (non-terminal, never consumes the terminal slot):
+        #   BREACH_CONTRACT_SELECTED       real OCC contract chosen, proceeding
+        #
         # _deferred_outcome["emitted"] is the sentinel the post-trigger guard checks.
+        _TERMINAL_DEFERRED_OUTCOMES = frozenset({
+            "BREACH_RISK_CHECK_BLOCKED",
+            "BREACH_SELECTOR_RETURNED_NONE",
+            "BREACH_SELECTOR_EXCEPTION",
+            "BREACH_SUBMISSION_SKIPPED",
+            "BREACH_BROKER_SUBMITTED",
+            "NO_VALID_PLAYBOOK_DTE_CONTRACT",
+            "UNTRADEABLE_FOR_ACCOUNT_SIZE",
+            "DATA_MISSING_OI_VOLUME",
+        })
         _deferred_outcome = {"emitted": False, "outcome": None, "is_deferred": False}
+
+        def _emit_deferred_progress(
+            outcome: str,
+            *,
+            contract: str = "",
+            extra: dict | None = None,
+        ) -> None:
+            """Log a NON-TERMINAL deferred milestone (e.g. BREACH_CONTRACT_SELECTED).
+            Deferred-guarded but does NOT set the exactly-once terminal sentinel,
+            so it can never block the real terminal outcome that follows. Never
+            raises."""
+            if not _deferred_outcome.get("is_deferred"):
+                return
+            try:
+                payload = {
+                    "outcome": outcome,
+                    "local_order_id": queue_local_order_id or "",
+                    "signal_id": signal_id or "",
+                    "symbol": ticker,
+                    "execution_mode": getattr(self, "mode", "n/a"),
+                    "contract": contract or "",
+                }
+                if extra:
+                    for _k, _v in extra.items():
+                        payload[_k] = _v
+                _fields = " ".join(f"{k}={v}" for k, v in payload.items())
+                log.info("DEFERRED_TRIGGER_PROGRESS %s", _fields)
+            except Exception:
+                pass
 
         def _emit_deferred_outcome(
             outcome: str,
@@ -946,18 +994,25 @@ class APExecutionCore:
             broker_order_id: str = "",
             extra: dict | None = None,
         ) -> None:
-            """Emit EXACTLY ONE canonical terminal outcome for a triggered
+            """Emit EXACTLY ONE canonical TERMINAL outcome for a triggered
             DEFERRED row. Never raises. Always includes local_order_id +
             signal_id so the event joins back to the order row.
 
-            Two guards (per review amendment):
-              1. Deferred-only: does nothing unless this trigger is a deferred
-                 entry (_deferred_outcome["is_deferred"] set True once known).
-                 Non-deferred triggers never emit a deferred outcome.
-              2. Exactly-once: the first emission wins; later calls are ignored
-                 so a row can never carry two terminal outcomes.
+            Three guards (per review amendments):
+              1. Deferred-only: no-op unless this trigger is a deferred entry.
+              2. Terminal-only: a non-terminal code (e.g. BREACH_CONTRACT_SELECTED)
+                 is rejected here — those go through _emit_deferred_progress so
+                 they never consume the terminal slot.
+              3. Exactly-once: the first TERMINAL emission wins; later calls are
+                 ignored so a row can never carry two terminal outcomes.
             """
             if not _deferred_outcome.get("is_deferred"):
+                return
+            if outcome not in _TERMINAL_DEFERRED_OUTCOMES:
+                # Defensive: a non-terminal code must never reach the terminal
+                # channel. Route it to progress logging instead of consuming the
+                # exactly-once slot.
+                _emit_deferred_progress(outcome, contract=contract, extra=extra)
                 return
             if _deferred_outcome.get("emitted"):
                 return
@@ -978,7 +1033,7 @@ class APExecutionCore:
                     for _k, _v in extra.items():
                         payload[_k] = _v
                 _fields = " ".join(f"{k}={v}" for k, v in payload.items())
-                if outcome in ("BREACH_CONTRACT_SELECTED", "BREACH_BROKER_SUBMITTED"):
+                if outcome == "BREACH_BROKER_SUBMITTED":
                     log.info("DEFERRED_TRIGGER_OUTCOME %s", _fields)
                 else:
                     log.warning("DEFERRED_TRIGGER_OUTCOME %s", _fields)
@@ -1241,7 +1296,7 @@ class APExecutionCore:
                         ticker, _live_contract, _reason,
                     )
                     return
-                _emit_deferred_outcome(
+                _emit_deferred_progress(
                     "BREACH_CONTRACT_SELECTED",
                     contract=_live_contract,
                     extra={
