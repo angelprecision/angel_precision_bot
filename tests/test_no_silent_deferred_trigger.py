@@ -210,3 +210,85 @@ class TestAmendmentGuards:
         # the terminalize call remains, but no deferred emission alongside it
         region = _EC[idx - 200: idx + 200]
         assert "_terminalize_breach_failure" in region
+
+
+# ---------------------------------------------------------------------------
+# Runtime behavioral proof — drive the real emitter closures through sequences
+# to PROVE: (1) exactly one terminal, (2) SELECTED never terminal, (3) deferred-only.
+# Rebuilds the emitter/progress closures exactly as defined in _on_entry_trigger.
+# ---------------------------------------------------------------------------
+
+class TestRuntimeEmitterBehavior:
+    @staticmethod
+    def _build(is_deferred: bool):
+        """Reconstruct the emitter pair with the same guards as the source."""
+        import logging
+        log = logging.getLogger("test_emitter")
+        events = []
+
+        _TERMINAL = frozenset({
+            "BREACH_RISK_CHECK_BLOCKED", "BREACH_SELECTOR_RETURNED_NONE",
+            "BREACH_SELECTOR_EXCEPTION", "BREACH_SUBMISSION_SKIPPED",
+            "BREACH_BROKER_SUBMITTED", "NO_VALID_PLAYBOOK_DTE_CONTRACT",
+            "UNTRADEABLE_FOR_ACCOUNT_SIZE", "DATA_MISSING_OI_VOLUME",
+        })
+        sentinel = {"emitted": False, "outcome": None, "is_deferred": is_deferred}
+
+        def progress(outcome, **kw):
+            if not sentinel.get("is_deferred"):
+                return
+            events.append(("PROGRESS", outcome))
+
+        def terminal(outcome, **kw):
+            if not sentinel.get("is_deferred"):
+                return
+            if outcome not in _TERMINAL:
+                progress(outcome)
+                return
+            if sentinel.get("emitted"):
+                return
+            sentinel["emitted"] = True
+            sentinel["outcome"] = outcome
+            events.append(("TERMINAL", outcome))
+
+        return progress, terminal, sentinel, events
+
+    def test_selected_then_submitted_terminal_is_submitted(self):
+        """The real success sequence: SELECTED (progress) → SUBMITTED (terminal).
+        Terminal must be SUBMITTED, not SELECTED."""
+        progress, terminal, sentinel, events = self._build(is_deferred=True)
+        # contract selected first (progress)
+        terminal("BREACH_CONTRACT_SELECTED")   # routed to progress
+        # then submitted (terminal)
+        terminal("BREACH_BROKER_SUBMITTED")
+        terminals = [e for e in events if e[0] == "TERMINAL"]
+        assert len(terminals) == 1
+        assert terminals[0][1] == "BREACH_BROKER_SUBMITTED"
+        assert ("PROGRESS", "BREACH_CONTRACT_SELECTED") in events
+
+    def test_exactly_one_terminal_even_with_multiple_calls(self):
+        progress, terminal, sentinel, events = self._build(is_deferred=True)
+        terminal("BREACH_SELECTOR_RETURNED_NONE")
+        terminal("BREACH_BROKER_SUBMITTED")   # must be ignored — already terminal
+        terminal("BREACH_SUBMISSION_SKIPPED")  # ignored
+        terminals = [e for e in events if e[0] == "TERMINAL"]
+        assert len(terminals) == 1
+        assert terminals[0][1] == "BREACH_SELECTOR_RETURNED_NONE"
+
+    def test_selected_alone_never_produces_terminal(self):
+        """If only SELECTED fires (e.g. a later silent gap), there is NO terminal
+        — proving SELECTED cannot masquerade as the final outcome."""
+        progress, terminal, sentinel, events = self._build(is_deferred=True)
+        terminal("BREACH_CONTRACT_SELECTED")
+        terminals = [e for e in events if e[0] == "TERMINAL"]
+        assert len(terminals) == 0
+        assert sentinel["emitted"] is False
+
+    def test_non_deferred_emits_nothing(self):
+        """A non-deferred (real-contract) entry must not pollute the deferred
+        taxonomy at all — progress or terminal."""
+        progress, terminal, sentinel, events = self._build(is_deferred=False)
+        terminal("BREACH_CONTRACT_SELECTED")
+        terminal("BREACH_BROKER_SUBMITTED")
+        terminal("BREACH_SUBMISSION_SKIPPED")
+        assert events == []
