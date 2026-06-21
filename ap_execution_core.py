@@ -936,7 +936,7 @@ class APExecutionCore:
         #   DATA_MISSING_OI_VOLUME         chain returned with zero OI/volume fields
         #
         # _deferred_outcome["emitted"] is the sentinel the post-trigger guard checks.
-        _deferred_outcome = {"emitted": False, "outcome": None}
+        _deferred_outcome = {"emitted": False, "outcome": None, "is_deferred": False}
 
         def _emit_deferred_outcome(
             outcome: str,
@@ -946,9 +946,21 @@ class APExecutionCore:
             broker_order_id: str = "",
             extra: dict | None = None,
         ) -> None:
-            """Emit one canonical terminal outcome for a triggered deferred row.
-            Never raises. Always includes local_order_id + signal_id so the event
-            joins back to the order row (the linkage that was missing before)."""
+            """Emit EXACTLY ONE canonical terminal outcome for a triggered
+            DEFERRED row. Never raises. Always includes local_order_id +
+            signal_id so the event joins back to the order row.
+
+            Two guards (per review amendment):
+              1. Deferred-only: does nothing unless this trigger is a deferred
+                 entry (_deferred_outcome["is_deferred"] set True once known).
+                 Non-deferred triggers never emit a deferred outcome.
+              2. Exactly-once: the first emission wins; later calls are ignored
+                 so a row can never carry two terminal outcomes.
+            """
+            if not _deferred_outcome.get("is_deferred"):
+                return
+            if _deferred_outcome.get("emitted"):
+                return
             _deferred_outcome["emitted"] = True
             _deferred_outcome["outcome"] = outcome
             try:
@@ -980,10 +992,9 @@ class APExecutionCore:
         approved_plan = self._recover_plan_for_revalidation(watched)
         if approved_plan is None:
             log.critical("[%s] PRODUCTION_ENTRY_BLOCK — approved plan missing after breach revalidation", ticker)
-            _emit_deferred_outcome(
-                "BREACH_SELECTOR_RETURNED_NONE",
-                reason="approved_plan_missing_after_revalidation",
-            )
+            # NOTE: _deferred is not yet known here, and an invalid/missing plan
+            # is not a deferred-selection outcome — do not emit a deferred
+            # outcome. _terminalize_breach_failure records this terminal state.
             _terminalize_breach_failure("approved_plan_missing_after_revalidation")
             return
 
@@ -1002,6 +1013,10 @@ class APExecutionCore:
             or not _contract_sym_raw
             or _contract_sym_raw.upper().startswith("DEFERRED:")  # safety: never submit placeholder
         )
+        # Enable deferred-outcome emission only for deferred triggers (amendment:
+        # guard deferred logs with _deferred). Non-deferred entries never emit a
+        # deferred terminal outcome.
+        _deferred_outcome["is_deferred"] = bool(_deferred)
         if _deferred:
             if self.contract_selector is None:
                 _reason = "contract_deferred_no_selector"

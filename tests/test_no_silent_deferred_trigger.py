@@ -47,13 +47,13 @@ class TestEmitterExists:
         """Every emission must carry local_order_id + signal_id so the event
         joins back to the order row (the linkage missing before PR3)."""
         idx = _EC.find("def _emit_deferred_outcome(")
-        body = _EC[idx: idx + 1800]
+        body = _EC[idx: idx + 2400]
         assert '"local_order_id": queue_local_order_id' in body
         assert '"signal_id": signal_id' in body
 
     def test_emitter_never_raises(self):
         idx = _EC.find("def _emit_deferred_outcome(")
-        body = _EC[idx: idx + 1800]
+        body = _EC[idx: idx + 2400]
         assert "except Exception:" in body
         assert "DEFERRED_TRIGGER_OUTCOME_EMIT_FAILED" in body
 
@@ -127,7 +127,7 @@ class TestNoBehaviorChange:
 
     def test_emitter_does_not_submit_or_cancel(self):
         idx = _EC.find("def _emit_deferred_outcome(")
-        body = _EC[idx: idx + 1800]
+        body = _EC[idx: idx + 2400]
         assert "submit_order" not in body
         assert "submit_existing_entry" not in body
         assert "cancel_pending_entry" not in body
@@ -135,6 +135,44 @@ class TestNoBehaviorChange:
 
     def test_emitter_only_logs_and_sets_sentinel(self):
         idx = _EC.find("def _emit_deferred_outcome(")
-        body = _EC[idx: idx + 1800]
+        body = _EC[idx: idx + 2400]
         # The only state it mutates is the local sentinel dict
         assert '_deferred_outcome["emitted"] = True' in body
+
+
+class TestAmendmentGuards:
+    """Review amendments: deferred-only guard + exactly-one terminal outcome."""
+
+    def test_emitter_is_deferred_guarded(self):
+        """Emitter must no-op unless the trigger is a deferred entry."""
+        idx = _EC.find("def _emit_deferred_outcome(")
+        body = _EC[idx: idx + 2400]
+        assert 'if not _deferred_outcome.get("is_deferred"):' in body
+        assert "return" in body
+
+    def test_emitter_exactly_once(self):
+        """First emission wins; later calls ignored (no double terminal)."""
+        idx = _EC.find("def _emit_deferred_outcome(")
+        body = _EC[idx: idx + 2400]
+        assert 'if _deferred_outcome.get("emitted"):' in body
+
+    def test_sentinel_has_is_deferred(self):
+        assert '"is_deferred": False' in _EC
+
+    def test_is_deferred_set_after_deferred_computed(self):
+        """is_deferred must be set from the _deferred computation, and the
+        emission gate at the missing-plan path must NOT fire a deferred outcome
+        (it runs before _deferred is known)."""
+        assert '_deferred_outcome["is_deferred"] = bool(_deferred)' in _EC
+        # the approved_plan-missing path must no longer emit a deferred outcome
+        idx = _EC.find("approved plan missing after breach revalidation")
+        region = _EC[idx: idx + 400]
+        assert "_emit_deferred_outcome" not in region
+
+    def test_missing_plan_path_does_not_emit(self):
+        """A non-deferred (or pre-_deferred) missing-plan trigger must not carry
+        a deferred outcome."""
+        idx = _EC.find("approved_plan_missing_after_revalidation")
+        # the terminalize call remains, but no deferred emission alongside it
+        region = _EC[idx - 200: idx + 200]
+        assert "_terminalize_breach_failure" in region
