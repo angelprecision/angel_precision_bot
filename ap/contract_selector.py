@@ -1064,6 +1064,12 @@ class APContractSelectionEngine:
                     "chain_size":       len(chain),
                     "rejection_counts": {_normalize_reason_code(k): v for k, v in _rejections.items()},
                     "raw_rejection_counts": _rejections,
+                    # PR2: budget context so the operator can correlate a
+                    # whole-chain quality wipeout with a too-small account
+                    # (e.g. only deep-OTM junk was affordable). Diagnostic only.
+                    "budget":                 _safe_float(budget),
+                    "max_affordable_premium": _safe_float(_safe_plan_attr(plan, "max_affordable_premium", 0)) or None,
+                    "underlying_price":       _safe_float(underlying_price) or None,
                 },
                 thresholds={
                     "max_spread_pct": _safe_float(_eff_max_spread),
@@ -1301,25 +1307,72 @@ class APContractSelectionEngine:
                     dte                  = selected.dte,
                 )
             else:
-                log.warning("[%s] BLOCKED -- budget $%.0f cannot afford %s @ $%.0f/contract",
-                            ticker, budget, selected.contract_symbol, selected.premium_per_contract)
+                # ── PR2: account-size tradeability classification ─────────────
+                # A QUALITY contract was found (it passed every liquidity / spread
+                # / OI / delta gate) but it exceeds the per-trade budget. This is
+                # not a data or liquidity failure — it is structurally untradeable
+                # for THIS account size. Classify it precisely so the operator can
+                # tell "account too small for this name right now" apart from
+                # "bad data / no liquidity / wrong DTE". Breach-time authoritative:
+                # this runs only after the chain (and, under PR1, the DTE ladder)
+                # has been fully evaluated, so the quality contract is real.
+                #
+                # NOTE: this does NOT loosen any gate and does NOT change the
+                # decision — the live reject still returns None. It only upgrades
+                # the REASON from generic NO_AFFORDABLE_CONTRACT to the specific
+                # UNTRADEABLE_FOR_ACCOUNT_SIZE, with full budget diagnostics.
+                _equity = _safe_float(_safe_plan_attr(plan, "account_equity", 0)) or None
+                _max_pos_pct = _safe_float(_safe_plan_attr(plan, "max_position_pct", 0)) or None
+                _max_afford_prem = (
+                    _safe_float(_safe_plan_attr(plan, "max_affordable_premium", 0)) or None
+                )
+                _underlying = _safe_float(underlying_price) or None
+                _tradeability_diag = {
+                    "equity":                 _equity,
+                    "max_position_pct":       _max_pos_pct,
+                    "max_trade_usd":          _safe_float(_max_trade_usd()),
+                    "max_affordable_premium": _max_afford_prem,
+                    "underlying_price":       _underlying,
+                    "budget":                 _safe_float(budget),
+                    "selected_dte":           _safe_float(getattr(selected, "dte", None)),
+                    "near_atm_premium_estimate": _safe_float(selected.premium_per_contract),
+                    "cheapest_quality_survivor_premium": _safe_float(selected.premium_per_contract),
+                    "classification":         "UNTRADEABLE_FOR_ACCOUNT_SIZE",
+                }
+                log.warning(
+                    "[%s] UNTRADEABLE_FOR_ACCOUNT_SIZE -- quality contract %s @ "
+                    "$%.0f/contract exceeds budget $%.0f (equity=%s pct=%s) — "
+                    "not a data/liquidity failure",
+                    ticker, selected.contract_symbol,
+                    selected.premium_per_contract, budget, _equity, _max_pos_pct,
+                )
                 self._emit_selector_event(
                     plan,
-                stage="affordability_gate",
+                    stage="affordability_gate",
                     decision="REJECT",
-                    reason_code="NO_AFFORDABLE_CONTRACT",
+                    reason_code="UNTRADEABLE_FOR_ACCOUNT_SIZE",
                     explanation=(
-                        f"Budget ${budget:.0f} cannot afford "
-                        f"{selected.contract_symbol} @ ${selected.premium_per_contract:.0f}/contract"
+                        f"Quality contract {selected.contract_symbol} @ "
+                        f"${selected.premium_per_contract:.0f}/contract exceeds budget "
+                        f"${budget:.0f} — structurally untradeable for this account size. "
+                        f"No ticker blacklist; eligible again if a cheaper quality "
+                        f"contract appears or the account grows."
                     ),
                     contract=selected.contract_symbol,
-                    inputs={
-                        "budget":               _safe_float(budget),
-                        "premium_per_contract": _safe_float(selected.premium_per_contract),
-                        "affordable_contracts": selected.affordable_contracts,
-                    },
+                    inputs=_tradeability_diag,
                     thresholds={"min_contracts": 1},
                 )
+                # Record as the authoritative last-failure reason for the queue
+                # and the deferred-breach audit (consumed by PR3's taxonomy).
+                self._last_failure = {
+                    "stage": "affordability_gate",
+                    "reason_code": "UNTRADEABLE_FOR_ACCOUNT_SIZE",
+                    "explanation": (
+                        f"Quality contract @ ${selected.premium_per_contract:.0f}/contract "
+                        f"exceeds budget ${budget:.0f}"
+                    ),
+                    "tradeability_diag": _tradeability_diag,
+                }
                 return None
 
         if selected is None:
