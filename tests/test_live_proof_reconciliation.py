@@ -40,10 +40,12 @@ def _load_script():
 class TestRepairPlanner:
     def test_links_broker_order_id_when_missing(self):
         mod = _load_script()
-        order = {"broker_order_id": "133931493", "local_order_id": "loc-1"}
+        order = {"broker_order_id": "133931493", "local_order_id": "loc-1",
+                 "client_id": "jasoncosby1@gmail.com"}
         proof = {"broker_entry_order_id": None, "local_order_id": None,
                  "execution_mode": "unknown", "entry_option_price": 1.20,
-                 "broker_reconciled": False, "entry_price_source": None}
+                 "broker_reconciled": False, "entry_price_source": None,
+                 "client_email": "jasoncosby1@gmail.com"}
         updates = mod._plan_repair(order, proof)
         assert updates["broker_entry_order_id"] == "133931493"
         assert updates["local_order_id"] == "loc-1"
@@ -52,48 +54,61 @@ class TestRepairPlanner:
     def test_marks_reconciled_only_with_real_entry_price(self):
         """broker_reconciled is set ONLY when a real entry fill price exists."""
         mod = _load_script()
-        order = {"broker_order_id": "X", "local_order_id": "L"}
-        # no entry price → must NOT mark reconciled
+        order = {"broker_order_id": "X", "local_order_id": "L",
+                 "client_id": "c@x.com"}
         proof_no_price = {"entry_option_price": 0, "broker_reconciled": False,
                           "execution_mode": "live", "broker_entry_order_id": "X",
-                          "local_order_id": "L", "entry_price_source": None}
+                          "local_order_id": "L", "entry_price_source": None,
+                          "client_email": "c@x.com"}
         updates = mod._plan_repair(order, proof_no_price)
         assert "broker_reconciled" not in updates
 
-        # real entry price → may mark reconciled
         proof_priced = {"entry_option_price": 1.50, "broker_reconciled": False,
                         "execution_mode": "live", "broker_entry_order_id": "X",
-                        "local_order_id": "L", "entry_price_source": None}
+                        "local_order_id": "L", "entry_price_source": None,
+                        "client_email": "c@x.com"}
         updates = mod._plan_repair(order, proof_priced)
         assert updates.get("broker_reconciled") is True
         assert updates.get("entry_price_source") == mod.PRICE_SOURCE_TRADIER_ENTRY
 
     def test_noop_when_already_linked(self):
         mod = _load_script()
-        order = {"broker_order_id": "X", "local_order_id": "L"}
+        order = {"broker_order_id": "X", "local_order_id": "L", "client_id": "c@x.com"}
         proof = {"broker_entry_order_id": "X", "local_order_id": "L",
                  "execution_mode": "live", "entry_option_price": 2.0,
-                 "broker_reconciled": True, "entry_price_source": "TRADIER_ENTRY_FILL"}
+                 "broker_reconciled": True, "entry_price_source": "TRADIER_ENTRY_FILL",
+                 "client_email": "c@x.com"}
         updates = mod._plan_repair(order, proof)
         assert updates == {}
 
     def test_never_fabricates_price(self):
-        """The planner must never write an entry/exit PRICE — only identifiers
-        and flags backed by the real order."""
         mod = _load_script()
-        order = {"broker_order_id": "X", "local_order_id": "L"}
+        order = {"broker_order_id": "X", "local_order_id": "L", "client_id": "c@x.com"}
         proof = {"broker_entry_order_id": None, "local_order_id": None,
                  "execution_mode": "unknown", "entry_option_price": 0,
-                 "broker_reconciled": False, "entry_price_source": None}
+                 "broker_reconciled": False, "entry_price_source": None,
+                 "client_email": "c@x.com"}
         updates = mod._plan_repair(order, proof)
         assert "entry_option_price" not in updates
         assert "exit_fill_price" not in updates
         assert "realized_pnl_pct" not in updates
 
+    def test_refuses_cross_client_repair(self):
+        """HARD HOLD: a proof row belonging to a different client must never be
+        touched, even if every other field lines up."""
+        mod = _load_script()
+        order = {"broker_order_id": "X", "local_order_id": "L",
+                 "client_id": "jasoncosby1@gmail.com"}
+        proof = {"broker_entry_order_id": None, "local_order_id": None,
+                 "execution_mode": "unknown", "entry_option_price": 1.5,
+                 "broker_reconciled": False, "entry_price_source": None,
+                 "client_email": "someone.else@gmail.com"}
+        updates = mod._plan_repair(order, proof)
+        assert updates == {}, "must refuse to repair across clients"
+
 
 class TestSafetyGuards:
     def test_apply_requires_double_confirmation(self):
-        """--apply alone must not write; needs the second flag."""
         src = _SCRIPT.read_text()
         assert "--i-understand-this-writes-live" in src
         assert "REFUSING TO WRITE" in src
@@ -103,15 +118,54 @@ class TestSafetyGuards:
         assert 'writing = args.apply and getattr(args, "i_understand_this_writes_live"' in src
 
     def test_reuses_classify_official(self):
-        """Must reuse the existing eligibility authority, not reimplement it."""
         src = _SCRIPT.read_text()
         assert "from ap.operator.live_execution_journal import (" in src
         assert "classify_official" in src
 
     def test_not_wired_into_runtime(self):
-        """Script must be standalone (only runs under __main__)."""
         src = _SCRIPT.read_text()
         assert 'if __name__ == "__main__":' in src
+
+
+class TestHardHoldFixes:
+    """The four HARD HOLD review fixes."""
+
+    def test_uses_real_conn_api_not_get_connection(self):
+        """Must use ap.db.conn() (the real @contextmanager), not the
+        nonexistent ap.db.get_connection."""
+        src = _SCRIPT.read_text()
+        assert "from ap.db import conn" in src
+        assert "with conn() as c:" in src
+        # the import line must not call get_connection
+        assert "from ap.db import get_connection" not in src
+        assert "ap.db.get_connection(" not in src
+        assert "get_connection()" not in src
+
+    def test_uses_client_id_not_client_email_on_orders(self):
+        """orders has NO client_email column — the orders query must select and
+        filter by client_id (proof_trades is the table that has client_email)."""
+        src = _SCRIPT.read_text()
+        # the orders SELECT must use client_id
+        oq_start = src.find("FROM orders")
+        oq = src[src.rfind("SELECT", 0, oq_start): oq_start + 300]
+        assert "client_id" in oq
+        assert "client_email" not in oq  # orders has no such column
+        assert "AND client_id = %s" in src
+
+    def test_fallback_match_requires_client_predicate(self):
+        """The fuzzy fallback (ticker+contract+time) MUST include the client
+        predicate so trades can't be mis-linked across clients."""
+        src = _SCRIPT.read_text()
+        # locate the fallback query block
+        idx = src.find("client + ticker + contract + entry-time window")
+        assert idx != -1
+        block = src[idx: idx + 600]
+        assert "client_email = %s" in block
+        assert "ticker = %s AND contract = %s" in block
+
+    def test_cross_table_bridge_documented(self):
+        src = _SCRIPT.read_text()
+        assert "orders.client_id == proof_trades.client_email" in src
 
 
 class TestMigration:
