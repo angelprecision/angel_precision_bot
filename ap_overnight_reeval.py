@@ -129,7 +129,7 @@ def _prior_trading_session_date(ref: Optional[datetime] = None) -> date:
     return d
 
 
-# -- PR4 (prior-day-level cache fallback) -------------------------------------
+# ── PR4 (prior-day-level cache fallback) ─────────────────────────────────────
 # DEFAULT OFF. When PRIOR_LEVEL_CACHE_FALLBACK != "1", the re-arm path behaves
 # exactly as before. When enabled, prior-day H/L successfully fetched at re-arm
 # are cached stamped with the trading session they represent, and a later re-arm
@@ -146,8 +146,7 @@ def _cache_prior_levels(ticker: str, broker_session_date: date, high, low, close
     `broker_session_date` MUST be the broker-provided prior_day_date that the
     caller has already verified equals the expected prior trading session. We
     never stamp with a locally-computed date — see the call site in the re-arm
-    loop. Best-effort; never raises.
-    """
+    loop. Best-effort; never raises."""
     try:
         if high is None and low is None:
             return
@@ -164,8 +163,7 @@ def _cache_prior_levels(ticker: str, broker_session_date: date, high, low, close
 def _get_cached_prior_levels(ticker: str, expected_session: date) -> Optional[dict]:
     """Return cached prior-day levels for ticker ONLY if the stamped session
     matches expected_session (the actual prior trading session). Otherwise None
-    (stale → fail-safe). Never raises.
-    """
+    (stale → fail-safe). Never raises."""
     try:
         rec = _PRIOR_LEVEL_CACHE.get((ticker or "").upper())
         if not rec:
@@ -665,7 +663,7 @@ def run_overnight_reeval(
                 None
             )
 
-            # -- PR4: session-validated fresh + cache fallback -----------------
+            # ── PR4: session-validated fresh + cache fallback ──────────────────
             # DEFAULT OFF (PRIOR_LEVEL_CACHE_FALLBACK). When on:
             #   (a) FRESH levels are only valid for use AND cache when the broker's
             #       own returned prior_day_date equals the expected prior trading
