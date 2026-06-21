@@ -171,6 +171,19 @@ def test_15_intel_block_proceeds_to_arm_when_recheck_disabled():
     # The PROCEED branch must end with the fall-through comment
     assert "Fall through to Step 5" in region
 
+def test_15a_score_block_proceeds_to_arm_when_recheck_disabled():
+    """Morning blocked_score rechecks must stay observe-only for WATCHING rows."""
+    for phrase in (
+        "blocked_score",
+        "rejected_low_score",
+        "score_below_floor",
+        "score_below_priority_floor",
+        "context_below_floor",
+        "tier_reject",
+    ):
+        assert phrase in OV_SRC, f"missing observe-only score phrase: {phrase}"
+    assert "SCORE_BELOW_THRESHOLD" in OV_SRC
+
 def test_15d_hydrate_plan_helper_exists():
     assert "_hydrate_plan_from_signal" in OV_SRC
 
@@ -191,6 +204,14 @@ def test_15f_intel_block_does_not_increment_skipped():
     assert 'result["skipped"]' not in branch_body, (
         "Intel-block PROCEED branch must not increment skipped"
     )
+
+def test_15g_score_recheck_reason_code_is_classified_observe_only():
+    """Overnight score recheck should key off SCORE_BELOW_THRESHOLD explicitly."""
+    assert "_observe_only_reason_codes" in OV_SRC
+    idx = OV_SRC.find("_observe_only_reason_codes")
+    region = OV_SRC[idx:idx+250]
+    assert "SCORE_BELOW_THRESHOLD" in region
+    assert "_reason_code in _observe_only_reason_codes" in OV_SRC
 
 def test_15b_hard_safety_block_still_rejects():
     """Hard safety blocks (capital/kill switch/etc) must still reject."""
