@@ -1674,13 +1674,33 @@ class APContractSelectionEngine:
     def _is_ladder_eligible(self, plan) -> bool:
         """Whether this plan should use the DTE ladder.
 
-        The ladder targets short-dated Strat setups where landing in 8+ DTE is
-        wrong. We DO NOT hard-force 0DTE — the ladder prefers near expirations
-        but falls back. Eligibility is intentionally broad (any plan) so the
-        flag alone controls rollout; timeframe only shapes the bucket ORDER, not
-        whether the ladder runs. Returns True whenever the flag let us in.
+        AMENDMENT (blast-radius fix): the ladder must apply ONLY to deferred
+        contract resolution at breach time, never to general selector usage. So
+        eligibility requires an EXPLICIT plan-scoped marker set by the deferred
+        breach-time path — NOT a broad timeframe heuristic. With this gate, even
+        when DEFERRED_DTE_LADDER=1, a normal (non-deferred) select() call is
+        byte-for-byte unchanged because no marker is present.
+
+        The marker is read from plan.metadata, accepting either:
+            metadata["deferred_breach_selection"] is True   (boolean marker)
+            metadata["selection_context"] == "deferred_breach"
+        Both object-plans and dict-plans are supported. Never raises.
         """
-        return True
+        try:
+            meta = None
+            if isinstance(plan, dict):
+                meta = plan.get("metadata")
+            else:
+                meta = getattr(plan, "metadata", None)
+            if not isinstance(meta, dict):
+                return False
+            if meta.get("deferred_breach_selection") is True:
+                return True
+            if str(meta.get("selection_context") or "") == "deferred_breach":
+                return True
+        except Exception:
+            pass
+        return False
 
     def _preferred_bucket_order(self, plan) -> list[str]:
         """Playbook/timeframe-derived DTE bucket order.

@@ -965,6 +965,30 @@ class APExecutionCore:
                     float(getattr(approved_plan, "trigger_price", 0) or 0),
                     getattr(approved_plan, "side", "?"),
                 )
+                # PR1 #166 amendment: explicitly mark this as deferred breach-time
+                # selection so the DTE ladder (when DEFERRED_DTE_LADDER=1) applies
+                # ONLY here, never to normal non-deferred selector calls. The
+                # selector reads plan.metadata["deferred_breach_selection"].
+                try:
+                    _ap_meta = getattr(approved_plan, "metadata", None)
+                    if isinstance(_ap_meta, dict):
+                        _ap_meta["deferred_breach_selection"] = True
+                        _ap_meta["selection_context"] = "deferred_breach"
+                    elif isinstance(approved_plan, dict):
+                        approved_plan.setdefault("metadata", {})
+                        approved_plan["metadata"]["deferred_breach_selection"] = True
+                        approved_plan["metadata"]["selection_context"] = "deferred_breach"
+                    else:
+                        # object plan with no metadata dict — attach one
+                        try:
+                            setattr(approved_plan, "metadata", {
+                                "deferred_breach_selection": True,
+                                "selection_context": "deferred_breach",
+                            })
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
                 _sel = self.contract_selector.select(approved_plan)
                 _sel_contract = str(getattr(_sel, "contract_symbol", "") or "").strip()
                 _live_contract = str(getattr(approved_plan, "contract_symbol", "") or "").strip()

@@ -144,8 +144,6 @@ class TestFlagOffIdentity:
         mod = _load_selector({"DEFERRED_DTE_LADDER": "0"})
         sel = object.__new__(mod.APContractSelectionEngine)
         sel.dte_ladder_enabled = False
-        # If the gate is correct, _is_ladder_eligible is never consulted when off.
-        # Emulate the gate condition directly:
         plan = _make_plan()
         should_ladder = (
             sel.dte_ladder_enabled
@@ -153,6 +151,69 @@ class TestFlagOffIdentity:
             and True
         )
         assert should_ladder is False
+
+
+class TestLadderEligibilityScope:
+    """Amendment (#166 blast-radius fix): the ladder must apply ONLY to deferred
+    breach-time selection — gated by an explicit plan marker, never every call."""
+
+    @staticmethod
+    def _bare_sel(mod):
+        sel = object.__new__(mod.APContractSelectionEngine)
+        sel.dte_ladder_enabled = True
+        return sel
+
+    def test_no_marker_not_eligible_even_with_flag_on(self):
+        """Flag on but NO deferred marker → not eligible → normal path."""
+        mod = _load_selector({"DEFERRED_DTE_LADDER": "1"})
+        sel = self._bare_sel(mod)
+        plan = MagicMock()
+        plan.metadata = {}  # no marker
+        assert sel._is_ladder_eligible(plan) is False
+
+    def test_boolean_marker_eligible(self):
+        mod = _load_selector({"DEFERRED_DTE_LADDER": "1"})
+        sel = self._bare_sel(mod)
+        plan = MagicMock()
+        plan.metadata = {"deferred_breach_selection": True}
+        assert sel._is_ladder_eligible(plan) is True
+
+    def test_context_marker_eligible(self):
+        mod = _load_selector({"DEFERRED_DTE_LADDER": "1"})
+        sel = self._bare_sel(mod)
+        plan = MagicMock()
+        plan.metadata = {"selection_context": "deferred_breach"}
+        assert sel._is_ladder_eligible(plan) is True
+
+    def test_dict_plan_marker_eligible(self):
+        mod = _load_selector({"DEFERRED_DTE_LADDER": "1"})
+        sel = self._bare_sel(mod)
+        plan = {"metadata": {"deferred_breach_selection": True}}
+        assert sel._is_ladder_eligible(plan) is True
+
+    def test_no_metadata_attr_not_eligible(self):
+        """An object plan with no metadata at all → not eligible (safe)."""
+        mod = _load_selector({"DEFERRED_DTE_LADDER": "1"})
+        sel = self._bare_sel(mod)
+        class _P:  # no metadata attribute
+            ticker = "AMAT"
+        assert sel._is_ladder_eligible(_P()) is False
+
+    def test_wrong_context_value_not_eligible(self):
+        mod = _load_selector({"DEFERRED_DTE_LADDER": "1"})
+        sel = self._bare_sel(mod)
+        plan = MagicMock()
+        plan.metadata = {"selection_context": "intraday"}
+        assert sel._is_ladder_eligible(plan) is False
+
+    def test_execution_core_sets_marker_before_select(self):
+        """The deferred breach path must set the marker before calling select."""
+        ec = (Path(__file__).resolve().parents[1] / "ap_execution_core.py").read_text()
+        idx = ec.find("_sel = self.contract_selector.select(approved_plan)")
+        assert idx != -1
+        before = ec[idx - 900: idx]
+        assert '"deferred_breach_selection"' in before
+        assert '"selection_context"' in before
 
 
 def _next_weekday(base: date, offset_days: int) -> str:
