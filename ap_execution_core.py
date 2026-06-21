@@ -918,10 +918,138 @@ class APExecutionCore:
             )
             return
 
+        # ── PR3 (no-silent-deferred-trigger-exits): canonical terminal outcome ──
+        # Every triggered deferred row MUST leave exactly one explicit TERMINAL
+        # outcome so no trigger returns silently. Observability only — it records
+        # the outcome the existing code paths already produce; it changes no
+        # decision or order action.
+        #
+        # IMPORTANT (review amendment): "contract selected" is PROGRESS, not a
+        # terminal state. The real terminal outcome of a successful deferred
+        # entry is BREACH_BROKER_SUBMITTED (or BREACH_SUBMISSION_SKIPPED on a
+        # submit failure). So contract-selected is emitted on a SEPARATE,
+        # non-terminal channel that does NOT consume the exactly-once terminal
+        # slot — otherwise it would block the true terminal outcome that follows.
+        #
+        # TERMINAL outcomes (exactly one per triggered deferred row):
+        #   BREACH_RISK_CHECK_BLOCKED      _breach_risk_check returned False
+        #   BREACH_SELECTOR_RETURNED_NONE  selector.select() returned None
+        #   BREACH_SELECTOR_EXCEPTION      selector.select() raised
+        #   BREACH_SUBMISSION_SKIPPED      submit attempted, OSM returned not-ok
+        #   BREACH_BROKER_SUBMITTED        order handed to broker submit path
+        #   NO_VALID_PLAYBOOK_DTE_CONTRACT no survivor in any evaluated DTE bucket
+        #   UNTRADEABLE_FOR_ACCOUNT_SIZE   quality contract exists but exceeds budget
+        #   DATA_MISSING_OI_VOLUME         chain returned with zero OI/volume fields
+        #
+        # PROGRESS (non-terminal, never consumes the terminal slot):
+        #   BREACH_CONTRACT_SELECTED       real OCC contract chosen, proceeding
+        #
+        # _deferred_outcome["emitted"] is the sentinel the post-trigger guard checks.
+        _TERMINAL_DEFERRED_OUTCOMES = frozenset({
+            "BREACH_RISK_CHECK_BLOCKED",
+            "BREACH_SELECTOR_RETURNED_NONE",
+            "BREACH_SELECTOR_EXCEPTION",
+            "BREACH_SUBMISSION_SKIPPED",
+            "BREACH_BROKER_SUBMITTED",
+            "NO_VALID_PLAYBOOK_DTE_CONTRACT",
+            "UNTRADEABLE_FOR_ACCOUNT_SIZE",
+            "DATA_MISSING_OI_VOLUME",
+        })
+        _deferred_outcome = {"emitted": False, "outcome": None, "is_deferred": False}
+
+        def _emit_deferred_progress(
+            outcome: str,
+            *,
+            contract: str = "",
+            extra: dict | None = None,
+        ) -> None:
+            """Log a NON-TERMINAL deferred milestone (e.g. BREACH_CONTRACT_SELECTED).
+            Deferred-guarded but does NOT set the exactly-once terminal sentinel,
+            so it can never block the real terminal outcome that follows. Never
+            raises."""
+            if not _deferred_outcome.get("is_deferred"):
+                return
+            try:
+                payload = {
+                    "outcome": outcome,
+                    "local_order_id": queue_local_order_id or "",
+                    "signal_id": signal_id or "",
+                    "symbol": ticker,
+                    "execution_mode": getattr(self, "mode", "n/a"),
+                    "contract": contract or "",
+                }
+                if extra:
+                    for _k, _v in extra.items():
+                        payload[_k] = _v
+                _fields = " ".join(f"{k}={v}" for k, v in payload.items())
+                log.info("DEFERRED_TRIGGER_PROGRESS %s", _fields)
+            except Exception:
+                pass
+
+        def _emit_deferred_outcome(
+            outcome: str,
+            *,
+            reason: str = "",
+            contract: str = "",
+            broker_order_id: str = "",
+            extra: dict | None = None,
+        ) -> None:
+            """Emit EXACTLY ONE canonical TERMINAL outcome for a triggered
+            DEFERRED row. Never raises. Always includes local_order_id +
+            signal_id so the event joins back to the order row.
+
+            Three guards (per review amendments):
+              1. Deferred-only: no-op unless this trigger is a deferred entry.
+              2. Terminal-only: a non-terminal code (e.g. BREACH_CONTRACT_SELECTED)
+                 is rejected here — those go through _emit_deferred_progress so
+                 they never consume the terminal slot.
+              3. Exactly-once: the first TERMINAL emission wins; later calls are
+                 ignored so a row can never carry two terminal outcomes.
+            """
+            if not _deferred_outcome.get("is_deferred"):
+                return
+            if outcome not in _TERMINAL_DEFERRED_OUTCOMES:
+                # Defensive: a non-terminal code must never reach the terminal
+                # channel. Route it to progress logging instead of consuming the
+                # exactly-once slot.
+                _emit_deferred_progress(outcome, contract=contract, extra=extra)
+                return
+            if _deferred_outcome.get("emitted"):
+                return
+            _deferred_outcome["emitted"] = True
+            _deferred_outcome["outcome"] = outcome
+            try:
+                payload = {
+                    "outcome": outcome,
+                    "local_order_id": queue_local_order_id or "",
+                    "signal_id": signal_id or "",
+                    "symbol": ticker,
+                    "execution_mode": getattr(self, "mode", "n/a"),
+                    "reason": reason or "",
+                    "contract": contract or "",
+                    "broker_order_id": broker_order_id or "",
+                }
+                if extra:
+                    for _k, _v in extra.items():
+                        payload[_k] = _v
+                _fields = " ".join(f"{k}={v}" for k, v in payload.items())
+                if outcome == "BREACH_BROKER_SUBMITTED":
+                    log.info("DEFERRED_TRIGGER_OUTCOME %s", _fields)
+                else:
+                    log.warning("DEFERRED_TRIGGER_OUTCOME %s", _fields)
+            except Exception:
+                try:
+                    log.warning("DEFERRED_TRIGGER_OUTCOME_EMIT_FAILED outcome=%s", outcome)
+                except Exception:
+                    pass
+
         # 3) Recover the already-approved queue/OSM plan.
         approved_plan = self._recover_plan_for_revalidation(watched)
         if approved_plan is None:
             log.critical("[%s] PRODUCTION_ENTRY_BLOCK — approved plan missing after breach revalidation", ticker)
+            # NOTE: _deferred is not yet known here, and an invalid/missing plan
+            # is not a deferred-selection outcome — do not emit a deferred
+            # outcome. _terminalize_breach_failure records this terminal state.
             _terminalize_breach_failure("approved_plan_missing_after_revalidation")
             return
 
@@ -940,12 +1068,20 @@ class APExecutionCore:
             or not _contract_sym_raw
             or _contract_sym_raw.upper().startswith("DEFERRED:")  # safety: never submit placeholder
         )
+        # Enable deferred-outcome emission only for deferred triggers (amendment:
+        # guard deferred logs with _deferred). Non-deferred entries never emit a
+        # deferred terminal outcome.
+        _deferred_outcome["is_deferred"] = bool(_deferred)
         if _deferred:
             if self.contract_selector is None:
                 _reason = "contract_deferred_no_selector"
                 log.critical(
                     "[%s] DEFERRED_BREACH_CONTRACT_FAILED — %s",
                     ticker, _reason,
+                )
+                _emit_deferred_outcome(
+                    "BREACH_SELECTOR_RETURNED_NONE",
+                    reason=_reason,
                 )
                 _terminalize_deferred_breach_failure(
                     _reason,
@@ -1081,6 +1217,15 @@ class APExecutionCore:
                         "client=%s ticker=%s reason=%s",
                         _breach_client_id, ticker, _reason,
                     )
+                    _emit_deferred_outcome(
+                        (
+                            "DATA_MISSING_OI_VOLUME"
+                            if "vol0_oi0" in str(_reason)
+                            else "BREACH_SELECTOR_RETURNED_NONE"
+                        ),
+                        reason=_reason,
+                        extra={"stage": _deferred_selector_audit.get("stage") or "unknown"},
+                    )
                     _terminalize_deferred_breach_failure(
                         _reason,
                         extra_meta={
@@ -1125,6 +1270,12 @@ class APExecutionCore:
                         queue_local_order_id or "",
                         str(getattr(approved_plan, "signal_id", "") or ""),
                     )
+                    _emit_deferred_outcome(
+                        "BREACH_SELECTOR_RETURNED_NONE",
+                        reason=_reason,
+                        contract=_live_contract,
+                        extra={"stage": "deferred_copy_back"},
+                    )
                     _terminalize_deferred_breach_failure(
                         _reason,
                         extra_meta={
@@ -1145,6 +1296,14 @@ class APExecutionCore:
                         ticker, _live_contract, _reason,
                     )
                     return
+                _emit_deferred_progress(
+                    "BREACH_CONTRACT_SELECTED",
+                    contract=_live_contract,
+                    extra={
+                        "limit_price": float(getattr(approved_plan, "limit_price", 0) or 0),
+                        "qty": int(getattr(approved_plan, "contracts", 0) or 0),
+                    },
+                )
                 log.info(
                     "[%s] DEFERRED_BREACH_CONTRACT_SELECTED — contract=%s limit=%.2f qty=%s",
                     ticker,
@@ -1183,6 +1342,11 @@ class APExecutionCore:
                 log.critical(
                     "[%s] DEFERRED_BREACH_CONTRACT_FAILED — %s",
                     ticker, _reason,
+                )
+                _emit_deferred_outcome(
+                    "BREACH_SELECTOR_EXCEPTION",
+                    reason=_reason,
+                    extra={"exception_type": type(_cs_err).__name__},
                 )
                 _terminalize_deferred_breach_failure(
                     _reason,
@@ -1631,6 +1795,11 @@ class APExecutionCore:
                 approved_contract,
                 submit_limit,
             )
+            _emit_deferred_outcome(
+                "BREACH_BROKER_SUBMITTED",
+                contract=str(approved_contract or ""),
+                broker_order_id=str(broker_order_id or ""),
+            )
             return
 
         log.error(
@@ -1638,6 +1807,11 @@ class APExecutionCore:
             ticker,
             submit_res.get("local_order_id") or queue_local_order_id,
             submit_res.get("error"),
+        )
+        _emit_deferred_outcome(
+            "BREACH_SUBMISSION_SKIPPED",
+            reason=f"osm_submit_existing_entry_failed:{submit_res.get('error')}",
+            contract=str(approved_contract or ""),
         )
         funnel.inc("order_failed")
         if signal_id:
