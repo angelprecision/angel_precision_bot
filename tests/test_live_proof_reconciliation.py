@@ -145,7 +145,6 @@ class TestHardHoldFixes:
         """orders has NO client_email column — the orders query must select and
         filter by client_id (proof_trades is the table that has client_email)."""
         src = _SCRIPT.read_text()
-        # the orders SELECT must use client_id
         oq_start = src.find("FROM orders")
         oq = src[src.rfind("SELECT", 0, oq_start): oq_start + 300]
         assert "client_id" in oq
@@ -156,16 +155,146 @@ class TestHardHoldFixes:
         """The fuzzy fallback (ticker+contract+time) MUST include the client
         predicate so trades can't be mis-linked across clients."""
         src = _SCRIPT.read_text()
-        # locate the fallback query block
         idx = src.find("client + ticker + contract + entry-time window")
         assert idx != -1
-        block = src[idx: idx + 600]
+        block = src[idx: idx + 1500]
         assert "client_email = %s" in block
         assert "ticker = %s AND contract = %s" in block
 
     def test_cross_table_bridge_documented(self):
         src = _SCRIPT.read_text()
         assert "orders.client_id == proof_trades.client_email" in src
+
+
+class TestAmendmentRound2:
+    """Review round 2 items 1-7."""
+
+    def test_script_imports_cleanly(self):
+        """Item 1: an actual importlib load — proves the script's imports are
+        wired correctly (not just that grep finds the right strings)."""
+        import importlib.util
+        from unittest.mock import MagicMock
+        from unittest.mock import patch
+        import sys as _sys
+        # Stub the late-imported deps so the module loads in a sandbox without a DB.
+        stubs = {
+            "ap.db": MagicMock(),
+            "ap.operator.live_execution_journal": MagicMock(),
+        }
+        with patch.dict(_sys.modules, stubs):
+            spec = importlib.util.spec_from_file_location("pr5_imp_test", _SCRIPT)
+            mod = importlib.util.module_from_spec(spec)
+            _sys.modules["pr5_imp_test"] = mod
+            try:
+                spec.loader.exec_module(mod)
+            finally:
+                _sys.modules.pop("pr5_imp_test", None)
+        # If we got here, the script imported cleanly.
+        assert callable(mod.main)
+        assert callable(mod._plan_repair)
+        assert callable(mod._find_proof_row)
+
+    def test_ambiguous_fallback_refuses(self):
+        """Item 3: if multiple proof rows match the fuzzy window, refuse and
+        return AMBIGUOUS_MATCH — never pick one and guess."""
+        mod = _load_script()
+        # Simulate a cursor that returns two matching rows on fetchall
+        class _Cur:
+            description = [("id",), ("client_email",), ("ticker",), ("contract",)]
+            _stage = 0
+            def execute(self, *a, **k):
+                # only the fallback query reaches fetchall; earlier id-based
+                # joins use fetchone() and return None to fall through
+                self._stage += 1
+            def fetchone(self):
+                return None  # broker_id / local_id / position_id miss
+            def fetchall(self):
+                # two ambiguous matches in the time window
+                return [
+                    (1, "jasoncosby1@gmail.com", "AMAT", "AMAT260620C00640000"),
+                    (2, "jasoncosby1@gmail.com", "AMAT", "AMAT260620C00640000"),
+                ]
+        from datetime import datetime
+        order = {
+            "broker_order_id": "X", "local_order_id": "L", "position_id": None,
+            "client_id": "jasoncosby1@gmail.com", "symbol": "AMAT",
+            "contract": "AMAT260620C00640000",
+            "created_ts": datetime(2026, 6, 18, 9, 35),
+        }
+        row, key = mod._find_proof_row(_Cur(), order)
+        assert row is None
+        assert key == "AMBIGUOUS_MATCH"
+
+    def test_missing_client_id_refuses_fallback(self):
+        """Item 3: if client_id is missing, refuse the fallback explicitly
+        rather than silently skipping."""
+        mod = _load_script()
+        class _Cur:
+            description = [("id",)]
+            def execute(self, *a, **k): pass
+            def fetchone(self): return None
+            def fetchall(self): return []
+        from datetime import datetime
+        order = {
+            "broker_order_id": "X", "local_order_id": None, "position_id": None,
+            "client_id": None,  # missing
+            "symbol": "AMAT", "contract": "AMAT260620C00640000",
+            "created_ts": datetime(2026, 6, 18, 9, 35),
+        }
+        row, key = mod._find_proof_row(_Cur(), order)
+        assert row is None
+        assert key == "missing_client_id_fallback_refused"
+
+    def test_no_price_fabrication_explicit(self):
+        """Item 5: planner must never touch price/pnl/eligibility columns —
+        only identifier/flag updates."""
+        mod = _load_script()
+        order = {"broker_order_id": "X", "local_order_id": "L", "client_id": "c@x.com"}
+        # extreme case: every linkage field empty, every price field zero/null
+        proof = {
+            "broker_entry_order_id": None, "local_order_id": None,
+            "execution_mode": "unknown", "entry_option_price": 0,
+            "exit_option_price": None, "realized_pnl_pct": None,
+            "broker_reconciled": False, "entry_price_source": None,
+            "exit_price_source": None,
+            "official_live_performance_eligible": False,
+            "client_email": "c@x.com",
+        }
+        updates = mod._plan_repair(order, proof)
+        FORBIDDEN = {
+            "entry_option_price", "exit_option_price",
+            "realized_pnl_pct", "option_pnl_pct",
+            "official_live_performance_eligible",
+        }
+        for f in FORBIDDEN:
+            assert f not in updates, f"planner must never write {f}"
+
+    def test_main_loop_surfaces_safety_refusals(self):
+        """Item 3: AMBIGUOUS_MATCH and missing-client refusals must be visible
+        in the operator-facing output (not silently dropped as 'no proof row')."""
+        src = _SCRIPT.read_text()
+        assert "[AMBIGUOUS]" in src
+        assert "[NO CLIENT_ID]" in src
+        assert "Safety refusals:" in src
+
+    def test_migration_is_evidence_backed_only(self):
+        """Item 6: no broad unknown -> live on proof_trades. Every proof_trades
+        UPDATE must JOIN to orders and require evidence."""
+        sql = _MIG.read_text()
+        # there must NOT be a bare proof_trades update that lowercases
+        # everything without joining to orders. Find every proof_trades UPDATE
+        # and ensure each has a FROM orders join.
+        import re
+        proof_updates = [m.start() for m in re.finditer(r"UPDATE proof_trades", sql)]
+        assert len(proof_updates) >= 1, "expected at least one proof_trades update"
+        for start in proof_updates:
+            # the next ; ends this statement
+            end = sql.find(";", start)
+            stmt = sql[start:end]
+            assert "FROM orders" in stmt or "FROM   orders" in stmt, (
+                "every proof_trades UPDATE must join to orders for evidence — "
+                "no broad normalization allowed"
+            )
 
 
 class TestMigration:

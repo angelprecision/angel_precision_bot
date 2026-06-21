@@ -35,29 +35,32 @@ BEGIN;
 -- ORDER BY tbl, execution_mode;
 
 -- ── 1. watcher_decision_audit: lowercase the casing ─────────────────────────
+-- Safe to normalize broadly: watcher_decision_audit is observability and
+-- casing does not change semantics. This is the table where 'LIVE'/'live'
+-- inconsistency originated.
 UPDATE watcher_decision_audit
 SET    execution_mode = lower(execution_mode)
 WHERE  execution_mode IS NOT NULL
   AND  execution_mode <> lower(execution_mode);
 
--- ── 2. proof_trades: lowercase existing non-null modes ──────────────────────
-UPDATE proof_trades
-SET    execution_mode = lower(execution_mode)
-WHERE  execution_mode IS NOT NULL
-  AND  execution_mode <> lower(execution_mode);
-
--- ── 3. proof_trades: resolve 'unknown'/NULL from the joined order ───────────
--- Only sets the mode when the linked order unambiguously proves it. Uses
--- local_order_id first; this is the safe, evidence-based fill (no guessing).
+-- ── 2. proof_trades: EVIDENCE-BACKED normalization only ─────────────────────
+-- AMENDMENT (review #6): do NOT broadly lowercase proof_trades.execution_mode.
+-- Only set it when we can JOIN the row to a real order whose execution_mode is
+-- 'live' (or 'paper'). This refuses to mark any row as 'live' without an order
+-- that proves it. Rows with no joinable order (no local_order_id, or
+-- local_order_id that doesn't match an orders row) are LEFT UNTOUCHED — the
+-- repair script will handle them case-by-case with safety guards.
 UPDATE proof_trades pt
 SET    execution_mode = lower(o.execution_mode)
 FROM   orders o
 WHERE  pt.local_order_id IS NOT NULL
   AND  pt.local_order_id = o.local_order_id
   AND  o.execution_mode IS NOT NULL
+  AND  o.execution_mode IN ('live', 'paper', 'LIVE', 'PAPER')
   AND  (pt.execution_mode IS NULL
+        OR pt.execution_mode = ''
         OR pt.execution_mode = 'unknown'
-        OR pt.execution_mode = '');
+        OR pt.execution_mode <> lower(o.execution_mode));
 
 -- ── Preview 2: post-update distribution (run before COMMIT) ─────────────────
 -- SELECT 'proof_trades' AS tbl, execution_mode, COUNT(*) FROM proof_trades GROUP BY execution_mode;

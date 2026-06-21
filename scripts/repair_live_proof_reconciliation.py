@@ -118,24 +118,36 @@ def _find_proof_row(c, order):
 
     # (d) fallback: client + ticker + contract + entry-time window.
     # CLIENT PREDICATE IS MANDATORY — never match across clients.
-    if client_id and order.get("created_ts"):
-        lo = order["created_ts"] - timedelta(minutes=ENTRY_TIME_WINDOW_MIN)
-        hi = order["created_ts"] + timedelta(minutes=ENTRY_TIME_WINDOW_MIN)
-        c.execute(
-            """
-            SELECT * FROM proof_trades
-            WHERE client_email = %s
-              AND ticker = %s AND contract = %s
-              AND opened_at BETWEEN %s AND %s
-            LIMIT 1
-            """,
-            [client_id, order["symbol"], order["contract"], lo, hi],
-        )
-        row = c.fetchone()
-        if row:
-            return _row_dict(c, row), "client_ticker_contract_time"
-
-    return None, None
+    # AMENDMENTS:
+    #   - If client_id is missing, REFUSE the fallback (explicit, logged) rather
+    #     than silently skipping. We never run a fuzzy match without a client.
+    #   - If multiple proof rows match the fuzzy window, REFUSE and tag
+    #     AMBIGUOUS_MATCH — picking either could mis-link the audit trail. The
+    #     operator resolves manually. We fetch LIMIT 2 to detect this cheaply.
+    if not order.get("created_ts"):
+        return None, "no_created_ts_no_fallback"
+    if not client_id:
+        return None, "missing_client_id_fallback_refused"
+    lo = order["created_ts"] - timedelta(minutes=ENTRY_TIME_WINDOW_MIN)
+    hi = order["created_ts"] + timedelta(minutes=ENTRY_TIME_WINDOW_MIN)
+    c.execute(
+        """
+        SELECT * FROM proof_trades
+        WHERE client_email = %s
+          AND ticker = %s AND contract = %s
+          AND opened_at BETWEEN %s AND %s
+        ORDER BY opened_at ASC
+        LIMIT 2
+        """,
+        [client_id, order["symbol"], order["contract"], lo, hi],
+    )
+    rows = c.fetchall()
+    if not rows:
+        return None, None
+    if len(rows) > 1:
+        # Ambiguous — never guess on live proof reconciliation.
+        return None, "AMBIGUOUS_MATCH"
+    return _row_dict(c, rows[0]), "client_ticker_contract_time"
 
 
 def _plan_repair(order, proof):
@@ -201,12 +213,24 @@ def main():
         print("Found %d live broker fills to reconcile.\n" % len(fills))
 
         repaired = 0
+        ambiguous = 0
+        refused_no_client = 0
         for order in fills:
             proof, key = _find_proof_row(c, order)
             tag = "%s %s broker=%s client=%s" % (
                 order["symbol"], order["contract"], order["broker_order_id"], order.get("client_id"))
             if proof is None:
-                print("[NO PROOF ROW]   %s -- no proof_trades match (manual create needed)" % tag)
+                # `key` now carries a refusal reason when we didn't match for a
+                # safety reason (ambiguous / missing client) — surface it so
+                # the operator can resolve manually rather than guessing.
+                if key == "AMBIGUOUS_MATCH":
+                    print("[AMBIGUOUS]      %s -- multiple proof rows in fuzzy window; REFUSED (resolve manually)" % tag)
+                    ambiguous += 1
+                elif key == "missing_client_id_fallback_refused":
+                    print("[NO CLIENT_ID]   %s -- fallback refused (cannot run fuzzy match without client_id)" % tag)
+                    refused_no_client += 1
+                else:
+                    print("[NO PROOF ROW]   %s -- no proof_trades match (manual create needed)" % tag)
                 continue
             updates = _plan_repair(order, proof)
             verdict = _verdict_after(proof, updates)
@@ -224,6 +248,11 @@ def main():
                     list(updates.values()) + [proof["id"]],
                 )
                 repaired += 1
+
+        # Summary footer so the operator can see refusals at a glance.
+        if ambiguous or refused_no_client:
+            print("\nSafety refusals: ambiguous=%d, no_client_id=%d (resolve manually)" %
+                  (ambiguous, refused_no_client))
 
         if writing:
             print("\nApplied %d repair(s). (conn() auto-commits on success.)" % repaired)
