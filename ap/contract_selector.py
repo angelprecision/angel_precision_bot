@@ -219,6 +219,42 @@ def _safe_plan_attr(plan, attr: str, default=None):
         return default
 
 
+def _plan_sizing_ctx(plan) -> dict:
+    """Return plan.metadata['sizing_context'] (object or dict plan), or {}.
+
+    Production plans store equity / budget / risk_pct / max_position_usd under
+    metadata['sizing_context'] — NOT as top-level plan attributes. Reading the
+    top-level attrs returns None in production, which defeats the account-size
+    diagnostics. This helper reads the canonical location. Never raises."""
+    try:
+        meta = None
+        if isinstance(plan, dict):
+            meta = plan.get("metadata")
+        else:
+            meta = getattr(plan, "metadata", None)
+        if isinstance(meta, dict):
+            ctx = meta.get("sizing_context")
+            if isinstance(ctx, dict):
+                return ctx
+    except Exception:
+        pass
+    return {}
+
+
+def _sizing_val(plan, *keys, default=None):
+    """Read the first present value from sizing_context for any of `keys`,
+    falling back to a same-named top-level plan attr, then default. Never raises."""
+    ctx = _plan_sizing_ctx(plan)
+    for k in keys:
+        if k in ctx and ctx[k] is not None:
+            return ctx[k]
+    for k in keys:
+        v = _safe_plan_attr(plan, k, None)
+        if v is not None:
+            return v
+    return default
+
+
 
 
 
@@ -1114,6 +1150,12 @@ class APContractSelectionEngine:
                     "chain_size":       len(chain),
                     "rejection_counts": {_normalize_reason_code(k): v for k, v in _rejections.items()},
                     "raw_rejection_counts": _rejections,
+                    # PR2: budget context so the operator can correlate a
+                    # whole-chain quality wipeout with a too-small account
+                    # (e.g. only deep-OTM junk was affordable). Diagnostic only.
+                    "budget":                 _safe_float(budget),
+                    "max_affordable_premium": _safe_float(_safe_plan_attr(plan, "max_affordable_premium", 0)) or None,
+                    "underlying_price":       _safe_float(underlying_price) or None,
                 },
                 thresholds={
                     "max_spread_pct": _safe_float(_eff_max_spread),
@@ -1351,25 +1393,85 @@ class APContractSelectionEngine:
                     dte                  = selected.dte,
                 )
             else:
-                log.warning("[%s] BLOCKED -- budget $%.0f cannot afford %s @ $%.0f/contract",
-                            ticker, budget, selected.contract_symbol, selected.premium_per_contract)
+                # ── PR2: account-size tradeability classification ─────────────
+                # A QUALITY contract was found (it passed every liquidity / spread
+                # / OI / delta gate) but it exceeds the per-trade budget. This is
+                # not a data or liquidity failure — it is structurally untradeable
+                # for THIS account size. Classify it precisely so the operator can
+                # tell "account too small for this name right now" apart from
+                # "bad data / no liquidity / wrong DTE". Breach-time authoritative:
+                # this runs only after the chain (and, under PR1, the DTE ladder)
+                # has been fully evaluated, so the quality contract is real.
+                #
+                # NOTE: this does NOT loosen any gate and does NOT change the
+                # decision — the live reject still returns None. It only upgrades
+                # the REASON from generic NO_AFFORDABLE_CONTRACT to the specific
+                # UNTRADEABLE_FOR_ACCOUNT_SIZE, with full budget diagnostics.
+                # Read sizing diagnostics from plan.metadata['sizing_context']
+                # first (their canonical production location); fall back to
+                # top-level attrs only if absent. Reading top-level alone returned
+                # None in production, defeating the diagnostics.
+                _equity = _safe_float(_sizing_val(plan, "account_equity", "equity", default=0)) or None
+                _max_pos_pct = _safe_float(_sizing_val(plan, "risk_pct", "max_position_pct", default=0)) or None
+                _max_afford_prem = _safe_float(_sizing_val(plan, "max_affordable_premium", default=0)) or None
+                _ctx_budget = _safe_float(_sizing_val(plan, "budget", "max_position_usd", default=0)) or _safe_float(budget)
+                _underlying = _safe_float(underlying_price) or None
+                _tradeability_diag = {
+                    "equity":                 _equity,
+                    "max_position_pct":       _max_pos_pct,
+                    "max_trade_usd":          _safe_float(_max_trade_usd()),
+                    "max_affordable_premium": _max_afford_prem,
+                    "underlying_price":       _underlying,
+                    "budget":                 _ctx_budget,
+                    "selected_dte":           _safe_float(getattr(selected, "dte", None)),
+                    "near_atm_premium_estimate": _safe_float(selected.premium_per_contract),
+                    "cheapest_quality_survivor_premium": _safe_float(selected.premium_per_contract),
+                    "classification":         "UNTRADEABLE_FOR_ACCOUNT_SIZE",
+                }
+                log.warning(
+                    "[%s] UNTRADEABLE_FOR_ACCOUNT_SIZE -- quality contract %s @ "
+                    "$%.0f/contract exceeds budget $%.0f (equity=%s pct=%s) — "
+                    "not a data/liquidity failure",
+                    ticker, selected.contract_symbol,
+                    selected.premium_per_contract, _ctx_budget, _equity, _max_pos_pct,
+                )
+                # Flatten the key diagnostics INTO the explanation string so they
+                # survive downstream: ap/queue.py _derive_last_error and the
+                # deferred-breach audit persist reason_code/stage/explanation but
+                # may drop the structured tradeability_diag dict. Embedding the
+                # numbers in explanation guarantees they reach the order row.
+                _diag_summary = (
+                    f"equity=${_equity or 0:.0f} budget=${_ctx_budget or 0:.0f} "
+                    f"premium=${selected.premium_per_contract:.0f} "
+                    f"underlying=${_underlying or 0:.2f} dte={getattr(selected,'dte',None)}"
+                )
+                _explanation = (
+                    f"Quality contract {selected.contract_symbol} @ "
+                    f"${selected.premium_per_contract:.0f}/contract exceeds budget "
+                    f"${_ctx_budget or 0:.0f} — structurally untradeable for this account "
+                    f"size [{_diag_summary}]. No ticker blacklist; eligible again if a "
+                    f"cheaper quality contract appears or the account grows."
+                )
                 self._emit_selector_event(
                     plan,
-                stage="affordability_gate",
+                    stage="affordability_gate",
                     decision="REJECT",
-                    reason_code="NO_AFFORDABLE_CONTRACT",
-                    explanation=(
-                        f"Budget ${budget:.0f} cannot afford "
-                        f"{selected.contract_symbol} @ ${selected.premium_per_contract:.0f}/contract"
-                    ),
+                    reason_code="UNTRADEABLE_FOR_ACCOUNT_SIZE",
+                    explanation=_explanation,
                     contract=selected.contract_symbol,
-                    inputs={
-                        "budget":               _safe_float(budget),
-                        "premium_per_contract": _safe_float(selected.premium_per_contract),
-                        "affordable_contracts": selected.affordable_contracts,
-                    },
+                    inputs=_tradeability_diag,
                     thresholds={"min_contracts": 1},
                 )
+                # Record as the authoritative last-failure reason for the queue
+                # and the deferred-breach audit (consumed by PR3's taxonomy). Both
+                # the structured diag AND the flattened explanation are included so
+                # the numbers survive whichever downstream copies them.
+                self._last_failure = {
+                    "stage": "affordability_gate",
+                    "reason_code": "UNTRADEABLE_FOR_ACCOUNT_SIZE",
+                    "explanation": _explanation,
+                    "tradeability_diag": _tradeability_diag,
+                }
                 return None
 
         if selected is None:
