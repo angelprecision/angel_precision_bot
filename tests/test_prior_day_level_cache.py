@@ -50,9 +50,9 @@ class TestSourceGuards:
         assert "return None" in body
 
     def test_fallback_only_when_fresh_null(self):
-        """Cache fallback only triggers when fresh levels are null."""
+        """Cache fallback triggers when fresh levels are null or invalidated."""
         assert "PRIOR_LEVEL_CACHE_FALLBACK_USED" in _SRC
-        assert "fresh fetch null" in _SRC.lower() or "fresh fetch null" in _SRC
+        assert "if prior_day_high is None and prior_day_low is None:" in _SRC
 
 
 # ---------------------------------------------------------------------------
@@ -180,9 +180,9 @@ class TestBrokerDateStamping:
         src = (Path(__file__).resolve().parents[1] / "ap_overnight_reeval.py").read_text()
         assert 'prior_levels.get("prior_day_date")' in src
         assert "_broker_session == _expected_session" in src
-        assert "PRIOR_LEVEL_CACHE_REFUSED" in src
+        assert "PRIOR_LEVEL_SESSION_MISMATCH" in src
         # must stamp with the broker session, not the computed expected session
-        idx = src.find("_cache_prior_levels(\n                            ticker, _broker_session")
+        idx = src.find("_cache_prior_levels(\n                        ticker, _broker_session")
         assert idx != -1, "cache must be stamped with _broker_session (broker date)"
 
     def test_broker_provides_prior_day_date(self):
@@ -190,3 +190,55 @@ class TestBrokerDateStamping:
         stamping has real data to use."""
         broker_src = (Path(__file__).resolve().parents[1] / "ap" / "brokers" / "tradier.py").read_text()
         assert '"prior_day_date":  prior.get("date")' in broker_src
+
+
+class TestFailClosedOnSessionMismatch:
+    """Amendment: fresh broker levels with a wrong/missing session date must be
+    FAIL-CLOSED — discarded for immediate use, not just skipped for caching."""
+
+    def test_source_clears_fresh_on_mismatch(self):
+        src = (Path(__file__).resolve().parents[1] / "ap_overnight_reeval.py").read_text()
+        # the mismatch branch must clear both fresh levels
+        idx = src.find("PRIOR_LEVEL_SESSION_MISMATCH")
+        assert idx != -1, "must log PRIOR_LEVEL_SESSION_MISMATCH"
+        block = src[idx: idx + 600]
+        assert "prior_day_high = None" in block
+        assert "prior_day_low = None" in block
+
+    def test_source_only_uses_fresh_when_session_ok(self):
+        """Fresh values are used/cached only under _have_fresh and _session_ok."""
+        src = (Path(__file__).resolve().parents[1] / "ap_overnight_reeval.py").read_text()
+        assert "_session_ok = (_broker_session is not None and _broker_session == _expected_session)" in src
+        assert "if _have_fresh and _session_ok:" in src
+        assert "elif _have_fresh and not _session_ok:" in src
+
+    def test_source_clears_close_only_if_from_stale_fetch(self):
+        """prior_day_close cleared only when it came from the same stale fetch."""
+        src = (Path(__file__).resolve().parents[1] / "ap_overnight_reeval.py").read_text()
+        idx = src.find("PRIOR_LEVEL_SESSION_MISMATCH")
+        block = src[idx: idx + 700]
+        assert 'prior_levels.get("prior_day_close") is not None' in block
+
+    def test_cache_fallback_after_invalidation(self):
+        """After fresh is discarded, the single cache fallback runs and only a
+        session-matched cache can supply levels."""
+        src = (Path(__file__).resolve().parents[1] / "ap_overnight_reeval.py").read_text()
+        # the fallback gate keys off both levels being None (fresh null OR cleared)
+        assert "if prior_day_high is None and prior_day_low is None:" in src
+        assert "_get_cached_prior_levels(ticker, _expected_session)" in src
+
+    def test_mismatch_with_valid_cache_uses_cache_runtime(self):
+        """Runtime: simulate fresh-mismatch + valid cache → levels come from cache."""
+        mod = _load({"PRIOR_LEVEL_CACHE_FALLBACK": "1"})
+        # seed a correct-session cache
+        expected = date(2026, 6, 19)
+        mod._cache_prior_levels("AMAT", expected, 640.0, 620.0, 632.0)
+        # the read with the correct expected session returns it
+        rec = mod._get_cached_prior_levels("AMAT", expected)
+        assert rec is not None and rec["prior_day_high"] == 640.0
+
+    def test_mismatch_no_cache_stays_none(self):
+        """Runtime: no cache for the expected session → read returns None
+        (signal stays fail-closed)."""
+        mod = _load({"PRIOR_LEVEL_CACHE_FALLBACK": "1"})
+        assert mod._get_cached_prior_levels("NOCACHE", date(2026, 6, 19)) is None

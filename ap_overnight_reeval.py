@@ -663,16 +663,16 @@ def run_overnight_reeval(
                 None
             )
 
-            # ── PR4: session-stamped cache write + freshness-guarded fallback ──
+            # ── PR4: session-validated fresh + cache fallback ──────────────────
             # DEFAULT OFF (PRIOR_LEVEL_CACHE_FALLBACK). When on:
-            #   (a) cache the fresh levels ONLY if the broker's own returned
-            #       prior_day_date equals the expected prior trading session.
-            #       (review amendment) We stamp with the BROKER-PROVIDED date,
-            #       never a locally-computed one, and refuse to cache a bar whose
-            #       broker date is stale/lagged (holiday gap, data lag) — so a
-            #       stale bar can never later look "fresh".
-            #   (b) if the fresh fetch (and signal) produced null, fall back to a
-            #       cached level ONLY if its stamped (broker) session matches the
+            #   (a) FRESH levels are only valid for use AND cache when the broker's
+            #       own returned prior_day_date equals the expected prior trading
+            #       session. (amendment) On mismatch/missing broker date we FAIL
+            #       CLOSED on the fresh values themselves — clear them — so a
+            #       stale/lagged/holiday bar can never arm a trade, not just never
+            #       be cached.
+            #   (b) if fresh is null or was invalidated, fall back to a cached
+            #       level ONLY if its stamped (broker) session matches the
             #       expected prior trading session.
             _prior_levels_source = "fresh"
             if _PRIOR_LEVEL_CACHE_ENABLED:
@@ -686,38 +686,47 @@ def run_overnight_reeval(
                         _broker_session = None
 
                 _have_fresh = (prior_day_high is not None or prior_day_low is not None)
-                if _have_fresh:
-                    # Only cache when the BROKER's date matches the expected prior
-                    # trading session. Otherwise refuse — do not cache a possibly
-                    # stale/lagged/holiday bar.
-                    if _broker_session is not None and _broker_session == _expected_session:
-                        _cache_prior_levels(
-                            ticker, _broker_session,
-                            prior_day_high, prior_day_low,
-                            prior_levels.get("prior_day_close"),
-                        )
-                    else:
-                        log.warning(
-                            "[%s] PRIOR_LEVEL_CACHE_REFUSED signal=%s broker_date=%s "
-                            "expected_session=%s — not caching (date mismatch or "
-                            "missing broker date; avoids stale-looking-fresh)",
-                            ticker, signal_id,
-                            (_broker_session.isoformat() if _broker_session else _broker_date_raw),
-                            _expected_session.isoformat(),
-                        )
-                else:
+                _session_ok = (_broker_session is not None and _broker_session == _expected_session)
+
+                if _have_fresh and _session_ok:
+                    # Correct-session fresh data: use it AND cache it.
+                    _cache_prior_levels(
+                        ticker, _broker_session,
+                        prior_day_high, prior_day_low,
+                        prior_levels.get("prior_day_close"),
+                    )
+                elif _have_fresh and not _session_ok:
+                    # FAIL CLOSED: broker date missing or wrong session. Do NOT
+                    # use these levels directly and do NOT cache them — discard.
+                    log.warning(
+                        "[%s] PRIOR_LEVEL_SESSION_MISMATCH signal=%s broker_date=%s "
+                        "expected_session=%s — discarding fresh levels (stale/lagged)",
+                        ticker, signal_id,
+                        (_broker_session.isoformat() if _broker_session else _broker_date_raw),
+                        _expected_session.isoformat(),
+                    )
+                    prior_day_high = None
+                    prior_day_low = None
+                    # Only clear prior_day_close if it came from this same stale
+                    # broker fetch (don't discard a trusted pre-existing value).
+                    if prior_levels.get("prior_day_close") is not None:
+                        prior_levels = dict(prior_levels)
+                        prior_levels["prior_day_close"] = None
+
+                # Single cache fallback: whenever we have no usable fresh value
+                # (null fetch, or fresh just discarded on session mismatch), try
+                # the session-matched cache. If the cache is wrong-session or
+                # absent, levels stay None and the existing fail-safe
+                # (INVALIDATED_MISSING_PRIOR_LEVELS) runs below.
+                if prior_day_high is None and prior_day_low is None:
                     _cached = _get_cached_prior_levels(ticker, _expected_session)
                     if _cached:
-                        prior_day_high = (
-                            float(_cached.get("prior_day_high") or 0) or None
-                        )
-                        prior_day_low = (
-                            float(_cached.get("prior_day_low") or 0) or None
-                        )
+                        prior_day_high = float(_cached.get("prior_day_high") or 0) or None
+                        prior_day_low = float(_cached.get("prior_day_low") or 0) or None
                         _prior_levels_source = "cache"
                         log.warning(
                             "[%s] PRIOR_LEVEL_CACHE_FALLBACK_USED signal=%s session=%s "
-                            "high=%s low=%s — fresh fetch null, using broker-session-matched cache",
+                            "high=%s low=%s — using broker-session-matched cache",
                             ticker, signal_id, _expected_session.isoformat(),
                             prior_day_high, prior_day_low,
                         )
