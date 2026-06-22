@@ -84,6 +84,19 @@ def test_watcher_owned_pending_trigger_row_is_restored_to_watching():
     assert plan[0].order_local_id == "local-1"
 
 
+def test_watching_order_is_also_treated_as_watcher_owned():
+    plan = build_paper_restart_guard_rescue_plan(
+        queue_rows=[_queue_row(queue_id=22)],
+        order_rows=[_order_row(status="WATCHING")],
+        active_paper_clients={"tradefluencehq@gmail.com"},
+        now_utc=datetime.now(timezone.utc),
+        lookback_hours=48,
+    )
+    assert len(plan) == 1
+    assert plan[0].action == "WATCHING"
+    assert plan[0].order_status == "WATCHING"
+
+
 def test_active_non_watcher_order_is_skipped():
     plan = build_paper_restart_guard_rescue_plan(
         queue_rows=[_queue_row(queue_id=3)],
@@ -165,3 +178,6 @@ def test_route_uses_dry_run_and_handoff_hook():
     assert 'dry_run = bool(body.get("dry_run", True))' in src
     assert "_run_paper_restart_guard_handoff" in src
     assert '"watching_restored"' in src
+    assert "COALESCE(last_error, '') = %s" in src
+    assert "status IN ('WATCHING', 'PENDING_TRIGGER')" in src
+    assert "SKIP_RACE_STATE_CHANGED" in src

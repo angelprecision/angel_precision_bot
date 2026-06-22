@@ -2836,9 +2836,10 @@ def create_app() -> Flask:
                     results[email] = {"ok": False, "error": str(e)}
         return jsonify({"ok": True, "results": results})
 
-    def _run_paper_restart_guard_handoff(client_email: str) -> dict:
+    def _run_paper_restart_guard_handoff(client_email: str, *, signal_id: str = "", local_order_id: str = "") -> dict:
         from client_runner import _active_runners, _registry_lock
         from ap_recovery import APStartupRecovery
+        from ap.db import conn, run_with_retry
 
         with _registry_lock:
             runner = _active_runners.get(client_email)
@@ -2854,9 +2855,109 @@ def create_app() -> Flask:
             exit_engine=getattr(getattr(runner, "core", None), "exit_eng", None),
             entry_watcher=getattr(getattr(runner, "core", None), "entry_watcher", None),
         )
-        result = {"watchers_requeued": 0}
-        recovery._reseed_watchers(result)
-        return {"ok": True, "client_id": client_email, **result}
+        if recovery.entry_watcher is None:
+            return {"ok": False, "error": "entry_watcher_missing", "client_id": client_email}
+
+        def _load_order():
+            with conn() as c:
+                c.execute(
+                    """
+                    SELECT local_order_id,
+                           signal_id,
+                           plan_id,
+                           symbol,
+                           contract,
+                           direction,
+                           score,
+                           tier,
+                           trigger_price,
+                           stop_underlying,
+                           target_underlying,
+                           pattern,
+                           timeframe,
+                           status,
+                           broker_order_id,
+                           submitted_ts,
+                           filled_ts,
+                           meta
+                    FROM orders
+                    WHERE client_id = %s
+                      AND kind = 'ENTRY'
+                      AND signal_id = %s
+                      AND (%s = '' OR local_order_id = %s)
+                      AND status IN ('WATCHING', 'PENDING_TRIGGER')
+                      AND COALESCE(broker_order_id, '') = ''
+                      AND submitted_ts IS NULL
+                      AND filled_ts IS NULL
+                    ORDER BY created_ts DESC
+                    LIMIT 1
+                    """,
+                    (client_email, signal_id, local_order_id, local_order_id),
+                )
+                return c.fetchone()
+
+        row = run_with_retry(_load_order)
+        if not row:
+            return {
+                "ok": False,
+                "error": "watcher_owned_order_not_found",
+                "client_id": client_email,
+                "signal_id": signal_id,
+                "local_order_id": local_order_id,
+            }
+
+        order = dict(row)
+        resolved_local_order_id = str(order.get("local_order_id") or "").strip()
+        if not resolved_local_order_id:
+            return {
+                "ok": False,
+                "error": "missing_local_order_id",
+                "client_id": client_email,
+                "signal_id": signal_id,
+            }
+
+        try:
+            if hasattr(recovery.entry_watcher, "has_order") and recovery.entry_watcher.has_order(resolved_local_order_id):
+                return {
+                    "ok": True,
+                    "client_id": client_email,
+                    "signal_id": str(order.get("signal_id") or signal_id),
+                    "local_order_id": resolved_local_order_id,
+                    "watchers_requeued": 0,
+                    "rearmed": False,
+                    "reason": "watcher_already_owns_order",
+                }
+        except Exception as exc:
+            admin_log.warning(
+                "paper rescue watcher ownership check failed client=%s signal_id=%s local_order_id=%s err=%s",
+                client_email,
+                signal_id,
+                resolved_local_order_id,
+                exc,
+            )
+
+        plan = recovery._build_recovery_plan_from_order(order)
+        try:
+            armed = bool(recovery.entry_watcher.watch(plan, resolved_local_order_id))
+        except Exception as exc:
+            return {
+                "ok": False,
+                "error": str(exc),
+                "client_id": client_email,
+                "signal_id": str(order.get("signal_id") or signal_id),
+                "local_order_id": resolved_local_order_id,
+                "stage": "watch",
+            }
+
+        return {
+            "ok": armed,
+            "client_id": client_email,
+            "signal_id": str(order.get("signal_id") or signal_id),
+            "local_order_id": resolved_local_order_id,
+            "watchers_requeued": 1 if armed else 0,
+            "rearmed": armed,
+            "reason": None if armed else getattr(recovery.entry_watcher, "_last_reject_reason", None),
+        }
 
     @app.post("/admin/operator/manual-rescue-restart-guard")
     @_require_admin
@@ -2994,52 +3095,178 @@ def create_app() -> Flask:
                 })
 
             def _apply():
+                applied_rows = []
+                race_skipped_rows = []
                 with conn() as c:
                     for decision in plan:
                         if decision.action not in {"NEW", "WATCHING"}:
                             continue
-                        c.execute(
-                            """
-                            UPDATE trade_queue
-                            SET
-                                status = %s,
-                                started_ts = NULL,
-                                finished_ts = NULL,
-                                last_error = 'manual_rescue_current_session',
-                                result_json = COALESCE(result_json, '{}'::jsonb) || jsonb_build_object(
-                                    'manual_rescue', true,
-                                    'manual_rescue_actor', 'operator_dashboard',
-                                    'manual_rescue_ts', NOW()::text,
-                                    'manual_rescue_reason', %s,
-                                    'prior_status', %s,
-                                    'prior_last_error', %s
-                                )
-                            WHERE id = %s
-                            """,
-                            (
-                                decision.action,
-                                decision.reason,
-                                decision.prior_status,
-                                decision.prior_last_error,
-                                decision.queue_id,
-                            ),
-                        )
-                    return True
+                        if decision.action == "NEW":
+                            c.execute(
+                                """
+                                UPDATE trade_queue
+                                SET
+                                    status = 'NEW',
+                                    started_ts = NULL,
+                                    finished_ts = NULL,
+                                    last_error = 'manual_rescue_current_session',
+                                    result_json = COALESCE(result_json, '{}'::jsonb) || jsonb_build_object(
+                                        'manual_rescue', true,
+                                        'manual_rescue_actor', 'operator_dashboard',
+                                        'manual_rescue_ts', NOW()::text,
+                                        'manual_rescue_reason', %s,
+                                        'prior_status', %s,
+                                        'prior_last_error', %s
+                                    )
+                                WHERE id = %s
+                                  AND client_id = %s
+                                  AND signal_id = %s
+                                  AND status = %s
+                                  AND COALESCE(last_error, '') = %s
+                                  AND NOT EXISTS (
+                                        SELECT 1
+                                        FROM orders o
+                                        WHERE o.client_id = trade_queue.client_id
+                                          AND o.signal_id = trade_queue.signal_id
+                                          AND o.kind = 'ENTRY'
+                                          AND o.status IN ('CREATED', 'WATCHING', 'PENDING_TRIGGER', 'SUBMITTED', 'ACKNOWLEDGED', 'PARTIAL_FILL')
+                                  )
+                                """,
+                                (
+                                    decision.reason,
+                                    decision.prior_status,
+                                    decision.prior_last_error,
+                                    decision.queue_id,
+                                    decision.client_id,
+                                    decision.signal_id,
+                                    decision.prior_status,
+                                    decision.prior_last_error,
+                                ),
+                            )
+                        else:
+                            c.execute(
+                                """
+                                UPDATE trade_queue
+                                SET
+                                    status = 'WATCHING',
+                                    started_ts = NULL,
+                                    finished_ts = NULL,
+                                    last_error = 'manual_rescue_current_session',
+                                    result_json = COALESCE(result_json, '{}'::jsonb) || jsonb_build_object(
+                                        'manual_rescue', true,
+                                        'manual_rescue_actor', 'operator_dashboard',
+                                        'manual_rescue_ts', NOW()::text,
+                                        'manual_rescue_reason', %s,
+                                        'prior_status', %s,
+                                        'prior_last_error', %s
+                                    )
+                                WHERE id = %s
+                                  AND client_id = %s
+                                  AND signal_id = %s
+                                  AND status = %s
+                                  AND COALESCE(last_error, '') = %s
+                                  AND EXISTS (
+                                        SELECT 1
+                                        FROM orders o
+                                        WHERE o.client_id = trade_queue.client_id
+                                          AND o.signal_id = trade_queue.signal_id
+                                          AND o.kind = 'ENTRY'
+                                          AND o.status IN ('WATCHING', 'PENDING_TRIGGER')
+                                          AND (%s = '' OR o.local_order_id = %s)
+                                          AND COALESCE(o.broker_order_id, '') = ''
+                                          AND o.submitted_ts IS NULL
+                                          AND o.filled_ts IS NULL
+                                  )
+                                """,
+                                (
+                                    decision.reason,
+                                    decision.prior_status,
+                                    decision.prior_last_error,
+                                    decision.queue_id,
+                                    decision.client_id,
+                                    decision.signal_id,
+                                    decision.prior_status,
+                                    decision.prior_last_error,
+                                    decision.order_local_id,
+                                    decision.order_local_id,
+                                ),
+                            )
 
-            run_with_retry(_apply)
+                        if int(getattr(c, "rowcount", 0) or 0) > 0:
+                            applied_rows.append(decision)
+                        else:
+                            race_skipped_rows.append(decision)
+                return {
+                    "applied_rows": applied_rows,
+                    "race_skipped_rows": race_skipped_rows,
+                    "applied_count": len(applied_rows),
+                    "race_skipped_count": len(race_skipped_rows),
+                }
+
+            apply_result = run_with_retry(_apply) or {}
+            applied_rows = list(apply_result.get("applied_rows") or [])
+            race_skipped_rows = list(apply_result.get("race_skipped_rows") or [])
 
             handoff_results = {}
-            for client_email in sorted({d.client_id for d in plan if d.action == "WATCHING"}):
+            for decision in applied_rows:
+                if decision.action != "WATCHING":
+                    continue
                 try:
-                    handoff_results[client_email] = _run_paper_restart_guard_handoff(client_email)
+                    key = f"{decision.client_id}:{decision.signal_id}:{decision.order_local_id or 'none'}"
+                    handoff_results[key] = _run_paper_restart_guard_handoff(
+                        decision.client_id,
+                        signal_id=decision.signal_id,
+                        local_order_id=decision.order_local_id,
+                    )
                 except Exception as handoff_exc:
-                    handoff_results[client_email] = {"ok": False, "error": str(handoff_exc), "client_id": client_email}
+                    key = f"{decision.client_id}:{decision.signal_id}:{decision.order_local_id or 'none'}"
+                    handoff_results[key] = {
+                        "ok": False,
+                        "error": str(handoff_exc),
+                        "client_id": decision.client_id,
+                        "signal_id": decision.signal_id,
+                        "local_order_id": decision.order_local_id,
+                    }
+
+            rows_payload = [
+                {
+                    "queue_id": d.queue_id,
+                    "client_id": d.client_id,
+                    "signal_id": d.signal_id,
+                    "ticker": d.ticker,
+                    "side": d.side,
+                    "action": d.action,
+                    "reason": d.reason,
+                    "prior_status": d.prior_status,
+                    "prior_last_error": d.prior_last_error,
+                    "order_local_id": d.order_local_id,
+                    "order_status": d.order_status,
+                }
+                for d in applied_rows
+            ] + [
+                {
+                    "queue_id": d.queue_id,
+                    "client_id": d.client_id,
+                    "signal_id": d.signal_id,
+                    "ticker": d.ticker,
+                    "side": d.side,
+                    "action": "SKIP_RACE_STATE_CHANGED",
+                    "reason": "cas_predicate_failed_or_downstream_state_changed",
+                    "prior_status": d.prior_status,
+                    "prior_last_error": d.prior_last_error,
+                    "order_local_id": d.order_local_id,
+                    "order_status": d.order_status,
+                }
+                for d in race_skipped_rows
+            ]
 
             admin_log.warning(
-                "MANUAL_RESCUE_RESTART_GUARD paper_rows=%s new=%s watching=%s skipped=%s lookback_hours=%s dry_run=%s ip=%s",
+                "MANUAL_RESCUE_RESTART_GUARD paper_rows=%s applied=%s race_skipped=%s new=%s watching=%s skipped=%s lookback_hours=%s dry_run=%s ip=%s",
                 len(plan),
-                sum(1 for d in plan if d.action == "NEW"),
-                sum(1 for d in plan if d.action == "WATCHING"),
+                int(apply_result.get("applied_count") or 0),
+                int(apply_result.get("race_skipped_count") or 0),
+                sum(1 for d in applied_rows if d.action == "NEW"),
+                sum(1 for d in applied_rows if d.action == "WATCHING"),
                 sum(1 for d in plan if d.action == "SKIP"),
                 lookback_hours,
                 dry_run,
@@ -3048,9 +3275,11 @@ def create_app() -> Flask:
             return jsonify({
                 "ok": True,
                 "dry_run": False,
-                "rescued": sum(1 for d in plan if d.action == "NEW"),
-                "watching_restored": sum(1 for d in plan if d.action == "WATCHING"),
+                "rescued": sum(1 for d in applied_rows if d.action == "NEW"),
+                "watching_restored": sum(1 for d in applied_rows if d.action == "WATCHING"),
                 "skipped": sum(1 for d in plan if d.action == "SKIP"),
+                "applied_count": int(apply_result.get("applied_count") or 0),
+                "race_skipped_count": int(apply_result.get("race_skipped_count") or 0),
                 "lookback_hours": lookback_hours,
                 "rows": rows_payload,
                 "handoff_results": handoff_results,

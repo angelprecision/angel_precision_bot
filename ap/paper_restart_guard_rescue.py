@@ -7,6 +7,7 @@ from typing import Iterable
 
 _ACTIVE_ENTRY_STATUSES = frozenset({
     "CREATED",
+    "WATCHING",
     "PENDING_TRIGGER",
     "SUBMITTED",
     "ACKNOWLEDGED",
@@ -14,6 +15,7 @@ _ACTIVE_ENTRY_STATUSES = frozenset({
 })
 
 _WATCHER_OWNED_ENTRY_STATUSES = frozenset({
+    "WATCHING",
     "PENDING_TRIGGER",
 })
 
