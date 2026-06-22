@@ -1944,20 +1944,83 @@ class APMasterControl:
                     meta=_block_meta,
                 )
         else:
-            # PAPER non-bootstrap: keep the existing static-estimate
-            # pre-check so selector work is skipped when the projection
-            # clearly exceeds the cap. Final cost is still revalidated
-            # post-selection (revalidate_exposure runs in PAPER too).
+            # PAPER non-bootstrap: two-gate static-estimate pre-check (PR #173).
+            # Replaces the old single-gate that incorrectly compared total
+            # projected exposure to per_trade_budget (max_capital alias).
+            #
+            # Gate 1 — per-trade estimate gate:
+            #   Is this single trade's estimated cost above the per-trade budget?
+            #   Catches oversized individual trades before the selector runs.
+            #
+            # Gate 2 — total-exposure gate:
+            #   Would adding this trade push the total portfolio above total_capital_cap?
+            #   current_total_exposure = snap["capital_deployed"] + pending_capital_real
+            #   (already computed above; pending exposure from _pending_capital_from_snapshot_or_db
+            #   is preserved — no bypass via open_positions() loop).
+            #
+            # Final real-cost revalidation still enforced in revalidate_exposure().
             estimated_contracts_pre = max(
                 MIN_CONTRACTS_PER_POSITION,
                 self._base_contracts(effective_score, _estimate_premium(ticker)),
             )
             estimated_new_cost_pre = estimated_contracts_pre * 100 * _estimate_premium(ticker)
-            projected_total = snap["capital_deployed"] + pending_capital_real + estimated_new_cost_pre
-            if projected_total > max_capital:
+
+            # Gate 1: single-trade estimate vs per-trade budget.
+            if estimated_new_cost_pre > per_trade_budget:
                 return self._block(
-                    signal_id, ticker, client_id, "blocked_risk",
-                    f"capital_limit (projected ${projected_total:.0f} > ${max_capital:.0f})",
+                    signal_id,
+                    ticker,
+                    client_id,
+                    "blocked_risk",
+                    f"capital_limit_per_trade_estimate "
+                    f"estimated=${estimated_new_cost_pre:.0f} "
+                    f"per_trade_budget=${per_trade_budget:.0f}",
+                    reason_code="CAPITAL_LIMIT_PER_TRADE_ESTIMATE",
+                    meta={
+                        "client_id":              client_id,
+                        "execution_mode":         str(current_mode or "").lower(),
+                        "account_equity":         float(account_equity),
+                        "max_position_pct":       float(self.max_position_pct),
+                        "max_total_capital_pct":  float(self.max_total_capital_pct),
+                        "per_trade_budget":       float(per_trade_budget),
+                        "total_capital_cap":      float(total_capital_cap),
+                        "capital_deployed":       float(snap.get("capital_deployed", 0)),
+                        "pending_capital":        float(pending_capital_real),
+                        "current_total_exposure": float(current_total_exposure),
+                        "estimated_new_cost_pre": float(estimated_new_cost_pre),
+                        "estimated_contracts_pre":int(estimated_contracts_pre),
+                        "legacy_max_capital_pct": float(self.max_capital_pct),
+                    },
+                )
+
+            # Gate 2: projected total portfolio exposure vs total cap.
+            projected_total = current_total_exposure + estimated_new_cost_pre
+            if projected_total > total_capital_cap:
+                return self._block(
+                    signal_id,
+                    ticker,
+                    client_id,
+                    "blocked_risk",
+                    f"capital_limit_total_exposure_cap_reached "
+                    f"projected=${projected_total:.0f} "
+                    f"total_cap=${total_capital_cap:.0f}",
+                    reason_code="CAPITAL_LIMIT_TOTAL_EXPOSURE_CAP_REACHED",
+                    meta={
+                        "client_id":              client_id,
+                        "execution_mode":         str(current_mode or "").lower(),
+                        "account_equity":         float(account_equity),
+                        "max_position_pct":       float(self.max_position_pct),
+                        "max_total_capital_pct":  float(self.max_total_capital_pct),
+                        "per_trade_budget":       float(per_trade_budget),
+                        "total_capital_cap":      float(total_capital_cap),
+                        "capital_deployed":       float(snap.get("capital_deployed", 0)),
+                        "pending_capital":        float(pending_capital_real),
+                        "current_total_exposure": float(current_total_exposure),
+                        "estimated_new_cost_pre": float(estimated_new_cost_pre),
+                        "projected_total":        float(projected_total),
+                        "remaining_total_cap":    float(remaining_total_cap),
+                        "legacy_max_capital_pct": float(self.max_capital_pct),
+                    },
                 )
 
         sector = self.SECTOR_MAP.get(ticker.upper(), "other")
