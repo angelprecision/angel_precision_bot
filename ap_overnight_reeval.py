@@ -845,16 +845,27 @@ def run_overnight_reeval(
                 decision = master_control.evaluate(reeval_signal, client_id=client_id)
                 if not decision.ok:
                     # Classify the rejection: intel/second-score vs hard safety.
-                    # When OVERNIGHT_REEVAL_SCORE_RECHECK_ENABLED=false, intel/
-                    # second-score blocks are treated as skip→RETRY_LATER.
+                    # When OVERNIGHT_REEVAL_SCORE_RECHECK_ENABLED=false, morning
+                    # score/intel rechecks on already-WATCHING signals are
+                    # observe-only and must proceed to watcher arm.
                     # Hard safety blocks ALWAYS reject regardless of the flag.
                     _r = (decision.reason or "").lower()
+                    _reason_code = str(getattr(decision, "reason_code", "") or "").upper()
                     _intel_phrases = (
                         "intel_skip", "blocked_intel", "intel_score",
                         "insufficient edge", "gate_g", "gate g",
                         "scanner_approved_intel_observe_only",
                         "data_unavailable_scanner_fallback",
+                        "blocked_score",
+                        "rejected_low_score",
+                        "score_below_floor",
+                        "score_below_priority_floor",
+                        "context_below_floor",
+                        "tier_reject",
                     )
+                    _observe_only_reason_codes = {
+                        "SCORE_BELOW_THRESHOLD",
+                    }
                     _hard_safety_phrases = (
                         "capital", "buying_power", "buying power",
                         "kill_switch", "kill switch",
@@ -867,7 +878,10 @@ def run_overnight_reeval(
                         "contract quality failed", "contract_quality",
                         "scanner signal is neutral", "neutral direction",
                     )
-                    _is_intel_block        = any(p in _r for p in _intel_phrases)
+                    _is_intel_block        = (
+                        any(p in _r for p in _intel_phrases)
+                        or _reason_code in _observe_only_reason_codes
+                    )
                     _is_hard_safety_block  = any(p in _r for p in _hard_safety_phrases)
 
                     if (_is_intel_block
