@@ -1,3 +1,4 @@
+
 # app.py - ANGEL PRECISION BOT (PRODUCTION VERSION - STABLE)
 # ── In-process caches (reduce DB round-trips on hot /signal path) ────────
 # Avoids blocking DB calls when scanner fires 20+ signals in a burst.
@@ -810,7 +811,7 @@ def create_app() -> Flask:
                 all_ok = False
             if morning_handoff.get("paper", {}).get("missing_after_929_et"):
                 all_ok = False
-            if preopen_readiness.get("status") != "OK":
+            if preopen_readiness.get("enforcement_active") and preopen_readiness.get("status") != "OK":
                 all_ok = False
             resp = {
                 "ok": all_ok,
