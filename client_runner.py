@@ -1169,6 +1169,7 @@ class ClientRunner(threading.Thread):
     def _run_startup_morning_handoff(self) -> None:
         try:
             from ap.morning_handoff import run_morning_handoff_audit
+            from ap.preopen_readiness import run_preopen_autonomous_readiness
 
             result = run_morning_handoff_audit(
                 client_id=self.email,
@@ -1178,6 +1179,21 @@ class ClientRunner(threading.Thread):
                 runner=self,
             )
             logger.info("[%s] Startup morning handoff result: %s", self.email, result)
+            readiness = run_preopen_autonomous_readiness(
+                self.email,
+                self.mode,
+                dry_run=False,
+                stage="startup",
+                runner=self,
+            )
+            logger.info("[%s] Startup preopen readiness result: %s", self.email, readiness)
+            if str(self.mode).lower() == "live":
+                if readiness.get("status") == "BLOCKED":
+                    self._enter_degraded_mode(
+                        "preopen_readiness_blocked:" + ",".join(readiness.get("errors") or ["unknown"])
+                    )
+                elif readiness.get("ok"):
+                    self._clear_degraded_reason_key("preopen_readiness_blocked")
         except Exception as exc:
             logger.error("[%s] Startup morning handoff failed (non-fatal): %s", self.email, exc, exc_info=True)
 
@@ -1187,6 +1203,7 @@ class ClientRunner(threading.Thread):
             return
         try:
             from ap.morning_handoff import run_morning_handoff_audit
+            from ap.preopen_readiness import run_preopen_autonomous_readiness
 
             result = run_morning_handoff_audit(
                 client_id=self.email,
@@ -1196,6 +1213,21 @@ class ClientRunner(threading.Thread):
                 runner=self,
             )
             logger.info("[%s] Post-overnight morning handoff result: %s", self.email, result)
+            readiness = run_preopen_autonomous_readiness(
+                self.email,
+                self.mode,
+                dry_run=False,
+                stage="post_overnight_reeval",
+                runner=self,
+            )
+            logger.info("[%s] Post-overnight preopen readiness result: %s", self.email, readiness)
+            if str(self.mode).lower() == "live":
+                if readiness.get("status") == "BLOCKED":
+                    self._enter_degraded_mode(
+                        "preopen_readiness_blocked:" + ",".join(readiness.get("errors") or ["unknown"])
+                    )
+                elif readiness.get("ok"):
+                    self._clear_degraded_reason_key("preopen_readiness_blocked")
         except Exception as exc:
             logger.error("[%s] Post-overnight morning handoff failed (non-fatal): %s", self.email, exc, exc_info=True)
 

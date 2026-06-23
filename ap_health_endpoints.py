@@ -29,15 +29,14 @@ log = logging.getLogger("ap.health_endpoints")
 health_bp = Blueprint("ap_health", __name__, url_prefix="/health")
 
 
-@health_bp.route("/status")
-def status():
-    """Full organ health snapshot + kill switch state."""
+def _health_payload():
     from ap_health_registry import HEALTH
     from ap_kill_switch import KILL
     from ap_quote_authority import QUOTES
     from ap.morning_handoff import get_morning_handoff_health
+    from ap.preopen_readiness import get_preopen_readiness_health
 
-    return jsonify({
+    return {
         "system_healthy":     HEALTH.is_system_healthy(),
         "killed":             KILL.is_killed(),
         "kill_reason":        KILL.reason,
@@ -45,7 +44,20 @@ def status():
         "unhealthy_critical": HEALTH.unhealthy_critical_organs(),
         "organs":             HEALTH.snapshot(),
         "morning_handoff":    get_morning_handoff_health(),
-    })
+        "preopen_readiness":  get_preopen_readiness_health(),
+    }
+
+
+@health_bp.route("/status")
+def status():
+    """Full organ health snapshot + kill switch state."""
+    return jsonify(_health_payload())
+
+
+@health_bp.route("/organs")
+def organs():
+    """Operator-friendly organ + autonomous readiness snapshot."""
+    return jsonify(_health_payload())
 
 
 @health_bp.route("/compact")

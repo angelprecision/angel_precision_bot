@@ -1,0 +1,206 @@
+from __future__ import annotations
+
+from pathlib import Path
+from types import SimpleNamespace
+
+import ap.preopen_readiness as pr
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+class _Evt:
+    def __init__(self, value: bool = True):
+        self._value = value
+
+    def is_set(self) -> bool:
+        return self._value
+
+
+class _Thread:
+    def __init__(self, alive: bool = True):
+        self._alive = alive
+
+    def is_alive(self) -> bool:
+        return self._alive
+
+
+class _Watcher:
+    def __init__(self, owned: set[str] | None = None):
+        self._owned = owned or set()
+
+    def has_order(self, local_order_id: str) -> bool:
+        return local_order_id in self._owned
+
+
+class _Runner:
+    def __init__(self, *, mode: str = "live", watcher=None):
+        self.mode = mode
+        self.initialized = _Evt(True)
+        self.worker_thread = _Thread(True)
+        self.order_state_machine = object()
+        self.position_manager = object()
+        self.master_control = SimpleNamespace(mode=mode)
+        self.core = SimpleNamespace(entry_watcher=watcher or _Watcher(), broker=object(), exit_eng=object())
+        self.contract_selector = SimpleNamespace(
+            data_broker=SimpleNamespace(
+                cfg=SimpleNamespace(base_url="https://api.tradier.com" if mode == "live" else "https://sandbox.tradier.com")
+            )
+        )
+        self.base_url = "https://api.tradier.com" if mode == "live" else "https://sandbox.tradier.com"
+        self.account_id = "acct-1"
+        self._last_overnight_reeval_date = "2026-06-22"
+
+    def is_alive(self) -> bool:
+        return True
+
+    def _get_token(self):
+        return "tok"
+
+
+def _stub_common(monkeypatch, *, handoff=True, client_state=None):
+    writes = []
+    monkeypatch.setattr(pr, "_upsert_preopen_row", lambda **kwargs: writes.append(kwargs))
+    monkeypatch.setattr(pr, "_morning_handoff_success_exists", lambda *args, **kwargs: handoff)
+    monkeypatch.setattr(
+        pr,
+        "_query_client_state",
+        lambda client_id: client_state or {
+            "stale_processing_ids": [],
+            "watching_orphans": [],
+            "pending_trigger_rows": [],
+            "watching_count": 0,
+        },
+    )
+    monkeypatch.setattr(pr, "_trading_date", lambda now=None: "2026-06-22")
+    monkeypatch.setattr(pr, "_pod_mode", lambda: "live")
+    monkeypatch.setattr(pr, "_after_929_et", lambda now=None: True)
+    return writes
+
+
+def test_all_green_readiness(monkeypatch):
+    writes = _stub_common(monkeypatch)
+    runner = _Runner(mode="live")
+
+    result = pr.run_preopen_autonomous_readiness(
+        "jason@example.com",
+        "live",
+        dry_run=True,
+        runner=runner,
+    )
+    assert result["ok"] is True
+    assert result["status"] == "OK"
+    assert writes[-1]["mark_success"] is True
+
+
+def test_missing_live_handoff_after_929_is_blocked(monkeypatch):
+    _stub_common(monkeypatch, handoff=False)
+    runner = _Runner(mode="live")
+
+    result = pr.run_preopen_autonomous_readiness("jason@example.com", "live", dry_run=True, runner=runner)
+    assert result["status"] == "BLOCKED"
+    assert "morning_handoff_missing" in result["errors"]
+
+
+def test_missing_entry_watcher_is_blocked_for_live(monkeypatch):
+    _stub_common(monkeypatch)
+    runner = _Runner(mode="live")
+    runner.core.entry_watcher = None
+
+    result = pr.run_preopen_autonomous_readiness("jason@example.com", "live", dry_run=True, runner=runner)
+    assert result["status"] == "BLOCKED"
+    assert "entry_watcher_missing" in result["errors"]
+
+
+def test_stale_processing_rows_are_reported(monkeypatch):
+    _stub_common(monkeypatch, client_state={
+        "stale_processing_ids": [11, 12],
+        "watching_orphans": [],
+        "pending_trigger_rows": [],
+        "watching_count": 0,
+    })
+    runner = _Runner(mode="paper")
+    monkeypatch.setattr(pr, "_pod_mode", lambda: "paper")
+
+    result = pr.run_preopen_autonomous_readiness("paper@example.com", "paper", dry_run=True, runner=runner)
+    assert result["status"] == "DEGRADED"
+    assert "stale_processing_rows" in result["errors"]
+    assert result["details"]["client_state"]["stale_processing_ids"] == [11, 12]
+
+
+def test_watching_row_with_no_orders_recommends_new_rescue(monkeypatch):
+    _stub_common(monkeypatch, client_state={
+        "stale_processing_ids": [],
+        "watching_orphans": [{"id": 41, "signal_id": "sig-41"}],
+        "pending_trigger_rows": [],
+        "watching_count": 1,
+    })
+    runner = _Runner(mode="paper")
+    monkeypatch.setattr(pr, "_pod_mode", lambda: "paper")
+
+    result = pr.run_preopen_autonomous_readiness("paper@example.com", "paper", dry_run=True, runner=runner)
+    assert "watching_rows_missing_orders_recommend_new_rescue" in result["errors"]
+    assert result["details"]["client_state"]["watching_orphans"][0]["id"] == 41
+
+
+def test_pending_trigger_without_watcher_is_degraded(monkeypatch):
+    _stub_common(monkeypatch, client_state={
+        "stale_processing_ids": [],
+        "watching_orphans": [],
+        "pending_trigger_rows": [{"local_order_id": "L-1", "signal_id": "sig-1"}],
+        "watching_count": 0,
+    })
+    runner = _Runner(mode="paper", watcher=_Watcher(set()))
+    monkeypatch.setattr(pr, "_pod_mode", lambda: "paper")
+
+    result = pr.run_preopen_autonomous_readiness("paper@example.com", "paper", dry_run=True, runner=runner)
+    assert "pending_trigger_without_watcher_ownership" in result["errors"]
+    assert result["details"]["pending_trigger_without_watcher"][0]["local_order_id"] == "L-1"
+
+
+def test_mode_mismatch_is_critical(monkeypatch):
+    _stub_common(monkeypatch)
+    runner = _Runner(mode="paper")
+    monkeypatch.setattr(pr, "_pod_mode", lambda: "live")
+
+    result = pr.run_preopen_autonomous_readiness("jason@example.com", "live", dry_run=True, runner=runner)
+    assert result["status"] == "BLOCKED"
+    assert "pod_mode_client_mode_mismatch" in result["errors"]
+
+
+def test_health_summary_exposes_preopen_status(monkeypatch):
+    monkeypatch.setattr(pr, "_trading_date", lambda now=None: "2026-06-22")
+    monkeypatch.setattr(pr, "_expected_clients_by_mode", lambda: {"paper": ["p@example.com"], "live": ["l@example.com"]})
+    monkeypatch.setattr(
+        pr,
+        "_latest_preopen_rows",
+        lambda trading_date: [
+            {"client_id": "p@example.com", "execution_mode": "paper", "stage": "startup", "status": "degraded", "last_run_at": "1", "last_success_at": None, "last_error": "stale_processing_rows", "details": {"errors": ["stale_processing_rows"]}},
+            {"client_id": "l@example.com", "execution_mode": "live", "stage": "manual", "status": "blocked", "last_run_at": "2", "last_success_at": None, "last_error": "morning_handoff_missing", "details": {"errors": ["morning_handoff_missing"]}},
+        ],
+    )
+    health = pr.get_preopen_readiness_health()
+    assert health["status"] == "BLOCKED"
+    assert health["live"]["clients"]["l@example.com"]["status"] == "blocked"
+
+
+def test_readiness_module_has_no_submit_cancel_or_state_mutation():
+    src = (REPO_ROOT / "ap" / "preopen_readiness.py").read_text()
+    assert "place_order(" not in src
+    assert "cancel_order(" not in src
+    assert "create_entry_order(" not in src
+    assert ".transition(" not in src
+    assert "UPDATE orders" not in src
+    assert "UPDATE positions" not in src
+
+
+def test_source_wires_runner_endpoint_and_health():
+    app_src = (REPO_ROOT / "app.py").read_text()
+    runner_src = (REPO_ROOT / "client_runner.py").read_text()
+    health_src = (REPO_ROOT / "ap_health_endpoints.py").read_text()
+    assert '/admin/preopen_readiness' in app_src
+    assert 'run_preopen_autonomous_readiness(' in app_src
+    assert 'Startup preopen readiness result' in runner_src
+    assert 'Post-overnight preopen readiness result' in runner_src
+    assert '@health_bp.route("/organs")' in health_src
+    assert '"preopen_readiness":  get_preopen_readiness_health()' in health_src

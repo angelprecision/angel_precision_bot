@@ -792,6 +792,7 @@ def create_app() -> Flask:
         try:
             st = load_state(client_id=DEFAULT_CLIENT_ID)
             from ap.morning_handoff import get_morning_handoff_health
+            from ap.preopen_readiness import get_preopen_readiness_health
             heartbeat_ok = False
             heartbeat_age = None
             if st.get("last_heartbeat_ts"):
@@ -804,9 +805,12 @@ def create_app() -> Flask:
 
             all_ok = heartbeat_ok or heartbeat_age is None
             morning_handoff = get_morning_handoff_health()
+            preopen_readiness = get_preopen_readiness_health()
             if morning_handoff.get("live", {}).get("missing_after_929_et"):
                 all_ok = False
             if morning_handoff.get("paper", {}).get("missing_after_929_et"):
+                all_ok = False
+            if preopen_readiness.get("status") != "OK":
                 all_ok = False
             resp = {
                 "ok": all_ok,
@@ -815,6 +819,7 @@ def create_app() -> Flask:
                 "kill_switch": st.get("kill_switch", False),
                 "heartbeat_age_seconds": heartbeat_age,
                 "morning_handoff": morning_handoff,
+                "preopen_readiness": preopen_readiness,
             }
 
             if APP_ENV != "prod":
@@ -2949,6 +2954,7 @@ def create_app() -> Flask:
         try:
             from client_runner import _active_runners, _registry_lock
             from ap.morning_handoff import run_morning_handoff_audit
+            from ap.preopen_readiness import run_preopen_autonomous_readiness
 
             body = request.get_json(silent=True) or {}
             client_id = str(body.get("client_id") or "").strip()
@@ -2987,10 +2993,79 @@ def create_app() -> Flask:
                 dry_run=dry_run,
                 runner=runner,
             )
-            log.info("morning_handoff_audit client=%s execution_mode=%s result=%s", client_id, actual_mode, result)
-            return jsonify(result), 200 if result.get("ok") else 503
+            readiness = run_preopen_autonomous_readiness(
+                client_id,
+                actual_mode,
+                dry_run=dry_run,
+                stage="manual",
+                runner=runner,
+            )
+            if actual_mode == "live" and readiness.get("status") == "BLOCKED":
+                try:
+                    runner._enter_degraded_mode(
+                        "preopen_readiness_blocked:" + ",".join(readiness.get("errors") or ["unknown"])
+                    )
+                except Exception:
+                    pass
+            elif actual_mode == "live" and readiness.get("ok"):
+                try:
+                    runner._clear_degraded_reason_key("preopen_readiness_blocked")
+                except Exception:
+                    pass
+            payload = dict(result)
+            payload["readiness"] = readiness
+            log.info("morning_handoff_audit client=%s execution_mode=%s result=%s", client_id, actual_mode, payload)
+            return jsonify(payload), 200 if result.get("ok") and readiness.get("status") != "BLOCKED" else 503
         except Exception as e:
             log.error("morning_handoff_audit endpoint failed: %s", e, exc_info=True)
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.route("/admin/preopen_readiness", methods=["GET", "POST"])
+    @require_hmac
+    def admin_preopen_readiness():
+        try:
+            from client_runner import _active_runners, _registry_lock
+            from ap.morning_jobs import select_runner_items
+            from ap.preopen_readiness import run_preopen_autonomous_readiness
+
+            body = request.get_json(silent=True) or {}
+            if request.method == "GET":
+                body = {
+                    "clients": request.args.getlist("clients"),
+                    "execution_mode": request.args.get("execution_mode"),
+                    "dry_run": request.args.get("dry_run", "true").lower() != "false",
+                }
+
+            requested_clients = body.get("clients") or []
+            execution_mode = str(body.get("execution_mode") or "").strip().lower()
+            dry_run = bool(body.get("dry_run", True))
+
+            with _registry_lock:
+                selected = select_runner_items(dict(_active_runners), requested_clients=requested_clients)
+
+            results = {}
+            for email, runner in selected:
+                runner_mode = str(getattr(runner, "mode", None) or getattr(runner.master_control, "mode", None) or "").strip().lower()
+                if execution_mode and runner_mode != execution_mode:
+                    continue
+                results[email] = run_preopen_autonomous_readiness(
+                    email,
+                    runner_mode,
+                    dry_run=dry_run,
+                    stage="manual",
+                    runner=runner,
+                )
+
+            ok = all(str(r.get("status")) == "OK" for r in results.values()) if results else False
+            return jsonify({
+                "ok": ok,
+                "requested_clients": [str(x).strip() for x in requested_clients if str(x).strip()],
+                "execution_mode": execution_mode or None,
+                "dry_run": dry_run,
+                "results": results,
+            }), 200 if ok else 503
+        except Exception as e:
+            log.error("preopen_readiness endpoint failed: %s", e, exc_info=True)
             return jsonify({"ok": False, "error": str(e)}), 500
 
     @app.post("/admin/reseed_exit_engine")
