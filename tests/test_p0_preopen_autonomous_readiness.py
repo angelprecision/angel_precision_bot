@@ -66,6 +66,7 @@ def _stub_common(monkeypatch, *, handoff=True, client_state=None):
     writes = []
     monkeypatch.setattr(pr, "_upsert_preopen_row", lambda **kwargs: writes.append(kwargs))
     monkeypatch.setattr(pr, "_morning_handoff_success_exists", lambda *args, **kwargs: handoff)
+    monkeypatch.setattr(pr, "_post_overnight_reeval_success_exists", lambda *args, **kwargs: False)
     monkeypatch.setattr(
         pr,
         "_query_client_state",
@@ -119,6 +120,29 @@ def test_missing_live_handoff_after_929_is_blocked(monkeypatch):
     result = pr.run_preopen_autonomous_readiness("jason@example.com", "live", dry_run=True, runner=runner)
     assert result["status"] == "BLOCKED"
     assert "morning_handoff_missing" in result["errors"]
+
+
+def test_live_startup_with_watching_rows_does_not_degrade_for_missing_overnight(monkeypatch):
+    _stub_common(monkeypatch, handoff=False, client_state={
+        "stale_processing_ids": [],
+        "watching_orphans": [],
+        "pending_trigger_rows": [{"local_order_id": "L-1", "signal_id": "sig-1"}],
+        "watching_count": 1,
+    })
+    runner = _Runner(mode="live", watcher=_Watcher({"L-1"}))
+    runner._last_overnight_reeval_date = None
+
+    result = pr.run_preopen_autonomous_readiness(
+        "jason@example.com",
+        "live",
+        dry_run=True,
+        runner=runner,
+        stage="startup",
+    )
+    assert result["status"] == "OK"
+    assert "overnight_reeval_missing" not in result["errors"]
+    assert result["details"]["overnight_reeval"]["status"] == "unknown"
+    assert "overnight_reeval_pending_startup" in result["warnings"]
 
 
 def test_missing_entry_watcher_is_blocked_for_live(monkeypatch):
@@ -196,22 +220,7 @@ def test_overnight_status_accepts_post_overnight_handoff_success(monkeypatch):
     })
     runner = _Runner(mode="live")
     runner._last_overnight_reeval_date = None
-    runner.email = "jason@example.com"
-
-    class _HandoffModule:
-        @staticmethod
-        def _latest_handoff_rows(_trading_date):
-            return [{
-                "client_id": "jason@example.com",
-                "execution_mode": "live",
-                "stage": "post_overnight_reeval",
-                "status": "success",
-                "last_success_at": "2026-06-22T09:20:00-04:00",
-            }]
-
-    import sys
-
-    monkeypatch.setitem(sys.modules, "ap.morning_handoff", _HandoffModule)
+    monkeypatch.setattr(pr, "_post_overnight_reeval_success_exists", lambda *args, **kwargs: True)
     status, details = pr._overnight_status(
         runner,
         {
@@ -226,6 +235,33 @@ def test_overnight_status_accepts_post_overnight_handoff_success(monkeypatch):
     )
     assert status == "success"
     assert details["source"] == "handoff_run_locks.post_overnight_reeval"
+
+
+def test_startup_handoff_success_does_not_count_as_post_overnight_success(monkeypatch):
+    _stub_common(monkeypatch, handoff=True, client_state={
+        "stale_processing_ids": [],
+        "watching_orphans": [],
+        "pending_trigger_rows": [{"local_order_id": "L-1", "signal_id": "sig-1"}],
+        "watching_count": 1,
+    })
+    runner = _Runner(mode="live")
+    runner._last_overnight_reeval_date = None
+    monkeypatch.setattr(pr, "_post_overnight_reeval_success_exists", lambda *args, **kwargs: False)
+
+    status, details = pr._overnight_status(
+        runner,
+        {
+            "stale_processing_ids": [],
+            "watching_orphans": [],
+            "pending_trigger_rows": [{"local_order_id": "L-1", "signal_id": "sig-1"}],
+            "watching_count": 1,
+        },
+        "2026-06-22",
+        client_id="jason@example.com",
+        execution_mode="live",
+    )
+    assert status == "missing"
+    assert details["source"] == "watching_or_pending_trigger_present_without_overnight_success"
 
 
 def test_health_summary_exposes_preopen_status(monkeypatch):
@@ -264,6 +300,26 @@ def test_readiness_module_has_no_submit_cancel_or_state_mutation():
     assert ".transition(" not in src
     assert "UPDATE orders" not in src
     assert "UPDATE positions" not in src
+
+
+def test_broker_credential_uncertainty_is_degraded_not_blocked(monkeypatch):
+    _stub_common(monkeypatch)
+    runner = _Runner(mode="live")
+    runner._resolved_tradier_token = None
+    runner.account_id = "acct-1"
+    runner.base_url = "https://api.tradier.com"
+    runner.core = SimpleNamespace(entry_watcher=_Watcher(), broker=object(), exit_eng=object())
+    runner._last_overnight_reeval_date = "2026-06-22"
+
+    result = pr.run_preopen_autonomous_readiness(
+        "jason@example.com",
+        "live",
+        dry_run=True,
+        runner=runner,
+        stage="manual",
+    )
+    assert result["status"] == "DEGRADED"
+    assert "broker_credentials_unverified" in result["errors"]
 
 
 def test_degraded_mode_path_only_clears_entries_not_exits():

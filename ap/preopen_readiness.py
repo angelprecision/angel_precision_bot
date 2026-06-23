@@ -325,6 +325,22 @@ def _morning_handoff_success_exists(client_id: str, execution_mode: str, trading
     return False
 
 
+def _post_overnight_reeval_success_exists(client_id: str, execution_mode: str, trading_date: str) -> bool:
+    from ap.morning_handoff import _latest_handoff_rows
+
+    rows = _latest_handoff_rows(trading_date)
+    for row in rows:
+        if (
+            str(row.get("client_id") or "").strip() == client_id
+            and _normalize_mode(row.get("execution_mode")) == execution_mode
+            and str(row.get("stage") or "").strip().lower() == "post_overnight_reeval"
+            and str(row.get("status") or "").strip().lower() == "success"
+            and row.get("last_success_at")
+        ):
+            return True
+    return False
+
+
 def _query_client_state(client_id: str) -> dict:
     from ap.db import conn, run_with_retry
 
@@ -448,20 +464,11 @@ def _overnight_status(
     client_id: str,
     execution_mode: str,
 ) -> tuple[str, dict]:
+    if _post_overnight_reeval_success_exists(client_id, execution_mode, trading_date):
+        return "success", {"source": "handoff_run_locks.post_overnight_reeval"}
     last_ran = getattr(runner, "_last_overnight_reeval_date", None)
     if str(last_ran or "") == trading_date:
         return "success", {"source": "runner_last_overnight_reeval_date"}
-    from ap.morning_handoff import _latest_handoff_rows
-
-    for row in _latest_handoff_rows(trading_date):
-        if (
-            str(row.get("client_id") or "").strip() == client_id
-            and _normalize_mode(row.get("execution_mode")) == execution_mode
-            and str(row.get("stage") or "").strip().lower() == "post_overnight_reeval"
-            and str(row.get("status") or "").strip().lower() == "success"
-            and row.get("last_success_at")
-        ):
-            return "success", {"source": "handoff_run_locks.post_overnight_reeval"}
     if int(client_state.get("watching_count", 0) or 0) == 0 and not client_state.get("pending_trigger_rows"):
         return "explicit_noop", {"source": "no_watching_or_pending_trigger_rows"}
     return "missing", {"source": "watching_or_pending_trigger_present_without_overnight_success"}
@@ -573,8 +580,11 @@ def run_preopen_autonomous_readiness(
     broker_ok, broker_details = _broker_credentials_present(runner, mode)
     details["broker_credentials"] = broker_details
     broker_state = str(broker_details.get("credential_status") or "missing").lower()
-    if not broker_ok and broker_state == "missing":
-        errors.append("broker_credentials_missing")
+    if stage != "startup":
+        if not broker_ok and broker_state == "missing":
+            errors.append("broker_credentials_missing")
+        elif not broker_ok:
+            errors.append("broker_credentials_unverified")
     elif not broker_ok:
         warnings.append("broker_credentials_unverified")
 
@@ -582,14 +592,6 @@ def run_preopen_autonomous_readiness(
     details["selector_identity"] = selector_identity
     if selector_identity["quote_source"] == "unknown" or not selector_identity["tradier_base_url"]:
         errors.append("selector_quote_identity_unresolved")
-
-    handoff_ok = _morning_handoff_success_exists(client_id, mode, trading_date)
-    details["morning_handoff_success"] = handoff_ok
-    if not handoff_ok:
-        if mode == "live" or _after_929_et(now):
-            errors.append("morning_handoff_missing")
-        else:
-            warnings.append("morning_handoff_missing")
 
     client_state = _query_client_state(client_id)
     details["client_state"] = client_state
@@ -605,19 +607,39 @@ def run_preopen_autonomous_readiness(
     if unowned_pending:
         errors.append("pending_trigger_without_watcher_ownership")
 
-    overnight_state, overnight_details = _overnight_status(
-        runner,
-        client_state,
-        trading_date,
-        client_id=client_id,
-        execution_mode=mode,
-    )
-    details["overnight_reeval"] = {"status": overnight_state, **overnight_details}
-    if overnight_state == "missing":
-        if mode == "live" or _after_929_et(now):
-            errors.append("overnight_reeval_missing")
+    handoff_ok = _morning_handoff_success_exists(client_id, mode, trading_date)
+    details["morning_handoff_success"] = handoff_ok
+    if stage != "startup":
+        if not handoff_ok:
+            if mode == "live" or _after_929_et(now):
+                errors.append("morning_handoff_missing")
+            else:
+                warnings.append("morning_handoff_missing")
+    elif not handoff_ok:
+        warnings.append("morning_handoff_pending_startup")
+
+    if stage == "startup":
+        if int(client_state.get("watching_count", 0) or 0) == 0 and not client_state.get("pending_trigger_rows"):
+            overnight_state = "explicit_noop"
+            overnight_details = {"source": "no_watching_or_pending_trigger_rows"}
         else:
-            warnings.append("overnight_reeval_missing")
+            overnight_state = "unknown"
+            overnight_details = {"source": "startup_stage_skips_overnight_requirement"}
+            warnings.append("overnight_reeval_pending_startup")
+    else:
+        overnight_state, overnight_details = _overnight_status(
+            runner,
+            client_state,
+            trading_date,
+            client_id=client_id,
+            execution_mode=mode,
+        )
+        if overnight_state == "missing":
+            if mode == "live" or _after_929_et(now):
+                errors.append("overnight_reeval_missing")
+            else:
+                warnings.append("overnight_reeval_missing")
+    details["overnight_reeval"] = {"status": overnight_state, **overnight_details}
 
     blocked_keys = {
         "pod_mode_client_mode_mismatch",
