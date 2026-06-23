@@ -49,11 +49,12 @@ jobs:
 
       - name: Run live morning job
         env:
-          BOT_URL: ${{ secrets.AP_BOT_URL }}
-          SIGNING_SECRET: ${{ secrets.AP_SIGNING_SECRET }}
+          BOT_URL: ${{ secrets.LIVE_BOT_URL }}
+          SIGNING_SECRET: ${{ secrets.LIVE_AP_SIGNING_SECRET }}
           MORNING_JOB: ${{ steps.cfg.outputs.job }}
           MORNING_JOB_CLIENT_ID: jasoncosby1@gmail.com
           MORNING_JOB_EXECUTION_MODE: live
           MORNING_JOB_TIMEOUT_SECONDS: "180"
+          MORNING_JOB_FORCE_WINDOW: ${{ github.event_name == 'schedule' && '1' || '0' }}
         run: |
           python3 ap/scripts/live_morning_jobs.py
