@@ -867,22 +867,34 @@ def _dispatch(
         try:
             selected = contract_selector.select(plan)
             if selected is None:
+                _selector_failure = {}
+                try:
+                    _selector_failure = (getattr(plan, "metadata", None) or {}).get("selector_failure") or {}
+                except Exception:
+                    _selector_failure = {}
+                _selector_reason = (
+                    str(_selector_failure.get("queue_reason_code") or _selector_failure.get("reason_code") or "").strip()
+                    or "no_contract_found"
+                )
                 log.warning(f"[{ticker}] Contract selection failed -- no suitable contract")
                 trace_gate(str(payload.get("signal_id","")), ticker, "QUALITY_FILTER", "REJECT",
                            reason="no_eligible_contracts", score=float(payload.get("score") or 0))
                 _mark_job(job_id, "REJECTED",
                           result={"stage": "contract_selection",
-                                  "reason": "no_contract_found",
+                                  "reason": _selector_reason,
+                                  "reason_code": _selector_failure.get("reason_code"),
+                                  "selector_failure": _selector_failure,
                                   "ticker": ticker})
                 try:
                     from ap.rejection_feed import post_no_contracts
                     post_no_contracts(
                         ticker=ticker,
                         side=payload.get("side", ""),
-                        chain_size=0,
-                        top_rejections={},
+                        chain_size=int(_selector_failure.get("chain_rows", 0) or 0),
+                        top_rejections=_selector_failure.get("top_reject_buckets") or {},
                         score=float(payload.get("score") or 0),
                         pattern=payload.get("pattern_id") or payload.get("pattern", ""),
+                        client_id=client_id,
                     )
                 except Exception:
                     pass

@@ -785,7 +785,21 @@ class APExecutionCore:
                         log.warning("[%s] deferred breach selected contract copy failed: %s", ticker, _copy_exc)
 
                 if not _sel or not _live_contract:
-                    _reason = "breach_time_contract_selection_no_result"
+                    _selector_failure = {}
+                    try:
+                        _selector_failure = (getattr(approved_plan, "metadata", None) or {}).get("selector_failure") or {}
+                    except Exception:
+                        _selector_failure = {}
+                    _selector_reason = str(
+                        _selector_failure.get("queue_reason_code")
+                        or _selector_failure.get("reason_code")
+                        or ""
+                    ).strip()
+                    _reason = (
+                        f"breach_time_contract_selection_no_result:{_selector_reason}"
+                        if _selector_reason else
+                        "breach_time_contract_selection_no_result"
+                    )
                     log.critical(
                         "[%s] DEFERRED_BREACH_CONTRACT_FAILED — %s",
                         ticker, _reason,
@@ -795,6 +809,7 @@ class APExecutionCore:
                         extra_meta={
                             "failure_stage": "deferred_contract_selection",
                             "selected_contract": _sel_contract or None,
+                            "selector_failure": _selector_failure,
                         },
                     )
                     log.critical(

@@ -77,13 +77,18 @@ def _get_max_premium(ticker: str) -> float:
 # =============================================================================
 
 _REASON_CODE_MAP: dict[str, str] = {
-    "zero_bid_or_ask":       "NO_CHAIN_DATA",
-    "ask_below_bid":         "NO_CHAIN_DATA",
-    "zero_mid":              "NO_CHAIN_DATA",
+    "chain_empty":           "CHAIN_EMPTY",
+    "chain_fetch_failed":    "CHAIN_FETCH_FAILED",
+    "quote_fetch_failed":    "QUOTE_FETCH_FAILED",
+    "direct_quote_zero_bid_ask": "DIRECT_QUOTE_ZERO_BID_ASK",
+    "direct_quote_unavailable": "QUOTE_FETCH_FAILED",
+    "zero_bid_or_ask":       "CHAIN_ROW_ZERO_BID_ASK",
+    "ask_below_bid":         "QUOTE_FETCH_FAILED",
+    "zero_mid":              "QUOTE_FETCH_FAILED",
+    "bid_below_":           "BID_BELOW_MIN",
     "size_too_thin":         "VOLUME_TOO_LOW",
     "spread_too_wide":       "SPREAD_TOO_WIDE",
     "illiquid_vol":          "OI_TOO_LOW",
-    "bid_below":             "NO_AFFORDABLE_CONTRACT",
     "oi_too_low":            "OI_TOO_LOW",
     "volume_too_low":        "VOLUME_TOO_LOW",
     "dte_out_of_range":      "DTE_OUT_OF_RANGE",
@@ -97,6 +102,7 @@ _REASON_CODE_MAP: dict[str, str] = {
     "dte_too_high":           "DTE_OUT_OF_RANGE",
     "invalid_expiration":     "DTE_OUT_OF_RANGE",
     "delta_out_of_band":      "DELTA_OUT_OF_RANGE",
+    "no_valid_playbook_dte_contract": "NO_VALID_PLAYBOOK_DTE_CONTRACT",
 }
 
 def _normalize_reason_code(raw_reason: str) -> str:
@@ -116,6 +122,44 @@ def _normalize_reason_code(raw_reason: str) -> str:
         _UNKNOWN_SELECTOR_REASONS_SEEN.add(code)
         log.warning("Unmapped selector rejection reason observed: %s", code)
     return code
+
+
+def _queue_reason_code(canonical_reason: str | None) -> str:
+    canonical = str(canonical_reason or "").strip().upper()
+    if canonical in {"CHAIN_EMPTY", "CHAIN_FETCH_FAILED"}:
+        return "NO_CHAIN_DATA"
+    if canonical in {"DIRECT_QUOTE_ZERO_BID_ASK", "CHAIN_ROW_ZERO_BID_ASK"}:
+        return "QUOTE_ZERO_BID_ASK"
+    if canonical in {"BID_BELOW_MIN", "SPREAD_TOO_WIDE", "OI_TOO_LOW", "VOLUME_TOO_LOW"}:
+        return canonical
+    if canonical:
+        return canonical
+    return "NO_CONTRACT_AFTER_FILTERS"
+
+
+def _is_sandbox_base_url(base_url) -> bool:
+    return "sandbox" in str(base_url or "").lower()
+
+
+def _broker_quote_identity(brk) -> dict:
+    base_url = (
+        getattr(getattr(brk, "cfg", None), "base_url", None)
+        or getattr(brk, "base_url", None)
+        or ""
+    )
+    base_url = str(base_url)
+    sandbox = _is_sandbox_base_url(base_url)
+    if not base_url:
+        source = "unknown"
+    elif sandbox:
+        source = "tradier_sandbox"
+    else:
+        source = "tradier_live"
+    return {
+        "quote_source": source,
+        "quote_base_url": base_url,
+        "sandbox_mode": bool(sandbox),
+    }
 
 
 def _safe_float(val, default: float = 0.0) -> float:
@@ -217,6 +261,23 @@ def _safe_plan_attr(plan, attr: str, default=None):
         return plan.get(attr, default) if isinstance(plan, dict) else default
     except Exception:
         return default
+
+
+def _plan_metadata(plan) -> dict:
+    if isinstance(plan, dict):
+        meta = plan.get("metadata")
+        if not isinstance(meta, dict):
+            meta = {}
+            plan["metadata"] = meta
+        return meta
+    meta = getattr(plan, "metadata", None)
+    if not isinstance(meta, dict):
+        meta = {}
+        try:
+            plan.metadata = meta
+        except Exception:
+            pass
+    return meta
 
 
 
@@ -489,6 +550,42 @@ class APContractSelectionEngine:
             type(iv_filter).__name__ if iv_filter is not None else "None",
         )
 
+    def _selector_sources(self) -> dict:
+        ident = _broker_quote_identity(self.data_broker)
+        return {
+            "quote_source": ident["quote_source"],
+            "chain_source": "tradier_options_chain",
+            "tradier_base_url": ident["quote_base_url"],
+            "sandbox_mode": ident["sandbox_mode"],
+            "execution_mode": str(self.mode or "").lower(),
+        }
+
+    def _record_selector_failure(
+        self,
+        plan,
+        *,
+        canonical_reason: str,
+        explanation: str,
+        chain_rows: int,
+        survivor_count: int,
+        rejections: dict | None = None,
+    ) -> dict:
+        buckets: dict[str, int] = {}
+        for raw_reason, count in (rejections or {}).items():
+            canon = _normalize_reason_code(raw_reason)
+            buckets[canon] = buckets.get(canon, 0) + int(count or 0)
+        payload = {
+            "reason_code": str(canonical_reason or "").upper(),
+            "queue_reason_code": _queue_reason_code(canonical_reason),
+            "explanation": explanation,
+            "chain_rows": int(chain_rows or 0),
+            "survivor_count": int(survivor_count or 0),
+            "top_reject_buckets": dict(sorted(buckets.items(), key=lambda kv: (-kv[1], kv[0]))),
+            **self._selector_sources(),
+        }
+        _plan_metadata(plan)["selector_failure"] = payload
+        return payload
+
 
     def _emit_selector_event(
         self,
@@ -637,25 +734,41 @@ class APContractSelectionEngine:
             chain, underlying_price = self._fetch_chain_with_price(ticker, direction)
         except Exception as e:
             log.error("[%s] chain fetch failed: %s", ticker, e)
+            failure = self._record_selector_failure(
+                plan,
+                canonical_reason="CHAIN_FETCH_FAILED",
+                explanation=f"Chain fetch failed: {e}",
+                chain_rows=0,
+                survivor_count=0,
+            )
             self._emit_selector_event(
                 plan,
                 stage="chain_fetch",
                 decision="REJECT",
-                reason_code="NO_CHAIN_DATA",
+                reason_code="CHAIN_FETCH_FAILED",
                 explanation=f"Chain fetch failed: {e}",
                 inputs={"ticker": ticker, "direction": direction},
+                context=failure,
             )
             return None
 
         if not chain:
             log.warning("[%s] EMPTY CHAIN -- Tradier returned no options", ticker)
+            failure = self._record_selector_failure(
+                plan,
+                canonical_reason="CHAIN_EMPTY",
+                explanation="Tradier returned empty options chain",
+                chain_rows=0,
+                survivor_count=0,
+            )
             self._emit_selector_event(
                 plan,
                 stage="chain_fetch",
                 decision="REJECT",
-                reason_code="NO_CHAIN_DATA",
+                reason_code="CHAIN_EMPTY",
                 explanation="Tradier returned empty options chain",
                 inputs={"ticker": ticker, "direction": direction},
+                context=failure,
             )
             return None
 
@@ -763,13 +876,21 @@ class APContractSelectionEngine:
             _intel = getattr(plan, "intel_result", {}) or {}
         if _intel.get("price_data_stub"):
             log.warning("[%s] BLOCKED — price data was stub during intel gate", ticker)
+            failure = self._record_selector_failure(
+                plan,
+                canonical_reason="QUOTE_FETCH_FAILED",
+                explanation="Price data was a stub during intel gate — signal quality insufficient",
+                chain_rows=len(chain),
+                survivor_count=0,
+            )
             self._emit_selector_event(
                 plan,
                 stage="chain_fetch",
                 decision="REJECT",
-                reason_code="NO_CHAIN_DATA",
+                reason_code="QUOTE_FETCH_FAILED",
                 explanation="Price data was a stub during intel gate — signal quality insufficient",
                 inputs={"price_data_stub": True},
+                context=failure,
             )
             return None
 
@@ -992,6 +1113,17 @@ class APContractSelectionEngine:
                 if _rejections else None
             )
             _obs_reason = _normalize_reason_code(_top_reject) if _top_reject else "NO_CONTRACT_AFTER_FILTERS"
+            failure = self._record_selector_failure(
+                plan,
+                canonical_reason=_obs_reason,
+                explanation=(
+                    "No contracts passed quality gates | chain=" + str(len(chain)) + " | "
+                    "top_reason=" + (_top_reject or "none")
+                ),
+                chain_rows=len(chain),
+                survivor_count=0,
+                rejections=_rejections,
+            )
             self._emit_selector_event(
                 plan,
                 stage="quality_summary",
@@ -1006,13 +1138,17 @@ class APContractSelectionEngine:
                 ),
                 inputs={
                     "chain_size":       len(chain),
+                    "chain_rows":       len(chain),
+                    "survivor_count":   0,
                     "rejection_counts": {_normalize_reason_code(k): v for k, v in _rejections.items()},
                     "raw_rejection_counts": _rejections,
+                    "top_reject_buckets": failure["top_reject_buckets"],
                 },
                 thresholds={
                     "max_spread_pct": _safe_float(_eff_max_spread),
                     "min_oi":         _safe_float(_eff_min_oi),
                 },
+                context=failure,
             )
             return None
 
