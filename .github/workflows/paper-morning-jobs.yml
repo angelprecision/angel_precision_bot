@@ -1,0 +1,66 @@
+name: Paper Morning Jobs
+
+on:
+  schedule:
+    - cron: "18 13 * * 1-5"
+    - cron: "18 14 * * 1-5"
+    - cron: "25 13 * * 1-5"
+    - cron: "25 14 * * 1-5"
+    - cron: "31 13 * * 1-5"
+    - cron: "31 14 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      job:
+        description: "Job to run"
+        required: true
+        default: "overnight_reeval"
+        type: choice
+        options:
+          - overnight_reeval
+          - morning_handoff_primary
+          - morning_handoff_backup
+
+jobs:
+  paper-morning-jobs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    strategy:
+      fail-fast: false
+      matrix:
+        client_id:
+          - jose.vasquez4011@gmail.com
+          - tradefluencehq@gmail.com
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Resolve scheduled job
+        id: cfg
+        run: |
+          JOB=""
+          case "${{ github.event.schedule }}" in
+            "18 13 * * 1-5"|"18 14 * * 1-5") JOB="overnight_reeval" ;;
+            "25 13 * * 1-5"|"25 14 * * 1-5") JOB="morning_handoff_primary" ;;
+            "31 13 * * 1-5"|"31 14 * * 1-5") JOB="morning_handoff_backup" ;;
+          esac
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            JOB="${{ github.event.inputs.job }}"
+          fi
+          echo "job=$JOB" >> "$GITHUB_OUTPUT"
+          echo "Resolved job=$JOB client=${{ matrix.client_id }}"
+
+      - name: Run paper morning job
+        env:
+          BOT_URL: ${{ secrets.PAPER_BOT_URL }}
+          SIGNING_SECRET: ${{ secrets.PAPER_AP_SIGNING_SECRET }}
+          MORNING_JOB: ${{ steps.cfg.outputs.job }}
+          MORNING_JOB_CLIENT_ID: ${{ matrix.client_id }}
+          MORNING_JOB_EXECUTION_MODE: paper
+          MORNING_JOB_TIMEOUT_SECONDS: "180"
+          MORNING_JOB_FORCE_WINDOW: ${{ github.event_name == 'schedule' && '1' || '0' }}
+        run: |
+          python3 ap/scripts/live_morning_jobs.py
