@@ -73,6 +73,123 @@ ENTRY_PAPER_ASK_CROSS_CENTS        = float(os.getenv("ENTRY_PAPER_ASK_CROSS_CENT
 ENTRY_LIVE_ASK_CROSS_CENTS         = float(os.getenv("ENTRY_LIVE_ASK_CROSS_CENTS",         "0.01"))
 ENTRY_MAX_PRICE_DRIFT_PCT_FROM_PLAN = float(os.getenv("ENTRY_MAX_PRICE_DRIFT_PCT_FROM_PLAN", "0.25"))
 
+# ── PR #180: Jason live entry spread + ask-cross precision guard ──────────────
+# Final pre-submit precision guard for the named live client. Applies ONLY when:
+#   - self.paper is False (live)
+#   - client_id matches the PR180_LIVE_CLIENT_IDS allowlist (default: Jason)
+#
+# Rules (all 4 must hold or submit is blocked / re-priced):
+#   1. Hard spread ceiling: spread_pct > PR180_MAX_SPREAD_PCT → BLOCK
+#      → ENTRY_SPREAD_TOO_WIDE_LIVE. No LIVE_ASK_CROSS at that width.
+#   2. Controlled-limit band: PR180_CONTROLLED_BAND_MIN_PCT < spread_pct <= MAX
+#      → limit_price = min(ask, mid + PR180_CONTROLLED_LIMIT_MID_CENTS)
+#        (replaces the standard ask + ENTRY_LIVE_ASK_CROSS_CENTS rule)
+#   3. Expected mark-to-mid loss floor:
+#      expected_mark_loss_pct = (submit_mid - intended_limit) / intended_limit
+#      If <= PR180_MAX_EXPECTED_MARK_LOSS_PCT (e.g. -0.06) → BLOCK
+#      → ENTRY_EXPECTED_MARK_LOSS_TOO_HIGH.
+#   4. Paper unchanged. Non-Jason live unchanged.
+#
+# Scope: ENTRY-only. Does not affect exits, scanner, or contract selection.
+# Risk: One named live client. Env-overridable for emergency rollback without
+#       deploy (set PR180_ENABLED=0).
+# ─────────────────────────────────────────────────────────────────────────────
+
+PR180_ENABLED                        = os.getenv("PR180_ENABLED", "1") not in ("0", "false", "False", "")
+PR180_MAX_SPREAD_PCT                = float(os.getenv("PR180_MAX_SPREAD_PCT",                "0.08"))
+PR180_CONTROLLED_BAND_MIN_PCT       = float(os.getenv("PR180_CONTROLLED_BAND_MIN_PCT",       "0.06"))
+PR180_CONTROLLED_LIMIT_MID_CENTS    = float(os.getenv("PR180_CONTROLLED_LIMIT_MID_CENTS",    "0.03"))
+PR180_MAX_EXPECTED_MARK_LOSS_PCT    = float(os.getenv("PR180_MAX_EXPECTED_MARK_LOSS_PCT",    "-0.06"))
+PR180_LIVE_CLIENT_IDS = frozenset(
+    s.strip().lower()
+    for s in os.getenv("PR180_LIVE_CLIENT_IDS", "jasoncosby1@gmail.com").split(",")
+    if s.strip()
+)
+
+
+def _pr180_is_named_live_client(client_id: str, paper: bool) -> bool:
+    """True if this submit is for a named live client (currently Jason)."""
+    if not PR180_ENABLED:
+        return False
+    if paper:
+        return False
+    return (client_id or "").lower().strip() in PR180_LIVE_CLIENT_IDS
+
+
+def _pr180_jason_live_entry_pricing_guard(
+    *,
+    submit_bid: float | None,
+    submit_mid: float | None,
+    submit_ask: float | None,
+    spread_pct: float | None,
+    proposed_limit: float,
+) -> tuple[str, float | None, dict]:
+    """
+    Pure helper. Returns:
+        ("PROCEED",         limit_price, audit_extras)   submit at limit_price
+        ("BLOCK",           None,        audit_extras)   block submit with reason in audit_extras
+        ("REPRICE_PROCEED", limit_price, audit_extras)   submit at re-priced limit_price
+
+    audit_extras is a dict that should be merged into the orders.meta entry
+    pricing audit for full observability of every Jason live submit decision.
+
+    Inputs may be None (degraded quote). When critical fields are missing,
+    the guard BLOCKS with ENTRY_QUOTE_INCOMPLETE_LIVE — never proceed on a
+    partial quote for a named live client.
+    """
+    audit: dict = {
+        "pr180_active":            True,
+        "pr180_max_spread_pct":    PR180_MAX_SPREAD_PCT,
+        "pr180_band_min_pct":      PR180_CONTROLLED_BAND_MIN_PCT,
+        "pr180_mid_cents":         PR180_CONTROLLED_LIMIT_MID_CENTS,
+        "pr180_max_mark_loss_pct": PR180_MAX_EXPECTED_MARK_LOSS_PCT,
+        "pr180_input_bid":         submit_bid,
+        "pr180_input_mid":         submit_mid,
+        "pr180_input_ask":         submit_ask,
+        "pr180_input_spread_pct":  spread_pct,
+        "pr180_input_proposed":    proposed_limit,
+    }
+
+    # Fail-closed: missing critical quote fields → block.
+    if submit_mid is None or submit_ask is None or spread_pct is None:
+        audit["pr180_block_reason"] = "ENTRY_QUOTE_INCOMPLETE_LIVE"
+        return "BLOCK", None, audit
+    if submit_mid <= 0 or submit_ask <= 0 or proposed_limit <= 0:
+        audit["pr180_block_reason"] = "ENTRY_QUOTE_INCOMPLETE_LIVE"
+        return "BLOCK", None, audit
+
+    # Rule 1: hard spread ceiling.
+    if spread_pct > PR180_MAX_SPREAD_PCT:
+        audit["pr180_block_reason"] = "ENTRY_SPREAD_TOO_WIDE_LIVE"
+        return "BLOCK", None, audit
+
+    # Rule 2: controlled-limit band (6%–8% by default).
+    final_limit = proposed_limit
+    repriced = False
+    if spread_pct > PR180_CONTROLLED_BAND_MIN_PCT:
+        controlled_cap = round(min(submit_ask, submit_mid + PR180_CONTROLLED_LIMIT_MID_CENTS), 2)
+        if final_limit > controlled_cap:
+            audit["pr180_controlled_cap"]   = controlled_cap
+            audit["pr180_original_limit"]   = proposed_limit
+            audit["pr180_repriced_to"]      = controlled_cap
+            final_limit = controlled_cap
+            repriced = True
+
+    # Rule 3: expected mark-to-mid loss floor (computed on FINAL limit).
+    if final_limit <= 0:
+        audit["pr180_block_reason"] = "ENTRY_QUOTE_INCOMPLETE_LIVE"
+        return "BLOCK", None, audit
+    expected_mark_loss_pct = (submit_mid - final_limit) / final_limit
+    audit["pr180_expected_mark_loss_pct"] = round(expected_mark_loss_pct, 6)
+    if expected_mark_loss_pct <= PR180_MAX_EXPECTED_MARK_LOSS_PCT:
+        audit["pr180_block_reason"] = "ENTRY_EXPECTED_MARK_LOSS_TOO_HIGH"
+        return "BLOCK", None, audit
+
+    audit["pr180_decision"] = "REPRICE_PROCEED" if repriced else "PROCEED"
+    audit["pr180_final_limit"] = final_limit
+    return ("REPRICE_PROCEED" if repriced else "PROCEED", final_limit, audit)
+
+
 # =============================================================================
 # EXECUTION CORE
 # =============================================================================
@@ -1493,6 +1610,52 @@ class APExecutionCore:
         _ask_cross = ENTRY_PAPER_ASK_CROSS_CENTS if self.paper else ENTRY_LIVE_ASK_CROSS_CENTS
         submit_limit = round(_submit_ask + _ask_cross, 2)
 
+        # ── PR #180: Jason live entry spread + ask-cross precision guard ──────
+        # Final pre-submit precision check for named live clients only.
+        # Paper and non-Jason live skip this entirely (helper returns no-op).
+        _pr180_audit_extras: dict = {}
+        if _pr180_is_named_live_client(self.client_id, self.paper):
+            _pr180_decision, _pr180_limit, _pr180_audit_extras = (
+                _pr180_jason_live_entry_pricing_guard(
+                    submit_bid    = _submit_quote_fields.get("submit_bid"),
+                    submit_mid    = _submit_quote_fields.get("submit_mid"),
+                    submit_ask    = _submit_quote_fields.get("submit_ask")
+                                    if _submit_quote_fields.get("submit_ask") is not None
+                                    else float(_submit_ask),
+                    spread_pct    = _submit_quote_fields.get("spread_pct"),
+                    proposed_limit= submit_limit,
+                )
+            )
+            if _pr180_decision == "BLOCK":
+                _pr180_reason = _pr180_audit_extras.get("pr180_block_reason", "PR180_BLOCKED")
+                _entry_pricing_decision = _pr180_reason
+                log.critical(
+                    "[%s] PR180_ENTRY_PRICING_BLOCK — %s | "
+                    "contract=%s bid=%s mid=%s ask=%s spread_pct=%s proposed_limit=%.2f "
+                    "client_id=%s",
+                    ticker, _pr180_reason, approved_contract,
+                    _submit_quote_fields.get("submit_bid"),
+                    _submit_quote_fields.get("submit_mid"),
+                    _submit_quote_fields.get("submit_ask"),
+                    _submit_quote_fields.get("spread_pct"),
+                    submit_limit, self.client_id,
+                )
+                _terminalize_breach_failure(
+                    f"pr180_block:{_pr180_reason.lower()}:"
+                    f"spread={_submit_quote_fields.get('spread_pct')!r}:"
+                    f"limit={submit_limit:.2f}"
+                )
+                return
+            if _pr180_decision == "REPRICE_PROCEED" and _pr180_limit is not None:
+                log.info(
+                    "[%s] PR180_ENTRY_REPRICED — controlled-limit band | "
+                    "contract=%s old_limit=%.2f new_limit=%.2f spread_pct=%.3f client_id=%s",
+                    ticker, approved_contract, submit_limit, _pr180_limit,
+                    float(_submit_quote_fields.get("spread_pct") or 0.0), self.client_id,
+                )
+                submit_limit = _pr180_limit
+        # ──────────────────────────────────────────────────────────────────────
+
         # Keep approved_plan in sync so OSM and DB record the correct price.
         try:
             approved_plan.limit_price = submit_limit
@@ -1522,6 +1685,8 @@ class APExecutionCore:
             "entry_price_decision":        _entry_pricing_decision,
             "attempt_number":              0,
             "retry_reprice_count":         0,
+            # PR #180: persist Jason-live precision guard audit (when active).
+            **(_pr180_audit_extras or {}),
         }
 
         # 5) Submit with the refreshed, ask-anchored limit price.
