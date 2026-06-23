@@ -35,6 +35,7 @@ class _Watcher:
 
 class _Runner:
     def __init__(self, *, mode: str = "live", watcher=None):
+        self.email = "runner@example.com"
         self.mode = mode
         self.initialized = _Evt(True)
         self.worker_thread = _Thread(True)
@@ -49,12 +50,15 @@ class _Runner:
         )
         self.base_url = "https://api.tradier.com" if mode == "live" else "https://sandbox.tradier.com"
         self.account_id = "acct-1"
+        self._resolved_tradier_token = "tok"
         self._last_overnight_reeval_date = "2026-06-22"
+        self._token_getter_called = False
 
     def is_alive(self) -> bool:
         return True
 
     def _get_token(self):
+        self._token_getter_called = True
         return "tok"
 
 
@@ -91,6 +95,21 @@ def test_all_green_readiness(monkeypatch):
     assert result["ok"] is True
     assert result["status"] == "OK"
     assert writes[-1]["mark_success"] is True
+
+
+def test_readiness_credential_check_does_not_call_token_getter(monkeypatch):
+    _stub_common(monkeypatch)
+    runner = _Runner(mode="live")
+    runner._resolved_tradier_token = "visible-token"
+
+    result = pr.run_preopen_autonomous_readiness(
+        "jason@example.com",
+        "live",
+        dry_run=True,
+        runner=runner,
+    )
+    assert result["status"] == "OK"
+    assert runner._token_getter_called is False
 
 
 def test_missing_live_handoff_after_929_is_blocked(monkeypatch):
@@ -168,6 +187,47 @@ def test_mode_mismatch_is_critical(monkeypatch):
     assert "pod_mode_client_mode_mismatch" in result["errors"]
 
 
+def test_overnight_status_accepts_post_overnight_handoff_success(monkeypatch):
+    _stub_common(monkeypatch, handoff=True, client_state={
+        "stale_processing_ids": [],
+        "watching_orphans": [],
+        "pending_trigger_rows": [{"local_order_id": "L-1", "signal_id": "sig-1"}],
+        "watching_count": 1,
+    })
+    runner = _Runner(mode="live")
+    runner._last_overnight_reeval_date = None
+    runner.email = "jason@example.com"
+
+    class _HandoffModule:
+        @staticmethod
+        def _latest_handoff_rows(_trading_date):
+            return [{
+                "client_id": "jason@example.com",
+                "execution_mode": "live",
+                "stage": "post_overnight_reeval",
+                "status": "success",
+                "last_success_at": "2026-06-22T09:20:00-04:00",
+            }]
+
+    import sys
+
+    monkeypatch.setitem(sys.modules, "ap.morning_handoff", _HandoffModule)
+    status, details = pr._overnight_status(
+        runner,
+        {
+            "stale_processing_ids": [],
+            "watching_orphans": [],
+            "pending_trigger_rows": [{"local_order_id": "L-1", "signal_id": "sig-1"}],
+            "watching_count": 1,
+        },
+        "2026-06-22",
+        client_id="jason@example.com",
+        execution_mode="live",
+    )
+    assert status == "success"
+    assert details["source"] == "handoff_run_locks.post_overnight_reeval"
+
+
 def test_health_summary_exposes_preopen_status(monkeypatch):
     monkeypatch.setattr(pr, "_trading_date", lambda now=None: "2026-06-22")
     monkeypatch.setattr(pr, "_expected_clients_by_mode", lambda: {"paper": ["p@example.com"], "live": ["l@example.com"]})
@@ -194,13 +254,23 @@ def test_readiness_module_has_no_submit_cancel_or_state_mutation():
     assert "UPDATE positions" not in src
 
 
+def test_degraded_mode_path_only_clears_entries_not_exits():
+    src = (REPO_ROOT / "client_runner.py").read_text()
+    assert "self.entries_allowed.clear()" in src
+    assert '"preopen_readiness_blocked:' in src
+    assert "stop_runner=False" in src
+    assert "exit_eng = getattr(self.core, \"exit_eng\", None)" in src
+
+
 def test_source_wires_runner_endpoint_and_health():
     app_src = (REPO_ROOT / "app.py").read_text()
     runner_src = (REPO_ROOT / "client_runner.py").read_text()
     health_src = (REPO_ROOT / "ap_health_endpoints.py").read_text()
     assert '/admin/preopen_readiness' in app_src
+    assert 'methods=["GET", "POST"]' in app_src
     assert 'run_preopen_autonomous_readiness(' in app_src
     assert 'Startup preopen readiness result' in runner_src
     assert 'Post-overnight preopen readiness result' in runner_src
     assert '@health_bp.route("/organs")' in health_src
     assert '"preopen_readiness":  get_preopen_readiness_health()' in health_src
+    assert 'get_morning_handoff_health()' in health_src
