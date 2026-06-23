@@ -274,6 +274,9 @@ class ManagedPosition:
     position_id:       str  = ""
     client_id:         str  = ""
     signal_id:         str  = ""
+    # PR #175: execution_mode populated at seed time ("live" | "paper" | "").
+    # Empty string is treated as "live" by the DATA_DEGRADED guard for safety.
+    execution_mode:    str  = ""
 
     # Context flags
     is_trend_day:         bool  = False
@@ -452,7 +455,17 @@ def _underlying_still_confirming(pos: ManagedPosition) -> tuple[bool, str]:
     side    = (getattr(pos, "side", "") or "").upper()
 
     if not entry_u or not curr_u:
-        return False, "no_underlying_data"
+        # PR #175 — P0 FIX: Do NOT return False here.
+        # False is interpreted by every caller as "thesis is broken → exit".
+        # Missing underlying data is NOT a thesis failure — it means we never
+        # captured entry context (broker-repair path, watcher_audit missing, etc.).
+        # Returning True/"DATA_DEGRADED_HOLD" keeps the position held while the
+        # DATA_DEGRADED_HOLD guard in the exit submission path provides the
+        # broker-level safety net for live positions.
+        # Root cause of NKE/RIVN premature exits: underlying_entry=0.0 in
+        # broker-repair positions caused not entry_u → True → (False, "no_underlying_data")
+        # → THESIS_FAIL_SOFT_STOP / NEVER_GREEN_STOP fired on valid live trades.
+        return True, "DATA_DEGRADED_HOLD"
 
     move_pct = (curr_u - entry_u) / entry_u  # positive = underlying went up
 
@@ -929,12 +942,16 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
             # 2. Position is young (< MIN_HOLD_MINUTES_BEFORE_SOFT_EXIT)
             # This allows cheap fragile contracts to breathe through
             # the initial spread/noise before the real move develops.
-            if _ng_confirming and _ng_age_min < _MIN_HOLD_NG:
+            # PR #175 — DATA_DEGRADED_HOLD suppresses NEVER_GREEN regardless of age.
+            # If underlying data was never captured, we cannot determine whether the
+            # position is truly "never green" — hold until data is available or EOD.
+            _ng_data_degraded = "DATA_DEGRADED_HOLD" in (_ng_confirm_reason or "")
+            if _ng_confirming and (_ng_age_min < _MIN_HOLD_NG or _ng_data_degraded):
                 log.info(
                     "[%s] NEVER_GREEN_STOP suppressed — underlying still confirming "
-                    "(%s) | age=%.1fmin < %.0fmin hold floor | pnl=%.1f%%",
+                    "(%s) | age=%.1fmin | hold_floor=%.0fmin | data_degraded=%s | pnl=%.1f%%",
                     pos.ticker, _ng_confirm_reason, _ng_age_min,
-                    _MIN_HOLD_NG, option_pnl * 100,
+                    _MIN_HOLD_NG, _ng_data_degraded, option_pnl * 100,
                 )
             else:
                 _profile = (
@@ -3007,6 +3024,9 @@ class APExitEngine:
                         position_id=str(row.get("id") or ""),
                         client_id=str(row.get("client_id") or ""),
                         signal_id=str(row.get("signal_id") or ""),
+                        # PR #175: carry execution_mode from positions row so the
+                        # DATA_DEGRADED live guard can check it without a DB round-trip.
+                        execution_mode=str(row.get("execution_mode") or "").lower().strip(),
                     )
                     mp.current_option_price = float(row.get("avg_fill", 0) or 0)
                     mp.scale_outs_done      = int(row.get("scale_outs_done", 0) or 0)
@@ -3255,13 +3275,67 @@ class APExitEngine:
             opened_at = opened_at.replace(tzinfo=_dt.timezone.utc)
 
         _now = datetime.now(timezone.utc)
+
+        # PR #175 — P0: Hydrate underlying_entry from DB rather than hardcoding 0.0.
+        # underlying_entry=0.0 caused _underlying_still_confirming to return
+        # (False, "no_underlying_data") which fired THESIS_FAIL_SOFT_STOP and
+        # NEVER_GREEN_STOP on valid live trades (NKE, RIVN) that were still profitable.
+        # Priority: orders.meta.watcher_audit → orders.meta.underlying_entry → positions row.
+        _repaired_underlying_entry = 0.0
+        try:
+            import ap.db as _apdb
+            with _apdb.conn() as _rc:
+                with _rc.cursor() as _cur:
+                    _cur.execute(
+                        """
+                        SELECT COALESCE(
+                            (o.meta->>'watcher_audit')::jsonb->>'underlying_price_at_trigger',
+                            o.meta->>'underlying_entry',
+                            p.underlying_entry::text
+                        )::numeric AS resolved_underlying_entry
+                        FROM orders o
+                        LEFT JOIN positions p ON p.id = o.position_id
+                        WHERE o.client_id = %s
+                          AND o.contract  = %s
+                          AND o.kind      = 'ENTRY'
+                          AND o.status    IN ('filled', 'FILLED', 'partial')
+                        ORDER BY o.filled_at DESC NULLS LAST,
+                                 o.created_ts DESC
+                        LIMIT 1
+                        """,
+                        (self._email, sym),
+                    )
+                    _r = _rc.fetchone() if hasattr(_rc, "fetchone") else _cur.fetchone()
+                    # RealDictCursor — row is a dict
+                    if not _r:
+                        _r = _cur.fetchone()
+                    if _r and _r.get("resolved_underlying_entry"):
+                        _repaired_underlying_entry = float(_r["resolved_underlying_entry"])
+                        log.info(
+                            "[exit_eng] BROKER_REPAIR_UNDERLYING_HYDRATED "
+                            "sym=%s underlying_entry=%.4f client=%s",
+                            sym, _repaired_underlying_entry, self._email,
+                        )
+                    else:
+                        log.warning(
+                            "[exit_eng] BROKER_REPAIR_UNDERLYING_MISSING "
+                            "sym=%s client=%s — entry context unavailable, "
+                            "DATA_DEGRADED_HOLD guard will protect live exits",
+                            sym, self._email,
+                        )
+        except Exception as _ue:
+            log.warning(
+                "[exit_eng] BROKER_REPAIR_UNDERLYING_DB_ERR sym=%s client=%s err=%s",
+                sym, self._email, _ue,
+            )
+
         mp = ManagedPosition(
             ticker           = ticker,
             option_symbol    = sym,
             side             = side,
             quantity         = qty,
             entry_price      = entry_px,
-            underlying_entry = 0.0,   # unknown from broker data — exits use current price
+            underlying_entry = _repaired_underlying_entry,   # PR #175: DB-hydrated
             underlying_target= 0.0,   # no target on repair — trailing/EOD rules still apply
             underlying_stop  = 0.0,   # no stop on repair — EOD/expiry rules protect
             position_id      = pos_id,
@@ -4102,6 +4176,54 @@ class APExitEngine:
 
                         if option_quote_stale and _is_forced_risk_exit_code(decision.reason_code):
                             decision.reason = f"{decision.reason} | DEGRADED_QUOTE_MODE:{option_quote_state}"
+
+                        # ── PR #175: DATA_DEGRADED_HOLD — live underlying guard ──────────────
+                        # Final broker-level safety net before any exit is submitted.
+                        # If underlying_entry was never captured for a live position,
+                        # we cannot trust thesis-fail soft exits — block them here.
+                        # HARD_DISASTER_STOP and BROKER_FORCE_CLOSE are exempt (EOD/disaster).
+                        _PR175_SOFT_CODES = frozenset({
+                            "THESIS_FAIL_SOFT_STOP", "NEVER_GREEN_STOP",
+                            "SOFT_LOSS_WATCH",       "DEEP_LOSS_STOP",
+                            "STOP_BREACH_CONFIRMING",
+                        })
+                        _pr175_entry_missing = (
+                            (getattr(pos, "underlying_entry", None) or 0.0) == 0.0
+                        )
+                        _pr175_exec_mode = (
+                            getattr(pos, "execution_mode", "") or ""
+                        ).lower().strip()
+                        # Treat "" (unknown) as live for safety — never risk a false exit
+                        _pr175_is_live = _pr175_exec_mode in ("live", "")
+                        if (
+                            _pr175_is_live
+                            and _pr175_entry_missing
+                            and decision.reason_code in _PR175_SOFT_CODES
+                        ):
+                            self._emit_exit_event(
+                                pos, decision="HOLD",
+                                reason_code="DATA_DEGRADED_HOLD",
+                                explanation=(
+                                    f"PR#175 live soft exit blocked: underlying_entry not captured. "
+                                    f"Proposed exit={decision.reason_code} will not be submitted to broker. "
+                                    f"position_id={pos.position_id or '?'} "
+                                    f"execution_mode={_pr175_exec_mode or 'unknown'}"
+                                ),
+                                stage="exit_decision",
+                                extra_inputs={
+                                    "decision_action": decision.action,
+                                    "decision_reason_code": decision.reason_code,
+                                    "underlying_entry": getattr(pos, "underlying_entry", None),
+                                    "execution_mode": _pr175_exec_mode,
+                                },
+                            )
+                            log.error(
+                                "[%s] PR175_DATA_DEGRADED_HOLD — live soft exit BLOCKED: "
+                                "underlying_entry not captured | proposed=%s pos_id=%s",
+                                pos.ticker, decision.reason_code, pos.position_id or "?",
+                            )
+                            continue
+                        # ────────────────────────────────────────────────────────────────────
 
                         self._emit_exit_event(
                             pos, decision="SUBMIT",
