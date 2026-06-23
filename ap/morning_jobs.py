@@ -17,6 +17,10 @@ log = logging.getLogger("ap.morning_jobs")
 ET = ZoneInfo("America/New_York")
 
 DEFAULT_LIVE_CLIENT = "jasoncosby1@gmail.com"
+DEFAULT_PAPER_CLIENTS = (
+    "jose.vasquez4011@gmail.com",
+    "tradefluencehq@gmail.com",
+)
 DEFAULT_EXECUTION_MODE = "live"
 
 OVERNIGHT_REEVAL_JOB = "overnight_reeval"
@@ -36,14 +40,19 @@ JOB_TARGET_MINUTE = {
 def build_overnight_reeval_payload(
     *,
     client_id: str = DEFAULT_LIVE_CLIENT,
+    execution_mode: str | None = None,
 ) -> dict:
-    return {
+    payload = {
         "force": True,
         "clients": [str(client_id).strip()],
         "max_clients": 1,
         "time_budget_seconds": 120,
         "async_background": False,
     }
+    mode = str(execution_mode or "").strip().lower()
+    if mode:
+        payload["execution_mode"] = mode
+    return payload
 
 
 def build_morning_handoff_payload(
