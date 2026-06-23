@@ -171,6 +171,36 @@ BROKER_TO_OSM = {
 _OCC_CP_RE = re.compile(r'([CP])\d{8}$')
 
 
+def _row_first_value(row, key: str = "id"):
+    """Extract the first/named value from a DB row regardless of row shape.
+
+    ap.db.conn() uses RealDictCursor by default — rows are dict-like, so
+    `row[0]` raises KeyError(0). Other call sites may produce tuple rows
+    (raw psycopg2 default) or None on no-match.
+
+    This helper supports all three shapes safely:
+      - dict / dict-like (RealDictRow): looks up by `key` (default 'id')
+      - tuple / list (legacy cursor): returns the first element
+      - None / empty: returns None
+
+    Returns the raw value (str cast is left to the caller).
+    """
+    if row is None:
+        return None
+    # dict-like: RealDictRow, dict, sqlite3.Row with mapping access, etc.
+    try:
+        # Prefer the named key when present (works for RealDictRow / dict)
+        if key in row:  # type: ignore[operator]
+            return row[key]
+    except (TypeError, AttributeError):
+        pass
+    # tuple / list / Row-by-index
+    try:
+        return row[0]
+    except (KeyError, IndexError, TypeError):
+        return None
+
+
 def _market_hours_interval(configured_interval: int = RECONCILE_INTERVAL_SEC) -> int:
     """
     15s market-hours reconciler safety net. Dedicated fill monitor should still
@@ -2244,7 +2274,11 @@ class APBrokerReconciler:
                                      q, qr, px, px, ts, cs, cc, li, b),
                                 )
                                 row = cur.fetchone()
-                                return str(row[0]) if row else pid
+                                # row may be RealDictRow (dict-like), tuple, or None.
+                                # row[0] crashed with KeyError(0) on RealDictRow —
+                                # use _row_first_value to handle every shape.
+                                _row_id = _row_first_value(row, "id")
+                                return str(_row_id) if _row_id else pid
                         pos_id = run_with_retry(_insert)
 
                     if not pos_id:
@@ -2289,6 +2323,22 @@ class APBrokerReconciler:
                         self.client_id, local_id, contract,
                         type(_be).__name__, _be,
                     )
+                    # Structured marker so the operator can quickly find every
+                    # orphan that needs manual reconciliation. Carries the
+                    # identifying fields per PR spec: order, client, contract,
+                    # broker_order_id, execution_mode (live by construction here).
+                    try:
+                        log.error(
+                            "[%s] MANUAL_REVIEW_REQUIRED reason=orphan_backfill_failed "
+                            "order=%s client=%s contract=%s broker_order_id=%s "
+                            "execution_mode=live",
+                            self.client_id, local_id, self.client_id, contract,
+                            o.get("broker_order_id") if isinstance(o, dict) else None,
+                        )
+                    except Exception:
+                        # Logging must never raise; if _o is unexpectedly shaped
+                        # we still recorded the primary error above.
+                        pass
 
             log.info(
                 "[%s] backfill_missing_position_links done: "
@@ -2328,7 +2378,9 @@ class APBrokerReconciler:
                     (self.client_id, contract, contract, ts),
                 )
                 row = cur.fetchone()
-                return str(row[0]) if row else None
+                # row may be RealDictRow (dict-like), tuple, or None.
+                _row_id = _row_first_value(row, "id")
+                return str(_row_id) if _row_id else None
         return run_with_retry(_q)
 
     def _create_closed_repair_position(self, o: dict, contract: str,
@@ -2380,7 +2432,9 @@ class APBrokerReconciler:
                      local_id, broker_id),
                 )
                 row = cur.fetchone()
-                return str(row[0]) if row else pid
+                # row may be RealDictRow (dict-like), tuple, or None.
+                _row_id = _row_first_value(row, "id")
+                return str(_row_id) if _row_id else pid
         return run_with_retry(_ins)
 
     def _check_ghost_fills(self, summary: dict):

@@ -559,9 +559,22 @@ class APOrderStateMachine:
         # Caller-supplied meta wins on conflict (e.g. queue path passing
         # selector_ask / selector_mid / option_bid / option_ask / option_mid /
         # account_equity / risk_pct / bootstrap_mode / total_trades).
+        # SAFETY (P0 hotfix/p0-preserve-overnight-sizing-meta):
+        # If caller meta contains a key that auto_meta already computed and the
+        # caller's value is None/empty-string, the caller value is STALE/MISSING
+        # and must NOT overwrite the good auto-derived value. This prevents a
+        # plan.metadata with e.g. selected_contract=None from clobbering the
+        # correctly derived selected_contract from the plan.contract_symbol.
+        # Only applies to keys already in auto_meta — new keys from caller
+        # (sizing_context, contract_deferred, snapshot_at_eval, etc.) pass
+        # through unconditionally.
         _final_meta = dict(_auto_meta)
         if meta and isinstance(meta, dict):
-            _final_meta.update(meta)
+            for _mk, _mv in meta.items():
+                if _mk in _auto_meta and (_mv is None or _mv == ""):
+                    # Caller has null/empty for a key OSM already derived — skip
+                    continue
+                _final_meta[_mk] = _mv
         try:
             import json as _json_mod
             _meta_json = _json_mod.dumps(_final_meta, default=str)

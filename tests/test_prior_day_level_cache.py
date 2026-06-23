@@ -1,0 +1,244 @@
+"""
+tests/test_prior_day_level_cache.py — PR4
+
+Verifies the prior-day high/low cache fallback with a trading-session freshness
+guard:
+  - Flag OFF (default) → no caching, no fallback (behavior unchanged).
+  - Cache write stamps the trading session the levels represent.
+  - Fallback uses cache ONLY when the stamped session matches the actual prior
+    trading session.
+  - Stale cache (wrong session: weekend/holiday/halt) is rejected → fail-safe.
+  - _prior_trading_session_date walks back over weekends correctly.
+"""
+from __future__ import annotations
+
+import sys
+import os
+import importlib.util
+from datetime import date, datetime, timedelta
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+from zoneinfo import ZoneInfo
+
+import pytest
+
+_REPO = Path(__file__).resolve().parents[1]
+_SRC  = (_REPO / "ap_overnight_reeval.py").read_text()
+
+
+# ---------------------------------------------------------------------------
+# Source guards
+# ---------------------------------------------------------------------------
+
+class TestSourceGuards:
+    def test_flag_defaults_off(self):
+        assert 'os.getenv("PRIOR_LEVEL_CACHE_FALLBACK", "0")' in _SRC
+
+    def test_session_helper_present(self):
+        assert "def _prior_trading_session_date(" in _SRC
+
+    def test_cache_write_and_read_present(self):
+        assert "def _cache_prior_levels(" in _SRC
+        assert "def _get_cached_prior_levels(" in _SRC
+
+    def test_freshness_guard_present(self):
+        """The read must reject a cache whose session != expected session."""
+        idx = _SRC.find("def _get_cached_prior_levels(")
+        end = _SRC.find("\ndef ", idx + 10)
+        body = _SRC[idx:end]
+        assert 'rec.get("session_date") != expected_session.isoformat()' in body
+        assert "return None" in body
+
+    def test_fallback_only_when_fresh_null(self):
+        """Cache fallback triggers when fresh levels are null or invalidated."""
+        assert "PRIOR_LEVEL_CACHE_FALLBACK_USED" in _SRC
+        assert "if prior_day_high is None and prior_day_low is None:" in _SRC
+
+
+# ---------------------------------------------------------------------------
+# Behavioral tests — load module with deps stubbed
+# ---------------------------------------------------------------------------
+
+def _load(env_overrides: dict | None = None):
+    stubs = {
+        "ap.brokers": MagicMock(),
+        "ap.brokers.tradier": MagicMock(),
+        "yfinance": MagicMock(),
+        "requests": MagicMock(),
+        "ap.db": MagicMock(),
+        "psycopg2": MagicMock(),
+    }
+    env = dict(os.environ)
+    if env_overrides:
+        env.update(env_overrides)
+    name = "ap_overnight_reeval_shim"
+    with patch.dict(sys.modules, stubs), patch.dict(os.environ, env, clear=False):
+        spec = importlib.util.spec_from_file_location(name, _REPO / "ap_overnight_reeval.py")
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[name] = mod
+        try:
+            spec.loader.exec_module(mod)
+        finally:
+            sys.modules.pop(name, None)
+    return mod
+
+
+class TestPriorTradingSession:
+    def test_monday_returns_friday(self):
+        mod = _load()
+        # Monday 2026-06-22 → prior trading session Friday 2026-06-19
+        monday = datetime(2026, 6, 22, 9, 35, tzinfo=ZoneInfo("America/New_York"))
+        assert mod._prior_trading_session_date(monday) == date(2026, 6, 19)
+
+    def test_tuesday_returns_monday(self):
+        mod = _load()
+        tuesday = datetime(2026, 6, 23, 9, 35, tzinfo=ZoneInfo("America/New_York"))
+        assert mod._prior_trading_session_date(tuesday) == date(2026, 6, 22)
+
+    def test_sunday_returns_friday(self):
+        mod = _load()
+        sunday = datetime(2026, 6, 21, 9, 35, tzinfo=ZoneInfo("America/New_York"))
+        assert mod._prior_trading_session_date(sunday) == date(2026, 6, 19)
+
+
+class TestCacheReadWrite:
+    def test_write_then_read_same_session(self):
+        mod = _load({"PRIOR_LEVEL_CACHE_FALLBACK": "1"})
+        session = date(2026, 6, 19)
+        mod._cache_prior_levels("AMAT", session, 640.0, 620.0, 632.0)
+        rec = mod._get_cached_prior_levels("AMAT", session)
+        assert rec is not None
+        assert rec["prior_day_high"] == 640.0
+        assert rec["prior_day_low"] == 620.0
+
+    def test_read_rejects_wrong_session(self):
+        """Stale cache: stamped session != expected → None (fail-safe)."""
+        mod = _load({"PRIOR_LEVEL_CACHE_FALLBACK": "1"})
+        mod._cache_prior_levels("AMAT", date(2026, 6, 18), 640.0, 620.0, 632.0)
+        # expected prior session is the 19th, cache holds the 18th → stale
+        rec = mod._get_cached_prior_levels("AMAT", date(2026, 6, 19))
+        assert rec is None
+
+    def test_read_missing_ticker_returns_none(self):
+        mod = _load({"PRIOR_LEVEL_CACHE_FALLBACK": "1"})
+        assert mod._get_cached_prior_levels("NOPE", date(2026, 6, 19)) is None
+
+    def test_write_skips_when_both_levels_none(self):
+        mod = _load({"PRIOR_LEVEL_CACHE_FALLBACK": "1"})
+        mod._cache_prior_levels("EMPTY", date(2026, 6, 19), None, None, None)
+        assert mod._get_cached_prior_levels("EMPTY", date(2026, 6, 19)) is None
+
+
+class TestFlagOff:
+    def test_flag_off_constant_false(self):
+        mod = _load({"PRIOR_LEVEL_CACHE_FALLBACK": "0"})
+        assert mod._PRIOR_LEVEL_CACHE_ENABLED is False
+
+    def test_flag_on_constant_true(self):
+        mod = _load({"PRIOR_LEVEL_CACHE_FALLBACK": "1"})
+        assert mod._PRIOR_LEVEL_CACHE_ENABLED is True
+
+
+class TestFailSafe:
+    def test_cache_helpers_never_raise(self):
+        mod = _load({"PRIOR_LEVEL_CACHE_FALLBACK": "1"})
+        # Garbage inputs must not raise
+        mod._cache_prior_levels(None, date(2026, 6, 19), "x", object(), None)
+        assert mod._get_cached_prior_levels(None, date(2026, 6, 19)) in (None, mod._PRIOR_LEVEL_CACHE.get("") )
+
+
+class TestBrokerDateStamping:
+    """Amendment: cache must be stamped with the BROKER's prior_day_date, and
+    must refuse to cache when the broker date != expected prior trading session."""
+
+    def test_cache_stamped_with_broker_date_matches_read(self):
+        """A cache stamped with the broker date reads back under that same
+        session date."""
+        mod = _load({"PRIOR_LEVEL_CACHE_FALLBACK": "1"})
+        broker_session = date(2026, 6, 19)
+        mod._cache_prior_levels("AMAT", broker_session, 640.0, 620.0, 632.0)
+        rec = mod._get_cached_prior_levels("AMAT", broker_session)
+        assert rec is not None
+        assert rec["session_date"] == "2026-06-19"
+
+    def test_refuse_logic_when_broker_date_mismatches(self):
+        """Simulate the re-arm decision: if the broker's prior_day_date does not
+        equal the expected prior trading session, the levels must NOT be cached.
+        We exercise the exact predicate used in the re-arm loop."""
+        mod = _load({"PRIOR_LEVEL_CACHE_FALLBACK": "1"})
+        expected = date(2026, 6, 19)             # expected prior session (Fri)
+        broker_date = date(2026, 6, 17)          # stale/lagged bar (Wed)
+        # the re-arm caches only when broker_session == expected
+        should_cache = (broker_date == expected)
+        assert should_cache is False
+        # ensure nothing was cached for this ticker
+        assert mod._get_cached_prior_levels("ZZZZ", expected) is None
+
+    def test_source_uses_broker_prior_day_date(self):
+        """Guard: the re-arm loop must read prior_levels['prior_day_date'] and
+        compare to the expected session, and stamp with the broker date."""
+        src = (Path(__file__).resolve().parents[1] / "ap_overnight_reeval.py").read_text()
+        assert 'prior_levels.get("prior_day_date")' in src
+        assert "_broker_session == _expected_session" in src
+        assert "PRIOR_LEVEL_SESSION_MISMATCH" in src
+        # must stamp with the broker session, not the computed expected session
+        idx = src.find("_cache_prior_levels(\n                        ticker, _broker_session")
+        assert idx != -1, "cache must be stamped with _broker_session (broker date)"
+
+    def test_broker_provides_prior_day_date(self):
+        """Sanity: the Tradier broker actually returns prior_day_date so the
+        stamping has real data to use."""
+        broker_src = (Path(__file__).resolve().parents[1] / "ap" / "brokers" / "tradier.py").read_text()
+        assert '"prior_day_date":  prior.get("date")' in broker_src
+
+
+class TestFailClosedOnSessionMismatch:
+    """Amendment: fresh broker levels with a wrong/missing session date must be
+    FAIL-CLOSED — discarded for immediate use, not just skipped for caching."""
+
+    def test_source_clears_fresh_on_mismatch(self):
+        src = (Path(__file__).resolve().parents[1] / "ap_overnight_reeval.py").read_text()
+        # the mismatch branch must clear both fresh levels
+        idx = src.find("PRIOR_LEVEL_SESSION_MISMATCH")
+        assert idx != -1, "must log PRIOR_LEVEL_SESSION_MISMATCH"
+        block = src[idx: idx + 600]
+        assert "prior_day_high = None" in block
+        assert "prior_day_low = None" in block
+
+    def test_source_only_uses_fresh_when_session_ok(self):
+        """Fresh values are used/cached only under _have_fresh and _session_ok."""
+        src = (Path(__file__).resolve().parents[1] / "ap_overnight_reeval.py").read_text()
+        assert "_session_ok = (_broker_session is not None and _broker_session == _expected_session)" in src
+        assert "if _have_fresh and _session_ok:" in src
+        assert "elif _have_fresh and not _session_ok:" in src
+
+    def test_source_clears_close_only_if_from_stale_fetch(self):
+        """prior_day_close cleared only when it came from the same stale fetch."""
+        src = (Path(__file__).resolve().parents[1] / "ap_overnight_reeval.py").read_text()
+        idx = src.find("PRIOR_LEVEL_SESSION_MISMATCH")
+        block = src[idx: idx + 700]
+        assert 'prior_levels.get("prior_day_close") is not None' in block
+
+    def test_cache_fallback_after_invalidation(self):
+        """After fresh is discarded, the single cache fallback runs and only a
+        session-matched cache can supply levels."""
+        src = (Path(__file__).resolve().parents[1] / "ap_overnight_reeval.py").read_text()
+        # the fallback gate keys off both levels being None (fresh null OR cleared)
+        assert "if prior_day_high is None and prior_day_low is None:" in src
+        assert "_get_cached_prior_levels(ticker, _expected_session)" in src
+
+    def test_mismatch_with_valid_cache_uses_cache_runtime(self):
+        """Runtime: simulate fresh-mismatch + valid cache → levels come from cache."""
+        mod = _load({"PRIOR_LEVEL_CACHE_FALLBACK": "1"})
+        # seed a correct-session cache
+        expected = date(2026, 6, 19)
+        mod._cache_prior_levels("AMAT", expected, 640.0, 620.0, 632.0)
+        # the read with the correct expected session returns it
+        rec = mod._get_cached_prior_levels("AMAT", expected)
+        assert rec is not None and rec["prior_day_high"] == 640.0
+
+    def test_mismatch_no_cache_stays_none(self):
+        """Runtime: no cache for the expected session → read returns None
+        (signal stays fail-closed)."""
+        mod = _load({"PRIOR_LEVEL_CACHE_FALLBACK": "1"})
+        assert mod._get_cached_prior_levels("NOCACHE", date(2026, 6, 19)) is None

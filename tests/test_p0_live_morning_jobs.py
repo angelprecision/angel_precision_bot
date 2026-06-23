@@ -182,27 +182,31 @@ def test_network_exception_returns_failure_without_crashing():
     assert "network down" in str(result["body"])
 
 
-def test_workflow_targets_live_and_paper_batches():
+def test_workflow_is_backup_only_and_uses_module_invocation():
     workflow = (REPO_ROOT / ".github" / "workflows" / "overnight-reeval.yml").read_text()
-    assert "schedule:" not in workflow
-    assert "MORNING_JOB_LIVE_CLIENT: jasoncosby1@gmail.com" in workflow
-    assert "MORNING_JOB_PAPER_CLIENTS: jose.vasquez4011@gmail.com,tradefluencehq@gmail.com" in workflow
-    assert 'MORNING_JOB_FORCE_WINDOW: "1"' in workflow
+    assert "50 13 * * 1-5" in workflow
+    assert "50 14 * * 1-5" in workflow
+    assert "18 13 * * 1-5" not in workflow
+    assert "26 13 * * 1-5" not in workflow
     assert "python3 -m ap.scripts.live_morning_jobs" in workflow
+    assert "python3 ap/scripts/live_morning_jobs.py" not in workflow
 
 
 def test_render_blueprint_defines_primary_render_cron_jobs():
     blueprint = (REPO_ROOT / "render.yaml").read_text()
-    assert "- type: cron" in blueprint
-    assert 'schedule: "18 13,14 * * 1-5"' in blueprint
-    assert 'schedule: "25 13,14 * * 1-5"' in blueprint
-    assert 'schedule: "31 13,14 * * 1-5"' in blueprint
-    assert 'schedule: "37 13,14 * * 1-5"' in blueprint
-    assert "startCommand: python -m ap.scripts.live_morning_jobs" in blueprint
-    assert "value: overnight_reeval_batch" in blueprint
-    assert "value: morning_handoff_primary" in blueprint
-    assert "value: morning_handoff_backup" in blueprint
-    assert "value: morning_recovery" in blueprint
+    assert blueprint.count("type: cron") == 8
+    for expr in (
+        "18 13 * * 1-5",
+        "18 14 * * 1-5",
+        "26 13 * * 1-5",
+        "26 14 * * 1-5",
+        "32 13 * * 1-5",
+        "32 14 * * 1-5",
+        "36 13 * * 1-5",
+        "36 14 * * 1-5",
+    ):
+        assert expr in blueprint
+    assert "startCommand: \"python -m ap.scripts.live_morning_jobs\"" in blueprint
 
 
 def test_script_accepts_render_and_backup_env_aliases():
@@ -210,6 +214,43 @@ def test_script_accepts_render_and_backup_env_aliases():
     assert 'os.getenv("BOT_URL", os.getenv("AP_BOT_URL", ""))' in script_src
     assert 'os.getenv("SIGNING_SECRET", os.getenv("AP_SIGNING_SECRET", ""))' in script_src
     assert "if __package__ in {None, \"\"}:" in script_src
+
+
+def test_recovery_release_is_paper_only_by_default():
+    import os
+
+    old = os.environ.pop("ENABLE_LIVE_AUTO_RELEASE_AFTER_OPEN", None)
+    try:
+        calls = build_job_calls(MORNING_RECOVERY_JOB)
+        release_call = calls[0]
+        assert DEFAULT_LIVE_CLIENT not in release_call.payload["clients"]
+        assert release_call.payload["clients"] == list(DEFAULT_PAPER_CLIENTS)
+        assert release_call.execution_mode == "paper"
+    finally:
+        if old is not None:
+            os.environ["ENABLE_LIVE_AUTO_RELEASE_AFTER_OPEN"] = old
+
+
+def test_recovery_release_includes_live_only_when_flag_set():
+    import os
+
+    old = os.environ.get("ENABLE_LIVE_AUTO_RELEASE_AFTER_OPEN")
+    os.environ["ENABLE_LIVE_AUTO_RELEASE_AFTER_OPEN"] = "true"
+    try:
+        calls = build_job_calls(MORNING_RECOVERY_JOB)
+        release_call = calls[0]
+        assert DEFAULT_LIVE_CLIENT in release_call.payload["clients"]
+        assert release_call.execution_mode == "mixed"
+    finally:
+        if old is None:
+            os.environ.pop("ENABLE_LIVE_AUTO_RELEASE_AFTER_OPEN", None)
+        else:
+            os.environ["ENABLE_LIVE_AUTO_RELEASE_AFTER_OPEN"] = old
+
+
+def test_handoff_backup_plan_builds_both_modes():
+    calls = build_job_calls(MORNING_HANDOFF_BACKUP_JOB)
+    assert [call.execution_mode for call in calls] == ["live", "paper"]
 
 
 def test_app_source_restores_existing_admin_endpoints_and_handoff_contract():
@@ -220,7 +261,7 @@ def test_app_source_restores_existing_admin_endpoints_and_handoff_contract():
     assert '@app.get("/admin/morning_handoff_audit")' in src
     assert '@app.post("/admin/morning_handoff_audit")' in src
     assert '@app.post("/admin/paper_rescue_restart_guard")' in src
-    assert "run_morning_handoff_audit" in src
+    assert '@app.route("/admin/preopen_readiness", methods=["GET", "POST"])' in src
     assert 'body.get("clients")' in src
     assert 'body.get("client_id")' in src
     assert 'body.get("execution_mode")' in src
@@ -265,17 +306,3 @@ def test_no_code_path_calls_broker_submit_or_cancel_directly():
     assert "cancel_order(" not in combined
     assert "submit_existing_entry" not in combined
 
-
-def test_job_batches_cover_recovery_path_without_manual_shell():
-    calls = build_job_calls(MORNING_RECOVERY_JOB)
-    assert [call.endpoint for call in calls] == [
-        "/admin/release_after_hours_deferred",
-        "/admin/paper_rescue_restart_guard",
-    ]
-    assert calls[0].payload["force"] is True
-    assert calls[1].payload["clients"] == list(DEFAULT_PAPER_CLIENTS)
-
-
-def test_handoff_backup_plan_builds_both_modes():
-    calls = build_job_calls(MORNING_HANDOFF_BACKUP_JOB)
-    assert [call.execution_mode for call in calls] == ["live", "paper"]

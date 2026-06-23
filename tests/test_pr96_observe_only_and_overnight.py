@@ -162,14 +162,25 @@ def test_15_intel_block_proceeds_to_arm_when_recheck_disabled():
     assert "OVERNIGHT_SCORE_RECHECK_DISABLED" in OV_SRC
     assert "PROCEED_TO_ARM" in OV_SRC
     assert "second_score_mode=observe_only" in OV_SRC
-    # The intel-block branch must NOT call _mark_job_rejected
     idx = OV_SRC.find("decision=PROCEED_TO_ARM")
     region = OV_SRC[idx:idx+1800]
     assert "_mark_job_rejected" not in region.split("else:")[0], (
         "PROCEED branch must not reach _mark_job_rejected before else:"
     )
-    # The PROCEED branch must end with the fall-through comment
     assert "Fall through to Step 5" in region
+
+def test_15a_score_block_proceeds_to_arm_when_recheck_disabled():
+    """Morning blocked_score rechecks must stay observe-only for WATCHING rows."""
+    for phrase in (
+        "blocked_score",
+        "rejected_low_score",
+        "score_below_floor",
+        "score_below_priority_floor",
+        "context_below_floor",
+        "tier_reject",
+    ):
+        assert phrase in OV_SRC, f"missing observe-only score phrase: {phrase}"
+    assert "SCORE_BELOW_THRESHOLD" in OV_SRC
 
 def test_15d_hydrate_plan_helper_exists():
     assert "_hydrate_plan_from_signal" in OV_SRC
@@ -183,23 +194,27 @@ def test_15e_hydrate_plan_carries_required_fields():
 
 def test_15f_intel_block_does_not_increment_skipped():
     """The intel-block PROCEED branch must not increment skipped."""
-    # Find the intel-block branch (PROCEED_TO_ARM)
     idx = OV_SRC.find("decision=PROCEED_TO_ARM")
-    # End of branch is the comment "Fall through to Step 5"
     end = OV_SRC.find("Fall through to Step 5", idx)
     branch_body = OV_SRC[idx:end]
     assert 'result["skipped"]' not in branch_body, (
         "Intel-block PROCEED branch must not increment skipped"
     )
 
+def test_15g_score_recheck_reason_code_is_classified_observe_only():
+    """Overnight score recheck should key off SCORE_BELOW_THRESHOLD explicitly."""
+    assert "_observe_only_reason_codes" in OV_SRC
+    idx = OV_SRC.find("_observe_only_reason_codes")
+    region = OV_SRC[idx:idx+250]
+    assert "SCORE_BELOW_THRESHOLD" in region
+    assert "_reason_code in _observe_only_reason_codes" in OV_SRC
+
 def test_15b_hard_safety_block_still_rejects():
     """Hard safety blocks (capital/kill switch/etc) must still reject."""
     assert "_is_hard_safety_block" in OV_SRC
-    # Hard safety branch reaches _mark_job_rejected — search wider window
     idx = OV_SRC.find('_is_hard_safety_block')
     region = OV_SRC[idx:idx+3500]
     assert "_mark_job_rejected" in region
-    # And the hard-safety-OR-recheck-enabled comment is the reject path
     assert "Hard safety block OR recheck enabled" in OV_SRC
 
 def test_15c_hard_safety_phrases_complete():
@@ -228,7 +243,6 @@ def test_17b_prior_levels_check_is_side_specific():
     """CALL checks prior_day_high; PUT checks prior_day_low."""
     assert '_side_upper == "CALL"' in OV_SRC
     assert '_side_upper == "PUT"'  in OV_SRC
-    # CALL → prior_day_high, PUT → prior_day_low
     idx = OV_SRC.find('_side_upper == "CALL"')
     region = OV_SRC[idx:idx+200]
     assert "prior_day_high" in region
@@ -240,22 +254,20 @@ def test_17c_call_missing_high_with_low_present_retries():
     """CALL signal: prior_day_high unavailable, prior_day_low present → RETRY_LATER.
     Behavioral check: the code path tests _side_upper == 'CALL' and prior_day_high is None
     independently of prior_day_low value."""
-    # The CALL check must not require prior_day_low to also be None
     idx = OV_SRC.find('_side_upper == "CALL"')
     region = OV_SRC[idx:idx+150]
     assert "prior_day_high is None" in region
-    assert "prior_day_low is None" not in region  # NOT a conjunction
+    assert "prior_day_low is None" not in region
 
 def test_17d_put_missing_low_with_high_present_retries():
     """PUT signal: prior_day_low unavailable, prior_day_high present → RETRY_LATER."""
     idx = OV_SRC.find('_side_upper == "PUT"')
     region = OV_SRC[idx:idx+150]
     assert "prior_day_low is None" in region
-    assert "prior_day_high is None" not in region  # NOT a conjunction
+    assert "prior_day_high is None" not in region
 
 def test_17e_explicit_entry_trigger_bypasses_levels_check():
     """If signal carries entry_trigger, no level fetch is required."""
-    # The level check is guarded by `if not _has_trigger:`
     idx = OV_SRC.find('_missing_level = None')
     region = OV_SRC[idx:idx+400]
     assert "_has_trigger" in region
@@ -265,6 +277,31 @@ def test_17f_log_includes_side_and_missing_field():
     idx = OV_SRC.find("OVERNIGHT_PRIOR_LEVELS_UNAVAILABLE")
     region = OV_SRC[idx:idx+600]
     assert "side=%s missing=%s" in region or ("side=" in region and "missing=" in region)
+
+def test_17g_prior_day_session_mismatch_fails_closed_before_arming():
+    """Mismatched/missing broker prior_day_date must not arm from stale fresh levels."""
+    assert "_PRIOR_LEVEL_CACHE_ENABLED" in OV_SRC
+    assert "_prior_trading_session_date" in OV_SRC
+    assert 'prior_levels.get("prior_day_date")' in OV_SRC
+    assert "PRIOR_LEVEL_SESSION_MISMATCH" in OV_SRC
+    idx = OV_SRC.find("PRIOR_LEVEL_SESSION_MISMATCH")
+    region = OV_SRC[idx:idx+1200]
+    assert "prior_day_high = None" in region
+    assert "prior_day_low = None" in region
+    assert "_get_cached_prior_levels" in OV_SRC
+
+
+def test_17h_cache_fallback_requires_session_matched_cache_only():
+    """Fallback after mismatch/null fresh levels must use session-matched cache only."""
+    idx = OV_SRC.find("_get_cached_prior_levels")
+    region = OV_SRC[idx:idx+700]
+    assert 'rec.get("session_date") != expected_session.isoformat()' in region
+    idx2 = OV_SRC.find("if _cached:")
+    region2 = OV_SRC[idx2:idx2+700]
+    assert 'prior_day_high = float(_cached.get("prior_day_high") or 0) or None' in region2
+    assert 'prior_day_low = float(_cached.get("prior_day_low") or 0) or None' in region2
+    assert "PRIOR_LEVEL_CACHE_FALLBACK_USED" in region2
+    assert "_expected_session.isoformat()" in region2
 
 def test_18_stale_signal_still_rejects():
     assert "stale_signal" in OV_SRC
@@ -289,7 +326,6 @@ def test_21_fetch_does_not_filter_ap_signals_by_client_email():
     idx = OV_SRC.find('sb.table("ap_signals")')
     assert idx > 0
     region = OV_SRC[idx:idx+800]
-    # The .eq() filters on the ap_signals query must NOT include client_email
     assert '.eq("client_email"' not in region
     assert "client_email=" not in region or "Do NOT filter ap_signals by client_email" in OV_SRC
 
@@ -302,6 +338,28 @@ def test_22_fetch_logs_total_trade_queue_ap_signals():
 def test_22b_shared_ap_signals_dedup_by_setup_identity():
     """Shared ap_signals are deduped by (ticker, side, timeframe, entry_trigger)."""
     assert "_seen_setup_keys" in OV_SRC
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Overnight order metadata preservation
+# ══════════════════════════════════════════════════════════════════════════════
+
+def test_23_overnight_create_entry_order_preserves_plan_metadata():
+    """Overnight/deferred OSM create must pass plan metadata through."""
+    assert "decision.plan.metadata" in OV_SRC
+    assert "meta=_plan_meta" in OV_SRC
+    idx = OV_SRC.find('_plan_meta = getattr(decision.plan, "metadata", None) or {}')
+    region = OV_SRC[idx:idx+700]
+    assert "create_entry_order(" in region
+    assert "meta=_plan_meta" in region
+
+
+def test_24_overnight_metadata_comment_lists_required_fields():
+    """The required overnight metadata fields must stay called out in code."""
+    idx = OV_SRC.find("Pass decision.plan.metadata into OSM")
+    region = OV_SRC[idx:idx+500]
+    for field in ("sizing_context", "contract_deferred", "risk_profile_source", "snapshot_at_eval"):
+        assert field in region, f"missing overnight metadata field note: {field}"
 
 
 # ══════════════════════════════════════════════════════════════════════════════

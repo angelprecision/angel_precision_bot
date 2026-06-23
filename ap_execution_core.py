@@ -135,6 +135,22 @@ class APExecutionCore:
             self.broker.data_broker = data_broker
         self.contract_selector = contract_selector  # wired for breach-time selection of deferred overnight signals
         self.email              = email
+
+        # P0 hotfix — APExecutionCore.client_id was never set, causing
+        # AttributeError at breach-time contract selection log calls.
+        # `email` IS the canonical client identity — it is the client_id
+        # (e.g. "jasoncosby1@gmail.com") passed from ClientRunner.
+        # We also set execution_mode as a stable alias of self.mode for
+        # use in breach-time logs that interpolate both attributes.
+        self.client_id    = email or os.getenv("SINGLE_CLIENT_EMAIL") or ""
+        # client_email: prefer the dedicated field if a subclass has set it
+        # separately; otherwise alias to client_id (same email address).
+        self.client_email = (
+            email
+            or os.getenv("SINGLE_CLIENT_EMAIL")
+            or ""
+        )
+        self.execution_mode = self.mode  # canonical alias for breach-time log fields
         self.position_manager   = position_manager
         self.order_state_machine = order_state_machine
         self._pos_lock = threading.Lock()
@@ -340,6 +356,82 @@ class APExecutionCore:
             )
             return None
 
+    # ── Diagnostic-only helper (PR hotfix/breach-block-diagnostics) ──────────
+    # Emits a single structured log line for every silent block / exception
+    # path in _breach_risk_check and _on_entry_trigger. The bot is working;
+    # this PR adds zero behavior changes. Operators grep Render logs for
+    # BREACH_RISK_CHECK_BLOCKED / BREACH_RISK_CHECK_EXCEPTION /
+    # WATCHER_ON_TRIGGER_RETURNED / WATCHER_ON_TRIGGER_EXCEPTION /
+    # ENTRY_TRIGGER_BLOCKED_RETURN to diagnose stuck PENDING_TRIGGER rows.
+    def _emit_breach_diag(
+        self,
+        event: str,
+        *,
+        watched: "WatchedSignal",
+        reason: str,
+        positions_open: object = "n/a",
+        pending_entries: object = "n/a",
+        max_positions: object = "n/a",
+        current_total_exposure: object = "n/a",
+        remaining_total_cap: object = "n/a",
+        mc_block_reason: str = "",
+        exception_type: str = "",
+        exception_message: str = "",
+        level: str = "warning",
+    ) -> None:
+        """Emit one structured diagnostic line. Never raises.
+
+        Field set is fixed across emissions so log-grep stays stable:
+        client_id, local_order_id, signal_id, symbol, contract, reason,
+        positions_open, pending_entries, max_positions, current_total_exposure,
+        remaining_total_cap, mc_block_reason, exception_type, exception_message,
+        execution_mode.
+        """
+        try:
+            sig             = getattr(watched, "signal", {}) or {}
+            client_id_val   = (
+                getattr(self, "client_id", None)
+                or getattr(self, "email", None)
+                or sig.get("client_email")
+                or "n/a"
+            )
+            local_order_id  = sig.get("local_order_id") or "n/a"
+            signal_id       = sig.get("signal_id") or "n/a"
+            symbol          = getattr(watched, "ticker", None) or sig.get("ticker") or "n/a"
+            contract        = (
+                (sig.get("plan") or {}).get("contract_symbol")
+                or sig.get("contract_symbol")
+                or sig.get("contract")
+                or "n/a"
+            )
+            execution_mode  = getattr(self, "mode", "n/a")
+
+            msg = (
+                f"{event} client_id={client_id_val} local_order_id={local_order_id} "
+                f"signal_id={signal_id} symbol={symbol} contract={contract} "
+                f"reason={reason} execution_mode={execution_mode} "
+                f"positions_open={positions_open} pending_entries={pending_entries} "
+                f"max_positions={max_positions} "
+                f"current_total_exposure={current_total_exposure} "
+                f"remaining_total_cap={remaining_total_cap} "
+                f"mc_block_reason={mc_block_reason or 'n/a'} "
+                f"exception_type={exception_type or 'n/a'} "
+                f"exception_message={(exception_message or 'n/a')[:200]}"
+            )
+            if level == "critical":
+                log.critical(msg)
+            elif level == "error":
+                log.error(msg)
+            elif level == "info":
+                log.info(msg)
+            else:
+                log.warning(msg)
+        except Exception:  # pragma: no cover — never let diagnostics break flow
+            try:
+                log.warning("BREACH_DIAG_EMIT_FAILED event=%s", event)
+            except Exception:
+                pass
+
     def _breach_risk_check(self, watched: WatchedSignal) -> bool:
         """
         Lightweight breach-time safety check.
@@ -360,6 +452,13 @@ class APExecutionCore:
                     "decision_status": "blocked_at_breach",
                     "context_notes": "kill_switch_active_at_breach",
                 })
+            self._emit_breach_diag(
+                "BREACH_RISK_CHECK_BLOCKED",
+                watched=watched,
+                reason="kill_switch_active",
+                max_positions=getattr(self, "_max_positions", "n/a"),
+                level="critical",
+            )
             return False
 
         if self.master_control is not None:
@@ -372,9 +471,25 @@ class APExecutionCore:
                             "decision_status": "blocked_at_breach",
                             "context_notes": "master_control_kill_switch_active_at_breach",
                         })
+                    self._emit_breach_diag(
+                        "BREACH_RISK_CHECK_BLOCKED",
+                        watched=watched,
+                        reason="master_control_kill_switch_active",
+                        max_positions=getattr(self, "_max_positions", "n/a"),
+                        level="critical",
+                    )
                     return False
             except Exception as exc:
                 log.warning("[%s] Kill-switch check failed at breach: %s", ticker, exc)
+                self._emit_breach_diag(
+                    "BREACH_RISK_CHECK_EXCEPTION",
+                    watched=watched,
+                    reason="kill_switch_check_exception",
+                    max_positions=getattr(self, "_max_positions", "n/a"),
+                    exception_type=type(exc).__name__,
+                    exception_message=str(exc),
+                    level="warning",
+                )
 
         open_count = self._current_open_position_count()
         pending_entries = self._current_pending_entry_count()
@@ -397,6 +512,15 @@ class APExecutionCore:
                 self._cleanup_pending_entry_order(watched, action="cancel", reason="positions_full_at_breach")
             except Exception as _clean_err:
                 log.error("[%s] Failed to cleanup pending entry order: %s", ticker, _clean_err)
+            self._emit_breach_diag(
+                "BREACH_RISK_CHECK_BLOCKED",
+                watched=watched,
+                reason="positions_full_at_breach",
+                positions_open=open_count,
+                pending_entries=pending_entries,
+                max_positions=self._max_positions,
+                level="info",
+            )
             return False
 
         approved_plan = self._recover_plan_for_revalidation(watched)
@@ -413,8 +537,16 @@ class APExecutionCore:
                         "context_notes": msg,
                     })
                 _sector = sig.get("sector") or sig.get("correlation_bucket") or ticker
+                self._emit_breach_diag(
+                    "BREACH_RISK_CHECK_BLOCKED",
+                    watched=watched,
+                    reason="approved_plan_missing_at_breach_revalidation",
+                    positions_open=open_count,
+                    pending_entries=pending_entries,
+                    max_positions=self._max_positions,
+                    level="critical",
+                )
                 return False
-
             log.critical(
                 "[%s] PAPER BREACH WARNING — _approved_plan missing; continuing without exposure revalidation",
                 ticker,
@@ -439,6 +571,31 @@ class APExecutionCore:
                             "context_notes": f"exposure_revalidation={reason}",
                         })
                     _sector = sig.get("sector") or sig.get("correlation_bucket") or ticker
+                    # Best-effort capacity numbers for diagnostics
+                    _cur_total_exp = (
+                        getattr(reval, "current_total_exposure", None)
+                        if hasattr(reval, "current_total_exposure") else "n/a"
+                    )
+                    _rem_total_cap = (
+                        getattr(reval, "remaining_total_cap", None)
+                        if hasattr(reval, "remaining_total_cap") else "n/a"
+                    )
+                    self._emit_breach_diag(
+                        "BREACH_RISK_CHECK_BLOCKED",
+                        watched=watched,
+                        reason="exposure_revalidation_blocked",
+                        positions_open=open_count,
+                        pending_entries=pending_entries,
+                        max_positions=self._max_positions,
+                        current_total_exposure=(
+                            _cur_total_exp if _cur_total_exp is not None else "n/a"
+                        ),
+                        remaining_total_cap=(
+                            _rem_total_cap if _rem_total_cap is not None else "n/a"
+                        ),
+                        mc_block_reason=str(reason),
+                        level="warning",
+                    )
                     return False
             except Exception as exc:
                 if self.mode == "LIVE":
@@ -452,8 +609,30 @@ class APExecutionCore:
                             "context_notes": f"exposure_revalidation_error={exc}",
                         })
                     _sector = sig.get("sector") or sig.get("correlation_bucket") or ticker
+                    self._emit_breach_diag(
+                        "BREACH_RISK_CHECK_EXCEPTION",
+                        watched=watched,
+                        reason="exposure_revalidation_error_live",
+                        positions_open=open_count,
+                        pending_entries=pending_entries,
+                        max_positions=self._max_positions,
+                        exception_type=type(exc).__name__,
+                        exception_message=str(exc),
+                        level="critical",
+                    )
                     return False
                 log.warning("[%s] PAPER breach exposure revalidation failed open: %s", ticker, exc)
+                self._emit_breach_diag(
+                    "BREACH_RISK_CHECK_EXCEPTION",
+                    watched=watched,
+                    reason="exposure_revalidation_error_paper_fail_open",
+                    positions_open=open_count,
+                    pending_entries=pending_entries,
+                    max_positions=self._max_positions,
+                    exception_type=type(exc).__name__,
+                    exception_message=str(exc),
+                    level="warning",
+                )
 
         return True
 
@@ -608,6 +787,27 @@ class APExecutionCore:
         ticker = watched.ticker
         signal_id = str(sig.get("signal_id", "") or "")
 
+        # P0 hotfix — resolve client identity from the signal dict first, then
+        # fall back to self.client_id (set in __init__), then self.email.
+        # This ensures breach-time logs never throw AttributeError and that
+        # the most-specific client identity (from the row/signal) is used even
+        # if self.client_id is somehow stale or missing.
+        _breach_client_id = (
+            str(sig.get("client_id") or sig.get("client_email") or "").strip()
+            or getattr(self, "client_id", None)
+            or self.email
+            or ""
+        )
+        if not _breach_client_id:
+            # Hard guard: log with ticker and write a sentinel last_error so
+            # the failure is diagnosable rather than an opaque AttributeError.
+            log.warning(
+                "[%s] BREACH_TIME_CONTRACT_SELECTION_FAILED "
+                "reason=missing_client_id — client identity cannot be resolved; "
+                "breach-time selection will continue but logs will be incomplete",
+                ticker,
+            )
+
         trigger_price = getattr(watched, "trigger_price", None)
         try:
             trigger_price_for_log = float(trigger_price or 0)
@@ -627,6 +827,13 @@ class APExecutionCore:
         # 1) Revalidate only. Never re-run selection/sizing logic here.
         if not self._breach_risk_check(watched):
             funnel.inc("master_control_blocked")
+            self._emit_breach_diag(
+                "ENTRY_TRIGGER_BLOCKED_RETURN",
+                watched=watched,
+                reason="breach_risk_check_false",
+                max_positions=getattr(self, "_max_positions", "n/a"),
+                level="info",
+            )
             return
 
         # 2) Require OSM + existing queue-created local order id.
@@ -711,10 +918,138 @@ class APExecutionCore:
             )
             return
 
+        # ── PR3 (no-silent-deferred-trigger-exits): canonical terminal outcome ──
+        # Every triggered deferred row MUST leave exactly one explicit TERMINAL
+        # outcome so no trigger returns silently. Observability only — it records
+        # the outcome the existing code paths already produce; it changes no
+        # decision or order action.
+        #
+        # IMPORTANT (review amendment): "contract selected" is PROGRESS, not a
+        # terminal state. The real terminal outcome of a successful deferred
+        # entry is BREACH_BROKER_SUBMITTED (or BREACH_SUBMISSION_SKIPPED on a
+        # submit failure). So contract-selected is emitted on a SEPARATE,
+        # non-terminal channel that does NOT consume the exactly-once terminal
+        # slot — otherwise it would block the true terminal outcome that follows.
+        #
+        # TERMINAL outcomes (exactly one per triggered deferred row):
+        #   BREACH_RISK_CHECK_BLOCKED      _breach_risk_check returned False
+        #   BREACH_SELECTOR_RETURNED_NONE  selector.select() returned None
+        #   BREACH_SELECTOR_EXCEPTION      selector.select() raised
+        #   BREACH_SUBMISSION_SKIPPED      submit attempted, OSM returned not-ok
+        #   BREACH_BROKER_SUBMITTED        order handed to broker submit path
+        #   NO_VALID_PLAYBOOK_DTE_CONTRACT no survivor in any evaluated DTE bucket
+        #   UNTRADEABLE_FOR_ACCOUNT_SIZE   quality contract exists but exceeds budget
+        #   DATA_MISSING_OI_VOLUME         chain returned with zero OI/volume fields
+        #
+        # PROGRESS (non-terminal, never consumes the terminal slot):
+        #   BREACH_CONTRACT_SELECTED       real OCC contract chosen, proceeding
+        #
+        # _deferred_outcome["emitted"] is the sentinel the post-trigger guard checks.
+        _TERMINAL_DEFERRED_OUTCOMES = frozenset({
+            "BREACH_RISK_CHECK_BLOCKED",
+            "BREACH_SELECTOR_RETURNED_NONE",
+            "BREACH_SELECTOR_EXCEPTION",
+            "BREACH_SUBMISSION_SKIPPED",
+            "BREACH_BROKER_SUBMITTED",
+            "NO_VALID_PLAYBOOK_DTE_CONTRACT",
+            "UNTRADEABLE_FOR_ACCOUNT_SIZE",
+            "DATA_MISSING_OI_VOLUME",
+        })
+        _deferred_outcome = {"emitted": False, "outcome": None, "is_deferred": False}
+
+        def _emit_deferred_progress(
+            outcome: str,
+            *,
+            contract: str = "",
+            extra: dict | None = None,
+        ) -> None:
+            """Log a NON-TERMINAL deferred milestone (e.g. BREACH_CONTRACT_SELECTED).
+            Deferred-guarded but does NOT set the exactly-once terminal sentinel,
+            so it can never block the real terminal outcome that follows. Never
+            raises."""
+            if not _deferred_outcome.get("is_deferred"):
+                return
+            try:
+                payload = {
+                    "outcome": outcome,
+                    "local_order_id": queue_local_order_id or "",
+                    "signal_id": signal_id or "",
+                    "symbol": ticker,
+                    "execution_mode": getattr(self, "mode", "n/a"),
+                    "contract": contract or "",
+                }
+                if extra:
+                    for _k, _v in extra.items():
+                        payload[_k] = _v
+                _fields = " ".join(f"{k}={v}" for k, v in payload.items())
+                log.info("DEFERRED_TRIGGER_PROGRESS %s", _fields)
+            except Exception:
+                pass
+
+        def _emit_deferred_outcome(
+            outcome: str,
+            *,
+            reason: str = "",
+            contract: str = "",
+            broker_order_id: str = "",
+            extra: dict | None = None,
+        ) -> None:
+            """Emit EXACTLY ONE canonical TERMINAL outcome for a triggered
+            DEFERRED row. Never raises. Always includes local_order_id +
+            signal_id so the event joins back to the order row.
+
+            Three guards (per review amendments):
+              1. Deferred-only: no-op unless this trigger is a deferred entry.
+              2. Terminal-only: a non-terminal code (e.g. BREACH_CONTRACT_SELECTED)
+                 is rejected here — those go through _emit_deferred_progress so
+                 they never consume the terminal slot.
+              3. Exactly-once: the first TERMINAL emission wins; later calls are
+                 ignored so a row can never carry two terminal outcomes.
+            """
+            if not _deferred_outcome.get("is_deferred"):
+                return
+            if outcome not in _TERMINAL_DEFERRED_OUTCOMES:
+                # Defensive: a non-terminal code must never reach the terminal
+                # channel. Route it to progress logging instead of consuming the
+                # exactly-once slot.
+                _emit_deferred_progress(outcome, contract=contract, extra=extra)
+                return
+            if _deferred_outcome.get("emitted"):
+                return
+            _deferred_outcome["emitted"] = True
+            _deferred_outcome["outcome"] = outcome
+            try:
+                payload = {
+                    "outcome": outcome,
+                    "local_order_id": queue_local_order_id or "",
+                    "signal_id": signal_id or "",
+                    "symbol": ticker,
+                    "execution_mode": getattr(self, "mode", "n/a"),
+                    "reason": reason or "",
+                    "contract": contract or "",
+                    "broker_order_id": broker_order_id or "",
+                }
+                if extra:
+                    for _k, _v in extra.items():
+                        payload[_k] = _v
+                _fields = " ".join(f"{k}={v}" for k, v in payload.items())
+                if outcome == "BREACH_BROKER_SUBMITTED":
+                    log.info("DEFERRED_TRIGGER_OUTCOME %s", _fields)
+                else:
+                    log.warning("DEFERRED_TRIGGER_OUTCOME %s", _fields)
+            except Exception:
+                try:
+                    log.warning("DEFERRED_TRIGGER_OUTCOME_EMIT_FAILED outcome=%s", outcome)
+                except Exception:
+                    pass
+
         # 3) Recover the already-approved queue/OSM plan.
         approved_plan = self._recover_plan_for_revalidation(watched)
         if approved_plan is None:
             log.critical("[%s] PRODUCTION_ENTRY_BLOCK — approved plan missing after breach revalidation", ticker)
+            # NOTE: _deferred is not yet known here, and an invalid/missing plan
+            # is not a deferred-selection outcome — do not emit a deferred
+            # outcome. _terminalize_breach_failure records this terminal state.
             _terminalize_breach_failure("approved_plan_missing_after_revalidation")
             return
 
@@ -733,12 +1068,20 @@ class APExecutionCore:
             or not _contract_sym_raw
             or _contract_sym_raw.upper().startswith("DEFERRED:")  # safety: never submit placeholder
         )
+        # Enable deferred-outcome emission only for deferred triggers (amendment:
+        # guard deferred logs with _deferred). Non-deferred entries never emit a
+        # deferred terminal outcome.
+        _deferred_outcome["is_deferred"] = bool(_deferred)
         if _deferred:
             if self.contract_selector is None:
                 _reason = "contract_deferred_no_selector"
                 log.critical(
                     "[%s] DEFERRED_BREACH_CONTRACT_FAILED — %s",
                     ticker, _reason,
+                )
+                _emit_deferred_outcome(
+                    "BREACH_SELECTOR_RETURNED_NONE",
+                    reason=_reason,
                 )
                 _terminalize_deferred_breach_failure(
                     _reason,
@@ -758,6 +1101,30 @@ class APExecutionCore:
                     float(getattr(approved_plan, "trigger_price", 0) or 0),
                     getattr(approved_plan, "side", "?"),
                 )
+                # PR1 #166 amendment: explicitly mark this as deferred breach-time
+                # selection so the DTE ladder (when DEFERRED_DTE_LADDER=1) applies
+                # ONLY here, never to normal non-deferred selector calls. The
+                # selector reads plan.metadata["deferred_breach_selection"].
+                try:
+                    _ap_meta = getattr(approved_plan, "metadata", None)
+                    if isinstance(_ap_meta, dict):
+                        _ap_meta["deferred_breach_selection"] = True
+                        _ap_meta["selection_context"] = "deferred_breach"
+                    elif isinstance(approved_plan, dict):
+                        approved_plan.setdefault("metadata", {})
+                        approved_plan["metadata"]["deferred_breach_selection"] = True
+                        approved_plan["metadata"]["selection_context"] = "deferred_breach"
+                    else:
+                        # object plan with no metadata dict — attach one
+                        try:
+                            setattr(approved_plan, "metadata", {
+                                "deferred_breach_selection": True,
+                                "selection_context": "deferred_breach",
+                            })
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
                 _sel = self.contract_selector.select(approved_plan)
                 _sel_contract = str(getattr(_sel, "contract_symbol", "") or "").strip()
                 _live_contract = str(getattr(approved_plan, "contract_symbol", "") or "").strip()
@@ -784,44 +1151,183 @@ class APExecutionCore:
                     except Exception as _copy_exc:
                         log.warning("[%s] deferred breach selected contract copy failed: %s", ticker, _copy_exc)
 
+                # ── P0 (hotfix/deferred-breach-selector-reasons, amended): ────
+                # Shared helper — builds the selector audit dict and extracts
+                # the canonical reason_code/stage from get_last_failure() for
+                # use by BOTH deferred-breach failure paths below.
+                # get_last_failure() is observability-only and never raises.
+                # After a failed select() it holds the last REJECT emitted.
+                # After a successful select() that failed to copy (unresolved
+                # DEFERRED: placeholder) it is None — the caller must supply
+                # an override_reason_code in that case.
+                def _build_deferred_selector_audit(
+                    *,
+                    override_reason_code: str | None = None,
+                    override_stage: str | None = None,
+                ) -> tuple[str, dict]:
+                    """
+                    Returns (last_error_string, deferred_selector_audit_dict).
+                    Reads selector.get_last_failure() and merges with any
+                    caller-supplied override values.
+                    override_reason_code is used when the selector succeeded
+                    but post-selection validation failed (DEFERRED unresolved).
+                    """
+                    _sf = None
+                    _rc = None
+                    _st = None
+                    _ex = None
+                    try:
+                        if hasattr(self.contract_selector, "get_last_failure"):
+                            _sf = self.contract_selector.get_last_failure()
+                        if isinstance(_sf, dict):
+                            _rc = _sf.get("reason_code") or None
+                            _st = _sf.get("stage") or None
+                            _ex = _sf.get("explanation") or None
+                    except Exception as _gf_exc:
+                        log.debug(
+                            "[%s] get_last_failure() read failed (non-fatal): %s",
+                            ticker, _gf_exc,
+                        )
+                    # Override takes precedence when the selector itself succeeded
+                    # (no REJECT emitted) but downstream validation failed.
+                    if override_reason_code:
+                        _rc = override_reason_code
+                    if override_stage:
+                        _st = override_stage
+
+                    _error = (
+                        f"breach_time_contract_selection:{_rc}"
+                        if _rc
+                        else "breach_time_contract_selection_no_result"
+                    )
+                    import datetime as _dt
+                    _audit: dict = {
+                        "reason_code":         _rc,
+                        "stage":               _st,
+                        "explanation":         _ex,
+                        "budget":              float(getattr(approved_plan, "max_position_usd", 0) or 0),
+                        "ticker":              ticker,
+                        "side":                str(getattr(approved_plan, "side", "") or ""),
+                        "execution_mode":      str(getattr(approved_plan, "execution_mode", "") or ""),
+                        "contract_before":     _contract_sym_raw or None,
+                        "selected_contract":   _sel_contract or None,
+                        "timestamp":           _dt.datetime.now(_dt.timezone.utc).isoformat(),
+                        "raw_selector_reason": (
+                            _sf.get("raw_reason") if isinstance(_sf, dict) else None
+                        ),
+                    }
+                    return _error, _audit
+
+                # Path A: selector returned None OR live contract is still empty
+                # after copy-back. The selector's REJECT is the blocker.
                 if not _sel or not _live_contract:
-                    _reason = "breach_time_contract_selection_no_result"
+                    _reason, _deferred_selector_audit = _build_deferred_selector_audit()
                     log.critical(
-                        "[%s] DEFERRED_BREACH_CONTRACT_FAILED — %s",
-                        ticker, _reason,
+                        "DEFERRED_BREACH_CONTRACT_SELECTION_FAILED "
+                        "client=%s symbol=%s side=%s execution_mode=%s "
+                        "budget=%.2f reason=%s stage=%s order_id=%s signal_id=%s",
+                        _breach_client_id,
+                        ticker,
+                        str(getattr(approved_plan, "side", "") or ""),
+                        str(getattr(approved_plan, "execution_mode", "") or ""),
+                        float(getattr(approved_plan, "max_position_usd", 0) or 0),
+                        _reason,
+                        _deferred_selector_audit.get("stage") or "unknown",
+                        queue_local_order_id or "",
+                        str(getattr(approved_plan, "signal_id", "") or ""),
+                    )
+                    log.critical(
+                        "BREACH_TIME_CONTRACT_SELECTION_FAILED "
+                        "client=%s ticker=%s reason=%s",
+                        _breach_client_id, ticker, _reason,
+                    )
+                    _emit_deferred_outcome(
+                        (
+                            "DATA_MISSING_OI_VOLUME"
+                            if "vol0_oi0" in str(_reason)
+                            else "BREACH_SELECTOR_RETURNED_NONE"
+                        ),
+                        reason=_reason,
+                        extra={"stage": _deferred_selector_audit.get("stage") or "unknown"},
                     )
                     _terminalize_deferred_breach_failure(
                         _reason,
                         extra_meta={
-                            "failure_stage": "deferred_contract_selection",
-                            "selected_contract": _sel_contract or None,
+                            "failure_stage":           "deferred_contract_selection",
+                            "selected_contract":       _sel_contract or None,
+                            "deferred_selector_audit": _deferred_selector_audit,
                         },
                     )
                     log.critical(
                         "[%s] PRODUCTION_ENTRY_BLOCK — breach-time contract selection "
-                        "returned no contract",
-                        ticker,
+                        "returned no contract (reason=%s stage=%s budget=%.2f)",
+                        ticker, _reason,
+                        _deferred_selector_audit.get("stage") or "unknown",
+                        float(getattr(approved_plan, "max_position_usd", 0) or 0),
                     )
                     return
+
+                # Path B: selector returned a result but the plan copy-back failed
+                # or the selector wrote a DEFERRED: placeholder — unresolved.
+                # The selector itself did not emit a REJECT (it returned a value),
+                # so get_last_failure() is None; supply override reason code.
                 if _live_contract.upper().startswith("DEFERRED:"):
-                    _reason = f"deferred_unresolved_at_breach:{_live_contract}"
+                    _reason, _deferred_selector_audit = _build_deferred_selector_audit(
+                        override_reason_code="DEFERRED_UNRESOLVED_AT_BREACH",
+                        override_stage="deferred_copy_back",
+                    )
+                    # Embed the unresolved placeholder in the reason string so
+                    # the order row records which contract was stuck.
+                    _reason = f"breach_time_contract_selection:DEFERRED_UNRESOLVED_AT_BREACH:{_live_contract}"
+                    _deferred_selector_audit["unresolved_placeholder"] = _live_contract
                     log.critical(
-                        "[%s] DEFERRED_BREACH_CONTRACT_FAILED — %s",
-                        ticker, _reason,
+                        "DEFERRED_BREACH_CONTRACT_SELECTION_FAILED "
+                        "client=%s symbol=%s side=%s execution_mode=%s "
+                        "budget=%.2f reason=%s stage=%s order_id=%s signal_id=%s",
+                        _breach_client_id,
+                        ticker,
+                        str(getattr(approved_plan, "side", "") or ""),
+                        str(getattr(approved_plan, "execution_mode", "") or ""),
+                        float(getattr(approved_plan, "max_position_usd", 0) or 0),
+                        _reason,
+                        _deferred_selector_audit.get("stage") or "unknown",
+                        queue_local_order_id or "",
+                        str(getattr(approved_plan, "signal_id", "") or ""),
+                    )
+                    _emit_deferred_outcome(
+                        "BREACH_SELECTOR_RETURNED_NONE",
+                        reason=_reason,
+                        contract=_live_contract,
+                        extra={"stage": "deferred_copy_back"},
                     )
                     _terminalize_deferred_breach_failure(
                         _reason,
                         extra_meta={
-                            "failure_stage": "deferred_contract_selection",
-                            "selected_contract": _sel_contract or None,
-                            "approved_contract": _live_contract,
+                            "failure_stage":           "deferred_contract_selection",
+                            "selected_contract":       _sel_contract or None,
+                            "approved_contract":       _live_contract,
+                            "deferred_selector_audit": _deferred_selector_audit,
                         },
                     )
                     log.critical(
-                        "[%s] PRODUCTION_ENTRY_BLOCK — contract selector left placeholder unresolved: %s",
-                        ticker, _live_contract,
+                        "BREACH_TIME_CONTRACT_SELECTION_FAILED "
+                        "client=%s ticker=%s reason=%s",
+                        _breach_client_id, ticker, _reason,
+                    )
+                    log.critical(
+                        "[%s] PRODUCTION_ENTRY_BLOCK — contract selector left placeholder "
+                        "unresolved: %s (reason=%s)",
+                        ticker, _live_contract, _reason,
                     )
                     return
+                _emit_deferred_progress(
+                    "BREACH_CONTRACT_SELECTED",
+                    contract=_live_contract,
+                    extra={
+                        "limit_price": float(getattr(approved_plan, "limit_price", 0) or 0),
+                        "qty": int(getattr(approved_plan, "contracts", 0) or 0),
+                    },
+                )
                 log.info(
                     "[%s] DEFERRED_BREACH_CONTRACT_SELECTED — contract=%s limit=%.2f qty=%s",
                     ticker,
@@ -832,6 +1338,20 @@ class APExecutionCore:
                 log.info(
                     "[%s] Breach-time contract selected: %s @ $%.2f x%s",
                     ticker, _live_contract,
+                    float(getattr(approved_plan, "limit_price", 0) or 0),
+                    int(getattr(approved_plan, "contracts", 1) or 1),
+                )
+                # Required structured log for ops confirmation that the existing
+                # PENDING_TRIGGER row was finalized in-place (not a new order).
+                log.info(
+                    "BREACH_TIME_CONTRACT_FINALIZED "
+                    "client=%s ticker=%s local_order_id=%s "
+                    "old_contract=%s new_contract=%s limit=%.4f qty=%s",
+                    _breach_client_id,
+                    ticker,
+                    queue_local_order_id or "",
+                    _contract_sym_raw or "DEFERRED:?",
+                    _live_contract,
                     float(getattr(approved_plan, "limit_price", 0) or 0),
                     int(getattr(approved_plan, "contracts", 1) or 1),
                 )
@@ -846,6 +1366,11 @@ class APExecutionCore:
                 log.critical(
                     "[%s] DEFERRED_BREACH_CONTRACT_FAILED — %s",
                     ticker, _reason,
+                )
+                _emit_deferred_outcome(
+                    "BREACH_SELECTOR_EXCEPTION",
+                    reason=_reason,
+                    extra={"exception_type": type(_cs_err).__name__},
                 )
                 _terminalize_deferred_breach_failure(
                     _reason,
@@ -1294,6 +1819,11 @@ class APExecutionCore:
                 approved_contract,
                 submit_limit,
             )
+            _emit_deferred_outcome(
+                "BREACH_BROKER_SUBMITTED",
+                contract=str(approved_contract or ""),
+                broker_order_id=str(broker_order_id or ""),
+            )
             return
 
         log.error(
@@ -1301,6 +1831,11 @@ class APExecutionCore:
             ticker,
             submit_res.get("local_order_id") or queue_local_order_id,
             submit_res.get("error"),
+        )
+        _emit_deferred_outcome(
+            "BREACH_SUBMISSION_SKIPPED",
+            reason=f"osm_submit_existing_entry_failed:{submit_res.get('error')}",
+            contract=str(approved_contract or ""),
         )
         funnel.inc("order_failed")
         if signal_id:

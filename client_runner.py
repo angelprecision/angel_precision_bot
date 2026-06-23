@@ -420,6 +420,166 @@ def resolve_tradier_credentials(member: dict) -> dict:
     }
 
 
+# =============================================================================
+# PR #150 — Paper Selector Market-Data Transport Split
+# =============================================================================
+#
+# Splits market-data transport from execution transport for the contract
+# selector. PAPER clients execute orders against the sandbox broker (15-min
+# delayed quotes) but must source CHAIN / QUOTE / EARNINGS / IV data from a
+# live read-only Tradier endpoint so:
+#   - Strike selection uses real-time chains (not 15-min-stale chains).
+#   - Spread / liquidity gates evaluate against real quotes.
+#   - Earnings guard / IV filter run against live underlying data.
+#
+# The watcher (ap_entry_watcher._fetch_quotes) already implements this split
+# and fails closed on PAPER if no market-data token resolves. This helper
+# brings the contract selector / earnings guard / IV filter onto the SAME
+# transport with the SAME token-priority order, so a paper Render pod that
+# has TRADIER_MARKET_DATA_TOKEN configured for the watcher will automatically
+# have it for the selector too — and a misconfigured pod fails closed at
+# startup instead of silently picking strikes off stale sandbox chains.
+#
+# LIVE behavior is preserved exactly: if no market-data token resolves in
+# LIVE mode, data_broker falls back to the live execution broker (which
+# already has live market-data access via the live execution token), with
+# only a warning log. There is no LIVE submit-path change.
+#
+# Submit / cancel / order-status routing is NEVER touched by this helper.
+# Those continue to use the execution broker built from
+# resolve_tradier_credentials() — which is sandbox for paper and live for
+# live, by construction.
+# =============================================================================
+
+class PaperSelectorNoMarketDataTokenError(RuntimeError):
+    """Raised when PAPER mode runner has no live market-data token configured.
+
+    The selector cannot safely fall back to the sandbox execution broker for
+    market data because sandbox quotes are delayed up to ~15 minutes, and the
+    watcher (which uses live data) will then disagree with the selector on
+    every breach evaluation. Fail closed at startup rather than ship bad
+    paper trades.
+    """
+
+
+def resolve_market_data_transport(
+    *,
+    mode: str,
+    account_id: str,
+    execution_broker,
+    env=None,
+    broker_cls=None,
+    broker_config_cls=None,
+) -> dict:
+    """Resolve the market-data transport for the contract selector / guards.
+
+    Returns a dict:
+        {
+          "data_broker":            <TradierBroker | execution_broker>,
+          "base_url":               "<resolved base url>",
+          "token_source":           "TRADIER_MARKET_DATA_TOKEN"
+                                    | "TRADIER_DATA_TOKEN"
+                                    | "execution_broker_fallback_live",
+          "is_dedicated":           bool,
+          "execution_base_url":     "<execution broker base_url>",
+        }
+
+    Token priority (matches ap_entry_watcher._resolve_watcher_quote_transport):
+        1. TRADIER_MARKET_DATA_TOKEN
+        2. TRADIER_DATA_TOKEN
+
+    Base URL priority:
+        1. TRADIER_MARKET_DATA_BASE_URL
+        2. TRADIER_DATA_BASE_URL
+        3. https://api.tradier.com  (hardcoded live default — NEVER sandbox)
+
+    PAPER mode: raises PaperSelectorNoMarketDataTokenError if no token resolves.
+    LIVE mode:  returns execution_broker as data_broker if no token resolves.
+
+    `env`, `broker_cls`, `broker_config_cls` are dependency-injection seams
+    for unit tests — production callers pass None and the real env / classes
+    are used. This keeps the resolver fully testable without touching real
+    network / global env.
+    """
+    if env is None:
+        env = os.environ
+    if broker_cls is None:
+        from ap.brokers.tradier import TradierBroker as _Broker
+        broker_cls = _Broker
+    if broker_config_cls is None:
+        from ap.brokers.tradier import TradierConfig as _Cfg
+        broker_config_cls = _Cfg
+
+    mode_upper = str(mode or "").strip().upper()
+    is_paper = (mode_upper == "PAPER")
+
+    # ── Token resolution ──────────────────────────────────────────────────
+    mdt = (env.get("TRADIER_MARKET_DATA_TOKEN") or "").strip()
+    dt  = (env.get("TRADIER_DATA_TOKEN") or "").strip()
+    if mdt:
+        token, token_source = mdt, "TRADIER_MARKET_DATA_TOKEN"
+    elif dt:
+        token, token_source = dt, "TRADIER_DATA_TOKEN"
+    else:
+        token, token_source = "", "missing"
+
+    # ── Base URL resolution ───────────────────────────────────────────────
+    base_url = (
+        (env.get("TRADIER_MARKET_DATA_BASE_URL") or "").strip()
+        or (env.get("TRADIER_DATA_BASE_URL") or "").strip()
+        or "https://api.tradier.com"
+    )
+
+    # Hard guard: market-data base URL must never be sandbox. Sandbox quotes
+    # are delayed and using them as the selector's truth source defeats the
+    # entire purpose of the split. Force live and warn loudly.
+    if "sandbox" in base_url.lower():
+        logger.critical(
+            "PAPER_SELECTOR_MARKET_DATA_BASE_URL_SANDBOX_GUARD_TRIGGERED "
+            "resolved_url=%s — sandbox URL must not be used for selector "
+            "market data. Forcing https://api.tradier.com.",
+            base_url,
+        )
+        base_url = "https://api.tradier.com"
+
+    execution_base_url = getattr(getattr(execution_broker, "cfg", None), "base_url", "")
+
+    # ── PAPER: fail closed if no token resolved ───────────────────────────
+    if is_paper and not token:
+        raise PaperSelectorNoMarketDataTokenError(
+            "PAPER_SELECTOR_NO_MARKET_DATA_TOKEN mode=PAPER "
+            f"base_url={base_url} token_source={token_source} "
+            "— contract selector requires a live market-data token to avoid "
+            "picking strikes against 15-min-delayed sandbox chains. "
+            "Set TRADIER_MARKET_DATA_TOKEN (preferred) or TRADIER_DATA_TOKEN "
+            "on the paper Render pod."
+        )
+
+    # ── Build the data broker ─────────────────────────────────────────────
+    if token:
+        cfg = broker_config_cls(
+            base_url=base_url,
+            access_token=token,
+            account_id=account_id,
+        )
+        data_broker = broker_cls(cfg)
+        is_dedicated = True
+    else:
+        # LIVE-only path: live execution broker already has live market data.
+        data_broker = execution_broker
+        token_source = "execution_broker_fallback_live"
+        base_url = execution_base_url or base_url
+        is_dedicated = False
+
+    return {
+        "data_broker":        data_broker,
+        "base_url":           base_url,
+        "token_source":       token_source,
+        "is_dedicated":       is_dedicated,
+        "execution_base_url": execution_base_url,
+    }
+
+
 class ClientRunner(threading.Thread):
     """
     One daemon thread per client. The runner owns all per-client subsystems and
@@ -1592,17 +1752,22 @@ class ClientRunner(threading.Thread):
         # Risk profile fields override anything from the clients table.
         _rp = getattr(self, "_risk_profile", {}) or {}
         _rp_field_map = {
-            "max_capital_pct":   "max_capital_pct",
-            "max_sector_pct":    "max_sector_pct",
-            "max_ticker_pct":    "max_ticker_pct",
-            "max_calls":         "max_calls",
-            "max_puts":          "max_puts",
-            "score_floor":       "score_floor",
-            "context_floor":     "context_floor",
-            "max_positions":     "max_concurrent_positions",  # map to clients table key
-            "daily_max_loss_pct":"daily_max_loss_pct",
-            "entries_enabled":   "entries_enabled",
+            "max_capital_pct":        "max_capital_pct",
+            "max_sector_pct":         "max_sector_pct",
+            "max_ticker_pct":         "max_ticker_pct",
+            "max_calls":              "max_calls",
+            "max_puts":               "max_puts",
+            "score_floor":            "score_floor",
+            "context_floor":          "context_floor",
+            "max_positions":          "max_concurrent_positions",  # map to clients table key
+            "daily_max_loss_pct":     "daily_max_loss_pct",
+            "entries_enabled":        "entries_enabled",
             "daily_profit_target_usd": "daily_profit_target_usd",
+            # PR #155 — split-cap fields. These map directly (same key in both
+            # client_risk_profiles and client_cfg). NULL in the risk profile
+            # means "use the backward-compat fallback in APMasterControl".
+            "max_position_pct":       "max_position_pct",
+            "max_total_capital_pct":  "max_total_capital_pct",
         }
         _risk_profile_source = "GLOBAL_ENV_DEFAULT"
         for _rp_key, _cfg_key in _rp_field_map.items():
@@ -1708,6 +1873,21 @@ class ClientRunner(threading.Thread):
         _mc_max_puts    = self._cfg_or_env(client_cfg, "max_puts",        "MAX_PUTS",        "10",   int)
         _mc_score_floor = self._cfg_or_env(client_cfg, "score_floor",     "SCORE_FLOOR",     "65",   float)
         _mc_ctx_floor   = self._cfg_or_env(client_cfg, "context_floor",   "CONTEXT_FLOOR",   "0.0",  float)
+
+        # PR #155 — split per-position cap from total portfolio exposure cap.
+        # max_position_pct: per-trade budget as fraction of equity.
+        #   Falls back to max_capital_pct if column is NULL (backward compat).
+        # max_total_capital_pct: total portfolio exposure cap.
+        #   Falls back to DEFAULT_MAX_TOTAL_CAPITAL_PCT env (default 0.40).
+        # Both fields are hydrated from client_risk_profiles via _rp_field_map
+        # above before _cfg_or_env reads them. NULL in the risk profile means
+        # "let APMasterControl.__init__ resolve the fallback".
+        _mc_position_pct = self._cfg_or_env(
+            client_cfg, "max_position_pct", "DEFAULT_MAX_POSITION_PCT", None, float
+        )
+        _mc_total_capital_pct = self._cfg_or_env(
+            client_cfg, "max_total_capital_pct", "DEFAULT_MAX_TOTAL_CAPITAL_PCT", None, float
+        )
         # H8: daily profit target (USD). NULL/0 = disabled. Per-client only —
         # no global env default, since a blanket target across all clients
         # would be wrong (different account sizes/goals).
@@ -1744,6 +1924,8 @@ class ClientRunner(threading.Thread):
             max_daily_loss=max_loss,
             daily_profit_target_usd=_mc_daily_target,
             account_equity=equity,
+            max_position_pct=_mc_position_pct,
+            max_total_capital_pct=_mc_total_capital_pct,
             position_manager=self.position_manager,
             position_sizer=position_sizer,
             supabase_client=sb,
@@ -1774,15 +1956,57 @@ class ClientRunner(threading.Thread):
             )
         # ─────────────────────────────────────────────────────────────────────
 
-        data_token = os.getenv("TRADIER_DATA_TOKEN", "").strip()
-        data_base_url = os.getenv("TRADIER_DATA_BASE_URL", "https://api.tradier.com").strip()
-        if data_token:
-            data_broker_cfg = TradierConfig(base_url=data_base_url, access_token=data_token, account_id=self.account_id)
-            data_broker = TradierBroker(data_broker_cfg)
-            logger.info("[%s] Live data broker initialized | %s", self.email, data_base_url)
+        # ─────────────────────────────────────────────────────────────────
+        # PR #150 — Paper Selector Market-Data Transport Split
+        # Resolve the selector / earnings / IV data_broker from the SAME
+        # token priority the watcher uses:
+        #   TRADIER_MARKET_DATA_TOKEN → TRADIER_DATA_TOKEN
+        # PAPER fails closed if neither is set (cannot safely pick strikes
+        # off 15-min-delayed sandbox chains). LIVE falls back to the live
+        # execution broker, unchanged.
+        # ─────────────────────────────────────────────────────────────────
+        try:
+            _md_transport = resolve_market_data_transport(
+                mode=self.mode,
+                account_id=self.account_id,
+                execution_broker=broker,
+            )
+        except PaperSelectorNoMarketDataTokenError as _md_exc:
+            # Hard fail-closed. The runner does not start with the selector
+            # silently pointed at sandbox chains.
+            logger.critical("[%s] %s", self.email, _md_exc)
+            self._mark_failed(f"paper_selector_no_market_data_token:{_md_exc}")
+            return
+
+        data_broker = _md_transport["data_broker"]
+        data_base_url = _md_transport["base_url"]
+        data_token_source = _md_transport["token_source"]
+        data_broker_is_dedicated = _md_transport["is_dedicated"]
+        _exec_base_url = _md_transport["execution_base_url"] or self.base_url
+
+        # ── Required audit logs (PR #150 acceptance) ─────────────────────
+        # These two log lines are the operator's confirmation that the
+        # transport split is wired correctly. Operators grep Render logs
+        # for them after deploy.
+        _mode_upper = str(self.mode).strip().upper()
+        if _mode_upper == "PAPER":
+            logger.info(
+                "PAPER_MARKET_DATA_TRANSPORT_SELECTED client_id=%s "
+                "source=tradier_live base_url=%s token_source=%s",
+                self.email, data_base_url, data_token_source,
+            )
+            logger.info(
+                "PAPER_EXECUTION_TRANSPORT_SELECTED client_id=%s "
+                "source=tradier_sandbox base_url=%s",
+                self.email, _exec_base_url,
+            )
         else:
-            data_broker = broker
-            logger.warning("[%s] TRADIER_DATA_TOKEN not set -- using execution broker for data", self.email)
+            logger.info(
+                "[%s] Live data broker resolved | base_url=%s "
+                "token_source=%s dedicated=%s",
+                self.email, data_base_url, data_token_source,
+                data_broker_is_dedicated,
+            )
 
         self.data_broker = data_broker
         self.databroker = data_broker
@@ -1847,8 +2071,16 @@ class ClientRunner(threading.Thread):
 
         self._register_exit_engine(exit_eng)
         self._run_startup_recovery(broker, exit_eng)
+        # PR feature/morning-handoff-audit — automatic startup watcher re-arm.
+        # Called immediately after startup recovery so any valid non-terminal
+        # ENTRY rows in the DB (PENDING_TRIGGER, WATCHING, CREATED) are
+        # classified and re-armed before the poll loop starts.
+        # entry_watcher is guaranteed to exist here: _start_worker_thread
+        # would have already blocked on entry_watcher_missing if absent.
+        # Failures are logged but never crash the runner.
+        self._run_morning_handoff_audit_startup()
         self._seed_exit_engine_from_db(exit_eng)
-        self._start_position_quote_monitor(data_broker if data_token else broker, exit_eng)
+        self._start_position_quote_monitor(data_broker if data_broker_is_dedicated else broker, exit_eng)
         # PR D / FIX-3 (BUG-CR-2): post-QPM quote refresh in LIVE.
         # The first refresh inside _seed_exit_engine_from_db runs BEFORE
         # QPM is attached. If that refresh fails (Render cold-start
@@ -1905,7 +2137,7 @@ class ClientRunner(threading.Thread):
             max_loss=max_loss,
             throttle_threshold=throttle_threshold,
             stop_threshold=stop_threshold,
-            data_broker_is_dedicated=bool(data_token),
+            data_broker_is_dedicated=data_broker_is_dedicated,
             exit_eng=exit_eng,
             mc_score_floor=_mc_score_floor,
             mc_ctx_floor=_mc_ctx_floor,
@@ -2449,6 +2681,66 @@ class ClientRunner(threading.Thread):
             return cast(val)
         except (TypeError, ValueError):
             return cast(os.getenv(env_name, env_default))
+
+    def _run_morning_handoff_audit_startup(self) -> None:
+        """Run the morning handoff audit once at startup after watcher/OSM are ready.
+
+        Classifies all non-terminal ENTRY rows for this client/mode and
+        re-arms watcher ownership when evidence shows the row is valid.
+        Called automatically after _run_startup_recovery() so valid rows
+        from prior sessions are re-armed before the poll loop starts.
+
+        Safety invariants (enforced by run_morning_handoff_audit):
+          - NEVER calls broker.submit_order
+          - NEVER creates new ENTRY orders
+          - NEVER transitions to SUBMITTED
+          - NEVER mutates terminal rows or changes contract/limit_price/qty
+          - NEVER duplicates watcher state for the same local_order_id
+          - Live runner only audits live rows; paper runner only audits paper rows
+
+        Failures log WATCHER_REARM_AUDIT_FAILED and never crash the runner.
+        """
+        try:
+            from ap_morning_handoff_audit import run_morning_handoff_audit
+        except ImportError as _ie:
+            logger.warning(
+                "[%s] WATCHER_REARM_AUDIT_FAILED: import failed: %s", self.email, _ie
+            )
+            return
+
+        _entry_watcher = getattr(getattr(self, "core", None), "entry_watcher", None)
+        _osm           = getattr(self, "order_state_machine", None)
+        _exec_mode     = str(getattr(self, "mode", "PAPER") or "PAPER").lower()
+
+        if _entry_watcher is None or _osm is None:
+            logger.warning(
+                "[%s] WATCHER_REARM_AUDIT_FAILED: entry_watcher=%s osm=%s — "
+                "skipping startup audit (dependencies not ready)",
+                self.email,
+                "ok" if _entry_watcher else "MISSING",
+                "ok" if _osm else "MISSING",
+            )
+            return
+
+        try:
+            audit_result = run_morning_handoff_audit(
+                client_id=self.email,
+                entry_watcher=_entry_watcher,
+                osm=_osm,
+                execution_mode=_exec_mode,
+                dry_run=False,
+            )
+            if not audit_result.get("ok"):
+                logger.warning(
+                    "[%s] WATCHER_REARM_AUDIT_FAILED startup audit returned ok=False: %s",
+                    self.email,
+                    audit_result.get("errors"),
+                )
+        except Exception as _exc:
+            logger.error(
+                "[%s] WATCHER_REARM_AUDIT_FAILED startup audit raised exception: %s",
+                self.email, _exc,
+            )
 
     def _run_startup_recovery(self, broker, exit_eng):
         """Run startup recovery with a hard timeout to prevent blocking initialization.

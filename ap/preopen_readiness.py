@@ -728,5 +728,5 @@ def get_preopen_readiness_health(now: datetime | None = None) -> dict:
         "live": by_mode["live"],
         "missing_expected_clients": missing_expected_clients,
         "last_run_at": max(filter(None, [by_mode["paper"]["last_run_at"], by_mode["live"]["last_run_at"]]), default=None),
-        "errors": by_mode["paper"]["errors"] + by_mode["live"]["errors],
+        "errors": by_mode["paper"]["errors"] + by_mode["live"]["errors"],
     }

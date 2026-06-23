@@ -34,6 +34,7 @@ import logging
 import copy
 from ap.trace import trace_gate
 import os
+import threading
 import time
 import uuid
 from typing import Any, Optional
@@ -77,6 +78,28 @@ def _is_regular_session_et(dt=None) -> bool:
 POLL_INTERVAL         = float(os.getenv("QUEUE_POLL_INTERVAL", "1.0"))
 PROCESSING_STALE_SECS = int(os.getenv("PROCESSING_STALE_SECS", "120"))
 ALLOW_IMMEDIATE_EXECUTION = os.getenv("ALLOW_IMMEDIATE_EXECUTION", "0").lower() in {"1", "true", "yes", "on"}
+
+# ── PR #143 amendment: per-client PAPER_RECOVERY_IMMEDIATE_PROMOTE audit counter ──
+# Process-local dict {client_id: count} incremented every time a paper recovery
+# row is promoted breach→immediate. Consulted by /admin/trade_flow_status and
+# exists to make the LIVE-protection invariant provable from a single source:
+# if any LIVE client_id ever appears in this dict, that is a bug, not normal
+# flow. Counter resets on process restart (intentional — restart = fresh audit
+# window). A durable per-row audit also writes to ap_signals.context_notes below.
+_PAPER_RECOVERY_IMMEDIATE_COUNTS: dict[str, int] = {}
+_PAPER_RECOVERY_IMMEDIATE_LOCK = threading.Lock()
+
+
+def get_paper_recovery_immediate_counts() -> dict[str, int]:
+    """Return a snapshot of the per-client paper-recovery-immediate counter.
+
+    Callers (e.g. /admin/trade_flow_status) should treat this as read-only.
+    The counter is process-local so a multi-pod deployment will return
+    per-pod counts; aggregate across pods via the ap_signals durable audit
+    instead.
+    """
+    with _PAPER_RECOVERY_IMMEDIATE_LOCK:
+        return dict(_PAPER_RECOVERY_IMMEDIATE_COUNTS)
 
 # PR F / queue truth hardening: ALLOW_IMMEDIATE_EXECUTION is a money-affecting
 # kill switch — it disables the breach-watch path and lets queue.py submit
@@ -220,6 +243,21 @@ _TERMINAL_QUEUE_STATUSES = {
     "EXPIRED",
     "DONE",
 }
+
+_MANUAL_RESTART_GUARD_BYPASS_ERRORS = frozenset({
+    "manual_requeue_after_overnight_reeval_timeout",
+    "manual_rescue_current_session",
+})
+
+
+def _manual_restart_guard_bypass_enabled(
+    *,
+    job_last_error: str | None = None,
+    job_result: dict | None = None,
+) -> bool:
+    if isinstance(job_result, dict) and bool(job_result.get("manual_rescue")):
+        return True
+    return str(job_last_error or "").strip() in _MANUAL_RESTART_GUARD_BYPASS_ERRORS
 
 
 def _derive_last_error(result: dict | None) -> str | None:
@@ -390,7 +428,7 @@ def _claim_one_job(client_id: str = "default") -> Optional[dict]:
                        started_ts = NOW()
                 FROM   next_job
                 WHERE  tq.id = next_job.id
-                RETURNING tq.id, tq.client_id, tq.signal_id, tq.payload
+                RETURNING tq.id, tq.client_id, tq.signal_id, tq.payload, tq.last_error, tq.result_json
                 """,
                 (client_id,),
             )
@@ -536,6 +574,8 @@ def _dispatch(
     signal_id: str,
     payload: dict,
     *,
+    job_last_error: str | None = None,
+    job_result: dict | None = None,
     master_control,
     contract_selector,
     order_state_machine,
@@ -578,7 +618,12 @@ def _dispatch(
     # Pre-market restarts are allowed through for morning revalidation.
     try:
         from ap.restart_guard import should_skip_on_restart
-        if should_skip_on_restart(payload):
+        _restart_skip = bool(should_skip_on_restart(payload))
+        _manual_rescue_bypass = _manual_restart_guard_bypass_enabled(
+            job_last_error=job_last_error,
+            job_result=job_result,
+        )
+        if _restart_skip and not _manual_rescue_bypass:
             log.warning("[%s] RESTART GUARD — overnight signal blocked", ticker)
             _mark_job(job_id, "REJECTED", error="restart_guard:overnight_skip")
             try:
@@ -594,6 +639,14 @@ def _dispatch(
             except Exception:
                 pass
             return
+        if _restart_skip and _manual_rescue_bypass:
+            log.warning(
+                "[%s] RESTART GUARD BYPASS — continuing manual rescue row | signal_id=%s job_id=%s last_error=%s",
+                ticker,
+                signal_id,
+                job_id,
+                job_last_error,
+            )
     except ImportError:
         pass  # restart_guard not yet deployed — skip silently
 
@@ -840,10 +893,41 @@ def _dispatch(
                 log.warning(f"[{ticker}] Contract selection failed -- no suitable contract")
                 trace_gate(str(payload.get("signal_id","")), ticker, "QUALITY_FILTER", "REJECT",
                            reason="no_eligible_contracts", score=float(payload.get("score") or 0))
-                _mark_job(job_id, "REJECTED",
-                          result={"stage": "contract_selection",
-                                  "reason": "no_contract_found",
-                                  "ticker": ticker})
+
+                # PR #149 — Selector Reason Honesty.
+                # Ask the selector for the most specific REJECT it captured
+                # during this call (OI_TOO_LOW, NO_CHAIN_DATA, SPREAD_TOO_WIDE,
+                # NO_AFFORDABLE_CONTRACT, etc). Keep umbrella stage as
+                # "contract_selection" so downstream stage-filters and the
+                # PR #120 _derive_last_error path continue to work, but write
+                # the specific reason into result_json.reason and reason_code
+                # so last_error becomes e.g. "contract_selection:OI_TOO_LOW"
+                # instead of the umbrella "contract_selection:no_contract_found".
+                # Fallback: if no specific reason was captured, preserve the
+                # legacy "no_contract_found" label exactly.
+                _sel_result: dict = {"stage": "contract_selection", "ticker": ticker}
+                try:
+                    _get_failure = getattr(contract_selector, "get_last_failure", None)
+                    _failure = _get_failure() if callable(_get_failure) else None
+                except Exception:
+                    _failure = None
+                if isinstance(_failure, dict) and str(_failure.get("reason_code") or "").strip():
+                    _reason_code = str(_failure["reason_code"]).strip()
+                    _sel_result["reason"]         = _reason_code
+                    _sel_result["reason_code"]    = _reason_code
+                    _explanation = str(_failure.get("explanation") or "").strip()
+                    if _explanation:
+                        _sel_result["details"] = _explanation
+                    _selector_stage = str(_failure.get("stage") or "").strip()
+                    if _selector_stage:
+                        # Preserve the underlying selector stage (e.g.
+                        # "quality_summary", "affordability_gate") for
+                        # diagnosis without changing the umbrella stage.
+                        _sel_result["selector_stage"] = _selector_stage
+                else:
+                    _sel_result["reason"] = "no_contract_found"
+
+                _mark_job(job_id, "REJECTED", result=_sel_result)
                 try:
                     from ap.rejection_feed import post_no_contracts
                     post_no_contracts(
@@ -945,6 +1029,121 @@ def _dispatch(
                 ticker,
             )
         trigger_type = "breach"
+
+    # ── PR #143: PAPER recovery-rescued immediate-entry promotion ─────────
+    # When recovery rescued a stale WATCHING signal back to NEW, the trigger
+    # event already happened (or the bot missed it). For PAPER mode we allow
+    # the signal to submit immediately after the normal quality gates pass:
+    #     - score floor (master_control already enforced above)
+    #     - contract selected (verified below before promotion)
+    #     - revalidation (master_control already enforced above)
+    #     - duplicate guard (master_control already enforced above)
+    #     - within entry cutoff (cutoff guard runs after this block, BEFORE
+    #       the OSM create — the cutoff still applies)
+    # LIVE rows are NEVER promoted — LIVE always waits for breach confirmation.
+    # Forced-breach signals are also never promoted — explicit operator override.
+    #
+    # The promotion only flips trigger_type. The existing immediate-execution
+    # branch at the bottom of _dispatch runs the actual submit, which goes
+    # through submit_existing_entry → OSM → broker_submit. No bypass of any
+    # quality gate, capital check, or compliance step.
+    if (
+        trigger_type == "breach"
+        and not forced_breach
+        and not live_mode
+        and bool(payload.get("recovery_rescue"))
+    ):
+        # PAPER recovery row — verify a real contract is selected before
+        # promotion. If selection deferred or produced a placeholder, fall
+        # through to the normal breach path so the watcher can re-select
+        # at breach time.
+        _rec_contract = str(getattr(plan, "contract_symbol", "") or "").strip()
+        _rec_contracts_qty = 0
+        try:
+            _rec_contracts_qty = int(getattr(plan, "contracts", 0) or 0)
+        except (TypeError, ValueError):
+            _rec_contracts_qty = 0
+        _rec_limit = 0.0
+        try:
+            _rec_limit = float(getattr(plan, "limit_price", 0) or 0)
+        except (TypeError, ValueError):
+            _rec_limit = 0.0
+        _rec_deferred = (
+            not _rec_contract
+            or _rec_contract.upper().startswith("DEFERRED:")
+        )
+        if _rec_deferred or _rec_contracts_qty <= 0 or _rec_limit <= 0:
+            log.info(
+                "[%s] PAPER_RECOVERY_IMMEDIATE_SKIP — contract not ready "
+                "(contract=%r contracts=%s limit=%s) — falling back to breach path",
+                ticker, _rec_contract, _rec_contracts_qty, _rec_limit,
+            )
+        else:
+            # Increment per-client counter under lock — single source of truth
+            # for the audit invariant: no LIVE client_id may ever appear here.
+            with _PAPER_RECOVERY_IMMEDIATE_LOCK:
+                _PAPER_RECOVERY_IMMEDIATE_COUNTS[client_id] = (
+                    _PAPER_RECOVERY_IMMEDIATE_COUNTS.get(client_id, 0) + 1
+                )
+                _client_count_after = _PAPER_RECOVERY_IMMEDIATE_COUNTS[client_id]
+
+            # Mode label from master_control — same source of truth used by
+            # the LIVE/PAPER gate above, NOT BOT_MODE env (which could
+            # disagree in a misconfig).
+            _mc_mode_label = str(getattr(master_control, "mode", "PAPER") or "PAPER").upper()
+
+            log.warning(
+                "[%s] PAPER_RECOVERY_IMMEDIATE_PROMOTE | client_id=%s "
+                "bot_mode=%s contract=%s qty=%s limit=$%.2f signal_id=%s "
+                "client_count_after=%d | promoting trigger_type breach→immediate "
+                "(LIVE clients are never promoted; this counter must never "
+                "include any LIVE client_id)",
+                ticker, client_id, _mc_mode_label,
+                _rec_contract, _rec_contracts_qty, _rec_limit,
+                signal_id, _client_count_after,
+            )
+            trigger_type = "immediate"
+            # Persist the promotion decision on plan.metadata so the immediate
+            # submit path can reference it in any downstream audit.
+            try:
+                if hasattr(plan, "metadata") and isinstance(plan.metadata, dict):
+                    plan.metadata["paper_recovery_immediate"] = True
+                    plan.metadata["paper_recovery_immediate_reason"] = (
+                        "recovery_rescued_signal_paper_mode_all_gates_passed"
+                    )
+                    plan.metadata["paper_recovery_immediate_count_after"] = (
+                        int(_client_count_after)
+                    )
+                    plan.metadata["paper_recovery_immediate_mode_observed"] = (
+                        _mc_mode_label
+                    )
+            except Exception:
+                pass
+
+            # Durable per-row audit in ap_signals.context_notes — proves
+            # from DB (not just logs) which client_id ever saw a promotion.
+            # ap_signals already has a row for this signal from earlier in
+            # dispatch; we only update context_notes. Audit is best-effort —
+            # if the table is unavailable, log at debug and proceed.
+            try:
+                _sb = _get_sb_client()
+                if _sb is not None:
+                    _audit_blob = (
+                        f"paper_recovery_immediate_promoted="
+                        f"client={client_id};bot_mode={_mc_mode_label};"
+                        f"contract={_rec_contract};qty={_rec_contracts_qty};"
+                        f"limit={_rec_limit:.2f};"
+                        f"client_count_after={_client_count_after}"
+                    )
+                    _sb.table("ap_signals").update({
+                        "context_notes": _audit_blob,
+                    }).eq("signal_id", signal_id).execute()
+            except Exception as _audit_exc:
+                log.debug(
+                    "[%s] PAPER_RECOVERY_IMMEDIATE_AUDIT_WRITE_FAILED "
+                    "client_id=%s signal_id=%s error=%s",
+                    ticker, client_id, signal_id, _audit_exc,
+                )
 
     if trigger_type == "breach" and not entry_watcher:
         log.critical("[%s] ENTRY WATCHER MISSING — cannot arm breach entry", ticker)
@@ -1276,11 +1475,40 @@ def _dispatch(
                 pending_ok = False
 
             if not pending_ok:
+                _handoff_reason = "pending_trigger_transition_failed"
+                _cleanup_method = "not_attempted"
+                _cleanup_ok = False
+                try:
+                    _expire_fn = getattr(order_state_machine, "expire_pending_entry", None)
+                    if callable(_expire_fn):
+                        _cleanup_method = "expire_pending_entry"
+                        _cleanup_ok = bool(_expire_fn(local_order_id, reason=_handoff_reason))
+
+                    if not _cleanup_ok:
+                        _cancel_fn = getattr(order_state_machine, "cancel_pending_entry", None)
+                        if callable(_cancel_fn):
+                            _cleanup_method = "cancel_pending_entry"
+                            _cleanup_ok = bool(_cancel_fn(local_order_id, reason=_handoff_reason))
+
+                    if not _cleanup_ok:
+                        _cleanup_method = "transition_ERROR"
+                        _cleanup_ok = bool(
+                            order_state_machine.transition(
+                                local_order_id, "ERROR", last_error=_handoff_reason,
+                            )
+                        )
+                except Exception as _cleanup_exc:
+                    log.error(
+                        "[%s] WATCH_ARM_ABORTED cleanup failed | local=%s method=%s error=%s",
+                        ticker, local_order_id, _cleanup_method, _cleanup_exc, exc_info=True,
+                    )
+
                 log.critical(
-                    "[%s] WATCH_ARM_ABORTED — could not mark order PENDING_TRIGGER | local=%s",
-                    ticker, local_order_id,
+                    "[%s] WATCH_ARM_ABORTED_PENDING_TRIGGER_TRANSITION_FAILED | local=%s "
+                    "| cleanup_method=%s cleanup_ok=%s",
+                    ticker, local_order_id, _cleanup_method, _cleanup_ok,
                 )
-                _mark_job(job_id, "ERROR", error="pending_trigger_transition_failed")
+                _mark_job(job_id, "ERROR", error=_handoff_reason)
                 return
 
             # Register with watcher — no broker submit yet. The watcher returns
@@ -1676,8 +1904,13 @@ def worker_loop(
                 continue
 
             if master_control is not None:
+                _job_result = None
+                if isinstance(job.get("result_json"), dict):
+                    _job_result = dict(job.get("result_json") or {})
                 _dispatch(
                     job_id, job_cid, signal_id, payload,
+                    job_last_error=job.get("last_error"),
+                    job_result=_job_result,
                     master_control=master_control,
                     contract_selector=contract_selector,
                     order_state_machine=order_state_machine,

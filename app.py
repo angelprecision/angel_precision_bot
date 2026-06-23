@@ -2977,7 +2977,6 @@ def create_app() -> Flask:
         try:
             from client_runner import _active_runners, _registry_lock
             from ap_overnight_reeval import run_overnight_reeval
-            from ap.morning_handoff import run_morning_handoff_audit
             import threading as _threading
             import time as _time
             import uuid as _uuid
@@ -3339,6 +3338,12 @@ def create_app() -> Flask:
         _apply_live_preopen_readiness(runner, readiness)
         return handoff, readiness
 
+    # Safety invariants:
+    #   NEVER calls broker submit/cancel from this endpoint
+    #   NEVER creates orders directly
+    #   NEVER mutates contract/qty/limit pricing
+    #   Morning handoff may only reattach/rearm existing watcher-owned state
+
     @app.get("/admin/morning_handoff_audit")
     @require_hmac
     def admin_morning_handoff_audit_get():
@@ -3398,6 +3403,39 @@ def create_app() -> Flask:
         mode = str(mode_raw or execution_mode_alias or "live").lower().strip()
         dry_run = bool(body.get("dry_run", False))
 
+        run_lock_key = None
+        if not dry_run and body.get("use_run_lock", True):
+            from ap_handoff_run_lock import (
+                build_run_key,
+                mark_run_lock_completed,
+                mark_run_lock_failed,
+                try_acquire_run_lock,
+            )
+
+            scope = str(
+                body.get("run_lock_scope")
+                or (",".join(sorted(clients_filter)) if clients_filter else "all_runners")
+            )
+            triggered_by = str(body.get("triggered_by") or "unknown")
+            run_lock_key = build_run_key(
+                job_name="morning_handoff_audit",
+                execution_mode=mode,
+                client_scope=scope,
+            )
+            if not try_acquire_run_lock(
+                run_lock_key,
+                job_name="morning_handoff_audit",
+                execution_mode=mode,
+                client_scope=scope,
+                triggered_by=triggered_by,
+            ):
+                return jsonify({
+                    "ok": True,
+                    "skipped": "run_lock_held",
+                    "run_key": run_lock_key,
+                    "mode": mode,
+                }), 200
+
         with _registry_lock:
             runners_all = dict(_active_runners)
 
@@ -3429,12 +3467,28 @@ def create_app() -> Flask:
                 readiness_results[email] = {"ok": False, "status": "ERROR", "error": str(exc)}
 
         elapsed = _time.monotonic() - _t0
+        ok = len(errors) == 0 and all(
+            str((row or {}).get("status") or "").upper() != "BLOCKED"
+            for row in readiness_results.values()
+            if isinstance(row, dict)
+        )
+        if run_lock_key is not None:
+            from ap_handoff_run_lock import mark_run_lock_completed, mark_run_lock_failed
+
+            summary = {
+                "clients_audited": len(handoff_results),
+                "errors": len(errors),
+                "elapsed_seconds": round(elapsed, 2),
+            }
+            if errors:
+                mark_run_lock_failed(run_lock_key, f"{len(errors)} client error(s)")
+            else:
+                mark_run_lock_completed(run_lock_key, summary)
+
         return jsonify({
-            "ok": len(errors) == 0 and all(
-                str((row or {}).get("status") or "").upper() != "BLOCKED"
-                for row in readiness_results.values()
-                if isinstance(row, dict)
-            ),
+            "ok": ok,
+            "run_key": run_lock_key,
+            "stage": "manual",
             "mode": mode,
             "dry_run": dry_run,
             "clients_audited": len(handoff_results),
@@ -3442,11 +3496,7 @@ def create_app() -> Flask:
             "handoff_results": handoff_results,
             "readiness_results": readiness_results,
             "errors": errors,
-        }), 200 if len(errors) == 0 and all(
-            str((row or {}).get("status") or "").upper() != "BLOCKED"
-            for row in readiness_results.values()
-            if isinstance(row, dict)
-        ) else 503
+        }), 200 if ok else 503
 
     @app.route("/admin/preopen_readiness", methods=["GET", "POST"])
     @require_hmac

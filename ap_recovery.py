@@ -620,11 +620,26 @@ class APStartupRecovery:
         cutoff_utc = (now_et.astimezone(timezone.utc) - timedelta(hours=_lookback_hours)).isoformat()
 
         def _reset():
+            # PR #143: tag rescued rows in payload.recovery_rescue so the
+            # queue dispatch can recognize them as eligible for PAPER
+            # immediate-entry submission after contract selection.
+            # Payload is a JSONB column — merge via || so the existing
+            # signal_id, ticker, score, etc. are preserved verbatim.
+            # The marker is also stamped with a UTC timestamp + the lookback
+            # window for audit. LIVE clients are not exempted in this query;
+            # the LIVE/PAPER gate lives in queue._dispatch so the LIVE path
+            # ignores the marker.
             with conn() as c:
+                _marker_payload = (
+                    '{"recovery_rescue":true,'
+                    '"recovery_rescue_ts":"' + now_et.astimezone(timezone.utc).isoformat() + '",'
+                    '"recovery_rescue_lookback_hours":' + str(int(_lookback_hours)) + '}'
+                )
                 c.execute(
                     """
                     UPDATE trade_queue
-                    SET    status = 'NEW'
+                    SET    status  = 'NEW',
+                           payload = COALESCE(payload, '{}'::jsonb) || %s::jsonb
                     WHERE  client_id  = %s
                       AND  status     = 'WATCHING'
                       AND  created_ts >= %s
@@ -640,7 +655,7 @@ class APStartupRecovery:
                                AND o.filled_ts IS NULL
                            )
                     """,
-                    (self.client_id, cutoff_utc),
+                    (_marker_payload, self.client_id, cutoff_utc),
                 )
                 return c.rowcount
 
@@ -676,7 +691,42 @@ class APStartupRecovery:
                 )
                 return c.fetchall()
 
-        count = run_with_retry(_reset) or 0
+        # ── PR #143 regression fix: LIVE never replays WATCHING rows ─────
+        # The _reset() block above resets WATCHING → NEW and tags rows with
+        # payload.recovery_rescue=true. PR #143 used this for paper-mode
+        # immediate-entry recovery. On 2026-06-16 Jason's LIVE pod replayed
+        # 23 WATCHING rows through MC/contract_selector with current (post-
+        # trigger) market data. The selector's earnings/IV/chain gates
+        # rejected all 23 with contract_selection:no_contract_found. Zero
+        # live trades. LIVE must NEVER replay stale signals through the
+        # selector — it can only reattach watcher ownership to current-
+        # session WATCHING/PENDING_TRIGGER rows.
+        #
+        # Detection: read mc.mode (canonical mode source per execution_core
+        # PR-B / FIX-3). Default to PAPER on lookup failure to preserve PR
+        # #143 paper behavior — never silently fall into LIVE replay if mc
+        # is mis-shaped.
+        _mc_mode = "PAPER"
+        try:
+            _mc_mode = str(getattr(self.mc, "mode", "PAPER") or "PAPER").upper()
+        except Exception:
+            _mc_mode = "PAPER"
+        _is_live = (_mc_mode == "LIVE")
+
+        if _is_live:
+            # Audit-required log; emitted before any DB write so it's
+            # visible even if downstream paths fail.
+            log.warning(
+                "LIVE_RECOVERY_REPLAY_SKIPPED client_id=%s mode=%s "
+                "reason=live_no_replay_policy lookback_hours=%d cutoff=%s "
+                "| WATCHING rows are NOT reset for LIVE clients; only "
+                "orphaned PENDING_TRIGGER watcher reattachment will run",
+                self.client_id, _mc_mode, _lookback_hours, cutoff_utc[:19],
+            )
+            count = 0  # No WATCHING rows reset for LIVE.
+        else:
+            count = run_with_retry(_reset) or 0
+
         rearmed = 0
         if self.entry_watcher is None:
             log.warning(

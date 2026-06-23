@@ -88,6 +88,8 @@ def build_morning_handoff_payload(
     client_id: Optional[str] = None,
     execution_mode: Optional[str] = None,
     dry_run: bool = False,
+    triggered_by: Optional[str] = None,
+    run_lock_scope: Optional[str] = None,
 ) -> dict:
     payload = {"dry_run": bool(dry_run)}
     client_list = _normalize_clients(clients)
@@ -100,6 +102,10 @@ def build_morning_handoff_payload(
         payload["mode"] = normalized_mode
     if execution_mode and str(execution_mode).strip():
         payload["execution_mode"] = str(execution_mode).strip().lower()
+    if triggered_by and str(triggered_by).strip():
+        payload["triggered_by"] = str(triggered_by).strip()
+    if run_lock_scope and str(run_lock_scope).strip():
+        payload["run_lock_scope"] = str(run_lock_scope).strip()
     return payload
 
 
@@ -255,30 +261,49 @@ def build_job_calls(
             MorningJobCall(
                 job_name=f"{job_name}_live",
                 endpoint=MORNING_HANDOFF_AUDIT_ENDPOINT,
-                payload=build_morning_handoff_payload(clients=[live_client], mode="live", dry_run=False),
+                payload=build_morning_handoff_payload(
+                    clients=[live_client],
+                    mode="live",
+                    dry_run=False,
+                    triggered_by="scheduler",
+                    run_lock_scope=f"handoff_live:{live_client}",
+                ),
                 client_scope=live_client,
                 execution_mode="live",
             ),
             MorningJobCall(
                 job_name=f"{job_name}_paper",
                 endpoint=MORNING_HANDOFF_AUDIT_ENDPOINT,
-                payload=build_morning_handoff_payload(clients=paper_client_list, mode="paper", dry_run=False),
+                payload=build_morning_handoff_payload(
+                    clients=paper_client_list,
+                    mode="paper",
+                    dry_run=False,
+                    triggered_by="scheduler",
+                    run_lock_scope="handoff_paper:" + ",".join(sorted(paper_client_list)),
+                ),
                 client_scope=",".join(paper_client_list),
                 execution_mode="paper",
             ),
         ]
     if job_name == MORNING_RECOVERY_JOB:
+        import os as _os
+
+        live_release_enabled = str(
+            _os.getenv("ENABLE_LIVE_AUTO_RELEASE_AFTER_OPEN", "false")
+        ).strip().lower() in ("1", "true", "yes")
+        release_clients = all_clients if live_release_enabled else list(paper_client_list)
+        release_scope = "live+paper" if live_release_enabled else "paper_only"
         return [
             MorningJobCall(
-                job_name="release_after_hours_deferred_all",
+                job_name=f"release_after_hours_deferred_{release_scope}",
                 endpoint=RELEASE_AFTER_HOURS_DEFERRED_ENDPOINT,
                 payload=build_release_after_hours_deferred_payload(
-                    clients=all_clients,
+                    clients=release_clients,
                     force=True,
                     lookback_h=36,
                 ),
-                client_scope=",".join(all_clients),
-                execution_mode="mixed",
+                client_scope=",".join(release_clients),
+                execution_mode="paper" if not live_release_enabled else "mixed",
             ),
             MorningJobCall(
                 job_name="paper_rescue_restart_guard",

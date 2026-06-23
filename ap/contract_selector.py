@@ -219,6 +219,42 @@ def _safe_plan_attr(plan, attr: str, default=None):
         return default
 
 
+def _plan_sizing_ctx(plan) -> dict:
+    """Return plan.metadata['sizing_context'] (object or dict plan), or {}.
+
+    Production plans store equity / budget / risk_pct / max_position_usd under
+    metadata['sizing_context'] — NOT as top-level plan attributes. Reading the
+    top-level attrs returns None in production, which defeats the account-size
+    diagnostics. This helper reads the canonical location. Never raises."""
+    try:
+        meta = None
+        if isinstance(plan, dict):
+            meta = plan.get("metadata")
+        else:
+            meta = getattr(plan, "metadata", None)
+        if isinstance(meta, dict):
+            ctx = meta.get("sizing_context")
+            if isinstance(ctx, dict):
+                return ctx
+    except Exception:
+        pass
+    return {}
+
+
+def _sizing_val(plan, *keys, default=None):
+    """Read the first present value from sizing_context for any of `keys`,
+    falling back to a same-named top-level plan attr, then default. Never raises."""
+    ctx = _plan_sizing_ctx(plan)
+    for k in keys:
+        if k in ctx and ctx[k] is not None:
+            return ctx[k]
+    for k in keys:
+        v = _safe_plan_attr(plan, k, None)
+        if v is not None:
+            return v
+    return default
+
+
 
 
 
@@ -445,6 +481,31 @@ class APContractSelectionEngine:
         self.iv_filter      = iv_filter
         self.mutate_plan    = bool(mutate_plan)
 
+        # ── PR1 (deferred-dte-ladder): DTE-bucket selection policy ────────────
+        # DEFAULT OFF. When DEFERRED_DTE_LADDER != "1", select() behaves exactly
+        # as before (single _pick_expiration). When enabled, eligible plans are
+        # routed through _select_with_dte_ladder, which evaluates expirations by
+        # DTE bucket in playbook-preferred order and only falls to 8+ DTE when
+        # nearer buckets yield zero quality survivors. Quality gates are NEVER
+        # loosened — the ladder only changes WHICH expiration is evaluated first.
+        self.dte_ladder_enabled = os.getenv("DEFERRED_DTE_LADDER", "0").strip() in ("1", "true", "yes")
+        # Bucket boundaries (inclusive upper, DTE). A=near, B=adjacent, C=fallback.
+        self.dte_bucket_a_max = int(os.getenv("DTE_BUCKET_A_MAX", "2"))   # 0–2 DTE
+        self.dte_bucket_b_max = int(os.getenv("DTE_BUCKET_B_MAX", "7"))   # 3–7 DTE
+        # Max expirations to probe per bucket (bounds Tradier calls per breach).
+        self.dte_ladder_probe_per_bucket = int(os.getenv("DTE_LADDER_PROBE_PER_BUCKET", "2"))
+        # Records the last ladder run for diagnostics (observability only).
+        self._last_dte_ladder_audit: Optional[dict] = None
+
+        # PR #149 — Selector Reason Honesty.
+        # Records the most recent REJECT event emitted during a single select()
+        # call so the queue can surface the actual blocker (e.g. OI_TOO_LOW)
+        # instead of the umbrella label "no_contract_found".
+        #   Shape: {"stage": str, "reason_code": str, "explanation": str} | None
+        # Reset to None at the top of every select() invocation.
+        # Never affects selection — observability only.
+        self._last_failure: Optional[dict] = None
+
         self.strategy_version = os.getenv("AP_STRATEGY_VERSION", "ap_live_beta")
         self.git_commit       = get_git_commit()
         self.config_hash = make_config_hash({
@@ -503,6 +564,21 @@ class APContractSelectionEngine:
         context: Optional[dict] = None,
     ) -> None:
         """Emit a structured observability event for every contract selection decision."""
+        # PR #149 — Selector Reason Honesty.
+        # Capture the most recent REJECT into self._last_failure so the queue
+        # can read the specific blocker after select() returns None. Always
+        # overwrites: by the time select() returns None, the last REJECT
+        # emitted is the actual terminating blocker. Errors here must not
+        # affect emit behavior — wrapped defensively. Observability only.
+        try:
+            if str(decision).upper() == "REJECT":
+                self._last_failure = {
+                    "stage":       str(stage or ""),
+                    "reason_code": str(reason_code or "") or "UNKNOWN_REJECTION",
+                    "explanation": str(explanation or ""),
+                }
+        except Exception:
+            pass
         try:
             _sig_id    = _safe_plan_attr(plan, "signal_id") or ""
             _client_id = _safe_plan_attr(plan, "client_id") or "default"
@@ -529,11 +605,50 @@ class APContractSelectionEngine:
             log.debug("Selector observability emit failed (non-critical): %s", e)
 
     # =========================================================================
-    # PUBLIC -- select(plan) → SelectedContract | None
+    # PR #149 — PUBLIC: get_last_failure()
     # =========================================================================
+    def get_last_failure(self) -> Optional[dict]:
+        """
+        Return the most recent REJECT captured during the last select() call,
+        or None if select() either succeeded or was never run.
+
+        Shape:
+            {"stage": "<selector stage>", "reason_code": "<canonical code>",
+             "explanation": "<human-readable detail>"}
+
+        Used by ap/queue.py to surface the *actual* blocker (e.g. OI_TOO_LOW,
+        NO_CHAIN_DATA, SPREAD_TOO_WIDE, NO_AFFORDABLE_CONTRACT) instead of
+        the umbrella label "no_contract_found".
+
+        Observability only. Never affects selection. Never raises.
+        """
+        try:
+            if isinstance(self._last_failure, dict):
+                # Defensive copy so callers can't mutate selector state.
+                return dict(self._last_failure)
+        except Exception:
+            pass
+        return None
+
+    def get_last_dte_ladder_audit(self) -> Optional[dict]:
+        """Return the audit from the most recent DTE-ladder run (buckets tried,
+        survivors per bucket, selected bucket/DTE/expiration), or None if the
+        ladder was not used. Observability only. Never raises."""
+        try:
+            if isinstance(self._last_dte_ladder_audit, dict):
+                return dict(self._last_dte_ladder_audit)
+        except Exception:
+            pass
+        return None
 
 
-    def select(self, plan) -> Optional[SelectedContract]:
+    def select(self, plan, *, expiration_override: Optional[str] = None) -> Optional[SelectedContract]:
+        # PR #149 — Selector Reason Honesty.
+        # Reset failure capture at the start of every invocation so that
+        # get_last_failure() reflects ONLY this call's most recent REJECT,
+        # never a stale value from a prior select(). Observability only.
+        self._last_failure = None
+
         ticker    = _safe_plan_attr(plan, "ticker")
         direction = str(_safe_plan_attr(plan, "side", "") or "").upper()
         budget    = float(_safe_plan_attr(plan, "max_position_usd", 0) or 0)
@@ -632,9 +747,36 @@ class APContractSelectionEngine:
                 if not fail_open:
                     return None
 
+        # ── PR1 (deferred-dte-ladder) ────────────────────────────────────────
+        # Route eligible plans through the DTE-bucket ladder, but ONLY when:
+        #   - the flag is enabled, AND
+        #   - this is not already a ladder sub-call (expiration_override is None).
+        #
+        # AMENDMENT: the ladder gate is intentionally placed AFTER the terminal
+        # non-DTE gates above (INVALID_PLAN, UNSUPPORTED_INDEX_MAPPING,
+        # EARNINGS_LOCKOUT / EARNINGS_GUARD_ERROR). Those gates are ticker-level —
+        # they give the same verdict regardless of expiration — so they must
+        # short-circuit with their TRUE reason before the ladder runs. This
+        # prevents the ladder from probing every DTE bucket and then overwriting
+        # _last_failure with NO_VALID_PLAYBOOK_DTE_CONTRACT, which would mask a
+        # real EARNINGS_LOCKOUT or invalid-plan rejection. Running them once here
+        # is also cheaper than re-running them inside every ladder sub-call.
+        #
+        # A ladder sub-call passes an explicit expiration_override and falls
+        # through to the normal single-expiration path below. When the flag is
+        # off, expiration_override is always None and behavior is unchanged.
+        if (
+            self.dte_ladder_enabled
+            and expiration_override is None
+            and self._is_ladder_eligible(plan)
+        ):
+            return self._select_with_dte_ladder(plan)
+
         # ── A. FETCH CHAIN ────────────────────────────────────────────────────
         try:
-            chain, underlying_price = self._fetch_chain_with_price(ticker, direction)
+            chain, underlying_price = self._fetch_chain_with_price(
+                ticker, direction, expiration_override=expiration_override
+            )
         except Exception as e:
             log.error("[%s] chain fetch failed: %s", ticker, e)
             self._emit_selector_event(
@@ -1008,6 +1150,12 @@ class APContractSelectionEngine:
                     "chain_size":       len(chain),
                     "rejection_counts": {_normalize_reason_code(k): v for k, v in _rejections.items()},
                     "raw_rejection_counts": _rejections,
+                    # PR2: budget context so the operator can correlate a
+                    # whole-chain quality wipeout with a too-small account
+                    # (e.g. only deep-OTM junk was affordable). Diagnostic only.
+                    "budget":                 _safe_float(budget),
+                    "max_affordable_premium": _safe_float(_safe_plan_attr(plan, "max_affordable_premium", 0)) or None,
+                    "underlying_price":       _safe_float(underlying_price) or None,
                 },
                 thresholds={
                     "max_spread_pct": _safe_float(_eff_max_spread),
@@ -1245,25 +1393,85 @@ class APContractSelectionEngine:
                     dte                  = selected.dte,
                 )
             else:
-                log.warning("[%s] BLOCKED -- budget $%.0f cannot afford %s @ $%.0f/contract",
-                            ticker, budget, selected.contract_symbol, selected.premium_per_contract)
+                # ── PR2: account-size tradeability classification ─────────────
+                # A QUALITY contract was found (it passed every liquidity / spread
+                # / OI / delta gate) but it exceeds the per-trade budget. This is
+                # not a data or liquidity failure — it is structurally untradeable
+                # for THIS account size. Classify it precisely so the operator can
+                # tell "account too small for this name right now" apart from
+                # "bad data / no liquidity / wrong DTE". Breach-time authoritative:
+                # this runs only after the chain (and, under PR1, the DTE ladder)
+                # has been fully evaluated, so the quality contract is real.
+                #
+                # NOTE: this does NOT loosen any gate and does NOT change the
+                # decision — the live reject still returns None. It only upgrades
+                # the REASON from generic NO_AFFORDABLE_CONTRACT to the specific
+                # UNTRADEABLE_FOR_ACCOUNT_SIZE, with full budget diagnostics.
+                # Read sizing diagnostics from plan.metadata['sizing_context']
+                # first (their canonical production location); fall back to
+                # top-level attrs only if absent. Reading top-level alone returned
+                # None in production, defeating the diagnostics.
+                _equity = _safe_float(_sizing_val(plan, "account_equity", "equity", default=0)) or None
+                _max_pos_pct = _safe_float(_sizing_val(plan, "risk_pct", "max_position_pct", default=0)) or None
+                _max_afford_prem = _safe_float(_sizing_val(plan, "max_affordable_premium", default=0)) or None
+                _ctx_budget = _safe_float(_sizing_val(plan, "budget", "max_position_usd", default=0)) or _safe_float(budget)
+                _underlying = _safe_float(underlying_price) or None
+                _tradeability_diag = {
+                    "equity":                 _equity,
+                    "max_position_pct":       _max_pos_pct,
+                    "max_trade_usd":          _safe_float(_max_trade_usd()),
+                    "max_affordable_premium": _max_afford_prem,
+                    "underlying_price":       _underlying,
+                    "budget":                 _ctx_budget,
+                    "selected_dte":           _safe_float(getattr(selected, "dte", None)),
+                    "near_atm_premium_estimate": _safe_float(selected.premium_per_contract),
+                    "cheapest_quality_survivor_premium": _safe_float(selected.premium_per_contract),
+                    "classification":         "UNTRADEABLE_FOR_ACCOUNT_SIZE",
+                }
+                log.warning(
+                    "[%s] UNTRADEABLE_FOR_ACCOUNT_SIZE -- quality contract %s @ "
+                    "$%.0f/contract exceeds budget $%.0f (equity=%s pct=%s) — "
+                    "not a data/liquidity failure",
+                    ticker, selected.contract_symbol,
+                    selected.premium_per_contract, _ctx_budget, _equity, _max_pos_pct,
+                )
+                # Flatten the key diagnostics INTO the explanation string so they
+                # survive downstream: ap/queue.py _derive_last_error and the
+                # deferred-breach audit persist reason_code/stage/explanation but
+                # may drop the structured tradeability_diag dict. Embedding the
+                # numbers in explanation guarantees they reach the order row.
+                _diag_summary = (
+                    f"equity=${_equity or 0:.0f} budget=${_ctx_budget or 0:.0f} "
+                    f"premium=${selected.premium_per_contract:.0f} "
+                    f"underlying=${_underlying or 0:.2f} dte={getattr(selected,'dte',None)}"
+                )
+                _explanation = (
+                    f"Quality contract {selected.contract_symbol} @ "
+                    f"${selected.premium_per_contract:.0f}/contract exceeds budget "
+                    f"${_ctx_budget or 0:.0f} — structurally untradeable for this account "
+                    f"size [{_diag_summary}]. No ticker blacklist; eligible again if a "
+                    f"cheaper quality contract appears or the account grows."
+                )
                 self._emit_selector_event(
                     plan,
-                stage="affordability_gate",
+                    stage="affordability_gate",
                     decision="REJECT",
-                    reason_code="NO_AFFORDABLE_CONTRACT",
-                    explanation=(
-                        f"Budget ${budget:.0f} cannot afford "
-                        f"{selected.contract_symbol} @ ${selected.premium_per_contract:.0f}/contract"
-                    ),
+                    reason_code="UNTRADEABLE_FOR_ACCOUNT_SIZE",
+                    explanation=_explanation,
                     contract=selected.contract_symbol,
-                    inputs={
-                        "budget":               _safe_float(budget),
-                        "premium_per_contract": _safe_float(selected.premium_per_contract),
-                        "affordable_contracts": selected.affordable_contracts,
-                    },
+                    inputs=_tradeability_diag,
                     thresholds={"min_contracts": 1},
                 )
+                # Record as the authoritative last-failure reason for the queue
+                # and the deferred-breach audit (consumed by PR3's taxonomy). Both
+                # the structured diag AND the flattened explanation are included so
+                # the numbers survive whichever downstream copies them.
+                self._last_failure = {
+                    "stage": "affordability_gate",
+                    "reason_code": "UNTRADEABLE_FOR_ACCOUNT_SIZE",
+                    "explanation": _explanation,
+                    "tradeability_diag": _tradeability_diag,
+                }
                 return None
 
         if selected is None:
@@ -1468,15 +1676,15 @@ class APContractSelectionEngine:
     # PRIVATE -- CHAIN FETCH
     # =========================================================================
 
-    def _fetch_chain_with_price(self, ticker: str, direction: str) -> tuple[list[dict], Optional[float]]:
+    def _fetch_chain_with_price(self, ticker: str, direction: str, *, expiration_override: Optional[str] = None) -> tuple[list[dict], Optional[float]]:
         option_type = direction.lower()
-        return self._fetch_tradier_chain(ticker, option_type)
+        return self._fetch_tradier_chain(ticker, option_type, expiration_override=expiration_override)
 
     def _fetch_chain(self, ticker: str, direction: str) -> list[dict]:
         chain, _ = self._fetch_chain_with_price(ticker, direction)
         return chain
 
-    def _fetch_tradier_chain(self, ticker: str, option_type: str) -> tuple[list[dict], Optional[float]]:
+    def _fetch_tradier_chain(self, ticker: str, option_type: str, *, expiration_override: Optional[str] = None) -> tuple[list[dict], Optional[float]]:
         """Direct Tradier API call for option chain. Returns (chain, underlying_price)."""
         import requests
         # Use broker's pooled session if available (connection reuse, keep-alive).
@@ -1525,8 +1733,14 @@ class APContractSelectionEngine:
         if not dates:
             return [], underlying_price
 
-        # 3. Pick best expiration
-        target_exp = self._pick_expiration(dates)
+        # 3. Pick best expiration (or honor an explicit override from the ladder)
+        if expiration_override:
+            target_exp = expiration_override if expiration_override in dates else None
+            if target_exp is None:
+                # Override not in the live expirations list — nothing to fetch.
+                return [], underlying_price
+        else:
+            target_exp = self._pick_expiration(dates)
         if not target_exp:
             return [], underlying_price
 
@@ -1554,6 +1768,228 @@ class APContractSelectionEngine:
 
         filtered = [o for o in options if o.get("option_type", "").lower() == option_type]
         return filtered, underlying_price
+
+    # =========================================================================
+    # PR1 — DTE-BUCKET LADDER (flag-gated, default off)
+    # =========================================================================
+
+    def _is_ladder_eligible(self, plan) -> bool:
+        """Whether this plan should use the DTE ladder.
+
+        AMENDMENT (blast-radius fix): the ladder must apply ONLY to deferred
+        contract resolution at breach time, never to general selector usage. So
+        eligibility requires an EXPLICIT plan-scoped marker set by the deferred
+        breach-time path — NOT a broad timeframe heuristic. With this gate, even
+        when DEFERRED_DTE_LADDER=1, a normal (non-deferred) select() call is
+        byte-for-byte unchanged because no marker is present.
+
+        The marker is read from plan.metadata, accepting either:
+            metadata["deferred_breach_selection"] is True   (boolean marker)
+            metadata["selection_context"] == "deferred_breach"
+        Both object-plans and dict-plans are supported. Never raises.
+        """
+        try:
+            meta = None
+            if isinstance(plan, dict):
+                meta = plan.get("metadata")
+            else:
+                meta = getattr(plan, "metadata", None)
+            if not isinstance(meta, dict):
+                return False
+            if meta.get("deferred_breach_selection") is True:
+                return True
+            if str(meta.get("selection_context") or "") == "deferred_breach":
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _preferred_bucket_order(self, plan) -> list[str]:
+        """Playbook/timeframe-derived DTE bucket order.
+
+        The playbook CSV carries no explicit DTE column, so the preferred bucket
+        is derived from timeframe. Short-dated daily Strat setups prefer the
+        nearest liquid expiration first, then adjacent, then 8+ only as last
+        resort. This does NOT hard-force 0DTE — it only orders the ladder.
+        """
+        timeframe = str(_safe_plan_attr(plan, "timeframe", "") or "").lower()
+        # 1d / daily / intraday short-dated → near-first ladder.
+        # Any longer/unknown timeframe uses the same near-first order by default;
+        # the fallback rungs guarantee a quality contract is still found if the
+        # near buckets are empty.
+        if timeframe in ("1d", "daily", "1day", "d", "60m", "1h", "30m", "15m", "5m", "0dte"):
+            return ["A", "B", "C"]
+        # Default: still near-first (safe — ladder falls back if empty).
+        return ["A", "B", "C"]
+
+    def _fetch_expirations_list(self, ticker: str) -> list[str]:
+        """Fetch the raw expirations list for the ticker (live data broker).
+        Returns [] on any failure (caller falls back gracefully)."""
+        import requests
+        _session = getattr(self.data_broker, "session", None) or requests
+        cfg      = getattr(self.data_broker, "cfg", None)
+        base_url = (getattr(cfg, "base_url", None)
+                    or getattr(self.data_broker, "base_url", "https://sandbox.tradier.com"))
+        token = (getattr(cfg, "access_token", None)
+                 or getattr(cfg, "token", None)
+                 or getattr(self.data_broker, "access_token", None)
+                 or getattr(self.data_broker, "token", "")) or ""
+        headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+        try:
+            resp = _session.get(
+                f"{base_url}/v1/markets/options/expirations",
+                params={"symbol": ticker, "includeAllRoots": "true"},
+                headers=headers, timeout=10,
+            )
+            if resp.status_code != 200:
+                return []
+            return resp.json().get("expirations", {}).get("date", []) or []
+        except Exception:
+            return []
+
+    def _bucket_expirations(self, dates: list[str]) -> dict[str, list[str]]:
+        """Group expirations into DTE buckets A (0–a), B (a+1–b), C (b+1+).
+        Each bucket's list is sorted nearest-first. Weekends skipped."""
+        today = date.today()
+        buckets: dict[str, list[tuple[int, str]]] = {"A": [], "B": [], "C": []}
+        for d_str in dates:
+            try:
+                d = date.fromisoformat(d_str)
+            except Exception:
+                continue
+            if d.weekday() >= 5:
+                continue
+            dte = (d - today).days
+            if dte < 0:
+                continue
+            if dte <= self.dte_bucket_a_max:
+                buckets["A"].append((dte, d_str))
+            elif dte <= self.dte_bucket_b_max:
+                buckets["B"].append((dte, d_str))
+            else:
+                buckets["C"].append((dte, d_str))
+        # nearest-first within each bucket
+        return {k: [d for _, d in sorted(v)] for k, v in buckets.items()}
+
+    def _select_with_dte_ladder(self, plan) -> Optional["SelectedContract"]:
+        """Evaluate expirations by DTE bucket in playbook-preferred order.
+
+        For each bucket (A→B→C by default), probe its expirations nearest-first
+        (up to dte_ladder_probe_per_bucket) and return the FIRST expiration that
+        yields a quality survivor. Quality gates are unchanged — this only
+        controls which expiration select() evaluates. Records a full audit of
+        buckets attempted / survivors per bucket for diagnostics.
+
+        Returns the selected contract, or None (records NO_VALID_PLAYBOOK_DTE_CONTRACT).
+        """
+        ticker = _safe_plan_attr(plan, "ticker")
+        audit: dict = {
+            "ladder": True,
+            "ticker": ticker,
+            "timeframe": str(_safe_plan_attr(plan, "timeframe", "") or ""),
+            "bucket_order": [],
+            "buckets_attempted": [],
+            "selected_bucket": None,
+            "selected_dte": None,
+            "selected_expiration": None,
+        }
+        try:
+            dates = self._fetch_expirations_list(ticker)
+            if not dates:
+                # No expirations data — fall back to the legacy single-shot path
+                # so we never regress to "no result" purely from a list-fetch miss.
+                audit["fallback"] = "no_expirations_list_legacy_single_shot"
+                self._last_dte_ladder_audit = audit
+                return self.select(plan, expiration_override="")  # "" => legacy pick
+
+            buckets = self._bucket_expirations(dates)
+            order = self._preferred_bucket_order(plan)
+            audit["bucket_order"] = order
+            today = date.today()
+
+            # Terminal non-DTE reason codes that the ladder must NEVER overwrite
+            # with NO_VALID_PLAYBOOK_DTE_CONTRACT (amendment). If a sub-call
+            # rejected for one of these ticker-level reasons, that is the true,
+            # authoritative cause and the same verdict holds for every DTE.
+            _TERMINAL_NON_DTE = {
+                "EARNINGS_LOCKOUT", "EARNINGS_GUARD_ERROR",
+                "INVALID_PLAN", "UNSUPPORTED_INDEX_MAPPING",
+                "NO_CHAIN_DATA",
+            }
+            _preserved_terminal = None
+
+            for bucket_name in order:
+                exps = buckets.get(bucket_name, [])[: self.dte_ladder_probe_per_bucket]
+                bucket_rec = {"bucket": bucket_name, "expirations_probed": [], "survivor": False}
+                for exp in exps:
+                    try:
+                        _dte = (date.fromisoformat(exp) - today).days
+                    except Exception:
+                        _dte = None
+                    result = self.select(plan, expiration_override=exp)
+                    # Capture a terminal non-DTE rejection from this sub-call so
+                    # the ladder can preserve it rather than masking it.
+                    _sub_fail = self._last_failure
+                    if (
+                        result is None
+                        and isinstance(_sub_fail, dict)
+                        and _sub_fail.get("reason_code") in _TERMINAL_NON_DTE
+                    ):
+                        _preserved_terminal = dict(_sub_fail)
+                    bucket_rec["expirations_probed"].append({"exp": exp, "dte": _dte, "hit": result is not None})
+                    if result is not None:
+                        bucket_rec["survivor"] = True
+                        audit["buckets_attempted"].append(bucket_rec)
+                        audit["selected_bucket"] = bucket_name
+                        audit["selected_dte"] = _dte
+                        audit["selected_expiration"] = exp
+                        self._last_dte_ladder_audit = audit
+                        log.info(
+                            "[%s] DTE_LADDER_SELECTED bucket=%s dte=%s exp=%s",
+                            ticker, bucket_name, _dte, exp,
+                        )
+                        return result
+                audit["buckets_attempted"].append(bucket_rec)
+                # If a terminal non-DTE reason was hit, stop laddering — probing
+                # further buckets is pointless (the verdict is ticker-level) and
+                # risks masking the true reason.
+                if _preserved_terminal is not None:
+                    break
+
+            # All buckets exhausted (or short-circuited on a terminal non-DTE
+            # reason). Preserve a terminal non-DTE reason if one was seen;
+            # otherwise record the DTE-ladder exhaustion reason.
+            self._last_dte_ladder_audit = audit
+            if _preserved_terminal is not None:
+                self._last_failure = _preserved_terminal
+                log.warning(
+                    "[%s] DTE_LADDER_TERMINAL_NON_DTE preserved reason=%s — not masking with NO_VALID_PLAYBOOK_DTE_CONTRACT",
+                    ticker, _preserved_terminal.get("reason_code"),
+                )
+                return None
+            self._last_failure = {
+                "stage": "dte_ladder",
+                "reason_code": "NO_VALID_PLAYBOOK_DTE_CONTRACT",
+                "explanation": (
+                    "No quality survivor in any evaluated DTE bucket "
+                    f"(order={order}, buckets={ {k: len(v) for k, v in buckets.items()} })"
+                ),
+            }
+            log.warning(
+                "[%s] DTE_LADDER_NO_SURVIVOR order=%s buckets=%s",
+                ticker, order, {k: len(v) for k, v in buckets.items()},
+            )
+            return None
+        except Exception as exc:
+            # Ladder must never harm the flow — on any unexpected error, fall
+            # back to the legacy single-shot selection.
+            log.warning("[%s] DTE_LADDER_ERROR falling back to legacy: %s", ticker, exc)
+            audit["fallback"] = f"ladder_error_legacy_single_shot:{exc}"
+            self._last_dte_ladder_audit = audit
+            try:
+                return self.select(plan, expiration_override="")
+            except Exception:
+                return None
 
     def _pick_expiration(self, dates: list[str]) -> Optional[str]:
         today = date.today()

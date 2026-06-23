@@ -1,12 +1,32 @@
-name: Manual Backup Morning Jobs
+name: Backup Morning Jobs
 
 on:
+  schedule:
+    # GitHub Actions is the BACKUP ONLY. Render Cron (render.yaml) is the
+    # primary scheduler and runs the four batches at 09:18/09:26/09:32/09:36 ET.
+    #
+    # This backup runs ONCE, at a LATER recovery window (09:50 ET), well after
+    # the last Render primary job (09:36 ET). It runs morning_recovery — the
+    # idempotent catch-all batch — so it cannot race the Render primary windows.
+    #
+    # DST-safe dual UTC entries (Render uses UTC; GitHub Actions also uses UTC):
+    #   09:50 EDT = 13:50 UTC
+    #   09:50 EST = 14:50 UTC
+    # The script's should_run_now() ET-window guard runs only the season-correct
+    # tick and skips the other.
+    #
+    # Idempotency is enforced server-side via the admin endpoints' DB run-lock
+    # (handoff_run_locks table — see app.py). Even if a Render job and this
+    # backup both target morning_recovery, only one acquires the lock; the other
+    # records skip_locked. job_window_key is NOT relied on as idempotency.
+    - cron: "50 13 * * 1-5"   # 13:50 UTC = 09:50 EDT
+    - cron: "50 14 * * 1-5"   # 14:50 UTC = 09:50 EST
   workflow_dispatch:
     inputs:
       job:
-        description: "Backup morning automation batch to run"
+        description: "Morning automation batch to run"
         required: true
-        default: "overnight_reeval_batch"
+        default: "morning_recovery"
         type: choice
         options:
           - overnight_reeval_batch
@@ -15,7 +35,7 @@ on:
           - morning_recovery
 
 concurrency:
-  group: manual-backup-morning-jobs-${{ github.event.inputs.job }}
+  group: backup-morning-jobs-${{ github.event.schedule || github.event.inputs.job }}
   cancel-in-progress: false
 
 jobs:
@@ -29,10 +49,17 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Resolve requested batch
+      - name: Resolve scheduled batch
         id: cfg
         run: |
-          JOB="${{ github.event.inputs.job }}"
+          JOB=""
+          # Backup runs the idempotent recovery batch at the later 09:50 ET window.
+          case "${{ github.event.schedule }}" in
+            "50 13 * * 1-5"|"50 14 * * 1-5") JOB="morning_recovery" ;;
+          esac
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            JOB="${{ github.event.inputs.job }}"
+          fi
           echo "job=$JOB" >> "$GITHUB_OUTPUT"
           echo "Resolved job=$JOB"
 
@@ -45,6 +72,5 @@ jobs:
           MORNING_JOB_PAPER_CLIENTS: jose.vasquez4011@gmail.com,tradefluencehq@gmail.com
           MORNING_JOB_TIMEOUT_SECONDS: "180"
           MORNING_JOB_WINDOW_TOLERANCE_MINUTES: "45"
-          MORNING_JOB_FORCE_WINDOW: "1"
         run: |
           python3 -m ap.scripts.live_morning_jobs

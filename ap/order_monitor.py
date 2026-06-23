@@ -177,6 +177,14 @@ PENDING_TRIGGER_CLEANUP_DRY_RUN = os.getenv(
     "PENDING_TRIGGER_CLEANUP_DRY_RUN", "0"
 ).strip().lower() in ("1", "true", "yes")
 
+# EOD entry cutoff for PENDING_TRIGGER watcher-held rows (ET).
+# Mirrors ap_entry_watcher.EOD_CUTOFF_HOUR / EOD_CUTOFF_MIN so the orphan
+# guard uses the same boundary the watcher uses when disarming at EOD.
+# After 15:30 ET a watcher-held row that still hasn't breached is legitimately
+# expired — it missed its trading window. Before that, it must be kept alive.
+_PT_ORPHAN_EOD_CUTOFF_HOUR = int(os.getenv("PT_ORPHAN_EOD_CUTOFF_HOUR", "15"))
+_PT_ORPHAN_EOD_CUTOFF_MIN  = int(os.getenv("PT_ORPHAN_EOD_CUTOFF_MIN",  "30"))
+
 # Watchdog ownership controls.
 # Default is intentionally passive for POSITION lifecycle (that authority
 # belongs to fill monitor / reconciler / OSM / exit engine). BUT a stale
@@ -674,6 +682,193 @@ class APOrderMonitor:
                         f"| Manual review required"
                     )
 
+    def _is_after_pt_eod_cutoff(self) -> bool:
+        """Return True if the current UTC time is past the entry-cutoff ET boundary.
+
+        Uses _PT_ORPHAN_EOD_CUTOFF_HOUR / _PT_ORPHAN_EOD_CUTOFF_MIN (default
+        15:30 ET), matching ap_entry_watcher.EOD_CUTOFF_HOUR / EOD_CUTOFF_MIN.
+        After this time, watcher-held rows that still haven't breached are
+        legitimately terminal for the session.
+        """
+        try:
+            import zoneinfo
+            _et = zoneinfo.ZoneInfo("America/New_York")
+        except ImportError:
+            try:
+                from datetime import timezone as _tz
+                import pytz as _pytz
+                _et = _pytz.timezone("America/New_York")
+            except ImportError:
+                # Cannot determine ET — default conservative: assume NOT past cutoff
+                # so watcher-held rows are preserved rather than wrongly expired.
+                return False
+        now_et = datetime.now(_et)
+        return (
+            now_et.hour > _PT_ORPHAN_EOD_CUTOFF_HOUR
+            or (now_et.hour == _PT_ORPHAN_EOD_CUTOFF_HOUR
+                and now_et.minute >= _PT_ORPHAN_EOD_CUTOFF_MIN)
+        )
+
+    def _is_overnight_or_deferred_row(self, order: dict) -> tuple[bool, str]:
+        """Return (is_overnight_or_deferred, evidence_description).
+
+        Overnight and deferred PENDING_TRIGGER rows must NOT be EOD-expired
+        at the 15:30 ET wall-clock cutoff. They are designed to survive across
+        sessions and will be re-evaluated at the next market open by
+        overnight_reeval or the morning handoff audit.
+
+        Evidence that a row is overnight/deferred (any single item is sufficient):
+          1. contract starts with DEFERRED: — explicitly deferred to breach time
+          2. meta.contract_deferred = True  — explicit deferred flag from MC
+          3. meta.overnight = True          — set by overnight signal path
+          4. meta.queue_status indicates overnight/open recheck
+             (after_hours_deferred, awaiting_overnight_reeval, open_recheck)
+          5. timeframe in daily/overnight/1d variants — The Strat daily timeframe
+          6. meta.prior_day_high or meta.prior_day_low present — cross-session
+             level, not an intraday signal
+          7. order.prior_day_high or order.prior_day_low present (top-level)
+
+        Same-day intraday signals (e.g. timeframe=5m, no deferred evidence)
+        MAY be EOD-expired after cutoff — they missed the session window.
+        """
+        meta_raw = order.get("meta")
+        if isinstance(meta_raw, str):
+            try:
+                import json as _json
+                meta = _json.loads(meta_raw) if meta_raw else {}
+            except Exception:
+                meta = {}
+        elif isinstance(meta_raw, dict):
+            meta = meta_raw
+        else:
+            meta = {}
+
+        contract = str(order.get("contract") or "").strip()
+
+        # Evidence 1: DEFERRED:* contract
+        if contract.upper().startswith("DEFERRED:"):
+            return True, f"deferred_contract={contract}"
+
+        # Evidence 2: meta.contract_deferred
+        if meta.get("contract_deferred"):
+            return True, "meta.contract_deferred=True"
+
+        # Evidence 3: meta.overnight
+        if meta.get("overnight"):
+            return True, "meta.overnight=True"
+
+        # Evidence 4: meta.queue_status overnight/open-recheck variants
+        _qs = str(meta.get("queue_status") or "").lower().strip()
+        if _qs in (
+            "after_hours_deferred",
+            "awaiting_overnight_reeval",
+            "open_recheck",
+            "overnight_deferred",
+            "deferred",
+        ):
+            return True, f"meta.queue_status={_qs}"
+
+        # Evidence 5: timeframe indicates daily/overnight signal
+        _tf = str(
+            order.get("timeframe")
+            or meta.get("timeframe")
+            or ""
+        ).strip().lower()
+        if _tf in ("1d", "daily", "overnight", "d", "day"):
+            return True, f"timeframe={_tf}"
+
+        # Evidence 6: prior_day_high/low in meta (cross-session level)
+        if meta.get("prior_day_high") is not None or meta.get("prior_day_low") is not None:
+            return True, "meta.prior_day_high_or_low_present"
+
+        # Evidence 7: prior_day_high/low at top level (stamped by plan builder)
+        if (order.get("prior_day_high") is not None
+                or order.get("prior_day_low") is not None):
+            return True, "prior_day_high_or_low_present"
+
+        return False, "no_overnight_deferred_evidence"
+
+    def _is_valid_watcher_held_pending_trigger(self, order: dict) -> tuple[bool, str]:
+        """Return (is_valid_watcher_row, evidence_description).
+
+        A PENDING_TRIGGER ENTRY row is watcher-held when it carries evidence
+        that it is legitimately waiting for a breach trigger before broker
+        submission. Such rows MUST NOT be expired as broker orphans solely
+        because broker_order_id/submitted_ts are NULL — that is the expected
+        pre-submit state for every overnight/deferred/watchlisted entry.
+
+        Evidence checked (any single item is sufficient):
+          1. trigger_price field is non-null/non-zero — set by MC when arming
+          2. meta.trigger_type present — set by OSM on watcher entries
+          3. meta.watcher_audit present — APEntryWatcher audit of the arm
+          4. meta.watcher_audit_history present — multi-cycle audit trail
+          5. contract is a real option symbol (TICKER + date + C/P + strike)
+             OR starts with DEFERRED: (overnight deferred — watcher will
+             resolve the contract at breach time)
+          6. meta.contract_deferred = True — explicit deferred flag from MC
+
+        NOT valid watcher evidence:
+          - status=PENDING_TRIGGER alone (could be broken CREATED→PT handoff)
+          - arbitrary meta fields like 'score' or 'tier'
+
+        Returns (False, reason) if no watcher evidence found. The caller
+        should then fall through to the normal orphan expiry logic, which
+        preserves additional guards (watcher ownership check, dry-run mode,
+        cleanup_enabled flag).
+        """
+        meta_raw = order.get("meta")
+        if isinstance(meta_raw, str):
+            try:
+                import json as _json
+                meta = _json.loads(meta_raw) if meta_raw else {}
+            except Exception:
+                meta = {}
+        elif isinstance(meta_raw, dict):
+            meta = meta_raw
+        else:
+            meta = {}
+
+        contract = str(order.get("contract") or "").strip()
+
+        # Evidence 1: trigger_price set
+        _trigger_price = order.get("trigger_price")
+        if _trigger_price is not None:
+            try:
+                if float(_trigger_price) > 0:
+                    return True, f"trigger_price={_trigger_price}"
+            except (TypeError, ValueError):
+                pass
+
+        # Evidence 2: meta.trigger_type present (set by OSM on watcher entries)
+        _trigger_type = meta.get("trigger_type") or meta.get("trigger_type_label")
+        if _trigger_type and str(_trigger_type).strip():
+            return True, f"trigger_type={_trigger_type}"
+
+        # Evidence 3: meta.watcher_audit present
+        if meta.get("watcher_audit"):
+            return True, "watcher_audit_present"
+
+        # Evidence 4: meta.watcher_audit_history present
+        if meta.get("watcher_audit_history"):
+            return True, "watcher_audit_history_present"
+
+        # Evidence 5a: contract is a real option symbol (heuristic: 8+ chars,
+        #   contains digits and C or P surrounded by digits — not a raw ticker)
+        if contract and len(contract) >= 8:
+            import re as _re
+            if _re.search(r'\d{6}[CP]\d{5,8}', contract):
+                return True, f"real_option_contract={contract}"
+
+        # Evidence 5b: DEFERRED:* overnight signal waiting for breach
+        if contract.upper().startswith("DEFERRED:"):
+            return True, f"deferred_contract={contract}"
+
+        # Evidence 6: meta.contract_deferred = True
+        if meta.get("contract_deferred"):
+            return True, "contract_deferred=True"
+
+        return False, "no_watcher_evidence_found"
+
     def _check_pending_trigger_order(
         self,
         *,
@@ -774,6 +969,175 @@ class APOrderMonitor:
                 _unknown_action,
             )
             return
+
+        # ── P0 (hotfix/pending-trigger-orphan-guard): watcher-evidence guard ──
+        #
+        # The watcher owner check (_watcher_owner_state is False) means this
+        # process's in-memory watcher does not currently hold this order.
+        # That happens legitimately on every watcher restart, pod restart, or
+        # recovery cycle — the OSM row persists across restarts but the in-
+        # memory watcher set does not.
+        #
+        # Before declaring the row a broker orphan and expiring it, check
+        # whether the row itself carries evidence that it is a valid watcher-
+        # held entry waiting for a breach trigger:
+        #   - trigger_price set            (MC wires this at plan creation)
+        #   - meta.trigger_type present    (OSM writes this from plan.trigger_type)
+        #   - meta.watcher_audit present   (watcher writes this on arm)
+        #   - meta.watcher_audit_history   (watcher multi-cycle audit trail)
+        #   - real option contract symbol  (C260626C00150000, not a raw ticker)
+        #   - DEFERRED:* contract          (overnight deferred pre-breach)
+        #   - meta.contract_deferred=True  (explicit deferred flag from MC)
+        #
+        # Production regression (Jason order 22514):
+        #   contract=C260626C00150000, trigger_price=155.0, reserved_cost=105.0
+        #   broker_order_id=NULL, submitted_ts=NULL, age=5452s > 5400s
+        #   → was expired as PENDING_TRIGGER_ORPHAN_EXPIRED
+        #   → WRONG: it was a valid breach-waiting entry; NULL broker fields
+        #     are EXPECTED for pre-submit watcher-held rows.
+        #
+        # After this guard:
+        #   If watcher evidence found AND entry cutoff has NOT passed:
+        #     → preserve the row and attempt a re-arm recovery.
+        #     → log PENDING_TRIGGER_WATCHER_EVIDENCE_PRESERVED.
+        #   If watcher evidence found AND entry cutoff HAS passed:
+        #     → expire with a cutoff reason (not orphan reason).
+        #     → log PENDING_TRIGGER_WATCHER_EVIDENCE_EOD_EXPIRED.
+        #   If no watcher evidence:
+        #     → fall through to normal orphan expiry (existing behavior).
+
+        _has_watcher_evidence, _watcher_evidence_desc = (
+            self._is_valid_watcher_held_pending_trigger(order)
+        )
+
+        if _has_watcher_evidence:
+            _after_cutoff = self._is_after_pt_eod_cutoff()
+
+            if not _after_cutoff:
+                # Valid watcher-held row, market session still open — PRESERVE.
+                # Attempt a re-arm in case the watcher lost its in-memory state
+                # after a restart. If re-arm fails, still preserve the row;
+                # the next cycle will retry.
+                _rearm_attempted, _rearm_succeeded, _rearm_reason = (
+                    self._attempt_lost_handoff_rearm(order, local_id, contract)
+                )
+                log.info(
+                    "[%s] PENDING_TRIGGER_WATCHER_EVIDENCE_PRESERVED "
+                    "| %s | %s | age=%.0fs | evidence=%s "
+                    "| rearm_attempted=%s | rearm_succeeded=%s | rearm_reason=%s "
+                    "| cleanup_action=preserve_watcher_evidence",
+                    self.client_id,
+                    contract,
+                    local_id,
+                    age_secs,
+                    _watcher_evidence_desc,
+                    _rearm_attempted,
+                    _rearm_succeeded,
+                    _rearm_reason,
+                )
+                self._log_pending_trigger_watchdog_seen(
+                    level="info",
+                    contract=contract,
+                    local_id=local_id,
+                    age_secs=age_secs,
+                    broker_order_id="None",
+                    submitted_ts_repr=_submitted_repr,
+                    watcher_owner_state=_owner_state_repr,
+                    ownership_check_available=_ownership_check_available,
+                    ownership_check_error=_ownership_error_repr,
+                    cleanup_action="preserve_watcher_evidence",
+                )
+                return
+
+            else:
+                # Wall-clock is past 15:30 ET.
+                # Before expiring, check whether this is an overnight or deferred
+                # row. Those survive across sessions — the 15:30 cutoff applies
+                # only to same-day intraday signals that missed the trading window.
+                _is_overnight, _overnight_evidence = (
+                    self._is_overnight_or_deferred_row(order)
+                )
+                if _is_overnight:
+                    # Overnight/deferred row: PRESERVE even after cutoff.
+                    # overnight_reeval or the morning handoff audit will handle it
+                    # at the next session open. Do NOT write EOD_EXPIRED or
+                    # ORPHAN_EXPIRED — this row is working as designed.
+                    _rearm_attempted, _rearm_succeeded, _rearm_reason = (
+                        self._attempt_lost_handoff_rearm(order, local_id, contract)
+                    )
+                    log.info(
+                        "[%s] PENDING_TRIGGER_OVERNIGHT_PRESERVED "
+                        "| %s | %s | age=%.0fs | watcher_evidence=%s "
+                        "| overnight_evidence=%s "
+                        "| rearm_attempted=%s | rearm_succeeded=%s | rearm_reason=%s "
+                        "| cleanup_action=preserve_overnight_deferred",
+                        self.client_id,
+                        contract,
+                        local_id,
+                        age_secs,
+                        _watcher_evidence_desc,
+                        _overnight_evidence,
+                        _rearm_attempted,
+                        _rearm_succeeded,
+                        _rearm_reason,
+                    )
+                    self._log_pending_trigger_watchdog_seen(
+                        level="info",
+                        contract=contract,
+                        local_id=local_id,
+                        age_secs=age_secs,
+                        broker_order_id="None",
+                        submitted_ts_repr=_submitted_repr,
+                        watcher_owner_state=_owner_state_repr,
+                        ownership_check_available=_ownership_check_available,
+                        ownership_check_error=_ownership_error_repr,
+                        cleanup_action="preserve_overnight_deferred",
+                    )
+                    return
+
+                # Same-day watcher row, entry cutoff passed — this trade missed
+                # its window. Expire with a cutoff reason (NOT orphan reason).
+                _eod_reason = (
+                    f"PENDING_TRIGGER_EOD_EXPIRED: watcher_evidence={_watcher_evidence_desc} "
+                    f"age={age_secs:.0f}s entry_cutoff_passed=True"
+                )
+                log.warning(
+                    "[%s] PENDING_TRIGGER_WATCHER_EVIDENCE_EOD_EXPIRED "
+                    "| %s | %s | age=%.0fs | evidence=%s "
+                    "| cleanup_action=expire_eod_cutoff | reason=%s",
+                    self.client_id,
+                    contract,
+                    local_id,
+                    age_secs,
+                    _watcher_evidence_desc,
+                    _eod_reason,
+                )
+                self._log_pending_trigger_watchdog_seen(
+                    level="warning",
+                    contract=contract,
+                    local_id=local_id,
+                    age_secs=age_secs,
+                    broker_order_id="None",
+                    submitted_ts_repr=_submitted_repr,
+                    watcher_owner_state=_owner_state_repr,
+                    ownership_check_available=_ownership_check_available,
+                    ownership_check_error=_ownership_error_repr,
+                    cleanup_action="expire_eod_cutoff",
+                )
+                if not PENDING_TRIGGER_CLEANUP_ENABLED or PENDING_TRIGGER_CLEANUP_DRY_RUN:
+                    return
+                try:
+                    if hasattr(self.osm, "expire_pending_entry"):
+                        self.osm.expire_pending_entry(local_id, reason=_eod_reason)
+                    elif hasattr(self.osm, "transition"):
+                        self.osm.transition(local_id, "EXPIRED", last_error=_eod_reason)
+                except Exception as _eod_exc:
+                    log.error(
+                        "[%s] PENDING_TRIGGER_EOD_EXPIRE_FAILED | %s | %s | error=%s",
+                        self.client_id, contract, local_id, _eod_exc,
+                    )
+                return
+        # ── End watcher-evidence guard ─────────────────────────────────────
 
         self._log_pending_trigger_watchdog_seen(
             level="info",
