@@ -10,6 +10,7 @@ log = logging.getLogger("ap.morning_handoff")
 
 ET = ZoneInfo("America/New_York")
 _TABLE_READY = False
+_WATCHER_RESEED_LOOKBACK_HOURS = 48
 
 
 def _now_et(now: datetime | None = None) -> datetime:
@@ -254,6 +255,49 @@ def _latest_handoff_rows(trading_date: str) -> list[dict]:
         return []
 
 
+def _has_unowned_pending_trigger_orders(client_id: str, entry_watcher, *, now: datetime | None = None) -> bool:
+    from ap.db import conn, run_with_retry
+    from datetime import timedelta, timezone
+    import os
+
+    if entry_watcher is None or not hasattr(entry_watcher, "has_order"):
+        return True
+
+    lookback_hours = int(os.getenv("STARTUP_WATCHER_RESEED_LOOKBACK_HOURS", str(_WATCHER_RESEED_LOOKBACK_HOURS)))
+    cutoff_utc = (_now_et(now).astimezone(timezone.utc) - timedelta(hours=lookback_hours))
+
+    def _load():
+        with conn() as c:
+            c.execute(
+                """
+                SELECT local_order_id
+                FROM orders
+                WHERE client_id = %s
+                  AND kind = 'ENTRY'
+                  AND status = 'PENDING_TRIGGER'
+                  AND created_ts >= %s
+                  AND broker_order_id IS NULL
+                  AND submitted_ts IS NULL
+                  AND filled_ts IS NULL
+                ORDER BY created_ts ASC
+                """,
+                (client_id, cutoff_utc),
+            )
+            return c.fetchall() or []
+
+    rows = run_with_retry(_load) or []
+    for row in rows:
+        local_order_id = str((row.get("local_order_id") if isinstance(row, dict) else row[0]) or "").strip()
+        if not local_order_id:
+            continue
+        try:
+            if not entry_watcher.has_order(local_order_id):
+                return True
+        except Exception:
+            return True
+    return False
+
+
 def get_morning_handoff_health(now: datetime | None = None) -> dict:
     trading_date = _trading_date(now)
     rows = _latest_handoff_rows(trading_date)
@@ -330,7 +374,15 @@ def run_morning_handoff_audit(
         trading_date=trading_date,
         stage=stage,
     )
-    if existing and str(existing.get("status") or "").lower() == "success" and existing.get("last_success_at"):
+    runner = runner or _resolve_runner(client_id)
+    core = getattr(runner, "core", None) if runner is not None else None
+    entry_watcher = getattr(core, "entry_watcher", None) if core else None
+
+    can_skip_existing = bool(existing and str(existing.get("status") or "").lower() == "success" and existing.get("last_success_at"))
+    if can_skip_existing and stage == "startup" and not dry_run:
+        if _has_unowned_pending_trigger_orders(client_id, entry_watcher, now=now):
+            can_skip_existing = False
+    if can_skip_existing:
         return {
             "ok": True,
             "skipped": True,
@@ -353,7 +405,6 @@ def run_morning_handoff_audit(
         mark_success=False,
     )
 
-    runner = runner or _resolve_runner(client_id)
     if runner is None:
         err = "runner_not_found"
         _upsert_handoff_run_lock(
