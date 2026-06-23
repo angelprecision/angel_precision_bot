@@ -12,6 +12,7 @@ from ap.morning_jobs import (
     DEFAULT_EXECUTION_MODE,
     DEFAULT_LIVE_CLIENT,
     DEFAULT_PAPER_CLIENTS,
+    DEFAULT_SCHEDULED_TOLERANCE_MINUTES,
     MORNING_HANDOFF_BACKUP_JOB,
     MORNING_HANDOFF_PRIMARY_JOB,
     OVERNIGHT_REEVAL_JOB,
@@ -160,7 +161,8 @@ def test_workflow_targets_jason_live_only():
     assert "SIGNING_SECRET: ${{ secrets.LIVE_AP_SIGNING_SECRET }}" in workflow
     assert "MORNING_JOB_CLIENT_ID: jasoncosby1@gmail.com" in workflow
     assert "MORNING_JOB_EXECUTION_MODE: live" in workflow
-    assert "MORNING_JOB_FORCE_WINDOW: ${{ github.event_name == 'schedule' && '1' || '0' }}" in workflow
+    assert "MORNING_JOB_TOLERANCE_MINUTES: \"20\"" in workflow
+    assert "github.event.inputs.force_window" in workflow
     assert "18 13 * * 1-5" in workflow
     assert "25 13 * * 1-5" in workflow
     assert "31 13 * * 1-5" in workflow
@@ -177,11 +179,18 @@ def test_paper_workflow_exists_and_uses_paper_only_targets():
 
 
 def test_scheduled_runs_use_force_window_bypass():
+    assert DEFAULT_SCHEDULED_TOLERANCE_MINUTES == 20
+    assert not build_overnight_reeval_payload().get("execution_mode")
+
+
+def test_workflows_use_manual_force_and_scheduled_tolerance_not_schedule_force():
     live_workflow = (REPO_ROOT / ".github" / "workflows" / "overnight-reeval.yml").read_text()
     paper_workflow = (REPO_ROOT / ".github" / "workflows" / "paper-morning-jobs.yml").read_text()
-    expected = "MORNING_JOB_FORCE_WINDOW: ${{ github.event_name == 'schedule' && '1' || '0' }}"
-    assert expected in live_workflow
-    assert expected in paper_workflow
+    expected_force = "MORNING_JOB_FORCE_WINDOW: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.force_window == 'true' && '1' || '0' }}"
+    assert expected_force in live_workflow
+    assert expected_force in paper_workflow
+    assert "MORNING_JOB_TOLERANCE_MINUTES: \"20\"" in live_workflow
+    assert "MORNING_JOB_TOLERANCE_MINUTES: \"20\"" in paper_workflow
 
 
 def test_app_source_supports_filtered_overnight_and_morning_handoff():
