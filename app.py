@@ -1,5 +1,5 @@
 # app.py - ANGEL PRECISION BOT (PRODUCTION VERSION - STABLE)
-# ‚îÄ‚îÄ In-process caches (reduce DB round-trips on hot /signal path) ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ
+# ── In-process caches (reduce DB round-trips on hot /signal path) ────────
 # Avoids blocking DB calls when scanner fires 20+ signals in a burst.
 # =====================================================================
 # THIS FILE IS NOW STABLE. DO NOT EDIT.
@@ -29,7 +29,7 @@ from ap.models import Signal
 from ap.queue import enqueue_signal, worker_loop
 from ap.state import load_state, update_state
 
-# ‚îÄ‚îÄ Angel Precision Intelligence infrastructure ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ
+# ── Angel Precision Intelligence infrastructure ───────────────────────────────
 try:
     from ap_bootstrap import bootstrap as _ap_bootstrap
     from ap_health_endpoints import health_bp as _health_bp
@@ -42,14 +42,14 @@ from ap.broker import SimBroker
 
 from ap.parsers import parse_scanner_text
 from ap.brokers.tradier import TradierBroker, TradierConfig
-# exit_manager_loop removed ‚Äî APExitEngine is the sole exit manager
+# exit_manager_loop removed — APExitEngine is the sole exit manager
 
 # ap.client_api and ap.admin_api not yet built -- routes are inline in create_app()
 # from ap.client_api import client_bp
 # from ap.admin_api import admin_bp
 from client_runner import start_multi_client_supervisor, route_signal_to_all_clients
 
-# ‚îÄ‚îÄ In-process caches (reduce DB round-trips on hot /signal path) ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ
+# ── In-process caches (reduce DB round-trips on hot /signal path) ──────────
 _SIGNAL_CACHE_LOCK   = threading.Lock()
 _client_status_cache: dict = {}   # {client_id: (status, expires_ts)}
 _kill_switch_cache:   dict = {}   # {client_id: (kill_val, mode, expires_ts)}
@@ -76,10 +76,10 @@ APP_ENV = os.getenv("APP_ENV", "prod").lower().strip()
 SIGNING_SECRET = os.getenv("SIGNING_SECRET", "").encode()
 log.info("SIGNING_SECRET_SHA256_8=" + hashlib.sha256(SIGNING_SECRET).hexdigest()[:8])
 
-# ‚úÖ CRITICAL: Validate SIGNING_SECRET in prod
+# ✅ CRITICAL: Validate SIGNING_SECRET in prod
 if APP_ENV == "prod" and not SIGNING_SECRET:
     log.error("=" * 70)
-    log.error("üö® CRITICAL: SIGNING_SECRET not set in production!")
+    log.error("🚨 CRITICAL: SIGNING_SECRET not set in production!")
     log.error("All signal ingestion will fail with 401 unauthorized")
     log.error("Set SIGNING_SECRET env var on Render")
     log.error("=" * 70)
@@ -114,7 +114,7 @@ _SELF_HEAL_IN_PROGRESS = threading.Event()
 IDEMP_TTL_SECONDS = int(os.getenv("IDEMP_TTL_SECONDS", "300"))
 
 # HMAC time drift (seconds)
-HMAC_MAX_SKEW_SECONDS = int(os.getenv("HMAC_MAX_SKEW_SECONDS", "300"))  # ‚úÖ 5 min default
+HMAC_MAX_SKEW_SECONDS = int(os.getenv("HMAC_MAX_SKEW_SECONDS", "300"))  # ✅ 5 min default
 
 # Threads
 THREADS_STARTED = False
@@ -125,7 +125,7 @@ MAX_CONTENT_LENGTH = int(os.getenv("MAX_CONTENT_LENGTH_BYTES", str(256 * 1024)))
 
 DEFAULT_CLIENT_ID = os.getenv("DEFAULT_CLIENT_ID", "default").strip() or "default"
 
-# ‚îÄ‚îÄ Single-client execution worker mode ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ
+# ── Single-client execution worker mode ──────────────────────────────────────
 # When CLIENT_ID is set this process is a dedicated Render service for one
 # client only (the isolated-per-client architecture). All runner discovery,
 # order queries, state reads/writes are pre-filtered to this client.
@@ -140,7 +140,7 @@ if CLIENT_ID:
     DEFAULT_CLIENT_ID = CLIENT_ID
     log.info(
         "\n" + "=" * 70 + "\n"
-        "  ANGEL PRECISION ‚Äî DEDICATED CLIENT EXECUTION WORKER\n"
+        "  ANGEL PRECISION — DEDICATED CLIENT EXECUTION WORKER\n"
         "  SINGLE_CLIENT:   %s\n"
         "  BOT_INSTANCE_ID: %s\n"
         "  MODE:            %s\n"
@@ -151,7 +151,7 @@ if CLIENT_ID:
 elif POD_ID:
     log.info(
         "\n" + "=" * 70 + "\n"
-        "  ANGEL PRECISION ‚Äî POD EXECUTION WORKER\n"
+        "  ANGEL PRECISION — POD EXECUTION WORKER\n"
         "  POD_ID:          %s\n"
         "  MAX_POD_CLIENTS: %s\n"
         "  BOT_INSTANCE_ID: %s\n"
@@ -163,7 +163,7 @@ elif POD_ID:
     )
 else:
     log.info(
-        "ANGEL PRECISION ‚Äî SHARED MODE | mode=%s | all approved clients "
+        "ANGEL PRECISION — SHARED MODE | mode=%s | all approved clients "
         "(paper/onboarding/load-test service)", _BOOT_MODE_LBL,
     )
 
@@ -276,21 +276,21 @@ def _verify_hmac(req) -> bool:
         try:
             ts_i = int(ts)
         except Exception:
-            log.warning(f"Invalid X-AP-Timestamp: {ts!r} ‚Äî rejecting, not falling through to Scheme B")
-            return False  # Scheme A headers present but ts unparseable ‚Äî hard reject
+            log.warning(f"Invalid X-AP-Timestamp: {ts!r} — rejecting, not falling through to Scheme B")
+            return False  # Scheme A headers present but ts unparseable — hard reject
 
         if ts_i is not None:
-            # Anti-replay / drift window ‚Äî hard reject, no Scheme B fallthrough
+            # Anti-replay / drift window — hard reject, no Scheme B fallthrough
             if abs(int(time.time()) - ts_i) > HMAC_MAX_SKEW_SECONDS:
-                log.warning(f"Timestamp out of range: {ts_i} ‚Äî rejecting, not falling through to Scheme B")
+                log.warning(f"Timestamp out of range: {ts_i} — rejecting, not falling through to Scheme B")
                 return False
             msg = str(ts_i).encode("utf-8") + b"." + raw
             expected = _hmac_hex(SIGNING_SECRET, msg)
             if hmac.compare_digest(expected, sig):
-                log.debug("‚úÖ HMAC verified (timestamped scheme)")
+                log.debug("✅ HMAC verified (timestamped scheme)")
                 return True
             log.warning("HMAC timestamped scheme failed (signature mismatch)")
-            return False  # Scheme A headers present but wrong sig ‚Äî never try Scheme B
+            return False  # Scheme A headers present but wrong sig — never try Scheme B
 
     # -----------------------------
     # Scheme B: Simple body-only HMAC
@@ -299,7 +299,7 @@ def _verify_hmac(req) -> bool:
     if simple_sig:
         expected_simple = _hmac_hex(SIGNING_SECRET, raw)
         if hmac.compare_digest(expected_simple, simple_sig):
-            log.debug("‚úÖ HMAC verified (simple scheme)")
+            log.debug("✅ HMAC verified (simple scheme)")
             return True
         else:
             log.warning("HMAC simple scheme failed (signature mismatch)")
@@ -363,7 +363,7 @@ def build_broker():
 
         if not access_token or not account_id:
             # In multi-client supervisor mode, broker credentials are validated
-            # per client ‚Äî global env vars are not required.
+            # per client — global env vars are not required.
             # Only fail if SINGLE_CLIENT mode explicitly requires them.
             _single = os.getenv("SINGLE_CLIENT_EMAIL", "").strip()
             if _single:
@@ -372,7 +372,7 @@ def build_broker():
                     "(required in SINGLE_CLIENT mode)"
                 )
             log.warning(
-                "Global TRADIER_ACCESS_TOKEN / TRADIER_ACCOUNT_ID not set ‚Äî "
+                "Global TRADIER_ACCESS_TOKEN / TRADIER_ACCOUNT_ID not set — "
                 "continuing because broker credentials are validated per client. "
                 "Set these only for SINGLE_CLIENT / legacy single-process mode."
             )
@@ -420,7 +420,7 @@ def start_background_threads_once(broker):
         start_worker(broker)
         start_fill_monitor(broker)
         THREADS_STARTED = True
-        log.info("‚úÖ All background threads started")
+        log.info("✅ All background threads started")
 
 
 # ============================================================
@@ -434,7 +434,7 @@ def _discord_signal_id(symbol: str, direction: str, strike, content_hash: str) -
     return hashlib.sha256(raw.encode()).hexdigest()[:32]
 
 def _fetch_broker_equity() -> float:
-    """Fetch live account equity at startup. Returns 0.0 on any failure ‚Äî
+    """Fetch live account equity at startup. Returns 0.0 on any failure —
     client_runner._sync_account_equity() pulls the real balance after startup.
     """
     try:
@@ -451,11 +451,11 @@ def _fetch_broker_equity() -> float:
                 if b.get(k) and float(b[k]) > 0:
                     return float(b[k])
     except Exception as _e:
-        log.warning("_fetch_broker_equity failed at startup ‚Äî defaulting to 0.0: %s", _e)
+        log.warning("_fetch_broker_equity failed at startup — defaulting to 0.0: %s", _e)
     return 0.0
 
 
-# ‚îÄ‚îÄ Ghost-order shared helpers ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ
+# ── Ghost-order shared helpers ─────────────────────────────────────────────
 #
 # These constants and functions are shared between
 #   GET  /admin/operator/ghost-orders/dry-run        (PR #62)
@@ -498,7 +498,7 @@ def _ghost_classify_row(
     expire_threshold: float,
 ) -> str:
     """Classify a single orders-table row into one of the 8 documented action
-    strings. Rule order matters ‚Äî earlier rules short-circuit later ones.
+    strings. Rule order matters — earlier rules short-circuit later ones.
 
     This is the SINGLE authoritative classifier. Both the dry-run endpoint
     and the manual-cleanup endpoint call this function so their behaviour
@@ -514,7 +514,7 @@ def _ghost_classify_row(
     except (TypeError, ValueError):
         age_f = None
 
-    # Structural skips ‚Äî these row shapes can never be ghost-cleanup
+    # Structural skips — these row shapes can never be ghost-cleanup
     # candidates regardless of age.
     if not loid:
         return "skip_missing_local_order_id"
@@ -526,7 +526,7 @@ def _ghost_classify_row(
         return "skip_not_pending_trigger"
 
     # Age-based gates. If age cannot be determined we cannot safely
-    # classify ‚Äî fall through to skip_unclear_state.
+    # classify — fall through to skip_unclear_state.
     if age_f is None:
         return "skip_unclear_state"
     if age_f < float(recent_skip_hours):
@@ -587,7 +587,7 @@ def _ghost_build_sql_and_params(
 
 
 # =============================================================================
-# ADMIN AUTH INFRASTRUCTURE (HOISTED ‚Äî must be defined BEFORE create_app)
+# ADMIN AUTH INFRASTRUCTURE (HOISTED — must be defined BEFORE create_app)
 # =============================================================================
 # These names are HOISTED above create_app() because create_app() contains
 # @_require_admin decorator usages. Module-level `app = create_app()` runs at
@@ -639,7 +639,7 @@ def _require_admin(fn):
 
 
 # =============================================================================
-# OVERNIGHT REEVAL ASYNC JOB STORE (HOISTED ‚Äî must be defined BEFORE create_app)
+# OVERNIGHT REEVAL ASYNC JOB STORE (HOISTED — must be defined BEFORE create_app)
 # =============================================================================
 _OVERNIGHT_REEVAL_JOBS: dict = {}
 
@@ -658,11 +658,11 @@ def create_app() -> Flask:
     log.info("=" * 70)
 
     init_db()
-    log.info("‚úÖ Database initialized")
+    log.info("✅ Database initialized")
 
-    # ‚îÄ‚îÄ Bootstrap Angel Precision Intelligence infrastructure ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ
+    # ── Bootstrap Angel Precision Intelligence infrastructure ─────────────────
     # Registers all organs, wires kill switch into health registry,
-    # starts health sweep thread. Runs once ‚Äî idempotent.
+    # starts health sweep thread. Runs once — idempotent.
     if _AP_INFRA_AVAILABLE and _ap_bootstrap:
         try:
             # Wire Discord alert function if available in this scope.
@@ -672,14 +672,14 @@ def create_app() -> Flask:
             except Exception:
                 pass
             _ap_bootstrap(alert_fn=_discord_alert_fn)
-            log.info("‚úÖ AP Intelligence infrastructure bootstrapped")
+            log.info("✅ AP Intelligence infrastructure bootstrapped")
         except Exception as _boot_err:
             log.error("AP bootstrap failed (non-fatal): %s", _boot_err)
 
     if _AP_INFRA_AVAILABLE and _health_bp:
         try:
             app.register_blueprint(_health_bp)
-            log.info("‚úÖ Health endpoints registered at /health/*")
+            log.info("✅ Health endpoints registered at /health/*")
         except Exception as _bp_err:
             log.error("Health blueprint registration failed (non-fatal): %s", _bp_err)
 
@@ -692,14 +692,14 @@ def create_app() -> Flask:
     try:
         from ap.telemetry_api import telemetry_bp as _telemetry_bp
         app.register_blueprint(_telemetry_bp)
-        log.info("‚úÖ Telemetry endpoints registered at /telemetry/*")
+        log.info("✅ Telemetry endpoints registered at /telemetry/*")
     except Exception as _tbp_err:
         log.error(
             "Telemetry blueprint registration failed (non-fatal): %s",
             _tbp_err,
         )
 
-    # ‚úÖ Ensure default client exists BEFORE any state write
+    # ✅ Ensure default client exists BEFORE any state write
     with conn() as c:
         row = c.execute("SELECT 1 FROM clients WHERE client_id=%s", (DEFAULT_CLIENT_ID,)).fetchone()
 
@@ -714,11 +714,11 @@ def create_app() -> Flask:
             broker_base_url=os.getenv("TRADIER_BASE_URL", "https://sandbox.tradier.com"),
             initial_equity=_fetch_broker_equity() or 0.0,
         )
-        log.info("‚úÖ Default client created")
+        log.info("✅ Default client created")
     else:
-        log.info("‚úÖ Default client exists")
+        log.info("✅ Default client exists")
 
-    # Debug routes ‚Äî only registered in non-prod environments.
+    # Debug routes — only registered in non-prod environments.
     # Conditional registration (not just conditional response) avoids
     # exposing these endpoints as attack surface in production.
     if APP_ENV != "prod":
@@ -753,25 +753,25 @@ def create_app() -> Flask:
             except Exception as e:
                 return jsonify({"ok": False, "error": str(e)}), 500
 
-    # ‚úÖ Explicit default client state update (prevents FK issues & ambiguity)
+    # ✅ Explicit default client state update (prevents FK issues & ambiguity)
     update_state({"mode": mode}, client_id=DEFAULT_CLIENT_ID)
-    log.info("‚úÖ State initialized")
+    log.info("✅ State initialized")
 
     broker = build_broker()
     if broker is None:
-        # Multi-client supervisor mode ‚Äî per-client credentials used instead.
+        # Multi-client supervisor mode — per-client credentials used instead.
         log.info(
-            "‚úÖ Global broker not initialized (supervisor/multi-client mode) ‚Äî "
+            "✅ Global broker not initialized (supervisor/multi-client mode) — "
             "per-client Tradier credentials will be used by each ClientRunner."
         )
     else:
-        log.info("‚úÖ Broker initialized")
+        log.info("✅ Broker initialized")
     app.config["BROKER"] = broker
 
     if os.getenv("RUN_SUPERVISOR") == "1":
         global THREADS_STARTED
-        THREADS_STARTED = True   # supervisor owns the workers ‚Äî mark ready
-        log.info("Supervisor active ‚Äî legacy worker threads DISABLED")
+        THREADS_STARTED = True   # supervisor owns the workers — mark ready
+        log.info("Supervisor active — legacy worker threads DISABLED")
     else:
         # Fix 5: hard block LIVE mode without supervisor
         _mode_now = os.getenv("BOT_MODE", os.getenv("MODE", "PAPER")).upper()
@@ -781,17 +781,17 @@ def create_app() -> Flask:
                 "Set RUN_SUPERVISOR=1 in Render env vars or switch to PAPER mode."
             )
         start_background_threads_once(broker)
-        log.info("Background threads started (legacy path ‚Äî PAPER/SIM only)")
+        log.info("Background threads started (legacy path — PAPER/SIM only)")
 
     # Register blueprints
     # Blueprints not yet built -- routes registered inline above
-    log.info("‚úÖ Blueprints registered")
+    log.info("✅ Blueprints registered")
 
     # CORS
     allow_headers = [
         "Content-Type", "Authorization", "X-Client-Id", "X-AP-Timestamp",
         "X-AP-Signature", "Idempotency-Key", "X-API-Key", "X-Admin-Key",
-        "X-Signature",  # ‚úÖ Added for simple HMAC scheme
+        "X-Signature",  # ✅ Added for simple HMAC scheme
     ]
     _trusted_origins = [
         "https://www.angelprecision.com",
@@ -926,7 +926,7 @@ def create_app() -> Flask:
     @app.post("/kill_switch/on")
     @require_hmac
     def kill_on():
-        log.warning("üî¥ KILL SWITCH ENABLED")
+        log.warning("🔴 KILL SWITCH ENABLED")
         update_state({"kill_switch": True, "mode": "READ_ONLY"}, client_id=DEFAULT_CLIENT_ID)
         with _SIGNAL_CACHE_LOCK:
             _kill_switch_cache.clear()
@@ -936,7 +936,7 @@ def create_app() -> Flask:
     @app.post("/kill_switch/off")
     @require_hmac
     def kill_off():
-        log.info("üü¢ KILL SWITCH DISABLED")
+        log.info("🟢 KILL SWITCH DISABLED")
         update_state({"kill_switch": False}, client_id=DEFAULT_CLIENT_ID)
         with _SIGNAL_CACHE_LOCK:
             _kill_switch_cache.clear()
@@ -951,7 +951,7 @@ def create_app() -> Flask:
         cid = (client_id or "").strip()
         if not cid:
             return jsonify({"ok": False, "error": "missing_client_id"}), 400
-        log.info("‚è∏Ô∏è CLIENT ENTRIES PAUSED | %s", cid)
+        log.info("⏸️ CLIENT ENTRIES PAUSED | %s", cid)
         update_state({"entries_paused": True}, client_id=cid)
         return jsonify({"ok": True, "client_id": cid, "entries_paused": True})
 
@@ -962,7 +962,7 @@ def create_app() -> Flask:
         cid = (client_id or "").strip()
         if not cid:
             return jsonify({"ok": False, "error": "missing_client_id"}), 400
-        log.info("‚ñ∂Ô∏è CLIENT ENTRIES RESUMED | %s", cid)
+        log.info("▶️ CLIENT ENTRIES RESUMED | %s", cid)
         update_state({"entries_paused": False}, client_id=cid)
         return jsonify({"ok": True, "client_id": cid, "entries_paused": False})
 
@@ -1005,9 +1005,9 @@ def create_app() -> Flask:
     @app.post("/signal")
     @require_hmac
     def signal():
-        # Guard: return 503 if worker not ready ‚Äî scanner will retry instead of silently dropping
+        # Guard: return 503 if worker not ready — scanner will retry instead of silently dropping
         if not THREADS_STARTED:
-            return jsonify({"ok": False, "error": "worker_not_ready", "hint": "Bot is starting up ‚Äî retry in 5s"}), 503
+            return jsonify({"ok": False, "error": "worker_not_ready", "hint": "Bot is starting up — retry in 5s"}), 503
         # Self-heal: if no runners alive after restart, spawn them now before routing.
         try:
             import os as _os2
@@ -1036,7 +1036,7 @@ def create_app() -> Flask:
                                         log.info(f"signal self-heal: started runner for {_email2}")
                         finally:
                             _SELF_HEAL_IN_PROGRESS.clear()
-                    # else: another request is already healing ‚Äî signals are enqueued durably
+                    # else: another request is already healing — signals are enqueued durably
         except Exception as _she:
             log.warning(f"signal self-heal error (non-fatal): {_she}")
         ip = _client_ip()
@@ -1082,7 +1082,7 @@ def create_app() -> Flask:
                 _kill_switch_cache[client_id] = (_ks, _mode, _now + _KILL_SWITCH_CACHE_TTL)
         if _ks or _mode == "READ_ONLY":
             # C2: do NOT write this into the idempotency cache. bot_in_read_only
-            # is a RECOVERABLE rejection ‚Äî the kill switch can be lifted seconds
+            # is a RECOVERABLE rejection — the kill switch can be lifted seconds
             # later. If we cache it under the signal_id, the scanner's retry of
             # the SAME signal_id returns this stale 403 for IDEMP_TTL_SECONDS
             # (300s) even though the bot is live again. Only terminal successes
@@ -1090,18 +1090,18 @@ def create_app() -> Flask:
             payload = {"ok": False, "error": "bot_in_read_only"}
             return jsonify(payload), 403
 
-        # Fix 4: synchronous durable enqueue ‚Äî 202 only after queue write succeeds
+        # Fix 4: synchronous durable enqueue — 202 only after queue write succeeds
         _sig_id = str(body.get("signal_id") or uuid.uuid4())
         body["signal_id"] = _sig_id
 
         try:
             enqueued = route_signal_to_all_clients(body)
             if not enqueued:
-                # NOT routed ‚Äî dropped. Do not call this "routed" in logs.
+                # NOT routed — dropped. Do not call this "routed" in logs.
                 # This is the exact symptom of the broken-deploy / zero-runners
                 # state. Log CRITICAL so it is impossible to miss.
                 log.critical(
-                    "SIGNAL DROPPED ‚Äî NO ACTIVE RUNNERS | %s %s score=%s "
+                    "SIGNAL DROPPED — NO ACTIVE RUNNERS | %s %s score=%s "
                     "sig=%s enqueued=0. Trading is DOWN: approved members may "
                     "exist but zero runners started (schema mismatch / boot "
                     "failure). Check /execution/health and run migrations.",
@@ -1238,11 +1238,11 @@ def create_app() -> Flask:
     @app.get("/admin/operator/signal-ledger")
     @require_hmac
     def admin_operator_signal_ledger():
-        """Item 4 ‚Äî READ-ONLY multi-account signal ledger.
+        """Item 4 — READ-ONLY multi-account signal ledger.
 
         One row per (canonical signal, client, ENTRY order) from the
         ap_multi_account_signal_ledger view. Answers "what happened on each
-        account for signal X?". No mutations ‚Äî SELECT only.
+        account for signal X?". No mutations — SELECT only.
 
         Query params (all optional):
           client_id, symbol, canonical_signal_id, status, bucket
@@ -1263,7 +1263,7 @@ def create_app() -> Flask:
             except (TypeError, ValueError):
                 limit = 500
 
-            # Parameterized WHERE ‚Äî never string-interpolate user input.
+            # Parameterized WHERE — never string-interpolate user input.
             where = ["order_created_ts > NOW() - (%s || ' hours')::interval"]
             params: list = [str(since_hours)]
             if client_id:
@@ -1293,7 +1293,7 @@ def create_app() -> Flask:
                     rows = []
                     for r in fetched:
                         if isinstance(r, dict):
-                            # psycopg2 RealDictCursor / psycopg3 Row ‚Äî already
+                            # psycopg2 RealDictCursor / psycopg3 Row — already
                             # keyed by column name; copy directly to avoid
                             # dict(zip(cols, cols)) when iterating a dict.
                             rows.append(dict(r))
@@ -1353,13 +1353,13 @@ def create_app() -> Flask:
 
 
     # =====================================================================
-    # PR81 Amendment ¬ß8 ‚Äî Client Opportunity Ledger admin endpoints
+    # PR81 Amendment §8 — Client Opportunity Ledger admin endpoints
     # =====================================================================
 
     @app.get("/admin/operator/client-opportunities")
     @require_hmac
     def admin_operator_client_opportunities():
-        """READ-ONLY client_signal_opportunities query (Amendment ¬ß8).
+        """READ-ONLY client_signal_opportunities query (Amendment §8).
 
         Query params (all optional):
           canonical_signal_id, signal_id, client_id, status, start, end
@@ -1401,7 +1401,7 @@ def create_app() -> Flask:
     @app.get("/admin/operator/client-parity-signal/<canonical_signal_id>")
     @require_hmac
     def admin_operator_client_parity_signal(canonical_signal_id):
-        """READ-ONLY side-by-side parity view (Amendment ¬ß8).
+        """READ-ONLY side-by-side parity view (Amendment §8).
 
         For one canonical_signal_id, returns every expected client's
         opportunity row with status, miss stage/reason, order IDs,
@@ -1429,7 +1429,7 @@ def create_app() -> Flask:
                 or []
             )
 
-            # Best-effort fan-out timing window (first-write ‚Üí last-write).
+            # Best-effort fan-out timing window (first-write → last-write).
             timestamps = [r.get("created_at") for r in rows if r.get("created_at")]
             updates    = [r.get("updated_at") for r in rows if r.get("updated_at")]
             fanout = {
@@ -1476,12 +1476,12 @@ def create_app() -> Flask:
 
 
     # =====================================================================
-    # PR89 ‚Äî Trade Volume Funnel + Scanner Gap Audit (READ-ONLY)
+    # PR89 — Trade Volume Funnel + Scanner Gap Audit (READ-ONLY)
     # =====================================================================
     @app.get("/admin/operator/trade-volume-funnel")
     @require_hmac
     def admin_operator_trade_volume_funnel():
-        """PR89 ‚Äî READ-ONLY operator report explaining why we are not
+        """PR89 — READ-ONLY operator report explaining why we are not
         averaging 5 executable trades per day across all active clients.
 
         The report decomposes the lifecycle from scanner signal generation
@@ -1494,7 +1494,7 @@ def create_app() -> Flask:
 
         Query params (all optional):
           start, end     ISO-8601 timestamps. Defaults: today's market
-                         open (09:30 ET) ‚Üí now.
+                         open (09:30 ET) → now.
           client_id      filter to one client (substring match on client_id).
           symbol         filter to one symbol (exact, uppercased).
           scanner        filter on scanner_name / scanner_type / pattern.
@@ -1541,20 +1541,20 @@ def create_app() -> Flask:
     @app.get("/admin/operator/fairness-audit")
     @require_hmac
     def admin_operator_fairness_audit():
-        """Item 6 ‚Äî READ-ONLY client fairness / fan-out mismatch audit.
+        """Item 6 — READ-ONLY client fairness / fan-out mismatch audit.
 
         Aggregates the multi-account signal ledger by canonical_signal_id and
         reports, per signal:
-          - n_clients               ‚Äî distinct clients that have a row
-          - clients_seen            ‚Äî list of those client_ids
-          - missing_clients         ‚Äî active clients with NO order row (if
+          - n_clients               — distinct clients that have a row
+          - clients_seen            — list of those client_ids
+          - missing_clients         — active clients with NO order row (if
                                       ?active_clients=a@x.com,b@y.com given)
-          - n_filled                ‚Äî how many clients filled
-          - n_blocked               ‚Äî how many clients in any *_NO_BROKER /
+          - n_filled                — how many clients filled
+          - n_blocked               — how many clients in any *_NO_BROKER /
                                       WATCHER_* / REJECTED / CANCELED bucket
-          - contract_mismatch       ‚Äî True if clients used different contracts
-          - qty_mismatch            ‚Äî True if clients used different qty
-          - bucket_breakdown        ‚Äî { bucket: n }
+          - contract_mismatch       — True if clients used different contracts
+          - qty_mismatch            — True if clients used different qty
+          - bucket_breakdown        — { bucket: n }
           - earliest_order_ts, latest_order_ts
 
         Read-only. SELECT only. No order mutation, no cleanup, no cancel.
@@ -1705,7 +1705,7 @@ def create_app() -> Flask:
     @app.get("/admin/operator/ghost-orders")
     @require_hmac
     def admin_operator_ghost_orders():
-        """Item 7 ‚Äî READ-ONLY ghost-order REPORT (no cleanup, no cancel).
+        """Item 7 — READ-ONLY ghost-order REPORT (no cleanup, no cancel).
 
         Identifies orders that look stranded:
           - kind='ENTRY'
@@ -1749,7 +1749,7 @@ def create_app() -> Flask:
             params.append(symbol_filter)
 
         # Pull plan_id / signal_id / direction / reserved_cost / trigger_price /
-        # pattern / timeframe from JSONB meta ‚Äî they live there, not as top-level
+        # pattern / timeframe from JSONB meta — they live there, not as top-level
         # columns on orders. NULLIF guards numeric casts against empty strings.
         sql = (
             "SELECT local_order_id, "
@@ -1847,32 +1847,32 @@ def create_app() -> Flask:
         anything. This endpoint exists so we can review what a cleanup pass
         WOULD do before any cleanup endpoint is built.
 
-        ‚îå‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îê
-        ‚îÇ HARD RULE                                                        ‚îÇ
-        ‚îÇ   This endpoint performs NO mutation under any circumstance.    ‚îÇ
-        ‚îÇ   It does NOT call:                                              ‚îÇ
-        ‚îÇ     - cancel_pending_entry / expire_pending_entry / transition  ‚îÇ
-        ‚îÇ     - update_order_meta or any OSM mutation method              ‚îÇ
-        ‚îÇ     - any broker submit/cancel                                   ‚îÇ
-        ‚îÇ   It does NOT execute INSERT, UPDATE, DELETE, or DROP.          ‚îÇ
-        ‚îÇ   It only runs SELECT and returns proposed_action strings.      ‚îÇ
-        ‚îî‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îò
+        ┌──────────────────────────────────────────────────────────────────┐
+        │ HARD RULE                                                        │
+        │   This endpoint performs NO mutation under any circumstance.    │
+        │   It does NOT call:                                              │
+        │     - cancel_pending_entry / expire_pending_entry / transition  │
+        │     - update_order_meta or any OSM mutation method              │
+        │     - any broker submit/cancel                                   │
+        │   It does NOT execute INSERT, UPDATE, DELETE, or DROP.          │
+        │   It only runs SELECT and returns proposed_action strings.      │
+        └──────────────────────────────────────────────────────────────────┘
 
         Proposed actions (one per row):
-          would_expire_pending_entry      ‚Äî stale beyond expire_threshold
-          would_cancel_pending_entry      ‚Äî stale beyond cancel_threshold
+          would_expire_pending_entry      — stale beyond expire_threshold
+          would_cancel_pending_entry      — stale beyond cancel_threshold
                                             but not yet expire_threshold
-          skip_recent                     ‚Äî within recent_skip_hours
-          skip_has_broker_order_id        ‚Äî broker already saw this order
-          skip_not_entry                  ‚Äî kind != 'ENTRY'
-          skip_not_pending_trigger        ‚Äî status != 'PENDING_TRIGGER'
-          skip_missing_local_order_id     ‚Äî local_order_id is null
-          skip_unclear_state              ‚Äî none of the above apply
+          skip_recent                     — within recent_skip_hours
+          skip_has_broker_order_id        — broker already saw this order
+          skip_not_entry                  — kind != 'ENTRY'
+          skip_not_pending_trigger        — status != 'PENDING_TRIGGER'
+          skip_missing_local_order_id     — local_order_id is null
+          skip_unclear_state              — none of the above apply
 
         Query params (all parameterized, all optional):
           recent_skip_hours    (default 1, range 0..168)
-          cancel_threshold     (default 24, range 1..720) ‚Äî hours
-          expire_threshold     (default 72, range 1..720) ‚Äî hours
+          cancel_threshold     (default 24, range 1..720) — hours
+          expire_threshold     (default 72, range 1..720) — hours
           client_id            (optional filter)
           symbol               (optional filter)
           limit                (default 500, max 2000)
@@ -2004,7 +2004,7 @@ def create_app() -> Flask:
                     "actions WITHOUT mutating the database. No INSERT/UPDATE/"
                     "DELETE, no OSM cancel_pending_entry/expire_pending_entry/"
                     "transition calls, no broker calls. The 'would_*' labels "
-                    "indicate what a cleanup pass would do ‚Äî actual cleanup "
+                    "indicate what a cleanup pass would do — actual cleanup "
                     "endpoints will be added in a separate, later PR."
                 ),
             })
@@ -2024,7 +2024,7 @@ def create_app() -> Flask:
     @app.post("/admin/operator/ghost-orders/manual-cleanup")
     @require_hmac
     def admin_operator_ghost_orders_manual_cleanup():
-        """Manual ghost-order cleanup ‚Äî HMAC-protected, audit-logged, narrowly scoped.
+        """Manual ghost-order cleanup — HMAC-protected, audit-logged, narrowly scoped.
 
         DEFAULT: dry_run=true. The endpoint performs NO mutation unless the
         caller explicitly passes {"dry_run": false} in the JSON body.
@@ -2047,8 +2047,8 @@ def create_app() -> Flask:
             No automatic / scheduled execution.
 
         Status mapping (OSM conventions):
-            would_cancel_pending_entry  ‚Üí CANCELED + last_error='ghost_cleanup_manual'
-            would_expire_pending_entry  ‚Üí EXPIRED  + last_error='ghost_cleanup_manual'
+            would_cancel_pending_entry  → CANCELED + last_error='ghost_cleanup_manual'
+            would_expire_pending_entry  → EXPIRED  + last_error='ghost_cleanup_manual'
 
         Audit trail (JSONB merge, non-destructive):
             ghost_cleanup          : true
@@ -2059,7 +2059,7 @@ def create_app() -> Flask:
             prior_updated_ts       : row's updated_ts at scan time
 
         Idempotency:
-            Re-running produces 0 mutations ‚Äî already-cleaned rows have
+            Re-running produces 0 mutations — already-cleaned rows have
             meta->>'ghost_cleanup'='true' which the WHERE clause excludes,
             and their status is no longer PENDING_TRIGGER.
 
@@ -2078,8 +2078,8 @@ def create_app() -> Flask:
 
         body = request.get_json(force=True, silent=True) or {}
 
-        # ‚îÄ‚îÄ Parse + validate ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ
-        # dry_run defaults to true ‚Äî caller must explicitly pass false.
+        # ── Parse + validate ──────────────────────────────────────────────
+        # dry_run defaults to true — caller must explicitly pass false.
         dry_run = body.get("dry_run", True)
         if not isinstance(dry_run, bool):
             dry_run = str(dry_run).lower() not in ("false", "0", "no")
@@ -2110,7 +2110,7 @@ def create_app() -> Flask:
         raw_ids          = body.get("local_order_ids")
         local_order_ids  = [str(x) for x in raw_ids if x] if isinstance(raw_ids, list) else []
 
-        # ‚îÄ‚îÄ Classify candidates (same SQL + classifier as dry-run) ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ
+        # ── Classify candidates (same SQL + classifier as dry-run) ────────
         sql, params, lookback_hours = _ghost_build_sql_and_params(
             recent_skip_hours=recent_skip_hours,
             cancel_threshold=cancel_threshold,
@@ -2180,7 +2180,7 @@ def create_app() -> Flask:
             per_client_summary = {cid: _compact(b) for cid, b in per_client.items()}
             per_symbol_summary = {sym: _compact(b) for sym, b in per_symbol.items()}
 
-            # ‚îÄ‚îÄ DRY-RUN: return classification without touching DB ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ
+            # ── DRY-RUN: return classification without touching DB ─────────
             if dry_run:
                 return jsonify({
                     "ok": True,
@@ -2208,7 +2208,7 @@ def create_app() -> Flask:
                     ),
                 })
 
-            # ‚îÄ‚îÄ LIVE MUTATION: dry_run=false ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ
+            # ── LIVE MUTATION: dry_run=false ──────────────────────────────
             # Each eligible row gets ONE parameterized UPDATE with a full
             # WHERE safety gate. The gate re-checks every structural
             # constraint atomically inside Postgres, so even if a row's
@@ -2259,16 +2259,16 @@ def create_app() -> Flask:
                 # Single atomic UPDATE with full CAS / staleness guards.
                 # RETURNING local_order_id confirms the row was actually
                 # changed. If RETURNING is empty, any WHERE condition
-                # failed ‚Äî the row is skipped as where_guard_no_match.
+                # failed — the row is skipped as where_guard_no_match.
                 #
                 # CAS guards added vs the initial WHERE set:
                 #   updated_ts = %s
-                #     ‚Äî exact snapshot match from the SELECT. If any
+                #     — exact snapshot match from the SELECT. If any
                 #       process touched the row after the scan (e.g. a
                 #       watcher re-arm that bumped updated_ts), this
                 #       condition fails and we skip safely.
                 #   updated_ts <= NOW() - (%s::text || ' hours')::interval
-                #     ‚Äî row must still be old enough at UPDATE time using
+                #     — row must still be old enough at UPDATE time using
                 #       the action-specific threshold (cancel_threshold or
                 #       expire_threshold). Belt-and-suspenders: even if
                 #       updated_ts matches the snapshot, a freshly-armed
@@ -2323,7 +2323,7 @@ def create_app() -> Flask:
                     continue
 
                 if returned:
-                    # RETURNING produced a row ‚Üí UPDATE matched and changed.
+                    # RETURNING produced a row → UPDATE matched and changed.
                     r_out = dict(r)
                     r_out["new_status"]            = new_status
                     r_out["ghost_cleanup_at"]      = now_iso
@@ -2335,9 +2335,9 @@ def create_app() -> Flask:
                         loid, client_id, action, new_status,
                     )
                 else:
-                    # RETURNING empty ‚Üí row no longer matched (already cleaned,
+                    # RETURNING empty → row no longer matched (already cleaned,
                     # status changed, or broker_order_id was set between scan
-                    # and update ‚Äî all are correct safety outcomes).
+                    # and update — all are correct safety outcomes).
                     r_skip = dict(r)
                     r_skip["skip_reason"] = "where_guard_no_match"
                     skipped_rows.append(r_skip)
@@ -2411,8 +2411,8 @@ def create_app() -> Flask:
                         if runner.fill_monitor_thread is None or not runner.fill_monitor_thread.is_alive():
                             runner._fill_dead_since = None  # reset grace period
                         if runner.worker_thread is None:
-                            # Create a dummy placeholder ‚Äî actual worker won't start but entries can flow
-                            log.warning(f"force_initialize: {email} worker_thread is None ‚Äî runner may not process signals")
+                            # Create a dummy placeholder — actual worker won't start but entries can flow
+                            log.warning(f"force_initialize: {email} worker_thread is None — runner may not process signals")
                         runner._set_entry_permission()
                         forced.append({
                             "email": email,
@@ -2504,7 +2504,7 @@ def create_app() -> Flask:
             if not client_id:
                 return jsonify({
                     "ok": False,
-                    "error": "client_id required in body (no default ‚Äî per-client routing is explicit).",
+                    "error": "client_id required in body (no default — per-client routing is explicit).",
                 }), 400
 
             signal_id = body.get("signal_id") or f"TEST-{_uuid.uuid4().hex[:8]}"
@@ -2550,7 +2550,7 @@ def create_app() -> Flask:
                     "ticker": ticker,
                     "side": side,
                     "score": score,
-                    "note": "Test signal enqueued ‚Äî worker will process but market_closed_no_contract_selection rejection is expected after hours",
+                    "note": "Test signal enqueued — worker will process but market_closed_no_contract_selection rejection is expected after hours",
                 })
             except Exception as eq_exc:
                 return jsonify({"ok": False, "error": f"enqueue failed: {eq_exc}"}), 500
@@ -2562,7 +2562,7 @@ def create_app() -> Flask:
     @app.post("/admin/force_start_runner")
     @require_hmac
     def admin_force_start_runner():
-        """Directly spawn a runner for a member ‚Äî bypasses supervisor for emergency recovery."""
+        """Directly spawn a runner for a member — bypasses supervisor for emergency recovery."""
         try:
             from client_runner import _active_runners, _registry_lock, ClientRunner, _fetch_active_members
             from supabase import create_client
@@ -2613,7 +2613,7 @@ def create_app() -> Flask:
     def client_trades():
         """Execution proof surface for clients and ops.
         Returns every completed trade with: entry time, fill, exit time, fill, net P&L.
-        This is what a $3K/month client needs to see ‚Äî not logs.
+        This is what a $3K/month client needs to see — not logs.
         """
         try:
             from ap.db import run_with_retry
@@ -2708,7 +2708,7 @@ def create_app() -> Flask:
     @app.get("/client/positions")
     @require_hmac
     def client_positions():
-        """Live open positions ‚Äî what the client holds right now."""
+        """Live open positions — what the client holds right now."""
         try:
             from ap.db import run_with_retry
             import psycopg2.extras
@@ -2768,7 +2768,7 @@ def create_app() -> Flask:
     @app.get("/client/rejections")
     @require_hmac
     def client_rejections():
-        """Every signal rejection ‚Äî queryable by client. No log-diving needed."""
+        """Every signal rejection — queryable by client. No log-diving needed."""
         try:
             import os as _os
             from supabase import create_client as _cc
@@ -2806,7 +2806,7 @@ def create_app() -> Flask:
         """Order lifecycle ledger for a client.
 
         AUDIT P0-3: this endpoint was previously called as `/client/me/orders` by the
-        dashboard backend but did not exist on the bot ‚Äî every call 404'd silently
+        dashboard backend but did not exist on the bot — every call 404'd silently
         and the dashboard ledger panel was permanently empty. Now implemented.
 
         Returns: order_id, broker_order_id, symbol, contract, side, kind (ENTRY/EXIT),
@@ -2887,7 +2887,7 @@ def create_app() -> Flask:
     @app.post("/admin/reset_dedup")
     @require_hmac
     def reset_dedup():
-        """Force reset the master control dedup cache ‚Äî clears stale signal blocks."""
+        """Force reset the master control dedup cache — clears stale signal blocks."""
         from client_runner import _active_runners, _registry_lock
         results = {}
         with _registry_lock:
@@ -3015,6 +3015,8 @@ def create_app() -> Flask:
                     "runners_queued": len(runners_window),
                     "runners_processed": 0,
                     "results": {},
+                    "handoff_results": {},
+                    "readiness_results": {},
                     "elapsed_seconds": None,
                 }
 
@@ -3050,12 +3052,20 @@ def create_app() -> Flask:
                                 )
                                 runner._last_overnight_reeval_date = None
                                 job["results"][email] = result
+                                job["readiness_results"][email] = {
+                                    "skipped": "async_background_readiness_not_run"
+                                }
                                 log.info(f"overnight_reeval[bg:{job_id}] [{email}]: {result}")
                             except Exception as _bg_err:
                                 import traceback as _tb
                                 job["results"][email] = {
                                     "error": str(_bg_err),
                                     "traceback": _tb.format_exc()[-2000:],
+                                }
+                                job["readiness_results"][email] = {
+                                    "ok": False,
+                                    "status": "ERROR",
+                                    "error": str(_bg_err),
                                 }
                                 log.error(
                                     f"overnight_reeval[bg:{job_id}] [{email}] failed: {_bg_err}",
@@ -3078,11 +3088,16 @@ def create_app() -> Flask:
                     "job_id": job_id,
                     "runners_queued": len(runners_window),
                     "force": force,
+                    "readiness_results": {
+                        email: {"skipped": "async_background_readiness_not_run"}
+                        for email, _runner in runners_window
+                    },
                     "status_endpoint": f"/admin/overnight_reeval/status?job_id={job_id}",
                 })
 
             results: dict = {}
             handoff_results: dict = {}
+            readiness_results: dict = {}
             t0 = _time.time()
             processed = 0
             skipped_budget = 0
@@ -3114,24 +3129,23 @@ def create_app() -> Flask:
                     )
                     runner._last_overnight_reeval_date = None
                     results[email] = result
+                    runner_mode = _runner_execution_mode(runner)
                     armed = int(result.get("armed", 0) or 0) if isinstance(result, dict) else 0
-                    if armed > 0:
-                        runner_mode = str(
-                            getattr(runner, "mode", None)
-                            or getattr(runner.master_control, "mode", None)
-                            or ""
-                        ).strip().lower()
-                        handoff_results[email] = run_morning_handoff_audit(
+                    if armed > 0 or isinstance(result, dict):
+                        handoff, readiness = _run_admin_handoff_and_readiness(
+                            runner=runner,
                             client_id=email,
                             execution_mode=runner_mode,
                             stage="post_overnight_reeval",
                             dry_run=False,
-                            runner=runner,
                         )
+                        handoff_results[email] = handoff
+                        readiness_results[email] = readiness
                     log.info(f"overnight_reeval [{email}]: {result}")
                 except Exception as e:
                     import traceback as _tb
                     results[email] = {"error": str(e), "traceback": _tb.format_exc()[-2000:]}
+                    readiness_results[email] = {"ok": False, "status": "ERROR", "error": str(e)}
                     log.error(f"overnight_reeval [{email}] failed: {e}", exc_info=True)
                 processed += 1
 
@@ -3156,6 +3170,7 @@ def create_app() -> Flask:
                 "total_armed": total_armed,
                 "total_rejected": total_rejected,
                 "handoff_results": handoff_results,
+                "readiness_results": readiness_results,
                 "results": results,
             })
         except Exception as e:
@@ -3277,12 +3292,57 @@ def create_app() -> Flask:
             admin_log.error("release_after_hours_deferred failed: %s", e, exc_info=True)
             return jsonify({"ok": False, "error": str(e)}), 500
 
+    def _runner_execution_mode(runner) -> str:
+        return str(
+            getattr(runner, "mode", None)
+            or getattr(getattr(runner, "master_control", None), "mode", None)
+            or ""
+        ).strip().lower()
+
+    def _apply_live_preopen_readiness(runner, readiness: dict | None):
+        if runner is None or not isinstance(readiness, dict):
+            return
+        if _runner_execution_mode(runner) != "live":
+            return
+        if readiness.get("status") == "BLOCKED":
+            try:
+                runner._enter_degraded_mode(
+                    "preopen_readiness_blocked:" + ",".join(readiness.get("errors") or ["unknown"]),
+                    stop_runner=False,
+                )
+            except Exception:
+                pass
+        elif readiness.get("status") == "OK":
+            try:
+                runner._clear_degraded_reason_key("preopen_readiness_blocked")
+            except Exception:
+                pass
+
+    def _run_admin_handoff_and_readiness(*, runner, client_id: str, execution_mode: str, stage: str, dry_run: bool):
+        from ap.morning_handoff import run_morning_handoff_audit
+        from ap.preopen_readiness import run_preopen_autonomous_readiness
+
+        handoff = run_morning_handoff_audit(
+            client_id=client_id,
+            execution_mode=execution_mode,
+            stage=stage,
+            dry_run=dry_run,
+            runner=runner,
+        )
+        readiness = run_preopen_autonomous_readiness(
+            client_id,
+            execution_mode,
+            dry_run=dry_run,
+            stage=stage,
+            runner=runner,
+        )
+        _apply_live_preopen_readiness(runner, readiness)
+        return handoff, readiness
+
     @app.get("/admin/morning_handoff_audit")
     @require_hmac
     def admin_morning_handoff_audit_get():
         from client_runner import _active_runners, _registry_lock
-        from ap_morning_handoff_audit import run_morning_handoff_audit
-
         client_id_req = request.args.get("client_id", "").strip().lower()
         if not client_id_req:
             return jsonify({"ok": False, "error": "client_id required"}), 400
@@ -3297,30 +3357,23 @@ def create_app() -> Flask:
         if runner is None:
             return jsonify({"ok": False, "error": f"client_id not in active runners: {client_id_req}"}), 404
 
-        entry_watcher = getattr(runner, "entry_watcher", None) or getattr(
-            getattr(runner, "core", None), "entry_watcher", None
-        )
-        osm = (
-            getattr(runner, "order_state_machine", None)
-            or getattr(runner, "osm", None)
-            or getattr(getattr(runner, "core", None), "order_state_machine", None)
-            or getattr(getattr(runner, "execution_core", None), "order_state_machine", None)
-        )
-        if osm is None:
-            log.warning(
-                "morning_handoff_audit GET: OSM not found for client %s ‚Äî re-arm metadata will not be persisted. WATCHER_REARM_AUDIT_FAILED",
-                client_id_req,
-            )
-
         try:
-            result = run_morning_handoff_audit(
+            handoff, readiness = _run_admin_handoff_and_readiness(
+                runner=runner,
                 client_id=client_id_req,
-                entry_watcher=entry_watcher,
-                osm=osm,
                 execution_mode=mode,
+                stage="manual",
                 dry_run=dry_run,
             )
-            return jsonify(result)
+            payload = {
+                "ok": bool(handoff.get("ok")) and readiness.get("status") != "BLOCKED",
+                "client_id": client_id_req,
+                "execution_mode": mode,
+                "stage": "manual",
+                "handoff": handoff,
+                "readiness": readiness,
+            }
+            return jsonify(payload), 200 if payload["ok"] else 503
         except Exception as exc:
             log.error("morning_handoff_audit GET failed: %s", exc, exc_info=True)
             return jsonify({"ok": False, "error": str(exc)}), 500
@@ -3329,7 +3382,6 @@ def create_app() -> Flask:
     @require_hmac
     def admin_morning_handoff_audit_post():
         from client_runner import _active_runners, _registry_lock
-        from ap_morning_handoff_audit import run_morning_handoff_audit
         import time as _time
 
         body = request.get_json(silent=True) or {}
@@ -3350,51 +3402,51 @@ def create_app() -> Flask:
             runners_all = dict(_active_runners)
 
         _t0 = _time.monotonic()
-        per_client_results = {}
+        handoff_results = {}
+        readiness_results = {}
         errors = {}
 
         for email, runner in runners_all.items():
             if clients_filter is not None and email not in clients_filter:
                 continue
-            entry_watcher = getattr(runner, "entry_watcher", None) or getattr(
-                getattr(runner, "core", None), "entry_watcher", None
-            )
-            osm = (
-                getattr(runner, "order_state_machine", None)
-                or getattr(runner, "osm", None)
-                or getattr(getattr(runner, "core", None), "order_state_machine", None)
-                or getattr(getattr(runner, "execution_core", None), "order_state_machine", None)
-            )
-            if osm is None:
-                log.warning(
-                    "morning_handoff_audit POST: OSM not found for client %s ‚Äî re-arm metadata will not be persisted. WATCHER_REARM_AUDIT_FAILED",
-                    email,
-                )
+            runner_mode = execution_mode_alias or _runner_execution_mode(runner) or mode
             try:
-                per_client_results[email] = run_morning_handoff_audit(
+                handoff, readiness = _run_admin_handoff_and_readiness(
+                    runner=runner,
                     client_id=email,
-                    entry_watcher=entry_watcher,
-                    osm=osm,
-                    execution_mode=mode,
+                    execution_mode=runner_mode,
+                    stage="manual",
                     dry_run=dry_run,
                 )
+                handoff_results[email] = handoff
+                readiness_results[email] = readiness
             except Exception as exc:
                 log.error(
                     "morning_handoff_audit POST failed for %s: %s", email, exc, exc_info=True
                 )
                 errors[email] = str(exc)
-                per_client_results[email] = {"ok": False, "error": str(exc)}
+                handoff_results[email] = {"ok": False, "error": str(exc)}
+                readiness_results[email] = {"ok": False, "status": "ERROR", "error": str(exc)}
 
         elapsed = _time.monotonic() - _t0
         return jsonify({
-            "ok": len(errors) == 0,
+            "ok": len(errors) == 0 and all(
+                str((row or {}).get("status") or "").upper() != "BLOCKED"
+                for row in readiness_results.values()
+                if isinstance(row, dict)
+            ),
             "mode": mode,
             "dry_run": dry_run,
-            "clients_audited": len(per_client_results),
+            "clients_audited": len(handoff_results),
             "elapsed_seconds": round(elapsed, 2),
-            "results": per_client_results,
+            "handoff_results": handoff_results,
+            "readiness_results": readiness_results,
             "errors": errors,
-        })
+        }), 200 if len(errors) == 0 and all(
+            str((row or {}).get("status") or "").upper() != "BLOCKED"
+            for row in readiness_results.values()
+            if isinstance(row, dict)
+        ) else 503
 
     @app.route("/admin/preopen_readiness", methods=["GET", "POST"])
     @require_hmac
@@ -3514,7 +3566,7 @@ def create_app() -> Flask:
     @app.post("/admin/reseed_exit_engine")
     @require_hmac
     def reseed_exit_engine():
-        """Force the exit engine to reseed from DB ‚Äî picks up manually seeded positions."""
+        """Force the exit engine to reseed from DB — picks up manually seeded positions."""
         from client_runner import _active_runners, _registry_lock
         results = {}
         with _registry_lock:
@@ -3654,7 +3706,7 @@ def create_app() -> Flask:
                 "ok": False,
                 "error": "no_global_broker",
                 "detail": (
-                    "Global broker not initialized ‚Äî multi-client supervisor mode "
+                    "Global broker not initialized — multi-client supervisor mode "
                     "uses per-client Tradier credentials. Use the per-client "
                     "health endpoint instead."
                 ),
@@ -3668,7 +3720,7 @@ def create_app() -> Flask:
             return jsonify({"ok": False, "error": str(e)}), 500
 
     log.info("=" * 70)
-    log.info("‚úÖ APP READY")
+    log.info("✅ APP READY")
     log.info("=" * 70)
     return app
 
@@ -3998,7 +4050,7 @@ def admin_force_exit_position(position_id: str):
         return jsonify({"ok": False, "error": f"Position lookup failed: {e}"}), 500
 
     if pos is None:
-        # Not in exit engine ‚Äî close directly via position manager
+        # Not in exit engine — close directly via position manager
         try:
             from ap.position_manager import APPositionManager
             from ap.db import conn, run_with_retry
@@ -4021,7 +4073,7 @@ def admin_force_exit_position(position_id: str):
             )
             return jsonify({"ok": True, "position_id": position_id,
                             "method": "position_manager_direct",
-                            "warning": "Closed at entry price ‚Äî update exit_option_price in proof_trades manually."})
+                            "warning": "Closed at entry price — update exit_option_price in proof_trades manually."})
         except Exception as e:
             return jsonify({"ok": False, "error": str(e)}), 500
 
@@ -4031,15 +4083,15 @@ def admin_force_exit_position(position_id: str):
         qty = int(getattr(pos, "quantity_remaining", 0) or getattr(pos, "quantity", 1))
         decision = ExitDecision(
             action="CLOSE_ALL", quantity=qty,
-            reason=f"ADMIN FORCE EXIT ‚Äî {reason}",
+            reason=f"ADMIN FORCE EXIT — {reason}",
             urgency="IMMEDIATE",
             pnl_pct=getattr(pos, "option_pnl_pct", 0.0),
             reason_code="ADMIN_FORCE_EXIT",
         )
         submitted = ee._submit_exit_decision(pos, decision, kill_active=True)
 
-        # ‚îÄ‚îÄ PROOF STAGING: admin force exit bypasses _on_position_close ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ‚îÄ
-        # The normal exit path (exit engine ‚Üí _on_position_close) sets
+        # ── PROOF STAGING: admin force exit bypasses _on_position_close ────────
+        # The normal exit path (exit engine → _on_position_close) sets
         # pos._proof_staged so _finalize_proof can write proof_trades on fill
         # confirmation. Admin force exit calls _submit_exit_decision directly,
         # skipping that callback chain. Without this block, the trade closes
@@ -4048,7 +4100,7 @@ def admin_force_exit_position(position_id: str):
         # CODEX PATCH: proof is ONLY written when submitted=True.
         # If _submit_exit_decision returns False (exit_in_flight block, kill-switch
         # guard, broker reject, or any _can_submit_exit failure) the position is
-        # still open ‚Äî writing proof here would create a fake closed trade.
+        # still open — writing proof here would create a fake closed trade.
         if not submitted:
             admin_log.warning(
                 "FORCE_EXIT_PROOF_SKIPPED pos=%s ticker=%s reason=submission_failed_or_not_accepted",
@@ -4086,7 +4138,7 @@ def admin_force_exit_position(position_id: str):
                         underlying_entry   = _ue,
                         underlying_exit    = _ux,
                         contracts          = _qty,
-                        exit_reason        = f"ADMIN FORCE EXIT ‚Äî {reason}",
+                        exit_reason        = f"ADMIN FORCE EXIT — {reason}",
                         option_pnl_pct     = _opt_pnl,
                         underlying_pnl_pct = _u_pnl,
                         win                = _win,
@@ -4101,7 +4153,7 @@ def admin_force_exit_position(position_id: str):
                     )
             except Exception as _proof_exc:
                 admin_log.error(
-                    "FORCE_EXIT_PROOF_FAILED pos=%s err=%s ‚Äî trade closed but not in proof_trades",
+                    "FORCE_EXIT_PROOF_FAILED pos=%s err=%s — trade closed but not in proof_trades",
                     position_id, _proof_exc,
                 )
 
@@ -4117,10 +4169,10 @@ def admin_force_exit_position(position_id: str):
 
 
 # =============================================================================
-# PR #90 ‚Äî Live Execution Journal (read-only, admin-protected)
+# PR #90 — Live Execution Journal (read-only, admin-protected)
 #
 # Two endpoints behind @_require_admin (same HMAC pattern as every other
-# /admin/* route). Both READ-ONLY ‚Äî never write, never mutate trading state.
+# /admin/* route). Both READ-ONLY — never write, never mutate trading state.
 # =============================================================================
 
 @app.get("/admin/operator/live-execution-journal")
@@ -4191,7 +4243,7 @@ def admin_live_execution_truth_sample():
 
 
 # =============================================================================
-# PR #91 ‚Äî Daily Operator Folders -> Weekly Archive Pipeline
+# PR #91 — Daily Operator Folders -> Weekly Archive Pipeline
 # =============================================================================
 # Archive/reporting only. No trading logic changes.
 #
@@ -4416,7 +4468,7 @@ def cron_daily_rollup():
 @app.post("/cron/weekly-rollup")
 def cron_weekly_rollup():
     """Cron entry point: aggregate daily folders into the weekly archive.
-    Does NOT silently skip missing days ‚Äî they are surfaced in days_missing."""
+    Does NOT silently skip missing days — they are surfaced in days_missing."""
     guard = _require_cron_secret()
     if guard is not None:
         return guard
@@ -4437,7 +4489,7 @@ def cron_weekly_rollup():
 
 @app.get("/health")
 def health_basic():
-    """Basic liveness check ‚Äî no auth required."""
+    """Basic liveness check — no auth required."""
     import time as _t
     return jsonify({"ok": True, "status": "healthy", "ts": _t.time()}), 200
 
@@ -4445,7 +4497,7 @@ def health_basic():
 @app.get("/execution/health")
 @require_hmac
 def execution_health():
-    """Execution component health ‚Äî fill monitor, reconciler, order worker.
+    """Execution component health — fill monitor, reconciler, order worker.
 
     CRITICAL READINESS: if approved+subscribed members exist in the DB for
     this service's mode but ZERO runners are active, the service is NOT
@@ -4485,7 +4537,7 @@ def execution_health():
                 _sbx = _ccx(SUPABASE_URL, SUPABASE_SERVICE_KEY)
                 expected_members = len(_fetch_active_members(_sbx))
         except Exception:
-            expected_members = None  # probe failed ‚Äî don't block on it
+            expected_members = None  # probe failed — don't block on it
 
         # The dangerous state: members are configured but no runners started.
         members_without_runners = (
@@ -4508,7 +4560,7 @@ def execution_health():
                 "detail": (
                     f"{expected_members} approved/subscribed member(s) for this "
                     f"mode but 0 active runners. Trading is DOWN. Likely a "
-                    f"schema mismatch or boot failure ‚Äî check logs and run "
+                    f"schema mismatch or boot failure — check logs and run "
                     f"pending migrations."
                 ),
                 "expected_members": expected_members,
@@ -4531,7 +4583,7 @@ def execution_health():
 @app.get("/scanner/health")
 @require_hmac
 def scanner_health():
-    """Scanner health ‚Äî reads from ap_signals for today's activity."""
+    """Scanner health — reads from ap_signals for today's activity."""
     try:
         from ap.db import conn, run_with_retry
         from datetime import date as _date
@@ -4558,7 +4610,7 @@ def scanner_health():
 @app.get("/intelligence/health")
 @require_hmac
 def intelligence_health():
-    """Intelligence gate health ‚Äî reads decision breakdown from ap_signals."""
+    """Intelligence gate health — reads decision breakdown from ap_signals."""
     try:
         from ap.db import conn, run_with_retry
         from datetime import date as _date
