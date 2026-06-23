@@ -274,6 +274,11 @@ class ManagedPosition:
     position_id:       str  = ""
     client_id:         str  = ""
     signal_id:         str  = ""
+    # PR #176: execution_mode populated at seed time ("live" | "paper" | "").
+    # Used by the LIVE_DEGRADED_SOFT_EXIT_GUARD at the SUBMIT site.
+    # Empty string is treated as live-risk when client_id matches a known
+    # live client, to fail safe.
+    execution_mode:    str  = ""
 
     # Context flags
     is_trend_day:         bool  = False
@@ -1201,6 +1206,204 @@ def _is_protective_exit(reason: str) -> bool:
         "TARGET HIT", "IMMEDIATE TP", "PROFIT PROTECT", "SMALL WIN", "RUNNER TRAIL",
         "PROFIT LOCK", "TOUCHED PROFIT", "NEVER GREEN", "DEAD TRADE",
     ))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PR #176 — LIVE_DEGRADED_SOFT_EXIT_GUARD
+#
+# Problem this guard fixes (production incident, NKE/RIVN, Jason live):
+#   Exit engine submitted SOFT_LOSS / THESIS_FAIL_SOFT_STOP / NEVER_GREEN_STOP
+#   while live context was degraded (underlying_entry=0, current_underlying
+#   missing, execution_mode='unknown'). NKE only needed a few more minutes,
+#   but the bot sold from no_underlying_data instead of holding.
+#
+# Scope (intentionally tiny):
+#   - One module-level guard helper here.
+#   - One call-site in _submit_exit_decision (the SUBMIT event).
+#   - No new modules. No new market data fetches. No paper behavior changes.
+#
+# Behavior:
+#   - Identifies the position as live-risk if execution_mode == "live", OR
+#     execution_mode is blank/unknown AND client_id is a known live client.
+#   - For these soft reason codes only:
+#         SOFT_LOSS, SOFT_LOSS_WATCH, DEEP_LOSS_STOP, STOP_BREACH_CONFIRMING,
+#         THESIS_FAIL_SOFT_STOP, NEVER_GREEN_STOP, "NEVER GREEN STOP" text
+#   - Context is degraded if ANY of:
+#         underlying_entry is null/zero,
+#         current_underlying is null/zero,
+#         decision.reason contains "no_underlying_data",
+#         option bid/ask/mid all null AND the decision turns on option loss.
+#   - Live-only minimum holds (overrides existing constants for live only):
+#         SOFT_LOSS: 8 minutes minimum
+#         NEVER_GREEN_STOP: 12 minutes minimum
+#   - Always-allowed exits (do not gate):
+#         manual close, EOD flatten, hard disaster / emergency, broker-already-gone.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Reason codes that this guard gates when the position is live-risk + degraded.
+_PR176_GATED_SOFT_REASON_CODES = frozenset({
+    "SOFT_LOSS",
+    "SOFT_LOSS_WATCH",
+    "DEEP_LOSS_STOP",
+    "STOP_BREACH_CONFIRMING",
+    "THESIS_FAIL_SOFT_STOP",
+    "NEVER_GREEN_STOP",
+})
+
+# Reason codes / text fragments that ALWAYS proceed (never gated by this guard).
+_PR176_ALWAYS_ALLOWED_REASON_CODES = frozenset({
+    "EOD_FORCE_CLOSE",
+    "HARD_STOP",
+    "HARD_DISASTER_STOP",
+    "EMERGENCY_FLATTEN",
+    "BROKER_FORCE_CLOSE",
+    "BROKER_POSITION_GONE",
+    "RECONCILER_BROKER_GONE",
+    "MANUAL_CLOSE",
+    "MANUAL_EXIT",
+    "RUNNER_TRAIL",
+    "PROFIT_LOCK",
+    "TRAILING_STOP",
+})
+_PR176_ALWAYS_ALLOWED_TEXT_FRAGMENTS = (
+    "EOD",
+    "MANUAL",
+    "EMERGENCY",
+    "BROKER POSITION GONE",
+    "RECONCILER",
+    "HARD STOP",
+    "HARD DISASTER",
+    "FORCE CLOSE",
+)
+
+# Live-only minimum hold floors (minutes). These override the global
+# _MIN_HOLD_BEFORE_EXIT_MIN constant when the position is live-risk.
+# Paper behavior is unchanged.
+_PR176_LIVE_MIN_HOLD_SOFT_LOSS_MIN     = 8.0
+_PR176_LIVE_MIN_HOLD_NEVER_GREEN_MIN  = 12.0
+
+# Known live client emails. Used as a safety net when execution_mode is
+# blank/unknown — fail to "live-risk" rather than letting a degraded
+# soft exit submit. Override via env (comma-separated) if needed.
+_PR176_LIVE_CLIENT_IDS = frozenset(
+    s.strip().lower()
+    for s in os.getenv("PR176_LIVE_CLIENT_IDS", "jasoncosby1@gmail.com").split(",")
+    if s.strip()
+)
+
+
+def _pr176_is_live_risk(pos: "ManagedPosition") -> bool:
+    """True if the position should be treated as live for the degraded guard."""
+    mode = (getattr(pos, "execution_mode", "") or "").lower().strip()
+    if mode == "live":
+        return True
+    if mode == "paper":
+        return False
+    # mode is blank/unknown → fail safe if client_id is on the live list
+    client_id = (getattr(pos, "client_id", "") or "").lower().strip()
+    return client_id in _PR176_LIVE_CLIENT_IDS
+
+
+def _pr176_reason_is_always_allowed(reason_code: str, reason_text: str) -> bool:
+    """Manual close / EOD / hard disaster / broker-gone → never gate."""
+    rc = (reason_code or "").upper().strip()
+    if rc in _PR176_ALWAYS_ALLOWED_REASON_CODES:
+        return True
+    rt = (reason_text or "").upper()
+    return any(frag in rt for frag in _PR176_ALWAYS_ALLOWED_TEXT_FRAGMENTS)
+
+
+def _pr176_context_is_degraded(pos: "ManagedPosition", decision_reason: str) -> tuple[bool, list[str]]:
+    """
+    Returns (is_degraded, list_of_signals). Order of checks matters for
+    observability — the returned signals are emitted with the gated event.
+    """
+    signals: list[str] = []
+    # 1) Missing/zero underlying entry
+    entry_u = getattr(pos, "underlying_entry", None)
+    if entry_u is None or float(entry_u or 0.0) == 0.0:
+        signals.append("underlying_entry_missing_or_zero")
+    # 2) Missing/zero current underlying
+    curr_u = getattr(pos, "current_underlying", None)
+    if curr_u is None or float(curr_u or 0.0) == 0.0:
+        signals.append("current_underlying_missing")
+    # 3) Decision text itself confessed no underlying data
+    if "no_underlying_data" in (decision_reason or "").lower():
+        signals.append("decision_text_no_underlying_data")
+    # 4) Bid/ask/mid all null AND we are evaluating an option-loss decision.
+    #    current_option_price doubles as mid in this engine; check bid/ask too.
+    cur_bid = float(getattr(pos, "current_bid", 0.0) or 0.0)
+    cur_ask = float(getattr(pos, "current_ask", 0.0) or 0.0)
+    cur_mid = float(getattr(pos, "current_option_price", 0.0) or 0.0)
+    if cur_bid == 0.0 and cur_ask == 0.0 and cur_mid == 0.0:
+        signals.append("option_quote_bid_ask_mid_all_zero")
+    return (len(signals) > 0), signals
+
+
+def _pr176_live_min_hold_blocks(pos: "ManagedPosition", reason_code: str) -> tuple[bool, float, float]:
+    """
+    Returns (blocked, age_min, floor_min). For live-risk positions only:
+      SOFT_LOSS:         8-minute floor
+      NEVER_GREEN_STOP:  12-minute floor
+    Paper is unaffected (this is only called when _pr176_is_live_risk is True).
+    """
+    age_min = _position_age_minutes(pos)
+    rc = (reason_code or "").upper().strip()
+    if rc == "SOFT_LOSS":
+        return (age_min < _PR176_LIVE_MIN_HOLD_SOFT_LOSS_MIN, age_min, _PR176_LIVE_MIN_HOLD_SOFT_LOSS_MIN)
+    if rc == "NEVER_GREEN_STOP":
+        return (age_min < _PR176_LIVE_MIN_HOLD_NEVER_GREEN_MIN, age_min, _PR176_LIVE_MIN_HOLD_NEVER_GREEN_MIN)
+    return (False, age_min, 0.0)
+
+
+def _pr176_should_hold(
+    pos: "ManagedPosition",
+    decision_reason_code: str,
+    decision_reason_text: str,
+) -> tuple[bool, str, dict]:
+    """
+    Top-level guard. Returns (should_hold, hold_reason_code, extra_inputs).
+
+    should_hold=True means: do NOT submit the broker exit. Emit a HOLD event
+    instead. The caller MUST `continue` to the next position in the loop.
+    """
+    # 1) Always-allowed paths never gated
+    if _pr176_reason_is_always_allowed(decision_reason_code, decision_reason_text):
+        return False, "", {}
+
+    # 2) Only gate the soft exit reason codes
+    rc = (decision_reason_code or "").upper().strip()
+    if rc not in _PR176_GATED_SOFT_REASON_CODES:
+        return False, "", {}
+
+    # 3) Only gate live-risk positions
+    if not _pr176_is_live_risk(pos):
+        return False, "", {}
+
+    # 4) DATA_DEGRADED_HOLD: any degraded signal blocks the exit
+    degraded, signals = _pr176_context_is_degraded(pos, decision_reason_text)
+    if degraded:
+        return True, "DATA_DEGRADED_HOLD", {
+            "pr176_degraded_signals": signals,
+            "pr176_reason_code": rc,
+            "pr176_execution_mode": (getattr(pos, "execution_mode", "") or "").lower().strip() or "unknown",
+            "pr176_client_id": getattr(pos, "client_id", "") or "",
+            "pr176_underlying_entry": getattr(pos, "underlying_entry", None),
+            "pr176_current_underlying": getattr(pos, "current_underlying", None),
+        }
+
+    # 5) Live-only minimum hold: SOFT_LOSS<8min and NEVER_GREEN_STOP<12min held
+    held_short, age_min, floor_min = _pr176_live_min_hold_blocks(pos, rc)
+    if held_short:
+        return True, "LIVE_MIN_HOLD_NOT_MET", {
+            "pr176_reason_code": rc,
+            "pr176_age_min": age_min,
+            "pr176_floor_min": floor_min,
+            "pr176_execution_mode": (getattr(pos, "execution_mode", "") or "").lower().strip() or "unknown",
+            "pr176_client_id": getattr(pos, "client_id", "") or "",
+        }
+
+    return False, "", {}
 
 
 def _is_runner_protective_reason(reason: str) -> bool:
@@ -3007,6 +3210,8 @@ class APExitEngine:
                         position_id=str(row.get("id") or ""),
                         client_id=str(row.get("client_id") or ""),
                         signal_id=str(row.get("signal_id") or ""),
+                        # PR #176: carry execution_mode from positions row
+                        execution_mode=str(row.get("execution_mode") or "").lower().strip(),
                     )
                     mp.current_option_price = float(row.get("avg_fill", 0) or 0)
                     mp.scale_outs_done      = int(row.get("scale_outs_done", 0) or 0)
@@ -4102,6 +4307,51 @@ class APExitEngine:
 
                         if option_quote_stale and _is_forced_risk_exit_code(decision.reason_code):
                             decision.reason = f"{decision.reason} | DEGRADED_QUOTE_MODE:{option_quote_state}"
+
+                        # ── PR #176: LIVE_DEGRADED_SOFT_EXIT_GUARD ────────────────────────────
+                        # Last line of defence before any live broker exit submission.
+                        # If the position is live-risk AND context is degraded AND the
+                        # reason code is a gated soft-exit code, emit HOLD and continue.
+                        # Manual close / EOD / hard disaster / broker-gone are exempt.
+                        _pr176_hold, _pr176_hold_code, _pr176_extra = _pr176_should_hold(
+                            pos,
+                            self._exit_reason_code(decision),
+                            decision.reason,
+                        )
+                        if _pr176_hold:
+                            self._emit_exit_event(
+                                pos, decision="HOLD",
+                                reason_code=_pr176_hold_code,
+                                explanation=(
+                                    f"PR#176 blocked live soft exit before broker submit. "
+                                    f"proposed={self._exit_reason_code(decision)} "
+                                    f"hold_reason={_pr176_hold_code} "
+                                    f"signals={_pr176_extra.get('pr176_degraded_signals', [])}"
+                                ),
+                                stage="exit_decision",
+                                extra_inputs={
+                                    "decision_action":      decision.action,
+                                    "decision_qty":         decision.quantity,
+                                    "decision_pnl_pct":     decision.pnl_pct,
+                                    "decision_reason_code": decision.reason_code,
+                                    **_pr176_extra,
+                                },
+                            )
+                            log.error(
+                                "[%s] PR176_%s — live broker exit BLOCKED | "
+                                "proposed=%s pos_id=%s execution_mode=%s "
+                                "underlying_entry=%s current_underlying=%s "
+                                "signals=%s",
+                                pos.ticker, _pr176_hold_code,
+                                self._exit_reason_code(decision),
+                                pos.position_id or "?",
+                                _pr176_extra.get("pr176_execution_mode", ""),
+                                _pr176_extra.get("pr176_underlying_entry", None),
+                                _pr176_extra.get("pr176_current_underlying", None),
+                                _pr176_extra.get("pr176_degraded_signals", []),
+                            )
+                            continue
+                        # ─────────────────────────────────────────────────────────────────────
 
                         self._emit_exit_event(
                             pos, decision="SUBMIT",
