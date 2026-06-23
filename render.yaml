@@ -1,0 +1,85 @@
+services:
+  - type: cron
+    name: ap-overnight-reeval-batch
+    runtime: python
+    schedule: "18 13,14 * * 1-5"
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m ap.scripts.live_morning_jobs
+    envVars:
+      - key: BOT_URL
+        sync: false
+      - key: SIGNING_SECRET
+        sync: false
+      - key: MORNING_JOB
+        value: overnight_reeval_batch
+      - key: MORNING_JOB_LIVE_CLIENT
+        value: jasoncosby1@gmail.com
+      - key: MORNING_JOB_PAPER_CLIENTS
+        value: jose.vasquez4011@gmail.com,tradefluencehq@gmail.com
+      - key: MORNING_JOB_TIMEOUT_SECONDS
+        value: "180"
+      - key: MORNING_JOB_WINDOW_TOLERANCE_MINUTES
+        value: "45"
+  - type: cron
+    name: ap-morning-handoff-primary
+    runtime: python
+    schedule: "25 13,14 * * 1-5"
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m ap.scripts.live_morning_jobs
+    envVars:
+      - key: BOT_URL
+        sync: false
+      - key: SIGNING_SECRET
+        sync: false
+      - key: MORNING_JOB
+        value: morning_handoff_primary
+      - key: MORNING_JOB_LIVE_CLIENT
+        value: jasoncosby1@gmail.com
+      - key: MORNING_JOB_PAPER_CLIENTS
+        value: jose.vasquez4011@gmail.com,tradefluencehq@gmail.com
+      - key: MORNING_JOB_TIMEOUT_SECONDS
+        value: "180"
+      - key: MORNING_JOB_WINDOW_TOLERANCE_MINUTES
+        value: "45"
+  - type: cron
+    name: ap-morning-handoff-backup
+    runtime: python
+    schedule: "31 13,14 * * 1-5"
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m ap.scripts.live_morning_jobs
+    envVars:
+      - key: BOT_URL
+        sync: false
+      - key: SIGNING_SECRET
+        sync: false
+      - key: MORNING_JOB
+        value: morning_handoff_backup
+      - key: MORNING_JOB_LIVE_CLIENT
+        value: jasoncosby1@gmail.com
+      - key: MORNING_JOB_PAPER_CLIENTS
+        value: jose.vasquez4011@gmail.com,tradefluencehq@gmail.com
+      - key: MORNING_JOB_TIMEOUT_SECONDS
+        value: "180"
+      - key: MORNING_JOB_WINDOW_TOLERANCE_MINUTES
+        value: "45"
+  - type: cron
+    name: ap-morning-recovery
+    runtime: python
+    schedule: "37 13,14 * * 1-5"
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m ap.scripts.live_morning_jobs
+    envVars:
+      - key: BOT_URL
+        sync: false
+      - key: SIGNING_SECRET
+        sync: false
+      - key: MORNING_JOB
+        value: morning_recovery
+      - key: MORNING_JOB_LIVE_CLIENT
+        value: jasoncosby1@gmail.com
+      - key: MORNING_JOB_PAPER_CLIENTS
+        value: jose.vasquez4011@gmail.com,tradefluencehq@gmail.com
+      - key: MORNING_JOB_TIMEOUT_SECONDS
+        value: "180"
+      - key: MORNING_JOB_WINDOW_TOLERANCE_MINUTES
+        value: "45"
