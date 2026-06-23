@@ -179,5 +179,11 @@ def test_route_uses_dry_run_and_handoff_hook():
     assert "_run_paper_restart_guard_handoff" in src
     assert '"watching_restored"' in src
     assert "COALESCE(last_error, '') = %s" in src
+    assert "status IN ('CREATED', 'WATCHING', 'PENDING_TRIGGER', 'SUBMITTED', 'ACKNOWLEDGED', 'PARTIAL_FILL')" in src
     assert "status IN ('WATCHING', 'PENDING_TRIGGER')" in src
     assert "SKIP_RACE_STATE_CHANGED" in src
+
+
+def test_endpoint_load_orders_includes_watching_so_planner_cannot_false_new():
+    src = (REPO_ROOT / "app.py").read_text()
+    assert "AND status IN ('CREATED', 'WATCHING', 'PENDING_TRIGGER', 'SUBMITTED', 'ACKNOWLEDGED', 'PARTIAL_FILL')" in src

@@ -3052,7 +3052,7 @@ def create_app() -> Flask:
                         WHERE client_id = ANY(%s)
                           AND signal_id = ANY(%s)
                           AND kind = 'ENTRY'
-                          AND status IN ('CREATED', 'PENDING_TRIGGER', 'SUBMITTED', 'ACKNOWLEDGED', 'PARTIAL_FILL')
+                          AND status IN ('CREATED', 'WATCHING', 'PENDING_TRIGGER', 'SUBMITTED', 'ACKNOWLEDGED', 'PARTIAL_FILL')
                         """,
                         (client_ids, signal_ids),
                     )
