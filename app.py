@@ -2839,7 +2839,7 @@ def create_app() -> Flask:
     @app.post("/admin/overnight_reeval")
     @require_hmac
     def admin_overnight_reeval():
-        """Manually trigger overnight daily signal reeval for all active runners.
+        """Manually trigger overnight daily signal reeval for active runners.
         Normally fires automatically at 9:00-9:45 AM ET.
         Use this to trigger it manually (e.g. after a late deploy or for testing).
         Pass {"force": true} to bypass the time-of-day guard.
@@ -2847,15 +2847,33 @@ def create_app() -> Flask:
         try:
             from client_runner import _active_runners, _registry_lock
             from ap_overnight_reeval import run_overnight_reeval
+            from ap.morning_jobs import select_runner_items
+            import time as _time
 
             body = request.get_json(silent=True) or {}
             force = bool(body.get("force", True))  # default force=True for manual calls
+            requested_clients = body.get("clients") or []
+            max_clients = int(body.get("max_clients") or 0) or None
+            time_budget_seconds = int(body.get("time_budget_seconds") or 0) or None
+            async_background = bool(body.get("async_background", False))
 
             results = {}
             with _registry_lock:
-                runners = list(_active_runners.items())
+                runners = select_runner_items(
+                    dict(_active_runners),
+                    requested_clients=requested_clients,
+                    max_clients=max_clients,
+                )
+
+            if async_background:
+                log.warning("overnight_reeval async_background=true requested but not supported — running synchronously")
+
+            deadline = (_time.monotonic() + time_budget_seconds) if time_budget_seconds else None
 
             for email, runner in runners:
+                if deadline is not None and _time.monotonic() >= deadline:
+                    results[email] = {"skipped": True, "reason": "time_budget_exceeded"}
+                    continue
                 if not runner.is_alive():
                     results[email] = {"error": "runner not alive"}
                     continue
@@ -2887,12 +2905,138 @@ def create_app() -> Flask:
                 "ok": True,
                 "force": force,
                 "runners": len(runners),
+                "requested_clients": [str(x).strip() for x in requested_clients if str(x).strip()],
+                "max_clients": max_clients,
+                "time_budget_seconds": time_budget_seconds,
+                "async_background": False,
                 "total_armed": total_armed,
                 "total_rejected": total_rejected,
                 "results": results,
             })
         except Exception as e:
             log.error(f"overnight_reeval endpoint failed: {e}", exc_info=True)
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.post("/admin/morning_handoff_audit")
+    @require_hmac
+    def admin_morning_handoff_audit():
+        """Live/paper morning recovery helper.
+
+        Safe scope:
+          - one client only
+          - no direct broker submit/cancel
+          - no direct order-state mutation here
+          - reuses startup recovery's watcher reseed logic
+        """
+        try:
+            from client_runner import _active_runners, _registry_lock
+            from ap_recovery import APStartupRecovery
+            from ap.db import conn, run_with_retry
+
+            body = request.get_json(silent=True) or {}
+            client_id = str(body.get("client_id") or "").strip()
+            execution_mode = str(body.get("execution_mode") or "").strip().lower()
+            dry_run = bool(body.get("dry_run", False))
+
+            if not client_id:
+                return jsonify({"ok": False, "error": "client_id required"}), 400
+            if execution_mode and execution_mode not in ("live", "paper"):
+                return jsonify({"ok": False, "error": "execution_mode must be live or paper"}), 400
+
+            with _registry_lock:
+                runner = _active_runners.get(client_id)
+
+            if runner is None:
+                return jsonify({"ok": False, "error": f"runner not found for {client_id}"}), 404
+            if not runner.is_alive():
+                return jsonify({"ok": False, "error": f"runner not alive for {client_id}"}), 503
+
+            actual_mode = str(getattr(runner.master_control, "mode", "UNKNOWN")).strip().lower()
+            if execution_mode and actual_mode != execution_mode:
+                return jsonify({
+                    "ok": False,
+                    "error": "execution_mode_mismatch",
+                    "requested_execution_mode": execution_mode,
+                    "actual_execution_mode": actual_mode,
+                }), 409
+
+            def _snapshot():
+                with conn() as c:
+                    c.execute(
+                        """
+                        SELECT
+                            COALESCE(SUM(CASE WHEN status = 'WATCHING' THEN 1 ELSE 0 END), 0)::int AS watching_rows,
+                            COALESCE(SUM(CASE WHEN status = 'NEW' THEN 1 ELSE 0 END), 0)::int AS new_rows
+                        FROM trade_queue
+                        WHERE client_id = %s
+                        """,
+                        (client_id,),
+                    )
+                    tq_row = c.fetchone()
+                    tq_cols = [d[0] for d in getattr(c, "description", [])]
+                    c.execute(
+                        """
+                        SELECT
+                            COALESCE(SUM(CASE WHEN status = 'PENDING_TRIGGER' THEN 1 ELSE 0 END), 0)::int AS pending_trigger_rows
+                        FROM orders
+                        WHERE client_id = %s
+                          AND kind = 'ENTRY'
+                        """,
+                        (client_id,),
+                    )
+                    orders_row = c.fetchone()
+                    orders_cols = [d[0] for d in getattr(c, "description", [])]
+                    tq = dict(tq_row or {}) if isinstance(tq_row, dict) else dict(zip(tq_cols, tq_row or ()))
+                    orders = (
+                        dict(orders_row or {})
+                        if isinstance(orders_row, dict)
+                        else dict(zip(orders_cols, orders_row or ()))
+                    )
+                    tq.update(orders)
+                    return tq
+
+            before = run_with_retry(_snapshot) or {}
+            recovery_result = {
+                "client_id": client_id,
+                "watchers_requeued": 0,
+                "errors": [],
+            }
+
+            if not dry_run:
+                core = getattr(runner, "core", None)
+                recovery = APStartupRecovery(
+                    client_id=client_id,
+                    broker=getattr(core, "broker", None) if core else None,
+                    osm=runner.order_state_machine,
+                    pm=runner.position_manager,
+                    master_control=runner.master_control,
+                    exit_engine=getattr(core, "exit_eng", None) if core else None,
+                    entry_watcher=getattr(core, "entry_watcher", None) if core else None,
+                )
+                recovery._reseed_watchers(recovery_result)
+
+            after = run_with_retry(_snapshot) or {}
+            log.info(
+                "morning_handoff_audit client=%s execution_mode=%s dry_run=%s watchers_requeued=%s before=%s after=%s",
+                client_id,
+                actual_mode,
+                dry_run,
+                recovery_result.get("watchers_requeued", 0),
+                before,
+                after,
+            )
+            return jsonify({
+                "ok": True,
+                "client_id": client_id,
+                "execution_mode": actual_mode,
+                "dry_run": dry_run,
+                "watchers_requeued": int(recovery_result.get("watchers_requeued", 0) or 0),
+                "errors": list(recovery_result.get("errors") or []),
+                "before": before,
+                "after": after,
+            })
+        except Exception as e:
+            log.error("morning_handoff_audit endpoint failed: %s", e, exc_info=True)
             return jsonify({"ok": False, "error": str(e)}), 500
 
     @app.post("/admin/reseed_exit_engine")
