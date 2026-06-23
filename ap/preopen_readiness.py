@@ -16,6 +16,10 @@ _TABLE_READY = False
 PROCESSING_STALE_MINUTES = int(os.getenv("PREOPEN_PROCESSING_STALE_MINUTES", "10"))
 WATCHING_ORPHAN_GRACE_MINUTES = int(os.getenv("PREOPEN_WATCHING_ORPHAN_GRACE_MINUTES", "5"))
 PENDING_TRIGGER_LOOKBACK_HOURS = int(os.getenv("STARTUP_WATCHER_RESEED_LOOKBACK_HOURS", "48"))
+READINESS_ENFORCEMENT_START_HOUR_ET = int(os.getenv("PREOPEN_READINESS_START_HOUR_ET", "9"))
+READINESS_ENFORCEMENT_START_MINUTE_ET = int(os.getenv("PREOPEN_READINESS_START_MINUTE_ET", "0"))
+READINESS_ENFORCEMENT_END_HOUR_ET = int(os.getenv("PREOPEN_READINESS_END_HOUR_ET", "10"))
+READINESS_ENFORCEMENT_END_MINUTE_ET = int(os.getenv("PREOPEN_READINESS_END_MINUTE_ET", "0"))
 
 
 def _now_et(now: datetime | None = None) -> datetime:
@@ -33,6 +37,20 @@ def _normalize_mode(value: str | None) -> str:
 def _after_929_et(now: datetime | None = None) -> bool:
     dt = _now_et(now)
     return dt.weekday() < 5 and (dt.hour > 9 or (dt.hour == 9 and dt.minute >= 29))
+
+
+def _is_market_day(now: datetime | None = None) -> bool:
+    return _now_et(now).weekday() < 5
+
+
+def _readiness_enforcement_active(now: datetime | None = None) -> bool:
+    dt = _now_et(now)
+    if not _is_market_day(dt):
+        return False
+    current = dt.hour * 60 + dt.minute
+    start = READINESS_ENFORCEMENT_START_HOUR_ET * 60 + READINESS_ENFORCEMENT_START_MINUTE_ET
+    end = READINESS_ENFORCEMENT_END_HOUR_ET * 60 + READINESS_ENFORCEMENT_END_MINUTE_ET
+    return start <= current <= end
 
 
 def _pod_mode() -> str:
@@ -643,6 +661,7 @@ def run_preopen_autonomous_readiness(
 
 def get_preopen_readiness_health(now: datetime | None = None) -> dict:
     trading_date = _trading_date(now)
+    enforcement_active = _readiness_enforcement_active(now)
     rows = _latest_preopen_rows(trading_date)
     expected = _expected_clients_by_mode()
     by_mode: dict[str, dict[str, Any]] = {
@@ -682,23 +701,32 @@ def get_preopen_readiness_health(now: datetime | None = None) -> dict:
         if row.get("last_error"):
             by_mode[mode]["errors"].append(row.get("last_error"))
 
-    all_statuses = []
+    observed_statuses = []
+    missing_expected_clients: dict[str, list[str]] = {"paper": [], "live": []}
     for mode, client_ids in expected.items():
         for client_id in client_ids:
-            all_statuses.append(str(by_mode[mode]["clients"].get(client_id, {}).get("status") or "missing").upper())
+            status = str(by_mode[mode]["clients"].get(client_id, {}).get("status") or "missing").upper()
+            if status == "MISSING":
+                missing_expected_clients[mode].append(client_id)
+            else:
+                observed_statuses.append(status)
 
-    if any(s == "BLOCKED" for s in all_statuses):
+    if any(s == "BLOCKED" for s in observed_statuses):
         overall = "BLOCKED"
-    elif any(s in {"DEGRADED", "MISSING"} for s in all_statuses):
+    elif any(s == "DEGRADED" for s in observed_statuses):
+        overall = "DEGRADED"
+    elif enforcement_active and any(missing_expected_clients.values()):
         overall = "DEGRADED"
     else:
         overall = "OK"
 
     return {
         "status": overall,
+        "enforcement_active": enforcement_active,
         "trading_date": trading_date,
         "paper": by_mode["paper"],
         "live": by_mode["live"],
+        "missing_expected_clients": missing_expected_clients,
         "last_run_at": max(filter(None, [by_mode["paper"]["last_run_at"], by_mode["live"]["last_run_at"]]), default=None),
-        "errors": by_mode["paper"]["errors"] + by_mode["live"]["errors"],
+        "errors": by_mode["paper"]["errors"] + by_mode["live"]["errors],
     }
