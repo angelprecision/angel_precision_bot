@@ -36,6 +36,8 @@ JOB_TARGET_MINUTE = {
     MORNING_HANDOFF_BACKUP_JOB: (9, 31),
 }
 
+DEFAULT_SCHEDULED_TOLERANCE_MINUTES = 20
+
 
 def build_overnight_reeval_payload(
     *,
