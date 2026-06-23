@@ -19,6 +19,11 @@ on:
           - overnight_reeval
           - morning_handoff_primary
           - morning_handoff_backup
+      force_window:
+        description: "Bypass ET timing window for manual recovery"
+        required: false
+        default: false
+        type: boolean
 
 jobs:
   paper-morning-jobs:
@@ -61,6 +66,7 @@ jobs:
           MORNING_JOB_CLIENT_ID: ${{ matrix.client_id }}
           MORNING_JOB_EXECUTION_MODE: paper
           MORNING_JOB_TIMEOUT_SECONDS: "180"
-          MORNING_JOB_FORCE_WINDOW: ${{ github.event_name == 'schedule' && '1' || '0' }}
+          MORNING_JOB_TOLERANCE_MINUTES: "20"
+          MORNING_JOB_FORCE_WINDOW: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.force_window == 'true' && '1' || '0' }}
         run: |
           python3 ap/scripts/live_morning_jobs.py
