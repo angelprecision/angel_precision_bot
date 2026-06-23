@@ -1615,43 +1615,83 @@ class APExecutionCore:
         # Paper and non-Jason live skip this entirely (helper returns no-op).
         _pr180_audit_extras: dict = {}
         if _pr180_is_named_live_client(self.client_id, self.paper):
+            # PR #180 amendment — production-safe field resolution.
+            # _submit_quote_fields may not have every field populated under
+            # every refresh path; fall back to the local variables that the
+            # ask-refresh produced, then derive a spread if necessary.
+            # Order of resolution:
+            #   bid: dict["submit_bid"] -> None (computed from ask/mid impossible)
+            #   mid: dict["submit_mid"] -> None
+            #   ask: dict["submit_ask"] -> local _submit_ask (always set by refresh)
+            #   spread_pct: dict["spread_pct"] -> dict["spread_pct_at_submit"]
+            #              -> compute from (ask - bid)/mid if bid/mid/ask all present
+            _pr180_bid = _submit_quote_fields.get("submit_bid")
+            _pr180_mid = _submit_quote_fields.get("submit_mid")
+            _pr180_ask = (
+                _submit_quote_fields.get("submit_ask")
+                if _submit_quote_fields.get("submit_ask") is not None
+                else (float(_submit_ask) if _submit_ask else None)
+            )
+            _pr180_spread = (
+                _submit_quote_fields.get("spread_pct")
+                if _submit_quote_fields.get("spread_pct") is not None
+                else _submit_quote_fields.get("spread_pct_at_submit")
+            )
+            _pr180_spread_source = (
+                "spread_pct"            if _submit_quote_fields.get("spread_pct") is not None
+                else "spread_pct_at_submit" if _submit_quote_fields.get("spread_pct_at_submit") is not None
+                else "missing"
+            )
+            # Computed-spread fallback — ONLY when all three of bid/mid/ask are
+            # present (non-None and non-zero). Missing bid/mid/ask must still
+            # fall through to ENTRY_QUOTE_INCOMPLETE_LIVE in the helper.
+            if (
+                _pr180_spread is None
+                and _pr180_bid is not None and _pr180_bid > 0
+                and _pr180_mid is not None and _pr180_mid > 0
+                and _pr180_ask is not None and _pr180_ask > 0
+            ):
+                _pr180_spread = (float(_pr180_ask) - float(_pr180_bid)) / float(_pr180_mid)
+                _pr180_spread_source = "computed_from_bid_mid_ask"
+
             _pr180_decision, _pr180_limit, _pr180_audit_extras = (
                 _pr180_jason_live_entry_pricing_guard(
-                    submit_bid    = _submit_quote_fields.get("submit_bid"),
-                    submit_mid    = _submit_quote_fields.get("submit_mid"),
-                    submit_ask    = _submit_quote_fields.get("submit_ask")
-                                    if _submit_quote_fields.get("submit_ask") is not None
-                                    else float(_submit_ask),
-                    spread_pct    = _submit_quote_fields.get("spread_pct"),
-                    proposed_limit= submit_limit,
+                    submit_bid     = _pr180_bid,
+                    submit_mid     = _pr180_mid,
+                    submit_ask     = _pr180_ask,
+                    spread_pct     = _pr180_spread,
+                    proposed_limit = submit_limit,
                 )
             )
+            # Mirror the resolved spread under both keys so dashboards and
+            # downstream queries can find it regardless of which alias they
+            # use. pr180_input_spread_pct is already set by the helper.
+            _pr180_audit_extras["spread_pct_at_submit"]   = _pr180_spread
+            _pr180_audit_extras["pr180_spread_source"]    = _pr180_spread_source
             if _pr180_decision == "BLOCK":
                 _pr180_reason = _pr180_audit_extras.get("pr180_block_reason", "PR180_BLOCKED")
                 _entry_pricing_decision = _pr180_reason
                 log.critical(
                     "[%s] PR180_ENTRY_PRICING_BLOCK — %s | "
-                    "contract=%s bid=%s mid=%s ask=%s spread_pct=%s proposed_limit=%.2f "
-                    "client_id=%s",
+                    "contract=%s bid=%s mid=%s ask=%s spread_pct=%s spread_source=%s "
+                    "proposed_limit=%.2f client_id=%s",
                     ticker, _pr180_reason, approved_contract,
-                    _submit_quote_fields.get("submit_bid"),
-                    _submit_quote_fields.get("submit_mid"),
-                    _submit_quote_fields.get("submit_ask"),
-                    _submit_quote_fields.get("spread_pct"),
-                    submit_limit, self.client_id,
+                    _pr180_bid, _pr180_mid, _pr180_ask, _pr180_spread,
+                    _pr180_spread_source, submit_limit, self.client_id,
                 )
                 _terminalize_breach_failure(
                     f"pr180_block:{_pr180_reason.lower()}:"
-                    f"spread={_submit_quote_fields.get('spread_pct')!r}:"
+                    f"spread={_pr180_spread!r}:"
                     f"limit={submit_limit:.2f}"
                 )
                 return
             if _pr180_decision == "REPRICE_PROCEED" and _pr180_limit is not None:
                 log.info(
                     "[%s] PR180_ENTRY_REPRICED — controlled-limit band | "
-                    "contract=%s old_limit=%.2f new_limit=%.2f spread_pct=%.3f client_id=%s",
+                    "contract=%s old_limit=%.2f new_limit=%.2f spread_pct=%.3f "
+                    "spread_source=%s client_id=%s",
                     ticker, approved_contract, submit_limit, _pr180_limit,
-                    float(_submit_quote_fields.get("spread_pct") or 0.0), self.client_id,
+                    float(_pr180_spread or 0.0), _pr180_spread_source, self.client_id,
                 )
                 submit_limit = _pr180_limit
         # ──────────────────────────────────────────────────────────────────────

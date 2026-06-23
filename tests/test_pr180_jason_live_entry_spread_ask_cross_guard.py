@@ -413,3 +413,281 @@ def test_merge_rule_mark_loss_block_prevents_submit():
     )
     assert trap.submit_called is False
     assert "entry_expected_mark_loss_too_high" in (trap.terminalize_reason or "")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PR #180 amendment tests — production-safe field resolution
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Production reality: `_submit_quote_fields` (the dict returned by
+# `_refresh_ask_at_submit`) may not have every field populated under every
+# refresh path, and historical code paths have used both `spread_pct` and
+# `spread_pct_at_submit` as keys.  The call site in `_on_entry_trigger`
+# now resolves fields through both aliases and the local `_submit_ask`
+# variable, and computes the spread from bid/mid/ask when neither alias
+# is present.
+#
+# These tests simulate the production resolution logic — they take a
+# `_submit_quote_fields`-shaped dict and an optional `_submit_ask` local
+# variable, do the same resolution the call site does, and pass the
+# resolved values to the (unchanged) pure helper.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _resolve_fields_like_call_site(
+    *,
+    submit_quote_fields: dict,
+    submit_ask_local: float | None,
+) -> dict:
+    """
+    Mirror exactly the resolution logic the production call site uses.
+    Returns a kwargs dict ready to pass to the helper.
+    """
+    bid = submit_quote_fields.get("submit_bid")
+    mid = submit_quote_fields.get("submit_mid")
+    ask = (
+        submit_quote_fields.get("submit_ask")
+        if submit_quote_fields.get("submit_ask") is not None
+        else (float(submit_ask_local) if submit_ask_local else None)
+    )
+    spread = (
+        submit_quote_fields.get("spread_pct")
+        if submit_quote_fields.get("spread_pct") is not None
+        else submit_quote_fields.get("spread_pct_at_submit")
+    )
+    # Compute-spread fallback — only when bid/mid/ask are all present
+    if (
+        spread is None
+        and bid is not None and bid > 0
+        and mid is not None and mid > 0
+        and ask is not None and ask > 0
+    ):
+        spread = (float(ask) - float(bid)) / float(mid)
+    return {
+        "submit_bid": bid,
+        "submit_mid": mid,
+        "submit_ask": ask,
+        "spread_pct": spread,
+    }
+
+
+def test_amendment_1_quote_with_spread_pct_at_submit_only_does_not_false_block():
+    """
+    Production sometimes provides spread under `spread_pct_at_submit` only
+    (the orders.meta canonical name).  The call site must accept it and
+    not false-block as ENTRY_QUOTE_INCOMPLETE_LIVE.
+    """
+    resolved = _resolve_fields_like_call_site(
+        submit_quote_fields={
+            "submit_bid": 1.00,
+            "submit_mid": 1.03,
+            "submit_ask": 1.06,
+            # NOTE: spread_pct is missing; only spread_pct_at_submit is set
+            "spread_pct_at_submit": 0.055,
+        },
+        submit_ask_local=1.06,
+    )
+    assert resolved["spread_pct"] == 0.055, (
+        "call site must resolve spread_pct_at_submit when spread_pct is absent"
+    )
+    decision, limit, audit = core._pr180_jason_live_entry_pricing_guard(
+        **resolved, proposed_limit=1.07,
+    )
+    assert decision == "PROCEED", f"clean spread under alias must proceed, got {decision}"
+    assert "pr180_block_reason" not in audit
+
+
+def test_amendment_2_spread_missing_computed_from_bid_mid_ask():
+    """
+    Neither `spread_pct` nor `spread_pct_at_submit` is present, but bid/mid/ask
+    are.  The call site must compute the spread as (ask - bid) / mid and
+    proceed with that derived value.
+    """
+    resolved = _resolve_fields_like_call_site(
+        submit_quote_fields={
+            "submit_bid": 1.00,
+            "submit_mid": 1.03,
+            "submit_ask": 1.06,
+            # NOTE: no spread fields at all
+        },
+        submit_ask_local=1.06,
+    )
+    # (1.06 - 1.00) / 1.03 = 0.0583
+    expected = (1.06 - 1.00) / 1.03
+    assert abs(resolved["spread_pct"] - expected) < 1e-9, (
+        f"computed spread must equal (ask-bid)/mid={expected}, got {resolved['spread_pct']}"
+    )
+    decision, _, audit = core._pr180_jason_live_entry_pricing_guard(
+        **resolved, proposed_limit=1.07,
+    )
+    assert decision == "PROCEED"
+    assert "pr180_block_reason" not in audit
+
+
+def test_amendment_3_nke_style_spread_pct_at_submit_blocks():
+    """
+    NKE-style production data carrying the bad spread under the
+    spread_pct_at_submit alias must still BLOCK with
+    ENTRY_SPREAD_TOO_WIDE_LIVE.  This proves the fix doesn't open a
+    new bypass.
+    """
+    resolved = _resolve_fields_like_call_site(
+        submit_quote_fields={
+            "submit_bid": 1.30,
+            "submit_mid": 1.38,
+            "submit_ask": 1.46,
+            "spread_pct_at_submit": 0.1159,   # 11.59% under the alias
+        },
+        submit_ask_local=1.46,
+    )
+    assert resolved["spread_pct"] == 0.1159
+    decision, _, audit = core._pr180_jason_live_entry_pricing_guard(
+        **resolved, proposed_limit=1.47,
+    )
+    assert decision == "BLOCK", "NKE-style wide spread under alias MUST still block"
+    assert audit["pr180_block_reason"] == "ENTRY_SPREAD_TOO_WIDE_LIVE"
+
+
+def test_amendment_4_clean_spread_computed_proceeds():
+    """
+    Tight bid/mid/ask, no spread field at all — must compute to under
+    the threshold and proceed.
+    """
+    resolved = _resolve_fields_like_call_site(
+        submit_quote_fields={
+            "submit_bid": 1.40,
+            "submit_mid": 1.42,
+            "submit_ask": 1.45,
+            # no spread at all
+        },
+        submit_ask_local=1.45,
+    )
+    # (1.45 - 1.40) / 1.42 = 0.0352 → well under 8%
+    decision, _, audit = core._pr180_jason_live_entry_pricing_guard(
+        **resolved, proposed_limit=1.46,
+    )
+    assert decision == "PROCEED"
+    assert resolved["spread_pct"] < core.PR180_MAX_SPREAD_PCT
+
+
+def test_amendment_5_missing_bid_mid_ask_still_blocks_incomplete():
+    """
+    The compute-spread fallback must NOT fire when bid/mid/ask are missing.
+    The helper must still see None for the critical fields and block as
+    ENTRY_QUOTE_INCOMPLETE_LIVE.  This is the safety floor.
+    """
+    # Case A: everything missing
+    resolved = _resolve_fields_like_call_site(
+        submit_quote_fields={
+            "submit_bid": None,
+            "submit_mid": None,
+            "submit_ask": None,
+        },
+        submit_ask_local=None,
+    )
+    decision, _, audit = core._pr180_jason_live_entry_pricing_guard(
+        **resolved, proposed_limit=1.46,
+    )
+    assert decision == "BLOCK"
+    assert audit["pr180_block_reason"] == "ENTRY_QUOTE_INCOMPLETE_LIVE"
+
+    # Case B: mid missing — cannot compute spread
+    resolved = _resolve_fields_like_call_site(
+        submit_quote_fields={
+            "submit_bid": 1.30,
+            "submit_mid": None,
+            "submit_ask": 1.46,
+        },
+        submit_ask_local=1.46,
+    )
+    decision, _, audit = core._pr180_jason_live_entry_pricing_guard(
+        **resolved, proposed_limit=1.47,
+    )
+    assert decision == "BLOCK"
+    assert audit["pr180_block_reason"] == "ENTRY_QUOTE_INCOMPLETE_LIVE"
+
+    # Case C: bid missing — cannot compute spread; helper must still block
+    resolved = _resolve_fields_like_call_site(
+        submit_quote_fields={
+            "submit_bid": None,
+            "submit_mid": 1.38,
+            "submit_ask": 1.46,
+        },
+        submit_ask_local=1.46,
+    )
+    # In this case bid=None, so the compute branch is skipped → spread None
+    # → helper blocks on the spread_pct is None check.
+    assert resolved["spread_pct"] is None
+    decision, _, audit = core._pr180_jason_live_entry_pricing_guard(
+        **resolved, proposed_limit=1.47,
+    )
+    assert decision == "BLOCK"
+    assert audit["pr180_block_reason"] == "ENTRY_QUOTE_INCOMPLETE_LIVE"
+
+
+def test_amendment_zero_bid_does_not_compute_false_spread():
+    """
+    Zero is treated as 'not present' for the compute fallback.  Bid=0
+    would give a nonsensical spread; we must block instead of computing
+    (ask-0)/mid ≈ 100% and then BLOCKing on the ceiling (correct outcome,
+    wrong reason — we want ENTRY_QUOTE_INCOMPLETE_LIVE for diagnostics).
+    """
+    resolved = _resolve_fields_like_call_site(
+        submit_quote_fields={
+            "submit_bid": 0.0,        # ← treated as missing
+            "submit_mid": 1.38,
+            "submit_ask": 1.46,
+        },
+        submit_ask_local=1.46,
+    )
+    assert resolved["spread_pct"] is None, "bid=0 must not produce a computed spread"
+    decision, _, audit = core._pr180_jason_live_entry_pricing_guard(
+        **resolved, proposed_limit=1.47,
+    )
+    assert decision == "BLOCK"
+    assert audit["pr180_block_reason"] == "ENTRY_QUOTE_INCOMPLETE_LIVE"
+
+
+def test_amendment_spread_pct_takes_precedence_over_alias():
+    """
+    If both `spread_pct` and `spread_pct_at_submit` are present, the
+    canonical `spread_pct` wins.  Mismatch shouldn't happen in production
+    but if it does, we want predictable behavior.
+    """
+    resolved = _resolve_fields_like_call_site(
+        submit_quote_fields={
+            "submit_bid": 1.30,
+            "submit_mid": 1.38,
+            "submit_ask": 1.46,
+            "spread_pct": 0.055,                # canonical
+            "spread_pct_at_submit": 0.1159,    # alias (stale)
+        },
+        submit_ask_local=1.46,
+    )
+    assert resolved["spread_pct"] == 0.055, (
+        "canonical spread_pct must win over alias when both present"
+    )
+
+
+def test_amendment_local_submit_ask_fallback_used():
+    """
+    When the dict has submit_ask=None but the local _submit_ask is set,
+    the call site must use the local fallback so the helper doesn't
+    false-block.
+    """
+    resolved = _resolve_fields_like_call_site(
+        submit_quote_fields={
+            "submit_bid": 1.00,
+            "submit_mid": 1.03,
+            "submit_ask": None,         # missing from dict
+            "spread_pct": 0.055,
+        },
+        submit_ask_local=1.06,           # available as local
+    )
+    assert resolved["submit_ask"] == 1.06, (
+        "local _submit_ask must be used when dict submit_ask is None"
+    )
+    decision, _, _ = core._pr180_jason_live_entry_pricing_guard(
+        **resolved, proposed_limit=1.07,
+    )
+    assert decision == "PROCEED"
