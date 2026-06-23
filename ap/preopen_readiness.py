@@ -214,18 +214,56 @@ def _expected_clients_by_mode() -> dict[str, list[str]]:
 
 
 def _broker_credentials_present(runner, execution_mode: str) -> tuple[bool, dict]:
-    base_url = str(getattr(runner, "base_url", "") or "")
-    account_id = str(getattr(runner, "account_id", "") or "")
-    token_present = False
-    try:
-        token_present = bool(getattr(runner, "_get_token", lambda: None)())
-    except Exception:
-        token_present = False
-    ok = bool(base_url and account_id and token_present)
-    return ok, {
+    member = getattr(runner, "member", None) or {}
+    broker = getattr(getattr(runner, "core", None), "broker", None)
+    broker_cfg = getattr(broker, "cfg", None)
+    base_url = str(
+        getattr(runner, "base_url", None)
+        or getattr(broker, "base_url", None)
+        or getattr(broker_cfg, "base_url", None)
+        or ""
+    )
+    account_id = str(
+        getattr(runner, "account_id", None)
+        or getattr(broker, "account_id", None)
+        or getattr(broker_cfg, "account_id", None)
+        or ""
+    )
+
+    token_candidates: list[tuple[str, Any]] = [
+        ("runner._resolved_tradier_token", getattr(runner, "_resolved_tradier_token", None)),
+        ("broker.access_token", getattr(broker, "access_token", None)),
+        ("broker._access_token", getattr(broker, "_access_token", None)),
+        ("broker.cfg.access_token", getattr(broker_cfg, "access_token", None)),
+    ]
+    if execution_mode == "live":
+        token_candidates.extend([
+            ("member.tradier_live_access_token", member.get("tradier_live_access_token")),
+            ("env.TRADIER_ACCESS_TOKEN", os.getenv("TRADIER_ACCESS_TOKEN")),
+        ])
+    else:
+        token_candidates.extend([
+            ("member.tradier_paper_access_token", member.get("tradier_paper_access_token")),
+            ("member.tradier_access_token", member.get("tradier_access_token")),
+            ("env.TRADIER_ACCESS_TOKEN", os.getenv("TRADIER_ACCESS_TOKEN")),
+        ])
+
+    token_sources = [
+        name for name, value in token_candidates
+        if str(value or "").strip()
+    ]
+    token_state = "configured" if token_sources else ("uncertain" if hasattr(runner, "_get_token") else "missing")
+    status = "configured" if (base_url and account_id and token_sources) else "missing"
+    if status != "configured" and base_url and account_id and token_state == "uncertain":
+        status = "uncertain"
+
+    return status == "configured", {
         "base_url": base_url,
         "account_id_present": bool(account_id),
-        "token_present": bool(token_present),
+        "token_state": token_state,
+        "token_present": bool(token_sources),
+        "token_sources": token_sources,
+        "credential_status": status,
         "execution_mode": execution_mode,
     }
 
@@ -384,10 +422,28 @@ def _pending_trigger_without_watcher(runner, pending_rows: list[dict]) -> list[d
     return out
 
 
-def _overnight_status(runner, client_state: dict, trading_date: str) -> tuple[str, dict]:
+def _overnight_status(
+    runner,
+    client_state: dict,
+    trading_date: str,
+    *,
+    client_id: str,
+    execution_mode: str,
+) -> tuple[str, dict]:
     last_ran = getattr(runner, "_last_overnight_reeval_date", None)
     if str(last_ran or "") == trading_date:
         return "success", {"source": "runner_last_overnight_reeval_date"}
+    from ap.morning_handoff import _latest_handoff_rows
+
+    for row in _latest_handoff_rows(trading_date):
+        if (
+            str(row.get("client_id") or "").strip() == client_id
+            and _normalize_mode(row.get("execution_mode")) == execution_mode
+            and str(row.get("stage") or "").strip().lower() == "post_overnight_reeval"
+            and str(row.get("status") or "").strip().lower() == "success"
+            and row.get("last_success_at")
+        ):
+            return "success", {"source": "handoff_run_locks.post_overnight_reeval"}
     if int(client_state.get("watching_count", 0) or 0) == 0 and not client_state.get("pending_trigger_rows"):
         return "explicit_noop", {"source": "no_watching_or_pending_trigger_rows"}
     return "missing", {"source": "watching_or_pending_trigger_present_without_overnight_success"}
@@ -498,8 +554,11 @@ def run_preopen_autonomous_readiness(
 
     broker_ok, broker_details = _broker_credentials_present(runner, mode)
     details["broker_credentials"] = broker_details
-    if not broker_ok:
+    broker_state = str(broker_details.get("credential_status") or "missing").lower()
+    if not broker_ok and broker_state == "missing":
         errors.append("broker_credentials_missing")
+    elif not broker_ok:
+        warnings.append("broker_credentials_unverified")
 
     selector_identity = _selector_identity(runner)
     details["selector_identity"] = selector_identity
@@ -528,7 +587,13 @@ def run_preopen_autonomous_readiness(
     if unowned_pending:
         errors.append("pending_trigger_without_watcher_ownership")
 
-    overnight_state, overnight_details = _overnight_status(runner, client_state, trading_date)
+    overnight_state, overnight_details = _overnight_status(
+        runner,
+        client_state,
+        trading_date,
+        client_id=client_id,
+        execution_mode=mode,
+    )
     details["overnight_reeval"] = {"status": overnight_state, **overnight_details}
     if overnight_state == "missing":
         if mode == "live" or _after_929_et(now):
