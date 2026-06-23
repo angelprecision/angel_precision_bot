@@ -401,3 +401,205 @@ def test_merge_rule_paper_always_reaches_submit():
     trap = _simulate_submit_call_site(pos, "SOFT_LOSS", "SOFT_LOSS — degraded")
     assert trap.submit_called is True, "paper SOFT_LOSS reaches SUBMIT unchanged"
     assert trap.hold_called is False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PR #179 amendment tests
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Two safety fixes applied before merge:
+#   1. Broad "RECONCILER" text fragment removed from bypass list.  Generic
+#      reconciler paths (e.g. RECONCILER_AUTO_CLOSE) must NOT skip the
+#      degraded live soft-exit guard.  Only explicit broker-gone codes
+#      (RECONCILER_BROKER_GONE, BROKER_POSITION_GONE) bypass.
+#   2. Gated soft-exit text fragments added so production reasons that
+#      carry the soft-exit meaning in text (even when reason_code is
+#      normalized differently) still trigger the guard.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_amendment_1_reconciler_auto_close_with_degraded_live_is_held():
+    """
+    RECONCILER_AUTO_CLOSE no longer bypasses by virtue of the "RECONCILER"
+    text fragment.  When wrapped around soft-exit text on a degraded live
+    position, the guard must HOLD.
+    """
+    pos = _make_pos(
+        ticker="NKE",
+        side="PUT",
+        execution_mode="live",
+        underlying_entry=0.0,
+        opened_at_minutes_ago=20.0,
+    )
+    should_hold, hold_code, extra = eng._pr176_should_hold(
+        pos,
+        decision_reason_code="RECONCILER_AUTO_CLOSE",
+        decision_reason_text="RECONCILER_AUTO_CLOSE wrapping NEVER GREEN STOP no_underlying_data",
+    )
+    assert should_hold is True, (
+        "RECONCILER_AUTO_CLOSE with degraded live context MUST NOT bypass — "
+        "this is the high-confidence-from-degraded-data hole"
+    )
+    assert hold_code == "DATA_DEGRADED_HOLD"
+    # Gated via the text fragment, not the unknown reason_code
+    assert extra.get("pr176_gated_by") == "reason_text"
+
+
+def test_amendment_1b_reconciler_broker_gone_still_bypasses():
+    """
+    The legitimate broker-gone case must still bypass: it is the position
+    is already closed at the broker so there is nothing to submit.
+    """
+    pos = _make_pos(
+        execution_mode="live",
+        underlying_entry=0.0,   # would otherwise trigger DATA_DEGRADED_HOLD
+        opened_at_minutes_ago=1.0,
+    )
+    should_hold, hold_code, _ = eng._pr176_should_hold(
+        pos,
+        decision_reason_code="RECONCILER_BROKER_GONE",
+        decision_reason_text="reconciler observed broker position is gone — flatten DB row",
+    )
+    assert should_hold is False, "RECONCILER_BROKER_GONE must still bypass cleanly"
+    assert hold_code == ""
+
+
+def test_amendment_2_soft_loss_with_manual_text_still_bypasses():
+    """
+    Order-of-checks invariant: manual-text bypass must run BEFORE the new
+    gated-text match.  reason_code=SOFT_LOSS (gated) with reason_text
+    containing 'MANUAL' must still proceed as a manual close.
+    """
+    pos = _make_pos(
+        execution_mode="live",
+        underlying_entry=0.0,
+        opened_at_minutes_ago=1.0,
+    )
+    should_hold, _, _ = eng._pr176_should_hold(
+        pos,
+        decision_reason_code="SOFT_LOSS",
+        decision_reason_text="MANUAL operator close requested via UI",
+    )
+    assert should_hold is False, (
+        "manual-text bypass must beat the gated-code check — operator override"
+    )
+
+
+def test_amendment_3_unknown_reason_code_with_gated_text_blocks_for_jason():
+    """
+    Production reasons may carry the soft-exit meaning in text even if the
+    reason_code is unrecognized (normalized by an upstream layer).  When
+    the text contains 'NEVER GREEN STOP' AND 'no_underlying_data', the
+    guard must HOLD on a Jason live position even though the reason_code
+    is not in _PR176_GATED_SOFT_REASON_CODES.
+    """
+    pos = _make_pos(
+        execution_mode="live",
+        client_id="jasoncosby1@gmail.com",
+        underlying_entry=0.0,
+        current_underlying=0.0,
+        opened_at_minutes_ago=20.0,
+    )
+    should_hold, hold_code, extra = eng._pr176_should_hold(
+        pos,
+        decision_reason_code="POST_NORMALIZED_EXIT",   # unknown to PR #176
+        decision_reason_text=(
+            "POST_NORMALIZED_EXIT wrapping NEVER GREEN STOP — thesis never "
+            "confirmed | underlying:no_underlying_data"
+        ),
+    )
+    assert should_hold is True, (
+        "gated text fragment MUST trigger the guard even with an unrecognized "
+        "reason_code — this is the upstream-normalization hole"
+    )
+    assert hold_code == "DATA_DEGRADED_HOLD"
+    assert extra.get("pr176_gated_by") == "reason_text"
+    # Both degraded signals should be visible
+    signals = extra.get("pr176_degraded_signals", [])
+    assert "underlying_entry_missing_or_zero" in signals
+    assert "decision_text_no_underlying_data" in signals
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Amendment merge-rule proofs — broker SUBMIT must not run in these cases
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_amendment_merge_rule_reconciler_auto_close_no_broker_submit():
+    pos = _make_pos(
+        execution_mode="live",
+        underlying_entry=0.0,
+        opened_at_minutes_ago=20.0,
+    )
+    trap = _simulate_submit_call_site(
+        pos,
+        "RECONCILER_AUTO_CLOSE",
+        "RECONCILER_AUTO_CLOSE wrapping NEVER GREEN STOP no_underlying_data",
+    )
+    assert trap.submit_called is False, (
+        "MERGE BLOCKER: RECONCILER_AUTO_CLOSE on degraded live must NOT reach broker"
+    )
+    assert trap.hold_called is True
+    assert trap.last_hold_reason_code == "DATA_DEGRADED_HOLD"
+
+
+def test_amendment_merge_rule_reconciler_broker_gone_does_submit():
+    """RECONCILER_BROKER_GONE must still proceed — DB cleanup path."""
+    pos = _make_pos(execution_mode="live", underlying_entry=0.0)
+    trap = _simulate_submit_call_site(
+        pos,
+        "RECONCILER_BROKER_GONE",
+        "broker position is gone",
+    )
+    assert trap.submit_called is True, "RECONCILER_BROKER_GONE must still proceed"
+    assert trap.hold_called is False
+
+
+def test_amendment_merge_rule_unknown_code_gated_text_no_submit():
+    pos = _make_pos(
+        execution_mode="live",
+        client_id="jasoncosby1@gmail.com",
+        underlying_entry=0.0,
+        opened_at_minutes_ago=20.0,
+    )
+    trap = _simulate_submit_call_site(
+        pos,
+        "POST_NORMALIZED_EXIT",
+        "POST_NORMALIZED_EXIT wrapping NEVER GREEN STOP no_underlying_data",
+    )
+    assert trap.submit_called is False, (
+        "MERGE BLOCKER: unknown reason_code + gated text on degraded live "
+        "must NOT reach broker"
+    )
+    assert trap.hold_called is True
+
+
+def test_amendment_paper_with_reconciler_auto_close_still_unchanged():
+    """Paper must remain unaffected by the amendment — guard is a no-op."""
+    pos = _make_pos(
+        execution_mode="paper",
+        underlying_entry=0.0,
+        opened_at_minutes_ago=20.0,
+    )
+    should_hold, _, _ = eng._pr176_should_hold(
+        pos,
+        decision_reason_code="RECONCILER_AUTO_CLOSE",
+        decision_reason_text="RECONCILER_AUTO_CLOSE NEVER GREEN STOP no_underlying_data",
+    )
+    assert should_hold is False, "paper must NEVER be gated"
+
+
+def test_amendment_non_jason_live_with_gated_text_unaffected():
+    """Non-Jason live with blank/unknown execution_mode is not on allowlist."""
+    pos = _make_pos(
+        execution_mode="",
+        client_id="some-other-live-client@example.com",  # not on PR176_LIVE_CLIENT_IDS
+        underlying_entry=0.0,
+        opened_at_minutes_ago=20.0,
+    )
+    should_hold, _, _ = eng._pr176_should_hold(
+        pos,
+        decision_reason_code="POST_NORMALIZED_EXIT",
+        decision_reason_text="NEVER GREEN STOP no_underlying_data",
+    )
+    assert should_hold is False, (
+        "non-allowlisted client with blank execution_mode must not be gated"
+    )

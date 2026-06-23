@@ -1270,10 +1270,25 @@ _PR176_ALWAYS_ALLOWED_TEXT_FRAGMENTS = (
     "MANUAL",
     "EMERGENCY",
     "BROKER POSITION GONE",
-    "RECONCILER",
+    # PR #179 amendment: removed broad "RECONCILER" fragment — generic reconciler
+    # paths must NOT bypass the degraded live soft-exit guard.  Only the
+    # explicit broker-gone reason codes (RECONCILER_BROKER_GONE,
+    # BROKER_POSITION_GONE) in _PR176_ALWAYS_ALLOWED_REASON_CODES bypass.
     "HARD STOP",
     "HARD DISASTER",
     "FORCE CLOSE",
+)
+
+# PR #179 amendment: text fragments that imply a gated soft-exit even when the
+# reason_code is unfamiliar/normalized differently.  Production reasons may
+# carry the soft-exit meaning in text (e.g. RECONCILER_AUTO_CLOSE wrapping a
+# "NEVER GREEN STOP ... no_underlying_data" decision) while reason_code reads
+# as something we don't recognize.  Any of these fragments in reason_text
+# triggers the same live-risk + degraded check.
+_PR176_GATED_SOFT_TEXT_FRAGMENTS = (
+    "NEVER GREEN STOP",
+    "THESIS_FAIL_SOFT_STOP",
+    "NO_UNDERLYING_DATA",
 )
 
 # Live-only minimum hold floors (minutes). These override the global
@@ -1367,13 +1382,22 @@ def _pr176_should_hold(
     should_hold=True means: do NOT submit the broker exit. Emit a HOLD event
     instead. The caller MUST `continue` to the next position in the loop.
     """
-    # 1) Always-allowed paths never gated
+    # 1) Always-allowed paths never gated.  Runs FIRST so manual/EOD/hard
+    #    text wins even when paired with a gated soft reason_code.
     if _pr176_reason_is_always_allowed(decision_reason_code, decision_reason_text):
         return False, "", {}
 
-    # 2) Only gate the soft exit reason codes
+    # 2) Gate when EITHER:
+    #      reason_code is in the gated soft-exit set, OR
+    #      reason_text contains a gated soft-exit fragment.
+    #    PR #179 amendment: text-fragment match catches production reasons
+    #    where the soft-exit meaning lives in the text (e.g. an unfamiliar
+    #    reason_code wrapping "NEVER GREEN STOP ... no_underlying_data").
     rc = (decision_reason_code or "").upper().strip()
-    if rc not in _PR176_GATED_SOFT_REASON_CODES:
+    rt = (decision_reason_text or "").upper()
+    code_is_gated = rc in _PR176_GATED_SOFT_REASON_CODES
+    text_is_gated = any(frag in rt for frag in _PR176_GATED_SOFT_TEXT_FRAGMENTS)
+    if not (code_is_gated or text_is_gated):
         return False, "", {}
 
     # 3) Only gate live-risk positions
@@ -1386,22 +1410,27 @@ def _pr176_should_hold(
         return True, "DATA_DEGRADED_HOLD", {
             "pr176_degraded_signals": signals,
             "pr176_reason_code": rc,
+            "pr176_gated_by": "reason_code" if code_is_gated else "reason_text",
             "pr176_execution_mode": (getattr(pos, "execution_mode", "") or "").lower().strip() or "unknown",
             "pr176_client_id": getattr(pos, "client_id", "") or "",
             "pr176_underlying_entry": getattr(pos, "underlying_entry", None),
             "pr176_current_underlying": getattr(pos, "current_underlying", None),
         }
 
-    # 5) Live-only minimum hold: SOFT_LOSS<8min and NEVER_GREEN_STOP<12min held
-    held_short, age_min, floor_min = _pr176_live_min_hold_blocks(pos, rc)
-    if held_short:
-        return True, "LIVE_MIN_HOLD_NOT_MET", {
-            "pr176_reason_code": rc,
-            "pr176_age_min": age_min,
-            "pr176_floor_min": floor_min,
-            "pr176_execution_mode": (getattr(pos, "execution_mode", "") or "").lower().strip() or "unknown",
-            "pr176_client_id": getattr(pos, "client_id", "") or "",
-        }
+    # 5) Live-only minimum hold: SOFT_LOSS<8min and NEVER_GREEN_STOP<12min held.
+    #    Hold floors are keyed off reason_code, so they only apply when
+    #    code_is_gated; text-only matches (without a recognized rc) fall
+    #    through to the no-hold return below if data is clean.
+    if code_is_gated:
+        held_short, age_min, floor_min = _pr176_live_min_hold_blocks(pos, rc)
+        if held_short:
+            return True, "LIVE_MIN_HOLD_NOT_MET", {
+                "pr176_reason_code": rc,
+                "pr176_age_min": age_min,
+                "pr176_floor_min": floor_min,
+                "pr176_execution_mode": (getattr(pos, "execution_mode", "") or "").lower().strip() or "unknown",
+                "pr176_client_id": getattr(pos, "client_id", "") or "",
+            }
 
     return False, "", {}
 
