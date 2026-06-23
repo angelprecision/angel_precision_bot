@@ -156,7 +156,7 @@ def test_app_source_supports_filtered_overnight_and_morning_handoff():
     src = (REPO_ROOT / "app.py").read_text()
     assert 'body.get("clients")' in src
     assert '@app.post("/admin/morning_handoff_audit")' in src
-    assert "APStartupRecovery" in src
+    assert "run_morning_handoff_audit" in src
 
 
 def test_no_code_path_calls_broker_submit_or_cancel_directly():

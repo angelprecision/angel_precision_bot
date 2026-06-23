@@ -35,6 +35,7 @@ def status():
     from ap_health_registry import HEALTH
     from ap_kill_switch import KILL
     from ap_quote_authority import QUOTES
+    from ap.morning_handoff import get_morning_handoff_health
 
     return jsonify({
         "system_healthy":     HEALTH.is_system_healthy(),
@@ -43,6 +44,7 @@ def status():
         "quote_rejects":      QUOTES.reject_count,
         "unhealthy_critical": HEALTH.unhealthy_critical_organs(),
         "organs":             HEALTH.snapshot(),
+        "morning_handoff":    get_morning_handoff_health(),
     })
 
 

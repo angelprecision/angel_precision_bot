@@ -791,6 +791,7 @@ def create_app() -> Flask:
     def health():
         try:
             st = load_state(client_id=DEFAULT_CLIENT_ID)
+            from ap.morning_handoff import get_morning_handoff_health
             heartbeat_ok = False
             heartbeat_age = None
             if st.get("last_heartbeat_ts"):
@@ -802,12 +803,18 @@ def create_app() -> Flask:
                     pass
 
             all_ok = heartbeat_ok or heartbeat_age is None
+            morning_handoff = get_morning_handoff_health()
+            if morning_handoff.get("live", {}).get("missing_after_929_et"):
+                all_ok = False
+            if morning_handoff.get("paper", {}).get("missing_after_929_et"):
+                all_ok = False
             resp = {
                 "ok": all_ok,
                 "status": "healthy" if all_ok else "degraded",
                 "mode": st.get("mode", "UNKNOWN"),
                 "kill_switch": st.get("kill_switch", False),
                 "heartbeat_age_seconds": heartbeat_age,
+                "morning_handoff": morning_handoff,
             }
 
             if APP_ENV != "prod":
@@ -2848,6 +2855,7 @@ def create_app() -> Flask:
             from client_runner import _active_runners, _registry_lock
             from ap_overnight_reeval import run_overnight_reeval
             from ap.morning_jobs import select_runner_items
+            from ap.morning_handoff import run_morning_handoff_audit
             import time as _time
 
             body = request.get_json(silent=True) or {}
@@ -2858,6 +2866,7 @@ def create_app() -> Flask:
             async_background = bool(body.get("async_background", False))
 
             results = {}
+            handoff_results = {}
             with _registry_lock:
                 runners = select_runner_items(
                     dict(_active_runners),
@@ -2893,6 +2902,14 @@ def create_app() -> Flask:
                     # Reset the daily gate so auto-run fires again tomorrow
                     runner._last_overnight_reeval_date = None
                     results[email] = result
+                    if int(result.get("armed", 0) or 0) > 0:
+                        handoff_results[email] = run_morning_handoff_audit(
+                            client_id=email,
+                            execution_mode=getattr(runner, "mode", None) or getattr(runner.master_control, "mode", None),
+                            stage="post_overnight_reeval",
+                            dry_run=False,
+                            runner=runner,
+                        )
                     log.info(f"overnight_reeval [{email}]: {result}")
                 except Exception as e:
                     import traceback as _tb
@@ -2911,6 +2928,7 @@ def create_app() -> Flask:
                 "async_background": False,
                 "total_armed": total_armed,
                 "total_rejected": total_rejected,
+                "handoff_results": handoff_results,
                 "results": results,
             })
         except Exception as e:
@@ -2930,12 +2948,14 @@ def create_app() -> Flask:
         """
         try:
             from client_runner import _active_runners, _registry_lock
-            from ap_recovery import APStartupRecovery
-            from ap.db import conn, run_with_retry
+            from ap.morning_handoff import run_morning_handoff_audit
 
             body = request.get_json(silent=True) or {}
             client_id = str(body.get("client_id") or "").strip()
-            execution_mode = str(body.get("execution_mode") or "").strip().lower()
+            requested_clients = body.get("clients") or []
+            if not client_id and requested_clients:
+                client_id = str(requested_clients[0] or "").strip()
+            execution_mode = str(body.get("execution_mode") or body.get("mode") or "").strip().lower()
             dry_run = bool(body.get("dry_run", False))
 
             if not client_id:
@@ -2960,81 +2980,15 @@ def create_app() -> Flask:
                     "actual_execution_mode": actual_mode,
                 }), 409
 
-            def _snapshot():
-                with conn() as c:
-                    c.execute(
-                        """
-                        SELECT
-                            COALESCE(SUM(CASE WHEN status = 'WATCHING' THEN 1 ELSE 0 END), 0)::int AS watching_rows,
-                            COALESCE(SUM(CASE WHEN status = 'NEW' THEN 1 ELSE 0 END), 0)::int AS new_rows
-                        FROM trade_queue
-                        WHERE client_id = %s
-                        """,
-                        (client_id,),
-                    )
-                    tq_row = c.fetchone()
-                    tq_cols = [d[0] for d in getattr(c, "description", [])]
-                    c.execute(
-                        """
-                        SELECT
-                            COALESCE(SUM(CASE WHEN status = 'PENDING_TRIGGER' THEN 1 ELSE 0 END), 0)::int AS pending_trigger_rows
-                        FROM orders
-                        WHERE client_id = %s
-                          AND kind = 'ENTRY'
-                        """,
-                        (client_id,),
-                    )
-                    orders_row = c.fetchone()
-                    orders_cols = [d[0] for d in getattr(c, "description", [])]
-                    tq = dict(tq_row or {}) if isinstance(tq_row, dict) else dict(zip(tq_cols, tq_row or ()))
-                    orders = (
-                        dict(orders_row or {})
-                        if isinstance(orders_row, dict)
-                        else dict(zip(orders_cols, orders_row or ()))
-                    )
-                    tq.update(orders)
-                    return tq
-
-            before = run_with_retry(_snapshot) or {}
-            recovery_result = {
-                "client_id": client_id,
-                "watchers_requeued": 0,
-                "errors": [],
-            }
-
-            if not dry_run:
-                core = getattr(runner, "core", None)
-                recovery = APStartupRecovery(
-                    client_id=client_id,
-                    broker=getattr(core, "broker", None) if core else None,
-                    osm=runner.order_state_machine,
-                    pm=runner.position_manager,
-                    master_control=runner.master_control,
-                    exit_engine=getattr(core, "exit_eng", None) if core else None,
-                    entry_watcher=getattr(core, "entry_watcher", None) if core else None,
-                )
-                recovery._reseed_watchers(recovery_result)
-
-            after = run_with_retry(_snapshot) or {}
-            log.info(
-                "morning_handoff_audit client=%s execution_mode=%s dry_run=%s watchers_requeued=%s before=%s after=%s",
-                client_id,
-                actual_mode,
-                dry_run,
-                recovery_result.get("watchers_requeued", 0),
-                before,
-                after,
+            result = run_morning_handoff_audit(
+                client_id=client_id,
+                execution_mode=actual_mode,
+                stage="manual",
+                dry_run=dry_run,
+                runner=runner,
             )
-            return jsonify({
-                "ok": True,
-                "client_id": client_id,
-                "execution_mode": actual_mode,
-                "dry_run": dry_run,
-                "watchers_requeued": int(recovery_result.get("watchers_requeued", 0) or 0),
-                "errors": list(recovery_result.get("errors") or []),
-                "before": before,
-                "after": after,
-            })
+            log.info("morning_handoff_audit client=%s execution_mode=%s result=%s", client_id, actual_mode, result)
+            return jsonify(result), 200 if result.get("ok") else 503
         except Exception as e:
             log.error("morning_handoff_audit endpoint failed: %s", e, exc_info=True)
             return jsonify({"ok": False, "error": str(e)}), 500

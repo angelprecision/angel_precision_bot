@@ -1162,8 +1162,42 @@ class ClientRunner(threading.Thread):
                 self.email, result["armed"], result["rejected"],
                 result["processed"], result["errors"],
             )
+            self._run_post_overnight_morning_handoff(result)
         except Exception as exc:
             logger.error("[%s] Overnight reeval error (non-fatal): %s", self.email, exc, exc_info=True)
+
+    def _run_startup_morning_handoff(self) -> None:
+        try:
+            from ap.morning_handoff import run_morning_handoff_audit
+
+            result = run_morning_handoff_audit(
+                client_id=self.email,
+                execution_mode=self.mode,
+                stage="startup",
+                dry_run=False,
+                runner=self,
+            )
+            logger.info("[%s] Startup morning handoff result: %s", self.email, result)
+        except Exception as exc:
+            logger.error("[%s] Startup morning handoff failed (non-fatal): %s", self.email, exc, exc_info=True)
+
+    def _run_post_overnight_morning_handoff(self, overnight_result: dict | None) -> None:
+        armed = int((overnight_result or {}).get("armed", 0) or 0)
+        if armed <= 0:
+            return
+        try:
+            from ap.morning_handoff import run_morning_handoff_audit
+
+            result = run_morning_handoff_audit(
+                client_id=self.email,
+                execution_mode=self.mode,
+                stage="post_overnight_reeval",
+                dry_run=False,
+                runner=self,
+            )
+            logger.info("[%s] Post-overnight morning handoff result: %s", self.email, result)
+        except Exception as exc:
+            logger.error("[%s] Post-overnight morning handoff failed (non-fatal): %s", self.email, exc, exc_info=True)
 
     def _run_exit_autonomous_recovery(self):
         """
@@ -1856,6 +1890,7 @@ class ClientRunner(threading.Thread):
 
         self.initialized.set()
         self._set_entry_permission()
+        self._run_startup_morning_handoff()
         self._start_runtime_health_loop()
 
         logger.info(
@@ -2400,7 +2435,7 @@ class ClientRunner(threading.Thread):
                 exit_engine=exit_eng,
                 entry_watcher=getattr(getattr(self, "core", None), "entry_watcher", None),
             )
-            return recovery.run()
+            return recovery.run(include_watcher_reseed=False)
 
         try:
             with _cf.ThreadPoolExecutor(max_workers=1) as _ex:
