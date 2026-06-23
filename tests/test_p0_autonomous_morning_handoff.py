@@ -74,6 +74,7 @@ def test_duplicate_same_stage_success_is_skipped(monkeypatch):
         "_load_handoff_run_lock",
         lambda **kwargs: {"status": "success", "last_success_at": "2026-06-22T09:25:00-04:00"},
     )
+    monkeypatch.setattr(morning_handoff, "_has_unowned_pending_trigger_orders", lambda *args, **kwargs: False)
     result = morning_handoff.run_morning_handoff_audit(
         client_id="jason@example.com",
         execution_mode="live",
@@ -84,6 +85,57 @@ def test_duplicate_same_stage_success_is_skipped(monkeypatch):
     assert result["ok"] is True
     assert result["skipped"] is True
     assert result["reason"] == "handoff_already_succeeded_for_stage_today"
+
+
+def test_startup_same_day_restart_does_not_skip_when_watcher_ownership_missing(monkeypatch):
+    monkeypatch.setattr(
+        morning_handoff,
+        "_load_handoff_run_lock",
+        lambda **kwargs: {"status": "success", "last_success_at": "2026-06-22T09:25:00-04:00"},
+    )
+    monkeypatch.setattr(morning_handoff, "_upsert_handoff_run_lock", lambda **kwargs: None)
+    monkeypatch.setattr(
+        morning_handoff,
+        "_count_state",
+        lambda client_id: {"watching_rows": 0, "new_rows": 0, "pending_trigger_rows": 1},
+    )
+    monkeypatch.setattr(morning_handoff, "_has_unowned_pending_trigger_orders", lambda *args, **kwargs: True)
+
+    reseed_calls = []
+
+    class _Recovery:
+        def __init__(self, **kwargs):
+            pass
+
+        def _reseed_watchers(self, result):
+            reseed_calls.append(True)
+            result["watchers_requeued"] = 1
+
+    import sys
+
+    monkeypatch.setitem(sys.modules, "ap_recovery", type("_M", (), {"APStartupRecovery": _Recovery}))
+
+    class _Core:
+        broker = object()
+        exit_eng = object()
+        entry_watcher = type("_Watcher", (), {"has_order": lambda self, local_order_id: False})()
+
+    class _Runner:
+        order_state_machine = object()
+        position_manager = object()
+        master_control = object()
+        core = _Core()
+
+    result = morning_handoff.run_morning_handoff_audit(
+        client_id="paper@example.com",
+        execution_mode="paper",
+        stage="startup",
+        dry_run=False,
+        runner=_Runner(),
+    )
+    assert result["ok"] is True
+    assert not result.get("skipped")
+    assert reseed_calls == [True]
 
 
 def test_missing_osm_is_safe_and_non_crashing(monkeypatch):
