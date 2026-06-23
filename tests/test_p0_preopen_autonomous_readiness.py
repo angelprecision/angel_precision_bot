@@ -230,6 +230,7 @@ def test_overnight_status_accepts_post_overnight_handoff_success(monkeypatch):
 
 def test_health_summary_exposes_preopen_status(monkeypatch):
     monkeypatch.setattr(pr, "_trading_date", lambda now=None: "2026-06-22")
+    monkeypatch.setattr(pr, "_readiness_enforcement_active", lambda now=None: True)
     monkeypatch.setattr(pr, "_expected_clients_by_mode", lambda: {"paper": ["p@example.com"], "live": ["l@example.com"]})
     monkeypatch.setattr(
         pr,
@@ -242,6 +243,17 @@ def test_health_summary_exposes_preopen_status(monkeypatch):
     health = pr.get_preopen_readiness_health()
     assert health["status"] == "BLOCKED"
     assert health["live"]["clients"]["l@example.com"]["status"] == "blocked"
+
+
+def test_health_missing_rows_do_not_degrade_outside_enforcement_window(monkeypatch):
+    monkeypatch.setattr(pr, "_trading_date", lambda now=None: "2026-06-22")
+    monkeypatch.setattr(pr, "_readiness_enforcement_active", lambda now=None: False)
+    monkeypatch.setattr(pr, "_expected_clients_by_mode", lambda: {"paper": ["p@example.com"], "live": ["l@example.com"]})
+    monkeypatch.setattr(pr, "_latest_preopen_rows", lambda trading_date: [])
+    health = pr.get_preopen_readiness_health()
+    assert health["status"] == "OK"
+    assert health["enforcement_active"] is False
+    assert health["missing_expected_clients"] == {"paper": ["p@example.com"], "live": ["l@example.com"]}
 
 
 def test_readiness_module_has_no_submit_cancel_or_state_mutation():
@@ -274,3 +286,4 @@ def test_source_wires_runner_endpoint_and_health():
     assert '@health_bp.route("/organs")' in health_src
     assert '"preopen_readiness":  get_preopen_readiness_health()' in health_src
     assert 'get_morning_handoff_health()' in health_src
+    assert 'preopen_readiness.get("enforcement_active")' in app_src
