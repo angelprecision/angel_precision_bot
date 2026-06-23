@@ -74,7 +74,10 @@ def main() -> int:
 
     endpoint, payload = _build_job_config(job_name)
     if job_name == OVERNIGHT_REEVAL_JOB:
-        payload = build_overnight_reeval_payload(client_id=client_id)
+        payload = build_overnight_reeval_payload(
+            client_id=client_id,
+            execution_mode=execution_mode if execution_mode != "live" else None,
+        )
     else:
         payload = build_morning_handoff_payload(
             client_id=client_id,
