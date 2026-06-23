@@ -11,6 +11,7 @@ from pathlib import Path
 from ap.morning_jobs import (
     DEFAULT_EXECUTION_MODE,
     DEFAULT_LIVE_CLIENT,
+    DEFAULT_PAPER_CLIENTS,
     MORNING_HANDOFF_BACKUP_JOB,
     MORNING_HANDOFF_PRIMARY_JOB,
     OVERNIGHT_REEVAL_JOB,
@@ -62,6 +63,16 @@ def test_scheduler_payload_for_morning_handoff_is_jason_live_only():
         "execution_mode": DEFAULT_EXECUTION_MODE,
         "dry_run": False,
     }
+
+
+def test_paper_overnight_payload_excludes_jason_and_marks_paper_mode():
+    payload = build_overnight_reeval_payload(
+        client_id=DEFAULT_PAPER_CLIENTS[0],
+        execution_mode="paper",
+    )
+    assert payload["clients"] == [DEFAULT_PAPER_CLIENTS[0]]
+    assert DEFAULT_LIVE_CLIENT not in payload["clients"]
+    assert payload["execution_mode"] == "paper"
 
 
 def test_duplicate_run_same_window_uses_same_idempotency_key():
@@ -145,11 +156,32 @@ def test_network_exception_returns_failure_without_crashing():
 
 def test_workflow_targets_jason_live_only():
     workflow = (REPO_ROOT / ".github" / "workflows" / "overnight-reeval.yml").read_text()
+    assert "BOT_URL: ${{ secrets.LIVE_BOT_URL }}" in workflow
+    assert "SIGNING_SECRET: ${{ secrets.LIVE_AP_SIGNING_SECRET }}" in workflow
     assert "MORNING_JOB_CLIENT_ID: jasoncosby1@gmail.com" in workflow
     assert "MORNING_JOB_EXECUTION_MODE: live" in workflow
+    assert "MORNING_JOB_FORCE_WINDOW: ${{ github.event_name == 'schedule' && '1' || '0' }}" in workflow
     assert "18 13 * * 1-5" in workflow
     assert "25 13 * * 1-5" in workflow
     assert "31 13 * * 1-5" in workflow
+
+
+def test_paper_workflow_exists_and_uses_paper_only_targets():
+    workflow = (REPO_ROOT / ".github" / "workflows" / "paper-morning-jobs.yml").read_text()
+    assert "BOT_URL: ${{ secrets.PAPER_BOT_URL }}" in workflow
+    assert "SIGNING_SECRET: ${{ secrets.PAPER_AP_SIGNING_SECRET }}" in workflow
+    assert "MORNING_JOB_EXECUTION_MODE: paper" in workflow
+    assert "jose.vasquez4011@gmail.com" in workflow
+    assert "tradefluencehq@gmail.com" in workflow
+    assert "jasoncosby1@gmail.com" not in workflow
+
+
+def test_scheduled_runs_use_force_window_bypass():
+    live_workflow = (REPO_ROOT / ".github" / "workflows" / "overnight-reeval.yml").read_text()
+    paper_workflow = (REPO_ROOT / ".github" / "workflows" / "paper-morning-jobs.yml").read_text()
+    expected = "MORNING_JOB_FORCE_WINDOW: ${{ github.event_name == 'schedule' && '1' || '0' }}"
+    assert expected in live_workflow
+    assert expected in paper_workflow
 
 
 def test_app_source_supports_filtered_overnight_and_morning_handoff():
