@@ -11,6 +11,7 @@ from zoneinfo import ZoneInfo
 from ap.morning_jobs import (
     DEFAULT_EXECUTION_MODE,
     DEFAULT_LIVE_CLIENT,
+    DEFAULT_SCHEDULED_TOLERANCE_MINUTES,
     MORNING_HANDOFF_AUDIT_ENDPOINT,
     MORNING_HANDOFF_BACKUP_JOB,
     MORNING_HANDOFF_PRIMARY_JOB,
@@ -54,6 +55,7 @@ def main() -> int:
     execution_mode = str(os.getenv("MORNING_JOB_EXECUTION_MODE", DEFAULT_EXECUTION_MODE) or "").strip().lower()
     timeout_seconds = int(os.getenv("MORNING_JOB_TIMEOUT_SECONDS", "180"))
     force_window = str(os.getenv("MORNING_JOB_FORCE_WINDOW", "0")).strip().lower() in {"1", "true", "yes"}
+    tolerance_minutes = int(os.getenv("MORNING_JOB_TOLERANCE_MINUTES", str(DEFAULT_SCHEDULED_TOLERANCE_MINUTES)))
 
     if not bot_url:
         raise SystemExit("BOT_URL env required")
@@ -62,12 +64,13 @@ def main() -> int:
 
     job_name = _resolve_job_from_env()
     now_et = datetime.now(ET)
-    if not force_window and not should_run_now(job_name, now=now_et):
+    if not force_window and not should_run_now(job_name, now=now_et, tolerance_minutes=tolerance_minutes):
         log.info(
-            "job=%s client=%s execution_mode=%s success=true skipped=true reason=outside_expected_window now_et=%s",
+            "job=%s client=%s execution_mode=%s success=true skipped=true reason=outside_expected_window tolerance_minutes=%s now_et=%s",
             job_name,
             client_id,
             execution_mode,
+            tolerance_minutes,
             now_et.isoformat(),
         )
         return 0
