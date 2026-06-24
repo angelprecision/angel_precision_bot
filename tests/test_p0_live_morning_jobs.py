@@ -7,7 +7,12 @@ import json
 import urllib.error
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 import os
+import sys
+
+import pytest
 
 from ap.morning_jobs import (
     DEFAULT_LIVE_CLIENT,
@@ -28,6 +33,73 @@ from ap.morning_jobs import (
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+_LOADED_APP_MODULE = None
+
+
+def _load_flask_app():
+    old_env = os.environ.get("APP_ENV")
+    old_db = os.environ.get("DATABASE_URL")
+    old_fill = os.environ.get("ALLOW_LEGACY_FILL_MONITOR")
+    os.environ["APP_ENV"] = "dev"
+    os.environ.setdefault("DATABASE_URL", "postgresql://mock/mock")
+    os.environ["ALLOW_LEGACY_FILL_MONITOR"] = "1"
+
+    psycopg2_mod = MagicMock()
+    psycopg2_mod.errors = SimpleNamespace()
+    psycopg2_extras_mod = MagicMock()
+    psycopg2_pool_mod = MagicMock()
+    supabase_mod = MagicMock()
+    cryptography_mod = MagicMock()
+    fernet_mod = MagicMock()
+    fernet_mod.Fernet = MagicMock()
+    supabase_mod.create_client = MagicMock()
+    supabase_mod.Client = MagicMock()
+
+    with patch.dict(sys.modules, {
+        "psycopg2": psycopg2_mod,
+        "psycopg2.extras": psycopg2_extras_mod,
+        "psycopg2.pool": psycopg2_pool_mod,
+        "supabase": supabase_mod,
+        "cryptography": cryptography_mod,
+        "cryptography.fernet": fernet_mod,
+    }):
+        try:
+            import app as app_mod
+            global _LOADED_APP_MODULE
+            _LOADED_APP_MODULE = app_mod
+            return app_mod.app
+        finally:
+            if old_env is None:
+                os.environ.pop("APP_ENV", None)
+            else:
+                os.environ["APP_ENV"] = old_env
+            if old_db is None:
+                os.environ.pop("DATABASE_URL", None)
+            else:
+                os.environ["DATABASE_URL"] = old_db
+            if old_fill is None:
+                os.environ.pop("ALLOW_LEGACY_FILL_MONITOR", None)
+            else:
+                os.environ["ALLOW_LEGACY_FILL_MONITOR"] = old_fill
+
+
+@pytest.fixture(scope="module")
+def morning_handoff_client():
+    flask_app = _load_flask_app()
+    flask_app.testing = True
+    client = flask_app.test_client()
+    client._app_mod = _LOADED_APP_MODULE  # type: ignore[attr-defined]
+    return client
+
+
+def _fake_client_runner_module(active_runners=None):
+    lock = type("_Lock", (), {"__enter__": lambda self: self, "__exit__": lambda self, *a: False})()
+    return SimpleNamespace(
+        _active_runners=active_runners or {},
+        _registry_lock=lock,
+    )
 
 
 def test_hmac_signature_matches_shell_format():
@@ -342,6 +414,50 @@ def test_admin_morning_handoff_source_uses_shared_modules_not_legacy_module():
     assert "from ap.morning_handoff import run_morning_handoff_audit" in src
     assert "from ap.preopen_readiness import run_preopen_autonomous_readiness" in src
     assert "from ap_morning_handoff_audit import run_morning_handoff_audit" not in src
+
+
+def test_admin_morning_handoff_post_conflicting_mode_and_execution_mode_returns_400(morning_handoff_client):
+    with patch.dict(sys.modules, {"client_runner": _fake_client_runner_module()}):
+        resp = morning_handoff_client.post(
+            "/admin/morning_handoff_audit",
+            json={"client_id": "jason@example.com", "mode": "live", "execution_mode": "paper"},
+        )
+    assert resp.status_code == 400
+    assert resp.get_json() == {
+        "ok": False,
+        "error": "mode_execution_mode_mismatch",
+        "mode": "live",
+        "execution_mode": "paper",
+    }
+
+
+def test_admin_morning_handoff_post_conflicting_mode_and_execution_mode_returns_400_reverse(morning_handoff_client):
+    with patch.dict(sys.modules, {"client_runner": _fake_client_runner_module()}):
+        resp = morning_handoff_client.post(
+            "/admin/morning_handoff_audit",
+            json={"client_id": "paper@example.com", "mode": "paper", "execution_mode": "live"},
+        )
+    assert resp.status_code == 400
+    assert resp.get_json() == {
+        "ok": False,
+        "error": "mode_execution_mode_mismatch",
+        "mode": "paper",
+        "execution_mode": "live",
+    }
+
+
+def test_admin_morning_handoff_get_conflicting_mode_and_execution_mode_returns_400(morning_handoff_client):
+    with patch.dict(sys.modules, {"client_runner": _fake_client_runner_module()}):
+        resp = morning_handoff_client.get(
+            "/admin/morning_handoff_audit?client_id=jason@example.com&mode=live&execution_mode=paper"
+        )
+    assert resp.status_code == 400
+    assert resp.get_json() == {
+        "ok": False,
+        "error": "mode_execution_mode_mismatch",
+        "mode": "live",
+        "execution_mode": "paper",
+    }
 
 
 def test_admin_morning_handoff_post_rejects_conflicting_mode_and_execution_mode():
