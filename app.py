@@ -3353,9 +3353,16 @@ def create_app() -> Flask:
         client_id_req = request.args.get("client_id", "").strip().lower()
         if not client_id_req:
             return jsonify({"ok": False, "error": "client_id required"}), 400
-        mode = str(
-            request.args.get("mode", request.args.get("execution_mode", "live"))
-        ).lower().strip()
+        mode_raw = request.args.get("mode")
+        execution_mode_alias = str(request.args.get("execution_mode") or "").strip().lower()
+        if mode_raw and execution_mode_alias and str(mode_raw).strip().lower() != execution_mode_alias:
+            return jsonify({
+                "ok": False,
+                "error": "mode_execution_mode_mismatch",
+                "mode": str(mode_raw).strip().lower(),
+                "execution_mode": execution_mode_alias,
+            }), 400
+        mode = str(mode_raw or execution_mode_alias or "live").lower().strip()
         dry_run = str(request.args.get("dry_run", "false")).lower() in ("1", "true", "yes")
 
         with _registry_lock:
@@ -3397,7 +3404,12 @@ def create_app() -> Flask:
         mode_raw = body.get("mode")
         execution_mode_alias = str(body.get("execution_mode") or "").strip().lower()
         if mode_raw and execution_mode_alias and str(mode_raw).strip().lower() != execution_mode_alias:
-            return jsonify({"ok": False, "error": "mode_execution_mode_mismatch"}), 400
+            return jsonify({
+                "ok": False,
+                "error": "mode_execution_mode_mismatch",
+                "mode": str(mode_raw).strip().lower(),
+                "execution_mode": execution_mode_alias,
+            }), 400
         if clients_filter is not None:
             clients_filter = {str(e).strip().lower() for e in clients_filter if str(e).strip()}
         elif client_id_alias:

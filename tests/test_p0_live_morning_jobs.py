@@ -344,6 +344,35 @@ def test_admin_morning_handoff_source_uses_shared_modules_not_legacy_module():
     assert "from ap_morning_handoff_audit import run_morning_handoff_audit" not in src
 
 
+def test_admin_morning_handoff_post_rejects_conflicting_mode_and_execution_mode():
+    src = (REPO_ROOT / "app.py").read_text()
+    assert 'mode_raw = body.get("mode")' in src
+    assert 'execution_mode_alias = str(body.get("execution_mode") or "").strip().lower()' in src
+    assert '"error": "mode_execution_mode_mismatch"' in src
+    assert '"mode": str(mode_raw).strip().lower()' in src
+    assert '"execution_mode": execution_mode_alias' in src
+
+
+def test_admin_morning_handoff_post_accepts_execution_mode_only_and_mode_only():
+    src = (REPO_ROOT / "app.py").read_text()
+    assert 'mode = str(mode_raw or execution_mode_alias or "live").lower().strip()' in src
+
+
+def test_admin_morning_handoff_get_rejects_conflicting_mode_and_execution_mode():
+    src = (REPO_ROOT / "app.py").read_text()
+    assert 'mode_raw = request.args.get("mode")' in src
+    assert 'execution_mode_alias = str(request.args.get("execution_mode") or "").strip().lower()' in src
+    assert 'if mode_raw and execution_mode_alias and str(mode_raw).strip().lower() != execution_mode_alias:' in src
+    assert '"mode": str(mode_raw).strip().lower()' in src
+    assert 'mode = str(mode_raw or execution_mode_alias or "live").lower().strip()' in src
+
+
+def test_admin_morning_handoff_get_accepts_execution_mode_only():
+    src = (REPO_ROOT / "app.py").read_text()
+    assert 'request.args.get("execution_mode")' in src
+    assert 'mode = str(mode_raw or execution_mode_alias or "live").lower().strip()' in src
+
+
 def test_admin_morning_handoff_returns_readiness_payload():
     src = (REPO_ROOT / "app.py").read_text()
     assert '"handoff": handoff' in src
