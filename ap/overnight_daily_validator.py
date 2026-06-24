@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import logging
 import os
+import requests  # PR #181: Polygon snapshot — no broker dependency
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
@@ -35,6 +36,14 @@ from typing import Optional
 log = logging.getLogger("ap.overnight_daily_validator")
 
 OVERNIGHT_DAILY_FAIL_OPEN = os.getenv("OVERNIGHT_DAILY_FAIL_OPEN", "0").strip().lower() in {"1", "true", "yes", "on"}
+
+# PR #181: Polygon — canonical daily-bar data source for overnight validation.
+# Using the same data provider as the scanner so prior_day_high/prior_day_low
+# (scanner-set on the signal) and today's session H/L come from the same source.
+# Polygon `day.h` / `day.l` on the snapshot endpoint are the regular-session
+# daily bar H/L — exactly what The Strat overnight rule evaluates against.
+POLYGON_API_KEY        = os.getenv("POLYGON_API_KEY", "")
+POLYGON_SNAPSHOT_BASE  = "https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers"
 
 
 # ---------------------------------------------------------------------------
@@ -145,71 +154,85 @@ class MarketSnapshot:
     fetched_at: str
 
 
-def _fetch_intraday_bars(ticker: str, broker, start_str: str, end_str: str) -> list:
+def _fetch_polygon_daily_snapshot(ticker: str) -> "dict | None":
     """
-    Fetch 1-minute regular-session bars from Tradier timesales.
-    start_str / end_str: "YYYY-MM-DDTHH:MM:SS" in Eastern time.
-    Returns list of bar dicts (may be empty). Never raises.
+    PR #181: Fetch today's daily-bar high/low and last price from Polygon.
+
+    Endpoint: GET /v2/snapshot/locale/us/markets/stocks/tickers/{ticker}
+    Returns dict(day_high, day_low, last_price) or None (→ RETRY_LATER).
+
+    Why Polygon and not Tradier timesales:
+      - Tradier timesales uses broker.session (paper accounts carry the
+        sandbox bearer token which is rejected by api.tradier.com → HTTP 401).
+      - Polygon uses a simple API key — no broker dependency, works for
+        paper and live accounts identically.
+      - Polygon `day.h` / `day.l` are the daily-bar H/L, exactly the same
+        reference frame as `prior_day_high` / `prior_day_low` that the
+        scanner writes to ap_signals. Consistent data source throughout.
+
+    Returns None when:
+      - POLYGON_API_KEY is not set
+      - HTTP error from Polygon
+      - day.h or day.l are 0/missing (market not yet open or no data)
     """
+    if not POLYGON_API_KEY:
+        log.error(
+            "[%s] OVERNIGHT_POLYGON_KEY_MISSING — POLYGON_API_KEY not set; "
+            "snapshot unavailable → RETRY_LATER",
+            ticker,
+        )
+        return None
     try:
-        # PR #111 amend: live market-data only.
-        base_url = _resolve_market_data_base_url(broker)
-        resp = broker.session.get(
-            f"{base_url}/v1/markets/timesales",
-            params={
-                "symbol":         ticker,
-                "interval":       "1min",
-                "start":          start_str,
-                "end":            end_str,
-                "session_filter": "open",
-            },
-            headers={"Accept": "application/json"},
-            timeout=10,
+        resp = requests.get(
+            f"{POLYGON_SNAPSHOT_BASE}/{ticker}",
+            params={"apiKey": POLYGON_API_KEY},
+            timeout=8,
         )
         if resp.status_code != 200:
-            log.warning("[%s] timesales HTTP %d", ticker, resp.status_code)
-            return []
-        series = (resp.json().get("series") or {})
-        if not series:
-            return []
-        data_node = series.get("data") or {}
-        items = data_node.get("item") if isinstance(data_node, dict) else data_node
-        if items is None:
-            return []
-        if isinstance(items, dict):
-            items = [items]
-        return [b for b in items if isinstance(b, dict)]
+            log.warning("[%s] Polygon snapshot HTTP %d", ticker, resp.status_code)
+            return None
+        tkr  = resp.json().get("ticker") or {}
+        day  = tkr.get("day") or {}
+        last = tkr.get("lastTrade") or {}
+        day_high  = float(day.get("h") or 0)
+        day_low   = float(day.get("l") or 0)
+        last_price = float(
+            last.get("p") or day.get("c") or day.get("vw") or 0
+        )
+        if not day_high or not day_low:
+            log.warning(
+                "OVERNIGHT_POLYGON_SNAPSHOT_NO_HILO ticker=%s day_h=%s day_l=%s "
+                "— session not yet started or data unavailable → RETRY_LATER",
+                ticker, day_high, day_low,
+            )
+            return None
+        log.info(
+            "OVERNIGHT_POLYGON_SNAPSHOT_OK ticker=%s day_high=%.4f day_low=%.4f last=%.4f",
+            ticker, day_high, day_low, last_price,
+        )
+        return {"day_high": day_high, "day_low": day_low, "last_price": last_price}
     except Exception as _e:
-        log.warning("[%s] timesales fetch failed: %s", ticker, _e)
-        return []
+        log.warning("[%s] Polygon snapshot fetch failed: %s", ticker, _e)
+        return None
 
 
-def fetch_market_snapshot(ticker: str, broker) -> Optional[MarketSnapshot]:
+def fetch_market_snapshot(ticker: str, broker=None) -> Optional[MarketSnapshot]:
     """
-    Compute session high/low from 1-minute regular-session intraday bars.
+    Fetch today's session high/low and last price for overnight validation.
 
-    Falls back to quote last/bid/ask for last_price ONLY — quote high/low
-    are unreliable before/near open and are never used for validation.
+    PR #181: switched from Tradier timesales to Polygon daily-bar snapshot.
+      - Prior: broker.session.get(timesales) → 401 for paper accounts because
+        the sandbox bearer token is rejected by api.tradier.com.
+      - Now:   requests.get(Polygon snapshot) → `day.h` / `day.l`
+        consistent with prior_day_high/prior_day_low from the scanner.
+
+    `broker` is kept in the signature for backward compatibility but is no
+    longer used for the snapshot fetch.
 
     Returns None when data is not yet available (→ RETRY_LATER in caller).
     Returning None is NOT a hard invalidation; ap_overnight_reeval treats
     SNAPSHOT_UNAVAILABLE as DATA_NOT_READY when not fail-closed.
-
-    Env-gate: OVERNIGHT_PREMARKET_HILO_ENABLED (default false).
-    Premarket bars are never used for invalidation by default.
     """
-    # ── Timezone helpers (zoneinfo stdlib ≥ 3.9, else fixed EDT offset) ───────
-    try:
-        from zoneinfo import ZoneInfo as _ZI
-        _ET = _ZI("America/New_York")
-    except ImportError:
-        from datetime import timedelta as _td
-        _ET = timezone(_td(hours=-4))  # EDT fallback — safe for 9 AM window
-
-    _PREMARKET_HILO_ENABLED = os.getenv(
-        "OVERNIGHT_PREMARKET_HILO_ENABLED", "false"
-    ).strip().lower() in {"1", "true", "yes", "on"}
-
     # Guard: OCC option symbols contain digits after position 4
     if len(ticker) > 6 and any(c.isdigit() for c in ticker[4:]):
         log.error(
@@ -218,95 +241,23 @@ def fetch_market_snapshot(ticker: str, broker) -> Optional[MarketSnapshot]:
         )
         return None
 
-    now_et    = datetime.now(timezone.utc).astimezone(_ET)
-    today_str = now_et.strftime("%Y-%m-%d")
-
-    # Regular-session open: 09:30 ET
-    try:
-        session_open = datetime(
-            now_et.year, now_et.month, now_et.day,
-            9, 30, 0, tzinfo=_ET,
-        )
-    except Exception:
-        # Fallback: construct as UTC offset
-        from datetime import timedelta as _td2
-        session_open = now_et.replace(
-            hour=9, minute=30, second=0, microsecond=0
-        )
-    regular_session_started = now_et >= session_open
-
-    # ── Step 1: Quote endpoint — last_price only ──────────────────────────────
-    last_price = 0.0
-    try:
-        # PR #111 amend: live market-data only.
-        base_url = _resolve_market_data_base_url(broker)
-        qresp = broker.session.get(
-            f"{base_url}/v1/markets/quotes",
-            params={"symbols": ticker, "greeks": "false"},
-            headers={"Accept": "application/json"},
-            timeout=8,
-        )
-        if qresp.status_code == 200:
-            raw = qresp.json().get("quotes", {}).get("quote", {})
-            q   = raw[0] if isinstance(raw, list) and raw else raw
-            if isinstance(q, dict):
-                last_price = float(q.get("last") or q.get("bid") or q.get("ask") or 0)
-                _qh = q.get("high")
-                _ql = q.get("low")
-                if not float(_qh or 0) or not float(_ql or 0):
-                    log.warning(
-                        "OVERNIGHT_SNAPSHOT_QUOTE_MISSING_HILO ticker=%s "
-                        "keys=%s last=%.4f bid=%.4f ask=%.4f high=%s low=%s",
-                        ticker, sorted(q.keys()),
-                        last_price,
-                        float(q.get("bid")  or 0),
-                        float(q.get("ask")  or 0),
-                        _qh, _ql,
-                    )
-    except Exception as _qe:
-        log.warning("[%s] Quote fetch failed (non-fatal for snapshot): %s", ticker, _qe)
-
-    # ── Step 2: Intraday bars for session high/low ────────────────────────────
-    start_str = f"{today_str}T09:30:00"
-    end_str   = now_et.strftime("%Y-%m-%dT%H:%M:%S")
-    bars = _fetch_intraday_bars(ticker, broker, start_str, end_str)
-
-    if bars:
-        session_high = max(float(b.get("high", 0) or 0) for b in bars)
-        session_low  = min(float(b.get("low",  0) or 0) for b in bars)
-        bar_close    = float(
-            bars[-1].get("close") or bars[-1].get("price") or bars[-1].get("last") or 0
-        )
-        if bar_close:
-            last_price = bar_close
-        log.info(
-            "OVERNIGHT_SESSION_BARS_OK ticker=%s bars=%d "
-            "session_high=%.4f session_low=%.4f last=%.4f",
-            ticker, len(bars), session_high, session_low, last_price,
-        )
-        return MarketSnapshot(
-            ticker=ticker,
-            session_high_so_far=session_high,
-            session_low_so_far=session_low,
-            last_price=last_price,
-            fetched_at=datetime.now(timezone.utc).isoformat(),
-        )
-
-    # ── Step 3: No bars — RETRY_LATER (not hard invalidation) ─────────────────
-    if not regular_session_started:
+    data = _fetch_polygon_daily_snapshot(ticker)
+    if data is None:
+        # No data yet — log and return None (→ RETRY_LATER in caller)
         log.warning(
             "OVERNIGHT_SESSION_BARS_NOT_READY ticker=%s "
             "final_decision=RETRY_LATER keep_watching=true",
             ticker,
         )
-    else:
-        log.warning(
-            "OVERNIGHT_SESSION_BARS_UNAVAILABLE ticker=%s "
-            "final_decision=RETRY_LATER keep_watching=true",
-            ticker,
-        )
-    return None
+        return None
 
+    return MarketSnapshot(
+        ticker=ticker,
+        session_high_so_far=data["day_high"],
+        session_low_so_far=data["day_low"],
+        last_price=data["last_price"],
+        fetched_at=datetime.now(timezone.utc).isoformat(),
+    )
 
 def _missing_data_result(
     *,
