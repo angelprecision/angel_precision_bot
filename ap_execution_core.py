@@ -96,6 +96,17 @@ ENTRY_MAX_PRICE_DRIFT_PCT_FROM_PLAN = float(os.getenv("ENTRY_MAX_PRICE_DRIFT_PCT
 # ─────────────────────────────────────────────────────────────────────────────
 
 PR180_ENABLED                        = os.getenv("PR180_ENABLED", "1") not in ("0", "false", "False", "")
+# PR #180 amendment: observe-first rollout.
+#   observe  (default) — run the guard, persist all audit fields, log
+#                        PR180_ENTRY_PRICING_OBSERVED when it would block,
+#                        but do NOT terminalize and do NOT block broker
+#                        submit. Reprice is also suppressed unless
+#                        PR180_OBSERVE_REPRICE_ENABLED=1 so we can measure
+#                        clean baseline impact before changing fill prices.
+#   enforce            — full PR #180 behavior: block submits and apply
+#                        controlled-band reprice.
+PR180_MODE                          = (os.getenv("PR180_MODE", "observe") or "observe").lower().strip()
+PR180_OBSERVE_REPRICE_ENABLED      = os.getenv("PR180_OBSERVE_REPRICE_ENABLED", "0") not in ("0", "false", "False", "")
 PR180_MAX_SPREAD_PCT                = float(os.getenv("PR180_MAX_SPREAD_PCT",                "0.08"))
 PR180_CONTROLLED_BAND_MIN_PCT       = float(os.getenv("PR180_CONTROLLED_BAND_MIN_PCT",       "0.06"))
 PR180_CONTROLLED_LIMIT_MID_CENTS    = float(os.getenv("PR180_CONTROLLED_LIMIT_MID_CENTS",    "0.03"))
@@ -1668,32 +1679,93 @@ class APExecutionCore:
             # use. pr180_input_spread_pct is already set by the helper.
             _pr180_audit_extras["spread_pct_at_submit"]   = _pr180_spread
             _pr180_audit_extras["pr180_spread_source"]    = _pr180_spread_source
-            if _pr180_decision == "BLOCK":
-                _pr180_reason = _pr180_audit_extras.get("pr180_block_reason", "PR180_BLOCKED")
-                _entry_pricing_decision = _pr180_reason
-                log.critical(
-                    "[%s] PR180_ENTRY_PRICING_BLOCK — %s | "
-                    "contract=%s bid=%s mid=%s ask=%s spread_pct=%s spread_source=%s "
-                    "proposed_limit=%.2f client_id=%s",
-                    ticker, _pr180_reason, approved_contract,
-                    _pr180_bid, _pr180_mid, _pr180_ask, _pr180_spread,
-                    _pr180_spread_source, submit_limit, self.client_id,
-                )
-                _terminalize_breach_failure(
-                    f"pr180_block:{_pr180_reason.lower()}:"
-                    f"spread={_pr180_spread!r}:"
-                    f"limit={submit_limit:.2f}"
-                )
-                return
-            if _pr180_decision == "REPRICE_PROCEED" and _pr180_limit is not None:
-                log.info(
-                    "[%s] PR180_ENTRY_REPRICED — controlled-limit band | "
-                    "contract=%s old_limit=%.2f new_limit=%.2f spread_pct=%.3f "
-                    "spread_source=%s client_id=%s",
-                    ticker, approved_contract, submit_limit, _pr180_limit,
-                    float(_pr180_spread or 0.0), _pr180_spread_source, self.client_id,
-                )
-                submit_limit = _pr180_limit
+            # PR #180 amendment — persist rollout mode so dashboards can
+            # correlate observed-vs-enforced incidents and measure baseline
+            # impact before flipping enforcement on.
+            _pr180_audit_extras["pr180_mode"]             = PR180_MODE
+            _pr180_audit_extras["pr180_observe_reprice_enabled"] = (
+                PR180_OBSERVE_REPRICE_ENABLED
+            )
+            # The helper writes pr180_decision on PROCEED / REPRICE_PROCEED
+            # but not on BLOCK; mirror the decision string here so audit
+            # always carries it, in either mode.
+            _pr180_audit_extras.setdefault("pr180_decision", _pr180_decision)
+
+            if PR180_MODE == "enforce":
+                # ── ENFORCE MODE — current PR #180 behavior ─────────────────
+                if _pr180_decision == "BLOCK":
+                    _pr180_reason = _pr180_audit_extras.get("pr180_block_reason", "PR180_BLOCKED")
+                    _entry_pricing_decision = _pr180_reason
+                    _pr180_audit_extras["pr180_runtime_action"] = "TERMINALIZED"
+                    log.critical(
+                        "[%s] PR180_ENTRY_PRICING_BLOCK — %s | mode=enforce | "
+                        "contract=%s bid=%s mid=%s ask=%s spread_pct=%s spread_source=%s "
+                        "proposed_limit=%.2f client_id=%s",
+                        ticker, _pr180_reason, approved_contract,
+                        _pr180_bid, _pr180_mid, _pr180_ask, _pr180_spread,
+                        _pr180_spread_source, submit_limit, self.client_id,
+                    )
+                    _terminalize_breach_failure(
+                        f"pr180_block:{_pr180_reason.lower()}:"
+                        f"spread={_pr180_spread!r}:"
+                        f"limit={submit_limit:.2f}"
+                    )
+                    return
+                if _pr180_decision == "REPRICE_PROCEED" and _pr180_limit is not None:
+                    _pr180_audit_extras["pr180_runtime_action"] = "REPRICED"
+                    log.info(
+                        "[%s] PR180_ENTRY_REPRICED — controlled-limit band | mode=enforce | "
+                        "contract=%s old_limit=%.2f new_limit=%.2f spread_pct=%.3f "
+                        "spread_source=%s client_id=%s",
+                        ticker, approved_contract, submit_limit, _pr180_limit,
+                        float(_pr180_spread or 0.0), _pr180_spread_source, self.client_id,
+                    )
+                    submit_limit = _pr180_limit
+                else:
+                    _pr180_audit_extras["pr180_runtime_action"] = "PASSED"
+            else:
+                # ── OBSERVE MODE — measure baseline impact, never block ─────
+                # The guard ran exactly as in enforce mode and the full audit
+                # is captured. We do NOT terminalize and we do NOT reprice
+                # (unless PR180_OBSERVE_REPRICE_ENABLED=1). The broker submit
+                # proceeds with the original limit price.
+                if _pr180_decision == "BLOCK":
+                    _pr180_reason = _pr180_audit_extras.get("pr180_block_reason", "PR180_BLOCKED")
+                    _pr180_audit_extras["pr180_runtime_action"] = "OBSERVED_WOULD_BLOCK"
+                    log.warning(
+                        "[%s] PR180_ENTRY_PRICING_OBSERVED — would_block=%s | mode=observe | "
+                        "contract=%s bid=%s mid=%s ask=%s spread_pct=%s spread_source=%s "
+                        "proposed_limit=%.2f client_id=%s",
+                        ticker, _pr180_reason, approved_contract,
+                        _pr180_bid, _pr180_mid, _pr180_ask, _pr180_spread,
+                        _pr180_spread_source, submit_limit, self.client_id,
+                    )
+                elif _pr180_decision == "REPRICE_PROCEED" and _pr180_limit is not None:
+                    if PR180_OBSERVE_REPRICE_ENABLED:
+                        _pr180_audit_extras["pr180_runtime_action"] = "OBSERVED_REPRICED"
+                        log.info(
+                            "[%s] PR180_ENTRY_REPRICED — controlled-limit band | "
+                            "mode=observe | observe_reprice=1 | "
+                            "contract=%s old_limit=%.2f new_limit=%.2f spread_pct=%.3f "
+                            "spread_source=%s client_id=%s",
+                            ticker, approved_contract, submit_limit, _pr180_limit,
+                            float(_pr180_spread or 0.0), _pr180_spread_source,
+                            self.client_id,
+                        )
+                        submit_limit = _pr180_limit
+                    else:
+                        _pr180_audit_extras["pr180_runtime_action"] = "OBSERVED_WOULD_REPRICE"
+                        log.info(
+                            "[%s] PR180_ENTRY_PRICING_OBSERVED — would_reprice "
+                            "to=%.2f | mode=observe | observe_reprice=0 | "
+                            "contract=%s current_limit=%.2f spread_pct=%.3f "
+                            "spread_source=%s client_id=%s",
+                            ticker, _pr180_limit, approved_contract, submit_limit,
+                            float(_pr180_spread or 0.0), _pr180_spread_source,
+                            self.client_id,
+                        )
+                else:
+                    _pr180_audit_extras["pr180_runtime_action"] = "OBSERVED_PROCEED"
         # ──────────────────────────────────────────────────────────────────────
 
         # Keep approved_plan in sync so OSM and DB record the correct price.

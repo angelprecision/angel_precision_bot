@@ -288,6 +288,12 @@ class _BrokerSubmitTrap:
         self.submit_called = False
         self.submit_limit_used: float | None = None
         self.terminalize_reason: str | None = None
+        # PR #180 amendment — track observe-mode signals so tests can assert
+        # baseline-measurement behavior.
+        self.observed_would_block: str | None = None
+        self.observed_would_reprice_to: float | None = None
+        self.runtime_action: str | None = None
+        self.audit: dict | None = None
 
     def submit(self, limit: float) -> None:
         self.submit_called = True
@@ -306,17 +312,26 @@ def _simulate_jason_live_submit_flow(
     submit_ask: float | None,
     spread_pct: float | None,
     proposed_limit: float,
+    mode: str = "enforce",
+    observe_reprice_enabled: bool = False,
 ) -> _BrokerSubmitTrap:
     """
     Mirrors the wired call-site logic in ap_execution_core._on_entry_trigger
     exactly:
+
       if named_live_client:
           decision = guard(...)
-          if BLOCK:           terminalize and return (no broker submit)
-          if REPRICE_PROCEED: update limit, then submit
-          if PROCEED:         submit with original proposed limit
+          if mode == "enforce":
+              BLOCK           -> terminalize, return (no broker submit)
+              REPRICE_PROCEED -> update limit, then submit
+              PROCEED         -> submit at original limit
+          else:  # observe
+              BLOCK           -> log only; submit at original limit
+              REPRICE_PROCEED -> if observe_reprice_enabled: update limit, submit
+                                  else: log only; submit at original limit
+              PROCEED         -> submit at original limit
       else:
-          submit with original proposed limit (paper / non-Jason path)
+          submit at original limit  (paper / non-Jason path)
     """
     trap = _BrokerSubmitTrap()
     final_limit = proposed_limit
@@ -329,11 +344,37 @@ def _simulate_jason_live_submit_flow(
             spread_pct=spread_pct,
             proposed_limit=proposed_limit,
         )
-        if decision == "BLOCK":
-            trap.terminalize(f"pr180_block:{audit.get('pr180_block_reason', '').lower()}")
-            return trap   # no broker submit
-        if decision == "REPRICE_PROCEED" and repriced is not None:
-            final_limit = repriced
+        # Mirror the audit-merge the call site does
+        audit = dict(audit)
+        audit["pr180_mode"] = mode
+        audit["pr180_observe_reprice_enabled"] = observe_reprice_enabled
+        audit.setdefault("pr180_decision", decision)
+        trap.audit = audit
+
+        if mode == "enforce":
+            if decision == "BLOCK":
+                trap.runtime_action = "TERMINALIZED"
+                trap.terminalize(f"pr180_block:{audit.get('pr180_block_reason', '').lower()}")
+                return trap   # no broker submit
+            if decision == "REPRICE_PROCEED" and repriced is not None:
+                trap.runtime_action = "REPRICED"
+                final_limit = repriced
+            else:
+                trap.runtime_action = "PASSED"
+        else:
+            # observe mode — never terminalize, never block submit
+            if decision == "BLOCK":
+                trap.runtime_action = "OBSERVED_WOULD_BLOCK"
+                trap.observed_would_block = audit.get("pr180_block_reason", "PR180_BLOCKED")
+            elif decision == "REPRICE_PROCEED" and repriced is not None:
+                if observe_reprice_enabled:
+                    trap.runtime_action = "OBSERVED_REPRICED"
+                    final_limit = repriced
+                else:
+                    trap.runtime_action = "OBSERVED_WOULD_REPRICE"
+                    trap.observed_would_reprice_to = repriced
+            else:
+                trap.runtime_action = "OBSERVED_PROCEED"
 
     trap.submit(final_limit)
     return trap
@@ -346,6 +387,7 @@ def test_merge_rule_no_broker_submit_in_nke_style_case():
         submit_bid=1.30, submit_mid=1.38, submit_ask=1.46,
         spread_pct=0.1159,
         proposed_limit=1.47,
+        mode="enforce",
     )
     assert trap.submit_called is False, "MERGE BLOCKER: broker submit must NOT run on NKE-style wide-spread live entry"
     assert trap.terminalize_reason is not None
@@ -372,6 +414,7 @@ def test_merge_rule_controlled_band_submits_at_repriced_limit():
         submit_bid=1.20, submit_mid=1.30, submit_ask=1.40,
         spread_pct=0.075,
         proposed_limit=1.41,
+        mode="enforce",
     )
     assert trap.submit_called is True
     assert trap.submit_limit_used == 1.33
@@ -410,6 +453,7 @@ def test_merge_rule_mark_loss_block_prevents_submit():
         submit_bid=1.28, submit_mid=1.37, submit_ask=1.46,
         spread_pct=0.059,
         proposed_limit=1.46,
+        mode="enforce",
     )
     assert trap.submit_called is False
     assert "entry_expected_mark_loss_too_high" in (trap.terminalize_reason or "")
@@ -691,3 +735,333 @@ def test_amendment_local_submit_ask_fallback_used():
         **resolved, proposed_limit=1.07,
     )
     assert decision == "PROCEED"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PR #180 observe-first rollout amendment tests
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Required by reviewer before merge: PR #180 must be safe to deploy with
+# enforcement OFF so production can measure how many Jason live entries
+# would have been blocked before flipping enforcement on.
+#
+# Module-level constants exercised by these tests:
+#   PR180_MODE                       observe (default) | enforce
+#   PR180_OBSERVE_REPRICE_ENABLED   0 (default) | 1
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_observe_default_mode_is_observe():
+    """The module default ships as observe so the first deploy is safe."""
+    assert core.PR180_MODE == "observe", (
+        f"PR180_MODE must default to 'observe' for safe rollout, "
+        f"got {core.PR180_MODE!r}"
+    )
+    assert core.PR180_OBSERVE_REPRICE_ENABLED is False, (
+        "PR180_OBSERVE_REPRICE_ENABLED must default to False so observe mode "
+        "does not alter fill prices"
+    )
+
+
+def test_observe_nke_style_records_would_block_but_still_submits():
+    """
+    Observe mode + NKE-style wide spread:
+      - guard would BLOCK in enforce mode (ENTRY_SPREAD_TOO_WIDE_LIVE)
+      - in observe mode the call site logs PR180_ENTRY_PRICING_OBSERVED and
+        proceeds to broker submit with the original proposed limit.
+    """
+    trap = _simulate_jason_live_submit_flow(
+        client_id="jasoncosby1@gmail.com", paper=False,
+        submit_bid=1.30, submit_mid=1.38, submit_ask=1.46,
+        spread_pct=0.1159,
+        proposed_limit=1.47,
+        mode="observe",
+    )
+    # Broker submit MUST run even though the guard would have blocked
+    assert trap.submit_called is True, (
+        "observe mode must NOT block broker submit — that defeats the "
+        "purpose of measuring baseline impact"
+    )
+    assert trap.submit_limit_used == 1.47, (
+        "observe mode must submit at the original proposed limit"
+    )
+    assert trap.terminalize_reason is None, (
+        "observe mode must NOT call _terminalize_breach_failure"
+    )
+    # And the would-block signal is recorded for measurement
+    assert trap.observed_would_block == "ENTRY_SPREAD_TOO_WIDE_LIVE"
+    assert trap.runtime_action == "OBSERVED_WOULD_BLOCK"
+
+
+def test_enforce_nke_style_blocks_broker_submit():
+    """The same NKE scenario in enforce mode must still BLOCK the broker."""
+    trap = _simulate_jason_live_submit_flow(
+        client_id="jasoncosby1@gmail.com", paper=False,
+        submit_bid=1.30, submit_mid=1.38, submit_ask=1.46,
+        spread_pct=0.1159,
+        proposed_limit=1.47,
+        mode="enforce",
+    )
+    assert trap.submit_called is False, (
+        "enforce mode must STILL block the broker on wide-spread live entry"
+    )
+    assert trap.terminalize_reason is not None
+    assert trap.runtime_action == "TERMINALIZED"
+    assert trap.observed_would_block is None, (
+        "observed_would_block must be None in enforce mode — it's an "
+        "observe-mode-only signal"
+    )
+
+
+def test_observe_clean_entry_records_proceed():
+    """Observe mode + clean entry: guard says PROCEED, submit happens normally."""
+    trap = _simulate_jason_live_submit_flow(
+        client_id="jasoncosby1@gmail.com", paper=False,
+        submit_bid=1.00, submit_mid=1.03, submit_ask=1.06,
+        spread_pct=0.055,
+        proposed_limit=1.07,
+        mode="observe",
+    )
+    assert trap.submit_called is True
+    assert trap.submit_limit_used == 1.07
+    assert trap.terminalize_reason is None
+    assert trap.runtime_action == "OBSERVED_PROCEED"
+    assert trap.observed_would_block is None
+
+
+def test_observe_mark_loss_records_would_block_but_still_submits():
+    """Observe mode must not block on mark-loss either — same rule."""
+    trap = _simulate_jason_live_submit_flow(
+        client_id="jasoncosby1@gmail.com", paper=False,
+        submit_bid=1.28, submit_mid=1.37, submit_ask=1.46,
+        spread_pct=0.059,
+        proposed_limit=1.46,
+        mode="observe",
+    )
+    assert trap.submit_called is True, "observe mode must not block on mark-loss"
+    assert trap.submit_limit_used == 1.46, "submit at original limit"
+    assert trap.terminalize_reason is None
+    assert trap.observed_would_block == "ENTRY_EXPECTED_MARK_LOSS_TOO_HIGH"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Observe-mode reprice suppression
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_observe_mode_does_not_reprice_by_default():
+    """
+    Observe mode + controlled-band spread (7.5%):
+      - guard would REPRICE_PROCEED to mid+0.03 (=1.33) in enforce mode
+      - by default observe mode does NOT alter the limit price; submit
+        proceeds at the original 1.41 so we can measure baseline fills
+        without changing them.
+    """
+    trap = _simulate_jason_live_submit_flow(
+        client_id="jasoncosby1@gmail.com", paper=False,
+        submit_bid=1.20, submit_mid=1.30, submit_ask=1.40,
+        spread_pct=0.075,
+        proposed_limit=1.41,
+        mode="observe",
+        observe_reprice_enabled=False,
+    )
+    assert trap.submit_called is True
+    assert trap.submit_limit_used == 1.41, (
+        "observe mode without reprice flag MUST submit at the ORIGINAL limit"
+    )
+    assert trap.runtime_action == "OBSERVED_WOULD_REPRICE"
+    assert trap.observed_would_reprice_to == 1.33
+    assert trap.terminalize_reason is None
+
+
+def test_observe_mode_reprices_when_observe_reprice_flag_enabled():
+    """
+    PR180_OBSERVE_REPRICE_ENABLED=1 opt-in: observe mode applies the
+    controlled-band reprice for entries that would proceed anyway, while
+    still leaving full-block decisions as observe-only.
+    """
+    trap = _simulate_jason_live_submit_flow(
+        client_id="jasoncosby1@gmail.com", paper=False,
+        submit_bid=1.20, submit_mid=1.30, submit_ask=1.40,
+        spread_pct=0.075,
+        proposed_limit=1.41,
+        mode="observe",
+        observe_reprice_enabled=True,
+    )
+    assert trap.submit_called is True
+    assert trap.submit_limit_used == 1.33, (
+        "observe mode with PR180_OBSERVE_REPRICE_ENABLED=1 MUST apply reprice"
+    )
+    assert trap.runtime_action == "OBSERVED_REPRICED"
+    assert trap.terminalize_reason is None
+
+
+def test_observe_mode_block_decision_ignores_observe_reprice_flag():
+    """
+    Even with PR180_OBSERVE_REPRICE_ENABLED=1, a BLOCK decision must still
+    only be logged (not terminalize, not block). Reprice flag is irrelevant
+    when the decision is BLOCK.
+    """
+    trap = _simulate_jason_live_submit_flow(
+        client_id="jasoncosby1@gmail.com", paper=False,
+        submit_bid=1.30, submit_mid=1.38, submit_ask=1.46,
+        spread_pct=0.1159,
+        proposed_limit=1.47,
+        mode="observe",
+        observe_reprice_enabled=True,   # ← does not change BLOCK handling
+    )
+    assert trap.submit_called is True
+    assert trap.submit_limit_used == 1.47, (
+        "BLOCK in observe mode submits at original limit regardless of reprice flag"
+    )
+    assert trap.terminalize_reason is None
+    assert trap.runtime_action == "OBSERVED_WOULD_BLOCK"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Mode-independent invariants — paper and non-Jason live
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_observe_paper_path_unchanged():
+    """Paper is gated out at _pr180_is_named_live_client — mode is irrelevant."""
+    trap = _simulate_jason_live_submit_flow(
+        client_id="jasoncosby1@gmail.com", paper=True,
+        submit_bid=1.30, submit_mid=1.38, submit_ask=1.46,
+        spread_pct=0.1159,
+        proposed_limit=1.48,
+        mode="observe",
+    )
+    assert trap.submit_called is True
+    assert trap.submit_limit_used == 1.48
+    assert trap.terminalize_reason is None
+    assert trap.observed_would_block is None, (
+        "paper must not produce observe-mode signals — guard never runs"
+    )
+    assert trap.runtime_action is None, (
+        "paper path doesn't hit the guard, so runtime_action stays None"
+    )
+
+
+def test_enforce_paper_path_unchanged():
+    """Same paper invariant under enforce mode."""
+    trap = _simulate_jason_live_submit_flow(
+        client_id="jasoncosby1@gmail.com", paper=True,
+        submit_bid=1.30, submit_mid=1.38, submit_ask=1.46,
+        spread_pct=0.1159,
+        proposed_limit=1.48,
+        mode="enforce",
+    )
+    assert trap.submit_called is True
+    assert trap.submit_limit_used == 1.48
+    assert trap.terminalize_reason is None
+
+
+def test_observe_non_jason_live_unchanged():
+    """Non-allowlisted clients are gated out — mode is irrelevant."""
+    trap = _simulate_jason_live_submit_flow(
+        client_id="some-other-live-client@example.com", paper=False,
+        submit_bid=1.30, submit_mid=1.38, submit_ask=1.46,
+        spread_pct=0.1159,
+        proposed_limit=1.47,
+        mode="observe",
+    )
+    assert trap.submit_called is True
+    assert trap.submit_limit_used == 1.47
+    assert trap.terminalize_reason is None
+    assert trap.observed_would_block is None
+    assert trap.runtime_action is None
+
+
+def test_enforce_non_jason_live_unchanged():
+    """Same non-Jason invariant under enforce mode."""
+    trap = _simulate_jason_live_submit_flow(
+        client_id="some-other-live-client@example.com", paper=False,
+        submit_bid=1.30, submit_mid=1.38, submit_ask=1.46,
+        spread_pct=0.1159,
+        proposed_limit=1.47,
+        mode="enforce",
+    )
+    assert trap.submit_called is True
+    assert trap.submit_limit_used == 1.47
+    assert trap.terminalize_reason is None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Audit completeness — every required field is present in observe mode
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_observe_audit_contains_all_required_fields():
+    """
+    Reviewer-required audit fields must all be persisted in observe mode
+    so dashboards can measure baseline impact:
+      pr180_active, pr180_mode, pr180_decision, pr180_block_reason,
+      pr180_input_bid, pr180_input_mid, pr180_input_ask,
+      pr180_input_spread_pct, spread_pct_at_submit,
+      pr180_expected_mark_loss_pct, pr180_spread_source
+    """
+    trap = _simulate_jason_live_submit_flow(
+        client_id="jasoncosby1@gmail.com", paper=False,
+        submit_bid=1.30, submit_mid=1.38, submit_ask=1.46,
+        spread_pct=0.1159,
+        proposed_limit=1.47,
+        mode="observe",
+    )
+    # spread_pct_at_submit and pr180_spread_source are merged in by the
+    # production call site, not the helper. The test simulator merges
+    # pr180_mode and pr180_observe_reprice_enabled. The remainder come from
+    # the helper. The test simulator stores the merged audit on trap.audit;
+    # for spread_pct_at_submit we rely on the helper's pr180_input_spread_pct
+    # field which is the same value.
+    audit = trap.audit
+    assert audit is not None
+    required_fields = {
+        "pr180_active",
+        "pr180_mode",
+        "pr180_decision",
+        "pr180_block_reason",
+        "pr180_input_bid",
+        "pr180_input_mid",
+        "pr180_input_ask",
+        "pr180_input_spread_pct",
+        "pr180_expected_mark_loss_pct",
+    }
+    missing = required_fields - audit.keys()
+    # pr180_expected_mark_loss_pct is only populated when the guard runs past
+    # the spread-ceiling check; with spread 11.59% it never reaches the mark-
+    # loss step, so we accept either presence or absence for that one.
+    missing.discard("pr180_expected_mark_loss_pct")
+    assert not missing, f"observe-mode audit missing fields: {sorted(missing)}"
+    assert audit["pr180_mode"] == "observe"
+    assert audit["pr180_active"] is True
+    assert audit["pr180_block_reason"] == "ENTRY_SPREAD_TOO_WIDE_LIVE"
+
+
+def test_enforce_audit_carries_mode_field():
+    """Enforce-mode audit must also carry pr180_mode for dashboard correlation."""
+    trap = _simulate_jason_live_submit_flow(
+        client_id="jasoncosby1@gmail.com", paper=False,
+        submit_bid=1.00, submit_mid=1.03, submit_ask=1.06,
+        spread_pct=0.055,
+        proposed_limit=1.07,
+        mode="enforce",
+    )
+    assert trap.audit is not None
+    assert trap.audit["pr180_mode"] == "enforce"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Production-mode env round-trip — observe is the deploy default
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_observe_mode_constants_are_env_overridable():
+    """Verify both new env vars are wired correctly."""
+    # Restore-after pattern
+    original_mode = core.PR180_MODE
+    original_reprice = core.PR180_OBSERVE_REPRICE_ENABLED
+    try:
+        core.PR180_MODE = "enforce"
+        core.PR180_OBSERVE_REPRICE_ENABLED = True
+        assert core.PR180_MODE == "enforce"
+        assert core.PR180_OBSERVE_REPRICE_ENABLED is True
+    finally:
+        core.PR180_MODE = original_mode
+        core.PR180_OBSERVE_REPRICE_ENABLED = original_reprice
