@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -138,11 +139,56 @@ def test_live_startup_with_watching_rows_does_not_degrade_for_missing_overnight(
         dry_run=True,
         runner=runner,
         stage="startup",
+        now=datetime(2026, 6, 22, 9, 10, tzinfo=pr.ET),
     )
     assert result["status"] == "OK"
     assert "overnight_reeval_missing" not in result["errors"]
-    assert result["details"]["overnight_reeval"]["status"] == "unknown"
+    assert result["details"]["overnight_reeval"]["status"] == "pending"
     assert "overnight_reeval_pending_startup" in result["warnings"]
+
+
+def test_startup_stage_with_watching_rows_before_due_is_pending_not_missing(monkeypatch):
+    _stub_common(monkeypatch, handoff=False, client_state={
+        "stale_processing_ids": [],
+        "watching_orphans": [],
+        "pending_trigger_rows": [{"local_order_id": "L-1", "signal_id": "sig-1"}],
+        "watching_count": 1,
+    })
+    runner = _Runner(mode="live", watcher=_Watcher({"L-1"}))
+    runner._last_overnight_reeval_date = None
+
+    result = pr.run_preopen_autonomous_readiness(
+        "jason@example.com",
+        "live",
+        dry_run=True,
+        runner=runner,
+        stage="startup",
+        now=datetime(2026, 6, 22, 9, 10, tzinfo=pr.ET),
+    )
+    assert result["details"]["overnight_reeval"]["status"] == "pending"
+    assert "overnight_reeval_missing" not in result["errors"]
+
+
+def test_post_due_missing_overnight_is_reported(monkeypatch):
+    _stub_common(monkeypatch, handoff=True, client_state={
+        "stale_processing_ids": [],
+        "watching_orphans": [],
+        "pending_trigger_rows": [{"local_order_id": "L-1", "signal_id": "sig-1"}],
+        "watching_count": 1,
+    })
+    runner = _Runner(mode="live", watcher=_Watcher({"L-1"}))
+    runner._last_overnight_reeval_date = None
+
+    result = pr.run_preopen_autonomous_readiness(
+        "jason@example.com",
+        "live",
+        dry_run=True,
+        runner=runner,
+        stage="manual",
+        now=datetime(2026, 6, 22, 9, 30, tzinfo=pr.ET),
+    )
+    assert result["details"]["overnight_reeval"]["status"] == "missing"
+    assert "overnight_reeval_missing" in result["errors"]
 
 
 def test_missing_entry_watcher_is_blocked_for_live(monkeypatch):
@@ -232,6 +278,8 @@ def test_overnight_status_accepts_post_overnight_handoff_success(monkeypatch):
         "2026-06-22",
         client_id="jason@example.com",
         execution_mode="live",
+        stage="manual",
+        now=datetime(2026, 6, 22, 9, 30, tzinfo=pr.ET),
     )
     assert status == "success"
     assert details["source"] == "handoff_run_locks.post_overnight_reeval"
@@ -259,6 +307,8 @@ def test_startup_handoff_success_does_not_count_as_post_overnight_success(monkey
         "2026-06-22",
         client_id="jason@example.com",
         execution_mode="live",
+        stage="manual",
+        now=datetime(2026, 6, 22, 9, 30, tzinfo=pr.ET),
     )
     assert status == "missing"
     assert details["source"] == "watching_or_pending_trigger_present_without_overnight_success"
@@ -319,7 +369,7 @@ def test_broker_credential_uncertainty_is_degraded_not_blocked(monkeypatch):
         stage="manual",
     )
     assert result["status"] == "DEGRADED"
-    assert "broker_credentials_unverified" in result["errors"]
+    assert "broker_credentials_missing" in result["errors"]
 
 
 def test_degraded_mode_path_only_clears_entries_not_exits():
@@ -328,6 +378,12 @@ def test_degraded_mode_path_only_clears_entries_not_exits():
     assert '"preopen_readiness_blocked:' in src
     assert "stop_runner=False" in src
     assert "exit_eng = getattr(self.core, \"exit_eng\", None)" in src
+
+
+def test_source_marks_runner_overnight_success_date_after_admin_reeval():
+    src = (REPO_ROOT / "app.py").read_text()
+    assert 'from ap.preopen_readiness import _trading_date as _preopen_trading_date' in src
+    assert 'runner._last_overnight_reeval_date = _preopen_trading_date()' in src
 
 
 def test_source_wires_runner_endpoint_and_health():

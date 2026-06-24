@@ -3049,7 +3049,8 @@ def create_app() -> Flask:
                                     exit_eng=getattr(_core, "exit_eng", None) if _core else None,
                                     force=force,
                                 )
-                                runner._last_overnight_reeval_date = None
+                                from ap.preopen_readiness import _trading_date as _preopen_trading_date
+                                runner._last_overnight_reeval_date = _preopen_trading_date()
                                 job["results"][email] = result
                                 job["readiness_results"][email] = {
                                     "skipped": "async_background_readiness_not_run"
@@ -3126,7 +3127,8 @@ def create_app() -> Flask:
                         exit_eng=getattr(_core, "exit_eng", None) if _core else None,
                         force=force,
                     )
-                    runner._last_overnight_reeval_date = None
+                    from ap.preopen_readiness import _trading_date as _preopen_trading_date
+                    runner._last_overnight_reeval_date = _preopen_trading_date()
                     results[email] = result
                     runner_mode = _runner_execution_mode(runner)
                     armed = int(result.get("armed", 0) or 0) if isinstance(result, dict) else 0

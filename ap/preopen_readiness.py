@@ -20,6 +20,8 @@ READINESS_ENFORCEMENT_START_HOUR_ET = int(os.getenv("PREOPEN_READINESS_START_HOU
 READINESS_ENFORCEMENT_START_MINUTE_ET = int(os.getenv("PREOPEN_READINESS_START_MINUTE_ET", "0"))
 READINESS_ENFORCEMENT_END_HOUR_ET = int(os.getenv("PREOPEN_READINESS_END_HOUR_ET", "10"))
 READINESS_ENFORCEMENT_END_MINUTE_ET = int(os.getenv("PREOPEN_READINESS_END_MINUTE_ET", "0"))
+OVERNIGHT_REEVAL_DUE_HOUR_ET = int(os.getenv("OVERNIGHT_REEVAL_DUE_HOUR_ET", "9"))
+OVERNIGHT_REEVAL_DUE_MINUTE_ET = int(os.getenv("OVERNIGHT_REEVAL_DUE_MINUTE_ET", "18"))
 
 
 def _now_et(now: datetime | None = None) -> datetime:
@@ -37,6 +39,15 @@ def _normalize_mode(value: str | None) -> str:
 def _after_929_et(now: datetime | None = None) -> bool:
     dt = _now_et(now)
     return dt.weekday() < 5 and (dt.hour > 9 or (dt.hour == 9 and dt.minute >= 29))
+
+
+def _overnight_reeval_due(now: datetime | None = None) -> bool:
+    dt = _now_et(now)
+    if dt.weekday() >= 5:
+        return False
+    current = dt.hour * 60 + dt.minute
+    due = OVERNIGHT_REEVAL_DUE_HOUR_ET * 60 + OVERNIGHT_REEVAL_DUE_MINUTE_ET
+    return current >= due
 
 
 def _is_market_day(now: datetime | None = None) -> bool:
@@ -270,10 +281,8 @@ def _broker_credentials_present(runner, execution_mode: str) -> tuple[bool, dict
         name for name, value in token_candidates
         if str(value or "").strip()
     ]
-    token_state = "configured" if token_sources else ("uncertain" if hasattr(runner, "_get_token") else "missing")
+    token_state = "configured" if token_sources else "missing"
     status = "configured" if (base_url and account_id and token_sources) else "missing"
-    if status != "configured" and base_url and account_id and token_state == "uncertain":
-        status = "uncertain"
 
     return status == "configured", {
         "base_url": base_url,
@@ -463,6 +472,8 @@ def _overnight_status(
     *,
     client_id: str,
     execution_mode: str,
+    stage: str = "",
+    now: datetime | None = None,
 ) -> tuple[str, dict]:
     if _post_overnight_reeval_success_exists(client_id, execution_mode, trading_date):
         return "success", {"source": "handoff_run_locks.post_overnight_reeval"}
@@ -471,6 +482,8 @@ def _overnight_status(
         return "success", {"source": "runner_last_overnight_reeval_date"}
     if int(client_state.get("watching_count", 0) or 0) == 0 and not client_state.get("pending_trigger_rows"):
         return "explicit_noop", {"source": "no_watching_or_pending_trigger_rows"}
+    if str(stage or "").strip().lower() == "startup" and not _overnight_reeval_due(now):
+        return "pending", {"source": "startup_before_overnight_reeval_due"}
     return "missing", {"source": "watching_or_pending_trigger_present_without_overnight_success"}
 
 
@@ -618,27 +631,22 @@ def run_preopen_autonomous_readiness(
     elif not handoff_ok:
         warnings.append("morning_handoff_pending_startup")
 
-    if stage == "startup":
-        if int(client_state.get("watching_count", 0) or 0) == 0 and not client_state.get("pending_trigger_rows"):
-            overnight_state = "explicit_noop"
-            overnight_details = {"source": "no_watching_or_pending_trigger_rows"}
+    overnight_state, overnight_details = _overnight_status(
+        runner,
+        client_state,
+        trading_date,
+        client_id=client_id,
+        execution_mode=mode,
+        stage=stage,
+        now=now,
+    )
+    if overnight_state == "pending":
+        warnings.append("overnight_reeval_pending_startup")
+    elif overnight_state == "missing":
+        if mode == "live" or _after_929_et(now):
+            errors.append("overnight_reeval_missing")
         else:
-            overnight_state = "unknown"
-            overnight_details = {"source": "startup_stage_skips_overnight_requirement"}
-            warnings.append("overnight_reeval_pending_startup")
-    else:
-        overnight_state, overnight_details = _overnight_status(
-            runner,
-            client_state,
-            trading_date,
-            client_id=client_id,
-            execution_mode=mode,
-        )
-        if overnight_state == "missing":
-            if mode == "live" or _after_929_et(now):
-                errors.append("overnight_reeval_missing")
-            else:
-                warnings.append("overnight_reeval_missing")
+            warnings.append("overnight_reeval_missing")
     details["overnight_reeval"] = {"status": overnight_state, **overnight_details}
 
     blocked_keys = {
