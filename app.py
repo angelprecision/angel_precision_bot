@@ -849,6 +849,8 @@ def create_app() -> Flask:
     def health():
         try:
             st = load_state(client_id=DEFAULT_CLIENT_ID)
+            from ap.morning_handoff import get_morning_handoff_health
+            from ap.preopen_readiness import get_preopen_readiness_health
             heartbeat_ok = False
             heartbeat_age = None
             if st.get("last_heartbeat_ts"):
@@ -860,12 +862,22 @@ def create_app() -> Flask:
                     pass
 
             all_ok = heartbeat_ok or heartbeat_age is None
+            morning_handoff = get_morning_handoff_health()
+            preopen_readiness = get_preopen_readiness_health()
+            if morning_handoff.get("live", {}).get("missing_after_929_et"):
+                all_ok = False
+            if morning_handoff.get("paper", {}).get("missing_after_929_et"):
+                all_ok = False
+            if preopen_readiness.get("enforcement_active") and preopen_readiness.get("status") != "OK":
+                all_ok = False
             resp = {
                 "ok": all_ok,
                 "status": "healthy" if all_ok else "degraded",
                 "mode": st.get("mode", "UNKNOWN"),
                 "kill_switch": st.get("kill_switch", False),
                 "heartbeat_age_seconds": heartbeat_age,
+                "morning_handoff": morning_handoff,
+                "preopen_readiness": preopen_readiness,
             }
 
             if APP_ENV != "prod":
@@ -3002,6 +3014,8 @@ def create_app() -> Flask:
                     "runners_queued": len(runners_window),
                     "runners_processed": 0,
                     "results": {},
+                    "handoff_results": {},
+                    "readiness_results": {},
                     "elapsed_seconds": None,
                 }
 
@@ -3035,14 +3049,23 @@ def create_app() -> Flask:
                                     exit_eng=getattr(_core, "exit_eng", None) if _core else None,
                                     force=force,
                                 )
-                                runner._last_overnight_reeval_date = None
+                                from ap.preopen_readiness import _trading_date as _preopen_trading_date
+                                runner._last_overnight_reeval_date = _preopen_trading_date()
                                 job["results"][email] = result
+                                job["readiness_results"][email] = {
+                                    "skipped": "async_background_readiness_not_run"
+                                }
                                 log.info(f"overnight_reeval[bg:{job_id}] [{email}]: {result}")
                             except Exception as _bg_err:
                                 import traceback as _tb
                                 job["results"][email] = {
                                     "error": str(_bg_err),
                                     "traceback": _tb.format_exc()[-2000:],
+                                }
+                                job["readiness_results"][email] = {
+                                    "ok": False,
+                                    "status": "ERROR",
+                                    "error": str(_bg_err),
                                 }
                                 log.error(
                                     f"overnight_reeval[bg:{job_id}] [{email}] failed: {_bg_err}",
@@ -3065,10 +3088,16 @@ def create_app() -> Flask:
                     "job_id": job_id,
                     "runners_queued": len(runners_window),
                     "force": force,
+                    "readiness_results": {
+                        email: {"skipped": "async_background_readiness_not_run"}
+                        for email, _runner in runners_window
+                    },
                     "status_endpoint": f"/admin/overnight_reeval/status?job_id={job_id}",
                 })
 
             results: dict = {}
+            handoff_results: dict = {}
+            readiness_results: dict = {}
             t0 = _time.time()
             processed = 0
             skipped_budget = 0
@@ -3098,12 +3127,26 @@ def create_app() -> Flask:
                         exit_eng=getattr(_core, "exit_eng", None) if _core else None,
                         force=force,
                     )
-                    runner._last_overnight_reeval_date = None
+                    from ap.preopen_readiness import _trading_date as _preopen_trading_date
+                    runner._last_overnight_reeval_date = _preopen_trading_date()
                     results[email] = result
+                    runner_mode = _runner_execution_mode(runner)
+                    armed = int(result.get("armed", 0) or 0) if isinstance(result, dict) else 0
+                    if armed > 0 or isinstance(result, dict):
+                        handoff, readiness = _run_admin_handoff_and_readiness(
+                            runner=runner,
+                            client_id=email,
+                            execution_mode=runner_mode,
+                            stage="post_overnight_reeval",
+                            dry_run=False,
+                        )
+                        handoff_results[email] = handoff
+                        readiness_results[email] = readiness
                     log.info(f"overnight_reeval [{email}]: {result}")
                 except Exception as e:
                     import traceback as _tb
                     results[email] = {"error": str(e), "traceback": _tb.format_exc()[-2000:]}
+                    readiness_results[email] = {"ok": False, "status": "ERROR", "error": str(e)}
                     log.error(f"overnight_reeval [{email}] failed: {e}", exc_info=True)
                 processed += 1
 
@@ -3127,6 +3170,8 @@ def create_app() -> Flask:
                 "elapsed_seconds": round(elapsed_total, 2),
                 "total_armed": total_armed,
                 "total_rejected": total_rejected,
+                "handoff_results": handoff_results,
+                "readiness_results": readiness_results,
                 "results": results,
             })
         except Exception as e:
@@ -3248,30 +3293,76 @@ def create_app() -> Flask:
             admin_log.error("release_after_hours_deferred failed: %s", e, exc_info=True)
             return jsonify({"ok": False, "error": str(e)}), 500
 
-    # ── PR feature/morning-handoff-audit ──────────────────────────────────────
-    # GET:  /admin/morning_handoff_audit?client_id=<email>&mode=live|paper
-    # POST: /admin/morning_handoff_audit  {"clients":[...], "mode":"live", "dry_run":false}
-    #       Also accepts legacy payload {"client_id":..., "execution_mode":...} for
-    #       backward compatibility with existing operator curl / dashboard scripts.
-    #
+    def _runner_execution_mode(runner) -> str:
+        return str(
+            getattr(runner, "mode", None)
+            or getattr(getattr(runner, "master_control", None), "mode", None)
+            or ""
+        ).strip().lower()
+
+    def _apply_live_preopen_readiness(runner, readiness: dict | None):
+        if runner is None or not isinstance(readiness, dict):
+            return
+        if _runner_execution_mode(runner) != "live":
+            return
+        if readiness.get("status") == "BLOCKED":
+            try:
+                runner._enter_degraded_mode(
+                    "preopen_readiness_blocked:" + ",".join(readiness.get("errors") or ["unknown"]),
+                    stop_runner=False,
+                )
+            except Exception:
+                pass
+        elif readiness.get("status") == "OK":
+            try:
+                runner._clear_degraded_reason_key("preopen_readiness_blocked")
+            except Exception:
+                pass
+
+    def _run_admin_handoff_and_readiness(*, runner, client_id: str, execution_mode: str, stage: str, dry_run: bool):
+        from ap.morning_handoff import run_morning_handoff_audit
+        from ap.preopen_readiness import run_preopen_autonomous_readiness
+
+        handoff = run_morning_handoff_audit(
+            client_id=client_id,
+            execution_mode=execution_mode,
+            stage=stage,
+            dry_run=dry_run,
+            runner=runner,
+        )
+        readiness = run_preopen_autonomous_readiness(
+            client_id,
+            execution_mode,
+            dry_run=dry_run,
+            stage=stage,
+            runner=runner,
+        )
+        _apply_live_preopen_readiness(runner, readiness)
+        return handoff, readiness
+
     # Safety invariants:
-    #   NEVER calls broker.submit_order   NEVER creates new orders
-    #   NEVER changes contract/limit/qty  NEVER mutates terminal rows
-    #   NEVER duplicates watcher state for the same local_order_id
-    #   Idempotent: auditing the same row twice produces the same result.
+    #   NEVER calls broker submit/cancel from this endpoint
+    #   NEVER creates orders directly
+    #   NEVER mutates contract/qty/limit pricing
+    #   Morning handoff may only reattach/rearm existing watcher-owned state
 
     @app.get("/admin/morning_handoff_audit")
     @require_hmac
     def admin_morning_handoff_audit_get():
         from client_runner import _active_runners, _registry_lock
-        from ap_morning_handoff_audit import run_morning_handoff_audit
-
         client_id_req = request.args.get("client_id", "").strip().lower()
         if not client_id_req:
             return jsonify({"ok": False, "error": "client_id required"}), 400
-        mode = str(
-            request.args.get("mode", request.args.get("execution_mode", "live"))
-        ).lower().strip()
+        mode_raw = request.args.get("mode")
+        execution_mode_alias = str(request.args.get("execution_mode") or "").strip().lower()
+        if mode_raw and execution_mode_alias and str(mode_raw).strip().lower() != execution_mode_alias:
+            return jsonify({
+                "ok": False,
+                "error": "mode_execution_mode_mismatch",
+                "mode": str(mode_raw).strip().lower(),
+                "execution_mode": execution_mode_alias,
+            }), 400
+        mode = str(mode_raw or execution_mode_alias or "live").lower().strip()
         dry_run = str(request.args.get("dry_run", "false")).lower() in ("1", "true", "yes")
 
         with _registry_lock:
@@ -3280,30 +3371,23 @@ def create_app() -> Flask:
         if runner is None:
             return jsonify({"ok": False, "error": f"client_id not in active runners: {client_id_req}"}), 404
 
-        entry_watcher = getattr(runner, "entry_watcher", None) or getattr(
-            getattr(runner, "core", None), "entry_watcher", None
-        )
-        osm = (
-            getattr(runner, "order_state_machine", None)
-            or getattr(runner, "osm", None)
-            or getattr(getattr(runner, "core", None), "order_state_machine", None)
-            or getattr(getattr(runner, "execution_core", None), "order_state_machine", None)
-        )
-        if osm is None:
-            log.warning(
-                "morning_handoff_audit GET: OSM not found for client %s — re-arm metadata will not be persisted. WATCHER_REARM_AUDIT_FAILED",
-                client_id_req,
-            )
-
         try:
-            result = run_morning_handoff_audit(
+            handoff, readiness = _run_admin_handoff_and_readiness(
+                runner=runner,
                 client_id=client_id_req,
-                entry_watcher=entry_watcher,
-                osm=osm,
                 execution_mode=mode,
+                stage="manual",
                 dry_run=dry_run,
             )
-            return jsonify(result)
+            payload = {
+                "ok": bool(handoff.get("ok")) and readiness.get("status") != "BLOCKED",
+                "client_id": client_id_req,
+                "execution_mode": mode,
+                "stage": "manual",
+                "handoff": handoff,
+                "readiness": readiness,
+            }
+            return jsonify(payload), 200 if payload["ok"] else 503
         except Exception as exc:
             log.error("morning_handoff_audit GET failed: %s", exc, exc_info=True)
             return jsonify({"ok": False, "error": str(exc)}), 500
@@ -3312,7 +3396,6 @@ def create_app() -> Flask:
     @require_hmac
     def admin_morning_handoff_audit_post():
         from client_runner import _active_runners, _registry_lock
-        from ap_morning_handoff_audit import run_morning_handoff_audit
         import time as _time
 
         body = request.get_json(silent=True) or {}
@@ -3321,7 +3404,12 @@ def create_app() -> Flask:
         mode_raw = body.get("mode")
         execution_mode_alias = str(body.get("execution_mode") or "").strip().lower()
         if mode_raw and execution_mode_alias and str(mode_raw).strip().lower() != execution_mode_alias:
-            return jsonify({"ok": False, "error": "mode_execution_mode_mismatch"}), 400
+            return jsonify({
+                "ok": False,
+                "error": "mode_execution_mode_mismatch",
+                "mode": str(mode_raw).strip().lower(),
+                "execution_mode": execution_mode_alias,
+            }), 400
         if clients_filter is not None:
             clients_filter = {str(e).strip().lower() for e in clients_filter if str(e).strip()}
         elif client_id_alias:
@@ -3329,39 +3417,36 @@ def create_app() -> Flask:
         mode = str(mode_raw or execution_mode_alias or "live").lower().strip()
         dry_run = bool(body.get("dry_run", False))
 
-        # ── Server-side idempotency run-lock ──────────────────────────────
-        # Render Cron (primary), GitHub Actions backup, and operator manual
-        # triggers can all hit this window. The run-lock enforces single
-        # execution at the DB layer. Scheduler passes run_lock_scope + the
-        # triggered_by tag; if omitted (e.g. an ad-hoc operator curl), the
-        # lock is keyed on the resolved client filter so behavior is still safe.
-        # dry_run never takes a lock (it must always be runnable for inspection).
-        _run_lock_key = None
+        run_lock_key = None
         if not dry_run and body.get("use_run_lock", True):
             from ap_handoff_run_lock import (
-                build_run_key, try_acquire_run_lock,
+                build_run_key,
+                mark_run_lock_completed,
+                mark_run_lock_failed,
+                try_acquire_run_lock,
             )
-            _scope = str(
+
+            scope = str(
                 body.get("run_lock_scope")
                 or (",".join(sorted(clients_filter)) if clients_filter else "all_runners")
             )
-            _triggered_by = str(body.get("triggered_by") or "unknown")
-            _run_lock_key = build_run_key(
+            triggered_by = str(body.get("triggered_by") or "unknown")
+            run_lock_key = build_run_key(
                 job_name="morning_handoff_audit",
                 execution_mode=mode,
-                client_scope=_scope,
+                client_scope=scope,
             )
             if not try_acquire_run_lock(
-                _run_lock_key,
+                run_lock_key,
                 job_name="morning_handoff_audit",
                 execution_mode=mode,
-                client_scope=_scope,
-                triggered_by=_triggered_by,
+                client_scope=scope,
+                triggered_by=triggered_by,
             ):
                 return jsonify({
                     "ok": True,
                     "skipped": "run_lock_held",
-                    "run_key": _run_lock_key,
+                    "run_key": run_lock_key,
                     "mode": mode,
                 }), 200
 
@@ -3369,68 +3454,115 @@ def create_app() -> Flask:
             runners_all = dict(_active_runners)
 
         _t0 = _time.monotonic()
-        per_client_results = {}
+        handoff_results = {}
+        readiness_results = {}
         errors = {}
 
         for email, runner in runners_all.items():
             if clients_filter is not None and email not in clients_filter:
                 continue
-            entry_watcher = getattr(runner, "entry_watcher", None) or getattr(
-                getattr(runner, "core", None), "entry_watcher", None
-            )
-            osm = (
-                getattr(runner, "order_state_machine", None)
-                or getattr(runner, "osm", None)
-                or getattr(getattr(runner, "core", None), "order_state_machine", None)
-                or getattr(getattr(runner, "execution_core", None), "order_state_machine", None)
-            )
-            if osm is None:
-                log.warning(
-                    "morning_handoff_audit POST: OSM not found for client %s — re-arm metadata will not be persisted. WATCHER_REARM_AUDIT_FAILED",
-                    email,
-                )
+            runner_mode = execution_mode_alias or _runner_execution_mode(runner) or mode
             try:
-                per_client_results[email] = run_morning_handoff_audit(
+                handoff, readiness = _run_admin_handoff_and_readiness(
+                    runner=runner,
                     client_id=email,
-                    entry_watcher=entry_watcher,
-                    osm=osm,
-                    execution_mode=mode,
+                    execution_mode=runner_mode,
+                    stage="manual",
                     dry_run=dry_run,
                 )
+                handoff_results[email] = handoff
+                readiness_results[email] = readiness
             except Exception as exc:
                 log.error(
                     "morning_handoff_audit POST failed for %s: %s", email, exc, exc_info=True
                 )
                 errors[email] = str(exc)
-                per_client_results[email] = {"ok": False, "error": str(exc)}
+                handoff_results[email] = {"ok": False, "error": str(exc)}
+                readiness_results[email] = {"ok": False, "status": "ERROR", "error": str(exc)}
 
         elapsed = _time.monotonic() - _t0
+        ok = len(errors) == 0 and all(
+            str((row or {}).get("status") or "").upper() != "BLOCKED"
+            for row in readiness_results.values()
+            if isinstance(row, dict)
+        )
+        if run_lock_key is not None:
+            from ap_handoff_run_lock import mark_run_lock_completed, mark_run_lock_failed
 
-        # Release the run-lock with terminal status so the window is auditable.
-        if _run_lock_key is not None:
-            from ap_handoff_run_lock import (
-                mark_run_lock_completed, mark_run_lock_failed,
-            )
-            _summary = {
-                "clients_audited": len(per_client_results),
+            summary = {
+                "clients_audited": len(handoff_results),
                 "errors": len(errors),
                 "elapsed_seconds": round(elapsed, 2),
             }
             if errors:
-                mark_run_lock_failed(_run_lock_key, f"{len(errors)} client error(s)")
+                mark_run_lock_failed(run_lock_key, f"{len(errors)} client error(s)")
             else:
-                mark_run_lock_completed(_run_lock_key, _summary)
+                mark_run_lock_completed(run_lock_key, summary)
 
         return jsonify({
-            "ok": len(errors) == 0,
+            "ok": ok,
+            "run_key": run_lock_key,
+            "stage": "manual",
             "mode": mode,
             "dry_run": dry_run,
-            "clients_audited": len(per_client_results),
+            "clients_audited": len(handoff_results),
             "elapsed_seconds": round(elapsed, 2),
-            "results": per_client_results,
+            "handoff_results": handoff_results,
+            "readiness_results": readiness_results,
             "errors": errors,
-            "run_key": _run_lock_key,
-        })
+        }), 200 if ok else 503
+
+    @app.route("/admin/preopen_readiness", methods=["GET", "POST"])
+    @require_hmac
+    def admin_preopen_readiness():
+        try:
+            from client_runner import _active_runners, _registry_lock
+            from ap.morning_jobs import select_runner_items
+            from ap.preopen_readiness import run_preopen_autonomous_readiness
+
+            body = request.get_json(silent=True) or {}
+            if request.method == "GET":
+                body = {
+                    "clients": request.args.getlist("clients"),
+                    "execution_mode": request.args.get("execution_mode"),
+                    "dry_run": request.args.get("dry_run", "true").lower() != "false",
+                }
+
+            requested_clients = body.get("clients") or []
+            execution_mode = str(body.get("execution_mode") or "").strip().lower()
+            dry_run = bool(body.get("dry_run", True))
+
+            with _registry_lock:
+                selected = select_runner_items(dict(_active_runners), requested_clients=requested_clients)
+
+            results = {}
+            for email, runner in selected:
+                runner_mode = str(
+                    getattr(runner, "mode", None)
+                    or getattr(runner.master_control, "mode", None)
+                    or ""
+                ).strip().lower()
+                if execution_mode and runner_mode != execution_mode:
+                    continue
+                results[email] = run_preopen_autonomous_readiness(
+                    email,
+                    runner_mode,
+                    dry_run=dry_run,
+                    stage="manual",
+                    runner=runner,
+                )
+
+            ok = all(str(r.get("status")) == "OK" for r in results.values()) if results else False
+            return jsonify({
+                "ok": ok,
+                "requested_clients": [str(x).strip() for x in requested_clients if str(x).strip()],
+                "execution_mode": execution_mode or None,
+                "dry_run": dry_run,
+                "results": results,
+            }), 200 if ok else 503
+        except Exception as e:
+            log.error("preopen_readiness endpoint failed: %s", e, exc_info=True)
+            return jsonify({"ok": False, "error": str(e)}), 500
 
     @app.post("/admin/paper_rescue_restart_guard")
     @require_hmac

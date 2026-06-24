@@ -75,7 +75,7 @@ class APStartupRecovery:
     # Entry point
     # ──────────────────────────────────────────────────────────────────────────
 
-    def run(self) -> dict:
+    def run(self, *, include_watcher_reseed: bool = True) -> dict:
         result = {
             "client_id":          self.client_id,
             "positions_recovered": 0,
@@ -120,11 +120,12 @@ class APStartupRecovery:
             log.error("[%s] Dedup reseed error: %s", self.client_id, e)
             result["errors"].append(f"dedup: {e}")
 
-        try:
-            self._reseed_watchers(result)
-        except Exception as e:
-            log.error("[%s] Watcher reseed error: %s", self.client_id, e)
-            result["errors"].append(f"watchers: {e}")
+        if include_watcher_reseed:
+            try:
+                self._reseed_watchers(result)
+            except Exception as e:
+                log.error("[%s] Watcher reseed error: %s", self.client_id, e)
+                result["errors"].append(f"watchers: {e}")
 
         log.info(
             "[%s] Recovery complete | positions=%d entries_verified=%d "

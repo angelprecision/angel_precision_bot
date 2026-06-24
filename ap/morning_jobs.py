@@ -102,9 +102,6 @@ def build_morning_handoff_payload(
         payload["mode"] = normalized_mode
     if execution_mode and str(execution_mode).strip():
         payload["execution_mode"] = str(execution_mode).strip().lower()
-    # Run-lock fields: when present, the admin endpoint keys its DB run-lock on
-    # run_lock_scope so Render Cron and the GitHub backup compute the SAME lock
-    # key and cannot both execute the same window.
     if triggered_by and str(triggered_by).strip():
         payload["triggered_by"] = str(triggered_by).strip()
     if run_lock_scope and str(run_lock_scope).strip():
@@ -265,7 +262,9 @@ def build_job_calls(
                 job_name=f"{job_name}_live",
                 endpoint=MORNING_HANDOFF_AUDIT_ENDPOINT,
                 payload=build_morning_handoff_payload(
-                    clients=[live_client], mode="live", dry_run=False,
+                    clients=[live_client],
+                    mode="live",
+                    dry_run=False,
                     triggered_by="scheduler",
                     run_lock_scope=f"handoff_live:{live_client}",
                 ),
@@ -276,7 +275,9 @@ def build_job_calls(
                 job_name=f"{job_name}_paper",
                 endpoint=MORNING_HANDOFF_AUDIT_ENDPOINT,
                 payload=build_morning_handoff_payload(
-                    clients=paper_client_list, mode="paper", dry_run=False,
+                    clients=paper_client_list,
+                    mode="paper",
+                    dry_run=False,
                     triggered_by="scheduler",
                     run_lock_scope="handoff_paper:" + ",".join(sorted(paper_client_list)),
                 ),
@@ -285,30 +286,24 @@ def build_job_calls(
             ),
         ]
     if job_name == MORNING_RECOVERY_JOB:
-        # release_after_hours_deferred is scoped to PAPER clients only by default.
-        # Auto-releasing LIVE after-hours-deferred rows at open is a real-money
-        # risk (the rows may reflect stale overnight conditions). To include the
-        # live client, the operator must explicitly set
-        # ENABLE_LIVE_AUTO_RELEASE_AFTER_OPEN=true in the cron service env.
         import os as _os
-        _live_release_enabled = str(
+
+        live_release_enabled = str(
             _os.getenv("ENABLE_LIVE_AUTO_RELEASE_AFTER_OPEN", "false")
         ).strip().lower() in ("1", "true", "yes")
-        _release_clients = (
-            all_clients if _live_release_enabled else list(paper_client_list)
-        )
-        _release_scope = "live+paper" if _live_release_enabled else "paper_only"
+        release_clients = all_clients if live_release_enabled else list(paper_client_list)
+        release_scope = "live+paper" if live_release_enabled else "paper_only"
         return [
             MorningJobCall(
-                job_name=f"release_after_hours_deferred_{_release_scope}",
+                job_name=f"release_after_hours_deferred_{release_scope}",
                 endpoint=RELEASE_AFTER_HOURS_DEFERRED_ENDPOINT,
                 payload=build_release_after_hours_deferred_payload(
-                    clients=_release_clients,
+                    clients=release_clients,
                     force=True,
                     lookback_h=36,
                 ),
-                client_scope=",".join(_release_clients),
-                execution_mode="paper" if not _live_release_enabled else "mixed",
+                client_scope=",".join(release_clients),
+                execution_mode="paper" if not live_release_enabled else "mixed",
             ),
             MorningJobCall(
                 job_name="paper_rescue_restart_guard",

@@ -1322,8 +1322,73 @@ class ClientRunner(threading.Thread):
                 self.email, result["armed"], result["rejected"],
                 result["processed"], result["errors"],
             )
+            self._run_post_overnight_morning_handoff(result)
         except Exception as exc:
             logger.error("[%s] Overnight reeval error (non-fatal): %s", self.email, exc, exc_info=True)
+
+    def _run_startup_morning_handoff(self) -> None:
+        try:
+            from ap.morning_handoff import run_morning_handoff_audit
+            from ap.preopen_readiness import run_preopen_autonomous_readiness
+
+            result = run_morning_handoff_audit(
+                client_id=self.email,
+                execution_mode=self.mode,
+                stage="startup",
+                dry_run=False,
+                runner=self,
+            )
+            logger.info("[%s] Startup morning handoff result: %s", self.email, result)
+            readiness = run_preopen_autonomous_readiness(
+                self.email,
+                self.mode,
+                dry_run=False,
+                stage="startup",
+                runner=self,
+            )
+            logger.info("[%s] Startup preopen readiness result: %s", self.email, readiness)
+            if str(self.mode).lower() == "live":
+                if readiness.get("status") == "BLOCKED":
+                    self._enter_degraded_mode(
+                        "preopen_readiness_blocked:" + ",".join(readiness.get("errors") or ["unknown"])
+                    )
+                elif readiness.get("ok"):
+                    self._clear_degraded_reason_key("preopen_readiness_blocked")
+        except Exception as exc:
+            logger.error("[%s] Startup morning handoff failed (non-fatal): %s", self.email, exc, exc_info=True)
+
+    def _run_post_overnight_morning_handoff(self, overnight_result: dict | None) -> None:
+        if not isinstance(overnight_result, dict):
+            return
+        try:
+            from ap.morning_handoff import run_morning_handoff_audit
+            from ap.preopen_readiness import run_preopen_autonomous_readiness
+
+            result = run_morning_handoff_audit(
+                client_id=self.email,
+                execution_mode=self.mode,
+                stage="post_overnight_reeval",
+                dry_run=False,
+                runner=self,
+            )
+            logger.info("[%s] Post-overnight morning handoff result: %s", self.email, result)
+            readiness = run_preopen_autonomous_readiness(
+                self.email,
+                self.mode,
+                dry_run=False,
+                stage="post_overnight_reeval",
+                runner=self,
+            )
+            logger.info("[%s] Post-overnight preopen readiness result: %s", self.email, readiness)
+            if str(self.mode).lower() == "live":
+                if readiness.get("status") == "BLOCKED":
+                    self._enter_degraded_mode(
+                        "preopen_readiness_blocked:" + ",".join(readiness.get("errors") or ["unknown"])
+                    )
+                elif readiness.get("ok"):
+                    self._clear_degraded_reason_key("preopen_readiness_blocked")
+        except Exception as exc:
+            logger.error("[%s] Post-overnight morning handoff failed (non-fatal): %s", self.email, exc, exc_info=True)
 
     def _run_exit_autonomous_recovery(self):
         """
@@ -2012,7 +2077,6 @@ class ClientRunner(threading.Thread):
         # entry_watcher is guaranteed to exist here: _start_worker_thread
         # would have already blocked on entry_watcher_missing if absent.
         # Failures are logged but never crash the runner.
-        self._run_morning_handoff_audit_startup()
         self._seed_exit_engine_from_db(exit_eng)
         self._start_position_quote_monitor(data_broker if data_broker_is_dedicated else broker, exit_eng)
         # PR D / FIX-3 (BUG-CR-2): post-QPM quote refresh in LIVE.
@@ -2088,6 +2152,7 @@ class ClientRunner(threading.Thread):
 
         self.initialized.set()
         self._set_entry_permission()
+        self._run_startup_morning_handoff()
         self._start_runtime_health_loop()
 
         logger.info(
@@ -2616,64 +2681,9 @@ class ClientRunner(threading.Thread):
             return cast(os.getenv(env_name, env_default))
 
     def _run_morning_handoff_audit_startup(self) -> None:
-        """Run the morning handoff audit once at startup after watcher/OSM are ready.
+        """Compatibility wrapper for the unified startup morning handoff path."""
+        self._run_startup_morning_handoff()
 
-        Classifies all non-terminal ENTRY rows for this client/mode and
-        re-arms watcher ownership when evidence shows the row is valid.
-        Called automatically after _run_startup_recovery() so valid rows
-        from prior sessions are re-armed before the poll loop starts.
-
-        Safety invariants (enforced by run_morning_handoff_audit):
-          - NEVER calls broker.submit_order
-          - NEVER creates new ENTRY orders
-          - NEVER transitions to SUBMITTED
-          - NEVER mutates terminal rows or changes contract/limit_price/qty
-          - NEVER duplicates watcher state for the same local_order_id
-          - Live runner only audits live rows; paper runner only audits paper rows
-
-        Failures log WATCHER_REARM_AUDIT_FAILED and never crash the runner.
-        """
-        try:
-            from ap_morning_handoff_audit import run_morning_handoff_audit
-        except ImportError as _ie:
-            logger.warning(
-                "[%s] WATCHER_REARM_AUDIT_FAILED: import failed: %s", self.email, _ie
-            )
-            return
-
-        _entry_watcher = getattr(getattr(self, "core", None), "entry_watcher", None)
-        _osm           = getattr(self, "order_state_machine", None)
-        _exec_mode     = str(getattr(self, "mode", "PAPER") or "PAPER").lower()
-
-        if _entry_watcher is None or _osm is None:
-            logger.warning(
-                "[%s] WATCHER_REARM_AUDIT_FAILED: entry_watcher=%s osm=%s — "
-                "skipping startup audit (dependencies not ready)",
-                self.email,
-                "ok" if _entry_watcher else "MISSING",
-                "ok" if _osm else "MISSING",
-            )
-            return
-
-        try:
-            audit_result = run_morning_handoff_audit(
-                client_id=self.email,
-                entry_watcher=_entry_watcher,
-                osm=_osm,
-                execution_mode=_exec_mode,
-                dry_run=False,
-            )
-            if not audit_result.get("ok"):
-                logger.warning(
-                    "[%s] WATCHER_REARM_AUDIT_FAILED startup audit returned ok=False: %s",
-                    self.email,
-                    audit_result.get("errors"),
-                )
-        except Exception as _exc:
-            logger.error(
-                "[%s] WATCHER_REARM_AUDIT_FAILED startup audit raised exception: %s",
-                self.email, _exc,
-            )
 
     def _run_startup_recovery(self, broker, exit_eng):
         """Run startup recovery with a hard timeout to prevent blocking initialization.
@@ -2692,7 +2702,7 @@ class ClientRunner(threading.Thread):
                 exit_engine=exit_eng,
                 entry_watcher=getattr(getattr(self, "core", None), "entry_watcher", None),
             )
-            return recovery.run()
+            return recovery.run(include_watcher_reseed=False)
 
         try:
             with _cf.ThreadPoolExecutor(max_workers=1) as _ex:
