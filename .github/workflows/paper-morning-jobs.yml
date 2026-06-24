@@ -13,10 +13,10 @@ on:
       job:
         description: "Job to run"
         required: true
-        default: "overnight_reeval"
+        default: "overnight_reeval_batch"
         type: choice
         options:
-          - overnight_reeval
+          - overnight_reeval_batch
           - morning_handoff_primary
           - morning_handoff_backup
       force_window:
@@ -48,7 +48,7 @@ jobs:
         run: |
           JOB=""
           case "${{ github.event.schedule }}" in
-            "18 13 * * 1-5"|"18 14 * * 1-5") JOB="overnight_reeval" ;;
+            "18 13 * * 1-5"|"18 14 * * 1-5") JOB="overnight_reeval_batch" ;;
             "25 13 * * 1-5"|"25 14 * * 1-5") JOB="morning_handoff_primary" ;;
             "31 13 * * 1-5"|"31 14 * * 1-5") JOB="morning_handoff_backup" ;;
           esac
@@ -63,10 +63,11 @@ jobs:
           BOT_URL: ${{ secrets.PAPER_BOT_URL }}
           SIGNING_SECRET: ${{ secrets.PAPER_AP_SIGNING_SECRET }}
           MORNING_JOB: ${{ steps.cfg.outputs.job }}
+          MORNING_JOB_PAPER_CLIENTS: ${{ matrix.client_id }}
           MORNING_JOB_CLIENT_ID: ${{ matrix.client_id }}
           MORNING_JOB_EXECUTION_MODE: paper
           MORNING_JOB_TIMEOUT_SECONDS: "180"
-          MORNING_JOB_TOLERANCE_MINUTES: "20"
+          MORNING_JOB_WINDOW_TOLERANCE_MINUTES: "20"
           MORNING_JOB_FORCE_WINDOW: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.force_window == 'true' && '1' || '0' }}
         run: |
           python3 ap/scripts/live_morning_jobs.py

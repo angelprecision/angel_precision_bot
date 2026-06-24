@@ -52,13 +52,35 @@ def _resolve_paper_clients() -> list[str]:
     return [item.strip() for item in raw.split(",") if item.strip()]
 
 
+def _resolve_execution_mode_filter() -> str | None:
+    raw = str(os.getenv("MORNING_JOB_EXECUTION_MODE", "") or "").strip().lower()
+    if not raw:
+        return None
+    if raw not in {"live", "paper"}:
+        raise SystemExit(f"unsupported MORNING_JOB_EXECUTION_MODE={raw!r}")
+    return raw
+
+
+def _resolve_scoped_clients() -> tuple[str, list[str], str | None]:
+    mode_filter = _resolve_execution_mode_filter()
+    explicit_client_id = str(os.getenv("MORNING_JOB_CLIENT_ID", "") or "").strip()
+    live_client = str(os.getenv("MORNING_JOB_LIVE_CLIENT", DEFAULT_LIVE_CLIENT) or "").strip()
+    paper_clients = _resolve_paper_clients()
+
+    if explicit_client_id and mode_filter == "paper":
+        paper_clients = [explicit_client_id]
+    elif explicit_client_id and mode_filter == "live":
+        live_client = explicit_client_id
+
+    return live_client, paper_clients, mode_filter
+
+
 def main() -> int:
     bot_url = str(os.getenv("BOT_URL", os.getenv("AP_BOT_URL", "")) or "").strip()
     signing_secret = str(
         os.getenv("SIGNING_SECRET", os.getenv("AP_SIGNING_SECRET", "")) or ""
     ).strip()
-    live_client = str(os.getenv("MORNING_JOB_LIVE_CLIENT", DEFAULT_LIVE_CLIENT) or "").strip()
-    paper_clients = _resolve_paper_clients()
+    live_client, paper_clients, mode_filter = _resolve_scoped_clients()
     timeout_seconds = int(os.getenv("MORNING_JOB_TIMEOUT_SECONDS", "180"))
     tolerance_minutes = int(os.getenv("MORNING_JOB_WINDOW_TOLERANCE_MINUTES", "45"))
     force_window = str(os.getenv("MORNING_JOB_FORCE_WINDOW", "0")).strip().lower() in {"1", "true", "yes"}
@@ -89,11 +111,15 @@ def main() -> int:
 
     results = []
     failures = 0
-    for call in build_job_calls(
+    calls = build_job_calls(
         job_name,
         live_client=live_client,
         paper_clients=paper_clients,
-    ):
+    )
+    if mode_filter is not None:
+        calls = [call for call in calls if call.execution_mode == mode_filter]
+
+    for call in calls:
         result = call_admin_endpoint(
             bot_url=bot_url,
             endpoint=call.endpoint,

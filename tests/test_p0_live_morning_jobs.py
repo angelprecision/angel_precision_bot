@@ -7,6 +7,7 @@ import json
 import urllib.error
 from datetime import datetime
 from pathlib import Path
+import os
 
 from ap.morning_jobs import (
     DEFAULT_LIVE_CLIENT,
@@ -214,6 +215,8 @@ def test_script_accepts_render_and_backup_env_aliases():
     assert 'os.getenv("BOT_URL", os.getenv("AP_BOT_URL", ""))' in script_src
     assert 'os.getenv("SIGNING_SECRET", os.getenv("AP_SIGNING_SECRET", ""))' in script_src
     assert "if __package__ in {None, \"\"}:" in script_src
+    assert 'os.getenv("MORNING_JOB_EXECUTION_MODE", "")' in script_src
+    assert 'os.getenv("MORNING_JOB_CLIENT_ID", "")' in script_src
 
 
 def test_recovery_release_is_paper_only_by_default():
@@ -251,6 +254,57 @@ def test_recovery_release_includes_live_only_when_flag_set():
 def test_handoff_backup_plan_builds_both_modes():
     calls = build_job_calls(MORNING_HANDOFF_BACKUP_JOB)
     assert [call.execution_mode for call in calls] == ["live", "paper"]
+
+
+def test_paper_workflow_uses_batch_job_name_and_paper_only_env():
+    workflow = (REPO_ROOT / ".github" / "workflows" / "paper-morning-jobs.yml").read_text()
+    assert 'default: "overnight_reeval_batch"' in workflow
+    assert '          - overnight_reeval_batch' in workflow
+    assert '"18 13 * * 1-5"|"18 14 * * 1-5") JOB="overnight_reeval_batch"' in workflow
+    assert "BOT_URL: ${{ secrets.PAPER_BOT_URL }}" in workflow
+    assert "MORNING_JOB_EXECUTION_MODE: paper" in workflow
+    assert "MORNING_JOB_PAPER_CLIENTS: ${{ matrix.client_id }}" in workflow
+    assert "MORNING_JOB_WINDOW_TOLERANCE_MINUTES: \"20\"" in workflow
+    assert "jasoncosby1@gmail.com" not in workflow
+
+
+def test_script_can_filter_to_paper_only_matrix_client():
+    old_mode = os.environ.get("MORNING_JOB_EXECUTION_MODE")
+    old_client = os.environ.get("MORNING_JOB_CLIENT_ID")
+    old_paper = os.environ.get("MORNING_JOB_PAPER_CLIENTS")
+    try:
+        os.environ["MORNING_JOB_EXECUTION_MODE"] = "paper"
+        os.environ["MORNING_JOB_CLIENT_ID"] = "jose.vasquez4011@gmail.com"
+        os.environ["MORNING_JOB_PAPER_CLIENTS"] = "jose.vasquez4011@gmail.com"
+        from ap.scripts.live_morning_jobs import _resolve_scoped_clients
+
+        live_client, paper_clients, mode_filter = _resolve_scoped_clients()
+        calls = [
+            call for call in build_job_calls(
+                OVERNIGHT_REEVAL_BATCH_JOB,
+                live_client=live_client,
+                paper_clients=paper_clients,
+            )
+            if call.execution_mode == mode_filter
+        ]
+        assert mode_filter == "paper"
+        assert len(calls) == 1
+        assert calls[0].execution_mode == "paper"
+        assert calls[0].payload["clients"] == ["jose.vasquez4011@gmail.com"]
+        assert DEFAULT_LIVE_CLIENT not in calls[0].payload["clients"]
+    finally:
+        if old_mode is None:
+            os.environ.pop("MORNING_JOB_EXECUTION_MODE", None)
+        else:
+            os.environ["MORNING_JOB_EXECUTION_MODE"] = old_mode
+        if old_client is None:
+            os.environ.pop("MORNING_JOB_CLIENT_ID", None)
+        else:
+            os.environ["MORNING_JOB_CLIENT_ID"] = old_client
+        if old_paper is None:
+            os.environ.pop("MORNING_JOB_PAPER_CLIENTS", None)
+        else:
+            os.environ["MORNING_JOB_PAPER_CLIENTS"] = old_paper
 
 
 def test_app_source_restores_existing_admin_endpoints_and_handoff_contract():
@@ -305,4 +359,3 @@ def test_no_code_path_calls_broker_submit_or_cancel_directly():
     assert "place_order(" not in combined
     assert "cancel_order(" not in combined
     assert "submit_existing_entry" not in combined
-
