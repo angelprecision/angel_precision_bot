@@ -359,6 +359,26 @@ def _watch_arm_cleanup_failed_reason(original_reason: str) -> str:
     return f"overnight_watch_arm_failed_cleanup_failed:{original_reason}"
 
 
+def _paper_overnight_rescue_only_signal(
+    signal: dict | None,
+    *,
+    job_source: str | None,
+    execution_mode: str | None,
+) -> bool:
+    if str(job_source or "").strip().lower() != "trade_queue":
+        return False
+    if str(execution_mode or "").strip().upper() != "PAPER":
+        return False
+    payload = signal if isinstance(signal, dict) else {}
+    return bool(payload.get("force_overnight_reeval_only")) and bool(payload.get("do_not_queue_directly"))
+
+
+def _paper_rescue_queue_reason(kind: str, detail: str | None = None) -> str:
+    kind = str(kind or "").strip()
+    detail = str(detail or "").strip()
+    return f"{kind}:{detail}" if detail else kind
+
+
 def _is_terminal_watch_arm_failure_reason(reason: str) -> bool:
     reason = str(reason or "")
     return (
@@ -601,6 +621,16 @@ def run_overnight_reeval(
         job_source = job.get("_source") or ("ap_signals" if str(job_id).startswith("sup:") else "trade_queue")
         ticker = signal.get("ticker") or signal.get("symbol", "?")
         side = (signal.get("side") or "").upper()
+        try:
+            from ap.authorization import execution_mode_for_broker as _exec_mode_for_broker
+            _execution_mode = str(_exec_mode_for_broker(broker) or "").upper()
+        except Exception:
+            _execution_mode = ""
+        _paper_rescue_only = _paper_overnight_rescue_only_signal(
+            signal,
+            job_source=job_source,
+            execution_mode=_execution_mode,
+        )
 
         try:
             # Age check: skip stale signals
@@ -639,9 +669,18 @@ def run_overnight_reeval(
                 result["rejected"] += 1
                 continue
 
-            if job_source == "ap_signals" and _shared_watch_arm_failure_already_recorded(
+            _shared_watch_arm_recorded = _shared_watch_arm_failure_already_recorded(
                 signal_id, client_id, signal, session_key=session_key
-            ):
+            )
+            if _shared_watch_arm_recorded and _paper_rescue_only:
+                _mark_job_rejected(
+                    job_id,
+                    client_id,
+                    "duplicate_setup:same_session_watch_arm_or_terminal_failure_proof",
+                )
+                result["rejected"] += 1
+                continue
+            if job_source == "ap_signals" and _shared_watch_arm_recorded:
                 result["skipped"] = result.get("skipped", 0) + 1
                 continue
 
@@ -760,6 +799,15 @@ def run_overnight_reeval(
                     "reason_code=OVERNIGHT_PRIOR_LEVELS_UNAVAILABLE",
                     ticker, signal_id, _side_upper, _missing_level,
                 )
+                if _paper_rescue_only:
+                    _mark_job_watching_reason(
+                        job_id,
+                        client_id,
+                        _paper_rescue_queue_reason(
+                            "after_hours_deferred",
+                            f"overnight_reeval_data_pending:{_missing_level}",
+                        ),
+                    )
                 result["skipped"] = result.get("skipped", 0) + 1
                 continue  # leave job WATCHING for next reeval run
 
@@ -769,6 +817,10 @@ def run_overnight_reeval(
                 float(signal.get("entry_trigger") or 0) or
                 (prior_day_high if side == "CALL" else prior_day_low)
             )
+            if not entry_trigger and _paper_rescue_only:
+                _mark_job_rejected(job_id, client_id, "trigger_invalid")
+                result["rejected"] += 1
+                continue
             if entry_trigger:
                 signal["entry_trigger"] = entry_trigger
 
@@ -796,6 +848,12 @@ def run_overnight_reeval(
                         "human_reason='Market snapshot unavailable — retry later'",
                         ticker, signal_id,
                     )
+                    if _paper_rescue_only:
+                        _mark_job_watching_reason(
+                            job_id,
+                            client_id,
+                            "after_hours_deferred:overnight_snapshot_unavailable",
+                        )
                     result["skipped"] = result.get("skipped", 0) + 1
                     continue  # leave job WATCHING for next reeval run
                 # True invalidation — reject
@@ -929,8 +987,17 @@ def run_overnight_reeval(
                             _is_hard_safety_block, _is_intel_block,
                             _OVERNIGHT_REEVAL_SCORE_RECHECK_ENABLED,
                         )
-                        _mark_job_rejected(job_id, client_id,
-                                           f"mc_blocked:{decision.reason}")
+                        if _paper_rescue_only:
+                            _reason_text = str(decision.reason or "")
+                            _reason_prefix = "duplicate_setup" if "duplicate" in _reason_text.lower() else "risk_blocked"
+                            _mark_job_rejected(
+                                job_id,
+                                client_id,
+                                _paper_rescue_queue_reason(_reason_prefix, _reason_text),
+                            )
+                        else:
+                            _mark_job_rejected(job_id, client_id,
+                                               f"mc_blocked:{decision.reason}")
                         if _lifecycle_ok:
                             try:
                                 _sig_rejected(signal_id, ticker, _LO.MASTER_CONTROL,
@@ -942,6 +1009,15 @@ def run_overnight_reeval(
                         continue
             except Exception as mc_exc:
                 log.error("[%s] overnight_reeval: master_control.evaluate failed: %s", ticker, mc_exc)
+                if _paper_rescue_only:
+                    _mark_job_error(
+                        job_id,
+                        client_id,
+                        _paper_rescue_queue_reason(
+                            "risk_blocked",
+                            f"master_control_exception:{type(mc_exc).__name__}",
+                        ),
+                    )
                 result["errors"] += 1
                 continue
 
@@ -1125,11 +1201,26 @@ def run_overnight_reeval(
                 )
             except Exception as osm_exc:
                 log.error("[%s] overnight_reeval: OSM create_entry_order failed: %s", ticker, osm_exc)
+                if _paper_rescue_only:
+                    _mark_job_error(
+                        job_id,
+                        client_id,
+                        _paper_rescue_queue_reason(
+                            "order_materialization_failed",
+                            f"create_entry_order:{type(osm_exc).__name__}",
+                        ),
+                    )
                 result["errors"] += 1
                 continue
 
             if not local_order_id:
                 log.error("[%s] overnight_reeval: OSM returned no local_order_id for %s", ticker, signal_id)
+                if _paper_rescue_only:
+                    _mark_job_error(
+                        job_id,
+                        client_id,
+                        "order_materialization_failed:missing_local_order_id",
+                    )
                 result["errors"] += 1
                 continue
 
@@ -1145,11 +1236,26 @@ def run_overnight_reeval(
                 if not _pt_ok:
                     log.error("[%s] overnight_reeval: could not mark PENDING_TRIGGER for %s — skipping arm",
                               ticker, local_order_id)
+                    if _paper_rescue_only:
+                        _mark_job_error(
+                            job_id,
+                            client_id,
+                            "order_materialization_failed:pending_trigger_transition_false",
+                        )
                     result["errors"] += 1
                     continue
             except Exception as _pt_exc:
                 log.error("[%s] overnight_reeval: PENDING_TRIGGER transition failed: %s — skipping arm",
                           ticker, _pt_exc)
+                if _paper_rescue_only:
+                    _mark_job_error(
+                        job_id,
+                        client_id,
+                        _paper_rescue_queue_reason(
+                            "order_materialization_failed",
+                            f"pending_trigger_transition_exception:{type(_pt_exc).__name__}",
+                        ),
+                    )
                 result["errors"] += 1
                 continue
 
@@ -1338,6 +1444,15 @@ def run_overnight_reeval(
 
         except Exception as outer_exc:
             log.error("[%s] overnight_reeval: unexpected error for %s: %s", ticker, signal_id, outer_exc, exc_info=True)
+            if _paper_rescue_only:
+                _mark_job_error(
+                    job_id,
+                    client_id,
+                    _paper_rescue_queue_reason(
+                        "overnight_reeval_internal_error",
+                        type(outer_exc).__name__,
+                    ),
+                )
             result["errors"] += 1
 
     log.info(
@@ -1615,6 +1730,34 @@ def _mark_job_error(job_id, client_id: str, reason: str) -> None:
         run_with_retry(_fn)
     except Exception as e:
         log.debug("_mark_job_error[trade_queue] failed non-fatal: %s", e)
+
+
+def _mark_job_watching_reason(job_id, client_id: str, reason: str) -> None:
+    """Keep WATCHING rows non-terminal but explicit when data is still pending."""
+    job_id_str = str(job_id)
+    if job_id_str.startswith("sup:"):
+        log.info(
+            "[%s] reeval waiting shared setup %s — shared row untouched: %s",
+            client_id, job_id_str[4:], reason[:200],
+        )
+        return
+
+    try:
+        from ap.db import conn, run_with_retry
+
+        def _fn():
+            with conn() as c:
+                c.execute("""
+                    UPDATE trade_queue
+                    SET status = 'WATCHING',
+                        last_error = %s,
+                        started_ts = COALESCE(started_ts, NOW()),
+                        finished_ts = NULL
+                    WHERE id = %s AND client_id = %s
+                """, (reason[:500], job_id, client_id))
+        run_with_retry(_fn)
+    except Exception as e:
+        log.debug("_mark_job_watching_reason[trade_queue] failed non-fatal: %s", e)
 
 
 def _mark_job_watching_armed(job_id, client_id: str, contract: str) -> None:
