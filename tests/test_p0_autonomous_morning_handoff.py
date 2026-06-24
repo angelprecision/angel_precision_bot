@@ -8,9 +8,11 @@ from ap import morning_handoff
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_startup_source_calls_morning_handoff_once():
+def test_startup_source_calls_only_unified_morning_handoff_once():
     src = (REPO_ROOT / "client_runner.py").read_text()
-    assert "self._run_startup_morning_handoff()" in src
+    run_idx = src.find("self._run_startup_morning_handoff()")
+    assert run_idx != -1
+    assert "self._run_morning_handoff_audit_startup()" not in src
     assert 'stage="startup"' in src
 
 
@@ -18,8 +20,24 @@ def test_post_overnight_source_calls_handoff_after_result():
     src = (REPO_ROOT / "client_runner.py").read_text()
     assert "self._run_post_overnight_morning_handoff(result)" in src
     assert 'stage="post_overnight_reeval"' in src
-    assert "if armed <= 0:" in src
+    assert "if not isinstance(overnight_result, dict):" in src
+    assert "if armed <= 0:" not in src
 
+
+
+def test_legacy_startup_helper_is_wrapper_only():
+    src = (REPO_ROOT / "client_runner.py").read_text()
+    start = src.find("def _run_morning_handoff_audit_startup")
+    end = src.find("def _run_startup_recovery", start)
+    block = src[start:end]
+    assert "self._run_startup_morning_handoff()" in block
+    assert "ap_morning_handoff_audit" not in block
+
+
+def test_render_primary_jobs_are_explicitly_live_scoped():
+    src = (REPO_ROOT / "render.yaml").read_text()
+    assert src.count("MORNING_JOB_EXECUTION_MODE, value: live") == 8
+    assert src.count("MORNING_JOB_CLIENT_ID, value: jasoncosby1@gmail.com") == 8
 
 def test_startup_recovery_disables_internal_watcher_reseed():
     src = (REPO_ROOT / "client_runner.py").read_text()

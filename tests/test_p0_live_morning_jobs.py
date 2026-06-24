@@ -210,6 +210,13 @@ def test_render_blueprint_defines_primary_render_cron_jobs():
     assert "startCommand: \"python -m ap.scripts.live_morning_jobs\"" in blueprint
 
 
+
+def test_render_primary_crons_are_live_scoped_to_jason_only():
+    blueprint = (REPO_ROOT / "render.yaml").read_text()
+    assert blueprint.count("MORNING_JOB_EXECUTION_MODE, value: live") == 8
+    assert blueprint.count("MORNING_JOB_CLIENT_ID, value: jasoncosby1@gmail.com") == 8
+
+
 def test_script_accepts_render_and_backup_env_aliases():
     script_src = (REPO_ROOT / "ap" / "scripts" / "live_morning_jobs.py").read_text()
     assert 'os.getenv("BOT_URL", os.getenv("AP_BOT_URL", ""))' in script_src

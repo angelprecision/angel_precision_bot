@@ -47,6 +47,8 @@ services:
     envVars:
       - { key: TZ, value: America/New_York }
       - { key: MORNING_JOB, value: overnight_reeval_batch }
+      - { key: MORNING_JOB_EXECUTION_MODE, value: live }
+      - { key: MORNING_JOB_CLIENT_ID, value: jasoncosby1@gmail.com }
       - { key: BOT_URL, sync: false }
       - { key: SIGNING_SECRET, sync: false }
   - type: cron
@@ -58,6 +60,8 @@ services:
     envVars:
       - { key: TZ, value: America/New_York }
       - { key: MORNING_JOB, value: overnight_reeval_batch }
+      - { key: MORNING_JOB_EXECUTION_MODE, value: live }
+      - { key: MORNING_JOB_CLIENT_ID, value: jasoncosby1@gmail.com }
       - { key: BOT_URL, sync: false }
       - { key: SIGNING_SECRET, sync: false }
 
@@ -71,6 +75,8 @@ services:
     envVars:
       - { key: TZ, value: America/New_York }
       - { key: MORNING_JOB, value: morning_handoff_primary }
+      - { key: MORNING_JOB_EXECUTION_MODE, value: live }
+      - { key: MORNING_JOB_CLIENT_ID, value: jasoncosby1@gmail.com }
       - { key: BOT_URL, sync: false }
       - { key: SIGNING_SECRET, sync: false }
   - type: cron
@@ -82,6 +88,8 @@ services:
     envVars:
       - { key: TZ, value: America/New_York }
       - { key: MORNING_JOB, value: morning_handoff_primary }
+      - { key: MORNING_JOB_EXECUTION_MODE, value: live }
+      - { key: MORNING_JOB_CLIENT_ID, value: jasoncosby1@gmail.com }
       - { key: BOT_URL, sync: false }
       - { key: SIGNING_SECRET, sync: false }
 
@@ -95,6 +103,8 @@ services:
     envVars:
       - { key: TZ, value: America/New_York }
       - { key: MORNING_JOB, value: morning_handoff_backup }
+      - { key: MORNING_JOB_EXECUTION_MODE, value: live }
+      - { key: MORNING_JOB_CLIENT_ID, value: jasoncosby1@gmail.com }
       - { key: BOT_URL, sync: false }
       - { key: SIGNING_SECRET, sync: false }
   - type: cron
@@ -106,6 +116,8 @@ services:
     envVars:
       - { key: TZ, value: America/New_York }
       - { key: MORNING_JOB, value: morning_handoff_backup }
+      - { key: MORNING_JOB_EXECUTION_MODE, value: live }
+      - { key: MORNING_JOB_CLIENT_ID, value: jasoncosby1@gmail.com }
       - { key: BOT_URL, sync: false }
       - { key: SIGNING_SECRET, sync: false }
 
@@ -119,6 +131,8 @@ services:
     envVars:
       - { key: TZ, value: America/New_York }
       - { key: MORNING_JOB, value: morning_recovery }
+      - { key: MORNING_JOB_EXECUTION_MODE, value: live }
+      - { key: MORNING_JOB_CLIENT_ID, value: jasoncosby1@gmail.com }
       - { key: BOT_URL, sync: false }
       - { key: SIGNING_SECRET, sync: false }
   - type: cron
@@ -130,5 +144,7 @@ services:
     envVars:
       - { key: TZ, value: America/New_York }
       - { key: MORNING_JOB, value: morning_recovery }
+      - { key: MORNING_JOB_EXECUTION_MODE, value: live }
+      - { key: MORNING_JOB_CLIENT_ID, value: jasoncosby1@gmail.com }
       - { key: BOT_URL, sync: false }
       - { key: SIGNING_SECRET, sync: false }
