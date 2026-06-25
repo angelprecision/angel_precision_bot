@@ -1549,6 +1549,13 @@ def _dispatch(
         try:
             if hasattr(plan, "metadata") and isinstance(plan.metadata, dict):
                 plan.metadata["local_order_id"] = str(local_order_id)
+                # PR #182: stash job_id so breach-time write-back can resolve the
+                # trade_queue row. Must happen before entry_watcher.watch() so
+                # watch() can carry it into signal_dict → watched.signal → sig
+                # inside _on_entry_trigger(). Without this, sig.get("queue_id")
+                # returns None and write_deferred_breach_last_error() no-ops.
+                plan.metadata["queue_id"] = job_id
+                plan.metadata["trade_queue_id"] = job_id
         except Exception:
             pass
         log.info(
