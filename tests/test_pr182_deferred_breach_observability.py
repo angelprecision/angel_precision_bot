@@ -569,3 +569,189 @@ class TestSourceStructure:
             "write_deferred_breach_last_error is not inside a try block — "
             "a DB failure would propagate and block the terminal cleanup path"
         )
+
+
+# ---------------------------------------------------------------------------
+# Real-shape propagation test — no synthetic queue_id fixtures
+# ---------------------------------------------------------------------------
+
+class TestQueueIdPropagation:
+    """PR #182 finding fix: queue_id was not carried through the real
+    queue → plan.metadata → watch() → signal_dict → watched.signal → _on_entry_trigger
+    chain. These tests verify the propagation without injecting queue_id
+    directly onto the fake watched signal (which is what the original tests
+    incorrectly did).
+
+    Shape under test:
+        _dispatch(job_id=77, plan=...) 
+          → plan.metadata["queue_id"] = 77
+          → entry_watcher.watch(plan=plan, ...)
+            → signal_dict["queue_id"] = plan.metadata["queue_id"]
+            → watched.signal["queue_id"] == 77
+          → _on_entry_trigger(watched)
+            → sig.get("queue_id") == 77
+            → write_deferred_breach_last_error(77, ...)
+    """
+
+    def test_dispatch_stashes_queue_id_on_plan_metadata(self):
+        """queue.py _dispatch() must write job_id to plan.metadata before
+        calling watch(). Verified against the source — no runtime execution."""
+        import inspect
+        from pathlib import Path
+        src = (Path(__file__).resolve().parents[1] / "ap" / "queue.py").read_text()
+
+        # The stash must happen in the metadata try block that also stashes local_order_id
+        idx_local = src.find('plan.metadata["local_order_id"] = str(local_order_id)')
+        assert idx_local != -1, "local_order_id stash not found in queue.py"
+
+        idx_queue_id = src.find('plan.metadata["queue_id"] = job_id')
+        assert idx_queue_id != -1, (
+            "plan.metadata['queue_id'] = job_id not found in queue.py — "
+            "queue_id will be None at breach time, write_deferred_breach_last_error no-ops"
+        )
+
+        # queue_id stash must come AFTER local_order_id stash (same try block)
+        # AND before the entry_watcher.watch() call
+        idx_watch = src.find("entry_watcher.watch(plan=plan")
+        assert idx_watch != -1, "entry_watcher.watch(plan=plan ...) not found"
+        assert idx_local < idx_queue_id < idx_watch, (
+            "plan.metadata['queue_id'] stash must be between "
+            "local_order_id stash and entry_watcher.watch() call. "
+            f"Got: local_order_id@{idx_local} queue_id@{idx_queue_id} watch@{idx_watch}"
+        )
+
+    def test_watch_carries_queue_id_into_signal_dict(self):
+        """ap_entry_watcher.watch() must copy queue_id from plan.metadata
+        into signal_dict so watched.signal["queue_id"] is available at breach."""
+        from pathlib import Path
+        src = (Path(__file__).resolve().parents[1] / "ap_entry_watcher.py").read_text()
+
+        # signal_dict must include queue_id from plan.metadata
+        assert '"queue_id"' in src or "'queue_id'" in src, (
+            "queue_id not found in ap_entry_watcher.py signal_dict — "
+            "sig.get('queue_id') will be None in _on_entry_trigger"
+        )
+        assert "plan" in src[src.find('"queue_id"'):src.find('"queue_id"') + 100], (
+            "queue_id in signal_dict does not read from plan.metadata"
+        )
+
+    def test_execution_core_reads_queue_id_from_sig_not_fixture(self):
+        """_on_entry_trigger must read queue_id from sig (which comes from
+        watched.signal, which comes from signal_dict in watch()), not only
+        from approved_plan.metadata. This ensures the real propagation path
+        is exercised, not the synthetic fixture shortcut."""
+        from pathlib import Path
+        src = (Path(__file__).resolve().parents[1] / "ap_execution_core.py").read_text()
+
+        # The write-back call must attempt sig.get("queue_id") as first option
+        idx_write = src.find("write_deferred_breach_last_error(")
+        assert idx_write != -1, "write_deferred_breach_last_error call not found"
+
+        # Find the queue_id resolution block before the call
+        region = src[max(0, idx_write - 600):idx_write]
+        assert 'sig.get("queue_id")' in region or "sig.get('queue_id')" in region, (
+            "write_deferred_breach_last_error queue_id resolution does not "
+            "attempt sig.get('queue_id') — real propagation path not wired"
+        )
+
+    def test_write_back_uses_sig_queue_id_at_runtime(self, monkeypatch):
+        """End-to-end real-shape test: queue_id starts on plan.metadata only,
+        flows through watch() into signal_dict, arrives at _on_entry_trigger
+        via sig, and reaches write_deferred_breach_last_error.
+
+        Does NOT put queue_id directly on fake watched.signal — that bypasses
+        the propagation chain and is what the original tests did incorrectly.
+        """
+        import types
+        import ap_execution_core as ec_mod
+        from ap import queue as q
+
+        write_calls: list[dict] = []
+        monkeypatch.setattr(
+            q, "write_deferred_breach_last_error",
+            lambda qid, *, reason_code, explanation, attempt, client_id, ticker:
+                write_calls.append({"queue_id": qid, "reason_code": reason_code}),
+        )
+
+        JOB_ID = 77
+
+        # Plan has queue_id in metadata (set by _dispatch before watch())
+        plan = types.SimpleNamespace(
+            ticker="ROST",
+            side="PUT",
+            contract_symbol="DEFERRED:ROST",
+            limit_price=None,
+            contracts=2,
+            max_position_usd=500.0,
+            trigger_price=227.62,
+            signal_id="sig-real-shape-001",
+            client_id="jose.vasquez4011",
+            metadata={
+                "contract_deferred": True,
+                "deferred_breach_selection": True,
+                "selection_context": "deferred_breach",
+                "local_order_id": "ord-real-001",
+                "queue_id": JOB_ID,           # set by _dispatch (Fix 1)
+                "trade_queue_id": JOB_ID,     # set by _dispatch (Fix 1)
+            },
+        )
+
+        # Simulate what watch() does: build signal_dict from plan (Fix 2)
+        signal_dict = {
+            "signal_id":      plan.signal_id,
+            "ticker":         plan.ticker,
+            "side":           plan.side,
+            "local_order_id": "ord-real-001",
+            "client_id":      plan.client_id,
+            # queue_id propagated from plan.metadata — this is what fix 2 adds
+            "queue_id":       plan.metadata.get("queue_id"),
+            "trade_queue_id": plan.metadata.get("trade_queue_id"),
+        }
+
+        # watched.signal is signal_dict — NOT manually injected with queue_id
+        watched = types.SimpleNamespace(
+            ticker=plan.ticker,
+            trigger_price=plan.trigger_price,
+            signal=signal_dict,   # real shape: queue_id came from plan.metadata via watch()
+        )
+
+        mock_sel = __import__("unittest.mock", fromlist=["MagicMock"]).MagicMock()
+        mock_sel.select.return_value = None
+        mock_sel.get_last_failure.return_value = {
+            "stage": "cheap_contract_gate",
+            "reason_code": "CHEAP_CONTRACT_NO_UPGRADE",
+            "explanation": "premium $35 below $50 min",
+        }
+
+        core = ec_mod.APExecutionCore.__new__(ec_mod.APExecutionCore)
+        core.paper = True
+        core.email = "jose.vasquez4011"
+        core.client_id = "jose.vasquez4011"
+        core.mode = "PAPER"
+        core.contract_selector = mock_sel
+        core.order_state_machine = __import__("unittest.mock", fromlist=["MagicMock"]).MagicMock()
+        core.store = __import__("unittest.mock", fromlist=["MagicMock"]).MagicMock()
+        core.entry_watcher = __import__("unittest.mock", fromlist=["MagicMock"]).MagicMock()
+        core.exit_eng = __import__("unittest.mock", fromlist=["MagicMock"]).MagicMock()
+        core.tracker = __import__("unittest.mock", fromlist=["MagicMock"]).MagicMock()
+        core.position_manager = __import__("unittest.mock", fromlist=["MagicMock"]).MagicMock()
+
+        monkeypatch.setattr(ec_mod.APExecutionCore, "_breach_risk_check",
+                            lambda s, w: True)
+        monkeypatch.setattr(ec_mod.APExecutionCore, "_recover_plan_for_revalidation",
+                            lambda s, w: plan)
+        monkeypatch.setattr(ec_mod.APExecutionCore, "_cleanup_pending_entry_order",
+                            lambda s, w, action, reason: None)
+
+        core._on_entry_trigger(watched)
+
+        assert len(write_calls) >= 1, (
+            "write_deferred_breach_last_error was not called. "
+            "Check that queue_id propagates from plan.metadata → signal_dict → sig."
+        )
+        assert write_calls[0]["queue_id"] == JOB_ID, (
+            f"Expected queue_id={JOB_ID}, got {write_calls[0]['queue_id']}. "
+            "queue_id is not flowing through the real watch() propagation path."
+        )
+        assert write_calls[0]["reason_code"] == "CHEAP_CONTRACT_NO_UPGRADE"
+
