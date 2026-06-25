@@ -2906,66 +2906,256 @@ def create_app() -> Flask:
                 results[email] = {"ok": False, "error": str(e)}
         return jsonify({"ok": True, "results": results})
 
+    def _run_paper_restart_guard_handoff(client_email: str) -> dict:
+        from client_runner import _active_runners, _registry_lock
+        from ap_recovery import APStartupRecovery
+
+        with _registry_lock:
+            runner = _active_runners.get(client_email)
+        if not runner or not runner.is_alive():
+            return {"ok": False, "error": "runner_not_alive", "client_id": client_email}
+
+        recovery = APStartupRecovery(
+            client_id=client_email,
+            broker=getattr(runner, "broker", None) or (getattr(runner, "core", None) and getattr(runner.core, "broker", None)),
+            osm=getattr(runner, "order_state_machine", None),
+            pm=getattr(runner, "position_manager", None),
+            master_control=getattr(runner, "master_control", None),
+            exit_engine=getattr(getattr(runner, "core", None), "exit_eng", None),
+            entry_watcher=getattr(getattr(runner, "core", None), "entry_watcher", None),
+        )
+        result = {"watchers_requeued": 0}
+        recovery._reseed_watchers(result)
+        return {"ok": True, "client_id": client_email, **result}
+
     @app.post("/admin/operator/manual-rescue-restart-guard")
     @_require_admin
     def manual_rescue_restart_guard():
         body = request.get_json(silent=True) or {}
         lookback_hours = int(body.get("hours") or 48)
+        dry_run = bool(body.get("dry_run", True))
 
         try:
-            from ap.db import conn, run_with_retry
+            _bot_mode = os.getenv("BOT_MODE", os.getenv("MODE", "paper")).strip().lower()
+            if _bot_mode != "paper":
+                return jsonify({
+                    "ok": False,
+                    "error": "paper_only_endpoint",
+                    "mode": _bot_mode,
+                }), 400
 
-            def _rescue():
+            from ap.db import conn, run_with_retry
+            from ap.paper_restart_guard_rescue import build_paper_restart_guard_rescue_plan
+            from client_runner import _fetch_active_members, SUPABASE_URL, SUPABASE_SERVICE_KEY
+            from supabase import create_client as _cc
+
+            if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+                return jsonify({"ok": False, "error": "missing_supabase_credentials"}), 503
+
+            sb = _cc(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+            active_paper_clients = {
+                str(m.get("email") or "").strip()
+                for m in (_fetch_active_members(sb) or [])
+                if str(m.get("email") or "").strip()
+            }
+            if not active_paper_clients:
+                return jsonify({
+                    "ok": True,
+                    "dry_run": dry_run,
+                    "rescued": 0,
+                    "watching_restored": 0,
+                    "skipped": 0,
+                    "rows": [],
+                    "active_paper_clients": [],
+                })
+
+            def _load_candidates():
                 with conn() as c:
                     c.execute(
                         """
-                        WITH rescued AS (
-                            UPDATE trade_queue
-                            SET    status = 'NEW',
-                                   started_ts = NULL,
-                                   finished_ts = NULL,
-                                   last_error = 'manual_rescue_current_session',
-                                   result_json = COALESCE(result_json, '{}'::jsonb) || jsonb_build_object(
-                                       'manual_rescue', true,
-                                       'manual_rescue_actor', 'operator_dashboard',
-                                       'manual_rescue_ts', NOW()::text,
-                                       'manual_rescue_previous_error', COALESCE(last_error, '')
-                                   )
-                            WHERE  status IN ('NEW', 'REJECTED', 'ERROR')
-                              AND  created_ts >= NOW() - (%s || ' hours')::interval
-                              AND (
-                                     COALESCE(payload->>'timeframe', '') IN ('1d', 'daily', 'overnight')
-                                  OR payload ? 'prior_day_high'
-                                  OR payload ? 'prior_day_low'
-                              )
-                              AND (
-                                     last_error IN (
-                                         'restart_guard:overnight_skip',
-                                         'manual_requeue_after_overnight_reeval_timeout',
-                                         'manual_rescue_current_session'
-                                     )
-                                  OR COALESCE(result_json->>'manual_rescue', 'false') = 'true'
-                              )
-                            RETURNING id, client_id, signal_id
-                        )
-                        SELECT COUNT(*)::int AS n FROM rescued
+                        SELECT
+                            id,
+                            client_id,
+                            signal_id,
+                            status,
+                            last_error,
+                            created_ts,
+                            started_ts,
+                            finished_ts,
+                            COALESCE(payload->>'ticker', payload->>'symbol', '') AS ticker,
+                            COALESCE(payload->>'side', '') AS side,
+                            payload,
+                            result_json
+                        FROM trade_queue
+                        WHERE client_id = ANY(%s)
+                          AND status IN ('REJECTED', 'ARCHIVED')
+                          AND last_error LIKE 'restart_guard:overnight_skip%%'
+                          AND created_ts >= NOW() - (%s || ' hours')::interval
+                        ORDER BY created_ts DESC, id DESC
                         """,
-                        (str(lookback_hours),),
+                        (list(active_paper_clients), str(lookback_hours)),
                     )
-                    row = c.fetchone() or {"n": 0}
-                    return int(row["n"] if isinstance(row, dict) else row[0])
+                    return c.fetchall()
 
-            rescued = run_with_retry(_rescue)
+            queue_rows = [dict(row) for row in (run_with_retry(_load_candidates) or [])]
+
+            signal_ids = sorted({str(r.get("signal_id") or "").strip() for r in queue_rows if str(r.get("signal_id") or "").strip()})
+            client_ids = sorted({str(r.get("client_id") or "").strip() for r in queue_rows if str(r.get("client_id") or "").strip()})
+
+            def _load_orders():
+                if not signal_ids or not client_ids:
+                    return []
+                with conn() as c:
+                    c.execute(
+                        """
+                        SELECT
+                            client_id,
+                            signal_id,
+                            local_order_id,
+                            kind,
+                            status,
+                            broker_order_id,
+                            submitted_ts,
+                            filled_ts
+                        FROM orders
+                        WHERE client_id = ANY(%s)
+                          AND signal_id = ANY(%s)
+                          AND kind = 'ENTRY'
+                          AND status IN ('CREATED', 'WATCHING', 'PENDING_TRIGGER', 'SUBMITTED', 'ACKNOWLEDGED', 'PARTIAL_FILL')
+                        """,
+                        (client_ids, signal_ids),
+                    )
+                    return c.fetchall()
+
+            order_rows = [dict(row) for row in (run_with_retry(_load_orders) or [])]
+            plan = build_paper_restart_guard_rescue_plan(
+                queue_rows=queue_rows,
+                order_rows=order_rows,
+                active_paper_clients=active_paper_clients,
+                lookback_hours=lookback_hours,
+            )
+
+            rows_payload = [
+                {
+                    "queue_id": d.queue_id,
+                    "client_id": d.client_id,
+                    "signal_id": d.signal_id,
+                    "ticker": d.ticker,
+                    "side": d.side,
+                    "action": d.action,
+                    "reason": d.reason,
+                    "prior_status": d.prior_status,
+                    "prior_last_error": d.prior_last_error,
+                    "order_local_id": d.order_local_id,
+                    "order_status": d.order_status,
+                }
+                for d in plan
+            ]
+
+            if dry_run:
+                return jsonify({
+                    "ok": True,
+                    "dry_run": True,
+                    "rescued": sum(1 for d in plan if d.action == "NEW"),
+                    "watching_restored": sum(1 for d in plan if d.action == "WATCHING"),
+                    "skipped": sum(1 for d in plan if d.action == "SKIP"),
+                    "rows": rows_payload,
+                    "active_paper_clients": sorted(active_paper_clients),
+                })
+
+            def _apply():
+                with conn() as c:
+                    for decision in plan:
+                        if decision.action == "NEW":
+                            c.execute(
+                                """
+                                UPDATE trade_queue
+                                SET
+                                    status = 'WATCHING',
+                                    started_ts = NULL,
+                                    finished_ts = NULL,
+                                    last_error = 'after_hours_deferred:awaiting_overnight_reeval',
+                                    payload = COALESCE(payload, '{}'::jsonb) || jsonb_build_object(
+                                        'force_overnight_reeval_only', true,
+                                        'do_not_queue_directly', true
+                                    ),
+                                    result_json = COALESCE(result_json, '{}'::jsonb) || jsonb_build_object(
+                                        'manual_rescue', true,
+                                        'manual_rescue_actor', 'operator_dashboard',
+                                        'manual_rescue_ts', NOW()::text,
+                                        'manual_rescue_reason', %s,
+                                        'manual_rescue_route', 'overnight_reeval_only',
+                                        'prior_status', %s,
+                                        'prior_last_error', %s
+                                    )
+                                WHERE id = %s
+                                """,
+                                (
+                                    decision.reason,
+                                    decision.prior_status,
+                                    decision.prior_last_error,
+                                    decision.queue_id,
+                                ),
+                            )
+                            continue
+                        if decision.action != "WATCHING":
+                            continue
+                        c.execute(
+                            """
+                            UPDATE trade_queue
+                            SET
+                                status = %s,
+                                started_ts = NULL,
+                                finished_ts = NULL,
+                                last_error = 'manual_rescue_current_session',
+                                result_json = COALESCE(result_json, '{}'::jsonb) || jsonb_build_object(
+                                    'manual_rescue', true,
+                                    'manual_rescue_actor', 'operator_dashboard',
+                                    'manual_rescue_ts', NOW()::text,
+                                    'manual_rescue_reason', %s,
+                                    'prior_status', %s,
+                                    'prior_last_error', %s
+                                )
+                            WHERE id = %s
+                            """,
+                            (
+                                decision.action,
+                                decision.reason,
+                                decision.prior_status,
+                                decision.prior_last_error,
+                                decision.queue_id,
+                            ),
+                        )
+                    return True
+
+            run_with_retry(_apply)
+
+            handoff_results = {}
+            for client_email in sorted({d.client_id for d in plan if d.action == "WATCHING"}):
+                try:
+                    handoff_results[client_email] = _run_paper_restart_guard_handoff(client_email)
+                except Exception as handoff_exc:
+                    handoff_results[client_email] = {"ok": False, "error": str(handoff_exc), "client_id": client_email}
+
             admin_log.warning(
-                "MANUAL_RESCUE_RESTART_GUARD rows=%s lookback_hours=%s ip=%s",
-                rescued,
+                "MANUAL_RESCUE_RESTART_GUARD paper_rows=%s new=%s watching=%s skipped=%s lookback_hours=%s dry_run=%s ip=%s",
+                len(plan),
+                sum(1 for d in plan if d.action == "NEW"),
+                sum(1 for d in plan if d.action == "WATCHING"),
+                sum(1 for d in plan if d.action == "SKIP"),
                 lookback_hours,
+                dry_run,
                 _admin_client_ip(),
             )
             return jsonify({
                 "ok": True,
-                "rescued": int(rescued or 0),
+                "dry_run": False,
+                "rescued": sum(1 for d in plan if d.action == "NEW"),
+                "watching_restored": sum(1 for d in plan if d.action == "WATCHING"),
+                "skipped": sum(1 for d in plan if d.action == "SKIP"),
                 "lookback_hours": lookback_hours,
+                "rows": rows_payload,
+                "handoff_results": handoff_results,
             })
         except Exception as e:
             admin_log.error("manual_rescue_restart_guard failed: %s", e, exc_info=True)

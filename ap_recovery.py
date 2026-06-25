@@ -726,7 +726,6 @@ class APStartupRecovery:
             count = 0  # No WATCHING rows reset for LIVE.
         else:
             count = run_with_retry(_reset) or 0
-
         rearmed = 0
         if self.entry_watcher is None:
             log.warning(

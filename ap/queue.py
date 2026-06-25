@@ -249,12 +249,28 @@ _MANUAL_RESTART_GUARD_BYPASS_ERRORS = frozenset({
     "manual_rescue_current_session",
 })
 
+_PAPER_OVERNIGHT_REEVAL_ONLY_ERROR = "after_hours_deferred:awaiting_overnight_reeval"
+
+
+def _paper_overnight_reeval_only_enabled(*, payload: dict | None = None, execution_mode: str | None = None) -> bool:
+    if str(execution_mode or "").strip().upper() != "PAPER":
+        return False
+    if not isinstance(payload, dict):
+        return False
+    return bool(payload.get("force_overnight_reeval_only")) and bool(payload.get("do_not_queue_directly"))
+
 
 def _manual_restart_guard_bypass_enabled(
     *,
     job_last_error: str | None = None,
     job_result: dict | None = None,
+    payload: dict | None = None,
+    execution_mode: str | None = None,
 ) -> bool:
+    if str(execution_mode or "").strip().upper() != "PAPER":
+        return False
+    if _paper_overnight_reeval_only_enabled(payload=payload, execution_mode=execution_mode):
+        return True
     if isinstance(job_result, dict) and bool(job_result.get("manual_rescue")):
         return True
     return str(job_last_error or "").strip() in _MANUAL_RESTART_GUARD_BYPASS_ERRORS
@@ -610,7 +626,23 @@ def _dispatch(
     # master_control is the sole authority for LIVE vs PAPER mode in _dispatch.
     # worker_loop's live_mode parameter is only used for the mode label log and
     # legacy-fallback guard; it does not affect _dispatch fail-closed logic.
-    live_mode: bool = str(getattr(master_control, "mode", "PAPER")).upper() == "LIVE"
+    _execution_mode = str(getattr(master_control, "mode", "PAPER")).upper()
+    live_mode: bool = _execution_mode == "LIVE"
+
+    if _paper_overnight_reeval_only_enabled(payload=payload, execution_mode=_execution_mode):
+        log.warning(
+            "[%s] PAPER OVERNIGHT RESCUE ROUTE — deferring queue row to overnight_reeval only | signal_id=%s job_id=%s",
+            ticker,
+            signal_id,
+            job_id,
+        )
+        _mark_job(
+            job_id,
+            "WATCHING",
+            result={"stage": "overnight_reeval", "reason": "paper_force_overnight_only"},
+            error=_PAPER_OVERNIGHT_REEVAL_ONLY_ERROR,
+        )
+        return
 
     # ── 0. RESTART GUARD ─────────────────────────────────────────────────────
     # Blocks overnight (previous-day) signals during market hours.
@@ -622,6 +654,8 @@ def _dispatch(
         _manual_rescue_bypass = _manual_restart_guard_bypass_enabled(
             job_last_error=job_last_error,
             job_result=job_result,
+            payload=payload,
+            execution_mode=_execution_mode,
         )
         if _restart_skip and not _manual_rescue_bypass:
             log.warning("[%s] RESTART GUARD — overnight signal blocked", ticker)
