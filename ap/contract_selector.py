@@ -77,13 +77,16 @@ def _get_max_premium(ticker: str) -> float:
 # =============================================================================
 
 _REASON_CODE_MAP: dict[str, str] = {
-    "zero_bid_or_ask":       "NO_CHAIN_DATA",
-    "ask_below_bid":         "NO_CHAIN_DATA",
-    "zero_mid":              "NO_CHAIN_DATA",
+    # P1 selector honesty: zero-quote chain rows are CHAIN_ROW_ZERO_BID_ASK,
+    # not NO_CHAIN_DATA. NO_CHAIN_DATA is reserved for empty/failed chain fetches.
+    "zero_bid_or_ask":       "CHAIN_ROW_ZERO_BID_ASK",
+    "ask_below_bid":         "CHAIN_ROW_ZERO_BID_ASK",
+    "zero_mid":              "CHAIN_ROW_ZERO_BID_ASK",
     "size_too_thin":         "VOLUME_TOO_LOW",
     "spread_too_wide":       "SPREAD_TOO_WIDE",
     "illiquid_vol":          "OI_TOO_LOW",
-    "bid_below":             "NO_AFFORDABLE_CONTRACT",
+    # P1: bid_below min is a distinct gate from premium affordability
+    "bid_below":             "BID_BELOW_MIN",
     "oi_too_low":            "OI_TOO_LOW",
     "volume_too_low":        "VOLUME_TOO_LOW",
     "dte_out_of_range":      "DTE_OUT_OF_RANGE",
@@ -116,6 +119,126 @@ def _normalize_reason_code(raw_reason: str) -> str:
         _UNKNOWN_SELECTOR_REASONS_SEEN.add(code)
         log.warning("Unmapped selector rejection reason observed: %s", code)
     return code
+
+
+# ── PR P1: queue/dashboard-facing reason mapping ─────────────────────────────
+# Maps internal canonical reason codes → stable queue-facing codes written to
+# trade_queue.last_error (via PR #183 write-back) and displayed in the dashboard.
+# Observability only. No gate, threshold, or selection logic is touched.
+# ─────────────────────────────────────────────────────────────────────────────
+_TO_QUEUE_REASON: dict[str, str] = {
+    # Chain-level fetch failures → generic NO_CHAIN_DATA for the queue layer
+    # (distinguishes "data pipeline problem" from "data exists but bad quality")
+    "CHAIN_EMPTY":                    "NO_CHAIN_DATA",
+    "CHAIN_FETCH_FAILED":             "NO_CHAIN_DATA",
+    "QUOTE_FETCH_FAILED":             "NO_CHAIN_DATA",
+    # Zero-quote rows — data was returned but bid/ask is unusable
+    "CHAIN_ROW_ZERO_BID_ASK":         "QUOTE_ZERO_BID_ASK",
+    "DIRECT_QUOTE_ZERO_BID_ASK":      "QUOTE_ZERO_BID_ASK",
+    # 1:1 pass-through — reason is already dashboard-safe and actionable
+    "BID_BELOW_MIN":                  "BID_BELOW_MIN",
+    "SPREAD_TOO_WIDE":                "SPREAD_TOO_WIDE",
+    "OI_TOO_LOW":                     "OI_TOO_LOW",
+    "VOLUME_TOO_LOW":                 "VOLUME_TOO_LOW",
+    "DELTA_OUT_OF_RANGE":             "DELTA_OUT_OF_RANGE",
+    "DTE_OUT_OF_RANGE":               "DTE_OUT_OF_RANGE",
+    "NO_AFFORDABLE_CONTRACT":         "NO_AFFORDABLE_CONTRACT",
+    "UNTRADEABLE_FOR_ACCOUNT_SIZE":   "NO_AFFORDABLE_CONTRACT",
+    "PREMIUM_CAP_EXCEEDED":           "PREMIUM_CAP_EXCEEDED",
+    "NO_VALID_PLAYBOOK_DTE_CONTRACT": "NO_VALID_PLAYBOOK_DTE_CONTRACT",
+    "NO_CONTRACT_AFTER_FILTERS":      "NO_CONTRACT_AFTER_FILTERS",
+}
+
+
+def _to_queue_reason(reason_code: str) -> str:
+    """Map an internal canonical reason code to its stable queue/dashboard-facing code.
+
+    Returns the reason_code unchanged when no mapping exists (unknown codes surface
+    as-is rather than silently collapsing to a misleading generic bucket).
+    """
+    return _TO_QUEUE_REASON.get(str(reason_code or ""), str(reason_code or "UNKNOWN_REJECTION"))
+
+
+def _attach_selector_failure(
+    plan,
+    *,
+    reason_code: str,
+    explanation: str,
+    chain_rows: int = 0,
+    survivor_count: int = 0,
+    reject_buckets: "dict | None" = None,
+    base_url: str = "",
+    execution_mode: str = "unknown",
+) -> None:
+    """Attach plan.metadata["selector_failure"] when select() returns None.
+
+    PR P1 — selector reason honesty. Provides a structured, queryable failure
+    dict so callers (e.g. PR #183 write-back in ap_execution_core) can surface
+    truthful reason codes to trade_queue.last_error and the operator dashboard.
+
+    Fields:
+        reason_code        — canonical internal code (e.g. CHAIN_ROW_ZERO_BID_ASK)
+        queue_reason_code  — stable dashboard-facing code (e.g. QUOTE_ZERO_BID_ASK)
+        explanation        — human-readable detail
+        chain_rows         — count of rows returned by the option chain fetch
+        survivor_count     — count of contracts that survived quality filters
+        quote_source       — tradier_live | tradier_sandbox | tradier_unknown | unknown
+        chain_source       — always "tradier" for now
+        tradier_base_url   — base URL from the data broker (for audit)
+        sandbox_mode       — True when base_url contains "sandbox"
+        execution_mode     — paper | live | unknown
+        top_reject_buckets — {canonical_reason: count} sorted highest-count first
+
+    Never raises. Observability only — does not affect any gate or decision.
+    """
+    try:
+        _rc  = str(reason_code or "UNKNOWN_REJECTION")
+        _qrc = _to_queue_reason(_rc)
+        _base = str(base_url or "")
+        if "api.tradier.com" in _base:
+            _quote_src = "tradier_live"
+        elif "sandbox" in _base.lower():
+            _quote_src = "tradier_sandbox"
+        elif _base:
+            _quote_src = "tradier_unknown"
+        else:
+            _quote_src = "unknown"
+
+        _top = {
+            _normalize_reason_code(k): v
+            for k, v in sorted(
+                (reject_buckets or {}).items(), key=lambda x: -x[1]
+            )
+        }
+
+        failure = {
+            "reason_code":        _rc,
+            "queue_reason_code":  _qrc,
+            "explanation":        str(explanation or ""),
+            "chain_rows":         int(chain_rows or 0),
+            "survivor_count":     int(survivor_count or 0),
+            "quote_source":       _quote_src,
+            "chain_source":       "tradier",
+            "tradier_base_url":   _base,
+            "sandbox_mode":       "sandbox" in _base.lower(),
+            "execution_mode":     str(execution_mode or "unknown").lower(),
+            "top_reject_buckets": _top,
+        }
+
+        if isinstance(plan, dict):
+            plan.setdefault("metadata", {})["selector_failure"] = failure
+        else:
+            meta = getattr(plan, "metadata", None)
+            if not isinstance(meta, dict):
+                meta = {}
+                try:
+                    setattr(plan, "metadata", meta)
+                except Exception:
+                    pass
+            if isinstance(meta, dict):
+                meta["selector_failure"] = failure
+    except Exception:
+        pass  # observability must never interrupt select()
 
 
 def _safe_float(val, default: float = 0.0) -> float:
@@ -649,6 +772,18 @@ class APContractSelectionEngine:
         # never a stale value from a prior select(). Observability only.
         self._last_failure = None
 
+        # PR P1 — selector failure metadata tracking (observability only).
+        # Updated at each stage and passed to _attach_selector_failure() at
+        # every return-None site so callers see a truthful, structured reason.
+        _sel_chain_rows:  int  = 0        # set after chain fetch
+        _sel_survivors:   int  = 0        # set after quality filter
+        _sel_rejections:  dict = {}        # set after quality filter
+        _sel_base_url:    str  = (         # for sandbox_mode / quote_source
+            str(getattr(getattr(self, "data_broker", None), "base_url", "") or
+                getattr(getattr(self, "broker",      None), "base_url", "") or "")
+        )
+        _sel_mode: str = str(getattr(self, "mode", "unknown") or "unknown").lower()
+
         ticker    = _safe_plan_attr(plan, "ticker")
         direction = str(_safe_plan_attr(plan, "side", "") or "").upper()
         budget    = float(_safe_plan_attr(plan, "max_position_usd", 0) or 0)
@@ -779,27 +914,45 @@ class APContractSelectionEngine:
             )
         except Exception as e:
             log.error("[%s] chain fetch failed: %s", ticker, e)
+            _cff_expl = f"Chain fetch failed: {e}"
             self._emit_selector_event(
                 plan,
                 stage="chain_fetch",
                 decision="REJECT",
-                reason_code="NO_CHAIN_DATA",
-                explanation=f"Chain fetch failed: {e}",
+                reason_code="CHAIN_FETCH_FAILED",
+                explanation=_cff_expl,
                 inputs={"ticker": ticker, "direction": direction},
+            )
+            _attach_selector_failure(
+                plan,
+                reason_code="CHAIN_FETCH_FAILED",
+                explanation=_cff_expl,
+                base_url=_sel_base_url,
+                execution_mode=_sel_mode,
             )
             return None
 
         if not chain:
             log.warning("[%s] EMPTY CHAIN -- Tradier returned no options", ticker)
+            _ce_expl = "Chain returned empty — Tradier returned no option rows for this ticker/expiration"
             self._emit_selector_event(
                 plan,
                 stage="chain_fetch",
                 decision="REJECT",
-                reason_code="NO_CHAIN_DATA",
-                explanation="Tradier returned empty options chain",
+                reason_code="CHAIN_EMPTY",
+                explanation=_ce_expl,
                 inputs={"ticker": ticker, "direction": direction},
             )
+            _attach_selector_failure(
+                plan,
+                reason_code="CHAIN_EMPTY",
+                explanation=_ce_expl,
+                chain_rows=0,
+                base_url=_sel_base_url,
+                execution_mode=_sel_mode,
+            )
             return None
+        _sel_chain_rows = len(chain)
 
         if not underlying_price:
             underlying_price = getattr(plan, "trigger_price", None)
@@ -968,8 +1121,11 @@ class APContractSelectionEngine:
                                 opt.get("symbol", "?"),
                             )
                         # else: direct quote fetched but still fails — fall through to reject
-                    elif _rv_pro.get("action") in ("REJECT_DIRECT_ZERO", "REJECT_UNAVAILABLE"):
-                        pro_reason = _rv_pro.get("reason_code") or pro_reason
+                    elif _rv_pro.get("action") == "REJECT_DIRECT_ZERO":
+                        # P1: name the specific failure — zero bid/ask on direct quote
+                        pro_reason = "DIRECT_QUOTE_ZERO_BID_ASK"
+                    elif _rv_pro.get("action") == "REJECT_UNAVAILABLE":
+                        pro_reason = _rv_pro.get("reason_code") or "QUOTE_FETCH_FAILED"
                     # SKIP_NOT_MARKET_HOURS / SKIP_NOT_REVALIDATABLE: original reason stands.
                 # ── end P0A/FIX-2 ────────────────────────────────────────────
 
@@ -1080,10 +1236,12 @@ class APContractSelectionEngine:
                         # spread too wide at direct prices) — reject with the
                         # real reason from the re-run, not the chain reason.
                         result = _result2
-                elif _rv_action in ("REJECT_DIRECT_ZERO", "REJECT_UNAVAILABLE"):
-                    # Direct quote confirmed invalid or unavailable.
-                    # Use the specific direct-quote reason code.
-                    result = _rv.get("reason_code") or result
+                elif _rv_action == "REJECT_DIRECT_ZERO":
+                    # P1: direct quote returned zero bid/ask — use truthful reason code
+                    result = "DIRECT_QUOTE_ZERO_BID_ASK"
+                elif _rv_action == "REJECT_UNAVAILABLE":
+                    # P1: quote source unavailable (network/auth failure)
+                    result = _rv.get("reason_code") or "QUOTE_FETCH_FAILED"
                 # SKIP_NOT_MARKET_HOURS / SKIP_NOT_REVALIDATABLE:
                 # fall through with original chain reject reason unchanged.
             # ── end P0A ───────────────────────────────────────────────────
@@ -1120,6 +1278,9 @@ class APContractSelectionEngine:
                     )
                 except Exception:
                     pass  # per-contract quality-filter emit — non-critical
+
+        _sel_survivors   = len(survivors)
+        _sel_rejections  = dict(_rejections)  # snapshot for selector_failure
 
         if not survivors:
             log.warning(
@@ -1161,6 +1322,20 @@ class APContractSelectionEngine:
                     "max_spread_pct": _safe_float(_eff_max_spread),
                     "min_oi":         _safe_float(_eff_min_oi),
                 },
+            )
+            _attach_selector_failure(
+                plan,
+                reason_code=_obs_reason,
+                explanation=(
+                    "No contracts passed quality gates"
+                    f" | chain={_sel_chain_rows}"
+                    f" | top_reason={_top_reject or 'none'}"
+                ),
+                chain_rows=_sel_chain_rows,
+                survivor_count=0,
+                reject_buckets=_sel_rejections,
+                base_url=_sel_base_url,
+                execution_mode=_sel_mode,
             )
             return None
 
@@ -1279,6 +1454,21 @@ class APContractSelectionEngine:
                                 "allow_cheap_if_only_choice": _allow_cheap},
                 )
                 if not _allow_cheap:
+                    _attach_selector_failure(
+                        plan,
+                        reason_code="NO_AFFORDABLE_CONTRACT",
+                        explanation=(
+                            f"{best.get('symbol','?')} premium ${best_exec_prem:.0f}"
+                            f" below min ${_MIN_ACCEPTABLE_PREMIUM:.0f}"
+                            f" and no upgrade found | chain={_sel_chain_rows}"
+                            f" survivors={_sel_survivors}"
+                        ),
+                        chain_rows=_sel_chain_rows,
+                        survivor_count=_sel_survivors,
+                        reject_buckets=_sel_rejections,
+                        base_url=_sel_base_url,
+                        execution_mode=_sel_mode,
+                    )
                     return None
         selected = self._build_selected(best, best_score, budget, today)
         if selected is None:
@@ -1347,6 +1537,19 @@ class APContractSelectionEngine:
                         },
                         thresholds={"max_premium": self.max_premium},
                         context={"mode": self.mode},
+                    )
+                    _attach_selector_failure(
+                        plan,
+                        reason_code="PREMIUM_CAP_EXCEEDED",
+                        explanation=(
+                            f"Paper premium cap: ${selected.premium_per_contract:.0f}"
+                            f" > max ${self.max_premium:.0f}"
+                        ),
+                        chain_rows=_sel_chain_rows,
+                        survivor_count=_sel_survivors,
+                        reject_buckets=_sel_rejections,
+                        base_url=_sel_base_url,
+                        execution_mode=_sel_mode,
                     )
                     return None
                 log.warning("[%s] budget $%.0f < premium $%.0f -- forcing 1 contract",
@@ -1472,6 +1675,16 @@ class APContractSelectionEngine:
                     "explanation": _explanation,
                     "tradeability_diag": _tradeability_diag,
                 }
+                _attach_selector_failure(
+                    plan,
+                    reason_code="UNTRADEABLE_FOR_ACCOUNT_SIZE",
+                    explanation=_explanation,
+                    chain_rows=_sel_chain_rows,
+                    survivor_count=_sel_survivors,
+                    reject_buckets=_sel_rejections,
+                    base_url=_sel_base_url,
+                    execution_mode=_sel_mode,
+                )
                 return None
 
         if selected is None:
@@ -1497,6 +1710,19 @@ class APContractSelectionEngine:
                 contract=selected.contract_symbol,
                 inputs={"delta": selected.delta, "strike": selected.strike},
                 thresholds={"min_delta": _MIN_DELTA},
+            )
+            _attach_selector_failure(
+                plan,
+                reason_code="DELTA_OUT_OF_RANGE",
+                explanation=(
+                    f"Deep OTM: delta={selected.delta:.2f} < min={_MIN_DELTA:.2f}"
+                    f" | {selected.contract_symbol}"
+                ),
+                chain_rows=_sel_chain_rows,
+                survivor_count=_sel_survivors,
+                reject_buckets=_sel_rejections,
+                base_url=_sel_base_url,
+                execution_mode=_sel_mode,
             )
             return None
 
@@ -1530,6 +1756,20 @@ class APContractSelectionEngine:
                     },
                     thresholds={"max_otm_pct": _MAX_OTM_PCT},
                 )
+                _attach_selector_failure(
+                    plan,
+                    reason_code="DELTA_OUT_OF_RANGE",
+                    explanation=(
+                        f"Deep OTM moneyness: strike={selected.strike:.2f}"
+                        f" underlying={underlying_price:.2f}"
+                        f" OTM={_otm_pct*100:.1f}% > max={_MAX_OTM_PCT*100:.0f}%"
+                    ),
+                    chain_rows=_sel_chain_rows,
+                    survivor_count=_sel_survivors,
+                    reject_buckets=_sel_rejections,
+                    base_url=_sel_base_url,
+                    execution_mode=_sel_mode,
+                )
                 return None
 
         # ── FINAL PREMIUM GATE (per-ticker cap) ──────────────────────────────
@@ -1552,6 +1792,19 @@ class APContractSelectionEngine:
                     "ticker_cap":           _safe_float(_final_prem_cap),
                 },
                 thresholds={"ticker_premium_cap": _final_prem_cap},
+            )
+            _attach_selector_failure(
+                plan,
+                reason_code="PREMIUM_CAP_EXCEEDED",
+                explanation=(
+                    f"Final premium gate: ${selected.premium_per_contract:.0f}"
+                    f" > ${_final_prem_cap:.0f} per-ticker cap for {ticker}"
+                ),
+                chain_rows=_sel_chain_rows,
+                survivor_count=_sel_survivors,
+                reject_buckets=_sel_rejections,
+                base_url=_sel_base_url,
+                execution_mode=_sel_mode,
             )
             return None
 
