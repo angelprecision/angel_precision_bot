@@ -267,6 +267,8 @@ def _manual_restart_guard_bypass_enabled(
     payload: dict | None = None,
     execution_mode: str | None = None,
 ) -> bool:
+    if str(execution_mode or "").strip().upper() != "PAPER":
+        return False
     if _paper_overnight_reeval_only_enabled(payload=payload, execution_mode=execution_mode):
         return True
     if isinstance(job_result, dict) and bool(job_result.get("manual_rescue")):
