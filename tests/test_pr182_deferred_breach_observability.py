@@ -479,7 +479,7 @@ class TestSourceStructure:
         src = self._src("ap/queue.py")
         idx = src.find("def write_deferred_breach_last_error")
         region = src[idx: idx + 1200]
-        for terminal_status in ("REJECTED", "EXPIRED", "CANCELED", "FILLED"):
+        for terminal_status in ("REJECTED", "EXPIRED", "CANCELED", "FILLED", "ARCHIVED"):
             assert terminal_status in region, (
                 f"Terminal status {terminal_status!r} not guarded in "
                 f"write_deferred_breach_last_error WHERE clause"
@@ -489,6 +489,60 @@ class TestSourceStructure:
         src = self._src("ap_execution_core.py")
         assert "write_deferred_breach_last_error" in src, (
             "write_deferred_breach_last_error not imported/called in ap_execution_core.py"
+        )
+
+    def test_updated_at_not_in_write_helper(self):
+        """trade_queue has no updated_at column. If write_deferred_breach_last_error
+        references it in SQL, the UPDATE will throw at runtime and silently fail
+        (the helper catches all exceptions). Assert it is absent so this class of
+        schema mismatch is caught at test time, not discovered in production logs."""
+        src = self._src("ap/queue.py")
+        idx = src.find("def write_deferred_breach_last_error")
+        assert idx != -1, "write_deferred_breach_last_error not found in ap/queue.py"
+        # Isolate just this function's body (up to the next top-level def)
+        fn_body = src[idx:]
+        next_def = fn_body.find("\ndef ", 10)
+        fn_body = fn_body[:next_def] if next_def != -1 else fn_body
+        assert "updated_at" not in fn_body, (
+            "write_deferred_breach_last_error references 'updated_at' — "
+            "this column does not exist on trade_queue. "
+            "The UPDATE will throw at runtime and silently fail. "
+            "Remove updated_at from the SET clause."
+        )
+
+    def test_archived_in_terminal_guard(self):
+        """ARCHIVED is a known terminal trade_queue status. The WHERE clause in
+        write_deferred_breach_last_error must exclude it so a concurrent OSM
+        ARCHIVED transition cannot be overwritten by a stale observability write."""
+        src = self._src("ap/queue.py")
+        idx = src.find("def write_deferred_breach_last_error")
+        fn_body = src[idx:idx + 2000]
+        assert "ARCHIVED" in fn_body, (
+            "'ARCHIVED' not found in write_deferred_breach_last_error terminal guard. "
+            "Add 'ARCHIVED' to the NOT IN exclusion list."
+        )
+
+    def test_verification_query_uses_payload_fields(self):
+        """The PR description verification query must use payload->>'ticker' not
+        direct ticker/contract/updated_at columns (those don't exist on trade_queue).
+        Checked against the PR_DESCRIPTION.md source."""
+        from pathlib import Path
+        pr_desc_candidates = [
+            Path(__file__).resolve().parents[1] / "PR_DESCRIPTION.md",
+            Path(__file__).resolve().parents[1] / "docs" / "PR_DESCRIPTION.md",
+        ]
+        pr_md = None
+        for p in pr_desc_candidates:
+            if p.exists():
+                pr_md = p.read_text()
+                break
+        if pr_md is None:
+            pytest.skip("PR_DESCRIPTION.md not found — skipping schema query check")
+        # If the file exists, it must NOT reference the non-existent direct columns
+        # in a raw SQL query context
+        assert "updated_at" not in pr_md or "payload->>" in pr_md, (
+            "PR_DESCRIPTION.md verification query references updated_at "
+            "without using payload fields — trade_queue has no updated_at column"
         )
 
     def test_write_back_is_inside_deferred_block(self):
