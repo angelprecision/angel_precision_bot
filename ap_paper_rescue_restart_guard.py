@@ -2,8 +2,9 @@
 ap_paper_rescue_restart_guard.py
 ─────────────────────────────────
 Converts REJECTED/restart_guard:overnight_skip trade_queue rows back to
-WATCHING for paper clients, then triggers the morning handoff audit so
-the watcher can re-arm them for the current session.
+WATCHING for paper clients, marks them as overnight-reeval-only rescue rows,
+then immediately runs overnight_reeval so queue-only WATCHING rows become
+real watcher/order state for the current session.
 
 Hard safety rules (enforced structurally, not just by convention):
   PAPER ONLY — any live client_id causes an immediate abort, not a skip.
@@ -11,13 +12,21 @@ Hard safety rules (enforced structurally, not just by convention):
   NEVER creates new orders rows.
   NEVER touches live client rows.
   NEVER changes orders.contract / orders.qty / orders.limit_price.
-  DB write is limited to:
-    UPDATE trade_queue SET status='WATCHING',
-                           last_error='manual_paper_rescue_restart_guard_bypass'
-    WHERE status='REJECTED'
-      AND last_error='restart_guard:overnight_skip'
-      AND client_id IN (<paper_client_ids>)
-      AND created_ts >= NOW() - lookback_h * INTERVAL '1 hour'
+  DB write is limited to trade_queue only:
+    UPDATE trade_queue
+       SET status='WATCHING',
+           started_ts=NULL,
+           finished_ts=NULL,
+           last_error='after_hours_deferred:awaiting_overnight_reeval',
+           payload += {
+             force_overnight_reeval_only=true,
+             do_not_queue_directly=true
+           },
+           result_json += rescue metadata
+     WHERE status='REJECTED'
+       AND last_error='restart_guard:overnight_skip'
+       AND client_id IN (<paper_client_ids>)
+       AND created_ts >= NOW() - lookback_h * INTERVAL '1 hour'
 
 Public API:
   run_paper_rescue_restart_guard(
@@ -43,7 +52,7 @@ log = logging.getLogger("ap.paper_rescue_restart_guard")
 _SOURCE_LAST_ERROR = "restart_guard:overnight_skip"
 
 # The last_error written to converted rows — makes every rescue auditable.
-_BYPASS_LAST_ERROR = "manual_paper_rescue_restart_guard_bypass"
+_BYPASS_LAST_ERROR = "after_hours_deferred:awaiting_overnight_reeval"
 
 # The status rows are converted FROM and TO.
 _FROM_STATUS = "REJECTED"
@@ -108,8 +117,20 @@ def _convert_row(job_id: int) -> bool:
             c.execute(
                 """
                 UPDATE trade_queue
-                SET    status     = %s,
-                       last_error = %s
+                SET    status       = %s,
+                       started_ts   = NULL,
+                       finished_ts  = NULL,
+                       last_error   = %s,
+                       payload      = COALESCE(payload, '{}'::jsonb) || jsonb_build_object(
+                           'force_overnight_reeval_only', true,
+                           'do_not_queue_directly', true
+                       ),
+                       result_json  = COALESCE(result_json, '{}'::jsonb) || jsonb_build_object(
+                           'manual_rescue', true,
+                           'manual_rescue_actor', 'paper_rescue_restart_guard',
+                           'manual_rescue_route', 'overnight_reeval_only',
+                           'manual_rescue_reason', 'restart_guard_archived_no_order_row'
+                       )
                 WHERE  id         = %s
                   AND  status     = %s
                   AND  last_error = %s
@@ -126,6 +147,24 @@ def _convert_row(job_id: int) -> bool:
 
     rowcount = run_with_retry(_u) or 0
     return rowcount == 1
+
+
+def _runner_components(runner: Any) -> dict[str, Any]:
+    core = getattr(runner, "core", None)
+    return {
+        "broker": getattr(runner, "broker", None) or (getattr(core, "broker", None) if core else None),
+        "master_control": getattr(runner, "master_control", None),
+        "contract_selector": getattr(runner, "contract_selector", None),
+        "order_state_machine": (
+            getattr(runner, "order_state_machine", None)
+            or getattr(runner, "osm", None)
+            or (getattr(core, "order_state_machine", None) if core else None)
+            or (getattr(getattr(runner, "execution_core", None), "order_state_machine", None))
+        ),
+        "entry_watcher": getattr(runner, "entry_watcher", None) or (getattr(core, "entry_watcher", None) if core else None),
+        "position_manager": getattr(runner, "position_manager", None),
+        "exit_eng": getattr(core, "exit_eng", None) if core else None,
+    }
 
 
 def run_paper_rescue_restart_guard(
@@ -150,7 +189,8 @@ def run_paper_rescue_restart_guard(
           "rows_converted": int,
           "rows_skipped_already_converted": int,
           "rows_failed": int,
-          "audit_results": {<email>: <run_morning_handoff_audit result>},
+        "reeval_results": {<email>: <run_overnight_reeval result>},
+        "audit_results": {<email>: <run_morning_handoff_audit result>},
           "errors": [...],
           "per_client": {
             <email>: {
@@ -183,6 +223,7 @@ def run_paper_rescue_restart_guard(
             "rows_converted": 0,
             "rows_skipped_already_converted": 0,
             "rows_failed": 0,
+            "reeval_results": {},
             "audit_results": {},
             "errors": [],
             "per_client": {},
@@ -202,6 +243,7 @@ def run_paper_rescue_restart_guard(
             "rows_converted": 0,
             "rows_skipped_already_converted": 0,
             "rows_failed": 0,
+            "reeval_results": {},
             "audit_results": {},
             "errors": [f"row_load_failed: {exc}"],
             "per_client": {},
@@ -276,15 +318,65 @@ def run_paper_rescue_restart_guard(
             "rows_converted": client_converted,
             "rows_skipped":   client_skipped,
             "rows_failed":    client_failed,
+            "reeval_result":  None,
             "audit_result":   None,
         }
 
-    # ── Morning handoff audit for each client ─────────────────────────────
-    # Only run if at least one row was converted (or dry_run for classification).
-    from ap_morning_handoff_audit import run_morning_handoff_audit
+    # ── Materialize rescued queue-only WATCHING rows via overnight_reeval ──
+    # This is the missing autonomous link: the rescue route must not leave
+    # queue-only WATCHING rows waiting for a later manual overnight call.
+    reeval_results: dict[str, dict] = {}
+    if not dry_run:
+        from ap_overnight_reeval import run_overnight_reeval
 
+        for email in paper_client_ids:
+            if per_client[email]["rows_converted"] <= 0:
+                continue
+            runner = runners.get(email)
+            if runner is None:
+                msg = f"{email}: runner_missing_for_overnight_reeval"
+                errors.append(msg)
+                log.error("paper_rescue_restart_guard: %s", msg)
+                continue
+            try:
+                comps = _runner_components(runner)
+                result = run_overnight_reeval(
+                    client_id=email,
+                    broker=comps["broker"],
+                    master_control=comps["master_control"],
+                    contract_selector=comps["contract_selector"],
+                    order_state_machine=comps["order_state_machine"],
+                    entry_watcher=comps["entry_watcher"],
+                    position_manager=comps["position_manager"],
+                    exit_eng=comps["exit_eng"],
+                    force=True,
+                )
+                reeval_results[email] = result
+                per_client[email]["reeval_result"] = result
+                log.info(
+                    "paper_rescue_restart_guard: overnight_reeval complete client=%s "
+                    "processed=%s armed=%s rejected=%s errors=%s",
+                    email,
+                    result.get("processed", 0),
+                    result.get("armed", 0),
+                    result.get("rejected", 0),
+                    result.get("errors", 0),
+                )
+            except Exception as exc:
+                msg = f"{email}: overnight_reeval failed: {exc}"
+                errors.append(msg)
+                reeval_results[email] = {"ok": False, "error": str(exc)}
+                per_client[email]["reeval_result"] = reeval_results[email]
+                log.error("paper_rescue_restart_guard: %s", msg)
+
+    # ── Morning handoff audit for each client ─────────────────────────────
+    # Run after overnight_reeval so any newly materialized PENDING_TRIGGER rows
+    # can be owned/re-armed by the watcher if needed.
+    from ap_morning_handoff_audit import run_morning_handoff_audit
     audit_results: dict[str, dict] = {}
     for email in paper_client_ids:
+        if not dry_run and per_client[email]["rows_converted"] <= 0:
+            continue
         runner        = runners.get(email)
         entry_watcher = getattr(runner, "entry_watcher", None) or getattr(
             getattr(runner, "core", None), "entry_watcher", None
@@ -333,16 +425,17 @@ def run_paper_rescue_restart_guard(
     )
 
     return {
-        "ok":                           len(errors) == 0,
-        "dry_run":                      dry_run,
-        "lookback_hours":               lookback_hours,
-        "clients_processed":            len(paper_client_ids),
-        "rows_found":                   total_found,
-        "rows_converted":               total_converted,
-        "rows_skipped_already_converted": total_skipped,
-        "rows_failed":                  total_failed,
-        "audit_results":                audit_results,
-        "errors":                       errors,
-        "per_client":                   per_client,
+            "ok":                           len(errors) == 0,
+            "dry_run":                      dry_run,
+            "lookback_hours":               lookback_hours,
+            "clients_processed":            len(paper_client_ids),
+            "rows_found":                   total_found,
+            "rows_converted":               total_converted,
+            "rows_skipped_already_converted": total_skipped,
+            "rows_failed":                  total_failed,
+            "reeval_results":               reeval_results,
+            "audit_results":                audit_results,
+            "errors":                       errors,
+            "per_client":                   per_client,
         "elapsed_seconds":              round(elapsed, 2),
     }
