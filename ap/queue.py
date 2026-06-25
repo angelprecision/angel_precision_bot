@@ -440,12 +440,12 @@ def write_deferred_breach_last_error(
                 c.execute(
                     """
                     UPDATE public.trade_queue
-                       SET last_error  = %s,
-                           updated_at  = NOW()
+                       SET last_error = %s
                      WHERE id = %s
                        AND UPPER(COALESCE(status, '')) NOT IN (
                            'REJECTED', 'ERROR', 'SUBMITTED', 'FILLED',
-                           'CANCELED', 'CANCELLED', 'EXPIRED', 'DONE'
+                           'CANCELED', 'CANCELLED', 'EXPIRED', 'DONE',
+                           'ARCHIVED'
                        )
                     """,
                     (_last_error, int(queue_id)),
