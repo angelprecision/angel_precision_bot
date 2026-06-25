@@ -4,7 +4,8 @@ tests/test_paper_rescue_restart_guard.py
 POST /admin/paper_rescue_restart_guard
 
 Converts REJECTED/restart_guard:overnight_skip trade_queue rows to WATCHING
-for paper clients only, then calls morning_handoff_audit to re-arm watchers.
+for paper clients only, marks them as overnight-reeval-only rescue rows,
+then runs overnight_reeval followed by morning_handoff_audit.
 
 Hard invariants tested throughout:
   PAPER ONLY — live client aborts the entire operation
@@ -101,7 +102,7 @@ class TestSourceGuards:
         assert "_SOURCE_LAST_ERROR = \"restart_guard:overnight_skip\"" in _MODULE_SRC
 
     def test_bypass_last_error_is_correct(self):
-        assert "_BYPASS_LAST_ERROR = \"manual_paper_rescue_restart_guard_bypass\"" in _MODULE_SRC
+        assert "_BYPASS_LAST_ERROR = \"after_hours_deferred:awaiting_overnight_reeval\"" in _MODULE_SRC
 
     def test_from_status_is_rejected(self):
         assert '_FROM_STATUS = "REJECTED"' in _MODULE_SRC
@@ -134,7 +135,7 @@ class TestSourceGuards:
     def test_idempotency_guard_in_convert_row(self):
         """_convert_row must only update rows that are STILL REJECTED/overnight_skip."""
         fn_start = _MODULE_SRC.find("def _convert_row(")
-        fn_body  = _MODULE_SRC[fn_start: fn_start + 800]
+        fn_body  = _MODULE_SRC[fn_start: fn_start + 1800]
         assert "_FROM_STATUS" in fn_body, "convert_row must guard status=REJECTED"
         assert "_SOURCE_LAST_ERROR" in fn_body, "convert_row must guard last_error"
 
@@ -160,6 +161,9 @@ class TestSourceGuards:
 
     def test_morning_handoff_audit_called_in_module(self):
         assert "run_morning_handoff_audit" in _MODULE_SRC
+
+    def test_overnight_reeval_called_in_module(self):
+        assert "run_overnight_reeval" in _MODULE_SRC
 
     def test_execution_mode_always_paper_in_audit_call(self):
         fn_start = _MODULE_SRC.find("run_morning_handoff_audit(")
@@ -320,7 +324,7 @@ class TestConversion:
 class TestDbWriteValues:
 
     def test_bypass_last_error_value(self):
-        assert _mod._BYPASS_LAST_ERROR == "manual_paper_rescue_restart_guard_bypass"
+        assert _mod._BYPASS_LAST_ERROR == "after_hours_deferred:awaiting_overnight_reeval"
 
     def test_from_status_is_rejected(self):
         assert _mod._FROM_STATUS == "REJECTED"
@@ -334,10 +338,17 @@ class TestDbWriteValues:
     def test_convert_row_where_clause_has_idempotency_guards(self):
         """_convert_row must only update rows still in REJECTED/overnight_skip state."""
         fn_start = _MODULE_SRC.find("def _convert_row(")
-        fn_body  = _MODULE_SRC[fn_start: fn_start + 1000]
+        fn_body  = _MODULE_SRC[fn_start: fn_start + 1800]
         assert "_FROM_STATUS" in fn_body
         assert "_SOURCE_LAST_ERROR" in fn_body
         assert "rowcount" in fn_body
+
+    def test_convert_row_sets_overnight_flags(self):
+        fn_start = _MODULE_SRC.find("def _convert_row(")
+        fn_body  = _MODULE_SRC[fn_start: fn_start + 2200]
+        assert "'force_overnight_reeval_only', true" in fn_body
+        assert "'do_not_queue_directly', true" in fn_body
+        assert "manual_rescue_route', 'overnight_reeval_only" in fn_body
 
     def test_no_rows_outside_lookback_window(self):
         """_load_rescue_rows must include a created_ts >= cutoff filter."""
