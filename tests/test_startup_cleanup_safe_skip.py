@@ -101,15 +101,17 @@ def test_new_reason_codes_appear_in_cleanup():
 # Parity safety: active_peers CTE + canonical_signal_id grouping
 # ---------------------------------------------------------------------------
 
-def test_active_peers_cte_groups_by_canonical_signal_id():
+def test_active_proof_cte_groups_by_canonical_signal_and_system_proof():
     method_src = _extract_cleanup_method(_read(CLIENT_RUNNER))
     # The CTE must exist and group across clients
-    assert "active_peers AS" in method_src, "missing active_peers CTE"
-    # Canonical id grouping
+    assert "active_proof AS" in method_src, "missing active_proof CTE"
+    # Canonical id grouping plus system proof lookups
     assert "canonical_signal_id" in method_src
-    assert "COALESCE(p.canonical_signal_id, p.signal_id)" in method_src, (
-        "active_peers must group by canonical_signal_id (with signal_id fallback)"
+    assert "COALESCE(p.canonical_signal_id, p.signal_id) = ca.order_canon_id" in method_src, (
+        "active_proof must group order peers by normalized canonical signal id"
     )
+    assert "FROM   ap_signals s" in method_src
+    assert "FROM   trade_queue tq" in method_src
 
 
 def test_active_peers_considers_submitted_and_filled():
@@ -210,16 +212,17 @@ def test_simulated_incident_would_now_skip(canonical_id):
        - one peer (tradefluencehq) has SUBMITTED row → 'active'
        - two candidates (jasoncosby1, jose.vasquez4011) hit Tier A criteria
 
-    The active_peers CTE would identify the canonical_id as active. The
+    The active_proof CTE would identify the canonical_id as active. The
     candidates would land in skip_targets → RETRY_ELIGIBLE, not in
     cancel_targets. We prove this by checking the CTE logic admits the
     case, since we can't run psql here.
     """
     method_src = _extract_cleanup_method(_read(CLIENT_RUNNER))
-    # The CTE matches a peer on canonical id OR signal id
+    # The CTE matches using normalized REEVAL ids across orders/ap_signals/trade_queue.
     assert "candidates ca" in method_src
-    assert "ca.canon_id" in method_src
-    # The skip path requires EXISTS active_peers
+    assert "ca.order_canon_id" in method_src
+    assert "ca.real_signal_id" in method_src
+    # The skip path requires EXISTS active_proof
     skip_idx = method_src.find("skip_targets AS (")
     skip_chunk = method_src[skip_idx : skip_idx + 2000]
-    assert "EXISTS (" in skip_chunk and "active_peers ap" in skip_chunk
+    assert "EXISTS (" in skip_chunk and "active_proof ap" in skip_chunk

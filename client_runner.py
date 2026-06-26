@@ -2353,15 +2353,21 @@ class ClientRunner(threading.Thread):
                     #                                  cancel them with the real
                     #                                  reason instead.)
                     #
-                    # PARITY SAFETY (2026-06-03 fix):
+                    # PARITY SAFETY (2026-06-03 fix, 2026-06-25 REEVAL amend):
                     #   Even after all the above pass, we partition the surviving
-                    #   candidates by whether the same canonical_signal_id has a
-                    #   peer row on ANY client that is alive (SUBMITTED,
-                    #   ACKNOWLEDGED, FILLED, or recently created in the parity
-                    #   window). If so, the row is NOT canceled — it is moved to
-                    #   RETRY_ELIGIBLE with reason STARTUP_CLEANUP_SKIPPED_ACTIVE_SIGNAL
-                    #   so the post-fill peer-retry path (future PR) can re-evaluate.
-                    #   Truly orphaned rows get STARTUP_CLEANUP_CANCELED_STALE_ORPHAN.
+                    #   candidates by whether the same opportunity is still alive
+                    #   anywhere in the system. For REEVAL rows we normalize:
+                    #     REEVAL:<uuid>:<hash> -> <uuid>         for ap_signals
+                    #     REEVAL:<uuid>:<hash> -> REEVAL:<uuid>  for order peers
+                    #   and then check:
+                    #     - active peer orders on the normalized canonical id
+                    #     - active ap_signals rows on the underlying UUID
+                    #     - active trade_queue rows on the UUID / REEVAL id
+                    #   If any proof exists, the row is NOT canceled — it is
+                    #   moved to RETRY_ELIGIBLE with reason
+                    #   STARTUP_CLEANUP_SKIPPED_ACTIVE_SIGNAL so the recovery /
+                    #   handoff path can re-evaluate it. Truly orphaned rows get
+                    #   STARTUP_CLEANUP_CANCELED_STALE_ORPHAN.
                     #
                     # Audit: meta is MERGED (jsonb concat) so existing
                     # watcher_audit, sizing_context, signal_id, etc. are NEVER
@@ -2386,7 +2392,22 @@ class ClientRunner(threading.Thread):
                         WITH candidates AS (
                             SELECT  o.local_order_id,
                                     o.signal_id,
-                                    COALESCE(o.canonical_signal_id, o.signal_id) AS canon_id,
+                                    CASE
+                                        WHEN o.signal_id LIKE 'REEVAL:%:%'
+                                            THEN split_part(o.signal_id, ':', 2)
+                                        WHEN o.signal_id LIKE 'REEVAL:%'
+                                            THEN split_part(o.signal_id, ':', 2)
+                                        ELSE o.signal_id
+                                    END AS real_signal_id,
+                                    CASE
+                                        WHEN TRIM(COALESCE(o.canonical_signal_id, '')) <> ''
+                                            THEN o.canonical_signal_id
+                                        WHEN o.signal_id LIKE 'REEVAL:%:%'
+                                            THEN 'REEVAL:' || split_part(o.signal_id, ':', 2)
+                                        WHEN o.signal_id LIKE 'REEVAL:%'
+                                            THEN o.signal_id
+                                        ELSE o.signal_id
+                                    END AS order_canon_id,
                                     o.created_ts
                             FROM    orders o
                             WHERE   o.client_id = %s
@@ -2415,19 +2436,40 @@ class ClientRunner(threading.Thread):
                                         )
                                     )
                         ),
-                        active_peers AS (
-                            SELECT  DISTINCT COALESCE(p.canonical_signal_id, p.signal_id) AS canon_id
-                            FROM    orders p
-                            JOIN    candidates ca
-                              ON    COALESCE(p.canonical_signal_id, p.signal_id)
-                                  = ca.canon_id
-                            WHERE   COALESCE(p.canonical_signal_id, p.signal_id) IS NOT NULL
-                              AND   (
-                                        p.status IN ('SUBMITTED','ACKNOWLEDGED','FILLED','PARTIALLY_FILLED')
-                                    OR  p.filled_ts IS NOT NULL
-                                    OR  p.submitted_ts IS NOT NULL
-                                    OR  p.created_ts > NOW() - (%s || ' seconds')::interval
-                                    )
+                        active_proof AS (
+                            SELECT DISTINCT ca.local_order_id
+                            FROM   candidates ca
+                            WHERE  EXISTS (
+                                       SELECT 1
+                                       FROM   orders p
+                                       WHERE  p.local_order_id <> ca.local_order_id
+                                         AND  COALESCE(p.canonical_signal_id, p.signal_id) = ca.order_canon_id
+                                         AND  COALESCE(p.canonical_signal_id, p.signal_id) IS NOT NULL
+                                         AND  (
+                                                   p.status IN ('SUBMITTED','ACKNOWLEDGED','FILLED','PARTIALLY_FILLED')
+                                               OR  p.filled_ts IS NOT NULL
+                                               OR  p.submitted_ts IS NOT NULL
+                                               OR  p.created_ts > NOW() - (%s || ' seconds')::interval
+                                              )
+                                   )
+                               OR  EXISTS (
+                                       SELECT 1
+                                       FROM   ap_signals s
+                                       WHERE  s.signal_id::text = ca.real_signal_id
+                                         AND  UPPER(COALESCE(s.decision_status, '')) IN ('WATCHING','ARMED')
+                                   )
+                               OR  EXISTS (
+                                       SELECT 1
+                                       FROM   trade_queue tq
+                                       WHERE  tq.client_id = %s
+                                         AND  tq.status IN ('NEW','PROCESSING','WATCHING')
+                                         AND  (
+                                                   COALESCE(tq.signal_id, '') = ca.real_signal_id
+                                               OR  COALESCE(tq.signal_id, '') = ca.signal_id
+                                               OR  COALESCE(tq.signal_id, '') = ca.order_canon_id
+                                               OR  COALESCE(tq.signal_id, '') LIKE (ca.order_canon_id || ':%')
+                                              )
+                                   )
                         ),
                         cancel_targets AS (
                             UPDATE orders o
@@ -2457,8 +2499,8 @@ class ClientRunner(threading.Thread):
                             FROM   candidates ca
                             WHERE  o.local_order_id = ca.local_order_id
                               AND  NOT EXISTS (
-                                       SELECT 1 FROM active_peers ap
-                                       WHERE  ap.canon_id = ca.canon_id
+                                       SELECT 1 FROM active_proof ap
+                                       WHERE  ap.local_order_id = ca.local_order_id
                                    )
                             RETURNING o.local_order_id
                         ),
@@ -2484,8 +2526,8 @@ class ClientRunner(threading.Thread):
                             FROM   candidates ca
                             WHERE  o.local_order_id = ca.local_order_id
                               AND  EXISTS (
-                                       SELECT 1 FROM active_peers ap
-                                       WHERE  ap.canon_id = ca.canon_id
+                                       SELECT 1 FROM active_proof ap
+                                       WHERE  ap.local_order_id = ca.local_order_id
                                    )
                             RETURNING o.local_order_id
                         )
@@ -2498,6 +2540,7 @@ class ClientRunner(threading.Thread):
                             str(min_age_seconds),
                             float(startup_ts) - startup_grace_seconds,
                             str(parity_window_seconds),
+                            self.email,
                             cleanup_rule_version, min_age_seconds, startup_grace_seconds,
                             str(parity_window_seconds),
                             cleanup_rule_version, min_age_seconds, startup_grace_seconds,
