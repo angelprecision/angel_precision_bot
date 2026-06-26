@@ -1,93 +1,205 @@
-import os
+from types import SimpleNamespace
 
-import pytest
+from ap import queue
+from ap.failed_dir_admission import (
+    failed_dir_block_result,
+    is_failed_dir_blocked,
+    payload_pattern_id,
+)
 
-from ap import restart_guard
+
+class _MasterControl:
+    def __init__(self, mode="PAPER"):
+        self.mode = mode
+
+    def evaluate(self, *args, **kwargs):  # pragma: no cover - must not be reached by blocked cases
+        raise AssertionError("master_control.evaluate must not run for FAILED_DIR blocks")
 
 
-def test_failed_dir_2d_15min_rejected_by_default(monkeypatch):
+def _call_dispatch(monkeypatch, payload, *, mode="PAPER", job_last_error=None, job_result=None):
+    marked = []
+    logged = []
+
+    def fake_mark_job(job_id, status, *, result=None, error=None):
+        marked.append({
+            "job_id": job_id,
+            "status": status,
+            "result": result,
+            "error": error,
+        })
+
+    def fake_log_rejection_to_db(**kwargs):
+        logged.append(kwargs)
+
+    monkeypatch.setattr(queue._orig, "_mark_job", fake_mark_job)
+    monkeypatch.setattr(queue._orig, "_log_rejection_to_db", fake_log_rejection_to_db)
+
+    queue._dispatch(
+        123,
+        "jose.vasquez4011@gmail.com",
+        "sig-failed-dir-001",
+        payload,
+        job_last_error=job_last_error,
+        job_result=job_result,
+        master_control=_MasterControl(mode=mode),
+        contract_selector=SimpleNamespace(),
+        order_state_machine=SimpleNamespace(),
+        entry_watcher=SimpleNamespace(),
+        position_manager=SimpleNamespace(),
+        exit_eng=SimpleNamespace(),
+        broker=SimpleNamespace(),
+    )
+    return marked, logged
+
+
+def test_failed_dir_2d_15min_rejects_before_master_control(monkeypatch):
     monkeypatch.delenv("FAILED_DIR_ENABLED", raising=False)
 
-    assert restart_guard.should_skip_on_restart({
+    marked, logged = _call_dispatch(monkeypatch, {
         "ticker": "GS",
         "pattern_id": "FAILED_DIR_2D_15min",
         "source_scanner": "failed_dir_intraday_1tf",
         "backtest_match_source": "FALLBACK_DEFAULT",
-    }) is True
+        "score": 65,
+    })
+
+    assert marked[0]["status"] == "REJECTED"
+    assert marked[0]["error"] == "blocked_pattern:FAILED_DIR_DISABLED"
+    assert marked[0]["result"]["reason_code"] == "BLOCKED_PATTERN_FAILED_DIR_DISABLED"
+    assert logged[0]["reason_code"] == "BLOCKED_PATTERN_FAILED_DIR_DISABLED"
 
 
-def test_failed_dir_2d_multitimeframe_rejected_by_startswith(monkeypatch):
+def test_failed_dir_multitimeframe_rejected_by_prefix(monkeypatch):
     monkeypatch.delenv("FAILED_DIR_ENABLED", raising=False)
 
-    assert restart_guard.should_skip_on_restart({
+    marked, _ = _call_dispatch(monkeypatch, {
         "ticker": "COIN",
         "pattern_id": "FAILED_DIR_2D_30min+60min",
         "source_scanner": "failed_dir_intraday_2tf",
         "score": 78,
-    }) is True
+    })
+
+    assert marked[0]["status"] == "REJECTED"
+    assert marked[0]["result"]["pattern_id"] == "FAILED_DIR_2D_30min+60min"
 
 
-def test_failed_dir_2u_15min_rejected_by_default(monkeypatch):
+def test_failed_dir_future_variant_rejected_by_prefix(monkeypatch):
     monkeypatch.delenv("FAILED_DIR_ENABLED", raising=False)
 
-    assert restart_guard.should_skip_on_restart({
-        "ticker": "MSFT",
-        "pattern_id": "FAILED_DIR_2U_15min",
-    }) is True
-
-
-def test_future_failed_dir_variant_rejected_by_prefix(monkeypatch):
-    monkeypatch.delenv("FAILED_DIR_ENABLED", raising=False)
-
-    assert restart_guard.should_skip_on_restart({
+    marked, _ = _call_dispatch(monkeypatch, {
         "ticker": "TEST",
         "pattern_id": "FAILED_DIR_CUSTOM_NEW",
-    }) is True
+    })
+
+    assert marked[0]["status"] == "REJECTED"
+    assert marked[0]["result"]["pattern_id"] == "FAILED_DIR_CUSTOM_NEW"
 
 
-def test_pattern_fallback_fields_are_checked(monkeypatch):
+def test_pattern_fallback_fields_are_checked():
+    assert payload_pattern_id({"pattern": "FAILED_DIR_2D_60min"}) == "FAILED_DIR_2D_60min"
+    assert payload_pattern_id({"strat_pattern": "FAILED_DIR_2U_30min"}) == "FAILED_DIR_2U_30min"
+    assert is_failed_dir_blocked({"pattern": "FAILED_DIR_2D_60min"}) is True
+    assert is_failed_dir_blocked({"strat_pattern": "FAILED_DIR_2U_30min"}) is True
+
+
+def test_paper_overnight_only_failed_dir_still_rejects_before_rescue_route(monkeypatch):
     monkeypatch.delenv("FAILED_DIR_ENABLED", raising=False)
 
-    assert restart_guard.should_skip_on_restart({"pattern": "FAILED_DIR_2D_60min"}) is True
-    assert restart_guard.should_skip_on_restart({"strat_pattern": "FAILED_DIR_2U_30min"}) is True
-
-
-def test_failed_dir_enabled_allows_pass_through_when_market_closed(monkeypatch):
-    monkeypatch.setenv("FAILED_DIR_ENABLED", "1")
-    monkeypatch.setattr(restart_guard, "_is_market_hours_now", lambda: False)
-
-    assert restart_guard.should_skip_on_restart({
-        "ticker": "GS",
+    marked, _ = _call_dispatch(monkeypatch, {
+        "ticker": "AMZN",
         "pattern_id": "FAILED_DIR_2D_15min",
-    }) is False
+        "force_overnight_reeval_only": True,
+        "do_not_queue_directly": True,
+    }, mode="PAPER")
+
+    assert marked[0]["status"] == "REJECTED"
+    assert marked[0]["error"] == "blocked_pattern:FAILED_DIR_DISABLED"
+    assert marked[0]["result"]["reason_code"] == "BLOCKED_PATTERN_FAILED_DIR_DISABLED"
 
 
-@pytest.mark.parametrize("value", ["true", "yes", "on", "1"])
-def test_failed_dir_enabled_truthy_values_allow_pass_through(monkeypatch, value):
-    monkeypatch.setenv("FAILED_DIR_ENABLED", value)
-    monkeypatch.setattr(restart_guard, "_is_market_hours_now", lambda: False)
-
-    assert restart_guard.should_skip_on_restart({
-        "pattern_id": "FAILED_DIR_2U_30min",
-    }) is False
-
-
-def test_non_failed_dir_signal_preserves_existing_restart_guard_path(monkeypatch):
+def test_paper_manual_rescue_failed_dir_still_rejects(monkeypatch):
     monkeypatch.delenv("FAILED_DIR_ENABLED", raising=False)
-    monkeypatch.setattr(restart_guard, "_is_market_hours_now", lambda: False)
 
-    assert restart_guard.should_skip_on_restart({
-        "ticker": "AAPL",
-        "pattern_id": "1-2_2U",
-    }) is False
+    marked, _ = _call_dispatch(
+        monkeypatch,
+        {
+            "ticker": "BA",
+            "pattern_id": "FAILED_DIR_2D_30min",
+        },
+        mode="PAPER",
+        job_last_error="manual_rescue_current_session",
+        job_result={"manual_rescue": True},
+    )
+
+    assert marked[0]["status"] == "REJECTED"
+    assert marked[0]["error"] == "blocked_pattern:FAILED_DIR_DISABLED"
 
 
-def test_payload_pattern_id_prefers_pattern_id():
+def test_result_json_preserves_client_id_and_execution_mode():
     payload = {
+        "ticker": "GS",
+        "side": "CALL",
         "pattern_id": "FAILED_DIR_2D_15min",
-        "pattern": "1-2_2U",
-        "strat_pattern": "3-2-2",
+        "source_scanner": "failed_dir_intraday_1tf",
+        "backtest_match_source": "FALLBACK_DEFAULT",
+        "score": 65,
     }
 
-    assert restart_guard._payload_pattern_id(payload) == "FAILED_DIR_2D_15min"
-    assert restart_guard._is_failed_dir_pattern(payload) is True
+    result = failed_dir_block_result(
+        payload,
+        client_id="jose.vasquez4011@gmail.com",
+        execution_mode="PAPER",
+        signal_id="sig-1",
+        ticker="GS",
+    )
+
+    assert result["client_id"] == "jose.vasquez4011@gmail.com"
+    assert result["execution_mode"] == "PAPER"
+    assert result["reason_code"] == "BLOCKED_PATTERN_FAILED_DIR_DISABLED"
+    assert result["backtest_match_source"] == "FALLBACK_DEFAULT"
+
+
+def test_failed_dir_enabled_is_only_pass_through_path(monkeypatch):
+    monkeypatch.setenv("FAILED_DIR_ENABLED", "1")
+    called = []
+
+    def fake_original_dispatch(*args, **kwargs):
+        called.append((args, kwargs))
+
+    monkeypatch.setattr(queue, "_ORIGINAL_DISPATCH", fake_original_dispatch)
+
+    queue._dispatch(
+        123,
+        "jose.vasquez4011@gmail.com",
+        "sig-failed-dir-enabled",
+        {"ticker": "GS", "pattern_id": "FAILED_DIR_2D_15min"},
+        master_control=_MasterControl(mode="PAPER"),
+        contract_selector=SimpleNamespace(),
+        order_state_machine=SimpleNamespace(),
+        entry_watcher=SimpleNamespace(),
+    )
+
+    assert len(called) == 1
+
+
+def test_non_failed_dir_passes_through(monkeypatch):
+    monkeypatch.delenv("FAILED_DIR_ENABLED", raising=False)
+    called = []
+
+    def fake_original_dispatch(*args, **kwargs):
+        called.append((args, kwargs))
+
+    monkeypatch.setattr(queue, "_ORIGINAL_DISPATCH", fake_original_dispatch)
+
+    queue._dispatch(
+        123,
+        "jose.vasquez4011@gmail.com",
+        "sig-normal",
+        {"ticker": "AAPL", "pattern_id": "1-2_2U"},
+        master_control=_MasterControl(mode="PAPER"),
+        contract_selector=SimpleNamespace(),
+        order_state_machine=SimpleNamespace(),
+        entry_watcher=SimpleNamespace(),
+    )
+
+    assert len(called) == 1
