@@ -1,57 +1,105 @@
 -- migrations/20260625_handoff_run_locks_schema_fix.sql
--- PR #182 — Fix handoff_run_locks schema collision
-
-BEGIN;
-
--- =============================================================================
+-- PR #182 — Fix handoff_run_locks schema collision (safe, conditional, idempotent)
+--
 -- ROOT CAUSE
---   Two independent systems both used the table name `handoff_run_locks`:
+--   migrations/2026_06_20_handoff_run_locks.sql created handoff_run_locks with
+--   run_key TEXT PRIMARY KEY (for ap_handoff_run_lock.py job-dedup locks).
+--   migrations/20260622_morning_handoff_run_locks.sql used CREATE TABLE IF NOT
+--   EXISTS → silent no-op. morning_handoff.py expected client_id / stage columns
+--   that never existed. Production crash: column "client_id" does not exist.
 --
---   System 1 (job dedup lock — ap_handoff_run_lock.py):
---     Created by migrations/2026_06_20_handoff_run_locks.sql — APPLIED first.
---     Schema: run_key TEXT PRIMARY KEY, trade_date, job_name, client_scope, ...
---     Purpose: prevents duplicate Render/GHA runs of the same morning job window.
+-- WHAT THIS MIGRATION DOES
+--   1. Renames handoff_run_locks → handoff_job_locks ONLY when:
+--        - handoff_run_locks has run_key (old schema), AND
+--        - handoff_run_locks does NOT already have client_id (new schema), AND
+--        - handoff_job_locks does not already exist.
+--      Raises an exception if the rename cannot be done safely.
+--   2. Creates handoff_run_locks with client_id schema IF it does not exist.
+--   3. Asserts the final state is correct. Raises if anything is wrong.
 --
---   System 2 (per-client stage tracker — ap/morning_handoff.py):
---     migrations/20260622_morning_handoff_run_locks.sql used CREATE TABLE IF
---     NOT EXISTS → SILENT NO-OP because the table already existed from System 1.
---     Expected schema: client_id, execution_mode, trading_date, stage, ...
---     Purpose: tracks which handoff stages each client completed today.
---
---   Result: morning_handoff.py crashed with
---     `column "client_id" does not exist FROM handoff_run_locks`
---   because it was querying the System 1 table with System 2 column names.
---
--- FIX
---   1. Rename System 1 table to handoff_job_locks (new canonical name).
---      Data preserved. ap_handoff_run_lock.py updated to use the new name.
---   2. Create handoff_run_locks fresh with the schema morning_handoff.py expects.
---      This is what 20260622_morning_handoff_run_locks.sql should have done.
+-- IDEMPOTENT: safe to re-run.
+-- ATOMIC: runs in a single transaction.
 --
 -- APPLY
 --   psql "$DATABASE_URL" -f migrations/20260625_handoff_run_locks_schema_fix.sql
 -- VERIFY
---   \d public.handoff_job_locks
---   \d public.handoff_run_locks
+--   \d public.handoff_job_locks   -- run_key PK
+--   \d public.handoff_run_locks   -- client_id PK
 -- =============================================================================
 
--- ── Step 1: Rename existing table ────────────────────────────────────────────
--- Preserves all run_key dedup data. ap_handoff_run_lock.py is updated in the
--- same PR to reference handoff_job_locks.
-ALTER TABLE IF EXISTS public.handoff_run_locks
-    RENAME TO handoff_job_locks;
+BEGIN;
 
--- Rename indexes so they stay legible after the table rename.
--- PostgreSQL renames the table but indexes keep their original names.
-ALTER INDEX IF EXISTS idx_handoff_run_locks_date
-    RENAME TO idx_handoff_job_locks_date;
+-- ── Step 1: Conditional rename ───────────────────────────────────────────────
 
-ALTER INDEX IF EXISTS idx_handoff_run_locks_status_acquired
-    RENAME TO idx_handoff_job_locks_status_acquired;
+DO $$
+DECLARE
+    v_run_has_run_key   boolean;
+    v_run_has_client_id boolean;
+    v_job_locks_exists  boolean;
+BEGIN
 
--- ── Step 2: Create handoff_run_locks with the schema morning_handoff.py needs ─
--- This is the table that 20260622_morning_handoff_run_locks.sql tried to create
--- but couldn't because the table already existed with the wrong schema.
+    SELECT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name   = 'handoff_run_locks'
+          AND column_name  = 'run_key'
+    ) INTO v_run_has_run_key;
+
+    SELECT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name   = 'handoff_run_locks'
+          AND column_name  = 'client_id'
+    ) INTO v_run_has_client_id;
+
+    SELECT EXISTS (
+        SELECT 1 FROM information_schema.tables
+        WHERE table_schema = 'public'
+          AND table_name   = 'handoff_job_locks'
+    ) INTO v_job_locks_exists;
+
+    -- Case A: old run_key schema present, client_id absent → rename.
+    IF v_run_has_run_key AND NOT v_run_has_client_id THEN
+
+        IF v_job_locks_exists THEN
+            RAISE EXCEPTION
+                'Cannot rename handoff_run_locks → handoff_job_locks: '
+                'handoff_job_locks already exists. '
+                'Inspect both tables and resolve manually before re-running.';
+        END IF;
+
+        ALTER TABLE public.handoff_run_locks RENAME TO handoff_job_locks;
+
+        ALTER INDEX IF EXISTS idx_handoff_run_locks_date
+            RENAME TO idx_handoff_job_locks_date;
+        ALTER INDEX IF EXISTS idx_handoff_run_locks_status_acquired
+            RENAME TO idx_handoff_job_locks_status_acquired;
+
+        RAISE NOTICE 'Renamed handoff_run_locks → handoff_job_locks (run_key schema preserved).';
+
+    -- Case B: client_id already present → table already has the new schema.
+    ELSIF v_run_has_client_id THEN
+        RAISE NOTICE 'handoff_run_locks already has client_id — rename skipped.';
+
+    -- Case C: table absent entirely → nothing to rename.
+    ELSIF NOT EXISTS (
+        SELECT 1 FROM information_schema.tables
+        WHERE table_schema = 'public'
+          AND table_name   = 'handoff_run_locks'
+    ) THEN
+        RAISE NOTICE 'handoff_run_locks does not exist — rename not needed.';
+
+    -- Case D: table exists but has neither run_key nor client_id → unknown state.
+    ELSE
+        RAISE EXCEPTION
+            'handoff_run_locks exists but has neither run_key nor client_id. '
+            'Unknown schema state — manual inspection required before re-running.';
+    END IF;
+
+END $$;
+
+-- ── Step 2: Create handoff_run_locks with client_id schema (idempotent) ──────
+
 CREATE TABLE IF NOT EXISTS public.handoff_run_locks (
     client_id       TEXT        NOT NULL,
     execution_mode  TEXT        NOT NULL,
@@ -74,12 +122,94 @@ CREATE INDEX IF NOT EXISTS idx_handoff_run_locks_client_status
     ON public.handoff_run_locks (client_id, status);
 
 COMMENT ON TABLE public.handoff_job_locks IS
-    'Job-level dedup lock. Prevents duplicate Render/GHA runs of the same '
-    'morning job window. PK: run_key. Used by ap_handoff_run_lock.py.';
+    'Job-level dedup lock. PK: run_key. Used by ap_handoff_run_lock.py.';
 
 COMMENT ON TABLE public.handoff_run_locks IS
-    'Per-client stage tracker for morning handoff. Tracks which stages each '
-    'client completed today. PK: (client_id, execution_mode, trading_date, stage). '
+    'Per-client stage tracker for morning handoff. '
+    'PK: (client_id, execution_mode, trading_date, stage). '
     'Used by ap/morning_handoff.py.';
+
+-- ── Step 3: Final assertions — fail loudly if schema is wrong ─────────────────
+
+DO $$
+DECLARE
+    v_job_has_run_key        boolean;
+    v_run_has_client_id      boolean;
+    v_run_has_execution_mode boolean;
+    v_run_has_trading_date   boolean;
+    v_run_has_stage          boolean;
+BEGIN
+
+    -- handoff_job_locks: must have run_key if the table exists
+    SELECT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name   = 'handoff_job_locks'
+          AND column_name  = 'run_key'
+    ) INTO v_job_has_run_key;
+
+    IF EXISTS (
+        SELECT 1 FROM information_schema.tables
+        WHERE table_schema = 'public' AND table_name = 'handoff_job_locks'
+    ) AND NOT v_job_has_run_key THEN
+        RAISE EXCEPTION
+            'ASSERTION FAILED: public.handoff_job_locks exists but has no run_key column. '
+            'Migration ended in an unexpected state.';
+    END IF;
+
+    -- handoff_run_locks: must have client_id, execution_mode, trading_date, stage
+    SELECT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name   = 'handoff_run_locks'
+          AND column_name  = 'client_id'
+    ) INTO v_run_has_client_id;
+
+    SELECT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name   = 'handoff_run_locks'
+          AND column_name  = 'execution_mode'
+    ) INTO v_run_has_execution_mode;
+
+    SELECT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name   = 'handoff_run_locks'
+          AND column_name  = 'trading_date'
+    ) INTO v_run_has_trading_date;
+
+    SELECT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name   = 'handoff_run_locks'
+          AND column_name  = 'stage'
+    ) INTO v_run_has_stage;
+
+    IF NOT v_run_has_client_id THEN
+        RAISE EXCEPTION
+            'ASSERTION FAILED: public.handoff_run_locks missing client_id.';
+    END IF;
+
+    IF NOT v_run_has_execution_mode THEN
+        RAISE EXCEPTION
+            'ASSERTION FAILED: public.handoff_run_locks missing execution_mode.';
+    END IF;
+
+    IF NOT v_run_has_trading_date THEN
+        RAISE EXCEPTION
+            'ASSERTION FAILED: public.handoff_run_locks missing trading_date.';
+    END IF;
+
+    IF NOT v_run_has_stage THEN
+        RAISE EXCEPTION
+            'ASSERTION FAILED: public.handoff_run_locks missing stage.';
+    END IF;
+
+    RAISE NOTICE
+        'PR #182 schema assertions passed: '
+        'handoff_job_locks=run_key, handoff_run_locks=client_id+execution_mode+trading_date+stage.';
+
+END $$;
 
 COMMIT;
