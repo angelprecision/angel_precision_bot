@@ -127,3 +127,23 @@ def test_paper_keeps_existing_fail_open_behavior_when_legacy_confirmation_not_re
     assert result.passed
     assert result.metadata["confirmation_required"] is False
     assert result.metadata["live_final_entry_guard"]["skipped"] is True
+
+
+def test_paper_execution_mode_skips_live_guard_even_when_sandbox_false():
+    plan = Plan(
+        execution_mode="paper",
+        side="CALL",
+        trigger_price=77.62,
+        stop_underlying=76.90,
+        target_underlying=78.56,
+        limit_price=1.47,
+    )
+
+    result = _run(plan, direction="CALL", current=83.985, live_ask=1.68, decision_price=1.47, sandbox=False)
+
+    assert result.passed
+    assert result.metadata["confirmation_required"] is False
+    guard = result.metadata["live_final_entry_guard"]
+    assert guard["skipped"] is True
+    assert guard["skip_reason"] == "non_live_execution_mode"
+    assert guard["execution_mode"] == "paper"
