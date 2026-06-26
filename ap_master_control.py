@@ -1561,12 +1561,9 @@ class APMasterControl:
         current_mode = self._current_mode()
         if current_mode == "READ_ONLY":
             return self._block(signal_id, ticker, client_id, "blocked_system", "mode_read_only")
-        if current_mode == "LIVE":
-            ev_score = float(signal.get("ev_score") or 0)
-            if ev_score <= 0:
-                return self._block(signal_id, ticker, client_id, "blocked_system", "live_mode_requires_ev_score")
-        # In LIVE mode, use ev_score (backtested EV) as the authoritative gate score.
-        effective_score = float(signal.get("ev_score") or score) if current_mode == "LIVE" else score
+        # Live trading must not depend on backtest EV metadata being present.
+        # Scanner score remains the gating score for both paper and live.
+        effective_score = score
 
         direction_raw = norm_side
         timeframe_raw = signal.get("timeframe", "1d")
