@@ -38,6 +38,9 @@ from __future__ import annotations
 import hashlib
 import logging
 from datetime import datetime, timezone, date
+# PR #182: table renamed handoff_run_locks → handoff_job_locks.
+# See migrations/20260625_handoff_run_locks_schema_fix.sql.
+# handoff_run_locks is now reserved for ap/morning_handoff.py (per-client stage tracking).
 from typing import Optional
 
 log = logging.getLogger("ap.handoff_run_lock")
@@ -100,7 +103,7 @@ def try_acquire_run_lock(
             # Fast path: first writer wins.
             c.execute(
                 """
-                INSERT INTO public.handoff_run_locks
+                INSERT INTO public.handoff_job_locks
                     (run_key, trade_date, job_name, execution_mode,
                      client_scope, triggered_by, status, acquired_at)
                 VALUES (%s, %s, %s, %s, %s, %s, 'running', NOW())
@@ -120,7 +123,7 @@ def try_acquire_run_lock(
             # two reclaimers cannot both win.
             c.execute(
                 """
-                UPDATE public.handoff_run_locks
+                UPDATE public.handoff_job_locks
                 SET    status='running', acquired_at=NOW(),
                        triggered_by=%s, completed_at=NULL, result_summary=NULL
                 WHERE  run_key=%s
@@ -168,7 +171,7 @@ def mark_run_lock_completed(run_key: str, result_summary: Optional[dict] = None)
         with conn() as c:
             c.execute(
                 """
-                UPDATE public.handoff_run_locks
+                UPDATE public.handoff_job_locks
                 SET    status='completed', completed_at=NOW(), result_summary=%s
                 WHERE  run_key=%s
                 """,
@@ -188,7 +191,7 @@ def mark_run_lock_failed(run_key: str, error: str) -> None:
         with conn() as c:
             c.execute(
                 """
-                UPDATE public.handoff_run_locks
+                UPDATE public.handoff_job_locks
                 SET    status='failed', completed_at=NOW()
                 WHERE  run_key=%s
                 """,
