@@ -3,8 +3,6 @@ from __future__ import annotations
 import json
 from copy import deepcopy
 
-import pytest
-
 from ap.entry_metadata_guard import (
     MISSING_PATTERN,
     MISSING_SIGNAL_ID,
@@ -94,10 +92,26 @@ def test_fully_shaped_signal_passes_unchanged():
     assert signal == before
 
 
-def test_guard_installed_on_osm_class():
+def test_guard_installed_on_master_control_and_osm_classes():
     from ap.order_state_machine import APOrderStateMachine
+    from ap_master_control import APMasterControl
 
+    assert getattr(APMasterControl, "_entry_metadata_guard_installed", False) is True
     assert getattr(APOrderStateMachine, "_entry_metadata_guard_installed", False) is True
+
+
+def test_master_control_blocks_invalid_metadata_before_contract_selection():
+    from ap_master_control import APMasterControl
+
+    mc = APMasterControl(mode="paper", client_id="jasoncosby1@gmail.com")
+    decision = mc.evaluate(
+        _shaped_signal(score=0, execution_mode="paper"),
+        client_id="jasoncosby1@gmail.com",
+    )
+
+    assert decision.ok is False
+    assert decision.stage == "metadata_validation"
+    assert decision.reason == ZERO_SCORE
 
 
 def test_submit_existing_entry_blocks_before_broker_submit_or_order_mutation(monkeypatch):
