@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 from ap.db import conn, run_with_retry, insert_order, update_order, new_local_order_id
+from ap.exit_safety import evaluate_exit_submission_safety
 from ap.utils import now_utc_iso, json_dumps
 from ap.logger import get_logger
 from ap.state import load_state
@@ -200,6 +201,26 @@ def get_exit_price_safe(broker: BrokerAdapter, contract: str) -> float:
 def submit_exit_order(broker: BrokerAdapter, position: dict, reason: str) -> tuple[bool, str | None, str | None]:
     contract = position["contract"]
     qty      = int(position["qty"])
+    execution_mode = str(position.get("execution_mode") or "").strip().lower() or None
+
+    if position.get("id") and position.get("client_id"):
+        safety = evaluate_exit_submission_safety(
+            position_id=str(position["id"]),
+            client_id=str(position["client_id"]),
+            execution_mode=execution_mode,
+            contract=str(contract or ""),
+        )
+        if safety.get("blocked"):
+            blocked_reason = str(safety.get("reason") or "exit_submission_blocked")
+            log.warning(
+                "[%s] exit_manager blocked broker exit | position_id=%s execution_mode=%s contract=%s reason=%s",
+                position.get("client_id"),
+                position.get("id"),
+                execution_mode or "",
+                contract,
+                blocked_reason,
+            )
+            return False, None, blocked_reason
 
     try:
         resp = broker.place_order(

@@ -52,6 +52,10 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from ap.db import conn, run_with_retry
+from ap.exit_safety import (
+    alert_exit_submission_halted,
+    evaluate_exit_submission_safety,
+)
 try:
     from psycopg2 import errors as pg_errors
 except ImportError:
@@ -668,6 +672,7 @@ class APOrderStateMachine:
         signal_id=None,
         limit_price=None,
         reserved_cost=None,
+        execution_mode: str | None = None,
     ) -> str:
         existing = self._get_active_exit_order(position_id)
         if existing:
@@ -678,6 +683,9 @@ class APOrderStateMachine:
             return existing["local_order_id"]
         local_id = local_order_id or str(uuid.uuid4())
         ts = now_utc_iso()
+        _exec_mode = str(execution_mode or "").strip().lower()
+        if _exec_mode not in ("live", "paper"):
+            _exec_mode = None
 
         # P0 client-parity: stamp canonical_signal_id on exit rows too so the
         # full lifecycle (entry + exit) groups by the same opportunity id.
@@ -692,6 +700,7 @@ class APOrderStateMachine:
                         canonical_signal_id,
                         kind, status,
                         symbol, contract, direction,
+                        execution_mode,
                         qty, limit_price, reserved_cost,
                         filled_qty,
                         created_ts, updated_ts
@@ -700,6 +709,7 @@ class APOrderStateMachine:
                         %s,
                         'EXIT','EXIT_REQUESTED',
                         %s,%s,%s,
+                        %s,
                         %s,%s,%s,
                         0,
                         %s,%s
@@ -711,6 +721,7 @@ class APOrderStateMachine:
                         position_id, plan_id, signal_id,
                         _exit_canonical_id,
                         symbol.upper(), contract, direction.upper(),
+                        _exec_mode,
                         int(qty),
                         float(limit_price) if limit_price else None,
                         float(reserved_cost) if reserved_cost else None,
@@ -2052,7 +2063,15 @@ class APOrderStateMachine:
         plan_id=None,
         signal_id=None,
         order_type: str = "limit",
+        execution_mode: str | None = None,
     ) -> dict:
+        if not execution_mode:
+            try:
+                from ap.authorization import execution_mode_for_broker
+                execution_mode = execution_mode_for_broker(broker)
+            except Exception:
+                execution_mode = None
+
         existing = self._get_active_exit_order(position_id)
         if existing:
             existing  = dict(existing)
@@ -2073,7 +2092,71 @@ class APOrderStateMachine:
             position_id=position_id, contract=contract, symbol=symbol,
             direction=direction, qty=qty, plan_id=plan_id, signal_id=signal_id,
             limit_price=limit_price,
+            execution_mode=execution_mode,
         )
+        safety = evaluate_exit_submission_safety(
+            position_id=str(position_id),
+            client_id=self.client_id,
+            execution_mode=execution_mode,
+            contract=str(contract or ""),
+            broker_truth_open_qty=int(qty or 0),
+            allow_missing_position_with_broker_truth=str(position_id or "").startswith("broker-repair-"),
+        )
+        if safety.get("blocked"):
+            blocked_reason = str(safety.get("reason") or "exit_submission_blocked")
+            log.warning(
+                "[%s] EXIT submit blocked before broker call | position_id=%s client_id=%s execution_mode=%s contract=%s reason=%s",
+                self.client_id,
+                position_id,
+                self.client_id,
+                str(execution_mode or "").strip().lower(),
+                contract,
+                blocked_reason,
+            )
+            try:
+                self.transition(local_id, OrderStatus.CANCELED, last_error=blocked_reason)
+            except Exception as exc:
+                log.debug("[%s] exit block cancel transition failed for %s: %s", self.client_id, local_id, exc)
+
+            position_state = (safety.get("position_state") or {}) if isinstance(safety, dict) else {}
+            if position_state.get("blocked"):
+                try:
+                    _ee = _get_exit_engine_for_client(self.client_id)
+                    if _ee and hasattr(_ee, "clear_exit_in_flight"):
+                        self._call_exit_engine(
+                            _ee,
+                            "clear_exit_in_flight",
+                            str(position_id),
+                            reason=blocked_reason,
+                        )
+                except Exception as exc:
+                    log.debug("[%s] clear_exit_in_flight on terminal exit block failed: %s", self.client_id, exc)
+
+            breaker = (safety.get("circuit_breaker") or {}) if isinstance(safety, dict) else {}
+            if blocked_reason == "exit_circuit_breaker_tripped":
+                try:
+                    alert_exit_submission_halted(
+                        client_id=self.client_id,
+                        execution_mode=execution_mode,
+                        position_id=str(position_id),
+                        contract=str(contract or ""),
+                        reason=blocked_reason,
+                        rejection_count=breaker.get("rejection_count"),
+                        threshold=breaker.get("threshold"),
+                    )
+                except Exception as exc:
+                    log.warning("[%s] exit circuit-breaker alert failed: %s", self.client_id, exc)
+
+            return {
+                "ok": False,
+                "local_order_id": local_id,
+                "broker_order_id": None,
+                "status": OrderStatus.CANCELED,
+                "error": blocked_reason,
+                "skipped": True,
+                "reason": blocked_reason,
+            }
+
         lp = float(limit_price or 0)
         _is_market = (order_type == "market") or (lp <= 0 and order_type != "limit")
         if lp <= 0 and not _is_market:
