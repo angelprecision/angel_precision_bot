@@ -4887,6 +4887,75 @@ class APExitEngine:
                 pos.quantity_remaining, decision.quantity, decision.reason,
             )
 
+        _exec_mode = str(
+            getattr(getattr(self, "master_control", None), "mode", "") or
+            getattr(pos, "execution_mode", "") or
+            ""
+        ).strip().lower()
+        try:
+            from ap.exit_safety import (
+                alert_exit_submission_halted,
+                evaluate_exit_submission_safety,
+            )
+
+            _exit_guard = evaluate_exit_submission_safety(
+                position_id=str(position_id or ""),
+                client_id=str(getattr(pos, "client_id", "") or self.client_id),
+                execution_mode=_exec_mode,
+                contract=str(option_symbol or ""),
+                broker_truth_open_qty=int(getattr(pos, "quantity_remaining", 0) or 0),
+                allow_missing_position_with_broker_truth=True,
+            )
+            if _exit_guard.get("blocked"):
+                _blocked_reason = str(_exit_guard.get("reason") or "exit_submission_blocked")
+                if _blocked_reason != "exit_circuit_breaker_tripped":
+                    with self._lock:
+                        pos.exit_in_flight = False
+                        pos.pending_exit_reason = ""
+                log.warning(
+                    "[%s] EXIT guard blocked before callback submit | position_id=%s client_id=%s execution_mode=%s contract=%s reason=%s",
+                    ticker,
+                    position_id or "?",
+                    getattr(pos, "client_id", "") or self.client_id,
+                    _exec_mode,
+                    option_symbol,
+                    _blocked_reason,
+                )
+                if _blocked_reason == "exit_circuit_breaker_tripped":
+                    _breaker = (_exit_guard.get("circuit_breaker") or {}) if isinstance(_exit_guard, dict) else {}
+                    try:
+                        alert_exit_submission_halted(
+                            client_id=str(getattr(pos, "client_id", "") or self.client_id),
+                            execution_mode=_exec_mode,
+                            position_id=str(position_id or ""),
+                            contract=str(option_symbol or ""),
+                            reason=_blocked_reason,
+                            rejection_count=_breaker.get("rejection_count"),
+                            threshold=_breaker.get("threshold"),
+                        )
+                    except Exception as _alert_err:
+                        log.warning("[%s] exit guard alert failed: %s", ticker, _alert_err)
+                self._emit_exit_event(
+                    pos,
+                    decision="HOLD",
+                    reason_code="EXIT_GUARD_BLOCKED",
+                    explanation=f"Exit submit blocked before callback: {_blocked_reason}",
+                    stage="exit_submission",
+                    extra_inputs={
+                        "decision_action": decision.action,
+                        "decision_qty": decision.quantity,
+                        "execution_mode": _exec_mode,
+                        "blocked_reason": _blocked_reason,
+                    },
+                )
+                return False
+        except Exception as _guard_err:
+            log.warning(
+                "[%s] exit pre-submit guard unavailable; continuing with callback submit: %s",
+                ticker,
+                _guard_err,
+            )
+
         # 2) External callback outside lock.
         callback_result  = None
         callback_identity = {"accepted": True, "local_order_id": "", "broker_order_id": "", "raw_status": ""}
