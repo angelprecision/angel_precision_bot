@@ -21,7 +21,6 @@ _REASON_CODES = {
     ZERO_UNDERLYING: "UNDERLYING_CONFIRMATION_MISSING_ZERO_UNDERLYING",
     CANNOT_EVALUATE_DIRECTION: "UNDERLYING_CONFIRMATION_MISSING_CANNOT_EVALUATE_DIRECTION",
 }
-
 DAILY_TIMEFRAMES = {"1d", "d", "daily", "1day", "1 day", "overnight"}
 PRICE_KEYS = ("last", "last_price", "price", "mark", "mid", "close", "current_underlying", "underlying_price")
 TS_KEYS = ("timestamp", "ts", "time", "datetime", "updated_at", "fetched_at", "quote_ts", "quote_timestamp", "asof")
@@ -147,10 +146,9 @@ def _first_float(src: list[Any], *keys: str) -> Optional[float]:
     for source in src:
         for key in keys:
             ok, value = _read(source, key)
-            if ok:
-                parsed = _safe_float(value)
-                if parsed is not None:
-                    return parsed
+            parsed = _safe_float(value) if ok else None
+            if parsed is not None:
+                return parsed
     return None
 
 
@@ -176,9 +174,8 @@ def _ts(value: Any) -> Optional[datetime]:
             return datetime.fromtimestamp(raw, tz=timezone.utc)
         except Exception:
             return None
-    text = str(value).strip().replace("Z", "+00:00")
     try:
-        dt = datetime.fromisoformat(text)
+        dt = datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
         return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
     except Exception:
         return None
@@ -223,8 +220,9 @@ def _quote_ts(raw: Any) -> Optional[datetime]:
 
 
 def _broker_quote(ticker: str, broker: Any) -> tuple[Any, str]:
-    sources = [x for x in (getattr(broker, "data_broker", None), getattr(broker, "market_data_broker", None), broker) if x is not None]
-    for source in sources:
+    for source in (getattr(broker, "data_broker", None), getattr(broker, "market_data_broker", None), broker):
+        if source is None:
+            continue
         for name in ("get_underlying_quote", "get_stock_quote", "get_equity_quote", "get_quote", "quote", "fetch_quote"):
             method = getattr(source, name, None)
             if not callable(method):
@@ -309,7 +307,6 @@ def install_underlying_confirmation_entry_guard() -> None:
 
     if getattr(APOrderStateMachine, "_underlying_confirmation_guard_installed", False):
         return
-    original_create = APOrderStateMachine.create_entry_order
     original_submit = APOrderStateMachine.submit_entry
     original_submit_existing = APOrderStateMachine.submit_existing_entry
 
@@ -322,15 +319,6 @@ def install_underlying_confirmation_entry_guard() -> None:
             return _clean(execution_mode_for_broker(broker)).lower()
         except Exception:
             return mode
-
-    def guarded_create(self, plan, *args, **kwargs):
-        execution_mode = _clean(kwargs.get("execution_mode") or _first_text(_sources(plan, kwargs.get("meta")), "execution_mode", "mode")).lower()
-        try:
-            require_underlying_confirmation_available(plan=plan, payload=kwargs.get("meta"), client_id=getattr(self, "client_id", ""), execution_mode=execution_mode)
-        except UnderlyingConfirmationUnavailable as exc:
-            log.warning("[%s] ENTRY_BLOCKED before create_entry_order reason=%s", getattr(self, "client_id", "?"), exc.reason)
-            raise ValueError(exc.reason)
-        return original_create(self, plan, *args, **kwargs)
 
     def guarded_submit(self, *args, **kwargs):
         broker = kwargs.get("broker")
@@ -367,7 +355,6 @@ def install_underlying_confirmation_entry_guard() -> None:
                 return {"ok": False, "local_order_id": local_order_id, "broker_order_id": order.get("broker_order_id"), "status": OrderStatus.ERROR, "error": exc.reason, "stage": STAGE, "reason_code": exc.reason_code, "underlying_confirmation": exc.metadata}
         return original_submit_existing(self, *args, **kwargs)
 
-    APOrderStateMachine.create_entry_order = guarded_create
     APOrderStateMachine.submit_entry = guarded_submit
     APOrderStateMachine.submit_existing_entry = guarded_submit_existing
     APOrderStateMachine._underlying_confirmation_guard_installed = True
