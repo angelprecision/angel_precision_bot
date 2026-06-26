@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 from datetime import datetime
+from types import SimpleNamespace
 
 from ap.daily_continuation_validator import (
     REASON_ALLOWED,
     REASON_BACK_THROUGH,
     REASON_MISSING_CONTEXT,
+    REASON_OPENING_EXHAUSTED,
     REASON_TOUCH_ONLY,
     validate_daily_intraday_continuation,
+    validate_daily_intraday_continuation_for_watched_signal,
 )
 
 
@@ -148,6 +151,59 @@ def test_missing_intraday_context_fails_safe(monkeypatch):
     assert decision.diagnostics["canonical_signal_id"] == "REEVAL:missing"
 
 
+def test_opening_breach_with_no_later_extension_blocks(monkeypatch):
+    monkeypatch.setenv("ENABLE_DAILY_CONTINUATION_VALIDATION", "true")
+
+    decision = validate_daily_intraday_continuation(
+        ticker="WFC",
+        timeframe="1d",
+        direction="CALL",
+        trigger_price=77.62,
+        current_underlying_price=77.80,
+        intraday_candles=[
+            candle(77.30, 77.70, 77.20, 77.55, "09:30"),
+            candle(77.55, 77.66, 77.40, 77.61, "09:31"),
+            candle(77.61, 77.65, 77.50, 77.62, "09:32"),
+            candle(77.62, 77.64, 77.56, 77.60, "09:33"),
+            candle(77.60, 77.63, 77.55, 77.61, "09:34"),
+            candle(77.61, 77.64, 77.58, 77.63, "09:45"),
+        ],
+        client_id="jasoncosby1@gmail.com",
+        execution_mode="live",
+        canonical_signal_id="REEVAL:open",
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == REASON_OPENING_EXHAUSTED
+    assert decision.diagnostics["opening_breach"] is True
+
+
+def test_current_price_above_trigger_buffer_allows_when_not_open_exhausted(monkeypatch):
+    monkeypatch.setenv("ENABLE_DAILY_CONTINUATION_VALIDATION", "true")
+
+    decision = validate_daily_intraday_continuation(
+        ticker="AAPL",
+        timeframe="1d",
+        direction="CALL",
+        trigger_price=100.0,
+        current_underlying_price=100.35,
+        intraday_candles=[
+            candle(99.80, 99.90, 99.60, 99.70),
+            candle(99.70, 99.95, 99.65, 99.90),
+            candle(99.90, 100.10, 99.80, 100.02),
+            candle(100.02, 100.12, 99.98, 100.08),
+            candle(100.08, 100.36, 100.05, 100.35),
+        ],
+        client_id="paper-client@example.com",
+        execution_mode="paper",
+        canonical_signal_id="REEVAL:buffer",
+    )
+
+    assert decision.allowed is True
+    assert decision.reason == REASON_ALLOWED
+    assert decision.diagnostics["holding_with_buffer"] is True
+
+
 def test_client_id_execution_mode_and_canonical_signal_id_preserved_on_block(monkeypatch):
     monkeypatch.setenv("ENABLE_DAILY_CONTINUATION_VALIDATION", "true")
 
@@ -246,7 +302,12 @@ def test_late_day_without_fresh_extension_blocks(monkeypatch):
         trigger_price=100.0,
         current_underlying_price=100.5,
         intraday_candles=[
-            candle(99.8, 100.2, 99.7, 100.1),
+            candle(99.50, 99.80, 99.40, 99.70),
+            candle(99.70, 99.85, 99.60, 99.75),
+            candle(99.75, 99.90, 99.65, 99.80),
+            candle(99.80, 99.95, 99.70, 99.90),
+            candle(99.90, 99.98, 99.80, 99.95),
+            candle(99.95, 100.2, 99.7, 100.1),
             candle(100.1, 100.15, 99.9, 100.05),
             candle(100.05, 100.12, 99.95, 100.06),
         ],
@@ -258,3 +319,66 @@ def test_late_day_without_fresh_extension_blocks(monkeypatch):
 
     assert decision.allowed is False
     assert decision.reason == "daily_continuation_failed:late_day_no_followthrough"
+
+
+class _FakeResponse:
+    status_code = 200
+
+    def json(self):
+        return {
+            "series": {
+                "data": {
+                    "item": [
+                        {"time": "09:30", "open": 99.5, "high": 100.1, "low": 99.4, "close": 100.05},
+                        {"time": "09:36", "open": 100.05, "high": 100.9, "low": 100.0, "close": 100.8},
+                    ]
+                }
+            }
+        }
+
+    def raise_for_status(self):
+        return None
+
+
+class _FakeSession:
+    def get(self, *args, **kwargs):
+        return _FakeResponse()
+
+
+class _FakeBroker:
+    session = _FakeSession()
+
+
+def test_watched_signal_adapter_uses_real_timesales_shape_and_preserves_diagnostics(monkeypatch):
+    monkeypatch.setenv("ENABLE_DAILY_CONTINUATION_VALIDATION", "true")
+    watched = SimpleNamespace(
+        ticker="AAPL",
+        side="CALL",
+        entry_trigger=100.0,
+        stop_level=98.0,
+        signal={
+            "signal_id": "sig-1",
+            "canonical_signal_id": "canon-1",
+            "client_id": "jasoncosby1@gmail.com",
+            "execution_mode": "live",
+            "timeframe": "1d",
+            "local_order_id": "ord-1",
+        },
+    )
+
+    decision = validate_daily_intraday_continuation_for_watched_signal(
+        watched,
+        _FakeBroker(),
+        client_id="jasoncosby1@gmail.com",
+        execution_mode="live",
+        canonical_signal_id="canon-1",
+        now=datetime(2026, 6, 26, 10, 0),
+    )
+
+    assert decision.allowed is True
+    assert decision.reason == REASON_ALLOWED
+    assert decision.diagnostics["adapter"] == "watched_signal"
+    assert decision.diagnostics["candles_count"] == 2
+    assert decision.diagnostics["local_order_id"] == "ord-1"
+    assert decision.diagnostics["client_id"] == "jasoncosby1@gmail.com"
+    assert decision.diagnostics["execution_mode"] == "live"
