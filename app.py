@@ -3561,18 +3561,28 @@ def create_app() -> Flask:
         if runner is None:
             return jsonify({"ok": False, "error": f"client_id not in active runners: {client_id_req}"}), 404
 
+        runner_mode = _runner_execution_mode(runner) or mode
+        if mode and runner_mode != mode:
+            return jsonify({
+                "ok": False,
+                "error": "runner_mode_mismatch",
+                "client_id": client_id_req,
+                "requested_mode": mode,
+                "runner_mode": runner_mode,
+            }), 409
+
         try:
             handoff, readiness = _run_admin_handoff_and_readiness(
                 runner=runner,
                 client_id=client_id_req,
-                execution_mode=mode,
+                execution_mode=runner_mode,
                 stage="manual",
                 dry_run=dry_run,
             )
             payload = {
                 "ok": bool(handoff.get("ok")) and readiness.get("status") != "BLOCKED",
                 "client_id": client_id_req,
-                "execution_mode": mode,
+                "execution_mode": runner_mode,
                 "stage": "manual",
                 "handoff": handoff,
                 "readiness": readiness,
@@ -3607,6 +3617,28 @@ def create_app() -> Flask:
         mode = str(mode_raw or execution_mode_alias or "live").lower().strip()
         dry_run = bool(body.get("dry_run", False))
 
+        with _registry_lock:
+            runners_all = dict(_active_runners)
+
+        selected_runners = []
+        for email, runner in runners_all.items():
+            if clients_filter is not None and email not in clients_filter:
+                continue
+            runner_mode = _runner_execution_mode(runner) or mode
+            if mode and runner_mode != mode:
+                continue
+            selected_runners.append((email, runner, runner_mode))
+
+        explicit_target = clients_filter is not None
+        if explicit_target and not selected_runners:
+            return jsonify({
+                "ok": False,
+                "error": "requested_clients_not_in_active_runners_for_mode",
+                "requested_clients": sorted(clients_filter),
+                "requested_mode": mode,
+                "active_runners": sorted(runners_all.keys()),
+            }), 404
+
         run_lock_key = None
         if not dry_run and body.get("use_run_lock", True):
             from ap_handoff_run_lock import (
@@ -3640,18 +3672,12 @@ def create_app() -> Flask:
                     "mode": mode,
                 }), 200
 
-        with _registry_lock:
-            runners_all = dict(_active_runners)
-
         _t0 = _time.monotonic()
         handoff_results = {}
         readiness_results = {}
         errors = {}
 
-        for email, runner in runners_all.items():
-            if clients_filter is not None and email not in clients_filter:
-                continue
-            runner_mode = execution_mode_alias or _runner_execution_mode(runner) or mode
+        for email, runner, runner_mode in selected_runners:
             try:
                 handoff, readiness = _run_admin_handoff_and_readiness(
                     runner=runner,
@@ -3686,10 +3712,13 @@ def create_app() -> Flask:
             }
             if errors:
                 mark_run_lock_failed(run_lock_key, f"{len(errors)} client error(s)")
+            elif explicit_target and len(handoff_results) == 0:
+                mark_run_lock_failed(run_lock_key, "requested_clients_not_in_active_runners_for_mode")
             else:
                 mark_run_lock_completed(run_lock_key, summary)
 
-        return jsonify({
+        ok = ok and (len(handoff_results) > 0 or not explicit_target)
+        response_body = {
             "ok": ok,
             "run_key": run_lock_key,
             "stage": "manual",
@@ -3697,10 +3726,14 @@ def create_app() -> Flask:
             "dry_run": dry_run,
             "clients_audited": len(handoff_results),
             "elapsed_seconds": round(elapsed, 2),
+            "requested_clients": sorted(clients_filter) if explicit_target else None,
             "handoff_results": handoff_results,
             "readiness_results": readiness_results,
             "errors": errors,
-        }), 200 if ok else 503
+        }
+        if explicit_target and len(handoff_results) == 0:
+            response_body["error"] = "requested_clients_not_in_active_runners_for_mode"
+        return jsonify(response_body), 200 if ok else (404 if explicit_target and len(handoff_results) == 0 else 503)
 
     @app.route("/admin/preopen_readiness", methods=["GET", "POST"])
     @require_hmac

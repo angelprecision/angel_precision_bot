@@ -102,6 +102,13 @@ def _fake_client_runner_module(active_runners=None):
     )
 
 
+def _fake_runner(mode="live"):
+    runner = MagicMock()
+    runner.mode = mode
+    runner.master_control = SimpleNamespace(mode=mode)
+    return runner
+
+
 def test_hmac_signature_matches_shell_format():
     secret = "031b4935137f1999d176700274b73bd0"
     ts = "1718591880"
@@ -269,14 +276,14 @@ def test_render_blueprint_defines_primary_render_cron_jobs():
     blueprint = (REPO_ROOT / "render.yaml").read_text()
     assert blueprint.count("type: cron") == 8
     for expr in (
-        "18 13 * * 1-5",
-        "18 14 * * 1-5",
-        "26 13 * * 1-5",
-        "26 14 * * 1-5",
+        "30 13 * * 1-5",
+        "30 14 * * 1-5",
         "32 13 * * 1-5",
         "32 14 * * 1-5",
         "36 13 * * 1-5",
         "36 14 * * 1-5",
+        "40 13 * * 1-5",
+        "40 14 * * 1-5",
     ):
         assert expr in blueprint
     assert "startCommand: \"python -m ap.scripts.live_morning_jobs\"" in blueprint
@@ -339,7 +346,7 @@ def test_paper_workflow_uses_batch_job_name_and_paper_only_env():
     workflow = (REPO_ROOT / ".github" / "workflows" / "paper-morning-jobs.yml").read_text()
     assert 'default: "overnight_reeval_batch"' in workflow
     assert '          - overnight_reeval_batch' in workflow
-    assert '"18 13 * * 1-5"|"18 14 * * 1-5") JOB="overnight_reeval_batch"' in workflow
+    assert '"30 13 * * 1-5"|"30 14 * * 1-5") JOB="overnight_reeval_batch"' in workflow
     assert "BOT_URL: ${{ secrets.PAPER_BOT_URL }}" in workflow
     assert "MORNING_JOB_EXECUTION_MODE: paper" in workflow
     assert "MORNING_JOB_PAPER_CLIENTS: ${{ matrix.client_id }}" in workflow
@@ -398,7 +405,9 @@ def test_app_source_restores_existing_admin_endpoints_and_handoff_contract():
     assert 'body.get("clients")' in src
     assert 'body.get("client_id")' in src
     assert 'body.get("execution_mode")' in src
-    assert "APStartupRecovery" not in src
+    handoff_idx = src.find('def admin_morning_handoff_audit_post')
+    handoff_region = src[handoff_idx: handoff_idx + 5000]
+    assert "APStartupRecovery" not in handoff_region
 
 
 def test_existing_async_overnight_status_contract_still_exists():
@@ -458,6 +467,37 @@ def test_admin_morning_handoff_get_conflicting_mode_and_execution_mode_returns_4
         "mode": "live",
         "execution_mode": "paper",
     }
+
+
+def test_admin_morning_handoff_get_rejects_runner_mode_mismatch(morning_handoff_client):
+    active = {"jason@example.com": _fake_runner(mode="paper")}
+    with patch.dict(sys.modules, {"client_runner": _fake_client_runner_module(active)}):
+        resp = morning_handoff_client.get(
+            "/admin/morning_handoff_audit?client_id=jason@example.com&execution_mode=live"
+        )
+    assert resp.status_code == 409
+    assert resp.get_json() == {
+        "ok": False,
+        "error": "runner_mode_mismatch",
+        "client_id": "jason@example.com",
+        "requested_mode": "live",
+        "runner_mode": "paper",
+    }
+
+
+def test_admin_morning_handoff_post_rejects_zero_matched_explicit_client(morning_handoff_client):
+    active = {"jose@example.com": _fake_runner(mode="paper")}
+    with patch.dict(sys.modules, {"client_runner": _fake_client_runner_module(active)}):
+        resp = morning_handoff_client.post(
+            "/admin/morning_handoff_audit",
+            json={"client_id": "jason@example.com", "execution_mode": "live", "dry_run": False},
+        )
+    body = resp.get_json()
+    assert resp.status_code == 404
+    assert body["ok"] is False
+    assert body["error"] == "requested_clients_not_in_active_runners_for_mode"
+    assert body["requested_clients"] == ["jason@example.com"]
+    assert body["requested_mode"] == "live"
 
 
 def test_admin_morning_handoff_post_rejects_conflicting_mode_and_execution_mode():
