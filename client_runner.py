@@ -2393,18 +2393,18 @@ class ClientRunner(threading.Thread):
                             SELECT  o.local_order_id,
                                     o.signal_id,
                                     CASE
-                                        WHEN o.signal_id LIKE 'REEVAL:%:%'
+                                        WHEN o.signal_id LIKE 'REEVAL:%%:%%'
                                             THEN split_part(o.signal_id, ':', 2)
-                                        WHEN o.signal_id LIKE 'REEVAL:%'
+                                        WHEN o.signal_id LIKE 'REEVAL:%%'
                                             THEN split_part(o.signal_id, ':', 2)
                                         ELSE o.signal_id
                                     END AS real_signal_id,
                                     CASE
                                         WHEN TRIM(COALESCE(o.canonical_signal_id, '')) <> ''
                                             THEN o.canonical_signal_id
-                                        WHEN o.signal_id LIKE 'REEVAL:%:%'
+                                        WHEN o.signal_id LIKE 'REEVAL:%%:%%'
                                             THEN 'REEVAL:' || split_part(o.signal_id, ':', 2)
-                                        WHEN o.signal_id LIKE 'REEVAL:%'
+                                        WHEN o.signal_id LIKE 'REEVAL:%%'
                                             THEN o.signal_id
                                         ELSE o.signal_id
                                     END AS order_canon_id,
@@ -2467,7 +2467,7 @@ class ClientRunner(threading.Thread):
                                                    COALESCE(tq.signal_id, '') = ca.real_signal_id
                                                OR  COALESCE(tq.signal_id, '') = ca.signal_id
                                                OR  COALESCE(tq.signal_id, '') = ca.order_canon_id
-                                               OR  COALESCE(tq.signal_id, '') LIKE (ca.order_canon_id || ':%')
+                                               OR  COALESCE(tq.signal_id, '') LIKE (ca.order_canon_id || ':%%')
                                               )
                                    )
                         ),
