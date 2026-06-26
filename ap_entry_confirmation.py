@@ -33,6 +33,16 @@ def _safe_float(value: Any) -> Optional[float]:
     return out if out > 0 else None
 
 
+def _normalize_pct_threshold(value: float) -> float:
+    """Normalize percentage-like thresholds to decimal form for option gain.
+
+    Existing submit guards use whole percentages (8.0 == 8%). The new remaining
+    opportunity config is specified as 0.08 == 8%. Accept both forms so a Render
+    typo of 8 still means 8%, not 800%.
+    """
+    return value / 100.0 if value > 1.0 else value
+
+
 def _tier_confirm_seconds(score: Optional[float], tier: Optional[str], timeframe: Optional[str]) -> float:
     base = _ef("ENTRY_CONFIRM_SECONDS", 45.0)
     tf = (timeframe or "1d").lower()
@@ -127,6 +137,203 @@ def _is_daily_or_overnight(timeframe: Optional[str], meta: dict) -> bool:
     return tf in _DAILY_TIMEFRAMES or bool(
         meta.get("overnight") or meta.get("contract_deferred") or meta.get("force_overnight_reeval_only")
     )
+
+
+def _resolve_expected_option_gain_pct(
+    *,
+    plan: Any,
+    remaining_move: Optional[float],
+    submit_ask: Optional[float],
+) -> tuple[Optional[float], str]:
+    """Resolve expected option gain as a decimal fraction.
+
+    Prefer production-supplied projected option upside when present. If absent,
+    use contract delta if available; if delta is also absent, use the conservative
+    selector-band default so the guard remains deterministic and auditable.
+    """
+    explicit = _safe_float(
+        _plan_get(
+            plan,
+            "expected_option_gain_pct",
+            "projected_option_gain_pct",
+            "option_expected_gain_pct",
+            "estimated_option_gain_pct",
+        )
+    )
+    if explicit is not None:
+        return _normalize_pct_threshold(explicit), "explicit_expected_gain_pct"
+
+    target_option_price = _safe_float(
+        _plan_get(
+            plan,
+            "target_option_price",
+            "option_target_price",
+            "target_contract_price",
+            "projected_option_target_price",
+        )
+    )
+    if target_option_price is not None and submit_ask is not None:
+        return (target_option_price - submit_ask) / submit_ask, "target_option_price"
+
+    if remaining_move is None or submit_ask is None or submit_ask <= 0:
+        return None, "unavailable"
+
+    delta = _safe_float(
+        _plan_get(
+            plan,
+            "contract_delta",
+            "selected_delta",
+            "delta",
+            "option_delta",
+        )
+    )
+    if delta is not None:
+        delta = abs(delta)
+        source = "contract_delta"
+    else:
+        delta = abs(_ef("REMAINING_OPPORTUNITY_DEFAULT_DELTA", 0.30))
+        source = "default_delta_proxy"
+
+    return (delta * remaining_move) / submit_ask, source
+
+
+def _remaining_opportunity_check(
+    *,
+    plan: Any,
+    dirn: str,
+    current: Optional[float],
+    target: Optional[float],
+    stop: Optional[float],
+    submit_ask: Optional[float],
+) -> tuple[bool, Optional[str], dict]:
+    enabled = _truthy_env("REMAINING_OPPORTUNITY_FILTER_ENABLED", True)
+    min_remaining_move_pct = _ef("MIN_REMAINING_MOVE_PCT", 0.25)
+    min_remaining_r = _ef("MIN_REMAINING_R", 0.75)
+    min_expected_option_gain_pct = _normalize_pct_threshold(
+        _ef("MIN_EXPECTED_OPTION_GAIN_PCT", 0.08)
+    )
+
+    audit: dict[str, Any] = {
+        "remaining_opportunity_filter": {
+            "enabled": enabled,
+            "min_remaining_move_pct": min_remaining_move_pct,
+            "min_remaining_r": min_remaining_r,
+            "min_expected_option_gain_pct": min_expected_option_gain_pct,
+            "current_underlying": current,
+            "target_underlying": target,
+            "stop_underlying": stop,
+            "submit_ask": submit_ask,
+        }
+    }
+
+    if not enabled:
+        audit["remaining_opportunity_filter"].update(
+            {"passed": True, "skipped": True, "skip_reason": "filter_disabled"}
+        )
+        return True, None, audit
+
+    def block(reason: str, **extra: Any) -> tuple[bool, str, dict]:
+        payload = {
+            **audit["remaining_opportunity_filter"],
+            **extra,
+            "passed": False,
+            "block_reason": reason,
+        }
+        return False, reason, {"remaining_opportunity_filter": payload, **payload}
+
+    if dirn not in {"CALL", "PUT"} or current is None or target is None:
+        # Existing metadata/shape guards own missing/invalid values. This helper
+        # should not introduce a second reason taxonomy for already-invalid shape.
+        audit["remaining_opportunity_filter"].update(
+            {"passed": True, "skipped": True, "skip_reason": "missing_required_shape"}
+        )
+        return True, None, audit
+
+    if dirn == "CALL":
+        if target <= current:
+            return block(
+                "remaining_opportunity_failed:target_already_reached",
+                remaining_move=round(target - current, 6),
+                remaining_move_pct=round(((target - current) / current) * 100.0, 6) if current else None,
+            )
+        if stop is not None and stop >= current:
+            return block("remaining_opportunity_failed:target_wrong_side")
+        remaining_move = target - current
+        risk_to_stop = (current - stop) if stop is not None else None
+    else:
+        if target >= current:
+            return block(
+                "remaining_opportunity_failed:target_already_reached",
+                remaining_move=round(current - target, 6),
+                remaining_move_pct=round(((current - target) / current) * 100.0, 6) if current else None,
+            )
+        if stop is not None and stop <= current:
+            return block("remaining_opportunity_failed:target_wrong_side")
+        remaining_move = current - target
+        risk_to_stop = (stop - current) if stop is not None else None
+
+    if remaining_move <= 0:
+        return block(
+            "remaining_opportunity_failed:target_already_reached",
+            remaining_move=round(remaining_move, 6),
+        )
+
+    remaining_move_pct = (remaining_move / current) * 100.0 if current else 0.0
+    remaining_r = (
+        (remaining_move / risk_to_stop)
+        if risk_to_stop is not None and risk_to_stop > 0
+        else None
+    )
+    expected_option_gain_pct, expected_source = _resolve_expected_option_gain_pct(
+        plan=plan,
+        remaining_move=remaining_move,
+        submit_ask=submit_ask,
+    )
+
+    common = {
+        "remaining_move": round(remaining_move, 6),
+        "remaining_move_pct": round(remaining_move_pct, 6),
+        "remaining_r": round(remaining_r, 6) if remaining_r is not None else None,
+        "risk_to_stop": round(risk_to_stop, 6) if risk_to_stop is not None else None,
+        "expected_option_gain_pct": (
+            round(expected_option_gain_pct, 6)
+            if expected_option_gain_pct is not None
+            else None
+        ),
+        "expected_option_gain_source": expected_source,
+    }
+
+    if remaining_move_pct < min_remaining_move_pct:
+        return block(
+            "remaining_opportunity_failed:insufficient_move_remaining",
+            failed_metric="remaining_move_pct",
+            **common,
+        )
+
+    if remaining_r is not None and remaining_r < min_remaining_r:
+        return block(
+            "remaining_opportunity_failed:insufficient_move_remaining",
+            failed_metric="remaining_r",
+            **common,
+        )
+
+    if (
+        expected_option_gain_pct is not None
+        and expected_option_gain_pct < min_expected_option_gain_pct
+    ):
+        return block(
+            "remaining_opportunity_failed:insufficient_expected_option_gain",
+            failed_metric="expected_option_gain_pct",
+            **common,
+        )
+
+    payload = {
+        **audit["remaining_opportunity_filter"],
+        **common,
+        "passed": True,
+        "block_reason": None,
+    }
+    return True, None, {"remaining_opportunity_filter": payload, **payload}
 
 
 def _final_live_entry_guard(
@@ -228,17 +435,29 @@ def _final_live_entry_guard(
     if dirn == "CALL":
         if current <= trigger:
             return block("CALL_TRIGGER_NOT_HELD")
-        if target is not None and current >= target:
-            return block("STALE_TARGET_ALREADY_REACHED_CALL")
-        if require_shape and target is not None and stop is not None and not (target > trigger > stop):
-            return block("INVALID_TARGET_TRIGGER_STOP_SHAPE_CALL")
+        if require_shape and target is not None and trigger is not None and target <= trigger:
+            return block("remaining_opportunity_failed:target_wrong_side")
+        if require_shape and stop is not None and trigger is not None and trigger <= stop:
+            return block("remaining_opportunity_failed:target_wrong_side")
     else:
         if current >= trigger:
             return block("PUT_TRIGGER_NOT_HELD")
-        if target is not None and current <= target:
-            return block("STALE_TARGET_ALREADY_REACHED_PUT")
-        if require_shape and target is not None and stop is not None and not (target < trigger < stop):
-            return block("INVALID_TARGET_TRIGGER_STOP_SHAPE_PUT")
+        if require_shape and target is not None and trigger is not None and target >= trigger:
+            return block("remaining_opportunity_failed:target_wrong_side")
+        if require_shape and stop is not None and trigger is not None and trigger >= stop:
+            return block("remaining_opportunity_failed:target_wrong_side")
+
+    remaining_ok, remaining_reason, remaining_meta = _remaining_opportunity_check(
+        plan=plan,
+        dirn=dirn,
+        current=current,
+        target=target,
+        stop=stop,
+        submit_ask=submit_ask,
+    )
+    guard_payload["remaining_opportunity_filter"] = remaining_meta.get("remaining_opportunity_filter")
+    if not remaining_ok:
+        return block(remaining_reason or "remaining_opportunity_failed", **remaining_meta)
 
     if daily_or_overnight and distance_to_trigger_pct is not None and abs(distance_to_trigger_pct) > max_distance_pct:
         return block("LIVE_TRIGGER_DISTANCE_TOO_FAR")
