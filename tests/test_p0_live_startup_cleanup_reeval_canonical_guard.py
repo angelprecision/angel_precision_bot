@@ -69,7 +69,7 @@ def test_cleanup_sql_checks_trade_queue_using_reeval_and_plain_signal_shapes():
     assert "COALESCE(tq.signal_id, '') = ca.real_signal_id" in method_src
     assert "COALESCE(tq.signal_id, '') = ca.signal_id" in method_src
     assert "COALESCE(tq.signal_id, '') = ca.order_canon_id" in method_src
-    assert "COALESCE(tq.signal_id, '') LIKE (ca.order_canon_id || ':%')" in method_src
+    assert "COALESCE(tq.signal_id, '') LIKE (ca.order_canon_id || ':%%')" in method_src
 
 
 def test_cleanup_sql_uses_normalized_order_canon_for_active_peer_proof():
@@ -79,3 +79,38 @@ def test_cleanup_sql_uses_normalized_order_canon_for_active_peer_proof():
     assert "p.local_order_id <> ca.local_order_id" in method_src
     assert "SELECT 1 FROM active_proof ap" in method_src
 
+
+
+def test_cleanup_sql_psycopg2_parameter_formatting_does_not_raise():
+    """Verify every % sign inside the parametrized c.execute() SQL block is
+    either a %s placeholder or an escaped %%.  A bare % followed by any
+    non-placeholder character causes psycopg2 to raise ProgrammingError before
+    Postgres ever sees the query.
+
+    Uses Python's native % operator (which psycopg2 mirrors internally) so
+    the test runs without a real DB connection or psycopg2 import.
+    """
+    import re as _re
+    method_src = _extract_cleanup_method(_read(CLIENT_RUNNER))
+    # Grab just the SQL string passed to c.execute()
+    sql_match = _re.search(
+        r'c\.execute\(\s*"""(.*?)"""\s*,\s*\(',
+        method_src,
+        _re.DOTALL,
+    )
+    assert sql_match, "Could not extract SQL from c.execute() call — update the regex if the source changed"
+    sql = sql_match.group(1)
+
+    # Count the %s placeholders so we can build a matching dummy params tuple
+    n_placeholders = sql.count("%s")
+    dummy_params = ("x",) * n_placeholders
+
+    try:
+        _ = sql % dummy_params
+    except (TypeError, ValueError) as exc:
+        raise AssertionError(
+            f"Startup cleanup SQL fails psycopg2-style parameter formatting: {exc}\n"
+            "This means a bare % sign exists that would raise ProgrammingError "
+            "in production before Postgres executes the query.\n"
+            "Fix: escape literal % as %% in the SQL string."
+        ) from exc
