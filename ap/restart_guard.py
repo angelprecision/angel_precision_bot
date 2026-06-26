@@ -4,7 +4,6 @@
 # during market hours.
 #
 # Rule:
-#   FAILED_DIR signal + FAILED_DIR_ENABLED disabled = SKIP
 #   Previous-day signal + market hours = SKIP
 #   Previous-day signal before market open = ALLOW (morning revalidation)
 #   Today's signal = ALLOW
@@ -22,7 +21,6 @@
 from __future__ import annotations
 
 import logging
-import os
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
@@ -30,36 +28,6 @@ log = logging.getLogger("ap.restart_guard")
 
 ET = ZoneInfo("America/New_York")
 _BOT_START_TIME: datetime = datetime.now(timezone.utc)
-
-
-_TRUE_VALUES = {"1", "true", "yes", "on"}
-
-
-def _failed_dir_enabled() -> bool:
-    """Return True only when FAILED_DIR entry flow is explicitly re-enabled."""
-    return os.getenv("FAILED_DIR_ENABLED", "0").strip().lower() in _TRUE_VALUES
-
-
-def _payload_pattern_id(signal: dict) -> str:
-    """Resolve scanner pattern id from the production payload fallbacks."""
-    if not isinstance(signal, dict):
-        return ""
-    return str(
-        signal.get("pattern_id")
-        or signal.get("pattern")
-        or signal.get("strat_pattern")
-        or ""
-    ).strip()
-
-
-def _is_failed_dir_pattern(signal: dict) -> bool:
-    """FAILED_DIR variants must be blocked by prefix, not by finite set."""
-    return _payload_pattern_id(signal).upper().startswith("FAILED_DIR")
-
-
-def _is_failed_dir_blocked(signal: dict) -> bool:
-    """Hard-block FAILED_DIR until higher-timeframe confluence is added."""
-    return (not _failed_dir_enabled()) and _is_failed_dir_pattern(signal)
 
 
 def _is_market_hours_now() -> bool:
@@ -78,25 +46,10 @@ def should_skip_on_restart(signal: dict) -> bool:
     """
     Returns True if this signal should be skipped.
 
-    Blocks FAILED_DIR queue rows before master_control.evaluate() because
-    queue._dispatch() invokes this guard as the first pre-MC admission check.
     Blocks previous-day signals during market hours (9:30–16:00 ET).
     Allows previous-day signals through before market open so morning
     revalidation can process them normally.
     """
-    if _is_failed_dir_blocked(signal):
-        pattern_id = _payload_pattern_id(signal)
-        log.warning(
-            "[RESTART_GUARD] Blocking FAILED_DIR signal pattern=%s ticker=%s "
-            "source_scanner=%s backtest_match_source=%s — set FAILED_DIR_ENABLED=1 "
-            "only after higher-TF confluence is merged",
-            pattern_id,
-            signal.get("ticker") or signal.get("symbol"),
-            signal.get("source_scanner"),
-            signal.get("backtest_match_source"),
-        )
-        return True
-
     if not _is_market_hours_now():
         return False
 
@@ -141,8 +94,7 @@ def get_bot_start_time() -> datetime:
 
 def log_startup():
     log.info(
-        "[RESTART_GUARD] Bot started at %s | market_hours=%s | failed_dir_enabled=%s",
+        "[RESTART_GUARD] Bot started at %s | market_hours=%s",
         _BOT_START_TIME.strftime("%Y-%m-%d %H:%M:%S UTC"),
         _is_market_hours_now(),
-        _failed_dir_enabled(),
     )
