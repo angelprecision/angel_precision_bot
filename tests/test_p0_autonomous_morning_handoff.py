@@ -58,6 +58,12 @@ def test_manual_endpoint_still_exists_and_uses_shared_helper():
     assert 'stage="manual"' in src
 
 
+def test_morning_handoff_audit_loads_retry_eligible_rows():
+    src = (REPO_ROOT / "ap_morning_handoff_audit.py").read_text()
+    assert '"RETRY_ELIGIBLE"' in src or "'RETRY_ELIGIBLE'" in src
+    assert "PENDING_TRIGGER', 'WATCHING', 'CREATED', 'RETRY_ELIGIBLE" in src
+
+
 def test_helper_source_has_stage_aware_locking():
     src = (REPO_ROOT / "ap" / "morning_handoff.py").read_text()
     assert "handoff_run_locks" in src
