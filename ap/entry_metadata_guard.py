@@ -237,14 +237,27 @@ def validate_entry_metadata(
     if _is_daily_timeframe(resolved_timeframe):
         target_ok, target = _first_present_positive(
             src,
-            ("target_underlying", "target_price", "target", "take_profit_underlying"),
+            (
+                "target_underlying",
+                "target_price",
+                "target",
+                "take_profit_underlying",
+                "trigger.pt1",
+                "trigger.target",
+            ),
         )
         if not target_ok:
             return EntryMetadataValidationResult(False, MISSING_TARGET, {"target": target})
 
         stop_ok, stop = _first_present_positive(
             src,
-            ("stop_underlying", "stop_price", "stop", "stop_loss_underlying"),
+            (
+                "stop_underlying",
+                "stop_price",
+                "stop",
+                "stop_loss_underlying",
+                "trigger.stop",
+            ),
         )
         if not stop_ok:
             return EntryMetadataValidationResult(False, MISSING_STOP, {"stop": stop})
