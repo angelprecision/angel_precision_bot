@@ -92,6 +92,22 @@ def test_fully_shaped_signal_passes_unchanged():
     assert signal == before
 
 
+def test_nested_daily_trigger_stop_target_shape_passes_unchanged():
+    signal = _shaped_signal(
+        entry_trigger=None,
+        target_price=None,
+        stop_price=None,
+        trigger={"entry": 77.62, "stop": 75.10, "pt1": 81.50},
+    )
+    before = deepcopy(signal)
+
+    result = validate_entry_metadata(plan=signal)
+
+    assert result.ok
+    assert result.reason is None
+    assert signal == before
+
+
 def test_guard_installed_on_master_control_and_osm_classes():
     from ap.order_state_machine import APOrderStateMachine
     from ap_master_control import APMasterControl
