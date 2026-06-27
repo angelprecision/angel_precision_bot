@@ -4,7 +4,7 @@ import json
 import logging
 from typing import Any, Mapping
 
-from ap.entry_metadata_guard import validate_entry_metadata
+from ap.entry_metadata_guard import VALID_EXECUTION_MODES, validate_entry_metadata
 
 log = logging.getLogger("ap.master_control_metadata_guard")
 
@@ -42,8 +42,13 @@ def _first(source: Any, *keys: str) -> str:
     return ""
 
 
+def _runtime_mode(self: Any) -> str | None:
+    raw = getattr(self, "mode", None)
+    normalized = str(raw or "").strip().lower()
+    return normalized if normalized in VALID_EXECUTION_MODES else None
+
+
 def install_master_control_metadata_guard() -> None:
-    """Fail closed before contract selection when signal metadata is invalid."""
     from ap_master_control import APMasterControl, ControlDecision
 
     if getattr(APMasterControl, "_entry_metadata_guard_installed", False):
@@ -56,7 +61,7 @@ def install_master_control_metadata_guard() -> None:
         result = validate_entry_metadata(
             plan=signal,
             client_id=client_id,
-            execution_mode=None,  # do not infer/default; require signal-carried mode
+            execution_mode=_runtime_mode(self),
         )
         if not result.ok:
             signal_id = _first(signal, "signal_id", "canonical_signal_id")
