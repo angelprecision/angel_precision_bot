@@ -120,7 +120,9 @@ def block_reason_for_untrusted_historical_edge(decision: HistoricalEdgeDecision)
 
 
 def _untrusted(source: Any, reason: str, raw_values: dict[str, Any], score_adjustment: float, raw_score: float, effective_score: float, has_stats: bool, fail_closed: bool, observe_only: bool) -> HistoricalEdgeDecision:
-    return HistoricalEdgeDecision(False, str(source) if source is not None else None, None, None, None, 0, reason=reason, raw_values=raw_values, score_adjustment_points=score_adjustment, raw_score=raw_score, effective_score=effective_score, has_historical_stats=has_stats, fail_closed=fail_closed, observe_only_override=observe_only)
+    blocks_client = fail_closed and not observe_only and has_stats
+    adjusted_score = 0.0 if blocks_client else effective_score
+    return HistoricalEdgeDecision(False, str(source) if source is not None else None, None, None, None, 0, reason=reason, raw_values=raw_values, score_adjustment_points=score_adjustment, raw_score=raw_score, effective_score=adjusted_score, has_historical_stats=has_stats, fail_closed=fail_closed, observe_only_override=observe_only)
 
 
 def _iter_containers(payload: dict[str, Any]):
