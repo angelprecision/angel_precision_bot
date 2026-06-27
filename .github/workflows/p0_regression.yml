@@ -49,6 +49,7 @@ jobs:
             tests/test_readiness_contract.py \
             tests/test_funnel_fixes.py \
             tests/test_p0_regression_suite.py \
+            tests/test_p0_entry_metadata_guard.py \
             -v --tb=short --color=yes
 
       - name: Summary
@@ -62,4 +63,5 @@ jobs:
           echo "  - PR #16 funnel-leak fixes + corrections"
           echo "  - Single readiness contract"
           echo "  - Reason-code taxonomy"
+          echo "  - PR200 entry metadata guard"
           echo "  - All 16 critical modules import clean"
