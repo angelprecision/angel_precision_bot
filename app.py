@@ -648,6 +648,101 @@ def create_app() -> Flask:
     app = Flask(__name__)
     app.config["MAX_CONTENT_LENGTH"] = MAX_CONTENT_LENGTH
 
+
+    # ── PR: feat/operator-manual-close-endpoint ───────────────────────────────
+    @app.post("/admin/operator/manual-close")
+    @require_hmac
+    def admin_operator_manual_close():
+        """
+        Backfill a true Tradier fill price onto a manually-closed position.
+
+        When Angel closes a position directly in Tradier, the reconciler
+        picks it up and writes a market-quote estimate as exit_price.
+        This endpoint corrects that record with the operator's known true fill,
+        recalculates PnL, cancels stale exit orders, and writes an audit log.
+
+        DEFAULT: dry_run=true. Pass {"dry_run": false} to mutate.
+
+        Request body (JSON):
+            position_id       str     required
+            client_id         str     required
+            true_fill_price   float   required — actual Tradier fill
+            tradier_order_id  str     optional — Tradier sell order ID
+            reason            str     optional — audit label (default: operator_manual_close)
+            operator_note     str     optional — free-form note
+            dry_run           bool    default true
+
+        Headers:
+            X-AP-Signature: <hmac>   (standard require_hmac auth)
+
+        Response 200:
+            {
+              "ok": true,
+              "dry_run": false,
+              "position_id": "...",
+              "contract": "...",
+              "exit_price": 1.05,
+              "realized_pnl": -35.00,
+              "realized_pnl_pct": -25.0,
+              "positions_updated": 1,
+              "orders_canceled": 3,
+              "was_already_closed": true
+            }
+        """
+        from ap.operator_manual_close import execute_operator_manual_close
+
+        body = request.get_json(force=True, silent=True) or {}
+        dry_run = body.get("dry_run", True)
+        if not isinstance(dry_run, bool):
+            dry_run = str(dry_run).lower() not in ("false", "0", "no")
+
+        position_id      = (body.get("position_id") or "").strip()
+        client_id        = (body.get("client_id") or "").strip()
+        tradier_order_id = (body.get("tradier_order_id") or "").strip() or None
+        reason           = (body.get("reason") or "operator_manual_close").strip()
+        operator_note    = (body.get("operator_note") or "").strip() or None
+
+        if not position_id:
+            return jsonify({"ok": False, "error": "position_id is required"}), 400
+        if not client_id:
+            return jsonify({"ok": False, "error": "client_id is required"}), 400
+
+        raw_fill = body.get("true_fill_price")
+        if raw_fill is None:
+            return jsonify({"ok": False, "error": "true_fill_price is required"}), 400
+        try:
+            true_fill_price = float(raw_fill)
+            if true_fill_price < 0:
+                raise ValueError("negative fill price")
+        except (TypeError, ValueError) as e:
+            return jsonify({"ok": False, "error": f"true_fill_price invalid: {e}"}), 400
+
+        if dry_run:
+            return jsonify({
+                "ok":       True,
+                "dry_run":  True,
+                "message":  "dry_run=true — no mutations. Pass dry_run=false to apply.",
+                "would_update_position_id": position_id,
+                "would_set_exit_price":     true_fill_price,
+                "would_set_close_source":   "operator_manual_close",
+                "would_set_reason":         reason,
+            }), 200
+
+        try:
+            result = execute_operator_manual_close(
+                position_id=position_id,
+                client_id=client_id,
+                true_fill_price=true_fill_price,
+                tradier_order_id=tradier_order_id,
+                reason=reason,
+                operator_note=operator_note,
+            )
+            status_code = result.pop("status_code", 200)
+            return jsonify({**result, "dry_run": False}), status_code
+        except Exception as e:
+            log.exception("admin_operator_manual_close failed")
+            return jsonify({"ok": False, "error": str(e), "dry_run": False}), 500
+
     log.info("=" * 70)
     log.info("ANGEL PRECISION BOT - INITIALIZING")
     log.info("=" * 70)
