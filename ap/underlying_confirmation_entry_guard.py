@@ -120,21 +120,21 @@ def _sources(*items: Any) -> list[Any]:
         if item is None:
             continue
         out.append(item)
-        m = _meta(item)
-        if m:
-            out.append(m)
+        meta = _meta(item)
+        if meta:
+            out.append(meta)
         if isinstance(item, Mapping):
             raw = item.get("raw_payload") or item.get("signal_payload") or item.get("payload")
             if isinstance(raw, Mapping):
                 out.append(raw)
-                rm = _meta(raw)
-                if rm:
-                    out.append(rm)
+                raw_meta = _meta(raw)
+                if raw_meta:
+                    out.append(raw_meta)
     return out
 
 
-def _first_text(src: list[Any], *keys: str) -> Any:
-    for source in src:
+def _first_text(sources: list[Any], *keys: str) -> Any:
+    for source in sources:
         for key in keys:
             ok, value = _read(source, key)
             if ok and _clean(value):
@@ -142,8 +142,8 @@ def _first_text(src: list[Any], *keys: str) -> Any:
     return None
 
 
-def _first_float(src: list[Any], *keys: str) -> Optional[float]:
-    for source in src:
+def _first_float(sources: list[Any], *keys: str) -> Optional[float]:
+    for source in sources:
         for key in keys:
             ok, value = _read(source, key)
             parsed = _safe_float(value) if ok else None
@@ -155,15 +155,22 @@ def _first_float(src: list[Any], *keys: str) -> Optional[float]:
 def requires_underlying_confirmation(*, plan: Any = None, payload: Any = None, order: Any = None) -> bool:
     if not _truthy_env("UNDERLYING_CONFIRMATION_ENTRY_GUARD_ENABLED", True):
         return False
-    src = _sources(plan, payload, order)
-    explicit = _first_text(src, "underlying_confirmation_required", "requires_underlying_confirmation", "hybrid_client_quality_gate.confirmation_required")
+    sources = _sources(plan, payload, order)
+    explicit = _first_text(
+        sources,
+        "underlying_confirmation_required",
+        "requires_underlying_confirmation",
+        "hybrid_client_quality_gate.confirmation_required",
+    )
     if explicit is not None:
         return str(explicit).strip().lower() in {"1", "true", "yes", "on"}
-    tf = _clean(_first_text(src, "timeframe")).lower()
-    return tf in DAILY_TIMEFRAMES or bool(_first_text(src, "overnight", "contract_deferred", "force_overnight_reeval_only"))
+    timeframe = _clean(_first_text(sources, "timeframe")).lower()
+    return timeframe in DAILY_TIMEFRAMES or bool(
+        _first_text(sources, "overnight", "contract_deferred", "force_overnight_reeval_only")
+    )
 
 
-def _ts(value: Any) -> Optional[datetime]:
+def _parse_ts(value: Any) -> Optional[datetime]:
     if value is None or value == "":
         return None
     if isinstance(value, datetime):
@@ -191,8 +198,8 @@ def _quote_dicts(raw: Any) -> list[Any]:
                 out.append(raw[key])
         quotes = raw.get("quotes")
         if isinstance(quotes, Mapping):
-            q = quotes.get("quote")
-            out.extend(q if isinstance(q, list) else [q] if isinstance(q, Mapping) else [])
+            quote = quotes.get("quote")
+            out.extend(quote if isinstance(quote, list) else [quote] if isinstance(quote, Mapping) else [])
     return out
 
 
@@ -200,9 +207,9 @@ def _quote_price(raw: Any) -> Optional[float]:
     scalar = _safe_float(raw)
     if scalar is not None:
         return scalar
-    for q in _quote_dicts(raw):
+    for quote in _quote_dicts(raw):
         for key in PRICE_KEYS:
-            ok, value = _read(q, key)
+            ok, value = _read(quote, key)
             parsed = _safe_float(value) if ok else None
             if parsed is not None:
                 return parsed
@@ -210,10 +217,10 @@ def _quote_price(raw: Any) -> Optional[float]:
 
 
 def _quote_ts(raw: Any) -> Optional[datetime]:
-    for q in _quote_dicts(raw):
+    for quote in _quote_dicts(raw):
         for key in TS_KEYS:
-            ok, value = _read(q, key)
-            parsed = _ts(value) if ok else None
+            ok, value = _read(quote, key)
+            parsed = _parse_ts(value) if ok else None
             if parsed is not None:
                 return parsed
     return None
@@ -239,60 +246,100 @@ def _broker_quote(ticker: str, broker: Any) -> tuple[Any, str]:
     return None, ""
 
 
-def _metadata_quote(src: list[Any]) -> tuple[Any, str]:
-    for source in src:
+def _metadata_quote(sources: list[Any]) -> tuple[Any, str]:
+    for source in sources:
         for key in ("underlying_quote", "last_underlying_quote", "current_underlying_quote", "quote_snapshot.underlying"):
             ok, value = _read(source, key)
             if ok and value:
                 return value, f"metadata.{key}"
-    price = _first_float(src, "current_underlying", "current_underlying_price", "underlying_last", "underlying_price")
-    ts = _first_text(src, "underlying_quote_ts", "underlying_quote_timestamp", "quote_ts")
-    return ({"price": price, "timestamp": ts}, "metadata.current_underlying") if price is not None else (None, "")
+    price = _first_float(sources, "current_underlying", "current_underlying_price", "underlying_last", "underlying_price")
+    ts = _first_text(sources, "underlying_quote_ts", "underlying_quote_timestamp", "quote_ts")
+    if price is not None:
+        return {"price": price, "timestamp": ts}, "metadata.current_underlying"
+    return None, ""
 
 
-def _block(reason: str, meta: dict[str, Any]) -> UnderlyingConfirmationResult:
-    payload = {**meta, "stage": STAGE, "reason": reason.split(":", 1)[1], "reason_full": reason, "reason_code": _REASON_CODES[reason], "passed": False}
+def _block(reason: str, metadata: dict[str, Any]) -> UnderlyingConfirmationResult:
+    payload = {
+        **metadata,
+        "stage": STAGE,
+        "reason": reason.split(":", 1)[1],
+        "reason_full": reason,
+        "reason_code": _REASON_CODES[reason],
+        "passed": False,
+    }
     return UnderlyingConfirmationResult(False, reason, payload)
 
 
-def check_underlying_confirmation(*, plan: Any = None, payload: Any = None, order: Any = None, broker: Any = None, client_id: str = "", execution_mode: str = "", now: datetime | None = None, max_age_sec: float | None = None) -> UnderlyingConfirmationResult:
-    src = _sources({"client_id": client_id, "execution_mode": execution_mode}, plan, payload, order)
+def check_underlying_confirmation(
+    *,
+    plan: Any = None,
+    payload: Any = None,
+    order: Any = None,
+    broker: Any = None,
+    client_id: str = "",
+    execution_mode: str = "",
+    now: datetime | None = None,
+    max_age_sec: float | None = None,
+) -> UnderlyingConfirmationResult:
+    sources = _sources({"client_id": client_id, "execution_mode": execution_mode}, plan, payload, order)
     required = requires_underlying_confirmation(plan=plan, payload=payload, order=order)
-    ticker = _clean(_first_text(src, "ticker", "symbol"))
-    side = _clean(_first_text(src, "side", "direction", "option_type")).upper()
-    tf = _clean(_first_text(src, "timeframe"))
-    trigger = _first_float(src, "trigger_price", "entry_trigger", "trigger.entry", "entry_price", "signal_entry_price")
-    stop = _first_float(src, "stop_underlying", "stop_price", "stop", "trigger.stop")
-    target = _first_float(src, "target_underlying", "target_price", "target", "trigger.pt1", "trigger.target")
-    limit = float(max_age_sec if max_age_sec is not None else _float_env("UNDERLYING_CONFIRMATION_MAX_AGE_SEC", 30.0))
+    ticker = _clean(_first_text(sources, "ticker", "symbol"))
+    side = _clean(_first_text(sources, "side", "direction", "option_type")).upper()
+    timeframe = _clean(_first_text(sources, "timeframe"))
+    trigger = _first_float(sources, "trigger_price", "entry_trigger", "trigger.entry", "entry_price", "signal_entry_price")
+    stop = _first_float(sources, "stop_underlying", "stop_price", "stop", "trigger.stop")
+    target = _first_float(sources, "target_underlying", "target_price", "target", "trigger.pt1", "trigger.target")
+    age_limit = float(max_age_sec if max_age_sec is not None else _float_env("UNDERLYING_CONFIRMATION_MAX_AGE_SEC", 30.0))
     clock = now or datetime.now(timezone.utc)
     clock = clock.replace(tzinfo=timezone.utc) if clock.tzinfo is None else clock.astimezone(timezone.utc)
-    base = {"underlying_confirmation_required": required, "client_id": _clean(client_id or _first_text(src, "client_id", "client_email")), "execution_mode": _clean(execution_mode or _first_text(src, "execution_mode", "mode")).lower(), "ticker": ticker, "side": side, "timeframe": tf, "trigger_price": trigger, "stop_underlying": stop, "target_underlying": target, "max_quote_age_seconds": limit}
+    base = {
+        "underlying_confirmation_required": required,
+        "client_id": _clean(client_id or _first_text(sources, "client_id", "client_email")),
+        "execution_mode": _clean(execution_mode or _first_text(sources, "execution_mode", "mode")).lower(),
+        "ticker": ticker,
+        "side": side,
+        "timeframe": timeframe,
+        "trigger_price": trigger,
+        "stop_underlying": stop,
+        "target_underlying": target,
+        "max_quote_age_seconds": age_limit,
+    }
     if not required:
         return UnderlyingConfirmationResult(True, None, {**base, "passed": True, "skipped": True})
     if not ticker:
         return _block(NO_UNDERLYING_DATA, base)
     quote, source = _broker_quote(ticker, broker)
     if not quote:
-        quote, source = _metadata_quote(src)
+        quote, source = _metadata_quote(sources)
     if not quote:
         return _block(NO_UNDERLYING_DATA, {**base, "quote_source": None})
     current = _quote_price(quote)
-    qts = _quote_ts(quote)
-    age = max(0.0, (clock - qts).total_seconds()) if qts else None
-    meta = {**base, "quote_source": source, "current_underlying": current, "quote_timestamp": qts.isoformat() if qts else None, "quote_age_seconds": round(age, 3) if age is not None else None}
+    quote_ts = _quote_ts(quote)
+    quote_age = max(0.0, (clock - quote_ts).total_seconds()) if quote_ts else None
+    with_quote = {
+        **base,
+        "quote_source": source,
+        "current_underlying": current,
+        "quote_timestamp": quote_ts.isoformat() if quote_ts else None,
+        "quote_age_seconds": round(quote_age, 3) if quote_age is not None else None,
+    }
     if current is None:
-        return _block(NO_UNDERLYING_DATA, meta)
+        return _block(NO_UNDERLYING_DATA, with_quote)
     if current <= 0:
-        return _block(ZERO_UNDERLYING, meta)
-    if qts is None or age is None or age > limit:
-        return _block(STALE_UNDERLYING_QUOTE, meta)
+        return _block(ZERO_UNDERLYING, with_quote)
+    if quote_ts is None or quote_age is None or quote_age > age_limit:
+        return _block(STALE_UNDERLYING_QUOTE, with_quote)
     if side not in {"CALL", "PUT"} or trigger is None or trigger <= 0 or stop is None or stop <= 0 or target is None or target <= 0:
-        return _block(CANNOT_EVALUATE_DIRECTION, meta)
+        return _block(CANNOT_EVALUATE_DIRECTION, with_quote)
     if (side == "CALL" and not (target > trigger > stop)) or (side == "PUT" and not (target < trigger < stop)):
-        return _block(CANNOT_EVALUATE_DIRECTION, meta)
+        return _block(CANNOT_EVALUATE_DIRECTION, with_quote)
     confirmed = current >= trigger if side == "CALL" else current <= trigger
-    return UnderlyingConfirmationResult(True, None, {**meta, "passed": True, "directional_confirmation_evaluable": True, "directional_confirmed": bool(confirmed)})
+    return UnderlyingConfirmationResult(
+        True,
+        None,
+        {**with_quote, "passed": True, "directional_confirmation_evaluable": True, "directional_confirmed": bool(confirmed)},
+    )
 
 
 def require_underlying_confirmation_available(**kwargs: Any) -> UnderlyingConfirmationResult:
@@ -316,6 +363,7 @@ def install_underlying_confirmation_entry_guard() -> None:
             return mode
         try:
             from ap.authorization import execution_mode_for_broker
+
             return _clean(execution_mode_for_broker(broker)).lower()
         except Exception:
             return mode
@@ -325,9 +373,24 @@ def install_underlying_confirmation_entry_guard() -> None:
         plan = kwargs.get("plan")
         execution_mode = mode_for(self, broker, plan=plan)
         try:
-            require_underlying_confirmation_available(plan=plan, broker=broker, client_id=getattr(self, "client_id", ""), execution_mode=execution_mode)
+            require_underlying_confirmation_available(
+                plan=plan,
+                broker=broker,
+                client_id=getattr(self, "client_id", ""),
+                execution_mode=execution_mode,
+            )
         except UnderlyingConfirmationUnavailable as exc:
-            return {"ok": False, "local_order_id": None, "broker_order_id": None, "status": OrderStatus.ERROR, "error": exc.reason, "stage": STAGE, "reason_code": exc.reason_code, "underlying_confirmation": exc.metadata}
+            return {
+                "ok": False,
+                "local_order_id": None,
+                "broker_order_id": None,
+                "status": OrderStatus.ERROR,
+                "error": exc.reason,
+                "stage": STAGE,
+                "reason_code": exc.reason_code,
+                "underlying_confirmation": exc.metadata,
+                "order_mutated": False,
+            }
         return original_submit(self, *args, **kwargs)
 
     def guarded_submit_existing(self, *args, **kwargs):
@@ -345,14 +408,40 @@ def install_underlying_confirmation_entry_guard() -> None:
         if current and _clean(order.get("kind")).upper() == "ENTRY" and status in (OrderStatus.CREATED, OrderStatus.PENDING_TRIGGER):
             execution_mode = mode_for(self, broker, plan=plan, order=order)
             try:
-                require_underlying_confirmation_available(plan=plan or order, payload=order, order=order, broker=broker, client_id=getattr(self, "client_id", ""), execution_mode=execution_mode)
+                require_underlying_confirmation_available(
+                    plan=plan or order,
+                    payload=order,
+                    order=order,
+                    broker=broker,
+                    client_id=getattr(self, "client_id", ""),
+                    execution_mode=execution_mode,
+                )
             except UnderlyingConfirmationUnavailable as exc:
-                self.transition(local_order_id, OrderStatus.ERROR, last_error=exc.reason)
                 try:
-                    self._emit_transition_event(local_order_id=local_order_id, old_status=status, new_status=OrderStatus.ERROR, order=order, decision="REJECT", reason_code=exc.reason_code, explanation=exc.reason, extra_inputs={"underlying_confirmation": exc.metadata})
+                    self._emit_transition_event(
+                        local_order_id=local_order_id,
+                        old_status=status,
+                        new_status=status,
+                        order=order,
+                        decision="REJECT",
+                        reason_code=exc.reason_code,
+                        explanation=exc.reason,
+                        extra_inputs={"underlying_confirmation": exc.metadata, "order_mutated": False},
+                    )
                 except Exception:
                     pass
-                return {"ok": False, "local_order_id": local_order_id, "broker_order_id": order.get("broker_order_id"), "status": OrderStatus.ERROR, "error": exc.reason, "stage": STAGE, "reason_code": exc.reason_code, "underlying_confirmation": exc.metadata}
+                return {
+                    "ok": False,
+                    "local_order_id": local_order_id,
+                    "broker_order_id": order.get("broker_order_id"),
+                    "status": status,
+                    "error": exc.reason,
+                    "stage": STAGE,
+                    "reason_code": exc.reason_code,
+                    "underlying_confirmation": exc.metadata,
+                    "order_mutated": False,
+                    "decision_event_only": True,
+                }
         return original_submit_existing(self, *args, **kwargs)
 
     APOrderStateMachine.submit_entry = guarded_submit
