@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from copy import deepcopy
+from types import SimpleNamespace
 
 from ap.entry_metadata_guard import (
     MISSING_PATTERN,
@@ -37,46 +38,44 @@ def _shaped_signal(**overrides):
     return signal
 
 
+def _queue_payload_without_mode(**overrides):
+    signal = _shaped_signal(**overrides)
+    signal.pop("execution_mode", None)
+    return signal
+
+
 def test_score_zero_blocks():
     result = validate_entry_metadata(plan=_shaped_signal(score=0))
-
     assert not result.ok
     assert result.reason == ZERO_SCORE
 
 
 def test_pattern_blank_blocks():
     result = validate_entry_metadata(plan=_shaped_signal(pattern="", pattern_id=""))
-
     assert not result.ok
     assert result.reason == MISSING_PATTERN
 
 
 def test_trigger_zero_blocks():
     result = validate_entry_metadata(plan=_shaped_signal(entry_trigger=0))
-
     assert not result.ok
     assert result.reason == ZERO_TRIGGER
 
 
 def test_underlying_zero_blocks():
     result = validate_entry_metadata(plan=_shaped_signal(underlying_entry=0))
-
     assert not result.ok
     assert result.reason == ZERO_UNDERLYING
 
 
 def test_execution_mode_unknown_blocks():
     result = validate_entry_metadata(plan=_shaped_signal(execution_mode="unknown"))
-
     assert not result.ok
     assert result.reason == UNKNOWN_EXECUTION_MODE
 
 
 def test_missing_signal_id_blocks_when_canonical_missing_too():
-    result = validate_entry_metadata(
-        plan=_shaped_signal(signal_id="", canonical_signal_id="")
-    )
-
+    result = validate_entry_metadata(plan=_shaped_signal(signal_id="", canonical_signal_id=""))
     assert not result.ok
     assert result.reason == MISSING_SIGNAL_ID
 
@@ -84,46 +83,58 @@ def test_missing_signal_id_blocks_when_canonical_missing_too():
 def test_fully_shaped_signal_passes_unchanged():
     signal = _shaped_signal()
     before = deepcopy(signal)
-
     result = validate_entry_metadata(plan=signal)
-
     assert result.ok
     assert result.reason is None
     assert signal == before
 
 
 def test_nested_daily_trigger_stop_target_shape_passes_unchanged():
-    signal = _shaped_signal(
-        entry_trigger=None,
-        target_price=None,
-        stop_price=None,
-        trigger={"entry": 77.62, "stop": 75.10, "pt1": 81.50},
-    )
+    signal = _shaped_signal(entry_trigger=None, target_price=None, stop_price=None, trigger={"entry": 77.62, "stop": 75.10, "pt1": 81.50})
     before = deepcopy(signal)
-
     result = validate_entry_metadata(plan=signal)
-
     assert result.ok
     assert result.reason is None
     assert signal == before
 
 
+def test_real_queue_payload_shape_passes_when_runtime_mode_is_valid():
+    payload = _queue_payload_without_mode()
+    result = validate_entry_metadata(plan=payload, client_id="jasoncosby1@gmail.com", execution_mode="paper")
+    assert result.ok
+    assert result.reason is None
+
+
+def test_real_queue_payload_shape_still_blocks_without_safe_runtime_mode():
+    payload = _queue_payload_without_mode()
+    result = validate_entry_metadata(plan=payload, client_id="jasoncosby1@gmail.com", execution_mode=None)
+    assert not result.ok
+    assert result.reason == UNKNOWN_EXECUTION_MODE
+
+
+def test_plan_mode_passes_without_execution_mode_attr():
+    plan = SimpleNamespace(**_queue_payload_without_mode(mode="PAPER"))
+    result = validate_entry_metadata(plan=plan, client_id="jasoncosby1@gmail.com")
+    assert result.ok
+
+
 def test_guard_installed_on_master_control_and_osm_classes():
+    import ap
     from ap.order_state_machine import APOrderStateMachine
     from ap_master_control import APMasterControl
 
+    ap.install_entry_metadata_safety_guards()
     assert getattr(APMasterControl, "_entry_metadata_guard_installed", False) is True
     assert getattr(APOrderStateMachine, "_entry_metadata_guard_installed", False) is True
 
 
-def test_master_control_blocks_invalid_metadata_before_contract_selection():
+def test_master_control_uses_valid_runtime_mode_before_contract_selection():
+    import ap
     from ap_master_control import APMasterControl
 
+    ap.install_entry_metadata_safety_guards()
     mc = APMasterControl(mode="paper", client_id="jasoncosby1@gmail.com")
-    decision = mc.evaluate(
-        _shaped_signal(score=0, execution_mode="paper"),
-        client_id="jasoncosby1@gmail.com",
-    )
+    decision = mc.evaluate(_queue_payload_without_mode(score=0), client_id="jasoncosby1@gmail.com")
 
     assert decision.ok is False
     assert decision.stage == "metadata_validation"
@@ -131,8 +142,10 @@ def test_master_control_blocks_invalid_metadata_before_contract_selection():
 
 
 def test_submit_existing_entry_blocks_before_broker_submit_or_order_mutation(monkeypatch):
+    import ap
     from ap.order_state_machine import APOrderStateMachine, OrderStatus
 
+    ap.install_entry_metadata_safety_guards()
     osm = APOrderStateMachine("jasoncosby1@gmail.com")
     order_row = {
         "local_order_id": "local-1",
@@ -167,12 +180,7 @@ def test_submit_existing_entry_blocks_before_broker_submit_or_order_mutation(mon
     monkeypatch.setattr(osm, "_submit_order_with_retry", _should_not_submit)
     monkeypatch.setattr(osm, "transition", _should_not_transition)
 
-    result = osm.submit_existing_entry(
-        local_order_id="local-1",
-        broker=object(),
-        plan=None,
-        limit_price=1.25,
-    )
+    result = osm.submit_existing_entry(local_order_id="local-1", broker=object(), plan=None, limit_price=1.25)
 
     assert result["ok"] is False
     assert result["metadata_blocked"] is True
