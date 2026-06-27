@@ -10,5 +10,7 @@ def install_entry_metadata_safety_guards() -> None:
 
 try:
     install_entry_metadata_safety_guards()
-except (ImportError, AttributeError):
+except Exception:
+    # Some smoke tests import ap.* while MC/OSM are partially initialized.
+    # Keep package import clean; explicit callers can run the installer again.
     pass
