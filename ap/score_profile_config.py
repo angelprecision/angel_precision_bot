@@ -36,6 +36,7 @@ POSITION_SCORE_PROFILE_FUTURE_GATE_ENABLED = False
 
 @dataclass(frozen=True)
 class ScoreProfileConfig:
+    # Canonical names requested for tuning safety.
     relative_volume_strong: float = RELATIVE_VOLUME_STRONG
     relative_volume_ok: float = RELATIVE_VOLUME_OK
     relative_volume_baseline: float = RELATIVE_VOLUME_BASELINE
@@ -56,6 +57,15 @@ class ScoreProfileConfig:
     remaining_opportunity_max_points: float = REMAINING_OPPORTUNITY_MAX_POINTS
     observe_only: bool = POSITION_SCORE_PROFILE_OBSERVE_ONLY
     future_gate_enabled: bool = POSITION_SCORE_PROFILE_FUTURE_GATE_ENABLED
+
+    # Backward-compatible aliases for stacked PRs while the book is merged.
+    relative_volume_thrust: float = RELATIVE_VOLUME_STRONG
+    relative_volume_confirmed: float = RELATIVE_VOLUME_OK
+    breakout_volume_minimum: float = BREAKOUT_VOLUME_MIN
+    breakout_volume_confirmed: float = BREAKOUT_VOLUME_STRONG
+    max_volume_confirmation_score: float = VOLUME_CONFIRMATION_MAX_POINTS
+    max_vwap_context_score: float = VWAP_CONTEXT_MAX_POINTS
+    max_sector_context_score: float = SECTOR_CONTEXT_MAX_POINTS
 
 
 DEFAULT_SCORE_PROFILE_CONFIG = ScoreProfileConfig()
