@@ -50,6 +50,8 @@ def build_position_score_profile(signal: dict[str, Any], market_context: dict[st
                 "side": "UNKNOWN", "early_return": "unknown_side",
                 "market_context_keys": sorted(ctx.keys()),
             },
+            observe_only=True,
+            warnings=["unknown_signal_side"],
         ).to_dict()
 
     # Track whether a meaningful context was supplied so we do not
@@ -94,8 +96,22 @@ def build_position_score_profile(signal: dict[str, Any], market_context: dict[st
     bonus, bonus_reasons = _bonus_points(htf, fvg, opportunity, volume)
     penalty, penalty_reasons = _penalties(blocks, missing, contract, context_provided=context_provided)
     total = clamp(base + bonus - penalty, 0, 120)
+    # Aggregate warnings from every scored component into a single top-level list.
+    # Surfaces actionable cautions without requiring callers to walk the components tree.
+    agg_warnings: list[str] = sorted(set(
+        w
+        for c in components.values()
+        for w in (c.details.get("warnings") or [])
+    ))
     diagnostics.update({"side": side, "bonus_reasons": bonus_reasons, "penalty_reasons": penalty_reasons, "component_total_before_bonus_penalty": round(base, 2), "market_context_keys": sorted(ctx.keys()), "context_provided": context_provided})
-    return PositionScoreProfile(PROFILE_VERSION, total, base, bonus, penalty, grade_from_score(total), bool(total >= 80 and not blocks), components, sorted(set(missing)), sorted(set(blocks)), diagnostics).to_dict()
+    return PositionScoreProfile(
+        PROFILE_VERSION, total, base, bonus, penalty,
+        grade_from_score(total),
+        bool(total >= 80 and not blocks),
+        components, sorted(set(missing)), sorted(set(blocks)), diagnostics,
+        observe_only=True,
+        warnings=agg_warnings,
+    ).to_dict()
 
 
 def attach_position_score_profile(plan: Any, signal: dict[str, Any], market_context: dict[str, Any] | None = None) -> dict[str, Any]:

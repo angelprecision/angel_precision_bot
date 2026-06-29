@@ -21,7 +21,9 @@ def test_fvg_detects_bullish_gap_and_flags_entry_inside_zone():
         {"side": "PUT", "entry_price": 10.75, "target_price": 10.0},
         {"candles": {"4h": candles, "daily": candles}},
     )
-    assert result["diagnostics"]["entry_inside_fvg"] is True
+    # PUT signal entering inside a BULLISH FVG = opposing gap entry
+    assert result["diagnostics"]["entry_inside_opposing_fvg"] is True
+    assert result["diagnostics"]["entry_inside_aligned_fvg"] is False
     assert "entry_inside_opposing_fvg" in result["block_recommendations"]
 
 
@@ -93,3 +95,17 @@ def test_position_profile_observe_only_shape_and_no_signal_mutation():
     assert "fair_value_gap" in profile["components"]
     assert "higher_timeframe_confluence" in profile["components"]
     assert profile["total_score"] > 70
+    # Shape assertions: top-level observe_only and warnings must always be present
+    assert profile["observe_only"] is True
+    assert isinstance(profile["warnings"], list)
+
+def test_position_profile_unknown_side_returns_reject_with_observe_only():
+    """UNKNOWN side must fail closed: REJECT grade, block, observe_only=True, warnings list."""
+    profile = build_position_score_profile({"side": "UNKNOWN", "entry_price": 50.0})
+    assert profile["grade"] == "REJECT"
+    assert profile["client_eligible_recommendation"] is False
+    assert "unknown_signal_side" in profile["block_recommendations"]
+    assert profile["observe_only"] is True
+    assert isinstance(profile["warnings"], list)
+    assert "unknown_signal_side" in profile["warnings"]
+    assert profile["total_score"] == 0.0

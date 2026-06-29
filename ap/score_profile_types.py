@@ -37,16 +37,20 @@ class PositionScoreProfile:
     missing_data: list[str] = field(default_factory=list)
     block_recommendations: list[str] = field(default_factory=list)
     diagnostics: dict[str, Any] = field(default_factory=dict)
+    observe_only: bool = True
+    warnings: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "profile_version": self.profile_version,
+            "observe_only": bool(self.observe_only),
             "total_score": round(float(self.total_score), 2),
             "base_score": round(float(self.base_score), 2),
             "bonus_score": round(float(self.bonus_score), 2),
             "penalty_score": round(float(self.penalty_score), 2),
             "grade": self.grade,
             "client_eligible_recommendation": bool(self.client_eligible_recommendation),
+            "warnings": sorted(set(self.warnings or [])),
             "components": {key: value.to_dict() for key, value in (self.components or {}).items()},
             "missing_data": list(self.missing_data or []),
             "block_recommendations": list(self.block_recommendations or []),
