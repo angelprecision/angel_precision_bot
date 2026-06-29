@@ -34,6 +34,645 @@ def _normalize_mode(value: str | None) -> str:
     return str(value or "").strip().lower()
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# PR #183 amendment — ap_signals → trade_queue WATCHING handoff
+# ─────────────────────────────────────────────────────────────────────────────
+
+import os as _os
+
+
+def _normalize_account_id(raw: str | None) -> str:
+    """Strip chr(10)/chr(13)/chr(9) and whitespace from Tradier account IDs."""
+    return str(raw or "").replace("\n", "").replace("\r", "").replace("\t", "").strip()
+
+
+def _fetch_paper_members_for_pod(target_client_id: str | None = None) -> list[dict]:
+    """
+    Query members table for paper-eligible clients on this pod.
+    Mirrors _fetch_active_members from client_runner.py but via psycopg2
+    (no supabase client available in this context).
+
+    Filters:
+      approved=true, subscription_active=true, tradier_account_mode='paper'
+      POD_ID env → execution_pod = POD_ID
+      SINGLE_CLIENT_EMAIL / target_client_id → email = X
+
+    Returns member dicts with credential fields.
+    Account IDs are normalised (strip whitespace/newlines).
+
+    On schema error (missing execution_pod column): falls back to core columns
+    without pod filter, same safe-degraded pattern as client_runner.
+    """
+    from ap.db import conn, run_with_retry
+
+    pod_id  = _os.getenv("POD_ID", "").strip()
+    single  = (
+        _os.getenv("SINGLE_CLIENT_EMAIL", "").strip()
+        or (target_client_id or "")
+    )
+
+    _FULL_COLS = (
+        "email, approved, subscription_active, "
+        "tradier_account_mode, tradier_active_mode, execution_pod, "
+        "tradier_paper_account_id, tradier_paper_access_token, "
+        "tradier_account_id, tradier_access_token"
+    )
+    _CORE_COLS = (
+        "email, approved, subscription_active, "
+        "tradier_account_mode, tradier_active_mode, "
+        "tradier_paper_account_id, tradier_paper_access_token, "
+        "tradier_account_id, tradier_access_token"
+    )
+
+    def _run(cols: str, include_pod: bool):
+        conditions = [
+            "approved = TRUE",
+            "subscription_active = TRUE",
+            "tradier_account_mode = 'paper'",
+        ]
+        params: list = []
+        if single:
+            conditions.append("email = %s")
+            params.append(single)
+        if include_pod and pod_id:
+            conditions.append("execution_pod = %s")
+            params.append(pod_id)
+        where = " AND ".join(conditions)
+        with conn() as c:
+            c.execute(f"SELECT {cols} FROM members WHERE {where}", params)
+            rows = c.fetchall() or []
+            col_names = [d[0] for d in getattr(c, "description", [])]
+            out = []
+            for row in rows:
+                m = dict(row) if isinstance(row, dict) else dict(zip(col_names, row))
+                m["tradier_paper_account_id"] = _normalize_account_id(
+                    m.get("tradier_paper_account_id")
+                )
+                m["tradier_account_id"] = _normalize_account_id(
+                    m.get("tradier_account_id")
+                )
+                out.append(m)
+            return out
+
+    try:
+        return run_with_retry(lambda: _run(_FULL_COLS, include_pod=True)) or []
+    except Exception as exc:
+        if "execution_pod" in str(exc).lower() or "column" in str(exc).lower():
+            log.warning(
+                "PR183 _fetch_paper_members_for_pod: execution_pod column missing "
+                "— falling back to core cols without pod filter: %s", exc
+            )
+            try:
+                return run_with_retry(lambda: _run(_CORE_COLS, include_pod=False)) or []
+            except Exception as exc2:
+                log.error("PR183 _fetch_paper_members_for_pod core fetch failed: %s", exc2)
+                return []
+        log.error("PR183 _fetch_paper_members_for_pod failed: %s", exc)
+        return []
+
+
+def _resolve_paper_creds_from_member(member: dict) -> tuple[str | None, str | None]:
+    """
+    Return (account_id, access_token) for paper, or (None, None) if missing.
+    Priority: tradier_paper_* over generic tradier_*.
+    Account_id already normalised by _fetch_paper_members_for_pod.
+    """
+    account_id = member.get("tradier_paper_account_id") or member.get("tradier_account_id")
+    token      = member.get("tradier_paper_access_token") or member.get("tradier_access_token")
+    account_id = _normalize_account_id(account_id)
+    token      = str(token or "").strip()
+    if not account_id or not token:
+        return None, None
+    return account_id, token
+
+
+def _is_shared_watch_signal_row(row: dict) -> bool:
+    """
+    Return True only for ap_signals WATCHING rows that match the existing
+    shared overnight scanner/deferred source shapes already used by the bot.
+
+    This keeps paper fanout scoped to shared overnight candidates instead of
+    treating every same-day WATCHING row as globally shareable.
+    """
+    payload = row.get("raw_payload") or {}
+    if not isinstance(payload, dict):
+        payload = {}
+
+    reason_code = str(payload.get("reason_code") or "").strip().lower()
+    stage = str(payload.get("stage") or "").strip().lower()
+    human_reason = str(payload.get("human_reason") or "").strip().lower()
+    context_notes = str(row.get("context_notes") or "").strip().lower()
+
+    if reason_code == "market_closed_deferred":
+        return True
+    if stage == "contract_selection" and "deferred" in human_reason:
+        return True
+    if context_notes.startswith("post_market_blocked:"):
+        return True
+    return False
+
+
+def _fetch_today_watching_signals(trading_date: str) -> tuple[list[dict] | None, str | None]:
+    """
+    Fetch shared ap_signals WATCHING rows with queued_at >= trading_date.
+    Does NOT filter by client_email, but it DOES fail closed unless the row
+    matches the existing shared overnight/deferred signal source shapes.
+    Date scope prevents stale Jun-25/Jun-26 rows from being re-armed.
+
+    Returns:
+      (rows, None)  — success, rows may be empty list
+      (None, error) — schema/query error: the error string must surface
+                      in enqueue_result; must NOT be silently treated as
+                      "no signals".
+    """
+    from ap.db import conn, run_with_retry
+    import json as _json
+
+    def _q():
+        with conn() as c:
+            c.execute(
+                """
+                SELECT signal_id,
+                       client_email,
+                       ticker,
+                       side,
+                       score,
+                       tier,
+                       pattern,
+                       timeframe,
+                       decision_status,
+                       entry_trigger,
+                       stop_price,
+                       target_price,
+                       underlying_at_signal,
+                       raw_payload,
+                       context_notes,
+                       queued_at,
+                       watcher_started_at
+                FROM ap_signals
+                WHERE decision_status = 'WATCHING'
+                  AND queued_at IS NOT NULL
+                  AND queued_at >= %s::date
+                ORDER BY queued_at ASC NULLS LAST
+                """,
+                (trading_date,),
+            )
+            rows = c.fetchall() or []
+            cols = [d[0] for d in getattr(c, "description", [])]
+            out = []
+            for row in rows:
+                r = dict(row) if isinstance(row, dict) else dict(zip(cols, row))
+                if isinstance(r.get("raw_payload"), str):
+                    try:
+                        r["raw_payload"] = _json.loads(r["raw_payload"])
+                    except Exception:
+                        r["raw_payload"] = {}
+                if _is_shared_watch_signal_row(r):
+                    out.append(r)
+            return out
+
+    try:
+        rows = run_with_retry(_q) or []
+        return rows, None
+    except Exception as exc:
+        msg = str(exc)
+        log.error(
+            "PR183 _fetch_today_watching_signals SCHEMA ERROR trading_date=%s: %s",
+            trading_date, msg,
+        )
+        return None, f"fetch_watching_signals_failed:{msg}"
+
+
+def _hydrate_trigger_from_raw_payload(signal_row: dict) -> dict:
+    """
+    Fill entry_trigger / stop_price / target_price / underlying_at_signal
+    from raw_payload when ap_signals columns are NULL.
+    Checks flat keys and nested raw_payload.trigger sub-dict.
+    """
+    out = dict(signal_row)
+    raw = out.get("raw_payload") or {}
+    trigger_block = raw.get("trigger") or {}
+
+    def _pick(current, *keys) -> float | None:
+        try:
+            if current is not None and float(current) > 0:
+                return float(current)
+        except (TypeError, ValueError):
+            pass
+        for k in keys:
+            v = trigger_block.get(k) or raw.get(k)
+            if v is not None:
+                try:
+                    f = float(v)
+                    if f > 0:
+                        return f
+                except (TypeError, ValueError):
+                    pass
+        return None
+
+    out["entry_trigger"] = _pick(
+        out.get("entry_trigger"),
+        "entry_trigger", "entry_price", "trigger_price", "price",
+    )
+    out["stop_price"] = _pick(
+        out.get("stop_price"),
+        "stop_price", "stop_underlying", "stop",
+    )
+    out["target_price"] = _pick(
+        out.get("target_price"),
+        "target_price", "target_underlying", "target",
+    )
+    out["underlying_at_signal"] = _pick(
+        out.get("underlying_at_signal"),
+        "underlying_at_signal", "underlying_price", "underlying",
+    )
+    return out
+
+
+def _validate_trigger_geometry(
+    side: str,
+    entry_trigger: float | None,
+    stop_price: float | None,
+    target_price: float | None,
+) -> tuple[bool, str]:
+    """
+    CALL: target > entry > stop
+    PUT:  stop  > entry > target
+    Missing geometry (any value None after hydration) is a hard block.
+    """
+    side = (side or "").upper().strip()
+    if entry_trigger is None:
+        return False, "entry_trigger_missing_after_hydration"
+    if stop_price is None:
+        return False, "stop_price_missing_after_hydration"
+    if target_price is None:
+        return False, "target_price_missing_after_hydration"
+
+    if side == "CALL":
+        if not (target_price > entry_trigger > stop_price):
+            return False, (
+                f"call_geometry_invalid: target={target_price} entry={entry_trigger} "
+                f"stop={stop_price} — required target>entry>stop"
+            )
+    elif side == "PUT":
+        if not (stop_price > entry_trigger > target_price):
+            return False, (
+                f"put_geometry_invalid: stop={stop_price} entry={entry_trigger} "
+                f"target={target_price} — required stop>entry>target"
+            )
+    else:
+        return False, f"unknown_side:{side}"
+
+    return True, "ok"
+
+
+def _update_ap_signal_blocked(signal_id: str, reason: str) -> None:
+    """
+    Mark ap_signals as blocked_at_breach and append handoff_rejected:<reason>
+    to context_notes. Called when geometry validation fails.
+    """
+    from ap.db import conn, run_with_retry
+
+    def _upd():
+        with conn() as c:
+            c.execute(
+                """
+                UPDATE ap_signals
+                SET decision_status = 'blocked_at_breach',
+                    context_notes   = COALESCE(context_notes, '') ||
+                                      %s
+                WHERE signal_id = %s
+                  AND decision_status = 'WATCHING'
+                """,
+                (f"\nhandoff_rejected:{reason}", signal_id),
+            )
+
+    try:
+        run_with_retry(_upd)
+    except Exception as exc:
+        log.warning(
+            "PR183 _update_ap_signal_blocked failed signal_id=%s: %s", signal_id, exc
+        )
+
+
+def _watching_row_exists(client_id: str, signal_id: str) -> bool:
+    """
+    True if trade_queue already has a WATCHING row for (client_id, signal_id).
+    Guards against duplicate rows regardless of idempotency key format.
+    Fails closed on error (returns True = skip rather than duplicate).
+    """
+    from ap.db import conn, run_with_retry
+
+    def _q():
+        with conn() as c:
+            c.execute(
+                "SELECT 1 FROM trade_queue "
+                "WHERE client_id=%s AND signal_id=%s AND status='WATCHING' "
+                "LIMIT 1",
+                (client_id, signal_id),
+            )
+            return c.fetchone() is not None
+
+    try:
+        return bool(run_with_retry(_q))
+    except Exception as exc:
+        log.warning(
+            "PR183 _watching_row_exists failed — failing closed signal_id=%s client=%s: %s",
+            signal_id, client_id, exc,
+        )
+        return True
+
+
+def _insert_trade_queue_watching(
+    *,
+    client_id: str,
+    signal_id: str,
+    payload: dict,
+    idempotency_key: str,
+) -> str:
+    """
+    Returns 'inserted' | 'duplicate' | 'error'.
+    ON CONFLICT (idempotency_key) DO NOTHING → 'duplicate'.
+    Any exception → 'error' (caller must NOT mark watcher_started_at).
+    """
+    import json as _json
+    from ap.db import conn, run_with_retry
+
+    def _ins():
+        with conn() as c:
+            c.execute(
+                """
+                INSERT INTO trade_queue
+                    (client_id, signal_id, created_ts, status, payload, idempotency_key)
+                VALUES (%s, %s, NOW(), 'WATCHING', %s, %s)
+                ON CONFLICT (idempotency_key) DO NOTHING
+                RETURNING id
+                """,
+                (client_id, signal_id, _json.dumps(payload), idempotency_key),
+            )
+            return c.fetchone() is not None
+
+    try:
+        return "inserted" if run_with_retry(_ins) else "duplicate"
+    except Exception as exc:
+        log.error(
+            "PR183 _insert_trade_queue_watching error signal_id=%s client=%s: %s",
+            signal_id, client_id, exc,
+        )
+        return "error"
+
+
+def _mark_watcher_started(client_id: str, signal_id: str) -> None:
+    """Set ap_signals.watcher_started_at = NOW() after confirmed insert or existing duplicate."""
+    from ap.db import conn, run_with_retry
+
+    def _upd():
+        with conn() as c:
+            c.execute(
+                """
+                UPDATE ap_signals
+                SET watcher_started_at = NOW()
+                WHERE signal_id = %s
+                  AND client_email = %s
+                  AND watcher_started_at IS NULL
+                """,
+                (signal_id, client_id),
+            )
+
+    try:
+        run_with_retry(_upd)
+    except Exception as exc:
+        log.warning(
+            "PR183 _mark_watcher_started failed signal_id=%s client=%s: %s",
+            signal_id, client_id, exc,
+        )
+
+
+def enqueue_watching_signals_to_trade_queue(
+    target_client_id: str,
+    execution_mode: str,
+    *,
+    trading_date: str | None = None,
+    dry_run: bool = False,
+    now: datetime | None = None,
+) -> dict:
+    """
+    PR #183 — Core fix for paper morning handoff.
+
+    Fanout: query ALL today's WATCHING ap_signals (no client_email filter),
+    create one trade_queue WATCHING row per signal for `target_client_id`.
+    A shared scanner signal is thus distributed to every eligible paper client
+    on this pod, not just the client it was originally scanned for.
+
+    Safety:
+      - Credential existence verified from members table (not clients table).
+        Raw tokens never stored in trade_queue.payload — broker resolves by
+        client_id + execution_mode at execution time.
+      - Date-scoped: queued_at >= trading_date prevents stale row re-arm.
+      - Schema errors surface visibly in enqueue_result, never silently [] .
+      - Missing geometry after hydration hard-blocks the signal and writes
+        blocked_at_breach to ap_signals.
+      - Idempotency: source_signal_id:target_client_id:YYYYMMDD so old rows
+        with different key formats don't block today.
+      - watcher_started_at set after insert confirmed OR on same-day duplicate.
+        Never set on insert error.
+    """
+    mode   = _normalize_mode(execution_mode)
+    cid    = str(target_client_id or "").strip()
+    tdate  = trading_date or _trading_date(now)
+    tdate_nodash = tdate.replace("-", "")
+
+    result: dict = {
+        "client_id":         cid,
+        "execution_mode":    mode,
+        "trading_date":      tdate,
+        "dry_run":           dry_run,
+        "signals_found":     0,
+        "inserted":          [],
+        "skipped_duplicate": [],
+        "rejected":          [],
+        "errors":            [],
+    }
+
+    if not cid:
+        result["errors"].append("client_id_required")
+        return result
+
+    # ── Step 1: Verify paper credentials from members table ───────────────────
+    # We verify credentials exist but DO NOT store them in trade_queue.payload.
+    # The broker/watcher resolves credentials at execution time via client_id +
+    # execution_mode. Storing raw tokens in the payload/logs is a security risk.
+    if mode == "paper":
+        members = _fetch_paper_members_for_pod(target_client_id=cid)
+        target_member = next(
+            (m for m in members if str(m.get("email") or "").strip() == cid),
+            None,
+        )
+        if target_member is None:
+            result["errors"].append("member_not_found_in_pod")
+            log.error(
+                "PR183 enqueue_watching_signals: member_not_found client=%s "
+                "pod=%s", cid, _os.getenv("POD_ID", "")
+            )
+            return result
+
+        account_id, _token = _resolve_paper_creds_from_member(target_member)
+        if not account_id or not _token:
+            result["errors"].append("paper_credentials_missing")
+            log.error(
+                "PR183 enqueue_watching_signals: paper_credentials_missing client=%s "
+                "paper_acct=%s paper_tok=%s",
+                cid,
+                "set" if target_member.get("tradier_paper_account_id") else "MISSING",
+                "set" if target_member.get("tradier_paper_access_token") else "MISSING",
+            )
+            return result
+        # Credentials verified. Do not persist to payload.
+
+    # ── Step 2: Fetch today's WATCHING signals (all clients, date-scoped) ─────
+    signals, fetch_err = _fetch_today_watching_signals(tdate)
+    if fetch_err is not None:
+        # Schema/query error: surface visibly, fail the handoff
+        result["errors"].append(fetch_err)
+        log.error(
+            "PR183 enqueue_watching_signals: signal fetch failed client=%s err=%s",
+            cid, fetch_err,
+        )
+        return result
+
+    result["signals_found"] = len(signals or [])
+    if not signals:
+        return result
+
+    # ── Step 3: Process each signal ───────────────────────────────────────────
+    for sig in signals:
+        src_signal_id        = str(sig.get("signal_id") or "").strip()
+        src_client_email     = str(sig.get("client_email") or "").strip()
+        ticker               = str(sig.get("ticker") or "").strip()
+        side                 = str(sig.get("side") or "").upper().strip()
+
+        if not src_signal_id:
+            result["errors"].append("signal_id_empty")
+            continue
+
+        # Hydrate missing trigger fields from raw_payload
+        sig = _hydrate_trigger_from_raw_payload(sig)
+
+        entry_trigger = sig.get("entry_trigger")
+        stop_price    = sig.get("stop_price")
+        target_price  = sig.get("target_price")
+
+        # Hard-block on missing / invalid geometry after hydration
+        valid, geom_reason = _validate_trigger_geometry(
+            side, entry_trigger, stop_price, target_price
+        )
+        if not valid:
+            log.warning(
+                "PR183 enqueue_watching_signals: geometry_rejected "
+                "signal_id=%s ticker=%s side=%s reason=%s",
+                src_signal_id, ticker, side, geom_reason,
+            )
+            if not dry_run:
+                _update_ap_signal_blocked(src_signal_id, geom_reason)
+            result["rejected"].append({
+                "signal_id": src_signal_id,
+                "source_client_email": src_client_email,
+                "ticker": ticker,
+                "side": side,
+                "reason": geom_reason,
+            })
+            continue
+
+        # Session-scoped idempotency key (fanout-aware: includes target client)
+        idempotency_key = f"{src_signal_id}:{cid}:{tdate_nodash}"
+
+        # Guard: existing WATCHING row regardless of key format
+        if not dry_run and _watching_row_exists(cid, src_signal_id):
+            # Duplicate — still mark watcher_started_at so repeated handoff doesn't loop
+            _mark_watcher_started(src_client_email, src_signal_id)
+            result["skipped_duplicate"].append({
+                "signal_id":           src_signal_id,
+                "source_client_email": src_client_email,
+                "ticker": ticker,
+                "side": side,
+                "idempotency_key": idempotency_key,
+                "reason": "watching_row_already_exists",
+            })
+            continue
+
+        # Build payload — NO raw credentials stored here
+        payload = {
+            # canonical_signal_id not on ap_signals — use signal_id as canonical
+            "signal_id":                  src_signal_id,
+            "client_id":                  cid,
+            "execution_mode":             mode,
+            "source_signal_client_email": src_client_email,
+            "source_signal_id":           src_signal_id,
+            "ticker":                     ticker,
+            "side":                       side,
+            "score":                      float(sig.get("score") or 0),
+            "tier":                       str(sig.get("tier") or "B"),
+            "pattern":                    str(sig.get("pattern") or ""),
+            "timeframe":                  str(sig.get("timeframe") or "1d"),
+            "entry_trigger":              entry_trigger,
+            "stop_price":                 stop_price,
+            "target_price":               target_price,
+            "underlying_at_signal":       sig.get("underlying_at_signal"),
+            "context_notes":              str(sig.get("context_notes") or ""),
+            "queued_at":                  str(sig.get("queued_at") or ""),
+            "handoff_source":             "pr183_morning_handoff",
+        }
+
+        if dry_run:
+            result["inserted"].append({
+                "signal_id":           src_signal_id,
+                "source_client_email": src_client_email,
+                "ticker": ticker, "side": side,
+                "idempotency_key": idempotency_key,
+                "dry_run": True,
+            })
+            continue
+
+        insert_outcome = _insert_trade_queue_watching(
+            client_id=cid,
+            signal_id=src_signal_id,
+            payload=payload,
+            idempotency_key=idempotency_key,
+        )
+
+        if insert_outcome == "inserted":
+            # Mark watcher_started_at on the source ap_signals row
+            _mark_watcher_started(src_client_email, src_signal_id)
+            result["inserted"].append({
+                "signal_id":           src_signal_id,
+                "source_client_email": src_client_email,
+                "ticker": ticker, "side": side,
+                "idempotency_key": idempotency_key,
+            })
+            log.info(
+                "PR183 INSERTED signal_id=%s ticker=%s -> client=%s key=%s",
+                src_signal_id, ticker, cid, idempotency_key,
+            )
+        elif insert_outcome == "duplicate":
+            # ON CONFLICT — still mark watcher_started_at so loop is idempotent
+            _mark_watcher_started(src_client_email, src_signal_id)
+            result["skipped_duplicate"].append({
+                "signal_id":           src_signal_id,
+                "source_client_email": src_client_email,
+                "ticker": ticker, "side": side,
+                "idempotency_key": idempotency_key,
+                "reason": "on_conflict_do_nothing",
+            })
+        else:  # "error"
+            # Do NOT mark watcher_started_at on error
+            result["errors"].append(
+                f"insert_error:signal_id={src_signal_id}:client={cid}"
+            )
+
+    return result
+
+
+# ─── end PR #183 ──────────────────────────────────────────────────────────────
 def _ensure_handoff_table() -> None:
     global _TABLE_READY
     if _TABLE_READY:
@@ -440,6 +1079,7 @@ def run_morning_handoff_audit(
 
     before = _count_state(client_id)
     recovery_result = {"client_id": client_id, "watchers_requeued": 0, "errors": []}
+    enqueue_result: dict = {}
     ok = True
     error = None
 
@@ -448,18 +1088,42 @@ def run_morning_handoff_audit(
         error = ",".join(warnings)
     elif not dry_run:
         try:
-            from ap_recovery import APStartupRecovery
+            # PR #183 final amendment: fanout is PAPER-ONLY.
+            # Live (Jason) already has trade_queue WATCHING rows written by
+            # overnight_reeval. Running fanout for live would create duplicate
+            # rows from shared/paper-origin ap_signals. Do not run for live.
+            if mode == "paper" and stage in ("post_overnight_reeval", "manual"):
+                enqueue_result = enqueue_watching_signals_to_trade_queue(
+                    target_client_id=client_id,
+                    execution_mode=mode,
+                    trading_date=trading_date,
+                    dry_run=False,
+                    now=now,
+                )
+                # Any enqueue error fails the handoff visibly in paper mode.
+                # member_not_found_in_pod, paper_credentials_missing,
+                # fetch_watching_signals_failed:*, insert_error:* all abort.
+                if enqueue_result.get("errors"):
+                    ok = False
+                    error = enqueue_result["errors"][0]
+                    log.error(
+                        "morning_handoff enqueue failed client=%s stage=%s errors=%s",
+                        client_id, stage, enqueue_result["errors"],
+                    )
 
-            recovery = APStartupRecovery(
-                client_id=client_id,
-                broker=broker,
-                osm=osm,
-                pm=pm,
-                master_control=mc,
-                exit_engine=exit_engine,
-                entry_watcher=entry_watcher,
-            )
-            recovery._reseed_watchers(recovery_result)
+            if ok:
+                from ap_recovery import APStartupRecovery
+
+                recovery = APStartupRecovery(
+                    client_id=client_id,
+                    broker=broker,
+                    osm=osm,
+                    pm=pm,
+                    master_control=mc,
+                    exit_engine=exit_engine,
+                    entry_watcher=entry_watcher,
+                )
+                recovery._reseed_watchers(recovery_result)
         except Exception as exc:  # noqa: BLE001
             ok = False
             error = str(exc)
@@ -477,6 +1141,7 @@ def run_morning_handoff_audit(
         "watchers_requeued": int(recovery_result.get("watchers_requeued", 0) or 0),
         "warnings": warnings,
         "errors": list(recovery_result.get("errors") or []),
+        "enqueue_result": enqueue_result,  # PR #183
     }
     _upsert_handoff_run_lock(
         client_id=client_id,
@@ -501,4 +1166,5 @@ def run_morning_handoff_audit(
         "warnings": warnings,
         "errors": list(recovery_result.get("errors") or []),
         "error": error,
+        "enqueue_result": enqueue_result,  # PR #183: signals inserted/skipped/rejected
     }
