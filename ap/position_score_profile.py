@@ -36,6 +36,28 @@ def build_position_score_profile(signal: dict[str, Any], market_context: dict[st
     ctx = market_context or {}
     sig = dict(signal or {})
     side = normalize_signal_side(sig.get("side") or sig.get("direction"))
+
+    # UNKNOWN side: fail closed — cannot score a directionless signal
+    if side == "UNKNOWN":
+        return PositionScoreProfile(
+            profile_version=PROFILE_VERSION, total_score=0.0, base_score=0.0,
+            bonus_score=0.0, penalty_score=0.0, grade="REJECT",
+            client_eligible_recommendation=False, components={},
+            missing_data=["side"], block_recommendations=["unknown_signal_side"],
+            diagnostics={
+                "observe_only": True, "live_behavior_changed": False,
+                "score_source": "diagnostic_position_profile",
+                "side": "UNKNOWN", "early_return": "unknown_side",
+                "market_context_keys": sorted(ctx.keys()),
+            },
+        ).to_dict()
+
+    # Track whether a meaningful context was supplied so we do not
+    # double-penalise callers that ran the profile without enriched data.
+    context_provided = bool(
+        ctx and (ctx.get("candles") or ctx.get("levels") or ctx.get("trend") or ctx.get("volume"))
+    )
+
     components: dict[str, ScoreComponent] = {}
     missing: list[str] = []
     blocks: list[str] = []
@@ -70,10 +92,10 @@ def build_position_score_profile(signal: dict[str, Any], market_context: dict[st
 
     base = sum(c.score for c in components.values())
     bonus, bonus_reasons = _bonus_points(htf, fvg, opportunity, volume)
-    penalty, penalty_reasons = _penalties(blocks, missing, contract)
+    penalty, penalty_reasons = _penalties(blocks, missing, contract, context_provided=context_provided)
     total = clamp(base + bonus - penalty, 0, 120)
-    diagnostics.update({"side": side, "bonus_reasons": bonus_reasons, "penalty_reasons": penalty_reasons, "component_total_before_bonus_penalty": round(base, 2), "market_context_keys": sorted(ctx.keys())})
-    return PositionScoreProfile(PROFILE_VERSION, total, base, bonus, penalty, grade_from_score(total), bool(total >= 80 and not set(blocks)), components, sorted(set(missing)), sorted(set(blocks)), diagnostics).to_dict()
+    diagnostics.update({"side": side, "bonus_reasons": bonus_reasons, "penalty_reasons": penalty_reasons, "component_total_before_bonus_penalty": round(base, 2), "market_context_keys": sorted(ctx.keys()), "context_provided": context_provided})
+    return PositionScoreProfile(PROFILE_VERSION, total, base, bonus, penalty, grade_from_score(total), bool(total >= 80 and not blocks), components, sorted(set(missing)), sorted(set(blocks)), diagnostics).to_dict()
 
 
 def attach_position_score_profile(plan: Any, signal: dict[str, Any], market_context: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -152,7 +174,12 @@ def _score_contract_execution_quality(sig):
     if delta is not None: pts += 3 if 0.30 <= abs(delta) <= 0.55 else 1.5 if 0.20 <= abs(delta) <= 0.70 else 0; blocks += ["delta_outside_quality_band"] if not 0.20 <= abs(delta) <= 0.70 else []
     if oi is not None: pts += 2 if oi >= 1000 else 1 if oi >= 500 else 0; blocks += ["open_interest_low"] if oi < 500 else []
     if opt_vol is not None: pts += 1 if opt_vol >= 250 else 0.5 if opt_vol >= 100 else 0
-    if dte is not None: pts += 1 if dte >= 1 else 0; blocks += ["zero_dte_or_unknown_quality"] if dte < 1 else []
+    if dte is not None:
+        if dte >= 1:
+            pts += 1
+        elif dte < 0:
+            missing.append("dte_invalid")
+        # dte == 0: primary trading mode (0DTE) — no bonus, no block
     return _c("contract_execution_quality", pts, 10, "block_recommended" if blocks else "missing_data" if missing else "ok", "contract quality", {"missing_data": missing, "warnings": blocks, "block_recommendations": blocks, **vals})
 
 
@@ -174,13 +201,16 @@ def _bonus_points(htf, fvg, opportunity, volume):
     return min(20, points), reasons
 
 
-def _penalties(block_recommendations, missing_data, contract):
+def _penalties(block_recommendations, missing_data, contract, *, context_provided: bool = True):
     points, reasons = 0.0, []
     for key, value in (("monthly_weekly_oppose_signal", 15), ("entry_inside_opposing_fvg", 12), ("target_into_opposing_fvg", 8)):
         if key in block_recommendations: points += value; reasons.append(key)
     if any("remaining" in r or "target_already" in r for r in block_recommendations): points += 10; reasons.append("insufficient_remaining_opportunity")
     if "unknown_side" in block_recommendations: points += 10; reasons.append("unknown_side")
     if contract.status == "block_recommended": points += 10; reasons.append("contract_quality_block_recommended")
-    required = [m for m in missing_data if m in {"monthly_candles", "weekly_candles", "daily_candles", "4h_candles", "relative_volume", "side"}]
-    if required: points += min(15, len(set(required)) * 3); reasons.append("required_context_missing")
+    if context_provided:
+        required = [m for m in missing_data if m in {"monthly_candles", "weekly_candles", "daily_candles", "4h_candles", "relative_volume"}]
+        if required:
+            points += min(15, len(set(required)) * 3)
+            reasons.append("required_context_missing")
     return min(35, points), reasons

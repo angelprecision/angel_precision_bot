@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from ap.score_profile_side import normalize_signal_side
+
 
 def _safe_float(value: Any) -> float | None:
     try:
@@ -12,14 +14,6 @@ def _safe_float(value: Any) -> float | None:
     except (TypeError, ValueError):
         return None
 
-
-def _normalize_side(side: Any) -> str:
-    raw = str(side or "").upper().strip()
-    if raw in {"CALL", "BUY", "LONG", "BULLISH", "CALLS"}:
-        return "CALL"
-    if raw in {"PUT", "BEARISH", "PUTS"}:
-        return "PUT"
-    return raw or "CALL"
 
 
 @dataclass(frozen=True)
@@ -35,7 +29,10 @@ class StratBarState:
     distance_to_two_down_pct: float | None = None
 
     def aligns_with(self, side: str) -> bool:
-        side = _normalize_side(side)
+        # UNKNOWN side can never be confirmed as aligned — return False so
+        # the timeframe contributes no score rather than silently aligning.
+        if side not in {"CALL", "PUT"}:
+            return False
         return (side == "CALL" and self.directional_bias == "bullish") or (side == "PUT" and self.directional_bias == "bearish")
 
     def to_dict(self) -> dict[str, Any]:
@@ -89,11 +86,21 @@ def classify_strat_bar(previous_candle: dict[str, Any], current_candle: dict[str
 def evaluate_higher_timeframe_confluence(signal: dict[str, Any], market_context: dict[str, Any] | None = None) -> dict[str, Any]:
     ctx = market_context or {}
     candles_by_tf = ctx.get("candles") or ctx.get("ohlcv") or {}
-    side = _normalize_side(signal.get("side") or signal.get("direction"))
+    side = normalize_signal_side(signal.get("side") or signal.get("direction"))
+
+    if side == "UNKNOWN":
+        return {
+            "score": 0.0, "max_score": 18.0, "status": "missing_data",
+            "missing_data": ["side"], "block_recommendations": ["unknown_signal_side"],
+            "aligned_timeframes": [], "opposing_timeframes": [],
+            "inside_timeframes": [], "near_breach_timeframes": [],
+            "diagnostics": {"states": {}, "side": "UNKNOWN", "current_price": None},
+        }
+
     current_price = _safe_float(signal.get("current_price") or signal.get("underlying_price") or signal.get("entry_price") or signal.get("trigger_price") or (signal.get("trigger") or {}).get("entry"))
     timeframe_weights = {"monthly": 5.0, "weekly": 4.0, "daily": 3.0, "4h": 2.0, "2d": 0.5, "3d": 0.5, "4d": 0.5, "5d": 0.5}
     score = 0.0
-    max_score = 15.0
+    max_score = 18.0  # weights(16) + two alignment bonuses(2) = 18 achievable
     missing_required: list[str] = []
     states: dict[str, Any] = {}
     aligned_tfs: list[str] = []

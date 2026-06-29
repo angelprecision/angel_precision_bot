@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Iterable
 
+from ap.score_profile_side import normalize_signal_side
+
 
 def _safe_float(value: Any) -> float | None:
     try:
@@ -12,14 +14,6 @@ def _safe_float(value: Any) -> float | None:
     except (TypeError, ValueError):
         return None
 
-
-def _normalize_side(side: Any) -> str:
-    raw = str(side or "").upper().strip()
-    if raw in {"CALL", "BUY", "LONG", "BULLISH", "CALLS"}:
-        return "CALL"
-    if raw in {"PUT", "SELL", "SHORT", "BEARISH", "PUTS"}:
-        return "PUT"
-    return raw or "CALL"
 
 
 @dataclass(frozen=True)
@@ -110,14 +104,27 @@ def _is_mitigated(future_candles: Iterable[dict[str, Any]], *, low: float, high:
 def evaluate_fvg_context(signal: dict[str, Any], market_context: dict[str, Any] | None = None) -> dict[str, Any]:
     ctx = market_context or {}
     candles_by_tf = ctx.get("candles") or ctx.get("ohlcv") or {}
-    side = _normalize_side(signal.get("side") or signal.get("direction"))
+    side = normalize_signal_side(signal.get("side") or signal.get("direction"))
+
+    if side == "UNKNOWN":
+        return {
+            "score": 0.0, "max_score": 15.0, "status": "missing_data",
+            "missing_data": ["side"], "block_recommendations": ["unknown_signal_side"],
+            "boosts": [], "penalties": ["unknown_signal_side"],
+            "diagnostics": {
+                "timeframes": {}, "entry_inside_aligned_fvg": False,
+                "entry_inside_opposing_fvg": False, "target_into_opposing_fvg": False,
+                "aligned_support_or_resistance": False, "nearest_fvg": None, "side": "UNKNOWN",
+            },
+        }
+
     entry = _safe_float(signal.get("entry_price") or signal.get("trigger_price") or (signal.get("trigger") or {}).get("entry") or signal.get("current_price"))
     target = _safe_float(signal.get("target_price") or signal.get("target_underlying") or (signal.get("trigger") or {}).get("pt1") or (signal.get("trigger") or {}).get("pt2"))
 
     missing: list[str] = []
     diagnostics: dict[str, Any] = {
         "timeframes": {},
-        "entry_inside_fvg": False,
+        "entry_inside_aligned_fvg": False,
         "entry_inside_opposing_fvg": False,
         "target_into_opposing_fvg": False,
         "aligned_support_or_resistance": False,
@@ -160,10 +167,15 @@ def evaluate_fvg_context(signal: dict[str, Any], market_context: dict[str, Any] 
                 tf_notes.append("entry_near_aligned_fvg")
             diagnostics["aligned_support_or_resistance"] = True
 
-        for gap in active:
+        # Being inside an aligned FVG is friction — you are in the imbalance
+        # zone rather than cleanly positioned above/below support.  Deduct
+        # 30% from this timeframe.  Being inside an OPPOSING FVG is handled
+        # below with a harder -70% penalty.  The old loop ran over ALL active
+        # gaps, penalising aligned-gap entries the same as opposing ones.
+        for gap in relevant:
             if gap.contains(entry):
-                diagnostics["entry_inside_fvg"] = True
-                tf_notes.append("entry_inside_fvg")
+                diagnostics["entry_inside_aligned_fvg"] = True
+                tf_notes.append("entry_inside_aligned_fvg")
                 tf_score -= weight * 0.30
 
         for gap in opposing:
@@ -192,10 +204,14 @@ def evaluate_fvg_context(signal: dict[str, Any], market_context: dict[str, Any] 
 
 
 def _relevant_gaps(gaps: list[FairValueGap], *, side: str) -> list[FairValueGap]:
+    if side not in {"CALL", "PUT"}:
+        return []
     desired = "bullish" if side == "CALL" else "bearish"
     return [g for g in gaps if g.direction == desired]
 
 
 def _opposing_gaps(gaps: list[FairValueGap], *, side: str) -> list[FairValueGap]:
+    if side not in {"CALL", "PUT"}:
+        return []
     undesired = "bearish" if side == "CALL" else "bullish"
     return [g for g in gaps if g.direction == undesired]
