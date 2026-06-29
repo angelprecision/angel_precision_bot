@@ -131,7 +131,7 @@ _TO_QUEUE_REASON: dict[str, str] = {
     # (distinguishes "data pipeline problem" from "data exists but bad quality")
     "CHAIN_EMPTY":                    "NO_CHAIN_DATA",
     "CHAIN_FETCH_FAILED":             "NO_CHAIN_DATA",
-    "QUOTE_FETCH_FAILED":             "NO_CHAIN_DATA",
+    "QUOTE_FETCH_FAILED":             "QUOTE_FETCH_FAILED",
     # Zero-quote rows — data was returned but bid/ask is unusable
     "CHAIN_ROW_ZERO_BID_ASK":         "QUOTE_ZERO_BID_ASK",
     "DIRECT_QUOTE_ZERO_BID_ASK":      "QUOTE_ZERO_BID_ASK",

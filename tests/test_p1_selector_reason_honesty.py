@@ -668,7 +668,7 @@ class TestSourceGuard:
         expected = {
             "CHAIN_EMPTY":                   "NO_CHAIN_DATA",
             "CHAIN_FETCH_FAILED":            "NO_CHAIN_DATA",
-            "QUOTE_FETCH_FAILED":            "NO_CHAIN_DATA",
+            "QUOTE_FETCH_FAILED":            "QUOTE_FETCH_FAILED",
             "CHAIN_ROW_ZERO_BID_ASK":        "QUOTE_ZERO_BID_ASK",
             "DIRECT_QUOTE_ZERO_BID_ASK":     "QUOTE_ZERO_BID_ASK",
             "BID_BELOW_MIN":                 "BID_BELOW_MIN",
