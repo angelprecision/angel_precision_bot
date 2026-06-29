@@ -452,3 +452,204 @@ def test_normalize_strips_chr10_chr13_chr9():
     assert _normalize_account_id("VA123\r\n") == "VA123"
     assert _normalize_account_id("\tVA123 ")  == "VA123"
     assert _normalize_account_id(None)         == ""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PR #217 final amendment tests
+# ─────────────────────────────────────────────────────────────────────────────
+
+from ap.morning_handoff import run_morning_handoff_audit
+
+
+def _run_handoff_audit(mode, stage, enqueue_result=None, enqueue_raises=False):
+    """
+    Simulate run_morning_handoff_audit with runner/OSM/watcher patched out.
+    enqueue_result: what enqueue_watching_signals_to_trade_queue returns.
+    """
+    fake_runner = MagicMock()
+    fake_runner.core            = MagicMock()
+    fake_runner.order_state_machine = MagicMock()
+    fake_runner.master_control  = MagicMock()
+    fake_runner.core.entry_watcher = MagicMock()
+    fake_runner.core.broker     = MagicMock()
+    fake_runner.core.exit_eng   = MagicMock()
+
+    def _fake_recovery_reseed(result_dict):
+        result_dict["watchers_requeued"] = 0
+
+    with patch("ap.morning_handoff._resolve_runner",        return_value=fake_runner), \
+         patch("ap.morning_handoff._ensure_handoff_table"), \
+         patch("ap.morning_handoff._load_handoff_run_lock",  return_value=None), \
+         patch("ap.morning_handoff._upsert_handoff_run_lock"), \
+         patch("ap.morning_handoff._count_state",            return_value={}), \
+         patch("ap.morning_handoff._has_unowned_pending_trigger_orders", return_value=False), \
+         patch("ap_recovery.APStartupRecovery") as MockRecovery, \
+         patch("ap.morning_handoff.enqueue_watching_signals_to_trade_queue",
+               side_effect=Exception("should not be called") if enqueue_raises
+               else (lambda **kw: enqueue_result or {"errors": [], "inserted": [], "signals_found": 0,
+                                                      "skipped_duplicate": [], "rejected": []})) as mock_enqueue:
+        instance = MockRecovery.return_value
+        instance._reseed_watchers.side_effect = _fake_recovery_reseed
+        result = run_morning_handoff_audit(
+            client_id=JOSE_EMAIL,
+            execution_mode=mode,
+            stage=stage,
+            dry_run=False,
+            now=None,
+        )
+        return result, mock_enqueue
+
+
+# ── Test 1: live mode does not call enqueue ──────────────────────────────────
+
+def test_final_1_live_mode_does_not_call_enqueue():
+    """
+    Live (Jason): enqueue_watching_signals_to_trade_queue must NEVER be called.
+    The fanout is paper-only. Live already has trade_queue rows from overnight_reeval.
+    """
+    result, mock_enqueue = _run_handoff_audit(
+        mode="live",
+        stage="post_overnight_reeval",
+        enqueue_raises=False,
+    )
+    mock_enqueue.assert_not_called(), (
+        "enqueue_watching_signals_to_trade_queue must NOT be called for live mode"
+    )
+
+
+def test_final_1b_live_mode_startup_stage_also_skips_enqueue():
+    """startup stage for live must not enqueue either."""
+    _, mock_enqueue = _run_handoff_audit(mode="live", stage="startup")
+    mock_enqueue.assert_not_called()
+
+
+def test_final_1c_paper_startup_stage_also_skips_enqueue():
+    """startup stage for paper must not enqueue (only post_overnight_reeval and manual)."""
+    _, mock_enqueue = _run_handoff_audit(mode="paper", stage="startup")
+    mock_enqueue.assert_not_called()
+
+
+# ── Test 2: queued_at NULL rows not selected ─────────────────────────────────
+
+def test_final_2_queued_at_null_rows_not_in_query():
+    """
+    _fetch_today_watching_signals must require queued_at IS NOT NULL.
+    Stale WATCHING rows with queued_at=NULL must never be selected.
+    """
+    import inspect
+    import ap.morning_handoff as mh
+    src = inspect.getsource(mh._fetch_today_watching_signals)
+    assert "queued_at IS NOT NULL" in src, (
+        "_fetch_today_watching_signals must have AND queued_at IS NOT NULL"
+    )
+    assert "queued_at IS NULL OR" not in src, (
+        "queued_at IS NULL OR must be removed — stale rows must not be re-armed"
+    )
+
+
+def test_final_2b_null_queued_at_signal_not_enqueued():
+    """
+    Signal with queued_at=NULL is filtered out at the SQL level.
+    The handoff must report 0 signals_found for all-null queued_at inputs.
+    (Simulated by returning empty list from the date-scoped fetch.)
+    """
+    # The SQL WHERE queued_at IS NOT NULL filters these out; we verify via
+    # the source check in test_final_2. Here we verify that an empty signals
+    # list from the fetch produces 0 inserted with no errors.
+    result, _, _, _ = _run(JOSE_EMAIL, "paper", signals=[])
+    assert result["signals_found"] == 0
+    assert len(result["inserted"]) == 0
+    assert len(result["errors"])   == 0
+
+
+# ── Test 3: enqueue errors cause run_morning_handoff_audit ok=False ──────────
+
+def test_final_3_member_not_found_causes_handoff_ok_false():
+    """
+    member_not_found_in_pod from enqueue must make run_morning_handoff_audit
+    return ok=False. The error must be visible in the handoff result.
+    """
+    enqueue_err_result = {
+        "errors": ["member_not_found_in_pod"],
+        "inserted": [], "skipped_duplicate": [], "rejected": [],
+        "signals_found": 0,
+    }
+    result, _ = _run_handoff_audit(
+        mode="paper",
+        stage="post_overnight_reeval",
+        enqueue_result=enqueue_err_result,
+    )
+    assert result["ok"] is False, (
+        "member_not_found_in_pod must cause handoff ok=False"
+    )
+    assert result.get("error") == "member_not_found_in_pod"
+
+
+def test_final_3b_fetch_schema_error_causes_handoff_ok_false():
+    """
+    fetch_watching_signals_failed:<msg> from enqueue must make handoff ok=False.
+    Schema errors must not be silently swallowed as 'no signals'.
+    """
+    enqueue_err_result = {
+        "errors": ["fetch_watching_signals_failed:column canonical_signal_id does not exist"],
+        "inserted": [], "skipped_duplicate": [], "rejected": [],
+        "signals_found": 0,
+    }
+    result, _ = _run_handoff_audit(
+        mode="paper",
+        stage="post_overnight_reeval",
+        enqueue_result=enqueue_err_result,
+    )
+    assert result["ok"] is False
+    assert "fetch_watching_signals_failed" in (result.get("error") or "")
+
+
+def test_final_3c_paper_credentials_missing_causes_handoff_ok_false():
+    enqueue_err_result = {
+        "errors": ["paper_credentials_missing"],
+        "inserted": [], "skipped_duplicate": [], "rejected": [],
+        "signals_found": 0,
+    }
+    result, _ = _run_handoff_audit(
+        mode="paper",
+        stage="post_overnight_reeval",
+        enqueue_result=enqueue_err_result,
+    )
+    assert result["ok"] is False
+    assert result.get("error") == "paper_credentials_missing"
+
+
+def test_final_3d_insert_error_causes_handoff_ok_false():
+    """insert_error:<...> must also fail the handoff."""
+    enqueue_err_result = {
+        "errors": ["insert_error:signal_id=sig-001:client=jose.vasquez4011@gmail.com"],
+        "inserted": [], "skipped_duplicate": [], "rejected": [],
+        "signals_found": 1,
+    }
+    result, _ = _run_handoff_audit(
+        mode="paper",
+        stage="post_overnight_reeval",
+        enqueue_result=enqueue_err_result,
+    )
+    assert result["ok"] is False
+
+
+def test_final_3e_live_with_no_enqueue_still_succeeds():
+    """Live mode skips enqueue entirely — handoff must still succeed."""
+    result, mock_enqueue = _run_handoff_audit(mode="live", stage="post_overnight_reeval")
+    mock_enqueue.assert_not_called()
+    assert result["ok"] is True
+
+
+def test_final_3f_paper_with_no_errors_still_succeeds():
+    """Paper mode with clean enqueue result — handoff succeeds."""
+    enqueue_ok_result = {
+        "errors": [], "inserted": [{"signal_id": "sig-001", "ticker": "NKE"}],
+        "skipped_duplicate": [], "rejected": [], "signals_found": 1,
+    }
+    result, _ = _run_handoff_audit(
+        mode="paper",
+        stage="post_overnight_reeval",
+        enqueue_result=enqueue_ok_result,
+    )
+    assert result["ok"] is True

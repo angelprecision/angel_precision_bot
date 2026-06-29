@@ -185,7 +185,8 @@ def _fetch_today_watching_signals(trading_date: str) -> tuple[list[dict] | None,
                        watcher_started_at
                 FROM ap_signals
                 WHERE decision_status = 'WATCHING'
-                  AND (queued_at IS NULL OR queued_at >= %s::date)
+                  AND queued_at IS NOT NULL
+                  AND queued_at >= %s::date
                 ORDER BY queued_at ASC NULLS LAST
                 """,
                 (trading_date,),
@@ -1060,32 +1061,28 @@ def run_morning_handoff_audit(
         error = ",".join(warnings)
     elif not dry_run:
         try:
-            # PR #183: For post_overnight_reeval and manual stages, enqueue
-            # ap_signals WATCHING rows into trade_queue before _reseed_watchers.
-            # This is the step that was missing for paper accounts — live worked
-            # because Jason's signals already had trade_queue WATCHING rows.
-            if stage in ("post_overnight_reeval", "manual"):
+            # PR #183 final amendment: fanout is PAPER-ONLY.
+            # Live (Jason) already has trade_queue WATCHING rows written by
+            # overnight_reeval. Running fanout for live would create duplicate
+            # rows from shared/paper-origin ap_signals. Do not run for live.
+            if mode == "paper" and stage in ("post_overnight_reeval", "manual"):
                 enqueue_result = enqueue_watching_signals_to_trade_queue(
-                    client_id=client_id,
+                    target_client_id=client_id,
                     execution_mode=mode,
                     trading_date=trading_date,
                     dry_run=False,
                     now=now,
                 )
+                # Any enqueue error fails the handoff visibly in paper mode.
+                # member_not_found_in_pod, paper_credentials_missing,
+                # fetch_watching_signals_failed:*, insert_error:* all abort.
                 if enqueue_result.get("errors"):
-                    # Hard errors (e.g. paper_credentials_missing) abort the handoff
-                    # so we don't proceed to _reseed_watchers with no valid signals.
-                    crit_errors = [
-                        e for e in enqueue_result["errors"]
-                        if e in ("paper_credentials_missing", "client_member_not_found")
-                    ]
-                    if crit_errors:
-                        ok = False
-                        error = crit_errors[0]
-                        log.error(
-                            "morning_handoff enqueue CRITICAL error client=%s stage=%s err=%s",
-                            client_id, stage, crit_errors,
-                        )
+                    ok = False
+                    error = enqueue_result["errors"][0]
+                    log.error(
+                        "morning_handoff enqueue failed client=%s stage=%s errors=%s",
+                        client_id, stage, enqueue_result["errors"],
+                    )
 
             if ok:
                 from ap_recovery import APStartupRecovery
