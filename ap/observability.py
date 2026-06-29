@@ -111,11 +111,22 @@ REASON_CODES = {
         "SCORE_BELOW_THRESHOLD", "SESSION_RULE_BLOCK",
     ],
     "CONTRACT": [
+        # Original codes (preserved for backward compat)
         "NO_CHAIN_DATA", "NO_VALID_EXPIRY", "NO_ATM_STRIKE", "SPREAD_TOO_WIDE",
         "OI_TOO_LOW", "VOLUME_TOO_LOW", "DELTA_OUT_OF_RANGE", "DTE_OUT_OF_RANGE",
         "IV_RANK_TOO_HIGH", "EARNINGS_LOCKOUT", "PREMIUM_CAP_EXCEEDED",
         "TIER_CAP_EXCEEDED", "NO_AFFORDABLE_CONTRACT", "FALLBACK_SPREAD_USED",
         "FALLBACK_OI_USED", "NO_CONTRACT_AFTER_FILTERS",
+        # PR P1 — truthful selector failure codes (replaces NO_CHAIN_DATA umbrella)
+        "CHAIN_EMPTY",               # chain request succeeded but returned 0 rows
+        "CHAIN_FETCH_FAILED",        # chain request threw or returned non-200
+        "QUOTE_FETCH_FAILED",        # direct-quote fetch failed / unavailable
+        "CHAIN_ROW_ZERO_BID_ASK",    # chain had rows but candidate bid/ask was zero
+        "DIRECT_QUOTE_ZERO_BID_ASK", # direct quote revalidation returned zero bid/ask
+        "QUOTE_ZERO_BID_ASK",        # queue-facing umbrella for zero-quote failures
+        "BID_BELOW_MIN",             # bid present but below pro-quality minimum ($0.10)
+        "NO_VALID_PLAYBOOK_DTE_CONTRACT",  # DTE ladder exhausted all buckets
+        "UNTRADEABLE_FOR_ACCOUNT_SIZE",    # quality contract found but exceeds budget
     ],
     "RISK": [
         "CAPITAL_UTIL_BLOCK", "POSITION_LIMIT_REACHED", "DAILY_STOP_ACTIVE", "KILL_SWITCH_ACTIVE",
