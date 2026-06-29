@@ -22,6 +22,7 @@ import pytest
 
 from ap.morning_handoff import (
     _hydrate_trigger_from_raw_payload,
+    _is_shared_watch_signal_row,
     _normalize_account_id,
     _resolve_paper_creds_from_member,
     _validate_trigger_geometry,
@@ -80,6 +81,12 @@ def _signal(signal_id="sig-001", client_email=JOSE_EMAIL, ticker="NKE",
         "watcher_started_at":  None,
         # NOTE: no canonical_signal_id — production ap_signals does not have it
     }
+
+
+def _shared_signal(**kwargs):
+    raw_payload = {"stage": "contract_selection", "reason_code": "market_closed_deferred"}
+    raw_payload.update(kwargs.pop("raw_payload", {}) or {})
+    return _signal(raw_payload=raw_payload, **kwargs)
 
 
 def _run(target_client, mode, signals, members=None, fetch_err=None,
@@ -158,7 +165,7 @@ def test_2_ap_signals_select_has_no_canonical_signal_id():
 
 
 def test_2b_signal_without_canonical_signal_id_still_enqueued():
-    sig = _signal(signal_id="sig-no-canon")
+    sig = _shared_signal(signal_id="sig-no-canon")
     assert "canonical_signal_id" not in sig, "test fixture must not have canonical_signal_id"
     result, mock_ins, _, _ = _run(JOSE_EMAIL, "paper", [sig])
     assert len(result["inserted"]) == 1
@@ -178,9 +185,9 @@ def test_3_fanout_same_signal_to_multiple_paper_clients():
     the inserted row is the TARGET client, not the source signal client.
     source_signal_client_email preserves the original ap_signals.client_email.
     """
-    shared_signal = _signal(
+    shared_signal = _shared_signal(
         signal_id="sig-shared-nke",
-        client_email="scanner@system.internal",  # scanner source client
+        client_email="scanner@system.internal",
         ticker="NKE", side="PUT",
     )
 
@@ -217,6 +224,22 @@ def test_3_fanout_same_signal_to_multiple_paper_clients():
     assert jose_key  == f"sig-shared-nke:{JOSE_EMAIL}:{TODAY_NODASH}"
     assert trade_key == f"sig-shared-nke:{TRADE_EMAIL}:{TODAY_NODASH}"
     assert jose_key != trade_key
+
+
+def test_3b_unmarked_watching_row_is_not_treated_as_shared():
+    sig = _signal(raw_payload={})
+    assert _is_shared_watch_signal_row(sig) is False
+
+
+def test_3c_market_closed_deferred_row_is_shared():
+    sig = _shared_signal()
+    assert _is_shared_watch_signal_row(sig) is True
+
+
+def test_3d_post_market_blocked_context_row_is_shared():
+    sig = _signal(raw_payload={}, queued_at=f"{TODAY}T09:00:00+00:00")
+    sig["context_notes"] = "post_market_blocked: after_hours"
+    assert _is_shared_watch_signal_row(sig) is True
 
 
 # ─────────────────────────────────────────────────────────────────────────────

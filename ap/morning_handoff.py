@@ -146,11 +146,37 @@ def _resolve_paper_creds_from_member(member: dict) -> tuple[str | None, str | No
     return account_id, token
 
 
+def _is_shared_watch_signal_row(row: dict) -> bool:
+    """
+    Return True only for ap_signals WATCHING rows that match the existing
+    shared overnight scanner/deferred source shapes already used by the bot.
+
+    This keeps paper fanout scoped to shared overnight candidates instead of
+    treating every same-day WATCHING row as globally shareable.
+    """
+    payload = row.get("raw_payload") or {}
+    if not isinstance(payload, dict):
+        payload = {}
+
+    reason_code = str(payload.get("reason_code") or "").strip().lower()
+    stage = str(payload.get("stage") or "").strip().lower()
+    human_reason = str(payload.get("human_reason") or "").strip().lower()
+    context_notes = str(row.get("context_notes") or "").strip().lower()
+
+    if reason_code == "market_closed_deferred":
+        return True
+    if stage == "contract_selection" and "deferred" in human_reason:
+        return True
+    if context_notes.startswith("post_market_blocked:"):
+        return True
+    return False
+
+
 def _fetch_today_watching_signals(trading_date: str) -> tuple[list[dict] | None, str | None]:
     """
-    Fetch ALL ap_signals WATCHING rows with queued_at >= trading_date.
-    Does NOT filter by client_email — fanout design: signals are shared
-    across paper clients on the same pod.
+    Fetch shared ap_signals WATCHING rows with queued_at >= trading_date.
+    Does NOT filter by client_email, but it DOES fail closed unless the row
+    matches the existing shared overnight/deferred signal source shapes.
     Date scope prevents stale Jun-25/Jun-26 rows from being re-armed.
 
     Returns:
@@ -201,7 +227,8 @@ def _fetch_today_watching_signals(trading_date: str) -> tuple[list[dict] | None,
                         r["raw_payload"] = _json.loads(r["raw_payload"])
                     except Exception:
                         r["raw_payload"] = {}
-                out.append(r)
+                if _is_shared_watch_signal_row(r):
+                    out.append(r)
             return out
 
     try:
