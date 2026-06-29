@@ -252,6 +252,45 @@ def _fetch_watching_signals(client_id: str) -> list[dict]:
         return []
 
 
+def _watching_row_exists(client_id: str, signal_id: str) -> bool:
+    """
+    Return True if trade_queue already has a non-terminal WATCHING row for
+    this (client_id, signal_id) pair — regardless of which idempotency key
+    format was used to create it.
+
+    This is the safety gate that prevents duplicate WATCHING rows for live
+    clients (Jason) whose overnight_reeval already wrote trade_queue rows
+    with the old key format (client_id:signal_id). Without this check,
+    PR #183's new session-scoped key (signal_id:client_id:YYYYMMDD) would
+    not conflict with the existing rows, creating duplicates.
+    """
+    from ap.db import conn, run_with_retry
+
+    def _q():
+        with conn() as c:
+            c.execute(
+                """
+                SELECT 1 FROM trade_queue
+                WHERE client_id  = %s
+                  AND signal_id  = %s
+                  AND status     = 'WATCHING'
+                LIMIT 1
+                """,
+                (client_id, signal_id),
+            )
+            return c.fetchone() is not None
+
+    try:
+        return bool(run_with_retry(_q))
+    except Exception as exc:
+        log.warning(
+            "_watching_row_exists check failed signal_id=%s client=%s — "
+            "treating as exists to fail safe: %s",
+            signal_id, client_id, exc,
+        )
+        return True  # fail closed: skip rather than duplicate
+
+
 def _insert_trade_queue_watching(
     *,
     client_id: str,
@@ -438,6 +477,23 @@ def enqueue_watching_signals_to_trade_queue(
 
         # Session-scoped idempotency: prevents old rejected rows from blocking today
         idempotency_key = f"{sig_id}:{cid}:{tdate_nodash}"
+
+        # Guard against duplicate WATCHING rows for clients (especially live)
+        # whose overnight_reeval already wrote trade_queue rows with a different
+        # idempotency key format. ON CONFLICT alone won't catch cross-format
+        # duplicates, so we check existence first.
+        if _watching_row_exists(cid, sig_id):
+            result["skipped_duplicate"].append({
+                "signal_id": sig_id, "ticker": ticker, "side": side,
+                "idempotency_key": idempotency_key,
+                "reason": "watching_row_already_exists",
+            })
+            log.info(
+                "PR183 enqueue_watching_signals SKIP_EXISTING_WATCHING signal_id=%s "
+                "client=%s — trade_queue WATCHING row already present",
+                sig_id, cid,
+            )
+            continue
 
         # Build the trade_queue payload — mirrors the shape the entry watcher expects
         payload = {
