@@ -176,18 +176,19 @@ def enqueue_signal(
     if payload.get("ev_score") is None:
         payload["ev_score"] = payload["score"]
 
-    if not payload.get("side") and not payload.get("direction"):
-        sig_id = str(payload.get("signal_id", "")).upper()
-        if sig_id.endswith(":PUT") or ":PUT:" in sig_id:
-            payload["side"] = "PUT"
-            payload["direction"] = "PUT"
-        else:
-            payload["side"] = "CALL"
-            payload["direction"] = "CALL"
-    elif not payload.get("direction"):
-        payload["direction"] = payload["side"]
-    elif not payload.get("side"):
-        payload["side"] = payload["direction"]
+    # PR #233: fail-CLOSED on missing/invalid side at enqueue time.  Pre-#233
+    # this defaulted to CALL (or PUT if signal_id hinted ":PUT"), silently
+    # routing malformed signals as bullish trades.  Now we preserve the failure
+    # in the payload as `side_validation_error` so _dispatch can reject it with
+    # the right stage/reason_code before Master Control sees it.
+    side, side_error = _normalize_queue_side(payload)
+    if side_error:
+        payload["side_validation_error"] = side_error
+        payload.pop("side", None)
+        payload.pop("direction", None)
+    else:
+        payload["side"] = side
+        payload["direction"] = side
 
     # PR F / queue truth hardening: scanner-provided signal_id is preserved
     # verbatim via `or` short-circuit. When the scanner omits it, the fallback
@@ -250,6 +251,102 @@ _MANUAL_RESTART_GUARD_BYPASS_ERRORS = frozenset({
 })
 
 _PAPER_OVERNIGHT_REEVAL_ONLY_ERROR = "after_hours_deferred:awaiting_overnight_reeval"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PR #233 — Queue side fail-closed + breach diagnostics hardening
+#
+# Migrated in-place from the `ap/queue/__init__.py` package-shadow.  All six
+# behaviors below previously lived in the shim; this module is now the single
+# source of truth.  No new behavior beyond shim parity.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Side aliases recognized by enqueue_signal and _dispatch.  Anything outside
+# {"CALL", "PUT"} after alias resolution is treated as missing/invalid and the
+# row is fail-closed before Master Control sees it.
+_SIDE_ALIASES: dict[str, str] = {
+    "BUY":     "CALL",
+    "LONG":    "CALL",
+    "CALLS":   "CALL",
+    "BULL":    "CALL",
+    "BULLISH": "CALL",
+    "SELL":    "PUT",
+    "SHORT":   "PUT",
+    "PUTS":    "PUT",
+    "BEAR":    "PUT",
+    "BEARISH": "PUT",
+}
+
+# Keys to merge from a captured selector failure (via get_last_failure()) into
+# the queue job's result_json so the operator dashboard can attribute
+# rejections without re-querying the selector.
+_SELECTOR_FAILURE_RESULT_KEYS: tuple[str, ...] = (
+    "queue_reason_code",
+    "chain_rows",
+    "survivor_count",
+    "top_reject_buckets",
+    "tradier_status_code",
+    "retryable",
+    "data_base_url",
+    "selector_stage",
+)
+
+# Per-job stash for selector failures.  _dispatch writes here when
+# contract_selector.select() returns None; _mark_job reads here when the
+# terminating result has stage="contract_selection".  Cleared on read.
+_selector_failure_by_job: dict[int, dict] = {}
+
+
+def _normalize_queue_side(payload: dict | None) -> tuple[str | None, str | None]:
+    """Canonical queue-level side normalizer.
+
+    Returns (side, error) where exactly one is non-None:
+      - (side, None)  when the payload carries a recognizable CALL/PUT.
+      - (None, "invalid_or_missing_side:<detail>")  otherwise.
+
+    Callers MUST treat a non-None error as a block condition.  Never substitute
+    a default direction.  This is the queue-level twin of
+    ap_master_control._normalize_signal_side; future consolidation will merge
+    them onto a single shared helper.
+    """
+    if not isinstance(payload, dict):
+        return None, "invalid_or_missing_side:payload_not_dict"
+    raw = payload.get("side") or payload.get("direction")
+    side = str(raw or "").strip().upper()
+    side = _SIDE_ALIASES.get(side, side)
+    if side in {"CALL", "PUT"}:
+        return side, None
+    return None, f"invalid_or_missing_side:{raw!r}"
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _positive_float_or_none(value: Any) -> float | None:
+    try:
+        val = float(value)
+    except (TypeError, ValueError):
+        return None
+    return val if val > 0 else None
+
+
+def _selector_failure_payload(failure: dict | None) -> dict | None:
+    """Pick the safe subset of a captured selector failure for result_json merge."""
+    if not isinstance(failure, dict):
+        return None
+    nested = failure.get("selector_failure")
+    if isinstance(nested, dict):
+        return copy.deepcopy(nested)
+    picked = {
+        key: copy.deepcopy(failure[key])
+        for key in _SELECTOR_FAILURE_RESULT_KEYS
+        if key in failure
+    }
+    return picked or copy.deepcopy(failure)
 
 
 def _paper_overnight_reeval_only_enabled(*, payload: dict | None = None, execution_mode: str | None = None) -> bool:
@@ -339,6 +436,33 @@ def _mark_job(
     """
     terminal = str(status).upper() in _TERMINAL_QUEUE_STATUSES
 
+    # PR #233: when the terminating result is a contract_selection failure,
+    # merge any selector failure metadata captured during _dispatch into
+    # result_json so the operator dashboard can see chain_rows / survivor_count /
+    # top_reject_buckets / tradier_status_code / retryable / data_base_url /
+    # selector_stage without re-querying the selector.  Stash lives in
+    # _selector_failure_by_job and is cleared on read.
+    try:
+        if isinstance(result, dict) and str(result.get("stage") or "") == "contract_selection":
+            try:
+                job_key = int(job_id)
+            except Exception:
+                job_key = job_id
+            captured = _selector_failure_by_job.pop(job_key, None)
+            selector_failure = _selector_failure_payload(captured)
+            if selector_failure:
+                merged = dict(result)
+                merged["selector_failure"] = selector_failure
+                for key in _SELECTOR_FAILURE_RESULT_KEYS:
+                    if key in selector_failure and key not in merged:
+                        merged[key] = selector_failure.get(key)
+                if "stage" in selector_failure and "selector_stage" not in merged:
+                    merged["selector_stage"] = selector_failure.get("stage")
+                result = merged
+    except Exception:
+        # Merge is observability-only — must never block the actual job update.
+        pass
+
     # Derive last_error for terminal statuses when caller did not supply error=.
     # Explicit error always wins.  Non-terminal statuses never derive last_error
     # from result_json — they preserve whatever last_error already exists in DB.
@@ -395,7 +519,7 @@ def _mark_job(
 #   - Fails silently: must never block the retry loop or terminal cleanup path.
 # ─────────────────────────────────────────────────────────────────────────────
 
-def write_deferred_breach_last_error(
+def write_breach_last_error(
     queue_id: Optional[int],
     *,
     reason_code: str,
@@ -403,37 +527,42 @@ def write_deferred_breach_last_error(
     attempt: int = 0,
     client_id: str = "",
     ticker: str = "",
+    label: str = "BREACH_ENTRY_FAILED",
 ) -> None:
-    """Write selector failure reason to trade_queue.last_error (non-terminal).
+    """Write a non-terminal breach failure reason to trade_queue.last_error.
 
-    Called when deferred breach select() returns None but the order is being
-    kept alive for the next trigger tick. Never called for terminal failures
-    — those go through _terminalize_deferred_breach_failure which already
-    handles last_error via _cleanup_pending_entry_order → OSM transition().
+    PR #233 (migrated from shim): generalized successor of
+    write_deferred_breach_last_error.  Used for execution-core quote /
+    confirmation / submit failure diagnostics on rows still in flight (i.e.
+    NOT in terminal status — REJECTED / ERROR / SUBMITTED / FILLED /
+    CANCELED / CANCELLED / EXPIRED / DONE / ARCHIVED).
 
     Written value format (human-readable, dashboard-queryable):
-        "DEFERRED_BREACH_CONTRACT_FAILED:CHEAP_CONTRACT_NO_UPGRADE:attempt_3
-         — premium $35 below $50 min, no upgrade found"
+        "<label>:<reason_code>:attempt_<N> - <explanation>"
 
     Args:
         queue_id:     trade_queue.id. If None or 0, no-op.
-        reason_code:  canonical selector reason from get_last_failure()
-                      (CHEAP_CONTRACT_NO_UPGRADE, NO_CHAIN_DATA,
-                      SPREAD_TOO_WIDE, OI_TOO_LOW, etc.)
+        reason_code:  canonical reason code (CHEAP_CONTRACT_NO_UPGRADE,
+                      NO_CHAIN_DATA, SPREAD_TOO_WIDE, OI_TOO_LOW,
+                      QUOTE_FETCH_FAILED, etc.)
         explanation:  human-readable detail (<=400 chars stored).
-        attempt:      1-indexed breach attempt count. 0 = unknown (no suffix).
+        attempt:      1-indexed attempt count. 0 = unknown (no suffix).
         client_id:    for logging only. Not written to DB.
         ticker:       for logging only. Not written to DB.
+        label:        leading label.  Defaults to "BREACH_ENTRY_FAILED".  The
+                      deferred-breach wrapper passes "DEFERRED_BREACH_CONTRACT_FAILED"
+                      to preserve PR #182's historical label.
     """
     if not queue_id:
         return
     try:
-        _rc = str(reason_code or "BREACH_SELECTOR_RETURNED_NONE").strip()
-        _label = f"DEFERRED_BREACH_CONTRACT_FAILED:{_rc}"
+        rc = str(reason_code or "BREACH_ENTRY_FAILED").strip()
+        event_label = str(label or "BREACH_ENTRY_FAILED").strip() or "BREACH_ENTRY_FAILED"
+        full_label = f"{event_label}:{rc}"
         if attempt > 0:
-            _label = f"{_label}:attempt_{attempt}"
-        _detail = str(explanation or "").strip()[:400]
-        _last_error = f"{_label} — {_detail}" if _detail else _label
+            full_label = f"{full_label}:attempt_{attempt}"
+        detail = str(explanation or "").strip()[:400]
+        last_error = f"{full_label} - {detail}" if detail else full_label
 
         def _write():
             with _conn()() as c:
@@ -448,27 +577,55 @@ def write_deferred_breach_last_error(
                            'ARCHIVED'
                        )
                     """,
-                    (_last_error, int(queue_id)),
+                    (last_error, int(queue_id)),
                 )
 
         _run_with_retry(_write)
         log.info(
-            "[%s] deferred_breach_last_error_written ticker=%s queue_id=%s "
-            "reason=%s attempt=%d",
+            "[%s] breach_last_error_written ticker=%s queue_id=%s "
+            "label=%s reason=%s attempt=%d",
             client_id or "?",
             ticker or "?",
             queue_id,
-            _rc,
+            event_label,
+            rc,
             attempt,
         )
-    except Exception as _e:
+    except Exception as exc:
         # Non-critical: a write failure here MUST NOT propagate.
         # The retry loop and terminal cleanup path must continue regardless.
         log.debug(
-            "[%s] write_deferred_breach_last_error failed (non-critical): %s",
+            "[%s] write_breach_last_error failed (non-critical): %s",
             client_id or "?",
-            _e,
+            exc,
         )
+
+
+def write_deferred_breach_last_error(
+    queue_id: Optional[int],
+    *,
+    reason_code: str,
+    explanation: str = "",
+    attempt: int = 0,
+    client_id: str = "",
+    ticker: str = "",
+) -> None:
+    """Backward-compatible wrapper.  Existing deferred-breach callers unchanged.
+
+    PR #233: the body of this function moved into write_breach_last_error(),
+    parameterized on `label`.  The DEFERRED_BREACH_CONTRACT_FAILED label is
+    preserved verbatim so PR #182's selector failure write-back rows continue
+    to grep identically in operator dashboards.
+    """
+    return write_breach_last_error(
+        queue_id,
+        reason_code=reason_code or "BREACH_SELECTOR_RETURNED_NONE",
+        explanation=explanation,
+        attempt=attempt,
+        client_id=client_id,
+        ticker=ticker,
+        label="DEFERRED_BREACH_CONTRACT_FAILED",
+    )
 
 
 def _claim_one_job(client_id: str = "default") -> Optional[dict]:
@@ -608,23 +765,39 @@ def _log_signal_to_db(
 
         _status = str(decision_status or "rejected").strip() or "rejected"
 
+        # PR #233: writing "CALL" for a missing/invalid side here used to
+        # contaminate ap_signals diagnostics with a phantom direction.  We now
+        # write "UNKNOWN" on invalid and surface the validation error inside
+        # raw_payload so operators can grep on side_validation_error to find
+        # malformed scanner output.
+        _payload_for_row = dict(payload or {})
+        _normalized_side, _side_error = _normalize_queue_side({
+            "side":      side or _payload_for_row.get("side"),
+            "direction": _payload_for_row.get("direction"),
+        })
+        _row_side = _normalized_side or "UNKNOWN"
+        if _side_error:
+            _payload_for_row["side_validation_error"] = _side_error
+            _payload_for_row.pop("side", None)
+            _payload_for_row.pop("direction", None)
+
         _row: dict = {
             "signal_id":       str(signal_id or _uuid.uuid4()),
             "client_email":    str(client_id),
             "system_version":  "v2",
             "ticker":          str(ticker),
-            "side":            str(side or payload.get("side") or "CALL").upper(),
-            "score":           float(score or payload.get("score") or 0),
-            "tier":            str(payload.get("tier") or "B"),
-            "pattern":         str(payload.get("pattern") or ""),
-            "timeframe":       str(payload.get("timeframe") or "1d"),
+            "side":            _row_side,
+            "score":           float(score or _payload_for_row.get("score") or 0),
+            "tier":            str(_payload_for_row.get("tier") or "B"),
+            "pattern":         str(_payload_for_row.get("pattern") or ""),
+            "timeframe":       str(_payload_for_row.get("timeframe") or "1d"),
             "decision_status": _status,
             "context_notes":   f"stage={stage} | code={reason_code} | {human_reason}",
             "raw_payload": {
                 "stage": stage,
                 "reason_code": reason_code,
                 "human_reason": human_reason,
-                **{k: v for k, v in payload.items()
+                **{k: v for k, v in _payload_for_row.items()
                    if k not in ("raw_payload", "signal_payload") and not callable(v)},
             },
         }
@@ -640,7 +813,7 @@ def _log_signal_to_db(
             ("underlying_price", "underlying_at_signal"),
         ):
             try:
-                val = payload.get(_src_key)
+                val = _payload_for_row.get(_src_key)
                 if val is not None and float(val) > 0 and _dst_key not in _row:
                     _row[_dst_key] = float(val)
             except Exception:
@@ -702,7 +875,81 @@ def _dispatch(
       4. order_state_machine.create_entry_order()
       5. breach → entry_watcher  |  immediate → SUBMITTED transition
     """
-    ticker = payload.get("ticker") or payload.get("symbol", "?")
+    ticker = (payload or {}).get("ticker") or (payload or {}).get("symbol", "?")
+
+    # ── PR #233 PRE-CHECKS ──────────────────────────────────────────────────
+    # These run before every gate below so a malformed payload or an
+    # operationally-unsafe LIVE config can never reach Master Control,
+    # the selector, OSM, the watcher, or the broker.
+
+    # PR #233 (a): LIVE + ALLOW_IMMEDIATE_EXECUTION=1 is queue-fatal.  The
+    # ALLOW_IMMEDIATE_EXECUTION env flag is intended for paper testing only;
+    # in LIVE it would bypass the breach-watcher trigger gate and submit to
+    # the broker immediately on every dispatched signal.  Marked ERROR (not
+    # REJECTED) because this is an operator configuration error, not a
+    # signal-level rejection.
+    _pre_execution_mode = str(getattr(master_control, "mode", "PAPER") or "PAPER").upper()
+    if _pre_execution_mode == "LIVE" and bool(ALLOW_IMMEDIATE_EXECUTION):
+        log.critical("[%s] LIVE_FATAL_IMMEDIATE_EXECUTION_ENABLED signal_id=%s", ticker, signal_id)
+        _mark_job(job_id, "ERROR", error="LIVE_FATAL_IMMEDIATE_EXECUTION_ENABLED")
+        return
+
+    # PR #233 (b): fail-CLOSED on missing/invalid side before any downstream
+    # gate.  enqueue_signal already validates and stores side_validation_error
+    # on the payload, but worker_loop may dispatch rows enqueued by an older
+    # code path or rows where direct DB writes bypassed enqueue_signal.  This
+    # is the last line of defense.
+    _side, _side_error = _normalize_queue_side(payload)
+    if _side_error:
+        _clean_payload = dict(payload or {})
+        _clean_payload["side_validation_error"] = _side_error
+        _clean_payload.pop("side", None)
+        _clean_payload.pop("direction", None)
+        log.error(
+            "[%s] QUEUE_SIDE_VALIDATION_REJECTED signal_id=%s client_id=%s reason=%s",
+            ticker, signal_id, client_id, _side_error,
+        )
+        _mark_job(
+            job_id,
+            "REJECTED",
+            result={
+                "stage":       "queue_side_validation",
+                "reason":      "INVALID_OR_MISSING_SIDE",
+                "reason_code": "INVALID_OR_MISSING_SIDE",
+                "details":     _side_error,
+            },
+            error="queue_side_validation:INVALID_OR_MISSING_SIDE",
+        )
+        _log_rejection_to_db(
+            signal_id=signal_id,
+            client_id=client_id,
+            ticker=ticker,
+            side="",
+            score=_safe_float(_clean_payload.get("score") or 0),
+            stage="queue_side_validation",
+            reason_code="INVALID_OR_MISSING_SIDE",
+            human_reason=_side_error,
+            payload=_clean_payload,
+        )
+        try:
+            from ap.rejection_feed import post_master_control_block
+            post_master_control_block(
+                ticker=ticker,
+                side="",
+                stage="queue_side_validation",
+                reason="INVALID_OR_MISSING_SIDE",
+                score=_safe_float(_clean_payload.get("score") or 0),
+                pattern=_clean_payload.get("pattern_id") or _clean_payload.get("pattern", ""),
+            )
+        except Exception:
+            pass
+        return
+
+    # Side is valid — normalize back onto the payload so downstream code sees
+    # canonical CALL/PUT regardless of which alias the scanner emitted.
+    payload["side"] = _side
+    payload["direction"] = _side
+    # ── END PR #233 PRE-CHECKS ──────────────────────────────────────────────
 
     # Resolve canonical_signal_id — primary idempotency key for opportunity ledger.
     # PR79 build_canonical_signal_id prevents REEVAL suffix variants from
@@ -1037,6 +1284,15 @@ def _dispatch(
                     _failure = _get_failure() if callable(_get_failure) else None
                 except Exception:
                     _failure = None
+                # PR #233: stash the full failure dict so _mark_job can merge
+                # chain_rows / survivor_count / top_reject_buckets / etc into
+                # result_json for operator-dashboard attribution.  Cleared on
+                # read inside _mark_job.
+                if isinstance(_failure, dict):
+                    try:
+                        _selector_failure_by_job[int(job_id)] = copy.deepcopy(_failure)
+                    except Exception:
+                        pass
                 if isinstance(_failure, dict) and str(_failure.get("reason_code") or "").strip():
                     _reason_code = str(_failure["reason_code"]).strip()
                     _sel_result["reason"]         = _reason_code
