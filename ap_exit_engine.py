@@ -4904,7 +4904,7 @@ class APExitEngine:
                 execution_mode=_exec_mode,
                 contract=str(option_symbol or ""),
                 broker_truth_open_qty=int(getattr(pos, "quantity_remaining", 0) or 0),
-                allow_missing_position_with_broker_truth=True,
+                allow_missing_position_with_broker_truth=str(position_id or "").startswith("broker-repair-"),
             )
             if _exit_guard.get("blocked"):
                 _blocked_reason = str(_exit_guard.get("reason") or "exit_submission_blocked")
