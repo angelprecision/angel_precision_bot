@@ -13,6 +13,9 @@ from ap.logger import get_logger
 log = get_logger("ap.brokers.tradier")
 
 
+_LIVE_MARKET_DATA_BASE_URL = "https://api.tradier.com"
+
+
 @dataclass(frozen=True)
 class TradierConfig:
     base_url: str
@@ -29,20 +32,113 @@ def _to_float(x: Any) -> Optional[float]:
         return None
 
 
+def _clean_base_url(value: str) -> str:
+    return str(value or "").strip().rstrip("/")
+
+
+def _resolve_market_data_token() -> tuple[str, str]:
+    """Return the read-only live Tradier market-data token, if configured.
+
+    Paper execution brokers use sandbox credentials for account/order endpoints.
+    Market-data reads must not inherit those sandbox credentials when a dedicated
+    live data token is available.
+    """
+    token = (os.getenv("TRADIER_MARKET_DATA_TOKEN") or "").strip()
+    if token:
+        return token, "TRADIER_MARKET_DATA_TOKEN"
+    token = (os.getenv("TRADIER_DATA_TOKEN") or "").strip()
+    if token:
+        return token, "TRADIER_DATA_TOKEN"
+    return "", "missing"
+
+
+def _resolve_market_data_base_url() -> str:
+    base_url = _clean_base_url(
+        os.getenv("TRADIER_MARKET_DATA_BASE_URL")
+        or os.getenv("TRADIER_DATA_BASE_URL")
+        or _LIVE_MARKET_DATA_BASE_URL
+    )
+    if not base_url or "sandbox.tradier.com" in base_url.lower():
+        log.warning(
+            "TRADIER_MARKET_DATA_BASE_URL_FORCED_LIVE resolved_url=%s",
+            base_url or "missing",
+        )
+        return _LIVE_MARKET_DATA_BASE_URL
+    return base_url
+
+
+def _is_market_data_url(url: str) -> bool:
+    text = str(url or "")
+    return "/v1/markets/" in text
+
+
+class _TradierSession(requests.Session):
+    """Tradier session that keeps order auth and market-data auth separated.
+
+    The same broker object is used in a few legacy read paths. For PAPER, account
+    and order URLs must continue using the sandbox execution token, while any
+    `/v1/markets/...` request should use the live read-only data token when it is
+    configured. This protects overnight reeval/snapshot reads without changing
+    submit, cancel, account, order-status, or position routes.
+    """
+
+    def __init__(self, *, execution_token: str, market_data_token: str):
+        super().__init__()
+        self._execution_token = str(execution_token or "")
+        self._market_data_token = str(market_data_token or "")
+        self.headers.update({
+            "Authorization": f"Bearer {self._execution_token}",
+            "Accept": "application/json",
+        })
+
+    def request(self, method, url, **kwargs):  # type: ignore[override]
+        headers = dict(kwargs.pop("headers", {}) or {})
+        token = self._execution_token
+        if _is_market_data_url(str(url)) and self._market_data_token:
+            token = self._market_data_token
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        headers.setdefault("Accept", "application/json")
+        kwargs["headers"] = headers
+        return super().request(method, url, **kwargs)
+
+
 class TradierBroker(BrokerAdapter):
     def __init__(self, cfg: TradierConfig):
         self.cfg = cfg
-        self.session = requests.Session()
-        self.session.headers.update({
-            "Authorization": f"Bearer {cfg.access_token}",
-            "Accept": "application/json",
-        })
+        self.market_data_base_url = _resolve_market_data_base_url()
+        self.market_data_token, self.market_data_token_source = _resolve_market_data_token()
+        self.session = _TradierSession(
+            execution_token=cfg.access_token,
+            market_data_token=self.market_data_token,
+        )
+        if "sandbox.tradier.com" in _clean_base_url(cfg.base_url).lower():
+            if self.market_data_token:
+                log.info(
+                    "TRADIER_MARKET_DATA_SPLIT_ACTIVE execution_base_url=%s "
+                    "market_data_base_url=%s token_source=%s",
+                    cfg.base_url,
+                    self.market_data_base_url,
+                    self.market_data_token_source,
+                )
+            else:
+                log.warning(
+                    "TRADIER_MARKET_DATA_SPLIT_MISSING_TOKEN execution_base_url=%s "
+                    "market-data reads will use execution broker fallback until "
+                    "TRADIER_MARKET_DATA_TOKEN or TRADIER_DATA_TOKEN is set",
+                    cfg.base_url,
+                )
 
     # -------------------------
     # HTTP helpers
     # -------------------------
+    def _base_url_for_get(self, path: str) -> str:
+        if str(path or "").startswith("/v1/markets/") and self.market_data_token:
+            return self.market_data_base_url
+        return self.cfg.base_url
+
     def _get(self, path: str, params: Optional[dict] = None) -> dict:
-        url = f"{self.cfg.base_url}{path}"
+        url = f"{self._base_url_for_get(path)}{path}"
         r = self.session.get(url, params=params, timeout=(3.05, 15))
         r.raise_for_status()
         return r.json() if r.content else {}
@@ -375,4 +471,3 @@ class TradierBroker(BrokerAdapter):
         except Exception as e:
             log.error("TRADIER_LIST_POSITIONS_FAILED | error=%s", e)
             return []
-
