@@ -589,6 +589,20 @@ class APMasterControl:
             self.max_daily_loss,
         )
 
+        # PR #224 amendment: surface FINAL_QUALITY_MODE disabled at startup so
+        # an operator sees immediately why no trades are flowing, instead of
+        # discovering it only via a stream of FINAL_QUALITY_MODE_DISABLED
+        # rejections in the decision log.
+        self.final_quality_mode_enabled = _env_true("FINAL_QUALITY_MODE_ENABLED", True)
+        if not self.final_quality_mode_enabled:
+            log.warning(
+                "FINAL_QUALITY_MODE_DISABLED_BLOCKS_ALL_ENTRIES=true | mode=%s "
+                "client=%s — every entry signal will be REJECTED with "
+                "FINAL_QUALITY_MODE_DISABLED until FINAL_QUALITY_MODE_ENABLED "
+                "is re-enabled.",
+                self.mode, getattr(self, "_client_id", "default"),
+            )
+
     def wire(self, *, kill_switch_fn=None, mode_fn=None, position_count_fn=None, alert_fn=None, entries_paused_fn=None, **kwargs):
         if kill_switch_fn:
             self._kill_switch_fn = kill_switch_fn
@@ -2923,17 +2937,38 @@ class APMasterControl:
         trigger_price = getattr(plan, "trigger_price", None)
         stop_price = getattr(plan, "stop_underlying", None)
         target_price = getattr(plan, "target_underlying", None)
+        # PR #224 amendment: entry_price must NEVER be used as a current-price
+        # fallback. entry_price is the planned/historical entry level, not a
+        # live market read. Using it would let stale/no-data signals pass
+        # current-price-dependent gates (TARGET_ALREADY_INVALID,
+        # REMAINING_OPPORTUNITY_TOO_SMALL) on a fabricated "current" price.
         current_price = (
             signal.get("current_price")
+            or signal.get("current_underlying")
             or signal.get("underlying_price")
             or signal.get("last_price")
-            or signal.get("entry_price")
         )
 
         try:
             current_price = float(current_price) if current_price is not None else None
         except Exception:
             current_price = None
+
+        if current_price is None:
+            # PR #224 amendment: do not fabricate a current price. Record why
+            # current-price-dependent gates (TARGET_ALREADY_INVALID,
+            # REMAINING_OPPORTUNITY_TOO_SMALL) are being skipped so operators
+            # can see the gap rather than have it pass silently.
+            if plan.metadata is None:
+                plan.metadata = {}
+            plan.metadata["final_gate_diagnostics"] = {
+                **(plan.metadata.get("final_gate_diagnostics") or {}),
+                "current_price_missing": True,
+                "current_price_dependent_gates_skipped": [
+                    "TARGET_ALREADY_INVALID",
+                    "REMAINING_OPPORTUNITY_TOO_SMALL",
+                ],
+            }
 
         try:
             trigger_price = float(trigger_price) if trigger_price is not None else None
@@ -3034,40 +3069,62 @@ class APMasterControl:
             )
 
         if not self.paper:
+            # PR #224 amendment: explicit rollout-safe env gate.
+            # FINAL_ENTRY_INTELLIGENCE_REQUIRED defaults to True for live so
+            # the existing fail-closed behavior is preserved out of the box.
+            # Setting it false is an explicit emergency rollback switch —
+            # intel unavailability is then only OBSERVED (logged + recorded
+            # in plan.metadata) and does not block the entry.
+            intel_required = _env_true("FINAL_ENTRY_INTELLIGENCE_REQUIRED", True)
             if not bool(intel.get("_available")):
-                self._store_update(signal_id, "rejected", "entry_intelligence_missing")
-                return self._block(
-                    signal_id,
+                if intel_required:
+                    self._store_update(signal_id, "rejected", "entry_intelligence_missing")
+                    return self._block(
+                        signal_id,
+                        ticker,
+                        client_id,
+                        "REJECTED",
+                        "entry_intelligence_missing",
+                        reason_code="ENTRY_INTELLIGENCE_MISSING",
+                    )
+                log.warning(
+                    "[%s] ENTRY_INTELLIGENCE_MISSING_OBSERVED — intel unavailable "
+                    "but FINAL_ENTRY_INTELLIGENCE_REQUIRED=false (emergency "
+                    "rollback active) — proceeding without block",
                     ticker,
-                    client_id,
-                    "REJECTED",
-                    "entry_intelligence_missing",
-                    reason_code="ENTRY_INTELLIGENCE_MISSING",
                 )
-            try:
-                intel_score = float(intel.get("intel_score", intel.get("score", 0)) or 0)
-            except Exception:
-                intel_score = 0.0
-            intel_min_score = float(
-                os.getenv(
-                    "FINAL_ENTRY_INTELLIGENCE_MIN_SCORE",
-                    os.getenv("INTEL_APPROVE_THRESHOLD", "35.0"),
+                if plan.metadata is None:
+                    plan.metadata = {}
+                plan.metadata["final_gate_diagnostics"] = {
+                    **(plan.metadata.get("final_gate_diagnostics") or {}),
+                    "entry_intelligence_missing_observed": True,
+                    "reason_code": "ENTRY_INTELLIGENCE_MISSING_OBSERVED",
+                }
+            else:
+                try:
+                    intel_score = float(intel.get("intel_score", intel.get("score", 0)) or 0)
+                except Exception:
+                    intel_score = 0.0
+                intel_min_score = float(
+                    os.getenv(
+                        "FINAL_ENTRY_INTELLIGENCE_MIN_SCORE",
+                        os.getenv("INTEL_APPROVE_THRESHOLD", "35.0"),
+                    )
                 )
-            )
-            if intel_score < intel_min_score:
-                self._store_update(
-                    signal_id,
-                    "rejected",
-                    f"entry_intelligence_score_too_low:{intel_score:.1f}",
-                )
-                return self._block(
-                    signal_id,
-                    ticker,
-                    client_id,
-                    "REJECTED",
-                    f"entry_intelligence_score_too_low ({intel_score:.1f}<{intel_min_score:.1f})",
-                    reason_code="ENTRY_INTELLIGENCE_SCORE_TOO_LOW",
-                )
+                if intel_score < intel_min_score:
+                    self._store_update(
+                        signal_id,
+                        "rejected",
+                        f"entry_intelligence_score_too_low:{intel_score:.1f}",
+                    )
+                    return self._block(
+                        signal_id,
+                        ticker,
+                        client_id,
+                        "REJECTED",
+                        f"entry_intelligence_score_too_low ({intel_score:.1f}<{intel_min_score:.1f})",
+                        reason_code="ENTRY_INTELLIGENCE_SCORE_TOO_LOW",
+                    )
 
         try:
             from ap_hybrid_client_quality_gate import evaluate_client_quality_gate

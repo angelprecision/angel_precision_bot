@@ -4838,6 +4838,13 @@ def execution_health():
             for v in components.values()
         ) if components else False
 
+        # PR #224 amendment: surface FINAL_QUALITY_MODE_ENABLED here so an
+        # operator hitting /execution/health sees immediately if the final
+        # quality gate is disabled (which blocks every entry signal).
+        _final_quality_mode_enabled = os.getenv(
+            "FINAL_QUALITY_MODE_ENABLED", "true"
+        ).strip().lower() not in {"0", "false", "no", "off", "disabled"}
+
         if members_without_runners:
             return jsonify({
                 "ok": False,
@@ -4853,6 +4860,10 @@ def execution_health():
                 "expected_members": expected_members,
                 "runner_count": 0,
                 "clients": components,
+                "final_quality_mode_enabled": _final_quality_mode_enabled,
+                "final_quality_mode_disabled_blocks_all_entries": (
+                    not _final_quality_mode_enabled
+                ),
             }), 503
 
         return jsonify({
@@ -4862,6 +4873,10 @@ def execution_health():
             "expected_members": expected_members,
             "runner_count": runner_count,
             "clients": components,
+            "final_quality_mode_enabled": _final_quality_mode_enabled,
+            "final_quality_mode_disabled_blocks_all_entries": (
+                not _final_quality_mode_enabled
+            ),
         })
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 200
