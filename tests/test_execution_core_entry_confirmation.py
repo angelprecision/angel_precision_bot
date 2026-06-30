@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import ap_execution_core as core_mod
+import ap_entry_confirmation as entry_confirmation_mod
 from ap_entry_watcher import WatchedSignal
 
 
@@ -216,3 +217,30 @@ def test_enforce_failed_continuation_with_data_blocks_submit(monkeypatch):
         "local-1",
         reason="daily_continuation_failed:trigger_touch_only",
     )
+
+
+def test_confirmation_exception_fails_closed_even_when_confirmation_not_required(monkeypatch):
+    monkeypatch.delenv("ENABLE_DAILY_CONTINUATION_VALIDATION", raising=False)
+    monkeypatch.setenv("ENABLE_DAILY_CONTINUATION_MODE", "observe")
+
+    monkeypatch.setattr(
+        entry_confirmation_mod,
+        "check_entry_confirmation",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+
+    result = _run_entry_trigger(
+        monkeypatch,
+        mode="observe",
+        confirmation_required=False,
+        candles=_failing_candles(),
+        underlying_last=99.60,
+    )
+
+    result["osm"].submit_existing_entry.assert_not_called()
+    result["osm"].expire_pending_entry.assert_called_once_with(
+        "local-1",
+        reason="entry_confirm_error:boom",
+    )
+    assert len(_blocked_calls(result["store"])) == 1
+    assert result["ledger_events"], "ENTRY_CONFIRMATION_FAILED should be recorded"

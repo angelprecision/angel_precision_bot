@@ -157,6 +157,18 @@ def test_legacy_validation_env_maps_to_observe_not_enforce(monkeypatch):
     assert result.metadata["daily_continuation_mode"] == "observe"
 
 
+def test_daily_continuation_default_mode_is_off(monkeypatch):
+    monkeypatch.delenv("ENABLE_DAILY_CONTINUATION_MODE", raising=False)
+    monkeypatch.delenv("ENABLE_DAILY_CONTINUATION_VALIDATION", raising=False)
+
+    result = _confirm(plan=_plan(confirmation_required=False, candles=None), underlying_last=100.9)
+
+    assert result.passed is True
+    assert result.fail_reason is None
+    assert result.metadata["daily_continuation_mode"] == "off"
+    assert result.metadata["daily_continuation_would_block"] is False
+
+
 def test_confirmation_result_to_meta_uses_hybrid_confirmation_required():
     result = ConfirmationResult(
         passed=True,

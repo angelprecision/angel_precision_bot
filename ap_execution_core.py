@@ -2117,52 +2117,37 @@ class APExecutionCore:
                 "(confirmation_required=False for this signal)"
             )
         except Exception as _ec_err:
-            _gate_meta_err = (getattr(approved_plan, "metadata", {}) or {})
-            _hcqg_err = _gate_meta_err.get("hybrid_client_quality_gate") or {}
-            _daily_mode_err = (
-                os.getenv("ENABLE_DAILY_CONTINUATION_MODE", "") or ""
-            ).strip().lower()
-            _sig_tf_err = str((watched.signal or {}).get("timeframe") or "").strip().lower()
-            _enforce_daily_err = (
-                _daily_mode_err == "enforce"
-                and _sig_tf_err in {"1d", "d", "day", "daily", "overnight"}
+            log.error("[%s] ENTRY_CONFIRM_ERROR — failing closed: %s", ticker, _ec_err)
+            _terminalize_breach_failure(
+                f"entry_confirm_error:{_ec_err}",
+                cleanup_action="expire",
+                funnel_key="entry_confirm_blocked",
             )
-            if _hcqg_err.get("confirmation_required") or _enforce_daily_err:
-                # Fail-closed only when legacy confirmation is required.
-                log.error("[%s] ENTRY_CONFIRM_ERROR — failing closed: %s", ticker, _ec_err)
-                _terminalize_breach_failure(
-                    f"entry_confirm_error:{_ec_err}",
-                    cleanup_action="expire",
-                    funnel_key="entry_confirm_blocked",
+            # Runtime confirmation exceptions are not safe observe-only events.
+            # Observe-mode daily continuation is handled above via a normal
+            # failed ConfirmationResult with daily_continuation_mode=observe.
+            try:
+                from ap.opportunity_ledger import (
+                    update_opportunity, STAGE_ENTRY_CONFIRMATION,
                 )
-                # PR81 Final Amendment v2 §3: ENTRY_CONFIRMATION_FAILED ledger write.
-                try:
-                    from ap.opportunity_ledger import (
-                        update_opportunity, STAGE_ENTRY_CONFIRMATION,
-                    )
-                    _client_id_for_ledger = str(
-                        watched.signal.get("client_id") if watched.signal else ""
-                    ) or getattr(self, "client_id", "")
-                    _canon = str(
-                        (watched.signal or {}).get("canonical_signal_id") or signal_id
-                    )
-                    update_opportunity(
-                        signal_id or _canon, _client_id_for_ledger,
-                        "ENTRY_CONFIRMATION_FAILED",
-                        canonical_signal_id=_canon,
-                        miss_stage=STAGE_ENTRY_CONFIRMATION,
-                        miss_reason=f"entry_confirm_error:{_ec_err}",
-                        order_local_id=str(queue_local_order_id) if queue_local_order_id else None,
-                        entry_confirmation_result=f"entry_confirm_error:{_ec_err}",
-                    )
-                except Exception:
-                    pass
-                return
-            log.warning(
-                "[%s] ENTRY_CONFIRM_ERROR_SKIPPED — confirmation_required=False | error=%s",
-                ticker,
-                _ec_err,
-            )
+                _client_id_for_ledger = str(
+                    watched.signal.get("client_id") if watched.signal else ""
+                ) or getattr(self, "client_id", "")
+                _canon = str(
+                    (watched.signal or {}).get("canonical_signal_id") or signal_id
+                )
+                update_opportunity(
+                    signal_id or _canon, _client_id_for_ledger,
+                    "ENTRY_CONFIRMATION_FAILED",
+                    canonical_signal_id=_canon,
+                    miss_stage=STAGE_ENTRY_CONFIRMATION,
+                    miss_reason=f"entry_confirm_error:{_ec_err}",
+                    order_local_id=str(queue_local_order_id) if queue_local_order_id else None,
+                    entry_confirmation_result=f"entry_confirm_error:{_ec_err}",
+                )
+            except Exception:
+                pass
+            return
 
         submit_res = self.order_state_machine.submit_existing_entry(
             local_order_id=queue_local_order_id,

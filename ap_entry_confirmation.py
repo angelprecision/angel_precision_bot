@@ -67,7 +67,7 @@ def _daily_continuation_mode() -> str:
         return raw_mode
     if os.getenv("ENABLE_DAILY_CONTINUATION_VALIDATION") is not None:
         return "observe" if _env_enabled("ENABLE_DAILY_CONTINUATION_VALIDATION", False) else "off"
-    return "observe"
+    return "off"
 
 def _tier_confirm_seconds(score: Optional[float], tier: Optional[str],
                           timeframe: Optional[str]) -> float:
