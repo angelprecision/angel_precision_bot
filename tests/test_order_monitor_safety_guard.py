@@ -117,6 +117,26 @@ def test_get_option_price_uses_explicit_data_broker():
     assert monitor._get_option_price("SPY260717C00500000") == 4.0
 
 
+def test_constructor_recovers_runner_local_data_broker_when_not_explicitly_passed():
+    execution_broker = DummyBroker({"bid": 1.0, "ask": 1.2})
+    data_broker = DummyBroker({"bid": 7.0, "ask": 9.0})
+
+    def build_like_client_runner():
+        return APOrderMonitor(
+            client_id="test-client",
+            broker=execution_broker,
+            order_state_machine=DummyOSM(),
+            position_manager=DummyPM(),
+            client_mode="PAPER",
+        )
+
+    monitor = build_like_client_runner()
+
+    assert monitor.data_broker is data_broker
+    assert execution_broker.data_broker is data_broker
+    assert monitor._get_option_price("SPY260717C00500000") == 8.0
+
+
 def test_active_entry_select_hydrates_retry_repeg_context():
     src = inspect.getsource(APOrderMonitor._get_active_entry_orders)
 
