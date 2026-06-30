@@ -1562,6 +1562,42 @@ def _dispatch(
             f"[{ticker}] Entry order created: {local_order_id} "
             f"contract={getattr(plan, 'contract_symbol', '?')}"
         )
+        try:
+            _queued_logged = _log_signal_to_db(
+                signal_id=signal_id,
+                client_id=client_id,
+                ticker=ticker,
+                side=payload.get("side", ""),
+                score=float(payload.get("score") or 0),
+                stage="order_creation",
+                reason_code="approved_for_execution",
+                human_reason="Master control approved and entry order created.",
+                payload=payload,
+                decision_status="queued",
+                queued_at=datetime.now(timezone.utc).isoformat(),
+            )
+            if not _queued_logged:
+                # PR #225 amendment: order creation already succeeded — that
+                # remains valid. But the ap_signals queued write failed, so
+                # this is the ONLY trace an operator gets to find the real
+                # order. Every field needed to locate it must be present.
+                log.error(
+                    "QUEUED_SIGNAL_WRITE_FAILED_AFTER_ORDER_CREATE "
+                    "signal_id=%s client_id=%s local_order_id=%s ticker=%s "
+                    "execution_mode=%s reason_code=QUEUED_SIGNAL_WRITE_FAILED_AFTER_ORDER_CREATE",
+                    signal_id, client_id, local_order_id, ticker, _execution_mode,
+                )
+        except Exception as _queued_exc:
+            # PR #225 amendment: same fields required on the exception path —
+            # an exception here must not produce a diagnostic with less
+            # information than the plain-failure branch above.
+            log.error(
+                "QUEUED_SIGNAL_WRITE_FAILED_AFTER_ORDER_CREATE "
+                "signal_id=%s client_id=%s local_order_id=%s ticker=%s "
+                "execution_mode=%s reason_code=QUEUED_SIGNAL_WRITE_FAILED_AFTER_ORDER_CREATE "
+                "error=%s",
+                signal_id, client_id, local_order_id, ticker, _execution_mode, _queued_exc,
+            )
         # PR1: ORDER_CREATED — only mark AFTER create_entry_order() returns
         # local_order_id. Status was PREFLIGHT_PASSED before this point.
         try:

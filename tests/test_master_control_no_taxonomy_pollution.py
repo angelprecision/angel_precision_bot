@@ -34,7 +34,12 @@ def test_final_quality_gate_runs_before_dedup_queue_and_approve():
 
     assert gate_idx > 0, "evaluate() must call _run_final_quality_gates()"
     assert dedup_idx > gate_idx, "final gate must run before dedup persistence"
-    assert queued_idx > gate_idx, "final gate must run before queued status mutation"
+    # PR #225: master_control no longer stamps queued directly — that status
+    # is now owned by the queue/worker layer, written only after
+    # create_entry_order() succeeds (see tests/test_queue_admission_truth.py).
+    # The old "queued before queue admission is real" bug (BUG-MC-2) is fixed
+    # by removing the stamp from evaluate() entirely, not by reordering it.
+    assert queued_idx == -1, "master_control must not stamp queued directly"
     assert approve_idx > gate_idx, "final gate must run before APPROVE event emission"
 
 
