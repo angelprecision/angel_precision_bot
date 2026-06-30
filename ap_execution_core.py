@@ -2020,7 +2020,15 @@ class APExecutionCore:
         except Exception as _ec_err:
             _gate_meta_err = (getattr(approved_plan, "metadata", {}) or {})
             _hcqg_err = _gate_meta_err.get("hybrid_client_quality_gate") or {}
-            if _hcqg_err.get("confirmation_required"):
+            _daily_mode_err = (
+                os.getenv("ENABLE_DAILY_CONTINUATION_MODE", "") or ""
+            ).strip().lower()
+            _sig_tf_err = str((watched.signal or {}).get("timeframe") or "").strip().lower()
+            _enforce_daily_err = (
+                _daily_mode_err == "enforce"
+                and _sig_tf_err in {"1d", "d", "day", "daily", "overnight"}
+            )
+            if _hcqg_err.get("confirmation_required") or _enforce_daily_err:
                 # Fail-closed only when legacy confirmation is required.
                 log.error("[%s] ENTRY_CONFIRM_ERROR — failing closed: %s", ticker, _ec_err)
                 _terminalize_breach_failure(
