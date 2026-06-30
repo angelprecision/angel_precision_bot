@@ -8,8 +8,10 @@ can all target the same job window. This module enforces SINGLE execution at the
 DB layer via an INSERT ... ON CONFLICT DO NOTHING on a unique run_key.
 
 This is REAL enforcement, not log-only job_window_key:
-  - try_acquire_run_lock() returns True only for the first caller of a run_key.
-  - All subsequent callers within the same trade_date get False (skip_locked).
+  - try_acquire_run_lock() returns an acquire result dict with `acquired=True`
+    only for the winning caller of a run_key.
+  - All subsequent callers within the same trade_date get
+    `{"acquired": False, "reason": "lock_held"}`.
   - A stale 'running' lock older than STALE_LOCK_SECONDS is reclaimable so a
     crashed run does not block the window forever.
 
@@ -22,26 +24,32 @@ Usage in an admin endpoint:
 
     run_key = build_run_key(job_name="morning_handoff_primary",
                             execution_mode="live", client_scope="jason@...")
-    acquired = try_acquire_run_lock(run_key, job_name=..., execution_mode=...,
-                                    client_scope=..., triggered_by="render_cron")
-    if not acquired:
+    acquire_result = try_acquire_run_lock(
+        run_key,
+        job_name=...,
+        execution_mode=...,
+        client_scope=...,
+        triggered_by="render_cron",
+    )
+    if not acquire_result.get("acquired"):
         return jsonify({"ok": True, "skipped": "run_lock_held", "run_key": run_key})
     try:
         ... do the work ...
-        mark_run_lock_completed(run_key, summary)
+        mark_run_lock_completed(run_key, acquire_result["owner_token"], summary)
     except Exception as e:
-        mark_run_lock_failed(run_key, str(e))
+        mark_run_lock_failed(run_key, acquire_result["owner_token"], str(e))
         raise
 """
 from __future__ import annotations
 
 import hashlib
 import logging
+import uuid
 from datetime import datetime, timezone, date
 # PR #182: table renamed handoff_run_locks → handoff_job_locks.
 # See migrations/20260625_handoff_run_locks_schema_fix.sql.
 # handoff_run_locks is now reserved for ap/morning_handoff.py (per-client stage tracking).
-from typing import Optional
+from typing import Any, Optional
 
 log = logging.getLogger("ap.handoff_run_lock")
 
@@ -83,8 +91,8 @@ def try_acquire_run_lock(
     client_scope: str,
     triggered_by: str = "unknown",
     trade_date: Optional[date] = None,
-) -> bool:
-    """Attempt to acquire the run lock. Returns True iff this caller won.
+) -> dict[str, Any]:
+    """Attempt to acquire the run lock.
 
     Single atomic statement: INSERT ... ON CONFLICT DO NOTHING. The unique
     PRIMARY KEY on run_key guarantees exactly one winner across all processes
@@ -97,22 +105,29 @@ def try_acquire_run_lock(
     from ap.db import conn, run_with_retry
 
     td = trade_date or _today_et()
+    owner_token = uuid.uuid4().hex
 
-    def _acquire() -> bool:
+    def _acquire() -> dict[str, Any]:
         with conn() as c:
             # Fast path: first writer wins.
             c.execute(
                 """
                 INSERT INTO public.handoff_job_locks
                     (run_key, trade_date, job_name, execution_mode,
-                     client_scope, triggered_by, status, acquired_at)
-                VALUES (%s, %s, %s, %s, %s, %s, 'running', NOW())
+                     client_scope, triggered_by, status, acquired_at, owner_token)
+                VALUES (%s, %s, %s, %s, %s, %s, 'running', NOW(), %s)
                 ON CONFLICT (run_key) DO NOTHING
                 """,
-                (run_key, td, job_name, execution_mode, client_scope, triggered_by),
+                (run_key, td, job_name, execution_mode, client_scope, triggered_by, owner_token),
             )
             if c.rowcount == 1:
-                return True
+                return {
+                    "acquired": True,
+                    "run_key": run_key,
+                    "owner_token": owner_token,
+                    "reclaimed": False,
+                    "lock_persisted": True,
+                }
 
             # Lock exists. Reclaim if it is:
             #   (a) a stale 'running' row (crashed run), OR
@@ -125,7 +140,8 @@ def try_acquire_run_lock(
                 """
                 UPDATE public.handoff_job_locks
                 SET    status='running', acquired_at=NOW(),
-                       triggered_by=%s, completed_at=NULL, result_summary=NULL
+                       triggered_by=%s, completed_at=NULL, result_summary=NULL,
+                       failed_reason=NULL, owner_token=%s
                 WHERE  run_key=%s
                   AND  (
                           status='failed'
@@ -133,23 +149,37 @@ def try_acquire_run_lock(
                            AND acquired_at < NOW() - (%s || ' seconds')::interval)
                        )
                 """,
-                (triggered_by, run_key, str(STALE_LOCK_SECONDS)),
+                (triggered_by, owner_token, run_key, str(STALE_LOCK_SECONDS)),
             )
-            return c.rowcount == 1
+            if c.rowcount == 1:
+                return {
+                    "acquired": True,
+                    "run_key": run_key,
+                    "owner_token": owner_token,
+                    "reclaimed": True,
+                    "lock_persisted": True,
+                }
+
+            return {
+                "acquired": False,
+                "run_key": run_key,
+                "owner_token": None,
+                "reason": "lock_held",
+            }
 
     try:
-        won = run_with_retry(_acquire)
-        if won:
+        result = run_with_retry(_acquire)
+        if result.get("acquired"):
             log.info(
-                "HANDOFF_RUN_LOCK_ACQUIRED run_key=%s triggered_by=%s",
-                run_key, triggered_by,
+                "HANDOFF_RUN_LOCK_ACQUIRED run_key=%s triggered_by=%s reclaimed=%s",
+                run_key, triggered_by, bool(result.get("reclaimed")),
             )
         else:
             log.info(
                 "HANDOFF_RUN_LOCK_SKIPPED run_key=%s triggered_by=%s reason=lock_held",
                 run_key, triggered_by,
             )
-        return bool(won)
+        return result
     except Exception as exc:
         # If the lock table is unavailable, FAIL OPEN with a warning rather than
         # blocking the morning job entirely. Double-execution is undesirable but
@@ -159,10 +189,21 @@ def try_acquire_run_lock(
             "HANDOFF_RUN_LOCK_ERROR run_key=%s triggered_by=%s error=%s — failing open",
             run_key, triggered_by, exc,
         )
-        return True
+        return {
+            "acquired": True,
+            "run_key": run_key,
+            "owner_token": owner_token,
+            "reclaimed": False,
+            "reason": "lock_error_fail_open",
+            "lock_persisted": False,
+        }
 
 
-def mark_run_lock_completed(run_key: str, result_summary: Optional[dict] = None) -> None:
+def mark_run_lock_completed(
+    run_key: str,
+    owner_token: str,
+    result_summary: Optional[dict] = None,
+) -> None:
     """Mark the lock completed. Never raises."""
     from ap.db import conn, run_with_retry
     import json as _json
@@ -174,29 +215,46 @@ def mark_run_lock_completed(run_key: str, result_summary: Optional[dict] = None)
                 UPDATE public.handoff_job_locks
                 SET    status='completed', completed_at=NOW(), result_summary=%s
                 WHERE  run_key=%s
+                  AND  owner_token=%s
+                  AND  status='running'
                 """,
-                (_json.dumps(result_summary or {}), run_key),
+                (_json.dumps(result_summary or {}), run_key, owner_token),
             )
+            if c.rowcount == 0:
+                log.warning("HANDOFF_RUN_LOCK_OWNER_MISMATCH run_key=%s action=complete", run_key)
     try:
         run_with_retry(_complete)
     except Exception as exc:
         log.warning("HANDOFF_RUN_LOCK_COMPLETE_FAILED run_key=%s error=%s", run_key, exc)
 
 
-def mark_run_lock_failed(run_key: str, error: str) -> None:
+def mark_run_lock_failed(
+    run_key: str,
+    owner_token: str,
+    error: str,
+    result_summary: Optional[dict] = None,
+) -> None:
     """Mark the lock failed so the window can be retried. Never raises."""
     from ap.db import conn, run_with_retry
+    import json as _json
 
     def _fail():
         with conn() as c:
             c.execute(
                 """
                 UPDATE public.handoff_job_locks
-                SET    status='failed', completed_at=NOW()
+                SET    status='failed',
+                       completed_at=NOW(),
+                       failed_reason=%s,
+                       result_summary=%s
                 WHERE  run_key=%s
+                  AND  owner_token=%s
+                  AND  status='running'
                 """,
-                (run_key,),
+                (error, _json.dumps(result_summary or {}), run_key, owner_token),
             )
+            if c.rowcount == 0:
+                log.warning("HANDOFF_RUN_LOCK_OWNER_MISMATCH run_key=%s action=fail", run_key)
     try:
         run_with_retry(_fail)
     except Exception as exc:

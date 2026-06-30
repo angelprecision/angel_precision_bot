@@ -487,7 +487,21 @@ def test_admin_morning_handoff_get_rejects_runner_mode_mismatch(morning_handoff_
 
 def test_admin_morning_handoff_post_rejects_zero_matched_explicit_client(morning_handoff_client):
     active = {"jose@example.com": _fake_runner(mode="paper")}
-    with patch.dict(sys.modules, {"client_runner": _fake_client_runner_module(active)}):
+    fake_lock_mod = SimpleNamespace(
+        build_run_key=lambda **_: "rk-zero",
+        try_acquire_run_lock=lambda *a, **k: {
+            "acquired": True,
+            "run_key": "rk-zero",
+            "owner_token": "tok-zero",
+            "reclaimed": False,
+        },
+        mark_run_lock_completed=MagicMock(),
+        mark_run_lock_failed=MagicMock(),
+    )
+    with patch.dict(sys.modules, {
+        "client_runner": _fake_client_runner_module(active),
+        "ap_handoff_run_lock": fake_lock_mod,
+    }):
         resp = morning_handoff_client.post(
             "/admin/morning_handoff_audit",
             json={"client_id": "jason@example.com", "execution_mode": "live", "dry_run": False},
@@ -498,6 +512,8 @@ def test_admin_morning_handoff_post_rejects_zero_matched_explicit_client(morning
     assert body["error"] == "requested_clients_not_in_active_runners_for_mode"
     assert body["requested_clients"] == ["jason@example.com"]
     assert body["requested_mode"] == "live"
+    fake_lock_mod.mark_run_lock_completed.assert_not_called()
+    fake_lock_mod.mark_run_lock_failed.assert_called_once()
 
 
 def test_admin_morning_handoff_post_rejects_conflicting_mode_and_execution_mode():
