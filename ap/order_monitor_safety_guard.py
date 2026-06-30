@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import re
@@ -71,6 +72,52 @@ def _direction_from_contract(contract: Any) -> str:
     return "CALL" if match.group(1) == "C" else "PUT"
 
 
+def _find_runner_data_broker(client_id: str | None = None):
+    """Best-effort recovery for current ClientRunner construction shape.
+
+    client_runner resolves a dedicated data_broker before constructing
+    APOrderMonitor, but the current constructor call does not pass it. While the
+    direct call site is being reviewed, recover the already-resolved object from
+    the caller frame or active runner so quote reads do not silently fall back to
+    the sandbox execution broker in PAPER.
+    """
+    try:
+        frame = inspect.currentframe()
+        if frame is None:
+            return None
+        frame = frame.f_back
+        while frame is not None:
+            loc = frame.f_locals
+            candidate = loc.get("data_broker") or loc.get("databroker")
+            if candidate is not None:
+                return candidate
+            runner = loc.get("self")
+            if runner is not None:
+                runner_email = getattr(runner, "email", None) or getattr(runner, "client_id", None)
+                if not client_id or not runner_email or str(runner_email) == str(client_id):
+                    candidate = getattr(runner, "data_broker", None) or getattr(runner, "databroker", None)
+                    if candidate is not None:
+                        return candidate
+            frame = frame.f_back
+    except Exception:
+        return None
+    finally:
+        try:
+            del frame
+        except Exception:
+            pass
+
+    try:
+        import client_runner as _client_runner
+        runners = getattr(_client_runner, "_active_runners", {}) or {}
+        runner = runners.get(client_id) if client_id else None
+        if runner is not None:
+            return getattr(runner, "data_broker", None) or getattr(runner, "databroker", None)
+    except Exception:
+        return None
+    return None
+
+
 def _quote_broker_for(monitor: Any):
     broker = getattr(monitor, "broker", None)
     return (
@@ -97,7 +144,17 @@ def _with_quote_routing(monitor: Any, fn, *args, **kwargs):
 def _guarded_init(self, *args, data_broker=None, **kwargs):
     _ORIGINALS["__init__"](self, *args, **kwargs)
     broker = getattr(self, "broker", None)
-    self.data_broker = data_broker or getattr(broker, "data_broker", None)
+    recovered_data_broker = (
+        data_broker
+        or getattr(broker, "data_broker", None)
+        or _find_runner_data_broker(getattr(self, "client_id", None))
+    )
+    self.data_broker = recovered_data_broker
+    if broker is not None and recovered_data_broker is not None and getattr(broker, "data_broker", None) is None:
+        try:
+            setattr(broker, "data_broker", recovered_data_broker)
+        except Exception:
+            pass
 
 
 def _guarded_advance_from_broker_status(self, local_order_id: str, broker_status, contract: str):
