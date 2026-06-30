@@ -571,3 +571,105 @@ def test_exit_engine_callback_path_allows_broker_repair_position_with_broker_tru
     assert calls["position_id"] == "broker-repair-jason@example.com-SMCI260626P00032500"
     assert calls["broker_truth_open_qty"] == 3
     assert calls["allow_missing_position_with_broker_truth"] is True
+
+
+def test_exit_engine_callback_path_does_not_allow_missing_non_repair_position(monkeypatch):
+    from ap_exit_engine import APExitEngine, ExitDecision, ManagedPosition
+    import ap_exit_engine as exit_engine_mod
+
+    engine = APExitEngine.__new__(APExitEngine)
+    engine.client_id = "jason@example.com"
+    engine._email = "jason@example.com"
+    engine._lock = __import__("threading").Lock()
+    engine._thread = None
+    engine._running = False
+    engine.run_id = "run-1"
+    engine.strategy_version = "test"
+    engine.git_commit = "test"
+    engine.master_control = type("MC", (), {"mode": "live"})()
+    engine.on_scale = None
+    engine.order_state_machine = None
+    engine.osm = None
+    engine._positions = []
+    engine._positions_by_id = {}
+    engine.hydrate_pending_exit_identity_from_db = lambda pos: False
+    engine._emit_exit_event = lambda *args, **kwargs: None
+    engine._extract_exit_order_identity = lambda result: {
+        "accepted": True,
+        "local_order_id": "L-EXIT-001",
+        "broker_order_id": "BO-EXIT-001",
+        "raw_status": "accepted",
+    }
+    engine._mark_exit_submitted = lambda current_pos, decision, local_order_id="", broker_order_id="": (
+        setattr(current_pos, "exit_in_flight", True),
+        setattr(current_pos, "pending_exit_local_order_id", local_order_id),
+        setattr(current_pos, "pending_exit_broker_order_id", broker_order_id),
+    )
+
+    calls = {}
+
+    def _fake_guard(**kwargs):
+        calls.update(kwargs)
+        return {
+            "blocked": True,
+            "reason": "position_missing",
+            "position_state": {"blocked": True, "reason": "position_missing"},
+            "circuit_breaker": None,
+        }
+
+    monkeypatch.setattr(exit_safety_mod, "evaluate_exit_submission_safety", _fake_guard)
+    monkeypatch.setattr(exit_engine_mod, "_is_option_quote_stale", lambda pos, now_utc: (False, 0.0, "fresh"))
+    monkeypatch.setattr(exit_engine_mod, "_classify_exit_decision", lambda decision: "RUNNER_TRAIL")
+
+    callback_calls = []
+    engine.on_exit = lambda pos, decision: callback_calls.append((pos.position_id, decision.quantity)) or {
+        "accepted": True,
+        "local_order_id": "L-EXIT-001",
+        "broker_order_id": "BO-EXIT-001",
+        "status": "accepted",
+    }
+
+    pos = ManagedPosition(
+        ticker="SMCI",
+        option_symbol="SMCI260626P00032500",
+        side="PUT",
+        quantity=3,
+        entry_price=1.0,
+        underlying_entry=100.0,
+        underlying_target=90.0,
+        underlying_stop=110.0,
+        position_id="pos-live-123",
+        client_id="jason@example.com",
+        execution_mode="live",
+        current_bid=1.2,
+        current_ask=1.3,
+        current_option_price=1.25,
+        current_underlying=99.0,
+        quantity_remaining=3,
+    )
+
+    decision = ExitDecision(
+        action="CLOSE_ALL",
+        quantity=3,
+        reason="manual test close",
+        urgency="HIGH",
+        pnl_pct=0.1,
+        suggested_limit=1.2,
+    )
+    engine._positions = [pos]
+    engine._positions_by_id = {pos.position_id: pos}
+
+    result = engine._submit_exit_decision(pos, decision)
+
+    assert result is False
+    assert callback_calls == []
+    assert calls["position_id"] == "pos-live-123"
+    assert calls["allow_missing_position_with_broker_truth"] is False
+
+
+def test_exit_manager_open_positions_query_includes_execution_mode():
+    src = (REPO_ROOT / "ap" / "exit_manager.py").read_text()
+    idx = src.find("def get_open_positions():")
+    assert idx != -1
+    region = src[idx: idx + 500]
+    assert "execution_mode" in region

@@ -40,7 +40,7 @@ def get_open_positions():
     with conn() as c:
         rows = run_with_retry(lambda: c.execute("""
             SELECT id, underlying, contract, direction, qty, avg_fill,
-                   tp_pct, sl_pct, entry_ts, status, client_id
+                   tp_pct, sl_pct, entry_ts, status, client_id, execution_mode
             FROM positions
             WHERE status IN ('OPEN','CLOSING')
             ORDER BY entry_ts ASC
