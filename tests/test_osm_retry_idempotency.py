@@ -102,6 +102,9 @@ def mock_osm():
                 "ticker": "BA", "contract": "BA260522C00220000", "qty": 2,
                 "limit_price": 1.50, "plan_id": "p", "signal_id": "s",
                 "client_id": "test@x.com", "direction": "CALL",
+                "execution_mode": "paper", "timeframe": "1d", "pattern": "2-3",
+                "score": 75.0, "trigger_price": 220.0, "underlying_entry": 220.25,
+                "target_price": 223.0, "stop_price": 218.5,
             }
 
     return _MockOSM()
@@ -117,6 +120,16 @@ def plan_stub():
         contract_symbol = "BA260522C00220000"
         contracts = 2
         limit_price = 1.50
+        execution_mode = "paper"
+        side = "CALL"
+        direction = "CALL"
+        timeframe = "1d"
+        pattern = "2-3"
+        score = 75.0
+        trigger_price = 220.0
+        underlying_entry = 220.25
+        target_price = 223.0
+        stop_price = 218.5
     return _Plan()
 
 
