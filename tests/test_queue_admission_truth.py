@@ -27,4 +27,16 @@ def test_master_control_no_longer_stamps_queued_directly():
 
 
 def test_queue_logs_when_post_create_queued_write_fails():
-    assert "queued ap_signals write failed after create_entry_order" in QUEUE_SRC
+    # PR #225 amendment: the diagnostic must carry every field an operator
+    # needs to find the real order when the post-create ap_signals queued
+    # write fails — signal_id, client_id, local_order_id, ticker,
+    # execution_mode, and an explicit reason_code. Checked on both the
+    # not-logged branch and the exception branch.
+    assert QUEUE_SRC.count("QUEUED_SIGNAL_WRITE_FAILED_AFTER_ORDER_CREATE") >= 2, (
+        "reason_code=QUEUED_SIGNAL_WRITE_FAILED_AFTER_ORDER_CREATE must appear "
+        "on both the failed-write branch and the exception branch"
+    )
+    assert "signal_id=%s" in QUEUE_SRC
+    assert "client_id=%s" in QUEUE_SRC
+    assert "local_order_id=%s" in QUEUE_SRC
+    assert "execution_mode=%s" in QUEUE_SRC
