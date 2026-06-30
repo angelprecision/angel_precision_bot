@@ -98,7 +98,7 @@ def _run(target_client, mode, signals, members=None, fetch_err=None,
          patch("ap.morning_handoff._watching_row_exists", return_value=exists), \
          patch("ap.morning_handoff._insert_trade_queue_watching",
                return_value=insert_return) as mock_ins, \
-         patch("ap.morning_handoff._mark_watcher_started") as mock_mark, \
+         patch("ap.morning_handoff._mark_source_signal_handoff_started") as mock_mark, \
          patch("ap.morning_handoff._update_ap_signal_blocked") as mock_block:
         result = enqueue_watching_signals_to_trade_queue(
             target_client, mode, trading_date=TODAY, dry_run=dry_run,
