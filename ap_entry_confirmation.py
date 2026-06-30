@@ -298,7 +298,7 @@ def _run_daily_continuation_guard(
     if not _is_daily_timeframe(timeframe):
         return None
 
-    if not _env_enabled("ENABLE_DAILY_CONTINUATION_VALIDATION", True):
+    if not _env_enabled("ENABLE_DAILY_CONTINUATION_VALIDATION", False):  # safe default: must be explicitly enabled in Render
         return ConfirmationResult(
             passed=True,
             fail_reason=None,

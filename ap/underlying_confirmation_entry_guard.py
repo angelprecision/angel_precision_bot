@@ -153,7 +153,7 @@ def _first_float(sources: list[Any], *keys: str) -> Optional[float]:
 
 
 def requires_underlying_confirmation(*, plan: Any = None, payload: Any = None, order: Any = None) -> bool:
-    if not _truthy_env("UNDERLYING_CONFIRMATION_ENTRY_GUARD_ENABLED", True):
+    if not _truthy_env("UNDERLYING_CONFIRMATION_ENTRY_GUARD_ENABLED", False):  # safe default: must be explicitly enabled in Render
         return False
     sources = _sources(plan, payload, order)
     explicit = _first_text(

@@ -514,7 +514,7 @@ def validate_daily_intraday_continuation(
         diagnostics["reason"] = reason
         return ContinuationDecision(allowed=allowed, reason=reason, diagnostics=diagnostics)
 
-    if not _env_enabled("ENABLE_DAILY_CONTINUATION_VALIDATION", True):
+    if not _env_enabled("ENABLE_DAILY_CONTINUATION_VALIDATION", False):  # safe default: must be explicitly enabled in Render
         return decide(True, REASON_DISABLED)
 
     if not _is_daily_timeframe(timeframe):
