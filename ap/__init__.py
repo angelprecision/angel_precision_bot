@@ -15,10 +15,17 @@ def install_underlying_confirmation_safety_guard() -> None:
     install_underlying_confirmation_entry_guard()
 
 
+def install_order_monitor_safety_guards() -> None:
+    from .order_monitor_safety_guard import install_order_monitor_safety_guard
+
+    install_order_monitor_safety_guard()
+
+
 def install_entry_safety_guards() -> None:
     installers = (
         install_entry_metadata_safety_guards,
         install_underlying_confirmation_safety_guard,
+        install_order_monitor_safety_guards,
     )
     for installer in installers:
         try:
