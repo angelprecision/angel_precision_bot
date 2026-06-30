@@ -859,24 +859,11 @@ class TestInvariantRevalidateExposureNoDoubleCount:
 # ══════════════════════════════════════════════════════════════════
 
 class TestFix7DeferredToPRf:
-    def test_queued_before_insert_todo_present_in_source(self):
-        """BUG-MC-2 (queued-before-insert) is out of scope for PR E
-        because the fix requires coordinated changes in the queue/
-        worker layer outside master_control. This test records the
-        deferred scope as a TODO comment in master_control so PR F
-        has a clear pickup signal."""
-        # The TODO must reference BUG-MC-2 explicitly and live near
-        # the _store_update(signal_id, "queued", ...) call site.
-        idx = MC_SRC.find('self._store_update(signal_id, "queued"')
-        assert idx > 0, "Could not locate the _store_update queued call site"
-        # Search ±20 lines for the TODO marker.
-        block = MC_SRC[max(0, idx - 1000):idx + 200]
-        assert re.search(
-            r'TODO\(PR\s*F\)|TODO:\s*BUG-MC-2|BUG-MC-2',
-            block,
-        ), (
-            "A TODO referencing PR F or BUG-MC-2 must appear near the "
-            "`_store_update(signal_id, 'queued', ...)` call in evaluate. "
-            "This is the deferred-scope marker so PR F has a clear "
-            "pickup signal for the queued-before-insert fix."
+    def test_master_control_no_longer_stamps_queued(self):
+        """BUG-MC-2 follow-up: queued status must not be stamped inside
+        master_control.evaluate(). Queue admission truth is owned by the
+        queue/worker layer after create_entry_order succeeds."""
+        assert 'self._store_update(signal_id, "queued"' not in MC_SRC, (
+            "master_control.evaluate must not stamp queued directly. "
+            "Queued status now belongs to the post-create_entry_order path in ap/queue.py."
         )

@@ -2650,7 +2650,7 @@ class APMasterControl:
                 _final_quality_block.plan.metadata = plan.metadata or {}
             return _final_quality_block
 
-        # Persist dedup first. Only then add in-memory keys and mark queued.
+        # Persist dedup first. Only then add in-memory keys.
         # In LIVE mode a dedup-persist failure blocks the signal (fail-closed).
         # In paper mode a transient DB hiccup should not kill a valid signal.
         try:
@@ -2666,14 +2666,6 @@ class APMasterControl:
             log.warning("[%s] Dedup persist failed in paper — proceeding: %s", ticker, _dedup_err)
         self._seen_signals[signal_key] = time.time()
         self._seen_signals[setup_key] = time.time()
-        # TODO(PR F) BUG-MC-2: This `queued` status is stamped BEFORE the
-        # queue/worker layer (route_signal_to_all_clients → enqueue_signal)
-        # has confirmed the insert. If the queue insert later fails, the
-        # signal row shows "queued" but is not actually in any queue. The
-        # fix requires moving this stamp to the post-enqueue path in
-        # client_runner / queue layer (broad changes outside master_control).
-        # Scope-deferred to PR F per audit decision (audit dated 2026-05-25).
-        self._store_update(signal_id, "queued", timestamp_flag="queued_at")
 
         try:
             if emit_decision_event:

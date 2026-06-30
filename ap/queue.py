@@ -1562,6 +1562,31 @@ def _dispatch(
             f"[{ticker}] Entry order created: {local_order_id} "
             f"contract={getattr(plan, 'contract_symbol', '?')}"
         )
+        try:
+            _queued_logged = _log_signal_to_db(
+                signal_id=signal_id,
+                client_id=client_id,
+                ticker=ticker,
+                side=payload.get("side", ""),
+                score=float(payload.get("score") or 0),
+                stage="order_creation",
+                reason_code="approved_for_execution",
+                human_reason="Master control approved and entry order created.",
+                payload=payload,
+                decision_status="queued",
+                queued_at=datetime.now(timezone.utc).isoformat(),
+            )
+            if not _queued_logged:
+                log.warning(
+                    "[%s] queued ap_signals write failed after create_entry_order "
+                    "signal=%s local_order_id=%s",
+                    ticker, signal_id, local_order_id,
+                )
+        except Exception as _queued_exc:
+            log.warning(
+                "[%s] queued ap_signals write raised after create_entry_order: %s",
+                ticker, _queued_exc,
+            )
         # PR1: ORDER_CREATED — only mark AFTER create_entry_order() returns
         # local_order_id. Status was PREFLIGHT_PASSED before this point.
         try:
