@@ -7,7 +7,6 @@ from types import SimpleNamespace
 import pytest
 
 from ap.entry_metadata_guard import (
-    MISSING_PATTERN,
     MISSING_SIGNAL_ID,
     UNKNOWN_EXECUTION_MODE,
     ZERO_SCORE,
@@ -61,10 +60,10 @@ def test_score_zero_blocks():
     assert result.reason == ZERO_SCORE
 
 
-def test_pattern_blank_blocks():
+def test_pattern_blank_is_non_blocking():
     result = validate_entry_metadata(plan=_shaped_signal(pattern="", pattern_id=""))
-    assert not result.ok
-    assert result.reason == MISSING_PATTERN
+    assert result.ok
+    assert result.reason is None
 
 
 def test_trigger_zero_blocks():

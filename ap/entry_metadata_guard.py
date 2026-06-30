@@ -102,7 +102,6 @@ def validate_entry_metadata(*, plan=None, order=None, caller_meta=None, client_i
     if _dir(raw_side) not in VALID_DIRECTIONS: return EntryMetadataValidationResult(False, INVALID_DIRECTION, {"direction": raw_side})
     raw_tf = _first(srcs, ("timeframe",))
     if not _txt(raw_tf): return EntryMetadataValidationResult(False, MISSING_TIMEFRAME)
-    if not _txt(_first(srcs, ("pattern", "pattern_id"))): return EntryMetadataValidationResult(False, MISSING_PATTERN)
     ok, val = _positive(srcs, ("score", "ev_score", "scanner_score"))
     if not ok: return EntryMetadataValidationResult(False, ZERO_SCORE, {"score": val})
     ok, val = _positive(srcs, ("trigger_price", "entry_trigger", "trigger.entry", "entry_price", "signal_entry_price"))
