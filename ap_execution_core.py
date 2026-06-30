@@ -1378,56 +1378,6 @@ class APExecutionCore:
                         reason=_reason,
                         extra={"stage": _deferred_selector_audit.get("stage") or "unknown"},
                     )
-                    # ── PR #182: write selector failure reason to trade_queue.last_error ──
-                    # Path A: select() returned None. Order is being terminated via
-                    # _terminalize_deferred_breach_failure below. Write the reason
-                    # to trade_queue.last_error first so the operator can see WHY
-                    # this DEFERRED row failed — without needing Render log access.
-                    # Best-effort: failure here must never block the cleanup below.
-                    try:
-                        from ap.queue import write_deferred_breach_last_error
-                        _queue_id_for_obs = (
-                            sig.get("queue_id")
-                            or sig.get("trade_queue_id")
-                            or (getattr(approved_plan, "metadata", None) or {}).get("queue_id")
-                        )
-                        _prior_attempt = 0
-                        try:
-                            _prior_attempt = int(
-                                (getattr(approved_plan, "metadata", None) or {}).get(
-                                    "breach_attempt_count", 0
-                                ) or 0
-                            )
-                        except (TypeError, ValueError):
-                            _prior_attempt = 0
-                        _this_attempt = _prior_attempt + 1
-                        _obs_rc_a = (
-                            _deferred_selector_audit.get("reason_code")
-                            or "BREACH_SELECTOR_RETURNED_NONE"
-                        )
-                        write_deferred_breach_last_error(
-                            _queue_id_for_obs,
-                            reason_code=str(_obs_rc_a),
-                            explanation=str(_reason or "")[:400],
-                            attempt=_this_attempt,
-                            client_id=_breach_client_id,
-                            ticker=ticker,
-                        )
-                        try:
-                            _upd_a = getattr(self.order_state_machine, "update_order_meta", None)
-                            if callable(_upd_a) and queue_local_order_id:
-                                _upd_a(queue_local_order_id, {
-                                    "breach_attempt_count":           _this_attempt,
-                                    "last_breach_failure_reason":     str(_reason or ""),
-                                    "last_breach_failure_reason_code": str(_obs_rc_a),
-                                    "last_breach_failure_at":         datetime.now(timezone.utc).isoformat(),
-                                    "last_breach_selector_audit":     _deferred_selector_audit or {},
-                                })
-                        except Exception as _ma_exc:
-                            log.debug("[%s] PR182 meta update non-critical: %s", ticker, _ma_exc)
-                    except Exception as _obs_a_exc:
-                        log.debug("[%s] PR182 write-back non-critical: %s", ticker, _obs_a_exc)
-                    # ── end PR #182 Path A ─────────────────────────────────────
                     _terminalize_deferred_breach_failure(
                         _reason,
                         extra_meta={
@@ -1478,55 +1428,6 @@ class APExecutionCore:
                         contract=_live_contract,
                         extra={"stage": "deferred_copy_back"},
                     )
-                    # ── PR #182: write selector failure reason to trade_queue.last_error ──
-                    # Path B: selector returned a value but contract is still DEFERRED:
-                    # (copy-back failed or returned unresolved placeholder). Write reason
-                    # to trade_queue.last_error before terminal cleanup.
-                    # Best-effort: failure here must never block the cleanup below.
-                    try:
-                        from ap.queue import write_deferred_breach_last_error
-                        _queue_id_for_obs_b = (
-                            sig.get("queue_id")
-                            or sig.get("trade_queue_id")
-                            or (getattr(approved_plan, "metadata", None) or {}).get("queue_id")
-                        )
-                        _prior_attempt_b = 0
-                        try:
-                            _prior_attempt_b = int(
-                                (getattr(approved_plan, "metadata", None) or {}).get(
-                                    "breach_attempt_count", 0
-                                ) or 0
-                            )
-                        except (TypeError, ValueError):
-                            _prior_attempt_b = 0
-                        _this_attempt_b = _prior_attempt_b + 1
-                        _obs_rc_b = (
-                            _deferred_selector_audit.get("reason_code")
-                            or "DEFERRED_UNRESOLVED_AT_BREACH"
-                        )
-                        write_deferred_breach_last_error(
-                            _queue_id_for_obs_b,
-                            reason_code=str(_obs_rc_b),
-                            explanation=str(_reason or "")[:400],
-                            attempt=_this_attempt_b,
-                            client_id=_breach_client_id,
-                            ticker=ticker,
-                        )
-                        try:
-                            _upd_b = getattr(self.order_state_machine, "update_order_meta", None)
-                            if callable(_upd_b) and queue_local_order_id:
-                                _upd_b(queue_local_order_id, {
-                                    "breach_attempt_count":           _this_attempt_b,
-                                    "last_breach_failure_reason":     str(_reason or ""),
-                                    "last_breach_failure_reason_code": str(_obs_rc_b),
-                                    "last_breach_failure_at":         datetime.now(timezone.utc).isoformat(),
-                                    "last_breach_selector_audit":     _deferred_selector_audit or {},
-                                })
-                        except Exception as _mb_exc:
-                            log.debug("[%s] PR182 meta update non-critical: %s", ticker, _mb_exc)
-                    except Exception as _obs_b_exc:
-                        log.debug("[%s] PR182 write-back non-critical: %s", ticker, _obs_b_exc)
-                    # ── end PR #182 Path B ─────────────────────────────────────
                     _terminalize_deferred_breach_failure(
                         _reason,
                         extra_meta={
@@ -1972,57 +1873,75 @@ class APExecutionCore:
             )
             if not _confirm_result.passed:
                 _fail_reason = _confirm_result.fail_reason or "entry_confirm_failed"
-                log.info(
-                    "[%s] ENTRY_CONFIRM_BLOCK — %s | client=%s | "
-                    "spread=%.3f fade=%.2f reversal=%.3f age=%.1fs",
-                    ticker, _fail_reason,
-                    str(watched.signal.get("client_id", "?") if watched.signal else "?"),
-                    float(_confirm_meta.get("spread_pct") or 0),
-                    float(_confirm_meta.get("option_move_pct") or 0),
-                    float(_confirm_meta.get("underlying_move_pct") or 0),
-                    float(_confirm_meta.get("quote_age_seconds") or 0),
+                _observe_only_daily_continuation = (
+                    _confirm_meta.get("daily_continuation_mode") == "observe"
+                    and str(_fail_reason).startswith("daily_continuation_failed")
                 )
-                funnel.inc("entry_confirm_blocked")
-                if signal_id:
-                    # Only write to known ap_signals columns — no unknown fields
-                    self.store.update_signal_fields(signal_id, {
-                        "decision_status": "blocked_at_breach",
-                        "context_notes":   _fail_reason,
-                    })
-                if queue_local_order_id and hasattr(self.order_state_machine, "update_order_meta"):
+                if _observe_only_daily_continuation:
+                    log.warning(
+                        "[%s] ENTRY_CONFIRM_OBSERVED — continuation would block in enforce mode "
+                        "but submit will continue | reason=%s",
+                        ticker,
+                        _fail_reason,
+                    )
+                    if queue_local_order_id and hasattr(self.order_state_machine, "update_order_meta"):
+                        try:
+                            self.order_state_machine.update_order_meta(
+                                queue_local_order_id, {"entry_confirmation": _confirm_meta})
+                        except Exception:
+                            pass
+                else:
+                    log.info(
+                        "[%s] ENTRY_CONFIRM_BLOCK — %s | client=%s | "
+                        "spread=%.3f fade=%.2f reversal=%.3f age=%.1fs",
+                        ticker, _fail_reason,
+                        str(watched.signal.get("client_id", "?") if watched.signal else "?"),
+                        float(_confirm_meta.get("spread_pct") or 0),
+                        float(_confirm_meta.get("option_move_pct") or 0),
+                        float(_confirm_meta.get("underlying_move_pct") or 0),
+                        float(_confirm_meta.get("quote_age_seconds") or 0),
+                    )
+                    funnel.inc("entry_confirm_blocked")
+                    if signal_id:
+                        # Only write to known ap_signals columns — no unknown fields
+                        self.store.update_signal_fields(signal_id, {
+                            "decision_status": "blocked_at_breach",
+                            "context_notes":   _fail_reason,
+                        })
+                    if queue_local_order_id and hasattr(self.order_state_machine, "update_order_meta"):
+                        try:
+                            self.order_state_machine.update_order_meta(
+                                queue_local_order_id, {"entry_confirmation": _confirm_meta})
+                        except Exception:
+                            pass
+                    self._cleanup_pending_entry_order(
+                        watched,
+                        action="expire",
+                        reason=_fail_reason,
+                    )
+                    # PR81 Final Amendment v2 §3: ENTRY_CONFIRMATION_FAILED ledger write.
                     try:
-                        self.order_state_machine.update_order_meta(
-                            queue_local_order_id, {"entry_confirmation": _confirm_meta})
+                        from ap.opportunity_ledger import (
+                            update_opportunity, STAGE_ENTRY_CONFIRMATION,
+                        )
+                        _client_id_for_ledger = str(
+                            watched.signal.get("client_id") if watched.signal else ""
+                        ) or getattr(self, "client_id", "")
+                        _canon = str(
+                            (watched.signal or {}).get("canonical_signal_id") or signal_id
+                        )
+                        update_opportunity(
+                            signal_id or _canon, _client_id_for_ledger,
+                            "ENTRY_CONFIRMATION_FAILED",
+                            canonical_signal_id=_canon,
+                            miss_stage=STAGE_ENTRY_CONFIRMATION,
+                            miss_reason=_fail_reason,
+                            order_local_id=str(queue_local_order_id) if queue_local_order_id else None,
+                            entry_confirmation_result=_fail_reason,
+                        )
                     except Exception:
                         pass
-                self._cleanup_pending_entry_order(
-                    watched,
-                    action="expire",
-                    reason=_fail_reason,
-                )
-                # PR81 Final Amendment v2 §3: ENTRY_CONFIRMATION_FAILED ledger write.
-                try:
-                    from ap.opportunity_ledger import (
-                        update_opportunity, STAGE_ENTRY_CONFIRMATION,
-                    )
-                    _client_id_for_ledger = str(
-                        watched.signal.get("client_id") if watched.signal else ""
-                    ) or getattr(self, "client_id", "")
-                    _canon = str(
-                        (watched.signal or {}).get("canonical_signal_id") or signal_id
-                    )
-                    update_opportunity(
-                        signal_id or _canon, _client_id_for_ledger,
-                        "ENTRY_CONFIRMATION_FAILED",
-                        canonical_signal_id=_canon,
-                        miss_stage=STAGE_ENTRY_CONFIRMATION,
-                        miss_reason=_fail_reason,
-                        order_local_id=str(queue_local_order_id) if queue_local_order_id else None,
-                        entry_confirmation_result=_fail_reason,
-                    )
-                except Exception:
-                    pass
-                return   # NO BROKER SUBMIT
+                    return   # NO BROKER SUBMIT
         except ImportError:
             # When confirmation_required=True, a missing module is NOT safe to skip.
             # Client-eligible trades must not bypass confirmation — fail closed.
@@ -2099,36 +2018,44 @@ class APExecutionCore:
                 "(confirmation_required=False for this signal)"
             )
         except Exception as _ec_err:
-            # Fail-closed for confirmation errors — block the submit
-            log.error("[%s] ENTRY_CONFIRM_ERROR — failing closed: %s", ticker, _ec_err)
-            _terminalize_breach_failure(
-                f"entry_confirm_error:{_ec_err}",
-                cleanup_action="expire",
-                funnel_key="entry_confirm_blocked",
+            _gate_meta_err = (getattr(approved_plan, "metadata", {}) or {})
+            _hcqg_err = _gate_meta_err.get("hybrid_client_quality_gate") or {}
+            if _hcqg_err.get("confirmation_required"):
+                # Fail-closed only when legacy confirmation is required.
+                log.error("[%s] ENTRY_CONFIRM_ERROR — failing closed: %s", ticker, _ec_err)
+                _terminalize_breach_failure(
+                    f"entry_confirm_error:{_ec_err}",
+                    cleanup_action="expire",
+                    funnel_key="entry_confirm_blocked",
+                )
+                # PR81 Final Amendment v2 §3: ENTRY_CONFIRMATION_FAILED ledger write.
+                try:
+                    from ap.opportunity_ledger import (
+                        update_opportunity, STAGE_ENTRY_CONFIRMATION,
+                    )
+                    _client_id_for_ledger = str(
+                        watched.signal.get("client_id") if watched.signal else ""
+                    ) or getattr(self, "client_id", "")
+                    _canon = str(
+                        (watched.signal or {}).get("canonical_signal_id") or signal_id
+                    )
+                    update_opportunity(
+                        signal_id or _canon, _client_id_for_ledger,
+                        "ENTRY_CONFIRMATION_FAILED",
+                        canonical_signal_id=_canon,
+                        miss_stage=STAGE_ENTRY_CONFIRMATION,
+                        miss_reason=f"entry_confirm_error:{_ec_err}",
+                        order_local_id=str(queue_local_order_id) if queue_local_order_id else None,
+                        entry_confirmation_result=f"entry_confirm_error:{_ec_err}",
+                    )
+                except Exception:
+                    pass
+                return
+            log.warning(
+                "[%s] ENTRY_CONFIRM_ERROR_SKIPPED — confirmation_required=False | error=%s",
+                ticker,
+                _ec_err,
             )
-            # PR81 Final Amendment v2 §3: ENTRY_CONFIRMATION_FAILED ledger write.
-            try:
-                from ap.opportunity_ledger import (
-                    update_opportunity, STAGE_ENTRY_CONFIRMATION,
-                )
-                _client_id_for_ledger = str(
-                    watched.signal.get("client_id") if watched.signal else ""
-                ) or getattr(self, "client_id", "")
-                _canon = str(
-                    (watched.signal or {}).get("canonical_signal_id") or signal_id
-                )
-                update_opportunity(
-                    signal_id or _canon, _client_id_for_ledger,
-                    "ENTRY_CONFIRMATION_FAILED",
-                    canonical_signal_id=_canon,
-                    miss_stage=STAGE_ENTRY_CONFIRMATION,
-                    miss_reason=f"entry_confirm_error:{_ec_err}",
-                    order_local_id=str(queue_local_order_id) if queue_local_order_id else None,
-                    entry_confirmation_result=f"entry_confirm_error:{_ec_err}",
-                )
-            except Exception:
-                pass
-            return
 
         submit_res = self.order_state_machine.submit_existing_entry(
             local_order_id=queue_local_order_id,
