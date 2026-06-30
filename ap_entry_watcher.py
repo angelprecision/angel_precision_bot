@@ -2101,6 +2101,11 @@ class APEntryWatcher:
             "target_price": getattr(plan, "target_underlying", None),
             "plan_id": getattr(plan, "plan_id", ""),
             "local_order_id": local_order_id,
+            # PR #182: carry trade_queue.id through to breach time so
+            # write_deferred_breach_last_error() can find the queue row.
+            # Populated by queue.py _dispatch() onto plan.metadata before watch() is called.
+            "queue_id": (getattr(plan, "metadata", None) or {}).get("queue_id"),
+            "trade_queue_id": (getattr(plan, "metadata", None) or {}).get("trade_queue_id"),
             "contract_symbol": getattr(plan, "contract_symbol", ""),
             "pattern": getattr(plan, "pattern", ""),
             "prior_day_high": getattr(plan, "prior_day_high", None),

@@ -379,6 +379,98 @@ def _mark_job(
     _run_with_retry(_fn)
 
 
+# ── PR #182: deferred breach failure write-back ───────────────────────────────
+# GAP: when contract_selector.select() returns None on a retryable failure,
+# the order is kept alive for the next trigger tick — no OSM cleanup runs.
+# But nothing writes back to trade_queue.last_error, so the dashboard shows
+# PENDING_TRIGGER / DEFERRED⌛ with a blank CONTRACT column forever.
+# Operators cannot distinguish "trigger not hit yet" from "trigger fired 12×
+# today and selection failed every time" without grepping Render logs.
+#
+# INVARIANTS:
+#   - Does NOT change trade_queue.status (stays PENDING_TRIGGER for retry).
+#   - Does NOT call _cleanup_pending_entry_order. Order remains live.
+#   - Uses the existing `last_error` TEXT column — no schema migration needed.
+#   - WHERE clause excludes terminal rows — safe against concurrent OSM expiry.
+#   - Fails silently: must never block the retry loop or terminal cleanup path.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def write_deferred_breach_last_error(
+    queue_id: Optional[int],
+    *,
+    reason_code: str,
+    explanation: str = "",
+    attempt: int = 0,
+    client_id: str = "",
+    ticker: str = "",
+) -> None:
+    """Write selector failure reason to trade_queue.last_error (non-terminal).
+
+    Called when deferred breach select() returns None but the order is being
+    kept alive for the next trigger tick. Never called for terminal failures
+    — those go through _terminalize_deferred_breach_failure which already
+    handles last_error via _cleanup_pending_entry_order → OSM transition().
+
+    Written value format (human-readable, dashboard-queryable):
+        "DEFERRED_BREACH_CONTRACT_FAILED:CHEAP_CONTRACT_NO_UPGRADE:attempt_3
+         — premium $35 below $50 min, no upgrade found"
+
+    Args:
+        queue_id:     trade_queue.id. If None or 0, no-op.
+        reason_code:  canonical selector reason from get_last_failure()
+                      (CHEAP_CONTRACT_NO_UPGRADE, NO_CHAIN_DATA,
+                      SPREAD_TOO_WIDE, OI_TOO_LOW, etc.)
+        explanation:  human-readable detail (<=400 chars stored).
+        attempt:      1-indexed breach attempt count. 0 = unknown (no suffix).
+        client_id:    for logging only. Not written to DB.
+        ticker:       for logging only. Not written to DB.
+    """
+    if not queue_id:
+        return
+    try:
+        _rc = str(reason_code or "BREACH_SELECTOR_RETURNED_NONE").strip()
+        _label = f"DEFERRED_BREACH_CONTRACT_FAILED:{_rc}"
+        if attempt > 0:
+            _label = f"{_label}:attempt_{attempt}"
+        _detail = str(explanation or "").strip()[:400]
+        _last_error = f"{_label} — {_detail}" if _detail else _label
+
+        def _write():
+            with _conn()() as c:
+                c.execute(
+                    """
+                    UPDATE public.trade_queue
+                       SET last_error = %s
+                     WHERE id = %s
+                       AND UPPER(COALESCE(status, '')) NOT IN (
+                           'REJECTED', 'ERROR', 'SUBMITTED', 'FILLED',
+                           'CANCELED', 'CANCELLED', 'EXPIRED', 'DONE',
+                           'ARCHIVED'
+                       )
+                    """,
+                    (_last_error, int(queue_id)),
+                )
+
+        _run_with_retry(_write)
+        log.info(
+            "[%s] deferred_breach_last_error_written ticker=%s queue_id=%s "
+            "reason=%s attempt=%d",
+            client_id or "?",
+            ticker or "?",
+            queue_id,
+            _rc,
+            attempt,
+        )
+    except Exception as _e:
+        # Non-critical: a write failure here MUST NOT propagate.
+        # The retry loop and terminal cleanup path must continue regardless.
+        log.debug(
+            "[%s] write_deferred_breach_last_error failed (non-critical): %s",
+            client_id or "?",
+            _e,
+        )
+
+
 def _claim_one_job(client_id: str = "default") -> Optional[dict]:
     """
     Atomically claim one NEW job for this specific client_id.
@@ -1457,6 +1549,13 @@ def _dispatch(
         try:
             if hasattr(plan, "metadata") and isinstance(plan.metadata, dict):
                 plan.metadata["local_order_id"] = str(local_order_id)
+                # PR #182: stash job_id so breach-time write-back can resolve the
+                # trade_queue row. Must happen before entry_watcher.watch() so
+                # watch() can carry it into signal_dict → watched.signal → sig
+                # inside _on_entry_trigger(). Without this, sig.get("queue_id")
+                # returns None and write_deferred_breach_last_error() no-ops.
+                plan.metadata["queue_id"] = job_id
+                plan.metadata["trade_queue_id"] = job_id
         except Exception:
             pass
         log.info(

@@ -1378,6 +1378,56 @@ class APExecutionCore:
                         reason=_reason,
                         extra={"stage": _deferred_selector_audit.get("stage") or "unknown"},
                     )
+                    # ── PR #182: write selector failure reason to trade_queue.last_error ──
+                    # Path A: select() returned None. Order is being terminated via
+                    # _terminalize_deferred_breach_failure below. Write the reason
+                    # to trade_queue.last_error first so the operator can see WHY
+                    # this DEFERRED row failed — without needing Render log access.
+                    # Best-effort: failure here must never block the cleanup below.
+                    try:
+                        from ap.queue import write_deferred_breach_last_error
+                        _queue_id_for_obs = (
+                            sig.get("queue_id")
+                            or sig.get("trade_queue_id")
+                            or (getattr(approved_plan, "metadata", None) or {}).get("queue_id")
+                        )
+                        _prior_attempt = 0
+                        try:
+                            _prior_attempt = int(
+                                (getattr(approved_plan, "metadata", None) or {}).get(
+                                    "breach_attempt_count", 0
+                                ) or 0
+                            )
+                        except (TypeError, ValueError):
+                            _prior_attempt = 0
+                        _this_attempt = _prior_attempt + 1
+                        _obs_rc_a = (
+                            _deferred_selector_audit.get("reason_code")
+                            or "BREACH_SELECTOR_RETURNED_NONE"
+                        )
+                        write_deferred_breach_last_error(
+                            _queue_id_for_obs,
+                            reason_code=str(_obs_rc_a),
+                            explanation=str(_reason or "")[:400],
+                            attempt=_this_attempt,
+                            client_id=_breach_client_id,
+                            ticker=ticker,
+                        )
+                        try:
+                            _upd_a = getattr(self.order_state_machine, "update_order_meta", None)
+                            if callable(_upd_a) and queue_local_order_id:
+                                _upd_a(queue_local_order_id, {
+                                    "breach_attempt_count":           _this_attempt,
+                                    "last_breach_failure_reason":     str(_reason or ""),
+                                    "last_breach_failure_reason_code": str(_obs_rc_a),
+                                    "last_breach_failure_at":         datetime.now(timezone.utc).isoformat(),
+                                    "last_breach_selector_audit":     _deferred_selector_audit or {},
+                                })
+                        except Exception as _ma_exc:
+                            log.debug("[%s] PR182 meta update non-critical: %s", ticker, _ma_exc)
+                    except Exception as _obs_a_exc:
+                        log.debug("[%s] PR182 write-back non-critical: %s", ticker, _obs_a_exc)
+                    # ── end PR #182 Path A ─────────────────────────────────────
                     _terminalize_deferred_breach_failure(
                         _reason,
                         extra_meta={
@@ -1428,6 +1478,55 @@ class APExecutionCore:
                         contract=_live_contract,
                         extra={"stage": "deferred_copy_back"},
                     )
+                    # ── PR #182: write selector failure reason to trade_queue.last_error ──
+                    # Path B: selector returned a value but contract is still DEFERRED:
+                    # (copy-back failed or returned unresolved placeholder). Write reason
+                    # to trade_queue.last_error before terminal cleanup.
+                    # Best-effort: failure here must never block the cleanup below.
+                    try:
+                        from ap.queue import write_deferred_breach_last_error
+                        _queue_id_for_obs_b = (
+                            sig.get("queue_id")
+                            or sig.get("trade_queue_id")
+                            or (getattr(approved_plan, "metadata", None) or {}).get("queue_id")
+                        )
+                        _prior_attempt_b = 0
+                        try:
+                            _prior_attempt_b = int(
+                                (getattr(approved_plan, "metadata", None) or {}).get(
+                                    "breach_attempt_count", 0
+                                ) or 0
+                            )
+                        except (TypeError, ValueError):
+                            _prior_attempt_b = 0
+                        _this_attempt_b = _prior_attempt_b + 1
+                        _obs_rc_b = (
+                            _deferred_selector_audit.get("reason_code")
+                            or "DEFERRED_UNRESOLVED_AT_BREACH"
+                        )
+                        write_deferred_breach_last_error(
+                            _queue_id_for_obs_b,
+                            reason_code=str(_obs_rc_b),
+                            explanation=str(_reason or "")[:400],
+                            attempt=_this_attempt_b,
+                            client_id=_breach_client_id,
+                            ticker=ticker,
+                        )
+                        try:
+                            _upd_b = getattr(self.order_state_machine, "update_order_meta", None)
+                            if callable(_upd_b) and queue_local_order_id:
+                                _upd_b(queue_local_order_id, {
+                                    "breach_attempt_count":           _this_attempt_b,
+                                    "last_breach_failure_reason":     str(_reason or ""),
+                                    "last_breach_failure_reason_code": str(_obs_rc_b),
+                                    "last_breach_failure_at":         datetime.now(timezone.utc).isoformat(),
+                                    "last_breach_selector_audit":     _deferred_selector_audit or {},
+                                })
+                        except Exception as _mb_exc:
+                            log.debug("[%s] PR182 meta update non-critical: %s", ticker, _mb_exc)
+                    except Exception as _obs_b_exc:
+                        log.debug("[%s] PR182 write-back non-critical: %s", ticker, _obs_b_exc)
+                    # ── end PR #182 Path B ─────────────────────────────────────
                     _terminalize_deferred_breach_failure(
                         _reason,
                         extra_meta={

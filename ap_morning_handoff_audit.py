@@ -81,7 +81,7 @@ _TERMINAL_STATUSES = frozenset({
 })
 
 # Statuses eligible for audit.
-_AUDIT_STATUSES = frozenset({"PENDING_TRIGGER", "WATCHING", "CREATED"})
+_AUDIT_STATUSES = frozenset({"PENDING_TRIGGER", "WATCHING", "CREATED", "RETRY_ELIGIBLE"})
 
 # ── Classification labels ──────────────────────────────────────────────────────
 
@@ -334,7 +334,7 @@ def _load_audit_rows(client_id: str, execution_mode: str, lookback_hours: int) -
                 FROM orders
                 WHERE client_id = %s
                   AND kind = 'ENTRY'
-                  AND status IN ('PENDING_TRIGGER', 'WATCHING', 'CREATED')
+                  AND status IN ('PENDING_TRIGGER', 'WATCHING', 'CREATED', 'RETRY_ELIGIBLE')
                   AND execution_mode = %s
                   AND created_ts >= %s
                   AND broker_order_id IS NULL
