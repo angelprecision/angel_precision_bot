@@ -293,6 +293,47 @@ def _truthy(value: Any) -> bool:
     return bool(value)
 
 
+# PR #229: Canonical signal-side normalizer for admission (APMasterControl.evaluate).
+#
+# This is the single source of truth for translating a raw signal `side` /
+# `direction` field into the bot's internal {"CALL", "PUT"} contract. It exists
+# at module scope so:
+#   1. It can be unit-tested in isolation without spinning up APMasterControl.
+#   2. Future consolidation can converge the four divergent `_normalize_side()`
+#      implementations elsewhere in the codebase onto this function rather than
+#      adding a fifth.
+#
+# Semantics: fail-CLOSED. Returns None for any value that is missing, empty,
+# or not in the recognized alias set. Call sites MUST treat None as a block
+# condition (no silent default to CALL — that was the pre-#229 bug).
+_SIDE_ALIASES: dict[str, str] = {
+    "CALL": "CALL",
+    "BUY": "CALL",
+    "LONG": "CALL",
+    "CALLS": "CALL",
+    "BULLISH": "CALL",
+    "PUT": "PUT",
+    "SELL": "PUT",
+    "SHORT": "PUT",
+    "PUTS": "PUT",
+    "BEARISH": "PUT",
+}
+
+
+def _normalize_signal_side(raw: Any) -> Optional[str]:
+    """Normalize a raw signal side/direction to 'CALL' or 'PUT'.
+
+    Returns None if `raw` is missing, empty, or not a recognized alias.
+    Callers must fail closed on None — never substitute a default direction.
+    """
+    if raw is None:
+        return None
+    side = str(raw).strip().upper()
+    if not side:
+        return None
+    return _SIDE_ALIASES.get(side)
+
+
 @dataclass
 class ApprovedExecutionPlan:
     plan_id: str
@@ -1543,12 +1584,21 @@ class APMasterControl:
         signal_id = str(signal.get("signal_id") or uuid.uuid4())
         signal["signal_id"] = signal_id
 
-        raw_side = signal.get("side") or signal.get("direction") or "CALL"
-        norm_side = str(raw_side).upper().strip()
-        if norm_side in {"BUY", "LONG", "CALLS", "BULLISH"}:
-            norm_side = "CALL"
-        elif norm_side in {"SELL", "SHORT", "PUTS", "BEARISH"}:
-            norm_side = "PUT"
+        # PR #229: fail-CLOSED on missing/invalid side. Pre-#229 this defaulted
+        # to "CALL" which meant a malformed signal would silently route as a
+        # bullish trade. Now blocked at admission with a stable reason_code so
+        # the operator dashboard can filter it. See _normalize_signal_side.
+        raw_side = signal.get("side") or signal.get("direction")
+        norm_side = _normalize_signal_side(raw_side)
+        if norm_side is None:
+            return self._block(
+                signal_id,
+                ticker,
+                client_id,
+                "blocked_system",
+                f"invalid_or_missing_side ({raw_side!r})",
+                reason_code="INVALID_OR_MISSING_SIDE",
+            )
         signal["side"] = norm_side
         signal["direction"] = norm_side
 

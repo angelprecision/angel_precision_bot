@@ -95,3 +95,40 @@ def test_master_control_normalizes_bearish_alias_to_put(monkeypatch):
 
     assert signal["side"] == "PUT"
     assert signal["direction"] == "PUT"
+
+
+# Direct unit coverage for the module-level helper. These tests do not
+# instantiate APMasterControl and lock the canonical contract that future
+# consolidation of the four divergent _normalize_side() implementations
+# elsewhere in the codebase will converge onto.
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ("CALL", "CALL"),
+        ("call", "CALL"),
+        ("  Call  ", "CALL"),
+        ("BUY", "CALL"),
+        ("long", "CALL"),
+        ("CALLS", "CALL"),
+        ("bullish", "CALL"),
+        ("PUT", "PUT"),
+        ("sell", "PUT"),
+        ("SHORT", "PUT"),
+        ("puts", "PUT"),
+        ("BEARISH", "PUT"),
+    ],
+)
+def test_normalize_signal_side_accepts_aliases(raw, expected):
+    import ap_master_control as mc
+
+    assert mc._normalize_signal_side(raw) == expected
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [None, "", "   ", "UNKNOWN", "neutral", "0", "123", "side", object()],
+)
+def test_normalize_signal_side_returns_none_for_invalid(raw):
+    import ap_master_control as mc
+
+    assert mc._normalize_signal_side(raw) is None
