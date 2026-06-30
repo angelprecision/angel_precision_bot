@@ -20,6 +20,27 @@ class TradierConfig:
     account_id: str
 
 
+class TradierMarketDataError(RuntimeError):
+    """Structured market-data failure raised by TradierBroker data endpoints."""
+
+    def __init__(self, reason_code: str, message: str, *, endpoint: str = "", symbol: str = "", expiration: str = "", status_code: int | None = None, base_url: str = "", retryable: bool = False, payload_shape: dict | None = None):
+        super().__init__(message)
+        self.reason_code = str(reason_code or "MARKET_DATA_ERROR")
+        self.endpoint = str(endpoint or "")
+        self.symbol = str(symbol or "")
+        self.expiration = str(expiration or "")
+        self.status_code = status_code
+        self.base_url = str(base_url or "")
+        self.retryable = bool(retryable)
+        self.payload_shape = dict(payload_shape or {})
+
+    def to_meta(self) -> dict:
+        meta = {"reason_code": self.reason_code, "endpoint": self.endpoint, "symbol": self.symbol, "expiration": self.expiration, "status_code": self.status_code, "base_url": self.base_url, "retryable": self.retryable}
+        if self.payload_shape:
+            meta["payload_shape"] = dict(self.payload_shape)
+        return meta
+
+
 def _to_float(x: Any) -> Optional[float]:
     try:
         if x is None:
@@ -32,11 +53,63 @@ def _to_float(x: Any) -> Optional[float]:
 class TradierBroker(BrokerAdapter):
     def __init__(self, cfg: TradierConfig):
         self.cfg = cfg
+        self._last_market_data_error: dict[str, Any] = {}
+        self._last_market_data_call: dict[str, Any] = {}
         self.session = requests.Session()
         self.session.headers.update({
             "Authorization": f"Bearer {cfg.access_token}",
             "Accept": "application/json",
         })
+
+    @property
+    def base_url(self) -> str:
+        return self.cfg.base_url
+
+    def get_last_market_data_error(self) -> dict[str, Any]:
+        try:
+            return dict(self._last_market_data_error or {})
+        except Exception:
+            return {}
+
+    def get_last_market_data_call(self) -> dict[str, Any]:
+        try:
+            return dict(self._last_market_data_call or {})
+        except Exception:
+            return {}
+
+    def _record_market_data_call(self, *, endpoint: str, symbol: str = "", expiration: str = "") -> None:
+        self._last_market_data_call = {"endpoint": endpoint, "symbol": symbol, "expiration": expiration, "base_url": self.cfg.base_url}
+
+    def _clear_market_data_error(self) -> None:
+        self._last_market_data_error = {}
+
+    def _record_market_data_error(self, *, reason_code: str, endpoint: str, symbol: str = "", expiration: str = "", status_code: int | None = None, retryable: bool = False, payload_shape: dict | None = None) -> dict[str, Any]:
+        meta = {"reason_code": str(reason_code or "MARKET_DATA_ERROR"), "endpoint": endpoint, "symbol": symbol, "expiration": expiration, "status_code": status_code, "base_url": self.cfg.base_url, "retryable": bool(retryable)}
+        if payload_shape:
+            meta["payload_shape"] = dict(payload_shape)
+        self._last_market_data_error = meta
+        return meta
+
+    def _classify_market_data_exception(self, prefix: str, exc: Exception) -> tuple[str, int | None, bool]:
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+        if isinstance(exc, requests.exceptions.Timeout):
+            return f"{prefix}_FETCH_TIMEOUT", status, True
+        if isinstance(exc, requests.exceptions.ConnectionError):
+            return f"{prefix}_FETCH_NETWORK_ERROR", status, True
+        if isinstance(exc, requests.exceptions.HTTPError):
+            if status == 429:
+                return f"{prefix}_FETCH_RATE_LIMITED", status, True
+            if status in (401, 403):
+                return f"{prefix}_FETCH_AUTH_FAILED", status, False
+            if status is not None and 500 <= int(status) < 600:
+                return f"{prefix}_FETCH_SERVER_ERROR", status, True
+            return f"{prefix}_FETCH_HTTP_ERROR", status, False
+        return f"{prefix}_PAYLOAD_MALFORMED", status, True
+
+    def _raise_market_data_error(self, prefix: str, exc: Exception, *, endpoint: str, symbol: str = "", expiration: str = "") -> None:
+        reason, status, retryable = self._classify_market_data_exception(prefix, exc)
+        self._record_market_data_error(reason_code=reason, endpoint=endpoint, symbol=symbol, expiration=expiration, status_code=status, retryable=retryable)
+        raise TradierMarketDataError(reason, str(exc), endpoint=endpoint, symbol=symbol, expiration=expiration, status_code=status, base_url=self.cfg.base_url, retryable=retryable) from exc
 
     # -------------------------
     # HTTP helpers
@@ -80,7 +153,12 @@ class TradierBroker(BrokerAdapter):
         Returns a dict with bid/ask/last if available.
         contract_pricing.py will handle spread sanity etc.
         """
-        j = self._get("/v1/markets/quotes", params={"symbols": symbol, "greeks": "false"})
+        endpoint = "/v1/markets/quotes"
+        self._record_market_data_call(endpoint=endpoint, symbol=symbol)
+        try:
+            j = self._get(endpoint, params={"symbols": symbol, "greeks": "false"})
+        except Exception as e:
+            self._raise_market_data_error("QUOTE", e, endpoint=endpoint, symbol=symbol)
         q = (j.get("quotes") or {}).get("quote")
 
         # Normalize list vs single
@@ -88,6 +166,7 @@ class TradierBroker(BrokerAdapter):
             q = q[0] if q else None
 
         if not isinstance(q, dict):
+            self._record_market_data_error(reason_code="QUOTE_EMPTY", endpoint=endpoint, symbol=symbol, retryable=True, payload_shape={"has_quotes": bool(j.get("quotes")), "quote_type": type(q).__name__})
             return {}
 
         # Ensure bid/ask/last are numeric if present
@@ -99,6 +178,14 @@ class TradierBroker(BrokerAdapter):
         out["bid"] = bid
         out["ask"] = ask
         out["last"] = last
+        if bid is None or ask is None:
+            self._record_market_data_error(reason_code="QUOTE_MISSING_BID_ASK", endpoint=endpoint, symbol=symbol, retryable=True)
+        elif bid <= 0 or ask <= 0:
+            self._record_market_data_error(reason_code="QUOTE_ZERO_BID_ASK", endpoint=endpoint, symbol=symbol, retryable=True)
+        elif ask < bid:
+            self._record_market_data_error(reason_code="QUOTE_INVERTED_BID_ASK", endpoint=endpoint, symbol=symbol, retryable=True)
+        else:
+            self._clear_market_data_error()
         return out
 
     # -------------------------
@@ -147,30 +234,46 @@ class TradierBroker(BrokerAdapter):
             return {}
 
     def get_option_expirations(self, symbol: str) -> List[str]:
-        j = self._get("/v1/markets/options/expirations", params={
-            "symbol": symbol,
-            "includeAllRoots": "true",
-            "strikes": "false",
-        })
-
-        dates = (j.get("expirations") or {}).get("date") or []
+        endpoint = "/v1/markets/options/expirations"
+        self._record_market_data_call(endpoint=endpoint, symbol=symbol)
+        try:
+            j = self._get(endpoint, params={"symbol": symbol, "includeAllRoots": "true", "strikes": "false"})
+        except Exception as e:
+            self._raise_market_data_error("EXPIRATIONS", e, endpoint=endpoint, symbol=symbol)
+        expirations = j.get("expirations") or {}
+        if not isinstance(expirations, dict):
+            payload_shape = {"expirations_type": type(expirations).__name__, "has_expirations": bool(j.get("expirations"))}
+            self._record_market_data_error(reason_code="EXPIRATIONS_PAYLOAD_MALFORMED", endpoint=endpoint, symbol=symbol, retryable=True, payload_shape=payload_shape)
+            raise TradierMarketDataError("EXPIRATIONS_PAYLOAD_MALFORMED", "Tradier expirations payload is malformed", endpoint=endpoint, symbol=symbol, base_url=self.cfg.base_url, retryable=True, payload_shape=payload_shape)
+        dates = expirations.get("date") or []
         if not isinstance(dates, list):
             dates = [dates] if dates else []
+        if not dates:
+            self._record_market_data_error(reason_code="EXPIRATIONS_EMPTY", endpoint=endpoint, symbol=symbol, retryable=False, payload_shape={"has_expirations": bool(j.get("expirations")), "has_date": bool(expirations.get("date"))})
+            return []
+        self._clear_market_data_error()
         return dates
 
     def get_option_chain(self, symbol: str, expiration: str) -> List[Dict[str, Any]]:
-        j = self._get("/v1/markets/options/chains", params={
-            "symbol": symbol,
-            "expiration": expiration,
-            "greeks": "false",
-        })
-
-        opts = (j.get("options") or {}).get("option")
+        endpoint = "/v1/markets/options/chains"
+        self._record_market_data_call(endpoint=endpoint, symbol=symbol, expiration=expiration)
+        try:
+            j = self._get(endpoint, params={"symbol": symbol, "expiration": expiration, "greeks": "false"})
+        except Exception as e:
+            self._raise_market_data_error("CHAIN", e, endpoint=endpoint, symbol=symbol, expiration=expiration)
+        options = j.get("options") or {}
+        if not isinstance(options, dict):
+            payload_shape = {"options_type": type(options).__name__, "has_options": bool(j.get("options"))}
+            self._record_market_data_error(reason_code="CHAIN_PAYLOAD_MALFORMED", endpoint=endpoint, symbol=symbol, expiration=expiration, retryable=True, payload_shape=payload_shape)
+            raise TradierMarketDataError("CHAIN_PAYLOAD_MALFORMED", "Tradier chain payload is malformed", endpoint=endpoint, symbol=symbol, expiration=expiration, base_url=self.cfg.base_url, retryable=True, payload_shape=payload_shape)
+        opts = options.get("option")
         if not opts:
+            self._record_market_data_error(reason_code="CHAIN_EMPTY", endpoint=endpoint, symbol=symbol, expiration=expiration, retryable=False, payload_shape={"has_options": bool(j.get("options")), "has_option": bool(options.get("option"))})
             return []
 
         if not isinstance(opts, list):
             opts = [opts]
+        self._clear_market_data_error()
         return opts
 
     # -------------------------
@@ -375,4 +478,3 @@ class TradierBroker(BrokerAdapter):
         except Exception as e:
             log.error("TRADIER_LIST_POSITIONS_FAILED | error=%s", e)
             return []
-
