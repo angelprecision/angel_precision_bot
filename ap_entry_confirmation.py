@@ -22,8 +22,10 @@ wider thresholds if configured.
 
 WHEN confirmation_required IS NOT SET
 --------------------------------------
-Gate is a no-op — non-client signals (operator, test, paper-only)
-flow through unchanged.
+Legacy quote confirmation is a no-op when confirmation_required is
+absent. Daily continuation still runs according to
+ENABLE_DAILY_CONTINUATION_MODE and is diagnostic-only in observe
+mode.
 
 ENV FLAGS (hot-read per call)
 ------------------------------
