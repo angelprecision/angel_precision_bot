@@ -1972,57 +1972,75 @@ class APExecutionCore:
             )
             if not _confirm_result.passed:
                 _fail_reason = _confirm_result.fail_reason or "entry_confirm_failed"
-                log.info(
-                    "[%s] ENTRY_CONFIRM_BLOCK — %s | client=%s | "
-                    "spread=%.3f fade=%.2f reversal=%.3f age=%.1fs",
-                    ticker, _fail_reason,
-                    str(watched.signal.get("client_id", "?") if watched.signal else "?"),
-                    float(_confirm_meta.get("spread_pct") or 0),
-                    float(_confirm_meta.get("option_move_pct") or 0),
-                    float(_confirm_meta.get("underlying_move_pct") or 0),
-                    float(_confirm_meta.get("quote_age_seconds") or 0),
+                _observe_only_daily_continuation = (
+                    _confirm_meta.get("daily_continuation_mode") == "observe"
+                    and str(_fail_reason).startswith("daily_continuation_failed")
                 )
-                funnel.inc("entry_confirm_blocked")
-                if signal_id:
-                    # Only write to known ap_signals columns — no unknown fields
-                    self.store.update_signal_fields(signal_id, {
-                        "decision_status": "blocked_at_breach",
-                        "context_notes":   _fail_reason,
-                    })
-                if queue_local_order_id and hasattr(self.order_state_machine, "update_order_meta"):
+                if _observe_only_daily_continuation:
+                    log.warning(
+                        "[%s] ENTRY_CONFIRM_OBSERVED — continuation would block in enforce mode "
+                        "but submit will continue | reason=%s",
+                        ticker,
+                        _fail_reason,
+                    )
+                    if queue_local_order_id and hasattr(self.order_state_machine, "update_order_meta"):
+                        try:
+                            self.order_state_machine.update_order_meta(
+                                queue_local_order_id, {"entry_confirmation": _confirm_meta})
+                        except Exception:
+                            pass
+                else:
+                    log.info(
+                        "[%s] ENTRY_CONFIRM_BLOCK — %s | client=%s | "
+                        "spread=%.3f fade=%.2f reversal=%.3f age=%.1fs",
+                        ticker, _fail_reason,
+                        str(watched.signal.get("client_id", "?") if watched.signal else "?"),
+                        float(_confirm_meta.get("spread_pct") or 0),
+                        float(_confirm_meta.get("option_move_pct") or 0),
+                        float(_confirm_meta.get("underlying_move_pct") or 0),
+                        float(_confirm_meta.get("quote_age_seconds") or 0),
+                    )
+                    funnel.inc("entry_confirm_blocked")
+                    if signal_id:
+                        # Only write to known ap_signals columns — no unknown fields
+                        self.store.update_signal_fields(signal_id, {
+                            "decision_status": "blocked_at_breach",
+                            "context_notes":   _fail_reason,
+                        })
+                    if queue_local_order_id and hasattr(self.order_state_machine, "update_order_meta"):
+                        try:
+                            self.order_state_machine.update_order_meta(
+                                queue_local_order_id, {"entry_confirmation": _confirm_meta})
+                        except Exception:
+                            pass
+                    self._cleanup_pending_entry_order(
+                        watched,
+                        action="expire",
+                        reason=_fail_reason,
+                    )
+                    # PR81 Final Amendment v2 §3: ENTRY_CONFIRMATION_FAILED ledger write.
                     try:
-                        self.order_state_machine.update_order_meta(
-                            queue_local_order_id, {"entry_confirmation": _confirm_meta})
+                        from ap.opportunity_ledger import (
+                            update_opportunity, STAGE_ENTRY_CONFIRMATION,
+                        )
+                        _client_id_for_ledger = str(
+                            watched.signal.get("client_id") if watched.signal else ""
+                        ) or getattr(self, "client_id", "")
+                        _canon = str(
+                            (watched.signal or {}).get("canonical_signal_id") or signal_id
+                        )
+                        update_opportunity(
+                            signal_id or _canon, _client_id_for_ledger,
+                            "ENTRY_CONFIRMATION_FAILED",
+                            canonical_signal_id=_canon,
+                            miss_stage=STAGE_ENTRY_CONFIRMATION,
+                            miss_reason=_fail_reason,
+                            order_local_id=str(queue_local_order_id) if queue_local_order_id else None,
+                            entry_confirmation_result=_fail_reason,
+                        )
                     except Exception:
                         pass
-                self._cleanup_pending_entry_order(
-                    watched,
-                    action="expire",
-                    reason=_fail_reason,
-                )
-                # PR81 Final Amendment v2 §3: ENTRY_CONFIRMATION_FAILED ledger write.
-                try:
-                    from ap.opportunity_ledger import (
-                        update_opportunity, STAGE_ENTRY_CONFIRMATION,
-                    )
-                    _client_id_for_ledger = str(
-                        watched.signal.get("client_id") if watched.signal else ""
-                    ) or getattr(self, "client_id", "")
-                    _canon = str(
-                        (watched.signal or {}).get("canonical_signal_id") or signal_id
-                    )
-                    update_opportunity(
-                        signal_id or _canon, _client_id_for_ledger,
-                        "ENTRY_CONFIRMATION_FAILED",
-                        canonical_signal_id=_canon,
-                        miss_stage=STAGE_ENTRY_CONFIRMATION,
-                        miss_reason=_fail_reason,
-                        order_local_id=str(queue_local_order_id) if queue_local_order_id else None,
-                        entry_confirmation_result=_fail_reason,
-                    )
-                except Exception:
-                    pass
-                return   # NO BROKER SUBMIT
+                    return   # NO BROKER SUBMIT
         except ImportError:
             # When confirmation_required=True, a missing module is NOT safe to skip.
             # Client-eligible trades must not bypass confirmation — fail closed.
@@ -2099,14 +2117,15 @@ class APExecutionCore:
                 "(confirmation_required=False for this signal)"
             )
         except Exception as _ec_err:
-            # Fail-closed for confirmation errors — block the submit
             log.error("[%s] ENTRY_CONFIRM_ERROR — failing closed: %s", ticker, _ec_err)
             _terminalize_breach_failure(
                 f"entry_confirm_error:{_ec_err}",
                 cleanup_action="expire",
                 funnel_key="entry_confirm_blocked",
             )
-            # PR81 Final Amendment v2 §3: ENTRY_CONFIRMATION_FAILED ledger write.
+            # Runtime confirmation exceptions are not safe observe-only events.
+            # Observe-mode daily continuation is handled above via a normal
+            # failed ConfirmationResult with daily_continuation_mode=observe.
             try:
                 from ap.opportunity_ledger import (
                     update_opportunity, STAGE_ENTRY_CONFIRMATION,

@@ -14,18 +14,18 @@ DESIGN PRINCIPLE
 ----------------
 This is NOT a sleep/delay loop.  The watcher already confirmed the
 price held for MOMENTUM_POLLS_REQUIRED ticks.  This preflight is a
-single synchronous check: are conditions STILL clean right now?
+single synchronous check:  are conditions STILL clean right now?
 
-For daily/1d setups, this also requires fresh intraday continuation.
-Missing continuation context fails closed for daily signals so the bot
-cannot enter after an opening touch/fade with no current follow-through.
+For A+ setups (score ≥ 78, daily, clean quote) this completes in
+milliseconds.  For B-tier or intraday it uses the same logic but with
+wider thresholds if configured.
 
 WHEN confirmation_required IS NOT SET
 --------------------------------------
-Legacy quote-confirmation checks remain a no-op for non-client signals,
-but daily continuation still runs for daily/1d entries. That makes this
-an entry-only protection without touching broker submit/cancel internals,
-handoff, positions, proof_trades, or order taxonomy.
+Legacy quote confirmation is a no-op when confirmation_required is
+absent. Daily continuation still runs according to
+ENABLE_DAILY_CONTINUATION_MODE and is diagnostic-only in observe
+mode.
 
 ENV FLAGS (hot-read per call)
 ------------------------------
@@ -34,16 +34,12 @@ MAX_PRE_ENTRY_OPTION_FADE_PCT    = 8    (block if option faded > 8%)
 MAX_PRE_ENTRY_UNDERLYING_REVERSAL_PCT = 0.25  (block if price moved > 0.25% wrong way)
 CLIENT_PROOF_MAX_SPREAD_PCT      = 0.10 (block if spread > 10%)
 CLIENT_PROOF_QUOTE_MAX_AGE_SECONDS = 10 (block if quote older than 10s)
-ENABLE_DAILY_CONTINUATION_VALIDATION = true (daily continuation guard)
 """
 
 from __future__ import annotations
 
-import json
-import logging
 import os
-import urllib.parse
-import urllib.request
+import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Mapping, Optional, Sequence
@@ -54,18 +50,24 @@ log = logging.getLogger(__name__)
 # ── Config ────────────────────────────────────────────────────────────────────
 
 def _ef(key: str, default: float) -> float:
-    try:
-        return float(os.getenv(key, str(default)))
-    except Exception:
-        return default
+    try: return float(os.getenv(key, str(default)))
+    except: return default
 
 
-def _env_enabled(key: str, default: bool = True) -> bool:
+def _env_enabled(key: str, default: bool = False) -> bool:
     raw = os.getenv(key)
     if raw is None:
         return default
     return raw.strip().lower() not in {"0", "false", "no", "off", "disabled"}
 
+
+def _daily_continuation_mode() -> str:
+    raw_mode = (os.getenv("ENABLE_DAILY_CONTINUATION_MODE") or "").strip().lower()
+    if raw_mode in {"off", "observe", "enforce"}:
+        return raw_mode
+    if os.getenv("ENABLE_DAILY_CONTINUATION_VALIDATION") is not None:
+        return "observe" if _env_enabled("ENABLE_DAILY_CONTINUATION_VALIDATION", False) else "off"
+    return "off"
 
 def _tier_confirm_seconds(score: Optional[float], tier: Optional[str],
                           timeframe: Optional[str]) -> float:
@@ -99,14 +101,17 @@ class ConfirmationResult:
 
     def to_meta(self, started_at: str, completed_at: str) -> dict:
         return {
-            "confirmation_required":    True,
+            "confirmation_required":    bool(
+                self.metadata.get("confirmation_required")
+                or self.metadata.get("hybrid_confirmation_required")
+            ),
             "confirmation_seconds":     self.metadata.get("confirmation_seconds"),
             "confirmation_started_at":  started_at,
             "confirmation_completed_at":completed_at,
             "confirmation_passed":      self.passed,
             "confirmation_fail_reason": self.fail_reason,
             **{k: v for k, v in self.metadata.items()
-               if k not in ("confirmation_seconds",)},
+               if k not in ("confirmation_seconds", "confirmation_required")},
         }
 
 
@@ -114,13 +119,10 @@ def _fail(reason: str, meta: dict) -> ConfirmationResult:
     log.info("[ENTRY_CONFIRM] BLOCKED reason=%s", reason)
     return ConfirmationResult(passed=False, fail_reason=reason, metadata=meta)
 
-
 def _pass(meta: dict) -> ConfirmationResult:
     log.info("[ENTRY_CONFIRM] PASSED")
     return ConfirmationResult(passed=True, fail_reason=None, metadata=meta)
 
-
-# ── Daily continuation helpers ────────────────────────────────────────────────
 
 _DAILY_TIMEFRAMES = {"1d", "d", "day", "daily", "overnight"}
 
@@ -133,33 +135,10 @@ def _as_mapping(value: Any) -> Mapping[str, Any]:
     return value if isinstance(value, Mapping) else {}
 
 
-def _as_float(value: Any) -> float | None:
-    try:
-        if value is None or value == "":
-            return None
-        return float(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def _plan_get(plan: Any, *names: str, default: Any = None) -> Any:
-    if plan is None:
-        return default
-    if isinstance(plan, Mapping):
-        for name in names:
-            if name in plan:
-                return plan.get(name)
-        return default
-    for name in names:
-        if hasattr(plan, name):
-            return getattr(plan, name)
-    return default
-
-
 def _extract_plan_metadata(plan: Any) -> dict:
     if hasattr(plan, "metadata"):
         raw = getattr(plan, "metadata") or {}
-    elif isinstance(plan, Mapping):
+    elif isinstance(plan, dict):
         raw = plan.get("metadata") or {}
     else:
         raw = {}
@@ -168,9 +147,7 @@ def _extract_plan_metadata(plan: Any) -> dict:
 
 def _first_sequence(*values: Any) -> Sequence[Any] | None:
     for value in values:
-        if value is None:
-            continue
-        if isinstance(value, (str, bytes, Mapping)):
+        if value is None or isinstance(value, (str, bytes, Mapping)):
             continue
         if isinstance(value, Sequence):
             return value
@@ -193,205 +170,176 @@ def _extract_intraday_candles(meta_src: Mapping[str, Any]) -> Sequence[Any] | No
     )
 
 
-def _market_data_base_url() -> str:
-    base_url = str(
-        os.getenv("TRADIER_MARKET_DATA_BASE_URL")
-        or os.getenv("TRADIER_DATA_BASE_URL")
-        or "https://api.tradier.com"
-    ).rstrip("/")
-    if "sandbox.tradier.com" in base_url.lower():
-        # Watcher/confirmation decisions must evaluate live market data even in paper.
-        return "https://api.tradier.com"
-    return base_url
-
-
-def _market_data_token() -> str | None:
-    return (
-        os.getenv("TRADIER_MARKET_DATA_TOKEN")
-        or os.getenv("TRADIER_DATA_TOKEN")
-        or os.getenv("TRADIER_LIVE_ACCESS_TOKEN")
-        or os.getenv("TRADIER_ACCESS_TOKEN")
-        or None
-    )
-
-
-def _fetch_daily_continuation_candles(ticker: str, *, now: datetime | None = None) -> list[dict[str, Any]]:
-    """Fetch same-day regular-session candles for the daily continuation gate.
-
-    Read-only market-data fetch. Returns [] on any unavailable context so the
-    caller fails closed for daily/1d entries.
-    """
-    ticker = str(ticker or "").upper().strip()
-    if not ticker:
-        return []
-    token = _market_data_token()
-    if not token:
-        return []
-
+def _as_float(value: Any) -> float | None:
     try:
-        from zoneinfo import ZoneInfo
-        et = ZoneInfo("America/New_York")
-    except Exception:  # pragma: no cover
-        et = timezone.utc
-
-    now_et = (now or datetime.now(timezone.utc)).astimezone(et)
-    today = now_et.strftime("%Y-%m-%d")
-    params = urllib.parse.urlencode({
-        "symbol": ticker,
-        "interval": os.getenv("DAILY_CONTINUATION_INTERVAL", "1min"),
-        "start": f"{today}T09:30:00",
-        "end": now_et.strftime("%Y-%m-%dT%H:%M:%S"),
-        "session_filter": "open",
-    })
-    url = f"{_market_data_base_url()}/v1/markets/timesales?{params}"
-    req = urllib.request.Request(
-        url,
-        headers={
-            "Accept": "application/json",
-            "Authorization": f"Bearer {token}",
-        },
-        method="GET",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=10) as resp:  # nosec B310 - fixed Tradier endpoint
-            payload = json.loads(resp.read().decode("utf-8") or "{}")
-    except Exception as exc:
-        log.warning("[ENTRY_CONFIRM] daily continuation candle fetch failed for %s: %s", ticker, exc)
-        return []
-
-    series = _as_mapping(payload.get("series"))
-    data_node = series.get("data")
-    if isinstance(data_node, Mapping):
-        items = data_node.get("item")
-    else:
-        items = data_node
-    if items is None:
-        return []
-    if isinstance(items, Mapping):
-        items = [items]
-
-    candles: list[dict[str, Any]] = []
-    for raw in items:
-        if not isinstance(raw, Mapping):
-            continue
-        candle = {
-            "open": _as_float(raw.get("open") or raw.get("o")),
-            "high": _as_float(raw.get("high") or raw.get("h")),
-            "low": _as_float(raw.get("low") or raw.get("l")),
-            "close": _as_float(raw.get("close") or raw.get("c") or raw.get("price")),
-            "time": raw.get("time") or raw.get("timestamp") or raw.get("datetime"),
-        }
-        if candle["high"] is not None and candle["low"] is not None and candle["close"] is not None:
-            candles.append(candle)
-    return candles
+        if value is None:
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
-def _run_daily_continuation_guard(
+def _candle_open(candle: Any) -> float | None:
+    if isinstance(candle, Mapping):
+        return _as_float(candle.get("open", candle.get("o")))
+    return _as_float(getattr(candle, "open", getattr(candle, "o", None)))
+
+
+def _candle_high(candle: Any) -> float | None:
+    if isinstance(candle, Mapping):
+        return _as_float(candle.get("high", candle.get("h")))
+    return _as_float(getattr(candle, "high", getattr(candle, "h", None)))
+
+
+def _candle_low(candle: Any) -> float | None:
+    if isinstance(candle, Mapping):
+        return _as_float(candle.get("low", candle.get("l")))
+    return _as_float(getattr(candle, "low", getattr(candle, "l", None)))
+
+
+def _candle_close(candle: Any) -> float | None:
+    if isinstance(candle, Mapping):
+        return _as_float(candle.get("close", candle.get("c")))
+    return _as_float(getattr(candle, "close", getattr(candle, "c", None)))
+
+
+def _first_breach_index(
+    candles: Sequence[Any],
     *,
-    plan: Any,
+    direction: str,
+    trigger_price: float,
+) -> int | None:
+    for idx, candle in enumerate(candles):
+        high = _candle_high(candle)
+        low = _candle_low(candle)
+        if direction == "CALL" and high is not None and high >= trigger_price:
+            return idx
+        if direction == "PUT" and low is not None and low <= trigger_price:
+            return idx
+    return None
+
+
+def _fresh_extension_after_breach(
+    candles: Sequence[Any],
+    *,
+    direction: str,
+    breach_index: int,
+) -> bool:
+    if breach_index >= len(candles) - 1:
+        return False
+    breach_candle = candles[breach_index]
+    if direction == "CALL":
+        breach_high = _candle_high(breach_candle)
+        highs_after = [_candle_high(c) for c in candles[breach_index + 1:]]
+        highs_after = [v for v in highs_after if v is not None]
+        return bool(breach_high is not None and highs_after and max(highs_after) > breach_high)
+    breach_low = _candle_low(breach_candle)
+    lows_after = [_candle_low(c) for c in candles[breach_index + 1:]]
+    lows_after = [v for v in lows_after if v is not None]
+    return bool(breach_low is not None and lows_after and min(lows_after) < breach_low)
+
+
+def _has_continuation_candle(
+    candles: Sequence[Any],
+    *,
+    direction: str,
+    trigger_price: float,
+    buffer: float,
+) -> bool:
+    for candle in list(candles[-3:]):
+        open_ = _candle_open(candle)
+        close = _candle_close(candle)
+        if open_ is None or close is None:
+            continue
+        if direction == "CALL" and close > trigger_price + buffer and close >= open_:
+            return True
+        if direction == "PUT" and close < trigger_price - buffer and close <= open_:
+            return True
+    return False
+
+
+def _evaluate_daily_continuation(
+    *,
     meta_src: Mapping[str, Any],
     direction: str,
     trigger_price: Optional[float],
     underlying_last: Optional[float],
     timeframe: Optional[str],
-) -> ConfirmationResult | None:
-    if not _is_daily_timeframe(timeframe):
-        return None
-
-    if not _env_enabled("ENABLE_DAILY_CONTINUATION_VALIDATION", False):  # safe default: must be explicitly enabled in Render
-        return ConfirmationResult(
-            passed=True,
-            fail_reason=None,
-            metadata={
-                "daily_continuation_allowed": True,
-                "daily_continuation_reason": "daily_continuation_skipped:disabled",
-                "daily_continuation_diagnostics": {
-                    "validator": "daily_intraday_continuation",
-                    "continuation_allowed": True,
-                    "reason": "daily_continuation_skipped:disabled",
-                    "timeframe": timeframe,
-                },
-            },
-        )
-
-    ticker = (
-        _plan_get(plan, "ticker", "symbol", default=None)
-        or meta_src.get("ticker")
-        or meta_src.get("symbol")
-    )
-    client_id = (
-        _plan_get(plan, "client_id", default=None)
-        or meta_src.get("client_id")
-        or meta_src.get("client_email")
-    )
-    execution_mode = (
-        _plan_get(plan, "execution_mode", default=None)
-        or meta_src.get("execution_mode")
-    )
-    canonical_signal_id = (
-        _plan_get(plan, "canonical_signal_id", "signal_id", default=None)
-        or meta_src.get("canonical_signal_id")
-        or meta_src.get("signal_id")
-    )
-    invalidation_price = (
-        _plan_get(plan, "stop_underlying", "stop_price", default=None)
-        or meta_src.get("stop_underlying")
-        or meta_src.get("stop_price")
-        or _as_mapping(meta_src.get("trigger")).get("stop")
-    )
-    candles = _extract_intraday_candles(meta_src)
-    if not candles:
-        candles = _fetch_daily_continuation_candles(str(ticker or ""))
-
-    try:
-        from ap.daily_continuation_validator import validate_daily_intraday_continuation
-    except Exception as exc:
-        diagnostics = {
-            "validator": "daily_intraday_continuation",
-            "continuation_allowed": False,
-            "reason": "daily_continuation_failed:missing_intraday_context",
-            "import_error": type(exc).__name__,
-            "ticker": ticker,
-            "timeframe": timeframe,
-            "direction": direction,
-            "client_id": client_id,
-            "execution_mode": execution_mode,
-            "canonical_signal_id": canonical_signal_id,
-        }
-        return _fail("daily_continuation_failed:missing_intraday_context", {
-            "daily_continuation_allowed": False,
-            "daily_continuation_reason": "daily_continuation_failed:missing_intraday_context",
-            "daily_continuation_diagnostics": diagnostics,
-        })
-
-    decision = validate_daily_intraday_continuation(
-        ticker=str(ticker or "") or None,
-        timeframe=timeframe,
-        direction=direction,
-        trigger_price=trigger_price,
-        current_underlying_price=underlying_last,
-        intraday_candles=candles,
-        client_id=str(client_id or "") or None,
-        execution_mode=str(execution_mode or "") or None,
-        canonical_signal_id=str(canonical_signal_id or "") or None,
-        option_premium_now=None,
-        option_premium_prev=None,
-        invalidation_price=_as_float(invalidation_price),
-        extra_diagnostics={
-            "adapter": "entry_confirmation_pre_submit",
-            "candles_count": len(candles or []),
-            "candles_source": "plan_metadata" if _extract_intraday_candles(meta_src) else "tradier_timesales",
-        },
-    )
-    diagnostics = dict(decision.diagnostics)
-    meta = {
-        "daily_continuation_allowed": bool(decision.allowed),
-        "daily_continuation_reason": decision.reason,
-        "daily_continuation_diagnostics": diagnostics,
+) -> tuple[bool | None, str | None, bool, dict]:
+    mode = _daily_continuation_mode()
+    diagnostics = {
+        "daily_continuation_mode": mode,
+        "daily_continuation_passed": None,
+        "daily_continuation_fail_reason": None,
+        "daily_continuation_would_block": False,
     }
-    if not decision.allowed:
-        return _fail(decision.reason, meta)
-    return ConfirmationResult(passed=True, fail_reason=None, metadata=meta)
+    if not _is_daily_timeframe(timeframe):
+        return True, None, False, diagnostics
+    if mode == "off":
+        return True, None, False, diagnostics
+
+    candles = _extract_intraday_candles(meta_src)
+    trigger = _as_float(trigger_price)
+    current = _as_float(underlying_last)
+    if not candles or trigger is None or current is None:
+        reason = "daily_continuation_failed:missing_intraday_context"
+        diagnostics["daily_continuation_fail_reason"] = reason
+        diagnostics["daily_continuation_would_block"] = True
+        return None, reason, mode == "enforce", diagnostics
+
+    candles = list(candles)
+    breach_index = _first_breach_index(candles, direction=direction, trigger_price=trigger)
+    if breach_index is None:
+        reason = "daily_continuation_failed:missing_intraday_context"
+        diagnostics["daily_continuation_fail_reason"] = reason
+        diagnostics["daily_continuation_would_block"] = True
+        return None, reason, mode == "enforce", diagnostics
+
+    buffer_pct = _as_float(os.getenv("DAILY_CONTINUATION_BUFFER_PCT", "0.001"))
+    if buffer_pct is None or buffer_pct < 0:
+        buffer_pct = 0.001
+    buffer = trigger * buffer_pct
+    fresh_extension = _fresh_extension_after_breach(
+        candles,
+        direction=direction,
+        breach_index=breach_index,
+    )
+    continuation_candle = _has_continuation_candle(
+        candles,
+        direction=direction,
+        trigger_price=trigger,
+        buffer=buffer,
+    )
+
+    if direction == "CALL":
+        price_back_through = current < trigger
+    else:
+        price_back_through = current > trigger
+
+    diagnostics["daily_continuation_fresh_extension"] = fresh_extension
+    diagnostics["daily_continuation_continuation_candle"] = continuation_candle
+    diagnostics["daily_continuation_price_back_through_trigger"] = price_back_through
+
+    if price_back_through:
+        reason = (
+            "daily_continuation_failed:trigger_touch_only"
+            if not fresh_extension and not continuation_candle
+            else "daily_continuation_failed:price_back_through_trigger"
+        )
+        diagnostics["daily_continuation_passed"] = False
+        diagnostics["daily_continuation_fail_reason"] = reason
+        diagnostics["daily_continuation_would_block"] = True
+        return False, reason, mode == "enforce", diagnostics
+
+    if fresh_extension or continuation_candle:
+        diagnostics["daily_continuation_passed"] = True
+        return True, None, False, diagnostics
+
+    reason = "daily_continuation_failed:opening_move_exhausted"
+    diagnostics["daily_continuation_passed"] = False
+    diagnostics["daily_continuation_fail_reason"] = reason
+    diagnostics["daily_continuation_would_block"] = True
+    return False, reason, mode == "enforce", diagnostics
 
 
 # ── Main preflight ────────────────────────────────────────────────────────────
@@ -415,12 +363,11 @@ def check_entry_confirmation(
     Pre-submit confirmation preflight.
 
     Checks (in order, fail-fast):
-    1. Daily / 1d intraday continuation, when applicable
-    2. confirmation_required present in plan metadata — skip legacy quote checks if absent
-    3. Quote freshness
-    4. Spread acceptability
-    5. Option fade from decision price
-    6. Underlying reversal from trigger
+    1. confirmation_required present in plan metadata — skip if absent
+    2. Quote freshness
+    3. Spread acceptability
+    4. Option fade from decision price
+    5. Underlying reversal from trigger
 
     Returns immediately on first failure (don't waste time on subsequent checks).
     """
@@ -448,6 +395,7 @@ def check_entry_confirmation(
 
     base = {
         "confirmation_required":      bool(confirmation_required),
+        "hybrid_confirmation_required": bool(confirmation_required),
         "confirmation_seconds":       confirm_s,
         "underlying_start":           trigger_price,
         "underlying_end":             underlying_last,
@@ -465,21 +413,18 @@ def check_entry_confirmation(
         "sandbox_mode":               sandbox_mode,
     }
 
-    # ── 0. Daily continuation guard ───────────────────────────────────────
-    daily_continuation_result = _run_daily_continuation_guard(
-        plan=plan,
+    daily_passed, daily_reason, daily_should_block, daily_meta = _evaluate_daily_continuation(
         meta_src=meta_src,
         direction=dirn,
         trigger_price=trigger_price,
         underlying_last=underlying_last,
         timeframe=timeframe,
     )
-    if daily_continuation_result is not None:
-        base.update(daily_continuation_result.metadata)
-        if not daily_continuation_result.passed:
-            return _fail(daily_continuation_result.fail_reason or "daily_continuation_failed", base)
+    base.update(daily_meta)
+    if daily_should_block:
+        return _fail(daily_reason or "daily_continuation_failed", base)
 
-    # ── Fast path: legacy quote confirmation not required ─────────────────
+    # ── Fast path: gate not required ──────────────────────────────────────
     if not confirmation_required:
         return ConfirmationResult(
             passed=True,
