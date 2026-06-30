@@ -428,17 +428,11 @@ def _insert_trade_queue_watching(
 # This timestamp only marks that the shared source signal has been handed off.
 # Per-client watcher state must be derived from trade_queue/orders/entry_watcher,
 # not ap_signals.watcher_started_at.
-def _mark_source_signal_handoff_started(source_client_email: str, signal_id: str) -> None:
-    """Set ap_signals.watcher_started_at = NOW() after confirmed insert or existing duplicate.
+def _mark_shared_signal_handoff_started(source_client_email: str, signal_id: str) -> None:
+    """Mark the shared ap_signals source row as handed off.
 
-    Despite the column name, this does NOT mark any target client's watcher as
-    started — ap_signals is the shared source-of-truth row created by the
-    originating scanner/client, and this timestamp only records that the
-    source signal has been handed off into the fanout loop at least once
-    (so a repeated handoff run doesn't re-process it). Each target client's
-    actual watcher/entry state lives in trade_queue / orders / entry_watcher,
-    keyed by that client's own rows — never read this field to answer
-    "is client X's watcher running for this signal".
+    This does NOT mean the target client's entry_watcher is armed.
+    Per-client watcher truth lives in trade_queue/orders/entry_watcher.
     """
     from ap.db import conn, run_with_retry
 
@@ -459,7 +453,7 @@ def _mark_source_signal_handoff_started(source_client_email: str, signal_id: str
         run_with_retry(_upd)
     except Exception as exc:
         log.warning(
-            "PR183 _mark_source_signal_handoff_started failed signal_id=%s client=%s: %s",
+            "PR183 _mark_shared_signal_handoff_started failed signal_id=%s client=%s: %s",
             signal_id, source_client_email, exc,
         )
 
@@ -606,7 +600,7 @@ def enqueue_watching_signals_to_trade_queue(
         if not dry_run and _watching_row_exists(cid, src_signal_id):
             # Duplicate — still mark the source signal's handoff timestamp so
             # repeated handoff runs don't re-process it (NOT a per-client watcher state).
-            _mark_source_signal_handoff_started(src_client_email, src_signal_id)
+            _mark_shared_signal_handoff_started(src_client_email, src_signal_id)
             result["skipped_duplicate"].append({
                 "signal_id":           src_signal_id,
                 "source_client_email": src_client_email,
@@ -660,7 +654,7 @@ def enqueue_watching_signals_to_trade_queue(
         if insert_outcome == "inserted":
             # Mark the source ap_signals row's handoff timestamp
             # (NOT a per-client watcher state — see function docstring)
-            _mark_source_signal_handoff_started(src_client_email, src_signal_id)
+            _mark_shared_signal_handoff_started(src_client_email, src_signal_id)
             result["inserted"].append({
                 "signal_id":           src_signal_id,
                 "source_client_email": src_client_email,
@@ -674,7 +668,7 @@ def enqueue_watching_signals_to_trade_queue(
         elif insert_outcome == "duplicate":
             # ON CONFLICT — still mark the source signal's handoff timestamp
             # so the loop is idempotent (NOT a per-client watcher state).
-            _mark_source_signal_handoff_started(src_client_email, src_signal_id)
+            _mark_shared_signal_handoff_started(src_client_email, src_signal_id)
             result["skipped_duplicate"].append({
                 "signal_id":           src_signal_id,
                 "source_client_email": src_client_email,

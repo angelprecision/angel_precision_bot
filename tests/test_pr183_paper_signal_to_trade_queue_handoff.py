@@ -98,7 +98,7 @@ def _run(target_client, mode, signals, members=None, fetch_err=None,
          patch("ap.morning_handoff._watching_row_exists", return_value=exists), \
          patch("ap.morning_handoff._insert_trade_queue_watching",
                return_value=insert_return) as mock_ins, \
-         patch("ap.morning_handoff._mark_source_signal_handoff_started") as mock_mark, \
+         patch("ap.morning_handoff._mark_shared_signal_handoff_started") as mock_mark, \
          patch("ap.morning_handoff._update_ap_signal_blocked") as mock_block:
         result = enqueue_watching_signals_to_trade_queue(
             target_client, mode, trading_date=TODAY, dry_run=dry_run,
@@ -224,6 +224,45 @@ def test_3_fanout_same_signal_to_multiple_paper_clients():
     assert jose_key  == f"sig-shared-nke:{JOSE_EMAIL}:{TODAY_NODASH}"
     assert trade_key == f"sig-shared-nke:{TRADE_EMAIL}:{TODAY_NODASH}"
     assert jose_key != trade_key
+
+
+def test_paper_fanout_marks_source_signal_but_creates_target_trade_queue_row():
+    shared_signal = _shared_signal(
+        signal_id="sig-paper-fanout",
+        client_email="scanner@system.internal",
+        ticker="AVGO",
+        side="CALL",
+        entry=145.0,
+        stop=140.0,
+        target=152.0,
+        raw_payload={"tradier_paper_access_token": "do-not-store"},
+    )
+
+    result, mock_ins, mock_mark, _ = _run(
+        JOSE_EMAIL,
+        "paper",
+        signals=[shared_signal],
+        members=[_member(email=JOSE_EMAIL)],
+    )
+
+    assert len(result["inserted"]) == 1
+    mock_mark.assert_called_once_with("scanner@system.internal", "sig-paper-fanout")
+
+    payload = mock_ins.call_args[1]["payload"]
+    assert payload["signal_id"] == "sig-paper-fanout"
+    assert payload["client_id"] == JOSE_EMAIL
+    assert payload["source_signal_client_email"] == "scanner@system.internal"
+    assert payload["execution_mode"] == "paper"
+    assert "tradier_paper_access_token" not in str(payload)
+    assert "tradier_access_token" not in str(payload)
+
+    live_result, mock_enqueue = _run_handoff_audit(
+        mode="live",
+        stage="post_overnight_reeval",
+        enqueue_result={"errors": [], "inserted": [], "signals_found": 0, "skipped_duplicate": [], "rejected": []},
+    )
+    assert live_result["ok"] is True
+    mock_enqueue.assert_not_called()
 
 
 def test_3b_unmarked_watching_row_is_not_treated_as_shared():
