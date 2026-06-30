@@ -280,6 +280,19 @@ def _estimate_premium(ticker: str) -> float:
 DEFAULT_PREMIUM_ESTIMATE = _DEFAULT_PREMIUM_FALLBACK
 
 
+def _env_true(name: str, default: bool = True) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() not in {"0", "false", "no", "off", "disabled"}
+
+
+def _truthy(value: Any) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
 @dataclass
 class ApprovedExecutionPlan:
     plan_id: str
@@ -575,6 +588,20 @@ class APMasterControl:
             self.max_trades_today,
             self.max_daily_loss,
         )
+
+        # PR #224 amendment: surface FINAL_QUALITY_MODE disabled at startup so
+        # an operator sees immediately why no trades are flowing, instead of
+        # discovering it only via a stream of FINAL_QUALITY_MODE_DISABLED
+        # rejections in the decision log.
+        self.final_quality_mode_enabled = _env_true("FINAL_QUALITY_MODE_ENABLED", True)
+        if not self.final_quality_mode_enabled:
+            log.warning(
+                "FINAL_QUALITY_MODE_DISABLED_BLOCKS_ALL_ENTRIES=true | mode=%s "
+                "client=%s — every entry signal will be REJECTED with "
+                "FINAL_QUALITY_MODE_DISABLED until FINAL_QUALITY_MODE_ENABLED "
+                "is re-enabled.",
+                self.mode, getattr(self, "_client_id", "default"),
+            )
 
     def wire(self, *, kill_switch_fn=None, mode_fn=None, position_count_fn=None, alert_fn=None, entries_paused_fn=None, **kwargs):
         if kill_switch_fn:
@@ -2598,6 +2625,31 @@ class APMasterControl:
         if self._kill_switch_fn and self._kill_switch_fn():
             return self._block(signal_id, ticker, client_id, "blocked_system", "kill_switch_active_pre_commit")
 
+        _final_quality_block = self._run_final_quality_gates(
+            signal=signal,
+            signal_id=signal_id,
+            ticker=ticker,
+            client_id=client_id,
+            plan=plan,
+            intel=intel,
+            snap=snap,
+        )
+        if _final_quality_block is not None:
+            if _final_quality_block.plan is None:
+                _final_quality_block = ControlDecision(
+                    ok=False,
+                    stage=_final_quality_block.stage,
+                    reason=_final_quality_block.reason,
+                    reason_code=_final_quality_block.reason_code,
+                    plan=plan,
+                    signal_id=signal_id,
+                    ticker=ticker,
+                    client_id=client_id,
+                )
+            elif _final_quality_block.plan.metadata is None:
+                _final_quality_block.plan.metadata = plan.metadata or {}
+            return _final_quality_block
+
         # Persist dedup first. Only then add in-memory keys and mark queued.
         # In LIVE mode a dedup-persist failure blocks the signal (fail-closed).
         # In paper mode a transient DB hiccup should not kill a valid signal.
@@ -2671,72 +2723,6 @@ class APMasterControl:
                 ticker=ticker,
                 signal_id=signal_id,
                 details={"error": str(e)},
-            )
-
-        # ── P0: Hybrid Client Quality Gate ─────────────────────────────────
-        # Terminal gate: if blocked here, signal_id cannot be re-approved.
-        # Inserted after QM verdict, after plan is built, before final approve.
-        try:
-            from ap_hybrid_client_quality_gate import evaluate_client_quality_gate
-            import os as _os
-            if _os.getenv("HYBRID_CLIENT_QUALITY_MODE", "false").strip().lower() in ("true", "1"):
-                _hcqg_snap = {
-                    "trades_today":    int(snap.get("total_trades", 0) or 0),
-                    "daily_trades":    int(snap.get("daily_trades", 0)
-                                          or snap.get("total_trades", 0) or 0),
-                    "intraday_trades": int(snap.get("intraday_trades", 0) or 0),
-                    "symbol_trades":   snap.get("symbol_trades") or {},
-                }
-                _hcqg = evaluate_client_quality_gate(
-                    signal=signal,
-                    client_id=client_id,
-                    snapshot=_hcqg_snap,
-                    live_quote=None,       # watcher-time quote check is live
-                    underlying_price=None, # ditto — pre-submit check uses watcher
-                )
-                # Persist gate metadata into plan regardless of outcome
-                if plan.metadata is None:
-                    plan.metadata = {}
-                plan.metadata["hybrid_client_quality_gate"] = _hcqg.to_meta()
-                # Hard termination — no re-approval
-                if not _hcqg.allowed:
-                    self._store_update(
-                        signal_id, "rejected",
-                        f"hybrid_client_gate: {_hcqg.block_reason}",
-                    )
-                    log.info(
-                        "[%s] HYBRID_GATE BLOCK | client=%s lane=%s reason=%s",
-                        ticker, client_id, _hcqg.quality_lane, _hcqg.block_reason,
-                    )
-                    _gate_block = self._block(
-                        signal_id, ticker, client_id,
-                        "blocked_hybrid_client_gate",
-                        _hcqg.block_reason or "hybrid_client_quality_gate",
-                        reason_code=_hcqg.block_reason,
-                    )
-                    if _gate_block.plan is None:
-                        from decision_packet import APTradePlan
-                        _gate_block = type(_gate_block)(
-                            ok=False, stage="blocked_hybrid_client_gate",
-                            reason=_hcqg.block_reason or "",
-                            plan=plan, signal_id=signal_id,
-                            ticker=ticker, client_id=client_id,
-                        )
-                    elif _gate_block.plan is not None:
-                        if _gate_block.plan.metadata is None:
-                            _gate_block.plan.metadata = {}
-                        _gate_block.plan.metadata["hybrid_client_quality_gate"] = _hcqg.to_meta()
-                    return _gate_block
-        except ImportError:
-            log.debug("ap_hybrid_client_quality_gate not found — gate skipped (install module)")
-        except Exception as _hcqg_err:
-            # Gate errors must FAIL CLOSED — block the signal
-            log.error("[%s] HYBRID_GATE ERROR — blocking as safety: %s", ticker, _hcqg_err)
-            return self._block(
-                signal_id, ticker, client_id,
-                "blocked_hybrid_client_gate",
-                f"hybrid_gate_error: {_hcqg_err}",
-                reason_code="HYBRID_GATE_ERROR",
             )
 
         return ControlDecision(ok=True, stage="approved", reason="", plan=plan, signal_id=signal_id, ticker=ticker, client_id=client_id)
@@ -2914,6 +2900,283 @@ class APMasterControl:
                 "reasoning": f"intel_error: {e}",
                 "_available": False,
             }
+
+    def _run_final_quality_gates(
+        self,
+        *,
+        signal: dict,
+        signal_id: str,
+        ticker: str,
+        client_id: str,
+        plan: ApprovedExecutionPlan,
+        intel: dict[str, Any],
+        snap: dict[str, Any],
+    ) -> Optional[ControlDecision]:
+        if not _env_true("FINAL_QUALITY_MODE_ENABLED", True):
+            self._store_update(signal_id, "rejected", "final_quality_mode_disabled")
+            return self._block(
+                signal_id,
+                ticker,
+                client_id,
+                "REJECTED",
+                "final_quality_mode_disabled",
+                reason_code="FINAL_QUALITY_MODE_DISABLED",
+            )
+
+        direction = str(
+            getattr(plan, "direction", None)
+            or signal.get("direction")
+            or signal.get("side")
+            or ""
+        ).upper()
+        timeframe = str(
+            getattr(plan, "timeframe", None)
+            or signal.get("timeframe")
+            or ""
+        ).strip().lower()
+        trigger_price = getattr(plan, "trigger_price", None)
+        stop_price = getattr(plan, "stop_underlying", None)
+        target_price = getattr(plan, "target_underlying", None)
+        # PR #224 amendment: entry_price must NEVER be used as a current-price
+        # fallback. entry_price is the planned/historical entry level, not a
+        # live market read. Using it would let stale/no-data signals pass
+        # current-price-dependent gates (TARGET_ALREADY_INVALID,
+        # REMAINING_OPPORTUNITY_TOO_SMALL) on a fabricated "current" price.
+        current_price = (
+            signal.get("current_price")
+            or signal.get("current_underlying")
+            or signal.get("underlying_price")
+            or signal.get("last_price")
+        )
+
+        try:
+            current_price = float(current_price) if current_price is not None else None
+        except Exception:
+            current_price = None
+
+        if current_price is None:
+            # PR #224 amendment: do not fabricate a current price. Record why
+            # current-price-dependent gates (TARGET_ALREADY_INVALID,
+            # REMAINING_OPPORTUNITY_TOO_SMALL) are being skipped so operators
+            # can see the gap rather than have it pass silently.
+            if plan.metadata is None:
+                plan.metadata = {}
+            plan.metadata["final_gate_diagnostics"] = {
+                **(plan.metadata.get("final_gate_diagnostics") or {}),
+                "current_price_missing": True,
+                "current_price_dependent_gates_skipped": [
+                    "TARGET_ALREADY_INVALID",
+                    "REMAINING_OPPORTUNITY_TOO_SMALL",
+                ],
+            }
+
+        try:
+            trigger_price = float(trigger_price) if trigger_price is not None else None
+        except Exception:
+            trigger_price = None
+        try:
+            stop_price = float(stop_price) if stop_price is not None else None
+        except Exception:
+            stop_price = None
+        try:
+            target_price = float(target_price) if target_price is not None else None
+        except Exception:
+            target_price = None
+
+        if direction in {"CALL", "PUT"} and trigger_price and stop_price and target_price:
+            _geometry_invalid = (
+                (direction == "CALL" and not (stop_price < trigger_price < target_price))
+                or (direction == "PUT" and not (target_price < trigger_price < stop_price))
+            )
+            if _geometry_invalid or _truthy(signal.get("trigger_geometry_invalid")):
+                self._store_update(signal_id, "rejected", "trigger_geometry_invalid")
+                return self._block(
+                    signal_id,
+                    ticker,
+                    client_id,
+                    "REJECTED",
+                    "trigger_geometry_invalid",
+                    reason_code="TRIGGER_GEOMETRY_INVALID",
+                )
+
+        if timeframe in {"1d", "d", "day", "daily", "overnight"} and (
+            _truthy(signal.get("stale_daily_plan"))
+            or _truthy(signal.get("daily_plan_stale"))
+        ):
+            self._store_update(signal_id, "rejected", "stale_daily_plan")
+            return self._block(
+                signal_id,
+                ticker,
+                client_id,
+                "REJECTED",
+                "stale_daily_plan",
+                reason_code="STALE_DAILY_PLAN",
+            )
+
+        if current_price is not None and target_price is not None and direction in {"CALL", "PUT"}:
+            _target_invalid = (
+                (direction == "CALL" and current_price >= target_price)
+                or (direction == "PUT" and current_price <= target_price)
+            )
+            if _target_invalid or _truthy(signal.get("target_already_invalid")):
+                self._store_update(signal_id, "rejected", "target_already_invalid")
+                return self._block(
+                    signal_id,
+                    ticker,
+                    client_id,
+                    "REJECTED",
+                    "target_already_invalid",
+                    reason_code="TARGET_ALREADY_INVALID",
+                )
+
+        if (
+            current_price is not None
+            and target_price is not None
+            and trigger_price is not None
+            and direction in {"CALL", "PUT"}
+        ):
+            initial_opportunity = abs(target_price - trigger_price)
+            remaining_opportunity = abs(target_price - current_price)
+            min_remaining_pct = float(os.getenv("FINAL_MIN_REMAINING_OPPORTUNITY_PCT", "0.15"))
+            if (
+                initial_opportunity > 0
+                and remaining_opportunity / initial_opportunity < min_remaining_pct
+            ) or _truthy(signal.get("remaining_opportunity_too_small")):
+                self._store_update(signal_id, "rejected", "remaining_opportunity_too_small")
+                return self._block(
+                    signal_id,
+                    ticker,
+                    client_id,
+                    "REJECTED",
+                    "remaining_opportunity_too_small",
+                    reason_code="REMAINING_OPPORTUNITY_TOO_SMALL",
+                )
+
+        risk_detail = (signal.get("risk_detail") or intel.get("risk_detail") or {})
+        if (
+            risk_detail.get("contract_quality_passes") is False
+            or _truthy(signal.get("contract_quality_failed"))
+            or _truthy(signal.get("contract_quality_block"))
+        ):
+            self._store_update(signal_id, "rejected", "contract_quality_block")
+            return self._block(
+                signal_id,
+                ticker,
+                client_id,
+                "REJECTED",
+                "contract_quality_block",
+                reason_code="CONTRACT_QUALITY_BLOCK",
+            )
+
+        if not self.paper:
+            # PR #224 amendment: explicit rollout-safe env gate.
+            # FINAL_ENTRY_INTELLIGENCE_REQUIRED defaults to True for live so
+            # the existing fail-closed behavior is preserved out of the box.
+            # Setting it false is an explicit emergency rollback switch —
+            # intel unavailability is then only OBSERVED (logged + recorded
+            # in plan.metadata) and does not block the entry.
+            intel_required = _env_true("FINAL_ENTRY_INTELLIGENCE_REQUIRED", True)
+            if not bool(intel.get("_available")):
+                if intel_required:
+                    self._store_update(signal_id, "rejected", "entry_intelligence_missing")
+                    return self._block(
+                        signal_id,
+                        ticker,
+                        client_id,
+                        "REJECTED",
+                        "entry_intelligence_missing",
+                        reason_code="ENTRY_INTELLIGENCE_MISSING",
+                    )
+                log.warning(
+                    "[%s] ENTRY_INTELLIGENCE_MISSING_OBSERVED — intel unavailable "
+                    "but FINAL_ENTRY_INTELLIGENCE_REQUIRED=false (emergency "
+                    "rollback active) — proceeding without block",
+                    ticker,
+                )
+                if plan.metadata is None:
+                    plan.metadata = {}
+                plan.metadata["final_gate_diagnostics"] = {
+                    **(plan.metadata.get("final_gate_diagnostics") or {}),
+                    "entry_intelligence_missing_observed": True,
+                    "reason_code": "ENTRY_INTELLIGENCE_MISSING_OBSERVED",
+                }
+            else:
+                try:
+                    intel_score = float(intel.get("intel_score", intel.get("score", 0)) or 0)
+                except Exception:
+                    intel_score = 0.0
+                intel_min_score = float(
+                    os.getenv(
+                        "FINAL_ENTRY_INTELLIGENCE_MIN_SCORE",
+                        os.getenv("INTEL_APPROVE_THRESHOLD", "35.0"),
+                    )
+                )
+                if intel_score < intel_min_score:
+                    self._store_update(
+                        signal_id,
+                        "rejected",
+                        f"entry_intelligence_score_too_low:{intel_score:.1f}",
+                    )
+                    return self._block(
+                        signal_id,
+                        ticker,
+                        client_id,
+                        "REJECTED",
+                        f"entry_intelligence_score_too_low ({intel_score:.1f}<{intel_min_score:.1f})",
+                        reason_code="ENTRY_INTELLIGENCE_SCORE_TOO_LOW",
+                    )
+
+        try:
+            from ap_hybrid_client_quality_gate import evaluate_client_quality_gate
+
+            if _env_true("HYBRID_CLIENT_QUALITY_MODE", False):
+                _hcqg_snap = {
+                    "trades_today": int(snap.get("total_trades", 0) or 0),
+                    "daily_trades": int(
+                        snap.get("daily_trades", 0) or snap.get("total_trades", 0) or 0
+                    ),
+                    "intraday_trades": int(snap.get("intraday_trades", 0) or 0),
+                    "symbol_trades": snap.get("symbol_trades") or {},
+                }
+                _hcqg = evaluate_client_quality_gate(
+                    signal=signal,
+                    client_id=client_id,
+                    snapshot=_hcqg_snap,
+                    live_quote=None,
+                    underlying_price=None,
+                )
+                if plan.metadata is None:
+                    plan.metadata = {}
+                plan.metadata["hybrid_client_quality_gate"] = _hcqg.to_meta()
+                if not _hcqg.allowed:
+                    self._store_update(
+                        signal_id,
+                        "rejected",
+                        f"hybrid_client_quality_block: {_hcqg.block_reason}",
+                    )
+                    return self._block(
+                        signal_id,
+                        ticker,
+                        client_id,
+                        "REJECTED",
+                        _hcqg.block_reason or "hybrid_client_quality_block",
+                        reason_code="HYBRID_CLIENT_QUALITY_BLOCK",
+                    )
+        except ImportError:
+            log.debug("ap_hybrid_client_quality_gate not found — gate skipped (install module)")
+        except Exception as _hcqg_err:
+            log.error("[%s] HYBRID_GATE ERROR — blocking as safety: %s", ticker, _hcqg_err)
+            self._store_update(signal_id, "rejected", "hybrid_client_quality_gate_error")
+            return self._block(
+                signal_id,
+                ticker,
+                client_id,
+                "REJECTED",
+                f"hybrid_gate_error: {_hcqg_err}",
+                reason_code="HYBRID_CLIENT_QUALITY_BLOCK",
+            )
+
+        return None
 
     def _fallback_tier(self, score: float) -> str:
         if score >= 85:
