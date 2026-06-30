@@ -3633,6 +3633,7 @@ def create_app() -> Flask:
 
         run_lock_key = None
         run_lock_owner_token = None
+        run_lock = None
         if not dry_run and body.get("use_run_lock", True):
             from ap_handoff_run_lock import (
                 build_run_key,
@@ -3715,7 +3716,21 @@ def create_app() -> Flask:
             no_clients_audited,
             handoff_not_ok_clients,
         ))
-        if run_lock_key is not None and run_lock_owner_token:
+        # PR #226 amendment: only attempt to mark the lock complete/failed when
+        # it was actually persisted to handoff_job_locks. When try_acquire_run_lock
+        # fails open (lock table unavailable — DB/schema error), it still returns
+        # acquired=True with a real owner_token so the job can proceed, but there
+        # is no row in the DB for that owner_token. Calling mark_run_lock_completed/
+        # mark_run_lock_failed in that case would always hit the `c.rowcount == 0`
+        # branch and log a misleading HANDOFF_RUN_LOCK_OWNER_MISMATCH warning that
+        # looks like a real concurrency bug but is actually just "there was never
+        # a row to update." lock_persisted defaults to True for backward
+        # compatibility with any caller/mock that predates this field.
+        if (
+            run_lock_key is not None
+            and run_lock_owner_token
+            and (run_lock or {}).get("lock_persisted", True)
+        ):
             from ap_handoff_run_lock import mark_run_lock_completed, mark_run_lock_failed
 
             summary = {

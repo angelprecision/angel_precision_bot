@@ -164,3 +164,90 @@ def test_owner_token_migration_and_sql_guards_exist():
     assert "ADD COLUMN IF NOT EXISTS owner_token TEXT" in sql
     assert "ADD COLUMN IF NOT EXISTS failed_reason TEXT" in sql
     assert "idx_handoff_job_locks_owner" in sql
+
+
+def test_normal_acquire_sets_lock_persisted_true():
+    """PR #226 amendment: a real INSERT-won acquire must report lock_persisted=True."""
+    db_state = _StatefulConn()
+    db_stub = MagicMock()
+    db_stub.conn = lambda: db_state
+    db_stub.run_with_retry = lambda fn, *a, **k: fn()
+
+    with patch.dict(sys.modules, {"ap.db": db_stub}):
+        mod = _load_run_lock()
+        result = mod.try_acquire_run_lock(
+            "rk-persisted",
+            job_name="morning_handoff_audit",
+            execution_mode="live",
+            client_scope="all_runners",
+            triggered_by="render_cron",
+        )
+    assert result["acquired"] is True
+    assert result["lock_persisted"] is True
+
+
+def test_reclaim_acquire_sets_lock_persisted_true():
+    """PR #226 amendment: a reclaimed stale-lock acquire must also report lock_persisted=True."""
+    db_state = _StatefulConn()
+    db_stub = MagicMock()
+    db_stub.conn = lambda: db_state
+    db_stub.run_with_retry = lambda fn, *a, **k: fn()
+
+    with patch.dict(sys.modules, {"ap.db": db_stub}):
+        mod = _load_run_lock()
+        first = mod.try_acquire_run_lock(
+            "rk-reclaim",
+            job_name="morning_handoff_audit",
+            execution_mode="live",
+            client_scope="all_runners",
+            triggered_by="render_cron",
+        )
+        assert first["lock_persisted"] is True
+
+        db_state.force_stale = True
+        second = mod.try_acquire_run_lock(
+            "rk-reclaim",
+            job_name="morning_handoff_audit",
+            execution_mode="live",
+            client_scope="all_runners",
+            triggered_by="github_backup",
+        )
+    assert second["acquired"] is True
+    assert second["reclaimed"] is True
+    assert second["lock_persisted"] is True
+
+
+def test_db_error_on_acquire_fails_open_with_lock_persisted_false():
+    """
+    PR #226 amendment — core fail-open contract test.
+
+    When the lock table itself is unreachable (any exception inside the
+    acquire transaction), try_acquire_run_lock must fail OPEN:
+      acquired=True            — the job is allowed to proceed
+      owner_token=<real uuid>  — present, even though it was never persisted
+      reason='lock_error_fail_open'
+      lock_persisted=False     — there is no row in handoff_job_locks for this
+                                  owner_token; callers must not attempt to
+                                  mark it complete/failed.
+    """
+    db_stub = MagicMock()
+    db_stub.conn = MagicMock(side_effect=Exception("relation handoff_job_locks does not exist"))
+    db_stub.run_with_retry = lambda fn, *a, **k: fn()
+
+    with patch.dict(sys.modules, {"ap.db": db_stub}):
+        mod = _load_run_lock()
+        result = mod.try_acquire_run_lock(
+            "rk-db-down",
+            job_name="morning_handoff_audit",
+            execution_mode="live",
+            client_scope="all_runners",
+            triggered_by="render_cron",
+        )
+
+    assert result["acquired"] is True
+    assert result["reason"] == "lock_error_fail_open"
+    assert result["lock_persisted"] is False
+    assert isinstance(result["owner_token"], str) and result["owner_token"], (
+        "owner_token must still be a real token even on fail-open, so the "
+        "caller's contract (extract owner_token unconditionally) doesn't break"
+    )

@@ -126,6 +126,7 @@ def try_acquire_run_lock(
                     "run_key": run_key,
                     "owner_token": owner_token,
                     "reclaimed": False,
+                    "lock_persisted": True,
                 }
 
             # Lock exists. Reclaim if it is:
@@ -156,6 +157,7 @@ def try_acquire_run_lock(
                     "run_key": run_key,
                     "owner_token": owner_token,
                     "reclaimed": True,
+                    "lock_persisted": True,
                 }
 
             return {
@@ -193,6 +195,7 @@ def try_acquire_run_lock(
             "owner_token": owner_token,
             "reclaimed": False,
             "reason": "lock_error_fail_open",
+            "lock_persisted": False,
         }
 
 

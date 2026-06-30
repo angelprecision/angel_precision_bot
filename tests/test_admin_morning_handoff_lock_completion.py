@@ -125,9 +125,80 @@ def test_blocked_readiness_marks_lock_failed_and_returns_503():
     assert failed[0][0][2] == "readiness_blocked"
 
 
+def test_fail_open_lock_succeeds_without_marking_completion():
+    """
+    PR #226 amendment — required test.
+
+    When try_acquire_run_lock() fails open (DB/table error on the lock itself,
+    not on the handoff work), it returns acquired=True with a real owner_token
+    but lock_persisted=False — there is no row in handoff_job_locks to update.
+
+    The route must:
+      - still run the handoff and return ok=True on success
+      - NOT call mark_run_lock_completed (no row exists for this owner_token)
+      - NOT call mark_run_lock_failed (same reason)
+
+    Calling either in this state would hit the `c.rowcount == 0` branch inside
+    ap_handoff_run_lock.py and log a misleading HANDOFF_RUN_LOCK_OWNER_MISMATCH
+    warning — that's exactly the noise this amendment eliminates.
+    """
+    client, app_mod = _load_flask_client()
+    completed = MagicMock()
+    failed = MagicMock()
+
+    fake_lock_mod = SimpleNamespace(
+        build_run_key=lambda **_: "rk-fail-open",
+        try_acquire_run_lock=lambda *a, **k: {
+            "acquired": True,
+            "run_key": "rk-fail-open",
+            "owner_token": "tok-fail-open",
+            "reclaimed": False,
+            "reason": "lock_error_fail_open",
+            "lock_persisted": False,
+        },
+        mark_run_lock_completed=completed,
+        mark_run_lock_failed=failed,
+    )
+    fake_client_runner = SimpleNamespace(
+        _active_runners={"jose@example.com": _fake_runner("paper")},
+        _registry_lock=_Lock(),
+    )
+
+    with patch.dict(sys.modules, {
+        "ap_handoff_run_lock": fake_lock_mod,
+        "client_runner": fake_client_runner,
+    }), patch(
+        "ap.morning_handoff.run_morning_handoff_audit",
+        return_value={"ok": True, "stage": "manual"},
+    ), patch(
+        "ap.preopen_readiness.run_preopen_autonomous_readiness",
+        return_value={"ok": True, "status": "OK"},
+    ), patch.object(
+        app_mod,
+        "_apply_live_preopen_readiness",
+        create=True,
+    ):
+        response = client.post(
+            "/admin/morning_handoff_audit",
+            json={"dry_run": False, "use_run_lock": True, "execution_mode": "paper"},
+        )
+
+    assert response.status_code == 200
+    body = response.get_json()
+    assert body["ok"] is True
+    assert body["run_key"] == "rk-fail-open"
+
+    completed.assert_not_called()
+    failed.assert_not_called()
+
+
 def test_route_uses_acquire_result_object_contract():
     src = (_REPO / "app.py").read_text()
     assert 'run_lock_owner_token = str((run_lock or {}).get("owner_token") or "")' in src
     assert 'if not bool((run_lock or {}).get("acquired")):' in src
     assert 'mark_run_lock_completed(run_lock_key, run_lock_owner_token, summary)' in src
     assert 'mark_run_lock_failed(run_lock_key, run_lock_owner_token, fail_reason, summary)' in src
+    # PR #226 amendment: completion/failure marking must be gated on
+    # lock_persisted so a fail-open acquire (no DB row) never triggers a
+    # misleading HANDOFF_RUN_LOCK_OWNER_MISMATCH warning.
+    assert '(run_lock or {}).get("lock_persisted", True)' in src
