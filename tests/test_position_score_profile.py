@@ -19,12 +19,80 @@ def test_fvg_detects_bullish_gap_and_flags_entry_inside_zone():
 
     result = evaluate_fvg_context(
         {"side": "PUT", "entry_price": 10.75, "target_price": 10.0},
-        {"candles": {"4h": candles, "daily": candles}},
+        {"candles": {"4h": candles, "1h": candles}},
     )
     # PUT signal entering inside a BULLISH FVG = opposing gap entry
     assert result["diagnostics"]["entry_inside_opposing_fvg"] is True
     assert result["diagnostics"]["entry_inside_aligned_fvg"] is False
     assert "entry_inside_opposing_fvg" in result["block_recommendations"]
+
+
+def test_fvg_flags_call_path_through_bearish_4h_wall_without_confirmation():
+    candles_4h = [
+        {"open": 105.8, "high": 106.2, "low": 104.5, "close": 105.0},
+        {"open": 104.8, "high": 105.0, "low": 102.0, "close": 102.5},
+        {"open": 102.2, "high": 103.5, "low": 101.4, "close": 101.8},
+        {"open": 101.7, "high": 102.3, "low": 100.0, "close": 100.4},
+    ]
+    result = evaluate_fvg_context(
+        {
+            "side": "CALL",
+            "current_underlying": 100.0,
+            "entry_trigger": 101.0,
+            "target_underlying": 105.0,
+        },
+        {"candles": {"4h": candles_4h, "1h": candles_4h}},
+    )
+
+    assert result["diagnostics"]["opposing_4h_fvg_in_path"] is True
+    assert result["diagnostics"]["path_state"] == "pushing_through_opposing_4h_fvg"
+    assert "opposing_4h_fvg_in_path_without_confirmation" in result["block_recommendations"]
+    assert result["target_guidance"]["action"] == "cap_before_opposing_fvg_or_block_entry"
+    assert result["target_guidance"]["suggested_target"] == 103.5
+
+
+def test_fvg_exposes_extension_candidate_when_target_stops_before_next_wall():
+    candles_4h = [
+        {"open": 105.8, "high": 106.2, "low": 104.5, "close": 105.0},
+        {"open": 104.8, "high": 105.0, "low": 102.0, "close": 102.5},
+        {"open": 102.2, "high": 103.5, "low": 101.4, "close": 101.8},
+        {"open": 101.7, "high": 102.3, "low": 100.0, "close": 100.4},
+    ]
+    result = evaluate_fvg_context(
+        {
+            "side": "CALL",
+            "current_underlying": 100.0,
+            "entry_trigger": 101.0,
+            "target_underlying": 102.0,
+        },
+        {"candles": {"4h": candles_4h, "1h": candles_4h}},
+    )
+
+    assert result["diagnostics"]["opposing_4h_fvg_in_path"] is False
+    assert result["target_guidance"]["action"] == "extension_candidate_to_opposing_fvg_front"
+    assert result["target_guidance"]["suggested_target"] == 103.5
+    assert result["target_guidance"]["candidate_fvg"]["direction"] == "bearish"
+
+
+def test_fvg_path_through_bearish_wall_allows_reclaim_confirmation():
+    candles_4h = [
+        {"open": 105.8, "high": 106.2, "low": 104.5, "close": 105.0},
+        {"open": 104.8, "high": 105.0, "low": 102.0, "close": 102.5},
+        {"open": 102.2, "high": 103.5, "low": 101.4, "close": 101.8},
+        {"open": 103.8, "high": 105.2, "low": 103.7, "close": 104.8},
+    ]
+    result = evaluate_fvg_context(
+        {
+            "side": "CALL",
+            "current_underlying": 100.0,
+            "entry_trigger": 101.0,
+            "target_underlying": 105.0,
+        },
+        {"candles": {"4h": candles_4h, "1h": candles_4h}},
+    )
+
+    assert result["diagnostics"]["opposing_4h_fvg_in_path"] is False
+    assert "opposing_4h_fvg_in_path_without_confirmation" not in result["block_recommendations"]
 
 
 def test_strat_classifies_two_up_monthly_confluence_for_call():
@@ -85,6 +153,11 @@ def test_position_profile_observe_only_shape_and_no_signal_mutation():
                 {"open": 48.6, "high": 49.0, "low": 48.1, "close": 48.9, "volume": 1100},
                 {"open": 49.7, "high": 50.3, "low": 49.4, "close": 50.1, "volume": 1900},
             ],
+            "1h": [
+                {"open": 48.0, "high": 48.8, "low": 47.7, "close": 48.5, "volume": 1000},
+                {"open": 48.6, "high": 49.0, "low": 48.1, "close": 48.9, "volume": 1100},
+                {"open": 49.7, "high": 50.3, "low": 49.4, "close": 50.1, "volume": 1900},
+            ],
         },
     }
     profile = build_position_score_profile(signal, context)
@@ -98,6 +171,7 @@ def test_position_profile_observe_only_shape_and_no_signal_mutation():
     # Shape assertions: top-level observe_only and warnings must always be present
     assert profile["observe_only"] is True
     assert isinstance(profile["warnings"], list)
+
 
 def test_position_profile_unknown_side_returns_reject_with_observe_only():
     """UNKNOWN side must fail closed: REJECT grade, block, observe_only=True, warnings list."""
