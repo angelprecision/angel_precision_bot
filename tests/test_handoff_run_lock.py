@@ -126,33 +126,43 @@ class TestAcquire:
             return _mod.try_acquire_run_lock(**kwargs)
 
     def test_first_caller_wins(self):
-        won = self._call_with_stub(
+        result = self._call_with_stub(
             _conn_factory(insert_rowcount=1),
             run_key="morning_job:2026-06-20:x:live:abc",
             job_name="x", execution_mode="live", client_scope="a",
             triggered_by="render_cron",
         )
-        assert won is True
+        assert result["acquired"] is True
+        assert result["reclaimed"] is False
+        assert result["run_key"] == "morning_job:2026-06-20:x:live:abc"
+        assert result["owner_token"]
 
     def test_second_caller_skips_when_lock_held(self):
         # INSERT conflicts (rowcount=0), UPDATE reclaim also fails (not stale) → 0
-        won = self._call_with_stub(
+        result = self._call_with_stub(
             _conn_factory(insert_rowcount=0, update_rowcount=0),
             run_key="morning_job:2026-06-20:x:live:abc",
             job_name="x", execution_mode="live", client_scope="a",
             triggered_by="github_backup",
         )
-        assert won is False
+        assert result == {
+            "acquired": False,
+            "run_key": "morning_job:2026-06-20:x:live:abc",
+            "owner_token": None,
+            "reason": "lock_held",
+        }
 
     def test_failed_lock_is_reclaimable(self):
         # INSERT conflicts (0), but UPDATE reclaim succeeds (1) because status=failed
-        won = self._call_with_stub(
+        result = self._call_with_stub(
             _conn_factory(insert_rowcount=0, update_rowcount=1),
             run_key="morning_job:2026-06-20:x:live:abc",
             job_name="x", execution_mode="live", client_scope="a",
             triggered_by="github_backup",
         )
-        assert won is True
+        assert result["acquired"] is True
+        assert result["reclaimed"] is True
+        assert result["owner_token"]
 
     def test_db_error_fails_open(self):
         """If the lock table is unavailable, acquire returns True (fail open)
@@ -163,10 +173,12 @@ class TestAcquire:
         db_stub.conn = _boom_factory
         db_stub.run_with_retry = lambda fn, *a, **k: fn()
         with patch.dict(sys.modules, {"ap.db": db_stub}):
-            won = _mod.try_acquire_run_lock(
+            result = _mod.try_acquire_run_lock(
                 run_key="k", job_name="x", execution_mode="live", client_scope="a",
             )
-        assert won is True  # fail open
+        assert result["acquired"] is True  # fail open
+        assert result["reason"] == "lock_error_fail_open"
+        assert result["owner_token"]
 
 
 # ---------------------------------------------------------------------------

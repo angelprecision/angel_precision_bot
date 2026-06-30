@@ -31,8 +31,8 @@ Verify:
 ### What happens if the table does NOT exist
 
 The run-lock helper (`ap_handoff_run_lock.py`) **fails open**: if the table is
-missing or the DB errors, `try_acquire_run_lock()` returns `True` and the job
-runs anyway. This means:
+missing or the DB errors, `try_acquire_run_lock()` returns an acquire result
+with `acquired=True` and the job runs anyway. This means:
 
 - Jobs are NOT blocked by a missing table (safe — automation still functions).
 - BUT duplicate-execution protection is **inactive** until the table exists.
