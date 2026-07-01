@@ -8,6 +8,7 @@ import pytest
 
 from ap.entry_metadata_guard import (
     MISSING_SIGNAL_ID,
+    MISSING_TIMEFRAME,
     UNKNOWN_EXECUTION_MODE,
     ZERO_SCORE,
     ZERO_TRIGGER,
@@ -120,6 +121,76 @@ def test_real_queue_payload_shape_still_blocks_without_safe_runtime_mode():
     result = validate_entry_metadata(plan=payload, client_id="jasoncosby1@gmail.com", execution_mode=None)
     assert not result.ok
     assert result.reason == UNKNOWN_EXECUTION_MODE
+
+
+def test_weekly_consolidation_scanner_payload_passes_with_explicit_scanner_timeframe_clues():
+    payload = {
+        "side": "PUT",
+        "score": 65,
+        "symbol": "WBD",
+        "ticker": "WBD",
+        "trigger": {
+            "pt1": 26.25,
+            "pt2": None,
+            "pt3": None,
+            "side": "PUT",
+            "stop": 26.88,
+            "entry": 26.57,
+            "source": "scanner_consolidation_v3_weekly",
+            "strike": 27,
+            "expiry_hint": "WEEKLY",
+            "current_price": 26.66,
+        },
+        "ev_score": 65,
+        "rr_ratio": 1.5,
+        "win_rate": 0.65,
+        "direction": "PUT",
+        "signal_id": "2026-07-01:1-1:WBD:Weekly:PUT",
+        "avg_return": 1.5,
+        "pattern_id": "1-1",
+        "avg_opt_ret": 400,
+        "n_occurrences": 5,
+        "timestamp_iso": "2026-07-01T12:31:32.416050Z",
+        "confidence_tag": "standard_pool",
+        "confidence_score": 49,
+        "backtest_match_source": "FALLBACK_DEFAULT",
+    }
+
+    before = deepcopy(payload)
+    result = validate_entry_metadata(
+        plan=payload,
+        client_id="jasoncosby1@gmail.com",
+        execution_mode="live",
+    )
+
+    assert result.ok
+    assert result.reason is None
+    assert payload == before
+
+
+def test_missing_timeframe_still_blocks_when_no_scanner_timeframe_clue_exists():
+    payload = _queue_payload_without_mode(
+        timeframe="",
+        signal_id="sig-without-timeframe-clue",
+        canonical_signal_id="sig-without-timeframe-clue",
+        underlying_entry=None,
+        trigger={
+            "entry": 77.62,
+            "stop": 75.10,
+            "pt1": 81.50,
+            "current_price": 77.88,
+            "source": "scanner_unknown",
+        },
+    )
+
+    result = validate_entry_metadata(
+        plan=payload,
+        client_id="jasoncosby1@gmail.com",
+        execution_mode="paper",
+    )
+
+    assert not result.ok
+    assert result.reason == MISSING_TIMEFRAME
 
 
 def test_plan_mode_passes_without_execution_mode_attr():
