@@ -11,15 +11,16 @@ app.py imports and calls execute_operator_manual_close().
 PURPOSE
   When Angel closes a position manually via Tradier, the bot records a
   RECONCILER_AUTO_CLOSE with a market-quote exit_price — not the true fill.
-  This endpoint backfills the true fill price, correct PnL, correct
-  close_source, and cancels any stale pending exit orders.
+  This endpoint is REPAIR-ONLY: it backfills the true fill price on an
+  already-closed position, corrects PnL, scopes stale EXIT-order cleanup to
+  the position's execution_mode, and writes an audit log.
 
 CALLED FROM
   app.py → POST /admin/operator/manual-close
 
 REQUIRES
   - Migration: migrations/2026_06_26_operator_audit_log.sql applied
-  - HMAC auth via @require_hmac (handled in app.py)
+  - Admin auth via @_require_admin (handled in app.py)
 ─────────────────────────────────────────────────────────────────────────────
 """
 from __future__ import annotations
@@ -30,6 +31,23 @@ from typing import Any, Optional
 from ap.db import conn, run_with_retry
 
 log = logging.getLogger("ap.operator_manual_close")
+
+_ALLOWED_REPAIR_CLOSE_SOURCES = frozenset({
+    "RECONCILER_AUTO_CLOSE",
+    "broker_fallback_auto_close",
+})
+
+_ACTIVE_EXIT_STATUSES = (
+    "NEW",
+    "PROCESSING",
+    "CREATED",
+    "WATCHING",
+    "PENDING_TRIGGER",
+    "SUBMITTED",
+    "ACKNOWLEDGED",
+    "PARTIAL_FILL",
+    "PARTIALLY_FILLED",
+)
 
 
 # ── Schema-safe column helpers ────────────────────────────────────────────────
@@ -62,6 +80,48 @@ def _fetch_position(db_conn, position_id: str, client_id: str) -> Optional[dict]
     if not row:
         return None
     return dict(row)
+
+
+def _audit_log_exists(db_conn) -> bool:
+    db_conn.execute("SELECT to_regclass('public.operator_audit_log')")
+    row = db_conn.fetchone()
+    if isinstance(row, dict):
+        val = next(iter(row.values()), None)
+    elif isinstance(row, (tuple, list)):
+        val = row[0] if row else None
+    else:
+        val = row
+    return bool(val)
+
+
+def _derive_execution_mode(db_conn, *, position_id: str, client_id: str, contract: str) -> Optional[str]:
+    db_conn.execute(
+        """
+        SELECT execution_mode
+        FROM   orders
+        WHERE  client_id = %s
+          AND  contract  = %s
+          AND  kind      = 'ENTRY'
+          AND (
+                position_id = %s
+             OR filled_ts IS NOT NULL
+             OR COALESCE(filled_qty, 0) > 0
+             OR status IN ('FILLED', 'PARTIAL_FILL', 'PARTIALLY_FILLED', 'OPEN')
+          )
+        ORDER BY updated_ts DESC NULLS LAST, created_ts DESC NULLS LAST
+        LIMIT 1
+        """,
+        (client_id, contract, position_id),
+    )
+    row = db_conn.fetchone()
+    if not row:
+        return None
+    if isinstance(row, dict):
+        mode = row.get("execution_mode")
+    else:
+        mode = row[0]
+    mode = str(mode or "").strip().lower()
+    return mode or None
 
 
 # ── PnL calculation ────────────────────────────────────────────────────────────
@@ -99,6 +159,13 @@ def _calculate_pnl(pos: dict, true_fill_price: float) -> tuple[float, float]:
 
 # ── Position update ────────────────────────────────────────────────────────────
 
+def _position_is_repair_eligible(pos: dict) -> bool:
+    return (
+        str(pos.get("status") or "").upper() == "CLOSED"
+        and str(pos.get("close_source") or "") in _ALLOWED_REPAIR_CLOSE_SOURCES
+    )
+
+
 def _update_position(
     db_conn,
     position_id: str,
@@ -122,8 +189,10 @@ def _update_position(
                exit_in_flight     = false,
                exit_ts            = COALESCE(exit_ts, NOW()),
                updated_at         = NOW()
-        WHERE  id        = %s
-          AND  client_id = %s
+        WHERE  id           = %s
+          AND  client_id    = %s
+          AND  status       = 'CLOSED'
+          AND  close_source IN ('RECONCILER_AUTO_CLOSE', 'broker_fallback_auto_close')
         """,
         (true_fill_price, reason, realized_pnl, realized_pnl_pct,
          position_id, client_id),
@@ -133,7 +202,41 @@ def _update_position(
 
 # ── Cancel stale exit orders ───────────────────────────────────────────────────
 
-def _cancel_pending_exit_orders(db_conn, client_id: str, contract: str) -> int:
+def _count_pending_exit_orders(db_conn, client_id: str, contract: str, execution_mode: Optional[str]) -> int:
+    db_conn.execute(
+        """
+        SELECT COUNT(*)
+        FROM   orders
+        WHERE  client_id  = %s
+          AND  contract   = %s
+          AND  kind       = 'EXIT'
+          AND  status IN (
+               'NEW',
+               'PROCESSING',
+               'CREATED',
+               'WATCHING',
+               'PENDING_TRIGGER',
+               'SUBMITTED',
+               'ACKNOWLEDGED',
+               'PARTIAL_FILL',
+               'PARTIALLY_FILLED'
+          )
+          AND (
+                (%s IS NOT NULL AND execution_mode = %s)
+             OR execution_mode IS NULL
+          )
+        """,
+        (client_id, contract, execution_mode, execution_mode),
+    )
+    row = db_conn.fetchone()
+    if isinstance(row, dict):
+        return int(next(iter(row.values()), 0) or 0)
+    if isinstance(row, (tuple, list)):
+        return int(row[0] or 0)
+    return int(row or 0)
+
+
+def _cancel_pending_exit_orders(db_conn, client_id: str, contract: str, execution_mode: Optional[str]) -> int:
     db_conn.execute(
         """
         UPDATE orders
@@ -154,8 +257,12 @@ def _cancel_pending_exit_orders(db_conn, client_id: str, contract: str) -> int:
                'PARTIAL_FILL',
                'PARTIALLY_FILLED'
           )
+          AND (
+                (%s IS NOT NULL AND execution_mode = %s)
+             OR execution_mode IS NULL
+          )
         """,
-        (client_id, contract),
+        (client_id, contract, execution_mode, execution_mode),
     )
     return db_conn.rowcount
 
@@ -202,6 +309,8 @@ def execute_operator_manual_close(
     tradier_order_id: Optional[str] = None,
     reason: str = "operator_manual_close",
     operator_note: Optional[str] = None,
+    dry_run: bool = False,
+    confirmed_broker_flat: bool = False,
 ) -> dict[str, Any]:
     """
     Execute a manual close with the true fill price.
@@ -213,6 +322,18 @@ def execute_operator_manual_close(
     """
     def _fn():
         with conn() as c:
+            if true_fill_price <= 0:
+                return {
+                    "ok": False,
+                    "error": "true_fill_price_must_be_positive",
+                    "status_code": 400,
+                }
+            if not _audit_log_exists(c):
+                return {
+                    "ok": False,
+                    "error": "operator_audit_log_missing",
+                    "status_code": 503,
+                }
             pos = _fetch_position(c, position_id, client_id)
             if not pos:
                 return {
@@ -222,14 +343,66 @@ def execute_operator_manual_close(
                 }
 
             contract = pos["contract"]
+            execution_mode = _derive_execution_mode(
+                c, position_id=position_id, client_id=client_id, contract=contract
+            )
             already_closed = (pos.get("status") or "").upper() == "CLOSED"
             realized_pnl, realized_pnl_pct = _calculate_pnl(pos, true_fill_price)
+            orders_cancellable = _count_pending_exit_orders(
+                c, client_id, contract, execution_mode
+            )
+
+            if not _position_is_repair_eligible(pos):
+                if confirmed_broker_flat and operator_note and tradier_order_id:
+                    return {
+                        "ok": False,
+                        "error": "override_not_supported_repair_only_endpoint",
+                        "status_code": 409,
+                        "position_status": pos.get("status"),
+                        "close_source": pos.get("close_source"),
+                    }
+                return {
+                    "ok": False,
+                    "error": "repair_only_closed_position_required",
+                    "status_code": 409,
+                    "position_status": pos.get("status"),
+                    "close_source": pos.get("close_source"),
+                }
+
+            if dry_run:
+                return {
+                    "ok": True,
+                    "dry_run": True,
+                    "status_code": 200,
+                    "position_id": position_id,
+                    "client_id": client_id,
+                    "contract": contract,
+                    "execution_mode": execution_mode,
+                    "position_status": pos.get("status"),
+                    "close_source": pos.get("close_source"),
+                    "current_exit_price": pos.get("exit_price"),
+                    "projected_exit_price": true_fill_price,
+                    "realized_pnl": realized_pnl,
+                    "realized_pnl_pct": realized_pnl_pct,
+                    "active_exit_orders": orders_cancellable,
+                    "operator_audit_log_exists": True,
+                    "would_update_close_source": "operator_manual_close",
+                    "would_set_reason": reason,
+                }
 
             positions_updated = _update_position(
                 c, position_id, client_id,
                 true_fill_price, reason, realized_pnl, realized_pnl_pct,
             )
-            orders_canceled = _cancel_pending_exit_orders(c, client_id, contract)
+            if positions_updated != 1:
+                return {
+                    "ok": False,
+                    "error": "position_update_conflict",
+                    "status_code": 409,
+                    "position_id": position_id,
+                    "client_id": client_id,
+                }
+            orders_canceled = _cancel_pending_exit_orders(c, client_id, contract, execution_mode)
             _write_audit_log(
                 c,
                 client_id=client_id,
@@ -261,6 +434,7 @@ def execute_operator_manual_close(
                 "realized_pnl_pct":  realized_pnl_pct,
                 "positions_updated": positions_updated,
                 "orders_canceled":   orders_canceled,
+                "execution_mode":    execution_mode,
                 "was_already_closed": already_closed,
             }
 

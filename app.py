@@ -651,7 +651,7 @@ def create_app() -> Flask:
 
     # ── PR: feat/operator-manual-close-endpoint ───────────────────────────────
     @app.post("/admin/operator/manual-close")
-    @require_hmac
+    @_require_admin
     def admin_operator_manual_close():
         """
         Backfill a true Tradier fill price onto a manually-closed position.
@@ -673,7 +673,7 @@ def create_app() -> Flask:
             dry_run           bool    default true
 
         Headers:
-            X-AP-Signature: <hmac>   (standard require_hmac auth)
+            X-Admin-Key: <admin key>
 
         Response 200:
             {
@@ -701,6 +701,7 @@ def create_app() -> Flask:
         tradier_order_id = (body.get("tradier_order_id") or "").strip() or None
         reason           = (body.get("reason") or "operator_manual_close").strip()
         operator_note    = (body.get("operator_note") or "").strip() or None
+        confirmed_broker_flat = bool(body.get("confirmed_broker_flat"))
 
         if not position_id:
             return jsonify({"ok": False, "error": "position_id is required"}), 400
@@ -712,21 +713,10 @@ def create_app() -> Flask:
             return jsonify({"ok": False, "error": "true_fill_price is required"}), 400
         try:
             true_fill_price = float(raw_fill)
-            if true_fill_price < 0:
-                raise ValueError("negative fill price")
+            if true_fill_price <= 0:
+                raise ValueError("must be > 0")
         except (TypeError, ValueError) as e:
             return jsonify({"ok": False, "error": f"true_fill_price invalid: {e}"}), 400
-
-        if dry_run:
-            return jsonify({
-                "ok":       True,
-                "dry_run":  True,
-                "message":  "dry_run=true — no mutations. Pass dry_run=false to apply.",
-                "would_update_position_id": position_id,
-                "would_set_exit_price":     true_fill_price,
-                "would_set_close_source":   "operator_manual_close",
-                "would_set_reason":         reason,
-            }), 200
 
         try:
             result = execute_operator_manual_close(
@@ -736,12 +726,14 @@ def create_app() -> Flask:
                 tradier_order_id=tradier_order_id,
                 reason=reason,
                 operator_note=operator_note,
+                dry_run=dry_run,
+                confirmed_broker_flat=confirmed_broker_flat,
             )
             status_code = result.pop("status_code", 200)
-            return jsonify({**result, "dry_run": False}), status_code
+            return jsonify(result), status_code
         except Exception as e:
             log.exception("admin_operator_manual_close failed")
-            return jsonify({"ok": False, "error": str(e), "dry_run": False}), 500
+            return jsonify({"ok": False, "error": str(e), "dry_run": dry_run}), 500
 
     log.info("=" * 70)
     log.info("ANGEL PRECISION BOT - INITIALIZING")
