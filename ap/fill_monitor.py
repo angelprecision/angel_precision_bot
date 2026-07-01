@@ -488,10 +488,10 @@ def check_order_with_broker(broker: BrokerAdapter, order: dict) -> dict:
         }
 
         # PR #235 (hardening #3): broker FILLED / EXIT_FILLED with cumulative
-        # filled_qty <= 0 is impossible truth.  Block the OSM transition and
+        # filled_qty <= 0 is impossible truth for filled or partial-fill states.  Block the OSM transition and
         # emit a critical audit + fill event so operators see it.  The
         # reconciler/next broker poll will re-check on the next tick.
-        if our in {"FILLED", "EXIT_FILLED"} and int(filled_qty or 0) <= 0:
+        if our in {"FILLED", "PARTIAL_FILL", "EXIT_FILLED", "EXIT_PARTIAL_FILL"} and int(filled_qty or 0) <= 0:
             reason = "BROKER_FILLED_ZERO_QTY"
             client_id = str(order.get("client_id") or "default")
             payload = {
@@ -509,9 +509,9 @@ def check_order_with_broker(broker: BrokerAdapter, order: dict) -> dict:
                 decision="ERROR",
                 reason_code=reason,
                 explanation=(
-                    "Broker reported FILLED but no positive cumulative filled "
-                    "quantity; OSM transition and side effects blocked pending "
-                    "next broker/reconciler pass."
+                    "Broker reported a fill/partial fill but no positive "
+                    "cumulative filled quantity; OSM transition and side "
+                    "effects blocked pending next broker/reconciler pass."
                 ),
                 result=result,
                 extra_context=payload,
