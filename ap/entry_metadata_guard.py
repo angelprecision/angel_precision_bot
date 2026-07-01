@@ -87,6 +87,33 @@ def _positive(srcs: list[Any], keys: tuple[str, ...]) -> tuple[bool, Any]:
             return num > 0, num
     return False, None
 
+def _infer_timeframe(srcs: list[Any]) -> Any:
+    """Resolve production scanner timeframe without mutating payloads.
+
+    Legacy scanner_consolidation_v3_weekly payloads have no top-level
+    `timeframe`, but they carry the timeframe in both the deterministic
+    signal_id (`...:Weekly:...`) and trigger.source
+    (`scanner_consolidation_v3_weekly`). Treat those as real metadata rather
+    than inventing a default. If no explicit clue exists, fail closed with
+    MISSING_TIMEFRAME as before.
+    """
+    explicit = _first(srcs, ("timeframe", "time_horizon"))
+    if _txt(explicit):
+        return explicit
+
+    source = _first(srcs, ("scanner_source", "scanner_type", "scanner_name", "source", "trigger.source"))
+    signal_id = _first(srcs, ("signal_id", "canonical_signal_id"))
+    expiry_hint = _first(srcs, ("expiry_hint", "trigger.expiry_hint"))
+    haystack = " ".join(_txt(v).lower() for v in (source, signal_id, expiry_hint) if _txt(v))
+
+    if "weekly" in haystack or ":1w:" in haystack or haystack.endswith(":1w"):
+        return "weekly"
+    if "daily" in haystack or ":1d:" in haystack or haystack.endswith(":1d"):
+        return "1d"
+    if "overnight" in haystack:
+        return "overnight"
+    return None
+
 def _mode(v: Any) -> str: return _txt(v).lower()
 def _dir(v: Any) -> str: return _txt(v).upper()
 def _tf(v: Any) -> str: return _txt(v).lower()
@@ -100,13 +127,13 @@ def validate_entry_metadata(*, plan=None, order=None, caller_meta=None, client_i
     if not _txt(_first(srcs, ("ticker", "symbol"))): return EntryMetadataValidationResult(False, MISSING_SYMBOL)
     raw_side = _first(srcs, ("side", "direction"))
     if _dir(raw_side) not in VALID_DIRECTIONS: return EntryMetadataValidationResult(False, INVALID_DIRECTION, {"direction": raw_side})
-    raw_tf = _first(srcs, ("timeframe",))
+    raw_tf = _infer_timeframe(srcs)
     if not _txt(raw_tf): return EntryMetadataValidationResult(False, MISSING_TIMEFRAME)
     ok, val = _positive(srcs, ("score", "ev_score", "scanner_score"))
     if not ok: return EntryMetadataValidationResult(False, ZERO_SCORE, {"score": val})
     ok, val = _positive(srcs, ("trigger_price", "entry_trigger", "trigger.entry", "entry_price", "signal_entry_price"))
     if not ok: return EntryMetadataValidationResult(False, ZERO_TRIGGER, {"trigger": val})
-    ok, val = _positive(srcs, ("underlying_entry", "underlying_at_signal", "underlying_price", "current_underlying_price", "current_underlying", "signal_underlying_price", "price_at_signal"))
+    ok, val = _positive(srcs, ("underlying_entry", "underlying_at_signal", "underlying_price", "current_underlying_price", "current_underlying", "signal_underlying_price", "price_at_signal", "trigger.current_price"))
     if not ok: return EntryMetadataValidationResult(False, ZERO_UNDERLYING, {"underlying": val})
     if _tf(raw_tf) in DAILY_TIMEFRAMES:
         ok, val = _positive(srcs, ("target_underlying", "target_price", "target", "take_profit_underlying", "trigger.pt1", "trigger.target"))
