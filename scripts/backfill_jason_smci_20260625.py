@@ -26,7 +26,7 @@ USAGE
 
 REQUIRES
   - DATABASE_URL env var set (or .env loaded)
-  - Migration 2026_06_26_operator_audit_log.sql applied (for audit log)
+  - Migration 2026_06_26_operator_audit_log.sql applied
 ─────────────────────────────────────────────────────────────────────────────
 """
 import argparse
@@ -146,26 +146,22 @@ def main():
             )
             print(f"\n✅ Position updated ({c.rowcount} row)")
 
-            # ── 3. Write audit log (if table exists) ──────────────────────────
-            try:
-                c.execute(
-                    """
-                    INSERT INTO operator_audit_log
-                      (event_type, client_id, position_id, contract,
-                       true_fill_price, tradier_order_id, reason,
-                       realized_pnl, realized_pnl_pct, operator_note, created_at)
-                    VALUES
-                      ('manual_close', %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
-                    """,
-                    (CLIENT_ID, POSITION_ID, CONTRACT,
-                     TRUE_FILL_PRICE, TRADIER_ORDER_ID or None, REASON,
-                     realized_pnl, realized_pnl_pct,
-                     "backfill of SMCI 2026-06-25 incident — reconciler used market quote"),
-                )
-                print(f"✅ Audit log written ({c.rowcount} row)")
-            except Exception as audit_err:
-                print(f"⚠️  Audit log failed (migration not applied?): {audit_err}")
-                print("   Continue without audit log — position update was committed.")
+            # ── 3. Write audit log (required for production repair proof) ─────
+            c.execute(
+                """
+                INSERT INTO operator_audit_log
+                  (event_type, client_id, position_id, contract,
+                   true_fill_price, tradier_order_id, reason,
+                   realized_pnl, realized_pnl_pct, operator_note, created_at)
+                VALUES
+                  ('manual_close', %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                """,
+                (CLIENT_ID, POSITION_ID, CONTRACT,
+                 TRUE_FILL_PRICE, TRADIER_ORDER_ID or None, REASON,
+                 realized_pnl, realized_pnl_pct,
+                 "backfill of SMCI 2026-06-25 incident — reconciler used market quote"),
+            )
+            print(f"✅ Audit log written ({c.rowcount} row)")
 
             # ── 4. Verify final state ─────────────────────────────────────────
             c.execute(
