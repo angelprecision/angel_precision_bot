@@ -284,6 +284,19 @@ def test_no_broker_submit_before_breach(monkeypatch):
     state.entry_watcher.watch.assert_called_once()
 
 
+def test_fresh_rows_still_process_and_arm_normally(monkeypatch):
+    state = _run(monkeypatch)
+
+    assert state.result["processed"] == 1
+    assert state.result["armed"] == 1
+    assert state.result["fresh_processed"] == 1
+    assert state.result["fresh_armed"] == 1
+    assert state.result["stale_skipped"] == 0
+    assert state.result["stale_inventory_only"] is False
+    state.entry_watcher.watch.assert_called_once()
+    state.master_control.evaluate.assert_called_once()
+
+
 def test_stale_rows_are_skipped_without_arming_and_reported_in_summary(monkeypatch):
     state = _run(
         monkeypatch,

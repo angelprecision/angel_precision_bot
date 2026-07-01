@@ -1550,6 +1550,14 @@ def run_overnight_reeval(
         result["fresh_armed"],
         result["stale_inventory_only"],
     )
+    if result["stale_inventory_only"] and result["armed"] == 0:
+        log.warning(
+            "[%s] overnight_reeval stale inventory only: handoff/readiness must not imply fresh setup success | "
+            "handoff_already_succeeded_for_stage_today may be expected downstream | fresh_armed=%d stale_inventory_only=%s",
+            client_id,
+            result["fresh_armed"],
+            result["stale_inventory_only"],
+        )
     return result
 
 
