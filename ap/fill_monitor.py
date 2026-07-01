@@ -35,6 +35,7 @@ from __future__ import annotations
 import importlib
 import inspect
 import os
+import re
 import time
 from datetime import datetime, timezone
 from typing import Optional
@@ -252,6 +253,171 @@ def get_pending_orders(client_id: str) -> list[dict]:
 
 
 # =============================================================================
+# PR #235 — Fill monitor safety helpers (inlined from prior shim).
+#
+# All logic here supports the eight hardening pieces:
+#   1. Confirmed broker fills must not default a missing side to CALL.
+#   2. Side is resolved from orders.direction first, then OCC C/P marker.
+#   3. Broker FILLED / EXIT_FILLED with cumulative filled_qty <= 0 must NOT
+#      transition to filled.
+#   4. underlying-at-fill is read from an explicit data broker when provided.
+#   5. Terminal ENTRY cleanup always releases the symbol lock, even when
+#      reserved_cost cannot be reconstructed.
+#   6. Position-creation failure after confirmed fill persists a dashboard-
+#      visible orders.last_error.
+#   7. data_broker is an optional argument on process_pending_order and
+#      fill_monitor_loop.
+#   8. BUY/SELL are NEVER mapped to CALL/PUT in the fill monitor — they are
+#      execution actions, not thesis direction.
+# =============================================================================
+
+# OCC option symbol format: <root><YYMMDD><C|P><strike>.  We only need the
+# side marker; strike/root normalization stays in the OCC parser used elsewhere.
+_OCC_SIDE_RE = re.compile(r"\d{6}([CP])")
+
+
+def _resolve_order_option_side(order: dict) -> tuple[Optional[str], str]:
+    """Resolve option thesis side without guessing.
+
+    Priority:
+      1. orders.direction / order.side when already canonical CALL or PUT.
+      2. OCC option symbol C/P marker.
+      3. unresolved — caller MUST fail closed / quarantine.  Never default
+         to CALL, and never map BUY/SELL → CALL/PUT (those are execution
+         actions on option orders, not thesis direction).
+
+    Returns (side, source) where source is one of:
+      "order_direction" | "occ_contract" | "missing_or_unparseable"
+    """
+    raw = str(order.get("direction") or order.get("side") or "").strip().upper()
+    if raw in {"CALL", "PUT"}:
+        return raw, "order_direction"
+
+    contract = str(
+        order.get("contract")
+        or order.get("option_symbol")
+        or order.get("symbol")
+        or ""
+    ).strip().upper()
+    m = _OCC_SIDE_RE.search(contract)
+    if m:
+        return ("CALL" if m.group(1) == "C" else "PUT"), "occ_contract"
+
+    return None, "missing_or_unparseable"
+
+
+def _with_resolved_direction(order: dict, side: str, source: str) -> dict:
+    """Return a shallow copy of the order with canonical direction + provenance."""
+    patched = dict(order)
+    patched["direction"] = side
+    patched["_fill_monitor_side_source"] = source
+    return patched
+
+
+def _broker_base_url(broker) -> Optional[str]:
+    """Best-effort broker base URL extraction for audit context."""
+    cfg_obj = getattr(broker, "cfg", None)
+    return (
+        getattr(broker, "base_url", None)
+        or getattr(cfg_obj, "base_url", None)
+        or getattr(cfg_obj, "baseurl", None)
+        or getattr(broker, "_base_url", None)
+    )
+
+
+def _select_quote_broker(execution_broker, data_broker=None):
+    """Prefer an explicit data broker over the execution broker for quote reads.
+
+    Priority:
+      1. explicit data_broker argument
+      2. execution_broker.data_broker attribute (attached via fill_monitor_loop)
+      3. execution_broker itself (fallback — matches legacy behavior)
+    """
+    return data_broker or getattr(execution_broker, "data_broker", None) or execution_broker
+
+
+def _emit_side_unresolved(order: dict, *, reason_code: str, alert_fn=None) -> None:
+    """Emit critical audit + fill event when option side cannot be resolved.
+
+    Callers MUST also skip whatever side-effect they were about to run
+    (position creation, exit engine seed, pair-opposite cancel, etc.).
+    """
+    client_id = str(order.get("client_id") or "default")
+    payload = {
+        "local_order_id":  order.get("local_order_id"),
+        "broker_order_id": order.get("broker_order_id"),
+        "symbol":          order.get("symbol"),
+        "contract":        order.get("contract"),
+        "direction":       order.get("direction"),
+        "side":            order.get("side"),
+        "reason":          "missing_or_unparseable_side",
+    }
+    log.critical("[%s] %s | %s", client_id, reason_code, payload)
+    audit(client_id, "CRITICAL", reason_code, payload)
+    emit_fill_event(
+        order,
+        decision="ERROR",
+        reason_code=reason_code,
+        explanation=(
+            "Confirmed broker fill could not be mapped to CALL/PUT without "
+            "guessing; normal position/exit seeding blocked."
+        ),
+        result={},
+        extra_context=payload,
+    )
+    _safe_alert(
+        alert_fn,
+        f"[fill_monitor:{client_id}] {reason_code} | "
+        f"order={order.get('local_order_id')} broker={order.get('broker_order_id')}",
+    )
+
+
+def _record_position_create_failure(order: dict, reason: str = "FILLED_ORDER_POSITION_CREATE_FAILED") -> None:
+    """Persist dashboard-visible orders.last_error when a confirmed fill's
+    downstream side effect (position create, exit engine seed, etc.) fails.
+
+    Never raises — this is observability, not a control-flow gate.
+    """
+    client_id = str(order.get("client_id") or "default")
+    local_order_id = order.get("local_order_id")
+    if not local_order_id:
+        return
+
+    def _write():
+        with conn() as c:
+            c.execute(
+                """
+                UPDATE orders
+                   SET last_error = %s,
+                       updated_ts = NOW()
+                 WHERE client_id = %s
+                   AND local_order_id = %s
+                """,
+                (reason, client_id, local_order_id),
+            )
+
+    try:
+        run_with_retry(_write)
+    except Exception as exc:
+        log.debug(
+            "[%s] failed to persist %s for %s: %s",
+            client_id, reason, local_order_id, exc,
+        )
+
+    audit(
+        client_id,
+        "CRITICAL",
+        reason,
+        {
+            "local_order_id":  local_order_id,
+            "broker_order_id": order.get("broker_order_id"),
+            "symbol":          order.get("symbol"),
+            "contract":        order.get("contract"),
+        },
+    )
+
+
+# =============================================================================
 # BROKER CHECK
 # =============================================================================
 
@@ -313,13 +479,69 @@ def check_order_with_broker(broker: BrokerAdapter, order: dict) -> dict:
 
         avg_fill = float(raw.get("avg_fill_price") or raw.get("price") or 0.0)
 
-        return {
+        result = {
             "status": our,
             "filled_qty": filled_qty,
             "avg_fill": avg_fill,
             "reason": raw.get("reason") or status,
             "raw": raw,
         }
+
+        # PR #235 (hardening #3): broker FILLED / EXIT_FILLED with cumulative
+        # filled_qty <= 0 is impossible truth for filled or partial-fill states.  Block the OSM transition and
+        # emit a critical audit + fill event so operators see it.  The
+        # reconciler/next broker poll will re-check on the next tick.
+        if our in {"FILLED", "PARTIAL_FILL", "EXIT_FILLED", "EXIT_PARTIAL_FILL"} and int(filled_qty or 0) <= 0:
+            reason = "BROKER_FILLED_ZERO_QTY"
+            client_id = str(order.get("client_id") or "default")
+            payload = {
+                "local_order_id":  order.get("local_order_id"),
+                "broker_order_id": broker_order_id,
+                "kind":            kind,
+                "mapped_status":   our,
+                "filled_qty":      filled_qty,
+                "broker_reason":   raw.get("reason") or status,
+            }
+            log.critical("[%s] %s | %s", client_id, reason, payload)
+            audit(client_id, "CRITICAL", reason, payload)
+            emit_fill_event(
+                order,
+                decision="ERROR",
+                reason_code=reason,
+                explanation=(
+                    "Broker reported a fill/partial fill but no positive "
+                    "cumulative filled quantity; OSM transition and side "
+                    "effects blocked pending next broker/reconciler pass."
+                ),
+                result=result,
+                extra_context=payload,
+            )
+            return {
+                **result,
+                "status": "ERROR",
+                "filled_qty": 0,
+                "reason": reason,
+            }
+
+        # PR #235 (hardening #1 + #2): on confirmed ENTRY FILLED, resolve
+        # option side from orders.direction (canonical) or the OCC C/P
+        # marker on the contract symbol.  If neither resolves, emit critical
+        # and return ERROR — do NOT silently default to CALL and do NOT map
+        # BUY/SELL.  This mutates `order` in-place so callers downstream of
+        # check_order_with_broker see the canonical direction.
+        if our == "FILLED" and kind == "ENTRY":
+            side, source = _resolve_order_option_side(order)
+            if not side:
+                _emit_side_unresolved(order, reason_code="FILLED_ORDER_SIDE_UNRESOLVED")
+                return {
+                    **result,
+                    "status": "ERROR",
+                    "reason": "FILLED_ORDER_SIDE_UNRESOLVED",
+                }
+            order["direction"] = side
+            order["_fill_monitor_side_source"] = source
+
+        return result
 
     except Exception as e:
         audit(
@@ -342,9 +564,14 @@ def check_order_with_broker(broker: BrokerAdapter, order: dict) -> dict:
 def _release_entry_guards(order: dict):
     """Release reserved equity and symbol lock for ENTRY orders."""
     client_id = order["client_id"]
-    symbol = order["symbol"]
+    symbol = order.get("symbol")
 
-    cost = None
+    # PR #235 (hardening #5): compute reserved cost defensively but do NOT
+    # let a missing cost skip the symbol lock release.  Pre-#235 an
+    # early-return here would leak the entry symbol lock forever if
+    # reserved_cost was None and limit_price × qty was also unavailable
+    # (e.g. broker-repair rows).
+    cost: Optional[float] = None
     if order.get("reserved_cost") is not None:
         try:
             cost = float(order["reserved_cost"])
@@ -352,20 +579,31 @@ def _release_entry_guards(order: dict):
             cost = None
 
     if cost is None:
-        cost = (
-            float(order.get("limit_price") or 0.0)
-            * int(order.get("qty") or 0)
-            * OPT_MULTIPLIER
-        )
+        try:
+            cost = (
+                float(order.get("limit_price") or 0.0)
+                * int(order.get("qty") or 0)
+                * OPT_MULTIPLIER
+            )
+        except Exception:
+            cost = None
 
-    if not cost or cost <= 0:
+    if cost and cost > 0:
+        release_equity(client_id, cost)
+    else:
         log.warning(
-            "[%s] _release_entry_guards: cost is zero for order=%s — equity may not be fully released",
+            "[%s] _release_entry_guards: cost is zero/unknown for order=%s — equity may not be fully released",
             order.get("client_id"), order.get("local_order_id"),
         )
-        return
-    release_equity(client_id, cost)
-    release_symbol_lock(client_id, symbol)
+
+    # Always release the symbol lock, regardless of cost resolution.
+    if symbol:
+        release_symbol_lock(client_id, symbol)
+    else:
+        log.warning(
+            "[%s] _release_entry_guards: symbol missing for order=%s — symbol lock could not be released",
+            order.get("client_id"), order.get("local_order_id"),
+        )
 
 
 # =============================================================================
@@ -385,9 +623,17 @@ def _cancel_pair_opposite(order: dict, broker: BrokerAdapter, osm, alert_fn=None
     try:
         from ap.signal_pair_manager import get_pair_manager
 
+        # PR #235 (hardening #2): resolve side from order/OCC — do NOT default
+        # to CALL when direction is missing.  If side is unresolvable, we
+        # cannot safely reason about which pair-opposite to cancel.
+        _pair_side, _pair_side_source = _resolve_order_option_side(order)
+        if not _pair_side:
+            _emit_side_unresolved(order, reason_code="PAIR_CANCEL_SIDE_UNRESOLVED", alert_fn=alert_fn)
+            return
+
         pair_manager = get_pair_manager()
         ticker = (order.get("symbol") or "").upper()
-        side = (order.get("direction") or "CALL").upper()
+        side = _pair_side
         filled_local_id = order.get("local_order_id", "")
 
         cancel_local_id = pair_manager.on_fill(
@@ -699,11 +945,58 @@ def _get_existing_position_by_order(pm, local_order_id: str, broker_order_id: Op
     return None
 
 
-def _open_position_safe(pm, *, order: dict, result: dict, plan_id: str, signal_id: str, local_id: str, broker: BrokerAdapter = None) -> Optional[str]:
-    """Open position with idempotency keys when the PM supports them."""
+def _open_position_safe(
+    pm,
+    *,
+    order: dict,
+    result: dict,
+    plan_id: str,
+    signal_id: str,
+    local_id: str,
+    broker: BrokerAdapter = None,
+    quote_broker=None,
+) -> Optional[str]:
+    """Open position with idempotency keys when the PM supports them.
+
+    PR #235 (hardening #1 + #2 + #4 + #6):
+      - Resolve side without guessing; fail closed on unresolved.
+      - Use quote_broker (or broker.data_broker) for the underlying-at-fill
+        quote read.
+      - Persist orders.last_error = FILLED_ORDER_POSITION_CREATE_FAILED when
+        position creation raises or returns falsy.
+    """
     existing = _get_existing_position_by_order(pm, local_id, order.get("broker_order_id"))
     if existing:
         return existing.get("id") or existing.get("position_id")
+
+    # PR #235: resolve canonical CALL/PUT — never default to CALL.
+    _side, _side_source = _resolve_order_option_side(order)
+    if not _side:
+        _emit_side_unresolved(order, reason_code="POSITION_OPEN_SIDE_UNRESOLVED")
+        _record_position_create_failure(order, "FILLED_ORDER_POSITION_CREATE_FAILED")
+        return None
+
+    # PR #235: pick an explicit data broker for the underlying-at-fill quote
+    # when the caller supplied one (or attached one to the execution broker).
+    _quote_broker = _select_quote_broker(broker, quote_broker)
+    if _quote_broker is not broker:
+        audit(
+            str(order.get("client_id") or "default"),
+            "INFO",
+            "FILL_MONITOR_UNDERLYING_ENTRY_QUOTE_BROKER_SELECTED",
+            {
+                "local_order_id":            order.get("local_order_id"),
+                "broker_order_id":           order.get("broker_order_id"),
+                "symbol":                    order.get("symbol"),
+                "contract":                  order.get("contract"),
+                "underlying_entry_source":   "data_broker",
+                "quote_broker_base_url":     _broker_base_url(_quote_broker),
+                "execution_broker_base_url": _broker_base_url(broker),
+                "quote_broker_is_data_broker": True,
+                "side":                      _side,
+                "side_source":               _side_source,
+            },
+        )
 
     contract = order.get("contract") or order.get("symbol") or ""
     ticker = _extract_underlying_from_contract(contract, fallback=order.get("symbol") or "")
@@ -715,14 +1008,14 @@ def _open_position_safe(pm, *, order: dict, result: dict, plan_id: str, signal_i
         or 0.0
     )
     if underlying_entry <= 0:
-        underlying_entry = _get_underlying_price_at_fill(broker, ticker)
+        underlying_entry = _get_underlying_price_at_fill(_quote_broker, ticker)
 
     kwargs = {
         "plan_id": plan_id,
         "signal_id": signal_id,
         "ticker": ticker,
         "contract": contract,
-        "side": (order.get("direction") or "CALL").upper(),
+        "side": _side,
         "qty": int(result.get("filled_qty") or order.get("qty") or 0),
         "entry_price": float(result.get("avg_fill") or 0.0),
         "underlying_entry": underlying_entry if underlying_entry > 0 else None,
@@ -736,10 +1029,21 @@ def _open_position_safe(pm, *, order: dict, result: dict, plan_id: str, signal_i
     }
 
     try:
-        return pm.open_position(**kwargs)
+        position_id = pm.open_position(**kwargs)
     except TypeError:
         # Compatibility with older PM signature that does not yet accept every field.
-        return _call_with_supported_kwargs(pm.open_position, **kwargs)
+        try:
+            position_id = _call_with_supported_kwargs(pm.open_position, **kwargs)
+        except Exception:
+            _record_position_create_failure(order, "FILLED_ORDER_POSITION_CREATE_FAILED")
+            raise
+    except Exception:
+        _record_position_create_failure(order, "FILLED_ORDER_POSITION_CREATE_FAILED")
+        raise
+
+    if not position_id:
+        _record_position_create_failure(order, "FILLED_ORDER_POSITION_CREATE_FAILED")
+    return position_id
 
 
 def _place_standing_stop_best_effort(
@@ -902,8 +1206,20 @@ def _safe_float(value, default: float = 0.0) -> float:
 
 
 def _seed_exit_engine(exit_engine, position_id: str, order: dict, result: dict, signal_id: str):
-    """Seed the exit engine after confirmed ENTRY fill without faking live quote state."""
+    """Seed the exit engine after confirmed ENTRY fill without faking live quote state.
+
+    PR #235 (hardening #2): resolve side from order/OCC — fail-closed on
+    unresolved, do NOT default to CALL.
+    """
     if not exit_engine or not position_id:
+        return
+
+    # Resolve canonical side up front — used by both the ManagedPosition
+    # constructor and the mp.signal dict below.  Emit critical + skip if
+    # unresolvable rather than silently seeding a wrong-direction position.
+    _side, _side_source = _resolve_order_option_side(order)
+    if not _side:
+        _emit_side_unresolved(order, reason_code="EXIT_ENGINE_SEED_SIDE_UNRESOLVED")
         return
 
     try:
@@ -936,7 +1252,7 @@ def _seed_exit_engine(exit_engine, position_id: str, order: dict, result: dict, 
         mp = _MP(
             ticker=ticker,
             option_symbol=contract,
-            side=(order.get("direction") or "CALL").upper(),
+            side=_side,
             quantity=int(result.get("filled_qty") or order.get("qty") or 0),
             entry_price=entry_option_price,
             underlying_entry=underlying_entry,
@@ -966,7 +1282,7 @@ def _seed_exit_engine(exit_engine, position_id: str, order: dict, result: dict, 
             "tier": str(order.get("tier") or "B"),
             "score": float(order.get("score") or 0),
             "timeframe": str(order.get("timeframe") or "1d"),
-            "side": (order.get("direction") or "CALL").upper(),
+            "side": _side,
             "quote_fresh": False,
             "seed_source": "fill_monitor",
         }
@@ -1095,6 +1411,7 @@ def process_pending_order(
     pm=None,
     exit_engine=None,
     alert_fn=None,
+    data_broker=None,
 ):
     if PRODUCTION_MODE and ALLOW_LEGACY_FILL_MONITOR:
         raise RuntimeError("ALLOW_LEGACY_FILL_MONITOR=1 is forbidden in production/live mode")
@@ -1202,6 +1519,7 @@ def process_pending_order(
                     signal_id=signal_id,
                     local_id=local_id,
                     broker=broker,
+                    quote_broker=data_broker,
                 )
 
                 # Secondary broker-side stop is best-effort only.
@@ -1625,8 +1943,15 @@ def fill_monitor_loop(
     stop_event=None,
     client_id: str | None = None,
     alert_fn=None,
+    data_broker=None,
 ):
-    """Fill monitor must never pause on kill switch — it reconciles reality."""
+    """Fill monitor must never pause on kill switch — it reconciles reality.
+
+    PR #235 (hardening #4 + #7): data_broker is an optional argument.  When
+    supplied, it becomes the quote source for underlying-at-fill reads
+    (see _select_quote_broker), keeping the execution broker (paper) and
+    the data broker (Polygon/prod-quotes) separated.
+    """
     if PRODUCTION_MODE and ALLOW_LEGACY_FILL_MONITOR:
         raise RuntimeError("ALLOW_LEGACY_FILL_MONITOR=1 is forbidden in production/live mode")
     if osm is None and not ALLOW_LEGACY_FILL_MONITOR:
@@ -1657,6 +1982,7 @@ def fill_monitor_loop(
                         pm=pm,
                         exit_engine=exit_engine,
                         alert_fn=alert_fn,
+                        data_broker=data_broker,
                     )
                 except Exception as exc:
                     log.exception("Failed to process order %s: %s", order.get("local_order_id"), exc)
@@ -1718,7 +2044,15 @@ def _legacy_create_position_from_fill(order: dict, avg_fill_price: float, filled
 
     pos_id = str(uuid.uuid4())
     client_id = order["client_id"]
-    direction = (order.get("direction") or "CALL").upper()
+
+    # PR #235 (hardening #2): resolve side without guessing.  This legacy
+    # fallback path is guarded by ALLOW_LEGACY_FILL_MONITOR=1 already, but
+    # even in that mode we must not persist a fabricated direction.
+    _leg_side, _leg_side_source = _resolve_order_option_side(order)
+    if not _leg_side:
+        _emit_side_unresolved(order, reason_code="LEGACY_POSITION_SIDE_UNRESOLVED")
+        raise RuntimeError("LEGACY_POSITION_SIDE_UNRESOLVED")
+    direction = _leg_side
 
     def _insert_pos():
         with conn() as c:
