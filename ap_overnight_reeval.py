@@ -6,7 +6,7 @@ This is the missing piece of the full trading loop.
 FLOW:
   1. Market close → scanner runs → signals arrive with timeframe=1d
   2. Bot marks them WATCHING (audit record, not yet armed)
-  3. *** THIS MODULE *** runs at 9:30 AM ET (market open)
+  3. *** THIS MODULE *** runs during the 9:00–9:45 AM ET pre-open/open handoff window
   4. For each WATCHING signal:
      a. Fetch prior-day high/low from Tradier history
      b. Run overnight_daily_validator (directional invalidation check)
@@ -563,7 +563,9 @@ def run_overnight_reeval(
 ) -> dict:
     """
     Re-evaluate all WATCHING signals for client_id.
-    Called at/after 9:30 AM ET when regular-session quotes are available.
+    Called during the 9:00–9:45 AM ET handoff window. Contract selection is
+    deferred when pre-market option chains are not yet ready, so this can
+    safely run before 9:30 without requiring live regular-session quotes.
 
     Returns summary dict: {processed, armed, rejected, skipped, errors}
     """
@@ -598,7 +600,7 @@ def run_overnight_reeval(
 
     result = {"processed": 0, "armed": 0, "rejected": 0, "skipped": 0, "errors": 0}
 
-    # Guard: only run on trading days, 9:00-9:29 AM ET window (unless force=True)
+    # Guard: only run on trading days, 9:00-9:45 AM ET window (unless force=True)
     now_et = _et_now()
     session_key = _overnight_reeval_session_key(now_et)
     if not force:
@@ -608,7 +610,7 @@ def run_overnight_reeval(
             return result
         _in_window = (now_et.hour == 9 and 0 <= now_et.minute <= 45)
         if not _in_window:
-            log.info("[%s] overnight_reeval: skipping — outside 9:30-9:45 AM ET window (now=%02d:%02d)",
+            log.info("[%s] overnight_reeval: skipping — outside 9:00-9:45 AM ET window (now=%02d:%02d)",
                      client_id, now_et.hour, now_et.minute)
             result["skipped"] = -1
             return result
