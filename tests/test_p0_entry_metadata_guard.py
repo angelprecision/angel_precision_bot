@@ -13,6 +13,8 @@ from ap.entry_metadata_guard import (
     ZERO_SCORE,
     ZERO_TRIGGER,
     ZERO_UNDERLYING,
+    _allow_deferred_overnight_watcher_create,
+    _mark_deferred_watcher_data_pending,
     validate_entry_metadata,
 )
 
@@ -191,6 +193,99 @@ def test_missing_timeframe_still_blocks_when_no_scanner_timeframe_clue_exists():
 
     assert not result.ok
     assert result.reason == MISSING_TIMEFRAME
+
+
+def test_deferred_overnight_watcher_handoff_still_fails_strict_validation_without_underlying():
+    plan = SimpleNamespace(
+        client_id="jasoncosby1@gmail.com",
+        execution_mode="live",
+        signal_id="REEVAL:95451d1d-c357-4b97-8863-e9ae6a45c9b6:731354",
+        ticker="CVS",
+        symbol="CVS",
+        side="CALL",
+        direction="CALL",
+        timeframe="1d",
+        score=70.0,
+        trigger_price=104.67,
+        target_underlying=105.93,
+        stop_underlying=102.69,
+        contract_symbol="DEFERRED:CVS",
+        metadata={"contract_deferred": True, "overnight": True},
+    )
+
+    result = validate_entry_metadata(plan=plan, client_id="jasoncosby1@gmail.com", execution_mode="live")
+
+    assert not result.ok
+    assert result.reason == ZERO_UNDERLYING
+
+
+def test_deferred_overnight_watcher_create_carveout_requires_pending_trigger():
+    plan = SimpleNamespace(
+        client_id="jasoncosby1@gmail.com",
+        execution_mode="live",
+        signal_id="REEVAL:95451d1d-c357-4b97-8863-e9ae6a45c9b6:731354",
+        ticker="CVS",
+        symbol="CVS",
+        side="CALL",
+        direction="CALL",
+        timeframe="1d",
+        score=70.0,
+        trigger_price=104.67,
+        target_underlying=105.93,
+        stop_underlying=102.69,
+        contract_symbol="DEFERRED:CVS",
+        metadata={"contract_deferred": True, "overnight": True},
+    )
+
+    assert _allow_deferred_overnight_watcher_create(
+        plan=plan,
+        caller_meta=plan.metadata,
+        initial_status="PENDING_TRIGGER",
+    )
+    assert not _allow_deferred_overnight_watcher_create(
+        plan=plan,
+        caller_meta=plan.metadata,
+        initial_status="CREATED",
+    )
+
+
+def test_deferred_overnight_watcher_marker_is_not_execution_ready():
+    plan = SimpleNamespace(metadata={"contract_deferred": True, "overnight": True})
+    caller_meta = {"contract_deferred": True, "overnight": True}
+
+    _mark_deferred_watcher_data_pending(plan, caller_meta, ZERO_UNDERLYING)
+
+    assert plan.metadata["metadata_validation_status"] == "DATA_PENDING"
+    assert plan.metadata["underlying_data_pending"] is True
+    assert plan.metadata["allowed_for_watcher"] is True
+    assert plan.metadata["allowed_for_execution"] is False
+    assert caller_meta["allowed_for_execution"] is False
+
+
+def test_submit_metadata_still_blocks_deferred_order_without_underlying():
+    order_row = {
+        "client_id": "jasoncosby1@gmail.com",
+        "execution_mode": "live",
+        "signal_id": "REEVAL:95451d1d-c357-4b97-8863-e9ea0e6a74e0:abc123",
+        "symbol": "CVS",
+        "direction": "CALL",
+        "timeframe": "1d",
+        "score": 70.0,
+        "trigger_price": 104.67,
+        "target_underlying": 105.93,
+        "stop_underlying": 102.69,
+        "meta": json.dumps({
+            "contract_deferred": True,
+            "overnight": True,
+            "underlying_data_pending": True,
+            "allowed_for_execution": False,
+        }),
+    }
+
+    result = validate_entry_metadata(order=order_row, client_id="jasoncosby1@gmail.com", execution_mode="live")
+
+    assert not result.ok
+    assert result.reason == ZERO_UNDERLYING
 
 
 def test_plan_mode_passes_without_execution_mode_attr():

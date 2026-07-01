@@ -30,6 +30,11 @@ class EntryMetadataValidationResult:
 def _txt(v: Any) -> str:
     return str(v or "").strip()
 
+def _truthy(v: Any) -> bool:
+    if isinstance(v, bool):
+        return v
+    return _txt(v).lower() in {"1", "true", "yes", "y", "on"}
+
 def _meta(raw: Any) -> dict[str, Any]:
     if isinstance(raw, dict): return dict(raw)
     if isinstance(raw, str) and raw.strip():
@@ -146,6 +151,86 @@ def _execution_mode_from(plan: Any, caller_meta: Any, requested: Any) -> Optiona
     raw = _first(_sources(plan=plan, caller_meta=caller_meta, client_id="probe", execution_mode=requested), ("execution_mode", "mode"))
     return _mode(raw) if _mode(raw) in VALID_EXECUTION_MODES else None
 
+def _is_pending_trigger_status(value: Any) -> bool:
+    raw = _txt(value).upper()
+    return raw == "PENDING_TRIGGER" or raw.endswith("PENDING_TRIGGER")
+
+def _allow_deferred_overnight_watcher_create(*, plan: Any, caller_meta: Any, initial_status: Any) -> bool:
+    """Allow only watcher materialization, not execution, when underlying is pending.
+
+    Overnight reeval may arm a PENDING_TRIGGER watcher with contract_deferred=True
+    so breach-time execution can select a live contract later. At this stage the
+    row is not broker-executable. We allow the watcher row to exist only when the
+    plan/caller metadata proves all of the following:
+      - initial_status is PENDING_TRIGGER
+      - contract_deferred is true
+      - overnight is true
+      - a positive trigger/entry level exists
+      - for daily-style timeframes, positive stop and target levels exist
+
+    validate_entry_metadata() itself still fails closed on zero underlying, and
+    submit_existing_entry()/submit_entry still use that strict path before any
+    broker submit.
+    """
+    if not _is_pending_trigger_status(initial_status):
+        return False
+    srcs = _sources(plan=plan, caller_meta=caller_meta, client_id="probe", execution_mode="paper")
+    if not _truthy(_first(srcs, ("contract_deferred",))):
+        return False
+    if not _truthy(_first(srcs, ("overnight",))):
+        return False
+    ok, _val = _positive(srcs, ("trigger_price", "entry_trigger", "trigger.entry", "entry_price", "signal_entry_price"))
+    if not ok:
+        return False
+    raw_tf = _infer_timeframe(srcs)
+    if _tf(raw_tf) in DAILY_TIMEFRAMES:
+        target_ok, _target = _positive(srcs, ("target_underlying", "target_price", "target", "take_profit_underlying", "trigger.pt1", "trigger.target"))
+        stop_ok, _stop = _positive(srcs, ("stop_underlying", "stop_price", "stop", "stop_loss_underlying", "trigger.stop"))
+        if not target_ok or not stop_ok:
+            return False
+    return True
+
+def _mark_deferred_watcher_data_pending(plan: Any, caller_meta: Any, reason: str) -> None:
+    marker = {
+        "metadata_validation_status": "DATA_PENDING",
+        "metadata_validation_reason": reason,
+        "underlying_data_pending": True,
+        "allowed_for_watcher": True,
+        "allowed_for_execution": False,
+        "watcher_handoff_only": True,
+    }
+    targets: list[Any] = []
+    if isinstance(caller_meta, dict):
+        targets.append(caller_meta)
+    if isinstance(plan, Mapping):
+        meta = plan.get("metadata")
+        if isinstance(meta, dict):
+            targets.append(meta)
+        else:
+            plan["metadata"] = dict(marker)
+            targets.append(plan["metadata"])
+        targets.append(plan)
+    elif plan is not None:
+        meta = getattr(plan, "metadata", None)
+        if isinstance(meta, dict):
+            targets.append(meta)
+        else:
+            try:
+                setattr(plan, "metadata", dict(marker))
+                targets.append(getattr(plan, "metadata"))
+            except Exception:
+                pass
+        targets.append(plan)
+    for target in targets:
+        try:
+            if isinstance(target, dict):
+                target.update(marker)
+            else:
+                for key, value in marker.items():
+                    setattr(target, key, value)
+        except Exception:
+            pass
+
 def install_entry_metadata_guard() -> None:
     from ap.order_state_machine import APOrderStateMachine, OrderStatus
     if getattr(APOrderStateMachine, "_entry_metadata_guard_installed", False): return
@@ -158,8 +243,21 @@ def install_entry_metadata_guard() -> None:
         requested_mode = kwargs.get("execution_mode")
         result = validate_entry_metadata(plan=plan, caller_meta=caller_meta, client_id=getattr(self, "client_id", None), execution_mode=requested_mode)
         if not result.ok:
-            log.warning("[%s] ENTRY_METADATA_BLOCKED before create_entry_order | reason=%s details=%s", getattr(self, "client_id", "?"), result.reason, result.details)
-            raise ValueError(result.reason)
+            if result.reason == ZERO_UNDERLYING and _allow_deferred_overnight_watcher_create(
+                plan=plan,
+                caller_meta=caller_meta,
+                initial_status=kwargs.get("initial_status"),
+            ):
+                _mark_deferred_watcher_data_pending(plan, caller_meta, result.reason)
+                log.warning(
+                    "[%s] ENTRY_METADATA_DATA_PENDING before create_entry_order | reason=%s "
+                    "action=allow_deferred_overnight_watcher_create allowed_for_execution=false",
+                    getattr(self, "client_id", "?"),
+                    result.reason,
+                )
+            else:
+                log.warning("[%s] ENTRY_METADATA_BLOCKED before create_entry_order | reason=%s details=%s", getattr(self, "client_id", "?"), result.reason, result.details)
+                raise ValueError(result.reason)
         if not requested_mode:
             resolved = _execution_mode_from(plan, caller_meta, requested_mode)
             if resolved: kwargs["execution_mode"] = resolved
