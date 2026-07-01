@@ -187,6 +187,55 @@ def _get_exit_engine_for_client(client_id: str):
         return _exit_engine_registry.get(key)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# PR #234 — OSM entry-direction fail-closed guard.
+#
+# The OSM is the final authority for order creation.  An ENTRY row must never
+# be inserted with a missing, empty, or non-canonical direction — that would
+# mean the broker submission path downstream has to guess, which is
+# unacceptable for live/paper order lifecycle.  This helper is the last line
+# of defense before create_entry_order() persists a row.
+#
+# Non-goals (PR #234 spec): transition graph, split-brain handling, broker
+# submit behavior, PENDING_TRIGGER handoff helpers, execution_mode handling,
+# order metadata shape (except canonical direction/side).  None are touched.
+# ─────────────────────────────────────────────────────────────────────────────
+_ENTRY_DIRECTION_ALIASES: dict[str, str] = {
+    "CALL":    "CALL",
+    "BUY":     "CALL",
+    "LONG":    "CALL",
+    "CALLS":   "CALL",
+    "BULLISH": "CALL",
+    "PUT":     "PUT",
+    "SELL":    "PUT",
+    "SHORT":   "PUT",
+    "PUTS":    "PUT",
+    "BEARISH": "PUT",
+}
+
+
+def _normalize_entry_direction(plan) -> str:
+    """Canonical CALL/PUT normalizer for the OSM entry-order insert path.
+
+    Reads plan.side first, falling back to plan.direction when side is
+    missing/empty.  Raises
+    ValueError('invalid_or_missing_entry_direction:<raw>') when the resolved
+    value is not one of the recognized aliases.  Never returns a default —
+    callers must not catch and substitute.
+    """
+    raw = getattr(plan, "side", None)
+    if raw is None or str(raw or "").strip() == "":
+        raw = getattr(plan, "direction", None)
+
+    raw_norm = str(raw or "").strip().upper()
+    direction = _ENTRY_DIRECTION_ALIASES.get(raw_norm)
+
+    if direction not in {"CALL", "PUT"}:
+        raise ValueError(f"invalid_or_missing_entry_direction:{raw_norm!r}")
+
+    return direction
+
+
 class OrderStatus:
     CREATED           = "CREATED"
     PENDING_TRIGGER   = "PENDING_TRIGGER"
@@ -480,9 +529,45 @@ class APOrderStateMachine:
                 f"invalid_entry_qty: plan.contracts={_contracts} for client={self.client_id}"
             )
 
-        # ── Req 1+3: Normalise direction from plan.side ───────────────────
-        _side_raw = str(getattr(plan, "side", "") or "").upper().strip()
-        _direction = _side_raw if _side_raw in ("CALL", "PUT") else _side_raw
+        # ── PR #234: fail-closed entry-direction guard ────────────────────
+        # OSM is the final order-creation authority.  If plan.side / plan.direction
+        # cannot be resolved to canonical CALL/PUT here, we MUST NOT insert the
+        # order — the broker submit path downstream cannot recover a missing
+        # direction.  The helper raises ValueError; we log.critical for
+        # operator visibility before letting it propagate.
+        try:
+            _direction = _normalize_entry_direction(plan)
+        except ValueError as _dir_err:
+            log.critical(
+                "[%s] create_entry_order BLOCKED %s plan=%s",
+                self.client_id,
+                _dir_err,
+                getattr(plan, "plan_id", "?"),
+            )
+            raise
+
+        # Defensive meta canonicalization: even if the caller passed a meta
+        # dict with a stale or missing direction/side, force the canonical
+        # value on a defensive copy so no downstream reader sees a mismatch
+        # between orders.direction and meta.direction.
+        if meta is None:
+            meta = {}
+        else:
+            meta = dict(meta)
+        meta["direction"] = _direction
+        meta["side"] = _direction
+
+        # Push the canonical direction back onto the plan object so any
+        # subsequent read of plan.side / plan.direction (retry engine,
+        # watcher, exit engine, logging) sees the normalized value.  Wrapped
+        # in try/except because plan may be a frozen dataclass / read-only
+        # proxy in some caller paths.
+        try:
+            plan.side = _direction
+            plan.direction = _direction
+        except Exception:
+            pass
+
         local_order_id = str(uuid.uuid4())
         contract = getattr(plan, "contract_symbol", None) or plan.ticker
         lp = float(limit_price) if limit_price else (float(plan.limit_price) if getattr(plan, "limit_price", None) else None)
