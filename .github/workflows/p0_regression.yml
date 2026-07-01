@@ -1,15 +1,5 @@
 name: P0 Regression Suite
 
-# Runs the canonical P0 + cohesion tests on every PR and push to main.
-# This is the gate that prevents regressions to:
-#   - P0-1 exit retry / idempotency
-#   - P0-2 entry retry / idempotency
-#   - P0-3 force-close circuit breaker (entry-gate + tick self-check)
-#   - P0-5 silent-swallow conversion
-#   - PR #16 funnel-leak fixes
-#   - Readiness contract
-#   - Reason-code taxonomy
-
 on:
   push:
     branches:
@@ -33,14 +23,9 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install pytest requests psycopg2-binary python-dotenv cryptography
-          # Most production deps not needed — tests use mocks. If a future
-          # test pulls a real dep, add it here individually rather than
-          # installing the full bot stack.
 
-      - name: Run P0 + cohesion test suite
+      - name: Run P0 plus cohesion tests
         env:
-          # Tests use mocks for DB — this is just to satisfy any module
-          # that requires DATABASE_URL at import time.
           DATABASE_URL: "postgresql://test:test@localhost/test"
         run: |
           python -m pytest \
@@ -50,18 +35,10 @@ jobs:
             tests/test_funnel_fixes.py \
             tests/test_p0_regression_suite.py \
             tests/test_p0_entry_metadata_guard.py \
+            tests/test_p0_trade_flow_contracts.py \
             -v --tb=short --color=yes
 
       - name: Summary
         if: always()
         run: |
-          echo "P0 regression suite covers:"
-          echo "  - P0-1 exit submission retry + idempotency"
-          echo "  - P0-2 entry submission retry + idempotency"
-          echo "  - P0-3 daily-loss force-close (entry-gate + tick self-check)"
-          echo "  - P0-5 silent-swallow reduction (count threshold)"
-          echo "  - PR #16 funnel-leak fixes + corrections"
-          echo "  - Single readiness contract"
-          echo "  - Reason-code taxonomy"
-          echo "  - PR200 entry metadata guard"
-          echo "  - All 16 critical modules import clean"
+          echo "P0 regression suite complete"
