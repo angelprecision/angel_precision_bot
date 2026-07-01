@@ -32,11 +32,11 @@ def test_overnight_rejects_invalid_side_before_prior_levels_or_trigger_math():
     prefix = _overnight_job_loop_prefix()
 
     assert "INVALID_OR_MISSING_SIDE" in prefix or "invalid_or_missing_side" in prefix
-    assert "normalize_signal_side" in prefix or "CALL_ALIASES" in prefix
+    assert "_normalize_overnight_side" in _OVERNIGHT_SRC or "CALL_ALIASES" in prefix
     assert "signal[\"side\"] = side" in prefix or "signal['side'] = side" in prefix
     assert "signal[\"direction\"] = side" in prefix or "signal['direction'] = side" in prefix
     assert "side = (signal.get(\"side\") or \"\").upper()" not in prefix
-
+ 
 
 def test_overnight_trigger_derivation_does_not_treat_invalid_side_as_put():
     """Entry trigger fallback must be explicit CALL/PUT, never side!=CALL => PUT."""
@@ -77,3 +77,10 @@ def test_overnight_create_entry_order_stays_pending_trigger_and_does_not_submit(
     pre_breach_region = _OVERNIGHT_SRC[: _OVERNIGHT_SRC.find("# Step 7:")]
     assert ".submit_order(" not in pre_breach_region
     assert ".submit_existing_entry(" not in pre_breach_region
+
+
+def test_overnight_result_tracks_stale_inventory_summary_fields():
+    assert '"stale_skipped"' in _OVERNIGHT_SRC
+    assert '"fresh_processed"' in _OVERNIGHT_SRC
+    assert '"fresh_armed"' in _OVERNIGHT_SRC
+    assert '"stale_inventory_only"' in _OVERNIGHT_SRC

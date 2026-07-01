@@ -567,7 +567,7 @@ def run_overnight_reeval(
     deferred when pre-market option chains are not yet ready, so this can
     safely run before 9:30 without requiring live regular-session quotes.
 
-    Returns summary dict: {processed, armed, rejected, skipped, errors}
+    Returns summary dict with core counts plus stale/fresh visibility.
     """
     from ap.overnight_daily_validator import (
         validate_overnight_daily_signal,
@@ -598,7 +598,17 @@ def run_overnight_reeval(
     except Exception as _e:
         log.warning("overnight_health_heartbeat_failed: %s", _e)
 
-    result = {"processed": 0, "armed": 0, "rejected": 0, "skipped": 0, "errors": 0}
+    result = {
+        "processed": 0,
+        "armed": 0,
+        "rejected": 0,
+        "skipped": 0,
+        "errors": 0,
+        "stale_skipped": 0,
+        "fresh_processed": 0,
+        "fresh_armed": 0,
+        "stale_inventory_only": False,
+    }
 
     # Guard: only run on trading days, 9:00-9:45 AM ET window (unless force=True)
     now_et = _et_now()
@@ -675,7 +685,9 @@ def run_overnight_reeval(
                         except Exception:
                             pass
                     result["rejected"] += 1
+                    result["stale_skipped"] += 1
                     continue
+            result["fresh_processed"] += 1
 
             # Timeframe guard: overnight reeval is DAILY signals only.
             # 60m, 5m, 15m, 1h signals are intraday — by 9 AM the thesis
@@ -1371,6 +1383,7 @@ def run_overnight_reeval(
                         except Exception:
                             pass
                     result["armed"] += 1
+                    result["fresh_armed"] += 1
                 else:
                     _reject_reason = str(
                         getattr(entry_watcher, "_last_reject_reason", None)
@@ -1519,10 +1532,23 @@ def run_overnight_reeval(
                 )
             result["errors"] += 1
 
+    result["stale_inventory_only"] = bool(
+        result["processed"] > 0
+        and result["fresh_processed"] == 0
+        and result["stale_skipped"] > 0
+    )
     log.info(
-        "[%s] overnight_reeval complete: processed=%d armed=%d rejected=%d skipped=%d errors=%d",
-        client_id, result["processed"], result["armed"], result["rejected"],
-        result["skipped"], result["errors"],
+        "[%s] overnight_reeval complete: processed=%d armed=%d rejected=%d skipped=%d errors=%d stale_skipped=%d fresh_processed=%d fresh_armed=%d stale_inventory_only=%s",
+        client_id,
+        result["processed"],
+        result["armed"],
+        result["rejected"],
+        result["skipped"],
+        result["errors"],
+        result["stale_skipped"],
+        result["fresh_processed"],
+        result["fresh_armed"],
+        result["stale_inventory_only"],
     )
     return result
 

@@ -282,3 +282,33 @@ def test_no_broker_submit_before_breach(monkeypatch):
     assert state.result["armed"] == 1
     assert broker.get_prior_day_levels_calls == ["AAPL"]
     state.entry_watcher.watch.assert_called_once()
+
+
+def test_stale_rows_are_skipped_without_arming_and_reported_in_summary(monkeypatch):
+    state = _run(
+        monkeypatch,
+        signal=_signal(created_at="2026-06-20T20:00:00+00:00"),
+    )
+
+    assert state.result["armed"] == 0
+    assert state.result["rejected"] == 1
+    assert state.result["stale_skipped"] == 1
+    assert state.result["fresh_processed"] == 0
+    assert state.result["fresh_armed"] == 0
+    assert state.result["stale_inventory_only"] is True
+    assert state.rejected == [(101, "tradefluencehq@gmail.com", "stale_signal:age=10d")]
+    state.entry_watcher.watch.assert_not_called()
+    state.master_control.evaluate.assert_not_called()
+
+
+def test_stale_only_run_reports_stale_inventory_only(monkeypatch):
+    state = _run(
+        monkeypatch,
+        signal=_signal(created_at="2026-06-22T20:00:00+00:00"),
+    )
+
+    assert state.result["processed"] == 1
+    assert state.result["stale_skipped"] == 1
+    assert state.result["fresh_processed"] == 0
+    assert state.result["fresh_armed"] == 0
+    assert state.result["stale_inventory_only"] is True
