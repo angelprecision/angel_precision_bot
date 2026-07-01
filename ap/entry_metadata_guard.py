@@ -166,6 +166,7 @@ def _allow_deferred_overnight_watcher_create(*, plan: Any, caller_meta: Any, ini
       - contract_deferred is true
       - overnight is true
       - a positive trigger/entry level exists
+      - for daily-style timeframes, positive stop and target levels exist
 
     validate_entry_metadata() itself still fails closed on zero underlying, and
     submit_existing_entry()/submit_entry still use that strict path before any
@@ -179,7 +180,15 @@ def _allow_deferred_overnight_watcher_create(*, plan: Any, caller_meta: Any, ini
     if not _truthy(_first(srcs, ("overnight",))):
         return False
     ok, _val = _positive(srcs, ("trigger_price", "entry_trigger", "trigger.entry", "entry_price", "signal_entry_price"))
-    return bool(ok)
+    if not ok:
+        return False
+    raw_tf = _infer_timeframe(srcs)
+    if _tf(raw_tf) in DAILY_TIMEFRAMES:
+        target_ok, _target = _positive(srcs, ("target_underlying", "target_price", "target", "take_profit_underlying", "trigger.pt1", "trigger.target"))
+        stop_ok, _stop = _positive(srcs, ("stop_underlying", "stop_price", "stop", "stop_loss_underlying", "trigger.stop"))
+        if not target_ok or not stop_ok:
+            return False
+    return True
 
 def _mark_deferred_watcher_data_pending(plan: Any, caller_meta: Any, reason: str) -> None:
     marker = {
