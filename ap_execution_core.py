@@ -1397,6 +1397,7 @@ class APExecutionCore:
                     except (TypeError, ValueError):
                         _prior_attempt_a = 0
                     _this_attempt_a = _prior_attempt_a + 1
+                    _retry_enabled_a    = str(os.getenv("BREACH_SELECTOR_RETRY_ENABLED", "0")).strip().lower() in ("1", "true", "yes")
                     _MAX_RETRIES_A      = int(os.getenv("MAX_BREACH_SELECTOR_RETRIES", "3"))
                     _RETRY_DELAY_A      = int(os.getenv("BREACH_SELECTOR_RETRY_DELAY_SECONDS", "20"))
                     _RETRY_CUTOFF_A     = int(os.getenv("BREACH_SELECTOR_RETRY_CUTOFF_ET", "945"))
@@ -1404,7 +1405,9 @@ class APExecutionCore:
                     _now_hhmm_a         = _now_et_a.hour * 100 + _now_et_a.minute
                     _past_cutoff_a      = _now_hhmm_a >= _RETRY_CUTOFF_A
                     _is_retryable_a     = (
-                        _obs_rc_a in RETRYABLE_BREACH_SELECTOR_REASONS
+                        _retry_enabled_a
+                        and bool(queue_local_order_id)
+                        and _obs_rc_a in RETRYABLE_BREACH_SELECTOR_REASONS
                         and _this_attempt_a <= _MAX_RETRIES_A
                         and not _past_cutoff_a
                     )
@@ -1458,9 +1461,25 @@ class APExecutionCore:
                         # Rearm: fire _on_entry_trigger again after delay.
                         # `watched` is still valid — the price already breached.
                         import threading as _threading_retry
+                        _retry_key_a = (
+                            str(queue_local_order_id or ""),
+                            int(_this_attempt_a),
+                        )
+                        _retry_inflight_a = getattr(self, "_deferred_breach_retry_inflight", None)
+                        if not isinstance(_retry_inflight_a, set):
+                            _retry_inflight_a = set()
+                            setattr(self, "_deferred_breach_retry_inflight", _retry_inflight_a)
+                        if _retry_key_a in _retry_inflight_a:
+                            log.warning(
+                                "[%s] DEFERRED_BREACH_RETRY_DUPLICATE_SUPPRESSED order=%s attempt=%d",
+                                ticker, queue_local_order_id, _this_attempt_a,
+                            )
+                            return
+                        _retry_inflight_a.add(_retry_key_a)
                         _watched_ref = watched
                         def _retry_deferred_breach_a(_w=_watched_ref, _t=ticker,
-                                                      _att=_this_attempt_a, _d=_RETRY_DELAY_A):
+                                                      _att=_this_attempt_a, _d=_RETRY_DELAY_A,
+                                                      _retry_key=_retry_key_a):
                             try:
                                 time.sleep(_d)
                                 log.info(
@@ -1473,6 +1492,11 @@ class APExecutionCore:
                                     "[%s] DEFERRED_BREACH_RETRY thread error attempt=%d: %s",
                                     _t, _att, _retry_exc_a,
                                 )
+                            finally:
+                                try:
+                                    getattr(self, "_deferred_breach_retry_inflight", set()).discard(_retry_key)
+                                except Exception:
+                                    pass
                         _rt_a = _threading_retry.Thread(
                             target=_retry_deferred_breach_a,
                             daemon=True,

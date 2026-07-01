@@ -640,8 +640,8 @@ class APContractSelectionEngine:
         self.mutate_plan    = bool(mutate_plan)
 
         # ── PR1 (deferred-dte-ladder): DTE-bucket selection policy ────────────
-        # Default ON, but applies only to explicit deferred-breach selection.
-        self.dte_ladder_enabled = os.getenv("DEFERRED_DTE_LADDER", "1").strip() in ("1", "true", "yes")
+        # Default OFF, and applies only to explicit deferred-breach selection.
+        self.dte_ladder_enabled = os.getenv("DEFERRED_DTE_LADDER", "0").strip() in ("1", "true", "yes")
         # Bucket boundaries (inclusive upper, DTE). A=near, B=adjacent, C=fallback.
         self.dte_bucket_a_max = int(os.getenv("DTE_BUCKET_A_MAX", "2"))   # 0–2 DTE
         self.dte_bucket_b_max = int(os.getenv("DTE_BUCKET_B_MAX", "7"))   # 3–7 DTE

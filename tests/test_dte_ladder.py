@@ -32,8 +32,8 @@ _SRC  = (_REPO / "ap" / "contract_selector.py").read_text()
 # ---------------------------------------------------------------------------
 
 class TestSourceGuards:
-    def test_flag_defaults_on(self):
-        assert 'os.getenv("DEFERRED_DTE_LADDER", "1")' in _SRC
+    def test_flag_defaults_off(self):
+        assert 'os.getenv("DEFERRED_DTE_LADDER", "0")' in _SRC
 
     def test_ladder_method_present(self):
         assert "def _select_with_dte_ladder(" in _SRC

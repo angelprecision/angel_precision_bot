@@ -130,6 +130,7 @@ def test_retryable_chain_failure_rearms_without_submit_or_terminalize(monkeypatc
     core = _make_core(_Selector("CHAIN_PROVIDER_ERROR", explanation="tradier warmup miss"))
     watched = _make_watched()
     with monkeypatch.context() as m:
+        m.setenv("BREACH_SELECTOR_RETRY_ENABLED", "1")
         m.setenv("MAX_BREACH_SELECTOR_RETRIES", "3")
         m.setenv("BREACH_SELECTOR_RETRY_DELAY_SECONDS", "1")
         m.setenv("BREACH_SELECTOR_RETRY_CUTOFF_ET", "945")
@@ -169,7 +170,9 @@ def test_no_expiration_in_dte_window_rearms_without_terminalizing(monkeypatch):
     monkeypatch.setattr(threading, "Thread", recorder.factory)
 
     core = _make_core(_Selector("NO_EXPIRATION_IN_DTE_WINDOW", explanation="dte ladder warming up"))
-    core._on_entry_trigger(_make_watched())
+    with monkeypatch.context() as m:
+        m.setenv("BREACH_SELECTOR_RETRY_ENABLED", "1")
+        core._on_entry_trigger(_make_watched())
 
     core.order_state_machine.submit_existing_entry.assert_not_called()
     core.order_state_machine.expire_pending_entry.assert_not_called()
@@ -217,6 +220,7 @@ def test_cutoff_after_945_terminalizes(monkeypatch):
 
     core = _make_core(_Selector("CHAIN_PROVIDER_ERROR"))
     with monkeypatch.context() as m:
+        m.setenv("BREACH_SELECTOR_RETRY_ENABLED", "1")
         m.setenv("MAX_BREACH_SELECTOR_RETRIES", "3")
         m.setenv("BREACH_SELECTOR_RETRY_CUTOFF_ET", "945")
         core._on_entry_trigger(_make_watched())
@@ -321,3 +325,43 @@ def test_chain_auth_error_remains_terminal(monkeypatch):
     result = sel._select_with_dte_ladder(SimpleNamespace(ticker="AVGO", timeframe="1d", metadata={"deferred_breach_selection": True}))
     assert result is None
     assert sel._last_failure["reason_code"] == "CHAIN_AUTH_ERROR"
+
+
+def test_non_deferred_selector_path_is_unchanged_when_ladder_flag_enabled(monkeypatch):
+    mod = _load_selector({"DEFERRED_DTE_LADDER": "1"})
+    APContractSelectionEngine = mod.APContractSelectionEngine
+    sel = object.__new__(APContractSelectionEngine)
+
+    assert sel._is_ladder_eligible(SimpleNamespace(ticker="AVGO", timeframe="1d", metadata={})) is False
+    assert sel._is_ladder_eligible(SimpleNamespace(ticker="AVGO", timeframe="1d")) is False
+
+
+def test_duplicate_retry_thread_is_suppressed(monkeypatch):
+    class _EarlyDatetime:
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 6, 30, 9, 35, 0, tzinfo=tz)
+
+    monkeypatch.setattr(ec_mod, "datetime", _EarlyDatetime)
+    monkeypatch.setattr(ec_mod.APExecutionCore, "_breach_risk_check", lambda self, watched: True)
+    monkeypatch.setattr(
+        ec_mod.APExecutionCore,
+        "_recover_plan_for_revalidation",
+        lambda self, watched: _make_plan(reason_code="CHAIN_PROVIDER_ERROR", execution_mode="live"),
+    )
+    monkeypatch.setattr("ap.queue.write_deferred_breach_last_error", lambda *args, **kwargs: None)
+    recorder = _ThreadRecorder()
+    monkeypatch.setattr(threading, "Thread", recorder.factory)
+
+    core = _make_core(_Selector("CHAIN_PROVIDER_ERROR", explanation="tradier warmup miss"))
+    watched = _make_watched()
+    with monkeypatch.context() as m:
+        m.setenv("BREACH_SELECTOR_RETRY_ENABLED", "1")
+        m.setenv("MAX_BREACH_SELECTOR_RETRIES", "3")
+        m.setenv("BREACH_SELECTOR_RETRY_DELAY_SECONDS", "1")
+        m.setenv("BREACH_SELECTOR_RETRY_CUTOFF_ET", "945")
+        core._on_entry_trigger(watched)
+        core._on_entry_trigger(watched)
+
+    assert recorder.starts == 1
+    assert getattr(core, "_deferred_breach_retry_inflight", None) == {("local-219", 1)}
