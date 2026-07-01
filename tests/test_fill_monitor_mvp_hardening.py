@@ -256,3 +256,41 @@ def test_fill_monitor_legacy_module_is_deleted():
     origin = importlib.util.find_spec("ap.fill_monitor").origin
     assert origin is not None and origin.endswith("fill_monitor.py")
     assert importlib.util.find_spec("ap.fill_monitor_legacy") is None
+
+
+def test_broker_partial_fill_zero_qty_returns_error_not_partial_fill(monkeypatch):
+    from ap import fill_monitor as fm
+
+    events = []
+    monkeypatch.setattr(fm, "audit", lambda *a, **k: events.append(("audit", a, k)))
+    monkeypatch.setattr(fm, "emit_fill_event", lambda *a, **k: events.append(("event", a, k)))
+
+    order = _base_order(direction="CALL", contract="AAPL260626C00195000")
+    broker = _Broker({"status": "partially_filled", "exec_quantity": 0, "avg_fill_price": 1.25})
+
+    result = fm.check_order_with_broker(broker, order)
+
+    assert result["status"] == "ERROR"
+    assert result["reason"] == "BROKER_FILLED_ZERO_QTY"
+    assert result["filled_qty"] == 0
+    assert any(item[0] == "audit" for item in events)
+    assert any(item[0] == "event" for item in events)
+
+
+def test_broker_exit_partial_fill_zero_qty_returns_error_not_exit_partial(monkeypatch):
+    from ap import fill_monitor as fm
+
+    events = []
+    monkeypatch.setattr(fm, "audit", lambda *a, **k: events.append(("audit", a, k)))
+    monkeypatch.setattr(fm, "emit_fill_event", lambda *a, **k: events.append(("event", a, k)))
+
+    order = _base_order(kind="EXIT", direction="CALL", contract="AAPL260626C00195000")
+    broker = _Broker({"status": "partially_filled", "exec_quantity": 0, "avg_fill_price": 1.25})
+
+    result = fm.check_order_with_broker(broker, order)
+
+    assert result["status"] == "ERROR"
+    assert result["reason"] == "BROKER_FILLED_ZERO_QTY"
+    assert result["filled_qty"] == 0
+    assert any(item[0] == "audit" for item in events)
+    assert any(item[0] == "event" for item in events)
