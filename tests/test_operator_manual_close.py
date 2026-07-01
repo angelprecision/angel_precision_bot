@@ -83,10 +83,26 @@ class TestCancelPendingExitOrders:
         result = _cancel_pending_exit_orders(cur, CLIENT_ID, CONTRACT)
         assert result == 3
         sql, params = cur.execute.call_args[0]
-        assert "NOT IN" in sql
-        assert "FILLED" in sql
-        assert "CANCELED" in sql
-        assert "REJECTED" in sql
+        assert "status IN" in sql
+        for active_status in (
+            "NEW",
+            "PROCESSING",
+            "CREATED",
+            "WATCHING",
+            "PENDING_TRIGGER",
+            "SUBMITTED",
+            "ACKNOWLEDGED",
+            "PARTIAL_FILL",
+            "PARTIALLY_FILLED",
+        ):
+            assert active_status in sql
+
+    def test_does_not_rewrite_terminal_exit_statuses(self):
+        cur = _mock_cursor(rowcount=0)
+        _cancel_pending_exit_orders(cur, CLIENT_ID, CONTRACT)
+        sql, _ = cur.execute.call_args[0]
+        for terminal_status in ("EXPIRED", "ARCHIVED", "ERROR"):
+            assert terminal_status not in sql
 
     def test_uses_parameterized_query(self):
         cur = _mock_cursor(rowcount=0)

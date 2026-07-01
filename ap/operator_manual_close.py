@@ -27,6 +27,8 @@ from __future__ import annotations
 import logging
 from typing import Any, Optional
 
+from ap.db import conn, run_with_retry
+
 log = logging.getLogger("ap.operator_manual_close")
 
 
@@ -83,8 +85,11 @@ def _calculate_pnl(pos: dict, true_fill_price: float) -> tuple[float, float]:
     elif entry_opt:
         entry_cost = float(entry_opt) * qty * 100
     else:
-        log.warning("no entry cost data for position %s — PnL will be approximate", pos["id"])
-        entry_cost = 0.0
+        log.warning(
+            "no entry cost data for position %s — PnL will be approximate",
+            pos.get("id", "<unknown>"),
+        )
+        return 0.0, 0.0
 
     exit_proceeds = float(true_fill_price) * qty * 100
     realized_pnl  = exit_proceeds - entry_cost
@@ -138,7 +143,17 @@ def _cancel_pending_exit_orders(db_conn, client_id: str, contract: str) -> int:
         WHERE  client_id  = %s
           AND  contract   = %s
           AND  kind       = 'EXIT'
-          AND  status NOT IN ('FILLED', 'CANCELED', 'REJECTED')
+          AND  status IN (
+               'NEW',
+               'PROCESSING',
+               'CREATED',
+               'WATCHING',
+               'PENDING_TRIGGER',
+               'SUBMITTED',
+               'ACKNOWLEDGED',
+               'PARTIAL_FILL',
+               'PARTIALLY_FILLED'
+          )
         """,
         (client_id, contract),
     )
@@ -196,8 +211,6 @@ def execute_operator_manual_close(
 
     Called from app.py POST /admin/operator/manual-close.
     """
-    from ap.db import conn, run_with_retry
-
     def _fn():
         with conn() as c:
             pos = _fetch_position(c, position_id, client_id)
