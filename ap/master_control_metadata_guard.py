@@ -2,11 +2,20 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import datetime, time as dt_time
 from typing import Any, Mapping
+from zoneinfo import ZoneInfo
 
-from ap.entry_metadata_guard import VALID_EXECUTION_MODES, validate_entry_metadata
+from ap.entry_metadata_guard import (
+    DAILY_TIMEFRAMES,
+    VALID_EXECUTION_MODES,
+    ZERO_UNDERLYING,
+    validate_entry_metadata,
+)
 
 log = logging.getLogger("ap.master_control_metadata_guard")
+
+ET = ZoneInfo("America/New_York")
 
 
 def _parse_meta(raw: Any) -> dict[str, Any]:
@@ -15,9 +24,9 @@ def _parse_meta(raw: Any) -> dict[str, Any]:
     if isinstance(raw, str) and raw.strip():
         try:
             decoded = json.loads(raw)
-            return decoded if isinstance(decoded, dict) else {}
         except Exception:
             return {}
+        return decoded if isinstance(decoded, dict) else {}
     return {}
 
 
@@ -48,6 +57,20 @@ def _runtime_mode(self: Any) -> str | None:
     return normalized if normalized in VALID_EXECUTION_MODES else None
 
 
+def _is_regular_session_et(now: datetime | None = None) -> bool:
+    current = now or datetime.now(ET)
+    return current.weekday() < 5 and dt_time(9, 30) <= current.time() < dt_time(16, 0)
+
+
+def _is_daily_timeframe(signal: Any) -> bool:
+    timeframe = _first(signal, "timeframe", "time_horizon").lower()
+    return timeframe in DAILY_TIMEFRAMES
+
+
+def should_allow_daily_handoff_without_underlying(signal: Any, *, now: datetime | None = None) -> bool:
+    return _is_daily_timeframe(signal) and not _is_regular_session_et(now)
+
+
 def install_master_control_metadata_guard() -> None:
     from ap_master_control import APMasterControl, ControlDecision
 
@@ -67,8 +90,19 @@ def install_master_control_metadata_guard() -> None:
             signal_id = _first(signal, "signal_id", "canonical_signal_id")
             ticker = _first(signal, "ticker", "symbol")
             reason = str(result.reason or "metadata_invalid")
+            if reason == ZERO_UNDERLYING and should_allow_daily_handoff_without_underlying(signal):
+                log.info(
+                    "[%s] ENTRY_METADATA_DATA_PENDING | client=%s signal=%s reason=%s "
+                    "action=allow_daily_handoff_without_underlying",
+                    ticker or "?",
+                    client_id,
+                    signal_id,
+                    reason,
+                )
+                return original_evaluate(self, signal, *args, **kwargs)
             log.warning(
-                "[%s] ENTRY_METADATA_BLOCKED before contract_selection | client=%s signal=%s reason=%s details=%s",
+                "[%s] ENTRY_METADATA_BLOCKED before contract_selection | client=%s signal=%s "
+                "reason=%s details=%s",
                 ticker or "?",
                 client_id,
                 signal_id,
