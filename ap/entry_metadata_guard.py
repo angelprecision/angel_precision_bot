@@ -95,12 +95,10 @@ def _positive(srcs: list[Any], keys: tuple[str, ...]) -> tuple[bool, Any]:
 def _infer_timeframe(srcs: list[Any]) -> Any:
     """Resolve production scanner timeframe without mutating payloads.
 
-    Legacy scanner_consolidation_v3_weekly payloads have no top-level
-    `timeframe`, but they carry the timeframe in both the deterministic
-    signal_id (`...:Weekly:...`) and trigger.source
-    (`scanner_consolidation_v3_weekly`). Treat those as real metadata rather
-    than inventing a default. If no explicit clue exists, fail closed with
-    MISSING_TIMEFRAME as before.
+    Scanner payloads may omit top-level `timeframe`, but can still carry
+    explicit scanner-owned timeframe evidence. Inference is intentionally
+    narrow: only trusted scanner fields can establish weekly/daily/overnight.
+    Arbitrary free text containing "weekly" is not enough.
     """
     explicit = _first(srcs, ("timeframe", "time_horizon"))
     if _txt(explicit):
@@ -109,13 +107,29 @@ def _infer_timeframe(srcs: list[Any]) -> Any:
     source = _first(srcs, ("scanner_source", "scanner_type", "scanner_name", "source", "trigger.source"))
     signal_id = _first(srcs, ("signal_id", "canonical_signal_id"))
     expiry_hint = _first(srcs, ("expiry_hint", "trigger.expiry_hint"))
-    haystack = " ".join(_txt(v).lower() for v in (source, signal_id, expiry_hint) if _txt(v))
+    source_txt = _txt(source).lower()
+    expiry_hint_txt = _txt(expiry_hint).upper()
+    signal_segments = [seg.strip().lower() for seg in _txt(signal_id).split(":") if seg.strip()]
 
-    if "weekly" in haystack or ":1w:" in haystack or haystack.endswith(":1w"):
+    if (
+        expiry_hint_txt == "WEEKLY"
+        or "scanner_consolidation_v3_weekly" in source_txt
+        or "weekly" in signal_segments
+        or "1w" in signal_segments
+    ):
         return "weekly"
-    if "daily" in haystack or ":1d:" in haystack or haystack.endswith(":1d"):
+    if (
+        expiry_hint_txt == "DAILY"
+        or "scanner_consolidation_v3_daily" in source_txt
+        or "daily" in signal_segments
+        or "1d" in signal_segments
+    ):
         return "1d"
-    if "overnight" in haystack:
+    if (
+        expiry_hint_txt == "OVERNIGHT"
+        or "scanner_consolidation_v3_overnight" in source_txt
+        or "overnight" in signal_segments
+    ):
         return "overnight"
     return None
 
