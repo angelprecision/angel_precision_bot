@@ -74,10 +74,6 @@ def main():
     print(f"  mode             : {'DRY RUN' if args.dry_run else 'APPLY — MUTATING DB'}")
     print("=" * 60)
 
-    if args.dry_run:
-        print("\nDRY RUN — no mutations. Re-run with --apply to commit.")
-        return
-
     # ── Connect ───────────────────────────────────────────────────────────────
     try:
         from ap.db import conn, run_with_retry
