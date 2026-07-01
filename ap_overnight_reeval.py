@@ -6,13 +6,13 @@ This is the missing piece of the full trading loop.
 FLOW:
   1. Market close → scanner runs → signals arrive with timeframe=1d
   2. Bot marks them WATCHING (audit record, not yet armed)
-  3. *** THIS MODULE *** runs at 9:15 AM ET (15 min before open)
+  3. *** THIS MODULE *** runs at 9:30 AM ET (market open)
   4. For each WATCHING signal:
      a. Fetch prior-day high/low from Tradier history
      b. Run overnight_daily_validator (directional invalidation check)
      c. If VALID: select contract, create OSM entry order, arm entry_watcher
      d. If INVALID: mark REJECTED with reason code, log to ap_signals
-  5. At 9:30 AM ET open: entry_watcher polls quotes, waits for breach
+  5. After 9:30 AM ET open: entry_watcher polls quotes, waits for breach
   6. On breach: on_trigger fires → OSM submits entry → fill monitor takes over
 
 WHEN IT RUNS:
@@ -96,6 +96,17 @@ def _hydrate_plan_from_signal(signal):
             "second_score_mode":     "observe_only",
         },
     )
+
+
+def _normalize_overnight_side(value) -> str:
+    raw = str(value or "").strip().upper()
+    if raw in {"CALL", "BUY", "LONG", "BULL", "BULLISH", "CALLS"}:
+        return "CALL"
+    if raw in {"PUT", "SELL", "SHORT", "BEAR", "BEARISH", "PUTS"}:
+        return "PUT"
+    return "UNKNOWN"
+
+
 # SIGNALS_LOOKBACK: hours-based alternative. When set, takes precedence over
 # OVERNIGHT_SIGNAL_MAX_AGE_DAYS for the initial created_at cutoff query.
 # Default 18h — covers signals from previous session's close to pre-market.
@@ -552,7 +563,7 @@ def run_overnight_reeval(
 ) -> dict:
     """
     Re-evaluate all WATCHING signals for client_id.
-    Called at ~9:15 AM ET before market open.
+    Called at/after 9:30 AM ET when regular-session quotes are available.
 
     Returns summary dict: {processed, armed, rejected, skipped, errors}
     """
@@ -597,7 +608,7 @@ def run_overnight_reeval(
             return result
         _in_window = (now_et.hour == 9 and 0 <= now_et.minute <= 45)
         if not _in_window:
-            log.info("[%s] overnight_reeval: skipping — outside 9:00-9:45 AM ET window (now=%02d:%02d)",
+            log.info("[%s] overnight_reeval: skipping — outside 9:30-9:45 AM ET window (now=%02d:%02d)",
                      client_id, now_et.hour, now_et.minute)
             result["skipped"] = -1
             return result
@@ -620,7 +631,20 @@ def run_overnight_reeval(
         signal_id = job.get("signal_id") or signal.get("signal_id", "")
         job_source = job.get("_source") or ("ap_signals" if str(job_id).startswith("sup:") else "trade_queue")
         ticker = signal.get("ticker") or signal.get("symbol", "?")
-        side = (signal.get("side") or "").upper()
+        side = _normalize_overnight_side(signal.get("side") or signal.get("direction"))
+        if side not in {"CALL", "PUT"}:
+            log.warning(
+                "[%s] overnight_reeval: INVALID_OR_MISSING_SIDE signal=%s raw_side=%r raw_direction=%r — rejecting before trigger math",
+                ticker,
+                signal_id,
+                signal.get("side"),
+                signal.get("direction"),
+            )
+            _mark_job_rejected(job_id, client_id, "invalid_or_missing_side")
+            result["rejected"] += 1
+            continue
+        signal["side"] = side
+        signal["direction"] = side
         try:
             from ap.authorization import execution_mode_for_broker as _exec_mode_for_broker
             _execution_mode = str(_exec_mode_for_broker(broker) or "").upper()
@@ -813,10 +837,12 @@ def run_overnight_reeval(
 
             # Step 2: Derive entry_trigger if not provided by scanner
             # The Strat: CALL entries breach prior-day high; PUT entries breach prior-day low
-            entry_trigger = (
-                float(signal.get("entry_trigger") or 0) or
-                (prior_day_high if side == "CALL" else prior_day_low)
-            )
+            entry_trigger = float(signal.get("entry_trigger") or 0) or None
+            if entry_trigger is None:
+                if side == "CALL":
+                    entry_trigger = prior_day_high
+                elif side == "PUT":
+                    entry_trigger = prior_day_low
             if not entry_trigger and _paper_rescue_only:
                 _mark_job_rejected(job_id, client_id, "trigger_invalid")
                 result["rejected"] += 1
@@ -1028,15 +1054,27 @@ def run_overnight_reeval(
             # at breach time when live quotes are available.
             # NEVER permanently reject a valid signal because of pre-market chain data.
             contract_deferred = False
+            _selector_failure = None
             try:
                 selected = contract_selector.select(decision.plan)
             except Exception as cs_exc:
+                _selector_failure = {
+                    "reason_code": "PRE_MARKET_SELECTOR_EXCEPTION",
+                    "error_type": type(cs_exc).__name__,
+                    "error": str(cs_exc),
+                }
                 log.warning(
                     "[%s] overnight_reeval: contract selection failed pre-market (%s) "
                     "— deferring to breach time with live quotes",
                     ticker, cs_exc,
                 )
                 selected = None
+            if selected is None:
+                try:
+                    if hasattr(contract_selector, "get_last_failure"):
+                        _selector_failure = contract_selector.get_last_failure() or _selector_failure
+                except Exception:
+                    pass
 
             if not selected or not str(getattr(decision.plan, "contract_symbol", "") or "").strip():
                 contract_deferred = True
@@ -1055,7 +1093,17 @@ def run_overnight_reeval(
                         decision.plan.contracts = int(os.getenv("MIN_CONTRACTS_PER_POSITION", "2"))
                     if not hasattr(decision.plan, "metadata") or decision.plan.metadata is None:
                         decision.plan.metadata = {}
-                    decision.plan.metadata["contract_deferred"] = True
+                    decision.plan.metadata.update({
+                        "contract_deferred": True,
+                        "pre_market_contract_selection_failed": True,
+                        "pre_market_selector_failure": _selector_failure,
+                        "pre_market_selector_reason_code": (
+                            _selector_failure.get("reason_code")
+                            if isinstance(_selector_failure, dict)
+                            else None
+                        ),
+                        "contract_selection_deferred_to": "breach_time",
+                    })
                 except Exception:
                     pass
                 if _lifecycle_ok:
@@ -1228,14 +1276,27 @@ def run_overnight_reeval(
             # cancel it as a stale CREATED order before the trigger breach fires.
             # This mirrors the queue.py intraday path which does the same before arming.
             try:
-                if hasattr(order_state_machine, "mark_entry_pending_trigger"):
+                _current_status = ""
+                if hasattr(order_state_machine, "get_order"):
+                    _current = order_state_machine.get_order(local_order_id) or {}
+                    _current_status = str((_current or {}).get("status") or "").upper()
+
+                if _current_status == "PENDING_TRIGGER":
+                    _pt_ok = True
+                elif hasattr(order_state_machine, "mark_entry_pending_trigger"):
                     _pt_ok = order_state_machine.mark_entry_pending_trigger(local_order_id)
                 else:
                     _pt_ok = order_state_machine.transition(
-                        local_order_id, "PENDING_TRIGGER", submitted_ts=None)
+                        local_order_id,
+                        "PENDING_TRIGGER",
+                        submitted_ts=None,
+                    )
                 if not _pt_ok:
-                    log.error("[%s] overnight_reeval: could not mark PENDING_TRIGGER for %s — skipping arm",
-                              ticker, local_order_id)
+                    log.error(
+                        "[%s] overnight_reeval: could not mark PENDING_TRIGGER for %s — skipping arm",
+                        ticker,
+                        local_order_id,
+                    )
                     if _paper_rescue_only:
                         _mark_job_error(
                             job_id,
@@ -1245,16 +1306,17 @@ def run_overnight_reeval(
                     result["errors"] += 1
                     continue
             except Exception as _pt_exc:
-                log.error("[%s] overnight_reeval: PENDING_TRIGGER transition failed: %s — skipping arm",
-                          ticker, _pt_exc)
+                log.error(
+                    "[%s] overnight_reeval: pending-trigger transition failed for %s: %s",
+                    ticker,
+                    local_order_id,
+                    _pt_exc,
+                )
                 if _paper_rescue_only:
                     _mark_job_error(
                         job_id,
                         client_id,
-                        _paper_rescue_queue_reason(
-                            "order_materialization_failed",
-                            f"pending_trigger_transition_exception:{type(_pt_exc).__name__}",
-                        ),
+                        f"order_materialization_failed:{type(_pt_exc).__name__}",
                     )
                 result["errors"] += 1
                 continue
