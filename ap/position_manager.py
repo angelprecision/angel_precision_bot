@@ -33,6 +33,47 @@ log = logging.getLogger("ap.position_manager")
 ET = ZoneInfo("America/New_York")
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# PR #237 — Position Manager fail-closed side normalization.
+#
+# Final DB guardrail: even if an upstream fill / recovery / manual-repair path
+# passes a raw or aliased direction (BUY, SHORT, "bullish", etc.), the
+# positions table only ever receives canonical CALL / PUT.  Anything outside
+# the alias table raises ValueError before the INSERT — no silent CALL
+# default, no direction-taxonomy contamination in the truth layer.
+#
+# Non-goals (see PR #237 spec): snapshot accounting, advisory locks,
+# partial-close math, proof_trades repair, capital/exposure accounting,
+# broker submit/cancel behavior.  None of those touch this helper.
+# ─────────────────────────────────────────────────────────────────────────────
+_POSITION_SIDE_ALIASES: dict[str, str] = {
+    "CALL":    "CALL",
+    "BUY":     "CALL",
+    "LONG":    "CALL",
+    "CALLS":   "CALL",
+    "BULLISH": "CALL",
+    "PUT":     "PUT",
+    "SELL":    "PUT",
+    "SHORT":   "PUT",
+    "PUTS":    "PUT",
+    "BEARISH": "PUT",
+}
+
+
+def _normalize_position_side(side) -> str:
+    """Canonical CALL/PUT normalizer for the Position Manager insert path.
+
+    Raises ValueError("invalid_or_missing_position_side:<raw>") when the input
+    is missing, empty, or not in the alias table.  Callers MUST NOT catch and
+    substitute a default — the raise is the fail-closed guardrail.
+    """
+    raw = str(side or "").strip().upper()
+    normalized = _POSITION_SIDE_ALIASES.get(raw)
+    if normalized not in {"CALL", "PUT"}:
+        raise ValueError(f"invalid_or_missing_position_side:{raw!r}")
+    return normalized
+
+
 class PositionStatus:
     OPEN = "OPEN"
     CLOSING = "CLOSING"
@@ -45,7 +86,13 @@ class PositionStatus:
     CANCELED = "CANCELED"
     CANCELLED = "CANCELLED"
 
-    ACTIVE = {OPEN, CLOSING}
+    # PR #237: widened to match the runtime active-position queries at
+    # get_active_positions and the reconciler active-status filters, which
+    # have always accepted OPEN/CLOSING/PARTIAL/ACTIVE in the DB.  The
+    # symbolic constant was drifted narrower than the actual SQL, so
+    # membership checks against PositionStatus.ACTIVE were silently missing
+    # PARTIAL and ACTIVE rows even though those rows are queried elsewhere.
+    ACTIVE = {OPEN, CLOSING, "PARTIAL", "ACTIVE"}
     TERMINAL = {CLOSED, CLOSED_REPAIR, EXPIRED, STOPPED, TAKEN_PROFIT, ERROR, CANCELED, CANCELLED}
 
     @classmethod
@@ -55,6 +102,13 @@ class PositionStatus:
     @classmethod
     def is_active(cls, status: str) -> bool:
         return status in cls.ACTIVE
+
+
+# PR #237: module-level twin of PositionStatus.ACTIVE for direct use in raw
+# SQL parameterization (e.g. status IN %s).  Kept as a set of literal strings
+# so callers do not need to import PositionStatus just to filter by active
+# status.  Membership MUST stay identical to PositionStatus.ACTIVE.
+ACTIVE_DB_STATUSES: set[str] = {"OPEN", "CLOSING", "PARTIAL", "ACTIVE"}
 
 
 _PENDING_ENTRY_STATUSES = (
@@ -377,9 +431,13 @@ class APPositionManager:
     """Client-scoped position + order truth layer backed by Postgres."""
 
     def __init__(self, client_id: str):
-        self.client_id = client_id
+        # PR #237: normalize client_id once at the boundary.  All downstream
+        # SQL runs against self.client_id, so if we do not canonicalize here,
+        # a caller passing "Jason ", "JASON", or "jason\n" writes and queries
+        # under different keys and quietly loses reconciliation.
+        self.client_id = str(client_id or "").strip().lower()
         self._position_columns_cache: Optional[set[str]] = None
-        log.info("[%s] APPositionManager initialized", client_id)
+        log.info("[%s] APPositionManager initialized", self.client_id)
 
     # ------------------------------------------------------------------
     # Schema helpers — allows local_order_id/broker_order_id support when
@@ -897,6 +955,12 @@ class APPositionManager:
         if float(entry_price or 0) <= 0:
             raise ValueError(f"entry_price must be positive, got {entry_price}")
 
+        # PR #237: fail-CLOSED on missing/invalid side.  Raises
+        # ValueError("invalid_or_missing_position_side:<raw>") — never
+        # substitute a default direction here.  This is the last line of
+        # defense before persisting the row to the positions truth layer.
+        _side = _normalize_position_side(side)
+
         has_local_col = self._has_position_column("local_order_id")
         has_broker_col = self._has_position_column("broker_order_id")
         has_underlying_entry_col = self._has_position_column("underlying_entry")
@@ -929,7 +993,7 @@ class APPositionManager:
         ]
         values = [
             position_id, self.client_id, plan_id, signal_id,
-            ticker.upper(), contract, side.upper(), int(qty), float(entry_price),
+            ticker.upper(), contract, _side, int(qty), float(entry_price),
             tier, float(score), pattern, float(tp_pct), float(sl_pct),
             self._nullable_float(stop_underlying),
             self._nullable_float(target_underlying),
