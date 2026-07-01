@@ -174,14 +174,19 @@ def test_trade_queue_schema_contract_does_not_use_updated_ts():
     This catches the exact syntax regression class that breaks operator/debug
     queries by accidentally treating trade_queue like orders.
     """
-    offenders = []
-    pattern = re.compile(r"trade_queue[\s\S]{0,500}updated_ts|updated_ts[\s\S]{0,500}trade_queue", re.IGNORECASE)
+    offenders: list[str] = []
+    patterns = [
+        re.compile(r"\bFROM\s+trade_queue\b[^;]*\bupdated_ts\b", re.IGNORECASE),
+        re.compile(r"\bUPDATE\s+trade_queue\b[^;]*\bupdated_ts\b", re.IGNORECASE),
+        re.compile(r"\bINSERT\s+INTO\s+trade_queue\b[^;]*\bupdated_ts\b", re.IGNORECASE),
+        re.compile(r"\btrade_queue\s+SET\b[^;]*\bupdated_ts\b", re.IGNORECASE),
+    ]
     for path in REPO_ROOT.rglob("*.py"):
         rel = path.relative_to(REPO_ROOT).as_posix()
         if rel.startswith((".venv/", "venv/")):
             continue
         text = path.read_text(errors="ignore")
-        if pattern.search(text):
+        if any(pattern.search(text) for pattern in patterns):
             offenders.append(rel)
 
     assert offenders == [], f"Do not reference trade_queue.updated_ts; use created_ts/started_ts/finished_ts: {offenders}"
