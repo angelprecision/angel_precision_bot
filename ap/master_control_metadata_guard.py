@@ -71,6 +71,46 @@ def should_allow_daily_handoff_without_underlying(signal: Any, *, now: datetime 
     return _is_daily_timeframe(signal) and not _is_regular_session_et(now)
 
 
+def _mark_daily_underlying_data_pending(signal: Any, reason: str) -> None:
+    """Mark after-hours daily zero-underlying bypass as handoff-only.
+
+    This keeps the carveout visible to dashboards/downstream code and makes the
+    safety invariant explicit: the signal may continue into WATCHING/overnight
+    hydration, but it is not execution-ready metadata yet.
+    """
+    marker = {
+        "metadata_validation_status": "DATA_PENDING",
+        "metadata_validation_reason": reason,
+        "underlying_data_pending": True,
+        "allowed_for_handoff": True,
+        "allowed_for_execution": False,
+    }
+
+    if isinstance(signal, dict):
+        signal.update(marker)
+
+        meta = signal.get("metadata")
+        if isinstance(meta, dict):
+            meta.update(marker)
+        else:
+            signal["metadata"] = dict(marker)
+
+        payload = signal.get("payload")
+        if isinstance(payload, dict):
+            payload.update(marker)
+
+        signal_payload = signal.get("signal_payload")
+        if isinstance(signal_payload, dict):
+            signal_payload.update(marker)
+        return
+
+    for key, value in marker.items():
+        try:
+            setattr(signal, key, value)
+        except Exception:
+            pass
+
+
 def install_master_control_metadata_guard() -> None:
     from ap_master_control import APMasterControl, ControlDecision
 
@@ -91,6 +131,7 @@ def install_master_control_metadata_guard() -> None:
             ticker = _first(signal, "ticker", "symbol")
             reason = str(result.reason or "metadata_invalid")
             if reason == ZERO_UNDERLYING and should_allow_daily_handoff_without_underlying(signal):
+                _mark_daily_underlying_data_pending(signal, reason)
                 log.info(
                     "[%s] ENTRY_METADATA_DATA_PENDING | client=%s signal=%s reason=%s "
                     "action=allow_daily_handoff_without_underlying",
