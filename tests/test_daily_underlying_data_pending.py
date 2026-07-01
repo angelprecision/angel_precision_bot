@@ -95,7 +95,7 @@ def test_regular_session_daily_missing_underlying_is_not_data_pending_candidate(
     assert allowed is False
 
 
-def test_master_control_daily_after_hours_missing_underlying_bypasses_terminal_metadata_block(monkeypatch):
+def test_master_control_daily_after_hours_missing_underlying_marks_data_pending(monkeypatch):
     ap.install_entry_metadata_safety_guards()
     mc = _make_mc()
 
@@ -104,10 +104,18 @@ def test_master_control_daily_after_hours_missing_underlying_bypasses_terminal_m
         lambda now=None: False,
     )
 
-    decision = mc.evaluate(_signal(underlying_at_signal=0), client_id="test@example.com")
+    signal = _signal(underlying_at_signal=0)
+    decision = mc.evaluate(signal, client_id="test@example.com")
 
     assert decision.ok is True
     assert str(getattr(decision, "stage", "")).lower() == "approved"
+    assert signal["underlying_data_pending"] is True
+    assert signal["allowed_for_handoff"] is True
+    assert signal["allowed_for_execution"] is False
+    assert signal["metadata_validation_status"] == "DATA_PENDING"
+    assert signal["metadata_validation_reason"] == ZERO_UNDERLYING
+    assert signal["metadata"]["underlying_data_pending"] is True
+    assert signal["metadata"]["allowed_for_execution"] is False
 
 
 def test_master_control_intraday_missing_underlying_still_blocks_at_metadata_validation(monkeypatch):
@@ -127,3 +135,22 @@ def test_master_control_intraday_missing_underlying_still_blocks_at_metadata_val
     assert decision.ok is False
     assert decision.stage == "metadata_validation"
     assert decision.reason == ZERO_UNDERLYING
+
+
+def test_regular_session_daily_missing_underlying_does_not_mark_data_pending(monkeypatch):
+    ap.install_entry_metadata_safety_guards()
+    mc = _make_mc()
+
+    monkeypatch.setattr(
+        "ap.master_control_metadata_guard._is_regular_session_et",
+        lambda now=None: True,
+    )
+
+    signal = _signal(underlying_at_signal=0)
+    decision = mc.evaluate(signal, client_id="test@example.com")
+
+    assert decision.ok is False
+    assert decision.stage == "metadata_validation"
+    assert decision.reason == ZERO_UNDERLYING
+    assert "underlying_data_pending" not in signal
+    assert "allowed_for_execution" not in signal
