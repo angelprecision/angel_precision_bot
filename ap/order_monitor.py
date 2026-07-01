@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import threading
 import time
 from datetime import datetime, timezone
@@ -39,6 +40,8 @@ from ap.observability import emit_decision_event, get_git_commit, make_config_ha
 from ap.utils import now_utc_iso
 
 log = logging.getLogger("ap.order_monitor")
+
+_OCC_SIDE_RE = re.compile(r"\d{6}([CP])")
 
 # ── Shared broker order-status cache ─────────────────────────────────────────
 # fill_monitor and order_monitor both call broker.get_order(broker_order_id)
@@ -243,6 +246,7 @@ class APOrderMonitor:
         # forgets to pass client_mode uses the strict 90s ceiling rather than
         # the relaxed 180s paper ceiling. Missing wiring fails safe, not relaxed.
         client_mode: str = "LIVE",
+        data_broker=None,
     ):
         self.client_id   = client_id
         self.broker      = broker
@@ -251,6 +255,7 @@ class APOrderMonitor:
         self.exit_engine = exit_engine
         self.entry_watcher = entry_watcher
         self.alert_fn    = alert_fn
+        self.data_broker = data_broker or getattr(broker, "data_broker", None)
         # PR66: store mode for per-mode max-age selection.
         # "or LIVE" guards against explicit None/empty being passed — fail safe.
         self.client_mode = str(client_mode or "LIVE").strip().upper()
@@ -279,6 +284,26 @@ class APOrderMonitor:
             "pending_trigger_max_age_seconds": PENDING_TRIGGER_MAX_AGE_SECONDS,
             "pending_trigger_cleanup_dry_run": PENDING_TRIGGER_CLEANUP_DRY_RUN,
         })
+
+    def _quote_broker(self):
+        return self.data_broker or getattr(self.broker, "data_broker", None) or self.broker
+
+    def _normalize_order_direction(self, value) -> str:
+        raw = str(value or "").strip().upper()
+        if raw in {"CALL", "PUT"}:
+            return raw
+        if raw in {"BUY", "LONG", "CALLS", "BULLISH"}:
+            return "CALL"
+        if raw in {"SELL", "SHORT", "PUTS", "BEARISH"}:
+            return "PUT"
+        return ""
+
+    def _direction_from_occ_contract(self, contract) -> str:
+        symbol = str(contract or "").strip().upper()
+        match = _OCC_SIDE_RE.search(symbol)
+        if not match:
+            return ""
+        return "CALL" if match.group(1) == "C" else "PUT"
 
     def _emit_order_event(
         self,
@@ -1384,12 +1409,31 @@ class APOrderMonitor:
                 or meta.get("contract_symbol")
                 or ""
             )
-            direction = str(
-                order.get("direction")
-                or meta.get("direction")
-                or meta.get("side")
-                or "CALL"
-            ).upper()
+            direction = (
+                self._normalize_order_direction(order.get("direction"))
+                or self._normalize_order_direction(meta.get("direction"))
+                or self._normalize_order_direction(meta.get("side"))
+                or self._direction_from_occ_contract(contract)
+            )
+            if direction not in {"CALL", "PUT"}:
+                self._emit_order_event(
+                    local_order_id=order.get("local_order_id") or order.get("id"),
+                    stage="order_monitor",
+                    decision="BLOCK",
+                    reason_code="LOST_HANDOFF_REARM_FAILED_INVALID_OR_MISSING_SIDE",
+                    explanation=(
+                        "Lost-handoff watcher rearm blocked because direction/side was "
+                        "missing or invalid and could not be safely derived from OCC C/P."
+                    ),
+                    contract=str(contract or ""),
+                    inputs={
+                        "order_direction": order.get("direction"),
+                        "meta_direction": meta.get("direction"),
+                        "meta_side": meta.get("side"),
+                        "contract": contract,
+                    },
+                )
+                return None
             stop = (
                 order.get("stop_underlying")
                 if order.get("stop_underlying") is not None
@@ -1778,7 +1822,7 @@ class APOrderMonitor:
                     # Capture live quote for metadata (best-effort — never blocks cancel).
                     _bid, _ask, _mid = None, None, None
                     try:
-                        _quote = self.broker.get_quote(_sym)
+                        _quote = self._quote_broker().get_quote(_sym)
                         if _quote:
                             _bid = _quote.get("bid")
                             _ask = _quote.get("ask")
@@ -2025,7 +2069,7 @@ class APOrderMonitor:
         if underlying:
             try:
                 if hasattr(self.broker, "get_quote"):
-                    q = self.broker.get_quote(underlying) or {}
+                    q = self._quote_broker().get_quote(underlying) or {}
                     last = q.get("last") or q.get("close") or q.get("price")
                     if last:
                         spot = float(last)
@@ -2934,7 +2978,44 @@ class APOrderMonitor:
         if not new_status:
             log.debug(f"[{self.client_id}] Unknown broker status '{s}' — no transition")
             return
-        ok = self.osm.transition(local_order_id, new_status)
+        kwargs = {}
+        if s in {"filled", "partially_filled"}:
+            fill_status = (
+                "EXIT_FILLED" if kind == "EXIT" and s == "filled" else
+                "EXIT_PARTIAL_FILL" if kind == "EXIT" else
+                "FILLED" if s == "filled" else
+                "PARTIAL_FILL"
+            )
+            log.warning(
+                "[%s] BROKER_FILL_SEEN_DEFER_TO_FILL_MONITOR | local=%s contract=%s kind=%s broker_status=%s blocked_status=%s",
+                self.client_id,
+                local_order_id,
+                contract,
+                kind or "ENTRY",
+                s,
+                fill_status,
+            )
+            self._emit_order_event(
+                local_order_id=local_order_id,
+                stage="order_monitor",
+                decision="ALERT",
+                reason_code="BROKER_FILL_SEEN_DEFER_TO_FILL_MONITOR",
+                explanation=(
+                    "Broker reported fill/partial fill, but order_monitor only has "
+                    "status-level data. Fill monitor owns fill finalization because it "
+                    "hydrates filled_qty/avg_fill and creates/syncs positions."
+                ),
+                contract=contract,
+                position_id=(order or {}).get("position_id"),
+                inputs={
+                    "broker_status": s,
+                    "kind": kind or "ENTRY",
+                    "blocked_status": fill_status,
+                    "requires_fill_monitor": True,
+                },
+            )
+            return
+        ok = self.osm.transition(local_order_id, new_status, **kwargs)
         if ok:
             log.info(f"[{self.client_id}] Advanced | {contract} | {local_order_id} → {new_status}")
             self._emit_order_event(
@@ -3024,6 +3105,7 @@ class APOrderMonitor:
                     SELECT local_order_id, broker_order_id, status, symbol,
                            contract, position_id, signal_id, plan_id,
                            created_ts, submitted_ts,
+                           qty, direction, execution_mode, reserved_cost,
                            limit_price,
                            limit_price AS price,
                            fill_price,
@@ -3036,7 +3118,8 @@ class APOrderMonitor:
                            -- tier (90s) even when score=70 (A/B tier) qualified for the
                            -- longer window. This was the source of "score=0.0 tier=normal"
                            -- log noise on rows that actually had score=70 tier=B.
-                           score, tier, trigger_price, meta
+                           score, tier, trigger_price, stop_underlying,
+                           target_underlying, meta
                     FROM orders
                     WHERE client_id=%s
                       AND kind='ENTRY'
@@ -3249,7 +3332,8 @@ class APOrderMonitor:
         live_bid = live_ask = live_mid = live_last = None
         spread_pct = None
         try:
-            q = self.broker.get_quote(contract) if hasattr(self.broker, "get_quote") else None
+            _qb = self._quote_broker()
+            q = _qb.get_quote(contract) if hasattr(_qb, "get_quote") else None
             if isinstance(q, dict):
                 _b = q.get("bid"); _a = q.get("ask"); _l = q.get("last")
                 try: live_bid = float(_b) if _b is not None else None
@@ -3692,8 +3776,9 @@ class APOrderMonitor:
         spot = None
         if underlying:
             try:
-                if hasattr(self.broker, "get_quote"):
-                    q = self.broker.get_quote(underlying)
+                _quote_broker = self._quote_broker()
+                if hasattr(_quote_broker, "get_quote"):
+                    q = _quote_broker.get_quote(underlying)
                     if isinstance(q, dict):
                         last = q.get("last") or q.get("close") or q.get("price")
                         if last:
@@ -3821,8 +3906,9 @@ class APOrderMonitor:
         _current_ask = None
         if _is_option_contract:
             try:
-                if hasattr(self.broker, "get_quote"):
-                    _opt_q = self.broker.get_quote(sym)
+                _quote_broker = self._quote_broker()
+                if hasattr(_quote_broker, "get_quote"):
+                    _opt_q = _quote_broker.get_quote(sym)
                     if isinstance(_opt_q, dict):
                         _ask_raw = _opt_q.get("ask")
                         if _ask_raw is not None:
@@ -3886,22 +3972,31 @@ class APOrderMonitor:
         return applied
 
     def _get_option_price(self, symbol: str) -> Optional[float]:
-        if not symbol or not self.broker:
+        quote_broker = self._quote_broker()
+        if not symbol or not quote_broker:
             return None
         try:
-            if hasattr(self.broker, "get_quote"):
-                q = self.broker.get_quote(symbol)
+            if hasattr(quote_broker, "get_quote"):
+                q = quote_broker.get_quote(symbol)
                 if isinstance(q, dict):
                     bid = float(q.get("bid") or 0)
                     ask = float(q.get("ask") or 0)
                     if bid > 0 and ask > 0:
                         return (bid + ask) / 2
-            if hasattr(self.broker, "session") and hasattr(self.broker, "cfg"):
-                cfg = self.broker.cfg
-                base = getattr(cfg, "base_url", "https://sandbox.tradier.com")
+            if hasattr(quote_broker, "session") and hasattr(quote_broker, "cfg"):
+                cfg = quote_broker.cfg
+                base = getattr(cfg, "base_url", None)
+                if not base or "sandbox" in str(base).lower():
+                    log.warning(
+                        "[%s] ORDER_MONITOR_MARKET_DATA_BASE_BLOCKED | symbol=%s base_url=%s",
+                        self.client_id,
+                        symbol,
+                        base or "missing",
+                    )
+                    return None
                 token = getattr(cfg, "access_token", None) or getattr(cfg, "token", "")
                 headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
-                resp = self.broker.session.get(
+                resp = quote_broker.session.get(
                     f"{base}/v1/markets/quotes",
                     params={"symbols": symbol, "greeks": "false"},
                     headers=headers, timeout=(3.05, 5),
