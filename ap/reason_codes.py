@@ -146,6 +146,27 @@ class REASON:
     EARNINGS_GUARD_ERROR:           Final[str] = "EARNINGS_GUARD_ERROR"
     FORCED_1_FOR_PAPER:             Final[str] = "FORCED_1_FOR_PAPER"
 
+    # ── P0 chain-fetch taxonomy (split from broad NO_CHAIN_DATA) ────────────
+    # Exact codes let operators distinguish transient data misses from real
+    # quality rejects on the dashboard and in post-mortems.
+    CHAIN_PROVIDER_ERROR:              Final[str] = "CHAIN_PROVIDER_ERROR"
+    CHAIN_AUTH_ERROR:                  Final[str] = "CHAIN_AUTH_ERROR"
+    CHAIN_PROVIDER_EMPTY_EXPIRATIONS:  Final[str] = "CHAIN_PROVIDER_EMPTY_EXPIRATIONS"
+    NO_EXPIRATION_IN_DTE_WINDOW:       Final[str] = "NO_EXPIRATION_IN_DTE_WINDOW"
+    CHAIN_PROVIDER_EMPTY_OPTIONS:      Final[str] = "CHAIN_PROVIDER_EMPTY_OPTIONS"
+    CHAIN_PARSE_EMPTY:                 Final[str] = "CHAIN_PARSE_EMPTY"
+    NO_CONTRACT_AFTER_FILTERS:         Final[str] = "NO_CONTRACT_AFTER_FILTERS"
+    CHAIN_ROW_ZERO_BID_ASK:            Final[str] = "CHAIN_ROW_ZERO_BID_ASK"
+    DIRECT_QUOTE_ZERO_BID_ASK:         Final[str] = "DIRECT_QUOTE_ZERO_BID_ASK"
+    DIRECT_QUOTE_UNAVAILABLE:          Final[str] = "DIRECT_QUOTE_UNAVAILABLE"
+
+    # ── P0 dashboard taxonomy for contract-selection outcomes ────────────────
+    # Replaces misclassified ORPHAN_ORDER labels on the dashboard.
+    CONTRACT_SELECTION_RETRY:          Final[str] = "CONTRACT_SELECTION_RETRY"
+    CONTRACT_SELECTION_BLOCKED:        Final[str] = "CONTRACT_SELECTION_BLOCKED"
+    CONTRACT_SELECTION_DATA_ERROR:     Final[str] = "CONTRACT_SELECTION_DATA_ERROR"
+    CONTRACT_SELECTION_QUALITY_REJECT: Final[str] = "CONTRACT_SELECTION_QUALITY_REJECT"
+
     # ── Client / runner ──────────────────────────────────────────────────────
     CLIENT_ENTRIES_PAUSED:          Final[str] = "CLIENT_ENTRIES_PAUSED"
     RUNNER_STARTUP_SKIPPED:         Final[str] = "RUNNER_STARTUP_SKIPPED"
@@ -258,6 +279,22 @@ REASON_DESCRIPTIONS: dict[str, str] = {
     REASON.EARNINGS_LOCKOUT:           "Earnings within lockout window",
     REASON.EARNINGS_GUARD_ERROR:       "Earnings guard check failed",
     REASON.FORCED_1_FOR_PAPER:         "Paper mode forced to 1 contract",
+    # P0 chain taxonomy
+    REASON.CHAIN_PROVIDER_ERROR:              "Tradier HTTP/network error fetching chain",
+    REASON.CHAIN_AUTH_ERROR:                  "Tradier 401/403 — credential/token failure",
+    REASON.CHAIN_PROVIDER_EMPTY_EXPIRATIONS:  "Tradier returned no option expirations",
+    REASON.NO_EXPIRATION_IN_DTE_WINDOW:       "No valid expiration within DTE window",
+    REASON.CHAIN_PROVIDER_EMPTY_OPTIONS:      "Tradier returned zero option rows for expiration",
+    REASON.CHAIN_PARSE_EMPTY:                 "Chain parsed to zero rows after direction filter",
+    REASON.NO_CONTRACT_AFTER_FILTERS:         "No contract survived quality/spread/OI filters",
+    REASON.CHAIN_ROW_ZERO_BID_ASK:            "Chain row has zero bid or ask — stale/illiquid",
+    REASON.DIRECT_QUOTE_ZERO_BID_ASK:         "Direct-quote revalidation confirmed zero bid/ask",
+    REASON.DIRECT_QUOTE_UNAVAILABLE:          "Direct-quote revalidation fetch failed",
+    # P0 dashboard taxonomy
+    REASON.CONTRACT_SELECTION_RETRY:          "Contract selection retrying — transient data miss",
+    REASON.CONTRACT_SELECTION_BLOCKED:        "Contract selection blocked — quality gate reject",
+    REASON.CONTRACT_SELECTION_DATA_ERROR:     "Contract selection failed — data unavailable after retries",
+    REASON.CONTRACT_SELECTION_QUALITY_REJECT: "Contract selection rejected — real quality failure",
     # Client / runner
     REASON.CLIENT_ENTRIES_PAUSED:    "Client entries are paused",
     REASON.RUNNER_STARTUP_SKIPPED:   "Runner startup skipped due to error",

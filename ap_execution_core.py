@@ -46,6 +46,30 @@ DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
 BOT_MODE            = (os.getenv("AP_MODE") or os.getenv("BOT_MODE") or "PAPER").upper()
 MAX_POSITIONS       = int(os.getenv("MAX_POSITIONS", "7"))
 
+# ── P0: deferred-breach contract-selector retry taxonomy ─────────────────────
+# Reason codes in this set mean the chain provider had a temporary data miss —
+# NOT a real contract-quality or risk reject.  On a retryable miss the deferred
+# row must NOT be expired/cancelled; instead it is rearmed for retry up to
+# MAX_BREACH_SELECTOR_RETRIES times (default 3) before giving up.
+#
+# Quality rejects (SPREAD_TOO_WIDE, DELTA_OUT_OF_RANGE, OI_TOO_LOW, etc.) and
+# fundamental blocks (EARNINGS_LOCKOUT, UNTRADEABLE_FOR_ACCOUNT_SIZE, etc.) are
+# NOT in this set — those still terminalize on the first attempt, exactly as today.
+#
+# Env overrides:
+#   MAX_BREACH_SELECTOR_RETRIES          default 3
+#   BREACH_SELECTOR_RETRY_DELAY_SECONDS  default 20
+#   BREACH_SELECTOR_RETRY_CUTOFF_ET      default 945 (= 9:45 AM ET)
+RETRYABLE_BREACH_SELECTOR_REASONS: frozenset = frozenset({
+    "NO_CHAIN_DATA",                    # legacy compat — broad code kept until all paths emit exact codes
+    "CHAIN_PROVIDER_ERROR",             # Tradier HTTP/network transient failure
+    "CHAIN_PROVIDER_EMPTY_EXPIRATIONS", # expirations endpoint returned nothing (can be transient at 9:30–9:36)
+    "CHAIN_PROVIDER_EMPTY_OPTIONS",     # chain endpoint returned zero rows for this expiration
+    "CHAIN_PARSE_EMPTY",                # chain parsed to zero rows after direction filter
+    "NO_EXPIRATION_IN_DTE_WINDOW",      # no eligible expiration in the current DTE probe window
+    "DIRECT_QUOTE_UNAVAILABLE",         # direct-quote revalidation fetch failed
+})
+
 # ── Mode metadata thresholds ────────────────────────────────────────────────
 # PR-B / FIX-8: floors are now env-overridable so they can be tuned
 # on Render without a code deploy (essential for proof-week response time).
@@ -1350,10 +1374,126 @@ class APExecutionCore:
                 # after copy-back. The selector's REJECT is the blocker.
                 if not _sel or not _live_contract:
                     _reason, _deferred_selector_audit = _build_deferred_selector_audit()
+
+                    # ── P0: Retryable breach-selector — do NOT terminalize on transient ──
+                    # If the failure reason is a temporary market-data miss (chain not
+                    # yet warmed up, Tradier 5xx, empty expirations at 9:30–9:36 ET),
+                    # rearm the trigger instead of expiring the row permanently.
+                    # Safety contract: no broker submit on retry path, max retries and
+                    # entry-cutoff both enforced. Quality rejects (spread, OI, delta,
+                    # earnings, account size) still terminalize immediately — they are
+                    # NOT in RETRYABLE_BREACH_SELECTOR_REASONS.
+                    _obs_rc_a = str(
+                        _deferred_selector_audit.get("reason_code")
+                        or "BREACH_SELECTOR_RETURNED_NONE"
+                    )
+                    _prior_attempt_a = 0
+                    try:
+                        _prior_attempt_a = int(
+                            (getattr(approved_plan, "metadata", None) or {}).get(
+                                "breach_attempt_count", 0
+                            ) or 0
+                        )
+                    except (TypeError, ValueError):
+                        _prior_attempt_a = 0
+                    _this_attempt_a = _prior_attempt_a + 1
+                    _MAX_RETRIES_A      = int(os.getenv("MAX_BREACH_SELECTOR_RETRIES", "3"))
+                    _RETRY_DELAY_A      = int(os.getenv("BREACH_SELECTOR_RETRY_DELAY_SECONDS", "20"))
+                    _RETRY_CUTOFF_A     = int(os.getenv("BREACH_SELECTOR_RETRY_CUTOFF_ET", "945"))
+                    _now_et_a           = datetime.now(ET)
+                    _now_hhmm_a         = _now_et_a.hour * 100 + _now_et_a.minute
+                    _past_cutoff_a      = _now_hhmm_a >= _RETRY_CUTOFF_A
+                    _is_retryable_a     = (
+                        _obs_rc_a in RETRYABLE_BREACH_SELECTOR_REASONS
+                        and _this_attempt_a <= _MAX_RETRIES_A
+                        and not _past_cutoff_a
+                    )
+
+                    if _is_retryable_a:
+                        log.warning(
+                            "[%s] DEFERRED_BREACH_SELECTOR_RETRYABLE "
+                            "attempt=%d/%d reason=%s delay=%ds cutoff=%d now=%d — rearming",
+                            ticker, _this_attempt_a, _MAX_RETRIES_A,
+                            _obs_rc_a, _RETRY_DELAY_A, _RETRY_CUTOFF_A, _now_hhmm_a,
+                        )
+                        # Update attempt count — do NOT expire/cancel the order
+                        try:
+                            _ap_meta_a = getattr(approved_plan, "metadata", None)
+                            if isinstance(_ap_meta_a, dict):
+                                _ap_meta_a["breach_attempt_count"] = _this_attempt_a
+                        except Exception:
+                            pass
+                        try:
+                            _upd_retry_a = getattr(self.order_state_machine, "update_order_meta", None)
+                            if callable(_upd_retry_a) and queue_local_order_id:
+                                _upd_retry_a(queue_local_order_id, {
+                                    "breach_attempt_count":            _this_attempt_a,
+                                    "last_breach_failure_reason":      str(_reason or ""),
+                                    "last_breach_failure_reason_code": str(_obs_rc_a),
+                                    "last_breach_failure_at":          datetime.now(timezone.utc).isoformat(),
+                                    "last_breach_selector_audit":      _deferred_selector_audit or {},
+                                    "contract_selection_status":       "CONTRACT_SELECTION_RETRY",
+                                })
+                        except Exception as _retry_meta_exc_a:
+                            log.debug("[%s] retry meta update non-critical: %s", ticker, _retry_meta_exc_a)
+                        try:
+                            from ap.queue import write_deferred_breach_last_error
+                            _queue_id_retry_a = (
+                                sig.get("queue_id")
+                                or sig.get("trade_queue_id")
+                                or (getattr(approved_plan, "metadata", None) or {}).get("queue_id")
+                            )
+                            write_deferred_breach_last_error(
+                                _queue_id_retry_a,
+                                reason_code=f"CONTRACT_SELECTION_RETRY:{_obs_rc_a}",
+                                explanation=(
+                                    f"Attempt {_this_attempt_a}/{_MAX_RETRIES_A}: {_reason}"
+                                )[:400],
+                                attempt=_this_attempt_a,
+                                client_id=_breach_client_id,
+                                ticker=ticker,
+                            )
+                        except Exception as _retry_obs_exc_a:
+                            log.debug("[%s] retry queue write non-critical: %s", ticker, _retry_obs_exc_a)
+                        # Rearm: fire _on_entry_trigger again after delay.
+                        # `watched` is still valid — the price already breached.
+                        import threading as _threading_retry
+                        _watched_ref = watched
+                        def _retry_deferred_breach_a(_w=_watched_ref, _t=ticker,
+                                                      _att=_this_attempt_a, _d=_RETRY_DELAY_A):
+                            try:
+                                time.sleep(_d)
+                                log.info(
+                                    "[%s] DEFERRED_BREACH_RETRY firing attempt=%d",
+                                    _t, _att,
+                                )
+                                self._on_entry_trigger(_w)
+                            except Exception as _retry_exc_a:
+                                log.error(
+                                    "[%s] DEFERRED_BREACH_RETRY thread error attempt=%d: %s",
+                                    _t, _att, _retry_exc_a,
+                                )
+                        _rt_a = _threading_retry.Thread(
+                            target=_retry_deferred_breach_a,
+                            daemon=True,
+                            name=f"deferred_retry_{ticker}_{_this_attempt_a}",
+                        )
+                        _rt_a.start()
+                        return  # do NOT terminalize — retry thread owns the outcome
+
+                    # Not retryable (quality reject, max retries exceeded, or past cutoff).
+                    # Classify into specific dashboard taxonomy before terminalizing.
+                    _cs_status_a = (
+                        "CONTRACT_SELECTION_DATA_ERROR"     # retryable but exhausted/past cutoff
+                        if _obs_rc_a in RETRYABLE_BREACH_SELECTOR_REASONS
+                        else "CONTRACT_SELECTION_QUALITY_REJECT"   # real quality failure
+                    )
+
                     log.critical(
                         "DEFERRED_BREACH_CONTRACT_SELECTION_FAILED "
                         "client=%s symbol=%s side=%s execution_mode=%s "
-                        "budget=%.2f reason=%s stage=%s order_id=%s signal_id=%s",
+                        "budget=%.2f reason=%s stage=%s order_id=%s signal_id=%s "
+                        "cs_status=%s attempt=%d/%d",
                         _breach_client_id,
                         ticker,
                         str(getattr(approved_plan, "side", "") or ""),
@@ -1363,6 +1503,9 @@ class APExecutionCore:
                         _deferred_selector_audit.get("stage") or "unknown",
                         queue_local_order_id or "",
                         str(getattr(approved_plan, "signal_id", "") or ""),
+                        _cs_status_a,
+                        _this_attempt_a,
+                        _MAX_RETRIES_A,
                     )
                     log.critical(
                         "BREACH_TIME_CONTRACT_SELECTION_FAILED "
@@ -1378,12 +1521,7 @@ class APExecutionCore:
                         reason=_reason,
                         extra={"stage": _deferred_selector_audit.get("stage") or "unknown"},
                     )
-                    # ── PR #182: write selector failure reason to trade_queue.last_error ──
-                    # Path A: select() returned None. Order is being terminated via
-                    # _terminalize_deferred_breach_failure below. Write the reason
-                    # to trade_queue.last_error first so the operator can see WHY
-                    # this DEFERRED row failed — without needing Render log access.
-                    # Best-effort: failure here must never block the cleanup below.
+                    # ── PR #182 + P0: write selector failure to trade_queue.last_error ──
                     try:
                         from ap.queue import write_deferred_breach_last_error
                         _queue_id_for_obs = (
@@ -1391,25 +1529,11 @@ class APExecutionCore:
                             or sig.get("trade_queue_id")
                             or (getattr(approved_plan, "metadata", None) or {}).get("queue_id")
                         )
-                        _prior_attempt = 0
-                        try:
-                            _prior_attempt = int(
-                                (getattr(approved_plan, "metadata", None) or {}).get(
-                                    "breach_attempt_count", 0
-                                ) or 0
-                            )
-                        except (TypeError, ValueError):
-                            _prior_attempt = 0
-                        _this_attempt = _prior_attempt + 1
-                        _obs_rc_a = (
-                            _deferred_selector_audit.get("reason_code")
-                            or "BREACH_SELECTOR_RETURNED_NONE"
-                        )
                         write_deferred_breach_last_error(
                             _queue_id_for_obs,
                             reason_code=str(_obs_rc_a),
                             explanation=str(_reason or "")[:400],
-                            attempt=_this_attempt,
+                            attempt=_this_attempt_a,
                             client_id=_breach_client_id,
                             ticker=ticker,
                         )
@@ -1417,31 +1541,34 @@ class APExecutionCore:
                             _upd_a = getattr(self.order_state_machine, "update_order_meta", None)
                             if callable(_upd_a) and queue_local_order_id:
                                 _upd_a(queue_local_order_id, {
-                                    "breach_attempt_count":           _this_attempt,
-                                    "last_breach_failure_reason":     str(_reason or ""),
+                                    "breach_attempt_count":            _this_attempt_a,
+                                    "last_breach_failure_reason":      str(_reason or ""),
                                     "last_breach_failure_reason_code": str(_obs_rc_a),
-                                    "last_breach_failure_at":         datetime.now(timezone.utc).isoformat(),
-                                    "last_breach_selector_audit":     _deferred_selector_audit or {},
+                                    "last_breach_failure_at":          datetime.now(timezone.utc).isoformat(),
+                                    "last_breach_selector_audit":      _deferred_selector_audit or {},
+                                    "contract_selection_status":       _cs_status_a,
                                 })
                         except Exception as _ma_exc:
                             log.debug("[%s] PR182 meta update non-critical: %s", ticker, _ma_exc)
                     except Exception as _obs_a_exc:
                         log.debug("[%s] PR182 write-back non-critical: %s", ticker, _obs_a_exc)
-                    # ── end PR #182 Path A ─────────────────────────────────────
+                    # ── end PR #182 + P0 Path A ────────────────────────────────
                     _terminalize_deferred_breach_failure(
                         _reason,
                         extra_meta={
                             "failure_stage":           "deferred_contract_selection",
                             "selected_contract":       _sel_contract or None,
                             "deferred_selector_audit": _deferred_selector_audit,
+                            "contract_selection_status": _cs_status_a,
                         },
                     )
                     log.critical(
                         "[%s] PRODUCTION_ENTRY_BLOCK — breach-time contract selection "
-                        "returned no contract (reason=%s stage=%s budget=%.2f)",
+                        "returned no contract (reason=%s stage=%s budget=%.2f cs_status=%s)",
                         ticker, _reason,
                         _deferred_selector_audit.get("stage") or "unknown",
                         float(getattr(approved_plan, "max_position_usd", 0) or 0),
+                        _cs_status_a,
                     )
                     return
 
@@ -1972,75 +2099,57 @@ class APExecutionCore:
             )
             if not _confirm_result.passed:
                 _fail_reason = _confirm_result.fail_reason or "entry_confirm_failed"
-                _observe_only_daily_continuation = (
-                    _confirm_meta.get("daily_continuation_mode") == "observe"
-                    and str(_fail_reason).startswith("daily_continuation_failed")
+                log.info(
+                    "[%s] ENTRY_CONFIRM_BLOCK — %s | client=%s | "
+                    "spread=%.3f fade=%.2f reversal=%.3f age=%.1fs",
+                    ticker, _fail_reason,
+                    str(watched.signal.get("client_id", "?") if watched.signal else "?"),
+                    float(_confirm_meta.get("spread_pct") or 0),
+                    float(_confirm_meta.get("option_move_pct") or 0),
+                    float(_confirm_meta.get("underlying_move_pct") or 0),
+                    float(_confirm_meta.get("quote_age_seconds") or 0),
                 )
-                if _observe_only_daily_continuation:
-                    log.warning(
-                        "[%s] ENTRY_CONFIRM_OBSERVED — continuation would block in enforce mode "
-                        "but submit will continue | reason=%s",
-                        ticker,
-                        _fail_reason,
-                    )
-                    if queue_local_order_id and hasattr(self.order_state_machine, "update_order_meta"):
-                        try:
-                            self.order_state_machine.update_order_meta(
-                                queue_local_order_id, {"entry_confirmation": _confirm_meta})
-                        except Exception:
-                            pass
-                else:
-                    log.info(
-                        "[%s] ENTRY_CONFIRM_BLOCK — %s | client=%s | "
-                        "spread=%.3f fade=%.2f reversal=%.3f age=%.1fs",
-                        ticker, _fail_reason,
-                        str(watched.signal.get("client_id", "?") if watched.signal else "?"),
-                        float(_confirm_meta.get("spread_pct") or 0),
-                        float(_confirm_meta.get("option_move_pct") or 0),
-                        float(_confirm_meta.get("underlying_move_pct") or 0),
-                        float(_confirm_meta.get("quote_age_seconds") or 0),
-                    )
-                    funnel.inc("entry_confirm_blocked")
-                    if signal_id:
-                        # Only write to known ap_signals columns — no unknown fields
-                        self.store.update_signal_fields(signal_id, {
-                            "decision_status": "blocked_at_breach",
-                            "context_notes":   _fail_reason,
-                        })
-                    if queue_local_order_id and hasattr(self.order_state_machine, "update_order_meta"):
-                        try:
-                            self.order_state_machine.update_order_meta(
-                                queue_local_order_id, {"entry_confirmation": _confirm_meta})
-                        except Exception:
-                            pass
-                    self._cleanup_pending_entry_order(
-                        watched,
-                        action="expire",
-                        reason=_fail_reason,
-                    )
-                    # PR81 Final Amendment v2 §3: ENTRY_CONFIRMATION_FAILED ledger write.
+                funnel.inc("entry_confirm_blocked")
+                if signal_id:
+                    # Only write to known ap_signals columns — no unknown fields
+                    self.store.update_signal_fields(signal_id, {
+                        "decision_status": "blocked_at_breach",
+                        "context_notes":   _fail_reason,
+                    })
+                if queue_local_order_id and hasattr(self.order_state_machine, "update_order_meta"):
                     try:
-                        from ap.opportunity_ledger import (
-                            update_opportunity, STAGE_ENTRY_CONFIRMATION,
-                        )
-                        _client_id_for_ledger = str(
-                            watched.signal.get("client_id") if watched.signal else ""
-                        ) or getattr(self, "client_id", "")
-                        _canon = str(
-                            (watched.signal or {}).get("canonical_signal_id") or signal_id
-                        )
-                        update_opportunity(
-                            signal_id or _canon, _client_id_for_ledger,
-                            "ENTRY_CONFIRMATION_FAILED",
-                            canonical_signal_id=_canon,
-                            miss_stage=STAGE_ENTRY_CONFIRMATION,
-                            miss_reason=_fail_reason,
-                            order_local_id=str(queue_local_order_id) if queue_local_order_id else None,
-                            entry_confirmation_result=_fail_reason,
-                        )
+                        self.order_state_machine.update_order_meta(
+                            queue_local_order_id, {"entry_confirmation": _confirm_meta})
                     except Exception:
                         pass
-                    return   # NO BROKER SUBMIT
+                self._cleanup_pending_entry_order(
+                    watched,
+                    action="expire",
+                    reason=_fail_reason,
+                )
+                # PR81 Final Amendment v2 §3: ENTRY_CONFIRMATION_FAILED ledger write.
+                try:
+                    from ap.opportunity_ledger import (
+                        update_opportunity, STAGE_ENTRY_CONFIRMATION,
+                    )
+                    _client_id_for_ledger = str(
+                        watched.signal.get("client_id") if watched.signal else ""
+                    ) or getattr(self, "client_id", "")
+                    _canon = str(
+                        (watched.signal or {}).get("canonical_signal_id") or signal_id
+                    )
+                    update_opportunity(
+                        signal_id or _canon, _client_id_for_ledger,
+                        "ENTRY_CONFIRMATION_FAILED",
+                        canonical_signal_id=_canon,
+                        miss_stage=STAGE_ENTRY_CONFIRMATION,
+                        miss_reason=_fail_reason,
+                        order_local_id=str(queue_local_order_id) if queue_local_order_id else None,
+                        entry_confirmation_result=_fail_reason,
+                    )
+                except Exception:
+                    pass
+                return   # NO BROKER SUBMIT
         except ImportError:
             # When confirmation_required=True, a missing module is NOT safe to skip.
             # Client-eligible trades must not bypass confirmation — fail closed.
@@ -2117,15 +2226,14 @@ class APExecutionCore:
                 "(confirmation_required=False for this signal)"
             )
         except Exception as _ec_err:
+            # Fail-closed for confirmation errors — block the submit
             log.error("[%s] ENTRY_CONFIRM_ERROR — failing closed: %s", ticker, _ec_err)
             _terminalize_breach_failure(
                 f"entry_confirm_error:{_ec_err}",
                 cleanup_action="expire",
                 funnel_key="entry_confirm_blocked",
             )
-            # Runtime confirmation exceptions are not safe observe-only events.
-            # Observe-mode daily continuation is handled above via a normal
-            # failed ConfirmationResult with daily_continuation_mode=observe.
+            # PR81 Final Amendment v2 §3: ENTRY_CONFIRMATION_FAILED ledger write.
             try:
                 from ap.opportunity_ledger import (
                     update_opportunity, STAGE_ENTRY_CONFIRMATION,
