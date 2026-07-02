@@ -46,6 +46,94 @@ DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
 BOT_MODE            = (os.getenv("AP_MODE") or os.getenv("BOT_MODE") or "PAPER").upper()
 MAX_POSITIONS       = int(os.getenv("MAX_POSITIONS", "7"))
 
+# ── P0: deferred-breach contract-selector retry taxonomy ─────────────────────
+# Reason codes in this set mean the chain provider had a temporary data miss —
+# NOT a real contract-quality or risk reject.  On a retryable miss the deferred
+# row must NOT be expired/cancelled; instead it is rearmed for retry up to
+# MAX_BREACH_SELECTOR_RETRIES times (default 3) before giving up.
+#
+# Quality rejects (SPREAD_TOO_WIDE, DELTA_OUT_OF_RANGE, OI_TOO_LOW, etc.) and
+# fundamental blocks (EARNINGS_LOCKOUT, UNTRADEABLE_FOR_ACCOUNT_SIZE, etc.) are
+# NOT in this set — those still terminalize on the first attempt, exactly as today.
+#
+# AMENDMENT (PR #219, Jason LIVE recovery): the original set missed the two
+# top-count failure codes on Jason LIVE today — CHAIN_ROW_ZERO_BID_ASK
+# (12 SBUX + 29 ACN candidates) and DIRECT_QUOTE_ZERO_BID_ASK (5 SBUX + 4 ACN).
+# Both are transient quote-quality signals at market open, not structural
+# rejects. NO_VALID_PLAYBOOK_DTE_CONTRACT is the aggregation reason emitted
+# after the ladder exhausts all buckets on transient signals; adding it here
+# means a second full ladder pass runs after RETRY_DELAY seconds instead of
+# terminalizing. QUOTE_FETCH_FAILED and CHAIN_EMPTY are historical variants
+# emitted by older selector paths that could still surface in edge cases.
+#
+# Env overrides:
+#   MAX_BREACH_SELECTOR_RETRIES          default 3
+#   BREACH_SELECTOR_RETRY_DELAY_SECONDS  default 20
+#   BREACH_SELECTOR_RETRY_CUTOFF_ET      default 945 (= 9:45 AM ET)
+RETRYABLE_BREACH_SELECTOR_REASONS: frozenset = frozenset({
+    "NO_CHAIN_DATA",                    # legacy compat — broad code kept until all paths emit exact codes
+    "CHAIN_PROVIDER_ERROR",             # Tradier HTTP/network transient failure
+    "CHAIN_PROVIDER_EMPTY_EXPIRATIONS", # expirations endpoint returned nothing (can be transient at 9:30–9:36)
+    "CHAIN_PROVIDER_EMPTY_OPTIONS",     # chain endpoint returned zero rows for this expiration
+    "CHAIN_PARSE_EMPTY",                # chain parsed to zero rows after direction filter
+    "NO_EXPIRATION_IN_DTE_WINDOW",      # no eligible expiration in the current DTE probe window
+    "DIRECT_QUOTE_UNAVAILABLE",         # direct-quote revalidation fetch failed
+    # ── PR #219 amendment: Jason LIVE 2026-07-01 recovery additions ──
+    "CHAIN_ROW_ZERO_BID_ASK",           # per-chain-row zero bid or ask — top failure on Jason LIVE today
+    "DIRECT_QUOTE_ZERO_BID_ASK",        # direct OCC quote came back zero — 2nd top failure on Jason LIVE
+    "QUOTE_FETCH_FAILED",               # quote endpoint returned an error/timeout
+    "CHAIN_EMPTY",                      # historical variant emitted when chain returns no rows
+    # NOTE: NO_VALID_PLAYBOOK_DTE_CONTRACT is intentionally excluded here.
+    # It is the DTE-ladder aggregation reason and may reflect structural quality
+    # rejects (OI_TOO_LOW, SPREAD_TOO_WIDE) as well as transient data-miss reasons.
+    # When the ladder emits it, execution_core inspects the dte_ladder_audit to
+    # determine whether the exhaustion came from data-miss (retryable) or quality
+    # rejects (terminal). See _is_ladder_exhaustion_retryable() below.
+})
+
+
+def _is_ladder_exhaustion_retryable(ladder_audit: Optional[dict]) -> bool:
+    """Determine whether a NO_VALID_PLAYBOOK_DTE_CONTRACT exhaustion is retryable.
+
+    Called only when the top-level selector reason_code is
+    NO_VALID_PLAYBOOK_DTE_CONTRACT (the DTE ladder ran but found no quality
+    survivor across all probed buckets). Retrying makes sense only when the
+    per-bucket rejections were all data-miss signals, not structural quality
+    verdicts that would fail again regardless of when we retry.
+
+    Logic:
+      - Retryable if ALL probed expirations failed with a code in
+        RETRYABLE_BREACH_SELECTOR_REASONS.
+      - Terminal if ANY probed expiration failed with a structural quality
+        code (OI_TOO_LOW, SPREAD_TOO_WIDE, BID_BELOW_MIN, etc.) — those
+        verdicts are contract-level and will not improve on a retry.
+      - Unknown / missing audit → conservative return of False (do not retry;
+        prefer to terminalize rather than loop on unknown failure).
+    """
+    if not isinstance(ladder_audit, dict):
+        return False
+    buckets_attempted = ladder_audit.get("buckets_attempted") or []
+    if not buckets_attempted:
+        return False
+
+    saw_any_retryable = False
+    for bucket in buckets_attempted:
+        for exp_rec in bucket.get("expirations_probed") or []:
+            _sub_fail = exp_rec.get("failure") or {}
+            _rc = str(_sub_fail.get("reason_code") or "").strip().upper()
+            if not _rc:
+                continue
+            if _rc not in RETRYABLE_BREACH_SELECTOR_REASONS:
+                # Any structural/quality/terminal reject means the exhaustion
+                # is not purely data-miss — do not retry.
+                return False
+            saw_any_retryable = True
+
+    # If we only saw retryable data-miss reasons (or no per-exp reason_code at
+    # all), allow the retry so the ladder gets a fresh chance after the delay.
+    return saw_any_retryable
+
+
 # ── Mode metadata thresholds ────────────────────────────────────────────────
 # PR-B / FIX-8: floors are now env-overridable so they can be tuned
 # on Render without a code deploy (essential for proof-week response time).
@@ -1344,16 +1432,311 @@ class APExecutionCore:
                             _sf.get("raw_reason") if isinstance(_sf, dict) else None
                         ),
                     }
+                    # AMENDMENT (PR #219, Jason LIVE recovery): propagate the
+                    # last DTE ladder run into order.meta so operator dashboards
+                    # can see which expirations were probed and why each bucket
+                    # failed. Without this, ladder observability stayed inside
+                    # the selector and never made it into Supabase — meaning
+                    # post-mortems on Jason's 54 EXPIRED rows had no visibility
+                    # into which expirations were tried. Best-effort read.
+                    try:
+                        if hasattr(self.contract_selector, "get_last_dte_ladder_audit"):
+                            _ladder_audit = self.contract_selector.get_last_dte_ladder_audit()
+                            if isinstance(_ladder_audit, dict) and _ladder_audit:
+                                _audit["last_dte_ladder_audit"] = _ladder_audit
+                                # Surface commonly-queried ladder fields at the
+                                # top level of the audit so dashboards can query
+                                # them without traversing the nested audit dict.
+                                _audit["ladder_selected_bucket"]     = _ladder_audit.get("selected_bucket")
+                                _audit["ladder_selected_expiration"] = _ladder_audit.get("selected_expiration")
+                                _audit["ladder_selected_dte"]        = _ladder_audit.get("selected_dte")
+                                _audit["ladder_buckets_attempted"]   = _ladder_audit.get("buckets_attempted")
+                                _audit["ladder_bucket_order"]        = _ladder_audit.get("bucket_order")
+                    except Exception as _ladder_exc:
+                        log.debug(
+                            "[%s] get_last_dte_ladder_audit() read failed (non-fatal): %s",
+                            ticker, _ladder_exc,
+                        )
                     return _error, _audit
 
                 # Path A: selector returned None OR live contract is still empty
                 # after copy-back. The selector's REJECT is the blocker.
                 if not _sel or not _live_contract:
                     _reason, _deferred_selector_audit = _build_deferred_selector_audit()
+
+                    # ── P0: Retryable breach-selector — do NOT terminalize on transient ──
+                    # If the failure reason is a temporary market-data miss (chain not
+                    # yet warmed up, Tradier 5xx, empty expirations at 9:30–9:36 ET),
+                    # rearm the trigger instead of expiring the row permanently.
+                    # Safety contract: no broker submit on retry path, max retries and
+                    # entry-cutoff both enforced. Quality rejects (spread, OI, delta,
+                    # earnings, account size) still terminalize immediately — they are
+                    # NOT in RETRYABLE_BREACH_SELECTOR_REASONS.
+                    _obs_rc_a = str(
+                        _deferred_selector_audit.get("reason_code")
+                        or "BREACH_SELECTOR_RETURNED_NONE"
+                    )
+                    # PR #219 Fix C: NO_VALID_PLAYBOOK_DTE_CONTRACT is the DTE
+                    # ladder aggregation code. Retrying makes sense only when
+                    # the per-bucket failures were all data-miss signals. Inspect
+                    # the ladder audit to decide, never treat it as unconditionally
+                    # retryable.
+                    _obs_rc_is_ladder_exhaustion = (
+                        _obs_rc_a == "NO_VALID_PLAYBOOK_DTE_CONTRACT"
+                    )
+                    _ladder_audit_for_retry = (
+                        _deferred_selector_audit.get("last_dte_ladder_audit") or {}
+                    )
+                    _ladder_exhaustion_is_retryable = (
+                        _is_ladder_exhaustion_retryable(_ladder_audit_for_retry)
+                        if _obs_rc_is_ladder_exhaustion
+                        else False
+                    )
+                    _prior_attempt_a = 0
+                    try:
+                        _prior_attempt_a = int(
+                            (getattr(approved_plan, "metadata", None) or {}).get(
+                                "breach_attempt_count", 0
+                            ) or 0
+                        )
+                    except (TypeError, ValueError):
+                        _prior_attempt_a = 0
+                    _this_attempt_a = _prior_attempt_a + 1
+                    # AMENDMENT (PR #219, Jason LIVE recovery): default is now
+                    # "1" (ON). Retry only applies to deferred breach selection
+                    # AND is further gated by RETRYABLE_BREACH_SELECTOR_REASONS,
+                    # queue_local_order_id presence, attempt count, and the
+                    # BREACH_SELECTOR_RETRY_CUTOFF_ET wall-clock cap — so this
+                    # cannot cause runaway retries for non-deferred flows or
+                    # for structural rejections. The env var is preserved as
+                    # an emergency kill switch (set to "0" to disable without
+                    # a code deploy).
+                    _retry_enabled_a    = str(os.getenv("BREACH_SELECTOR_RETRY_ENABLED", "1")).strip().lower() in ("1", "true", "yes")
+                    _MAX_RETRIES_A      = int(os.getenv("MAX_BREACH_SELECTOR_RETRIES", "3"))
+                    _RETRY_DELAY_A      = int(os.getenv("BREACH_SELECTOR_RETRY_DELAY_SECONDS", "20"))
+                    _RETRY_CUTOFF_A     = int(os.getenv("BREACH_SELECTOR_RETRY_CUTOFF_ET", "945"))
+                    _now_et_a           = datetime.now(ET)
+                    _now_hhmm_a         = _now_et_a.hour * 100 + _now_et_a.minute
+                    _past_cutoff_a      = _now_hhmm_a >= _RETRY_CUTOFF_A
+                    _is_retryable_a     = (
+                        _retry_enabled_a
+                        and bool(queue_local_order_id)
+                        and (
+                            _obs_rc_a in RETRYABLE_BREACH_SELECTOR_REASONS
+                            or _ladder_exhaustion_is_retryable
+                        )
+                        and _this_attempt_a <= _MAX_RETRIES_A
+                        and not _past_cutoff_a
+                    )
+
+                    if _is_retryable_a:
+                        log.warning(
+                            "[%s] DEFERRED_BREACH_SELECTOR_RETRYABLE "
+                            "attempt=%d/%d reason=%s delay=%ds cutoff=%d now=%d — rearming",
+                            ticker, _this_attempt_a, _MAX_RETRIES_A,
+                            _obs_rc_a, _RETRY_DELAY_A, _RETRY_CUTOFF_A, _now_hhmm_a,
+                        )
+                        # Update attempt count — do NOT expire/cancel the order
+                        try:
+                            _ap_meta_a = getattr(approved_plan, "metadata", None)
+                            if isinstance(_ap_meta_a, dict):
+                                _ap_meta_a["breach_attempt_count"] = _this_attempt_a
+                        except Exception:
+                            pass
+                        try:
+                            _upd_retry_a = getattr(self.order_state_machine, "update_order_meta", None)
+                            if callable(_upd_retry_a) and queue_local_order_id:
+                                _upd_retry_a(queue_local_order_id, {
+                                    "breach_attempt_count":            _this_attempt_a,
+                                    "last_breach_failure_reason":      str(_reason or ""),
+                                    "last_breach_failure_reason_code": str(_obs_rc_a),
+                                    "last_breach_failure_at":          datetime.now(timezone.utc).isoformat(),
+                                    "last_breach_selector_audit":      _deferred_selector_audit or {},
+                                    "contract_selection_status":       "CONTRACT_SELECTION_RETRY",
+                                })
+                        except Exception as _retry_meta_exc_a:
+                            log.debug("[%s] retry meta update non-critical: %s", ticker, _retry_meta_exc_a)
+                        try:
+                            from ap.queue import write_deferred_breach_last_error
+                            _queue_id_retry_a = (
+                                sig.get("queue_id")
+                                or sig.get("trade_queue_id")
+                                or (getattr(approved_plan, "metadata", None) or {}).get("queue_id")
+                            )
+                            write_deferred_breach_last_error(
+                                _queue_id_retry_a,
+                                reason_code=f"CONTRACT_SELECTION_RETRY:{_obs_rc_a}",
+                                explanation=(
+                                    f"Attempt {_this_attempt_a}/{_MAX_RETRIES_A}: {_reason}"
+                                )[:400],
+                                attempt=_this_attempt_a,
+                                client_id=_breach_client_id,
+                                ticker=ticker,
+                            )
+                        except Exception as _retry_obs_exc_a:
+                            log.debug("[%s] retry queue write non-critical: %s", ticker, _retry_obs_exc_a)
+                        # Rearm: fire _on_entry_trigger again after delay.
+                        # `watched` is still valid — the price already breached.
+                        import threading as _threading_retry
+                        _retry_key_a = (
+                            str(queue_local_order_id or ""),
+                            int(_this_attempt_a),
+                        )
+                        _retry_inflight_a = getattr(self, "_deferred_breach_retry_inflight", None)
+                        if not isinstance(_retry_inflight_a, set):
+                            _retry_inflight_a = set()
+                            setattr(self, "_deferred_breach_retry_inflight", _retry_inflight_a)
+                        if _retry_key_a in _retry_inflight_a:
+                            log.warning(
+                                "[%s] DEFERRED_BREACH_RETRY_DUPLICATE_SUPPRESSED order=%s attempt=%d",
+                                ticker, queue_local_order_id, _this_attempt_a,
+                            )
+                            return
+                        _retry_inflight_a.add(_retry_key_a)
+                        _watched_ref = watched
+                        def _retry_deferred_breach_a(_w=_watched_ref, _t=ticker,
+                                                      _att=_this_attempt_a, _d=_RETRY_DELAY_A,
+                                                      _retry_key=_retry_key_a,
+                                                      _oid=queue_local_order_id):
+                            try:
+                                time.sleep(_d)
+                                # PR #219 Fix B: stale-state guard.
+                                # Between the first _on_entry_trigger call and now, the
+                                # pending entry row may have been terminalized externally:
+                                # - order_monitor EOD cleanup / cancel
+                                # - watcher expiry from a separate watcher poll
+                                # - a concurrent retry thread that already succeeded
+                                # - manual operator DB update
+                                # Re-entering _on_entry_trigger on a non-PENDING_TRIGGER
+                                # row causes duplicate OSM transitions, phantom broker
+                                # submits, or worst-case a double-fill on Jason's LIVE
+                                # account. Abort if the order is no longer in a
+                                # retry-eligible state.
+                                if _oid:
+                                    try:
+                                        _stale_check_osm = getattr(self, "order_state_machine", None)
+                                        _stale_check_fn = getattr(_stale_check_osm, "get_order", None)
+                                        if callable(_stale_check_fn):
+                                            _stale_row = _stale_check_fn(_oid)
+                                            if isinstance(_stale_row, dict):
+                                                _current_status = str(
+                                                    _stale_row.get("status") or ""
+                                                ).upper()
+                                                _current_broker_id = str(
+                                                    _stale_row.get("broker_order_id") or ""
+                                                ).strip()
+                                                _current_submitted_ts = _stale_row.get("submitted_ts")
+                                                _current_contract = str(
+                                                    _stale_row.get("contract") or ""
+                                                )
+                                                _current_meta = _stale_row.get("meta") or {}
+                                                try:
+                                                    _current_attempt = int(
+                                                        _current_meta.get("breach_attempt_count") or 0
+                                                    )
+                                                except Exception:
+                                                    _current_attempt = 0
+                                                _is_still_deferred = (
+                                                    _current_contract.startswith("DEFERRED:")
+                                                    or bool(_current_meta.get("contract_deferred"))
+                                                    or bool(_current_meta.get("deferred_breach_selection"))
+                                                )
+
+                                                # Guard 1: status must still be retryable
+                                                if _current_status not in {"PENDING_TRIGGER", "CREATED"}:
+                                                    log.warning(
+                                                        "[%s] DEFERRED_BREACH_RETRY_STALE_STATE_ABORT "
+                                                        "order=%s reason=status_changed "
+                                                        "current_status=%s attempt=%d",
+                                                        _t, _oid, _current_status, _att,
+                                                    )
+                                                    return
+                                                # Guard 2: must not already have a broker order
+                                                if _current_broker_id:
+                                                    log.warning(
+                                                        "[%s] DEFERRED_BREACH_RETRY_STALE_STATE_ABORT "
+                                                        "order=%s reason=broker_id_present "
+                                                        "broker_order_id=%s attempt=%d",
+                                                        _t, _oid, _current_broker_id, _att,
+                                                    )
+                                                    return
+                                                # Guard 3: must not have been submitted already
+                                                if _current_submitted_ts:
+                                                    log.warning(
+                                                        "[%s] DEFERRED_BREACH_RETRY_STALE_STATE_ABORT "
+                                                        "order=%s reason=submitted_ts_present "
+                                                        "submitted_ts=%s attempt=%d",
+                                                        _t, _oid, _current_submitted_ts, _att,
+                                                    )
+                                                    return
+                                                # Guard 4: contract must still be deferred
+                                                if not _is_still_deferred:
+                                                    log.warning(
+                                                        "[%s] DEFERRED_BREACH_RETRY_STALE_STATE_ABORT "
+                                                        "order=%s reason=no_longer_deferred "
+                                                        "contract=%s attempt=%d",
+                                                        _t, _oid, _current_contract, _att,
+                                                    )
+                                                    return
+                                                # Guard 5: attempt counter must be consistent.
+                                                # If meta.breach_attempt_count > _att it means
+                                                # another thread already incremented the counter
+                                                # beyond this thread's slot — abort to avoid
+                                                # duplicate entry attempts.
+                                                if _current_attempt > int(_att):
+                                                    log.warning(
+                                                        "[%s] DEFERRED_BREACH_RETRY_STALE_STATE_ABORT "
+                                                        "order=%s reason=attempt_count_advanced "
+                                                        "db_attempt=%d thread_attempt=%d",
+                                                        _t, _oid, _current_attempt, _att,
+                                                    )
+                                                    return
+                                    except Exception as _stale_exc:
+                                        # Stale check is best-effort — if it fails, proceed
+                                        # with the retry rather than silently dropping it.
+                                        # The inflight-key dedup set still prevents true
+                                        # duplicates within the same process.
+                                        log.debug(
+                                            "[%s] DEFERRED_BREACH_RETRY stale-state check failed "
+                                            "(non-fatal, proceeding): %s",
+                                            _t, _stale_exc,
+                                        )
+                                log.info(
+                                    "[%s] DEFERRED_BREACH_RETRY firing attempt=%d",
+                                    _t, _att,
+                                )
+                                self._on_entry_trigger(_w)
+                            except Exception as _retry_exc_a:
+                                log.error(
+                                    "[%s] DEFERRED_BREACH_RETRY thread error attempt=%d: %s",
+                                    _t, _att, _retry_exc_a,
+                                )
+                            finally:
+                                try:
+                                    getattr(self, "_deferred_breach_retry_inflight", set()).discard(_retry_key)
+                                except Exception:
+                                    pass
+                        _rt_a = _threading_retry.Thread(
+                            target=_retry_deferred_breach_a,
+                            daemon=True,
+                            name=f"deferred_retry_{ticker}_{_this_attempt_a}",
+                        )
+                        _rt_a.start()
+                        return  # do NOT terminalize — retry thread owns the outcome
+
+                    # Not retryable (quality reject, max retries exceeded, or past cutoff).
+                    # Classify into specific dashboard taxonomy before terminalizing.
+                    _cs_status_a = (
+                        "CONTRACT_SELECTION_DATA_ERROR"     # retryable but exhausted/past cutoff
+                        if _obs_rc_a in RETRYABLE_BREACH_SELECTOR_REASONS
+                        else "CONTRACT_SELECTION_QUALITY_REJECT"   # real quality failure
+                    )
+
                     log.critical(
                         "DEFERRED_BREACH_CONTRACT_SELECTION_FAILED "
                         "client=%s symbol=%s side=%s execution_mode=%s "
-                        "budget=%.2f reason=%s stage=%s order_id=%s signal_id=%s",
+                        "budget=%.2f reason=%s stage=%s order_id=%s signal_id=%s "
+                        "cs_status=%s attempt=%d/%d",
                         _breach_client_id,
                         ticker,
                         str(getattr(approved_plan, "side", "") or ""),
@@ -1363,6 +1746,9 @@ class APExecutionCore:
                         _deferred_selector_audit.get("stage") or "unknown",
                         queue_local_order_id or "",
                         str(getattr(approved_plan, "signal_id", "") or ""),
+                        _cs_status_a,
+                        _this_attempt_a,
+                        _MAX_RETRIES_A,
                     )
                     log.critical(
                         "BREACH_TIME_CONTRACT_SELECTION_FAILED "
@@ -1378,12 +1764,7 @@ class APExecutionCore:
                         reason=_reason,
                         extra={"stage": _deferred_selector_audit.get("stage") or "unknown"},
                     )
-                    # ── PR #182: write selector failure reason to trade_queue.last_error ──
-                    # Path A: select() returned None. Order is being terminated via
-                    # _terminalize_deferred_breach_failure below. Write the reason
-                    # to trade_queue.last_error first so the operator can see WHY
-                    # this DEFERRED row failed — without needing Render log access.
-                    # Best-effort: failure here must never block the cleanup below.
+                    # ── PR #182 + P0: write selector failure to trade_queue.last_error ──
                     try:
                         from ap.queue import write_deferred_breach_last_error
                         _queue_id_for_obs = (
@@ -1391,25 +1772,11 @@ class APExecutionCore:
                             or sig.get("trade_queue_id")
                             or (getattr(approved_plan, "metadata", None) or {}).get("queue_id")
                         )
-                        _prior_attempt = 0
-                        try:
-                            _prior_attempt = int(
-                                (getattr(approved_plan, "metadata", None) or {}).get(
-                                    "breach_attempt_count", 0
-                                ) or 0
-                            )
-                        except (TypeError, ValueError):
-                            _prior_attempt = 0
-                        _this_attempt = _prior_attempt + 1
-                        _obs_rc_a = (
-                            _deferred_selector_audit.get("reason_code")
-                            or "BREACH_SELECTOR_RETURNED_NONE"
-                        )
                         write_deferred_breach_last_error(
                             _queue_id_for_obs,
                             reason_code=str(_obs_rc_a),
                             explanation=str(_reason or "")[:400],
-                            attempt=_this_attempt,
+                            attempt=_this_attempt_a,
                             client_id=_breach_client_id,
                             ticker=ticker,
                         )
@@ -1417,31 +1784,34 @@ class APExecutionCore:
                             _upd_a = getattr(self.order_state_machine, "update_order_meta", None)
                             if callable(_upd_a) and queue_local_order_id:
                                 _upd_a(queue_local_order_id, {
-                                    "breach_attempt_count":           _this_attempt,
-                                    "last_breach_failure_reason":     str(_reason or ""),
+                                    "breach_attempt_count":            _this_attempt_a,
+                                    "last_breach_failure_reason":      str(_reason or ""),
                                     "last_breach_failure_reason_code": str(_obs_rc_a),
-                                    "last_breach_failure_at":         datetime.now(timezone.utc).isoformat(),
-                                    "last_breach_selector_audit":     _deferred_selector_audit or {},
+                                    "last_breach_failure_at":          datetime.now(timezone.utc).isoformat(),
+                                    "last_breach_selector_audit":      _deferred_selector_audit or {},
+                                    "contract_selection_status":       _cs_status_a,
                                 })
                         except Exception as _ma_exc:
                             log.debug("[%s] PR182 meta update non-critical: %s", ticker, _ma_exc)
                     except Exception as _obs_a_exc:
                         log.debug("[%s] PR182 write-back non-critical: %s", ticker, _obs_a_exc)
-                    # ── end PR #182 Path A ─────────────────────────────────────
+                    # ── end PR #182 + P0 Path A ────────────────────────────────
                     _terminalize_deferred_breach_failure(
                         _reason,
                         extra_meta={
                             "failure_stage":           "deferred_contract_selection",
                             "selected_contract":       _sel_contract or None,
                             "deferred_selector_audit": _deferred_selector_audit,
+                            "contract_selection_status": _cs_status_a,
                         },
                     )
                     log.critical(
                         "[%s] PRODUCTION_ENTRY_BLOCK — breach-time contract selection "
-                        "returned no contract (reason=%s stage=%s budget=%.2f)",
+                        "returned no contract (reason=%s stage=%s budget=%.2f cs_status=%s)",
                         ticker, _reason,
                         _deferred_selector_audit.get("stage") or "unknown",
                         float(getattr(approved_plan, "max_position_usd", 0) or 0),
+                        _cs_status_a,
                     )
                     return
 
@@ -1972,23 +2342,34 @@ class APExecutionCore:
             )
             if not _confirm_result.passed:
                 _fail_reason = _confirm_result.fail_reason or "entry_confirm_failed"
+
+                # PR #219 Fix A: observe-only daily continuation must NOT terminalize.
+                # When daily_continuation_mode="observe" and the fail reason is a
+                # daily_continuation_failed:<> code, this is a non-blocking observation
+                # signal — the submit path must continue. Only enforce-mode and
+                # non-continuation failures should expire the pending entry.
                 _observe_only_daily_continuation = (
                     _confirm_meta.get("daily_continuation_mode") == "observe"
                     and str(_fail_reason).startswith("daily_continuation_failed")
                 )
+
                 if _observe_only_daily_continuation:
                     log.warning(
-                        "[%s] ENTRY_CONFIRM_OBSERVED — continuation would block in enforce mode "
-                        "but submit will continue | reason=%s",
-                        ticker,
-                        _fail_reason,
+                        "[%s] ENTRY_CONFIRM_OBSERVED — daily continuation would block "
+                        "in enforce mode but observe mode is active; submit will "
+                        "continue | reason=%s",
+                        ticker, _fail_reason,
                     )
+                    # Persist confirmation meta for observability without blocking.
                     if queue_local_order_id and hasattr(self.order_state_machine, "update_order_meta"):
                         try:
                             self.order_state_machine.update_order_meta(
                                 queue_local_order_id, {"entry_confirmation": _confirm_meta})
                         except Exception:
                             pass
+                    # Fall through to broker submit — do NOT cleanup, expire, or
+                    # write blocked_at_breach.
+
                 else:
                     log.info(
                         "[%s] ENTRY_CONFIRM_BLOCK — %s | client=%s | "
@@ -2117,15 +2498,14 @@ class APExecutionCore:
                 "(confirmation_required=False for this signal)"
             )
         except Exception as _ec_err:
+            # Fail-closed for confirmation errors — block the submit
             log.error("[%s] ENTRY_CONFIRM_ERROR — failing closed: %s", ticker, _ec_err)
             _terminalize_breach_failure(
                 f"entry_confirm_error:{_ec_err}",
                 cleanup_action="expire",
                 funnel_key="entry_confirm_blocked",
             )
-            # Runtime confirmation exceptions are not safe observe-only events.
-            # Observe-mode daily continuation is handled above via a normal
-            # failed ConfirmationResult with daily_continuation_mode=observe.
+            # PR81 Final Amendment v2 §3: ENTRY_CONFIRMATION_FAILED ledger write.
             try:
                 from ap.opportunity_ledger import (
                     update_opportunity, STAGE_ENTRY_CONFIRMATION,

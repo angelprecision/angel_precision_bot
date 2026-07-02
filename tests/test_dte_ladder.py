@@ -32,8 +32,22 @@ _SRC  = (_REPO / "ap" / "contract_selector.py").read_text()
 # ---------------------------------------------------------------------------
 
 class TestSourceGuards:
-    def test_flag_defaults_off(self):
-        assert 'os.getenv("DEFERRED_DTE_LADDER", "0")' in _SRC
+    def test_flag_defaults_on(self):
+        # PR #219 amendment (Jason LIVE recovery 2026-07-01): the default
+        # flipped from "0" (off) to "1" (on). The ladder is still narrowly
+        # gated by _is_ladder_eligible(plan) so non-deferred callers see no
+        # behavior change. The env var is preserved as an emergency kill
+        # switch: DEFERRED_DTE_LADDER=0 disables without a code deploy.
+        assert 'os.getenv("DEFERRED_DTE_LADDER", "1")' in _SRC, (
+            "DEFERRED_DTE_LADDER default must be '1' — the PR #219 "
+            "Jason LIVE recovery amendment enables the ladder by default."
+        )
+        # And the pre-amendment default must NOT be present anywhere in the
+        # module, so a silent revert of the amendment surfaces in CI.
+        assert 'os.getenv("DEFERRED_DTE_LADDER", "0")' not in _SRC, (
+            "Old default '0' for DEFERRED_DTE_LADDER still in source — the "
+            "PR #219 amendment may have been reverted."
+        )
 
     def test_ladder_method_present(self):
         assert "def _select_with_dte_ladder(" in _SRC
@@ -76,6 +90,11 @@ def _load_selector(env_overrides: dict | None = None):
     stubs = {
         "ap.brokers": MagicMock(),
         "ap.brokers.tradier": MagicMock(),
+        "ap.observability": MagicMock(
+            emit_decision_event=MagicMock(),
+            get_git_commit=MagicMock(return_value="test"),
+            make_config_hash=MagicMock(return_value="test"),
+        ),
         "yfinance": MagicMock(),
         "requests": MagicMock(),
     }
@@ -382,9 +401,9 @@ class TestAmendmentGateOrdering:
         # the true reason must survive
         assert sel._last_failure["reason_code"] == "EARNINGS_LOCKOUT"
 
-    def test_ladder_records_no_dte_reason_when_no_terminal(self):
-        """When sub-calls fail for ordinary (non-terminal) reasons, the ladder
-        still records NO_VALID_PLAYBOOK_DTE_CONTRACT on exhaustion."""
+    def test_ladder_preserves_quality_reason_when_no_terminal(self):
+        """When sub-calls fail after real chain rows are evaluated, preserve
+        the quality reason instead of masking it as DTE exhaustion."""
         mod = _load_selector({"DEFERRED_DTE_LADDER": "1"})
         sel = object.__new__(mod.APContractSelectionEngine)
         sel.dte_ladder_enabled = True
@@ -409,4 +428,42 @@ class TestAmendmentGateOrdering:
 
         result = sel._select_with_dte_ladder(_make_plan(timeframe="1d"))
         assert result is None
-        assert sel._last_failure["reason_code"] == "NO_VALID_PLAYBOOK_DTE_CONTRACT"
+        assert sel._last_failure["reason_code"] == "OI_TOO_LOW"
+
+    def test_ladder_preserves_retryable_data_reason_when_all_probes_data_miss(self):
+        """All-probe retryable data misses must stay retryable so the deferred
+        breach path can rearm instead of terminalizing immediately."""
+        mod = _load_selector({"DEFERRED_DTE_LADDER": "1"})
+        sel = object.__new__(mod.APContractSelectionEngine)
+        sel.dte_ladder_enabled = True
+        sel.dte_bucket_a_max = 2
+        sel.dte_bucket_b_max = 7
+        sel.dte_ladder_probe_per_bucket = 2
+        sel._last_failure = None
+        sel._last_dte_ladder_audit = None
+
+        today = date.today()
+        a_exp = _next_weekday(today, 1)
+        c_exp = _next_weekday(today, 14)
+        sel._fetch_expirations_list = MagicMock(return_value=[a_exp, c_exp])
+
+        def _fake_select(plan, *, expiration_override=None):
+            sel._last_failure = {
+                "stage": "chain_fetch",
+                "reason_code": (
+                    "CHAIN_PROVIDER_EMPTY_OPTIONS"
+                    if expiration_override == a_exp else
+                    "CHAIN_PARSE_EMPTY"
+                ),
+                "explanation": "provider warming up",
+            }
+            return None
+
+        sel.select = _fake_select
+
+        result = sel._select_with_dte_ladder(_make_plan(timeframe="1d"))
+        assert result is None
+        assert sel._last_failure["reason_code"] in {
+            "CHAIN_PROVIDER_EMPTY_OPTIONS",
+            "CHAIN_PARSE_EMPTY",
+        }

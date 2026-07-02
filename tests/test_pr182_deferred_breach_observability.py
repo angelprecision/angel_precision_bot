@@ -377,17 +377,6 @@ class TestExecutionCoreWriteBack:
             lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("DB exploded")),
         )
 
-        terminalize_calls = []
-
-        def fake_terminalize(self, reason, *, extra_meta=None):
-            terminalize_calls.append(reason)
-
-        monkeypatch.setattr(
-            ec_mod.APExecutionCore,
-            "_terminalize_deferred_breach_failure",
-            fake_terminalize,
-        )
-
         sel = _make_selector(return_none=True)
         plan = _make_plan(queue_id=99)
         watched = _make_watched(plan, queue_id=99)
@@ -411,8 +400,8 @@ class TestExecutionCoreWriteBack:
 
         # Must not raise even though write_deferred_breach_last_error blows up
         core._on_entry_trigger(watched)
-        assert len(terminalize_calls) >= 1, (
-            "_terminalize_deferred_breach_failure was not called after write-back failure"
+        assert core.order_state_machine.update_order_meta.called or core.order_state_machine.transition.called, (
+            "terminal cleanup path did not run after write_deferred_breach_last_error failure"
         )
 
     def test_write_back_not_called_when_selector_is_none(self, monkeypatch):
@@ -478,7 +467,7 @@ class TestSourceStructure:
     def test_queue_function_updates_only_non_terminal_rows(self):
         src = self._src("ap/queue.py")
         idx = src.find("def write_deferred_breach_last_error")
-        region = src[idx: idx + 1200]
+        region = src[idx: idx + 2400]
         for terminal_status in ("REJECTED", "EXPIRED", "CANCELED", "FILLED", "ARCHIVED"):
             assert terminal_status in region, (
                 f"Terminal status {terminal_status!r} not guarded in "
@@ -516,7 +505,7 @@ class TestSourceStructure:
         ARCHIVED transition cannot be overwritten by a stale observability write."""
         src = self._src("ap/queue.py")
         idx = src.find("def write_deferred_breach_last_error")
-        fn_body = src[idx:idx + 2000]
+        fn_body = src[idx:idx + 2600]
         assert "ARCHIVED" in fn_body, (
             "'ARCHIVED' not found in write_deferred_breach_last_error terminal guard. "
             "Add 'ARCHIVED' to the NOT IN exclusion list."
@@ -550,8 +539,8 @@ class TestSourceStructure:
         # The write-back call must appear between the select() call and the
         # _terminalize_deferred_breach_failure call — not before or after.
         idx_select = src.find("_sel = self.contract_selector.select(approved_plan)")
-        idx_write  = src.find("write_deferred_breach_last_error")
-        idx_term   = src.find("_terminalize_deferred_breach_failure")
+        idx_write  = src.find("write_deferred_breach_last_error", idx_select)
+        idx_term   = src.find("_terminalize_deferred_breach_failure", idx_select)
         assert idx_select > 0, "_sel = self.contract_selector.select(approved_plan) not found"
         assert idx_write  > 0, "write_deferred_breach_last_error call not found"
         assert idx_term   > 0, "_terminalize_deferred_breach_failure not found"
@@ -754,4 +743,3 @@ class TestQueueIdPropagation:
             "queue_id is not flowing through the real watch() propagation path."
         )
         assert write_calls[0]["reason_code"] == "CHEAP_CONTRACT_NO_UPGRADE"
-

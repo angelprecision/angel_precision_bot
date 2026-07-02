@@ -55,6 +55,38 @@ from ap.contract_quote_revalidator import (
     DEFAULT_REVALIDATE_TOP_N,
 )
 
+# ── P0: exact chain-fetch taxonomy exceptions ────────────────────────────────
+class ChainProviderError(Exception):
+    """HTTP or network error from the options chain provider."""
+    def __init__(self, msg: str, *, status_code: int | None = None):
+        super().__init__(msg)
+        self.status_code = status_code
+
+
+class ChainAuthError(ChainProviderError):
+    """401/403 from the options chain provider — credential/token failure."""
+    pass
+
+
+class ChainEmptyExpirations(Exception):
+    """Expirations endpoint returned an empty list for this ticker."""
+    pass
+
+
+class NoExpirationInDTEWindow(Exception):
+    """Expirations exist but none fall within the configured DTE window."""
+    pass
+
+
+class ChainEmptyOptions(Exception):
+    """Options chain endpoint returned zero rows for this expiration."""
+    pass
+
+
+class ChainParseEmpty(Exception):
+    """Options chain response parsed to zero rows after direction filter."""
+    pass
+
 TICKER_MAX_PREMIUM_PER_CONTRACT = {
     "NVDA":  1500.0,  "TSLA": 1200.0,  "MSTR": 2000.0,
     "META":   800.0,  "MSFT":  800.0,  "AMZN":  800.0,
@@ -82,6 +114,8 @@ _REASON_CODE_MAP: dict[str, str] = {
     "zero_bid_or_ask":       "CHAIN_ROW_ZERO_BID_ASK",
     "ask_below_bid":         "CHAIN_ROW_ZERO_BID_ASK",
     "zero_mid":              "CHAIN_ROW_ZERO_BID_ASK",
+    "reject_direct_zero":    "DIRECT_QUOTE_ZERO_BID_ASK",
+    "reject_unavailable":    "DIRECT_QUOTE_UNAVAILABLE",
     "size_too_thin":         "VOLUME_TOO_LOW",
     "spread_too_wide":       "SPREAD_TOO_WIDE",
     "illiquid_vol":          "OI_TOO_LOW",
@@ -131,6 +165,7 @@ _TO_QUEUE_REASON: dict[str, str] = {
     # (distinguishes "data pipeline problem" from "data exists but bad quality")
     "CHAIN_EMPTY":                    "NO_CHAIN_DATA",
     "CHAIN_FETCH_FAILED":             "NO_CHAIN_DATA",
+    "CHAIN_PROVIDER_EMPTY_EXPIRATIONS": "NO_CHAIN_DATA",
     "QUOTE_FETCH_FAILED":             "QUOTE_FETCH_FAILED",
     # Zero-quote rows — data was returned but bid/ask is unusable
     "CHAIN_ROW_ZERO_BID_ASK":         "QUOTE_ZERO_BID_ASK",
@@ -605,13 +640,17 @@ class APContractSelectionEngine:
         self.mutate_plan    = bool(mutate_plan)
 
         # ── PR1 (deferred-dte-ladder): DTE-bucket selection policy ────────────
-        # DEFAULT OFF. When DEFERRED_DTE_LADDER != "1", select() behaves exactly
-        # as before (single _pick_expiration). When enabled, eligible plans are
-        # routed through _select_with_dte_ladder, which evaluates expirations by
-        # DTE bucket in playbook-preferred order and only falls to 8+ DTE when
-        # nearer buckets yield zero quality survivors. Quality gates are NEVER
-        # loosened — the ladder only changes WHICH expiration is evaluated first.
-        self.dte_ladder_enabled = os.getenv("DEFERRED_DTE_LADDER", "0").strip() in ("1", "true", "yes")
+        # AMENDMENT (PR #219, Jason LIVE recovery): default is now "1" (ON).
+        # The ladder is already narrowly gated by _is_ladder_eligible(plan) —
+        # only fires when plan.metadata["deferred_breach_selection"] is True,
+        # a marker set exclusively by ap_execution_core's breach-time path.
+        # Non-deferred select() calls are byte-for-byte unchanged. Flipping
+        # the default from "0" to "1" enables the ladder for the exact path
+        # that needed it (54 Jason LIVE overnight setups today expired without
+        # a single broker submit because they all tried only one expiration).
+        # The env var is preserved as an emergency kill switch: set
+        # DEFERRED_DTE_LADDER=0 on Render to disable without a code deploy.
+        self.dte_ladder_enabled = os.getenv("DEFERRED_DTE_LADDER", "1").strip() in ("1", "true", "yes")
         # Bucket boundaries (inclusive upper, DTE). A=near, B=adjacent, C=fallback.
         self.dte_bucket_a_max = int(os.getenv("DTE_BUCKET_A_MAX", "2"))   # 0–2 DTE
         self.dte_bucket_b_max = int(os.getenv("DTE_BUCKET_B_MAX", "7"))   # 3–7 DTE
@@ -912,40 +951,102 @@ class APContractSelectionEngine:
             chain, underlying_price = self._fetch_chain_with_price(
                 ticker, direction, expiration_override=expiration_override
             )
-        except Exception as e:
-            log.error("[%s] chain fetch failed: %s", ticker, e)
-            _cff_expl = f"Chain fetch failed: {e}"
+        except ChainAuthError as e:
+            _expl = f"Chain provider auth failed ({getattr(e, 'status_code', '?')}): {e}"
+            log.error("[%s] chain auth error (401/403): %s", ticker, e)
             self._emit_selector_event(
                 plan,
                 stage="chain_fetch",
                 decision="REJECT",
-                reason_code="CHAIN_FETCH_FAILED",
-                explanation=_cff_expl,
+                reason_code="CHAIN_AUTH_ERROR",
+                explanation=_expl,
+                inputs={"ticker": ticker, "direction": direction, "status_code": getattr(e, "status_code", None)},
+            )
+            _attach_selector_failure(plan, reason_code="CHAIN_AUTH_ERROR", explanation=_expl, base_url=_sel_base_url, execution_mode=_sel_mode)
+            return None
+        except ChainEmptyExpirations as e:
+            _expl = f"Provider returned empty expirations list: {e}"
+            log.warning("[%s] chain provider returned no expirations: %s", ticker, e)
+            self._emit_selector_event(
+                plan,
+                stage="chain_fetch",
+                decision="REJECT",
+                reason_code="CHAIN_PROVIDER_EMPTY_EXPIRATIONS",
+                explanation=_expl,
+                inputs={"ticker": ticker},
+            )
+            _attach_selector_failure(plan, reason_code="CHAIN_PROVIDER_EMPTY_EXPIRATIONS", explanation=_expl, base_url=_sel_base_url, execution_mode=_sel_mode)
+            return None
+        except NoExpirationInDTEWindow as e:
+            _expl = f"No valid expiration within DTE window [{self.min_dte},{self.max_dte}]: {e}"
+            log.warning("[%s] no expiration in DTE window [%d,%d]: %s", ticker, self.min_dte, self.max_dte, e)
+            self._emit_selector_event(
+                plan,
+                stage="chain_fetch",
+                decision="REJECT",
+                reason_code="NO_EXPIRATION_IN_DTE_WINDOW",
+                explanation=_expl,
+                inputs={"ticker": ticker, "min_dte": self.min_dte, "max_dte": self.max_dte},
+            )
+            _attach_selector_failure(plan, reason_code="NO_EXPIRATION_IN_DTE_WINDOW", explanation=_expl, base_url=_sel_base_url, execution_mode=_sel_mode)
+            return None
+        except ChainEmptyOptions as e:
+            _expl = f"Provider returned zero option rows for this expiration: {e}"
+            log.warning("[%s] chain provider returned empty options list: %s", ticker, e)
+            self._emit_selector_event(
+                plan,
+                stage="chain_fetch",
+                decision="REJECT",
+                reason_code="CHAIN_PROVIDER_EMPTY_OPTIONS",
+                explanation=_expl,
                 inputs={"ticker": ticker, "direction": direction},
             )
-            _attach_selector_failure(
+            _attach_selector_failure(plan, reason_code="CHAIN_PROVIDER_EMPTY_OPTIONS", explanation=_expl, base_url=_sel_base_url, execution_mode=_sel_mode)
+            return None
+        except ChainProviderError as e:
+            _expl = f"Chain provider HTTP/network error: {e}"
+            log.error("[%s] chain provider error (status=%s): %s", ticker, getattr(e, "status_code", "?"), e)
+            self._emit_selector_event(
                 plan,
-                reason_code="CHAIN_FETCH_FAILED",
-                explanation=_cff_expl,
-                base_url=_sel_base_url,
-                execution_mode=_sel_mode,
+                stage="chain_fetch",
+                decision="REJECT",
+                reason_code="CHAIN_PROVIDER_ERROR",
+                explanation=_expl,
+                inputs={"ticker": ticker, "direction": direction, "status_code": getattr(e, "status_code", None)},
             )
+            _attach_selector_failure(plan, reason_code="CHAIN_PROVIDER_ERROR", explanation=_expl, base_url=_sel_base_url, execution_mode=_sel_mode)
+            return None
+        except Exception as e:
+            _expl = f"Chain fetch unexpected error: {e}"
+            log.error("[%s] chain fetch unexpected error: %s", ticker, e)
+            self._emit_selector_event(
+                plan,
+                stage="chain_fetch",
+                decision="REJECT",
+                reason_code="CHAIN_PROVIDER_ERROR",
+                explanation=_expl,
+                inputs={"ticker": ticker, "direction": direction},
+            )
+            _attach_selector_failure(plan, reason_code="CHAIN_PROVIDER_ERROR", explanation=_expl, base_url=_sel_base_url, execution_mode=_sel_mode)
             return None
 
         if not chain:
-            log.warning("[%s] EMPTY CHAIN -- Tradier returned no options", ticker)
-            _ce_expl = "Chain returned empty — Tradier returned no option rows for this ticker/expiration"
+            _ce_expl = (
+                f"No {direction} options after direction filter "
+                f"(chain rows may be all-opposite-direction or un-parseable)"
+            )
+            log.warning("[%s] CHAIN_PARSE_EMPTY -- no %s options after direction filter", ticker, direction)
             self._emit_selector_event(
                 plan,
                 stage="chain_fetch",
                 decision="REJECT",
-                reason_code="CHAIN_EMPTY",
+                reason_code="CHAIN_PARSE_EMPTY",
                 explanation=_ce_expl,
                 inputs={"ticker": ticker, "direction": direction},
             )
             _attach_selector_failure(
                 plan,
-                reason_code="CHAIN_EMPTY",
+                reason_code="CHAIN_PARSE_EMPTY",
                 explanation=_ce_expl,
                 chain_rows=0,
                 base_url=_sel_base_url,
@@ -1978,24 +2079,35 @@ class APContractSelectionEngine:
                 headers=headers, timeout=10,
             )
         except requests.exceptions.RequestException as _e:
-            raise ValueError(f"Expirations fetch network error: {_e}") from _e
+            raise ChainProviderError(f"Expirations fetch network error: {_e}") from _e
+        if exp_resp.status_code in (401, 403):
+            raise ChainAuthError(
+                f"Expirations auth error {exp_resp.status_code} for {ticker}",
+                status_code=exp_resp.status_code,
+            )
         if exp_resp.status_code != 200:
-            raise ValueError(f"Expirations fetch failed: {exp_resp.status_code}")
+            raise ChainProviderError(
+                f"Expirations fetch failed: HTTP {exp_resp.status_code} for {ticker}",
+                status_code=exp_resp.status_code,
+            )
 
         dates = exp_resp.json().get("expirations", {}).get("date", []) or []
         if not dates:
-            return [], underlying_price
+            raise ChainEmptyExpirations(f"[{ticker}] Tradier returned empty expirations list")
 
         # 3. Pick best expiration (or honor an explicit override from the ladder)
         if expiration_override:
             target_exp = expiration_override if expiration_override in dates else None
             if target_exp is None:
-                # Override not in the live expirations list — nothing to fetch.
-                return [], underlying_price
+                raise NoExpirationInDTEWindow(
+                    f"[{ticker}] expiration_override={expiration_override!r} not found in live expirations"
+                )
         else:
             target_exp = self._pick_expiration(dates)
         if not target_exp:
-            return [], underlying_price
+            raise NoExpirationInDTEWindow(
+                f"[{ticker}] No valid expiration in DTE window [{self.min_dte},{self.max_dte}] from {len(dates)} dates"
+            )
 
         # 4. Get chain with greeks
         try:
@@ -2005,11 +2117,23 @@ class APContractSelectionEngine:
                 headers=headers, timeout=10,
             )
         except requests.exceptions.RequestException as _e:
-            raise ValueError(f"Chain fetch network error: {_e}") from _e
+            raise ChainProviderError(f"Chain fetch network error (exp={target_exp}): {_e}") from _e
+        if chain_resp.status_code in (401, 403):
+            raise ChainAuthError(
+                f"Chain fetch auth error {chain_resp.status_code} for {ticker}/{target_exp}",
+                status_code=chain_resp.status_code,
+            )
         if chain_resp.status_code != 200:
-            raise ValueError(f"Chain fetch failed: {chain_resp.status_code}")
+            raise ChainProviderError(
+                f"Chain fetch failed: HTTP {chain_resp.status_code} for {ticker}/{target_exp}",
+                status_code=chain_resp.status_code,
+            )
 
         options = chain_resp.json().get("options", {}).get("option", []) or []
+        if not options:
+            raise ChainEmptyOptions(
+                f"[{ticker}] Tradier returned zero option rows for expiration={target_exp}"
+            )
 
         # 5. Inject ticker into every option dict regardless of quote availability.
         # _quality_filter() uses _ticker for per-ticker premium caps, so this must
@@ -2160,16 +2284,40 @@ class APContractSelectionEngine:
             audit["bucket_order"] = order
             today = date.today()
 
-            # Terminal non-DTE reason codes that the ladder must NEVER overwrite
-            # with NO_VALID_PLAYBOOK_DTE_CONTRACT (amendment). If a sub-call
-            # rejected for one of these ticker-level reasons, that is the true,
-            # authoritative cause and the same verdict holds for every DTE.
+            # Terminal non-DTE reason codes: a verdict that cannot improve by
+            # trying another expiration. The ladder stops immediately when one
+            # is seen because probing further buckets is pointless AND risks
+            # masking the true blocker reason.
+            #
+            # CRITICALLY these must be true non-DTE blockers only — system
+            # or account-level verdicts that hold regardless of expiration.
+            # Quality codes like OI_TOO_LOW / SPREAD_TOO_WIDE are NOT here
+            # because a different expiration might pass those gates; they go
+            # into _preserved_quality instead so probing continues.
             _TERMINAL_NON_DTE = {
                 "EARNINGS_LOCKOUT", "EARNINGS_GUARD_ERROR",
                 "INVALID_PLAN", "UNSUPPORTED_INDEX_MAPPING",
+                "CHAIN_AUTH_ERROR",
+                "CHAIN_PROVIDER_EMPTY_EXPIRATIONS",
+                "UNTRADEABLE_FOR_ACCOUNT_SIZE",
+                "DELTA_OUT_OF_RANGE",
+                "PREMIUM_CAP_EXCEEDED",
+            }
+            _RETRYABLE_DATA_REASONS = {
+                "CHAIN_PROVIDER_ERROR",
+                "CHAIN_PROVIDER_EMPTY_OPTIONS",
+                "CHAIN_PARSE_EMPTY",
+                "NO_EXPIRATION_IN_DTE_WINDOW",
                 "NO_CHAIN_DATA",
+                "CHAIN_ROW_ZERO_BID_ASK",
+                "DIRECT_QUOTE_ZERO_BID_ASK",
+                "QUOTE_FETCH_FAILED",
+                "CHAIN_EMPTY",
+                "DIRECT_QUOTE_UNAVAILABLE",
             }
             _preserved_terminal = None
+            _preserved_retryable = None
+            _preserved_quality = None
 
             for bucket_name in order:
                 exps = buckets.get(bucket_name, [])[: self.dte_ladder_probe_per_bucket]
@@ -2180,16 +2328,41 @@ class APContractSelectionEngine:
                     except Exception:
                         _dte = None
                     result = self.select(plan, expiration_override=exp)
-                    # Capture a terminal non-DTE rejection from this sub-call so
-                    # the ladder can preserve it rather than masking it.
                     _sub_fail = self._last_failure
-                    if (
-                        result is None
-                        and isinstance(_sub_fail, dict)
-                        and _sub_fail.get("reason_code") in _TERMINAL_NON_DTE
-                    ):
-                        _preserved_terminal = dict(_sub_fail)
-                    bucket_rec["expirations_probed"].append({"exp": exp, "dte": _dte, "hit": result is not None})
+                    if result is None and isinstance(_sub_fail, dict):
+                        _reason_code = _sub_fail.get("reason_code")
+                        if _reason_code in _TERMINAL_NON_DTE:
+                            # True non-DTE terminal — stop laddering immediately.
+                            _preserved_terminal = dict(_sub_fail)
+                            # Record the exp so audit has the failure
+                            bucket_rec["expirations_probed"].append({
+                                "exp": exp, "dte": _dte, "hit": False,
+                                "failure": dict(_sub_fail),
+                            })
+                            audit["buckets_attempted"].append(bucket_rec)
+                            # Short-circuit everything.
+                            self._last_failure = _preserved_terminal
+                            self._last_dte_ladder_audit = audit
+                            log.warning(
+                                "[%s] DTE_LADDER_TERMINAL_NON_DTE preserved reason=%s "
+                                "— stopping ladder immediately (non-DTE verdict)",
+                                ticker, _preserved_terminal.get("reason_code"),
+                            )
+                            return None
+                        elif _reason_code in _RETRYABLE_DATA_REASONS:
+                            # Data miss — keep probing, remember this as a candidate
+                            # for preservation if no quality reason appears.
+                            if _preserved_retryable is None:
+                                _preserved_retryable = dict(_sub_fail)
+                        elif _reason_code:
+                            # Quality reject (OI_TOO_LOW, SPREAD_TOO_WIDE, etc.)
+                            # Keep probing — a different expiration might pass.
+                            # Remember the most specific quality reason seen.
+                            _preserved_quality = dict(_sub_fail)
+                    bucket_rec["expirations_probed"].append({
+                        "exp": exp, "dte": _dte, "hit": result is not None,
+                        "failure": dict(_sub_fail) if result is None and isinstance(_sub_fail, dict) else None,
+                    })
                     if result is not None:
                         bucket_rec["survivor"] = True
                         audit["buckets_attempted"].append(bucket_rec)
@@ -2203,21 +2376,32 @@ class APContractSelectionEngine:
                         )
                         return result
                 audit["buckets_attempted"].append(bucket_rec)
-                # If a terminal non-DTE reason was hit, stop laddering — probing
-                # further buckets is pointless (the verdict is ticker-level) and
-                # risks masking the true reason.
-                if _preserved_terminal is not None:
-                    break
 
-            # All buckets exhausted (or short-circuited on a terminal non-DTE
-            # reason). Preserve a terminal non-DTE reason if one was seen;
-            # otherwise record the DTE-ladder exhaustion reason.
+            # All buckets exhausted. Priority for final reason preservation:
+            #   1. Retryable data-miss — upstream retry loop will re-probe after delay.
+            #   2. Quality reject — true contract-quality blocker; preserve the most
+            #      specific quality reason so dashboards show the real gate, not
+            #      the ladder-aggregation NO_VALID_PLAYBOOK_DTE_CONTRACT.
+            #   3. NO_VALID_PLAYBOOK_DTE_CONTRACT — fallback when no specific reason
+            #      was captured (empty chain, ladder never got any sub-failure).
+            #
+            # NOTE: _preserved_terminal is handled above via early return; it
+            # should be None here.
             self._last_dte_ladder_audit = audit
-            if _preserved_terminal is not None:
-                self._last_failure = _preserved_terminal
+            if _preserved_retryable is not None:
+                self._last_failure = _preserved_retryable
                 log.warning(
-                    "[%s] DTE_LADDER_TERMINAL_NON_DTE preserved reason=%s — not masking with NO_VALID_PLAYBOOK_DTE_CONTRACT",
-                    ticker, _preserved_terminal.get("reason_code"),
+                    "[%s] DTE_LADDER_RETRYABLE_REASON preserved reason=%s "
+                    "— not masking with NO_VALID_PLAYBOOK_DTE_CONTRACT",
+                    ticker, _preserved_retryable.get("reason_code"),
+                )
+                return None
+            if _preserved_quality is not None:
+                self._last_failure = _preserved_quality
+                log.warning(
+                    "[%s] DTE_LADDER_QUALITY_REASON preserved reason=%s "
+                    "— not masking with NO_VALID_PLAYBOOK_DTE_CONTRACT",
+                    ticker, _preserved_quality.get("reason_code"),
                 )
                 return None
             self._last_failure = {
