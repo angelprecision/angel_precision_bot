@@ -1622,20 +1622,80 @@ class APExecutionCore:
                                                 _current_status = str(
                                                     _stale_row.get("status") or ""
                                                 ).upper()
-                                                if _current_status not in {
-                                                    "PENDING_TRIGGER",
-                                                    "CREATED",
-                                                }:
+                                                _current_broker_id = str(
+                                                    _stale_row.get("broker_order_id") or ""
+                                                ).strip()
+                                                _current_submitted_ts = _stale_row.get("submitted_ts")
+                                                _current_contract = str(
+                                                    _stale_row.get("contract") or ""
+                                                )
+                                                _current_meta = _stale_row.get("meta") or {}
+                                                try:
+                                                    _current_attempt = int(
+                                                        _current_meta.get("breach_attempt_count") or 0
+                                                    )
+                                                except Exception:
+                                                    _current_attempt = 0
+                                                _is_still_deferred = (
+                                                    _current_contract.startswith("DEFERRED:")
+                                                    or bool(_current_meta.get("contract_deferred"))
+                                                    or bool(_current_meta.get("deferred_breach_selection"))
+                                                )
+
+                                                # Guard 1: status must still be retryable
+                                                if _current_status not in {"PENDING_TRIGGER", "CREATED"}:
                                                     log.warning(
                                                         "[%s] DEFERRED_BREACH_RETRY_STALE_STATE_ABORT "
-                                                        "order=%s status=%s attempt=%d — order is "
-                                                        "no longer retry-eligible; aborting retry thread",
+                                                        "order=%s reason=status_changed "
+                                                        "current_status=%s attempt=%d",
                                                         _t, _oid, _current_status, _att,
                                                     )
                                                     return
+                                                # Guard 2: must not already have a broker order
+                                                if _current_broker_id:
+                                                    log.warning(
+                                                        "[%s] DEFERRED_BREACH_RETRY_STALE_STATE_ABORT "
+                                                        "order=%s reason=broker_id_present "
+                                                        "broker_order_id=%s attempt=%d",
+                                                        _t, _oid, _current_broker_id, _att,
+                                                    )
+                                                    return
+                                                # Guard 3: must not have been submitted already
+                                                if _current_submitted_ts:
+                                                    log.warning(
+                                                        "[%s] DEFERRED_BREACH_RETRY_STALE_STATE_ABORT "
+                                                        "order=%s reason=submitted_ts_present "
+                                                        "submitted_ts=%s attempt=%d",
+                                                        _t, _oid, _current_submitted_ts, _att,
+                                                    )
+                                                    return
+                                                # Guard 4: contract must still be deferred
+                                                if not _is_still_deferred:
+                                                    log.warning(
+                                                        "[%s] DEFERRED_BREACH_RETRY_STALE_STATE_ABORT "
+                                                        "order=%s reason=no_longer_deferred "
+                                                        "contract=%s attempt=%d",
+                                                        _t, _oid, _current_contract, _att,
+                                                    )
+                                                    return
+                                                # Guard 5: attempt counter must be consistent.
+                                                # If meta.breach_attempt_count > _att it means
+                                                # another thread already incremented the counter
+                                                # beyond this thread's slot — abort to avoid
+                                                # duplicate entry attempts.
+                                                if _current_attempt > int(_att):
+                                                    log.warning(
+                                                        "[%s] DEFERRED_BREACH_RETRY_STALE_STATE_ABORT "
+                                                        "order=%s reason=attempt_count_advanced "
+                                                        "db_attempt=%d thread_attempt=%d",
+                                                        _t, _oid, _current_attempt, _att,
+                                                    )
+                                                    return
                                     except Exception as _stale_exc:
-                                        # stale check is best-effort — if it fails, proceed
-                                        # with the retry (the alternative is silent skip)
+                                        # Stale check is best-effort — if it fails, proceed
+                                        # with the retry rather than silently dropping it.
+                                        # The inflight-key dedup set still prevents true
+                                        # duplicates within the same process.
                                         log.debug(
                                             "[%s] DEFERRED_BREACH_RETRY stale-state check failed "
                                             "(non-fatal, proceeding): %s",
