@@ -190,6 +190,18 @@ def enqueue_signal(
         payload["side"] = side
         payload["direction"] = side
 
+    # P0: Normalize raw payload keys into canonical execution metadata fields.
+    # Applied BEFORE trade_queue INSERT so the worker reads canonical field names
+    # at execution time and validate_entry_metadata() does not block with
+    # metadata_invalid:zero_underlying / zero_trigger on valid signals that
+    # merely used non-canonical field names (trigger, underlying, last, close, mark).
+    # Best-effort — falls back to original payload on any import error.
+    try:
+        from ap_signal_normalizer import normalize_raw_signal_payload as _norm_payload
+        payload = _norm_payload(payload)
+    except Exception as _norm_exc:
+        log.warning("enqueue_signal: payload normalization failed (non-fatal): %s", _norm_exc)
+
     # PR F / queue truth hardening: scanner-provided signal_id is preserved
     # verbatim via `or` short-circuit. When the scanner omits it, the fallback
     # MUST include a uuid suffix — timestamp-only fallbacks collide on burst
