@@ -35,6 +35,7 @@ from zoneinfo import ZoneInfo
 import yfinance as yf
 
 from ap.logger import get_logger
+from ap_signal_normalizer import normalize_raw_signal_payload
 from ap.config import Config
 from ap.db import (
     conn,
@@ -804,6 +805,74 @@ def _submit_order_with_retry(broker, symbol: str, contract: str, qty: int, premi
     return False, None, last_error
 
 
+def _first_positive_value(payload: dict, keys: tuple[str, ...]) -> float | None:
+    for key in keys:
+        value = payload.get(key)
+        if value in (None, ""):
+            continue
+        try:
+            numeric = float(value)
+        except Exception:
+            continue
+        if numeric > 0:
+            return numeric
+    return None
+
+
+def _final_submit_block_reason(contract: str, limit_price: float, signal_payload: dict) -> str | None:
+    if str(contract or "").upper().startswith("DEFERRED:"):
+        return "submit_blocked:deferred_contract_not_materialized"
+
+    try:
+        submit_limit = float(limit_price)
+    except Exception:
+        submit_limit = 0.0
+    if submit_limit <= 0.01:
+        return "submit_blocked:limit_not_materialized"
+
+    raw_payload = signal_payload or {}
+    normalized_payload = normalize_raw_signal_payload(raw_payload)
+    # Final broker-submit proof must come from canonical/live-ish execution
+    # metadata, not from stale prior-close aliases that may be acceptable
+    # earlier in overnight normalization.
+    fresh_underlying_source = _first_positive_value(
+        raw_payload,
+        (
+            "underlying_at_signal",
+            "underlying_entry",
+            "underlying_price",
+            "current_underlying_price",
+            "current_underlying",
+            "signal_underlying_price",
+            "price_at_signal",
+            "underlying",
+            "price",
+            "last",
+            "close",
+            "mark",
+        ),
+    )
+    if fresh_underlying_source is None:
+        return "submit_blocked:metadata_invalid_zero_underlying"
+
+    underlying = _first_positive_value(
+        normalized_payload,
+        (
+            "underlying_at_signal",
+            "underlying_entry",
+            "underlying_price",
+            "current_underlying_price",
+            "current_underlying",
+            "signal_underlying_price",
+            "price_at_signal",
+        ),
+    )
+    if underlying is None or underlying <= 0:
+        return "submit_blocked:metadata_invalid_zero_underlying"
+
+    return None
+
+
 # ── MAIN ENTRY POINT ──────────────────────────────────────────────────────────
 
 def process_signal(broker, client_id: str, signal_payload: dict) -> dict:
@@ -1445,6 +1514,27 @@ def process_signal(broker, client_id: str, signal_payload: dict) -> dict:
             release_equity(client_id, reserved_cost)
             release_symbol_lock(client_id, symbol)
             return {"ok": False, "error": "killed_before_submit"}
+
+        block_reason = _final_submit_block_reason(contract, float(submit_limit), signal_payload)
+        if block_reason:
+            update_order(local_order_id, status="REJECTED", last_error=block_reason)
+            release_equity(client_id, reserved_cost)
+            release_symbol_lock(client_id, symbol)
+            reserved = False
+            locked = False
+            audit(client_id, "ERROR", "ORDER_SUBMIT_BLOCKED", {
+                "symbol": symbol,
+                "contract": contract,
+                "limit_price": float(submit_limit),
+                "local_order_id": local_order_id,
+                "reason": block_reason,
+            })
+            return {
+                "ok": False,
+                "error": "submit_blocked",
+                "details": block_reason,
+                "local_order_id": local_order_id,
+            }
 
         # PHASE 3: emit explicit entry_attempt=0 token on the original submit
         # for parity with retry_engine's REPEG_APPLIED entry_attempt=N logs.
