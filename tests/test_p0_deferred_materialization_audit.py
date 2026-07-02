@@ -650,10 +650,14 @@ class TestNoSelectorThresholdChanges:
 
 def test_prebreach_hydration_window_and_status_scope_exist_in_monitor_source():
     src = open("ap/order_monitor.py", "r").read()
+    assert "DEFERRED_PREBREACH_HYDRATION_ENABLED" in src
+    assert "DEFERRED_HYDRATION_MAX_PER_CYCLE" in src
     assert "DEFERRED_HYDRATION_WINDOW_START_ET" in src
     assert "DEFERRED_HYDRATION_WINDOW_END_ET" in src
-    assert 'status not in {"PENDING_TRIGGER", "CREATED"}' in src or 'status not in {\\"PENDING_TRIGGER\\", \\"CREATED\\"}' in src
+    assert 'if status != "PENDING_TRIGGER":' in src or "if status != 'PENDING_TRIGGER':" in src
     assert '"deferred_prebreach_hydration"' in src
+    assert "DEFERRED_HYDRATION_DISABLED" in src
+    assert "DEFERRED_HYDRATION_SKIPPED_MAX_PER_CYCLE" in src
 
 
 def test_osm_hydration_write_path_is_in_place_and_guarded():
@@ -661,7 +665,7 @@ def test_osm_hydration_write_path_is_in_place_and_guarded():
     assert "FOR UPDATE" in src
     assert "contract_selection_status = %s" in src
     assert "qty = %s" in src
-    assert 'current_status not in {"PENDING_TRIGGER", "CREATED"}' in src or 'current_status not in {\\"PENDING_TRIGGER\\", \\"CREATED\\"}' in src
+    assert 'current_status != "PENDING_TRIGGER"' in src or "current_status != 'PENDING_TRIGGER'" in src
     assert '"contract_materialized_source": "prebreach_hydration"' in src
 
 

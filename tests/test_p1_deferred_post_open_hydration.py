@@ -71,6 +71,8 @@ def _enable_window(monkeypatch):
         "ap.order_monitor.APOrderMonitor._is_within_deferred_hydration_window",
         lambda self: True,
     )
+    monkeypatch.setattr("ap.order_monitor.DEFERRED_PREBREACH_HYDRATION_ENABLED", True)
+    monkeypatch.setattr("ap.order_monitor.DEFERRED_HYDRATION_MAX_PER_CYCLE", 3)
 
 
 def test_hydrates_real_contract_without_broker_submit(monkeypatch):

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -26,6 +27,7 @@ def _make_order(**overrides):
         "reserved_cost": 0.0,
         "broker_order_id": None,
         "submitted_ts": None,
+        "created_ts": datetime.now(timezone.utc).isoformat(),
         "execution_mode": "paper",
         "direction": "CALL",
         "score": 88.0,
@@ -67,6 +69,20 @@ def _enable_window(monkeypatch):
         "ap.order_monitor.APOrderMonitor._is_within_deferred_hydration_window",
         lambda self: True,
     )
+    monkeypatch.setattr("ap.order_monitor.DEFERRED_PREBREACH_HYDRATION_ENABLED", True)
+    monkeypatch.setattr("ap.order_monitor.DEFERRED_HYDRATION_MAX_PER_CYCLE", 3)
+
+
+def test_disabled_flag_prevents_hydration_and_selector_call(monkeypatch):
+    selector = MagicMock()
+    monitor = _make_monitor(contract_selector=selector)
+    monkeypatch.setattr("ap.order_monitor.DEFERRED_PREBREACH_HYDRATION_ENABLED", False)
+
+    result = monitor._maybe_hydrate_deferred_order(_make_order())
+
+    assert result == {"attempted": False, "reason": "disabled"}
+    selector.select.assert_not_called()
+    monitor.osm.record_deferred_hydration_result.assert_not_called()
 
 
 def test_pending_trigger_deferred_row_hydrates_to_occ_contract_and_limit_gt_point_01(monkeypatch):
@@ -246,6 +262,17 @@ def test_hydration_ignores_rows_already_submitted_or_terminal(monkeypatch):
     monitor.osm.record_deferred_hydration_result.assert_not_called()
 
 
+def test_created_deferred_rows_are_ignored(monkeypatch):
+    selector = MagicMock()
+    monitor = _make_monitor(contract_selector=selector)
+    _enable_window(monkeypatch)
+
+    result = monitor._maybe_hydrate_deferred_order(_make_order(status="CREATED"))
+
+    assert result == {"attempted": False, "reason": "status_not_eligible"}
+    selector.select.assert_not_called()
+
+
 def test_hydration_is_idempotent_second_run_is_duplicate_suppressed(monkeypatch):
     selector = MagicMock()
     selector.select.side_effect = lambda plan: SimpleNamespace(
@@ -278,3 +305,42 @@ def test_live_paper_taxonomy_preserved_by_execution_mode_scope(monkeypatch):
     assert result == {"attempted": False, "reason": "execution_mode_mismatch"}
     monitor.osm.record_deferred_hydration_result.assert_not_called()
 
+
+def test_cap_stops_hydration_after_max_per_cycle(monkeypatch):
+    selector = MagicMock()
+
+    def _select(plan):
+        plan.contract_symbol = "AAPL260717C00200000"
+        plan.limit_price = 1.23
+        plan.contracts = 1
+        return SimpleNamespace(
+            contract_symbol="AAPL260717C00200000",
+            execution_price_per_share=1.23,
+            affordable_contracts=1,
+        )
+
+    selector.select.side_effect = _select
+    selector.get_last_failure.return_value = None
+
+    monitor = _make_monitor(contract_selector=selector)
+    _enable_window(monkeypatch)
+    monkeypatch.setattr("ap.order_monitor.DEFERRED_HYDRATION_MAX_PER_CYCLE", 2)
+    monkeypatch.setattr(
+        monitor,
+        "_get_active_entry_orders",
+        lambda: [
+            _make_order(local_order_id="local-1"),
+            _make_order(local_order_id="local-2"),
+            _make_order(local_order_id="local-3"),
+        ],
+    )
+    monkeypatch.setattr(
+        monitor,
+        "_check_pending_trigger_order",
+        lambda **kwargs: None,
+    )
+
+    monitor._check_entry_orders()
+
+    assert selector.select.call_count == 2
+    assert monitor.osm.record_deferred_hydration_result.call_count == 2

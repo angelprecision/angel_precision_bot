@@ -172,6 +172,12 @@ POLL_INTERVAL = int(os.getenv("ORDER_MONITOR_POLL", "60"))  # seconds (entry che
 # H4: exits run on this faster cadence (account risk). Keep >= a few seconds
 # to avoid hammering the broker; 15s + 45s timeout => hung exit caught fast.
 EXIT_CHECK_INTERVAL = int(os.getenv("ORDER_MONITOR_EXIT_POLL", "15"))  # seconds
+DEFERRED_PREBREACH_HYDRATION_ENABLED = os.getenv(
+    "DEFERRED_PREBREACH_HYDRATION_ENABLED", "0"
+).strip().lower() in ("1", "true", "yes")
+DEFERRED_HYDRATION_MAX_PER_CYCLE = int(
+    os.getenv("DEFERRED_HYDRATION_MAX_PER_CYCLE", "3")
+)
 DEFERRED_HYDRATION_WINDOW_START_ET = int(
     os.getenv("DEFERRED_HYDRATION_WINDOW_START_ET", "935")
 )
@@ -501,6 +507,8 @@ class APOrderMonitor:
         orders = self._get_active_entry_orders()
         now = datetime.now(timezone.utc)
         hydration_seen: set[str] = set()
+        hydration_attempts = 0
+        hydration_disabled_logged = False
 
         for order in orders:
             status = order.get("status", "")
@@ -516,7 +524,6 @@ class APOrderMonitor:
             age_secs = (now - created_ts).total_seconds()
 
             if status == "CREATED":
-                self._maybe_hydrate_deferred_order(order, hydration_seen=hydration_seen)
                 # Fast diagnostic watchdog: surface CREATED/no broker_id early.
                 #
                 # Overnight watcher-held entries should move CREATED → PENDING_TRIGGER
@@ -663,7 +670,31 @@ class APOrderMonitor:
                         log.debug("[%s] lost-handoff systemic check failed: %s", self.client_id, _e)
 
             elif status == "PENDING_TRIGGER":
-                self._maybe_hydrate_deferred_order(order, hydration_seen=hydration_seen)
+                if hydration_attempts >= max(1, DEFERRED_HYDRATION_MAX_PER_CYCLE):
+                    if str(order.get("contract") or "").strip().upper().startswith("DEFERRED:"):
+                        log.info(
+                            "[%s] DEFERRED_HYDRATION_SKIPPED_MAX_PER_CYCLE | local=%s cap=%s",
+                            self.client_id,
+                            local_id,
+                            DEFERRED_HYDRATION_MAX_PER_CYCLE,
+                        )
+                else:
+                    hydration_result = self._maybe_hydrate_deferred_order(
+                        order,
+                        hydration_seen=hydration_seen,
+                    )
+                    if hydration_result.get("reason") == "disabled":
+                        if not hydration_disabled_logged:
+                            log.info(
+                                "[%s] DEFERRED_HYDRATION_DISABLED | cap=%s window=%s-%s",
+                                self.client_id,
+                                DEFERRED_HYDRATION_MAX_PER_CYCLE,
+                                DEFERRED_HYDRATION_WINDOW_START_ET,
+                                DEFERRED_HYDRATION_WINDOW_END_ET,
+                            )
+                            hydration_disabled_logged = True
+                    elif hydration_result.get("attempted"):
+                        hydration_attempts += 1
                 self._check_pending_trigger_order(
                     order=order,
                     local_id=local_id,
@@ -1720,7 +1751,9 @@ class APOrderMonitor:
             return {"attempted": False, "reason": "not_deferred"}
 
         status = str(order.get("status") or "").strip().upper()
-        if status not in {"PENDING_TRIGGER", "CREATED"}:
+        if not DEFERRED_PREBREACH_HYDRATION_ENABLED:
+            return {"attempted": False, "reason": "disabled"}
+        if status != "PENDING_TRIGGER":
             return {"attempted": False, "reason": "status_not_eligible"}
         if str(order.get("kind") or "ENTRY").strip().upper() != "ENTRY":
             return {"attempted": False, "reason": "non_entry"}

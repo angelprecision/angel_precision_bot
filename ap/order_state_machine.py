@@ -1674,7 +1674,7 @@ class APOrderStateMachine:
                 current_contract = str(row.get("contract") or "")
                 if status and current_status != status:
                     return 0
-                if current_status not in {"PENDING_TRIGGER", "CREATED"}:
+                if current_status != "PENDING_TRIGGER":
                     return 0
                 if row.get("broker_order_id") or row.get("submitted_ts"):
                     return 0
@@ -1744,7 +1744,7 @@ class APOrderStateMachine:
                 current_contract = str(row.get("contract") or "")
                 if status and current_status != status:
                     return 0
-                if current_status not in {"PENDING_TRIGGER", "CREATED"}:
+                if current_status != "PENDING_TRIGGER":
                     return 0
                 if row.get("broker_order_id") or row.get("submitted_ts"):
                     return 0
