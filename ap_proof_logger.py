@@ -40,26 +40,49 @@ SYSTEM_VERSION = "v2"   # bump this to reset client-facing performance history
 # function over (reason, pnl, win) — it changes no exit behavior, only adds
 # a derived label to the proof row.
 EXIT_BUCKETS = (
-    "WIN_BASE_HIT",     # target/scale/profit-lock win at/near base target
-    "WIN_RUNNER",       # runner trailed out above base — the big winners
-    "BREAKEVEN_SAVE",   # closed within +/-3% — no real gain or loss
-    "SOFT_LOSS",        # losing exit but not the hard stop (managed cut)
-    "HARD_STOP",        # hit the hard stop threshold
-    "EOD_CLOSE",        # forced flat at end of day
-    "MANUAL_EXIT",      # operator/admin force-exit
-    "RECONCILED_CLOSE", # reconciler/quarantine evidence-based close
-    "UNCLASSIFIED",     # fell through — should be ~0; investigate if not
+    "WIN_BASE_HIT",             # target/scale/profit-lock win at/near base target
+    "WIN_RUNNER",               # runner trailed out above base — the big winners
+    "BREAKEVEN_SAVE",           # closed within +/-3% — no real gain or loss
+    "TARGET_HIT_OPTION_LOSS",   # underlying target hit but the option contract lost money
+    "SOFT_LOSS",                # losing exit but not the hard stop (managed cut)
+    "HARD_STOP",                # hit the hard stop threshold
+    "EOD_CLOSE",                # forced flat at end of day
+    "MANUAL_EXIT",              # operator/admin force-exit
+    "RECONCILED_CLOSE",         # reconciler/quarantine evidence-based close
+    "UNCLASSIFIED",             # fell through — should be ~0; investigate if not
 )
+
+
+def _safe_float(value, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def is_target_hit_option_loss(exit_reason: str, option_pnl_pct: float) -> bool:
+    """True when the underlying target was hit but the option trade lost money.
+
+    This is reporting/intelligence taxonomy only. It does not change exit,
+    broker, order, handoff, queue, or position behavior.
+    """
+    r = (exit_reason or "").upper().replace("_", " ")
+    return "TARGET HIT" in r and _safe_float(option_pnl_pct) < 0.0
 
 
 def classify_exit(exit_reason: str, option_pnl_pct: float, win: bool) -> str:
     """Map a raw exit reason + P&L into one canonical EXIT_BUCKETS value.
 
     Order matters: explicit-cause reasons (manual, EOD, hard stop, reconcile)
-    take priority over P&L-shape inference (runner vs base vs breakeven).
+    take priority over P&L-shape inference (runner vs base vs breakeven), except
+    target-hit option losses, which must never be treated as a clean target win.
     """
     r = (exit_reason or "").upper()
-    pnl = float(option_pnl_pct or 0.0)
+    pnl = _safe_float(option_pnl_pct)
+
+    # 0. Underlying target success is not proof success when the option loses.
+    if is_target_hit_option_loss(exit_reason, pnl):
+        return "TARGET_HIT_OPTION_LOSS"
 
     # 1. Explicit operational causes — independent of P&L sign.
     if "MANUAL" in r or "ADMIN_FORCE" in r or "ADMIN FORCE" in r or "FORCE_EXIT" in r:
@@ -95,6 +118,30 @@ def classify_exit(exit_reason: str, option_pnl_pct: float, win: bool) -> str:
         return "SOFT_LOSS"
 
     return "UNCLASSIFIED"
+
+
+def normalize_trade_outcome(exit_reason: str, option_pnl_pct: float, win: bool) -> dict:
+    """Normalize proof-trade outcome fields before persistence/training.
+
+    Future records that say TARGET HIT while the option P&L is negative become
+    non-wins with a dedicated diagnostic/bucket. Historical rows are not changed.
+    """
+    target_hit_option_loss = is_target_hit_option_loss(exit_reason, option_pnl_pct)
+    normalized_win = False if target_hit_option_loss else bool(win)
+    return {
+        "win": normalized_win,
+        "exit_bucket": classify_exit(exit_reason, option_pnl_pct, normalized_win),
+        "target_hit_option_loss": target_hit_option_loss,
+    }
+
+
+def is_positive_training_label(trade: dict) -> bool:
+    """Return whether a proof trade is safe to use as a positive training label."""
+    if not isinstance(trade, dict):
+        return False
+    if trade.get("target_hit_option_loss") or trade.get("exit_bucket") == "TARGET_HIT_OPTION_LOSS":
+        return False
+    return bool(trade.get("win")) and _safe_float(trade.get("option_pnl_pct")) >= 0.0
 
 
 # =============================================================================
@@ -434,6 +481,8 @@ class APProofLogger:
         # client may have switched modes while the position was open. Missing →
         # 'unknown' (never guess 'live').
         _execution_mode = _resolve_entry_execution_mode(local_order_id)
+        _outcome = normalize_trade_outcome(exit_reason, option_pnl_pct, win)
+        _win = _outcome["win"]
         row = {
             "client_email":       self.email,
             "mode":               self.mode,
@@ -456,10 +505,11 @@ class APProofLogger:
             "underlying_exit":    round(underlying_exit, 4),
             "contracts":          contracts,
             "exit_reason":        exit_reason,
-            "exit_bucket":        classify_exit(exit_reason, option_pnl_pct, win),
+            "exit_bucket":        _outcome["exit_bucket"],
             "option_pnl_pct":     round(option_pnl_pct, 2),
             "underlying_pnl_pct": round(underlying_pnl_pct, 3),
-            "win":                win,
+            "win":                _win,
+            "target_hit_option_loss": _outcome["target_hit_option_loss"],
             "spread_pct":         round(spread_pct, 4),
             "chain_grade":        chain_grade,
             "synthetic_entry":    bool(synthetic_entry),
@@ -484,15 +534,17 @@ class APProofLogger:
 
         log.info(
             f"[PROOF] CLOSED {ticker} {side} {tier} | "
-            f"P&L={option_pnl_pct:+.1f}% | {'WIN' if win else 'LOSS'} | "
+            f"P&L={option_pnl_pct:+.1f}% | {'WIN' if _win else 'LOSS'} | "
             f"{exit_reason} | score={score:.0f} ctx={context_score:.0f}"
         )
 
         # Write to Supabase immediately — this is the source of truth.
-        # Three-stage fallback so trades are NEVER silently lost on column drift:
-        #   Stage 1: full row (all fields including slippage tracking)
-        #   Stage 2: strip slippage + exit_bucket (columns that may not exist yet)
-        #   Stage 3: core-only rows (guaranteed columns — minimal but never lost)
+        # Four-stage fallback so trades are NEVER silently lost on column drift:
+        #   Stage 1: full row (all fields including diagnostic + slippage tracking)
+        #   Stage 2: strip target-hit diagnostic if the migration has not run yet
+        #   Stage 3: strip slippage + exit_bucket (columns that may not exist yet)
+        #   Stage 4: core-only rows (guaranteed columns — minimal but never lost)
+        _DIAGNOSTIC_COLS = {"target_hit_option_loss"}
         _SLIPPAGE_COLS = {
             "exit_bid", "exit_ask", "exit_mid", "exit_limit_placed",
             "exit_fill_price", "slippage_vs_mid", "slippage_vs_bid",
@@ -515,34 +567,52 @@ class APProofLogger:
                 if not any(k in emsg1 for k in ("column", "schema", "field", "violat", "null", "type")):
                     log.error("[PROOF] Supabase write failed (non-schema error): %s", e1)
                 else:
-                    # Stage 2: strip slippage columns + exit_bucket
-                    _stage2 = {k: v for k, v in row.items()
-                               if k not in _SLIPPAGE_COLS and k != "exit_bucket"}
+                    # Stage 2: strip diagnostic-only columns that may not exist yet.
+                    _stage2 = {k: v for k, v in row.items() if k not in _DIAGNOSTIC_COLS}
                     try:
                         self.sb.table("proof_trades").insert(_stage2).execute()
                         log.warning(
-                            "[PROOF] %s written without slippage columns — "                            "run proof_trades migration to add: %s",
+                            "[PROOF] %s written without target_hit_option_loss diagnostic — "
+                            "run migration migrations/20260626_target_hit_option_loss_diagnostic.sql",
                             ticker,
-                            ", ".join(sorted(_SLIPPAGE_COLS | {"exit_bucket"})),
                         )
                     except Exception as e2:
                         emsg2 = str(e2).lower()
-                        if not any(k in emsg2 for k in ("column", "schema", "field")):
+                        if not any(k in emsg2 for k in ("column", "schema", "field", "violat", "null", "type")):
                             log.error("[PROOF] Supabase write failed stage-2 (non-schema): %s", e2)
                         else:
-                            # Stage 3: core columns only — guaranteed minimal write
-                            _stage3 = {k: v for k, v in row.items() if k in _CORE_COLS}
+                            # Stage 3: strip slippage columns + exit_bucket + diagnostics
+                            _stage3 = {k: v for k, v in row.items()
+                                       if k not in _SLIPPAGE_COLS and k != "exit_bucket" and k not in _DIAGNOSTIC_COLS}
                             try:
                                 self.sb.table("proof_trades").insert(_stage3).execute()
                                 log.warning(
-                                    "[PROOF] %s written with CORE COLUMNS ONLY — "                                    "proof_trades schema is significantly out of date. "                                    "Run all migrations immediately.",
+                                    "[PROOF] %s written without slippage columns — "
+                                    "run proof_trades migration to add: %s",
                                     ticker,
+                                    ", ".join(sorted(_SLIPPAGE_COLS | {"exit_bucket"} | _DIAGNOSTIC_COLS)),
                                 )
                             except Exception as e3:
-                                log.error(
-                                    "[PROOF] ALL WRITE ATTEMPTS FAILED for %s — "                                    "TRADE WILL NOT APPEAR IN PROOF. Error: %s",
-                                    ticker, e3,
-                                )
+                                emsg3 = str(e3).lower()
+                                if not any(k in emsg3 for k in ("column", "schema", "field")):
+                                    log.error("[PROOF] Supabase write failed stage-3 (non-schema): %s", e3)
+                                else:
+                                    # Stage 4: core columns only — guaranteed minimal write
+                                    _stage4 = {k: v for k, v in row.items() if k in _CORE_COLS}
+                                    try:
+                                        self.sb.table("proof_trades").insert(_stage4).execute()
+                                        log.warning(
+                                            "[PROOF] %s written with CORE COLUMNS ONLY — "
+                                            "proof_trades schema is significantly out of date. "
+                                            "Run all migrations immediately.",
+                                            ticker,
+                                        )
+                                    except Exception as e4:
+                                        log.error(
+                                            "[PROOF] ALL WRITE ATTEMPTS FAILED for %s — "
+                                            "TRADE WILL NOT APPEAR IN PROOF. Error: %s",
+                                            ticker, e4,
+                                        )
 
         return row
 
@@ -739,13 +809,25 @@ class APProofLogger:
                     pass
         avg_hold_min = round(sum(hold_times) / len(hold_times), 1) if hold_times else None
 
-        exit_counts = {"TARGET HIT": 0, "STOP HIT": 0, "THETA/TIME": 0, "PROFIT PROTECT": 0}
+        exit_counts = {
+            "TARGET HIT": 0,
+            "TARGET HIT OPTION LOSS": 0,
+            "STOP HIT": 0,
+            "THETA/TIME": 0,
+            "PROFIT PROTECT": 0,
+        }
         for t in trades:
             r = (t.get("exit_reason") or "").upper()
-            if "TARGET" in r:       exit_counts["TARGET HIT"] += 1
-            elif "STOP" in r:       exit_counts["STOP HIT"] += 1
-            elif "PROTECT" in r:    exit_counts["PROFIT PROTECT"] += 1
-            else:                   exit_counts["THETA/TIME"] += 1
+            if t.get("target_hit_option_loss") or t.get("exit_bucket") == "TARGET_HIT_OPTION_LOSS":
+                exit_counts["TARGET HIT OPTION LOSS"] += 1
+            elif "TARGET" in r:
+                exit_counts["TARGET HIT"] += 1
+            elif "STOP" in r:
+                exit_counts["STOP HIT"] += 1
+            elif "PROTECT" in r:
+                exit_counts["PROFIT PROTECT"] += 1
+            else:
+                exit_counts["THETA/TIME"] += 1
 
         max_dd      = _max_equity_drawdown(pnls)
         worst_trade = min(pnls) if pnls else 0
