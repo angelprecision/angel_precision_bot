@@ -640,8 +640,17 @@ class APContractSelectionEngine:
         self.mutate_plan    = bool(mutate_plan)
 
         # ── PR1 (deferred-dte-ladder): DTE-bucket selection policy ────────────
-        # Default OFF, and applies only to explicit deferred-breach selection.
-        self.dte_ladder_enabled = os.getenv("DEFERRED_DTE_LADDER", "0").strip() in ("1", "true", "yes")
+        # AMENDMENT (PR #219, Jason LIVE recovery): default is now "1" (ON).
+        # The ladder is already narrowly gated by _is_ladder_eligible(plan) —
+        # only fires when plan.metadata["deferred_breach_selection"] is True,
+        # a marker set exclusively by ap_execution_core's breach-time path.
+        # Non-deferred select() calls are byte-for-byte unchanged. Flipping
+        # the default from "0" to "1" enables the ladder for the exact path
+        # that needed it (54 Jason LIVE overnight setups today expired without
+        # a single broker submit because they all tried only one expiration).
+        # The env var is preserved as an emergency kill switch: set
+        # DEFERRED_DTE_LADDER=0 on Render to disable without a code deploy.
+        self.dte_ladder_enabled = os.getenv("DEFERRED_DTE_LADDER", "1").strip() in ("1", "true", "yes")
         # Bucket boundaries (inclusive upper, DTE). A=near, B=adjacent, C=fallback.
         self.dte_bucket_a_max = int(os.getenv("DTE_BUCKET_A_MAX", "2"))   # 0–2 DTE
         self.dte_bucket_b_max = int(os.getenv("DTE_BUCKET_B_MAX", "7"))   # 3–7 DTE

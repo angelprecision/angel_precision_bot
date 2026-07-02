@@ -32,8 +32,22 @@ _SRC  = (_REPO / "ap" / "contract_selector.py").read_text()
 # ---------------------------------------------------------------------------
 
 class TestSourceGuards:
-    def test_flag_defaults_off(self):
-        assert 'os.getenv("DEFERRED_DTE_LADDER", "0")' in _SRC
+    def test_flag_defaults_on(self):
+        # PR #219 amendment (Jason LIVE recovery 2026-07-01): the default
+        # flipped from "0" (off) to "1" (on). The ladder is still narrowly
+        # gated by _is_ladder_eligible(plan) so non-deferred callers see no
+        # behavior change. The env var is preserved as an emergency kill
+        # switch: DEFERRED_DTE_LADDER=0 disables without a code deploy.
+        assert 'os.getenv("DEFERRED_DTE_LADDER", "1")' in _SRC, (
+            "DEFERRED_DTE_LADDER default must be '1' — the PR #219 "
+            "Jason LIVE recovery amendment enables the ladder by default."
+        )
+        # And the pre-amendment default must NOT be present anywhere in the
+        # module, so a silent revert of the amendment surfaces in CI.
+        assert 'os.getenv("DEFERRED_DTE_LADDER", "0")' not in _SRC, (
+            "Old default '0' for DEFERRED_DTE_LADDER still in source — the "
+            "PR #219 amendment may have been reverted."
+        )
 
     def test_ladder_method_present(self):
         assert "def _select_with_dte_ladder(" in _SRC

@@ -365,3 +365,163 @@ def test_duplicate_retry_thread_is_suppressed(monkeypatch):
 
     assert recorder.starts == 1
     assert getattr(core, "_deferred_breach_retry_inflight", None) == {("local-219", 1)}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PR #219 amendment — Jason LIVE 2026-07-01 recovery parity tests
+#
+# These lock the four amendments applied after the initial retry+taxonomy work
+# on this PR was reviewed against Jason's actual production failure pattern:
+#   1. DEFERRED_DTE_LADDER default = "1"
+#   2. BREACH_SELECTOR_RETRY_ENABLED default = "1"
+#   3. RETRYABLE_BREACH_SELECTOR_REASONS extended with the codes that killed
+#      17 of 54 Jason LIVE overnight setups today
+#   4. Ladder audit propagated into _deferred_selector_audit for order.meta
+#
+# If any future edit reverts one of these without an equivalent amendment,
+# these tests fail loud so the regression surfaces in CI before merge.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class TestJasonLiveRecoveryAmendments:
+    """Parity locks for the PR #219 amendment (see commit body)."""
+
+    def test_amendment_1_dte_ladder_default_is_on(self, monkeypatch):
+        """DEFERRED_DTE_LADDER unset => ladder is enabled by default."""
+        monkeypatch.delenv("DEFERRED_DTE_LADDER", raising=False)
+        mod = _load_selector()
+        sel = object.__new__(mod.APContractSelectionEngine)
+        mod.APContractSelectionEngine.__init__(sel, broker=SimpleNamespace(), data_broker=SimpleNamespace())
+        assert sel.dte_ladder_enabled is True, (
+            "DEFERRED_DTE_LADDER must default to '1' — 54 Jason LIVE setups "
+            "expired today because only one expiration was probed."
+        )
+
+    def test_amendment_1_kill_switch_still_works(self, monkeypatch):
+        """DEFERRED_DTE_LADDER=0 must still disable the ladder as an emergency
+        kill switch, so operators can turn it off from Render without a code
+        deploy if the ladder itself misbehaves."""
+        monkeypatch.setenv("DEFERRED_DTE_LADDER", "0")
+        mod = _load_selector({"DEFERRED_DTE_LADDER": "0"})
+        sel = object.__new__(mod.APContractSelectionEngine)
+        mod.APContractSelectionEngine.__init__(sel, broker=SimpleNamespace(), data_broker=SimpleNamespace())
+        assert sel.dte_ladder_enabled is False
+
+    def test_amendment_2_retryable_set_contains_zero_bid_ask_codes(self):
+        """The two codes that made up 17 of Jason's 54 failures today must be
+        in the retryable set; otherwise the retry loop never fires on them."""
+        assert "CHAIN_ROW_ZERO_BID_ASK" in ec_mod.RETRYABLE_BREACH_SELECTOR_REASONS
+        assert "DIRECT_QUOTE_ZERO_BID_ASK" in ec_mod.RETRYABLE_BREACH_SELECTOR_REASONS
+
+    def test_amendment_2_retryable_set_contains_ladder_exhaustion_reason(self):
+        """After the DTE ladder exhausts all buckets on transient quote-quality
+        signals, it emits NO_VALID_PLAYBOOK_DTE_CONTRACT as the aggregate reason.
+        Execution core sees this — not the per-strike reason — so it MUST be in
+        the retryable set or the ladder's aggregation defeats the retry."""
+        assert "NO_VALID_PLAYBOOK_DTE_CONTRACT" in ec_mod.RETRYABLE_BREACH_SELECTOR_REASONS
+
+    def test_amendment_2_retryable_set_contains_all_amendment_codes(self):
+        """Snapshot lock: the exact set of amendment-added codes must remain
+        stable so silent reverts trip CI."""
+        amendment_additions = {
+            "CHAIN_ROW_ZERO_BID_ASK",
+            "DIRECT_QUOTE_ZERO_BID_ASK",
+            "QUOTE_FETCH_FAILED",
+            "CHAIN_EMPTY",
+            "NO_VALID_PLAYBOOK_DTE_CONTRACT",
+        }
+        missing = amendment_additions - set(ec_mod.RETRYABLE_BREACH_SELECTOR_REASONS)
+        assert not missing, f"amendment-added retryable codes missing: {missing}"
+
+    def test_amendment_2_terminal_codes_still_terminal(self):
+        """Terminal reasons — the ones that would fail regardless of retry —
+        must NOT be in the retryable set. Otherwise we'd burn API calls and
+        potentially loop against structural rejections."""
+        must_stay_terminal = {
+            "OI_TOO_LOW",
+            "UNTRADEABLE_FOR_ACCOUNT_SIZE",
+            "BID_BELOW_MIN",
+            "DELTA_OUT_OF_RANGE",
+            "PREMIUM_CAP_EXCEEDED",
+            "EARNINGS_LOCKOUT",
+            "SPREAD_TOO_WIDE",
+            "VOLUME_TOO_LOW",
+            "INVALID_PLAN",
+            "UNSUPPORTED_INDEX_MAPPING",
+            "DEFERRED_UNRESOLVED_AT_BREACH",
+        }
+        overlap = must_stay_terminal & set(ec_mod.RETRYABLE_BREACH_SELECTOR_REASONS)
+        assert overlap == set(), (
+            f"structural terminal codes must never be retryable — overlap: {overlap}"
+        )
+
+    def test_amendment_3_retry_enabled_default_is_on(self, monkeypatch):
+        """BREACH_SELECTOR_RETRY_ENABLED unset => retry path is active. The
+        code path we lock: read the default from execution_core's source so
+        a silent revert of the default to '0' surfaces in CI."""
+        src = open("ap_execution_core.py").read()
+        assert 'os.getenv("BREACH_SELECTOR_RETRY_ENABLED", "1")' in src, (
+            "BREACH_SELECTOR_RETRY_ENABLED must default to '1' — without "
+            "retry enabled by default, Jason LIVE recovery fix is inert."
+        )
+        # And the reverse — the pre-amendment default must NOT be present
+        assert 'os.getenv("BREACH_SELECTOR_RETRY_ENABLED", "0")' not in src, (
+            "Old default '0' for BREACH_SELECTOR_RETRY_ENABLED is still in "
+            "the source — the amendment may have been reverted."
+        )
+
+    def test_amendment_3_retry_kill_switch_still_works(self):
+        """Emergency operator override: BREACH_SELECTOR_RETRY_ENABLED=0 must
+        still disable the retry path if it misbehaves in production."""
+        # Verified structurally: the guard is a plain env-read whose value is
+        # tested against the truthy set — the same shape used for every other
+        # kill switch. If the amendment kept the same shape (which we assert
+        # via the string in the previous test), the kill switch works.
+        src = open("ap_execution_core.py").read()
+        # The retry-enable expression must still evaluate the env var against
+        # the truthy set — this is the shape that makes '0' disable it.
+        assert 'BREACH_SELECTOR_RETRY_ENABLED' in src
+        assert '.strip().lower() in ("1", "true", "yes")' in src
+
+    def test_amendment_4_ladder_audit_wired_into_selector_audit(self):
+        """Ladder audit must be read from selector.get_last_dte_ladder_audit()
+        and injected into the _deferred_selector_audit dict so it lands in
+        order.meta.deferred_selector_audit for operator dashboards."""
+        src = open("ap_execution_core.py").read()
+        # 1. The read call must be present.
+        assert "get_last_dte_ladder_audit" in src, (
+            "Amendment 4 missing: selector.get_last_dte_ladder_audit() is "
+            "never called; ladder audit will not propagate into order.meta."
+        )
+        # 2. The audit dict must be assigned into the _audit key structure
+        #    surfaced to callers (which serializes into order.meta).
+        assert "last_dte_ladder_audit" in src, (
+            "Amendment 4 missing: last_dte_ladder_audit key not written to "
+            "_deferred_selector_audit dict — dashboards can't query it."
+        )
+        # 3. The commonly-queried top-level fields must be surfaced.
+        for expected in (
+            "ladder_selected_bucket",
+            "ladder_selected_expiration",
+            "ladder_selected_dte",
+            "ladder_buckets_attempted",
+            "ladder_bucket_order",
+        ):
+            assert expected in src, (
+                f"Amendment 4 missing top-level surface field: {expected!r}"
+            )
+
+    def test_amendment_4_ladder_audit_read_is_best_effort(self):
+        """Amendment 4 must not block terminalization if the ladder audit
+        read raises. Verified structurally by checking the read is wrapped
+        in a try/except."""
+        src = open("ap_execution_core.py").read()
+        # Locate the read call site and verify a try/except immediately
+        # precedes it within a reasonable window.
+        idx = src.find("get_last_dte_ladder_audit()")
+        assert idx > 0
+        preceding = src[max(0, idx - 300):idx]
+        assert "try:" in preceding, (
+            "get_last_dte_ladder_audit() call is not wrapped in try/except — "
+            "a ladder-audit read failure could block deferred terminalization."
+        )

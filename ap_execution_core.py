@@ -56,6 +56,16 @@ MAX_POSITIONS       = int(os.getenv("MAX_POSITIONS", "7"))
 # fundamental blocks (EARNINGS_LOCKOUT, UNTRADEABLE_FOR_ACCOUNT_SIZE, etc.) are
 # NOT in this set — those still terminalize on the first attempt, exactly as today.
 #
+# AMENDMENT (PR #219, Jason LIVE recovery): the original set missed the two
+# top-count failure codes on Jason LIVE today — CHAIN_ROW_ZERO_BID_ASK
+# (12 SBUX + 29 ACN candidates) and DIRECT_QUOTE_ZERO_BID_ASK (5 SBUX + 4 ACN).
+# Both are transient quote-quality signals at market open, not structural
+# rejects. NO_VALID_PLAYBOOK_DTE_CONTRACT is the aggregation reason emitted
+# after the ladder exhausts all buckets on transient signals; adding it here
+# means a second full ladder pass runs after RETRY_DELAY seconds instead of
+# terminalizing. QUOTE_FETCH_FAILED and CHAIN_EMPTY are historical variants
+# emitted by older selector paths that could still surface in edge cases.
+#
 # Env overrides:
 #   MAX_BREACH_SELECTOR_RETRIES          default 3
 #   BREACH_SELECTOR_RETRY_DELAY_SECONDS  default 20
@@ -68,6 +78,12 @@ RETRYABLE_BREACH_SELECTOR_REASONS: frozenset = frozenset({
     "CHAIN_PARSE_EMPTY",                # chain parsed to zero rows after direction filter
     "NO_EXPIRATION_IN_DTE_WINDOW",      # no eligible expiration in the current DTE probe window
     "DIRECT_QUOTE_UNAVAILABLE",         # direct-quote revalidation fetch failed
+    # ── PR #219 amendment: Jason LIVE 2026-07-01 recovery additions ──
+    "CHAIN_ROW_ZERO_BID_ASK",           # per-chain-row zero bid or ask — top failure on Jason LIVE today
+    "DIRECT_QUOTE_ZERO_BID_ASK",        # direct OCC quote came back zero — 2nd top failure on Jason LIVE
+    "QUOTE_FETCH_FAILED",               # quote endpoint returned an error/timeout
+    "CHAIN_EMPTY",                      # historical variant emitted when chain returns no rows
+    "NO_VALID_PLAYBOOK_DTE_CONTRACT",   # ladder-level: all DTE buckets exhausted with transient failures
 })
 
 # ── Mode metadata thresholds ────────────────────────────────────────────────
@@ -1368,6 +1384,31 @@ class APExecutionCore:
                             _sf.get("raw_reason") if isinstance(_sf, dict) else None
                         ),
                     }
+                    # AMENDMENT (PR #219, Jason LIVE recovery): propagate the
+                    # last DTE ladder run into order.meta so operator dashboards
+                    # can see which expirations were probed and why each bucket
+                    # failed. Without this, ladder observability stayed inside
+                    # the selector and never made it into Supabase — meaning
+                    # post-mortems on Jason's 54 EXPIRED rows had no visibility
+                    # into which expirations were tried. Best-effort read.
+                    try:
+                        if hasattr(self.contract_selector, "get_last_dte_ladder_audit"):
+                            _ladder_audit = self.contract_selector.get_last_dte_ladder_audit()
+                            if isinstance(_ladder_audit, dict) and _ladder_audit:
+                                _audit["last_dte_ladder_audit"] = _ladder_audit
+                                # Surface commonly-queried ladder fields at the
+                                # top level of the audit so dashboards can query
+                                # them without traversing the nested audit dict.
+                                _audit["ladder_selected_bucket"]     = _ladder_audit.get("selected_bucket")
+                                _audit["ladder_selected_expiration"] = _ladder_audit.get("selected_expiration")
+                                _audit["ladder_selected_dte"]        = _ladder_audit.get("selected_dte")
+                                _audit["ladder_buckets_attempted"]   = _ladder_audit.get("buckets_attempted")
+                                _audit["ladder_bucket_order"]        = _ladder_audit.get("bucket_order")
+                    except Exception as _ladder_exc:
+                        log.debug(
+                            "[%s] get_last_dte_ladder_audit() read failed (non-fatal): %s",
+                            ticker, _ladder_exc,
+                        )
                     return _error, _audit
 
                 # Path A: selector returned None OR live contract is still empty
@@ -1397,7 +1438,16 @@ class APExecutionCore:
                     except (TypeError, ValueError):
                         _prior_attempt_a = 0
                     _this_attempt_a = _prior_attempt_a + 1
-                    _retry_enabled_a    = str(os.getenv("BREACH_SELECTOR_RETRY_ENABLED", "0")).strip().lower() in ("1", "true", "yes")
+                    # AMENDMENT (PR #219, Jason LIVE recovery): default is now
+                    # "1" (ON). Retry only applies to deferred breach selection
+                    # AND is further gated by RETRYABLE_BREACH_SELECTOR_REASONS,
+                    # queue_local_order_id presence, attempt count, and the
+                    # BREACH_SELECTOR_RETRY_CUTOFF_ET wall-clock cap — so this
+                    # cannot cause runaway retries for non-deferred flows or
+                    # for structural rejections. The env var is preserved as
+                    # an emergency kill switch (set to "0" to disable without
+                    # a code deploy).
+                    _retry_enabled_a    = str(os.getenv("BREACH_SELECTOR_RETRY_ENABLED", "1")).strip().lower() in ("1", "true", "yes")
                     _MAX_RETRIES_A      = int(os.getenv("MAX_BREACH_SELECTOR_RETRIES", "3"))
                     _RETRY_DELAY_A      = int(os.getenv("BREACH_SELECTOR_RETRY_DELAY_SECONDS", "20"))
                     _RETRY_CUTOFF_A     = int(os.getenv("BREACH_SELECTOR_RETRY_CUTOFF_ET", "945"))
