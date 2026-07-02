@@ -195,6 +195,37 @@ def test_missing_timeframe_still_blocks_when_no_scanner_timeframe_clue_exists():
     assert result.reason == MISSING_TIMEFRAME
 
 
+def test_random_weekly_text_without_valid_scanner_clue_still_fails_missing_timeframe():
+    payload = _queue_payload_without_mode(
+        timeframe="",
+        time_horizon="",
+        signal_id="sig-random-text-only",
+        canonical_signal_id="sig-random-text-only",
+        pattern="weekly fake note",
+        underlying_entry=None,
+        trigger={
+            "entry": 77.62,
+            "stop": 75.10,
+            "pt1": 81.50,
+            "current_price": 77.88,
+            "source": "scanner_unknown",
+            "comment": "this note says weekly but is not a scanner timeframe clue",
+            "expiry_hint": "",
+        },
+    )
+    before = deepcopy(payload)
+
+    result = validate_entry_metadata(
+        plan=payload,
+        client_id="jasoncosby1@gmail.com",
+        execution_mode="paper",
+    )
+
+    assert not result.ok
+    assert result.reason == MISSING_TIMEFRAME
+    assert payload == before
+
+
 def test_deferred_overnight_watcher_handoff_still_fails_strict_validation_without_underlying():
     plan = SimpleNamespace(
         client_id="jasoncosby1@gmail.com",
