@@ -43,6 +43,13 @@ def _signal(**overrides):
     return base
 
 
+def _add_intraday_signal(watcher: TestWatcher, **overrides):
+    watched = WatchedSignal(_signal(**overrides), overnight=False)
+    watched._watcher_ref = watcher
+    watcher._pending.append(watched)
+    return watched
+
+
 def _plan(**overrides):
     base = {
         "signal_id": "sig-plan-1",
@@ -65,7 +72,7 @@ def _plan(**overrides):
 
 
 def _prime_trigger(watcher: TestWatcher):
-    assert watcher.add_signal(_signal()) is True
+    _add_intraday_signal(watcher)
     watcher._quotes = {
         "AAPL": {"bid": 100.0, "ask": 101.0, "last": 101.0, "quote_age_ms": 1}
     }
@@ -110,7 +117,7 @@ def test_active_watcher_does_not_trigger_from_last_only_quote():
         DummyBroker(),
         quotes={"AAPL": {"bid": 0.0, "ask": 0.0, "last": 150.0, "quote_age_ms": 4}},
     )
-    assert watcher.add_signal(_signal()) is True
+    _add_intraday_signal(watcher)
     triggered = []
     watcher.on_trigger = lambda watched: triggered.append(watched)
 
