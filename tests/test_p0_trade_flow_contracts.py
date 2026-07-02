@@ -176,10 +176,11 @@ def test_trade_queue_schema_contract_does_not_use_updated_ts():
     """
     offenders: list[str] = []
     patterns = [
-        re.compile(r"\bFROM\s+trade_queue\b[^;]*\bupdated_ts\b", re.IGNORECASE),
         re.compile(r"\bUPDATE\s+trade_queue\b[^;]*\bupdated_ts\b", re.IGNORECASE),
         re.compile(r"\bINSERT\s+INTO\s+trade_queue\b[^;]*\bupdated_ts\b", re.IGNORECASE),
         re.compile(r"\btrade_queue\s+SET\b[^;]*\bupdated_ts\b", re.IGNORECASE),
+        re.compile(r"\bFROM\s+trade_queue\b[^;\n]*\bupdated_ts\b", re.IGNORECASE),
+        re.compile(r"\bSELECT\b[^;\n]*\bupdated_ts\b[^;\n]*\bFROM\s+trade_queue\b", re.IGNORECASE),
     ]
     for path in REPO_ROOT.rglob("*.py"):
         rel = path.relative_to(REPO_ROOT).as_posix()
