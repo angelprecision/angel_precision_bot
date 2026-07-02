@@ -30,6 +30,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import time
 import types
 from datetime import datetime, timezone, timedelta
@@ -45,6 +46,145 @@ ENTRY_LIVE_STATUSES  = frozenset({"CREATED", "SUBMITTED", "ACKNOWLEDGED", "PARTI
 
 # Statuses that mean an exit is in-flight
 EXIT_LIVE_STATUSES   = frozenset({"EXIT_SUBMITTED", "EXIT_ACKNOWLEDGED", "EXIT_PARTIAL_FILL"})
+
+# Position statuses that still consume runtime management after restart.
+# PARTIAL and ACTIVE are legacy/scale-out compatible; remaining qty always wins.
+ACTIVE_POSITION_STATUSES = ("OPEN", "CLOSING", "PARTIAL", "ACTIVE")
+
+_OCC_SIDE_RE = re.compile(r"\d{6}([CP])\d{8}$")
+
+
+def _safe_int(value, default: int = 0) -> int:
+    try:
+        if value is None or value == "":
+            return default
+        return int(float(value))
+    except Exception:
+        return default
+
+
+def _safe_float(value, default: float = 0.0) -> float:
+    try:
+        if value is None or value == "":
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def _extract_explicit_fill_qty(raw: dict) -> Optional[int]:
+    """Extract explicit cumulative filled qty from broker payload.
+
+    Startup recovery must never invent qty=0 for a broker-filled order.  A
+    missing value means the adapter did not give us enough fill truth yet; leave
+    the order for fill_monitor/reconciler instead of terminalizing it.
+    """
+    for key in (
+        "filled_qty",
+        "filled_quantity",
+        "cumulative_filled_qty",
+        "cumulative_filled_quantity",
+        "exec_quantity",
+        "executed_quantity",
+        "filled",
+    ):
+        if key not in raw:
+            continue
+        val = raw.get(key)
+        if val is None or val == "":
+            continue
+        try:
+            qty = int(float(val))
+            if qty > 0:
+                return qty
+        except Exception:
+            continue
+    return None
+
+
+def _extract_avg_fill_price(raw: dict) -> Optional[float]:
+    """Extract explicit execution price from broker payload.
+
+    Do not use generic broker "price" / "avg_price" fields here: those can be
+    limit/stop prices, not execution truth.
+    """
+    for key in (
+        "avg_fill_price",
+        "average_fill_price",
+        "fill_price",
+        "filled_avg_price",
+    ):
+        if key not in raw:
+            continue
+        val = raw.get(key)
+        if val is None or val == "":
+            continue
+        try:
+            px = float(val)
+            if px > 0:
+                return px
+        except Exception:
+            continue
+    return None
+
+
+def _resolve_side_from_order_or_meta(order: dict, meta: dict | None = None) -> tuple[str | None, str]:
+    """Resolve strategy side without ever defaulting missing direction to CALL."""
+    meta = meta or {}
+    raw = str(
+        order.get("direction")
+        or order.get("side")
+        or meta.get("direction")
+        or meta.get("side")
+        or ""
+    ).upper().strip()
+
+    if raw in {"CALL", "PUT"}:
+        return raw, "field"
+
+    if raw in {"BUY", "LONG", "CALLS", "BULLISH"}:
+        return "CALL", "alias"
+
+    if raw in {"SELL", "SHORT", "PUTS", "BEARISH"}:
+        return "PUT", "alias"
+
+    contract = str(
+        order.get("contract")
+        or order.get("symbol")
+        or meta.get("selected_contract")
+        or meta.get("contract_symbol")
+        or meta.get("contract")
+        or ""
+    ).upper().strip()
+
+    m = _OCC_SIDE_RE.search(contract)
+    if m:
+        return ("CALL" if m.group(1) == "C" else "PUT"), "occ_contract"
+
+    return None, "unresolved"
+
+
+def _position_reserved_cost(pos: dict) -> float:
+    """Return reserved position capital with fill-cost fallback."""
+    for key in ("reserved_cost", "cost"):
+        cost = _safe_float(pos.get(key), 0.0)
+        if cost > 0:
+            return cost
+
+    px = (
+        _safe_float(pos.get("avg_fill"), 0.0)
+        or _safe_float(pos.get("entry_price"), 0.0)
+        or _safe_float(pos.get("fill_price"), 0.0)
+    )
+    qty = (
+        _safe_int(pos.get("quantity_remaining"), 0)
+        or _safe_int(pos.get("qty"), 0)
+        or _safe_int(pos.get("quantity"), 0)
+        or _safe_int(pos.get("contracts"), 0)
+    )
+    if px > 0 and qty > 0:
+        return float(px) * int(qty) * 100.0
+    return 0.0
 
 
 class APStartupRecovery:
@@ -63,7 +203,7 @@ class APStartupRecovery:
         exit_engine=None, # APExitEngine (optional — needed for exit re-attachment)
         entry_watcher=None,  # APEntryWatcher (optional — needed for watcher reseed)
     ):
-        self.client_id     = client_id
+        self.client_id     = str(client_id or "").strip().lower()
         self.broker        = broker
         self.osm           = osm
         self.pm            = pm
@@ -143,27 +283,47 @@ class APStartupRecovery:
         return result
 
     # ──────────────────────────────────────────────────────────────────────────
+    # Active position loading
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def _load_active_positions(self) -> list[dict]:
+        """Load all economically active position rows for this client."""
+        from ap.db import conn, run_with_retry
+
+        def _query():
+            with conn() as c:
+                c.execute(
+                    """
+                    SELECT *
+                    FROM positions
+                    WHERE client_id = %s
+                      AND (
+                        UPPER(COALESCE(status, '')) IN ('OPEN','CLOSING','PARTIAL','ACTIVE')
+                        OR COALESCE(quantity_remaining, 0) > 0
+                      )
+                    ORDER BY entry_ts DESC NULLS LAST, created_at DESC NULLS LAST
+                    """,
+                    (self.client_id,),
+                )
+                return c.fetchall()
+
+        return run_with_retry(_query) or []
+
+    # ──────────────────────────────────────────────────────────────────────────
     # 1. Position recovery
     # ──────────────────────────────────────────────────────────────────────────
 
     def _recover_positions(self, result: dict):
-        """Re-register open positions with PositionManager in-memory state."""
-        from ap.db import list_positions, run_with_retry
-
-        opens = run_with_retry(
-            lambda: list_positions(client_id=self.client_id, status="OPEN")
-        )
-        closings = run_with_retry(
-            lambda: list_positions(client_id=self.client_id, status="CLOSING")
-        )
-        all_active = (opens or []) + (closings or [])
+        """Re-register active positions with PositionManager in-memory state."""
+        all_active = self._load_active_positions()
 
         for pos in all_active:
             pos_id     = pos.get("id")
             underlying = pos.get("underlying") or pos.get("ticker", "?")
             status     = pos.get("status", "OPEN")
-            qty        = int(pos.get("qty") or pos.get("quantity") or 0)
-            direction  = pos.get("direction", "CALL")
+            qty        = _safe_int(pos.get("quantity_remaining"), 0) or _safe_int(pos.get("qty"), 0) or _safe_int(pos.get("quantity"), 0)
+            direction, side_source = _resolve_side_from_order_or_meta(pos)
+            direction_label = direction or "UNKNOWN"
 
             # Re-register with PositionManager if supported
             try:
@@ -197,8 +357,8 @@ class APStartupRecovery:
                 log.warning("recovery_sector_counts_inc_failed: %s", _e)
 
             log.info(
-                "[%s] RECOVERY: position restored | %s %s qty=%d status=%s pos=%s",
-                self.client_id, underlying, direction, qty, status, pos_id,
+                "[%s] RECOVERY: position restored | %s %s qty=%d status=%s pos=%s side_source=%s",
+                self.client_id, underlying, direction_label, qty, status, pos_id, side_source,
             )
             result["positions_recovered"] += 1
 
@@ -234,40 +394,65 @@ class APStartupRecovery:
                     self.client_id, local_id, db_status,
                 )
                 continue
-
             try:
-                broker_raw    = self.broker.get_order(broker_oid)
+                broker_raw    = self.broker.get_order(broker_oid) or {}
                 broker_status = str(broker_raw.get("status") or "").lower()
             except Exception as e:
                 log.warning("[%s] RECOVERY: broker get_order failed for %s: %s",
                             self.client_id, broker_oid, e)
                 continue
 
-            # Map broker → OSM status
             from ap_reconciler import BROKER_TO_OSM, BROKER_FILLED, BROKER_TERMINAL
-            if broker_status in BROKER_FILLED or broker_status in BROKER_TERMINAL:
+
+            if broker_status in BROKER_FILLED:
+                new_status = BROKER_TO_OSM.get(broker_status)
+                if not new_status or new_status == db_status:
+                    continue
+
+                filled_qty = _extract_explicit_fill_qty(broker_raw)
+                avg_fill   = _extract_avg_fill_price(broker_raw)
+                if not filled_qty or filled_qty <= 0 or not avg_fill or avg_fill <= 0:
+                    msg = (
+                        f"RECOVERY_FILL_TRUTH_MISSING entry local={local_id} "
+                        f"broker={broker_oid} contract={contract} broker_status={broker_status} "
+                        "missing explicit filled_qty/avg_fill; leaving for fill_monitor/reconciler"
+                    )
+                    log.critical("[%s] %s", self.client_id, msg)
+                    result.setdefault("errors", []).append(msg)
+                    continue
+
+                try:
+                    ok = self.osm.transition(
+                        local_id, new_status,
+                        filled_qty=filled_qty,
+                        fill_price=avg_fill,
+                    )
+                    if ok:
+                        result["entries_corrected"] += 1
+                        log.info(
+                            "[%s] RECOVERY: corrected filled entry %s | %s | %s → %s qty=%d avg=$%.4f",
+                            self.client_id, local_id, contract, db_status, new_status, filled_qty, avg_fill,
+                        )
+                except Exception as e:
+                    log.error("[%s] RECOVERY: OSM fill transition failed: %s", self.client_id, e)
+                continue
+
+            if broker_status in BROKER_TERMINAL:
                 new_status = BROKER_TO_OSM.get(broker_status)
                 if new_status and new_status != db_status:
-                    filled_qty = int(broker_raw.get("exec_quantity") or 0)
-                    avg_fill   = float(broker_raw.get("avg_fill_price") or 0.0)
                     try:
                         ok = self.osm.transition(
                             local_id, new_status,
-                            filled_qty=filled_qty,
-                            fill_price=avg_fill,
-                            last_error=(
-                                f"recovery: broker_status={broker_status}"
-                                if broker_status in BROKER_TERMINAL else None
-                            ),
+                            last_error=f"recovery: broker_status={broker_status}",
                         )
                         if ok:
                             result["entries_corrected"] += 1
                             log.info(
-                                "[%s] RECOVERY: corrected entry %s | %s | %s → %s",
+                                "[%s] RECOVERY: corrected terminal entry %s | %s | %s → %s",
                                 self.client_id, local_id, contract, db_status, new_status,
                             )
                     except Exception as e:
-                        log.error("[%s] RECOVERY: OSM transition failed: %s", self.client_id, e)
+                        log.error("[%s] RECOVERY: OSM terminal transition failed: %s", self.client_id, e)
 
     # ──────────────────────────────────────────────────────────────────────────
     # 3. Exit protection reattachment
@@ -335,7 +520,7 @@ class APStartupRecovery:
 
             # Verify at broker
             try:
-                broker_raw    = self.broker.get_order(broker_oid)
+                broker_raw    = self.broker.get_order(broker_oid) or {}
                 broker_status = str(broker_raw.get("status") or "").lower()
             except Exception as e:
                 log.warning("[%s] RECOVERY: broker exit order check failed: %s",
@@ -346,8 +531,18 @@ class APStartupRecovery:
 
             if broker_status in BROKER_FILLED:
                 # Exit actually filled while we were down — close the position
-                filled_qty = int(broker_raw.get("exec_quantity") or 0)
-                avg_fill   = float(broker_raw.get("avg_fill_price") or 0.0)
+                filled_qty = _extract_explicit_fill_qty(broker_raw)
+                avg_fill   = _extract_avg_fill_price(broker_raw)
+                if not filled_qty or filled_qty <= 0 or not avg_fill or avg_fill <= 0:
+                    msg = (
+                        f"RECOVERY_EXIT_FILL_TRUTH_MISSING local={local_id} "
+                        f"broker={broker_oid} pos={pos_id} broker_status={broker_status} "
+                        "missing explicit filled_qty/avg_fill; keeping CLOSING for reconciler/fill_monitor"
+                    )
+                    log.critical("[%s] %s", self.client_id, msg)
+                    result.setdefault("errors", []).append(msg)
+                    continue
+
                 try:
                     self.osm.transition(
                         local_id, "EXIT_FILLED",
@@ -368,7 +563,7 @@ class APStartupRecovery:
                 # Exit canceled — revert position to OPEN so it can be re-exited
                 try:
                     self.osm.transition(
-                        local_id, "CANCELED",
+                        local_id, BROKER_TO_OSM.get(broker_status, "CANCELED"),
                         last_error=f"recovery: broker_status={broker_status}",
                     )
                     # Revert position
@@ -421,22 +616,14 @@ class APStartupRecovery:
 
     def _recompute_buying_power(self, result: dict):
         """
-        Recompute how much capital is reserved by open positions + pending entries.
+        Recompute how much capital is reserved by active positions.
         Updates master_control.account_equity if needed.
         """
-        from ap.db import list_positions, run_with_retry
-
-        opens = run_with_retry(
-            lambda: list_positions(client_id=self.client_id, status="OPEN")
-        ) or []
-        closings = run_with_retry(
-            lambda: list_positions(client_id=self.client_id, status="CLOSING")
-        ) or []
+        active_positions = self._load_active_positions()
 
         total_reserved = 0.0
-        for pos in opens + closings:
-            cost = float(pos.get("reserved_cost") or pos.get("cost") or 0.0)
-            total_reserved += cost
+        for pos in active_positions:
+            total_reserved += _position_reserved_cost(pos)
 
         result["buying_power_reserved"] = total_reserved
 
@@ -447,8 +634,8 @@ class APStartupRecovery:
             self.mc.reserved_capital = total_reserved
 
         log.info(
-            "[%s] RECOVERY: buying power reserved=$%.2f across %d open + %d closing positions",
-            self.client_id, total_reserved, len(opens), len(closings),
+            "[%s] RECOVERY: buying power reserved=$%.2f across %d active positions",
+            self.client_id, total_reserved, len(active_positions),
         )
 
     # ──────────────────────────────────────────────────────────────────────────
@@ -469,9 +656,13 @@ class APStartupRecovery:
                 c.execute(
                     """
                     SELECT signal_id,
-                           payload->>'ticker'    AS ticker,
-                           payload->>'direction' AS direction,
-                           payload->>'timeframe' AS timeframe,
+                           payload->>'ticker'            AS ticker,
+                           payload->>'direction'         AS direction,
+                           payload->>'side'              AS side,
+                           payload->>'contract'          AS contract,
+                           payload->>'selected_contract' AS selected_contract,
+                           payload->>'contract_symbol'   AS contract_symbol,
+                           payload->>'timeframe'         AS timeframe,
                            client_id, status
                     FROM trade_queue
                     WHERE client_id=%s
@@ -499,17 +690,22 @@ class APStartupRecovery:
         for row in (rows or []):
             signal_id = row.get("signal_id")
             ticker    = str(row.get("ticker") or "").upper()
-            direction = str(row.get("direction") or "CALL").upper()
+            side, side_source = _resolve_side_from_order_or_meta(row)
             timeframe = str(row.get("timeframe") or "1d")
 
-            # Re-add both the signal_id key and the setup key
-            # _seen_signals is a dict[str, float] — use direct assignment not .add()
+            # Re-add signal_id even when side is unresolved. Do NOT create a
+            # ticker:CALL setup key from missing/dirty side metadata.
             _ts = time.time()
             if signal_id:
                 self.mc._seen_signals[f"sig:{signal_id}:{self.client_id}"] = _ts
-            if ticker:
-                setup_key = f"{self.client_id}:{ticker}:{direction}:{timeframe}"
+            if ticker and side:
+                setup_key = f"{self.client_id}:{ticker}:{side}:{timeframe}"
                 self.mc._seen_signals[setup_key] = _ts
+            elif ticker:
+                log.warning(
+                    "[%s] RECOVERY: dedup setup key skipped for ticker=%s signal_id=%s side_source=%s",
+                    self.client_id, ticker, signal_id, side_source,
+                )
             count += 1
 
         result["dedup_seeded"] = count
@@ -546,12 +742,18 @@ class APStartupRecovery:
             or meta.get("contract_symbol")
             or ""
         )
-        direction = str(
-            order.get("direction")
-            or meta.get("direction")
-            or meta.get("side")
-            or "CALL"
-        ).upper()
+        direction, side_source = _resolve_side_from_order_or_meta(order, meta)
+        if direction not in {"CALL", "PUT"}:
+            log.warning(
+                "[%s] RECOVERY: invalid_or_missing_side for local_order_id=%s signal_id=%s contract=%s side_source=%s",
+                self.client_id,
+                order.get("local_order_id"),
+                order.get("signal_id"),
+                contract,
+                side_source,
+            )
+            return None
+
         ticker = str(
             order.get("symbol")
             or meta.get("symbol")
@@ -573,6 +775,9 @@ class APStartupRecovery:
             if order.get("target_underlying") is not None
             else meta.get("target_underlying")
         )
+
+        metadata = dict(meta)
+        metadata["recovery_side_source"] = side_source
 
         return types.SimpleNamespace(
             signal_id=str(
@@ -596,7 +801,7 @@ class APStartupRecovery:
             prior_day_high=meta.get("prior_day_high"),
             prior_day_low=meta.get("prior_day_low"),
             strategy_type=str(meta.get("strategy_type") or ""),
-            metadata=dict(meta),
+            metadata=metadata,
         )
 
     def _reseed_watchers(self, result: dict):
@@ -753,6 +958,12 @@ class APStartupRecovery:
                     )
 
                 plan = self._build_recovery_plan_from_order(order)
+                if plan is None:
+                    log.warning(
+                        "[%s] RECOVERY: cannot reseed local_order_id=%s — invalid_or_missing_side",
+                        self.client_id, local_order_id,
+                    )
+                    continue
                 if not getattr(plan, "ticker", "") or getattr(plan, "trigger_price", None) in (None, 0, 0.0):
                     log.warning(
                         "[%s] RECOVERY: cannot reseed local_order_id=%s — missing ticker or trigger_price",
