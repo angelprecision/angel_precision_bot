@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import logging
 import os
+import inspect
 import time
 from datetime import date, datetime, timezone, timedelta
 from typing import TYPE_CHECKING, Optional
@@ -599,7 +600,14 @@ def run_overnight_reeval(
     except Exception as _e:
         log.warning("overnight_health_heartbeat_failed: %s", _e)
 
-    attached_data_broker = getattr(broker, "data_broker", None) if broker is not None else None
+    attached_data_broker = None
+    if broker is not None:
+        try:
+            _attached_data_broker = inspect.getattr_static(broker, "data_broker")
+        except AttributeError:
+            _attached_data_broker = None
+        if _attached_data_broker is not None:
+            attached_data_broker = getattr(broker, "data_broker", None)
     market_data_broker = data_broker or attached_data_broker or broker
     try:
         from ap.authorization import execution_mode_for_broker as _exec_mode_for_broker
