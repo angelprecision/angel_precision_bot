@@ -96,7 +96,8 @@ _ENTRY_TRIGGER_ALIASES: tuple[tuple[str, bool], ...] = (
 # The metadata guard already handles: underlying_entry, underlying_at_signal,
 #   underlying_price, current_underlying_price, current_underlying,
 #   signal_underlying_price, price_at_signal, trigger.current_price.
-# This normalizer adds: underlying, last, close, mark.
+# This normalizer adds: underlying, last, close, mark,
+# prior_day_close, previous_close, prev_close, prior_close.
 _UNDERLYING_ALIASES: tuple[tuple[str, bool], ...] = (
     ("underlying_at_signal",          False),  # canonical → gate; skip if present
     ("underlying_price",              False),  # common alias (already in guard)
@@ -105,6 +106,16 @@ _UNDERLYING_ALIASES: tuple[tuple[str, bool], ...] = (
     ("last",                          False),  # last trade price
     ("close",                         False),  # prior close price
     ("mark",                          False),  # options mark price
+    # Prior-day close prices — used by overnight Strat scanner when live quotes
+    # are unavailable pre-open.  Placed after live-quote aliases so a live quote
+    # always wins when both are present, but before lower-confidence inference.
+    # prior_day_high / prior_day_low are intentionally NOT mapped: they are
+    # range bounds, not the representative closing price, so writing either one
+    # as underlying_at_signal would produce a systematically wrong value.
+    ("prior_day_close",               False),  # overnight scanner alias (primary)
+    ("previous_close",                False),  # variant spelling
+    ("prev_close",                    False),  # short alias
+    ("prior_close",                   False),  # short alias
     ("current_underlying_price",      False),  # intelligence alias
     ("current_underlying",            False),  # intelligence alias
     ("signal_underlying_price",       False),  # ledger alias
@@ -180,9 +191,10 @@ def normalize_raw_signal_payload(raw: dict) -> dict:
         entry_trigger:
             trigger (scalar) | entry_price | entry | signal_entry_price | trigger.entry
         underlying_at_signal:
-            underlying | price | last | close | mark | current_underlying_price |
-            current_underlying | signal_underlying_price | price_at_signal |
-            trigger.current_price
+            underlying | price | last | close | mark |
+            prior_day_close | previous_close | prev_close | prior_close |
+            current_underlying_price | current_underlying |
+            signal_underlying_price | price_at_signal | trigger.current_price
         stop_price:
             stop | stop_loss_underlying | stop_underlying | trigger.stop
         target_price:

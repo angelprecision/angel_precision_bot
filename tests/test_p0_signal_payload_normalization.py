@@ -469,3 +469,219 @@ class TestStopAndTargetNormalization:
         """Canonical target_price is preserved when already positive."""
         result = normalize_raw_signal_payload(_CANONICAL_PAYLOAD)
         assert result["target_price"] == 520.00
+
+
+# ---------------------------------------------------------------------------
+# Regression: production overnight payload shape (KHC / Strat scanner)
+# This is the EXACT field shape emitted by the overnight Strat scanner for
+# overnight / 1d signals when live quotes are not yet available pre-open.
+# Previously left underlying_at_signal null because the scanner emits
+# `prior_day_close`, not `underlying`, `last`, `close`, or `mark`.
+# ---------------------------------------------------------------------------
+
+_PROD_OVERNIGHT_KHC = {
+    "signal_id":      "prod-overnight-shape",
+    "ticker":         "KHC",
+    "side":           "PUT",
+    "direction":      "PUT",
+    "pattern":        "2-3",
+    "timeframe":      "1d",
+    "score":          72,
+    "client_id":      "jasoncosby1@gmail.com",
+    "execution_mode": "live",
+    "trigger":        24.02,
+    "prior_day_high": 25.40,
+    "prior_day_low":  24.70,
+    "prior_day_close": 25.04,
+}
+
+
+class TestProductionOvernightShape:
+    """Regression suite for the exact overnight Strat scanner payload shape.
+
+    These tests must never be removed — they capture the precise production
+    payload that was leaving underlying_at_signal null in ap_signals rows,
+    causing metadata_invalid:zero_underlying to block live-client execution.
+    """
+
+    def test_entry_trigger_from_trigger_scalar(self):
+        """`trigger` scalar → entry_trigger (core overnight path)."""
+        result = normalize_raw_signal_payload(_PROD_OVERNIGHT_KHC)
+        assert result["entry_trigger"] == 24.02, (
+            f"entry_trigger expected 24.02, got {result.get('entry_trigger')}"
+        )
+
+    def test_underlying_at_signal_from_prior_day_close(self):
+        """`prior_day_close` → underlying_at_signal (the field that was null in prod)."""
+        result = normalize_raw_signal_payload(_PROD_OVERNIGHT_KHC)
+        assert result["underlying_at_signal"] == 25.04, (
+            f"underlying_at_signal expected 25.04 (from prior_day_close), "
+            f"got {result.get('underlying_at_signal')}"
+        )
+
+    def test_side_preserved(self):
+        result = normalize_raw_signal_payload(_PROD_OVERNIGHT_KHC)
+        assert result["side"] == "PUT"
+
+    def test_direction_preserved(self):
+        result = normalize_raw_signal_payload(_PROD_OVERNIGHT_KHC)
+        assert result["direction"] == "PUT"
+
+    def test_client_id_preserved(self):
+        result = normalize_raw_signal_payload(_PROD_OVERNIGHT_KHC)
+        assert result["client_id"] == "jasoncosby1@gmail.com"
+
+    def test_execution_mode_preserved(self):
+        result = normalize_raw_signal_payload(_PROD_OVERNIGHT_KHC)
+        assert result["execution_mode"] == "live"
+
+    def test_prior_day_high_preserved_in_result(self):
+        """prior_day_high must survive normalisation unchanged — it is raw context
+        data for the signal, not mapped to any canonical execution field."""
+        result = normalize_raw_signal_payload(_PROD_OVERNIGHT_KHC)
+        assert result["prior_day_high"] == 25.40, (
+            f"prior_day_high lost or altered: {result.get('prior_day_high')}"
+        )
+
+    def test_prior_day_low_preserved_in_result(self):
+        """prior_day_low must survive normalisation unchanged."""
+        result = normalize_raw_signal_payload(_PROD_OVERNIGHT_KHC)
+        assert result["prior_day_low"] == 24.70
+
+    def test_no_zero_default_underlying_written(self):
+        """underlying_at_signal must come from prior_day_close (25.04), not 0 or None."""
+        result = normalize_raw_signal_payload(_PROD_OVERNIGHT_KHC)
+        val = result.get("underlying_at_signal")
+        assert val is not None and val > 0, (
+            f"underlying_at_signal must be a positive float, got {val!r}"
+        )
+
+    def test_live_quote_aliases_take_priority_over_prior_day_close(self):
+        """When both `underlying` (live) and `prior_day_close` exist, the live
+        quote (`underlying`) must win because it appears earlier in the alias list."""
+        payload = {
+            **_PROD_OVERNIGHT_KHC,
+            "underlying": 24.85,   # live price (lower priority field added)
+        }
+        result = normalize_raw_signal_payload(payload)
+        assert result["underlying_at_signal"] == 24.85, (
+            f"Live `underlying` should beat `prior_day_close`, "
+            f"got {result.get('underlying_at_signal')}"
+        )
+
+    def test_previous_close_alias(self):
+        """Alternative spelling `previous_close` also resolves underlying_at_signal."""
+        payload = {**_PROD_OVERNIGHT_KHC}
+        del payload["prior_day_close"]
+        payload["previous_close"] = 25.04
+        result = normalize_raw_signal_payload(payload)
+        assert result["underlying_at_signal"] == 25.04
+
+    def test_prev_close_alias(self):
+        """`prev_close` short alias resolves underlying_at_signal."""
+        payload = {**_PROD_OVERNIGHT_KHC}
+        del payload["prior_day_close"]
+        payload["prev_close"] = 25.04
+        result = normalize_raw_signal_payload(payload)
+        assert result["underlying_at_signal"] == 25.04
+
+    def test_prior_close_alias(self):
+        """`prior_close` short alias resolves underlying_at_signal."""
+        payload = {**_PROD_OVERNIGHT_KHC}
+        del payload["prior_day_close"]
+        payload["prior_close"] = 25.04
+        result = normalize_raw_signal_payload(payload)
+        assert result["underlying_at_signal"] == 25.04
+
+    def test_input_not_mutated(self):
+        """Normalizer must not mutate the input payload."""
+        import copy
+        original = copy.deepcopy(_PROD_OVERNIGHT_KHC)
+        normalize_raw_signal_payload(_PROD_OVERNIGHT_KHC)
+        assert _PROD_OVERNIGHT_KHC == original, "Input dict was mutated"
+
+
+class TestNegativeNoUnderlyingAlias:
+    """Negative regression: when trigger is present but NO underlying alias exists,
+    underlying_at_signal must remain ABSENT — not written as 0 or any default.
+
+    This is the DATA_PENDING path.  The metadata guard in
+    ap/master_control_metadata_guard.py is responsible for classifying absent
+    underlying as DATA_PENDING and allowing overnight handoff without execution.
+    The normalizer must not pre-empt that by writing a zero or dummy value.
+    """
+
+    def test_underlying_absent_when_no_alias_present(self):
+        """Trigger present, but no underlying / price / last / close / mark /
+        prior_day_close — underlying_at_signal must NOT appear in result."""
+        payload = {
+            "signal_id":      "neg-no-underlying",
+            "ticker":         "XOM",
+            "side":           "CALL",
+            "direction":      "CALL",
+            "pattern":        "3-1-2",
+            "timeframe":      "1d",
+            "score":          70.0,
+            "client_id":      "jasoncosby1@gmail.com",
+            "execution_mode": "paper",
+            "trigger":        115.50,
+            # Deliberately no underlying, price, last, close, mark,
+            # prior_day_close, prev_close, previous_close, prior_close.
+        }
+        result = normalize_raw_signal_payload(payload)
+        val = result.get("underlying_at_signal")
+        assert val is None, (
+            f"underlying_at_signal must be absent when no alias is present, "
+            f"got {val!r}"
+        )
+
+    def test_zero_not_written_as_underlying(self):
+        """A field that exists but is 0 must not become underlying_at_signal."""
+        payload = {
+            "signal_id":      "neg-zero-close",
+            "ticker":         "XOM",
+            "side":           "CALL",
+            "trigger":        115.50,
+            "prior_day_close": 0,        # zero — must be rejected
+            "score":          70.0,
+        }
+        result = normalize_raw_signal_payload(payload)
+        val = result.get("underlying_at_signal")
+        assert val is None or val > 0, (
+            f"Zero prior_day_close must not be written as underlying_at_signal, got {val!r}"
+        )
+
+    def test_prior_day_high_and_low_alone_do_not_set_underlying(self):
+        """prior_day_high and prior_day_low are range bounds, not closing prices.
+        They must NEVER be written to underlying_at_signal even if they are the
+        only price-like fields in the payload."""
+        payload = {
+            "signal_id":      "neg-highs-lows-only",
+            "ticker":         "KHC",
+            "side":           "PUT",
+            "trigger":        24.02,
+            "prior_day_high": 25.40,
+            "prior_day_low":  24.70,
+            # No prior_day_close — only high and low present
+            "score":          72.0,
+        }
+        result = normalize_raw_signal_payload(payload)
+        val = result.get("underlying_at_signal")
+        assert val is None, (
+            f"prior_day_high/prior_day_low must NOT set underlying_at_signal, got {val!r}"
+        )
+
+    def test_data_pending_marker_not_written_by_normalizer(self):
+        """The normalizer must NOT write metadata_validation_status or any
+        DATA_PENDING marker — that is the metadata guard's responsibility."""
+        payload = {
+            "signal_id": "neg-no-underlying-2",
+            "ticker":    "XOM",
+            "side":      "CALL",
+            "trigger":   115.50,
+            "score":     70.0,
+        }
+        result = normalize_raw_signal_payload(payload)
+        assert "metadata_validation_status" not in result
+        assert "allowed_for_execution" not in result
+        assert "underlying_data_pending" not in result
