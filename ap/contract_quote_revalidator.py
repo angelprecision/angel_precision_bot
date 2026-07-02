@@ -33,12 +33,12 @@ Direct quote results are accepted ONLY if they pass the same hard rules:
   - bid > 0 AND ask > 0
   - ask >= bid (no inverted books)
   - spread within max_spread_pct
-  - mid >= min_premium / 100 and <= max_premium / 100
+  - premium within configured premium bounds
   - affordable at execution_price (ask for live, mid for paper)
 
 If the direct quote is missing or also returns zero, we reject with
-DIRECT_QUOTE_ZERO_BID_ASK or DIRECT_QUOTE_UNAVAILABLE — never accept a
-true-zero quote, never bypass spread/premium/capital limits.
+DIRECT_QUOTE_ZERO_BID_ASK or a structured DIRECT_QUOTE_* fetch reason —
+never accept a true-zero quote, never bypass spread/premium/capital limits.
 
 PR: hotfix/p0-direct-option-quote-revalidation
 """
@@ -64,7 +64,7 @@ log = logging.getLogger("angel.contract_quote_revalidator")
 # look bad.  Keeping this small keeps the Tradier rate-limit budget bounded.
 DEFAULT_REVALIDATE_TOP_N = int(os.getenv("CONTRACT_REVALIDATE_TOP_N", "5"))
 
-# Per-symbol cache so a single selector pass doesn't double-fetch.
+# Per-transport/per-symbol cache so a single selector pass doesn't double-fetch.
 # Cleared per process; tests can reset by calling clear_quote_cache().
 _QUOTE_CACHE: dict[str, tuple[float, dict]] = {}
 _CACHE_TTL_S = float(os.getenv("CONTRACT_REVALIDATE_CACHE_TTL_S", "3.0"))
@@ -74,12 +74,21 @@ REASON_CHAIN_ROW_ZERO_BID_ASK         = "CHAIN_ROW_ZERO_BID_ASK"
 REASON_DIRECT_QUOTE_ZERO_BID_ASK      = "DIRECT_QUOTE_ZERO_BID_ASK"
 REASON_DIRECT_QUOTE_RECOVERED_CHAIN_ZERO = "DIRECT_QUOTE_RECOVERED_CHAIN_ZERO"
 REASON_DIRECT_QUOTE_UNAVAILABLE       = "DIRECT_QUOTE_UNAVAILABLE"
+REASON_DIRECT_QUOTE_FETCH_TIMEOUT     = "DIRECT_QUOTE_FETCH_TIMEOUT"
+REASON_DIRECT_QUOTE_RATE_LIMITED      = "DIRECT_QUOTE_RATE_LIMITED"
+REASON_DIRECT_QUOTE_AUTH_FAILED       = "DIRECT_QUOTE_AUTH_FAILED"
+REASON_DIRECT_QUOTE_SERVER_ERROR      = "DIRECT_QUOTE_SERVER_ERROR"
 REASON_FINAL_CONTRACT_QUOTE_INVALID   = "FINAL_CONTRACT_QUOTE_INVALID"
 REASON_FINAL_SPREAD_TOO_WIDE          = "FINAL_SPREAD_TOO_WIDE"
 REASON_FINAL_CONTRACT_UNAFFORDABLE    = "FINAL_CONTRACT_UNAFFORDABLE"
 REASON_LIQUIDITY_BELOW_THRESHOLD      = "LIQUIDITY_BELOW_THRESHOLD"
 
-# Reasons that warrant direct quote revalidation
+# Reasons that warrant direct quote revalidation.
+#
+# NOTE: NO_CHAIN_DATA and NO_AFFORDABLE_CONTRACT are intentionally preserved here
+# for backward compatibility with the existing selector/tests. RQ4 should narrow
+# these in a separate behavior-changing PR because it changes which contracts get
+# a direct-quote repair attempt.
 _CHAIN_REJECT_REASONS_TO_REVALIDATE = frozenset({
     "zero_bid_or_ask",
     "bid_below_0.1",
@@ -132,41 +141,95 @@ def _now() -> float:
     return time.time()
 
 
-def fetch_direct_option_quote(
-    broker,
-    occ_symbol: str,
-    *,
-    cache_ttl_s: Optional[float] = None,
-) -> Optional[dict]:
-    """
-    Fetch a direct option quote for an OCC symbol via broker.get_quote().
-    Cached per-process for cache_ttl_s seconds.  Returns:
-      {
-        "bid": float|None, "ask": float|None, "last": float|None,
-        "bid_size": int|None, "ask_size": int|None,
-        "volume": int|None, "open_interest": int|None,
-        "quote_age_ms": int, "fetched_at": float,
-      }
-    Returns None on broker error or empty result.
-    """
-    ttl = cache_ttl_s if cache_ttl_s is not None else _CACHE_TTL_S
-    if not occ_symbol or broker is None:
-        return None
+def _broker_cache_identity(broker) -> str:
+    """Stable enough identity for direct-quote cache isolation.
 
-    cached = _QUOTE_CACHE.get(occ_symbol)
-    if cached and (_now() - cached[0]) < ttl:
-        return cached[1]
+    The same OCC symbol may be queried through live-data, paper/sandbox, or stub
+    transports inside one process. A symbol-only cache can accidentally share a
+    quote across those transports. Use the broker/cfg base_url when available,
+    then fall back to explicit source-ish attributes, then class name.
+    """
+    if broker is None:
+        return "none"
 
-    t0 = _now()
+    cfg = getattr(broker, "cfg", None)
+    for owner in (cfg, broker):
+        for attr in ("base_url", "quote_base_url", "data_base_url"):
+            value = getattr(owner, attr, None)
+            if value:
+                return str(value)
+
+    return type(broker).__name__
+
+
+def _cache_key_for(broker, occ_symbol: str) -> str:
+    return f"{_broker_cache_identity(broker)}:{occ_symbol}"
+
+
+def _exception_status_code(exc: Exception) -> Optional[int]:
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        response = getattr(exc, "response", None)
+        status = getattr(response, "status_code", None)
     try:
-        raw = broker.get_quote(occ_symbol) or {}
-    except Exception as e:
-        log.warning(
-            "fetch_direct_option_quote: broker.get_quote raised contract=%s err=%s",
-            occ_symbol, e,
-        )
+        return int(status) if status is not None else None
+    except (TypeError, ValueError):
         return None
 
+
+def _classify_direct_quote_exception(exc: Exception) -> dict:
+    """Map broker/HTTP exceptions into stable, queryable direct-quote reasons."""
+    endpoint = getattr(exc, "endpoint", None) or "/v1/markets/quotes"
+    status_code = _exception_status_code(exc)
+    reason_code = getattr(exc, "reason_code", None)
+    retryable = getattr(exc, "retryable", None)
+
+    if not reason_code:
+        name = type(exc).__name__.lower()
+        msg = str(exc).lower()
+
+        if "timeout" in name or "timeout" in msg or "timed out" in msg:
+            reason_code = REASON_DIRECT_QUOTE_FETCH_TIMEOUT
+        elif status_code in (401, 403):
+            reason_code = REASON_DIRECT_QUOTE_AUTH_FAILED
+        elif status_code == 429:
+            reason_code = REASON_DIRECT_QUOTE_RATE_LIMITED
+        elif status_code is not None and 500 <= status_code <= 599:
+            reason_code = REASON_DIRECT_QUOTE_SERVER_ERROR
+        else:
+            reason_code = REASON_DIRECT_QUOTE_UNAVAILABLE
+
+    if retryable is None:
+        retryable = reason_code in {
+            REASON_DIRECT_QUOTE_FETCH_TIMEOUT,
+            REASON_DIRECT_QUOTE_RATE_LIMITED,
+            REASON_DIRECT_QUOTE_SERVER_ERROR,
+        }
+
+    return {
+        "ok": False,
+        "quote": None,
+        "reason_code": str(reason_code),
+        "error": str(exc),
+        "endpoint": str(endpoint),
+        "status_code": status_code,
+        "retryable": bool(retryable),
+    }
+
+
+def _empty_quote_failure() -> dict:
+    return {
+        "ok": False,
+        "quote": None,
+        "reason_code": REASON_DIRECT_QUOTE_UNAVAILABLE,
+        "error": "empty quote payload",
+        "endpoint": "/v1/markets/quotes",
+        "status_code": None,
+        "retryable": None,
+    }
+
+
+def _normalize_quote(raw: dict, fetched_at: float, latency_ms: int) -> dict:
     def _f(v):
         try:
             return float(v) if v is not None else None
@@ -183,18 +246,138 @@ def fetch_direct_option_quote(
     ask = _f(raw.get("ask"))
     last = _f(raw.get("last"))
 
-    out = {
-        "bid":           bid,
-        "ask":           ask,
-        "last":          last,
-        "bid_size":      _i(raw.get("bidsize") or raw.get("bid_size")),
-        "ask_size":      _i(raw.get("asksize") or raw.get("ask_size")),
-        "volume":        _i(raw.get("volume")),
-        "open_interest": _i(raw.get("open_interest")),
-        "quote_age_ms":  int((_now() - t0) * 1000),
-        "fetched_at":    t0,
+    return {
+        "bid":                  bid,
+        "ask":                  ask,
+        "last":                 last,
+        "bid_size":             _i(raw.get("bidsize") or raw.get("bid_size")),
+        "ask_size":             _i(raw.get("asksize") or raw.get("ask_size")),
+        "volume":               _i(raw.get("volume")),
+        "open_interest":        _i(raw.get("open_interest")),
+        # Backward-compatible name. This is not exchange quote age.
+        "quote_age_ms":         latency_ms,
+        "fetched_at":           fetched_at,
+        # Explicit names for the true semantics.
+        "quote_fetch_latency_ms": latency_ms,
+        "quote_fetched_at":       fetched_at,
+        "quote_age_semantics":    "fetch_latency_not_exchange_age",
+        "_quote_payload_empty":   not bool(raw),
     }
-    _QUOTE_CACHE[occ_symbol] = (t0, out)
+
+
+def fetch_direct_option_quote_with_meta(
+    broker,
+    occ_symbol: str,
+    *,
+    cache_ttl_s: Optional[float] = None,
+) -> dict:
+    """
+    Fetch a direct option quote and preserve structured broker failure metadata.
+
+    Returns:
+      {
+        "ok": bool,
+        "quote": dict | None,
+        "reason_code": str | None,
+        "error": str | None,
+        "endpoint": str,
+        "status_code": int | None,
+        "retryable": bool | None,
+      }
+
+    Unlike fetch_direct_option_quote(), empty broker payloads are treated as a
+    structured DIRECT_QUOTE_UNAVAILABLE for callers making a decision.
+    """
+    ttl = cache_ttl_s if cache_ttl_s is not None else _CACHE_TTL_S
+    if not occ_symbol or broker is None:
+        return _empty_quote_failure()
+
+    cache_key = _cache_key_for(broker, occ_symbol)
+    cached = _QUOTE_CACHE.get(cache_key)
+    if cached and (_now() - cached[0]) < ttl:
+        quote = cached[1]
+        if quote.get("_quote_payload_empty"):
+            return _empty_quote_failure()
+        return {
+            "ok": True,
+            "quote": quote,
+            "reason_code": None,
+            "error": None,
+            "endpoint": "/v1/markets/quotes",
+            "status_code": None,
+            "retryable": None,
+        }
+
+    t0 = _now()
+    try:
+        raw = broker.get_quote(occ_symbol) or {}
+    except Exception as e:
+        log.warning(
+            "fetch_direct_option_quote: broker.get_quote raised contract=%s err=%s",
+            occ_symbol, e,
+        )
+        return _classify_direct_quote_exception(e)
+
+    latency_ms = int((_now() - t0) * 1000)
+    quote = _normalize_quote(raw, t0, latency_ms)
+    _QUOTE_CACHE[cache_key] = (t0, quote)
+
+    if quote.get("_quote_payload_empty"):
+        return _empty_quote_failure()
+
+    return {
+        "ok": True,
+        "quote": quote,
+        "reason_code": None,
+        "error": None,
+        "endpoint": "/v1/markets/quotes",
+        "status_code": None,
+        "retryable": None,
+    }
+
+
+def fetch_direct_option_quote(
+    broker,
+    occ_symbol: str,
+    *,
+    cache_ttl_s: Optional[float] = None,
+) -> Optional[dict]:
+    """
+    Fetch a direct option quote for an OCC symbol via broker.get_quote().
+    Cached per-process for cache_ttl_s seconds.  Returns:
+      {
+        "bid": float|None, "ask": float|None, "last": float|None,
+        "bid_size": int|None, "ask_size": int|None,
+        "volume": int|None, "open_interest": int|None,
+        "quote_age_ms": int, "fetched_at": float,
+        "quote_fetch_latency_ms": int, "quote_fetched_at": float,
+        "quote_age_semantics": "fetch_latency_not_exchange_age",
+      }
+    Returns None on broker error. Empty broker payloads retain backward-compatible
+    behavior and return a normalized quote with None bid/ask.
+    """
+    ttl = cache_ttl_s if cache_ttl_s is not None else _CACHE_TTL_S
+    if not occ_symbol or broker is None:
+        return None
+
+    cache_key = _cache_key_for(broker, occ_symbol)
+    cached = _QUOTE_CACHE.get(cache_key)
+    if cached and (_now() - cached[0]) < ttl:
+        return cached[1]
+
+    t0 = _now()
+    try:
+        raw = broker.get_quote(occ_symbol) or {}
+    except Exception as e:
+        log.warning(
+            "fetch_direct_option_quote: broker.get_quote raised contract=%s err=%s",
+            occ_symbol, e,
+        )
+        return None
+
+    latency_ms = int((_now() - t0) * 1000)
+    out = _normalize_quote(raw, t0, latency_ms)
+    _QUOTE_CACHE[cache_key] = (t0, out)
     return out
 
 
@@ -242,6 +425,9 @@ def revalidate_with_direct_quote(
           "direct_ask":  float|None,
           "direct_mid":  float|None,
           "direct_quote_age_ms": int|None,
+          "direct_quote_fetch_latency_ms": int|None,
+          "direct_quote_fetched_at": float|None,
+          "direct_quote_age_semantics": str|None,
           "contract_quote_source": "chain"|"direct"|"none",
         }
       }
@@ -256,13 +442,20 @@ def revalidate_with_direct_quote(
     chain_bid = opt.get("bid")
     chain_ask = opt.get("ask")
     audit_base = {
-        "chain_bid":             chain_bid,
-        "chain_ask":             chain_ask,
-        "direct_bid":            None,
-        "direct_ask":            None,
-        "direct_mid":            None,
-        "direct_quote_age_ms":   None,
-        "contract_quote_source": "chain",
+        "chain_bid":                       chain_bid,
+        "chain_ask":                       chain_ask,
+        "direct_bid":                      None,
+        "direct_ask":                      None,
+        "direct_mid":                      None,
+        "direct_quote_age_ms":             None,
+        "direct_quote_fetch_latency_ms":   None,
+        "direct_quote_fetched_at":         None,
+        "direct_quote_age_semantics":      None,
+        "direct_quote_error":              None,
+        "direct_quote_endpoint":           None,
+        "direct_quote_status_code":        None,
+        "direct_quote_retryable":          None,
+        "contract_quote_source":           "chain",
     }
 
     if not should_revalidate(chain_reject_reason):
@@ -294,20 +487,30 @@ def revalidate_with_direct_quote(
             "audit":             audit_base,
         }
 
-    quote = fetch_direct_option_quote(broker, occ)
-    if quote is None:
+    quote_meta = fetch_direct_option_quote_with_meta(broker, occ)
+    if not quote_meta.get("ok"):
+        audit = dict(audit_base)
+        audit["direct_quote_error"] = quote_meta.get("error")
+        audit["direct_quote_endpoint"] = quote_meta.get("endpoint")
+        audit["direct_quote_status_code"] = quote_meta.get("status_code")
+        audit["direct_quote_retryable"] = quote_meta.get("retryable")
+        audit["contract_quote_source"] = "none"
         return {
             "action":            "REJECT_UNAVAILABLE",
-            "reason_code":       REASON_DIRECT_QUOTE_UNAVAILABLE,
+            "reason_code":       quote_meta.get("reason_code") or REASON_DIRECT_QUOTE_UNAVAILABLE,
             "direct_quote_used": False,
             "opt_updated":       None,
-            "audit":             audit_base,
+            "audit":             audit,
         }
 
+    quote = quote_meta.get("quote")
     audit = dict(audit_base)
-    audit["direct_bid"]          = quote.get("bid")
-    audit["direct_ask"]          = quote.get("ask")
-    audit["direct_quote_age_ms"] = quote.get("quote_age_ms")
+    audit["direct_bid"]                    = quote.get("bid")
+    audit["direct_ask"]                    = quote.get("ask")
+    audit["direct_quote_age_ms"]           = quote.get("quote_age_ms")
+    audit["direct_quote_fetch_latency_ms"] = quote.get("quote_fetch_latency_ms")
+    audit["direct_quote_fetched_at"]       = quote.get("quote_fetched_at")
+    audit["direct_quote_age_semantics"]    = quote.get("quote_age_semantics")
     if quote.get("bid") is not None and quote.get("ask") is not None:
         try:
             audit["direct_mid"] = (float(quote["bid"]) + float(quote["ask"])) / 2.0
@@ -334,10 +537,13 @@ def revalidate_with_direct_quote(
         patched["volume"] = quote["volume"]
     if quote.get("open_interest") is not None and (patched.get("open_interest") in (None, 0)):
         patched["open_interest"] = quote["open_interest"]
-    patched["_direct_quote_used"]   = True
+    patched["_direct_quote_used"] = True
     patched["_direct_quote_age_ms"] = quote.get("quote_age_ms")
-    patched["_chain_bid"]           = chain_bid
-    patched["_chain_ask"]           = chain_ask
+    patched["_direct_quote_fetch_latency_ms"] = quote.get("quote_fetch_latency_ms")
+    patched["_direct_quote_fetched_at"] = quote.get("quote_fetched_at")
+    patched["_direct_quote_age_semantics"] = quote.get("quote_age_semantics")
+    patched["_chain_bid"] = chain_bid
+    patched["_chain_ask"] = chain_ask
 
     audit["contract_quote_source"] = "direct"
     return {
@@ -378,18 +584,32 @@ def final_quote_check_before_submit(
         "final_last": float | None,
         "spread_pct": float | None,
         "quote_age_ms": int | None,
+        "quote_fetch_latency_ms": int | None,
+        "quote_fetched_at": float | None,
+        "quote_age_semantics": str | None,
+        "pricing_basis": "ASK_EXECUTION" | "MID_SIMULATION",
+        "execution_price": float | None,
+        "execution_cost": float | None,
+        "qty": int,
       }
 
     Hard rejects on:
       - missing/invalid quote                → FINAL_CONTRACT_QUOTE_INVALID
       - bid <= 0 or ask <= 0 or ask < bid    → FINAL_CONTRACT_QUOTE_INVALID
       - spread_pct > max_spread_pct          → FINAL_SPREAD_TOO_WIDE
-      - premium < min_premium                → FINAL_CONTRACT_QUOTE_INVALID
-      - premium > max_premium                → FINAL_CONTRACT_UNAFFORDABLE
-      - execution_price * 100 > budget_usd   → FINAL_CONTRACT_UNAFFORDABLE
+      - execution-basis premium < min        → FINAL_CONTRACT_QUOTE_INVALID
+      - execution-basis premium > max        → FINAL_CONTRACT_UNAFFORDABLE
+      - execution_price * 100 * qty > budget → FINAL_CONTRACT_UNAFFORDABLE
 
     Never bypasses any of these for any reason.
     """
+    try:
+        _qty = max(1, int(qty))
+    except (TypeError, ValueError):
+        _qty = 1
+
+    pricing_basis = "ASK_EXECUTION" if is_live else "MID_SIMULATION"
+
     _null_qf = {
         "final_bid":   None,
         "final_ask":   None,
@@ -397,17 +617,30 @@ def final_quote_check_before_submit(
         "final_last":  None,
         "spread_pct":  None,
         "quote_age_ms": None,
+        "quote_fetch_latency_ms": None,
+        "quote_fetched_at": None,
+        "quote_age_semantics": "fetch_latency_not_exchange_age",
+        "pricing_basis": pricing_basis,
+        "execution_price": None,
+        "execution_cost": None,
+        "qty": _qty,
     }
 
-    quote = fetch_direct_option_quote(broker, contract, cache_ttl_s=0.0)
-    if quote is None:
+    quote_meta = fetch_direct_option_quote_with_meta(broker, contract, cache_ttl_s=0.0)
+    if not quote_meta.get("ok"):
         return {
             "ok":          False,
             "reason_code": REASON_FINAL_CONTRACT_QUOTE_INVALID,
             "explanation": "final pre-submit quote unavailable",
+            "quote_fetch_reason_code": quote_meta.get("reason_code") or REASON_DIRECT_QUOTE_UNAVAILABLE,
+            "quote_fetch_error": quote_meta.get("error"),
+            "quote_fetch_endpoint": quote_meta.get("endpoint"),
+            "quote_fetch_status_code": quote_meta.get("status_code"),
+            "quote_fetch_retryable": quote_meta.get("retryable"),
             **_null_qf,
         }
 
+    quote = quote_meta.get("quote")
     bid = quote.get("bid")
     ask = quote.get("ask")
     last = quote.get("last")
@@ -423,11 +656,21 @@ def final_quote_check_before_submit(
             "final_last":  last,
             "spread_pct":  None,
             "quote_age_ms": quote.get("quote_age_ms"),
+            "quote_fetch_latency_ms": quote.get("quote_fetch_latency_ms"),
+            "quote_fetched_at": quote.get("quote_fetched_at"),
+            "quote_age_semantics": quote.get("quote_age_semantics"),
+            "pricing_basis": pricing_basis,
+            "execution_price": None,
+            "execution_cost": None,
+            "qty": _qty,
         }
 
     bid_f, ask_f = float(bid), float(ask)
     mid = (bid_f + ask_f) / 2.0
     spread_pct = (ask_f - bid_f) / mid if mid > 0 else None
+    execution_price = ask_f if is_live else mid
+    execution_cost = execution_price * 100.0 * _qty
+    premium_per_contract = execution_price * 100.0
 
     qf = {
         "final_bid":    bid_f,
@@ -436,6 +679,13 @@ def final_quote_check_before_submit(
         "final_last":   last,
         "spread_pct":   spread_pct,
         "quote_age_ms": quote.get("quote_age_ms"),
+        "quote_fetch_latency_ms": quote.get("quote_fetch_latency_ms"),
+        "quote_fetched_at": quote.get("quote_fetched_at"),
+        "quote_age_semantics": quote.get("quote_age_semantics"),
+        "pricing_basis": pricing_basis,
+        "execution_price": execution_price,
+        "execution_cost": execution_cost,
+        "qty": _qty,
     }
 
     if spread_pct is not None and spread_pct > max_spread_pct:
@@ -446,7 +696,6 @@ def final_quote_check_before_submit(
             **qf,
         }
 
-    premium_per_contract = mid * 100.0
     if premium_per_contract < min_premium:
         return {
             "ok":          False,
@@ -462,11 +711,8 @@ def final_quote_check_before_submit(
             **qf,
         }
 
-    # FIX 3: validate full order cost (qty contracts) against budget.
+    # Validate full order cost (qty contracts) against budget.
     # execution_cost = execution_price * 100 * qty
-    _qty = max(1, int(qty))
-    execution_price = ask_f if is_live else mid
-    execution_cost  = execution_price * 100.0 * _qty
     if execution_cost > budget_usd:
         return {
             "ok":          False,
