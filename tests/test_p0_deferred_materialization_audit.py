@@ -662,6 +662,15 @@ def test_osm_hydration_write_path_is_in_place_and_guarded():
     assert "contract_selection_status = %s" in src
     assert "qty = %s" in src
     assert 'current_status not in {"PENDING_TRIGGER", "CREATED"}' in src or 'current_status not in {\\"PENDING_TRIGGER\\", \\"CREATED\\"}' in src
+    assert '"contract_materialized_source": "prebreach_hydration"' in src
+
+
+def test_execution_core_bridges_hydrated_order_row_before_deferred_selection():
+    src = open("ap_execution_core.py", "r").read()
+    assert "_refresh_hydrated_prebreach_plan(" in src
+    assert "PREBREACH_HYDRATION_BRIDGE_APPLIED" in src
+    assert 'sig["contract_deferred"] = False' in src
+    assert 'sig["contract_materialized_source"] = "prebreach_hydration"' in src
 
 
 def test_dashboard_read_model_hides_deferred_point_zero_one_limit():

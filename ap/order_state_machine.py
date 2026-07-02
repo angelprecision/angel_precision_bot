@@ -1638,6 +1638,16 @@ class APOrderStateMachine:
                 **deferred_hydration,
             }
         }
+        if success:
+            meta_patch.update({
+                "selected_contract": str(contract) if contract else None,
+                "contract_symbol": str(contract) if contract else None,
+                "limit_price": float(limit_price) if limit_price is not None else None,
+                "contracts": int(qty) if qty is not None else None,
+                "max_position_usd": float(reserved_cost) if reserved_cost is not None else None,
+                "reserved_cost": float(reserved_cost) if reserved_cost is not None else None,
+                "contract_materialized_source": "prebreach_hydration",
+            })
 
         try:
             meta_json = _json_local.dumps(meta_patch, default=str)
