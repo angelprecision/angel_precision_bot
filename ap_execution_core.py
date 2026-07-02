@@ -83,8 +83,56 @@ RETRYABLE_BREACH_SELECTOR_REASONS: frozenset = frozenset({
     "DIRECT_QUOTE_ZERO_BID_ASK",        # direct OCC quote came back zero — 2nd top failure on Jason LIVE
     "QUOTE_FETCH_FAILED",               # quote endpoint returned an error/timeout
     "CHAIN_EMPTY",                      # historical variant emitted when chain returns no rows
-    "NO_VALID_PLAYBOOK_DTE_CONTRACT",   # ladder-level: all DTE buckets exhausted with transient failures
+    # NOTE: NO_VALID_PLAYBOOK_DTE_CONTRACT is intentionally excluded here.
+    # It is the DTE-ladder aggregation reason and may reflect structural quality
+    # rejects (OI_TOO_LOW, SPREAD_TOO_WIDE) as well as transient data-miss reasons.
+    # When the ladder emits it, execution_core inspects the dte_ladder_audit to
+    # determine whether the exhaustion came from data-miss (retryable) or quality
+    # rejects (terminal). See _is_ladder_exhaustion_retryable() below.
 })
+
+
+def _is_ladder_exhaustion_retryable(ladder_audit: Optional[dict]) -> bool:
+    """Determine whether a NO_VALID_PLAYBOOK_DTE_CONTRACT exhaustion is retryable.
+
+    Called only when the top-level selector reason_code is
+    NO_VALID_PLAYBOOK_DTE_CONTRACT (the DTE ladder ran but found no quality
+    survivor across all probed buckets). Retrying makes sense only when the
+    per-bucket rejections were all data-miss signals, not structural quality
+    verdicts that would fail again regardless of when we retry.
+
+    Logic:
+      - Retryable if ALL probed expirations failed with a code in
+        RETRYABLE_BREACH_SELECTOR_REASONS.
+      - Terminal if ANY probed expiration failed with a structural quality
+        code (OI_TOO_LOW, SPREAD_TOO_WIDE, BID_BELOW_MIN, etc.) — those
+        verdicts are contract-level and will not improve on a retry.
+      - Unknown / missing audit → conservative return of False (do not retry;
+        prefer to terminalize rather than loop on unknown failure).
+    """
+    if not isinstance(ladder_audit, dict):
+        return False
+    buckets_attempted = ladder_audit.get("buckets_attempted") or []
+    if not buckets_attempted:
+        return False
+
+    saw_any_retryable = False
+    for bucket in buckets_attempted:
+        for exp_rec in bucket.get("expirations_probed") or []:
+            _sub_fail = exp_rec.get("failure") or {}
+            _rc = str(_sub_fail.get("reason_code") or "").strip().upper()
+            if not _rc:
+                continue
+            if _rc not in RETRYABLE_BREACH_SELECTOR_REASONS:
+                # Any structural/quality/terminal reject means the exhaustion
+                # is not purely data-miss — do not retry.
+                return False
+            saw_any_retryable = True
+
+    # If we only saw retryable data-miss reasons (or no per-exp reason_code at
+    # all), allow the retry so the ladder gets a fresh chance after the delay.
+    return saw_any_retryable
+
 
 # ── Mode metadata thresholds ────────────────────────────────────────────────
 # PR-B / FIX-8: floors are now env-overridable so they can be tuned
@@ -1428,6 +1476,22 @@ class APExecutionCore:
                         _deferred_selector_audit.get("reason_code")
                         or "BREACH_SELECTOR_RETURNED_NONE"
                     )
+                    # PR #219 Fix C: NO_VALID_PLAYBOOK_DTE_CONTRACT is the DTE
+                    # ladder aggregation code. Retrying makes sense only when
+                    # the per-bucket failures were all data-miss signals. Inspect
+                    # the ladder audit to decide, never treat it as unconditionally
+                    # retryable.
+                    _obs_rc_is_ladder_exhaustion = (
+                        _obs_rc_a == "NO_VALID_PLAYBOOK_DTE_CONTRACT"
+                    )
+                    _ladder_audit_for_retry = (
+                        _deferred_selector_audit.get("last_dte_ladder_audit") or {}
+                    )
+                    _ladder_exhaustion_is_retryable = (
+                        _is_ladder_exhaustion_retryable(_ladder_audit_for_retry)
+                        if _obs_rc_is_ladder_exhaustion
+                        else False
+                    )
                     _prior_attempt_a = 0
                     try:
                         _prior_attempt_a = int(
@@ -1457,7 +1521,10 @@ class APExecutionCore:
                     _is_retryable_a     = (
                         _retry_enabled_a
                         and bool(queue_local_order_id)
-                        and _obs_rc_a in RETRYABLE_BREACH_SELECTOR_REASONS
+                        and (
+                            _obs_rc_a in RETRYABLE_BREACH_SELECTOR_REASONS
+                            or _ladder_exhaustion_is_retryable
+                        )
                         and _this_attempt_a <= _MAX_RETRIES_A
                         and not _past_cutoff_a
                     )
@@ -1529,9 +1596,51 @@ class APExecutionCore:
                         _watched_ref = watched
                         def _retry_deferred_breach_a(_w=_watched_ref, _t=ticker,
                                                       _att=_this_attempt_a, _d=_RETRY_DELAY_A,
-                                                      _retry_key=_retry_key_a):
+                                                      _retry_key=_retry_key_a,
+                                                      _oid=queue_local_order_id):
                             try:
                                 time.sleep(_d)
+                                # PR #219 Fix B: stale-state guard.
+                                # Between the first _on_entry_trigger call and now, the
+                                # pending entry row may have been terminalized externally:
+                                # - order_monitor EOD cleanup / cancel
+                                # - watcher expiry from a separate watcher poll
+                                # - a concurrent retry thread that already succeeded
+                                # - manual operator DB update
+                                # Re-entering _on_entry_trigger on a non-PENDING_TRIGGER
+                                # row causes duplicate OSM transitions, phantom broker
+                                # submits, or worst-case a double-fill on Jason's LIVE
+                                # account. Abort if the order is no longer in a
+                                # retry-eligible state.
+                                if _oid:
+                                    try:
+                                        _stale_check_osm = getattr(self, "order_state_machine", None)
+                                        _stale_check_fn = getattr(_stale_check_osm, "get_order", None)
+                                        if callable(_stale_check_fn):
+                                            _stale_row = _stale_check_fn(_oid)
+                                            if isinstance(_stale_row, dict):
+                                                _current_status = str(
+                                                    _stale_row.get("status") or ""
+                                                ).upper()
+                                                if _current_status not in {
+                                                    "PENDING_TRIGGER",
+                                                    "CREATED",
+                                                }:
+                                                    log.warning(
+                                                        "[%s] DEFERRED_BREACH_RETRY_STALE_STATE_ABORT "
+                                                        "order=%s status=%s attempt=%d — order is "
+                                                        "no longer retry-eligible; aborting retry thread",
+                                                        _t, _oid, _current_status, _att,
+                                                    )
+                                                    return
+                                    except Exception as _stale_exc:
+                                        # stale check is best-effort — if it fails, proceed
+                                        # with the retry (the alternative is silent skip)
+                                        log.debug(
+                                            "[%s] DEFERRED_BREACH_RETRY stale-state check failed "
+                                            "(non-fatal, proceeding): %s",
+                                            _t, _stale_exc,
+                                        )
                                 log.info(
                                     "[%s] DEFERRED_BREACH_RETRY firing attempt=%d",
                                     _t, _att,
@@ -2173,57 +2282,86 @@ class APExecutionCore:
             )
             if not _confirm_result.passed:
                 _fail_reason = _confirm_result.fail_reason or "entry_confirm_failed"
-                log.info(
-                    "[%s] ENTRY_CONFIRM_BLOCK — %s | client=%s | "
-                    "spread=%.3f fade=%.2f reversal=%.3f age=%.1fs",
-                    ticker, _fail_reason,
-                    str(watched.signal.get("client_id", "?") if watched.signal else "?"),
-                    float(_confirm_meta.get("spread_pct") or 0),
-                    float(_confirm_meta.get("option_move_pct") or 0),
-                    float(_confirm_meta.get("underlying_move_pct") or 0),
-                    float(_confirm_meta.get("quote_age_seconds") or 0),
+
+                # PR #219 Fix A: observe-only daily continuation must NOT terminalize.
+                # When daily_continuation_mode="observe" and the fail reason is a
+                # daily_continuation_failed:<> code, this is a non-blocking observation
+                # signal — the submit path must continue. Only enforce-mode and
+                # non-continuation failures should expire the pending entry.
+                _observe_only_daily_continuation = (
+                    _confirm_meta.get("daily_continuation_mode") == "observe"
+                    and str(_fail_reason).startswith("daily_continuation_failed")
                 )
-                funnel.inc("entry_confirm_blocked")
-                if signal_id:
-                    # Only write to known ap_signals columns — no unknown fields
-                    self.store.update_signal_fields(signal_id, {
-                        "decision_status": "blocked_at_breach",
-                        "context_notes":   _fail_reason,
-                    })
-                if queue_local_order_id and hasattr(self.order_state_machine, "update_order_meta"):
+
+                if _observe_only_daily_continuation:
+                    log.warning(
+                        "[%s] ENTRY_CONFIRM_OBSERVED — daily continuation would block "
+                        "in enforce mode but observe mode is active; submit will "
+                        "continue | reason=%s",
+                        ticker, _fail_reason,
+                    )
+                    # Persist confirmation meta for observability without blocking.
+                    if queue_local_order_id and hasattr(self.order_state_machine, "update_order_meta"):
+                        try:
+                            self.order_state_machine.update_order_meta(
+                                queue_local_order_id, {"entry_confirmation": _confirm_meta})
+                        except Exception:
+                            pass
+                    # Fall through to broker submit — do NOT cleanup, expire, or
+                    # write blocked_at_breach.
+
+                else:
+                    log.info(
+                        "[%s] ENTRY_CONFIRM_BLOCK — %s | client=%s | "
+                        "spread=%.3f fade=%.2f reversal=%.3f age=%.1fs",
+                        ticker, _fail_reason,
+                        str(watched.signal.get("client_id", "?") if watched.signal else "?"),
+                        float(_confirm_meta.get("spread_pct") or 0),
+                        float(_confirm_meta.get("option_move_pct") or 0),
+                        float(_confirm_meta.get("underlying_move_pct") or 0),
+                        float(_confirm_meta.get("quote_age_seconds") or 0),
+                    )
+                    funnel.inc("entry_confirm_blocked")
+                    if signal_id:
+                        # Only write to known ap_signals columns — no unknown fields
+                        self.store.update_signal_fields(signal_id, {
+                            "decision_status": "blocked_at_breach",
+                            "context_notes":   _fail_reason,
+                        })
+                    if queue_local_order_id and hasattr(self.order_state_machine, "update_order_meta"):
+                        try:
+                            self.order_state_machine.update_order_meta(
+                                queue_local_order_id, {"entry_confirmation": _confirm_meta})
+                        except Exception:
+                            pass
+                    self._cleanup_pending_entry_order(
+                        watched,
+                        action="expire",
+                        reason=_fail_reason,
+                    )
+                    # PR81 Final Amendment v2 §3: ENTRY_CONFIRMATION_FAILED ledger write.
                     try:
-                        self.order_state_machine.update_order_meta(
-                            queue_local_order_id, {"entry_confirmation": _confirm_meta})
+                        from ap.opportunity_ledger import (
+                            update_opportunity, STAGE_ENTRY_CONFIRMATION,
+                        )
+                        _client_id_for_ledger = str(
+                            watched.signal.get("client_id") if watched.signal else ""
+                        ) or getattr(self, "client_id", "")
+                        _canon = str(
+                            (watched.signal or {}).get("canonical_signal_id") or signal_id
+                        )
+                        update_opportunity(
+                            signal_id or _canon, _client_id_for_ledger,
+                            "ENTRY_CONFIRMATION_FAILED",
+                            canonical_signal_id=_canon,
+                            miss_stage=STAGE_ENTRY_CONFIRMATION,
+                            miss_reason=_fail_reason,
+                            order_local_id=str(queue_local_order_id) if queue_local_order_id else None,
+                            entry_confirmation_result=_fail_reason,
+                        )
                     except Exception:
                         pass
-                self._cleanup_pending_entry_order(
-                    watched,
-                    action="expire",
-                    reason=_fail_reason,
-                )
-                # PR81 Final Amendment v2 §3: ENTRY_CONFIRMATION_FAILED ledger write.
-                try:
-                    from ap.opportunity_ledger import (
-                        update_opportunity, STAGE_ENTRY_CONFIRMATION,
-                    )
-                    _client_id_for_ledger = str(
-                        watched.signal.get("client_id") if watched.signal else ""
-                    ) or getattr(self, "client_id", "")
-                    _canon = str(
-                        (watched.signal or {}).get("canonical_signal_id") or signal_id
-                    )
-                    update_opportunity(
-                        signal_id or _canon, _client_id_for_ledger,
-                        "ENTRY_CONFIRMATION_FAILED",
-                        canonical_signal_id=_canon,
-                        miss_stage=STAGE_ENTRY_CONFIRMATION,
-                        miss_reason=_fail_reason,
-                        order_local_id=str(queue_local_order_id) if queue_local_order_id else None,
-                        entry_confirmation_result=_fail_reason,
-                    )
-                except Exception:
-                    pass
-                return   # NO BROKER SUBMIT
+                    return   # NO BROKER SUBMIT
         except ImportError:
             # When confirmation_required=True, a missing module is NOT safe to skip.
             # Client-eligible trades must not bypass confirmation — fail closed.

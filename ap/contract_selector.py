@@ -2284,15 +2284,24 @@ class APContractSelectionEngine:
             audit["bucket_order"] = order
             today = date.today()
 
-            # Terminal non-DTE reason codes that the ladder must NEVER overwrite
-            # with NO_VALID_PLAYBOOK_DTE_CONTRACT. A code is terminal-non-DTE
-            # when the same verdict holds regardless of which expiration is tried.
+            # Terminal non-DTE reason codes: a verdict that cannot improve by
+            # trying another expiration. The ladder stops immediately when one
+            # is seen because probing further buckets is pointless AND risks
+            # masking the true blocker reason.
+            #
+            # CRITICALLY these must be true non-DTE blockers only — system
+            # or account-level verdicts that hold regardless of expiration.
+            # Quality codes like OI_TOO_LOW / SPREAD_TOO_WIDE are NOT here
+            # because a different expiration might pass those gates; they go
+            # into _preserved_quality instead so probing continues.
             _TERMINAL_NON_DTE = {
                 "EARNINGS_LOCKOUT", "EARNINGS_GUARD_ERROR",
                 "INVALID_PLAN", "UNSUPPORTED_INDEX_MAPPING",
                 "CHAIN_AUTH_ERROR",
                 "CHAIN_PROVIDER_EMPTY_EXPIRATIONS",
-                "NO_CHAIN_DATA",
+                "UNTRADEABLE_FOR_ACCOUNT_SIZE",
+                "DELTA_OUT_OF_RANGE",
+                "PREMIUM_CAP_EXCEEDED",
             }
             _RETRYABLE_DATA_REASONS = {
                 "CHAIN_PROVIDER_ERROR",
@@ -2300,6 +2309,11 @@ class APContractSelectionEngine:
                 "CHAIN_PARSE_EMPTY",
                 "NO_EXPIRATION_IN_DTE_WINDOW",
                 "NO_CHAIN_DATA",
+                "CHAIN_ROW_ZERO_BID_ASK",
+                "DIRECT_QUOTE_ZERO_BID_ASK",
+                "QUOTE_FETCH_FAILED",
+                "CHAIN_EMPTY",
+                "DIRECT_QUOTE_UNAVAILABLE",
             }
             _preserved_terminal = None
             _preserved_retryable = None
@@ -2314,18 +2328,41 @@ class APContractSelectionEngine:
                     except Exception:
                         _dte = None
                     result = self.select(plan, expiration_override=exp)
-                    # Capture a terminal non-DTE rejection from this sub-call so
-                    # the ladder can preserve it rather than masking it.
                     _sub_fail = self._last_failure
                     if result is None and isinstance(_sub_fail, dict):
                         _reason_code = _sub_fail.get("reason_code")
                         if _reason_code in _TERMINAL_NON_DTE:
+                            # True non-DTE terminal — stop laddering immediately.
                             _preserved_terminal = dict(_sub_fail)
+                            # Record the exp so audit has the failure
+                            bucket_rec["expirations_probed"].append({
+                                "exp": exp, "dte": _dte, "hit": False,
+                                "failure": dict(_sub_fail),
+                            })
+                            audit["buckets_attempted"].append(bucket_rec)
+                            # Short-circuit everything.
+                            self._last_failure = _preserved_terminal
+                            self._last_dte_ladder_audit = audit
+                            log.warning(
+                                "[%s] DTE_LADDER_TERMINAL_NON_DTE preserved reason=%s "
+                                "— stopping ladder immediately (non-DTE verdict)",
+                                ticker, _preserved_terminal.get("reason_code"),
+                            )
+                            return None
                         elif _reason_code in _RETRYABLE_DATA_REASONS:
-                            _preserved_retryable = dict(_sub_fail)
+                            # Data miss — keep probing, remember this as a candidate
+                            # for preservation if no quality reason appears.
+                            if _preserved_retryable is None:
+                                _preserved_retryable = dict(_sub_fail)
                         elif _reason_code:
+                            # Quality reject (OI_TOO_LOW, SPREAD_TOO_WIDE, etc.)
+                            # Keep probing — a different expiration might pass.
+                            # Remember the most specific quality reason seen.
                             _preserved_quality = dict(_sub_fail)
-                    bucket_rec["expirations_probed"].append({"exp": exp, "dte": _dte, "hit": result is not None})
+                    bucket_rec["expirations_probed"].append({
+                        "exp": exp, "dte": _dte, "hit": result is not None,
+                        "failure": dict(_sub_fail) if result is None and isinstance(_sub_fail, dict) else None,
+                    })
                     if result is not None:
                         bucket_rec["survivor"] = True
                         audit["buckets_attempted"].append(bucket_rec)
@@ -2339,35 +2376,32 @@ class APContractSelectionEngine:
                         )
                         return result
                 audit["buckets_attempted"].append(bucket_rec)
-                # If a terminal non-DTE reason was hit, stop laddering — probing
-                # further buckets is pointless (the verdict is ticker-level) and
-                # risks masking the true reason.
-                if _preserved_terminal is not None:
-                    break
 
-            # All buckets exhausted (or short-circuited on a terminal non-DTE
-            # reason). Preserve a terminal non-DTE reason if one was seen;
-            # otherwise record the DTE-ladder exhaustion reason.
+            # All buckets exhausted. Priority for final reason preservation:
+            #   1. Retryable data-miss — upstream retry loop will re-probe after delay.
+            #   2. Quality reject — true contract-quality blocker; preserve the most
+            #      specific quality reason so dashboards show the real gate, not
+            #      the ladder-aggregation NO_VALID_PLAYBOOK_DTE_CONTRACT.
+            #   3. NO_VALID_PLAYBOOK_DTE_CONTRACT — fallback when no specific reason
+            #      was captured (empty chain, ladder never got any sub-failure).
+            #
+            # NOTE: _preserved_terminal is handled above via early return; it
+            # should be None here.
             self._last_dte_ladder_audit = audit
-            if _preserved_terminal is not None:
-                self._last_failure = _preserved_terminal
+            if _preserved_retryable is not None:
+                self._last_failure = _preserved_retryable
                 log.warning(
-                    "[%s] DTE_LADDER_TERMINAL_NON_DTE preserved reason=%s — not masking with NO_VALID_PLAYBOOK_DTE_CONTRACT",
-                    ticker, _preserved_terminal.get("reason_code"),
+                    "[%s] DTE_LADDER_RETRYABLE_REASON preserved reason=%s "
+                    "— not masking with NO_VALID_PLAYBOOK_DTE_CONTRACT",
+                    ticker, _preserved_retryable.get("reason_code"),
                 )
                 return None
             if _preserved_quality is not None:
                 self._last_failure = _preserved_quality
                 log.warning(
-                    "[%s] DTE_LADDER_QUALITY_REASON preserved reason=%s — not masking with NO_VALID_PLAYBOOK_DTE_CONTRACT",
+                    "[%s] DTE_LADDER_QUALITY_REASON preserved reason=%s "
+                    "— not masking with NO_VALID_PLAYBOOK_DTE_CONTRACT",
                     ticker, _preserved_quality.get("reason_code"),
-                )
-                return None
-            if _preserved_retryable is not None:
-                self._last_failure = _preserved_retryable
-                log.warning(
-                    "[%s] DTE_LADDER_RETRYABLE_REASON preserved reason=%s — not masking with NO_VALID_PLAYBOOK_DTE_CONTRACT",
-                    ticker, _preserved_retryable.get("reason_code"),
                 )
                 return None
             self._last_failure = {

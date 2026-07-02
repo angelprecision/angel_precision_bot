@@ -276,6 +276,11 @@ def test_dte_ladder_all_retryable_failures_remain_retryable(monkeypatch):
 
 
 def test_dte_ladder_preserves_quality_reason_when_chain_rows_exist(monkeypatch):
+    """Fix C: when a bucket returns OI_TOO_LOW the ladder must preserve that
+    quality reason rather than masking it as NO_VALID_PLAYBOOK_DTE_CONTRACT."""
+    from datetime import date, timedelta
+    tomorrow = (date.today() + timedelta(days=1)).isoformat()
+
     mod = _load_selector({"DEFERRED_DTE_LADDER": "1"})
     APContractSelectionEngine = mod.APContractSelectionEngine
     sel = object.__new__(APContractSelectionEngine)
@@ -285,7 +290,8 @@ def test_dte_ladder_preserves_quality_reason_when_chain_rows_exist(monkeypatch):
     sel.dte_ladder_probe_per_bucket = 2
     sel._last_failure = None
     sel._last_dte_ladder_audit = None
-    sel._fetch_expirations_list = MagicMock(return_value=["2026-07-01"])
+    # tomorrow is 1 DTE → bucket A
+    sel._fetch_expirations_list = MagicMock(return_value=[tomorrow])
 
     def _fake_select(plan, *, expiration_override=None):
         sel._last_failure = {
@@ -296,9 +302,16 @@ def test_dte_ladder_preserves_quality_reason_when_chain_rows_exist(monkeypatch):
         return None
 
     sel.select = _fake_select
-    result = sel._select_with_dte_ladder(SimpleNamespace(ticker="AVGO", timeframe="1d", metadata={"deferred_breach_selection": True}))
+    result = sel._select_with_dte_ladder(SimpleNamespace(
+        ticker="AVGO", timeframe="1d",
+        metadata={"deferred_breach_selection": True},
+    ))
     assert result is None
-    assert sel._last_failure["reason_code"] == "OI_TOO_LOW"
+    assert sel._last_failure["reason_code"] == "OI_TOO_LOW", (
+        f"Expected OI_TOO_LOW to be preserved; got {sel._last_failure.get('reason_code')}. "
+        "Fix C: quality reasons must be preserved over NO_VALID_PLAYBOOK_DTE_CONTRACT "
+        "when no retryable data-miss was seen."
+    )
 
 
 def test_chain_auth_error_remains_terminal(monkeypatch):
@@ -413,12 +426,70 @@ class TestJasonLiveRecoveryAmendments:
         assert "CHAIN_ROW_ZERO_BID_ASK" in ec_mod.RETRYABLE_BREACH_SELECTOR_REASONS
         assert "DIRECT_QUOTE_ZERO_BID_ASK" in ec_mod.RETRYABLE_BREACH_SELECTOR_REASONS
 
-    def test_amendment_2_retryable_set_contains_ladder_exhaustion_reason(self):
-        """After the DTE ladder exhausts all buckets on transient quote-quality
-        signals, it emits NO_VALID_PLAYBOOK_DTE_CONTRACT as the aggregate reason.
-        Execution core sees this — not the per-strike reason — so it MUST be in
-        the retryable set or the ladder's aggregation defeats the retry."""
-        assert "NO_VALID_PLAYBOOK_DTE_CONTRACT" in ec_mod.RETRYABLE_BREACH_SELECTOR_REASONS
+    def test_amendment_2_no_valid_playbook_dte_contract_not_in_global_set(self):
+        """Fix C: NO_VALID_PLAYBOOK_DTE_CONTRACT must NOT be in the global
+        retryable set. It is the DTE-ladder aggregation reason and may reflect
+        structural quality rejects. Retryability must be determined by inspecting
+        the ladder audit, not by treating it as unconditionally retryable."""
+        assert "NO_VALID_PLAYBOOK_DTE_CONTRACT" not in ec_mod.RETRYABLE_BREACH_SELECTOR_REASONS, (
+            "NO_VALID_PLAYBOOK_DTE_CONTRACT must be removed from the global "
+            "retryable set — use _is_ladder_exhaustion_retryable(audit) instead."
+        )
+
+    def test_amendment_2_is_ladder_exhaustion_retryable_helper_exists(self):
+        """Fix C: _is_ladder_exhaustion_retryable must be importable from
+        execution_core so the retry check can use it."""
+        assert hasattr(ec_mod, "_is_ladder_exhaustion_retryable"), (
+            "_is_ladder_exhaustion_retryable helper must exist in ap_execution_core"
+        )
+
+    def test_amendment_2_ladder_exhaustion_retryable_on_data_miss_only(self):
+        """Fix C: ladder-exhaustion retryability requires ALL sub-failures to
+        be in the retryable data-miss set, not mixed with quality rejects."""
+        fn = ec_mod._is_ladder_exhaustion_retryable
+        # Retryable: all failures are transient data-miss codes.
+        retryable_audit = {
+            "buckets_attempted": [
+                {"expirations_probed": [
+                    {"failure": {"reason_code": "CHAIN_ROW_ZERO_BID_ASK"}},
+                    {"failure": {"reason_code": "DIRECT_QUOTE_ZERO_BID_ASK"}},
+                ]},
+            ]
+        }
+        assert fn(retryable_audit) is True
+
+    def test_amendment_2_ladder_exhaustion_terminal_on_quality_reject(self):
+        """Fix C: if ANY sub-failure is a quality reject, ladder exhaustion is
+        NOT retryable — the quality verdict won't improve on a second attempt."""
+        fn = ec_mod._is_ladder_exhaustion_retryable
+        mixed_audit = {
+            "buckets_attempted": [
+                {"expirations_probed": [
+                    {"failure": {"reason_code": "CHAIN_ROW_ZERO_BID_ASK"}},
+                    {"failure": {"reason_code": "OI_TOO_LOW"}},  # quality
+                ]},
+            ]
+        }
+        assert fn(mixed_audit) is False
+
+    def test_amendment_2_ladder_exhaustion_terminal_on_spread_too_wide(self):
+        fn = ec_mod._is_ladder_exhaustion_retryable
+        quality_audit = {
+            "buckets_attempted": [
+                {"expirations_probed": [
+                    {"failure": {"reason_code": "SPREAD_TOO_WIDE"}},
+                ]},
+            ]
+        }
+        assert fn(quality_audit) is False
+
+    def test_amendment_2_ladder_exhaustion_conservative_on_unknown_audit(self):
+        """Missing/invalid audit defaults to non-retryable — safer to
+        terminalize than to loop on unknown failure."""
+        fn = ec_mod._is_ladder_exhaustion_retryable
+        assert fn(None) is False
+        assert fn({}) is False
+        assert fn({"buckets_attempted": []}) is False
 
     def test_amendment_2_retryable_set_contains_all_amendment_codes(self):
         """Snapshot lock: the exact set of amendment-added codes must remain
@@ -428,7 +499,6 @@ class TestJasonLiveRecoveryAmendments:
             "DIRECT_QUOTE_ZERO_BID_ASK",
             "QUOTE_FETCH_FAILED",
             "CHAIN_EMPTY",
-            "NO_VALID_PLAYBOOK_DTE_CONTRACT",
         }
         missing = amendment_additions - set(ec_mod.RETRYABLE_BREACH_SELECTOR_REASONS)
         assert not missing, f"amendment-added retryable codes missing: {missing}"
@@ -454,6 +524,148 @@ class TestJasonLiveRecoveryAmendments:
         assert overlap == set(), (
             f"structural terminal codes must never be retryable — overlap: {overlap}"
         )
+
+    # ── Fix A regression tests ──────────────────────────────────────────────
+
+    def test_fix_a_observe_mode_daily_continuation_does_not_terminate(self):
+        """Fix A: when daily_continuation_mode='observe' and fail_reason starts
+        with 'daily_continuation_failed', the submit path must NOT be blocked."""
+        src = open("ap_execution_core.py").read()
+        assert "_observe_only_daily_continuation" in src, (
+            "Fix A: _observe_only_daily_continuation guard must be present"
+        )
+        assert "ENTRY_CONFIRM_OBSERVED" in src, (
+            "Fix A: ENTRY_CONFIRM_OBSERVED log must be emitted for observe path"
+        )
+        # The guard must read the right condition shape from the confirmation meta.
+        assert 'daily_continuation_mode") == "observe"' in src, (
+            "Fix A: must check _confirm_meta.get('daily_continuation_mode') == 'observe'"
+        )
+        assert 'startswith("daily_continuation_failed")' in src, (
+            "Fix A: must check _fail_reason.startswith('daily_continuation_failed')"
+        )
+        # The observe block must persist meta but NOT write blocked_at_breach or cleanup.
+        # Find the observe block between the if and its else.
+        idx_observe_if = src.find("if _observe_only_daily_continuation:")
+        idx_observe_else = src.find("\n                else:", idx_observe_if)
+        observe_block = src[idx_observe_if:idx_observe_else]
+        assert "ENTRY_CONFIRM_OBSERVED" in observe_block, (
+            "Fix A: ENTRY_CONFIRM_OBSERVED must be logged inside the observe block"
+        )
+        assert "blocked_at_breach" not in [
+            line.strip() for line in observe_block.split("\n")
+            if '"decision_status": "blocked_at_breach"' in line
+            or "'decision_status': 'blocked_at_breach'" in line
+        ], (
+            "Fix A: observe block must NOT write blocked_at_breach to ap_signals"
+        )
+        # Alternative: the specific assignment must not appear in the observe block.
+        assert '"decision_status": "blocked_at_breach"' not in observe_block, (
+            "Fix A: observe block must NOT assign decision_status=blocked_at_breach"
+        )
+        assert "_cleanup_pending_entry_order" not in observe_block, (
+            "Fix A: observe block must NOT call _cleanup_pending_entry_order"
+        )
+        # The observe block must not have a bare 'return' — the submit continues.
+        # (It may have a comment or string containing 'return', so check actual statements.)
+        observe_lines = observe_block.split("\n")
+        bare_returns = [
+            l for l in observe_lines
+            if l.strip() == "return" or l.strip().startswith("return ")
+        ]
+        assert bare_returns == [], (
+            f"Fix A: observe block must not return early — found: {bare_returns}"
+        )
+
+    def test_fix_a_enforce_mode_still_blocks_on_daily_continuation_failure(self):
+        """Fix A: non-observe failures must still terminalize — the observe
+        path is a narrow carve-out for daily_continuation_mode=observe only."""
+        src = open("ap_execution_core.py").read()
+        idx_observe_if = src.find("if _observe_only_daily_continuation:")
+        idx_observe_else = src.find("\n                else:", idx_observe_if)
+        # The else block (enforce path) should contain cleanup and return.
+        # Get a reasonable window past the else marker.
+        enforce_block = src[idx_observe_else: idx_observe_else + 3000]
+        assert "_cleanup_pending_entry_order" in enforce_block, (
+            "Fix A: enforce path must still call _cleanup_pending_entry_order"
+        )
+        assert "return" in enforce_block, (
+            "Fix A: enforce path must still return to block submit"
+        )
+        assert "blocked_at_breach" in enforce_block, (
+            "Fix A: enforce path must still write blocked_at_breach to ap_signals"
+        )
+
+    # ── Fix B regression tests ──────────────────────────────────────────────
+
+    def test_fix_b_stale_state_guard_in_retry_thread(self):
+        """Fix B: the retry thread must check order status before re-entering
+        _on_entry_trigger. A stale PENDING_TRIGGER row that was externally
+        terminalized must not receive a second broker submit attempt."""
+        src = open("ap_execution_core.py").read()
+        assert "DEFERRED_BREACH_RETRY_STALE_STATE_ABORT" in src, (
+            "Fix B: stale-state abort log must be present in retry thread"
+        )
+        # Verify PENDING_TRIGGER appears in the retry-thread body (not just
+        # elsewhere in the file) — find the retry function and check it.
+        idx_retry_fn = src.find("def _retry_deferred_breach_a(")
+        assert idx_retry_fn > 0, "Fix B: retry thread function must exist"
+        # Get the thread body up to the next top-level def or reasonable window
+        retry_body = src[idx_retry_fn: idx_retry_fn + 3000]
+        assert "PENDING_TRIGGER" in retry_body, (
+            "Fix B: stale-state guard must check for PENDING_TRIGGER status "
+            "inside the retry thread body"
+        )
+        assert "DEFERRED_BREACH_RETRY_STALE_STATE_ABORT" in retry_body, (
+            "Fix B: stale-state abort log must be inside the retry thread body"
+        )
+
+    def test_fix_b_stale_guard_is_best_effort(self):
+        """Fix B: a failure of the stale-state check must not abort the retry
+        silently — it should proceed with a debug log."""
+        src = open("ap_execution_core.py").read()
+        idx = src.find("DEFERRED_BREACH_RETRY_STALE_STATE_ABORT")
+        surrounding = src[max(0, idx - 500): idx + 1000]
+        assert "except Exception" in surrounding, (
+            "Fix B: stale-state guard must be wrapped in try/except so a "
+            "failed check does not silently drop the retry"
+        )
+
+    # ── Fix C additional structural tests ───────────────────────────────────
+
+    def test_fix_c_ladder_priority_retryable_before_quality(self):
+        """Fix C: when ladder exhausts, retryable reason takes priority over
+        quality reason so the retry loop can fire."""
+        src = open("ap/contract_selector.py").read()
+        idx_ret = src.find("_preserved_retryable is not None")
+        idx_qual = src.find("_preserved_quality is not None")
+        # Both must exist
+        assert idx_ret > 0, "Fix C: _preserved_retryable is not None check missing"
+        assert idx_qual > 0, "Fix C: _preserved_quality is not None check missing"
+        # Retryable must come BEFORE quality in the final preservation block
+        # (after all buckets are exhausted)
+        assert idx_ret < idx_qual, (
+            "Fix C: in the final preservation block, _preserved_retryable "
+            "must be checked before _preserved_quality so data-miss failures "
+            "are retried before quality rejects terminalize."
+        )
+
+    def test_fix_c_quality_rejects_do_not_stop_ladder_mid_probe(self):
+        """Fix C: OI_TOO_LOW, SPREAD_TOO_WIDE, and similar quality codes must
+        NOT be in _TERMINAL_NON_DTE inside the ladder — they must not cause an
+        early break that stops probing other expirations."""
+        src = open("ap/contract_selector.py").read()
+        # Find _TERMINAL_NON_DTE definition
+        idx_start = src.find("_TERMINAL_NON_DTE = {")
+        idx_end = src.find("}", idx_start)
+        terminal_block = src[idx_start:idx_end]
+        for quality_code in ("OI_TOO_LOW", "SPREAD_TOO_WIDE", "VOLUME_TOO_LOW",
+                             "BID_BELOW_MIN", "CHAIN_ROW_ZERO_BID_ASK",
+                             "DIRECT_QUOTE_ZERO_BID_ASK"):
+            assert quality_code not in terminal_block, (
+                f"Fix C: {quality_code} must NOT be in _TERMINAL_NON_DTE — "
+                "it's a per-expiration quality reject, not a DTE-agnostic blocker."
+            )
 
     def test_amendment_3_retry_enabled_default_is_on(self, monkeypatch):
         """BREACH_SELECTOR_RETRY_ENABLED unset => retry path is active. The
