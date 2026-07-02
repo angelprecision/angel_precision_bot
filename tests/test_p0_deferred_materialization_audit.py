@@ -646,3 +646,27 @@ class TestNoSelectorThresholdChanges:
             assert mod not in source, (
                 f"Unexpected import of {mod!r} found in ap_execution_core.py"
             )
+
+
+def test_prebreach_hydration_window_and_status_scope_exist_in_monitor_source():
+    src = open("ap/order_monitor.py", "r").read()
+    assert "DEFERRED_HYDRATION_WINDOW_START_ET" in src
+    assert "DEFERRED_HYDRATION_WINDOW_END_ET" in src
+    assert 'status not in {"PENDING_TRIGGER", "CREATED"}' in src or 'status not in {\\"PENDING_TRIGGER\\", \\"CREATED\\"}' in src
+    assert '"deferred_prebreach_hydration"' in src
+
+
+def test_osm_hydration_write_path_is_in_place_and_guarded():
+    src = open("ap/order_state_machine.py", "r").read()
+    assert "FOR UPDATE" in src
+    assert "contract_selection_status = %s" in src
+    assert "qty = %s" in src
+    assert 'current_status not in {"PENDING_TRIGGER", "CREATED"}' in src or 'current_status not in {\\"PENDING_TRIGGER\\", \\"CREATED\\"}' in src
+
+
+def test_dashboard_read_model_hides_deferred_point_zero_one_limit():
+    src = open("ap/operator_queue_read_model.py", "r").read()
+    assert "pending pre-breach hydration / breach-time selection" in src
+    assert "not priced yet" in src
+    assert "last_hydration_attempt" in src
+    assert "hydration_failure_reason" in src

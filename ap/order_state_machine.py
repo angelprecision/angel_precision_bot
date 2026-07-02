@@ -1590,23 +1590,54 @@ class APOrderStateMachine:
         local_order_id: str,
         *,
         success: bool,
+        status: str | None = None,
         reason: str | None = None,
         contract: str | None = None,
         limit_price: float | None = None,
+        qty: int | None = None,
         reserved_cost: float | None = None,
+        contract_selection_status: str | None = None,
+        selector_audit: dict | None = None,
+        hydration_meta: dict | None = None,
     ) -> bool:
         """Persist post-open deferred contract hydration on an existing row."""
         import json as _json_local
 
+        status = str(status or "").strip().upper() or None
+        reason = str(reason) if reason else None
+        contract_selection_status = (
+            str(contract_selection_status)
+            if contract_selection_status
+            else (
+                "HYDRATED_PRE_BREACH"
+                if success
+                else reason
+            )
+        )
+        deferred_hydration = {
+            "attempted": True,
+            "success": bool(success),
+            "selected_contract": str(contract) if success and contract else None,
+            "selected_limit_price": float(limit_price) if success and limit_price is not None else None,
+            "qty": int(qty) if success and qty is not None else None,
+            "reserved_cost": float(reserved_cost) if success and reserved_cost is not None else None,
+            "selector_audit": selector_audit or {},
+            "last_attempt_at": now_utc_iso(),
+            "failure_reason": None if success else reason,
+            "reason": None if success else reason,
+        }
+        if hydration_meta:
+            for key, value in hydration_meta.items():
+                if value is not None:
+                    deferred_hydration[key] = value
+
         meta_patch = {
+            "contract_deferred": not bool(success),
+            "contract_selection_status": contract_selection_status,
             "deferred_hydration": {
-                "success": bool(success),
-                "reason": str(reason) if reason else None,
-                "timestamp": now_utc_iso(),
+                **deferred_hydration,
             }
         }
-        if not success and reason:
-            meta_patch["contract_selection_status"] = str(reason)
 
         try:
             meta_json = _json_local.dumps(meta_patch, default=str)
@@ -1615,14 +1646,39 @@ class APOrderStateMachine:
 
         def _update_with_status_column():
             with conn() as c:
+                cur = c.execute(
+                    """
+                    SELECT status, contract, broker_order_id, submitted_ts
+                    FROM orders
+                    WHERE local_order_id = %s
+                      AND client_id = %s
+                    FOR UPDATE
+                    """,
+                    (local_order_id, self.client_id),
+                )
+                row = cur.fetchone()
+                if not row:
+                    return 0
+                row = dict(row) if not isinstance(row, dict) else row
+                current_status = str(row.get("status") or "").upper()
+                current_contract = str(row.get("contract") or "")
+                if status and current_status != status:
+                    return 0
+                if current_status not in {"PENDING_TRIGGER", "CREATED"}:
+                    return 0
+                if row.get("broker_order_id") or row.get("submitted_ts"):
+                    return 0
+                if not current_contract.upper().startswith("DEFERRED:"):
+                    return 0
                 if success:
                     cur = c.execute(
                         """
                         UPDATE orders
                         SET contract = %s,
                             limit_price = %s,
+                            qty = %s,
                             reserved_cost = %s,
-                            contract_selection_status = NULL,
+                            contract_selection_status = %s,
                             meta = COALESCE(meta, '{}'::jsonb) || %s::jsonb,
                             updated_ts = NOW()
                         WHERE local_order_id = %s
@@ -1631,7 +1687,9 @@ class APOrderStateMachine:
                         (
                             contract,
                             float(limit_price) if limit_price is not None else None,
+                            int(qty) if qty is not None else None,
                             float(reserved_cost) if reserved_cost is not None else None,
+                            contract_selection_status,
                             meta_json,
                             local_order_id,
                             self.client_id,
@@ -1648,7 +1706,7 @@ class APOrderStateMachine:
                           AND client_id = %s
                         """,
                         (
-                            str(reason) if reason else None,
+                            contract_selection_status,
                             meta_json,
                             local_order_id,
                             self.client_id,
@@ -1658,12 +1716,37 @@ class APOrderStateMachine:
 
         def _update_without_status_column():
             with conn() as c:
+                cur = c.execute(
+                    """
+                    SELECT status, contract, broker_order_id, submitted_ts
+                    FROM orders
+                    WHERE local_order_id = %s
+                      AND client_id = %s
+                    FOR UPDATE
+                    """,
+                    (local_order_id, self.client_id),
+                )
+                row = cur.fetchone()
+                if not row:
+                    return 0
+                row = dict(row) if not isinstance(row, dict) else row
+                current_status = str(row.get("status") or "").upper()
+                current_contract = str(row.get("contract") or "")
+                if status and current_status != status:
+                    return 0
+                if current_status not in {"PENDING_TRIGGER", "CREATED"}:
+                    return 0
+                if row.get("broker_order_id") or row.get("submitted_ts"):
+                    return 0
+                if not current_contract.upper().startswith("DEFERRED:"):
+                    return 0
                 if success:
                     cur = c.execute(
                         """
                         UPDATE orders
                         SET contract = %s,
                             limit_price = %s,
+                            qty = %s,
                             reserved_cost = %s,
                             meta = COALESCE(meta, '{}'::jsonb) || %s::jsonb,
                             updated_ts = NOW()
@@ -1673,6 +1756,7 @@ class APOrderStateMachine:
                         (
                             contract,
                             float(limit_price) if limit_price is not None else None,
+                            int(qty) if qty is not None else None,
                             float(reserved_cost) if reserved_cost is not None else None,
                             meta_json,
                             local_order_id,
