@@ -153,6 +153,11 @@ def _runner_components(runner: Any) -> dict[str, Any]:
     core = getattr(runner, "core", None)
     return {
         "broker": getattr(runner, "broker", None) or (getattr(core, "broker", None) if core else None),
+        "data_broker": (
+            getattr(runner, "data_broker", None)
+            or (getattr(core, "data_broker", None) if core else None)
+            or getattr(getattr(runner, "execution_core", None), "data_broker", None)
+        ),
         "master_control": getattr(runner, "master_control", None),
         "contract_selector": getattr(runner, "contract_selector", None),
         "order_state_machine": (
@@ -343,6 +348,7 @@ def run_paper_rescue_restart_guard(
                 result = run_overnight_reeval(
                     client_id=email,
                     broker=comps["broker"],
+                    data_broker=comps["data_broker"],
                     master_control=comps["master_control"],
                     contract_selector=comps["contract_selector"],
                     order_state_machine=comps["order_state_machine"],

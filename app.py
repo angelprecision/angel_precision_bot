@@ -3231,6 +3231,10 @@ def create_app() -> Flask:
                                 result = run_overnight_reeval(
                                     client_id=email,
                                     broker=getattr(_core, "broker", None) if _core else None,
+                                    data_broker=(
+                                        getattr(runner, "data_broker", None)
+                                        or (getattr(_core, "data_broker", None) if _core else None)
+                                    ),
                                     master_control=runner.master_control,
                                     contract_selector=runner.contract_selector,
                                     order_state_machine=runner.order_state_machine,
@@ -3309,6 +3313,10 @@ def create_app() -> Flask:
                     result = run_overnight_reeval(
                         client_id=email,
                         broker=getattr(_core, "broker", None) if _core else None,
+                        data_broker=(
+                            getattr(runner, "data_broker", None)
+                            or (getattr(_core, "data_broker", None) if _core else None)
+                        ),
                         master_control=runner.master_control,
                         contract_selector=runner.contract_selector,
                         order_state_machine=runner.order_state_machine,
