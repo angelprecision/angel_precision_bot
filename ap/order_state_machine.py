@@ -1585,6 +1585,140 @@ class APOrderStateMachine:
             )
             return False
 
+    def record_deferred_hydration_result(
+        self,
+        local_order_id: str,
+        *,
+        success: bool,
+        reason: str | None = None,
+        contract: str | None = None,
+        limit_price: float | None = None,
+        reserved_cost: float | None = None,
+    ) -> bool:
+        """Persist post-open deferred contract hydration on an existing row."""
+        import json as _json_local
+
+        meta_patch = {
+            "deferred_hydration": {
+                "success": bool(success),
+                "reason": str(reason) if reason else None,
+                "timestamp": now_utc_iso(),
+            }
+        }
+        if not success and reason:
+            meta_patch["contract_selection_status"] = str(reason)
+
+        try:
+            meta_json = _json_local.dumps(meta_patch, default=str)
+        except Exception:
+            return False
+
+        def _update_with_status_column():
+            with conn() as c:
+                if success:
+                    cur = c.execute(
+                        """
+                        UPDATE orders
+                        SET contract = %s,
+                            limit_price = %s,
+                            reserved_cost = %s,
+                            contract_selection_status = NULL,
+                            meta = COALESCE(meta, '{}'::jsonb) || %s::jsonb,
+                            updated_ts = NOW()
+                        WHERE local_order_id = %s
+                          AND client_id = %s
+                        """,
+                        (
+                            contract,
+                            float(limit_price) if limit_price is not None else None,
+                            float(reserved_cost) if reserved_cost is not None else None,
+                            meta_json,
+                            local_order_id,
+                            self.client_id,
+                        ),
+                    )
+                else:
+                    cur = c.execute(
+                        """
+                        UPDATE orders
+                        SET contract_selection_status = %s,
+                            meta = COALESCE(meta, '{}'::jsonb) || %s::jsonb,
+                            updated_ts = NOW()
+                        WHERE local_order_id = %s
+                          AND client_id = %s
+                        """,
+                        (
+                            str(reason) if reason else None,
+                            meta_json,
+                            local_order_id,
+                            self.client_id,
+                        ),
+                    )
+                return getattr(cur, "rowcount", getattr(c, "rowcount", None))
+
+        def _update_without_status_column():
+            with conn() as c:
+                if success:
+                    cur = c.execute(
+                        """
+                        UPDATE orders
+                        SET contract = %s,
+                            limit_price = %s,
+                            reserved_cost = %s,
+                            meta = COALESCE(meta, '{}'::jsonb) || %s::jsonb,
+                            updated_ts = NOW()
+                        WHERE local_order_id = %s
+                          AND client_id = %s
+                        """,
+                        (
+                            contract,
+                            float(limit_price) if limit_price is not None else None,
+                            float(reserved_cost) if reserved_cost is not None else None,
+                            meta_json,
+                            local_order_id,
+                            self.client_id,
+                        ),
+                    )
+                else:
+                    cur = c.execute(
+                        """
+                        UPDATE orders
+                        SET meta = COALESCE(meta, '{}'::jsonb) || %s::jsonb,
+                            updated_ts = NOW()
+                        WHERE local_order_id = %s
+                          AND client_id = %s
+                        """,
+                        (
+                            meta_json,
+                            local_order_id,
+                            self.client_id,
+                        ),
+                    )
+                return getattr(cur, "rowcount", getattr(c, "rowcount", None))
+
+        try:
+            rowcount = run_with_retry(_update_with_status_column)
+        except Exception as exc:
+            if not (
+                pg_errors
+                and isinstance(exc, getattr(pg_errors, "UndefinedColumn", tuple()))
+            ):
+                log.warning(
+                    "[%s] record_deferred_hydration_result failed for local_order_id=%s: %s",
+                    self.client_id, local_order_id, exc,
+                )
+                return False
+            try:
+                rowcount = run_with_retry(_update_without_status_column)
+            except Exception as fallback_exc:
+                log.warning(
+                    "[%s] record_deferred_hydration_result fallback failed for local_order_id=%s: %s",
+                    self.client_id, local_order_id, fallback_exc,
+                )
+                return False
+
+        return bool(rowcount and rowcount > 0)
+
     def get_order(self, local_order_id: str):
         return self._get_order(local_order_id)
 
