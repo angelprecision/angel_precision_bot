@@ -2118,6 +2118,7 @@ class ClientRunner(threading.Thread):
             exit_engine=exit_eng,
             entry_watcher=getattr(self.core, "entry_watcher", None),
             client_mode=self.mode,   # PR66: pass PAPER/LIVE so max-age splits correctly
+            data_broker=data_broker,
         )
         self.order_monitor.start()
 
