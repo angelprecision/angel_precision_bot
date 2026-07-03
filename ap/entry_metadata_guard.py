@@ -83,14 +83,44 @@ def _first(srcs: list[Any], keys: tuple[str, ...]) -> Any:
     return None
 
 def _positive(srcs: list[Any], keys: tuple[str, ...]) -> tuple[bool, Any]:
+    """
+    Return (True, value) for the FIRST strictly-positive numeric value found
+    across sources/keys.
+
+    P0 (2026-07-02) — key-shadowing fix. The previous implementation
+    returned on the first key that merely PARSED: a placeholder zero (or an
+    unparseable string) in an early key like `underlying_entry` shadowed a
+    valid positive value in a later key like `trigger.current_price`, and
+    the whole signal was rejected `metadata_invalid:zero_*` even though
+    valid data was present. This is the exact mechanism behind the
+    2026-07-01 mass rejection wave (366 daily signals in one session) —
+    #241/#242 patched it by adding key aliases, but the shadowing semantics
+    remained and would bite again on the next producer that emits a zeroed
+    placeholder field.
+
+    New semantics (matches `_first_positive_value` introduced at the broker
+    submit boundary in #251, so both guards agree):
+      - skip missing/empty keys
+      - skip unparseable values (keep searching)
+      - skip zero/negative values (keep searching)
+      - succeed on the first strictly-positive number
+      - only fail after ALL sources and keys are exhausted; the returned
+        value is the last non-missing candidate seen, for diagnostics.
+
+    Fail-closed behavior is preserved: a payload with NO positive value in
+    any accepted key is still rejected.
+    """
+    last_seen: Any = None
     for src in srcs:
         for k in keys:
             ok, val = _read(src, k)
             if not ok or val is None or val == "": continue
+            last_seen = val
             try: num = float(val)
-            except Exception: return False, val
-            return num > 0, num
-    return False, None
+            except Exception: continue
+            if num > 0:
+                return True, num
+    return False, last_seen
 
 def _infer_timeframe(srcs: list[Any]) -> Any:
     """Resolve production scanner timeframe without mutating payloads.
