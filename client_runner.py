@@ -123,6 +123,181 @@ def _env_bool(name: str, default: str = "0") -> bool:
     return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
 
 
+class PaperSelectorNoMarketDataTokenError(RuntimeError):
+    """Raised when PAPER mode runner has no live market-data token configured."""
+
+
+def resolve_market_data_transport(
+    *,
+    mode: str,
+    account_id: str,
+    execution_broker,
+    env=None,
+    broker_cls=None,
+    broker_config_cls=None,
+) -> dict:
+    """Resolve the market-data transport for selector / preflight quote reads."""
+    if env is None:
+        env = os.environ
+    if broker_cls is None:
+        from ap.brokers.tradier import TradierBroker as _Broker
+        broker_cls = _Broker
+    if broker_config_cls is None:
+        from ap.brokers.tradier import TradierConfig as _Cfg
+        broker_config_cls = _Cfg
+
+    mode_upper = str(mode or "").strip().upper()
+    is_paper = (mode_upper == "PAPER")
+
+    market_data_token = (env.get("TRADIER_MARKET_DATA_TOKEN") or "").strip()
+    data_token = (env.get("TRADIER_DATA_TOKEN") or "").strip()
+    if market_data_token:
+        token, token_source = market_data_token, "TRADIER_MARKET_DATA_TOKEN"
+    elif data_token:
+        token, token_source = data_token, "TRADIER_DATA_TOKEN"
+    else:
+        token, token_source = "", "missing"
+
+    base_url = (
+        (env.get("TRADIER_MARKET_DATA_BASE_URL") or "").strip()
+        or (env.get("TRADIER_DATA_BASE_URL") or "").strip()
+        or "https://api.tradier.com"
+    )
+    if "sandbox" in base_url.lower():
+        logger.critical(
+            "PAPER_SELECTOR_MARKET_DATA_BASE_URL_SANDBOX_GUARD_TRIGGERED "
+            "resolved_url=%s — forcing https://api.tradier.com for market data.",
+            base_url,
+        )
+        base_url = "https://api.tradier.com"
+
+    execution_base_url = getattr(getattr(execution_broker, "cfg", None), "base_url", "")
+
+    if is_paper and not token:
+        raise PaperSelectorNoMarketDataTokenError(
+            "PAPER_SELECTOR_NO_MARKET_DATA_TOKEN mode=PAPER "
+            f"base_url={base_url} token_source={token_source} "
+            "— set TRADIER_MARKET_DATA_TOKEN (preferred) or TRADIER_DATA_TOKEN."
+        )
+
+    if token:
+        cfg = broker_config_cls(
+            base_url=base_url,
+            access_token=token,
+            account_id=account_id,
+        )
+        data_broker = broker_cls(cfg)
+        is_dedicated = True
+    else:
+        data_broker = execution_broker
+        token_source = "execution_broker_fallback_live"
+        base_url = execution_base_url or base_url
+        is_dedicated = False
+
+    return {
+        "data_broker": data_broker,
+        "base_url": base_url,
+        "token_source": token_source,
+        "is_dedicated": is_dedicated,
+        "execution_base_url": execution_base_url,
+    }
+
+
+def _extract_quote_preflight_price(quote: dict | None) -> float | None:
+    if not isinstance(quote, dict):
+        return None
+
+    def _coerce(value):
+        try:
+            if value is None:
+                return None
+            return float(value)
+        except Exception:
+            return None
+
+    bid = _coerce(quote.get("bid"))
+    ask = _coerce(quote.get("ask"))
+    if bid and ask and bid > 0 and ask > 0:
+        return (bid + ask) / 2.0
+    for key in ("last", "mark", "mid", "close", "bid", "ask"):
+        value = _coerce(quote.get(key))
+        if value and value > 0:
+            return value
+    return None
+
+
+def _run_live_startup_preflight(
+    *,
+    client_id: str,
+    execution_broker,
+    data_broker,
+    quote_symbol: str = "SPY",
+    quote_broker_source: str = "",
+) -> dict:
+    """Fail-closed LIVE startup preflight.
+
+    Equity/auth must pass on the execution broker. Quote preflight must pass on
+    the resolved market-data broker.
+    """
+    if not hasattr(execution_broker, "get_account_equity"):
+        raise RuntimeError(
+            f"LIVE_STARTUP_FATAL: execution broker missing get_account_equity client_id={client_id}"
+        )
+    try:
+        equity = float(execution_broker.get_account_equity())
+    except Exception as exc:
+        raise RuntimeError(
+            f"LIVE_STARTUP_FATAL: execution broker equity preflight failed client_id={client_id} err={exc}"
+        ) from exc
+    if equity <= 0:
+        raise RuntimeError(
+            f"LIVE_STARTUP_FATAL: execution broker equity preflight returned non_positive_equity "
+            f"client_id={client_id} equity={equity}"
+        )
+
+    quote_broker = data_broker or execution_broker
+    quote_source = quote_broker_source or (
+        "execution_broker_fallback_live" if quote_broker is execution_broker else "dedicated_market_data_broker"
+    )
+    quote_broker_class = type(quote_broker).__name__
+    quote_base_url = getattr(getattr(quote_broker, "cfg", None), "base_url", "")
+    if not hasattr(quote_broker, "get_quote"):
+        raise RuntimeError(
+            "LIVE_STARTUP_FATAL: market-data broker missing get_quote "
+            f"client_id={client_id} source={quote_source} broker_class={quote_broker_class}"
+        )
+    try:
+        quote = quote_broker.get_quote(quote_symbol) or {}
+    except Exception as exc:
+        raise RuntimeError(
+            "LIVE_STARTUP_FATAL: market-data quote preflight failed "
+            f"client_id={client_id} source={quote_source} broker_class={quote_broker_class} "
+            f"symbol={quote_symbol} err={exc}"
+        ) from exc
+
+    quote_price = _extract_quote_preflight_price(quote)
+    if quote_price is None or quote_price <= 0:
+        raise RuntimeError(
+            "LIVE_STARTUP_FATAL: market-data quote preflight failed "
+            f"client_id={client_id} source={quote_source} broker_class={quote_broker_class} "
+            f"symbol={quote_symbol} quote={quote}"
+        )
+
+    logger.info(
+        "[%s] LIVE preflight passed | equity=$%.2f quote_symbol=%s quote_price=%.4f "
+        "quote_source=%s quote_broker_class=%s quote_base_url=%s",
+        client_id, equity, quote_symbol, quote_price, quote_source, quote_broker_class, quote_base_url,
+    )
+    return {
+        "equity": equity,
+        "quote_symbol": quote_symbol,
+        "quote_price": quote_price,
+        "quote_source": quote_source,
+        "quote_broker_class": quote_broker_class,
+        "quote_base_url": quote_base_url,
+    }
+
+
 def _new_scheme_fernet(raw_key: str) -> "Fernet":
     """NEW scheme: ENCRYPTION_KEY is a raw 44-char base64 Fernet key used
     directly. Matches ap/crypto.encrypt_token.
@@ -1009,6 +1184,11 @@ class ClientRunner(threading.Thread):
         risk_profile_valid: bool  = False,
         missing_risk_fields: list = None,
         daily_max_loss_pct: float = 0.06,
+        quote_preflight_source: str = "",
+        quote_preflight_broker_class: str = "",
+        quote_preflight_base_url: str = "",
+        quote_preflight_symbol: str = "SPY",
+        quote_preflight_price: float | None = None,
     ):
         if missing_risk_fields is None:
             missing_risk_fields = []
@@ -1032,6 +1212,11 @@ class ClientRunner(threading.Thread):
             "equity_alive": bool(self.equity_thread and self.equity_thread.is_alive()),
             "reconciler_enabled": bool(self.reconciler is not None),
             "data_broker_mode": "dedicated" if data_broker_is_dedicated else "shared_execution_broker",
+            "quote_preflight_source": quote_preflight_source,
+            "quote_preflight_broker_class": quote_preflight_broker_class,
+            "quote_preflight_base_url": quote_preflight_base_url,
+            "quote_preflight_symbol": quote_preflight_symbol,
+            "quote_preflight_price": float(quote_preflight_price) if quote_preflight_price is not None else None,
             "equity": float(equity),
             "max_trades": int(max_trades),
             "max_positions": int(max_pos),
@@ -1514,6 +1699,52 @@ class ClientRunner(threading.Thread):
         broker = TradierBroker(broker_cfg)
         self.broker = broker
 
+        quote_preflight_source = ""
+        quote_preflight_broker_class = ""
+        quote_preflight_base_url = ""
+        quote_preflight_symbol = "SPY"
+        quote_preflight_price = None
+
+        if self.mode == "LIVE":
+            try:
+                market_data_transport = resolve_market_data_transport(
+                    mode=self.mode,
+                    account_id=self.account_id,
+                    execution_broker=broker,
+                )
+            except Exception as exc:
+                self._mark_failed(str(exc))
+                return
+            data_broker = market_data_transport["data_broker"]
+            data_broker_is_dedicated = bool(market_data_transport["is_dedicated"])
+            try:
+                live_preflight = _run_live_startup_preflight(
+                    client_id=self.email,
+                    execution_broker=broker,
+                    data_broker=data_broker,
+                    quote_symbol=quote_preflight_symbol,
+                    quote_broker_source=market_data_transport["token_source"],
+                )
+            except Exception as exc:
+                self._mark_failed(str(exc))
+                return
+            equity = float(live_preflight["equity"])
+            quote_preflight_source = str(live_preflight["quote_source"])
+            quote_preflight_broker_class = str(live_preflight["quote_broker_class"])
+            quote_preflight_base_url = str(live_preflight["quote_base_url"])
+            quote_preflight_price = float(live_preflight["quote_price"])
+        else:
+            data_token = os.getenv("TRADIER_DATA_TOKEN", "").strip()
+            data_base_url = os.getenv("TRADIER_DATA_BASE_URL", "https://api.tradier.com").strip()
+            if data_token:
+                data_broker_cfg = TradierConfig(base_url=data_base_url, access_token=data_token, account_id=self.account_id)
+                data_broker = TradierBroker(data_broker_cfg)
+                logger.info("[%s] Live data broker initialized | %s", self.email, data_base_url)
+            else:
+                data_broker = broker
+                logger.warning("[%s] TRADIER_DATA_TOKEN not set -- using execution broker for data", self.email)
+            data_broker_is_dedicated = bool(data_token)
+
         self._clear_old_phantom_orders()
         # BUG-3 FIX: guard both URL and key — an empty service key produces a
         # confusing auth error inside Supabase rather than a clear None here.
@@ -1568,22 +1799,23 @@ class ClientRunner(threading.Thread):
         # Equity truth: fetch from Tradier FIRST before creating master_control.
         # This ensures capital gates are always calibrated to the client's actual
         # account balance — not a hardcoded default. $25K default is last resort only.
-        _default_equity = float(client_cfg.get("initial_equity", os.getenv("ACCOUNT_EQUITY", "25000")) or 25000)
-        try:
-            if hasattr(broker, "get_account_equity"):
-                _live_eq = broker.get_account_equity()
-                if _live_eq and float(_live_eq) > 0:
-                    equity = float(_live_eq)
-                    logger.info("[%s] Startup equity from Tradier: $%.2f", self.email, equity)
+        if self.mode != "LIVE":
+            _default_equity = float(client_cfg.get("initial_equity", os.getenv("ACCOUNT_EQUITY", "25000")) or 25000)
+            try:
+                if hasattr(broker, "get_account_equity"):
+                    _live_eq = broker.get_account_equity()
+                    if _live_eq and float(_live_eq) > 0:
+                        equity = float(_live_eq)
+                        logger.info("[%s] Startup equity from Tradier: $%.2f", self.email, equity)
+                    else:
+                        equity = _default_equity
+                        logger.warning("[%s] Tradier returned zero equity — using default $%.2f", self.email, equity)
                 else:
                     equity = _default_equity
-                    logger.warning("[%s] Tradier returned zero equity — using default $%.2f", self.email, equity)
-            else:
+                    logger.warning("[%s] Broker has no get_account_equity — using default $%.2f", self.email, equity)
+            except Exception as _eq_startup_exc:
                 equity = _default_equity
-                logger.warning("[%s] Broker has no get_account_equity — using default $%.2f", self.email, equity)
-        except Exception as _eq_startup_exc:
-            equity = _default_equity
-            logger.warning("[%s] Equity fetch at startup failed: %s — using default $%.2f", self.email, _eq_startup_exc, equity)
+                logger.warning("[%s] Equity fetch at startup failed: %s — using default $%.2f", self.email, _eq_startup_exc, equity)
         max_trades = int(client_cfg.get("max_trades_per_day", os.getenv("MAX_TRADES_TODAY", "10")) or 10)
         max_pos = int(client_cfg.get("max_concurrent_positions", os.getenv("MAX_POSITIONS", "10")) or 10)
         loss_pct = float(client_cfg.get("daily_max_loss_pct", 0.06) or 0.06)
@@ -1708,16 +1940,6 @@ class ClientRunner(threading.Thread):
             )
         # ─────────────────────────────────────────────────────────────────────
 
-        data_token = os.getenv("TRADIER_DATA_TOKEN", "").strip()
-        data_base_url = os.getenv("TRADIER_DATA_BASE_URL", "https://api.tradier.com").strip()
-        if data_token:
-            data_broker_cfg = TradierConfig(base_url=data_base_url, access_token=data_token, account_id=self.account_id)
-            data_broker = TradierBroker(data_broker_cfg)
-            logger.info("[%s] Live data broker initialized | %s", self.email, data_base_url)
-        else:
-            data_broker = broker
-            logger.warning("[%s] TRADIER_DATA_TOKEN not set -- using execution broker for data", self.email)
-
         self.data_broker = data_broker
         self.databroker = data_broker
 
@@ -1782,7 +2004,7 @@ class ClientRunner(threading.Thread):
         self._register_exit_engine(exit_eng)
         self._run_startup_recovery(broker, exit_eng)
         self._seed_exit_engine_from_db(exit_eng)
-        self._start_position_quote_monitor(data_broker if data_token else broker, exit_eng)
+        self._start_position_quote_monitor(data_broker if data_broker_is_dedicated else broker, exit_eng)
         # PR D / FIX-3 (BUG-CR-2): post-QPM quote refresh in LIVE.
         # The first refresh inside _seed_exit_engine_from_db runs BEFORE
         # QPM is attached. If that refresh fails (Render cold-start
@@ -1838,7 +2060,7 @@ class ClientRunner(threading.Thread):
             max_loss=max_loss,
             throttle_threshold=throttle_threshold,
             stop_threshold=stop_threshold,
-            data_broker_is_dedicated=bool(data_token),
+            data_broker_is_dedicated=data_broker_is_dedicated,
             exit_eng=exit_eng,
             mc_score_floor=_mc_score_floor,
             mc_ctx_floor=_mc_ctx_floor,
@@ -1849,6 +2071,11 @@ class ClientRunner(threading.Thread):
             risk_profile_valid=(len(_missing_live) == 0),
             missing_risk_fields=_missing_live,
             daily_max_loss_pct=loss_pct,
+            quote_preflight_source=quote_preflight_source,
+            quote_preflight_broker_class=quote_preflight_broker_class,
+            quote_preflight_base_url=quote_preflight_base_url,
+            quote_preflight_symbol=quote_preflight_symbol,
+            quote_preflight_price=quote_preflight_price,
         )
 
         self._validate_control_stack()
