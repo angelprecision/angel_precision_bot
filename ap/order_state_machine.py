@@ -557,6 +557,19 @@ class APOrderStateMachine:
         meta["direction"] = _direction
         meta["side"] = _direction
 
+        # P0 (PR #264): enforcement provenance on every order row. The
+        # runner computes a runtime_config_hash at LIVE startup (risk
+        # limits, PR180 state, confirmation-required state, commit sha,
+        # pod id) and pins it on this OSM instance. Every order created by
+        # ANY path (queue dispatch, overnight reeval, armed-deferred
+        # rescue) carries the hash, so a fill can always be traced to the
+        # exact enforcement configuration that produced it. Caller-supplied
+        # meta wins if it already set the key; absent hash writes nothing
+        # (paper runners may not set one).
+        _rt_hash = getattr(self, "runtime_config_hash", None)
+        if _rt_hash and "enforcement_config_hash" not in meta:
+            meta["enforcement_config_hash"] = str(_rt_hash)
+
         # Push the canonical direction back onto the plan object so any
         # subsequent read of plan.side / plan.direction (retry engine,
         # watcher, exit engine, logging) sees the normalized value.  Wrapped
