@@ -25,6 +25,7 @@ from __future__ import annotations
 import types
 from unittest.mock import MagicMock, call, ANY
 from datetime import datetime, timezone
+from pathlib import Path
 
 
 # ---------------------------------------------------------------------------
@@ -71,23 +72,47 @@ def _make_deferred_plan(
 
 def _import_helper():
     """Import _write_deferred_materialization_audit from the execution core module."""
-    import importlib
     import sys
 
+    repo_root = Path(__file__).resolve().parents[1]
+
     # Stub heavy deps so we can import just the helper without the full runtime
-    for mod in [
-        "ap_entry_watcher", "ap_exit_engine", "ap_feedback_loop",
-        "ap_tier_engine", "ap_proof_logger", "ap_signal_store",
-        "ap_signal_tracker", "intelligence_bridge",
-    ]:
-        if mod not in sys.modules:
-            sys.modules[mod] = types.ModuleType(mod)
+    watcher_mod = types.ModuleType("ap_entry_watcher")
+    watcher_mod.APEntryWatcher = MagicMock
+    watcher_mod.WatchedSignal = MagicMock
+    sys.modules["ap_entry_watcher"] = watcher_mod
+
+    exit_mod = types.ModuleType("ap_exit_engine")
+    exit_mod.APExitEngine = MagicMock
+    exit_mod.ManagedPosition = MagicMock
+    sys.modules["ap_exit_engine"] = exit_mod
+
+    feedback_mod = types.ModuleType("ap_feedback_loop")
+    feedback_mod.APFeedbackLoop = MagicMock
+    sys.modules["ap_feedback_loop"] = feedback_mod
+
+    tier_mod = types.ModuleType("ap_tier_engine")
+    tier_mod.APShadowTracker = MagicMock
+    sys.modules["ap_tier_engine"] = tier_mod
+
+    signal_store_mod = types.ModuleType("ap_signal_store")
+    signal_store_mod.APSignalStore = MagicMock
+    sys.modules["ap_signal_store"] = signal_store_mod
+
+    signal_tracker_mod = types.ModuleType("ap_signal_tracker")
+    signal_tracker_mod.APSignalTracker = MagicMock
+    sys.modules["ap_signal_tracker"] = signal_tracker_mod
+
+    sys.modules.setdefault("intelligence_bridge", types.ModuleType("intelligence_bridge"))
 
     stub_ap = types.ModuleType("ap")
+    stub_ap.__path__ = [str(repo_root / "ap")]
     stub_ap.db = types.ModuleType("ap.db")
     stub_ap.queue = types.ModuleType("ap.queue")
     stub_ap.observability = types.ModuleType("ap.observability")
     stub_ap.observability.emit_decision_event = lambda *a, **kw: None
+    stub_ap.observability.get_git_commit = lambda: "test"
+    stub_ap.observability.make_config_hash = lambda d: "hash"
     stub_ap.trace = types.ModuleType("ap.trace")
     stub_ap.trace.trace_gate = lambda *a, **kw: None
     sys.modules.setdefault("ap", stub_ap)
@@ -102,6 +127,7 @@ def _import_helper():
     stub_funnel.funnel = MagicMock()
     sys.modules["ap_proof_logger"] = stub_funnel
 
+    sys.modules.pop("ap_execution_core", None)
     import ap_execution_core as core_mod
     return core_mod._write_deferred_materialization_audit
 
@@ -646,3 +672,40 @@ class TestNoSelectorThresholdChanges:
             assert mod not in source, (
                 f"Unexpected import of {mod!r} found in ap_execution_core.py"
             )
+
+
+def test_prebreach_hydration_window_and_status_scope_exist_in_monitor_source():
+    src = open("ap/order_monitor.py", "r").read()
+    assert "DEFERRED_PREBREACH_HYDRATION_ENABLED" in src
+    assert "DEFERRED_HYDRATION_MAX_PER_CYCLE" in src
+    assert "DEFERRED_HYDRATION_WINDOW_START_ET" in src
+    assert "DEFERRED_HYDRATION_WINDOW_END_ET" in src
+    assert 'if status != "PENDING_TRIGGER":' in src or "if status != 'PENDING_TRIGGER':" in src
+    assert '"deferred_prebreach_hydration"' in src
+    assert "DEFERRED_HYDRATION_DISABLED" in src
+    assert "DEFERRED_HYDRATION_SKIPPED_MAX_PER_CYCLE" in src
+
+
+def test_osm_hydration_write_path_is_in_place_and_guarded():
+    src = open("ap/order_state_machine.py", "r").read()
+    assert "FOR UPDATE" in src
+    assert "contract_selection_status = %s" in src
+    assert "qty = %s" in src
+    assert 'current_status != "PENDING_TRIGGER"' in src or "current_status != 'PENDING_TRIGGER'" in src
+    assert '"contract_materialized_source": "prebreach_hydration"' in src
+
+
+def test_execution_core_bridges_hydrated_order_row_before_deferred_selection():
+    src = open("ap_execution_core.py", "r").read()
+    assert "_refresh_hydrated_prebreach_plan(" in src
+    assert "PREBREACH_HYDRATION_BRIDGE_APPLIED" in src
+    assert 'sig["contract_deferred"] = False' in src
+    assert 'sig["contract_materialized_source"] = "prebreach_hydration"' in src
+
+
+def test_dashboard_read_model_hides_deferred_point_zero_one_limit():
+    src = open("ap/operator_queue_read_model.py", "r").read()
+    assert "pending pre-breach hydration / breach-time selection" in src
+    assert "not priced yet" in src
+    assert "last_hydration_attempt" in src
+    assert "hydration_failure_reason" in src

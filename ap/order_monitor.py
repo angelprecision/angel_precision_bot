@@ -172,6 +172,18 @@ POLL_INTERVAL = int(os.getenv("ORDER_MONITOR_POLL", "60"))  # seconds (entry che
 # H4: exits run on this faster cadence (account risk). Keep >= a few seconds
 # to avoid hammering the broker; 15s + 45s timeout => hung exit caught fast.
 EXIT_CHECK_INTERVAL = int(os.getenv("ORDER_MONITOR_EXIT_POLL", "15"))  # seconds
+DEFERRED_PREBREACH_HYDRATION_ENABLED = os.getenv(
+    "DEFERRED_PREBREACH_HYDRATION_ENABLED", "0"
+).strip().lower() in ("1", "true", "yes")
+DEFERRED_HYDRATION_MAX_PER_CYCLE = int(
+    os.getenv("DEFERRED_HYDRATION_MAX_PER_CYCLE", "3")
+)
+DEFERRED_HYDRATION_WINDOW_START_ET = int(
+    os.getenv("DEFERRED_HYDRATION_WINDOW_START_ET", "935")
+)
+DEFERRED_HYDRATION_WINDOW_END_ET = int(
+    os.getenv("DEFERRED_HYDRATION_WINDOW_END_ET", "950")
+)
 PENDING_TRIGGER_CLEANUP_ENABLED = os.getenv(
     "PENDING_TRIGGER_CLEANUP_ENABLED", "1"
 ).strip().lower() in ("1", "true", "yes")
@@ -272,6 +284,7 @@ class APOrderMonitor:
         position_manager,
         exit_engine=None,
         entry_watcher=None,
+        contract_selector=None,
         alert_fn=None,
         # PR66: "PAPER" or "LIVE". Default is "LIVE" so any call site that
         # forgets to pass client_mode uses the strict 90s ceiling rather than
@@ -285,6 +298,7 @@ class APOrderMonitor:
         self.pm          = position_manager
         self.exit_engine = exit_engine
         self.entry_watcher = entry_watcher
+        self.contract_selector = contract_selector
         self.alert_fn    = alert_fn
         self.data_broker = data_broker or getattr(broker, "data_broker", None)
         # PR66: store mode for per-mode max-age selection.
@@ -492,6 +506,9 @@ class APOrderMonitor:
     def _check_entry_orders(self):
         orders = self._get_active_entry_orders()
         now = datetime.now(timezone.utc)
+        hydration_seen: set[str] = set()
+        hydration_attempts = 0
+        hydration_disabled_logged = False
 
         for order in orders:
             status = order.get("status", "")
@@ -653,6 +670,40 @@ class APOrderMonitor:
                         log.debug("[%s] lost-handoff systemic check failed: %s", self.client_id, _e)
 
             elif status == "PENDING_TRIGGER":
+                if hydration_attempts >= max(1, DEFERRED_HYDRATION_MAX_PER_CYCLE):
+                    if str(order.get("contract") or "").strip().upper().startswith("DEFERRED:"):
+                        log.info(
+                            "[%s] DEFERRED_HYDRATION_SKIPPED_MAX_PER_CYCLE | local=%s cap=%s",
+                            self.client_id,
+                            local_id,
+                            DEFERRED_HYDRATION_MAX_PER_CYCLE,
+                        )
+                else:
+                    hydration_result = self._maybe_hydrate_deferred_order(
+                        order,
+                        hydration_seen=hydration_seen,
+                    )
+                    if hydration_result.get("reason") == "disabled":
+                        if not hydration_disabled_logged:
+                            log.info(
+                                "[%s] DEFERRED_HYDRATION_DISABLED | cap=%s window=%s-%s",
+                                self.client_id,
+                                DEFERRED_HYDRATION_MAX_PER_CYCLE,
+                                DEFERRED_HYDRATION_WINDOW_START_ET,
+                                DEFERRED_HYDRATION_WINDOW_END_ET,
+                            )
+                            hydration_disabled_logged = True
+                    elif hydration_result.get("attempted"):
+                        hydration_attempts += 1
+                        if hydration_result.get("success"):
+                            log.info(
+                                "[%s] DEFERRED_HYDRATION_REFRESH_REQUIRED | local=%s stale_contract=%s hydrated_contract=%s",
+                                self.client_id,
+                                local_id,
+                                str(order.get("contract") or "").strip(),
+                                str(hydration_result.get("contract") or "").strip(),
+                            )
+                            continue
                 self._check_pending_trigger_order(
                     order=order,
                     local_id=local_id,
@@ -1511,6 +1562,393 @@ class APOrderMonitor:
             return (True, False, getattr(watcher, "_last_reject_reason", "watch_returned_false"))
         return (True, True, "lost_handoff_recovery")
 
+    @staticmethod
+    def _is_real_occ_contract(contract: str, ticker: str = "") -> bool:
+        contract = str(contract or "").strip().upper()
+        ticker = str(ticker or "").strip().upper()
+        if not contract or contract.startswith("DEFERRED:"):
+            return False
+        if ticker and contract == ticker:
+            return False
+        return bool(re.search(r"\d{6}[CP]\d{5,8}", contract))
+
+    def _get_deferred_hydration_selector(self):
+        selector = getattr(self, "contract_selector", None)
+        if selector is not None:
+            return selector
+        selector = getattr(self, "_deferred_hydration_selector", None)
+        if selector is not None:
+            return selector
+        from ap.contract_selector import APContractSelectionEngine
+        selector = APContractSelectionEngine(
+            self._quote_broker(),
+            data_broker=self._quote_broker(),
+            mode=str(self.client_mode or "LIVE").lower(),
+            mutate_plan=True,
+        )
+        self._deferred_hydration_selector = selector
+        return selector
+
+    @staticmethod
+    def _coerce_meta_dict(meta_raw) -> dict:
+        if isinstance(meta_raw, dict):
+            return dict(meta_raw)
+        if isinstance(meta_raw, str) and meta_raw:
+            try:
+                import json as _json
+                loaded = _json.loads(meta_raw)
+                if isinstance(loaded, dict):
+                    return loaded
+            except Exception:
+                return {}
+        return {}
+
+    def _is_within_deferred_hydration_window(self) -> bool:
+        try:
+            import zoneinfo
+            _et = zoneinfo.ZoneInfo("America/New_York")
+        except ImportError:
+            return False
+        now_et = datetime.now(_et)
+        if now_et.weekday() >= 5:
+            return False
+        hhmm = now_et.hour * 100 + now_et.minute
+        return (
+            DEFERRED_HYDRATION_WINDOW_START_ET
+            <= hhmm
+            <= DEFERRED_HYDRATION_WINDOW_END_ET
+        )
+
+    def _get_live_underlying_snapshot(self, ticker: str) -> Optional[dict]:
+        ticker = str(ticker or "").strip().upper()
+        if not ticker:
+            return None
+        quote_broker = self._quote_broker()
+        if not hasattr(quote_broker, "get_quote"):
+            return None
+        try:
+            quote = quote_broker.get_quote(ticker) or {}
+        except Exception as exc:
+            log.debug("[%s] deferred hydration underlying quote failed for %s: %s", self.client_id, ticker, exc)
+            return None
+        if not isinstance(quote, dict):
+            return None
+
+        price = None
+        for key in ("last", "mark", "close", "mid", "ask", "bid", "price"):
+            raw = quote.get(key)
+            try:
+                val = float(raw)
+            except (TypeError, ValueError):
+                continue
+            if val > 0:
+                price = val
+                break
+        if not price:
+            return None
+
+        ts = (
+            quote.get("quote_time")
+            or quote.get("timestamp")
+            or quote.get("updated_at")
+            or now_utc_iso()
+        )
+        return {
+            "price": float(price),
+            "source": "tradier_live",
+            "timestamp": str(ts),
+        }
+
+    def _build_deferred_hydration_audit(
+        self,
+        *,
+        order: dict,
+        plan,
+        selected_contract: str | None,
+        selector_failure: dict | None,
+    ) -> dict:
+        audit = {
+            "reason_code": None,
+            "stage": None,
+            "explanation": None,
+            "ticker": str(order.get("symbol") or getattr(plan, "ticker", "") or "").upper(),
+            "side": str(getattr(plan, "side", "") or ""),
+            "client_id": str(order.get("client_id") or self.client_id or ""),
+            "execution_mode": str(
+                order.get("execution_mode")
+                or getattr(plan, "execution_mode", "")
+                or self.client_mode
+                or ""
+            ).lower(),
+            "score": getattr(plan, "score", None),
+            "timeframe": getattr(plan, "timeframe", None),
+            "pattern": getattr(plan, "pattern", None),
+            "entry_trigger": getattr(plan, "trigger_price", None),
+            "underlying_at_signal": (
+                (getattr(plan, "metadata", None) or {}).get("underlying_at_signal")
+                if isinstance(getattr(plan, "metadata", None), dict)
+                else None
+            ),
+            "contract_before": str(order.get("contract") or ""),
+            "selected_contract": str(selected_contract or "") or None,
+            "timestamp": now_utc_iso(),
+        }
+        if isinstance(selector_failure, dict):
+            audit["reason_code"] = selector_failure.get("reason_code")
+            audit["stage"] = selector_failure.get("stage")
+            audit["explanation"] = selector_failure.get("explanation")
+            if selector_failure.get("raw_reason") is not None:
+                audit["raw_selector_reason"] = selector_failure.get("raw_reason")
+        return audit
+
+    def _classify_deferred_hydration_failure(self, selector_failure: dict | None) -> tuple[str, str]:
+        reason_code = ""
+        if isinstance(selector_failure, dict):
+            reason_code = str(selector_failure.get("reason_code") or "").strip().upper()
+        if not reason_code:
+            return ("NO_CONTRACT_FOUND", "HYDRATION_QUALITY_REJECT")
+
+        if reason_code == "NO_VALID_PLAYBOOK_DTE_CONTRACT":
+            ladder_audit = None
+            try:
+                selector = self._get_deferred_hydration_selector()
+                if hasattr(selector, "get_last_dte_ladder_audit"):
+                    ladder_audit = selector.get_last_dte_ladder_audit()
+            except Exception:
+                ladder_audit = None
+            try:
+                from ap_execution_core import _is_ladder_exhaustion_retryable
+                if _is_ladder_exhaustion_retryable(ladder_audit):
+                    return (reason_code, "HYDRATION_DATA_PENDING")
+            except Exception:
+                pass
+            return (reason_code, "HYDRATION_QUALITY_REJECT")
+
+        try:
+            from ap_execution_core import RETRYABLE_BREACH_SELECTOR_REASONS
+            if reason_code in RETRYABLE_BREACH_SELECTOR_REASONS:
+                return (reason_code, "HYDRATION_DATA_PENDING")
+        except Exception:
+            pass
+        return (reason_code, "HYDRATION_QUALITY_REJECT")
+
+    def _resolve_deferred_hydration_reason(self, selector, plan) -> str:
+        try:
+            failure = getattr(selector, "get_last_failure", lambda: None)()
+            if isinstance(failure, dict):
+                reason_code = str(failure.get("reason_code") or "").strip()
+                if reason_code:
+                    return reason_code
+        except Exception:
+            pass
+
+        try:
+            meta = getattr(plan, "metadata", None)
+            if isinstance(meta, dict):
+                selector_failure = meta.get("selector_failure")
+                if isinstance(selector_failure, dict):
+                    reason_code = str(selector_failure.get("reason_code") or "").strip()
+                    if reason_code:
+                        return reason_code
+        except Exception:
+            pass
+        return "no_contract_found"
+
+    def _maybe_hydrate_deferred_order(self, order: dict, *, hydration_seen: Optional[set[str]] = None) -> dict:
+        contract_before = str(order.get("contract") or "").strip()
+        if not contract_before.upper().startswith("DEFERRED:"):
+            return {"attempted": False, "reason": "not_deferred"}
+
+        status = str(order.get("status") or "").strip().upper()
+        if not DEFERRED_PREBREACH_HYDRATION_ENABLED:
+            return {"attempted": False, "reason": "disabled"}
+        if status != "PENDING_TRIGGER":
+            return {"attempted": False, "reason": "status_not_eligible"}
+        if str(order.get("kind") or "ENTRY").strip().upper() != "ENTRY":
+            return {"attempted": False, "reason": "non_entry"}
+        if order.get("broker_order_id") or order.get("submitted_ts"):
+            return {"attempted": False, "reason": "already_submitted"}
+        if str(order.get("execution_mode") or self.client_mode or "").strip().lower() != str(self.client_mode or "").strip().lower():
+            return {"attempted": False, "reason": "execution_mode_mismatch"}
+
+        try:
+            limit_price = float(order.get("limit_price")) if order.get("limit_price") is not None else None
+        except (TypeError, ValueError):
+            limit_price = None
+        if limit_price is not None and limit_price > 0.01:
+            return {"attempted": False, "reason": "already_priced"}
+
+        local_order_id = str(order.get("local_order_id") or "")
+        ticker = str(order.get("symbol") or "").upper()
+        if not local_order_id or not ticker:
+            return {"attempted": False, "reason": "missing_order_identity"}
+        if hydration_seen is not None:
+            if local_order_id in hydration_seen:
+                return {"attempted": False, "reason": "duplicate_suppressed"}
+            hydration_seen.add(local_order_id)
+
+        try:
+            from ap.contract_quote_revalidator import is_market_open
+            if not is_market_open():
+                return {"attempted": False, "reason": "market_closed"}
+        except Exception as exc:
+            log.debug("[%s] deferred hydration market-open check failed: %s", self.client_id, exc)
+            return {"attempted": False, "reason": "market_open_check_failed"}
+
+        if not self._is_within_deferred_hydration_window():
+            return {"attempted": False, "reason": "outside_hydration_window"}
+
+        plan = self._build_lost_handoff_plan_from_order(order)
+        if plan is None:
+            reason = "plan_rebuild_failed"
+            getattr(self.osm, "record_deferred_hydration_result", lambda *args, **kwargs: False)(
+                local_order_id,
+                success=False,
+                status=status,
+                reason=reason,
+                contract_selection_status="HYDRATION_QUALITY_REJECT",
+                selector_audit={
+                    "reason_code": reason,
+                    "stage": "plan_rebuild",
+                    "ticker": ticker,
+                    "contract_before": contract_before,
+                    "timestamp": now_utc_iso(),
+                },
+            )
+            return {"attempted": True, "success": False, "reason": reason}
+
+        if not isinstance(getattr(plan, "metadata", None), dict):
+            plan.metadata = {}
+        plan.metadata["contract_deferred"] = True
+        plan.metadata["selection_context"] = "deferred_prebreach_hydration"
+
+        if not plan.metadata.get("underlying_at_signal"):
+            live_underlying = self._get_live_underlying_snapshot(ticker)
+            if live_underlying:
+                plan.metadata["underlying_at_signal"] = live_underlying["price"]
+                plan.metadata["hydration_underlying_price"] = live_underlying["price"]
+                plan.metadata["hydration_underlying_source"] = live_underlying["source"]
+                plan.metadata["hydration_underlying_ts"] = live_underlying["timestamp"]
+
+        selector = self._get_deferred_hydration_selector()
+        selected = selector.select(plan)
+        selector_failure = getattr(selector, "get_last_failure", lambda: None)()
+
+        _plan_contract = str(getattr(plan, "contract_symbol", "") or "").strip()
+        _selected_contract = str(getattr(selected, "contract_symbol", "") or "").strip()
+        if self._is_real_occ_contract(_selected_contract, ticker):
+            selected_contract = _selected_contract
+        else:
+            selected_contract = (_plan_contract or _selected_contract or "").strip()
+        _plan_limit = getattr(plan, "limit_price", None)
+        _selected_limit = getattr(selected, "execution_price_per_share", None)
+        selected_limit = (
+            _selected_limit
+            if _selected_limit not in (None, 0, 0.0)
+            else _plan_limit
+        )
+        try:
+            if selected_limit is None and _plan_limit is not None:
+                selected_limit = float(_plan_limit)
+        except (TypeError, ValueError):
+            selected_limit = _selected_limit
+        selector_audit = self._build_deferred_hydration_audit(
+            order=order,
+            plan=plan,
+            selected_contract=selected_contract,
+            selector_failure=selector_failure,
+        )
+
+        if not self._is_real_occ_contract(selected_contract, ticker):
+            reason, selection_status = self._classify_deferred_hydration_failure(selector_failure)
+            getattr(self.osm, "record_deferred_hydration_result", lambda *args, **kwargs: False)(
+                local_order_id,
+                success=False,
+                status=status,
+                reason=reason,
+                contract_selection_status=selection_status,
+                selector_audit=selector_audit,
+                hydration_meta={
+                    "hydration_underlying_price": plan.metadata.get("hydration_underlying_price"),
+                    "hydration_underlying_source": plan.metadata.get("hydration_underlying_source"),
+                    "hydration_underlying_ts": plan.metadata.get("hydration_underlying_ts"),
+                },
+            )
+            log.info(
+                "[%s] DEFERRED_HYDRATION_PENDING | local=%s contract=%s reason=%s",
+                self.client_id, local_order_id, contract_before, reason,
+            )
+            return {"attempted": True, "success": False, "reason": reason}
+
+        try:
+            selected_limit = float(selected_limit)
+        except (TypeError, ValueError):
+            selected_limit = 0.0
+        if selected_limit <= 0.01:
+            reason = "invalid_executable_limit"
+            getattr(self.osm, "record_deferred_hydration_result", lambda *args, **kwargs: False)(
+                local_order_id,
+                success=False,
+                status=status,
+                reason=reason,
+                contract_selection_status="HYDRATION_QUALITY_REJECT",
+                selector_audit=selector_audit,
+            )
+            return {"attempted": True, "success": False, "reason": reason}
+
+        qty = int(getattr(selected, "affordable_contracts", 0) or 0)
+        if qty <= 0:
+            qty = int(getattr(plan, "contracts", 0) or 0)
+        if qty <= 0:
+            reason = "invalid_qty"
+            getattr(self.osm, "record_deferred_hydration_result", lambda *args, **kwargs: False)(
+                local_order_id,
+                success=False,
+                status=status,
+                reason=reason,
+                contract_selection_status="HYDRATION_QUALITY_REJECT",
+                selector_audit=selector_audit,
+            )
+            return {"attempted": True, "success": False, "reason": reason}
+
+        reserved_cost = round(qty * selected_limit * 100.0, 2)
+        ok = bool(
+            getattr(self.osm, "record_deferred_hydration_result", lambda *args, **kwargs: False)(
+                local_order_id,
+                success=True,
+                status=status,
+                contract=selected_contract,
+                limit_price=selected_limit,
+                qty=qty,
+                reserved_cost=reserved_cost,
+                contract_selection_status="HYDRATED_PRE_BREACH",
+                selector_audit=selector_audit,
+                hydration_meta={
+                    "hydration_underlying_price": plan.metadata.get("hydration_underlying_price"),
+                    "hydration_underlying_source": plan.metadata.get("hydration_underlying_source"),
+                    "hydration_underlying_ts": plan.metadata.get("hydration_underlying_ts"),
+                },
+            )
+        )
+        if ok:
+            log.info(
+                "[%s] DEFERRED_HYDRATION_OK | local=%s %s -> %s | limit=%.2f reserved=%.2f",
+                self.client_id, local_order_id, contract_before, selected_contract,
+                selected_limit, reserved_cost,
+            )
+        return {
+            "attempted": True,
+            "success": ok,
+            "reason": None if ok else "persist_failed",
+            "contract": selected_contract,
+            "limit_price": selected_limit,
+            "qty": qty,
+            "reserved_cost": reserved_cost,
+        }
+
+    def _maybe_hydrate_deferred_pending_trigger(self, order: dict) -> dict:
+        return self._maybe_hydrate_deferred_order(order)
+
     def _build_lost_handoff_plan_from_order(self, order: dict):
         """Rebuild a minimal watcher plan from an orders row.
 
@@ -1597,6 +2035,7 @@ class APOrderMonitor:
             )
 
             plan = _types.SimpleNamespace(
+                client_id=self.client_id,
                 signal_id=str(
                     order.get("signal_id")
                     or meta.get("signal_id")
@@ -1618,6 +2057,17 @@ class APOrderMonitor:
                 timeframe=str(meta.get("timeframe") or "1d"),
                 pattern=str(meta.get("pattern") or ""),
                 limit_price=float(order.get("limit_price") or 0) or None,
+                max_position_usd=float(
+                    order.get("reserved_cost")
+                    or meta.get("max_position_usd")
+                    or 0
+                ) or None,
+                execution_mode=str(
+                    order.get("execution_mode")
+                    or meta.get("execution_mode")
+                    or self.client_mode
+                    or ""
+                ).lower(),
                 metadata=dict(meta) if isinstance(meta, dict) else {},
             )
             # Preserve deferred-contract behavior — see PR #140.

@@ -92,8 +92,23 @@ def _order_row(row: Any) -> dict:
     meta = r.get("meta") or {}
     if not isinstance(meta, dict):
         meta = {}
+    deferred_hydration = meta.get("deferred_hydration") or {}
+    if not isinstance(deferred_hydration, dict):
+        deferred_hydration = {}
     status = str(r.get("status") or "").upper()
     bucket = dashboard_queue_bucket(status)
+    contract = r.get("contract") or meta.get("contract_symbol")
+    raw_limit = r.get("limit_price")
+    contract_selection_status = (
+        meta.get("contract_selection_status")
+        or deferred_hydration.get("contract_selection_status")
+    )
+    display_contract = contract
+    display_limit = raw_limit
+    if str(contract or "").upper().startswith("DEFERRED:"):
+        display_contract = "pending pre-breach hydration / breach-time selection"
+        if raw_limit is None or float(raw_limit or 0) <= 0.01:
+            display_limit = "not priced yet"
     return {
         "source": "orders",
         "id": r.get("local_order_id") or r.get("id"),
@@ -106,7 +121,14 @@ def _order_row(row: Any) -> dict:
         "side": r.get("side") or meta.get("side") or meta.get("direction"),
         "score": r.get("score") or meta.get("score"),
         "trigger_price": meta.get("trigger_price") or meta.get("entry_trigger"),
-        "contract": r.get("contract") or meta.get("contract_symbol"),
+        "contract": contract,
+        "display_contract": display_contract,
+        "limit_price": raw_limit,
+        "display_limit_price": display_limit,
+        "last_hydration_attempt": deferred_hydration.get("last_attempt_at"),
+        "hydration_failure_reason": deferred_hydration.get("failure_reason"),
+        "hydration_retryability": contract_selection_status,
+        "contract_selection_status": contract_selection_status,
         "last_error": r.get("last_error"),
     }
 
@@ -139,7 +161,7 @@ def build_operator_queue_read_model(*, client_id: str | None = None, hours: int 
     )
     order_sql = (
         "SELECT local_order_id, client_id, kind, status, broker_order_id, symbol, side, contract, "
-        "       score, signal_id, created_ts, updated_ts, last_error, meta "
+        "       limit_price, score, signal_id, created_ts, updated_ts, last_error, meta "
         "FROM orders "
         "WHERE " + " AND ".join(order_where) + " "
         "  AND kind = 'ENTRY' "

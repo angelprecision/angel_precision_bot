@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import os
+import re
 import time
 import uuid
 import logging
@@ -41,6 +42,7 @@ except ImportError:
 
 log = logging.getLogger("ap.execution_core")
 ET  = ZoneInfo("America/New_York")
+_OCC_CONTRACT_RE = re.compile(r"\d{6}[CP]\d{5,8}")
 
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
 BOT_MODE            = (os.getenv("AP_MODE") or os.getenv("BOT_MODE") or "PAPER").upper()
@@ -862,6 +864,120 @@ class APExecutionCore:
             )
             return None
 
+    @staticmethod
+    def _is_real_occ_contract(contract_symbol: str, ticker: str = "") -> bool:
+        contract_symbol = str(contract_symbol or "").strip().upper()
+        ticker = str(ticker or "").strip().upper()
+        if not contract_symbol or contract_symbol.startswith("DEFERRED:"):
+            return False
+        if ticker and contract_symbol == ticker:
+            return False
+        return bool(_OCC_CONTRACT_RE.search(contract_symbol))
+
+    def _refresh_hydrated_prebreach_plan(
+        self,
+        *,
+        approved_plan,
+        sig: dict,
+        local_order_id: str,
+        ticker: str,
+    ) -> bool:
+        """Bridge hydrated DB state into the watcher-held approved plan.
+
+        P0 invariant: a successful pre-breach hydration must be consumed by the
+        breach callback even if the watcher still holds the original
+        DEFERRED:<ticker> plan object.
+        """
+        if (
+            approved_plan is None
+            or not local_order_id
+            or self.order_state_machine is None
+            or not hasattr(self.order_state_machine, "get_order")
+        ):
+            return False
+
+        try:
+            order = self.order_state_machine.get_order(local_order_id)
+        except Exception as exc:
+            log.debug("[%s] hydrated pre-breach refresh get_order failed for %s: %s", ticker, local_order_id, exc)
+            return False
+
+        if not isinstance(order, dict):
+            return False
+
+        contract = str(order.get("contract") or "").strip()
+        if not self._is_real_occ_contract(contract, ticker):
+            return False
+        if order.get("broker_order_id") or order.get("submitted_ts"):
+            return False
+
+        try:
+            limit_price = float(order.get("limit_price") or 0)
+        except Exception:
+            limit_price = 0.0
+        if limit_price <= 0.01:
+            return False
+
+        try:
+            qty = int(order.get("qty") or 0)
+        except Exception:
+            qty = 0
+        if qty <= 0:
+            return False
+
+        try:
+            reserved_cost = float(order.get("reserved_cost") or 0)
+        except Exception:
+            reserved_cost = 0.0
+        if reserved_cost <= 0:
+            reserved_cost = round(limit_price * qty * 100.0, 2)
+
+        meta = getattr(approved_plan, "metadata", None)
+        if not isinstance(meta, dict):
+            meta = {}
+            try:
+                approved_plan.metadata = meta
+            except Exception:
+                pass
+
+        approved_plan.contract_symbol = contract
+        approved_plan.limit_price = limit_price
+        approved_plan.contracts = qty
+        approved_plan.max_position_usd = reserved_cost
+
+        meta.update({
+            "selected_contract": contract,
+            "contract_symbol": contract,
+            "limit_price": limit_price,
+            "contracts": qty,
+            "max_position_usd": reserved_cost,
+            "reserved_cost": reserved_cost,
+            "contract_deferred": False,
+            "contract_selection_status": "HYDRATED_PRE_BREACH",
+            "contract_materialized_source": "prebreach_hydration",
+        })
+
+        sig["contract_deferred"] = False
+        sig["contract_symbol"] = contract
+        sig["selected_contract"] = contract
+        sig["limit_price"] = limit_price
+        sig["contracts"] = qty
+        sig["reserved_cost"] = reserved_cost
+        sig["contract_selection_status"] = "HYDRATED_PRE_BREACH"
+        sig["contract_materialized_source"] = "prebreach_hydration"
+        sig["_approved_plan"] = approved_plan
+
+        log.info(
+            "[%s] PREBREACH_HYDRATION_BRIDGE_APPLIED | local=%s contract=%s limit=%.2f qty=%s reserved=%.2f",
+            ticker,
+            local_order_id,
+            contract,
+            limit_price,
+            qty,
+            reserved_cost,
+        )
+        return True
+
     # ── Diagnostic-only helper (PR hotfix/breach-block-diagnostics) ──────────
     # Emits a single structured log line for every silent block / exception
     # path in _breach_risk_check and _on_entry_trigger. The bot is working;
@@ -1558,6 +1674,76 @@ class APExecutionCore:
             # outcome. _terminalize_breach_failure records this terminal state.
             _terminalize_breach_failure("approved_plan_missing_after_revalidation")
             return
+
+        _hydration_bridge_applied = self._refresh_hydrated_prebreach_plan(
+            approved_plan=approved_plan,
+            sig=sig,
+            local_order_id=queue_local_order_id,
+            ticker=ticker,
+        )
+        _hydrated_master_control = getattr(self, "master_control", None)
+        if _hydration_bridge_applied:
+            if _hydrated_master_control is None:
+                reason = "hydrated_prebreach_revalidation_unavailable"
+                log.critical(
+                    "[%s] PRODUCTION_ENTRY_BLOCK — hydration applied but master_control missing; "
+                    "cannot revalidate hydrated contract/qty/limit safely",
+                    ticker,
+                )
+                _terminalize_breach_failure(
+                    reason,
+                    cleanup_action="expire",
+                    meta_patch={
+                        "hydration_bridge_applied": True,
+                        "hydrated_prebreach_revalidation": "unavailable",
+                        "local_order_id": queue_local_order_id,
+                    },
+                    context_notes=reason,
+                )
+                return
+            try:
+                _hydrated_reval = _hydrated_master_control.revalidate_exposure(
+                    approved_plan,
+                    client_id=self.email or "default",
+                )
+            except Exception as exc:
+                reason = f"hydrated_prebreach_revalidation_error:{exc}"
+                log.critical(
+                    "[%s] PRODUCTION_ENTRY_BLOCK — hydrated pre-breach revalidation errored: %s",
+                    ticker,
+                    exc,
+                )
+                _terminalize_breach_failure(
+                    reason,
+                    cleanup_action="expire",
+                    meta_patch={
+                        "hydration_bridge_applied": True,
+                        "hydrated_prebreach_revalidation": "error",
+                        "local_order_id": queue_local_order_id,
+                    },
+                    context_notes=reason,
+                )
+                return
+            if not getattr(_hydrated_reval, "ok", False):
+                _reason = getattr(_hydrated_reval, "reason", "revalidation_failed")
+                reason = f"hydrated_prebreach_revalidation_blocked:{_reason}"
+                log.critical(
+                    "[%s] PRODUCTION_ENTRY_BLOCK — hydrated pre-breach revalidation blocked: %s",
+                    ticker,
+                    _reason,
+                )
+                _terminalize_breach_failure(
+                    reason,
+                    cleanup_action="expire",
+                    meta_patch={
+                        "hydration_bridge_applied": True,
+                        "hydrated_prebreach_revalidation": "blocked",
+                        "hydrated_prebreach_revalidation_reason": str(_reason),
+                        "local_order_id": queue_local_order_id,
+                    },
+                    context_notes=reason,
+                )
+                return
 
         # 3b) Breach-time contract selection for overnight deferred signals.
         # Pre-market option chains have zero bids — overnight_reeval cannot select

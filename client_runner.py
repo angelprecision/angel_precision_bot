@@ -2156,6 +2156,7 @@ class ClientRunner(threading.Thread):
             position_manager=self.position_manager,
             exit_engine=exit_eng,
             entry_watcher=getattr(self.core, "entry_watcher", None),
+            contract_selector=getattr(self.core, "contract_selector", None),
             client_mode=self.mode,   # PR66: pass PAPER/LIVE so max-age splits correctly
             data_broker=data_broker,
         )

@@ -1585,6 +1585,271 @@ class APOrderStateMachine:
             )
             return False
 
+    def record_deferred_hydration_result(
+        self,
+        local_order_id: str,
+        *,
+        success: bool,
+        status: str | None = None,
+        reason: str | None = None,
+        contract: str | None = None,
+        limit_price: float | None = None,
+        qty: int | None = None,
+        reserved_cost: float | None = None,
+        contract_selection_status: str | None = None,
+        selector_audit: dict | None = None,
+        hydration_meta: dict | None = None,
+    ) -> bool:
+        """Persist post-open deferred contract hydration on an existing row."""
+        import json as _json_local
+
+        status = str(status or "").strip().upper() or None
+        reason = str(reason) if reason else None
+        contract_selection_status = (
+            str(contract_selection_status)
+            if contract_selection_status
+            else (
+                "HYDRATED_PRE_BREACH"
+                if success
+                else reason
+            )
+        )
+        deferred_hydration = {
+            "attempted": True,
+            "success": bool(success),
+            "selected_contract": str(contract) if success and contract else None,
+            "selected_limit_price": float(limit_price) if success and limit_price is not None else None,
+            "qty": int(qty) if success and qty is not None else None,
+            "reserved_cost": float(reserved_cost) if success and reserved_cost is not None else None,
+            "selector_audit": selector_audit or {},
+            "last_attempt_at": now_utc_iso(),
+            "failure_reason": None if success else reason,
+            "reason": None if success else reason,
+        }
+        if hydration_meta:
+            for key, value in hydration_meta.items():
+                if value is not None:
+                    deferred_hydration[key] = value
+
+        meta_patch = {
+            "contract_deferred": not bool(success),
+            "contract_selection_status": contract_selection_status,
+            "deferred_hydration": {
+                **deferred_hydration,
+            }
+        }
+        if success:
+            meta_patch.update({
+                "selected_contract": str(contract) if contract else None,
+                "contract_symbol": str(contract) if contract else None,
+                "limit_price": float(limit_price) if limit_price is not None else None,
+                "contracts": int(qty) if qty is not None else None,
+                "max_position_usd": float(reserved_cost) if reserved_cost is not None else None,
+                "reserved_cost": float(reserved_cost) if reserved_cost is not None else None,
+                "contract_materialized_source": "prebreach_hydration",
+            })
+
+        try:
+            meta_json = _json_local.dumps(meta_patch, default=str)
+        except Exception:
+            return False
+
+        def _rowcount(cur, c) -> int:
+            try:
+                return int(getattr(cur, "rowcount", getattr(c, "rowcount", 0)) or 0)
+            except Exception:
+                return 0
+
+        def _log_cas_miss() -> None:
+            log.info(
+                "[%s] DEFERRED_HYDRATION_STALE_SKIP local=%s reason=cas_miss",
+                self.client_id,
+                local_order_id,
+            )
+
+        def _update_with_status_column():
+            with conn() as c:
+                cur = c.execute(
+                    """
+                    SELECT status, contract, broker_order_id, submitted_ts
+                    FROM orders
+                    WHERE local_order_id = %s
+                      AND client_id = %s
+                    FOR UPDATE
+                    """,
+                    (local_order_id, self.client_id),
+                )
+                row = cur.fetchone()
+                if not row:
+                    return 0
+                row = dict(row) if not isinstance(row, dict) else row
+                current_status = str(row.get("status") or "").upper()
+                current_contract = str(row.get("contract") or "")
+                if status and current_status != status:
+                    return 0
+                if current_status != "PENDING_TRIGGER":
+                    return 0
+                if row.get("broker_order_id") or row.get("submitted_ts"):
+                    return 0
+                if not current_contract.upper().startswith("DEFERRED:"):
+                    return 0
+                if success:
+                    cur = c.execute(
+                        """
+                        UPDATE orders
+                        SET contract = %s,
+                            limit_price = %s,
+                            qty = %s,
+                            reserved_cost = %s,
+                            contract_selection_status = %s,
+                            meta = COALESCE(meta, '{}'::jsonb) || %s::jsonb,
+                            updated_ts = NOW()
+                        WHERE local_order_id = %s
+                          AND client_id = %s
+                          AND UPPER(COALESCE(status,'')) = 'PENDING_TRIGGER'
+                          AND UPPER(COALESCE(contract,'')) LIKE 'DEFERRED:%%'
+                          AND (broker_order_id IS NULL OR broker_order_id = '')
+                          AND submitted_ts IS NULL
+                          AND (limit_price IS NULL OR limit_price <= 0.01)
+                        """,
+                        (
+                            contract,
+                            float(limit_price) if limit_price is not None else None,
+                            int(qty) if qty is not None else None,
+                            float(reserved_cost) if reserved_cost is not None else None,
+                            contract_selection_status,
+                            meta_json,
+                            local_order_id,
+                            self.client_id,
+                        ),
+                    )
+                else:
+                    cur = c.execute(
+                        """
+                        UPDATE orders
+                        SET contract_selection_status = %s,
+                            meta = COALESCE(meta, '{}'::jsonb) || %s::jsonb,
+                            updated_ts = NOW()
+                        WHERE local_order_id = %s
+                          AND client_id = %s
+                          AND UPPER(COALESCE(status,'')) = 'PENDING_TRIGGER'
+                          AND UPPER(COALESCE(contract,'')) LIKE 'DEFERRED:%%'
+                          AND (broker_order_id IS NULL OR broker_order_id = '')
+                          AND submitted_ts IS NULL
+                        """,
+                        (
+                            contract_selection_status,
+                            meta_json,
+                            local_order_id,
+                            self.client_id,
+                        ),
+                    )
+                rowcount = _rowcount(cur, c)
+                if rowcount == 0:
+                    _log_cas_miss()
+                return rowcount
+
+        def _update_without_status_column():
+            with conn() as c:
+                cur = c.execute(
+                    """
+                    SELECT status, contract, broker_order_id, submitted_ts
+                    FROM orders
+                    WHERE local_order_id = %s
+                      AND client_id = %s
+                    FOR UPDATE
+                    """,
+                    (local_order_id, self.client_id),
+                )
+                row = cur.fetchone()
+                if not row:
+                    return 0
+                row = dict(row) if not isinstance(row, dict) else row
+                current_status = str(row.get("status") or "").upper()
+                current_contract = str(row.get("contract") or "")
+                if status and current_status != status:
+                    return 0
+                if current_status != "PENDING_TRIGGER":
+                    return 0
+                if row.get("broker_order_id") or row.get("submitted_ts"):
+                    return 0
+                if not current_contract.upper().startswith("DEFERRED:"):
+                    return 0
+                if success:
+                    cur = c.execute(
+                        """
+                        UPDATE orders
+                        SET contract = %s,
+                            limit_price = %s,
+                            qty = %s,
+                            reserved_cost = %s,
+                            meta = COALESCE(meta, '{}'::jsonb) || %s::jsonb,
+                            updated_ts = NOW()
+                        WHERE local_order_id = %s
+                          AND client_id = %s
+                          AND UPPER(COALESCE(status,'')) = 'PENDING_TRIGGER'
+                          AND UPPER(COALESCE(contract,'')) LIKE 'DEFERRED:%%'
+                          AND (broker_order_id IS NULL OR broker_order_id = '')
+                          AND submitted_ts IS NULL
+                          AND (limit_price IS NULL OR limit_price <= 0.01)
+                        """,
+                        (
+                            contract,
+                            float(limit_price) if limit_price is not None else None,
+                            int(qty) if qty is not None else None,
+                            float(reserved_cost) if reserved_cost is not None else None,
+                            meta_json,
+                            local_order_id,
+                            self.client_id,
+                        ),
+                    )
+                else:
+                    cur = c.execute(
+                        """
+                        UPDATE orders
+                        SET meta = COALESCE(meta, '{}'::jsonb) || %s::jsonb,
+                            updated_ts = NOW()
+                        WHERE local_order_id = %s
+                          AND client_id = %s
+                          AND UPPER(COALESCE(status,'')) = 'PENDING_TRIGGER'
+                          AND UPPER(COALESCE(contract,'')) LIKE 'DEFERRED:%%'
+                          AND (broker_order_id IS NULL OR broker_order_id = '')
+                          AND submitted_ts IS NULL
+                        """,
+                        (
+                            meta_json,
+                            local_order_id,
+                            self.client_id,
+                        ),
+                    )
+                rowcount = _rowcount(cur, c)
+                if rowcount == 0:
+                    _log_cas_miss()
+                return rowcount
+
+        try:
+            rowcount = run_with_retry(_update_with_status_column)
+        except Exception as exc:
+            if not (
+                pg_errors
+                and isinstance(exc, getattr(pg_errors, "UndefinedColumn", tuple()))
+            ):
+                log.warning(
+                    "[%s] record_deferred_hydration_result failed for local_order_id=%s: %s",
+                    self.client_id, local_order_id, exc,
+                )
+                return False
+            try:
+                rowcount = run_with_retry(_update_without_status_column)
+            except Exception as fallback_exc:
+                log.warning(
+                    "[%s] record_deferred_hydration_result fallback failed for local_order_id=%s: %s",
+                    self.client_id, local_order_id, fallback_exc,
+                )
+                return False
+
+        return bool(rowcount and rowcount > 0)
+
     def get_order(self, local_order_id: str):
         return self._get_order(local_order_id)
 
