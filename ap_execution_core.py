@@ -134,6 +134,87 @@ def _is_ladder_exhaustion_retryable(ladder_audit: Optional[dict]) -> bool:
     return saw_any_retryable
 
 
+# ── P0: Deferred materialization audit helper ─────────────────────────────────
+# Writes orders.meta.deferred_materialization on every breach-selector attempt
+# so every probed expiration, chain size, reject bucket, and account budget is
+# permanently captured in the order row — whether or not the trade is filled.
+#
+# Called on BOTH success and failure paths.  On success the caller supplies the
+# real OCC symbol and limit; on failure success=False and failure_reason names
+# the blocker.  Best-effort — never raises; observability only.
+# ─────────────────────────────────────────────────────────────────────────────
+def _write_deferred_materialization_audit(
+    osm,
+    local_order_id: str,
+    *,
+    success: bool,
+    attempt_ts: str,
+    original_contract: str,
+    symbol: str,
+    side: str,
+    execution_mode: str,
+    account_budget: float,
+    selector_status: "str | None",
+    selected_contract: "str | None",
+    selected_limit_price: "float | None",
+    failure_reason: "str | None",
+    stage: "str | None",
+    expirations_probed: "list | None",
+    chain_rows_total: int,
+    survivor_count: int,
+    top_reject_buckets: "dict | None",
+    nearest_affordable_contract: "str | None" = None,
+    best_liquid_contract: "str | None" = None,
+    why_best_contract_failed: "str | None" = None,
+) -> None:
+    """Write orders.meta.deferred_materialization for every breach selector attempt.
+
+    Required fields on every call:
+        attempted=True, success, attempt_ts, original_contract, symbol, side,
+        execution_mode, account_budget, selector_status, selected_contract,
+        selected_limit_price, failure_reason, stage, expirations_probed,
+        chain_rows_total, survivor_count, top_reject_buckets.
+    Optional enrichment (set when available):
+        nearest_affordable_contract, best_liquid_contract, why_best_contract_failed.
+
+    Never raises. Observability only — does not affect any gate or transition.
+    """
+    try:
+        if not osm or not local_order_id:
+            return
+        _update = getattr(osm, "update_order_meta", None)
+        if not callable(_update):
+            return
+        audit: dict = {
+            "attempted":              True,
+            "success":                bool(success),
+            "attempt_ts":             str(attempt_ts or ""),
+            "original_contract":      str(original_contract or ""),
+            "symbol":                 str(symbol or ""),
+            "side":                   str(side or ""),
+            "execution_mode":         str(execution_mode or ""),
+            "account_budget":         float(account_budget or 0),
+            "selector_status":        str(selector_status) if selector_status else None,
+            "selected_contract":      str(selected_contract) if selected_contract else None,
+            "selected_limit_price":   float(selected_limit_price) if selected_limit_price is not None else None,
+            "failure_reason":         str(failure_reason) if failure_reason else None,
+            "stage":                  str(stage) if stage else None,
+            "expirations_probed":     list(expirations_probed) if expirations_probed else [],
+            "chain_rows_total":       int(chain_rows_total or 0),
+            "survivor_count":         int(survivor_count or 0),
+            "top_reject_buckets":     dict(top_reject_buckets) if top_reject_buckets else {},
+        }
+        if nearest_affordable_contract is not None:
+            audit["nearest_affordable_contract"] = str(nearest_affordable_contract)
+        if best_liquid_contract is not None:
+            audit["best_liquid_contract"] = str(best_liquid_contract)
+        if why_best_contract_failed is not None:
+            audit["why_best_contract_failed"] = str(why_best_contract_failed)
+        _update(local_order_id, {"deferred_materialization": audit})
+    except Exception:
+        pass  # observability must never interrupt the submit path
+
+
 # ── Mode metadata thresholds ────────────────────────────────────────────────
 # PR-B / FIX-8: floors are now env-overridable so they can be tuned
 # on Render without a code deploy (essential for proof-week response time).
@@ -1796,6 +1877,39 @@ class APExecutionCore:
                     except Exception as _obs_a_exc:
                         log.debug("[%s] PR182 write-back non-critical: %s", ticker, _obs_a_exc)
                     # ── end PR #182 + P0 Path A ────────────────────────────────
+                    # P0: Write durable materialization audit before terminalizing.
+                    # Extracts chain/reject data from plan.metadata["selector_failure"]
+                    # (written by _attach_selector_failure in contract_selector) and
+                    # DTE ladder buckets from the selector audit.  Best-effort.
+                    try:
+                        _sel_failure_a = (
+                            getattr(approved_plan, "metadata", {}) or {}
+                        ).get("selector_failure") or {}
+                        _ladder_buckets_a = (
+                            _deferred_selector_audit.get("last_dte_ladder_audit") or {}
+                        ).get("buckets_attempted")
+                        _write_deferred_materialization_audit(
+                            self.order_state_machine,
+                            queue_local_order_id,
+                            success=False,
+                            attempt_ts=datetime.now(timezone.utc).isoformat(),
+                            original_contract=_contract_sym_raw or f"DEFERRED:{ticker}",
+                            symbol=ticker,
+                            side=str(getattr(approved_plan, "side", "") or ""),
+                            execution_mode=str(getattr(approved_plan, "execution_mode", "") or ""),
+                            account_budget=float(_deferred_selector_audit.get("budget") or 0),
+                            selector_status=_cs_status_a,
+                            selected_contract=None,
+                            selected_limit_price=None,
+                            failure_reason=_reason,
+                            stage=_deferred_selector_audit.get("stage"),
+                            expirations_probed=_ladder_buckets_a,
+                            chain_rows_total=int(_sel_failure_a.get("chain_rows") or 0),
+                            survivor_count=int(_sel_failure_a.get("survivor_count") or 0),
+                            top_reject_buckets=_sel_failure_a.get("top_reject_buckets") or {},
+                        )
+                    except Exception:
+                        pass  # audit write is non-critical
                     _terminalize_deferred_breach_failure(
                         _reason,
                         extra_meta={
@@ -1897,6 +2011,36 @@ class APExecutionCore:
                     except Exception as _obs_b_exc:
                         log.debug("[%s] PR182 write-back non-critical: %s", ticker, _obs_b_exc)
                     # ── end PR #182 Path B ─────────────────────────────────────
+                    # P0: Write durable materialization audit before terminalizing (Path B).
+                    try:
+                        _sel_failure_b = (
+                            getattr(approved_plan, "metadata", {}) or {}
+                        ).get("selector_failure") or {}
+                        _ladder_buckets_b = (
+                            _deferred_selector_audit.get("last_dte_ladder_audit") or {}
+                        ).get("buckets_attempted")
+                        _write_deferred_materialization_audit(
+                            self.order_state_machine,
+                            queue_local_order_id,
+                            success=False,
+                            attempt_ts=datetime.now(timezone.utc).isoformat(),
+                            original_contract=_contract_sym_raw or f"DEFERRED:{ticker}",
+                            symbol=ticker,
+                            side=str(getattr(approved_plan, "side", "") or ""),
+                            execution_mode=str(getattr(approved_plan, "execution_mode", "") or ""),
+                            account_budget=float(_deferred_selector_audit.get("budget") or 0),
+                            selector_status="DEFERRED_UNRESOLVED_AT_BREACH",
+                            selected_contract=None,
+                            selected_limit_price=None,
+                            failure_reason=_reason,
+                            stage="deferred_copy_back",
+                            expirations_probed=_ladder_buckets_b,
+                            chain_rows_total=int(_sel_failure_b.get("chain_rows") or 0),
+                            survivor_count=int(_sel_failure_b.get("survivor_count") or 0),
+                            top_reject_buckets=_sel_failure_b.get("top_reject_buckets") or {},
+                        )
+                    except Exception:
+                        pass  # audit write is non-critical
                     _terminalize_deferred_breach_failure(
                         _reason,
                         extra_meta={
@@ -1925,6 +2069,35 @@ class APExecutionCore:
                         "qty": int(getattr(approved_plan, "contracts", 0) or 0),
                     },
                 )
+                # P0: Write durable materialization audit on success path.
+                # Captures the real OCC symbol, executable limit, and selector
+                # evidence so the row proves materialization happened correctly.
+                try:
+                    _cand_audit_for_meta = getattr(_sel, "candidate_audit", None) or {}
+                    _write_deferred_materialization_audit(
+                        self.order_state_machine,
+                        queue_local_order_id,
+                        success=True,
+                        attempt_ts=datetime.now(timezone.utc).isoformat(),
+                        original_contract=_contract_sym_raw or f"DEFERRED:{ticker}",
+                        symbol=ticker,
+                        side=str(getattr(approved_plan, "side", "") or ""),
+                        execution_mode=str(getattr(approved_plan, "execution_mode", "") or ""),
+                        account_budget=float(getattr(approved_plan, "max_position_usd", 0) or 0),
+                        selector_status="CONTRACT_SELECTED",
+                        selected_contract=_live_contract,
+                        selected_limit_price=float(getattr(approved_plan, "limit_price", 0) or 0),
+                        failure_reason=None,
+                        stage="contract_selected",
+                        expirations_probed=(
+                            self.contract_selector.get_last_dte_ladder_audit() or {}
+                        ).get("buckets_attempted") if hasattr(self.contract_selector, "get_last_dte_ladder_audit") else None,
+                        chain_rows_total=int(_cand_audit_for_meta.get("candidates_considered") or 0),
+                        survivor_count=int(_cand_audit_for_meta.get("candidates_considered") or 0),
+                        top_reject_buckets=_cand_audit_for_meta.get("rejected_candidate_reasons") or {},
+                    )
+                except Exception:
+                    pass  # audit write is non-critical
                 log.info(
                     "[%s] DEFERRED_BREACH_CONTRACT_SELECTED — contract=%s limit=%.2f qty=%s",
                     ticker,
@@ -2528,6 +2701,36 @@ class APExecutionCore:
             except Exception:
                 pass
             return
+
+        # ── P0: Deferred materialization pre-submit invariant ──────────────────
+        # For deferred orders only: assert that contract resolution and limit-price
+        # materialization actually happened before we send any bytes to Tradier.
+        # The OSM has its own DEFERRED_CONTRACT_BLOCKED guard as a second layer,
+        # but this execution-core-layer guard fires first and uses named reason
+        # codes (DEFERRED_CONTRACT_NOT_MATERIALIZED / DEFERRED_LIMIT_NOT_MATERIALIZED)
+        # so dashboards can distinguish "selection ran and copy-back failed" from
+        # "selection never ran" — broker_order_id remains null in both cases.
+        if _deferred:
+            _pre_contract = str(approved_contract or "")
+            _pre_limit    = float(submit_limit or 0)
+            if (not _pre_contract) or _pre_contract.upper().startswith("DEFERRED:"):
+                _inv_err = "DEFERRED_CONTRACT_NOT_MATERIALIZED"
+                log.critical(
+                    "[%s] PRE_SUBMIT_INVARIANT_FAILED — %s | contract=%r | "
+                    "broker_order_id=null; blocking broker POST",
+                    ticker, _inv_err, _pre_contract,
+                )
+                _terminalize_breach_failure(_inv_err)
+                return
+            if _pre_limit <= 0.01:
+                _inv_err = "DEFERRED_LIMIT_NOT_MATERIALIZED"
+                log.critical(
+                    "[%s] PRE_SUBMIT_INVARIANT_FAILED — %s | limit_price=%r | "
+                    "broker_order_id=null; blocking broker POST",
+                    ticker, _inv_err, _pre_limit,
+                )
+                _terminalize_breach_failure(_inv_err)
+                return
 
         submit_res = self.order_state_machine.submit_existing_entry(
             local_order_id=queue_local_order_id,

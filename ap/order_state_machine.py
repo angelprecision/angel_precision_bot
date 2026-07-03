@@ -1707,13 +1707,21 @@ class APOrderStateMachine:
             try:
                 def _update_contract_pre_submit():
                     with conn() as c:
+                        _upd_qty = int(getattr(plan, "contracts", 0) or current.get("qty") or 0)
+                        _upd_lp  = round(lp, 2)
+                        # P0: also update reserved_cost = qty * limit_price * 100 so
+                        # the capital gate sees the real breach-time cost, not the
+                        # placeholder 0.01 * 100 written at PENDING_TRIGGER arm time.
+                        _upd_rc  = round(_upd_qty * _upd_lp * 100, 2) if _upd_qty > 0 and _upd_lp > 0 else None
                         c.execute(
-                            "UPDATE orders SET contract=%s, limit_price=%s, qty=%s, updated_ts=NOW() "
+                            "UPDATE orders SET contract=%s, limit_price=%s, qty=%s, "
+                            "reserved_cost=%s, updated_ts=NOW() "
                             "WHERE local_order_id=%s AND client_id=%s",
                             (
                                 contract,
-                                round(lp, 2),
-                                int(getattr(plan, "contracts", 0) or current.get("qty") or 0),
+                                _upd_lp,
+                                _upd_qty,
+                                _upd_rc,
                                 local_order_id,
                                 self.client_id,
                             ),
