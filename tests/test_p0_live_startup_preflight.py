@@ -8,8 +8,12 @@ market data is reachable: a LIVE runner with a revoked token started anyway
 and calibrated capital gates to a fake $25K default equity — silent
 degraded startup, false confidence, dead trade flow.
 
-These tests drive _run_live_preflight() directly with stub brokers, and
-source-fence the fatal LIVE equity fallback + manifest exposure.
+These tests drive the split LIVE preflight directly:
+  - _run_live_preflight() covers execution-broker auth/equity readiness
+  - _run_live_market_data_preflight() covers quote readiness after
+    resolve_market_data_transport()
+
+They also source-fence the fatal LIVE equity fallback + manifest exposure.
 """
 
 import os
@@ -107,17 +111,29 @@ def test_broker_without_equity_method_fails(monkeypatch):
     assert not ok and reason == "broker_missing_get_account_equity"
 
 
-def test_quote_error_fails(monkeypatch):
+def test_quote_error_fails_after_transport_resolution(monkeypatch):
     monkeypatch.delenv("LIVE_PREFLIGHT_ENABLED", raising=False)
     r = _make_runner(monkeypatch)
-    ok, reason = r._run_live_preflight(_Broker(quote_exc=RuntimeError("timeout")))
+    r.live_preflight_equity = 12500.0
+    ok, reason = r._run_live_market_data_preflight(
+        _Broker(quote_exc=RuntimeError("timeout")),
+        data_broker_source="TRADIER_MARKET_DATA_TOKEN",
+        data_base_url="https://api.tradier.com",
+        data_broker_is_dedicated=True,
+    )
     assert not ok and reason.startswith("market_data_unusable")
 
 
-def test_zero_quote_fails(monkeypatch):
+def test_zero_quote_fails_after_transport_resolution(monkeypatch):
     monkeypatch.delenv("LIVE_PREFLIGHT_ENABLED", raising=False)
     r = _make_runner(monkeypatch)
-    ok, reason = r._run_live_preflight(_Broker(quote={"last": 0, "bid": 0}))
+    r.live_preflight_equity = 12500.0
+    ok, reason = r._run_live_market_data_preflight(
+        _Broker(quote={"last": 0, "bid": 0}),
+        data_broker_source="TRADIER_MARKET_DATA_TOKEN",
+        data_base_url="https://api.tradier.com",
+        data_broker_is_dedicated=True,
+    )
     assert not ok and reason == "market_data_quote_not_positive"
 
 
@@ -136,13 +152,29 @@ def test_valid_live_config_passes(monkeypatch):
     ok, reason = r._run_live_preflight(_Broker(equity=8421.55, quote={"last": 552.31}))
     assert ok and reason == "ok"
     assert r.live_preflight_status == "ok"
+    ok2, reason2 = r._run_live_market_data_preflight(
+        _Broker(quote={"last": 552.31}),
+        data_broker_source="TRADIER_MARKET_DATA_TOKEN",
+        data_base_url="https://api.tradier.com",
+        data_broker_is_dedicated=True,
+    )
+    assert ok2 and reason2 == "ok"
+    assert r.live_preflight_quote_source == "TRADIER_MARKET_DATA_TOKEN"
+    assert r.live_preflight_quote_broker_mode == "dedicated_market_data_broker"
 
 
 def test_quote_price_falls_through_fields(monkeypatch):
     monkeypatch.delenv("LIVE_PREFLIGHT_ENABLED", raising=False)
     r = _make_runner(monkeypatch)
-    ok, _ = r._run_live_preflight(_Broker(quote={"last": None, "bid": 0, "ask": 552.10}))
+    r.live_preflight_equity = 12500.0
+    ok, _ = r._run_live_market_data_preflight(
+        _Broker(quote={"last": None, "bid": 0, "ask": 552.10}),
+        data_broker_source="execution_broker_fallback_live",
+        data_base_url="https://api.tradier.com",
+        data_broker_is_dedicated=False,
+    )
     assert ok
+    assert r.live_preflight_quote_broker_mode == "execution_broker_fallback"
 
 
 # ── Kill switch is loud, never silent ────────────────────────────────────────
@@ -163,6 +195,8 @@ def test_preflight_called_after_broker_construction_live_only():
         r"self\.broker = broker(.*?)_run_live_preflight\(broker\)", SRC, re.S
     )
     assert m and 'strip().upper() == "LIVE"' in m.group(1)
+    assert "_run_live_market_data_preflight(" in SRC
+    assert SRC.index("resolve_market_data_transport(") < SRC.index("_run_live_market_data_preflight(")
     assert '_mark_failed(f"LIVE_PREFLIGHT_FAILED:{_pf_reason}")' in SRC
 
 
@@ -180,8 +214,11 @@ def test_paper_equity_fallback_preserved():
 
 def test_manifest_exposes_preflight_status():
     assert '"live_preflight_status": getattr(self, "live_preflight_status", "not_applicable")' in SRC
+    assert '"live_preflight_quote_source": getattr(self, "live_preflight_quote_source", "")' in SRC
+    assert '"live_preflight_quote_broker_mode": getattr(self, "live_preflight_quote_broker_mode", "")' in SRC
 
 
 def test_markers_present():
     assert "LIVE_PREFLIGHT_OK" in SRC
     assert "LIVE_PREFLIGHT_FAILED reason=" in SRC
+    assert "data_quote_source=%s" in SRC
