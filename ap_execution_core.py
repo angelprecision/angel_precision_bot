@@ -20,7 +20,7 @@ import time
 import uuid
 import logging
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
@@ -132,6 +132,178 @@ def _is_ladder_exhaustion_retryable(ladder_audit: Optional[dict]) -> bool:
     # If we only saw retryable data-miss reasons (or no per-exp reason_code at
     # all), allow the retry so the ladder gets a fresh chance after the delay.
     return saw_any_retryable
+
+
+def _classify_deferred_breach_retry_decision(
+    reason_code: str,
+    *,
+    queue_local_order_id: str,
+    attempt: int,
+    max_attempts: int,
+    past_cutoff: bool,
+    retry_enabled: bool,
+    ladder_retryable: bool = False,
+) -> dict:
+    _reason_code = str(reason_code or "").strip() or "BREACH_SELECTOR_RETURNED_NONE"
+    _retryable_reason = (
+        _reason_code in RETRYABLE_BREACH_SELECTOR_REASONS or bool(ladder_retryable)
+    )
+    if (
+        _retryable_reason
+        and retry_enabled
+        and bool(queue_local_order_id)
+        and attempt <= max_attempts
+        and not past_cutoff
+    ):
+        return {
+            "action": "retry_schedule",
+            "reason_code": _reason_code,
+            "retryable_reason": True,
+        }
+    if _retryable_reason and past_cutoff:
+        return {
+            "action": "retry_cutoff",
+            "reason_code": _reason_code,
+            "retryable_reason": True,
+            "terminal_reason": f"breach_retry_cutoff:{_reason_code}",
+        }
+    if _retryable_reason and attempt > max_attempts:
+        return {
+            "action": "retry_exhausted",
+            "reason_code": _reason_code,
+            "retryable_reason": True,
+            "terminal_reason": f"breach_retry_exhausted:{_reason_code}",
+        }
+    if _retryable_reason and not retry_enabled:
+        return {
+            "action": "retry_disabled",
+            "reason_code": _reason_code,
+            "retryable_reason": True,
+            "terminal_reason": f"breach_retry_disabled:{_reason_code}",
+        }
+    if _retryable_reason and not bool(queue_local_order_id):
+        return {
+            "action": "retry_unavailable",
+            "reason_code": _reason_code,
+            "retryable_reason": True,
+            "terminal_reason": f"breach_retry_unavailable:{_reason_code}",
+        }
+    return {
+        "action": "terminal_quality",
+        "reason_code": _reason_code,
+        "retryable_reason": False,
+    }
+
+
+def _build_deferred_retry_schedule_meta(
+    *,
+    reason_code: str,
+    selector_audit: Optional[dict],
+    attempt: int,
+    max_attempts: int,
+    delay_seconds: int,
+    client_id: str,
+    execution_mode: str,
+    local_order_id: str,
+    signal_id: str,
+    now: Optional[datetime] = None,
+) -> dict:
+    _now = now or datetime.now(timezone.utc)
+    return {
+        "deferred_retry_scheduled": True,
+        "deferred_retry_reason_code": str(reason_code or ""),
+        "deferred_retry_attempt": int(attempt),
+        "deferred_retry_max_attempts": int(max_attempts),
+        "deferred_retry_delay_seconds": int(delay_seconds),
+        "deferred_retry_scheduled_at": _now.isoformat(),
+        "deferred_retry_next_attempt_at": (
+            _now + timedelta(seconds=int(delay_seconds))
+        ).isoformat(),
+        "last_breach_selector_audit": selector_audit or {},
+        "breach_attempt_count": int(attempt),
+        "client_id": str(client_id or ""),
+        "execution_mode": str(execution_mode or ""),
+        "local_order_id": str(local_order_id or ""),
+        "signal_id": str(signal_id or ""),
+        "contract_selection_status": "CONTRACT_SELECTION_RETRY",
+    }
+
+
+def _build_deferred_retry_terminal_meta(
+    *,
+    terminal_reason: str,
+    reason_code: str,
+    selector_audit: Optional[dict],
+    attempt: int,
+    max_attempts: int,
+    client_id: str,
+    execution_mode: str,
+    local_order_id: str,
+    signal_id: str,
+    now: Optional[datetime] = None,
+) -> dict:
+    _now = now or datetime.now(timezone.utc)
+    return {
+        "deferred_retry_scheduled": False,
+        "deferred_retry_terminal_reason": str(terminal_reason or ""),
+        "deferred_retry_reason_code": str(reason_code or ""),
+        "deferred_retry_attempt": int(attempt),
+        "deferred_retry_max_attempts": int(max_attempts),
+        "last_breach_selector_audit": selector_audit or {},
+        "breach_attempt_count": int(attempt),
+        "client_id": str(client_id or ""),
+        "execution_mode": str(execution_mode or ""),
+        "local_order_id": str(local_order_id or ""),
+        "signal_id": str(signal_id or ""),
+        "last_breach_failure_at": _now.isoformat(),
+    }
+
+
+def _build_deferred_retry_stale_abort_meta(
+    *,
+    current_status: str,
+    broker_order_id: str,
+    submitted_ts,
+    current_contract: str,
+    current_attempt: int,
+    thread_attempt: int,
+    selector_audit: Optional[dict],
+    client_id: str,
+    execution_mode: str,
+    local_order_id: str,
+    signal_id: str,
+    reason: str,
+    now: Optional[datetime] = None,
+) -> dict:
+    _now = now or datetime.now(timezone.utc)
+    _current_attempt = int(current_attempt)
+    _thread_attempt = int(thread_attempt)
+    return {
+        "deferred_retry_scheduled": False,
+        "deferred_retry_stale_abort": True,
+        "deferred_retry_terminal_reason": f"breach_retry_stale_state_abort:{reason}",
+        "deferred_retry_reason_code": str(reason or ""),
+        "breach_attempt_count": max(_current_attempt, _thread_attempt),
+        "last_breach_selector_audit": selector_audit or {},
+        "client_id": str(client_id or ""),
+        "execution_mode": str(execution_mode or ""),
+        "local_order_id": str(local_order_id or ""),
+        "signal_id": str(signal_id or ""),
+        "deferred_retry_stale_abort_details": {
+            "reason": str(reason or ""),
+            "status_changed": str(reason or "") == "status_changed",
+            "current_status": str(current_status or ""),
+            "broker_id_present": bool(str(broker_order_id or "").strip()),
+            "submitted_ts_present": bool(submitted_ts),
+            "broker_or_submitted_present": str(reason or "") == "broker_or_submitted_present",
+            "no_longer_deferred": str(reason or "") == "no_longer_deferred",
+            "attempt_count_advanced": str(reason or "") == "attempt_count_advanced",
+            "current_contract": str(current_contract or ""),
+            "db_attempt": _current_attempt,
+            "thread_attempt": _thread_attempt,
+        },
+        "last_breach_failure_at": _now.isoformat(),
+    }
 
 
 # ── P0: Deferred materialization audit helper ─────────────────────────────────
@@ -1592,25 +1764,24 @@ class APExecutionCore:
                     # for structural rejections. The env var is preserved as
                     # an emergency kill switch (set to "0" to disable without
                     # a code deploy).
-                    _retry_enabled_a    = str(os.getenv("BREACH_SELECTOR_RETRY_ENABLED", "1")).strip().lower() in ("1", "true", "yes")
-                    _MAX_RETRIES_A      = int(os.getenv("MAX_BREACH_SELECTOR_RETRIES", "3"))
-                    _RETRY_DELAY_A      = int(os.getenv("BREACH_SELECTOR_RETRY_DELAY_SECONDS", "20"))
-                    _RETRY_CUTOFF_A     = int(os.getenv("BREACH_SELECTOR_RETRY_CUTOFF_ET", "945"))
-                    _now_et_a           = datetime.now(ET)
-                    _now_hhmm_a         = _now_et_a.hour * 100 + _now_et_a.minute
-                    _past_cutoff_a      = _now_hhmm_a >= _RETRY_CUTOFF_A
-                    _is_retryable_a     = (
-                        _retry_enabled_a
-                        and bool(queue_local_order_id)
-                        and (
-                            _obs_rc_a in RETRYABLE_BREACH_SELECTOR_REASONS
-                            or _ladder_exhaustion_is_retryable
-                        )
-                        and _this_attempt_a <= _MAX_RETRIES_A
-                        and not _past_cutoff_a
+                    _retry_enabled_a = str(os.getenv("BREACH_SELECTOR_RETRY_ENABLED", "1")).strip().lower() in ("1", "true", "yes")
+                    _MAX_RETRIES_A = int(os.getenv("MAX_BREACH_SELECTOR_RETRIES", "3"))
+                    _RETRY_DELAY_A = int(os.getenv("BREACH_SELECTOR_RETRY_DELAY_SECONDS", "20"))
+                    _RETRY_CUTOFF_A = int(os.getenv("BREACH_SELECTOR_RETRY_CUTOFF_ET", "945"))
+                    _now_et_a = datetime.now(ET)
+                    _now_hhmm_a = _now_et_a.hour * 100 + _now_et_a.minute
+                    _past_cutoff_a = _now_hhmm_a >= _RETRY_CUTOFF_A
+                    _decision_a = _classify_deferred_breach_retry_decision(
+                        _obs_rc_a,
+                        queue_local_order_id=str(queue_local_order_id or ""),
+                        attempt=_this_attempt_a,
+                        max_attempts=_MAX_RETRIES_A,
+                        past_cutoff=_past_cutoff_a,
+                        retry_enabled=_retry_enabled_a,
+                        ladder_retryable=_ladder_exhaustion_is_retryable,
                     )
 
-                    if _is_retryable_a:
+                    if _decision_a["action"] == "retry_schedule":
                         log.warning(
                             "[%s] DEFERRED_BREACH_SELECTOR_RETRYABLE "
                             "attempt=%d/%d reason=%s delay=%ds cutoff=%d now=%d — rearming",
@@ -1632,8 +1803,17 @@ class APExecutionCore:
                                     "last_breach_failure_reason":      str(_reason or ""),
                                     "last_breach_failure_reason_code": str(_obs_rc_a),
                                     "last_breach_failure_at":          datetime.now(timezone.utc).isoformat(),
-                                    "last_breach_selector_audit":      _deferred_selector_audit or {},
-                                    "contract_selection_status":       "CONTRACT_SELECTION_RETRY",
+                                    **_build_deferred_retry_schedule_meta(
+                                        reason_code=_obs_rc_a,
+                                        selector_audit=_deferred_selector_audit or {},
+                                        attempt=_this_attempt_a,
+                                        max_attempts=_MAX_RETRIES_A,
+                                        delay_seconds=_RETRY_DELAY_A,
+                                        client_id=_breach_client_id,
+                                        execution_mode=str(getattr(approved_plan, "execution_mode", "") or ""),
+                                        local_order_id=str(queue_local_order_id or ""),
+                                        signal_id=str(getattr(approved_plan, "signal_id", "") or ""),
+                                    ),
                                 })
                         except Exception as _retry_meta_exc_a:
                             log.debug("[%s] retry meta update non-critical: %s", ticker, _retry_meta_exc_a)
@@ -1648,7 +1828,8 @@ class APExecutionCore:
                                 _queue_id_retry_a,
                                 reason_code=f"CONTRACT_SELECTION_RETRY:{_obs_rc_a}",
                                 explanation=(
-                                    f"Attempt {_this_attempt_a}/{_MAX_RETRIES_A}: {_reason}"
+                                    f"retry_scheduled attempt={_this_attempt_a}/{_MAX_RETRIES_A} "
+                                    f"delay={_RETRY_DELAY_A}s reason={_reason}"
                                 )[:400],
                                 attempt=_this_attempt_a,
                                 client_id=_breach_client_id,
@@ -1723,8 +1904,30 @@ class APExecutionCore:
                                                     or bool(_current_meta.get("deferred_breach_selection"))
                                                 )
 
+                                                def _record_stale_abort(_reason_code: str) -> None:
+                                                    try:
+                                                        _upd_abort = getattr(self.order_state_machine, "update_order_meta", None)
+                                                        if callable(_upd_abort):
+                                                            _upd_abort(_oid, _build_deferred_retry_stale_abort_meta(
+                                                                current_status=_current_status,
+                                                                broker_order_id=_current_broker_id,
+                                                                submitted_ts=_current_submitted_ts,
+                                                                current_contract=_current_contract,
+                                                                current_attempt=_current_attempt,
+                                                                thread_attempt=int(_att),
+                                                                selector_audit=_current_meta.get("last_breach_selector_audit") or {},
+                                                                client_id=_breach_client_id,
+                                                                execution_mode=str(_current_meta.get("execution_mode") or ""),
+                                                                local_order_id=str(_oid or ""),
+                                                                signal_id=str(_current_meta.get("signal_id") or signal_id or ""),
+                                                                reason=_reason_code,
+                                                            ))
+                                                    except Exception:
+                                                        pass
+
                                                 # Guard 1: status must still be retryable
                                                 if _current_status not in {"PENDING_TRIGGER", "CREATED"}:
+                                                    _record_stale_abort("status_changed")
                                                     log.warning(
                                                         "[%s] DEFERRED_BREACH_RETRY_STALE_STATE_ABORT "
                                                         "order=%s reason=status_changed "
@@ -1732,26 +1935,19 @@ class APExecutionCore:
                                                         _t, _oid, _current_status, _att,
                                                     )
                                                     return
-                                                # Guard 2: must not already have a broker order
-                                                if _current_broker_id:
+                                                # Guard 2/3: must not already have broker submit truth
+                                                if _current_broker_id or _current_submitted_ts:
+                                                    _record_stale_abort("broker_or_submitted_present")
                                                     log.warning(
                                                         "[%s] DEFERRED_BREACH_RETRY_STALE_STATE_ABORT "
-                                                        "order=%s reason=broker_id_present "
-                                                        "broker_order_id=%s attempt=%d",
-                                                        _t, _oid, _current_broker_id, _att,
-                                                    )
-                                                    return
-                                                # Guard 3: must not have been submitted already
-                                                if _current_submitted_ts:
-                                                    log.warning(
-                                                        "[%s] DEFERRED_BREACH_RETRY_STALE_STATE_ABORT "
-                                                        "order=%s reason=submitted_ts_present "
-                                                        "submitted_ts=%s attempt=%d",
-                                                        _t, _oid, _current_submitted_ts, _att,
+                                                        "order=%s reason=broker_or_submitted_present "
+                                                        "broker_order_id=%s submitted_ts=%s attempt=%d",
+                                                        _t, _oid, _current_broker_id, _current_submitted_ts, _att,
                                                     )
                                                     return
                                                 # Guard 4: contract must still be deferred
                                                 if not _is_still_deferred:
+                                                    _record_stale_abort("no_longer_deferred")
                                                     log.warning(
                                                         "[%s] DEFERRED_BREACH_RETRY_STALE_STATE_ABORT "
                                                         "order=%s reason=no_longer_deferred "
@@ -1765,6 +1961,7 @@ class APExecutionCore:
                                                 # beyond this thread's slot — abort to avoid
                                                 # duplicate entry attempts.
                                                 if _current_attempt > int(_att):
+                                                    _record_stale_abort("attempt_count_advanced")
                                                     log.warning(
                                                         "[%s] DEFERRED_BREACH_RETRY_STALE_STATE_ABORT "
                                                         "order=%s reason=attempt_count_advanced "
@@ -1808,9 +2005,9 @@ class APExecutionCore:
                     # Not retryable (quality reject, max retries exceeded, or past cutoff).
                     # Classify into specific dashboard taxonomy before terminalizing.
                     _cs_status_a = (
-                        "CONTRACT_SELECTION_DATA_ERROR"     # retryable but exhausted/past cutoff
-                        if _obs_rc_a in RETRYABLE_BREACH_SELECTOR_REASONS
-                        else "CONTRACT_SELECTION_QUALITY_REJECT"   # real quality failure
+                        "CONTRACT_SELECTION_DATA_ERROR"
+                        if _decision_a["retryable_reason"]
+                        else "CONTRACT_SELECTION_QUALITY_REJECT"
                     )
 
                     log.critical(
@@ -1836,13 +2033,14 @@ class APExecutionCore:
                         "client=%s ticker=%s reason=%s",
                         _breach_client_id, ticker, _reason,
                     )
+                    _final_reason_a = str(_decision_a.get("terminal_reason") or _reason)
                     _emit_deferred_outcome(
                         (
                             "DATA_MISSING_OI_VOLUME"
                             if "vol0_oi0" in str(_reason)
                             else "BREACH_SELECTOR_RETURNED_NONE"
                         ),
-                        reason=_reason,
+                        reason=_final_reason_a,
                         extra={"stage": _deferred_selector_audit.get("stage") or "unknown"},
                     )
                     # ── PR #182 + P0: write selector failure to trade_queue.last_error ──
@@ -1855,8 +2053,14 @@ class APExecutionCore:
                         )
                         write_deferred_breach_last_error(
                             _queue_id_for_obs,
-                            reason_code=str(_obs_rc_a),
-                            explanation=str(_reason or "")[:400],
+                            reason_code=(
+                                _decision_a.get("terminal_reason")
+                                or str(_obs_rc_a)
+                            ),
+                            explanation=(
+                                _decision_a.get("terminal_reason")
+                                or str(_reason or "")
+                            )[:400],
                             attempt=_this_attempt_a,
                             client_id=_breach_client_id,
                             ticker=ticker,
@@ -1866,11 +2070,29 @@ class APExecutionCore:
                             if callable(_upd_a) and queue_local_order_id:
                                 _upd_a(queue_local_order_id, {
                                     "breach_attempt_count":            _this_attempt_a,
-                                    "last_breach_failure_reason":      str(_reason or ""),
+                                    "last_breach_failure_reason":      str(
+                                        _decision_a.get("terminal_reason") or _reason or ""
+                                    ),
                                     "last_breach_failure_reason_code": str(_obs_rc_a),
                                     "last_breach_failure_at":          datetime.now(timezone.utc).isoformat(),
-                                    "last_breach_selector_audit":      _deferred_selector_audit or {},
                                     "contract_selection_status":       _cs_status_a,
+                                    **(
+                                        _build_deferred_retry_terminal_meta(
+                                            terminal_reason=str(_decision_a.get("terminal_reason") or ""),
+                                            reason_code=_obs_rc_a,
+                                            selector_audit=_deferred_selector_audit or {},
+                                            attempt=_this_attempt_a,
+                                            max_attempts=_MAX_RETRIES_A,
+                                            client_id=_breach_client_id,
+                                            execution_mode=str(getattr(approved_plan, "execution_mode", "") or ""),
+                                            local_order_id=str(queue_local_order_id or ""),
+                                            signal_id=str(getattr(approved_plan, "signal_id", "") or ""),
+                                        )
+                                        if _decision_a["retryable_reason"]
+                                        else {
+                                            "last_breach_selector_audit": _deferred_selector_audit or {},
+                                        }
+                                    ),
                                 })
                         except Exception as _ma_exc:
                             log.debug("[%s] PR182 meta update non-critical: %s", ticker, _ma_exc)
@@ -1901,7 +2123,7 @@ class APExecutionCore:
                             selector_status=_cs_status_a,
                             selected_contract=None,
                             selected_limit_price=None,
-                            failure_reason=_reason,
+                            failure_reason=_final_reason_a,
                             stage=_deferred_selector_audit.get("stage"),
                             expirations_probed=_ladder_buckets_a,
                             chain_rows_total=int(_sel_failure_a.get("chain_rows") or 0),
@@ -1911,7 +2133,7 @@ class APExecutionCore:
                     except Exception:
                         pass  # audit write is non-critical
                     _terminalize_deferred_breach_failure(
-                        _reason,
+                        _final_reason_a,
                         extra_meta={
                             "failure_stage":           "deferred_contract_selection",
                             "selected_contract":       _sel_contract or None,
