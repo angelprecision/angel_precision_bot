@@ -279,7 +279,10 @@ def test_dte_ladder_preserves_quality_reason_when_chain_rows_exist(monkeypatch):
     """Fix C: when a bucket returns OI_TOO_LOW the ladder must preserve that
     quality reason rather than masking it as NO_VALID_PLAYBOOK_DTE_CONTRACT."""
     from datetime import date, timedelta
-    tomorrow = (date.today() + timedelta(days=1)).isoformat()
+    probe_day = date.today() + timedelta(days=1)
+    while probe_day.weekday() >= 5:
+        probe_day += timedelta(days=1)
+    tomorrow = probe_day.isoformat()
 
     mod = _load_selector({"DEFERRED_DTE_LADDER": "1"})
     APContractSelectionEngine = mod.APContractSelectionEngine
