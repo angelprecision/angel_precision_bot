@@ -10,7 +10,7 @@ import ap_entry_confirmation as entry_confirmation_mod
 from ap_entry_watcher import WatchedSignal
 
 
-def _plan(*, confirmation_required: bool = False, candles=None):
+def _plan(*, confirmation_required: bool = False, candles=None, metadata_override=None):
     metadata = {
         "hybrid_client_quality_gate": {
             "confirmation_required": confirmation_required,
@@ -19,6 +19,8 @@ def _plan(*, confirmation_required: bool = False, candles=None):
     }
     if candles is not None:
         metadata["intraday_candles"] = candles
+    if metadata_override is not None:
+        metadata = metadata_override
     return SimpleNamespace(
         contract_symbol="AAPL260117C00200000",
         limit_price=1.00,
@@ -61,9 +63,11 @@ def _run_entry_trigger(
     confirmation_required: bool = False,
     candles=None,
     underlying_last: float = 100.80,
+    plan_override=None,
 ):
     monkeypatch.delenv("ENABLE_DAILY_CONTINUATION_VALIDATION", raising=False)
     monkeypatch.setenv("ENABLE_DAILY_CONTINUATION_MODE", mode)
+    monkeypatch.setenv("ENTRY_CONFIRMATION_REQUIRED_DEFAULT", "1")
 
     fake_execution_mod = types.ModuleType("ap.execution")
     fake_execution_mod._refresh_ask_at_submit = lambda broker, contract: (
@@ -87,7 +91,7 @@ def _run_entry_trigger(
     fake_ledger_mod.update_opportunity = lambda *args, **kwargs: ledger_events.append((args, kwargs))
     monkeypatch.setitem(sys.modules, "ap.opportunity_ledger", fake_ledger_mod)
 
-    plan = _plan(confirmation_required=confirmation_required, candles=candles)
+    plan = plan_override or _plan(confirmation_required=confirmation_required, candles=candles)
     osm = MagicMock()
     osm.submit_existing_entry.return_value = {
         "ok": True,
@@ -156,7 +160,6 @@ def test_observe_missing_continuation_submits_and_records_would_block(monkeypatc
         candles=None,
         underlying_last=100.90,
     )
-
     result["osm"].submit_existing_entry.assert_called_once()
     result["osm"].expire_pending_entry.assert_not_called()
     assert _blocked_calls(result["store"]) == []
@@ -173,17 +176,16 @@ def test_enforce_missing_continuation_blocks_and_expires_pending_entry(monkeypat
         candles=None,
         underlying_last=100.90,
     )
-
     result["osm"].submit_existing_entry.assert_not_called()
     result["osm"].expire_pending_entry.assert_called_once_with(
         "local-1",
-        reason="daily_continuation_failed:missing_intraday_context",
+        reason="DAILY_CONTINUATION_MISSING_INTRADAY_CANDLES",
     )
     assert len(_blocked_calls(result["store"])) == 1
     assert result["ledger_events"], "ENTRY_CONFIRMATION_FAILED should be recorded"
     args, kwargs = result["ledger_events"][0]
     assert args[2] == "ENTRY_CONFIRMATION_FAILED"
-    assert kwargs["miss_reason"] == "daily_continuation_failed:missing_intraday_context"
+    assert kwargs["miss_reason"] == "DAILY_CONTINUATION_MISSING_INTRADAY_CANDLES"
 
 
 def test_observe_failed_continuation_with_data_submits_and_records_would_block(monkeypatch):
@@ -194,13 +196,13 @@ def test_observe_failed_continuation_with_data_submits_and_records_would_block(m
         candles=_failing_candles(),
         underlying_last=99.60,
     )
-
     result["osm"].submit_existing_entry.assert_called_once()
     result["osm"].expire_pending_entry.assert_not_called()
     meta = _capture_entry_confirmation_patch(result["osm"])
     assert meta["daily_continuation_mode"] == "observe"
     assert meta["daily_continuation_passed"] is False
     assert meta["daily_continuation_would_block"] is True
+    assert meta["daily_continuation_fail_reason"] == "DAILY_CONTINUATION_TRIGGER_TOUCH_ONLY"
 
 
 def test_enforce_failed_continuation_with_data_blocks_submit(monkeypatch):
@@ -211,24 +213,39 @@ def test_enforce_failed_continuation_with_data_blocks_submit(monkeypatch):
         candles=_failing_candles(),
         underlying_last=99.60,
     )
-
     result["osm"].submit_existing_entry.assert_not_called()
     result["osm"].expire_pending_entry.assert_called_once_with(
         "local-1",
-        reason="daily_continuation_failed:trigger_touch_only",
+        reason="DAILY_CONTINUATION_TRIGGER_TOUCH_ONLY",
     )
+
+
+def test_missing_confirmation_required_defaults_on_and_blocks_reversal_before_submit(monkeypatch):
+    plan = _plan(metadata_override={})
+    result = _run_entry_trigger(
+        monkeypatch,
+        mode="off",
+        underlying_last=99.60,
+        plan_override=plan,
+    )
+    result["osm"].submit_existing_entry.assert_not_called()
+    result["osm"].expire_pending_entry.assert_called_once_with(
+        "local-1",
+        reason="entry_confirm_failed_underlying_reversal",
+    )
+    meta = _capture_entry_confirmation_patch(result["osm"])
+    assert meta["confirmation_required"] is True
+    assert meta["confirmation_required_source"] == "global_default"
 
 
 def test_confirmation_exception_fails_closed_even_when_confirmation_not_required(monkeypatch):
     monkeypatch.delenv("ENABLE_DAILY_CONTINUATION_VALIDATION", raising=False)
     monkeypatch.setenv("ENABLE_DAILY_CONTINUATION_MODE", "observe")
-
     monkeypatch.setattr(
         entry_confirmation_mod,
         "check_entry_confirmation",
         lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("boom")),
     )
-
     result = _run_entry_trigger(
         monkeypatch,
         mode="observe",
@@ -236,7 +253,6 @@ def test_confirmation_exception_fails_closed_even_when_confirmation_not_required
         candles=_failing_candles(),
         underlying_last=99.60,
     )
-
     result["osm"].submit_existing_entry.assert_not_called()
     result["osm"].expire_pending_entry.assert_called_once_with(
         "local-1",
