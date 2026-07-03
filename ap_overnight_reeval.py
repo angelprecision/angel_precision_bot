@@ -649,6 +649,15 @@ def run_overnight_reeval(
         "fresh_processed": 0,
         "fresh_armed": 0,
         "stale_inventory_only": False,
+        # P0 (2026-07-02): silent-stall detection. Production paper reeval
+        # reported plain "success" for 4 consecutive sessions while every
+        # fetched row hit the RETRY_LATER branches (sandbox broker cannot
+        # serve prior-day levels) and stayed WATCHING forever — 486 rows
+        # frozen at awaiting_overnight_reeval with a green lock row. These
+        # two fields make that condition visible in the return value so the
+        # caller can persist an honest status instead of "success".
+        "fetched": 0,
+        "stalled": False,
     }
 
     # Guard: only run on trading days, 9:00-9:45 AM ET window (unless force=True)
@@ -668,6 +677,7 @@ def run_overnight_reeval(
 
     # Fetch WATCHING signals from trade_queue
     watching_signals = _fetch_watching_signals(client_id)
+    result["fetched"] = len(watching_signals or [])
     if not watching_signals:
         log.info("[%s] overnight_reeval: no WATCHING signals found", client_id)
         return result
@@ -1598,6 +1608,30 @@ def run_overnight_reeval(
             result["fresh_armed"],
             result["stale_inventory_only"],
         )
+    # P0 (2026-07-02): a run that fetched work but produced NO decisions —
+    # nothing armed, nothing rejected, no errors, everything deferred to
+    # "next reeval" — is a stall, not a success. This is exactly the paper
+    # signature when market data is unavailable: every row takes a
+    # RETRY_LATER continue, the queue never drains, and the run reports
+    # green. Flag it so callers persist status='partial' and operators see
+    # the pipeline is wedged the same morning, not four sessions later.
+    if (
+        result["fetched"] > 0
+        and result["armed"] == 0
+        and result["rejected"] == 0
+        and result["errors"] == 0
+        and result.get("skipped", 0) and result["skipped"] > 0
+    ):
+        result["stalled"] = True
+        log.error(
+            "[%s] OVERNIGHT_REEVAL_STALLED fetched=%d skipped=%d armed=0 rejected=0 — "
+            "every fetched signal deferred to next run; queue is NOT draining. "
+            "category=SILENT_STALL severity=ERROR "
+            "likely_cause=market_data_unavailable_or_all_rows_retry_later",
+            client_id,
+            result["fetched"],
+            result["skipped"],
+        )
     return result
 
 
@@ -1621,6 +1655,19 @@ def _fetch_watching_signals(client_id: str) -> list:
         from ap.db import conn, run_with_retry
         import json as _j
 
+        # P0 (2026-07-02): backlog starvation fix. The hardcoded LIMIT 100
+        # starved the queue when the paper WATCHING backlog exceeded 100 rows
+        # per client (observed: 248–258/client). DESC ordering meant only the
+        # newest 100 were ever fetched; anything older was never re-evaluated
+        # and never expired — rows from 2026-06-22 were still WATCHING on
+        # 2026-07-02. Env-tunable with a hard floor (never below the old 100)
+        # and ceiling (bounded per-run work).
+        try:
+            _fetch_limit = int(os.getenv("OVERNIGHT_FETCH_LIMIT", "500"))
+        except (TypeError, ValueError):
+            _fetch_limit = 500
+        _fetch_limit = max(100, min(_fetch_limit, 2000))
+
         def _fn():
             with conn() as c:
                 c.execute("""
@@ -1629,8 +1676,8 @@ def _fetch_watching_signals(client_id: str) -> list:
                     WHERE client_id = %s
                       AND status = 'WATCHING'
                     ORDER BY created_ts DESC
-                    LIMIT 100
-                """, (client_id,))
+                    LIMIT %s
+                """, (client_id, _fetch_limit))
                 return c.fetchall()
 
         rows = run_with_retry(_fn) or []
