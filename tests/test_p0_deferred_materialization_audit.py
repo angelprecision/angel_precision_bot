@@ -25,6 +25,7 @@ from __future__ import annotations
 import types
 from unittest.mock import MagicMock, call, ANY
 from datetime import datetime, timezone
+from pathlib import Path
 
 
 # ---------------------------------------------------------------------------
@@ -71,23 +72,47 @@ def _make_deferred_plan(
 
 def _import_helper():
     """Import _write_deferred_materialization_audit from the execution core module."""
-    import importlib
     import sys
 
+    repo_root = Path(__file__).resolve().parents[1]
+
     # Stub heavy deps so we can import just the helper without the full runtime
-    for mod in [
-        "ap_entry_watcher", "ap_exit_engine", "ap_feedback_loop",
-        "ap_tier_engine", "ap_proof_logger", "ap_signal_store",
-        "ap_signal_tracker", "intelligence_bridge",
-    ]:
-        if mod not in sys.modules:
-            sys.modules[mod] = types.ModuleType(mod)
+    watcher_mod = types.ModuleType("ap_entry_watcher")
+    watcher_mod.APEntryWatcher = MagicMock
+    watcher_mod.WatchedSignal = MagicMock
+    sys.modules["ap_entry_watcher"] = watcher_mod
+
+    exit_mod = types.ModuleType("ap_exit_engine")
+    exit_mod.APExitEngine = MagicMock
+    exit_mod.ManagedPosition = MagicMock
+    sys.modules["ap_exit_engine"] = exit_mod
+
+    feedback_mod = types.ModuleType("ap_feedback_loop")
+    feedback_mod.APFeedbackLoop = MagicMock
+    sys.modules["ap_feedback_loop"] = feedback_mod
+
+    tier_mod = types.ModuleType("ap_tier_engine")
+    tier_mod.APShadowTracker = MagicMock
+    sys.modules["ap_tier_engine"] = tier_mod
+
+    signal_store_mod = types.ModuleType("ap_signal_store")
+    signal_store_mod.APSignalStore = MagicMock
+    sys.modules["ap_signal_store"] = signal_store_mod
+
+    signal_tracker_mod = types.ModuleType("ap_signal_tracker")
+    signal_tracker_mod.APSignalTracker = MagicMock
+    sys.modules["ap_signal_tracker"] = signal_tracker_mod
+
+    sys.modules.setdefault("intelligence_bridge", types.ModuleType("intelligence_bridge"))
 
     stub_ap = types.ModuleType("ap")
+    stub_ap.__path__ = [str(repo_root / "ap")]
     stub_ap.db = types.ModuleType("ap.db")
     stub_ap.queue = types.ModuleType("ap.queue")
     stub_ap.observability = types.ModuleType("ap.observability")
     stub_ap.observability.emit_decision_event = lambda *a, **kw: None
+    stub_ap.observability.get_git_commit = lambda: "test"
+    stub_ap.observability.make_config_hash = lambda d: "hash"
     stub_ap.trace = types.ModuleType("ap.trace")
     stub_ap.trace.trace_gate = lambda *a, **kw: None
     sys.modules.setdefault("ap", stub_ap)
@@ -102,6 +127,7 @@ def _import_helper():
     stub_funnel.funnel = MagicMock()
     sys.modules["ap_proof_logger"] = stub_funnel
 
+    sys.modules.pop("ap_execution_core", None)
     import ap_execution_core as core_mod
     return core_mod._write_deferred_materialization_audit
 
