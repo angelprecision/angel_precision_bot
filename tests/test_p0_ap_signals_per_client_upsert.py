@@ -172,8 +172,20 @@ def test_ownerless_updates_only_touch_shared_row():
 def test_legacy_fallback_exists_and_logs_missing_migration():
     assert 'on_conflict="signal_id,client_email"' in SRC
     assert "AP_SIGNALS_PER_CLIENT_KEY_MISSING" in SRC
-    m = re.search(r"def _upsert_per_client.*?self\.sb\.table\(\"ap_signals\"\)\.upsert\(p\)\.execute\(\)", SRC, re.S)
+    m = re.search(r"def upsert_ap_signal_row_with_fallback.*?sb\.table\(\"ap_signals\"\)\.upsert\(p\)\.execute\(\)", SRC, re.S)
     assert m, "legacy single-key fallback must remain inside the exception path"
+
+
+def test_repo_wide_ap_signals_writers_use_composite_key_path():
+    queue_src = (_REPO / "ap" / "queue.py").read_text()
+    overnight_src = (_REPO / "ap_overnight_reeval.py").read_text()
+
+    assert 'on_conflict="signal_id"' not in queue_src
+    assert 'on_conflict="signal_id"' not in overnight_src
+    assert 'upsert_ap_signal_row_with_fallback' in queue_src
+    assert 'upsert_ap_signal_row_with_fallback' in overnight_src
+    assert 'canonical_client_email(client_id)' in queue_src
+    assert 'canonical_client_email(client_id)' in overnight_src
 
 
 # ── Migration file contract ──────────────────────────────────────────────────

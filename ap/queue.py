@@ -40,6 +40,7 @@ import uuid
 from typing import Any, Optional
 
 from ap.state import update_state
+from ap_signal_store import canonical_client_email, upsert_ap_signal_row_with_fallback
 
 def _conn():
     from ap.db import conn
@@ -783,7 +784,7 @@ def _log_signal_to_db(
 
         _row: dict = {
             "signal_id":       str(signal_id or _uuid.uuid4()),
-            "client_email":    str(client_id),
+            "client_email":    canonical_client_email(client_id),
             "system_version":  "v2",
             "ticker":          str(ticker),
             "side":            _row_side,
@@ -822,7 +823,7 @@ def _log_signal_to_db(
         if queued_at:
             _row["queued_at"] = queued_at
 
-        _sbc.table("ap_signals").upsert(_row, on_conflict="signal_id").execute()
+        upsert_ap_signal_row_with_fallback(_sbc, _row)
         return True
     except Exception as _rlog_exc:
         log.debug("_log_signal_to_db failed (non-fatal): %s", _rlog_exc)
@@ -1131,9 +1132,9 @@ def _dispatch(
                 _sbc = _get_sb_client()
                 if _sbc:
                     _sig_id = str(payload.get("signal_id") or _uuid.uuid4())
-                    _sbc.table("ap_signals").upsert({
+                    upsert_ap_signal_row_with_fallback(_sbc, {
                         "signal_id":       _sig_id,
-                        "client_email":    client_id,
+                        "client_email":    canonical_client_email(client_id),
                         "system_version":  "v2",
                         "ticker":          ticker,
                         "side":            str(payload.get("side") or payload.get("direction") or "CALL").upper(),
@@ -1147,7 +1148,7 @@ def _dispatch(
                         "decision_status": "watching",
                         "context_notes":   f"post_market_blocked: {decision.reason}",
                         "raw_payload":     payload,
-                    }, on_conflict="signal_id").execute()
+                    })
                     log.info(f"[{ticker}] Written to ap_signals as watching (post-market queue)")
         except Exception as _e:
             log.debug(f"[{ticker}] ap_signals write skipped: {_e}")
