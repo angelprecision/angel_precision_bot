@@ -1466,12 +1466,43 @@ class APExecutionCore:
             _terminalize_breach_failure("approved_plan_missing_after_revalidation")
             return
 
-        self._refresh_hydrated_prebreach_plan(
+        _hydration_bridge_applied = self._refresh_hydrated_prebreach_plan(
             approved_plan=approved_plan,
             sig=sig,
             local_order_id=queue_local_order_id,
             ticker=ticker,
         )
+        _hydrated_master_control = getattr(self, "master_control", None)
+        if _hydration_bridge_applied and _hydrated_master_control is not None:
+            try:
+                _hydrated_reval = _hydrated_master_control.revalidate_exposure(
+                    approved_plan,
+                    client_id=self.email or "default",
+                )
+            except Exception as exc:
+                log.warning(
+                    "[%s] Hydrated pre-breach exposure revalidation failed: %s",
+                    ticker, exc,
+                )
+                _terminalize_breach_failure(
+                    "hydrated_prebreach_exposure_revalidation_exception",
+                    context_notes="hydrated_prebreach_exposure_revalidation_exception",
+                )
+                return
+
+            if not getattr(_hydrated_reval, "ok", False):
+                _hydrated_reason = getattr(
+                    _hydrated_reval, "reason", "hydrated_prebreach_revalidation_failed"
+                )
+                log.info(
+                    "[%s] Hydrated pre-breach exposure revalidation blocked: %s",
+                    ticker, _hydrated_reason,
+                )
+                _terminalize_breach_failure(
+                    f"hydrated_prebreach_exposure_revalidation:{_hydrated_reason}",
+                    context_notes=f"hydrated_prebreach_exposure_revalidation={_hydrated_reason}",
+                )
+                return
 
         # 3b) Breach-time contract selection for overnight deferred signals.
         # Pre-market option chains have zero bids — overnight_reeval cannot select

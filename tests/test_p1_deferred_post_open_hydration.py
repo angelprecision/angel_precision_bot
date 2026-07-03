@@ -298,6 +298,141 @@ def test_breach_uses_hydrated_order_row_without_rerunning_deferred_selector(monk
     assert watched.signal["client_id"] == "client@example.com"
 
 
+def test_hydrated_prebreach_bridge_revalidates_exposure_before_submit(monkeypatch):
+    from ap_execution_core import APExecutionCore
+    import ap.execution as execution_mod
+
+    approved_plan = SimpleNamespace(
+        contract_symbol="DEFERRED:AAPL",
+        limit_price=0.01,
+        contracts=1,
+        max_position_usd=1.0,
+        trigger_price=201.5,
+        side="CALL",
+        direction="CALL",
+        execution_mode="paper",
+        client_id="client@example.com",
+        signal_id="sig-bridge-2",
+        ticker="AAPL",
+        tier="A",
+        score=88.0,
+        metadata={
+            "contract_deferred": True,
+            "execution_mode": "paper",
+            "timeframe": "1d",
+            "pattern": "2-1-2",
+        },
+    )
+    watched = SimpleNamespace(
+        ticker="AAPL",
+        trigger_price=201.5,
+        entry_trigger=201.5,
+        stop_level=None,
+        target_price=None,
+        last_quote_ask=201.8,
+        last_quote_bid=201.7,
+        signal={
+            "signal_id": "sig-bridge-2",
+            "client_id": "client@example.com",
+            "local_order_id": "local-124",
+            "_approved_plan": approved_plan,
+        },
+    )
+
+    hydrated_row = {
+        "local_order_id": "local-124",
+        "client_id": "client@example.com",
+        "signal_id": "sig-bridge-2",
+        "status": "PENDING_TRIGGER",
+        "execution_mode": "paper",
+        "contract": "AAPL260717C00200000",
+        "limit_price": 2.50,
+        "qty": 3,
+        "reserved_cost": 750.0,
+        "broker_order_id": None,
+        "submitted_ts": None,
+        "meta": {
+            "contract_deferred": False,
+            "contract_selection_status": "HYDRATED_PRE_BREACH",
+            "contract_materialized_source": "prebreach_hydration",
+        },
+    }
+
+    osm = MagicMock()
+    osm.get_order.return_value = hydrated_row
+    osm.submit_existing_entry.return_value = {
+        "ok": True,
+        "local_order_id": "local-124",
+        "broker_order_id": None,
+    }
+
+    core = object.__new__(APExecutionCore)
+    core.broker = MagicMock()
+    core.order_state_machine = osm
+    core.contract_selector = MagicMock()
+    core.store = MagicMock()
+    core.paper = True
+    core.mode = "PAPER"
+    core.client_id = "client@example.com"
+    core.client_email = "client@example.com"
+    core.email = "client@example.com"
+    core.execution_mode = "PAPER"
+    core._max_positions = 7
+    core._breach_risk_check = MagicMock(return_value=True)
+    core._cleanup_pending_entry_order = MagicMock()
+    core._emit_breach_diag = MagicMock()
+    core._alert_degraded = MagicMock()
+    core.master_control = SimpleNamespace(
+        revalidate_exposure=MagicMock(
+            return_value=SimpleNamespace(ok=False, reason="capital_limit_after_hydration")
+        )
+    )
+
+    monkeypatch.setattr(execution_mod, "_refresh_ask_at_submit", lambda broker, contract: (
+        2.50,
+        0,
+        True,
+        "ok",
+        {
+            "submit_bid": 2.40,
+            "submit_mid": 2.45,
+            "submit_ask": 2.50,
+            "submit_last": 2.48,
+            "spread_pct": 0.04,
+        },
+    ))
+
+    fake_confirm_module = types.SimpleNamespace(
+        check_entry_confirmation=lambda **kwargs: types.SimpleNamespace(
+            passed=True,
+            fail_reason="",
+            metadata={},
+            to_meta=lambda **meta_kwargs: {"confirmation_passed": True},
+        )
+    )
+    monkeypatch.setitem(sys.modules, "ap_entry_confirmation", fake_confirm_module)
+    monkeypatch.setattr("ap_execution_core.funnel.inc", lambda *args, **kwargs: None)
+
+    core._on_entry_trigger(watched)
+
+    core.master_control.revalidate_exposure.assert_called_once()
+    core.contract_selector.select.assert_not_called()
+    osm.submit_existing_entry.assert_not_called()
+    core._cleanup_pending_entry_order.assert_called_once()
+    cleanup_kwargs = core._cleanup_pending_entry_order.call_args.kwargs
+    assert cleanup_kwargs["action"] == "expire"
+    assert cleanup_kwargs["reason"] == (
+        "hydrated_prebreach_exposure_revalidation:capital_limit_after_hydration"
+    )
+    core.store.update_signal_fields.assert_any_call(
+        "sig-bridge-2",
+        {
+            "decision_status": "blocked_at_breach",
+            "context_notes": "hydrated_prebreach_exposure_revalidation=capital_limit_after_hydration",
+        },
+    )
+
+
 def test_hydration_success_cas_miss_when_status_changed_before_persist(monkeypatch, caplog):
     osm = _make_osm()
     cur = _HydrationCursor(
