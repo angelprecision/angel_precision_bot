@@ -69,7 +69,8 @@ MAX_POSITIONS       = int(os.getenv("MAX_POSITIONS", "7"))
 # Env overrides:
 #   MAX_BREACH_SELECTOR_RETRIES          default 3
 #   BREACH_SELECTOR_RETRY_DELAY_SECONDS  default 20
-#   BREACH_SELECTOR_RETRY_CUTOFF_ET      default 945 (= 9:45 AM ET)
+#   BREACH_SELECTOR_RETRY_CUTOFF_ET      default 1530 (= 3:30 PM ET; last-entry
+#                                        boundary — see _breach_retry_cutoff_hhmm)
 RETRYABLE_BREACH_SELECTOR_REASONS: frozenset = frozenset({
     "NO_CHAIN_DATA",                    # legacy compat — broad code kept until all paths emit exact codes
     "CHAIN_PROVIDER_ERROR",             # Tradier HTTP/network transient failure
@@ -132,6 +133,42 @@ def _is_ladder_exhaustion_retryable(ladder_audit: Optional[dict]) -> bool:
     # If we only saw retryable data-miss reasons (or no per-exp reason_code at
     # all), allow the retry so the ladder gets a fresh chance after the delay.
     return saw_any_retryable
+
+
+# ── P0 (2026-07-02): breach retry cutoff is the LAST-ENTRY boundary, not the
+# open-warmup boundary. The original default of 945 (9:45 AM ET) was written
+# for the "chain not warmed at 9:30–9:36" incident, but the queue is not even
+# released until ~9:45 ET, so no breach could ever occur BEFORE the cutoff —
+# the retry system was structurally disabled for the entire session. Forensics
+# 2026-06-30 → 2026-07-02: every retryable death (CHAIN_ROW_ZERO_BID_ASK,
+# NO_CHAIN_DATA, DIRECT_QUOTE_ZERO_BID_ASK) shows breach_attempt_count=1 with
+# cs_status=CONTRACT_SELECTION_DATA_ERROR at 09:46–11:16 ET, i.e. terminalized
+# on the first transient miss because now_hhmm >= 945.
+#
+# New default: 1530 (3:30 PM ET) — the system's own last-entry boundary
+# (matches ap_entry_watcher EOD disarm and ap/order_monitor
+# _PT_ORPHAN_EOD_CUTOFF). Total retry span per order remains bounded by
+# MAX_BREACH_SELECTOR_RETRIES × BREACH_SELECTOR_RETRY_DELAY_SECONDS
+# (default 3 × 20s = ~60s), so this cannot cause open-ended retry loops;
+# the cutoff only stops NEW retries from being scheduled into the close.
+# Env var name is unchanged so the operational kill-switch muscle memory
+# ("set BREACH_SELECTOR_RETRY_CUTOFF_ET=0 to stop all retries") still works.
+_BREACH_RETRY_CUTOFF_DEFAULT_HHMM = 1530
+
+
+def _breach_retry_cutoff_hhmm() -> int:
+    """
+    HHMM (ET) after which NO new deferred-breach selector retries may be
+    scheduled. Reads BREACH_SELECTOR_RETRY_CUTOFF_ET; falls back to the
+    module default on missing/invalid values (never raises).
+    """
+    _raw = os.getenv(
+        "BREACH_SELECTOR_RETRY_CUTOFF_ET", str(_BREACH_RETRY_CUTOFF_DEFAULT_HHMM)
+    )
+    try:
+        return int(str(_raw).strip())
+    except (TypeError, ValueError):
+        return _BREACH_RETRY_CUTOFF_DEFAULT_HHMM
 
 
 def _classify_deferred_breach_retry_decision(
@@ -1685,6 +1722,31 @@ class APExecutionCore:
                             _sf.get("raw_reason") if isinstance(_sf, dict) else None
                         ),
                     }
+                    # P0 (2026-07-02): config provability. Production ran for
+                    # multiple sessions with the DTE ladder silently disabled
+                    # (env pin overriding the PR #219 default flip) and there
+                    # was NO durable record of the effective flag — zero rows
+                    # in `orders` ever carried last_dte_ladder_audit, and the
+                    # only way to distinguish "ladder off" from "ladder ran
+                    # and lost" was reading Render env by hand. Every deferred
+                    # selector audit now records the effective flag and
+                    # whether the plan carried the eligibility marker, so
+                    # "was the ladder even on?" is answerable from Supabase
+                    # alone. Best-effort; never blocks the audit write.
+                    try:
+                        _audit["dte_ladder_enabled"] = bool(
+                            getattr(self.contract_selector, "dte_ladder_enabled", False)
+                        )
+                        _plan_meta_for_audit = getattr(approved_plan, "metadata", None)
+                        _audit["ladder_eligible_marker"] = bool(
+                            isinstance(_plan_meta_for_audit, dict)
+                            and _plan_meta_for_audit.get("deferred_breach_selection") is True
+                        )
+                    except Exception as _cfg_exc:
+                        log.debug(
+                            "[%s] ladder config provability read failed (non-fatal): %s",
+                            ticker, _cfg_exc,
+                        )
                     # AMENDMENT (PR #219, Jason LIVE recovery): propagate the
                     # last DTE ladder run into order.meta so operator dashboards
                     # can see which expirations were probed and why each bucket
@@ -1764,13 +1826,15 @@ class APExecutionCore:
                     # for structural rejections. The env var is preserved as
                     # an emergency kill switch (set to "0" to disable without
                     # a code deploy).
-                    _retry_enabled_a = str(os.getenv("BREACH_SELECTOR_RETRY_ENABLED", "1")).strip().lower() in ("1", "true", "yes")
-                    _MAX_RETRIES_A = int(os.getenv("MAX_BREACH_SELECTOR_RETRIES", "3"))
-                    _RETRY_DELAY_A = int(os.getenv("BREACH_SELECTOR_RETRY_DELAY_SECONDS", "20"))
-                    _RETRY_CUTOFF_A = int(os.getenv("BREACH_SELECTOR_RETRY_CUTOFF_ET", "945"))
-                    _now_et_a = datetime.now(ET)
-                    _now_hhmm_a = _now_et_a.hour * 100 + _now_et_a.minute
-                    _past_cutoff_a = _now_hhmm_a >= _RETRY_CUTOFF_A
+                    _retry_enabled_a    = str(os.getenv("BREACH_SELECTOR_RETRY_ENABLED", "1")).strip().lower() in ("1", "true", "yes")
+                    _MAX_RETRIES_A      = int(os.getenv("MAX_BREACH_SELECTOR_RETRIES", "3"))
+                    _RETRY_DELAY_A      = int(os.getenv("BREACH_SELECTOR_RETRY_DELAY_SECONDS", "20"))
+                    # P0 (2026-07-02): cutoff default moved 945 → 1530. See
+                    # _breach_retry_cutoff_hhmm() for the full forensic note.
+                    _RETRY_CUTOFF_A     = _breach_retry_cutoff_hhmm()
+                    _now_et_a           = datetime.now(ET)
+                    _now_hhmm_a         = _now_et_a.hour * 100 + _now_et_a.minute
+                    _past_cutoff_a      = _now_hhmm_a >= _RETRY_CUTOFF_A
                     _decision_a = _classify_deferred_breach_retry_decision(
                         _obs_rc_a,
                         queue_local_order_id=str(queue_local_order_id or ""),
