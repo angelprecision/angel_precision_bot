@@ -128,6 +128,68 @@ def _extract_avg_fill_price(raw: dict) -> Optional[float]:
     return None
 
 
+def _write_fill_truth_blocked_meta(
+    client_id: str,
+    local_order_id: str,
+    *,
+    reason: str,
+    broker_order_id: str,
+    broker_status: str,
+    extracted_qty,
+    extracted_price,
+) -> None:
+    """
+    P0 (PR #259): durable diagnostic when recovery REFUSES to mark a
+    broker-"filled" order FILLED because the payload lacks positive executed
+    quantity and/or average fill price.
+
+    The refusal itself already existed (RECOVERY_FILL_TRUTH_MISSING /
+    RECOVERY_EXIT_FILL_TRUTH_MISSING logged, no transition, row left for
+    fill_monitor/reconciler). What was missing is a DURABLE record: the
+    block lived only in logs and the in-memory result dict, so a row that
+    kept failing extraction across restarts carried no forensic trail in
+    the database. This helper merges the block reason, the broker order id,
+    the raw broker status, and the (invalid) extracted values into
+    orders.meta.
+
+    Strictly additive and best-effort: jsonb concat (never overwrites
+    existing meta), no status change, no position writes, never raises —
+    a diagnostics failure must not affect the recovery pass.
+    """
+    try:
+        from ap.db import conn as _conn, run_with_retry as _rwr
+
+        _patch = json.dumps({
+            "recovery_fill_truth_block": {
+                "reason": reason,
+                "broker_order_id": str(broker_order_id or ""),
+                "broker_status_raw": str(broker_status or ""),
+                "extracted_filled_qty": extracted_qty,
+                "extracted_avg_fill_price": extracted_price,
+                "blocked_at": datetime.now(timezone.utc).isoformat(),
+                "recorded_by": "ap_recovery",
+            }
+        })
+
+        def _merge():
+            with _conn() as c:
+                c.execute(
+                    """
+                    UPDATE orders
+                    SET meta = COALESCE(meta, '{}'::jsonb) || %s::jsonb
+                    WHERE local_order_id = %s AND client_id = %s
+                    """,
+                    (_patch, local_order_id, client_id),
+                )
+
+        _rwr(_merge)
+    except Exception as _exc:
+        log.debug(
+            "[%s] fill-truth block meta write failed (non-fatal): %s",
+            client_id, _exc,
+        )
+
+
 def _resolve_side_from_order_or_meta(order: dict, meta: dict | None = None) -> tuple[str | None, str]:
     """Resolve strategy side without ever defaulting missing direction to CALL."""
     meta = meta or {}
@@ -419,6 +481,15 @@ class APStartupRecovery:
                     )
                     log.critical("[%s] %s", self.client_id, msg)
                     result.setdefault("errors", []).append(msg)
+                    # P0 (PR #259): durable forensic trail on the row itself.
+                    _write_fill_truth_blocked_meta(
+                        self.client_id, local_id,
+                        reason="recovery_fill_truth_missing",
+                        broker_order_id=broker_oid,
+                        broker_status=broker_status,
+                        extracted_qty=filled_qty,
+                        extracted_price=avg_fill,
+                    )
                     continue
 
                 try:
@@ -541,6 +612,15 @@ class APStartupRecovery:
                     )
                     log.critical("[%s] %s", self.client_id, msg)
                     result.setdefault("errors", []).append(msg)
+                    # P0 (PR #259): durable forensic trail on the row itself.
+                    _write_fill_truth_blocked_meta(
+                        self.client_id, local_id,
+                        reason="recovery_exit_fill_truth_missing",
+                        broker_order_id=broker_oid,
+                        broker_status=broker_status,
+                        extracted_qty=filled_qty,
+                        extracted_price=avg_fill,
+                    )
                     continue
 
                 try:
