@@ -136,11 +136,38 @@ class APSignalStore:
             "score_breakdown":      signal.get("score_breakdown"),
             "context_notes":        signal.get("context_notes"),
         }
+        # P0 (PR #260): per-client identity. ap_signals is keyed by
+        # (signal_id, client_email) after migration
+        # 2026_07_02_ap_signals_per_client_key.sql — the same scanner signal
+        # fans out to ONE ROW PER CLIENT instead of last-writer-wins row
+        # theft. client_email is never NULL: scanner/ownerless writes use
+        # the '__shared__' sentinel the migration canonicalizes to.
+        # Legacy fallback: if the migration is not yet applied, the
+        # composite on_conflict raises (42P10 no matching unique constraint)
+        # and we retry with the legacy single-key upsert — fail-open to
+        # today's exact semantics, never worse, and log loudly so the
+        # missing migration is visible.
+        payload["client_email"] = payload.get("client_email") or "__shared__"
+
+        def _upsert_per_client(p=payload):
+            try:
+                return (
+                    self.sb.table("ap_signals")
+                    .upsert(p, on_conflict="signal_id,client_email")
+                    .execute()
+                )
+            except Exception as exc:
+                log.error(
+                    "AP_SIGNALS_PER_CLIENT_KEY_MISSING falling back to legacy "
+                    "single-key upsert — apply migration "
+                    "2026_07_02_ap_signals_per_client_key.sql | signal_id=%s "
+                    "client=%s error=%s",
+                    p.get("signal_id"), p.get("client_email"), exc,
+                )
+                return self.sb.table("ap_signals").upsert(p).execute()
+
         # HIGH-015: bind payload by default parameter to avoid lambda closure bug
-        self._enqueue(
-            signal_id, "insert_signal",
-            lambda p=payload: self.sb.table("ap_signals").upsert(p).execute(),
-        )
+        self._enqueue(signal_id, "insert_signal", _upsert_per_client)
 
     def update_status(
         self,
@@ -165,9 +192,16 @@ class APSignalStore:
         # REEVAL: wrapped IDs target the underlying ap_signals row (UUID column).
         db_signal_id = canonical_signal_id(signal_id)
         # HIGH-015: bind by default parameter to avoid lambda closure bug
+        # P0 (PR #260): scope lifecycle updates to THIS client's row so one
+        # client's queued/executed transition can never suppress the setup
+        # for other clients. Ownerless stores mutate only '__shared__' rows.
+        _own_email = self.client_email or "__shared__"
         self._enqueue(
             signal_id, f"status_{status}",
-            lambda p=patch, sid=db_signal_id: self.sb.table("ap_signals").update(p).eq("signal_id", sid).execute(),
+            lambda p=patch, sid=db_signal_id, ce=_own_email: (
+                self.sb.table("ap_signals").update(p)
+                .eq("signal_id", sid).eq("client_email", ce).execute()
+            ),
         )
 
     def update_signal_fields(
@@ -191,9 +225,14 @@ class APSignalStore:
         # P0 FIX (2026-05-21): canonicalize signal_id for the .eq filter.
         db_signal_id = canonical_signal_id(signal_id)
         # HIGH-015: bind by default parameter to avoid lambda closure bug
+        # P0 (PR #260): client-scoped — see update_status.
+        _own_email = self.client_email or "__shared__"
         self._enqueue(
             signal_id, "update_signal_fields",
-            lambda p=patch, sid=db_signal_id: self.sb.table("ap_signals").update(p).eq("signal_id", sid).execute(),
+            lambda p=patch, sid=db_signal_id, ce=_own_email: (
+                self.sb.table("ap_signals").update(p)
+                .eq("signal_id", sid).eq("client_email", ce).execute()
+            ),
         )
 
     def insert_option_outcome(self, signal_id: str, outcome: dict[str, Any]):
