@@ -60,10 +60,14 @@ class TestSourcePreservesWriteBackBlocks:
         signature of both paths being wired."""
         src = self._src()
         count = src.count("from ap.queue import write_deferred_breach_last_error")
-        assert count == 2, (
-            f"Expected 2 occurrences of the write_deferred_breach_last_error "
-            f"import (Path A + Path B), found {count}. One or both PR182 "
-            f"write-back blocks may have been dropped."
+        # RED-ON-MAIN CLEANUP (PR #265): PR #252 added a third write-back
+        # site (stale-abort proof). The invariant is "AT LEAST Path A and
+        # Path B are wired" — additional observability sites are welcome,
+        # never a regression.
+        assert count >= 2, (
+            f"Expected >= 2 occurrences of the write_deferred_breach_last_error "
+            f"import (Path A + Path B minimum), found {count}. One or both "
+            f"PR182 write-back blocks may have been dropped."
         )
 
     def test_write_deferred_breach_last_error_called_twice(self):

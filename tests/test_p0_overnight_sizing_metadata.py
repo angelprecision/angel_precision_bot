@@ -67,8 +67,13 @@ class TestSourceGuards:
 
     def test_osm_merges_caller_meta_on_top_of_auto(self):
         """OSM must merge caller meta on top of auto-meta with null-safety guard."""
+        # RED-ON-MAIN CLEANUP (PR #265): the function outgrew the fixed
+        # 9000-char slice (direction canonicalization + enforcement stamp).
+        # Extract the FULL function body to the next method def instead —
+        # the merge invariant itself is unchanged and still enforced below.
         fn_start = _OSM_SRC.find("def create_entry_order(")
-        fn_body = _OSM_SRC[fn_start: fn_start + 9000]
+        fn_end = _OSM_SRC.find("\n    def ", fn_start + 10)
+        fn_body = _OSM_SRC[fn_start: fn_end if fn_end != -1 else len(_OSM_SRC)]
         assert "_auto_meta" in fn_body, "OSM must build _auto_meta dict"
         assert "_final_meta" in fn_body, "OSM must build _final_meta dict"
         # Must NOT use raw .update() — must guard against null/empty overwriting auto
@@ -82,8 +87,11 @@ class TestSourceGuards:
 
     def test_osm_does_not_use_raw_update_for_caller_meta(self):
         """OSM must NOT use _final_meta.update(meta) — that allows null clobber."""
+        # RED-ON-MAIN CLEANUP (PR #265): full-function extraction — the
+        # function outgrew the fixed 9000-char slice. Invariant unchanged.
         fn_start = _OSM_SRC.find("def create_entry_order(")
-        fn_body = _OSM_SRC[fn_start: fn_start + 9000]
+        fn_end = _OSM_SRC.find("\n    def ", fn_start + 10)
+        fn_body = _OSM_SRC[fn_start: fn_end if fn_end != -1 else len(_OSM_SRC)]
         # After the _final_meta = dict(_auto_meta) line, there must NOT be
         # a raw _final_meta.update(meta) call
         final_meta_idx = fn_body.find("_final_meta = dict(_auto_meta)")

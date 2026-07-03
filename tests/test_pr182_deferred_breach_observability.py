@@ -205,10 +205,22 @@ class TestWriteDeferredBreachLastError:
     def test_does_not_overwrite_terminal_rows(self):
         """The UPDATE WHERE clause excludes rows already in terminal statuses.
         Verified by inspecting the SQL text, not by executing against a real DB.
+
+        RED-ON-MAIN CLEANUP (PR #265): PR #233 moved the body into
+        write_breach_last_error(), parameterized on `label`; the wrapper
+        delegates with the DEFERRED_BREACH_CONTRACT_FAILED label preserved.
+        The invariant is unchanged — the terminal guard now lives in the
+        delegated function, and we additionally assert the delegation so a
+        future refactor cannot silently detach the wrapper from the guard.
         """
         import inspect
         from ap import queue as q
-        src = inspect.getsource(q.write_deferred_breach_last_error)
+        wrapper = inspect.getsource(q.write_deferred_breach_last_error)
+        assert "write_breach_last_error(" in wrapper, (
+            "wrapper must delegate to the guarded write_breach_last_error"
+        )
+        assert 'label="DEFERRED_BREACH_CONTRACT_FAILED"' in wrapper
+        src = inspect.getsource(q.write_breach_last_error)
         # The WHERE clause must guard against terminal statuses
         assert "REJECTED" in src
         assert "EXPIRED"  in src
@@ -465,8 +477,11 @@ class TestSourceStructure:
         )
 
     def test_queue_function_updates_only_non_terminal_rows(self):
+        # RED-ON-MAIN CLEANUP (PR #265): guard moved into
+        # write_breach_last_error by PR #233 — inspect the delegated body.
         src = self._src("ap/queue.py")
-        idx = src.find("def write_deferred_breach_last_error")
+        idx = src.find("def write_breach_last_error")
+        assert idx != -1, "guarded write_breach_last_error missing from ap/queue.py"
         region = src[idx: idx + 2400]
         for terminal_status in ("REJECTED", "EXPIRED", "CANCELED", "FILLED", "ARCHIVED"):
             assert terminal_status in region, (
@@ -503,8 +518,11 @@ class TestSourceStructure:
         """ARCHIVED is a known terminal trade_queue status. The WHERE clause in
         write_deferred_breach_last_error must exclude it so a concurrent OSM
         ARCHIVED transition cannot be overwritten by a stale observability write."""
+        # RED-ON-MAIN CLEANUP (PR #265): guard moved into
+        # write_breach_last_error by PR #233 — inspect the delegated body.
         src = self._src("ap/queue.py")
-        idx = src.find("def write_deferred_breach_last_error")
+        idx = src.find("def write_breach_last_error")
+        assert idx != -1, "guarded write_breach_last_error missing from ap/queue.py"
         fn_body = src[idx:idx + 2600]
         assert "ARCHIVED" in fn_body, (
             "'ARCHIVED' not found in write_deferred_breach_last_error terminal guard. "

@@ -146,13 +146,15 @@ def test_total_daily_cap_blocks():
     snap = {**EMPTY_SNAP, "trades_today": 5, "daily_trades": 3}
     g = evaluate_client_quality_gate(_sig(), "c1", snap)
     assert g.allowed is False
-    assert g.block_reason == "client_daily_cap_reached"
+    # RED-ON-MAIN CLEANUP (PR #265): reason split into total vs lane caps.
+    assert g.block_reason == "client_total_daily_cap_reached"
 
 def test_daily_lane_cap_blocks():
     snap = {**EMPTY_SNAP, "daily_trades": 3}
     g = evaluate_client_quality_gate(_sig(timeframe="1d"), "c1", snap)
     assert g.allowed is False
-    assert g.block_reason == "client_daily_cap_reached"
+    # RED-ON-MAIN CLEANUP (PR #265): reason split into total vs lane caps.
+    assert g.block_reason == "client_daily_lane_cap_reached"
 
 def test_intraday_cap_blocks():
     os.environ["INTRADAY_CLIENT_PATTERN_WHITELIST"] = "2-3"
