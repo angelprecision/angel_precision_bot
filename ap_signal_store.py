@@ -116,25 +116,43 @@ class APSignalStore:
         # an in-memory dedup key only; the row in ap_signals is keyed by the
         # original UUID.
         db_signal_id = canonical_signal_id(signal_id)
+
+        # P0: Normalize raw payload keys into canonical execution metadata fields
+        # before writing to ap_signals. Handles scanner-specific field name aliases
+        # (trigger, underlying, last, close, mark, stop, target, pt1) that would
+        # otherwise leave underlying_at_signal and entry_trigger null in the DB.
+        # Best-effort — falls back to `signal` unchanged on any import failure.
+        try:
+            from ap_signal_normalizer import normalize_raw_signal_payload as _norm
+            _signal = _norm(signal)
+        except Exception as _norm_exc:
+            log.warning("insert_signal normalization failed (non-fatal): %s", _norm_exc)
+            _signal = signal
+
         payload = {
             "signal_id":            db_signal_id,
             "client_email":         self.client_email or None,
             "system_version":       self.system_version,
-            "ticker":               signal.get("ticker"),
-            "pattern":              signal.get("pattern"),
-            "timeframe":            signal.get("timeframe"),
-            "side":                 signal.get("side"),
-            "score":                signal.get("score"),
-            "context_score":        (signal.get("score_breakdown") or {}).get("real_time_ctx"),
-            "tier":                 signal.get("tier") or signal.get("grade"),
+            "ticker":               _signal.get("ticker"),
+            "pattern":              _signal.get("pattern"),
+            "timeframe":            _signal.get("timeframe"),
+            "side":                 _signal.get("side"),
+            "score":                _signal.get("score"),
+            "context_score":        (_signal.get("score_breakdown") or {}).get("real_time_ctx"),
+            "tier":                 _signal.get("tier") or _signal.get("grade"),
             "decision_status":      decision_status,
-            "entry_trigger":        signal.get("entry_trigger", signal.get("entry_price")),
-            "stop_price":           signal.get("stop_price"),
-            "target_price":         signal.get("target_price"),
-            "underlying_at_signal": signal.get("underlying_price", signal.get("price")),
-            "signal_payload":       signal,
-            "score_breakdown":      signal.get("score_breakdown"),
-            "context_notes":        signal.get("context_notes"),
+            # Canonical field — already resolved by the normalizer from any alias.
+            # The normalizer writes entry_trigger if the field was missing/zero and
+            # a valid value existed under trigger / entry_price / entry / trigger.entry.
+            "entry_trigger":        _signal.get("entry_trigger"),
+            "stop_price":           _signal.get("stop_price"),
+            "target_price":         _signal.get("target_price"),
+            # Canonical field — normalizer resolved from underlying / price / last /
+            # close / mark if underlying_at_signal was not already present.
+            "underlying_at_signal": _signal.get("underlying_at_signal"),
+            "signal_payload":       signal,   # always store the original raw payload
+            "score_breakdown":      _signal.get("score_breakdown"),
+            "context_notes":        _signal.get("context_notes"),
         }
         # HIGH-015: bind payload by default parameter to avoid lambda closure bug
         self._enqueue(
