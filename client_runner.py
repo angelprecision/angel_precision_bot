@@ -1300,6 +1300,7 @@ class ClientRunner(threading.Thread):
                         self.email, now_et.hour, now_et.minute)
 
             broker = self._get_broker()
+            data_broker = getattr(self, "data_broker", None) or broker
             # All of these are stored directly on the runner (not on self.core)
             entry_watcher = getattr(self.core, "entry_watcher", None) if self.core else None
             contract_selector = self.contract_selector
@@ -1309,6 +1310,7 @@ class ClientRunner(threading.Thread):
             result = run_overnight_reeval(
                 client_id=self.email,
                 broker=broker,
+                data_broker=data_broker,
                 master_control=self.master_control,
                 contract_selector=contract_selector,
                 order_state_machine=self.order_state_machine,

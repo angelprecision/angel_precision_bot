@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import logging
 import os
+import inspect
 import time
 from datetime import date, datetime, timezone, timedelta
 from typing import TYPE_CHECKING, Optional
@@ -552,6 +553,7 @@ def run_overnight_reeval(
     *,
     client_id: str,
     broker,
+    data_broker=None,
     master_control,
     contract_selector,
     order_state_machine,
@@ -598,6 +600,45 @@ def run_overnight_reeval(
     except Exception as _e:
         log.warning("overnight_health_heartbeat_failed: %s", _e)
 
+    attached_data_broker = None
+    if broker is not None:
+        try:
+            _attached_data_broker = inspect.getattr_static(broker, "data_broker")
+        except AttributeError:
+            _attached_data_broker = None
+        if _attached_data_broker is not None:
+            attached_data_broker = getattr(broker, "data_broker", None)
+    market_data_broker = data_broker or attached_data_broker or broker
+    try:
+        from ap.authorization import execution_mode_for_broker as _exec_mode_for_broker
+        _run_execution_mode = str(_exec_mode_for_broker(broker) or "").upper()
+    except Exception:
+        _run_execution_mode = ""
+    log.info(
+        "OVERNIGHT_REEVAL_MARKET_DATA_BROKER_SELECTED "
+        "client_id=%s execution_mode=%s data_broker_present=%s "
+        "broker_class=%s data_broker_class=%s market_data_broker_class=%s",
+        client_id,
+        _run_execution_mode or "UNKNOWN",
+        bool(data_broker is not None or attached_data_broker is not None),
+        type(broker).__name__ if broker is not None else "None",
+        type(data_broker).__name__ if data_broker is not None else "None",
+        type(market_data_broker).__name__ if market_data_broker is not None else "None",
+    )
+    if (
+        _run_execution_mode == "PAPER"
+        and data_broker is None
+        and attached_data_broker is None
+        and market_data_broker is broker
+    ):
+        log.warning(
+            "PAPER_OVERNIGHT_DATA_BROKER_MISSING_USING_EXECUTION_BROKER "
+            "client_id=%s execution_mode=%s broker_class=%s market_data_broker_class=%s",
+            client_id,
+            _run_execution_mode,
+            type(broker).__name__ if broker is not None else "None",
+            type(market_data_broker).__name__ if market_data_broker is not None else "None",
+        )
     result = {
         "processed": 0,
         "armed": 0,
@@ -657,11 +698,7 @@ def run_overnight_reeval(
             continue
         signal["side"] = side
         signal["direction"] = side
-        try:
-            from ap.authorization import execution_mode_for_broker as _exec_mode_for_broker
-            _execution_mode = str(_exec_mode_for_broker(broker) or "").upper()
-        except Exception:
-            _execution_mode = ""
+        _execution_mode = _run_execution_mode
         _paper_rescue_only = _paper_overnight_rescue_only_signal(
             signal,
             job_source=job_source,
@@ -724,10 +761,13 @@ def run_overnight_reeval(
 
             # Step 1: Fetch prior-day levels from broker
             prior_levels = {}
-            if hasattr(broker, "get_prior_day_levels"):
-                prior_levels = broker.get_prior_day_levels(ticker) or {}
+            if hasattr(market_data_broker, "get_prior_day_levels"):
+                prior_levels = market_data_broker.get_prior_day_levels(ticker) or {}
             else:
-                log.warning("[%s] broker has no get_prior_day_levels — cannot validate overnight daily signal", ticker)
+                log.warning(
+                    "[%s] market-data broker has no get_prior_day_levels — cannot validate overnight daily signal",
+                    ticker,
+                )
 
             prior_day_high = (
                 float(signal.get("prior_day_high") or 0) or
@@ -866,7 +906,7 @@ def run_overnight_reeval(
 
             # Step 3: Overnight daily structure validation
             # Fetch a fresh market snapshot (pre-market quote)
-            snapshot = fetch_market_snapshot(ticker, broker)
+            snapshot = fetch_market_snapshot(ticker, market_data_broker)
             validation = validate_overnight_daily_signal(
                 ticker=ticker,
                 side=side,
