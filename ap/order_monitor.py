@@ -32,7 +32,7 @@ import os
 import re
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 from ap.db import conn, run_with_retry
@@ -187,6 +187,37 @@ PENDING_TRIGGER_CLEANUP_DRY_RUN = os.getenv(
 # expired — it missed its trading window. Before that, it must be kept alive.
 _PT_ORPHAN_EOD_CUTOFF_HOUR = int(os.getenv("PT_ORPHAN_EOD_CUTOFF_HOUR", "15"))
 _PT_ORPHAN_EOD_CUTOFF_MIN  = int(os.getenv("PT_ORPHAN_EOD_CUTOFF_MIN",  "30"))
+
+# ── P0 (2026-07-02): DEFERRED ghost sweep ────────────────────────────────────
+# DEFERRED PENDING_TRIGGER rows are deliberately exempt from the same-day EOD
+# expiry (_is_overnight_or_deferred_row) so daily setups can carry into the
+# next morning's reeval/handoff. Production proved the carry loop does not
+# reliably CLOSE them: ghost rows recurred twice (4 rows hand-terminalized in
+# a prior incident; 9 rows on 2026-07-02 each reserving $190.21 ≈ $1,712 of
+# phantom live capital). A stale row is doubly harmful: (1) its reserved_cost
+# is subtracted from the client's capital budget, blocking REAL trades via
+# affordability/slot gates; (2) its signal_id blocks the armed-deferred
+# rescue's NOT-EXISTS dedup, so tomorrow's fresh materialization for the same
+# setup is silently suppressed.
+#
+# Sweep rule (deliberately conservative — the overnight carry design is
+# preserved): a DEFERRED PENDING_TRIGGER row with NO broker_order_id is
+# EXPIRED only once it has crossed a full session boundary — created before
+# the current ET trading date AND the current time is past the EOD cutoff.
+# I.e. the row survives its creation day, survives the next morning's
+# reeval/handoff/rescue window (their chance to consume or refresh it), and
+# dies at the NEXT session close if still untouched. A hard age ceiling
+# (default 48h) additionally sweeps multi-day ghosts at any time of day
+# (weekends, restarts, stuck watchers).
+EOD_DEFERRED_GHOST_SWEEP_ENABLED = os.getenv(
+    "EOD_DEFERRED_GHOST_SWEEP_ENABLED", "1"
+).strip().lower() in ("1", "true", "yes")
+EOD_DEFERRED_GHOST_MAX_AGE_HOURS = int(
+    os.getenv("EOD_DEFERRED_GHOST_MAX_AGE_HOURS", "48")
+)
+EOD_DEFERRED_GHOST_SWEEP_INTERVAL_SECONDS = int(
+    os.getenv("EOD_DEFERRED_GHOST_SWEEP_INTERVAL_SECONDS", "600")
+)
 
 # Watchdog ownership controls.
 # Default is intentionally passive for POSITION lifecycle (that authority
@@ -383,6 +414,21 @@ class APOrderMonitor:
                     self._check_entry_orders()
                 except Exception as e:
                     log.error(f"[{self.client_id}] OrderMonitor entry-check error: {e}")
+                # P0 (2026-07-02): DEFERRED ghost sweep. Runs on the entry
+                # cadence, further throttled (default every 600s) — a stale
+                # ghost costs reserved capital by the day, not the second,
+                # so this must never add per-minute DB load. Wrapped: a
+                # sweep failure must NEVER prevent the next entry tick.
+                if _now - getattr(self, "_last_ghost_sweep", 0.0) >= (
+                    EOD_DEFERRED_GHOST_SWEEP_INTERVAL_SECONDS
+                ):
+                    self._last_ghost_sweep = _now
+                    try:
+                        self._sweep_stale_deferred_ghosts()
+                    except Exception as e:
+                        log.error(
+                            f"[{self.client_id}] OrderMonitor ghost-sweep error: {e}"
+                        )
             # PHASE 5 WIRE-IN: armed retries are polled on the FAST cadence
             # (every EXIT_CHECK_INTERVAL = 15s by default) so a retry whose
             # ready_at falls inside the 15-30s wait window is submitted within
@@ -733,6 +779,111 @@ class APOrderMonitor:
             or (now_et.hour == _PT_ORPHAN_EOD_CUTOFF_HOUR
                 and now_et.minute >= _PT_ORPHAN_EOD_CUTOFF_MIN)
         )
+
+    def _sweep_stale_deferred_ghosts(self) -> int:
+        """
+        P0 (2026-07-02): terminalize DEFERRED PENDING_TRIGGER ghosts.
+
+        See the constant block (EOD_DEFERRED_GHOST_SWEEP_*) for the full
+        forensic rationale. Compare-and-swap semantics: the UPDATE's WHERE
+        clause re-asserts status='PENDING_TRIGGER', empty broker_order_id,
+        and DEFERRED contract at write time, so a row that breaches,
+        materializes, or submits between any read and this write is never
+        touched — the guard the row's terminal transition must have.
+
+        Returns the number of rows swept. Never raises.
+        """
+        if not EOD_DEFERRED_GHOST_SWEEP_ENABLED:
+            return 0
+        try:
+            try:
+                import zoneinfo
+                _et = zoneinfo.ZoneInfo("America/New_York")
+            except ImportError:
+                return 0  # cannot resolve ET — conservative: sweep nothing
+            _now_et = datetime.now(_et)
+            _today_et_start = _now_et.replace(
+                hour=0, minute=0, second=0, microsecond=0
+            )
+            # Threshold selection:
+            #  - past EOD cutoff → sweep anything created before today's ET
+            #    session (crossed >=1 session boundary; morning carry already
+            #    had its chance). This subsumes the age ceiling.
+            #  - otherwise → only the hard age ceiling applies.
+            if self._is_after_pt_eod_cutoff():
+                _threshold = _today_et_start
+                _rule = "session_boundary_past_eod_cutoff"
+            else:
+                _threshold = _now_et - timedelta(
+                    hours=EOD_DEFERRED_GHOST_MAX_AGE_HOURS
+                )
+                _rule = f"max_age_{EOD_DEFERRED_GHOST_MAX_AGE_HOURS}h"
+
+            import json as _json
+            _sweep_meta = _json.dumps({
+                "deferred_ghost_sweep": {
+                    "swept_at": datetime.now(timezone.utc).isoformat(),
+                    "rule": _rule,
+                    "threshold_et": _threshold.isoformat(),
+                    "sweeper": "ap.order_monitor",
+                }
+            })
+
+            def _fn():
+                with conn() as c:
+                    c.execute(
+                        """
+                        UPDATE orders
+                        SET status = 'EXPIRED',
+                            last_error = 'eod_deferred_never_triggered:' || %s,
+                            meta = COALESCE(meta, '{}'::jsonb) || %s::jsonb,
+                            updated_ts = NOW()
+                        WHERE client_id = %s
+                          AND status = 'PENDING_TRIGGER'
+                          AND (broker_order_id IS NULL OR broker_order_id = '')
+                          AND UPPER(contract) LIKE 'DEFERRED:%%'
+                          AND kind = 'ENTRY'
+                          AND created_ts < %s
+                        RETURNING local_order_id, symbol, reserved_cost, created_ts
+                        """,
+                        (_rule, _sweep_meta, self.client_id, _threshold),
+                    )
+                    return c.fetchall() or []
+
+            swept = run_with_retry(_fn) or []
+            for _row in swept:
+                _r = dict(_row) if not isinstance(_row, dict) else _row
+                log.warning(
+                    "[%s] DEFERRED_GHOST_SWEPT local_order_id=%s symbol=%s "
+                    "reserved_cost=%s created_ts=%s rule=%s "
+                    "category=CAPITAL_RECLAIM severity=WARNING",
+                    self.client_id,
+                    _r.get("local_order_id"),
+                    _r.get("symbol"),
+                    _r.get("reserved_cost"),
+                    _r.get("created_ts"),
+                    _rule,
+                )
+                try:
+                    self._emit_order_event(
+                        local_order_id=_r.get("local_order_id"),
+                        stage="deferred_ghost_sweep",
+                        decision="EXPIRED",
+                        reason_code="EOD_DEFERRED_NEVER_TRIGGERED",
+                        explanation=(
+                            f"DEFERRED ghost swept rule={_rule} "
+                            f"reserved_cost={_r.get('reserved_cost')} reclaimed"
+                        ),
+                    )
+                except Exception:
+                    pass
+            return len(swept)
+        except Exception as _sweep_exc:
+            log.error(
+                "[%s] deferred ghost sweep failed (non-fatal): %s",
+                self.client_id, _sweep_exc,
+            )
+            return 0
 
     def _is_overnight_or_deferred_row(self, order: dict) -> tuple[bool, str]:
         """Return (is_overnight_or_deferred, evidence_description).
