@@ -1473,34 +1473,66 @@ class APExecutionCore:
             ticker=ticker,
         )
         _hydrated_master_control = getattr(self, "master_control", None)
-        if _hydration_bridge_applied and _hydrated_master_control is not None:
+        if _hydration_bridge_applied:
+            if _hydrated_master_control is None:
+                reason = "hydrated_prebreach_revalidation_unavailable"
+                log.critical(
+                    "[%s] PRODUCTION_ENTRY_BLOCK — hydration applied but master_control missing; "
+                    "cannot revalidate hydrated contract/qty/limit safely",
+                    ticker,
+                )
+                _terminalize_breach_failure(
+                    reason,
+                    cleanup_action="expire",
+                    meta_patch={
+                        "hydration_bridge_applied": True,
+                        "hydrated_prebreach_revalidation": "unavailable",
+                        "local_order_id": queue_local_order_id,
+                    },
+                    context_notes=reason,
+                )
+                return
             try:
                 _hydrated_reval = _hydrated_master_control.revalidate_exposure(
                     approved_plan,
                     client_id=self.email or "default",
                 )
             except Exception as exc:
-                log.warning(
-                    "[%s] Hydrated pre-breach exposure revalidation failed: %s",
-                    ticker, exc,
+                reason = f"hydrated_prebreach_revalidation_error:{exc}"
+                log.critical(
+                    "[%s] PRODUCTION_ENTRY_BLOCK — hydrated pre-breach revalidation errored: %s",
+                    ticker,
+                    exc,
                 )
                 _terminalize_breach_failure(
-                    "hydrated_prebreach_exposure_revalidation_exception",
-                    context_notes="hydrated_prebreach_exposure_revalidation_exception",
+                    reason,
+                    cleanup_action="expire",
+                    meta_patch={
+                        "hydration_bridge_applied": True,
+                        "hydrated_prebreach_revalidation": "error",
+                        "local_order_id": queue_local_order_id,
+                    },
+                    context_notes=reason,
                 )
                 return
-
             if not getattr(_hydrated_reval, "ok", False):
-                _hydrated_reason = getattr(
-                    _hydrated_reval, "reason", "hydrated_prebreach_revalidation_failed"
-                )
-                log.info(
-                    "[%s] Hydrated pre-breach exposure revalidation blocked: %s",
-                    ticker, _hydrated_reason,
+                _reason = getattr(_hydrated_reval, "reason", "revalidation_failed")
+                reason = f"hydrated_prebreach_revalidation_blocked:{_reason}"
+                log.critical(
+                    "[%s] PRODUCTION_ENTRY_BLOCK — hydrated pre-breach revalidation blocked: %s",
+                    ticker,
+                    _reason,
                 )
                 _terminalize_breach_failure(
-                    f"hydrated_prebreach_exposure_revalidation:{_hydrated_reason}",
-                    context_notes=f"hydrated_prebreach_exposure_revalidation={_hydrated_reason}",
+                    reason,
+                    cleanup_action="expire",
+                    meta_patch={
+                        "hydration_bridge_applied": True,
+                        "hydrated_prebreach_revalidation": "blocked",
+                        "hydrated_prebreach_revalidation_reason": str(_reason),
+                        "local_order_id": queue_local_order_id,
+                    },
+                    context_notes=reason,
                 )
                 return
 

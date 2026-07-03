@@ -344,3 +344,63 @@ def test_cap_stops_hydration_after_max_per_cycle(monkeypatch):
 
     assert selector.select.call_count == 2
     assert monitor.osm.record_deferred_hydration_result.call_count == 2
+
+
+def test_successful_hydration_does_not_pass_stale_deferred_order_downstream(monkeypatch):
+    monitor = _make_monitor(contract_selector=MagicMock())
+    _enable_window(monkeypatch)
+    monkeypatch.setattr(
+        monitor,
+        "_get_active_entry_orders",
+        lambda: [_make_order(local_order_id="local-refresh-1", contract="DEFERRED:AAPL")],
+    )
+    monkeypatch.setattr(
+        monitor,
+        "_maybe_hydrate_deferred_order",
+        lambda order, hydration_seen=None: {
+            "attempted": True,
+            "success": True,
+            "contract": "AAPL260717C00200000",
+        },
+    )
+    check_calls = []
+    monkeypatch.setattr(
+        monitor,
+        "_check_pending_trigger_order",
+        lambda **kwargs: check_calls.append(kwargs),
+    )
+
+    monitor._check_entry_orders()
+
+    assert check_calls == []
+
+
+def test_hydration_failure_keeps_existing_pending_trigger_downstream_behavior(monkeypatch):
+    monitor = _make_monitor(contract_selector=MagicMock())
+    _enable_window(monkeypatch)
+    order = _make_order(local_order_id="local-refresh-2", contract="DEFERRED:AAPL")
+    monkeypatch.setattr(
+        monitor,
+        "_get_active_entry_orders",
+        lambda: [order],
+    )
+    monkeypatch.setattr(
+        monitor,
+        "_maybe_hydrate_deferred_order",
+        lambda current_order, hydration_seen=None: {
+            "attempted": True,
+            "success": False,
+            "reason": "NO_CHAIN_DATA",
+        },
+    )
+    check_calls = []
+    monkeypatch.setattr(
+        monitor,
+        "_check_pending_trigger_order",
+        lambda **kwargs: check_calls.append(kwargs),
+    )
+
+    monitor._check_entry_orders()
+
+    assert len(check_calls) == 1
+    assert check_calls[0]["order"]["contract"] == "DEFERRED:AAPL"

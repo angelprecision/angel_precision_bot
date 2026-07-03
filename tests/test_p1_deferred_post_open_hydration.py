@@ -252,6 +252,9 @@ def test_breach_uses_hydrated_order_row_without_rerunning_deferred_selector(monk
     core._cleanup_pending_entry_order = MagicMock()
     core._emit_breach_diag = MagicMock()
     core._alert_degraded = MagicMock()
+    core.master_control = SimpleNamespace(
+        revalidate_exposure=MagicMock(return_value=SimpleNamespace(ok=True))
+    )
 
     monkeypatch.setattr(execution_mod, "_refresh_ask_at_submit", lambda broker, contract: (
         2.50,
@@ -297,10 +300,8 @@ def test_breach_uses_hydrated_order_row_without_rerunning_deferred_selector(monk
     assert watched.signal["local_order_id"] == "local-123"
     assert watched.signal["client_id"] == "client@example.com"
 
-
-def test_hydrated_prebreach_bridge_revalidates_exposure_before_submit(monkeypatch):
+def _build_hydrated_breach_harness():
     from ap_execution_core import APExecutionCore
-    import ap.execution as execution_mod
 
     approved_plan = SimpleNamespace(
         contract_symbol="DEFERRED:AAPL",
@@ -334,13 +335,12 @@ def test_hydrated_prebreach_bridge_revalidates_exposure_before_submit(monkeypatc
         signal={
             "signal_id": "sig-bridge-2",
             "client_id": "client@example.com",
-            "local_order_id": "local-124",
+            "local_order_id": "local-123",
             "_approved_plan": approved_plan,
         },
     )
-
     hydrated_row = {
-        "local_order_id": "local-124",
+        "local_order_id": "local-123",
         "client_id": "client@example.com",
         "signal_id": "sig-bridge-2",
         "status": "PENDING_TRIGGER",
@@ -357,15 +357,13 @@ def test_hydrated_prebreach_bridge_revalidates_exposure_before_submit(monkeypatc
             "contract_materialized_source": "prebreach_hydration",
         },
     }
-
     osm = MagicMock()
     osm.get_order.return_value = hydrated_row
     osm.submit_existing_entry.return_value = {
         "ok": True,
-        "local_order_id": "local-124",
+        "local_order_id": "local-123",
         "broker_order_id": None,
     }
-
     core = object.__new__(APExecutionCore)
     core.broker = MagicMock()
     core.order_state_machine = osm
@@ -382,11 +380,11 @@ def test_hydrated_prebreach_bridge_revalidates_exposure_before_submit(monkeypatc
     core._cleanup_pending_entry_order = MagicMock()
     core._emit_breach_diag = MagicMock()
     core._alert_degraded = MagicMock()
-    core.master_control = SimpleNamespace(
-        revalidate_exposure=MagicMock(
-            return_value=SimpleNamespace(ok=False, reason="capital_limit_after_hydration")
-        )
-    )
+    return core, watched, osm
+
+
+def _install_hydrated_submit_test_stubs(monkeypatch):
+    import ap.execution as execution_mod
 
     monkeypatch.setattr(execution_mod, "_refresh_ask_at_submit", lambda broker, contract: (
         2.50,
@@ -401,7 +399,6 @@ def test_hydrated_prebreach_bridge_revalidates_exposure_before_submit(monkeypatc
             "spread_pct": 0.04,
         },
     ))
-
     fake_confirm_module = types.SimpleNamespace(
         check_entry_confirmation=lambda **kwargs: types.SimpleNamespace(
             passed=True,
@@ -413,26 +410,55 @@ def test_hydrated_prebreach_bridge_revalidates_exposure_before_submit(monkeypatc
     monkeypatch.setitem(sys.modules, "ap_entry_confirmation", fake_confirm_module)
     monkeypatch.setattr("ap_execution_core.funnel.inc", lambda *args, **kwargs: None)
 
+def test_hydration_applied_without_master_control_terminalizes(monkeypatch):
+    core, watched, osm = _build_hydrated_breach_harness()
+    _install_hydrated_submit_test_stubs(monkeypatch)
+    core.master_control = None
+
     core._on_entry_trigger(watched)
 
-    core.master_control.revalidate_exposure.assert_called_once()
-    core.contract_selector.select.assert_not_called()
     osm.submit_existing_entry.assert_not_called()
     core._cleanup_pending_entry_order.assert_called_once()
-    cleanup_kwargs = core._cleanup_pending_entry_order.call_args.kwargs
-    assert cleanup_kwargs["action"] == "expire"
-    assert cleanup_kwargs["reason"] == (
-        "hydrated_prebreach_exposure_revalidation:capital_limit_after_hydration"
-    )
-    core.store.update_signal_fields.assert_any_call(
+    assert core._cleanup_pending_entry_order.call_args.kwargs["reason"] == "hydrated_prebreach_revalidation_unavailable"
+    core.store.update_signal_fields.assert_called_with(
         "sig-bridge-2",
         {
             "decision_status": "blocked_at_breach",
-            "context_notes": "hydrated_prebreach_exposure_revalidation=capital_limit_after_hydration",
+            "context_notes": "hydrated_prebreach_revalidation_unavailable",
         },
     )
 
 
+def test_hydration_applied_with_revalidation_ok_may_proceed(monkeypatch):
+    core, watched, osm = _build_hydrated_breach_harness()
+    _install_hydrated_submit_test_stubs(monkeypatch)
+    core.master_control = SimpleNamespace(
+        revalidate_exposure=MagicMock(return_value=SimpleNamespace(ok=True))
+    )
+
+    core._on_entry_trigger(watched)
+
+    core.master_control.revalidate_exposure.assert_called_once()
+    osm.submit_existing_entry.assert_called_once()
+
+
+def test_hydration_applied_with_revalidation_blocked_terminalizes(monkeypatch):
+    core, watched, osm = _build_hydrated_breach_harness()
+    _install_hydrated_submit_test_stubs(monkeypatch)
+    core.master_control = SimpleNamespace(
+        revalidate_exposure=MagicMock(
+            return_value=SimpleNamespace(ok=False, reason="cap_exceeded")
+        )
+    )
+
+    core._on_entry_trigger(watched)
+
+    osm.submit_existing_entry.assert_not_called()
+    core._cleanup_pending_entry_order.assert_called_once()
+    assert (
+        core._cleanup_pending_entry_order.call_args.kwargs["reason"]
+        == "hydrated_prebreach_revalidation_blocked:cap_exceeded"
+    )
 def test_hydration_success_cas_miss_when_status_changed_before_persist(monkeypatch, caplog):
     osm = _make_osm()
     cur = _HydrationCursor(

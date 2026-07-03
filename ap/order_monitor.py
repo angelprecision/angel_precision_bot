@@ -695,6 +695,15 @@ class APOrderMonitor:
                             hydration_disabled_logged = True
                     elif hydration_result.get("attempted"):
                         hydration_attempts += 1
+                        if hydration_result.get("success"):
+                            log.info(
+                                "[%s] DEFERRED_HYDRATION_REFRESH_REQUIRED | local=%s stale_contract=%s hydrated_contract=%s",
+                                self.client_id,
+                                local_id,
+                                str(order.get("contract") or "").strip(),
+                                str(hydration_result.get("contract") or "").strip(),
+                            )
+                            continue
                 self._check_pending_trigger_order(
                     order=order,
                     local_id=local_id,
