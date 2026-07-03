@@ -1654,6 +1654,19 @@ class APOrderStateMachine:
         except Exception:
             return False
 
+        def _rowcount(cur, c) -> int:
+            try:
+                return int(getattr(cur, "rowcount", getattr(c, "rowcount", 0)) or 0)
+            except Exception:
+                return 0
+
+        def _log_cas_miss() -> None:
+            log.info(
+                "[%s] DEFERRED_HYDRATION_STALE_SKIP local=%s reason=cas_miss",
+                self.client_id,
+                local_order_id,
+            )
+
         def _update_with_status_column():
             with conn() as c:
                 cur = c.execute(
@@ -1693,6 +1706,11 @@ class APOrderStateMachine:
                             updated_ts = NOW()
                         WHERE local_order_id = %s
                           AND client_id = %s
+                          AND UPPER(COALESCE(status,'')) = 'PENDING_TRIGGER'
+                          AND UPPER(COALESCE(contract,'')) LIKE 'DEFERRED:%%'
+                          AND (broker_order_id IS NULL OR broker_order_id = '')
+                          AND submitted_ts IS NULL
+                          AND (limit_price IS NULL OR limit_price <= 0.01)
                         """,
                         (
                             contract,
@@ -1714,6 +1732,10 @@ class APOrderStateMachine:
                             updated_ts = NOW()
                         WHERE local_order_id = %s
                           AND client_id = %s
+                          AND UPPER(COALESCE(status,'')) = 'PENDING_TRIGGER'
+                          AND UPPER(COALESCE(contract,'')) LIKE 'DEFERRED:%%'
+                          AND (broker_order_id IS NULL OR broker_order_id = '')
+                          AND submitted_ts IS NULL
                         """,
                         (
                             contract_selection_status,
@@ -1722,7 +1744,10 @@ class APOrderStateMachine:
                             self.client_id,
                         ),
                     )
-                return getattr(cur, "rowcount", getattr(c, "rowcount", None))
+                rowcount = _rowcount(cur, c)
+                if rowcount == 0:
+                    _log_cas_miss()
+                return rowcount
 
         def _update_without_status_column():
             with conn() as c:
@@ -1762,6 +1787,11 @@ class APOrderStateMachine:
                             updated_ts = NOW()
                         WHERE local_order_id = %s
                           AND client_id = %s
+                          AND UPPER(COALESCE(status,'')) = 'PENDING_TRIGGER'
+                          AND UPPER(COALESCE(contract,'')) LIKE 'DEFERRED:%%'
+                          AND (broker_order_id IS NULL OR broker_order_id = '')
+                          AND submitted_ts IS NULL
+                          AND (limit_price IS NULL OR limit_price <= 0.01)
                         """,
                         (
                             contract,
@@ -1781,6 +1811,10 @@ class APOrderStateMachine:
                             updated_ts = NOW()
                         WHERE local_order_id = %s
                           AND client_id = %s
+                          AND UPPER(COALESCE(status,'')) = 'PENDING_TRIGGER'
+                          AND UPPER(COALESCE(contract,'')) LIKE 'DEFERRED:%%'
+                          AND (broker_order_id IS NULL OR broker_order_id = '')
+                          AND submitted_ts IS NULL
                         """,
                         (
                             meta_json,
@@ -1788,7 +1822,10 @@ class APOrderStateMachine:
                             self.client_id,
                         ),
                     )
-                return getattr(cur, "rowcount", getattr(c, "rowcount", None))
+                rowcount = _rowcount(cur, c)
+                if rowcount == 0:
+                    _log_cas_miss()
+                return rowcount
 
         try:
             rowcount = run_with_retry(_update_with_status_column)
