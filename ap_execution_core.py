@@ -92,6 +92,25 @@ RETRYABLE_BREACH_SELECTOR_REASONS: frozenset = frozenset({
 })
 
 
+def _live_confirmation_required() -> bool:
+    """
+    P0 (PR #262): LIVE submits require an explicit entry-confirmation PASS.
+
+    check_entry_confirmation is a deliberate NO-OP when the plan does not
+    carry confirmation_required=True (legacy design). In LIVE that meant a
+    submit could reach the broker with ZERO confirmation whenever the
+    hybrid gate didn't set the flag or plan metadata was lost through a
+    recovery/rescue path — confirmation "disabled unintentionally".
+
+    Default-required in LIVE. Env LIVE_CONFIRMATION_REQUIRED=0 is the only
+    bypass and is logged at CRITICAL by the caller. Hot-read per call
+    (repo convention for entry-confirmation flags).
+    """
+    return str(
+        os.getenv("LIVE_CONFIRMATION_REQUIRED", "1")
+    ).strip().lower() in ("1", "true", "yes")
+
+
 def _is_ladder_exhaustion_retryable(ladder_audit: Optional[dict]) -> bool:
     """Determine whether a NO_VALID_PLAYBOOK_DTE_CONTRACT exhaustion is retryable.
 
@@ -2305,6 +2324,29 @@ class APExecutionCore:
             from ap_entry_confirmation import check_entry_confirmation
             _sig_for_confirm = watched.signal or {}
             _plan_meta_for_confirm = getattr(approved_plan, "metadata", {}) or {}
+            # P0 (PR #262): LIVE default-required. Force the flag into plan
+            # metadata so the legacy no-op path is impossible in LIVE — the
+            # confirmation checks ALWAYS run, and only an explicit
+            # passed=True reaches the broker. Paper behavior unchanged.
+            _is_live_submit = str(
+                getattr(self, "execution_mode", "") or getattr(self, "mode", "") or ""
+            ).strip().upper() == "LIVE"
+            if _is_live_submit:
+                if _live_confirmation_required():
+                    if isinstance(_plan_meta_for_confirm, dict):
+                        _plan_meta_for_confirm["confirmation_required"] = True
+                        try:
+                            setattr(approved_plan, "metadata", _plan_meta_for_confirm)
+                        except Exception:
+                            pass
+                else:
+                    log.critical(
+                        "[%s] LIVE_CONFIRMATION_BYPASSED_BY_ENV — "
+                        "LIVE_CONFIRMATION_REQUIRED=0 is set; live submit will "
+                        "proceed under legacy confirmation semantics. This must "
+                        "never be set in normal operation.",
+                        ticker,
+                    )
             _sandbox = bool(
                 _plan_meta_for_confirm.get("sandbox_mode")
                 or getattr(self.broker, "sandbox", False)
@@ -2335,6 +2377,14 @@ class APExecutionCore:
                 timeframe = str(_sig_for_confirm.get("timeframe") or "1d"),
                 sandbox_mode = _sandbox,
             )
+            # P0 (PR #262): LIVE must block on an unknown/None result with an
+            # explicit reason. (The outer except already fails closed on any
+            # raise; this names the None-shape case instead of surfacing an
+            # AttributeError.)
+            if _is_live_submit and (
+                _confirm_result is None or not hasattr(_confirm_result, "passed")
+            ):
+                raise RuntimeError("live_confirmation_error:none_result")
             _confirm_meta = _confirm_result.to_meta(
                 started_at   = _confirm_result.metadata.get("live_entry_ts", ""),
                 completed_at = __import__("datetime").datetime.now(
@@ -2427,7 +2477,16 @@ class APExecutionCore:
             # Client-eligible trades must not bypass confirmation — fail closed.
             _gate_meta_imp = (getattr(approved_plan, "metadata", {}) or {})
             _hcqg_imp      = _gate_meta_imp.get("hybrid_client_quality_gate") or {}
-            if _hcqg_imp.get("confirmation_required"):
+            # P0 (PR #262): in LIVE the module is required, full stop —
+            # reason live_confirmation_required. The plan-flag path below
+            # continues to cover client-gated paper flows.
+            _live_needs_confirm_imp = (
+                str(
+                    getattr(self, "execution_mode", "") or getattr(self, "mode", "") or ""
+                ).strip().upper() == "LIVE"
+                and _live_confirmation_required()
+            )
+            if _live_needs_confirm_imp or _hcqg_imp.get("confirmation_required"):
                 log.critical(
                     "[%s] ENTRY_CONFIRM_MODULE_MISSING — confirmation_required=True "
                     "but ap_entry_confirmation is not deployed. "
