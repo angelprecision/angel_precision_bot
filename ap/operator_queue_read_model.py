@@ -161,7 +161,7 @@ def build_operator_queue_read_model(*, client_id: str | None = None, hours: int 
     )
     order_sql = (
         "SELECT local_order_id, client_id, kind, status, broker_order_id, symbol, side, contract, "
-        "       score, signal_id, created_ts, updated_ts, last_error, meta "
+        "       limit_price, score, signal_id, created_ts, updated_ts, last_error, meta "
         "FROM orders "
         "WHERE " + " AND ".join(order_where) + " "
         "  AND kind = 'ENTRY' "
