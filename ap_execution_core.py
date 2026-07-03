@@ -1935,14 +1935,24 @@ class APExecutionCore:
                                                         _t, _oid, _current_status, _att,
                                                     )
                                                     return
-                                                # Guard 2/3: must not already have broker submit truth
-                                                if _current_broker_id or _current_submitted_ts:
-                                                    _record_stale_abort("broker_or_submitted_present")
+                                                # Guard 2: must not already have a broker order
+                                                if _current_broker_id:
+                                                    _record_stale_abort("broker_id_present")
                                                     log.warning(
                                                         "[%s] DEFERRED_BREACH_RETRY_STALE_STATE_ABORT "
-                                                        "order=%s reason=broker_or_submitted_present "
-                                                        "broker_order_id=%s submitted_ts=%s attempt=%d",
-                                                        _t, _oid, _current_broker_id, _current_submitted_ts, _att,
+                                                        "order=%s reason=broker_id_present "
+                                                        "broker_order_id=%s attempt=%d",
+                                                        _t, _oid, _current_broker_id, _att,
+                                                    )
+                                                    return
+                                                # Guard 3: must not have been submitted already
+                                                if _current_submitted_ts:
+                                                    _record_stale_abort("submitted_ts_present")
+                                                    log.warning(
+                                                        "[%s] DEFERRED_BREACH_RETRY_STALE_STATE_ABORT "
+                                                        "order=%s reason=submitted_ts_present "
+                                                        "submitted_ts=%s attempt=%d",
+                                                        _t, _oid, _current_submitted_ts, _att,
                                                     )
                                                     return
                                                 # Guard 4: contract must still be deferred
