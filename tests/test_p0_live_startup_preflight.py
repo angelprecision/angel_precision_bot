@@ -93,6 +93,7 @@ def test_live_preflight_uses_dedicated_data_broker_for_quotes():
         data_broker=data_broker,
         quote_broker_source="TRADIER_MARKET_DATA_TOKEN",
     )
+    assert out["status"] == "passed"
     assert out["equity"] == 50000.0
     assert out["quote_source"] == "TRADIER_MARKET_DATA_TOKEN"
     assert out["quote_broker_class"] == "_DataBroker"
@@ -119,6 +120,7 @@ def test_live_preflight_falls_back_to_execution_broker_when_no_data_broker():
         data_broker=execution_broker,
         quote_broker_source="execution_broker_fallback_live",
     )
+    assert out["status"] == "passed"
     assert out["quote_source"] == "execution_broker_fallback_live"
     assert out["quote_broker_class"] == "_ExecutionBroker"
     assert out["quote_price"] == 598.25
@@ -133,6 +135,47 @@ def test_live_preflight_fails_when_equity_fetch_fails():
             data_broker=_DataBroker(),
             quote_broker_source="TRADIER_MARKET_DATA_TOKEN",
         )
+
+
+def test_manifest_records_live_preflight_status_and_market_data_source():
+    runner = object.__new__(_cr.ClientRunner)
+    runner.email = "live@test"
+    runner.account_id = "LIVE123"
+    runner.mode = "LIVE"
+    runner.base_url = "https://api.tradier.com"
+    runner.core = None
+    runner.position_manager = None
+    runner.order_state_machine = None
+    runner.contract_selector = None
+    runner.order_monitor = None
+    runner.quotemonitor = None
+    runner.quote_monitor = None
+    runner.fill_monitor_thread = None
+    runner.worker_thread = None
+    runner.equity_thread = None
+    runner.reconciler = None
+    runner.startup_manifest = {}
+
+    runner._build_startup_manifest(
+        equity=50000.0,
+        max_trades=5,
+        max_pos=2,
+        max_loss=-2500.0,
+        throttle_threshold=-1000.0,
+        stop_threshold=-2500.0,
+        data_broker_is_dedicated=True,
+        exit_eng=None,
+        live_preflight_status="passed",
+        quote_preflight_source="TRADIER_MARKET_DATA_TOKEN",
+        quote_preflight_broker_class="TradierBroker",
+        quote_preflight_base_url="https://api.tradier.com",
+        quote_preflight_symbol="SPY",
+        quote_preflight_price=601.0,
+    )
+
+    assert runner.startup_manifest["live_preflight_status"] == "passed"
+    assert runner.startup_manifest["quote_preflight_source"] == "TRADIER_MARKET_DATA_TOKEN"
+    assert runner.startup_manifest["quote_preflight_broker_class"] == "TradierBroker"
 
 
 def test_paper_path_not_forced_through_live_preflight():

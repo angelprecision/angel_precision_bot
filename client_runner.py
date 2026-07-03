@@ -289,6 +289,7 @@ def _run_live_startup_preflight(
         client_id, equity, quote_symbol, quote_price, quote_source, quote_broker_class, quote_base_url,
     )
     return {
+        "status": "passed",
         "equity": equity,
         "quote_symbol": quote_symbol,
         "quote_price": quote_price,
@@ -1184,6 +1185,7 @@ class ClientRunner(threading.Thread):
         risk_profile_valid: bool  = False,
         missing_risk_fields: list = None,
         daily_max_loss_pct: float = 0.06,
+        live_preflight_status: str = "",
         quote_preflight_source: str = "",
         quote_preflight_broker_class: str = "",
         quote_preflight_base_url: str = "",
@@ -1212,6 +1214,7 @@ class ClientRunner(threading.Thread):
             "equity_alive": bool(self.equity_thread and self.equity_thread.is_alive()),
             "reconciler_enabled": bool(self.reconciler is not None),
             "data_broker_mode": "dedicated" if data_broker_is_dedicated else "shared_execution_broker",
+            "live_preflight_status": live_preflight_status,
             "quote_preflight_source": quote_preflight_source,
             "quote_preflight_broker_class": quote_preflight_broker_class,
             "quote_preflight_base_url": quote_preflight_base_url,
@@ -1704,6 +1707,7 @@ class ClientRunner(threading.Thread):
         quote_preflight_base_url = ""
         quote_preflight_symbol = "SPY"
         quote_preflight_price = None
+        live_preflight_status = ""
 
         if self.mode == "LIVE":
             try:
@@ -1729,6 +1733,7 @@ class ClientRunner(threading.Thread):
                 self._mark_failed(str(exc))
                 return
             equity = float(live_preflight["equity"])
+            live_preflight_status = str(live_preflight["status"])
             quote_preflight_source = str(live_preflight["quote_source"])
             quote_preflight_broker_class = str(live_preflight["quote_broker_class"])
             quote_preflight_base_url = str(live_preflight["quote_base_url"])
@@ -1744,6 +1749,7 @@ class ClientRunner(threading.Thread):
                 data_broker = broker
                 logger.warning("[%s] TRADIER_DATA_TOKEN not set -- using execution broker for data", self.email)
             data_broker_is_dedicated = bool(data_token)
+            live_preflight_status = "not_applicable"
 
         self._clear_old_phantom_orders()
         # BUG-3 FIX: guard both URL and key — an empty service key produces a
@@ -2071,6 +2077,7 @@ class ClientRunner(threading.Thread):
             risk_profile_valid=(len(_missing_live) == 0),
             missing_risk_fields=_missing_live,
             daily_max_loss_pct=loss_pct,
+            live_preflight_status=live_preflight_status,
             quote_preflight_source=quote_preflight_source,
             quote_preflight_broker_class=quote_preflight_broker_class,
             quote_preflight_base_url=quote_preflight_base_url,
