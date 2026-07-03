@@ -1322,6 +1322,43 @@ class ClientRunner(threading.Thread):
                 self.email, result["armed"], result["rejected"],
                 result["processed"], result["errors"],
             )
+            # P0 (2026-07-02): durable, HONEST record of the reeval itself.
+            # The only handoff_run_locks row previously written for this
+            # window was stage='post_overnight_reeval' status='success' —
+            # emitted by the handoff audit regardless of whether the reeval
+            # actually drained anything. Paper ran 4 sessions with 486 rows
+            # frozen behind a green lock. This dedicated stage row carries
+            # the run counts and reports 'partial' when the run stalled
+            # (fetched work, produced zero decisions). Best-effort: a lock
+            # write failure must never take down the reeval path.
+            try:
+                from ap.morning_handoff import _upsert_handoff_run_lock
+                _stalled = bool(result.get("stalled"))
+                _upsert_handoff_run_lock(
+                    client_id=self.email,
+                    execution_mode=str(self.mode).lower(),
+                    trading_date=datetime.now(_ET).date().isoformat(),
+                    stage="overnight_reeval",
+                    status="partial" if _stalled else "success",
+                    last_error=(
+                        "OVERNIGHT_REEVAL_STALLED:all_fetched_rows_deferred"
+                        if _stalled else None
+                    ),
+                    details={
+                        k: result.get(k)
+                        for k in (
+                            "fetched", "processed", "armed", "rejected",
+                            "skipped", "errors", "stale_skipped",
+                            "fresh_processed", "fresh_armed", "stalled",
+                        )
+                    },
+                    mark_success=not _stalled,
+                )
+            except Exception as _lock_exc:
+                logger.warning(
+                    "[%s] overnight_reeval lock write failed (non-fatal): %s",
+                    self.email, _lock_exc,
+                )
             self._run_post_overnight_morning_handoff(result)
         except Exception as exc:
             logger.error("[%s] Overnight reeval error (non-fatal): %s", self.email, exc, exc_info=True)
