@@ -1064,7 +1064,9 @@ class APBrokerReconciler:
             if broker_status in BROKER_FILLED and db_status in DB_OPEN_STATUSES:
                 self._advance_order_to_broker_fill(order, broker_raw, broker_status, summary)
             elif broker_status in BROKER_TERMINAL and db_status in DB_OPEN_STATUSES:
-                self._advance_order_to_terminal(order, broker_status, summary)
+                self._advance_order_to_terminal(
+                    order, broker_status, summary, broker_raw=broker_raw
+                )
             elif broker_status in ("open", "pending", "partially_filled"):
                 pass
             elif broker_status not in ("", "unknown", "error"):
@@ -1775,7 +1777,9 @@ class APBrokerReconciler:
         except Exception as e:
             log.error("[%s] Reconcile transition error: %s", self.client_id, e)
 
-    def _advance_order_to_terminal(self, order: dict, broker_status: str, summary: dict) -> None:
+    def _advance_order_to_terminal(
+        self, order: dict, broker_status: str, summary: dict, broker_raw: dict | None = None
+    ) -> None:
         """
         Advance a DB-open order to its terminal broker state.
 
@@ -1821,21 +1825,73 @@ class APBrokerReconciler:
                 )
                 family = "ENTRY"   # conservative: don't revert, don't corrupt
 
+        # P1 (2026-07-02): persist the broker's rejection reason. The
+        # 2026-06-25 SMCI incident left 355+ REJECTED rows whose only
+        # forensic record was the word "REJECTED" — Tradier returns
+        # reason_description on rejected orders and the reconciler had the
+        # full payload in hand (broker_raw at the call site) but dropped it
+        # at this boundary. Every broker-side rejection was unexplainable
+        # after the fact. Reason is truncated so last_error stays sane.
+        _broker_reason = ""
+        if isinstance(broker_raw, dict):
+            _broker_reason = str(
+                broker_raw.get("reason_description")
+                or broker_raw.get("reason")
+                or broker_raw.get("ReasonDescription")
+                or ""
+            ).strip()
+        _last_error = f"reconciler: broker_status={broker_status}"
+        if _broker_reason:
+            _last_error = f"{_last_error} reason={_broker_reason[:160]}"
+
         log.warning(
-            "[%s] RECONCILE_CORRECT: %s | %s | DB=%s broker=%s → advancing to %s",
+            "[%s] RECONCILE_CORRECT: %s | %s | DB=%s broker=%s → advancing to %s%s",
             self.client_id, contract, local_id, db_status, broker_status, new_status,
+            f" | broker_reason={_broker_reason[:160]}" if _broker_reason else "",
         )
 
         try:
             ok = self.osm.transition(
                 local_id,
                 new_status,
-                last_error=f"reconciler: broker_status={broker_status}",
+                last_error=_last_error,
             )
             if not ok:
                 log.error("[%s] OSM transition failed %s → %s",
                           self.client_id, local_id, new_status)
                 return
+
+            # Best-effort structured forensics: merge the broker's terminal
+            # payload reason into orders.meta so dashboards can query it
+            # without parsing last_error. Never blocks the correction.
+            if _broker_reason:
+                try:
+                    import json as _json
+                    from ap.db import conn as _conn, run_with_retry as _rwr
+
+                    _meta_patch = _json.dumps({
+                        "broker_reject_reason": _broker_reason[:400],
+                        "broker_terminal_status": broker_status,
+                        "broker_terminal_recorded_by": "ap_reconciler",
+                    })
+
+                    def _merge_meta():
+                        with _conn() as _c:
+                            _c.execute(
+                                """
+                                UPDATE orders
+                                SET meta = COALESCE(meta, '{}'::jsonb) || %s::jsonb
+                                WHERE local_order_id = %s AND client_id = %s
+                                """,
+                                (_meta_patch, local_id, self.client_id),
+                            )
+
+                    _rwr(_merge_meta)
+                except Exception as _meta_exc:
+                    log.debug(
+                        "[%s] broker reject reason meta merge failed (non-fatal): %s",
+                        self.client_id, _meta_exc,
+                    )
 
             summary["orders_corrected"] += 1
             if family == "EXIT":
@@ -1849,6 +1905,7 @@ class APBrokerReconciler:
             self._alert(
                 f"RECONCILE_AUTO_CORRECT | {contract} | {local_id} | "
                 f"DB was {db_status}, broker={broker_status} → {new_status}"
+                + (f" | reason={_broker_reason[:120]}" if _broker_reason else "")
             )
         except Exception as e:
             log.error("[%s] Reconcile terminal transition error: %s", self.client_id, e)
