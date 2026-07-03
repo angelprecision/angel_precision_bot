@@ -52,6 +52,7 @@ EXIT_LIVE_STATUSES   = frozenset({"EXIT_SUBMITTED", "EXIT_ACKNOWLEDGED", "EXIT_P
 ACTIVE_POSITION_STATUSES = ("OPEN", "CLOSING", "PARTIAL", "ACTIVE")
 
 _OCC_SIDE_RE = re.compile(r"\d{6}([CP])\d{8}$")
+_VALID_EXECUTION_MODES = frozenset({"PAPER", "LIVE"})
 
 
 def _safe_int(value, default: int = 0) -> int:
@@ -190,6 +191,11 @@ def _write_fill_truth_blocked_meta(
         )
 
 
+def _normalize_execution_mode(value) -> str | None:
+    mode = str(value or "").strip().upper()
+    return mode if mode in _VALID_EXECUTION_MODES else None
+
+
 def _resolve_side_from_order_or_meta(order: dict, meta: dict | None = None) -> tuple[str | None, str]:
     """Resolve strategy side without ever defaulting missing direction to CALL."""
     meta = meta or {}
@@ -292,6 +298,11 @@ class APStartupRecovery:
 
         log.info("[%s] Startup recovery beginning...", self.client_id)
 
+        if self._execution_mode() is None:
+            log.error("[%s] RECOVERY_BLOCKED unknown execution_mode", self.client_id)
+            result["errors"].append("recovery_unknown_execution_mode")
+            return result
+
         try:
             self._recover_positions(result)
         except Exception as e:
@@ -343,6 +354,9 @@ class APStartupRecovery:
             len(result["errors"]),
         )
         return result
+
+    def _execution_mode(self) -> str | None:
+        return _normalize_execution_mode(getattr(self.mc, "mode", None))
 
     # ──────────────────────────────────────────────────────────────────────────
     # Active position loading
@@ -434,6 +448,9 @@ class APStartupRecovery:
         If broker disagrees, advance the OSM to broker truth.
         This prevents phantom 'open' entries from blocking new trades after restart.
         """
+        if self._execution_mode() is None:
+            result.setdefault("errors", []).append("recovery_unknown_execution_mode")
+            return
         from ap.db import get_open_orders_for_reconcile, run_with_retry
 
         orders = run_with_retry(
@@ -535,6 +552,9 @@ class APStartupRecovery:
         broker. If the exit filled while we were down, advance the position.
         If exit canceled/expired, revert position to OPEN.
         """
+        if self._execution_mode() is None:
+            result.setdefault("errors", []).append("recovery_unknown_execution_mode")
+            return
         from ap.db import list_positions, run_with_retry, conn
 
         closings = run_with_retry(

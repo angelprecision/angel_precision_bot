@@ -40,6 +40,13 @@ except ImportError:
     _record_intel_outcome = None
 
 log = logging.getLogger("ap.execution_core")
+
+_VALID_EXECUTION_MODES = frozenset({"paper", "live"})
+
+
+def _normalize_execution_mode(value) -> str | None:
+    mode = str(value or "").strip().lower()
+    return mode if mode in _VALID_EXECUTION_MODES else None
 ET  = ZoneInfo("America/New_York")
 
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
@@ -2700,6 +2707,19 @@ class APExecutionCore:
                 )
             except Exception:
                 pass
+            return
+
+        _submit_execution_mode = _normalize_execution_mode(
+            getattr(approved_plan, "execution_mode", None)
+            or (getattr(approved_plan, "metadata", None) or {}).get("execution_mode")
+            or sig.get("execution_mode")
+        )
+        if _submit_execution_mode is None:
+            _terminalize_breach_failure(
+                "metadata_invalid:unknown_execution_mode",
+                cleanup_action="expire",
+                funnel_key="entry_metadata_blocked",
+            )
             return
 
         # ── P0: Deferred materialization pre-submit invariant ──────────────────
