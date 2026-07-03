@@ -829,6 +829,143 @@ class ClientRunner(threading.Thread):
         )
         return True, "ok"
 
+    def _verify_live_enforcement(
+        self,
+        *,
+        score_floor: float,
+        capital_pct: float,
+        sector_pct: float,
+        ticker_pct: float,
+        max_calls: int,
+        max_puts: int,
+        daily_max_loss_pct: float,
+    ) -> tuple[bool, str]:
+        """
+        P0 (PR #264): durable proof that a LIVE runner is under the enforced
+        live policy — not stale code, not a paper/default policy, not a
+        bypassed PR180 pricing guard.
+
+        Fail-closed conditions (LIVE only):
+          - ap_execution_core PR180 constants unimportable → the enforcement
+            module itself is missing/stale
+          - named live client (PR180_LIVE_CLIENT_IDS, e.g. Jason) with
+            PR180_ENABLED off → enforcement bypassed
+          - live client NOT in the enforcement allowlist while
+            LIVE_REQUIRE_NAMED_ENFORCEMENT=1 (default) → a live runner can
+            never start under paper/default policy
+
+        On success: builds the enforcement snapshot (client, mode, pod,
+        commit sha, PR180 state, confirmation-required state, intraday
+        FAILED_DIR state, effective risk limits), computes
+        runtime_config_hash = sha256(canonical JSON), stores
+        self.live_enforcement / self.runtime_config_hash, and emits
+        LIVE_ENFORCEMENT_OK at CRITICAL. The hash is pinned onto the OSM by
+        the caller so EVERY order row carries enforcement_config_hash.
+
+        Kill switch LIVE_ENFORCEMENT_PROOF_ENABLED=0 (loud; emergencies only).
+        """
+        if os.getenv("LIVE_ENFORCEMENT_PROOF_ENABLED", "1").strip().lower() not in ("1", "true", "yes"):
+            logger.critical(
+                "[%s] LIVE_ENFORCEMENT_PROOF_DISABLED_BY_ENV — starting WITHOUT "
+                "enforcement verification. This must never be set in normal "
+                "operation.", self.email,
+            )
+            self.live_enforcement = {"status": "disabled_by_env"}
+            return True, "disabled_by_env"
+
+        def _fail(reason: str) -> tuple[bool, str]:
+            logger.critical(
+                "[%s] LIVE_ENFORCEMENT_FAILED reason=%s — refusing to start "
+                "LIVE runner outside the enforced live policy",
+                self.email, reason,
+            )
+            self.live_enforcement = {"status": f"failed:{reason}"}
+            return False, reason
+
+        try:
+            from ap_execution_core import (
+                PR180_ENABLED as _pr180_enabled,
+                PR180_MODE as _pr180_mode,
+                PR180_LIVE_CLIENT_IDS as _pr180_ids,
+            )
+        except Exception as _exc:
+            return _fail(f"pr180_module_unavailable:{type(_exc).__name__}")
+
+        _client_lower = str(self.email or "").lower().strip()
+        _is_named = _client_lower in _pr180_ids
+
+        if _is_named and not _pr180_enabled:
+            return _fail("pr180_disabled_for_named_live_client")
+
+        _require_named = os.getenv(
+            "LIVE_REQUIRE_NAMED_ENFORCEMENT", "1"
+        ).strip().lower() in ("1", "true", "yes")
+        if not _is_named and _require_named:
+            return _fail("live_client_not_in_enforcement_allowlist")
+
+        import hashlib
+        import json as _json
+        import socket
+
+        _commit_sha = (
+            os.getenv("RENDER_GIT_COMMIT")
+            or os.getenv("GIT_COMMIT")
+            or "unknown"
+        ).strip()
+        _pod_id = (
+            os.getenv("RENDER_INSTANCE_ID")
+            or os.getenv("RENDER_SERVICE_NAME")
+            or socket.gethostname()
+            or "unknown"
+        ).strip()
+
+        _confirmation_required = os.getenv(
+            "LIVE_CONFIRMATION_REQUIRED", "1"
+        ).strip().lower() in ("1", "true", "yes")
+        _intraday_failed_dir_allowed = os.getenv(
+            "ALLOW_FAILED_DIR_CLIENT", "0"
+        ).strip().lower() in ("1", "true", "yes")
+
+        enforcement = {
+            "client_id": _client_lower,
+            "execution_mode": str(self.mode).strip().upper(),
+            "pod_id": _pod_id,
+            "commit_sha": _commit_sha,
+            "pr180_enabled": bool(_pr180_enabled),
+            "pr180_mode": str(_pr180_mode),
+            "pr180_named_client": _is_named,
+            "confirmation_required": _confirmation_required,
+            "intraday_failed_dir_allowed": _intraday_failed_dir_allowed,
+            "risk": {
+                "score_floor": float(score_floor),
+                "max_capital_pct": float(capital_pct),
+                "max_sector_pct": float(sector_pct),
+                "max_ticker_pct": float(ticker_pct),
+                "max_calls": int(max_calls),
+                "max_puts": int(max_puts),
+                "daily_max_loss_pct": float(daily_max_loss_pct),
+            },
+        }
+        _hash = hashlib.sha256(
+            _json.dumps(enforcement, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()[:16]
+        enforcement["runtime_config_hash"] = _hash
+        enforcement["status"] = "ok"
+
+        self.live_enforcement = enforcement
+        self.runtime_config_hash = _hash
+
+        logger.critical(
+            "[%s] LIVE_ENFORCEMENT_OK config_hash=%s commit=%s pod=%s "
+            "pr180=%s/%s named=%s confirmation_required=%s "
+            "intraday_failed_dir_allowed=%s risk=%s",
+            self.email, _hash, _commit_sha, _pod_id,
+            _pr180_enabled, _pr180_mode, _is_named,
+            _confirmation_required, _intraday_failed_dir_allowed,
+            enforcement["risk"],
+        )
+        return True, "ok"
+
     def _mark_failed(self, reason: str):
         reason = str(reason or "failed")
         self.failed.set()
@@ -1305,6 +1442,8 @@ class ClientRunner(threading.Thread):
             "account_id": self.account_id,
             "mode": self.mode,
             "live_preflight_status": getattr(self, "live_preflight_status", "not_applicable"),
+            "live_enforcement": getattr(self, "live_enforcement", {"status": "not_applicable"}),
+            "runtime_config_hash": getattr(self, "runtime_config_hash", None),
             "live_preflight_quote_source": getattr(self, "live_preflight_quote_source", ""),
             "live_preflight_quote_broker_mode": getattr(self, "live_preflight_quote_broker_mode", ""),
             "live_preflight_quote_base_url": getattr(self, "live_preflight_quote_base_url", ""),
@@ -1353,6 +1492,8 @@ class ClientRunner(threading.Thread):
                 self.startup_manifest = {
                     "client_id": self.email,
                     "mode":      getattr(self, "mode", "unknown"),
+                    "live_enforcement": getattr(self, "live_enforcement", {"status": "not_applicable"}),
+                    "runtime_config_hash": getattr(self, "runtime_config_hash", None),
                     "manifest_error": str(_manifest_exc),
                 }
 
@@ -2212,6 +2353,31 @@ class ClientRunner(threading.Thread):
 
         self.data_broker = data_broker
         self.databroker = data_broker
+
+        # P0 (PR #264): LIVE enforcement proof — runs after both preflight
+        # halves (auth/equity + market data) so a runner that reaches here
+        # has working credentials and data, and must now prove it is under
+        # the ENFORCED live policy before any thread starts. Pins the
+        # resulting runtime_config_hash on the OSM so every order row
+        # created by any path carries enforcement provenance.
+        if str(self.mode).strip().upper() == "LIVE":
+            _enf_ok, _enf_reason = self._verify_live_enforcement(
+                score_floor=_mc_score_floor,
+                capital_pct=_mc_capital_pct,
+                sector_pct=_mc_sector_pct,
+                ticker_pct=_mc_ticker_pct,
+                max_calls=_mc_max_calls,
+                max_puts=_mc_max_puts,
+                daily_max_loss_pct=loss_pct,
+            )
+            if not _enf_ok:
+                self._mark_failed(f"LIVE_ENFORCEMENT_FAILED:{_enf_reason}")
+                return
+            try:
+                if self.order_state_machine is not None:
+                    self.order_state_machine.runtime_config_hash = self.runtime_config_hash
+            except Exception:
+                pass
 
         earnings_guard = APEarningsGuard(
             broker=data_broker,
