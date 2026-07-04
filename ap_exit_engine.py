@@ -66,9 +66,14 @@ from zoneinfo import ZoneInfo
 
 
 try:
-    from ap.observability import emit_decision_event, get_git_commit
+    from ap.observability import (
+        emit_decision_event,
+        emit_exit_decision_stamp,
+        get_git_commit,
+    )
 except Exception:
     emit_decision_event = None
+    emit_exit_decision_stamp = None
 
     def get_git_commit(default: str = "unknown") -> str:
         return default
@@ -1206,6 +1211,117 @@ def _is_protective_exit(reason: str) -> bool:
         "TARGET HIT", "IMMEDIATE TP", "PROFIT PROTECT", "SMALL WIN", "RUNNER TRAIL",
         "PROFIT LOCK", "TOUCHED PROFIT", "NEVER GREEN", "DEAD TRADE",
     ))
+
+
+def _positive_or_none(value) -> Optional[float]:
+    try:
+        num = float(value)
+    except Exception:
+        return None
+    return num if num > 0 else None
+
+
+def _decision_window(decision: "ExitDecision", now_et: Optional[datetime] = None) -> str:
+    code = _classify_exit_decision(decision)
+    reason = (getattr(decision, "reason", "") or "").upper()
+    if code == "EOD_FORCE_CLOSE" or "EOD" in reason:
+        return "EOD"
+    if code in {"HARD_STOP", "STOP_HIT"} or "HARD STOP" in reason:
+        return "HARD_STOP"
+    if code == "THETA_STOP" or "THETA STOP" in reason:
+        return "THETA_STOP"
+    if code == "PROFIT_PROTECT_W3" or "PROFIT PROTECT W3" in reason:
+        return "W3"
+    if code == "PROFIT_PROTECT_W2" or "PROFIT PROTECT W2" in reason:
+        return "W2"
+    if code == "PROFIT_PROTECT_W1" or "PROFIT PROTECT W1" in reason:
+        return "W1"
+    if code in {
+        "IMMEDIATE_TP",
+        "TP_SCALE_OUT",
+        "PROFIT_LOCK",
+        "RUNNER_TRAIL",
+        "TRAILING_STOP",
+    } or any(fragment in reason for fragment in (
+        "TARGET HIT",
+        "IMMEDIATE TP",
+        "SCALE_",
+        "PROFIT LOCK",
+        "RUNNER TRAIL",
+        "TRAILING STOP",
+    )):
+        return "TP"
+    if now_et is not None:
+        hour, minute = now_et.hour, now_et.minute
+        if hour > PROFIT_PROTECT_3_HOUR or (hour == PROFIT_PROTECT_3_HOUR and minute >= PROFIT_PROTECT_3_MIN):
+            return "W3"
+        if hour > PROFIT_PROTECT_2_HOUR or (hour == PROFIT_PROTECT_2_HOUR and minute >= PROFIT_PROTECT_2_MIN):
+            return "W2"
+        if hour > PROFIT_PROTECT_1_HOUR or (hour == PROFIT_PROTECT_1_HOUR and minute >= PROFIT_PROTECT_1_MIN):
+            return "W1"
+        if hour >= 12:
+            return "THETA_STOP"
+    return "TP"
+
+
+def build_exit_decision_stamp(
+    pos: "ManagedPosition",
+    decision: "ExitDecision",
+    *,
+    client_id: str = "",
+    execution_mode: str = "",
+    run_id: str = "",
+    strategy_version: str = "",
+    git_commit: str = "",
+    now_et: Optional[datetime] = None,
+) -> dict:
+    bid = _positive_or_none(getattr(pos, "current_bid", None))
+    ask = _positive_or_none(getattr(pos, "current_ask", None))
+    if bid is not None and ask is not None:
+        mid = round((bid + ask) / 2.0, 4)
+    else:
+        mid = _positive_or_none(getattr(pos, "current_option_price", None))
+
+    pnl_pct = None
+    if (
+        _positive_or_none(getattr(pos, "entry_price", None)) is not None
+        and _positive_or_none(getattr(pos, "current_option_price", None)) is not None
+    ):
+        try:
+            pnl_pct = float(getattr(decision, "pnl_pct", 0.0))
+        except Exception:
+            pnl_pct = None
+
+    return {
+        "event": "exit_decision",
+        "window": _decision_window(decision, now_et),
+        "action": "fired" if getattr(decision, "should_act", False) else "skipped",
+        "reason": getattr(decision, "reason", "") or "",
+        "client_id": str(client_id or getattr(pos, "client_id", "") or ""),
+        "execution_mode": str(execution_mode or getattr(pos, "execution_mode", "") or ""),
+        "position_id": str(getattr(pos, "position_id", "") or ""),
+        "local_order_id": str(getattr(pos, "pending_exit_local_order_id", "") or ""),
+        "broker_order_id": str(getattr(pos, "pending_exit_broker_order_id", "") or ""),
+        "ticker": str(getattr(pos, "ticker", "") or ""),
+        "option_symbol": str(getattr(pos, "option_symbol", "") or ""),
+        "option_bid": bid,
+        "option_ask": ask,
+        "option_mid": mid,
+        "option_last": _positive_or_none(getattr(pos, "current_last", None)),
+        "underlying_price": _positive_or_none(getattr(pos, "current_underlying", None)),
+        "pnl_pct_at_decision": pnl_pct,
+        "mfe_pct_so_far": (
+            float(getattr(pos, "peak_pnl_pct", 0.0) or 0.0)
+            if getattr(pos, "peak_pnl_pct", None) is not None else None
+        ),
+        "mae_pct_so_far": getattr(pos, "mae_pct_so_far", None),
+        "ladder_mode": "legacy",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "run_id": run_id,
+        "candidate_id": getattr(pos, "signal_id", None) or getattr(pos, "position_id", None),
+        "strategy_version": strategy_version,
+        "git_commit": git_commit,
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2906,6 +3022,35 @@ class APExitEngine:
         except Exception as e:
             log.debug("Exit observability emit failed (non-critical): %s", e)
 
+    def _emit_exit_decision_stamp(
+        self,
+        pos: ManagedPosition,
+        decision: ExitDecision,
+        *,
+        now_et: Optional[datetime] = None,
+    ) -> None:
+        if emit_exit_decision_stamp is None:
+            return
+        try:
+            _exec_mode = str(
+                getattr(getattr(self, "master_control", None), "mode", "") or
+                getattr(pos, "execution_mode", "") or
+                ""
+            ).strip().lower()
+            payload = build_exit_decision_stamp(
+                pos,
+                decision,
+                client_id=getattr(pos, "client_id", "") or getattr(self, "_email", "") or "default",
+                execution_mode=_exec_mode,
+                run_id=getattr(self, "run_id", ""),
+                strategy_version=getattr(self, "strategy_version", ""),
+                git_commit=getattr(self, "git_commit", ""),
+                now_et=now_et,
+            )
+            emit_exit_decision_stamp(payload)
+        except Exception as e:
+            log.debug("Exit decision stamp failed (non-critical): %s", e)
+
     def _exit_reason_code(self, decision: ExitDecision) -> Optional[str]:
         code = _classify_exit_decision(decision)
         return None if code == "UNKNOWN_EXIT" else code
@@ -4153,6 +4298,7 @@ class APExitEngine:
                         "[%s] EOD PRE-GATE EXIT | pos_id=%s | %d:%02d ET | qty=%d | option_pnl=%.1f%% | bypassing quote gate",
                         pos.ticker, pos.position_id or "?", _eg_h, _eg_m, _eod_qty, option_pnl * 100,
                     )
+                    self._emit_exit_decision_stamp(pos, _eod_decision, now_et=now_et)
                     actions_to_take.append((pos, _eod_decision, False))
                     continue
 
@@ -4295,6 +4441,7 @@ class APExitEngine:
                     decision = evaluate_exit(pos, now_et)
                     decision.reason_code = _classify_exit_decision(decision)
                     _ledger_exit_decision(pos, decision, client_id=getattr(pos, "client_id", "") or getattr(self, "client_id", ""))
+                    self._emit_exit_decision_stamp(pos, decision, now_et=now_et)
 
                     if decision.should_act:
                         option_quote_stale, option_quote_age_sec, option_quote_state = _is_option_quote_stale(pos, now_utc)
