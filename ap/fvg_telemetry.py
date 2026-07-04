@@ -69,6 +69,31 @@ _CACHE_MAX_TICKERS = 256
 _cache_lock = threading.Lock()
 _candle_cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
 
+# ── singleflight (#283 review amendment, round 2) ────────────────────────────
+# The TTL cache alone protects read/write, not IN-FLIGHT fetches: a 50–100
+# same-ticker dispatch burst can all miss the cache before the leader stores
+# bars, producing N simultaneous timesales calls — violating the bounded-spend
+# invariant. Per-ticker singleflight: exactly one leader fetches; followers
+# wait on the leader's Event (bounded by FETCH_WAIT_SEC > request timeout),
+# then re-read the cache. A leader failure releases followers, who observe the
+# empty cache and degrade to 'no candles' — never a second herd.
+_inflight_lock = threading.Lock()
+_inflight: dict[str, threading.Event] = {}
+FETCH_WAIT_SEC = 12.0  # > 10s request timeout so followers outlast the leader
+
+# Telemetry thread cap: burst threads are cheap under singleflight (they park
+# on an Event), but unbounded daemon spawn is still sloppy under a 500-signal
+# dispatch storm. Beyond the cap we DROP and count — the drop counter makes
+# the dataset bias visible instead of silent.
+_thread_gate = threading.BoundedSemaphore(int(os.getenv("FVG_TELEMETRY_MAX_THREADS", "32")))
+_drop_lock = threading.Lock()
+_dropped_thread_cap = 0
+
+
+def dropped_by_thread_cap() -> int:
+    with _drop_lock:
+        return _dropped_thread_cap
+
 TELEMETRY_ENABLED_ENV = "FVG_TELEMETRY_ENABLED"  # default ON; "0" disables
 
 
@@ -95,7 +120,8 @@ def _resolve_base_url(broker: Any) -> str:
 
 
 def fetch_15m_bars(ticker: str, broker: Any, *, now: Optional[datetime] = None) -> list[dict[str, Any]]:
-    """15-min RTH bars for the trailing LOOKBACK_DAYS. Cached per ticker.
+    """15-min RTH bars for the trailing LOOKBACK_DAYS. Cached per ticker,
+    singleflighted per ticker (one in-flight network call max).
 
     Returns [] on any failure so callers degrade to 'no candles' — identical
     to the pre-PR state for that signal.
@@ -104,12 +130,45 @@ def fetch_15m_bars(ticker: str, broker: Any, *, now: Optional[datetime] = None) 
     if not key or broker is None:
         return []
 
-    now_mono = time.monotonic()
-    with _cache_lock:
-        hit = _candle_cache.get(key)
-        if hit and (now_mono - hit[0]) < CANDLE_TTL_SEC:
-            return hit[1]
+    while True:
+        now_mono = time.monotonic()
+        with _cache_lock:
+            hit = _candle_cache.get(key)
+            if hit and (now_mono - hit[0]) < CANDLE_TTL_SEC:
+                return hit[1]
 
+        # Leader election for this ticker.
+        with _inflight_lock:
+            evt = _inflight.get(key)
+            if evt is None:
+                evt = threading.Event()
+                _inflight[key] = evt
+                is_leader = True
+            else:
+                is_leader = False
+
+        if not is_leader:
+            # Follower: park until the leader finishes (or times out), then
+            # re-read the cache exactly once. Empty cache after wait → degrade.
+            evt.wait(FETCH_WAIT_SEC)
+            with _cache_lock:
+                hit = _candle_cache.get(key)
+                if hit and (time.monotonic() - hit[0]) < CANDLE_TTL_SEC:
+                    return hit[1]
+            return []
+
+        try:
+            return _fetch_15m_bars_network(key, broker, now=now)
+        finally:
+            # Release followers and clear in-flight marker even on failure —
+            # a stuck marker would silently disable fetches for the ticker.
+            with _inflight_lock:
+                _inflight.pop(key, None)
+            evt.set()
+
+
+def _fetch_15m_bars_network(key: str, broker: Any, *, now: Optional[datetime] = None) -> list[dict[str, Any]]:
+    """The actual network fetch. Leader-only; caller owns singleflight."""
     # #283 REVIEW AMENDMENT: prefer the attached data_broker for market-data
     # reads, matching the quote-truth pattern (#248/#227 and #277's resolver).
     # Falls back to the broker itself when no data_broker is attached.
@@ -163,7 +222,7 @@ def fetch_15m_bars(ticker: str, broker: Any, *, now: Optional[datetime] = None) 
             if len(_candle_cache) >= _CACHE_MAX_TICKERS:
                 oldest = min(_candle_cache, key=lambda k: _candle_cache[k][0])
                 _candle_cache.pop(oldest, None)
-            _candle_cache[key] = (now_mono, bars)
+            _candle_cache[key] = (time.monotonic(), bars)
         return bars
     except Exception as exc:
         log.warning("fvg_telemetry: timesales fetch failed for %s: %s", key, exc)
@@ -338,19 +397,41 @@ def record_fvg_telemetry_async(
     nothing propagates.
     """
     try:
+        if not _thread_gate.acquire(blocking=False):
+            global _dropped_thread_cap
+            with _drop_lock:
+                _dropped_thread_cap += 1
+                dropped = _dropped_thread_cap
+            log.warning(
+                "fvg_telemetry: thread cap reached — dropping telemetry for "
+                "signal=%s (total dropped=%d). Dataset bias is VISIBLE via "
+                "dropped_by_thread_cap(); raise FVG_TELEMETRY_MAX_THREADS if "
+                "this fires under normal load.", signal_id, dropped,
+            )
+            return
+
+        def _run() -> None:
+            try:
+                record_fvg_telemetry(
+                    signal_id=signal_id,
+                    client_email=client_email,
+                    payload=snapshot,
+                    broker=broker,
+                )
+            finally:
+                _thread_gate.release()
+
         snapshot = dict(payload or {})
         threading.Thread(
-            target=record_fvg_telemetry,
-            kwargs=dict(
-                signal_id=signal_id,
-                client_email=client_email,
-                payload=snapshot,
-                broker=broker,
-            ),
+            target=_run,
             name=f"fvg-telemetry-{str(signal_id)[:8]}",
             daemon=True,
         ).start()
     except Exception as exc:
+        try:
+            _thread_gate.release()
+        except ValueError:
+            pass
         log.warning("fvg_telemetry: async spawn failed signal=%s: %s", signal_id, exc)
 
 

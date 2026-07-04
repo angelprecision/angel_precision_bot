@@ -319,3 +319,115 @@ def test_t6_persist_sql_merges_under_fvg_key(monkeypatch):
     assert json.loads(payload_json)["status"] == "unfilled"
     assert sid == "0f3542c0-244f-40c1-90af-bec8391e9bfa"
     assert email == "tradefluencehq@gmail.com"
+
+
+# ── T9: #283 round-2 amendment — singleflight + thread cap ───────────────────
+
+class _SlowSession:
+    """Session whose GET blocks long enough for a full herd to pile up."""
+    def __init__(self, items, delay=0.3):
+        self.items, self.delay = items, delay
+        self.calls = 0
+        self._lock = threading.Lock()
+    def get(self, *a, **k):
+        with self._lock:
+            self.calls += 1
+        import time as _t
+        _t.sleep(self.delay)
+        return _FakeResp(self.items)
+
+
+class _SlowBroker:
+    def __init__(self, items, delay=0.3):
+        self.session = _SlowSession(items, delay)
+
+
+def test_t9a_burst_20_same_ticker_one_network_call():
+    """The reviewer's exact scenario: 20 concurrent same-ticker fetches with
+    a slow leader must produce ONE timesales call, and every follower must
+    receive the leader's bars."""
+    broker = _SlowBroker(_gapped_session_items(), delay=0.3)
+    results = []
+    errors = []
+
+    def worker():
+        try:
+            bars = ft.fetch_15m_bars("GOOGL", broker)
+            results.append(len(bars))
+        except BaseException as e:   # invariant: never raises
+            errors.append(e)
+
+    threads = [threading.Thread(target=worker) for _ in range(20)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+
+    assert errors == []
+    assert broker.session.calls == 1, f"herd leaked: {broker.session.calls} calls"
+    assert len(results) == 20
+    assert all(n > 0 for n in results), "followers must get the leader's bars"
+
+
+def test_t9b_leader_failure_releases_followers_no_second_herd():
+    """A leader whose fetch raises must release followers promptly; followers
+    degrade to [] (no candles) instead of fetching again or hanging."""
+    class _BoomSession:
+        def __init__(self):
+            self.calls = 0
+        def get(self, *a, **k):
+            self.calls += 1
+            import time as _t
+            _t.sleep(0.2)
+            raise RuntimeError("tradier 500")
+
+    class _BoomBroker:
+        def __init__(self):
+            self.session = _BoomSession()
+
+    broker = _BoomBroker()
+    results = []
+    threads = [
+        threading.Thread(target=lambda: results.append(ft.fetch_15m_bars("SPY", broker)))
+        for _ in range(10)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=5)
+
+    assert broker.session.calls == 1          # no second herd after failure
+    assert all(r == [] for r in results)      # graceful degrade
+    with ft._inflight_lock:                   # marker cleared — ticker not bricked
+        assert "SPY" not in ft._inflight
+
+
+def test_t9c_cache_hit_after_singleflight_skips_network():
+    broker = _SlowBroker(_gapped_session_items(), delay=0.05)
+    ft.fetch_15m_bars("GOOGL", broker)
+    ft.fetch_15m_bars("GOOGL", broker)
+    assert broker.session.calls == 1
+
+
+def test_t9d_thread_cap_drops_visibly(monkeypatch):
+    """Beyond FVG_TELEMETRY_MAX_THREADS the async wrapper drops with a
+    counter, never blocks dispatch and never raises."""
+    gate = threading.BoundedSemaphore(2)
+    monkeypatch.setattr(ft, "_thread_gate", gate)
+    monkeypatch.setattr(ft, "_dropped_thread_cap", 0)
+    release = threading.Event()
+
+    def stuck(*a, **k):
+        release.wait(3)
+        return {"status": "skipped", "reason": "no_candles"}
+
+    monkeypatch.setattr(ft, "record_fvg_telemetry", stuck)
+    before = ft.dropped_by_thread_cap()
+    for i in range(5):
+        ft.record_fvg_telemetry_async(
+            signal_id=f"s{i}", client_email="c",
+            payload={"ticker": "SPY"}, broker=_FakeBroker([]),
+        )
+    dropped = ft.dropped_by_thread_cap() - before
+    release.set()
+    assert dropped == 3                       # 2 admitted, 3 dropped, all counted
