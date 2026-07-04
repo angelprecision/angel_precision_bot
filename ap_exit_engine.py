@@ -64,6 +64,7 @@ from datetime import datetime, timezone
 from typing import Optional, Callable
 from zoneinfo import ZoneInfo
 
+from ap.expected_move import clamp_expected_option_daily_range_pct
 
 try:
     from ap.observability import emit_decision_event, get_git_commit
@@ -162,6 +163,10 @@ _MIN_HOLD_BEFORE_EXIT_MIN = float(os.getenv("MIN_HOLD_MINUTES_BEFORE_SOFT_EXIT",
 _INDEX_ETFS = {"QQQ", "SPY", "IWM", "DIA", "SPX"}
 
 
+def _env_flag(name: str, default: str = "false") -> bool:
+    return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _et_session_date():
     """Return the current market/session calendar date in America/New_York."""
     return datetime.now(ET).date()
@@ -247,6 +252,91 @@ def _effective_thresholds(pos: "ManagedPosition") -> tuple:
         return -0.26, 0.25, 0.12
     return HARD_STOP_PCT, IMMEDIATE_TP_PCT, PROFIT_LOCK_PCT
 
+
+def _legacy_exit_ladder(pos: "ManagedPosition", *, requested_mode: str, fallback_reason: str) -> dict:
+    hard_stop, immediate_tp, profit_lock = _effective_thresholds(pos)
+    return {
+        "requested_mode": requested_mode,
+        "ladder_mode": "legacy",
+        "fallback_reason": fallback_reason,
+        "entry_atm_iv": getattr(pos, "entry_atm_iv", None),
+        "expected_move_1d_pct_underlying": getattr(pos, "expected_move_1d_pct_underlying", None),
+        "expected_option_daily_range_pct": getattr(pos, "expected_option_daily_range_pct", None),
+        "hard_stop": hard_stop,
+        "immediate_tp": immediate_tp,
+        "profit_lock": profit_lock,
+        "scale_out_1": SCALE_OUT_1_THRESHOLD,
+        "scale_out_2": SCALE_OUT_2_THRESHOLD,
+        "protect_3": PROTECT_3_THRESHOLD,
+        "theta_stop": THETA_STOP_LOSS_PCT,
+        "k_values": {
+            "tp_k": float(os.getenv("VOL_EXIT_TP_K", "0.5")),
+            "w1_k": float(os.getenv("VOL_EXIT_W1_K", "1.0")),
+            "w2_k": float(os.getenv("VOL_EXIT_W2_K", "0.6")),
+            "w3_k": float(os.getenv("VOL_EXIT_W3_K", "0.4")),
+            "hard_stop_k": float(os.getenv("VOL_EXIT_HARD_STOP_K", "-0.75")),
+            "theta_stop_k": float(os.getenv("VOL_EXIT_THETA_STOP_K", "-0.85")),
+        },
+    }
+
+
+def _resolve_exit_ladder(pos: "ManagedPosition") -> dict:
+    requested_mode = str(os.getenv("EXIT_LADDER_MODE", "legacy") or "legacy").strip().lower()
+    execution_mode = str(getattr(pos, "execution_mode", "") or "paper").strip().lower()
+    if requested_mode != "vol_scaled":
+        return _legacy_exit_ladder(pos, requested_mode=requested_mode, fallback_reason="mode_legacy")
+
+    if execution_mode == "live" and not _env_flag("VOL_EXIT_LIVE_ENABLED", "false"):
+        return _legacy_exit_ladder(pos, requested_mode=requested_mode, fallback_reason="live_disabled")
+
+    if execution_mode != "live" and not _env_flag("VOL_EXIT_ENABLED", "false"):
+        return _legacy_exit_ladder(pos, requested_mode=requested_mode, fallback_reason="vol_exit_disabled")
+
+    if execution_mode == "live" and _env_flag("VOL_EXIT_PAPER_ONLY", "true"):
+        return _legacy_exit_ladder(pos, requested_mode=requested_mode, fallback_reason="paper_only_live_disabled")
+
+    entry_atm_iv = getattr(pos, "entry_atm_iv", None)
+    if entry_atm_iv in (None, ""):
+        return _legacy_exit_ladder(pos, requested_mode=requested_mode, fallback_reason="missing_iv")
+
+    expected_range = clamp_expected_option_daily_range_pct(
+        getattr(pos, "expected_option_daily_range_pct", None)
+    )
+    if expected_range is None:
+        return _legacy_exit_ladder(pos, requested_mode=requested_mode, fallback_reason="missing_expected_range")
+
+    tp_k = float(os.getenv("VOL_EXIT_TP_K", "0.5"))
+    w1_k = float(os.getenv("VOL_EXIT_W1_K", "1.0"))
+    w2_k = float(os.getenv("VOL_EXIT_W2_K", "0.6"))
+    w3_k = float(os.getenv("VOL_EXIT_W3_K", "0.4"))
+    hard_stop_k = float(os.getenv("VOL_EXIT_HARD_STOP_K", "-0.75"))
+    theta_stop_k = float(os.getenv("VOL_EXIT_THETA_STOP_K", "-0.85"))
+    _, _, legacy_profit_lock = _effective_thresholds(pos)
+
+    return {
+        "requested_mode": requested_mode,
+        "ladder_mode": "vol_scaled",
+        "fallback_reason": "",
+        "entry_atm_iv": entry_atm_iv,
+        "expected_move_1d_pct_underlying": getattr(pos, "expected_move_1d_pct_underlying", None),
+        "expected_option_daily_range_pct": expected_range,
+        "hard_stop": min(-0.01, expected_range * hard_stop_k),
+        "immediate_tp": max(0.01, expected_range * tp_k),
+        "profit_lock": legacy_profit_lock,
+        "scale_out_1": max(0.01, expected_range * w1_k),
+        "scale_out_2": max(0.01, expected_range * w2_k),
+        "protect_3": max(0.01, expected_range * w3_k),
+        "theta_stop": min(-0.01, expected_range * theta_stop_k),
+        "k_values": {
+            "tp_k": tp_k,
+            "w1_k": w1_k,
+            "w2_k": w2_k,
+            "w3_k": w3_k,
+            "hard_stop_k": hard_stop_k,
+            "theta_stop_k": theta_stop_k,
+        },
+    }
+
 # TRAILING STOP — fires when position drops N points from its peak
 # Wide enough to let winners run to 25-30%, tight enough to protect gains
 TRAIL_DROP_FROM_PEAK  = 0.10   # 10pt drop from peak fires exit (e.g. +30% → exits at +20%)
@@ -279,6 +369,9 @@ class ManagedPosition:
     # Empty string is treated as live-risk when client_id matches a known
     # live client, to fail safe.
     execution_mode:    str  = ""
+    entry_atm_iv: Optional[float] = None
+    expected_move_1d_pct_underlying: Optional[float] = None
+    expected_option_daily_range_pct: Optional[float] = None
 
     # Context flags
     is_trend_day:         bool  = False
@@ -501,7 +594,14 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
     """
     if now_et is None:
         now_et = datetime.now(ET)
-    _hard_stop, _immediate_tp, _profit_lock = _effective_thresholds(pos)
+    _ladder = _resolve_exit_ladder(pos)
+    _hard_stop = _ladder["hard_stop"]
+    _immediate_tp = _ladder["immediate_tp"]
+    _profit_lock = _ladder["profit_lock"]
+    _scale_out_1_threshold = _ladder["scale_out_1"]
+    _scale_out_2_threshold = _ladder["scale_out_2"]
+    _protect_3_threshold = _ladder["protect_3"]
+    _theta_stop_loss_pct = _ladder["theta_stop"]
 
     hour, minute = now_et.hour, now_et.minute
     option_pnl   = pos.option_pnl_pct
@@ -622,7 +722,7 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
     # Single-contract positions: hold until trail fires or 30%+ hit.
 
     # Scale 1: first +10% hit → sell first third
-    if option_pnl >= SCALE_OUT_1_THRESHOLD and pos.scale_outs_done == 0:
+    if option_pnl >= _scale_out_1_threshold and pos.scale_outs_done == 0:
         if qty_rem <= 1:
             # 1 contract — do NOT sell here, let it run to trail
             pass  # fall through to trail/profit-lock checks
@@ -635,7 +735,7 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
             )
 
     # Scale 2: +20% hit → sell second third
-    if option_pnl >= SCALE_OUT_2_THRESHOLD and pos.scale_outs_done == 1:
+    if option_pnl >= _scale_out_2_threshold and pos.scale_outs_done == 1:
         if qty_rem <= 1:
             pass  # 1 contract runner — let it run to +30% or trail
         else:
@@ -1009,7 +1109,7 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
     # ── 4. PROFIT PROTECTION -- WINDOW 3 (2:00 PM+) ──────────────────────────
     past_window3 = (hour > PROFIT_PROTECT_3_HOUR or
                     (hour == PROFIT_PROTECT_3_HOUR and minute >= PROFIT_PROTECT_3_MIN))
-    protect3_thresh = 0.50 if direction_aligns else PROTECT_3_THRESHOLD
+    protect3_thresh = 0.50 if direction_aligns else _protect_3_threshold
     if past_window3 and option_pnl >= protect3_thresh:
         trend_note = " [trend day -- raised to 50% threshold]" if direction_aligns else ""
         return ExitDecision(
@@ -1027,7 +1127,7 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
         w2_hour += 1
         w2_min  -= 60
     past_window2 = (hour > w2_hour or (hour == w2_hour and minute >= w2_min))
-    scale2_threshold = SCALE_OUT_2_THRESHOLD * trend_bonus_threshold
+    scale2_threshold = _scale_out_2_threshold * trend_bonus_threshold
     if past_window2 and option_pnl >= scale2_threshold and pos.scale_outs_done < 2:
         qty_close  = max(1, round(qty_rem * (0.50 if direction_aligns else 0.75)))
         trend_note = " [TREND DAY -- reduced scale]" if direction_aligns else ""
@@ -1046,7 +1146,7 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
         w1_hour += 1
         w1_min  -= 60
     past_window1 = (hour > w1_hour or (hour == w1_hour and minute >= w1_min))
-    scale1_threshold = SCALE_OUT_1_THRESHOLD * trend_bonus_threshold
+    scale1_threshold = _scale_out_1_threshold * trend_bonus_threshold
     if past_window1 and option_pnl >= scale1_threshold and pos.scale_outs_done < 1:
         qty_close  = max(1, round(qty_rem * (0.35 if direction_aligns else 0.50)))
         trend_note = " [TREND DAY -- let runner breathe]" if direction_aligns else ""
@@ -1058,7 +1158,7 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
 
     # ── 7. THETA KILL SWITCH (past noon, down >35%) ───────────────────────────
     past_noon = hour >= 12
-    if past_noon and option_pnl <= THETA_STOP_LOSS_PCT:
+    if past_noon and option_pnl <= _theta_stop_loss_pct:
         return ExitDecision(
             action="CLOSE_ALL", quantity=qty_rem,
             reason=f"THETA STOP -- option down {option_pnl*100:.0f}% after noon, cutting losses",
@@ -2870,6 +2970,18 @@ class APExitEngine:
         if emit_decision_event is None:
             return
         try:
+            _ladder = _resolve_exit_ladder(pos)
+            _ladder_context = {
+                "exit_ladder": {
+                    "requested_mode": _ladder.get("requested_mode"),
+                    "ladder_mode": _ladder.get("ladder_mode"),
+                    "fallback_reason": _ladder.get("fallback_reason"),
+                    "entry_atm_iv": _ladder.get("entry_atm_iv"),
+                    "expected_move_1d_pct_underlying": _ladder.get("expected_move_1d_pct_underlying"),
+                    "expected_option_daily_range_pct": _ladder.get("expected_option_daily_range_pct"),
+                    "k_values": _ladder.get("k_values"),
+                }
+            }
             emit_decision_event(
                 run_id=self.run_id,
                 candidate_id=getattr(pos, "signal_id", None) or getattr(pos, "position_id", None),
@@ -2901,7 +3013,7 @@ class APExitEngine:
                     "pending_exit_broker_order_id": getattr(pos, "pending_exit_broker_order_id", ""),
                     **(extra_inputs or {}),
                 },
-                context=extra_context or {},
+                context=dict(_ladder_context, **(extra_context or {})),
             )
         except Exception as e:
             log.debug("Exit observability emit failed (non-critical): %s", e)
@@ -3241,6 +3353,9 @@ class APExitEngine:
                         signal_id=str(row.get("signal_id") or ""),
                         # PR #176: carry execution_mode from positions row
                         execution_mode=str(row.get("execution_mode") or "").lower().strip(),
+                        entry_atm_iv=row.get("entry_atm_iv"),
+                        expected_move_1d_pct_underlying=row.get("expected_move_1d_pct_underlying"),
+                        expected_option_daily_range_pct=row.get("expected_option_daily_range_pct"),
                     )
                     mp.current_option_price = float(row.get("avg_fill", 0) or 0)
                     mp.scale_outs_done      = int(row.get("scale_outs_done", 0) or 0)
@@ -3503,6 +3618,9 @@ class APExitEngine:
             signal_id        = sig_id,
             quantity_remaining = qty,
             opened_at        = opened_at or _now,
+            entry_atm_iv     = row.get("entry_atm_iv"),
+            expected_move_1d_pct_underlying = row.get("expected_move_1d_pct_underlying"),
+            expected_option_daily_range_pct = row.get("expected_option_daily_range_pct"),
         )
         # Final broker-truth enforcement: if prefer_qty_override is active,
         # ensure both quantity fields match broker qty regardless of constructor defaults.

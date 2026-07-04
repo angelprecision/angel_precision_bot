@@ -1262,6 +1262,25 @@ def _seed_exit_engine(exit_engine, position_id: str, order: dict, result: dict, 
         mp.position_id = position_id
         mp.client_id = str(order.get("client_id") or "")
         mp.signal_id = signal_id
+        try:
+            _order_meta = order.get("meta") or {}
+            if isinstance(_order_meta, str):
+                import json as _json
+                _order_meta = _json.loads(_order_meta) if _order_meta.strip() else {}
+            if not isinstance(_order_meta, dict):
+                _order_meta = {}
+            _vol_exit_meta = dict(_order_meta.get("vol_exit_snapshot") or {})
+            mp.entry_atm_iv = _vol_exit_meta.get("entry_atm_iv", _order_meta.get("entry_atm_iv"))
+            mp.expected_move_1d_pct_underlying = _vol_exit_meta.get(
+                "expected_move_1d_pct_underlying",
+                _order_meta.get("expected_move_1d_pct_underlying"),
+            )
+            mp.expected_option_daily_range_pct = _vol_exit_meta.get(
+                "expected_option_daily_range_pct",
+                _order_meta.get("expected_option_daily_range_pct"),
+            )
+        except Exception:
+            pass
 
         try:
             mp.current_underlying = _safe_float(order.get("last_underlying_price") or 0.0)

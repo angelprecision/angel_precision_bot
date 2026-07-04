@@ -2951,6 +2951,13 @@ class APExecutionCore:
             pass  # plan is a namespace; attribute assignment is always valid
 
         # Build the entry pricing audit to persist in orders.meta post-submit.
+        _vol_exit_snapshot = {}
+        try:
+            _plan_meta_for_vol = getattr(approved_plan, "metadata", None) or {}
+            if isinstance(_plan_meta_for_vol, dict):
+                _vol_exit_snapshot = dict(_plan_meta_for_vol.get("vol_exit_snapshot") or {})
+        except Exception:
+            _vol_exit_snapshot = {}
         _entry_pricing_audit = {
             "entry_pricing_audit":         True,
             "selected_contract":           approved_contract,
@@ -2973,6 +2980,10 @@ class APExecutionCore:
             "entry_price_decision":        _entry_pricing_decision,
             "attempt_number":              0,
             "retry_reprice_count":         0,
+            "entry_atm_iv":                _vol_exit_snapshot.get("entry_atm_iv"),
+            "expected_move_1d_pct_underlying": _vol_exit_snapshot.get("expected_move_1d_pct_underlying"),
+            "expected_option_daily_range_pct": _vol_exit_snapshot.get("expected_option_daily_range_pct"),
+            "vol_exit_snapshot":           _vol_exit_snapshot or None,
             # PR #180: persist Jason-live precision guard audit (when active).
             **(_pr180_audit_extras or {}),
         }

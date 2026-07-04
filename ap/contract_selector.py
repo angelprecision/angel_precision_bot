@@ -46,6 +46,7 @@ import os
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from typing import Optional
+from ap.expected_move import build_vol_exit_snapshot
 
 # P0A: direct option quote revalidation (do not remove — restores flow for
 # liquid tickers with stale/zero chain data without weakening safety rules).
@@ -309,6 +310,28 @@ def _extract_abs_delta(opt: dict) -> tuple[Optional[float], str]:
     return d, "ok"
 
 
+def _extract_iv(opt: dict) -> Optional[float]:
+    for _key in ("iv", "implied_volatility", "impliedVolatility"):
+        _val = opt.get(_key)
+        if _val not in (None, ""):
+            try:
+                _f = float(_val)
+                return _f / 100.0 if _f > 1.0 else _f
+            except Exception:
+                pass
+    greeks = opt.get("greeks")
+    if isinstance(greeks, dict):
+        for _key in ("iv", "mid_iv", "smv_vol"):
+            _val = greeks.get(_key)
+            if _val not in (None, ""):
+                try:
+                    _f = float(_val)
+                    return _f / 100.0 if _f > 1.0 else _f
+                except Exception:
+                    pass
+    return None
+
+
 def _build_candidate_audit(scored, underlying_price, selected_symbol, selected_reason, rejections, top_n=3):
     """Item 3 — build the persisted selector candidate audit (EVIDENCE ONLY).
 
@@ -561,6 +584,7 @@ class SelectedContract:
     effective_budget: float = 0.0
     budget_clipped: bool = False
     pricing_basis: str = ""
+    vol_exit_snapshot: Optional[dict] = None
     # Item 3 — selector candidate audit (EVIDENCE ONLY, no behavior change).
     # Top-N candidates considered, each with bid/ask/mid/last/spread/delta/dte/
     # strike/moneyness/volume/OI + rank, plus selected_reason and the rejected
@@ -592,6 +616,7 @@ class SelectedContract:
             "effective_budget": self.effective_budget,
             "budget_clipped": self.budget_clipped,
             "pricing_basis": self.pricing_basis,
+            "vol_exit_snapshot": self.vol_exit_snapshot,
             "candidate_audit": self.candidate_audit,
         }
 
@@ -1575,6 +1600,27 @@ class APContractSelectionEngine:
         if selected is None:
             return None
 
+        try:
+            _vol_exit_snapshot = build_vol_exit_snapshot(
+                entry_atm_iv=_extract_iv(best),
+                abs_delta=selected.delta,
+                underlying_price=underlying_price or 0.0,
+                option_premium_per_share=selected.premium_per_share,
+            )
+            selected.vol_exit_snapshot = _vol_exit_snapshot
+            if isinstance(plan, dict):
+                plan.setdefault("metadata", {})
+                if isinstance(plan.get("metadata"), dict):
+                    plan["metadata"]["vol_exit_snapshot"] = _vol_exit_snapshot
+            else:
+                _plan_meta = getattr(plan, "metadata", None)
+                if not isinstance(_plan_meta, dict):
+                    _plan_meta = {}
+                _plan_meta["vol_exit_snapshot"] = _vol_exit_snapshot
+                plan.metadata = _plan_meta
+        except Exception:
+            selected.vol_exit_snapshot = None
+
         # Item 3 — attach the selector candidate audit (EVIDENCE ONLY). Built
         # from the final sorted `scored` list + the rejection counts. Persisted
         # downstream into orders.meta. Never affects selection. Best-effort.
@@ -1692,6 +1738,7 @@ class APContractSelectionEngine:
                     effective_budget          = selected.effective_budget,
                     budget_clipped            = selected.budget_clipped,
                     pricing_basis             = selected.pricing_basis,
+                    vol_exit_snapshot         = selected.vol_exit_snapshot,
                     selection_reason     = selected.selection_reason + " [forced_1]",
                     selection_score      = selected.selection_score,
                     dte                  = selected.dte,
