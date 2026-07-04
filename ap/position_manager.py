@@ -937,9 +937,16 @@ class APPositionManager:
         target_underlying: Optional[float] = None,
         local_order_id: Optional[str] = None,
         broker_order_id: Optional[str] = None,
+        vol_exit: Optional[dict] = None,
     ) -> str:
         """
         Atomically insert a new OPEN position and return position_id.
+
+        PR-G: `vol_exit` carries volatility-scaled-exit IV metadata captured at
+        contract selection. It is persisted into the OPTIONAL positions column
+        `vol_exit_meta` (JSONB) ONLY when that column exists (migration-gated).
+        With no column and/or the ladder flag off, it is silently ignored and
+        exits stay legacy — a second dormancy layer beyond the env flags.
 
         Hardening rules:
         - Serialize by advisory transaction lock on local_order_id/broker_order_id
@@ -1016,6 +1023,17 @@ class APPositionManager:
         if broker_order_id and has_broker_col:
             columns.append("broker_order_id")
             values.append(broker_order_id)
+
+        # PR-G: persist vol-exit IV metadata only when the optional column
+        # exists (migration-gated dormancy). psycopg2 adapts dict→jsonb via
+        # Json(); guard the import so a missing extra never breaks an insert.
+        if vol_exit and self._has_position_column("vol_exit_meta"):
+            try:
+                from psycopg2.extras import Json as _Json
+                columns.append("vol_exit_meta")
+                values.append(_Json(vol_exit))
+            except Exception as _ve_exc:
+                log.debug("vol_exit_meta persist skipped: %s", _ve_exc)
 
         placeholders = ",".join(["%s"] * len(columns))
         col_sql = ", ".join(columns)

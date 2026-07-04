@@ -567,6 +567,13 @@ class SelectedContract:
     # candidate reasons. None when not built. Persisted into orders.meta by the
     # execution layer so we can answer "why this contract and not that one?".
     candidate_audit: Optional[dict] = None
+    # PR-G — volatility-scaled exit ladder inputs, captured at selection.
+    # EVIDENCE + DORMANT-INPUT ONLY: persisted into orders.meta.vol_exit and
+    # read back by the exit engine ONLY when the vol_scaled ladder is enabled
+    # (triple-flag gated). When the ladder is off (default) this dict is
+    # written but never consumed, so it has zero effect on live behavior.
+    # None when IV/delta/premium unavailable ⇒ exit engine falls back to legacy.
+    vol_exit: Optional[dict] = None
 
     def to_dict(self) -> dict:
         return {
@@ -593,6 +600,7 @@ class SelectedContract:
             "budget_clipped": self.budget_clipped,
             "pricing_basis": self.pricing_basis,
             "candidate_audit": self.candidate_audit,
+            "vol_exit": self.vol_exit,
         }
 
 
@@ -2739,6 +2747,36 @@ class APContractSelectionEngine:
             _MAX_CONTRACTS_HARD_CAP   = int(os.getenv("MAX_CONTRACTS", "15"))
             affordable                = min(_raw_affordable, _MAX_CONTRACTS_HARD_CAP)
 
+            # ── PR-G: capture volatility-scaled-exit inputs (dormant input) ──
+            # Best-effort, never raises. Absent/invalid IV ⇒ vol_exit=None ⇒
+            # exit engine uses legacy ladder for this position.
+            _vol_exit = None
+            try:
+                _atm_iv = greeks.get("mid_iv") or greeks.get("iv") or greeks.get("smv_vol")
+                _spot = opt.get("_underlying_price")
+                _atm_iv_f = float(_atm_iv) if _atm_iv not in (None, "") else None
+                if _atm_iv_f and _atm_iv_f > 0 and delta and premium_per_share > 0 and _spot:
+                    from ap.expected_move import (
+                        expected_move_1d_pct as _em1,
+                        expected_option_daily_range_pct as _eodr,
+                    )
+                    _em1_val, _em1_q = _em1(_atm_iv_f)
+                    _range_val, _range_q = _eodr(delta, premium_per_share, _spot, _atm_iv_f)
+                    if _range_val is not None:
+                        _vol_exit = {
+                            "entry_atm_iv": round(_atm_iv_f, 4),
+                            "delta": round(float(delta), 4),
+                            "premium_per_share": round(float(premium_per_share), 4),
+                            "underlying_price": round(float(_spot), 4),
+                            "expected_move_1d_pct_underlying": round(_em1_val, 6) if _em1_val else None,
+                            "expected_option_daily_range_pct": round(_range_val, 6),
+                            "range_quality": _range_q,
+                            "iv_source": "mid_iv" if greeks.get("mid_iv") else "fallback",
+                        }
+            except Exception as _ve_exc:
+                log.debug("vol_exit capture skipped: %s", _ve_exc)
+                _vol_exit = None
+
             return SelectedContract(
                 contract_symbol      = opt.get("symbol", ""),
                 expiration           = exp_str,
@@ -2754,6 +2792,7 @@ class APContractSelectionEngine:
                 premium_per_share    = premium_per_share,
                 premium_per_contract = premium_per_contract,
                 affordable_contracts = affordable,
+                vol_exit             = _vol_exit,
                 selection_reason     = (
                     "delta=%.2f spread=%.1f%% OI=%d vol=%d DTE=%d premium=$%.0f" % (
                         delta, spread_pct*100, oi, vol, dte, premium_per_contract

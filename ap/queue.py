@@ -1467,6 +1467,16 @@ def _dispatch(
                     plan.metadata["selector_candidate_audit"] = _ca
             except Exception:
                 pass
+            # PR-G: stash selector vol_exit so the preselected (non-deferred)
+            # path persists it into orders.meta.vol_exit for exit-ladder use.
+            try:
+                _ve = getattr(selected, "vol_exit", None)
+                if _ve is not None:
+                    if not hasattr(plan, "metadata") or not isinstance(plan.metadata, dict):
+                        plan.metadata = {}
+                    plan.metadata["selector_vol_exit"] = _ve
+            except Exception:
+                pass
         except Exception as e:
             log.error(f"[{ticker}] contract_selector.select() raised: {e}")
             _mark_job(job_id, "ERROR", error=f"contract_selector_error: {e}")
