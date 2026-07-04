@@ -219,7 +219,17 @@ def collect_command_center(date_value: Any, *, conn_factory=None) -> dict[str, A
                 COUNT(*) FILTER (WHERE status='FILLED')     AS filled_orders,
                 COUNT(*) FILTER (WHERE status='SUBMITTED')  AS submitted_orders,
                 COUNT(*) FILTER (WHERE status IN ('CANCELED','CANCELLED','REJECTED','FAILED'))
-                                                            AS failed_orders
+                                                            AS failed_orders,
+                COUNT(*) FILTER (WHERE status IN ('FILLED','CLOSED','CANCELLED','CANCELED','EXPIRED'))
+                                                            AS mfe_mae_closed_count,
+                COUNT(*) FILTER (
+                    WHERE status IN ('FILLED','CLOSED','CANCELLED','CANCELED','EXPIRED')
+                      AND (
+                          meta ? 'mfe_pct'
+                          OR meta ? 'mae_pct'
+                          OR meta ? 'mfe_mae_unavailable_reason'
+                      )
+                )                                           AS mfe_mae_covered_count
             FROM orders
             WHERE created_ts >= %s::timestamptz
               AND created_ts <  %s::timestamptz
@@ -859,6 +869,12 @@ def build_daily_summary(sections: dict[str, dict[str, Any]]) -> dict[str, Any]:
         rs_items = (sections.get("rejected_setups") or {}).get("items") or []
         if rs_items:
             top_drop_stage = (rs_items[0] or {}).get("reason")
+    mfe_mae_closed_count = _count("command_center", "mfe_mae_closed_count")
+    mfe_mae_covered_count = _count("command_center", "mfe_mae_covered_count")
+    mfe_mae_coverage_pct = (
+        round(100.0 * mfe_mae_covered_count / mfe_mae_closed_count, 1)
+        if mfe_mae_closed_count else None
+    )
 
     return {
         # Volume funnel
@@ -878,6 +894,13 @@ def build_daily_summary(sections: dict[str, dict[str, Any]]) -> dict[str, Any]:
         "wins":                              _count("closed_trades", "wins"),
         "losses":                            _count("closed_trades", "losses"),
         "win_rate":                          _count_float("closed_trades", "win_rate"),
+        "mfe_mae_coverage_pct":              mfe_mae_coverage_pct,
+        "mfe_mae_covered_count":             mfe_mae_covered_count,
+        "mfe_mae_closed_count":              mfe_mae_closed_count,
+        "mfe_mae_coverage_under_95":         (
+            mfe_mae_coverage_pct < 95.0
+            if mfe_mae_coverage_pct is not None else None
+        ),
         # Failure / drop stages
         "top_drop_stage":                    top_drop_stage,
         "top_failure_stage":                 top_failure_stage,

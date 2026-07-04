@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import json
 import time
 import logging
 import threading
@@ -114,6 +115,7 @@ class APPositionQuoteMonitor:
         # audit, and restart-recovery integrity.
         self._last_db_persist_ts:    dict[str, float] = {}   # pid -> epoch
         self._last_db_persist_price: dict[str, float] = {}   # pid -> option price
+        self._orders_meta_available: Optional[bool] = None
 
         self._cycles = 0
         self._consecutive_failures = 0
@@ -414,6 +416,19 @@ class APPositionQuoteMonitor:
                         option_pnl_pct  = pnl_pct,
                         now_utc         = now_utc,
                     )
+                    self._persist_mfe_mae_to_orders(
+                        position_id = pid,
+                        contract    = c,
+                        option_pnl_pct = pnl_pct,
+                        now_utc     = now_utc,
+                        source      = price_source,
+                    )
+                elif cost_basis > 0 and cur_opt <= 0:
+                    self._mark_mfe_mae_unavailable(
+                        position_id = pid,
+                        contract = c,
+                        reason   = "missing_option_quote",
+                    )
 
                 cur_underlying = _safe_float(_get_attr(pos, "currentunderlying", "current_underlying", default=None), 0.0)
                 cur_option = _safe_float(_get_attr(pos, "currentoptionprice", "current_option_price", default=None), 0.0)
@@ -575,6 +590,335 @@ class APPositionQuoteMonitor:
             log.debug(
                 "[%s] _persist_quote_to_db non-fatal failure for pos=%s: %s",
                 self.client_id, position_id, exc,
+            )
+            return False
+
+    def _orders_meta_column_exists(self) -> bool:
+        """Verify orders.meta exists before mutating JSONB. Cached per monitor."""
+        if self._orders_meta_available is not None:
+            return bool(self._orders_meta_available)
+        try:
+            from ap.db import conn, run_with_retry  # local import avoids cycle
+
+            def _check():
+                with conn() as c:
+                    c.execute(
+                        """
+                        SELECT 1
+                        FROM information_schema.columns
+                        WHERE table_schema = 'public'
+                          AND table_name = 'orders'
+                          AND column_name = 'meta'
+                        LIMIT 1
+                        """
+                    )
+                    return c.fetchone() is not None
+
+            self._orders_meta_available = bool(run_with_retry(_check))
+        except Exception as exc:
+            log.debug("[%s] orders.meta availability check failed: %s", self.client_id, exc)
+            self._orders_meta_available = False
+        return bool(self._orders_meta_available)
+
+    @staticmethod
+    def _parse_order_meta(raw) -> dict:
+        if isinstance(raw, dict):
+            return dict(raw)
+        if isinstance(raw, str) and raw.strip():
+            try:
+                parsed = json.loads(raw)
+                return dict(parsed) if isinstance(parsed, dict) else {}
+            except Exception:
+                return {}
+        return {}
+
+    @staticmethod
+    def _meta_float(meta: dict, key: str):
+        try:
+            value = meta.get(key)
+            if value in (None, ""):
+                return None
+            return float(value)
+        except Exception:
+            return None
+
+    @classmethod
+    def _mfe_mae_patch(cls, prior_meta: dict, option_pnl_pct: float, now_utc, source: str) -> dict:
+        """
+        Build a JSONB patch for high/low option-PnL excursions.
+
+        Prior orders.meta is the restart source of truth; missing prior values
+        initialize to the first observed real PnL, never to fake zero.
+        """
+        try:
+            pnl = float(option_pnl_pct)
+        except Exception:
+            return {}
+
+        prior_mfe = cls._meta_float(prior_meta, "mfe_pct")
+        prior_mae = cls._meta_float(prior_meta, "mae_pct")
+        patch: dict = {}
+        ts = now_utc.isoformat() if hasattr(now_utc, "isoformat") else str(now_utc)
+
+        if prior_mfe is None or pnl > prior_mfe:
+            patch["mfe_pct"] = pnl
+            patch["mfe_at"] = ts
+        if prior_mae is None or pnl < prior_mae:
+            patch["mae_pct"] = pnl
+            patch["mae_at"] = ts
+
+        if patch:
+            patch["mfe_mae_source"] = source or "position_quote_monitor"
+            patch.pop("mfe_mae_unavailable_reason", None)
+        return patch
+
+    def _build_mfe_mae_order_locator(
+        self,
+        *,
+        contract: str,
+        position_id: str = "",
+        local_order_id: str = "",
+        broker_order_id: str = "",
+        meta_position_id: str = "",
+        created_ts_start=None,
+        created_ts_end=None,
+    ) -> tuple[str, tuple, str] | tuple[None, tuple, str]:
+        contract = str(contract or "").strip().upper()
+        position_id = str(position_id or "").strip()
+        local_order_id = str(local_order_id or "").strip()
+        broker_order_id = str(broker_order_id or "").strip()
+        meta_position_id = str(meta_position_id or "").strip()
+
+        if not contract:
+            return None, (), "missing_contract"
+
+        terminal_clause = "status IN ('FILLED','CLOSED','CANCELLED','CANCELED','EXPIRED')"
+        base_client = "client_id = %s"
+
+        if position_id:
+            return (
+                f"{base_client} AND contract = %s AND position_id = %s AND {terminal_clause}",
+                (self.client_id, contract, position_id),
+                "position_id",
+            )
+        if local_order_id:
+            return (
+                f"{base_client} AND local_order_id = %s AND contract = %s AND {terminal_clause}",
+                (self.client_id, local_order_id, contract),
+                "local_order_id",
+            )
+        if broker_order_id:
+            return (
+                f"{base_client} AND broker_order_id = %s AND contract = %s AND {terminal_clause}",
+                (self.client_id, broker_order_id, contract),
+                "broker_order_id",
+            )
+        if meta_position_id:
+            return (
+                f"""{base_client} AND contract = %s
+                    AND (
+                        COALESCE(meta, '{{}}'::jsonb)->>'position_id' = %s
+                        OR COALESCE(meta, '{{}}'::jsonb)->>'mfe_mae_position_id' = %s
+                    )
+                    AND {terminal_clause}""",
+                (self.client_id, contract, meta_position_id, meta_position_id),
+                "meta_position_id",
+            )
+        if created_ts_start is not None and created_ts_end is not None:
+            return (
+                f"""{base_client} AND contract = %s
+                    AND created_ts >= %s
+                    AND created_ts < %s
+                    AND {terminal_clause}""",
+                (self.client_id, contract, created_ts_start, created_ts_end),
+                "created_ts_window",
+            )
+        return None, (), "missing_safe_order_locator"
+
+    def _fetch_prior_mfe_mae_meta(
+        self,
+        *,
+        contract: str,
+        position_id: str = "",
+        local_order_id: str = "",
+        broker_order_id: str = "",
+        meta_position_id: str = "",
+        created_ts_start=None,
+        created_ts_end=None,
+    ) -> dict:
+        where_sql, where_params, _ = self._build_mfe_mae_order_locator(
+            contract=contract,
+            position_id=position_id,
+            local_order_id=local_order_id,
+            broker_order_id=broker_order_id,
+            meta_position_id=meta_position_id,
+            created_ts_start=created_ts_start,
+            created_ts_end=created_ts_end,
+        )
+        if where_sql is None or not self._orders_meta_column_exists():
+            return {}
+        try:
+            from ap.db import conn, run_with_retry  # local import avoids cycle
+
+            def _select():
+                with conn() as c:
+                    c.execute(
+                        f"""
+                        SELECT meta
+                        FROM orders
+                        WHERE {where_sql}
+                        ORDER BY created_ts DESC
+                        LIMIT 1
+                        """,
+                        where_params,
+                    )
+                    row = c.fetchone()
+                    if not row:
+                        return {}
+                    try:
+                        return row.get("meta") if hasattr(row, "get") else row[0]
+                    except Exception:
+                        return row[0]
+
+            return self._parse_order_meta(run_with_retry(_select))
+        except Exception as exc:
+            log.debug("[%s] prior MFE/MAE meta read failed for %s: %s", self.client_id, contract, exc)
+            return {}
+
+    def _persist_mfe_mae_to_orders(
+        self,
+        *,
+        position_id: str,
+        contract: str,
+        option_pnl_pct: float,
+        now_utc,
+        source: str,
+        local_order_id: str = "",
+        broker_order_id: str = "",
+        meta_position_id: str = "",
+        created_ts_start=None,
+        created_ts_end=None,
+    ) -> bool:
+        """Persist real MFE/MAE to orders.meta. Non-fatal, change-only."""
+        where_sql, where_params, locator_used = self._build_mfe_mae_order_locator(
+            contract=contract,
+            position_id=position_id,
+            local_order_id=local_order_id,
+            broker_order_id=broker_order_id,
+            meta_position_id=meta_position_id,
+            created_ts_start=created_ts_start,
+            created_ts_end=created_ts_end,
+        )
+        if where_sql is None or not self._orders_meta_column_exists():
+            return False
+        try:
+            prior = self._fetch_prior_mfe_mae_meta(
+                contract=contract,
+                position_id=position_id,
+                local_order_id=local_order_id,
+                broker_order_id=broker_order_id,
+                meta_position_id=meta_position_id,
+                created_ts_start=created_ts_start,
+                created_ts_end=created_ts_end,
+            )
+            patch = self._mfe_mae_patch(prior, option_pnl_pct, now_utc, source)
+            if not patch:
+                return False
+            if position_id:
+                patch["mfe_mae_position_id"] = position_id
+
+            from ap.db import conn, run_with_retry  # local import avoids cycle
+
+            def _update():
+                with conn() as c:
+                    c.execute(
+                        f"""
+                        UPDATE orders
+                        SET meta = (COALESCE(meta, '{{}}'::jsonb) - 'mfe_mae_unavailable_reason') || %s::jsonb
+                        WHERE {where_sql}
+                        """,
+                        (json.dumps(patch, default=str),) + tuple(where_params),
+                    )
+                    return c.rowcount
+
+            return (run_with_retry(_update) or 0) > 0
+        except Exception as exc:
+            log.debug(
+                "[%s] MFE/MAE orders.meta write failed for %s via %s: %s",
+                self.client_id, contract, locator_used, exc,
+            )
+            return False
+
+    def _mark_mfe_mae_unavailable(
+        self,
+        *,
+        contract: str,
+        reason: str,
+        position_id: str = "",
+        local_order_id: str = "",
+        broker_order_id: str = "",
+        meta_position_id: str = "",
+        created_ts_start=None,
+        created_ts_end=None,
+    ) -> bool:
+        """Mark uncovered rows explicitly unavailable without overwriting real MFE/MAE."""
+        where_sql, where_params, locator_used = self._build_mfe_mae_order_locator(
+            contract=contract,
+            position_id=position_id,
+            local_order_id=local_order_id,
+            broker_order_id=broker_order_id,
+            meta_position_id=meta_position_id,
+            created_ts_start=created_ts_start,
+            created_ts_end=created_ts_end,
+        )
+        if where_sql is None or not self._orders_meta_column_exists():
+            return False
+        try:
+            prior = self._fetch_prior_mfe_mae_meta(
+                contract=contract,
+                position_id=position_id,
+                local_order_id=local_order_id,
+                broker_order_id=broker_order_id,
+                meta_position_id=meta_position_id,
+                created_ts_start=created_ts_start,
+                created_ts_end=created_ts_end,
+            )
+            if (
+                "mfe_pct" in prior
+                or "mae_pct" in prior
+                or "mfe_mae_unavailable_reason" in prior
+            ):
+                return False
+            patch = {
+                "mfe_mae_unavailable_reason": reason or "mfe_mae_unavailable",
+                "mfe_mae_source": "position_quote_monitor",
+                "mfe_mae_unavailable_at": _utc_now().isoformat(),
+            }
+
+            from ap.db import conn, run_with_retry  # local import avoids cycle
+
+            def _update():
+                with conn() as c:
+                    c.execute(
+                        f"""
+                        UPDATE orders
+                        SET meta = COALESCE(meta, '{{}}'::jsonb) || %s::jsonb
+                        WHERE {where_sql}
+                          AND NOT (
+                              COALESCE(meta, '{{}}'::jsonb) ? 'mfe_pct'
+                              OR COALESCE(meta, '{{}}'::jsonb) ? 'mae_pct'
+                              OR COALESCE(meta, '{{}}'::jsonb) ? 'mfe_mae_unavailable_reason'
+                          )
+                        """,
+                        (json.dumps(patch, default=str),) + tuple(where_params),
+                    )
+                    return c.rowcount
+
+            return (run_with_retry(_update) or 0) > 0
+        except Exception as exc:
+            log.debug(
+                "[%s] MFE/MAE unavailable write failed for %s via %s: %s",
+                self.client_id, contract, locator_used, exc,
             )
             return False
 

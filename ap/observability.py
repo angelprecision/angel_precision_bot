@@ -145,6 +145,19 @@ REASON_CODES = {
     ],
 }
 
+MFE_MAE_COVERAGE_AUDIT_SQL = """
+SELECT
+  COUNT(*) AS closed_count,
+  COUNT(*) FILTER (
+    WHERE meta ? 'mfe_pct'
+       OR meta ? 'mae_pct'
+       OR meta ? 'mfe_mae_unavailable_reason'
+  ) AS covered_count
+FROM orders
+WHERE status IN ('FILLED','CLOSED','CANCELLED','EXPIRED')
+  AND created_ts >= now() - interval '30 days';
+"""
+
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
