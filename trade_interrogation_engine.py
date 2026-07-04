@@ -30,6 +30,12 @@ import time
 from datetime import datetime, timezone
 from typing import Optional, TYPE_CHECKING
 
+from ap.admission_thresholds import (
+    build_threshold_trace,
+    log_admission_thresholds,
+    resolve_admission_thresholds,
+)
+
 from decision_packet import (
     DecisionPacket, DecisionStatus,
     RiskProfile, BestContract, ReentryCondition,
@@ -45,7 +51,8 @@ log = logging.getLogger("ap.interrogation")
 # ---------------------------------------------------------------------------
 
 INTERROGATION_ENABLED   = os.getenv("INTERROGATION_ENABLED", "1").lower() in {"1", "true", "yes"}
-MIN_QUALITY_TO_EXECUTE  = float(os.getenv("INTERROGATION_MIN_SCORE", "62"))
+_ADMISSION_THRESHOLDS   = resolve_admission_thresholds()
+MIN_QUALITY_TO_EXECUTE  = float(_ADMISSION_THRESHOLDS.thresholds.interrogation_floor)
 MIN_RR_RATIO            = float(os.getenv("INTERROGATION_MIN_RR",    "1.5"))
 MAX_SPREAD_PCT          = float(os.getenv("MAX_SPREAD_PCT",          "0.12"))
 MIN_OPEN_INTEREST       = int(os.getenv("MIN_OPEN_INTEREST",         "100"))
@@ -573,11 +580,18 @@ class APTradeInterrogationEngine:
         self.broker           = broker
         self.position_manager = position_manager
         self.state_loader     = state_loader
+        self._admission_thresholds = resolve_admission_thresholds()
         _load_evolver_config()   # load evolver config at init
+        log_admission_thresholds(
+            log,
+            component="APTradeInterrogationEngine",
+            resolved=self._admission_thresholds,
+        )
         log.info(
-            "APTradeInterrogationEngine ready | gate=%.1f | evolver_gate=%.1f",
+            "APTradeInterrogationEngine ready | gate=%.1f | evolver_gate=%.1f | threshold_config_hash=%s",
             MIN_QUALITY_TO_EXECUTE,
             _EVOLVER_GATE,
+            self._admission_thresholds.config_hash,
         )
 
     def _load_state(self, signal: dict) -> Optional[dict]:
@@ -699,7 +713,7 @@ class APTradeInterrogationEngine:
         confidence = float(signal.get("score") or signal.get("confidence") or quality)
 
         # ── Decision ─────────────────────────────────────────────────────────
-        effective_gate = max(_EVOLVER_GATE, MIN_QUALITY_TO_EXECUTE)
+        effective_gate = max(_EVOLVER_GATE, self._admission_thresholds.thresholds.interrogation_floor)
         all_gates_ok = g1_ok and g2_ok and g3_ok and g4_ok and g5_ok and g6_ok and g7_ok and g8_ok
 
         if all_blocked and any(
@@ -741,6 +755,34 @@ class APTradeInterrogationEngine:
 
         elapsed = int(time.time() * 1000) - start_ms
 
+        try:
+            scanner_score_value = float(signal.get("score") or signal.get("confidence") or 0)
+        except Exception:
+            scanner_score_value = None
+        threshold_trace = {
+            "scanner_floor": build_threshold_trace(
+                threshold_name="scanner_floor",
+                score_value=scanner_score_value,
+                floor_value=self._admission_thresholds.thresholds.scanner_floor,
+                passed=(
+                    scanner_score_value >= self._admission_thresholds.thresholds.scanner_floor
+                    if scanner_score_value is not None else None
+                ),
+                source=self._admission_thresholds.sources["scanner_floor"],
+            ),
+            "interrogation_floor": build_threshold_trace(
+                threshold_name="interrogation_floor",
+                score_value=round(quality, 1),
+                floor_value=effective_gate,
+                passed=quality >= effective_gate,
+                source=(
+                    f"evolver_config:gate_threshold>{self._admission_thresholds.sources['interrogation_floor']}"
+                    if _EVOLVER_GATE > self._admission_thresholds.thresholds.interrogation_floor
+                    else self._admission_thresholds.sources["interrogation_floor"]
+                ),
+            ),
+        }
+
         packet = DecisionPacket(
             ticker=ticker,
             pattern=pattern,
@@ -776,6 +818,8 @@ class APTradeInterrogationEngine:
                 "gate_used":     effective_gate,
                 "tech_score":    round(tech_score, 1),
                 "fit_score":     round(fit_score, 1),
+                "threshold_config_hash": self._admission_thresholds.config_hash,
+                "threshold_trace": threshold_trace,
             },
         )
 
