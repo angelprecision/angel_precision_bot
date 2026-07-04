@@ -94,3 +94,31 @@ jobs:
           if total_mismatches > 0:
               sys.exit(1)
           PY
+
+      - name: Resolve blocked signal counterfactuals
+        env:
+          BOT_URL:        ${{ secrets.BOT_URL }}
+          SIGNING_SECRET: ${{ secrets.SIGNING_SECRET }}
+        run: |
+          python3 <<'PY'
+          import hashlib, hmac, json, os, time, urllib.request
+
+          bot_url = os.environ["BOT_URL"]
+          secret = os.environ["SIGNING_SECRET"].encode()
+          body = b"{}"
+          ts = str(int(time.time()))
+          sig = hmac.new(secret, ts.encode() + b"." + body, hashlib.sha256).hexdigest()
+          req = urllib.request.Request(
+              f"{bot_url}/admin/nightly_counterfactuals",
+              data=body,
+              headers={
+                  "Content-Type": "application/json",
+                  "X-AP-Timestamp": ts,
+                  "X-AP-Signature": sig,
+              },
+              method="POST",
+          )
+          with urllib.request.urlopen(req, timeout=120) as resp:
+              payload = json.loads(resp.read())
+          print(json.dumps(payload, indent=2))
+          PY

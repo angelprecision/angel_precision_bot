@@ -4036,6 +4036,51 @@ def create_app() -> Flask:
             "total_mismatches": total_mismatches,
         })
 
+    @app.post("/admin/nightly_counterfactuals")
+    @require_hmac
+    def nightly_counterfactuals():
+        """Resolve blocked/watched counterfactual rows after market close."""
+        from client_runner import _active_runners, _registry_lock
+        from ap.counterfactual_tracker import resolve_pending_counterfactuals
+
+        results = {}
+        with _registry_lock:
+            runners = dict(_active_runners)
+
+        for email, runner in runners.items():
+            try:
+                broker = getattr(runner, "broker", None)
+                if broker is None:
+                    results[email] = {"ok": False, "error": "no_broker"}
+                    continue
+                mode = (
+                    getattr(getattr(runner, "master_control", None), "mode", None)
+                    or getattr(broker, "mode", None)
+                    or "paper"
+                )
+                summary = resolve_pending_counterfactuals(
+                    broker=broker,
+                    client_id=email,
+                    execution_mode=mode,
+                )
+                results[email] = {"ok": True, **summary}
+            except Exception as e:
+                results[email] = {"ok": False, "error": str(e)}
+                log.error("nightly_counterfactuals failed for %s: %s", email, e)
+
+        total_resolved = sum(int(r.get("resolved", 0)) for r in results.values() if isinstance(r, dict))
+        total_unknown = sum(int(r.get("unknown", 0)) for r in results.values() if isinstance(r, dict))
+        total_retry_later = sum(int(r.get("retry_later", 0)) for r in results.values() if isinstance(r, dict))
+        total_unavailable = sum(int(r.get("unavailable", 0)) for r in results.values() if isinstance(r, dict))
+        return jsonify({
+            "ok": True,
+            "results": results,
+            "total_resolved": total_resolved,
+            "total_unknown": total_unknown,
+            "total_retry_later": total_retry_later,
+            "total_unavailable": total_unavailable,
+        })
+
     @app.get("/tradier/test")
     @require_hmac
     def tradier_test():
@@ -4653,6 +4698,7 @@ def _run_daily_rollup(date_value, *, disk_export=True):
 
 def _run_weekly_rollup(*, iso_week=None, date_value=None, disk_export=True):
     from ap_operator_daily_folders import iso_week_string
+    from ap.counterfactual_tracker import build_weekly_counterfactual_rollup
     from ap_operator_weekly_rollup import (
         build_weekly_rollup, upsert_weekly_rollup,
     )
@@ -4667,6 +4713,9 @@ def _run_weekly_rollup(*, iso_week=None, date_value=None, disk_export=True):
     wrote = upsert_weekly_rollup(rollup)
     public = rollup.to_public()
     public["supabase_written"] = bool(wrote)
+    public["counterfactual_summary"] = build_weekly_counterfactual_rollup(
+        iso_week=target,
+    )
     return public
 
 
