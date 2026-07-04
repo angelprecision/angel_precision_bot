@@ -27,6 +27,7 @@ Known follow-up items:
 - Final decision on local handling of partial entry fills.
 - Audit that all exit-order creation paths always populate position_id.
 - Audit that all sizer callers pass premium_per_contract as total contract dollars (option price * 100).
+- `ap_strategy_evolver.py` is frozen by default. It only runs when `ENABLE_STRATEGY_EVOLVER=true`, and any emitted config is research-only and not runtime-eligible.
 - ## Execution invariants
 
 The live execution stack follows a strict contract:

@@ -34,6 +34,7 @@ import logging
 import random
 import copy
 import argparse
+import os
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from pathlib import Path
@@ -67,7 +68,9 @@ BASELINE_CONFIG = {
 }
 
 RESULTS_FILE = Path("results_evolver.tsv")
+BEST_CONFIG_FILE = Path("best_evolver_config.json")
 MIN_TRADES_FOR_VALID_RESULT = 10     # Anti-oracle-gaming threshold
+EVOLVER_ENABLED = os.getenv("ENABLE_STRATEGY_EVOLVER", "false").lower() == "true"
 
 
 # ---------------------------------------------------------------------------
@@ -464,6 +467,10 @@ def run_evolution_loop(
     Per Auto-Quant: DO NOT stop to ask for confirmation.
     Keep iterating until interrupted or rounds exhausted.
     """
+    if not EVOLVER_ENABLED:
+        logger.warning("evolver_frozen_pending_walkforward_rebuild")
+        return None
+
     logger.info("="*60)
     logger.info("AP STRATEGY EVOLVER — Starting evolution loop")
     logger.info(f"Target: {target_win_rate:.0%} win rate | Rounds: {rounds}")
@@ -579,18 +586,19 @@ def run_evolution_loop(
     logger.info(f"\nFull log: {RESULTS_FILE}")
 
     # Save best config as JSON for ap_strat_agent.py update
-    best_config_path = Path("best_evolver_config.json")
-    with open(best_config_path, "w") as f:
+    with open(BEST_CONFIG_FILE, "w") as f:
         json.dump({
             "achieved_win_rate": best_result.win_rate,
             "trade_count":       best_result.trade_count,
             "avg_return":        best_result.avg_return,
             "rounds_run":        rounds,
             "evolved_at":        datetime.now().isoformat(),
+            "runtime_eligible":  False,
+            "objective_warning": "raw_win_rate_not_runtime_safe",
             "config":            best_config.to_dict(),
         }, f, indent=2)
-    logger.info(f"Best config saved to: {best_config_path}")
-    logger.info("Paste 'config' block into ap_strat_agent.py → STRATEGY_WEIGHTS + DEFAULT_GATE_THRESHOLD")
+    logger.info(f"Research-only config saved to: {BEST_CONFIG_FILE}")
+    logger.info("Research only: raw win rate optimization is not runtime safe")
 
     return best_config, best_result
 
@@ -606,8 +614,11 @@ if __name__ == "__main__":
     parser.add_argument("--target", type=float, default=0.80, help="Target win rate (e.g. 0.80)")
     args = parser.parse_args()
 
-    run_evolution_loop(
-        source_csv=args.source,
-        rounds=args.rounds,
-        target_win_rate=args.target,
-    )
+    if not EVOLVER_ENABLED:
+        logger.warning("evolver_frozen_pending_walkforward_rebuild")
+    else:
+        run_evolution_loop(
+            source_csv=args.source,
+            rounds=args.rounds,
+            target_win_rate=args.target,
+        )
