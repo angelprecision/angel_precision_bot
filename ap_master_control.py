@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import queue
 import threading
 import time
 import uuid
@@ -66,6 +67,10 @@ except Exception as _intel_import_err:  # pragma: no cover
     )
 
 MIN_CONTRACTS_PER_POSITION = int(os.getenv("MIN_CONTRACTS_PER_POSITION", "2"))
+TRADE_DOSSIER_CACHE_TTL_SEC = float(os.getenv("TRADE_DOSSIER_CACHE_TTL_SEC", "1800"))
+TRADE_DOSSIER_CACHE_MAX = int(os.getenv("TRADE_DOSSIER_CACHE_MAX", "500"))
+TRADE_DOSSIER_QUEUE_MAX = int(os.getenv("TRADE_DOSSIER_QUEUE_MAX", "256"))
+TRADE_DOSSIER_DB_HEALTH_TTL_SEC = float(os.getenv("TRADE_DOSSIER_DB_HEALTH_TTL_SEC", "900"))
 
 # QUARTERLY REVIEW REQUIRED: These estimates are used for capital gate projections
 # before real contract pricing is known. If ATM premiums diverge significantly
@@ -611,6 +616,14 @@ class APMasterControl:
         self._entries_paused_fn = None
         self._mode_fn = None
         self._seen_signals: dict[str, float] = {}  # key -> inserted_ts, expires after 1800s
+        self._trade_dossier_signal_cache: dict[str, dict[str, Any]] = {}
+        self._trade_dossier_signal_cache_ts: dict[str, float] = {}
+        self._trade_dossier_queue: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=TRADE_DOSSIER_QUEUE_MAX)
+        self._trade_dossier_worker: Optional[threading.Thread] = None
+        self._trade_dossier_worker_lock = threading.Lock()
+        self._trade_dossier_db_healthy: Optional[bool] = None
+        self._trade_dossier_db_last_ok_ts: Optional[float] = None
+        self._trade_dossier_db_last_err_ts: Optional[float] = None
         self._trade_cooldowns: dict[str, float] = {}
         # PR E / FIX-3: protect concurrent equity / max_daily_loss reads &
         # writes. set_account_equity() updates both fields from the
@@ -638,6 +651,7 @@ class APMasterControl:
         # Guard so we only fire the request once per session even though the
         # daily-loss check runs on every entry signal.
         self._daily_loss_force_close_fired: bool = False
+        self._start_trade_dossier_worker()
         self._seed_dedup_from_db(client_id=getattr(self, "_client_id", "default"))
         log.info(
             "APMasterControl initialized | mode=%s | score_floor=%s | ctx_floor=%s | max_pos=%s | max_cap=%.0f%% | max_sector=%.0f%% | max_ticker=%.0f%% | max_calls=%s | max_puts=%s | max_trades_today=%s | max_daily_loss=%s",
@@ -1607,6 +1621,7 @@ class APMasterControl:
         score = float(signal.get("score", 0) or 0)
         signal_id = str(signal.get("signal_id") or uuid.uuid4())
         signal["signal_id"] = signal_id
+        self._cache_trade_dossier_signal(signal_id, signal)
         try:
             self._counterfactual_ctx.signal = dict(signal or {})
             self._counterfactual_ctx.signal["signal_id"] = signal_id
@@ -1680,6 +1695,7 @@ class APMasterControl:
         _now_ts = time.time()
         if len(self._seen_signals) > 500:
             self._seen_signals = {k: v for k, v in self._seen_signals.items() if _now_ts - v < 1800}
+        self._prune_trade_dossier_signal_cache(_now_ts)
 
         # Durable per-client duplicate check.
         # _seen_signals is a fast in-memory HINT only — unsafe as sole
@@ -2808,6 +2824,20 @@ class APMasterControl:
                 )
             elif _final_quality_block.plan.metadata is None:
                 _final_quality_block.plan.metadata = plan.metadata or {}
+            self._emit_trade_dossier(
+                signal,
+                client_id=client_id,
+                decision_context={
+                    "master_control_decision": "REJECT",
+                    "decision_reason": _final_quality_block.reason,
+                    "block_reason": _final_quality_block.reason,
+                    "approved": False,
+                    "git_commit": self.git_commit,
+                    "config_hash": self.config_hash,
+                },
+                background=True,
+                cache_signal_id=signal_id,
+            )
             return _final_quality_block
 
         # Persist dedup first. Only then add in-memory keys.
@@ -2826,6 +2856,19 @@ class APMasterControl:
             log.warning("[%s] Dedup persist failed in paper — proceeding: %s", ticker, _dedup_err)
         self._seen_signals[signal_key] = time.time()
         self._seen_signals[setup_key] = time.time()
+        self._emit_trade_dossier(
+            signal,
+            client_id=client_id,
+            decision_context={
+                "master_control_decision": "APPROVE",
+                "decision_reason": "Signal approved by master control",
+                "approved": True,
+                "git_commit": self.git_commit,
+                "config_hash": self.config_hash,
+            },
+            background=True,
+            cache_signal_id=signal_id,
+        )
 
         try:
             if emit_decision_event:
@@ -2882,6 +2925,201 @@ class APMasterControl:
             )
 
         return ControlDecision(ok=True, stage="approved", reason="", plan=plan, signal_id=signal_id, ticker=ticker, client_id=client_id)
+
+    def _emit_trade_dossier(
+        self,
+        signal: dict,
+        *,
+        client_id: str,
+        decision_context: Optional[dict] = None,
+        background: bool = True,
+        cache_signal_id: Optional[str] = None,
+        require_db_health: bool = False,
+    ) -> None:
+        if cache_signal_id:
+            self._pop_trade_dossier_signal(cache_signal_id)
+        if os.getenv("ENABLE_TRADE_DOSSIER", "true").lower() != "true":
+            return
+        if background:
+            if require_db_health and not self._trade_dossier_db_health_allows_write():
+                self._log_trade_dossier_db_unavailable(
+                    signal=signal or {},
+                    client_id=client_id,
+                    err="health_gated",
+                )
+                return
+            self._enqueue_trade_dossier_write(
+                signal=signal or {},
+                client_id=client_id,
+                decision_context=decision_context or {},
+                require_db_health=require_db_health,
+            )
+            return
+        self._write_trade_dossier_now(
+            signal=signal or {},
+            client_id=client_id,
+            decision_context=decision_context or {},
+        )
+
+    def _start_trade_dossier_worker(self) -> None:
+        if os.getenv("ENABLE_TRADE_DOSSIER", "true").lower() != "true":
+            return
+        with self._trade_dossier_worker_lock:
+            if self._trade_dossier_worker and self._trade_dossier_worker.is_alive():
+                return
+            self._trade_dossier_worker = threading.Thread(
+                target=self._trade_dossier_worker_loop,
+                daemon=True,
+                name=f"trade-dossier-{self._client_id}",
+            )
+            self._trade_dossier_worker.start()
+
+    def _trade_dossier_worker_loop(self) -> None:
+        while True:
+            try:
+                payload = self._trade_dossier_queue.get(timeout=1.0)
+            except queue.Empty:
+                continue
+            try:
+                self._process_trade_dossier_payload(payload)
+            except Exception:
+                pass
+
+    def _process_trade_dossier_payload(self, payload: dict[str, Any]) -> None:
+        signal = payload.get("signal") or {}
+        client_id = str(payload.get("client_id") or self._client_id)
+        decision_context = payload.get("decision_context") or {}
+        require_db_health = bool(payload.get("require_db_health"))
+        if require_db_health and not self._trade_dossier_db_health_allows_write():
+            self._log_trade_dossier_db_unavailable(
+                signal=signal,
+                client_id=client_id,
+                err="health_gated",
+            )
+            return
+        self._write_trade_dossier_now(
+            signal=signal,
+            client_id=client_id,
+            decision_context=decision_context,
+        )
+
+    def _enqueue_trade_dossier_write(
+        self,
+        *,
+        signal: dict,
+        client_id: str,
+        decision_context: dict,
+        require_db_health: bool = False,
+    ) -> None:
+        self._start_trade_dossier_worker()
+        try:
+            self._trade_dossier_queue.put_nowait(
+                {
+                    "signal": dict(signal or {}),
+                    "client_id": client_id,
+                    "decision_context": dict(decision_context or {}),
+                    "require_db_health": bool(require_db_health),
+                }
+            )
+        except queue.Full:
+            log.warning(
+                "trade_dossier_write_skipped_queue_full ticker=%s client_id=%s execution_mode=%s canonical_signal_id=%s",
+                (signal or {}).get("ticker") or (signal or {}).get("symbol") or "?",
+                client_id,
+                "LIVE" if self._is_live_mode() else "PAPER",
+                (signal or {}).get("canonical_signal_id") or (signal or {}).get("signal_id") or "",
+            )
+
+    def _write_trade_dossier_now(
+        self,
+        *,
+        signal: dict,
+        client_id: str,
+        decision_context: dict,
+    ) -> None:
+        try:
+            from ap.db import conn
+            from ap.trade_dossier import build_and_persist_trade_dossier
+
+            execution_mode = "LIVE" if self._is_live_mode() else "PAPER"
+            with conn() as c:
+                build_and_persist_trade_dossier(
+                    c,
+                    signal or {},
+                    client_id=client_id,
+                    execution_mode=execution_mode,
+                    decision_context=decision_context or {},
+                )
+            self._mark_trade_dossier_db_health(True)
+        except Exception as exc:
+            self._mark_trade_dossier_db_health(False)
+            self._log_trade_dossier_db_unavailable(
+                signal=signal or {},
+                client_id=client_id,
+                err=exc,
+            )
+
+    def _mark_trade_dossier_db_health(self, healthy: bool) -> None:
+        now_ts = time.time()
+        self._trade_dossier_db_healthy = bool(healthy)
+        if healthy:
+            self._trade_dossier_db_last_ok_ts = now_ts
+        else:
+            self._trade_dossier_db_last_err_ts = now_ts
+
+    def _trade_dossier_db_health_allows_write(self) -> bool:
+        if self._trade_dossier_db_healthy is not True:
+            return False
+        if self._trade_dossier_db_last_ok_ts is None:
+            return False
+        return (time.time() - self._trade_dossier_db_last_ok_ts) <= TRADE_DOSSIER_DB_HEALTH_TTL_SEC
+
+    def _log_trade_dossier_db_unavailable(self, *, signal: dict, client_id: str, err: Any) -> None:
+        log.warning(
+            "trade_dossier_write_skipped_db_unavailable ticker=%s client_id=%s execution_mode=%s canonical_signal_id=%s err=%s",
+            (signal or {}).get("ticker") or (signal or {}).get("symbol") or "?",
+            client_id,
+            "LIVE" if self._is_live_mode() else "PAPER",
+            (signal or {}).get("canonical_signal_id") or (signal or {}).get("signal_id") or "",
+            err,
+        )
+
+    def _cache_trade_dossier_signal(self, signal_id: str, signal: dict) -> None:
+        if not signal_id:
+            return
+        now_ts = time.time()
+        self._trade_dossier_signal_cache[signal_id] = dict(signal or {})
+        self._trade_dossier_signal_cache_ts[signal_id] = now_ts
+        self._prune_trade_dossier_signal_cache(now_ts)
+
+    def _pop_trade_dossier_signal(self, signal_id: str) -> dict[str, Any]:
+        cached = dict(self._trade_dossier_signal_cache.pop(signal_id, {}) or {})
+        self._trade_dossier_signal_cache_ts.pop(signal_id, None)
+        return cached
+
+    def _prune_trade_dossier_signal_cache(self, now_ts: Optional[float] = None) -> None:
+        now_ts = now_ts if now_ts is not None else time.time()
+        stale_ids = [
+            sid for sid, inserted_ts in self._trade_dossier_signal_cache_ts.items()
+            if now_ts - inserted_ts >= TRADE_DOSSIER_CACHE_TTL_SEC
+        ]
+        for sid in stale_ids:
+            self._trade_dossier_signal_cache.pop(sid, None)
+            self._trade_dossier_signal_cache_ts.pop(sid, None)
+        if len(self._trade_dossier_signal_cache) <= TRADE_DOSSIER_CACHE_MAX:
+            return
+        keep_ids = sorted(
+            self._trade_dossier_signal_cache_ts.items(),
+            key=lambda item: item[1],
+            reverse=True,
+        )[:TRADE_DOSSIER_CACHE_MAX]
+        keep = {sid for sid, _ in keep_ids}
+        self._trade_dossier_signal_cache = {
+            sid: sig for sid, sig in self._trade_dossier_signal_cache.items() if sid in keep
+        }
+        self._trade_dossier_signal_cache_ts = {
+            sid: ts for sid, ts in self._trade_dossier_signal_cache_ts.items() if sid in keep
+        }
 
     def _compute_bootstrap_mode(self, *, total_trades: int) -> bool:
         """
@@ -3828,6 +4066,26 @@ class APMasterControl:
                 details={"error": str(e), "stage": stage, "reason": reason},
             )
         try:
+            dossier_signal = self._pop_trade_dossier_signal(signal_id)
+            if not dossier_signal:
+                dossier_signal = {"signal_id": signal_id, "ticker": ticker, "symbol": ticker}
+            dossier_signal.setdefault("signal_id", signal_id)
+            dossier_signal.setdefault("ticker", ticker)
+            dossier_signal.setdefault("symbol", ticker)
+            self._emit_trade_dossier(
+                dossier_signal,
+                client_id=client_id,
+                decision_context={
+                    "master_control_decision": "REJECT",
+                    "decision_reason": reason,
+                    "block_reason": reason,
+                    "approved": False,
+                    "git_commit": self.git_commit,
+                    "config_hash": self.config_hash,
+                },
+                background=True,
+                require_db_health=True,
+            )
             if track_counterfactual_signal:
                 _cf_signal = getattr(self._counterfactual_ctx, "signal", None) or {
                     "signal_id": signal_id,
@@ -3981,6 +4239,8 @@ class APMasterControl:
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         client_prefix = client_id or (self.pm.client_id if hasattr(self.pm, "client_id") else "")
         self._seen_signals.clear()  # dict.clear() — same interface
+        self._trade_dossier_signal_cache.clear()
+        self._trade_dossier_signal_cache_ts.clear()
         # PR E / FIX-4: clear _trade_cooldowns under _cooldown_lock so a new
         # trading day starts with no stale cooldowns AND the clear is atomic
         # w.r.t. any concurrent set_cooldown / execution-core writes.
