@@ -10,6 +10,13 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Optional
 
+from ap.admission_thresholds import (
+    build_interrogation_packet_threshold_trace,
+    build_threshold_trace,
+    log_admission_thresholds,
+    resolve_admission_thresholds,
+)
+
 try:
     from ap.observability import (
         emit_decision_event,
@@ -575,6 +582,17 @@ class APMasterControl:
                 "pending_capital_fail_closed_live": self.pending_capital_fail_closed_live,
                 "entry_capital_reserved_statuses": sorted(_ENTRY_CAPITAL_RESERVED_STATUSES),
             }
+        )
+        self.admission_thresholds = resolve_admission_thresholds(
+            mc_score_floor=self.score_floor,
+            mc_priority_floor=_PRIORITY_FLOOR,
+            context_floor=self.context_floor,
+        )
+        self.admission_threshold_config_hash = self.admission_thresholds.config_hash
+        log_admission_thresholds(
+            log,
+            component=f"APMasterControl:{self.mode}",
+            resolved=self.admission_thresholds,
         )
 
         self._kill_switch_fn = None
@@ -2139,6 +2157,10 @@ class APMasterControl:
         # protecting the green day with quality rather than by stopping.
         _eff_priority_floor = _PRIORITY_FLOOR + _post_target_score_bump
         _eff_score_floor    = self.score_floor + _post_target_score_bump
+        _interrogation_trace = build_interrogation_packet_threshold_trace(
+            signal.get("decision_packet") or signal.get("_decision_packet") or signal.get("interrogation_packet"),
+            resolved=self.admission_thresholds,
+        )
 
         # PR B + SCORE-65 REFINEMENT — structured score eligibility.
         # Runs BEFORE every other admission gate. The universal hard floor
@@ -2208,6 +2230,30 @@ class APMasterControl:
             delta=_delta_for_gate,
             dte_known=_dte_known,
         )
+        _threshold_trace = {
+            "scanner_floor": build_threshold_trace(
+                threshold_name="scanner_floor",
+                score_value=float(score),
+                floor_value=self.admission_thresholds.thresholds.scanner_floor,
+                passed=float(score) >= self.admission_thresholds.thresholds.scanner_floor,
+                source=self.admission_thresholds.sources["scanner_floor"],
+            ),
+            "interrogation_floor": _interrogation_trace,
+            "mc_score_floor": build_threshold_trace(
+                threshold_name="mc_score_floor",
+                score_value=float(effective_score),
+                floor_value=float(_eff_score_floor),
+                passed=float(effective_score) >= float(_eff_score_floor),
+                source=self.admission_thresholds.sources["mc_score_floor"],
+            ),
+            "mc_priority_floor": build_threshold_trace(
+                threshold_name="mc_priority_floor",
+                score_value=float(effective_score),
+                floor_value=float(_eff_priority_floor),
+                passed=float(effective_score) >= float(_eff_priority_floor),
+                source=self.admission_thresholds.sources["mc_priority_floor"],
+            ),
+        }
         if not _score_ok:
             self._store_update(
                 signal_id, "rejected_low_score",
@@ -2217,6 +2263,10 @@ class APMasterControl:
                 signal_id, ticker, client_id, "blocked_score",
                 f"{_score_reason} (score={effective_score:.1f} "
                 f"min_eligible={_hard_floor:.1f})",
+                meta={
+                    "threshold_trace": _threshold_trace,
+                    "threshold_config_hash": self.admission_threshold_config_hash,
+                },
             )
         elif _score_reason:
             # Admitted via the score-65 exception band — record WHY for the audit.
@@ -2310,18 +2360,63 @@ class APMasterControl:
         if ticker.upper() in _PRIORITY_TICKERS:
             if effective_score < _eff_priority_floor:
                 self._store_update(signal_id, "rejected", f"priority score {score:.1f} < floor {_eff_priority_floor}")
-                return self._block(signal_id, ticker, client_id, "blocked_score", f"score_below_priority_floor ({score:.1f}<{_eff_priority_floor})")
+                return self._block(
+                    signal_id,
+                    ticker,
+                    client_id,
+                    "blocked_score",
+                    f"score_below_priority_floor ({score:.1f}<{_eff_priority_floor})",
+                    meta={
+                        "threshold_trace": _threshold_trace,
+                        "threshold_config_hash": self.admission_threshold_config_hash,
+                    },
+                )
         else:
             if effective_score < _eff_score_floor:
                 self._store_update(signal_id, "rejected", f"score {effective_score:.1f} < floor {_eff_score_floor}")
-                return self._block(signal_id, ticker, client_id, "blocked_score", f"score_below_floor ({effective_score:.1f}<{_eff_score_floor})")
+                return self._block(
+                    signal_id,
+                    ticker,
+                    client_id,
+                    "blocked_score",
+                    f"score_below_floor ({effective_score:.1f}<{_eff_score_floor})",
+                    meta={
+                        "threshold_trace": _threshold_trace,
+                        "threshold_config_hash": self.admission_threshold_config_hash,
+                    },
+                )
 
         score_breakdown = signal.get("score_breakdown") or {}
         if "real_time_ctx" in score_breakdown:
             ctx = float(score_breakdown.get("real_time_ctx", 0) or 0)
+            _threshold_trace["context_floor"] = build_threshold_trace(
+                threshold_name="context_floor",
+                score_value=ctx,
+                floor_value=float(self.context_floor),
+                passed=ctx >= float(self.context_floor),
+                source=self.admission_thresholds.sources["context_floor"],
+            )
             if ctx < self.context_floor:
                 self._store_update(signal_id, "context_blocked", f"ctx={ctx:.1f} < floor {self.context_floor}")
-                return self._block(signal_id, ticker, client_id, "blocked_score", f"context_below_floor (ctx={ctx:.1f}<{self.context_floor})")
+                return self._block(
+                    signal_id,
+                    ticker,
+                    client_id,
+                    "blocked_score",
+                    f"context_below_floor (ctx={ctx:.1f}<{self.context_floor})",
+                    meta={
+                        "threshold_trace": _threshold_trace,
+                        "threshold_config_hash": self.admission_threshold_config_hash,
+                    },
+                )
+        else:
+            _threshold_trace["context_floor"] = build_threshold_trace(
+                threshold_name="context_floor",
+                score_value=None,
+                floor_value=float(self.context_floor),
+                passed=None,
+                source="unavailable:score_breakdown.real_time_ctx_missing",
+            )
 
         try:
             from ap_tier_engine import Tier
@@ -2651,6 +2746,8 @@ class APMasterControl:
                     "reject_reasons":       [],
                     "score_reason":         _score_reason or "",
                     "score_components":     signal.get("score_breakdown") or {},
+                    "threshold_trace":      _threshold_trace,
+                    "threshold_config_hash": self.admission_threshold_config_hash,
                     "setup_status":         setup_status,
                     # quality_mode_result: canonical output from PR-72.
                     # PR-73 reads this; it does not recompute QM outcome.
@@ -2743,6 +2840,8 @@ class APMasterControl:
                         "snapshot_age_sec": snap.get("_snapshot_age_sec"),
                     },
                     thresholds={
+                        "scanner_floor": self.admission_thresholds.thresholds.scanner_floor,
+                        "interrogation_floor": self.admission_thresholds.thresholds.interrogation_floor,
                         "priority_floor": _PRIORITY_FLOOR,
                         "score_floor": self.score_floor,
                         "context_floor": self.context_floor,
@@ -2754,6 +2853,8 @@ class APMasterControl:
                         "contracts": plan.contracts,
                         "trigger_type": plan.trigger_type,
                         "bootstrap_mode": bootstrap_mode,
+                        "threshold_trace": _threshold_trace,
+                        "threshold_config_hash": self.admission_threshold_config_hash,
                     },
                 )
         except Exception as e:
