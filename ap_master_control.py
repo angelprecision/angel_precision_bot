@@ -11,6 +11,18 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Optional
 
+from ap.admission_thresholds import (
+    build_interrogation_packet_threshold_trace,
+    build_threshold_trace,
+    log_admission_thresholds,
+    resolve_admission_thresholds,
+)
+
+try:
+    from ap.counterfactual_tracker import track_counterfactual_signal
+except Exception:  # pragma: no cover
+    track_counterfactual_signal = None
+
 try:
     from ap.observability import (
         emit_decision_event,
@@ -557,6 +569,7 @@ class APMasterControl:
         self._equity_cache_ts: float = 0.0   # initialized here; set by _dispatch() after broker call
         self._alert_fn = None
         self._degraded_counts: dict[str, int] = {}
+        self._counterfactual_ctx = threading.local()
 
         self.run_id = os.getenv("AP_RUN_ID", new_run_id("ap"))
         self.strategy_version = os.getenv("AP_STRATEGY_VERSION", "ap_live_beta")
@@ -580,6 +593,17 @@ class APMasterControl:
                 "pending_capital_fail_closed_live": self.pending_capital_fail_closed_live,
                 "entry_capital_reserved_statuses": sorted(_ENTRY_CAPITAL_RESERVED_STATUSES),
             }
+        )
+        self.admission_thresholds = resolve_admission_thresholds(
+            mc_score_floor=self.score_floor,
+            mc_priority_floor=_PRIORITY_FLOOR,
+            context_floor=self.context_floor,
+        )
+        self.admission_threshold_config_hash = self.admission_thresholds.config_hash
+        log_admission_thresholds(
+            log,
+            component=f"APMasterControl:{self.mode}",
+            resolved=self.admission_thresholds,
         )
 
         self._kill_switch_fn = None
@@ -1598,6 +1622,13 @@ class APMasterControl:
         signal_id = str(signal.get("signal_id") or uuid.uuid4())
         signal["signal_id"] = signal_id
         self._cache_trade_dossier_signal(signal_id, signal)
+        try:
+            self._counterfactual_ctx.signal = dict(signal or {})
+            self._counterfactual_ctx.signal["signal_id"] = signal_id
+            self._counterfactual_ctx.client_id = str(client_id or "default")
+            self._counterfactual_ctx.execution_mode = str(self._current_mode() or "PAPER")
+        except Exception:
+            pass
 
         # PR #229: fail-CLOSED on missing/invalid side. Pre-#229 this defaulted
         # to "CALL" which meant a malformed signal would silently route as a
@@ -2155,6 +2186,10 @@ class APMasterControl:
         # protecting the green day with quality rather than by stopping.
         _eff_priority_floor = _PRIORITY_FLOOR + _post_target_score_bump
         _eff_score_floor    = self.score_floor + _post_target_score_bump
+        _interrogation_trace = build_interrogation_packet_threshold_trace(
+            signal.get("decision_packet") or signal.get("_decision_packet") or signal.get("interrogation_packet"),
+            resolved=self.admission_thresholds,
+        )
 
         # PR B + SCORE-65 REFINEMENT — structured score eligibility.
         # Runs BEFORE every other admission gate. The universal hard floor
@@ -2224,6 +2259,30 @@ class APMasterControl:
             delta=_delta_for_gate,
             dte_known=_dte_known,
         )
+        _threshold_trace = {
+            "scanner_floor": build_threshold_trace(
+                threshold_name="scanner_floor",
+                score_value=float(score),
+                floor_value=self.admission_thresholds.thresholds.scanner_floor,
+                passed=float(score) >= self.admission_thresholds.thresholds.scanner_floor,
+                source=self.admission_thresholds.sources["scanner_floor"],
+            ),
+            "interrogation_floor": _interrogation_trace,
+            "mc_score_floor": build_threshold_trace(
+                threshold_name="mc_score_floor",
+                score_value=float(effective_score),
+                floor_value=float(_eff_score_floor),
+                passed=float(effective_score) >= float(_eff_score_floor),
+                source=self.admission_thresholds.sources["mc_score_floor"],
+            ),
+            "mc_priority_floor": build_threshold_trace(
+                threshold_name="mc_priority_floor",
+                score_value=float(effective_score),
+                floor_value=float(_eff_priority_floor),
+                passed=float(effective_score) >= float(_eff_priority_floor),
+                source=self.admission_thresholds.sources["mc_priority_floor"],
+            ),
+        }
         if not _score_ok:
             self._store_update(
                 signal_id, "rejected_low_score",
@@ -2233,6 +2292,10 @@ class APMasterControl:
                 signal_id, ticker, client_id, "blocked_score",
                 f"{_score_reason} (score={effective_score:.1f} "
                 f"min_eligible={_hard_floor:.1f})",
+                meta={
+                    "threshold_trace": _threshold_trace,
+                    "threshold_config_hash": self.admission_threshold_config_hash,
+                },
             )
         elif _score_reason:
             # Admitted via the score-65 exception band — record WHY for the audit.
@@ -2326,18 +2389,63 @@ class APMasterControl:
         if ticker.upper() in _PRIORITY_TICKERS:
             if effective_score < _eff_priority_floor:
                 self._store_update(signal_id, "rejected", f"priority score {score:.1f} < floor {_eff_priority_floor}")
-                return self._block(signal_id, ticker, client_id, "blocked_score", f"score_below_priority_floor ({score:.1f}<{_eff_priority_floor})")
+                return self._block(
+                    signal_id,
+                    ticker,
+                    client_id,
+                    "blocked_score",
+                    f"score_below_priority_floor ({score:.1f}<{_eff_priority_floor})",
+                    meta={
+                        "threshold_trace": _threshold_trace,
+                        "threshold_config_hash": self.admission_threshold_config_hash,
+                    },
+                )
         else:
             if effective_score < _eff_score_floor:
                 self._store_update(signal_id, "rejected", f"score {effective_score:.1f} < floor {_eff_score_floor}")
-                return self._block(signal_id, ticker, client_id, "blocked_score", f"score_below_floor ({effective_score:.1f}<{_eff_score_floor})")
+                return self._block(
+                    signal_id,
+                    ticker,
+                    client_id,
+                    "blocked_score",
+                    f"score_below_floor ({effective_score:.1f}<{_eff_score_floor})",
+                    meta={
+                        "threshold_trace": _threshold_trace,
+                        "threshold_config_hash": self.admission_threshold_config_hash,
+                    },
+                )
 
         score_breakdown = signal.get("score_breakdown") or {}
         if "real_time_ctx" in score_breakdown:
             ctx = float(score_breakdown.get("real_time_ctx", 0) or 0)
+            _threshold_trace["context_floor"] = build_threshold_trace(
+                threshold_name="context_floor",
+                score_value=ctx,
+                floor_value=float(self.context_floor),
+                passed=ctx >= float(self.context_floor),
+                source=self.admission_thresholds.sources["context_floor"],
+            )
             if ctx < self.context_floor:
                 self._store_update(signal_id, "context_blocked", f"ctx={ctx:.1f} < floor {self.context_floor}")
-                return self._block(signal_id, ticker, client_id, "blocked_score", f"context_below_floor (ctx={ctx:.1f}<{self.context_floor})")
+                return self._block(
+                    signal_id,
+                    ticker,
+                    client_id,
+                    "blocked_score",
+                    f"context_below_floor (ctx={ctx:.1f}<{self.context_floor})",
+                    meta={
+                        "threshold_trace": _threshold_trace,
+                        "threshold_config_hash": self.admission_threshold_config_hash,
+                    },
+                )
+        else:
+            _threshold_trace["context_floor"] = build_threshold_trace(
+                threshold_name="context_floor",
+                score_value=None,
+                floor_value=float(self.context_floor),
+                passed=None,
+                source="unavailable:score_breakdown.real_time_ctx_missing",
+            )
 
         try:
             from ap_tier_engine import Tier
@@ -2667,6 +2775,8 @@ class APMasterControl:
                     "reject_reasons":       [],
                     "score_reason":         _score_reason or "",
                     "score_components":     signal.get("score_breakdown") or {},
+                    "threshold_trace":      _threshold_trace,
+                    "threshold_config_hash": self.admission_threshold_config_hash,
                     "setup_status":         setup_status,
                     # quality_mode_result: canonical output from PR-72.
                     # PR-73 reads this; it does not recompute QM outcome.
@@ -2786,6 +2896,8 @@ class APMasterControl:
                         "snapshot_age_sec": snap.get("_snapshot_age_sec"),
                     },
                     thresholds={
+                        "scanner_floor": self.admission_thresholds.thresholds.scanner_floor,
+                        "interrogation_floor": self.admission_thresholds.thresholds.interrogation_floor,
                         "priority_floor": _PRIORITY_FLOOR,
                         "score_floor": self.score_floor,
                         "context_floor": self.context_floor,
@@ -2797,6 +2909,8 @@ class APMasterControl:
                         "contracts": plan.contracts,
                         "trigger_type": plan.trigger_type,
                         "bootstrap_mode": bootstrap_mode,
+                        "threshold_trace": _threshold_trace,
+                        "threshold_config_hash": self.admission_threshold_config_hash,
                     },
                 )
         except Exception as e:
@@ -3521,6 +3635,19 @@ class APMasterControl:
         plan.max_position_usd with real premium. This version logs blocked and
         approved capital-utilization rows before returning.
         """
+        try:
+            _cf_signal = plan.to_signal_dict() if hasattr(plan, "to_signal_dict") else {}
+            _plan_meta = getattr(plan, "metadata", None) or {}
+            if isinstance(_plan_meta, dict) and _plan_meta.get("canonical_signal_id"):
+                _cf_signal["canonical_signal_id"] = _plan_meta.get("canonical_signal_id")
+            _cf_signal["signal_id"] = str(
+                getattr(plan, "signal_id", None) or _cf_signal.get("signal_id") or ""
+            )
+            self._counterfactual_ctx.signal = _cf_signal
+            self._counterfactual_ctx.client_id = str(client_id or "default")
+            self._counterfactual_ctx.execution_mode = str(getattr(plan, "mode", None) or self._current_mode() or "PAPER")
+        except Exception:
+            pass
         ticker = plan.ticker
         execution_mode = "live" if self._is_live_mode() else "paper"
 
@@ -3959,6 +4086,21 @@ class APMasterControl:
                 background=True,
                 require_db_health=True,
             )
+            if track_counterfactual_signal:
+                _cf_signal = getattr(self._counterfactual_ctx, "signal", None) or {
+                    "signal_id": signal_id,
+                    "ticker": ticker,
+                }
+                _cf_signal["signal_id"] = str(_cf_signal.get("signal_id") or signal_id)
+                track_counterfactual_signal(
+                    signal=_cf_signal,
+                    client_id=str(getattr(self._counterfactual_ctx, "client_id", client_id) or client_id),
+                    execution_mode=str(getattr(self._counterfactual_ctx, "execution_mode", self._current_mode()) or "PAPER"),
+                    block_stage=stage,
+                    block_reason=reason,
+                    reason_code=reason_code,
+                    source="block",
+                )
         except Exception:
             pass
         return ControlDecision(ok=False, stage=stage, reason=reason, reason_code=reason_code, signal_id=signal_id, ticker=ticker, client_id=client_id)

@@ -130,6 +130,42 @@ def install_master_control_metadata_guard() -> None:
             signal_id = _first(signal, "signal_id", "canonical_signal_id")
             ticker = _first(signal, "ticker", "symbol")
             reason = str(result.reason or "metadata_invalid")
+
+            # P0 (2026-07-03) — underlying quote hydration.
+            # Evidence: 301/301 zero_underlying rejections in the 5 days ending
+            # 2026-07-03 carried NO underlying key in the raw payload under ANY
+            # alias — the daily Strat scanner and all failed_dir_intraday
+            # scanners never emit one. Normalization (#250) and key-shadowing
+            # (#257) cannot recover a value that was never sent. Before
+            # rejecting, attempt ONE live quote fetch via the resolver the
+            # execution core registered; on success re-run the FULL validation.
+            # No resolver / failed quote / still-invalid → identical fail-closed
+            # rejection as before this change.
+            if reason == ZERO_UNDERLYING and ticker:
+                from ap.underlying_quote_hydration import try_hydrate_underlying
+
+                hydrated_price = try_hydrate_underlying(signal, ticker=ticker)
+                if hydrated_price is not None:
+                    revalidated = validate_entry_metadata(
+                        plan=signal,
+                        client_id=client_id,
+                        execution_mode=_runtime_mode(self),
+                    )
+                    if revalidated.ok:
+                        log.info(
+                            "[%s] ENTRY_METADATA_HYDRATED | client=%s signal=%s "
+                            "underlying=%.4f action=revalidated_and_passed",
+                            ticker or "?",
+                            client_id,
+                            signal_id,
+                            hydrated_price,
+                        )
+                        return original_evaluate(self, signal, *args, **kwargs)
+                    # Hydration succeeded but another field is still invalid —
+                    # surface the NEW reason (e.g. zero_trigger), not the stale one.
+                    result = revalidated
+                    reason = str(result.reason or "metadata_invalid")
+
             if reason == ZERO_UNDERLYING and should_allow_daily_handoff_without_underlying(signal):
                 _mark_daily_underlying_data_pending(signal, reason)
                 log.info(

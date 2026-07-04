@@ -145,6 +145,19 @@ REASON_CODES = {
     ],
 }
 
+MFE_MAE_COVERAGE_AUDIT_SQL = """
+SELECT
+  COUNT(*) AS closed_count,
+  COUNT(*) FILTER (
+    WHERE meta ? 'mfe_pct'
+       OR meta ? 'mae_pct'
+       OR meta ? 'mfe_mae_unavailable_reason'
+  ) AS covered_count
+FROM orders
+WHERE status IN ('FILLED','CLOSED','CANCELLED','EXPIRED')
+  AND created_ts >= now() - interval '30 days';
+"""
+
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -270,6 +283,65 @@ def emit_decision_event(
         run_with_retry(_insert)
     except Exception as e:
         log.debug("emit_decision_event DB insert failed (non-critical): %s", e)
+    return event
+
+
+def emit_exit_decision_stamp(payload: dict[str, Any]) -> dict[str, Any]:
+    """
+    Best-effort exit-decision audit stamp.
+
+    The payload is intentionally denormalized so one paper/live session can be
+    queried by position without depending on broker order side effects.
+    """
+    event = {
+        "event": "exit_decision",
+        "window": payload.get("window"),
+        "action": payload.get("action"),
+        "reason": payload.get("reason"),
+        "client_id": payload.get("client_id"),
+        "execution_mode": payload.get("execution_mode"),
+        "position_id": payload.get("position_id"),
+        "local_order_id": payload.get("local_order_id"),
+        "broker_order_id": payload.get("broker_order_id"),
+        "ticker": payload.get("ticker"),
+        "option_symbol": payload.get("option_symbol"),
+        "option_bid": payload.get("option_bid"),
+        "option_ask": payload.get("option_ask"),
+        "option_mid": payload.get("option_mid"),
+        "option_last": payload.get("option_last"),
+        "underlying_price": payload.get("underlying_price"),
+        "pnl_pct_at_decision": payload.get("pnl_pct_at_decision"),
+        "mfe_pct_so_far": payload.get("mfe_pct_so_far"),
+        "mae_pct_so_far": payload.get("mae_pct_so_far"),
+        "ladder_mode": payload.get("ladder_mode", "legacy"),
+        "created_at": payload.get("created_at") or utc_now_iso(),
+    }
+    log.info("EXIT_DECISION %s", json.dumps(event, sort_keys=True, default=str))
+    try:
+        emit_decision_event(
+            run_id=str(payload.get("run_id") or os.getenv("AP_RUN_ID", "unknown")),
+            candidate_id=str(
+                payload.get("candidate_id")
+                or payload.get("position_id")
+                or payload.get("option_symbol")
+                or "unknown"
+            ),
+            trade_id=payload.get("position_id"),
+            position_id=payload.get("position_id"),
+            client_id=str(payload.get("client_id") or "default"),
+            stage="exit_decision",
+            decision=str(payload.get("action") or "skipped").upper(),
+            reason_code=f"EXIT_DECISION_{payload.get('window')}_{payload.get('action')}".upper(),
+            explanation=payload.get("reason"),
+            symbol=payload.get("ticker"),
+            contract=payload.get("option_symbol"),
+            strategy_version=payload.get("strategy_version"),
+            git_commit=payload.get("git_commit"),
+            inputs=event,
+            context={"event": "exit_decision"},
+        )
+    except Exception as e:
+        log.debug("emit_exit_decision_stamp failed (non-critical): %s", e)
     return event
 
 

@@ -3787,6 +3787,33 @@ def create_app() -> Flask:
             response_body["active_runners"] = sorted(runners_all.keys())
         return jsonify(response_body), 200 if ok else (404 if explicit_target and len(handoff_results) == 0 else 503)
 
+    @app.route("/admin/flatline_check", methods=["GET", "POST"])
+    @require_hmac
+    def admin_flatline_check():
+        """P0 zero-submission trading-day alarm (ap/flatline_alarm.py).
+
+        Invoked by Render Cron at 10:30 + 13:00 ET. GET defaults to dry_run
+        (classify only, no Discord); POST with {"dry_run": false} sends alerts.
+        Response is the full classification for dashboard/forensic use.
+        """
+        try:
+            from ap.flatline_alarm import run_flatline_check
+
+            if request.method == "GET":
+                dry_run = request.args.get("dry_run", "true").lower() != "false"
+            else:
+                body = request.get_json(silent=True) or {}
+                dry_run = bool(body.get("dry_run", False))
+
+            result = run_flatline_check(dry_run=dry_run)
+            status = 200 if result.worst_state in (
+                "OK", "SKIPPED_NOT_TRADING_DAY", "SKIPPED_BEFORE_CHECKPOINT"
+            ) else 503
+            return jsonify(result.to_dict()), status
+        except Exception as exc:
+            log.exception("admin_flatline_check failed")
+            return jsonify({"error": str(exc), "worst_state": "CHECK_ERROR"}), 500
+
     @app.route("/admin/preopen_readiness", methods=["GET", "POST"])
     @require_hmac
     def admin_preopen_readiness():
@@ -4034,6 +4061,51 @@ def create_app() -> Flask:
             "ok": True,
             "results": results,
             "total_mismatches": total_mismatches,
+        })
+
+    @app.post("/admin/nightly_counterfactuals")
+    @require_hmac
+    def nightly_counterfactuals():
+        """Resolve blocked/watched counterfactual rows after market close."""
+        from client_runner import _active_runners, _registry_lock
+        from ap.counterfactual_tracker import resolve_pending_counterfactuals
+
+        results = {}
+        with _registry_lock:
+            runners = dict(_active_runners)
+
+        for email, runner in runners.items():
+            try:
+                broker = getattr(runner, "broker", None)
+                if broker is None:
+                    results[email] = {"ok": False, "error": "no_broker"}
+                    continue
+                mode = (
+                    getattr(getattr(runner, "master_control", None), "mode", None)
+                    or getattr(broker, "mode", None)
+                    or "paper"
+                )
+                summary = resolve_pending_counterfactuals(
+                    broker=broker,
+                    client_id=email,
+                    execution_mode=mode,
+                )
+                results[email] = {"ok": True, **summary}
+            except Exception as e:
+                results[email] = {"ok": False, "error": str(e)}
+                log.error("nightly_counterfactuals failed for %s: %s", email, e)
+
+        total_resolved = sum(int(r.get("resolved", 0)) for r in results.values() if isinstance(r, dict))
+        total_unknown = sum(int(r.get("unknown", 0)) for r in results.values() if isinstance(r, dict))
+        total_retry_later = sum(int(r.get("retry_later", 0)) for r in results.values() if isinstance(r, dict))
+        total_unavailable = sum(int(r.get("unavailable", 0)) for r in results.values() if isinstance(r, dict))
+        return jsonify({
+            "ok": True,
+            "results": results,
+            "total_resolved": total_resolved,
+            "total_unknown": total_unknown,
+            "total_retry_later": total_retry_later,
+            "total_unavailable": total_unavailable,
         })
 
     @app.get("/tradier/test")
@@ -4653,6 +4725,7 @@ def _run_daily_rollup(date_value, *, disk_export=True):
 
 def _run_weekly_rollup(*, iso_week=None, date_value=None, disk_export=True):
     from ap_operator_daily_folders import iso_week_string
+    from ap.counterfactual_tracker import build_weekly_counterfactual_rollup
     from ap_operator_weekly_rollup import (
         build_weekly_rollup, upsert_weekly_rollup,
     )
@@ -4667,6 +4740,9 @@ def _run_weekly_rollup(*, iso_week=None, date_value=None, disk_export=True):
     wrote = upsert_weekly_rollup(rollup)
     public = rollup.to_public()
     public["supabase_written"] = bool(wrote)
+    public["counterfactual_summary"] = build_weekly_counterfactual_rollup(
+        iso_week=target,
+    )
     return public
 
 
@@ -4824,6 +4900,58 @@ def cron_weekly_rollup():
         admin_log.error("cron/weekly-rollup failed: %s", e)
         return jsonify({"ok": False, "error": f"weekly rollup failed: {e}"}), 500
     return jsonify({"ok": True, **out})
+
+
+@app.post("/cron/chain-archive")
+@require_hmac
+def cron_chain_archive():
+    """Signed, flag-off daily option-chain archive capture.
+
+    Market data only: this route never calls broker submit/cancel/order APIs
+    and never writes orders, positions, proof_trades, or queue state.
+    """
+    from ap.chain_archiver import archive_daily_chains
+
+    if os.getenv("ENABLE_CHAIN_ARCHIVER", "false").strip().lower() != "true":
+        return jsonify({"ok": True, "enabled": False, "skipped": "chain_archiver_disabled"})
+
+    body = request.get_json(silent=True) or {}
+    try:
+        target_date = _parse_date_arg(body.get("date"))
+    except ValueError as e:
+        return jsonify({"ok": False, "error": f"bad date: {e}"}), 400
+
+    token = (
+        os.getenv("TRADIER_MARKET_DATA_TOKEN", "").strip()
+        or os.getenv("TRADIER_DATA_TOKEN", "").strip()
+        or os.getenv("TRADIER_ACCESS_TOKEN", "").strip()
+    )
+    if not token:
+        return jsonify({"ok": False, "error": "missing_market_data_token"}), 503
+
+    base_url = (
+        os.getenv("TRADIER_MARKET_DATA_BASE_URL", "").strip()
+        or os.getenv("TRADIER_DATA_BASE_URL", "").strip()
+        or "https://api.tradier.com"
+    )
+    if "sandbox" in base_url.lower():
+        base_url = "https://api.tradier.com"
+
+    broker = TradierBroker(TradierConfig(
+        base_url=base_url,
+        access_token=token,
+        account_id=os.getenv("TRADIER_ACCOUNT_ID", "chain-archive"),
+    ))
+    try:
+        result = archive_daily_chains(
+            broker=broker,
+            snapshot_date=target_date,
+            enabled=True,
+        )
+    except Exception as e:
+        log.error("cron/chain-archive failed: %s", e)
+        return jsonify({"ok": False, "error": f"chain archive failed: {e}"}), 500
+    return jsonify(result.to_dict())
 
 
 @app.get("/health")

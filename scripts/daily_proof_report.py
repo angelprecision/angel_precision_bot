@@ -132,6 +132,10 @@ class DailyProofReport:
     # ---- exits -------------------------------------------------------
     exit_orders_submitted: int
     exit_orders_filled: int
+    mfe_mae_closed_count: int
+    mfe_mae_covered_count: int
+    mfe_mae_coverage_pct: Optional[float]
+    mfe_mae_coverage_warning: Optional[str]
     # ---- P/L by client ----------------------------------------------
     realized_pnl_by_client: list[ClientDailyPnL]
     # ---- audit signals ----------------------------------------------
@@ -303,6 +307,44 @@ def _fetch_exit_orders(conn_fn, day_start, day_end, client_id=None) -> tuple[int
     return submitted, filled
 
 
+def _fetch_mfe_mae_coverage(conn_fn, day_start, day_end, client_id=None) -> dict[str, int]:
+    """Coverage audit for closed/terminal orders using orders.meta JSONB."""
+    params: list[Any] = [day_start, day_end]
+    where_extra = ""
+    if client_id:
+        where_extra = " AND client_id = %s"
+        params.append(client_id)
+
+    sql = f"""
+        SELECT
+          COUNT(*) AS closed_count,
+          COUNT(*) FILTER (
+            WHERE meta ? 'mfe_pct'
+               OR meta ? 'mae_pct'
+               OR meta ? 'mfe_mae_unavailable_reason'
+          ) AS covered_count
+        FROM orders
+        WHERE status IN ('FILLED','CLOSED','CANCELLED','CANCELED','EXPIRED')
+          AND created_ts >= %s
+          AND created_ts <  %s
+          {where_extra}
+    """
+    with conn_fn() as c:
+        c.execute(sql, tuple(params))
+        row = c.fetchone()
+        if not row:
+            return {"closed_count": 0, "covered_count": 0}
+        if hasattr(row, "get"):
+            return {
+                "closed_count": int(row.get("closed_count") or 0),
+                "covered_count": int(row.get("covered_count") or 0),
+            }
+        return {
+            "closed_count": int(row[0] or 0),
+            "covered_count": int(row[1] or 0),
+        }
+
+
 # ----------------------------------------------------------------------
 # Per-row projection
 # ----------------------------------------------------------------------
@@ -380,6 +422,7 @@ def _aggregate(
     audit_counts: dict[str, int],
     exit_submitted: int,
     exit_filled: int,
+    mfe_mae_coverage: dict[str, int],
     active_clients: list[dict],
     target_date: _date_type,
     mode_hint: Optional[str] = None,
@@ -438,6 +481,10 @@ def _aggregate(
     missed_move_canx  = audit_counts.get("MISSED_MOVE_ENTRY_CANCEL", 0)
     broker_circuit    = audit_counts.get("BROKER_ERROR_CIRCUIT_OPEN", 0)
     reconciler_stale  = audit_counts.get("RECONCILER_STALE", 0)
+    mfe_mae_closed = int(mfe_mae_coverage.get("closed_count") or 0)
+    mfe_mae_covered = int(mfe_mae_coverage.get("covered_count") or 0)
+    mfe_mae_pct = (100.0 * mfe_mae_covered / mfe_mae_closed) if mfe_mae_closed else None
+    mfe_mae_warning = None
 
     # --- problems / fixes ------------------------------------------
     errors: list[str] = []
@@ -469,6 +516,17 @@ def _aggregate(
             "dominant -> chase band or repeg logic; canceled_signal_dead "
             "dominant -> scanner is firing on bad setups."
         )
+    if mfe_mae_pct is not None and mfe_mae_pct < 95.0:
+        mfe_mae_warning = (
+            f"MFE/MAE coverage {mfe_mae_pct:.1f}% below 95% target "
+            f"({mfe_mae_covered}/{mfe_mae_closed} terminal orders covered)."
+        )
+        errors.append(mfe_mae_warning)
+        fixes_needed.append(
+            "Inspect orders.meta for missing mfe_pct/mae_pct/"
+            "mfe_mae_unavailable_reason and verify PositionQuoteMonitor ran "
+            "during the session."
+        )
 
     return DailyProofReport(
         date                       = target_date.isoformat(),
@@ -491,6 +549,10 @@ def _aggregate(
         reconciler_stale_events    = reconciler_stale,
         exit_orders_submitted      = exit_submitted,
         exit_orders_filled         = exit_filled,
+        mfe_mae_closed_count       = mfe_mae_closed,
+        mfe_mae_covered_count      = mfe_mae_covered,
+        mfe_mae_coverage_pct       = _round(mfe_mae_pct, 1),
+        mfe_mae_coverage_warning   = mfe_mae_warning,
         realized_pnl_by_client     = list(pnl_by_client.values()),
         bot_vs_broker_mismatch_count = 0,   # Filled in by reconciler MVP (Task 9, future)
         client_sync_issues         = [],
@@ -533,6 +595,10 @@ def render_text(rpt: DailyProofReport) -> str:
     add("EXITS")
     add(f"  exit_orders_submitted     : {rpt.exit_orders_submitted}")
     add(f"  exit_orders_filled        : {rpt.exit_orders_filled}    (broker-confirmed only)")
+    add(f"  mfe_mae_coverage_pct      : {rpt.mfe_mae_coverage_pct if rpt.mfe_mae_coverage_pct is not None else 'n/a'}")
+    add(f"  mfe_mae_covered_count     : {rpt.mfe_mae_covered_count}/{rpt.mfe_mae_closed_count}")
+    if rpt.mfe_mae_coverage_warning:
+        add(f"  ! {rpt.mfe_mae_coverage_warning}")
     add("")
     add("REALIZED P/L BY CLIENT (broker-confirmed exit fills only)")
     if not rpt.realized_pnl_by_client:
@@ -624,9 +690,13 @@ def generate_report(
         exit_sub, exit_fil = _fetch_exit_orders(conn_fn, day_start, day_end, client_id=client_id)
     except Exception:
         exit_sub, exit_fil = 0, 0
+    try:
+        mfe_mae_coverage = _fetch_mfe_mae_coverage(conn_fn, day_start, day_end, client_id=client_id)
+    except Exception:
+        mfe_mae_coverage = {"closed_count": 0, "covered_count": 0}
 
     rpt = _aggregate(
-        rows, audit_counts, exit_sub, exit_fil, active, target_date,
+        rows, audit_counts, exit_sub, exit_fil, mfe_mae_coverage, active, target_date,
         mode_hint=mode_hint,
     )
 
@@ -679,6 +749,8 @@ def main(argv: Optional[list[str]] = None) -> int:
                 "orders_filled":        rpt.orders_filled,
                 "fill_rate_pct":        rpt.fill_rate_pct,
                 "exit_orders_filled":   rpt.exit_orders_filled,
+                "mfe_mae_coverage_pct": rpt.mfe_mae_coverage_pct,
+                "mfe_mae_coverage_warning": rpt.mfe_mae_coverage_warning,
                 "errors":               rpt.errors,
             },
         )

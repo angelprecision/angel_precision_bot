@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import pathlib
+import queue
 import sys
 import time
 import types
@@ -242,6 +243,7 @@ def test_block_db_connect_failure_returns_immediately_and_preserves_decision(mon
     monkeypatch.setenv("ENABLE_TRADE_DOSSIER", "true")
 
     from ap_master_control import APMasterControl
+    monkeypatch.setattr("ap_master_control.track_counterfactual_signal", None, raising=False)
 
     mc = APMasterControl(mode="paper", client_id="client-a")
     mc._cache_trade_dossier_signal("sig-block-fast", {"signal_id": "sig-block-fast", "ticker": "SPY"})
@@ -286,8 +288,10 @@ def test_blocked_signal_gets_dossier_when_async_writer_succeeds(monkeypatch):
     writes = []
     monkeypatch.setenv("ENABLE_TRADE_DOSSIER", "true")
     from ap_master_control import APMasterControl
+    monkeypatch.setattr("ap_master_control.track_counterfactual_signal", None, raising=False)
 
     mc = APMasterControl(mode="paper", client_id="client-a")
+    mc._trade_dossier_queue = queue.Queue()
     mc._trade_dossier_db_healthy = True
     mc._trade_dossier_db_last_ok_ts = time.time()
     monkeypatch.setattr(mc, "_start_trade_dossier_worker", lambda: None)

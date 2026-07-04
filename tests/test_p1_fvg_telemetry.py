@@ -1,0 +1,433 @@
+# tests/test_p1_fvg_telemetry.py
+# P1: FVG telemetry activation (observe-only wiring of PR #221).
+#
+# Evidence base: 0 of 4,331 signals in the 30 days ending 2026-07-03 carried
+# any FVG output — #221 was merged dead code because production never supplied
+# candles to the score-profile path.
+#
+# Invariants:
+#   T1  Session-anchored aggregation: 15m→1h yields 09:30-anchored buckets
+#       (last bar 30min); 15m→4h yields [09:30–13:30)+[13:30–16:00] per day;
+#       OHLC composition correct (open=first, close=last, high=max, low=min).
+#   T2  A genuine 3-candle gap in aggregated 4h bars is detected by #221's
+#       detector through the full record path, and diagnostics persist compact.
+#   T3  Observe-only: record_fvg_telemetry never raises — broker None, fetch
+#       exploding, persist exploding, evaluate exploding all return status
+#       dicts, never exceptions.
+#   T4  TTL cache: two calls for the same ticker hit the network once.
+#   T5  Kill switch: FVG_TELEMETRY_ENABLED=0 → status "disabled", no network.
+#   T6  Persist merge: SQL merges under score_breakdown->'fvg' with composite
+#       (signal_id, client_email) predicate — verified via captured SQL.
+
+from __future__ import annotations
+
+import json
+import threading
+from typing import Any
+
+import pytest
+
+import ap.fvg_telemetry as ft
+from ap.fvg_telemetry import (
+    aggregate_bars,
+    record_fvg_telemetry,
+)
+
+
+@pytest.fixture(autouse=True)
+def _fresh_cache(monkeypatch):
+    monkeypatch.setattr(ft, "_candle_cache", {})
+    yield
+
+
+def _bar(t, o, h, l, c):
+    return {"time": t, "open": o, "high": h, "low": l, "close": c}
+
+
+def _session_15m(day: str, base: float, step: float = 0.0):
+    """26 RTH 15-min bars for one session, mildly trending by `step`."""
+    bars = []
+    px = base
+    minutes = 9 * 60 + 30
+    for i in range(26):
+        hh, mm = divmod(minutes + i * 15, 60)
+        t = f"{day}T{hh:02d}:{mm:02d}:00-04:00"
+        bars.append(_bar(t, px, px + 0.5, px - 0.5, px + step))
+        px += step
+    return bars
+
+
+# ── T1: aggregation geometry ─────────────────────────────────────────────────
+
+def test_t1_1h_aggregation_session_anchored():
+    bars = _session_15m("2026-07-01", 100.0, 0.1)
+    hourly = aggregate_bars(bars, bucket_minutes=60)
+    assert len(hourly) == 7                      # 6x60min + final 30min
+    assert hourly[0]["open"] == pytest.approx(100.0)
+    assert hourly[0]["close"] == pytest.approx(100.4)   # 4th bar's close
+    assert hourly[0]["high"] == pytest.approx(100.8)    # max of first 4 bars
+    assert hourly[-1]["close"] == pytest.approx(bars[-1]["close"])
+
+
+def test_t1b_4h_aggregation_two_buckets_per_session():
+    two_days = _session_15m("2026-07-01", 100.0) + _session_15m("2026-07-02", 101.0)
+    fourh = aggregate_bars(two_days, bucket_minutes=240)
+    assert len(fourh) == 4                       # 2 buckets x 2 sessions
+    assert fourh[0]["open"] == pytest.approx(100.0)
+    assert fourh[2]["open"] == pytest.approx(101.0)     # new session restarts bucket
+
+
+def test_t1c_garbage_timestamps_skipped():
+    bars = [_bar("not-a-time", 1, 2, 0, 1)] + _session_15m("2026-07-01", 100.0)
+    hourly = aggregate_bars(bars, bucket_minutes=60)
+    assert len(hourly) == 7
+
+
+# ── fake broker plumbing ─────────────────────────────────────────────────────
+
+class _FakeResp:
+    def __init__(self, items):
+        self._items = items
+    def raise_for_status(self):
+        return None
+    def json(self):
+        return {"series": {"data": {"item": self._items}}}
+
+
+class _FakeSession:
+    def __init__(self, items):
+        self.items = items
+        self.calls = 0
+    def get(self, *a, **k):
+        self.calls += 1
+        return _FakeResp(self.items)
+
+
+class _FakeBroker:
+    def __init__(self, items):
+        self.session = _FakeSession(items)
+
+
+def _gapped_session_items():
+    """Three sessions where session 2 gaps up hard: the 4h bars form a
+    bullish FVG (bar1.high < bar3.low)."""
+    s1 = _session_15m("2026-06-29", 100.0)          # 4h highs ~100.5
+    s2 = _session_15m("2026-06-30", 108.0)          # displacement day
+    s3 = _session_15m("2026-07-01", 116.0)          # 4h lows ~115.5 > 100.5
+    return s1 + s2 + s3
+
+
+# ── T2: end-to-end detection + compact persistence ───────────────────────────
+
+def test_t2_end_to_end_records_fvg(monkeypatch):
+    captured: dict[str, Any] = {}
+
+    def fake_persist(signal_id, client_email, compact):
+        captured.update(signal_id=signal_id, client_email=client_email, compact=compact)
+        return True
+
+    monkeypatch.setattr(ft, "_persist", fake_persist)
+    broker = _FakeBroker(_gapped_session_items())
+    payload = {
+        "ticker": "GOOGL", "side": "CALL", "direction": "CALL",
+        "entry_trigger": 116.2, "current_underlying": 116.0,
+        "target_underlying": 118.0,
+    }
+    out = record_fvg_telemetry(
+        signal_id="sig-1", client_email="tradefluencehq@gmail.com",
+        payload=payload, broker=broker,
+    )
+    assert out["status"] == "recorded"
+    compact = captured["compact"]
+    assert compact["v"] == 1
+    assert compact["bars"]["4h"] == 6            # 2 buckets x 3 sessions
+    tf4 = compact["timeframes"].get("4h") or {}
+    assert tf4.get("available") is True
+    assert (tf4.get("fvg_count") or 0) >= 1      # the engineered bullish gap
+    assert "computed_at" in compact
+    assert captured["client_email"] == "tradefluencehq@gmail.com"
+
+
+# ── T3: never raises into dispatch ───────────────────────────────────────────
+
+def test_t3a_broker_none_skips():
+    out = record_fvg_telemetry(signal_id="s", client_email="c", payload={"ticker": "SPY"}, broker=None)
+    assert out["status"] == "skipped"
+
+
+def test_t3b_fetch_explosion_is_skipped(monkeypatch):
+    class _Boom:
+        @property
+        def session(self):
+            raise RuntimeError("session exploded")
+    out = record_fvg_telemetry(signal_id="s", client_email="c", payload={"ticker": "SPY"}, broker=_Boom())
+    assert out["status"] in ("skipped", "error")
+
+
+def test_t3c_persist_explosion_reported_not_raised(monkeypatch):
+    monkeypatch.setattr(ft, "_persist", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("db")))
+    broker = _FakeBroker(_gapped_session_items())
+    out = record_fvg_telemetry(
+        signal_id="s", client_email="c",
+        payload={"ticker": "SPY", "side": "CALL", "entry_trigger": 116.0},
+        broker=broker,
+    )
+    assert out["status"] == "error"
+
+
+def test_t3d_missing_ticker_skips():
+    out = record_fvg_telemetry(signal_id="s", client_email="c", payload={}, broker=_FakeBroker([]))
+    assert out["status"] == "skipped"
+    assert out["reason"] == "missing_ticker_or_identity"
+
+
+# ── T4: TTL cache bounds market-data spend ───────────────────────────────────
+
+def test_t4_cache_one_network_call_per_ticker(monkeypatch):
+    monkeypatch.setattr(ft, "_persist", lambda *a, **k: True)
+    broker = _FakeBroker(_gapped_session_items())
+    payload = {"ticker": "GOOGL", "side": "CALL", "entry_trigger": 116.0}
+    record_fvg_telemetry(signal_id="a", client_email="c1", payload=payload, broker=broker)
+    record_fvg_telemetry(signal_id="b", client_email="c2", payload=payload, broker=broker)
+    assert broker.session.calls == 1
+
+
+# ── T5: kill switch ──────────────────────────────────────────────────────────
+
+def test_t5_kill_switch(monkeypatch):
+    monkeypatch.setenv("FVG_TELEMETRY_ENABLED", "0")
+    broker = _FakeBroker(_gapped_session_items())
+    out = record_fvg_telemetry(
+        signal_id="s", client_email="c",
+        payload={"ticker": "SPY", "side": "CALL"}, broker=broker,
+    )
+    assert out["status"] == "disabled"
+    assert broker.session.calls == 0
+
+
+# ── T7: #283 review amendments ───────────────────────────────────────────────
+
+def test_t7a_underlying_at_signal_bridged_no_entry_price_fallback(monkeypatch):
+    """Payload carrying ONLY underlying_at_signal (the ap_signals canonical
+    key, and what #277 hydration injects) must reach #221 as
+    current_underlying — never via the entry_price(premium) fallback."""
+    seen = {}
+    import ap.fair_value_gap as fvg_mod
+    real_evaluate = fvg_mod.evaluate_fvg_context   # capture BEFORE patching
+
+    def spy_evaluate(sig, ctx):
+        seen.update(sig=sig)
+        return real_evaluate(sig, ctx)
+
+    monkeypatch.setattr(fvg_mod, "evaluate_fvg_context", spy_evaluate)
+    monkeypatch.setattr(ft, "_persist", lambda *a, **k: True)
+
+    broker = _FakeBroker(_gapped_session_items())
+    payload = {
+        "ticker": "GOOGL", "side": "CALL",
+        "underlying_at_signal": 116.3,      # only this underlying key
+        "entry_price": 2.35,                # option premium — must NOT leak
+        "entry_trigger": 116.5,
+    }
+    out = record_fvg_telemetry(signal_id="s", client_email="c",
+                               payload=payload, broker=broker)
+    assert out["status"] == "recorded"
+    sig = seen["sig"]
+    assert sig["current_underlying"] == pytest.approx(116.3)
+    assert sig["underlying_price"] == pytest.approx(116.3)
+
+
+def test_t7b_no_underlying_anywhere_blocks_premium_fallback():
+    sig = ft.normalize_price_shape({"ticker": "SPY", "entry_price": 2.35})
+    assert "entry_price" not in sig            # fallback path severed
+    assert "current_underlying" not in sig
+
+
+def test_t7c_existing_underlying_never_overwritten():
+    sig = ft.normalize_price_shape({
+        "current_underlying": 448.10, "underlying_at_signal": 999.0,
+    })
+    assert sig["current_underlying"] == pytest.approx(448.10)
+
+
+def test_t7d_data_broker_preferred_for_timesales():
+    """Matches the quote-truth pattern: candle reads go to broker.data_broker
+    when attached, never the trading session."""
+    data_broker = _FakeBroker(_gapped_session_items())
+
+    class _TradingBroker:
+        def __init__(self, db):
+            self.session = _FakeSession(_gapped_session_items())
+            self.data_broker = db
+
+    trading = _TradingBroker(data_broker)
+    bars = ft.fetch_15m_bars("GOOGL", trading)
+    assert len(bars) > 0
+    assert data_broker.session.calls == 1
+    assert trading.session.calls == 0
+
+
+def test_t7e_async_never_blocks_dispatch(monkeypatch):
+    """The submit-critical-path guarantee: a fetch stuck at full timeout must
+    not delay the caller of the async entry point."""
+    import time as _t
+    started = threading.Event()
+
+    def slow_fetch(*a, **k):
+        started.set()
+        _t.sleep(3)
+        return []
+
+    monkeypatch.setattr(ft, "fetch_15m_bars", slow_fetch)
+    t0 = _t.monotonic()
+    ft.record_fvg_telemetry_async(
+        signal_id="s", client_email="c",
+        payload={"ticker": "SPY", "side": "CALL"},
+        broker=_FakeBroker([]),
+    )
+    elapsed = _t.monotonic() - t0
+    assert elapsed < 0.5, f"async spawn blocked dispatch for {elapsed:.2f}s"
+    assert started.wait(2.0)                   # thread genuinely running
+
+
+def test_t6_persist_sql_merges_under_fvg_key(monkeypatch):
+    captured = {}
+
+    class _Cur:
+        rowcount = 1
+        def execute(self, sql, params):
+            captured["sql"] = sql
+            captured["params"] = params
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            return False
+
+    import ap.db as db
+    monkeypatch.setattr(db, "conn", lambda: _Cur())
+    monkeypatch.setattr(db, "run_with_retry", lambda fn: fn())
+
+    ok = ft._persist("0f3542c0-244f-40c1-90af-bec8391e9bfa",
+                     "tradefluencehq@gmail.com", {"v": 1, "status": "unfilled"})
+    assert ok is True
+    sql = captured["sql"]
+    assert "score_breakdown" in sql
+    assert "jsonb_build_object('fvg'" in sql
+    assert "signal_id::text = %s" in sql
+    assert "client_email = %s" in sql
+    payload_json, sid, email = captured["params"]
+    assert json.loads(payload_json)["status"] == "unfilled"
+    assert sid == "0f3542c0-244f-40c1-90af-bec8391e9bfa"
+    assert email == "tradefluencehq@gmail.com"
+
+
+# ── T9: #283 round-2 amendment — singleflight + thread cap ───────────────────
+
+class _SlowSession:
+    """Session whose GET blocks long enough for a full herd to pile up."""
+    def __init__(self, items, delay=0.3):
+        self.items, self.delay = items, delay
+        self.calls = 0
+        self._lock = threading.Lock()
+    def get(self, *a, **k):
+        with self._lock:
+            self.calls += 1
+        import time as _t
+        _t.sleep(self.delay)
+        return _FakeResp(self.items)
+
+
+class _SlowBroker:
+    def __init__(self, items, delay=0.3):
+        self.session = _SlowSession(items, delay)
+
+
+def test_t9a_burst_20_same_ticker_one_network_call():
+    """The reviewer's exact scenario: 20 concurrent same-ticker fetches with
+    a slow leader must produce ONE timesales call, and every follower must
+    receive the leader's bars."""
+    broker = _SlowBroker(_gapped_session_items(), delay=0.3)
+    results = []
+    errors = []
+
+    def worker():
+        try:
+            bars = ft.fetch_15m_bars("GOOGL", broker)
+            results.append(len(bars))
+        except BaseException as e:   # invariant: never raises
+            errors.append(e)
+
+    threads = [threading.Thread(target=worker) for _ in range(20)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+
+    assert errors == []
+    assert broker.session.calls == 1, f"herd leaked: {broker.session.calls} calls"
+    assert len(results) == 20
+    assert all(n > 0 for n in results), "followers must get the leader's bars"
+
+
+def test_t9b_leader_failure_releases_followers_no_second_herd():
+    """A leader whose fetch raises must release followers promptly; followers
+    degrade to [] (no candles) instead of fetching again or hanging."""
+    class _BoomSession:
+        def __init__(self):
+            self.calls = 0
+        def get(self, *a, **k):
+            self.calls += 1
+            import time as _t
+            _t.sleep(0.2)
+            raise RuntimeError("tradier 500")
+
+    class _BoomBroker:
+        def __init__(self):
+            self.session = _BoomSession()
+
+    broker = _BoomBroker()
+    results = []
+    threads = [
+        threading.Thread(target=lambda: results.append(ft.fetch_15m_bars("SPY", broker)))
+        for _ in range(10)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=5)
+
+    assert broker.session.calls == 1          # no second herd after failure
+    assert all(r == [] for r in results)      # graceful degrade
+    with ft._inflight_lock:                   # marker cleared — ticker not bricked
+        assert "SPY" not in ft._inflight
+
+
+def test_t9c_cache_hit_after_singleflight_skips_network():
+    broker = _SlowBroker(_gapped_session_items(), delay=0.05)
+    ft.fetch_15m_bars("GOOGL", broker)
+    ft.fetch_15m_bars("GOOGL", broker)
+    assert broker.session.calls == 1
+
+
+def test_t9d_thread_cap_drops_visibly(monkeypatch):
+    """Beyond FVG_TELEMETRY_MAX_THREADS the async wrapper drops with a
+    counter, never blocks dispatch and never raises."""
+    gate = threading.BoundedSemaphore(2)
+    monkeypatch.setattr(ft, "_thread_gate", gate)
+    monkeypatch.setattr(ft, "_dropped_thread_cap", 0)
+    release = threading.Event()
+
+    def stuck(*a, **k):
+        release.wait(3)
+        return {"status": "skipped", "reason": "no_candles"}
+
+    monkeypatch.setattr(ft, "record_fvg_telemetry", stuck)
+    before = ft.dropped_by_thread_cap()
+    for i in range(5):
+        ft.record_fvg_telemetry_async(
+            signal_id=f"s{i}", client_email="c",
+            payload={"ticker": "SPY"}, broker=_FakeBroker([]),
+        )
+    dropped = ft.dropped_by_thread_cap() - before
+    release.set()
+    assert dropped == 3                       # 2 admitted, 3 dropped, all counted
