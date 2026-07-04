@@ -3787,6 +3787,33 @@ def create_app() -> Flask:
             response_body["active_runners"] = sorted(runners_all.keys())
         return jsonify(response_body), 200 if ok else (404 if explicit_target and len(handoff_results) == 0 else 503)
 
+    @app.route("/admin/flatline_check", methods=["GET", "POST"])
+    @require_hmac
+    def admin_flatline_check():
+        """P0 zero-submission trading-day alarm (ap/flatline_alarm.py).
+
+        Invoked by Render Cron at 10:30 + 13:00 ET. GET defaults to dry_run
+        (classify only, no Discord); POST with {"dry_run": false} sends alerts.
+        Response is the full classification for dashboard/forensic use.
+        """
+        try:
+            from ap.flatline_alarm import run_flatline_check
+
+            if request.method == "GET":
+                dry_run = request.args.get("dry_run", "true").lower() != "false"
+            else:
+                body = request.get_json(silent=True) or {}
+                dry_run = bool(body.get("dry_run", False))
+
+            result = run_flatline_check(dry_run=dry_run)
+            status = 200 if result.worst_state in (
+                "OK", "SKIPPED_NOT_TRADING_DAY", "SKIPPED_BEFORE_CHECKPOINT"
+            ) else 503
+            return jsonify(result.to_dict()), status
+        except Exception as exc:
+            log.exception("admin_flatline_check failed")
+            return jsonify({"error": str(exc), "worst_state": "CHECK_ERROR"}), 500
+
     @app.route("/admin/preopen_readiness", methods=["GET", "POST"])
     @require_hmac
     def admin_preopen_readiness():
