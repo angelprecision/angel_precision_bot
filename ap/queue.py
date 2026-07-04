@@ -1203,6 +1203,23 @@ def _dispatch(
         _mark_job(job_id, "ERROR", error=f"master_control_error: {e}")
         return
 
+    # ── FVG TELEMETRY (observe-only, PR #221 activation) ──────────────────
+    # Runs on EVERY dispatched signal regardless of decision outcome so the
+    # dataset covers accepted AND rejected populations (required for the
+    # path-risk hypothesis test). Reads market data only (TTL-cached per
+    # ticker); its ONLY write is score_breakdown->'fvg' on ap_signals.
+    # Never influences `decision`, never raises (module invariant 2).
+    try:
+        from ap.fvg_telemetry import record_fvg_telemetry
+        record_fvg_telemetry(
+            signal_id=signal_id,
+            client_email=client_id,
+            payload=payload_for_mc,
+            broker=broker,
+        )
+    except Exception as _fvg_exc:
+        log.warning("[%s] fvg_telemetry wiring error (non-fatal): %s", ticker, _fvg_exc)
+
     if not decision.ok:
         log.info(f"[{ticker}] BLOCKED | stage={decision.stage} reason={decision.reason}")
 
