@@ -702,6 +702,133 @@ class ClientRunner(threading.Thread):
             logger.error("[%s] Token decrypt failed: %s", self.email, exc)
             return None
 
+    def _run_live_preflight(self, broker) -> tuple[bool, str]:
+        """
+        P0 (PR #261): LIVE runners must not start half-configured.
+
+        Existing LIVE startup already fail-closes on: missing token, missing
+        account_id, missing DATABASE_URL, unsafe flags (legacy fill monitor,
+        immediate execution, non-fatal rowcount), default encryption key,
+        and incomplete risk profile. What it did NOT verify is that the
+        execution credentials actually WORK before startup calibrates any
+        capital gate to a fake default equity.
+
+        Checks (each fail-closed, first failure wins):
+          1. client email present
+          2. execution mode resolves to LIVE
+          3. account_id present
+          4. broker auth round-trip: get_account_equity() succeeds
+          5. account equity > 0 (a $0 live account is misconfiguration)
+          6. entry confirmation module importable/callable
+
+        Returns (ok, reason). Sets self.live_preflight_status. Kill switch:
+        LIVE_PREFLIGHT_ENABLED=0 (logged loudly; intended for emergencies
+        only). Paper runners never call this.
+        """
+        if os.getenv("LIVE_PREFLIGHT_ENABLED", "1").strip().lower() not in ("1", "true", "yes"):
+            logger.critical(
+                "[%s] LIVE_PREFLIGHT_DISABLED_BY_ENV — starting WITHOUT live "
+                "preflight verification. This must never be set in normal "
+                "operation.", self.email,
+            )
+            self.live_preflight_status = "disabled_by_env"
+            return True, "disabled_by_env"
+
+        def _fail(reason: str) -> tuple[bool, str]:
+            self.live_preflight_status = f"failed:{reason}"
+            logger.critical(
+                "[%s] LIVE_PREFLIGHT_FAILED reason=%s — refusing to start "
+                "half-configured LIVE runner", self.email, reason,
+            )
+            return False, reason
+
+        if not str(self.email or "").strip():
+            return _fail("missing_client_email")
+        if str(self.mode).strip().upper() != "LIVE":
+            return _fail(f"execution_mode_not_live:{self.mode}")
+        if not str(self.account_id or "").strip():
+            return _fail("missing_account_id")
+
+        # 4–5. Broker auth round-trip + funded account.
+        try:
+            if not hasattr(broker, "get_account_equity"):
+                return _fail("broker_missing_get_account_equity")
+            _equity = float(broker.get_account_equity() or 0.0)
+        except Exception as _exc:
+            return _fail(f"broker_auth_profile_unreadable:{type(_exc).__name__}")
+        if _equity <= 0:
+            return _fail("account_equity_not_positive")
+
+        # 6. Entry confirmation availability (deep default-required
+        #    enforcement lives in the execution core; here we prove the
+        #    module a LIVE submit depends on can actually load).
+        try:
+            from ap_entry_confirmation import check_entry_confirmation as _cec
+            if not callable(_cec):
+                return _fail("entry_confirmation_not_callable")
+        except Exception as _exc:
+            return _fail(f"entry_confirmation_unavailable:{type(_exc).__name__}")
+
+        self.live_preflight_status = "ok"
+        self.live_preflight_equity = float(_equity)
+        return True, "ok"
+
+    def _run_live_market_data_preflight(
+        self,
+        data_broker,
+        *,
+        data_broker_source: str,
+        data_base_url: str,
+        data_broker_is_dedicated: bool,
+    ) -> tuple[bool, str]:
+        """Verify LIVE market data using the resolved data transport."""
+        def _fail(reason: str) -> tuple[bool, str]:
+            self.live_preflight_status = f"failed:{reason}"
+            logger.critical(
+                "[%s] LIVE_PREFLIGHT_FAILED reason=%s — refusing to start "
+                "half-configured LIVE runner", self.email, reason,
+            )
+            return False, reason
+
+        try:
+            _q = data_broker.get_quote("SPY") or {}
+            _px = 0.0
+            for _k in ("last", "bid", "ask", "close", "prevclose"):
+                try:
+                    _v = float(_q.get(_k) or 0)
+                except (TypeError, ValueError):
+                    _v = 0.0
+                if _v > 0:
+                    _px = _v
+                    break
+        except Exception as _exc:
+            return _fail(f"market_data_unusable:{type(_exc).__name__}")
+        if _px <= 0:
+            return _fail("market_data_quote_not_positive")
+
+        self.live_preflight_status = "ok"
+        self.live_preflight_quote_spy = float(_px)
+        self.live_preflight_quote_source = str(data_broker_source or "")
+        self.live_preflight_quote_base_url = str(data_base_url or "")
+        self.live_preflight_quote_broker_mode = (
+            "dedicated_market_data_broker"
+            if data_broker_is_dedicated
+            else "execution_broker_fallback"
+        )
+        logger.critical(
+            "[%s] LIVE_PREFLIGHT_OK equity=%.2f quote_spy=%.2f account_id=%s "
+            "data_quote_source=%s data_quote_broker_mode=%s data_base_url=%s "
+            "confirmation_module=present",
+            self.email,
+            float(getattr(self, "live_preflight_equity", 0.0) or 0.0),
+            self.live_preflight_quote_spy,
+            self.account_id,
+            self.live_preflight_quote_source,
+            self.live_preflight_quote_broker_mode,
+            self.live_preflight_quote_base_url,
+        )
+        return True, "ok"
+
     def _mark_failed(self, reason: str):
         reason = str(reason or "failed")
         self.failed.set()
@@ -1177,6 +1304,10 @@ class ClientRunner(threading.Thread):
             "client_id": self.email,
             "account_id": self.account_id,
             "mode": self.mode,
+            "live_preflight_status": getattr(self, "live_preflight_status", "not_applicable"),
+            "live_preflight_quote_source": getattr(self, "live_preflight_quote_source", ""),
+            "live_preflight_quote_broker_mode": getattr(self, "live_preflight_quote_broker_mode", ""),
+            "live_preflight_quote_base_url": getattr(self, "live_preflight_quote_base_url", ""),
             "base_url": self.base_url,
             "core_present": self.core is not None,
             "exit_engine_present": exit_eng is not None,
@@ -1778,6 +1909,16 @@ class ClientRunner(threading.Thread):
         broker = TradierBroker(broker_cfg)
         self.broker = broker
 
+        # P0 (PR #261): LIVE preflight — credentials and market data must
+        # actually WORK before any thread, gate, or capital calibration
+        # runs. Paper runners skip this entirely (they fail-close on their
+        # own market-data token requirement at transport split).
+        if str(self.mode).strip().upper() == "LIVE":
+            _pf_ok, _pf_reason = self._run_live_preflight(broker)
+            if not _pf_ok:
+                self._mark_failed(f"LIVE_PREFLIGHT_FAILED:{_pf_reason}")
+                return
+
         self._clear_old_phantom_orders()
         # BUG-3 FIX: guard both URL and key — an empty service key produces a
         # confusing auth error inside Supabase rather than a clear None here.
@@ -1845,12 +1986,24 @@ class ClientRunner(threading.Thread):
                     equity = float(_live_eq)
                     logger.info("[%s] Startup equity from Tradier: $%.2f", self.email, equity)
                 else:
+                    # P0 (PR #261): in LIVE, zero equity is a fatal
+                    # misconfiguration — capital gates must never calibrate
+                    # to a fake default on a live account.
+                    if str(self.mode).strip().upper() == "LIVE":
+                        self._mark_failed("LIVE_PREFLIGHT_FAILED:equity_zero_at_calibration")
+                        return
                     equity = _default_equity
                     logger.warning("[%s] Tradier returned zero equity — using default $%.2f", self.email, equity)
             else:
+                if str(self.mode).strip().upper() == "LIVE":
+                    self._mark_failed("LIVE_PREFLIGHT_FAILED:broker_missing_get_account_equity")
+                    return
                 equity = _default_equity
                 logger.warning("[%s] Broker has no get_account_equity — using default $%.2f", self.email, equity)
         except Exception as _eq_startup_exc:
+            if str(self.mode).strip().upper() == "LIVE":
+                self._mark_failed(f"LIVE_PREFLIGHT_FAILED:equity_fetch_failed:{type(_eq_startup_exc).__name__}")
+                return
             equity = _default_equity
             logger.warning("[%s] Equity fetch at startup failed: %s — using default $%.2f", self.email, _eq_startup_exc, equity)
         max_trades = int(client_cfg.get("max_trades_per_day", os.getenv("MAX_TRADES_TODAY", "10")) or 10)
@@ -2045,6 +2198,17 @@ class ClientRunner(threading.Thread):
                 self.email, data_base_url, data_token_source,
                 data_broker_is_dedicated,
             )
+
+        if str(self.mode).strip().upper() == "LIVE" and getattr(self, "live_preflight_status", "") != "disabled_by_env":
+            _md_ok, _md_reason = self._run_live_market_data_preflight(
+                data_broker,
+                data_broker_source=data_token_source,
+                data_base_url=data_base_url,
+                data_broker_is_dedicated=data_broker_is_dedicated,
+            )
+            if not _md_ok:
+                self._mark_failed(f"LIVE_PREFLIGHT_FAILED:{_md_reason}")
+                return
 
         self.data_broker = data_broker
         self.databroker = data_broker
