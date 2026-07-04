@@ -4826,6 +4826,58 @@ def cron_weekly_rollup():
     return jsonify({"ok": True, **out})
 
 
+@app.post("/cron/chain-archive")
+@require_hmac
+def cron_chain_archive():
+    """Signed, flag-off daily option-chain archive capture.
+
+    Market data only: this route never calls broker submit/cancel/order APIs
+    and never writes orders, positions, proof_trades, or queue state.
+    """
+    from ap.chain_archiver import archive_daily_chains
+
+    if os.getenv("ENABLE_CHAIN_ARCHIVER", "false").strip().lower() != "true":
+        return jsonify({"ok": True, "enabled": False, "skipped": "chain_archiver_disabled"})
+
+    body = request.get_json(silent=True) or {}
+    try:
+        target_date = _parse_date_arg(body.get("date"))
+    except ValueError as e:
+        return jsonify({"ok": False, "error": f"bad date: {e}"}), 400
+
+    token = (
+        os.getenv("TRADIER_MARKET_DATA_TOKEN", "").strip()
+        or os.getenv("TRADIER_DATA_TOKEN", "").strip()
+        or os.getenv("TRADIER_ACCESS_TOKEN", "").strip()
+    )
+    if not token:
+        return jsonify({"ok": False, "error": "missing_market_data_token"}), 503
+
+    base_url = (
+        os.getenv("TRADIER_MARKET_DATA_BASE_URL", "").strip()
+        or os.getenv("TRADIER_DATA_BASE_URL", "").strip()
+        or "https://api.tradier.com"
+    )
+    if "sandbox" in base_url.lower():
+        base_url = "https://api.tradier.com"
+
+    broker = TradierBroker(TradierConfig(
+        base_url=base_url,
+        access_token=token,
+        account_id=os.getenv("TRADIER_ACCOUNT_ID", "chain-archive"),
+    ))
+    try:
+        result = archive_daily_chains(
+            broker=broker,
+            snapshot_date=target_date,
+            enabled=True,
+        )
+    except Exception as e:
+        log.error("cron/chain-archive failed: %s", e)
+        return jsonify({"ok": False, "error": f"chain archive failed: {e}"}), 500
+    return jsonify(result.to_dict())
+
+
 @app.get("/health")
 def health_basic():
     """Basic liveness check — no auth required."""

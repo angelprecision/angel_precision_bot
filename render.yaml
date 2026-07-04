@@ -148,3 +148,27 @@ services:
       - { key: MORNING_JOB_CLIENT_ID, value: jasoncosby1@gmail.com }
       - { key: BOT_URL, sync: false }
       - { key: SIGNING_SECRET, sync: false }
+
+  # -- 15:50 ET -- option chain archive capture (flag-off by default) -----
+  - type: cron
+    name: ap-chain-archive-close-edt
+    runtime: python
+    schedule: "50 19 * * 1-5"   # 19:50 UTC = 15:50 EDT
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python -m ap.chain_archiver"
+    envVars:
+      - { key: TZ, value: America/New_York }
+      - { key: ENABLE_CHAIN_ARCHIVER, value: "false" }
+      - { key: BOT_URL, sync: false }
+      - { key: SIGNING_SECRET, sync: false }
+  - type: cron
+    name: ap-chain-archive-close-est
+    runtime: python
+    schedule: "50 20 * * 1-5"   # 20:50 UTC = 15:50 EST
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python -m ap.chain_archiver"
+    envVars:
+      - { key: TZ, value: America/New_York }
+      - { key: ENABLE_CHAIN_ARCHIVER, value: "false" }
+      - { key: BOT_URL, sync: false }
+      - { key: SIGNING_SECRET, sync: false }
