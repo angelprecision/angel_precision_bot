@@ -41,6 +41,39 @@ except ImportError:
     _record_intel_outcome = None
 
 log = logging.getLogger("ap.execution_core")
+
+_VALID_EXECUTION_MODES = frozenset({"paper", "live"})
+
+
+def _normalize_execution_mode(value) -> str | None:
+    mode = str(value or "").strip().lower()
+    return mode if mode in _VALID_EXECUTION_MODES else None
+
+
+def _resolve_submit_execution_mode(approved_plan, signal, runtime_mode, paper_flag) -> str | None:
+    explicit_values = [
+        getattr(approved_plan, "execution_mode", None),
+        getattr(approved_plan, "mode", None),
+    ]
+    if isinstance(signal, dict):
+        explicit_values.extend([
+            signal.get("execution_mode"),
+            signal.get("mode"),
+        ])
+    for raw_value in explicit_values:
+        if not str(raw_value or "").strip():
+            continue
+        normalized = _normalize_execution_mode(raw_value)
+        if normalized is None:
+            return None
+        return normalized
+
+    runtime_normalized = _normalize_execution_mode(runtime_mode)
+    if runtime_normalized is not None:
+        return runtime_normalized
+    if isinstance(paper_flag, bool):
+        return "paper" if paper_flag else "live"
+    return None
 ET  = ZoneInfo("America/New_York")
 _OCC_CONTRACT_RE = re.compile(r"\d{6}[CP]\d{5,8}")
 
@@ -3241,6 +3274,20 @@ class APExecutionCore:
                 )
             except Exception:
                 pass
+            return
+
+        _submit_execution_mode = _resolve_submit_execution_mode(
+            approved_plan,
+            sig,
+            getattr(self, "mode", None),
+            getattr(self, "paper", None),
+        )
+        if _submit_execution_mode is None:
+            _terminalize_breach_failure(
+                "metadata_invalid:unknown_execution_mode",
+                cleanup_action="expire",
+                funnel_key="entry_metadata_blocked",
+            )
             return
 
         # ── P0: Deferred materialization pre-submit invariant ──────────────────

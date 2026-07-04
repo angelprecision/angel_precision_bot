@@ -117,6 +117,7 @@ RECONCILE_INTERVAL_SEC = int(os.getenv("RECONCILE_INTERVAL_SEC", "60"))  # was 1
 # Rapid-fire callers (watchdogs, fill monitors, the reconciler loop itself) receive
 # the cached last summary and skip the full broker/DB/OSM pass.
 RUN_ONCE_MIN_INTERVAL_SEC = float(os.getenv("RECONCILER_RUN_ONCE_MIN_INTERVAL_SEC", "3.0"))
+_VALID_EXECUTION_MODES = frozenset({"paper", "live"})
 
 # PR fix/health-and-reconciler-startup-noise:
 # Grace window after reconciler thread start during which a missing
@@ -251,6 +252,11 @@ def _empty_summary(client_id: str, run: int = 0) -> dict:
     }
 
 
+def _normalize_execution_mode(value: object) -> str | None:
+    mode = str(value or "").strip().lower()
+    return mode if mode in _VALID_EXECUTION_MODES else None
+
+
 class APBrokerReconciler:
     """
     Continuously reconciles broker truth against DB state.
@@ -302,6 +308,32 @@ class APBrokerReconciler:
         self._health_name = f"ap_reconciler:{self.client_id}"
         self._register_health()
         # ─────────────────────────────────────────────────────────────────────
+
+    def _record_unknown_execution_mode(self, summary: dict, ref: str) -> None:
+        summary.setdefault("errors", []).append("reconciler_unknown_execution_mode")
+        summary["orders_alerted"] = int(summary.get("orders_alerted", 0)) + 1
+        log.error("[%s] RECONCILER_BLOCKED unknown execution_mode ref=%s", self.client_id, ref)
+
+    def _write_order_last_error(self, local_id: str, reason: str) -> None:
+        if not local_id:
+            return
+        try:
+            from ap.db import conn, run_with_retry
+
+            def _upd():
+                with conn() as c:
+                    c.execute(
+                        """
+                        UPDATE orders
+                        SET last_error=%s, updated_ts=NOW()
+                        WHERE client_id=%s AND local_order_id=%s
+                        """,
+                        (reason, self.client_id, local_id),
+                    )
+
+            run_with_retry(_upd)
+        except Exception as exc:
+            log.debug("[%s] reconciler last_error update failed for %s: %s", self.client_id, local_id, exc)
 
     # ──────────────────────────────────────────────────────────────────────────
     # Lifecycle
@@ -1045,6 +1077,11 @@ class APBrokerReconciler:
             broker_oid = order.get("broker_order_id")
             db_status  = (order.get("status") or "").upper()
             contract   = order.get("contract") or order.get("symbol") or "?"
+
+            if _normalize_execution_mode(order.get("execution_mode")) is None:
+                self._write_order_last_error(str(local_id or ""), "reconciler_unknown_execution_mode")
+                self._record_unknown_execution_mode(summary, str(local_id or contract or "?"))
+                continue
 
             if not broker_oid or broker_oid in ("N/A", "PENDING", ""):
                 self._handle_order_without_broker_id(order, summary)
@@ -2832,6 +2869,12 @@ class APBrokerReconciler:
             underlying = self._norm_underlying(pos.get("underlying") or pos.get("ticker") or self._norm_underlying(contract))
             db_qty     = int(pos.get("qty") or pos.get("quantity") or 0)
             entry_px   = float(pos.get("avg_fill") or pos.get("entry_price") or 0.0)
+
+            if _normalize_execution_mode(pos.get("execution_mode")) is None:
+                summary.setdefault("errors", []).append("reconciler_unknown_execution_mode")
+                summary["positions_alerted"] = int(summary.get("positions_alerted", 0)) + 1
+                log.error("[%s] RECONCILER_POSITION_BLOCKED unknown execution_mode pos=%s contract=%s", self.client_id, pos_id, contract)
+                continue
 
             if contract:
                 db_contracts.add(contract)

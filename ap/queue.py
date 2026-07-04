@@ -264,6 +264,7 @@ _MANUAL_RESTART_GUARD_BYPASS_ERRORS = frozenset({
 })
 
 _PAPER_OVERNIGHT_REEVAL_ONLY_ERROR = "after_hours_deferred:awaiting_overnight_reeval"
+_VALID_EXECUTION_MODES = frozenset({"PAPER", "LIVE"})
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -330,6 +331,21 @@ def _normalize_queue_side(payload: dict | None) -> tuple[str | None, str | None]
     if side in {"CALL", "PUT"}:
         return side, None
     return None, f"invalid_or_missing_side:{raw!r}"
+
+
+def _normalize_execution_mode(value: Any) -> str | None:
+    mode = str(value or "").strip().upper()
+    return mode if mode in _VALID_EXECUTION_MODES else None
+
+
+def _payload_execution_mode_value(payload: dict | None) -> Any:
+    if not isinstance(payload, dict):
+        return None
+    if str(payload.get("execution_mode") or "").strip():
+        return payload.get("execution_mode")
+    if str(payload.get("mode") or "").strip():
+        return payload.get("mode")
+    return None
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -901,8 +917,105 @@ def _dispatch(
     # the broker immediately on every dispatched signal.  Marked ERROR (not
     # REJECTED) because this is an operator configuration error, not a
     # signal-level rejection.
-    _pre_execution_mode = str(getattr(master_control, "mode", "PAPER") or "PAPER").upper()
-    if _pre_execution_mode == "LIVE" and bool(ALLOW_IMMEDIATE_EXECUTION):
+    runtime_mode_for_dispatch = _normalize_execution_mode(getattr(master_control, "mode", None))
+    if runtime_mode_for_dispatch is None:
+        _clean_payload = dict(payload or {})
+        raw_mode = getattr(master_control, "mode", None)
+        _clean_payload["execution_mode_validation_error"] = "metadata_invalid:unknown_execution_mode"
+        log.error(
+            "[%s] QUEUE_RUNTIME_EXECUTION_MODE_REJECTED signal_id=%s client_id=%s raw_mode=%r",
+            ticker, signal_id, client_id, raw_mode,
+        )
+        _mark_job(
+            job_id,
+            "REJECTED",
+            result={
+                "stage": "execution_mode_validation",
+                "reason": "metadata_invalid:unknown_execution_mode",
+                "reason_code": "metadata_invalid:unknown_execution_mode",
+            },
+            error="metadata_invalid:unknown_execution_mode",
+        )
+        _log_rejection_to_db(
+            signal_id=signal_id,
+            client_id=client_id,
+            ticker=ticker,
+            side=_clean_payload.get("side", "") or "",
+            score=_safe_float(_clean_payload.get("score") or 0),
+            stage="execution_mode_validation",
+            reason_code="metadata_invalid:unknown_execution_mode",
+            human_reason=f"unknown execution_mode: {raw_mode!r}",
+            payload=_clean_payload,
+        )
+        return
+
+    payload_execution_mode_raw = _payload_execution_mode_value(payload)
+    payload_execution_mode = _normalize_execution_mode(payload_execution_mode_raw)
+    if str(payload_execution_mode_raw or "").strip() and payload_execution_mode is None:
+        _clean_payload = dict(payload or {})
+        _clean_payload["execution_mode_validation_error"] = "metadata_invalid:unknown_execution_mode"
+        log.error(
+            "[%s] QUEUE_PAYLOAD_EXECUTION_MODE_REJECTED signal_id=%s client_id=%s raw_mode=%r runtime_mode=%s",
+            ticker, signal_id, client_id, payload_execution_mode_raw, runtime_mode_for_dispatch,
+        )
+        _mark_job(
+            job_id,
+            "REJECTED",
+            result={
+                "stage": "execution_mode_validation",
+                "reason": "metadata_invalid:unknown_execution_mode",
+                "reason_code": "metadata_invalid:unknown_execution_mode",
+            },
+            error="metadata_invalid:unknown_execution_mode",
+        )
+        _log_rejection_to_db(
+            signal_id=signal_id,
+            client_id=client_id,
+            ticker=ticker,
+            side=_clean_payload.get("side", "") or "",
+            score=_safe_float(_clean_payload.get("score") or 0),
+            stage="execution_mode_validation",
+            reason_code="metadata_invalid:unknown_execution_mode",
+            human_reason=f"unknown payload execution_mode: {payload_execution_mode_raw!r}",
+            payload=_clean_payload,
+        )
+        return
+    if payload_execution_mode is not None and payload_execution_mode != runtime_mode_for_dispatch:
+        _clean_payload = dict(payload or {})
+        _clean_payload["execution_mode_validation_error"] = "metadata_invalid:execution_mode_mismatch"
+        log.error(
+            "[%s] QUEUE_EXECUTION_MODE_MISMATCH signal_id=%s client_id=%s payload_mode=%s runtime_mode=%s",
+            ticker, signal_id, client_id, payload_execution_mode, runtime_mode_for_dispatch,
+        )
+        _mark_job(
+            job_id,
+            "REJECTED",
+            result={
+                "stage": "execution_mode_validation",
+                "reason": "metadata_invalid:execution_mode_mismatch",
+                "reason_code": "metadata_invalid:execution_mode_mismatch",
+            },
+            error="metadata_invalid:execution_mode_mismatch",
+        )
+        _log_rejection_to_db(
+            signal_id=signal_id,
+            client_id=client_id,
+            ticker=ticker,
+            side=_clean_payload.get("side", "") or "",
+            score=_safe_float(_clean_payload.get("score") or 0),
+            stage="execution_mode_validation",
+            reason_code="metadata_invalid:execution_mode_mismatch",
+            human_reason=(
+                f"payload execution_mode {payload_execution_mode!r} "
+                f"does not match runtime mode {runtime_mode_for_dispatch!r}"
+            ),
+            payload=_clean_payload,
+        )
+        return
+    if isinstance(payload, dict) and not str(payload_execution_mode_raw or "").strip():
+        payload["execution_mode"] = runtime_mode_for_dispatch.lower()
+
+    if runtime_mode_for_dispatch == "LIVE" and bool(ALLOW_IMMEDIATE_EXECUTION):
         log.critical("[%s] LIVE_FATAL_IMMEDIATE_EXECUTION_ENABLED signal_id=%s", ticker, signal_id)
         _mark_job(job_id, "ERROR", error="LIVE_FATAL_IMMEDIATE_EXECUTION_ENABLED")
         return
@@ -978,7 +1091,7 @@ def _dispatch(
     # master_control is the sole authority for LIVE vs PAPER mode in _dispatch.
     # worker_loop's live_mode parameter is only used for the mode label log and
     # legacy-fallback guard; it does not affect _dispatch fail-closed logic.
-    _execution_mode = str(getattr(master_control, "mode", "PAPER")).upper()
+    _execution_mode = runtime_mode_for_dispatch
     live_mode: bool = _execution_mode == "LIVE"
 
     if _paper_overnight_reeval_only_enabled(payload=payload, execution_mode=_execution_mode):

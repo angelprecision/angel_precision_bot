@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 import types
 from contextlib import contextmanager
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 
@@ -37,7 +38,7 @@ def _make_recovery():
         broker=MagicMock(),
         osm=MagicMock(),
         pm=MagicMock(),
-        master_control=MagicMock(),
+        master_control=SimpleNamespace(mode="paper"),
     )
     return rec, ap_recovery
 

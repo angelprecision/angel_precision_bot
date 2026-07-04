@@ -507,6 +507,9 @@ def enqueue_watching_signals_to_trade_queue(
     if not cid:
         result["errors"].append("client_id_required")
         return result
+    if mode not in {"paper", "live"}:
+        result["errors"].append("metadata_invalid:unknown_execution_mode")
+        return result
 
     # ── Step 1: Verify paper credentials from members table ───────────────────
     # We verify credentials exist but DO NOT store them in trade_queue.payload.

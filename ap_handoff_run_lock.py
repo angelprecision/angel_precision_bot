@@ -57,6 +57,12 @@ log = logging.getLogger("ap.handoff_run_lock")
 # protects against a crashed run blocking the window forever. 10 minutes is
 # well beyond the longest morning job (handoff audit over ~20 rows).
 STALE_LOCK_SECONDS = 600
+_VALID_EXECUTION_MODES = frozenset({"paper", "live"})
+
+
+def _normalize_execution_mode(value: str | None) -> str | None:
+    mode = str(value or "").strip().lower()
+    return mode if mode in _VALID_EXECUTION_MODES else None
 
 
 def _today_et() -> date:
@@ -102,6 +108,15 @@ def try_acquire_run_lock(
     second UPDATE that only succeeds if the existing row is still stale —
     itself race-safe because the WHERE clause re-checks staleness atomically.
     """
+    normalized_mode = _normalize_execution_mode(execution_mode)
+    if normalized_mode is None:
+        return {
+            "acquired": False,
+            "run_key": run_key,
+            "owner_token": None,
+            "reason": "metadata_invalid:unknown_execution_mode",
+        }
+
     from ap.db import conn, run_with_retry
 
     td = trade_date or _today_et()
@@ -118,7 +133,7 @@ def try_acquire_run_lock(
                 VALUES (%s, %s, %s, %s, %s, %s, 'running', NOW(), %s)
                 ON CONFLICT (run_key) DO NOTHING
                 """,
-                (run_key, td, job_name, execution_mode, client_scope, triggered_by, owner_token),
+                (run_key, td, job_name, normalized_mode, client_scope, triggered_by, owner_token),
             )
             if c.rowcount == 1:
                 return {
