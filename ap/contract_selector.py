@@ -309,43 +309,111 @@ def _extract_abs_delta(opt: dict) -> tuple[Optional[float], str]:
     return d, "ok"
 
 
+def _extract_iv(opt: dict) -> Optional[float]:
+    """Best-effort IV extraction for observability payloads."""
+    for _key in ("iv", "implied_volatility", "impliedVolatility"):
+        _val = opt.get(_key)
+        if _val not in (None, ""):
+            try:
+                return round(float(_val), 4)
+            except Exception:
+                pass
+    greeks = opt.get("greeks")
+    if isinstance(greeks, dict):
+        for _key in ("iv", "smv_vol", "mid_iv"):
+            _val = greeks.get(_key)
+            if _val not in (None, ""):
+                try:
+                    return round(float(_val), 4)
+                except Exception:
+                    pass
+    return None
+
+
+def _extract_option_type(opt: dict) -> str:
+    """Return canonical CALL/PUT label for observability payloads."""
+    raw = (
+        opt.get("option_type")
+        or opt.get("type")
+        or opt.get("put_call")
+        or opt.get("right")
+        or ""
+    )
+    label = str(raw).strip().upper()
+    if label in {"C", "CALL"}:
+        return "CALL"
+    if label in {"P", "PUT"}:
+        return "PUT"
+    return ""
+
+
+def _round_or_none(value, digits=4):
+    try:
+        if value is None:
+            return None
+        return round(float(value), digits)
+    except Exception:
+        return None
+
+
+def _build_candidate_row(
+    opt: dict,
+    *,
+    rank_score: Optional[float],
+    rejected_at_step: Optional[str],
+    rejection_reason: Optional[str],
+    selected: bool,
+) -> dict:
+    bid = _safe_float(opt.get("bid"))
+    ask = _safe_float(opt.get("ask"))
+    mid = (bid + ask) / 2 if (bid > 0 and ask > 0) else _safe_float(opt.get("mid"))
+    spread_pct = ((ask - bid) / mid) if mid > 0 else None
+    premium = mid * 100 if mid > 0 else None
+    abs_delta, _ = _extract_abs_delta(opt)
+    return {
+        "symbol": opt.get("symbol", "?"),
+        "strike": _round_or_none(opt.get("strike")),
+        "expiration": opt.get("expiration_date") or opt.get("expiration") or "",
+        "option_type": _extract_option_type(opt),
+        "delta": _round_or_none(abs_delta),
+        "iv": _extract_iv(opt),
+        "bid": _round_or_none(bid),
+        "ask": _round_or_none(ask),
+        "mid": _round_or_none(mid),
+        "spread_pct": _round_or_none(spread_pct),
+        "open_interest": int(_safe_float(opt.get("open_interest"))),
+        "volume": int(_safe_float(opt.get("volume"))),
+        "premium": _round_or_none(premium, 2),
+        "rank_score": _round_or_none(rank_score),
+        "rejected_at_step": rejected_at_step,
+        "rejection_reason": rejection_reason,
+        "selected": bool(selected),
+    }
+
+
 def _build_candidate_audit(scored, underlying_price, selected_symbol, selected_reason, rejections, top_n=3):
-    """Item 3 — build the persisted selector candidate audit (EVIDENCE ONLY).
+    """Build compact selector candidate persistence payload (observability only).
 
     scored: list of (rank_score, opt_dict) already sorted best-first.
     Returns a dict safe to drop into orders.meta. Never raises.
     """
     candidates = []
+    selected_winner = None
     try:
         for _rank, (_s, _c) in enumerate(scored[:top_n]):
-            bid = _safe_float(_c.get("bid"))
-            ask = _safe_float(_c.get("ask"))
-            mid = (bid + ask) / 2 if (bid > 0 and ask > 0) else _safe_float(_c.get("mid"))
-            last = _safe_float(_c.get("last"))
-            spread_pct = ((ask - bid) / mid) if mid > 0 else None
-            abs_delta, delta_reason = _extract_abs_delta(_c)
-            strike = _safe_float(_c.get("strike"))
-            up = _safe_float(underlying_price)
-            moneyness_pct = ((strike - up) / up) if up > 0 else None
-            candidates.append({
-                "rank":                _rank + 1,
-                "contract":            _c.get("symbol", "?"),
-                "strike":              strike,
-                "expiration":          _c.get("expiration_date") or _c.get("expiration") or "",
-                "dte":                 _c.get("dte"),
-                "bid":                 round(bid, 4),
-                "ask":                 round(ask, 4),
-                "mid":                 round(mid, 4),
-                "last":                round(last, 4),
-                "spread_pct":          round(spread_pct, 4) if spread_pct is not None else None,
-                "delta":               round(abs_delta, 4) if abs_delta is not None else None,
-                "delta_reason":        delta_reason,
-                "moneyness_pct":       round(moneyness_pct, 4) if moneyness_pct is not None else None,
-                "distance_from_underlying": round(strike - up, 4) if up > 0 else None,
-                "volume":              int(_safe_float(_c.get("volume"))),
-                "open_interest":       int(_safe_float(_c.get("open_interest"))),
-                "rank_score":          round(_safe_float(_s), 4),
-            })
+            _selected = bool(selected_symbol) and _c.get("symbol") == selected_symbol
+            _row = _build_candidate_row(
+                _c,
+                rank_score=_s,
+                rejected_at_step=None if _selected else "ranking",
+                rejection_reason=None if _selected else "ranked_below_selected",
+                selected=_selected,
+            )
+            _row["rank"] = _rank + 1
+            _row["contract"] = _row["symbol"]
+            candidates.append(_row)
+            if _selected:
+                selected_winner = dict(_row)
     except Exception:
         pass
 
@@ -356,10 +424,16 @@ def _build_candidate_audit(scored, underlying_price, selected_symbol, selected_r
         rejected = {}
 
     return {
+        "schema_version":            2,
         "selected_contract":          selected_symbol,
         "selected_reason":            selected_reason,
+        "selected_winner":            selected_winner,
         "underlying_price":           round(_safe_float(underlying_price), 4),
         "candidates_considered":      len(scored) if scored else 0,
+        "candidate_cap":              top_n,
+        "candidates":                 candidates,
+        "hard_filter_rejects":        rejected,
+        # Backward-compatible aliases for existing readers/tests.
         "top_candidates":             candidates,
         "rejected_candidate_reasons": rejected,
     }
@@ -1423,6 +1497,16 @@ class APContractSelectionEngine:
                     "max_spread_pct": _safe_float(_eff_max_spread),
                     "min_oi":         _safe_float(_eff_min_oi),
                 },
+                context={
+                    "candidate_table": _build_candidate_audit(
+                        [],
+                        underlying_price or 0.0,
+                        selected_symbol=None,
+                        selected_reason="no_survivors",
+                        rejections=_rejections,
+                        top_n=int(os.getenv("SELECTOR_CANDIDATE_TABLE_TOP_N", "15")),
+                    ),
+                },
             )
             _attach_selector_failure(
                 plan,
@@ -1553,6 +1637,16 @@ class APContractSelectionEngine:
                             "selected_premium": round(best_exec_prem, 2)},
                     thresholds={"min_acceptable_premium": _MIN_ACCEPTABLE_PREMIUM,
                                 "allow_cheap_if_only_choice": _allow_cheap},
+                    context={
+                        "candidate_table": _build_candidate_audit(
+                            scored,
+                            underlying_price or 0.0,
+                            selected_symbol=best.get("symbol"),
+                            selected_reason="cheap_contract_no_upgrade",
+                            rejections=_rejections,
+                            top_n=int(os.getenv("SELECTOR_CANDIDATE_TABLE_TOP_N", "15")),
+                        ),
+                    },
                 )
                 if not _allow_cheap:
                     _attach_selector_failure(
@@ -1575,9 +1669,8 @@ class APContractSelectionEngine:
         if selected is None:
             return None
 
-        # Item 3 — attach the selector candidate audit (EVIDENCE ONLY). Built
-        # from the final sorted `scored` list + the rejection counts. Persisted
-        # downstream into orders.meta. Never affects selection. Best-effort.
+        # Persist compact candidate-table evidence from the final sorted
+        # survivor list + rejection counts. This is observational only.
         try:
             selected.candidate_audit = _build_candidate_audit(
                 scored,
@@ -1585,10 +1678,11 @@ class APContractSelectionEngine:
                 selected_symbol=selected.contract_symbol,
                 selected_reason=selected.selection_reason,
                 rejections=_rejections,
-                top_n=int(os.getenv("SELECTOR_CANDIDATE_AUDIT_TOP_N", "3")),
+                top_n=int(os.getenv("SELECTOR_CANDIDATE_TABLE_TOP_N", "15")),
             )
         except Exception:
             selected.candidate_audit = None
+        _candidate_context = {"candidate_table": selected.candidate_audit} if selected.candidate_audit else None
 
         _effective_budget_used, _max_trade_cap, _budget_was_clipped = _effective_budget(budget)
         if _budget_was_clipped:
@@ -1637,7 +1731,7 @@ class APContractSelectionEngine:
                             "max_premium":          _safe_float(self.max_premium),
                         },
                         thresholds={"max_premium": self.max_premium},
-                        context={"mode": self.mode},
+                        context=dict({"mode": self.mode}, **(_candidate_context or {})),
                     )
                     _attach_selector_failure(
                         plan,
@@ -1695,6 +1789,7 @@ class APContractSelectionEngine:
                     selection_reason     = selected.selection_reason + " [forced_1]",
                     selection_score      = selected.selection_score,
                     dte                  = selected.dte,
+                    candidate_audit      = selected.candidate_audit,
                 )
             else:
                 # ── PR2: account-size tradeability classification ─────────────
@@ -1765,6 +1860,7 @@ class APContractSelectionEngine:
                     contract=selected.contract_symbol,
                     inputs=_tradeability_diag,
                     thresholds={"min_contracts": 1},
+                    context=_candidate_context,
                 )
                 # Record as the authoritative last-failure reason for the queue
                 # and the deferred-breach audit (consumed by PR3's taxonomy). Both
@@ -1811,6 +1907,7 @@ class APContractSelectionEngine:
                 contract=selected.contract_symbol,
                 inputs={"delta": selected.delta, "strike": selected.strike},
                 thresholds={"min_delta": _MIN_DELTA},
+                context=_candidate_context,
             )
             _attach_selector_failure(
                 plan,
@@ -1856,6 +1953,7 @@ class APContractSelectionEngine:
                         "delta":            _safe_float(selected.delta),
                     },
                     thresholds={"max_otm_pct": _MAX_OTM_PCT},
+                    context=_candidate_context,
                 )
                 _attach_selector_failure(
                     plan,
@@ -1893,6 +1991,7 @@ class APContractSelectionEngine:
                     "ticker_cap":           _safe_float(_final_prem_cap),
                 },
                 thresholds={"ticker_premium_cap": _final_prem_cap},
+                context=_candidate_context,
             )
             _attach_selector_failure(
                 plan,
