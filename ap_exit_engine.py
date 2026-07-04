@@ -128,10 +128,20 @@ def _ledger_exit_decision(pos, decision, *, client_id: str = "") -> None:
     try:
         if _ledger_record is None:
             return
+        # PR-G3: attach the exit-ladder stamp so the R-multiple comparison
+        # harness can attribute each recorded decision to legacy vs vol_scaled.
+        # _ladder is a small dict set by evaluate_exit(); default {} is safe.
+        _meta = {"event_context": "exit_loop"}
+        try:
+            _ladder = getattr(decision, "_ladder", None)
+            if isinstance(_ladder, dict) and _ladder:
+                _meta["ladder"] = _ladder
+        except Exception:
+            pass
         _ledger_record(
             pos, decision,
             client_id=client_id or str(getattr(pos, "client_id", "") or ""),
-            metadata={"event_context": "exit_loop"},
+            metadata=_meta,
         )
     except Exception:
         pass
