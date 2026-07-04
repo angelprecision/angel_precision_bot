@@ -110,7 +110,11 @@ def fetch_15m_bars(ticker: str, broker: Any, *, now: Optional[datetime] = None) 
         if hit and (now_mono - hit[0]) < CANDLE_TTL_SEC:
             return hit[1]
 
-    session = getattr(broker, "session", None)
+    # #283 REVIEW AMENDMENT: prefer the attached data_broker for market-data
+    # reads, matching the quote-truth pattern (#248/#227 and #277's resolver).
+    # Falls back to the broker itself when no data_broker is attached.
+    quote_src = getattr(broker, "data_broker", None) or broker
+    session = getattr(quote_src, "session", None)
     if session is None or not hasattr(session, "get"):
         return []
 
@@ -120,7 +124,7 @@ def fetch_15m_bars(ticker: str, broker: Any, *, now: Optional[datetime] = None) 
 
     try:
         resp = session.get(
-            f"{_resolve_base_url(broker)}/v1/markets/timesales",
+            f"{_resolve_base_url(quote_src)}/v1/markets/timesales",
             params={
                 "symbol": key,
                 "interval": "15min",
@@ -274,7 +278,81 @@ def _persist(signal_id: str, client_email: str, compact: dict[str, Any]) -> bool
         return False
 
 
-# ── entry point ──────────────────────────────────────────────────────────────
+# ── price-shape normalization (#283 review amendment) ────────────────────────
+
+def normalize_price_shape(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Return an evaluation copy whose underlying-price keys match what
+    evaluate_fvg_context() actually reads.
+
+    #221 reads current_underlying / underlying_price / last_price etc. but NOT
+    underlying_at_signal — the canonical execution-side key (ap_signals column,
+    and what #277 hydration injects). Without this bridge, a payload carrying
+    only underlying_at_signal falls back to generic entry_price, which #221
+    itself warns is often the OPTION PREMIUM — silently polluting the
+    experiment with premium-vs-underlying geometry.
+
+    Rules:
+    - never overwrite an existing positive current_underlying/underlying_price
+    - bridge underlying_at_signal into both keys when they're absent
+    - if NO real underlying exists under any key, REMOVE entry_price from the
+      evaluation copy so #221's fallback cannot fire: for telemetry purposes
+      'missing current price' is honest data, premium-as-underlying is not.
+    """
+    sig = dict(payload)
+
+    def _pos(v: Any) -> Optional[float]:
+        try:
+            f = float(v)
+            return f if f > 0 else None
+        except (TypeError, ValueError):
+            return None
+
+    existing = _pos(sig.get("current_underlying")) or _pos(sig.get("underlying_price"))
+    uas = _pos(sig.get("underlying_at_signal"))
+    if existing is None and uas is not None:
+        sig["current_underlying"] = uas
+        sig["underlying_price"] = uas
+        existing = uas
+    if existing is None and _pos(sig.get("last_price")) is None:
+        # No genuine underlying anywhere → block the entry_price fallback.
+        sig.pop("entry_price", None)
+    return sig
+
+
+# ── entry points ─────────────────────────────────────────────────────────────
+
+def record_fvg_telemetry_async(
+    *,
+    signal_id: str,
+    client_email: str,
+    payload: Mapping[str, Any],
+    broker: Any,
+) -> None:
+    """Fire-and-forget wrapper for the dispatch hot path (#283 amendment).
+
+    The synchronous path can spend up to one timesales timeout (10s) on a
+    ticker cache miss. That is unacceptable ahead of live contract selection /
+    watcher creation, so dispatch calls THIS: a daemon thread with a deep-ish
+    payload copy (top-level dict copy; telemetry only reads). Returns
+    immediately. Thread failures are logged inside record_fvg_telemetry —
+    nothing propagates.
+    """
+    try:
+        snapshot = dict(payload or {})
+        threading.Thread(
+            target=record_fvg_telemetry,
+            kwargs=dict(
+                signal_id=signal_id,
+                client_email=client_email,
+                payload=snapshot,
+                broker=broker,
+            ),
+            name=f"fvg-telemetry-{str(signal_id)[:8]}",
+            daemon=True,
+        ).start()
+    except Exception as exc:
+        log.warning("fvg_telemetry: async spawn failed signal=%s: %s", signal_id, exc)
+
 
 def record_fvg_telemetry(
     *,
@@ -305,7 +383,7 @@ def record_fvg_telemetry(
         }
 
         from ap.fair_value_gap import evaluate_fvg_context
-        result = evaluate_fvg_context(dict(payload), {"candles": candles})
+        result = evaluate_fvg_context(normalize_price_shape(payload), {"candles": candles})
 
         compact = _compact(result, bars_1h=len(candles["1h"]), bars_4h=len(candles["4h"]))
         persisted = _persist(signal_id, client_email, compact)

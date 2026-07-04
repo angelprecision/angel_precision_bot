@@ -22,6 +22,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from typing import Any
 
 import pytest
@@ -204,7 +205,90 @@ def test_t5_kill_switch(monkeypatch):
     assert broker.session.calls == 0
 
 
-# ── T6: persistence SQL shape ────────────────────────────────────────────────
+# ── T7: #283 review amendments ───────────────────────────────────────────────
+
+def test_t7a_underlying_at_signal_bridged_no_entry_price_fallback(monkeypatch):
+    """Payload carrying ONLY underlying_at_signal (the ap_signals canonical
+    key, and what #277 hydration injects) must reach #221 as
+    current_underlying — never via the entry_price(premium) fallback."""
+    seen = {}
+    import ap.fair_value_gap as fvg_mod
+    real_evaluate = fvg_mod.evaluate_fvg_context   # capture BEFORE patching
+
+    def spy_evaluate(sig, ctx):
+        seen.update(sig=sig)
+        return real_evaluate(sig, ctx)
+
+    monkeypatch.setattr(fvg_mod, "evaluate_fvg_context", spy_evaluate)
+    monkeypatch.setattr(ft, "_persist", lambda *a, **k: True)
+
+    broker = _FakeBroker(_gapped_session_items())
+    payload = {
+        "ticker": "GOOGL", "side": "CALL",
+        "underlying_at_signal": 116.3,      # only this underlying key
+        "entry_price": 2.35,                # option premium — must NOT leak
+        "entry_trigger": 116.5,
+    }
+    out = record_fvg_telemetry(signal_id="s", client_email="c",
+                               payload=payload, broker=broker)
+    assert out["status"] == "recorded"
+    sig = seen["sig"]
+    assert sig["current_underlying"] == pytest.approx(116.3)
+    assert sig["underlying_price"] == pytest.approx(116.3)
+
+
+def test_t7b_no_underlying_anywhere_blocks_premium_fallback():
+    sig = ft.normalize_price_shape({"ticker": "SPY", "entry_price": 2.35})
+    assert "entry_price" not in sig            # fallback path severed
+    assert "current_underlying" not in sig
+
+
+def test_t7c_existing_underlying_never_overwritten():
+    sig = ft.normalize_price_shape({
+        "current_underlying": 448.10, "underlying_at_signal": 999.0,
+    })
+    assert sig["current_underlying"] == pytest.approx(448.10)
+
+
+def test_t7d_data_broker_preferred_for_timesales():
+    """Matches the quote-truth pattern: candle reads go to broker.data_broker
+    when attached, never the trading session."""
+    data_broker = _FakeBroker(_gapped_session_items())
+
+    class _TradingBroker:
+        def __init__(self, db):
+            self.session = _FakeSession(_gapped_session_items())
+            self.data_broker = db
+
+    trading = _TradingBroker(data_broker)
+    bars = ft.fetch_15m_bars("GOOGL", trading)
+    assert len(bars) > 0
+    assert data_broker.session.calls == 1
+    assert trading.session.calls == 0
+
+
+def test_t7e_async_never_blocks_dispatch(monkeypatch):
+    """The submit-critical-path guarantee: a fetch stuck at full timeout must
+    not delay the caller of the async entry point."""
+    import time as _t
+    started = threading.Event()
+
+    def slow_fetch(*a, **k):
+        started.set()
+        _t.sleep(3)
+        return []
+
+    monkeypatch.setattr(ft, "fetch_15m_bars", slow_fetch)
+    t0 = _t.monotonic()
+    ft.record_fvg_telemetry_async(
+        signal_id="s", client_email="c",
+        payload={"ticker": "SPY", "side": "CALL"},
+        broker=_FakeBroker([]),
+    )
+    elapsed = _t.monotonic() - t0
+    assert elapsed < 0.5, f"async spawn blocked dispatch for {elapsed:.2f}s"
+    assert started.wait(2.0)                   # thread genuinely running
+
 
 def test_t6_persist_sql_merges_under_fvg_key(monkeypatch):
     captured = {}
