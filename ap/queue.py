@@ -1375,6 +1375,22 @@ def _dispatch(
                     error="ap_signals_write_failed:after_hours_deferred",
                 )
                 return
+            try:
+                from ap.counterfactual_tracker import track_counterfactual_signal
+
+                payload_copy = dict(payload or {})
+                payload_copy["signal_id"] = signal_id
+                track_counterfactual_signal(
+                    signal=payload_copy,
+                    client_id=client_id,
+                    execution_mode=str(getattr(master_control, "mode", "PAPER") or "PAPER"),
+                    block_stage="contract_selection",
+                    block_reason="market_closed_deferred",
+                    reason_code="market_closed_deferred",
+                    source="watch",
+                )
+            except Exception:
+                pass
             # Status: WATCHING — signal is valid, awaiting 9 AM overnight reeval to arm.
             # The overnight reeval queries WHERE status='WATCHING' to find these signals.
             # WATCHING here means: master control approved, contract selection deferred to breach.

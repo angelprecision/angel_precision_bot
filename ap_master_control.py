@@ -11,6 +11,11 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 try:
+    from ap.counterfactual_tracker import track_counterfactual_signal
+except Exception:  # pragma: no cover
+    track_counterfactual_signal = None
+
+try:
     from ap.observability import (
         emit_decision_event,
         get_git_commit,
@@ -552,6 +557,7 @@ class APMasterControl:
         self._equity_cache_ts: float = 0.0   # initialized here; set by _dispatch() after broker call
         self._alert_fn = None
         self._degraded_counts: dict[str, int] = {}
+        self._counterfactual_ctx = threading.local()
 
         self.run_id = os.getenv("AP_RUN_ID", new_run_id("ap"))
         self.strategy_version = os.getenv("AP_STRATEGY_VERSION", "ap_live_beta")
@@ -1583,6 +1589,13 @@ class APMasterControl:
         score = float(signal.get("score", 0) or 0)
         signal_id = str(signal.get("signal_id") or uuid.uuid4())
         signal["signal_id"] = signal_id
+        try:
+            self._counterfactual_ctx.signal = dict(signal or {})
+            self._counterfactual_ctx.signal["signal_id"] = signal_id
+            self._counterfactual_ctx.client_id = str(client_id or "default")
+            self._counterfactual_ctx.execution_mode = str(self._current_mode() or "PAPER")
+        except Exception:
+            pass
 
         # PR #229: fail-CLOSED on missing/invalid side. Pre-#229 this defaulted
         # to "CALL" which meant a malformed signal would silently route as a
@@ -3283,6 +3296,19 @@ class APMasterControl:
         plan.max_position_usd with real premium. This version logs blocked and
         approved capital-utilization rows before returning.
         """
+        try:
+            _cf_signal = plan.to_signal_dict() if hasattr(plan, "to_signal_dict") else {}
+            _plan_meta = getattr(plan, "metadata", None) or {}
+            if isinstance(_plan_meta, dict) and _plan_meta.get("canonical_signal_id"):
+                _cf_signal["canonical_signal_id"] = _plan_meta.get("canonical_signal_id")
+            _cf_signal["signal_id"] = str(
+                getattr(plan, "signal_id", None) or _cf_signal.get("signal_id") or ""
+            )
+            self._counterfactual_ctx.signal = _cf_signal
+            self._counterfactual_ctx.client_id = str(client_id or "default")
+            self._counterfactual_ctx.execution_mode = str(getattr(plan, "mode", None) or self._current_mode() or "PAPER")
+        except Exception:
+            pass
         ticker = plan.ticker
         execution_mode = "live" if self._is_live_mode() else "paper"
 
@@ -3700,6 +3726,24 @@ class APMasterControl:
                 signal_id=signal_id,
                 details={"error": str(e), "stage": stage, "reason": reason},
             )
+        try:
+            if track_counterfactual_signal:
+                _cf_signal = getattr(self._counterfactual_ctx, "signal", None) or {
+                    "signal_id": signal_id,
+                    "ticker": ticker,
+                }
+                _cf_signal["signal_id"] = str(_cf_signal.get("signal_id") or signal_id)
+                track_counterfactual_signal(
+                    signal=_cf_signal,
+                    client_id=str(getattr(self._counterfactual_ctx, "client_id", client_id) or client_id),
+                    execution_mode=str(getattr(self._counterfactual_ctx, "execution_mode", self._current_mode()) or "PAPER"),
+                    block_stage=stage,
+                    block_reason=reason,
+                    reason_code=reason_code,
+                    source="block",
+                )
+        except Exception:
+            pass
         return ControlDecision(ok=False, stage=stage, reason=reason, reason_code=reason_code, signal_id=signal_id, ticker=ticker, client_id=client_id)
 
     def _reason_code_from_block(self, stage: str, reason: str) -> str:
