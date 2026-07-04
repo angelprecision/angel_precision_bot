@@ -147,6 +147,9 @@ INDEX_0DTE_CUTOFF_ET         = os.getenv("INDEX_0DTE_CUTOFF_ET",         "14:30"
 INDEX_LATE_DAY_CAUTION_ET    = os.getenv("INDEX_LATE_DAY_CAUTION_ET",    "13:30")  # 1:30 PM ET
 INDEX_LATE_DAY_SCORE_FLOOR   = float(os.getenv("INDEX_LATE_DAY_SCORE_FLOOR", "75"))
 _INDEX_TO_ETF = {"^GSPC": "SPY", "^NDX": "QQQ", "^RUT": "IWM", "^DJI": "DIA"}
+ENABLE_FEASIBILITY_OBSERVE = os.getenv("ENABLE_FEASIBILITY_OBSERVE", "false").strip().lower() in ("1", "true", "yes", "on")
+ENABLE_FEASIBILITY_ENFORCE = os.getenv("ENABLE_FEASIBILITY_ENFORCE", "false").strip().lower() in ("1", "true", "yes", "on")
+FEASIBILITY_MAX_RATIO = float(os.getenv("FEASIBILITY_MAX_RATIO", "1.2"))
 
 
 def _score_allows_entry(
@@ -332,6 +335,39 @@ def _normalize_signal_side(raw: Any) -> Optional[str]:
     if not side:
         return None
     return _SIDE_ALIASES.get(side)
+
+
+def _coerce_float(value: Any) -> float | None:
+    try:
+        if value is None or value == "":
+            return None
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    return numeric if numeric > 0 else None
+
+
+def _signal_chain_rows(signal: dict[str, Any]) -> tuple[list[dict[str, Any]] | None, str]:
+    direct_candidates: list[tuple[str, Any]] = [
+        ("live_chain", signal.get("option_chain")),
+        ("live_chain", signal.get("options_chain")),
+        ("live_chain", signal.get("chain")),
+    ]
+    meta = signal.get("metadata") if isinstance(signal.get("metadata"), dict) else {}
+    snapshot_candidates: list[tuple[str, Any]] = [
+        ("archiver_snapshot", signal.get("chain_snapshot")),
+        ("archiver_snapshot", signal.get("archived_chain")),
+        ("archiver_snapshot", signal.get("archiver_snapshot")),
+        ("archiver_snapshot", meta.get("chain_snapshot")),
+        ("archiver_snapshot", meta.get("archived_chain")),
+        ("archiver_snapshot", meta.get("archiver_snapshot")),
+    ]
+    for source, candidate in [*direct_candidates, *snapshot_candidates]:
+        if isinstance(candidate, list):
+            rows = [row for row in candidate if isinstance(row, dict)]
+            if rows:
+                return rows, source
+    return None, "unavailable"
 
 
 @dataclass
@@ -2316,6 +2352,9 @@ class APMasterControl:
                 self._store_update(signal_id, "rejected", f"score {effective_score:.1f} < floor {_eff_score_floor}")
                 return self._block(signal_id, ticker, client_id, "blocked_score", f"score_below_floor ({effective_score:.1f}<{_eff_score_floor})")
 
+        feasibility_obs = self._build_feasibility_observation(signal)
+        self._stamp_feasibility_observation(signal, feasibility_obs)
+
         score_breakdown = signal.get("score_breakdown") or {}
         if "real_time_ctx" in score_breakdown:
             ctx = float(score_breakdown.get("real_time_ctx", 0) or 0)
@@ -2636,6 +2675,7 @@ class APMasterControl:
                     if _qm_verdict is not None
                     else _qm_disabled_result
                 ),
+                "expected_move_feasibility": feasibility_obs,
                 # PR73: score_audit — complete scoring visibility.
                 # Extends the skeleton written by PR-72 with all gate fields.
                 # Read-only — zero changes to scoring logic, tiers, or floors.
@@ -2659,6 +2699,7 @@ class APMasterControl:
                         if _qm_verdict is not None
                         else _qm_disabled_result
                     ),
+                    "expected_move_feasibility": feasibility_obs,
                     "intel_result": {
                         "approved":  intel_approve,
                         "score":     intel_score,
@@ -2741,6 +2782,10 @@ class APMasterControl:
                         "total_trades": snap.get("total_trades"),
                         "snapshot_ts": snap.get("_snapshot_ts"),
                         "snapshot_age_sec": snap.get("_snapshot_age_sec"),
+                        "feasibility_entry": feasibility_obs.get("entry"),
+                        "feasibility_target": feasibility_obs.get("target"),
+                        "expected_move": feasibility_obs.get("expected_move"),
+                        "feasibility_ratio": feasibility_obs.get("feasibility_ratio"),
                     },
                     thresholds={
                         "priority_floor": _PRIORITY_FLOOR,
@@ -2754,6 +2799,7 @@ class APMasterControl:
                         "contracts": plan.contracts,
                         "trigger_type": plan.trigger_type,
                         "bootstrap_mode": bootstrap_mode,
+                        "expected_move_feasibility": feasibility_obs,
                     },
                 )
         except Exception as e:
@@ -2768,6 +2814,83 @@ class APMasterControl:
             )
 
         return ControlDecision(ok=True, stage="approved", reason="", plan=plan, signal_id=signal_id, ticker=ticker, client_id=client_id)
+
+    def _build_feasibility_observation(self, signal: dict[str, Any]) -> dict[str, Any]:
+        from ap.expected_move import atm_iv_from_chain, expected_move_1d, feasibility_ratio
+
+        entry = _coerce_float(
+            signal.get("entry_price")
+            or signal.get("trigger_price")
+            or (signal.get("trigger") or {}).get("entry")
+        )
+        target = _coerce_float(
+            signal.get("target_price")
+            or signal.get("target_underlying")
+            or (signal.get("trigger") or {}).get("pt1")
+            or (signal.get("trigger") or {}).get("pt2")
+        )
+        underlying = _coerce_float(
+            signal.get("underlying_at_signal")
+            or signal.get("underlying_price")
+            or signal.get("current_underlying")
+            or signal.get("current_price")
+            or entry
+        )
+        max_ratio = _coerce_float(os.getenv("FEASIBILITY_MAX_RATIO", str(FEASIBILITY_MAX_RATIO))) or FEASIBILITY_MAX_RATIO
+        chain, source = _signal_chain_rows(signal)
+
+        quality = "unavailable"
+        expected_move = None
+        ratio = None
+        status_code = None
+        detail_reason = "missing_chain"
+
+        if chain:
+            iv_result = atm_iv_from_chain(chain, underlying)
+            quality = iv_result.quality
+            detail_reason = iv_result.reason
+            em_result = expected_move_1d(underlying, iv_result.value)
+            if em_result.value is not None:
+                expected_move = round(float(em_result.value), 6)
+                ratio_result = feasibility_ratio(entry, target, expected_move)
+                if ratio_result.value is not None:
+                    ratio = round(float(ratio_result.value), 6)
+                else:
+                    detail_reason = ratio_result.reason
+            elif quality == "unavailable":
+                detail_reason = em_result.reason
+        if expected_move is None or ratio is None:
+            source = "unavailable" if source == "unavailable" else source
+            status_code = "EXPECTED_MOVE_UNAVAILABLE"
+            if quality == "ok":
+                quality = "unavailable"
+
+        return {
+            "mode": "observe" if ENABLE_FEASIBILITY_OBSERVE else "off",
+            "observe_enabled": bool(ENABLE_FEASIBILITY_OBSERVE),
+            "enforce_enabled": bool(ENABLE_FEASIBILITY_ENFORCE),
+            "enforced": False,
+            "entry": entry,
+            "target": target,
+            "expected_move": expected_move,
+            "feasibility_ratio": ratio,
+            "max_ratio": float(max_ratio),
+            "source": source,
+            "quality": quality,
+            "would_block": bool(ratio is not None and ratio > max_ratio),
+            "status_code": status_code,
+            "detail_reason": detail_reason,
+        }
+
+    def _stamp_feasibility_observation(self, signal: dict[str, Any], observation: dict[str, Any]) -> None:
+        signal["expected_move_feasibility"] = dict(observation)
+        meta = signal.get("metadata")
+        if isinstance(meta, dict):
+            meta["expected_move_feasibility"] = dict(observation)
+            if observation.get("status_code") == "EXPECTED_MOVE_UNAVAILABLE":
+                meta["expected_move_status"] = "EXPECTED_MOVE_UNAVAILABLE"
+        elif observation.get("status_code") == "EXPECTED_MOVE_UNAVAILABLE":
+            signal["expected_move_status"] = "EXPECTED_MOVE_UNAVAILABLE"
 
     def _compute_bootstrap_mode(self, *, total_trades: int) -> bool:
         """
@@ -3940,3 +4063,11 @@ class APMasterControl:
                 client_id=client_id,
                 details={"error": str(e)},
             )
+
+
+try:
+    from ap.master_control_metadata_guard import install_master_control_metadata_guard as _install_master_control_metadata_guard
+
+    _install_master_control_metadata_guard()
+except Exception:
+    pass
