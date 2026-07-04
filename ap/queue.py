@@ -1203,6 +1203,27 @@ def _dispatch(
         _mark_job(job_id, "ERROR", error=f"master_control_error: {e}")
         return
 
+    # ── FVG TELEMETRY (observe-only, PR #221 activation) ──────────────────
+    # Runs on EVERY dispatched signal regardless of decision outcome so the
+    # dataset covers accepted AND rejected populations (required for the
+    # path-risk hypothesis test). #283 REVIEW AMENDMENT: fire-and-forget
+    # daemon thread — the synchronous form could spend up to one timesales
+    # timeout (10s) on a ticker cache miss AHEAD of contract selection /
+    # watcher creation, which is not observe-only for a live entry. The
+    # thread reads market data (TTL-cached per ticker); its ONLY write is
+    # score_breakdown->'fvg' on ap_signals. Never influences `decision`,
+    # never raises (module invariant 2).
+    try:
+        from ap.fvg_telemetry import record_fvg_telemetry_async
+        record_fvg_telemetry_async(
+            signal_id=signal_id,
+            client_email=client_id,
+            payload=payload_for_mc,
+            broker=broker,
+        )
+    except Exception as _fvg_exc:
+        log.warning("[%s] fvg_telemetry wiring error (non-fatal): %s", ticker, _fvg_exc)
+
     if not decision.ok:
         log.info(f"[{ticker}] BLOCKED | stage={decision.stage} reason={decision.reason}")
 
