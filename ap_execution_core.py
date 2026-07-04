@@ -693,6 +693,28 @@ class APExecutionCore:
         # order submission.
         if data_broker is not None and data_broker is not broker:
             self.broker.data_broker = data_broker
+
+        # P0 (2026-07-03) — register the underlying quote resolver used by the
+        # entry metadata guard's hydration path (ap/underlying_quote_hydration).
+        # Quote source preference matches P0B paper-quote-truth: data_broker
+        # (live market data) when distinct, else broker itself. Registration is
+        # best-effort: failure to register leaves the pre-existing fail-closed
+        # behavior fully intact (zero_underlying rejects as before).
+        try:
+            from ap.underlying_quote_hydration import (
+                build_broker_resolver,
+                register_quote_resolver,
+            )
+            _quote_src = data_broker if (data_broker is not None) else broker
+            register_quote_resolver(
+                build_broker_resolver(_quote_src),
+                name=f"{type(_quote_src).__name__}:{'data_broker' if _quote_src is data_broker and data_broker is not broker else 'broker'}",
+            )
+        except Exception as _hyd_exc:
+            log.warning(
+                "[%s] underlying quote resolver registration failed (non-fatal, "
+                "guard stays fail-closed): %s", email, _hyd_exc,
+            )
         self.contract_selector = contract_selector  # wired for breach-time selection of deferred overnight signals
         self.email              = email
 
