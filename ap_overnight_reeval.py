@@ -39,6 +39,8 @@ import time
 from datetime import date, datetime, timezone, timedelta
 from typing import TYPE_CHECKING, Optional
 
+from ap_signal_store import canonical_client_email, canonical_signal_id, upsert_ap_signal_row_with_fallback
+
 log = logging.getLogger("ap.overnight_reeval")
 
 if TYPE_CHECKING:
@@ -1994,9 +1996,9 @@ def _log_rejection_supabase(
         if not sb_url or not sb_key:
             return
         sbc = _cc(sb_url, sb_key)
-        sbc.table("ap_signals").upsert({
-            "signal_id":       str(signal_id),
-            "client_email":    str(client_id),
+        upsert_ap_signal_row_with_fallback(sbc, {
+            "signal_id":       canonical_signal_id(str(signal_id)),
+            "client_email":    canonical_client_email(client_id),
             "system_version":  "v2",
             "ticker":          str(ticker),
             "side":            str(side).upper(),
@@ -2013,6 +2015,6 @@ def _log_rejection_supabase(
                 **{k: v for k, v in payload.items()
                    if k not in ("raw_payload",) and not callable(v)},
             },
-        }, on_conflict="signal_id").execute()
+        })
     except Exception as e:
         log.debug("_log_rejection_supabase failed: %s", e)
