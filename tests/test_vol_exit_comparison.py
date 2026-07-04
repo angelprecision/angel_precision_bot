@@ -143,3 +143,77 @@ def test_verdict_never_recommends_on_thin_vol_arm():
     # Even a great-looking vol arm with too few trades must not pass
     v, _ = render_verdict(_arm(30, 0.5, 0.4), _arm(MIN_TRADES_PER_ARM - 1, 2.0, 1.8))
     assert v == "NOT_ENOUGH_DATA"
+
+
+# ── attribution across exit paths (reviewer-required regression) ──────────────
+# Proves the fix in PR-G #291: a vol_scaled position that exits via HARD STOP,
+# EOD, or TARGET (paths that previously did not stamp _ladder) is still
+# classified vol_scaled by the harness — because those ledger rows now carry
+# metadata.ladder.ladder_mode == 'vol_scaled'.
+from ap.vol_exit_comparison import attribute_ladder_modes
+
+
+def _ledger_row(pid, mode, reason):
+    return {"position_id": pid,
+            "metadata": {"ladder": {"ladder_mode": mode}, "reason": reason}}
+
+
+def test_vol_scaled_via_hard_stop_is_attributed_vol_scaled():
+    # Position governed by vol_scaled that exits ONLY via a hard-stop row —
+    # no scale event ever fired. Before the PR-G stamp fix this row carried no
+    # ladder and the position was mis-attributed legacy.
+    rows = [_ledger_row("pHARD", "vol_scaled", "HARD STOP -- -22% max loss")]
+    modes = attribute_ladder_modes(rows)
+    assert modes["pHARD"] == "vol_scaled"
+
+
+def test_vol_scaled_via_eod_is_attributed_vol_scaled():
+    rows = [_ledger_row("pEOD", "vol_scaled", "EOD FORCE CLOSE")]
+    assert attribute_ladder_modes(rows)["pEOD"] == "vol_scaled"
+
+
+def test_vol_scaled_via_target_is_attributed_vol_scaled():
+    rows = [_ledger_row("pTGT", "vol_scaled", "TARGET HIT")]
+    assert attribute_ladder_modes(rows)["pTGT"] == "vol_scaled"
+
+
+def test_attribution_is_sticky_mixed_rows():
+    # A position with several HOLD legacy-looking rows plus ONE vol_scaled row
+    # (e.g. only the final hard stop was under vol thresholds) → vol_scaled.
+    rows = [
+        _ledger_row("pMIX", "legacy", "HOLD"),
+        _ledger_row("pMIX", "legacy", "HOLD"),
+        _ledger_row("pMIX", "vol_scaled", "HARD STOP"),
+    ]
+    assert attribute_ladder_modes(rows)["pMIX"] == "vol_scaled"
+
+
+def test_all_legacy_rows_stay_legacy():
+    rows = [_ledger_row("pLEG", "legacy", "EOD"),
+            _ledger_row("pLEG", "legacy", "HOLD")]
+    assert attribute_ladder_modes(rows)["pLEG"] == "legacy"
+
+
+def test_unstamped_rows_default_legacy():
+    # A ledger row with no ladder metadata at all (e.g. pre-fix data) → legacy.
+    rows = [{"position_id": "pOLD", "metadata": {"reason": "HARD STOP"}}]
+    assert attribute_ladder_modes(rows)["pOLD"] == "legacy"
+
+
+def test_end_to_end_vol_position_hard_stop_flows_to_arm():
+    # Full flow: attribution + record build → the hard-stopped vol position
+    # lands in the vol_scaled arm, not legacy.
+    ledger = [_ledger_row("pE2E", "vol_scaled", "HARD STOP")]
+    modes = attribute_ladder_modes(ledger)
+    trade_rows = [{
+        "position_id": "pE2E", "client_id": "c", "symbol": "NVDA",
+        "pnl_dollars": -66.0, "exit_reason_code": "HARD_STOP", "exit_ts": "t",
+        "git_commit": "g", "tr_entry_price": 2.0, "tr_qty": 2,
+        "p_avg_fill": 2.0, "p_qty": 2, "sl_pct": 0.33, "p_realized_pnl": -66.0,
+        "execution_mode": "paper", "mfe_pct": 0.1, "mae_pct": -0.5, "pnl_pct": -0.25,
+    }]
+    recs, excluded = build_trade_records(trade_rows, modes)
+    assert recs[0].ladder_mode == "vol_scaled"      # NOT legacy — the whole point
+    assert recs[0].realized_r is not None
+    vol_arm = compute_arm_stats("vol_scaled", [r for r in recs if r.ladder_mode == "vol_scaled"])
+    assert vol_arm.n == 1

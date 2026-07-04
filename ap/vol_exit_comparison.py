@@ -242,6 +242,20 @@ def _fetch_ladder_modes_by_position(client_filter: Optional[str], lookback_days:
             c.execute(sql, tuple(params))
             return c.fetchall()
     rows = run_with_retry(_fn)
+    return attribute_ladder_modes(rows)
+
+
+def attribute_ladder_modes(rows: list) -> dict:
+    """Pure: ledger rows -> {position_id: 'vol_scaled'|'legacy'}.
+
+    A position is 'vol_scaled' iff ANY of its ledger rows carries
+    metadata.ladder.ladder_mode == 'vol_scaled' (sticky — vol presence wins),
+    regardless of WHICH exit path produced that row. This is why PR-G must
+    stamp _ladder on every exit path (target/hard-stop/EOD/HOLD, not just
+    scale/window): a vol_scaled position that exits via hard stop or EOD still
+    has vol_scaled ledger rows, so it is correctly attributed here. Factored
+    out of DB access so it is unit-testable without a database.
+    """
     modes: dict = {}
     for row in rows:
         pid = str(row.get("position_id") or "")
