@@ -233,8 +233,15 @@ def test_16_snapshot_unavailable_keeps_watching():
 def test_17_prior_levels_unavailable_retry_later():
     """Broker/history failure → RETRY_LATER, not reject. Side-specific."""
     assert "OVERNIGHT_PRIOR_LEVELS_UNAVAILABLE" in OV_SRC
+    # RED-ON-MAIN CLEANUP (PR #265): the structured log line grew (marker
+    # taxonomy from the paper-rescue PRs) past the old fixed 600-char
+    # window. Bound the region at the branch's own terminating `continue`
+    # instead of a fixed width — the invariant is that THIS branch skips
+    # and continues without rejecting; downstream branches may legitimately
+    # reject for other reasons.
     idx = OV_SRC.find("OVERNIGHT_PRIOR_LEVELS_UNAVAILABLE")
-    region = OV_SRC[idx:idx+600]
+    end = OV_SRC.find("continue", idx) + len("continue")
+    region = OV_SRC[idx:end]
     assert 'result["skipped"]' in region
     assert "continue" in region
     assert "_mark_job_rejected" not in region
@@ -274,8 +281,15 @@ def test_17e_explicit_entry_trigger_bypasses_levels_check():
 
 def test_17f_log_includes_side_and_missing_field():
     """Log line must include side= and missing= fields."""
+    # RED-ON-MAIN CLEANUP (PR #265): the structured log line grew (marker
+    # taxonomy from the paper-rescue PRs) past the old fixed 600-char
+    # window. Bound the region at the branch's own terminating `continue`
+    # instead of a fixed width — the invariant is that THIS branch skips
+    # and continues without rejecting; downstream branches may legitimately
+    # reject for other reasons.
     idx = OV_SRC.find("OVERNIGHT_PRIOR_LEVELS_UNAVAILABLE")
-    region = OV_SRC[idx:idx+600]
+    end = OV_SRC.find("continue", idx) + len("continue")
+    region = OV_SRC[idx:end]
     assert "side=%s missing=%s" in region or ("side=" in region and "missing=" in region)
 
 def test_17g_prior_day_session_mismatch_fails_closed_before_arming():
