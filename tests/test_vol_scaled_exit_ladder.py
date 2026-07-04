@@ -312,3 +312,82 @@ def test_eod_hard_close_unaffected_by_ladder(exit_mod):
     d = exit_mod.evaluate_exit(pos, now_et=now)
     assert d.action == "CLOSE_ALL"
     assert "EOD" in d.reason
+
+
+# ── D. PR-G3 attribution-coverage: EVERY exit path must carry _ladder ─────────
+# Regression for the bug where only scale/window/theta paths stamped _ladder,
+# causing #292 to mis-attribute vol_scaled positions (that exited via hard
+# stop / target / EOD) as legacy and contaminate the R-multiple comparison.
+
+def test_target_hit_carries_ladder_stamp(exit_mod):
+    _fresh_env(EXIT_LADDER_MODE="vol_scaled", VOL_EXIT_ENABLED="true",
+               VOL_EXIT_PAPER_ONLY="true")
+    import datetime as dt
+    now = dt.datetime(2026, 1, 15, 10, 30, tzinfo=exit_mod.ET)
+    pos = _mk_pos(exit_mod, execution_mode="paper", vol_meta=VOL_META)
+    pos.current_underlying = 611.0   # past target 610 → TARGET HIT (was unstamped)
+    d = exit_mod.evaluate_exit(pos, now_et=now)
+    assert "TARGET HIT" in d.reason
+    assert d._ladder.get("ladder_mode") == "vol_scaled"   # was 'legacy' before fix
+
+
+def test_hard_stop_carries_ladder_stamp(exit_mod):
+    _fresh_env(EXIT_LADDER_MODE="vol_scaled", VOL_EXIT_ENABLED="true",
+               VOL_EXIT_PAPER_ONLY="true")
+    import datetime as dt
+    now = dt.datetime(2026, 1, 15, 10, 30, tzinfo=exit_mod.ET)
+    pos = _mk_pos(exit_mod, execution_mode="paper", vol_meta=VOL_META)
+    # vol_scaled hard stop = -0.75 * range(0.30) = -0.225 → drive well past it.
+    # The soft-loss tier may return a HOLD that stamps a breach for later
+    # confirmation rather than an immediate STOP; either way the decision MUST
+    # carry the ladder stamp (that is the property under test).
+    pos.current_option_price = 2.0 * (1 - 0.40)   # -40%
+    d = exit_mod.evaluate_exit(pos, now_et=now)
+    assert d._ladder.get("ladder_mode") == "vol_scaled"
+
+
+def test_eod_close_carries_ladder_stamp(exit_mod):
+    _fresh_env(EXIT_LADDER_MODE="vol_scaled", VOL_EXIT_ENABLED="true",
+               VOL_EXIT_PAPER_ONLY="true")
+    import datetime as dt
+    now = dt.datetime(2026, 1, 15, 15, 55, tzinfo=exit_mod.ET)   # past EOD
+    pos = _mk_pos(exit_mod, execution_mode="paper", vol_meta=VOL_META)
+    pos.current_option_price = 2.0   # flat
+    d = exit_mod.evaluate_exit(pos, now_et=now)
+    assert "EOD" in d.reason
+    assert d._ladder.get("ladder_mode") == "vol_scaled"
+
+
+def test_hold_carries_ladder_stamp(exit_mod):
+    _fresh_env(EXIT_LADDER_MODE="vol_scaled", VOL_EXIT_ENABLED="true",
+               VOL_EXIT_PAPER_ONLY="true")
+    import datetime as dt
+    now = dt.datetime(2026, 1, 15, 10, 15, tzinfo=exit_mod.ET)   # early, flat
+    pos = _mk_pos(exit_mod, execution_mode="paper", vol_meta=VOL_META)
+    pos.current_option_price = 2.0 * 1.05   # +5%, below every gate
+    d = exit_mod.evaluate_exit(pos, now_et=now)
+    assert d.action == "HOLD"
+    assert d._ladder.get("ladder_mode") == "vol_scaled"
+
+
+def test_all_exit_paths_stamp_ladder_when_vol_scaled(exit_mod):
+    """Exhaustive: sweep representative states; NO returned decision may be
+    missing _ladder once the ladder has been resolved for a vol_scaled pos."""
+    _fresh_env(EXIT_LADDER_MODE="vol_scaled", VOL_EXIT_ENABLED="true",
+               VOL_EXIT_PAPER_ONLY="true")
+    import datetime as dt
+    scenarios = [
+        (dt.datetime(2026, 1, 15, 10, 30, tzinfo=exit_mod.ET), 611.0, 2.0),     # target
+        (dt.datetime(2026, 1, 15, 10, 30, tzinfo=exit_mod.ET), 600.0, 2.0*0.60),# hard stop
+        (dt.datetime(2026, 1, 15, 13, 30, tzinfo=exit_mod.ET), 600.0, 2.0*0.70),# theta
+        (dt.datetime(2026, 1, 15, 11, 30, tzinfo=exit_mod.ET), 600.0, 2.0*1.40),# scale
+        (dt.datetime(2026, 1, 15, 15, 55, tzinfo=exit_mod.ET), 600.0, 2.0),     # EOD
+        (dt.datetime(2026, 1, 15, 10, 15, tzinfo=exit_mod.ET), 600.0, 2.0*1.05),# HOLD
+    ]
+    for now, undl, opt in scenarios:
+        pos = _mk_pos(exit_mod, execution_mode="paper", vol_meta=VOL_META)
+        pos.current_underlying = undl
+        pos.current_option_price = opt
+        d = exit_mod.evaluate_exit(pos, now_et=now)
+        assert getattr(d, "_ladder", None), f"missing _ladder for reason={d.reason!r}"
+        assert d._ladder.get("ladder_mode") in ("vol_scaled", "legacy")

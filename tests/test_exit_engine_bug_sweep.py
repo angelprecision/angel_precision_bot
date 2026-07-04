@@ -437,9 +437,16 @@ class TestInvariantExitDecisionContract:
         offenders = []
         # Crude but effective: split at each top-level "def " or "class "
         # and inspect each block.
+        # Sanctioned decision producers: the public wrapper `evaluate_exit`
+        # and its single private core `_evaluate_exit_core`. PR-G3 split the
+        # evaluator into wrapper+core so the ladder-attribution stamp could be
+        # guaranteed on every return path from ONE choke point. The core is the
+        # producer; the wrapper is its only caller. Any OTHER module-level
+        # function building 2+ ExitDecisions is still a rogue parallel path.
+        _sanctioned = {"evaluate_exit", "_evaluate_exit_core"}
         for m in re.finditer(r"^def\s+(\w+)\s*\(", src, re.MULTILINE):
             name = m.group(1)
-            if name == "evaluate_exit":
+            if name in _sanctioned:
                 continue
             start = m.start()
             # Find the next top-level def/class start, or EOF.
