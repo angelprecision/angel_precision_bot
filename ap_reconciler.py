@@ -3406,8 +3406,24 @@ class APBrokerReconciler:
         the actual entry value, corrupting stop/target progress math for the position's
         entire remaining lifetime.
         """
-        imported_plan_id   = f"reconciled:{contract}:{int(time.time())}"
-        imported_signal_id = f"reconciled:{contract}:{uuid.uuid4().hex[:8]}"
+        # ── ATTRIBUTION INTEGRITY (P0, 2026-07-04) ──────────────────────────
+        # Before fabricating identity, attempt lineage recovery: 78 of 132
+        # historical BROKER_IMPORT positions had a matching ENTRY order with a
+        # real signal_id for the same client+contract — the bot ordered them
+        # itself and the import path threw the attribution away. Recovery is
+        # read-only and fail-closed: any error yields exactly the previous
+        # fabricated identity. Provenance is preserved either way (tier stays
+        # RECONCILED, plan_id keeps the 'reconciled:' prefix).
+        from ap.attribution_integrity import import_identity
+
+        _ident = import_identity(
+            contract=contract,
+            client_id=self.client_id,
+            price_untrusted=price_untrusted,
+        )
+        imported_plan_id   = _ident.plan_id
+        imported_signal_id = _ident.signal_id
+        imported_pattern   = _ident.pattern
 
         if self.pm is not None:
             try:
@@ -3421,7 +3437,7 @@ class APBrokerReconciler:
                     entry_price=entry_px,
                     tier="RECONCILED",
                     score=0.0,
-                    pattern="BROKER_IMPORT_PRICE_UNTRUSTED" if price_untrusted else "BROKER_IMPORT",
+                    pattern=imported_pattern,
                     stop_underlying=None,
                     target_underlying=None,
                 )
@@ -3450,18 +3466,20 @@ class APBrokerReconciler:
             pos_id  = str(uuid.uuid4())
             now_iso = datetime.now(timezone.utc).isoformat()
 
-            # FIX-3: underlying_entry included in the full-schema insert.
+            # ATTRIBUTION INTEGRITY: pattern + tier now included — this INSERT
+            # previously omitted the pattern column entirely, producing the
+            # NULL-pattern rows in the closed record (8 of 178 measured).
             def _insert_full():
                 with conn() as c:
                     c.execute(
                         """
                         INSERT INTO positions (
                             id, client_id, underlying, contract, direction, qty, avg_fill,
-                            entry_ts, status, plan_id, signal_id, close_source,
+                            entry_ts, status, plan_id, signal_id, pattern, tier, close_source,
                             close_confidence, underlying_entry
                         ) VALUES (
                             %s,%s,%s,%s,%s,%s,%s,
-                            %s,'OPEN',%s,%s,%s,%s,%s
+                            %s,'OPEN',%s,%s,%s,'RECONCILED',%s,%s,%s
                         )
                         ON CONFLICT (id) DO NOTHING
                         """,
@@ -3476,6 +3494,7 @@ class APBrokerReconciler:
                             now_iso,
                             imported_plan_id,
                             imported_signal_id,
+                            imported_pattern,
                             "RECONCILER_IMPORT",
                             "BROKER_OPEN_PRICE_UNTRUSTED" if price_untrusted else "BROKER_OPEN",
                             float(underlying_entry) if underlying_entry > 0 else None,
