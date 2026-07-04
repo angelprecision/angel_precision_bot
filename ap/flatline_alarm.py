@@ -254,8 +254,39 @@ def run_flatline_check(
         return res
 
     res.counts = counts
-    res.state_by_mode = {mode: _classify(c) for mode, c in counts.items()
-                         if mode != "unknown" or c.get("submissions", 0) > 0}
+
+    # ── #282 REVIEW AMENDMENT (classification completeness) ─────────────────
+    # 1. live and paper are ALWAYS classified, even when the orders table has
+    #    zero rows for a mode. A mode absent from today's orders IS the
+    #    failure signal, not a reason to skip classification. (Original bug:
+    #    paper-only rows produced counts without a 'live' key → live silently
+    #    unclassified on the exact Jun-29..Jul-02 shape.)
+    # 2. 'unknown' (NULL execution_mode — 137 historical rows carry it) is
+    #    classified whenever it shows ANY activity (orders created, signals,
+    #    or submissions). It is only omitted when fully inert, so a NULL-mode
+    #    day of expired orders with zero submissions ALARMS instead of
+    #    disappearing from state_by_mode. (Original bug: unknown was dropped
+    #    unless it had submissions — hiding precisely the historical
+    #    production shape this alarm exists to catch.)
+    signals_global = max(
+        (c.get("signals_global", 0) for c in counts.values()), default=0
+    )
+    for required_mode in ("live", "paper"):
+        counts.setdefault(required_mode, {
+            "submissions": 0, "fills": 0, "orders_created": 0,
+            "signals_global": signals_global,
+        })
+    res.state_by_mode = {}
+    for mode, c in counts.items():
+        if mode == "unknown":
+            active = (
+                c.get("submissions", 0) > 0
+                or c.get("orders_created", 0) > 0
+                or c.get("signals_global", 0) > 0
+            )
+            if not active:
+                continue
+        res.state_by_mode[mode] = _classify(c)
     if not dry_run:
         res.alerts_sent = _send_alert(res.state_by_mode, counts, now)
     log.info("flatline_alarm: %s", res.to_dict())
