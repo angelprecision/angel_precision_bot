@@ -1010,6 +1010,19 @@ def _open_position_safe(
     if underlying_entry <= 0:
         underlying_entry = _get_underlying_price_at_fill(_quote_broker, ticker)
 
+    # PR-G: extract vol-exit IV meta stamped on the order at selection so it
+    # persists into positions.vol_exit_meta (dormant unless ladder enabled).
+    _vol_exit_kw = None
+    try:
+        _om = order.get("meta")
+        if isinstance(_om, str) and _om.strip():
+            import json as _json
+            _om = _json.loads(_om)
+        _ve = _om.get("vol_exit") if isinstance(_om, dict) else None
+        _vol_exit_kw = _ve if isinstance(_ve, dict) else None
+    except Exception:
+        _vol_exit_kw = None
+
     kwargs = {
         "plan_id": plan_id,
         "signal_id": signal_id,
@@ -1026,6 +1039,7 @@ def _open_position_safe(
         "target_underlying": float(order.get("target_underlying")) if order.get("target_underlying") is not None else None,
         "local_order_id": local_id,
         "broker_order_id": order.get("broker_order_id"),
+        "vol_exit": _vol_exit_kw,
     }
 
     try:
@@ -1262,6 +1276,19 @@ def _seed_exit_engine(exit_engine, position_id: str, order: dict, result: dict, 
         mp.position_id = position_id
         mp.client_id = str(order.get("client_id") or "")
         mp.signal_id = signal_id
+
+        # PR-G: carry vol-exit IV meta onto the live position (dormant unless
+        # the vol_scaled ladder is enabled). Source order.meta.vol_exit if the
+        # order row exposes meta; None ⇒ legacy ladder for this position.
+        try:
+            _om = order.get("meta")
+            if isinstance(_om, str) and _om.strip():
+                import json as _json
+                _om = _json.loads(_om)
+            _ve = _om.get("vol_exit") if isinstance(_om, dict) else None
+            mp.vol_exit_meta = _ve if isinstance(_ve, dict) else None
+        except Exception:
+            mp.vol_exit_meta = None
 
         try:
             mp.current_underlying = _safe_float(order.get("last_underlying_price") or 0.0)

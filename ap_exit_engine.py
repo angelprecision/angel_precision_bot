@@ -82,6 +82,46 @@ try:
 except Exception:
     _ledger_record = None  # type: ignore[assignment]
 
+# ── PR-G: VOLATILITY-SCALED EXIT LADDER (dormant by default) ──────────────────
+# If the module fails to import for any reason, the shim below resolves EVERY
+# position to pure legacy thresholds, so the exit engine behaves exactly as it
+# did before PR-G. This keeps the money path safe even under a broken deploy.
+_LADDER_MODE_LEGACY = "legacy"
+try:
+    from ap.exit_ladder import (
+        resolve_exit_ladder as _resolve_exit_ladder,
+        LegacyThresholds as _LegacyThresholds,
+    )
+except Exception:  # pragma: no cover — import-failure safety
+    from dataclasses import dataclass as _dc
+
+    @_dc(frozen=True)
+    class _LegacyThresholds:  # type: ignore[no-redef]
+        hard_stop: float
+        immediate_tp: float
+        profit_lock: float
+        theta_stop: float
+        w1_threshold: float
+        w2_threshold: float
+        w3_threshold: float
+
+    def _resolve_exit_ladder(execution_mode, legacy, vol_meta, config=None):  # type: ignore[no-redef]
+        class _R:
+            mode = _LADDER_MODE_LEGACY
+            hard_stop = legacy.hard_stop
+            immediate_tp = legacy.immediate_tp
+            profit_lock = legacy.profit_lock
+            theta_stop = legacy.theta_stop
+            w1_threshold = legacy.w1_threshold
+            w2_threshold = legacy.w2_threshold
+            w3_threshold = legacy.w3_threshold
+
+            @staticmethod
+            def stamp():
+                return {"ladder_mode": _LADDER_MODE_LEGACY,
+                        "fallback_reason": "exit_ladder_import_failed"}
+        return _R()
+
 
 def _ledger_exit_decision(pos, decision, *, client_id: str = "") -> None:
     """Non-fatal wrapper — logs every exit decision cycle when position is green."""
@@ -338,6 +378,13 @@ class ManagedPosition:
     pending_exit_qty:     int   = 0
     pending_exit_filled_qty: int = 0
     pending_scale_counted: bool = False
+
+    # PR-G: Volatility-scaled exit ladder metadata (DORMANT unless
+    # EXIT_LADDER_MODE=vol_scaled + VOL_EXIT_ENABLED=true + live/paper gate).
+    # Populated at seed/fill time from orders.meta.vol_exit; absence ⇒ the
+    # ladder resolver falls back to legacy for THIS position (per-position).
+    # These are inputs only; they never alter money-safety coordination.
+    vol_exit_meta: Optional[dict] = None
     pending_exit_local_order_id: str = ""
     pending_exit_broker_order_id: str = ""
     last_applied_exit_local_order_id: str = ""
@@ -433,6 +480,11 @@ class ExitDecision:
     # _submit_exit_decision() reads this and fires Discord after lock release.
     _runner_alert_peak_pct: float = 0.0
     _runner_trail_used:     float = 0.0
+    # PR-G: exit-ladder audit stamp (ladder_mode + resolved thresholds when
+    # vol_scaled). Carried on the decision so _submit_exit_decision() / the
+    # exit-decision ledger can persist WHICH ladder produced this action,
+    # without touching reason_code (which drives the PR-176 hold guard).
+    _ladder: dict = field(default_factory=dict)
     _runner_duration_min:   int   = 0
 
     @property
@@ -491,17 +543,87 @@ def _position_age_minutes(pos: ManagedPosition) -> float:
 
 def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> ExitDecision:
     """
-    Core exit evaluation. Called every POLL_INTERVAL_SEC for each position.
-    Returns ExitDecision.
+    Public exit evaluator — thin wrapper around _evaluate_exit_core().
 
-    FIX-1: This is now a pure function with no side effects. The Discord runner
-    alert that previously lived here (blocking requests.post under self._lock)
-    has been moved to _submit_exit_decision(), which fires it after the
-    callback returns, outside both lock sections.
+    PR-G3 ATTRIBUTION CHOKE POINT: the core evaluator has ~24 distinct return
+    paths, and only the scale/window/theta paths stamped decision._ladder.
+    Paths like TARGET HIT, STOP HIT, HARD STOP, PROFIT LOCK, TRAILING, and EOD
+    did not — which meant a vol_scaled position that exited via one of those
+    (very common) was mis-attributed as legacy by the R-multiple comparison
+    harness (#292), silently contaminating the evidence that gates going live.
+
+    Rather than stamp 24 sites by hand (and every future one), this wrapper
+    guarantees EVERY returned decision carries the ladder stamp for the ladder
+    that actually governed this position's thresholds. It is behavior-neutral:
+    it only populates an audit field; it never changes action/qty/reason.
+
+    FIX-1 (unchanged): evaluate_exit remains a pure function with no side
+    effects; the Discord runner alert lives in _submit_exit_decision().
+    """
+    decision, ladder_stamp = _evaluate_exit_core(pos, now_et)
+    try:
+        # Backfill only when a return path forgot to stamp. Paths that already
+        # set _ladder (scale/window/theta) are left exactly as-is.
+        if not getattr(decision, "_ladder", None):
+            decision._ladder = ladder_stamp
+    except Exception:
+        # Attribution must never break the exit path. Worst case: this one
+        # decision is unstamped (harness treats it as legacy) — same as before.
+        pass
+    return decision
+
+
+def _evaluate_exit_core(
+    pos: ManagedPosition, now_et: Optional[datetime] = None
+) -> "tuple[ExitDecision, dict]":
+    """
+    Core exit evaluation. Called every POLL_INTERVAL_SEC for each position.
+    Returns (ExitDecision, ladder_stamp) — the wrapper uses ladder_stamp to
+    guarantee attribution coverage across all return paths.
     """
     if now_et is None:
         now_et = datetime.now(ET)
     _hard_stop, _immediate_tp, _profit_lock = _effective_thresholds(pos)
+
+    # ── PR-G: resolve the effective exit ladder for THIS position ────────────
+    # Legacy mode (default) returns the engine's own values byte-identically —
+    # this module holds no copy of any legacy number, so it cannot drift.
+    # vol_scaled applies ONLY under the triple flag guard + valid IV meta +
+    # (paper, or explicitly live-enabled). Any failure ⇒ legacy for this pos.
+    # Time windows, EOD close, exit_in_flight, and scale-out counting are
+    # UNTOUCHED — only the P&L threshold NUMBERS can change.
+    _ladder_stamp: dict = {"ladder_mode": _LADDER_MODE_LEGACY}
+    try:
+        _legacy_thresholds = _LegacyThresholds(
+            hard_stop=_hard_stop,
+            immediate_tp=_immediate_tp,
+            profit_lock=_profit_lock,
+            theta_stop=THETA_STOP_LOSS_PCT,
+            w1_threshold=SCALE_OUT_1_THRESHOLD,
+            w2_threshold=SCALE_OUT_2_THRESHOLD,
+            w3_threshold=PROTECT_3_THRESHOLD,
+        )
+        _ladder = _resolve_exit_ladder(
+            execution_mode=getattr(pos, "execution_mode", "") or "",
+            legacy=_legacy_thresholds,
+            vol_meta=getattr(pos, "vol_exit_meta", None),
+        )
+        _hard_stop      = _ladder.hard_stop
+        _immediate_tp   = _ladder.immediate_tp
+        _profit_lock    = _ladder.profit_lock
+        _theta_stop     = _ladder.theta_stop
+        _w1_threshold   = _ladder.w1_threshold
+        _w2_threshold   = _ladder.w2_threshold
+        _w3_threshold   = _ladder.w3_threshold
+        _ladder_stamp   = _ladder.stamp()
+    except Exception:
+        # Total fail-safe: on any unexpected error, use pure legacy values.
+        _theta_stop   = THETA_STOP_LOSS_PCT
+        _w1_threshold = SCALE_OUT_1_THRESHOLD
+        _w2_threshold = SCALE_OUT_2_THRESHOLD
+        _w3_threshold = PROTECT_3_THRESHOLD
+        _ladder_stamp = {"ladder_mode": _LADDER_MODE_LEGACY,
+                         "fallback_reason": "engine_resolver_guard"}
 
     hour, minute = now_et.hour, now_et.minute
     option_pnl   = pos.option_pnl_pct
@@ -513,7 +635,7 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
             action="CLOSE_ALL", quantity=qty_rem,
             reason=f"TARGET HIT -- underlying ${pos.current_underlying:.2f} reached ${pos.underlying_target:.2f}",
             urgency="IMMEDIATE", pnl_pct=option_pnl,
-        )
+        ), _ladder_stamp
 
     # ── 2. STOP HIT ──────────────────────────────────────────────────────────
     # Require 30s confirmation before exiting on underlying stop breach.
@@ -546,7 +668,7 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
                         f"for {_breach_age_sec:.0f}s"
                     ),
                     urgency="HIGH", pnl_pct=option_pnl,
-                )
+                ), _ladder_stamp
             else:
                 log.info(
                     "[%s] UNDERLYING_STOP_CONFIRMING — $%.2f below stop $%.2f "
@@ -611,7 +733,7 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
                         f"underlying={'confirming' if _confirming else 'not confirming'}"
                     ),
                     urgency="IMMEDIATE", pnl_pct=option_pnl,
-                )
+                ), _ladder_stamp
 
     # ── 33/33/34 SCALE-OUT LADDER ────────────────────────────────────────────
     # Scale-out ladder:
@@ -621,8 +743,11 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
     # Do NOT close everything at 15% — let winners run to 25-30%+ with trail.
     # Single-contract positions: hold until trail fires or 30%+ hit.
 
-    # Scale 1: first +10% hit → sell first third
-    if option_pnl >= SCALE_OUT_1_THRESHOLD and pos.scale_outs_done == 0:
+    # Scale 1: first threshold hit → sell first third
+    # PR-G: threshold routed through resolver (_w1_threshold). Legacy mode
+    # returns SCALE_OUT_1_THRESHOLD unchanged (0.15). Reason text shows the
+    # resolved threshold so paper-soak logs are honest about what fired.
+    if option_pnl >= _w1_threshold and pos.scale_outs_done == 0:
         if qty_rem <= 1:
             # 1 contract — do NOT sell here, let it run to trail
             pass  # fall through to trail/profit-lock checks
@@ -630,21 +755,21 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
             qty_s1 = max(1, round(qty_rem / 3))
             return ExitDecision(
                 action="SCALE_OUT", quantity=qty_s1,
-                reason=f"SCALE_1 (+15%) -- selling {qty_s1}/{qty_rem} | running {qty_rem-qty_s1} to +25%",
-                urgency="HIGH", pnl_pct=option_pnl,
-            )
+                reason=f"SCALE_1 (+{_w1_threshold*100:.0f}%) -- selling {qty_s1}/{qty_rem} | running {qty_rem-qty_s1} to next",
+                urgency="HIGH", pnl_pct=option_pnl, _ladder=_ladder_stamp,
+            ), _ladder_stamp
 
-    # Scale 2: +20% hit → sell second third
-    if option_pnl >= SCALE_OUT_2_THRESHOLD and pos.scale_outs_done == 1:
+    # Scale 2: second threshold hit → sell second third
+    if option_pnl >= _w2_threshold and pos.scale_outs_done == 1:
         if qty_rem <= 1:
             pass  # 1 contract runner — let it run to +30% or trail
         else:
             qty_s2 = max(1, round(qty_rem / 2))  # half of what's left ≈ second third of original
             return ExitDecision(
                 action="SCALE_OUT", quantity=qty_s2,
-                reason=f"SCALE_2 (+25%) -- selling {qty_s2}/{qty_rem} runner | targeting +40%",
-                urgency="HIGH", pnl_pct=option_pnl,
-            )
+                reason=f"SCALE_2 (+{_w2_threshold*100:.0f}%) -- selling {qty_s2}/{qty_rem} runner | targeting runner",
+                urgency="HIGH", pnl_pct=option_pnl, _ladder=_ladder_stamp,
+            ), _ladder_stamp
 
     # Scale 3: +30% → close remainder (full exit for final runner)
     # Runner (scale_outs_done >= 2): exits via trail only — no fixed ceiling
@@ -680,7 +805,7 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
                 urgency="IMMEDIATE",
                 pnl_pct=option_pnl,
                 reason_code="PROFIT_LOCK",
-            )
+            ), _ladder_stamp
         # ─────────────────────────────────────────────────────────────────────
 
         # Tightened trail thresholds — was 12-20%, now 8-15%
@@ -730,7 +855,7 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
                     f"protecting +{option_pnl*100:.0f}%"
                 ),
                 urgency="HIGH", pnl_pct=option_pnl,
-            )
+            ), _ladder_stamp
 
     # Underlying progress: if 60%+ toward scanner target, log but do NOT close.
     # Closing the entire position at +5% because the underlying made partial
@@ -804,7 +929,7 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
                 action="HOLD", quantity=0,
                 reason=f"STOP_BREACH_STARTED — {option_pnl*100:.1f}% loss | breach stamped, waiting for confirmation window",
                 urgency="NORMAL", pnl_pct=option_pnl, reason_code="STOP_BREACH_STARTED",
-            )
+            ), _ladder_stamp
 
         _breach_age_sec = (_now_dt - _breach_dt).total_seconds()
 
@@ -823,7 +948,7 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
                     action="HOLD", quantity=0,
                     reason=f"STOP_BREACH_RESET — underlying recovered {_u_move*100:.2f}%, wick not confirmed",
                     urgency="NORMAL", pnl_pct=option_pnl, reason_code="STOP_BREACH_RESET",
-                )
+                ), _ladder_stamp
             # Still in confirmation window — log and wait
             log.info(
                 "[%s] STOP_BREACH_CONFIRMING — %.1f%% loss | breach=%.0fs/%.0fs | "
@@ -835,7 +960,7 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
                 action="HOLD", quantity=0,
                 reason=f"STOP_BREACH_CONFIRMING — {option_pnl*100:.1f}% loss | {_breach_age_sec:.0f}s/{_STOP_CONFIRM_SEC:.0f}s window | {_soft_reason}",
                 urgency="NORMAL", pnl_pct=option_pnl, reason_code="STOP_BREACH_CONFIRMING",
-            )
+            ), _ladder_stamp
 
         # ── Breach confirmed (held past confirmation window) ──────────────────
         # Now evaluate whether to exit
@@ -851,7 +976,7 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
                     f"underlying={_soft_reason}"
                 ),
                 urgency="HIGH", pnl_pct=option_pnl,
-            )
+            ), _ladder_stamp
 
         # Young position with confirming underlying → suppress, give more time
         if _soft_age < _MIN_HOLD_SOFT and (_soft_confirm or _strong_confirm):
@@ -864,7 +989,7 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
                 action="HOLD", quantity=0,
                 reason=f"SOFT_STOP_SUPPRESSED — age {_soft_age:.1f}min < {_MIN_HOLD_SOFT:.0f}min floor, underlying confirming",
                 urgency="NORMAL", pnl_pct=option_pnl, reason_code="SOFT_STOP_SUPPRESSED",
-            )
+            ), _ladder_stamp
 
         if not _soft_confirm:
             # Thesis confirmed broken — underlying not holding, breach confirmed
@@ -877,7 +1002,7 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
                     f"age={_soft_age:.1f}min | confirmed {_breach_age_sec:.0f}s"
                 ),
                 urgency="HIGH", pnl_pct=option_pnl,
-            )
+            ), _ladder_stamp
 
         # Thesis still valid — watch, don't exit on time alone
         log.warning(
@@ -890,7 +1015,7 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
             action="HOLD", quantity=0,
             reason=f"SOFT_LOSS_WATCH — {option_pnl*100:.1f}% loss | thesis holding, underlying={_soft_reason}",
             urgency="NORMAL", pnl_pct=option_pnl, reason_code="SOFT_LOSS_WATCH",
-        )
+        ), _ladder_stamp
 
     # ── NEVER-GREEN ESCALATING STOP ───────────────────────────────────────────
     if not pos.touched_profit:
@@ -955,7 +1080,7 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
                         f"thesis never confirmed | underlying:{_ng_confirm_reason}"
                     ),
                     urgency="HIGH", pnl_pct=option_pnl,
-                )
+                ), _ladder_stamp
 
     # ── HARD STOP ─────────────────────────────────────────────────────────────
     if option_pnl <= _hard_stop:
@@ -963,7 +1088,7 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
             action="STOP", quantity=qty_rem,
             reason=f"HARD STOP -- {option_pnl*100:.0f}% exceeded -{abs(_hard_stop)*100:.0f}% max loss",
             urgency="IMMEDIATE", pnl_pct=option_pnl,
-        )
+        ), _ladder_stamp
 
     # ── PROFIT LOCK ───────────────────────────────────────────────────────────
     if pos.peak_pnl_pct >= _immediate_tp:
@@ -972,14 +1097,14 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
                 action="CLOSE_ALL", quantity=qty_rem,
                 reason=f"PROFIT LOCK -- peaked at +{pos.peak_pnl_pct*100:.0f}%, fell to +{option_pnl*100:.0f}% — locking in",
                 urgency="HIGH", pnl_pct=option_pnl,
-            )
+            ), _ladder_stamp
         drop_from_peak = pos.peak_pnl_pct - option_pnl
         if drop_from_peak >= TRAIL_DROP_FROM_PEAK:
             return ExitDecision(
                 action="CLOSE_ALL", quantity=qty_rem,
                 reason=f"TRAILING STOP -- peak +{pos.peak_pnl_pct*100:.0f}%, dropped {drop_from_peak*100:.0f}pts to +{option_pnl*100:.0f}%",
                 urgency="HIGH", pnl_pct=option_pnl,
-            )
+            ), _ladder_stamp
 
     # ── TREND DAY MULTIPLIERS ─────────────────────────────────────────────────
     direction_aligns = (
@@ -1004,19 +1129,19 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
             action="CLOSE_ALL", quantity=qty_rem,
             reason=f"EOD FORCE CLOSE -- {hour}:{minute:02d} ET {'(market closed)' if market_clearly_closed else f'past {EOD_HARD_CLOSE_HOUR}:{EOD_HARD_CLOSE_MIN:02d}'}",
             urgency="IMMEDIATE", pnl_pct=option_pnl,
-        )
+        ), _ladder_stamp
 
     # ── 4. PROFIT PROTECTION -- WINDOW 3 (2:00 PM+) ──────────────────────────
     past_window3 = (hour > PROFIT_PROTECT_3_HOUR or
                     (hour == PROFIT_PROTECT_3_HOUR and minute >= PROFIT_PROTECT_3_MIN))
-    protect3_thresh = 0.50 if direction_aligns else PROTECT_3_THRESHOLD
+    protect3_thresh = 0.50 if direction_aligns else _w3_threshold
     if past_window3 and option_pnl >= protect3_thresh:
         trend_note = " [trend day -- raised to 50% threshold]" if direction_aligns else ""
         return ExitDecision(
             action="CLOSE_ALL", quantity=qty_rem,
             reason=f"PROFIT PROTECT W3 -- +{option_pnl*100:.0f}% at 2PM+{trend_note}",
-            urgency="HIGH", pnl_pct=option_pnl,
-        )
+            urgency="HIGH", pnl_pct=option_pnl, _ladder=_ladder_stamp,
+        ), _ladder_stamp
 
     # ── 5. PROFIT PROTECTION -- WINDOW 2 (1:00 PM+, or 1:30 PM on trend day) ─
     # FIX-5a: comment corrected from "2:30 PM+" to "1:00 PM+" to match
@@ -1027,15 +1152,15 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
         w2_hour += 1
         w2_min  -= 60
     past_window2 = (hour > w2_hour or (hour == w2_hour and minute >= w2_min))
-    scale2_threshold = SCALE_OUT_2_THRESHOLD * trend_bonus_threshold
+    scale2_threshold = _w2_threshold * trend_bonus_threshold
     if past_window2 and option_pnl >= scale2_threshold and pos.scale_outs_done < 2:
         qty_close  = max(1, round(qty_rem * (0.50 if direction_aligns else 0.75)))
         trend_note = " [TREND DAY -- reduced scale]" if direction_aligns else ""
         return ExitDecision(
             action="SCALE_OUT", quantity=qty_close,
             reason=f"PROFIT PROTECT W2 -- +{option_pnl*100:.0f}% at {w2_hour}:{w2_min:02d}+ scale{trend_note}",
-            urgency="HIGH", pnl_pct=option_pnl,
-        )
+            urgency="HIGH", pnl_pct=option_pnl, _ladder=_ladder_stamp,
+        ), _ladder_stamp
 
     # ── 6. PROFIT PROTECTION -- WINDOW 1 (11:00 AM+, or 11:30 AM on trend day) ─
     # FIX-5b: comment corrected from "1:30 PM+" to "11:00 AM+" to match
@@ -1046,29 +1171,29 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
         w1_hour += 1
         w1_min  -= 60
     past_window1 = (hour > w1_hour or (hour == w1_hour and minute >= w1_min))
-    scale1_threshold = SCALE_OUT_1_THRESHOLD * trend_bonus_threshold
+    scale1_threshold = _w1_threshold * trend_bonus_threshold
     if past_window1 and option_pnl >= scale1_threshold and pos.scale_outs_done < 1:
         qty_close  = max(1, round(qty_rem * (0.35 if direction_aligns else 0.50)))
         trend_note = " [TREND DAY -- let runner breathe]" if direction_aligns else ""
         return ExitDecision(
             action="SCALE_OUT", quantity=qty_close,
             reason=f"PROFIT PROTECT W1 -- +{option_pnl*100:.0f}% at {w1_hour}:{w1_min:02d}+ scale{trend_note}",
-            urgency="NORMAL", pnl_pct=option_pnl,
-        )
+            urgency="NORMAL", pnl_pct=option_pnl, _ladder=_ladder_stamp,
+        ), _ladder_stamp
 
     # ── 7. THETA KILL SWITCH (past noon, down >35%) ───────────────────────────
     past_noon = hour >= 12
-    if past_noon and option_pnl <= THETA_STOP_LOSS_PCT:
+    if past_noon and option_pnl <= _theta_stop:
         return ExitDecision(
             action="CLOSE_ALL", quantity=qty_rem,
             reason=f"THETA STOP -- option down {option_pnl*100:.0f}% after noon, cutting losses",
-            urgency="NORMAL", pnl_pct=option_pnl,
-        )
+            urgency="NORMAL", pnl_pct=option_pnl, _ladder=_ladder_stamp,
+        ), _ladder_stamp
 
     return ExitDecision(
         action="HOLD", quantity=0,
         reason="No exit condition met", urgency="NORMAL", pnl_pct=option_pnl,
-    )
+    ), _ladder_stamp
 
 
 # ── EXIT ENGINE ───────────────────────────────────────────────────────────────
@@ -3244,6 +3369,16 @@ class APExitEngine:
                     )
                     mp.current_option_price = float(row.get("avg_fill", 0) or 0)
                     mp.scale_outs_done      = int(row.get("scale_outs_done", 0) or 0)
+                    # PR-G: hydrate vol-exit IV meta (dormant unless ladder on).
+                    # Absent column/value ⇒ None ⇒ legacy ladder for this pos.
+                    try:
+                        _ve = row.get("vol_exit_meta")
+                        if isinstance(_ve, str) and _ve.strip():
+                            import json as _json
+                            _ve = _json.loads(_ve)
+                        mp.vol_exit_meta = _ve if isinstance(_ve, dict) else None
+                    except Exception:
+                        mp.vol_exit_meta = None
                     _qty_remaining = int(row.get("quantity_remaining", 0) or 0)
                     if _qty_remaining > 0:
                         mp.quantity_remaining = min(_qty_remaining, mp.quantity) if mp.quantity > 0 else _qty_remaining

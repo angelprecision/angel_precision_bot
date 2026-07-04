@@ -3366,6 +3366,28 @@ class APExecutionCore:
                     )
             except Exception as _ca_exc:
                 log.warning("[%s] candidate_audit persist failed: %s", ticker, _ca_exc)
+            # PR-G: persist selector vol_exit IV meta into orders.meta so the
+            # fill_monitor / seed path can hydrate it onto the live position.
+            # DORMANT INPUT — consumed only when the vol_scaled ladder is
+            # enabled (triple-flag gated). Best-effort, never blocks entry.
+            try:
+                _persist_ve = None
+                _sel_local = locals().get("_sel")
+                if _sel_local is not None:
+                    _persist_ve = getattr(_sel_local, "vol_exit", None)
+                if not _persist_ve and approved_plan is not None:
+                    _pmeta = getattr(approved_plan, "metadata", None) or {}
+                    if isinstance(_pmeta, dict):
+                        _persist_ve = _pmeta.get("selector_vol_exit")
+                if _persist_ve and local_order_id and hasattr(
+                    self.order_state_machine, "update_order_meta"
+                ):
+                    self.order_state_machine.update_order_meta(
+                        local_order_id,
+                        {"vol_exit": _persist_ve},
+                    )
+            except Exception as _ve_exc:
+                log.warning("[%s] vol_exit persist failed: %s", ticker, _ve_exc)
             if signal_id:
                 self.store.update_signal_fields(signal_id, {
                     "decision_status": "submitted",
