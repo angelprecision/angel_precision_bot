@@ -7,10 +7,12 @@ must NEVER raise and must NOT affect selection.
 Run: DATABASE_URL=postgresql://test:test@localhost/test python -m pytest tests/test_selector_candidate_audit.py -v
 """
 import os
+import json
 import importlib
 
 
 def _load():
+    os.environ.setdefault("DATABASE_URL", "postgresql://test:test@localhost/test")
     import ap.contract_selector as cs
     importlib.reload(cs)
     return cs
@@ -36,10 +38,12 @@ class TestCandidateAudit:
                   (70.0, _opt("C", 110, 0.3, 0.4)),
                   (60.0, _opt("D", 115, 0.2, 0.3))]
         audit = cs._build_candidate_audit(scored, 100.0, "A", "best_fit", {}, top_n=3)
+        assert len(audit["candidates"]) == 3
         assert len(audit["top_candidates"]) == 3
         assert audit["candidates_considered"] == 4
         assert audit["selected_contract"] == "A"
         assert audit["selected_reason"] == "best_fit"
+        assert audit["candidate_cap"] == 3
 
     def test_field_extraction(self):
         cs = _load()
@@ -48,17 +52,20 @@ class TestCandidateAudit:
         c = audit["top_candidates"][0]
         assert c["rank"] == 1
         assert c["contract"] == "A"
+        assert c["symbol"] == "A"
         assert c["strike"] == 105.0
+        assert c["option_type"] == ""
         assert c["bid"] == 1.0 and c["ask"] == 1.20
         assert c["mid"] == 1.10
         assert c["delta"] == 0.55
-        assert c["dte"] == 7
         assert c["volume"] == 250 and c["open_interest"] == 900
         # spread_pct = (1.20-1.0)/1.10 = 0.1818
         assert abs(c["spread_pct"] - 0.1818) < 0.001
-        # moneyness = (105-100)/100 = 0.05
-        assert abs(c["moneyness_pct"] - 0.05) < 0.0001
-        assert abs(c["distance_from_underlying"] - 5.0) < 0.0001
+        assert c["premium"] == 110.0
+        assert c["selected"] is True
+        assert c["rank_score"] == 90.0
+        assert c["rejected_at_step"] is None
+        assert c["rejection_reason"] is None
 
     def test_missing_delta_is_none_not_crash(self):
         cs = _load()
@@ -66,14 +73,14 @@ class TestCandidateAudit:
         audit = cs._build_candidate_audit(scored, 100.0, "A", "r", {}, top_n=3)
         c = audit["top_candidates"][0]
         assert c["delta"] is None
-        assert "delta_reason" in c  # records why it's missing
+        assert c["iv"] is None
 
     def test_rejected_reasons_sorted_desc(self):
         cs = _load()
         scored = [(50.0, _opt("A", 100, 1.0, 1.1))]
         rejections = {"spread_too_wide": 2, "delta_out_of_range": 7, "low_oi": 1}
         audit = cs._build_candidate_audit(scored, 100.0, "A", "r", rejections, top_n=3)
-        keys = list(audit["rejected_candidate_reasons"].keys())
+        keys = list(audit["hard_filter_rejects"].keys())
         assert keys[0] == "delta_out_of_range"  # highest count first
 
     def test_empty_scored_no_crash(self):
@@ -82,13 +89,37 @@ class TestCandidateAudit:
         assert audit["top_candidates"] == []
         assert audit["candidates_considered"] == 0
 
-    def test_zero_underlying_moneyness_none(self):
+    def test_all_rejected_fixture_stores_rejection_reasons(self):
         cs = _load()
-        scored = [(50.0, _opt("A", 100, 1.0, 1.1))]
-        audit = cs._build_candidate_audit(scored, 0.0, "A", "r", {}, top_n=3)
-        c = audit["top_candidates"][0]
-        assert c["moneyness_pct"] is None
-        assert c["distance_from_underlying"] is None
+        audit = cs._build_candidate_audit(
+            [],
+            100.0,
+            None,
+            "no_survivors",
+            {"spread_too_wide": 4, "low_oi": 2},
+            top_n=15,
+        )
+        assert audit["candidates"] == []
+        assert audit["hard_filter_rejects"] == {"spread_too_wide": 4, "low_oi": 2}
+        assert audit["selected_winner"] is None
+
+    def test_unselected_ranked_candidates_marked_as_ranked_below_selected(self):
+        cs = _load()
+        scored = [(90.0, _opt("A", 100, 1.0, 1.1)), (80.0, _opt("B", 105, 0.8, 1.0))]
+        audit = cs._build_candidate_audit(scored, 100.0, "A", "r", {}, top_n=3)
+        c = audit["top_candidates"][1]
+        assert c["selected"] is False
+        assert c["rejected_at_step"] == "ranking"
+        assert c["rejection_reason"] == "ranked_below_selected"
+
+    def test_meta_size_bound(self):
+        cs = _load()
+        scored = []
+        for idx in range(30):
+            scored.append((100.0 - idx, _opt(f"OPT{idx}", 100 + idx, 1.0, 1.2, delta=0.4, vol=500, oi=1200)))
+        audit = cs._build_candidate_audit(scored, 100.0, "OPT0", "r", {"spread_too_wide": 9}, top_n=15)
+        assert len(audit["candidates"]) == 15
+        assert len(json.dumps(audit, sort_keys=True)) < 12000
 
     def test_selectedcontract_carries_candidate_audit_field(self):
         cs = _load()
@@ -146,10 +177,13 @@ class TestPreselectedQueueAuditPersistence:
             if not hasattr(plan, "metadata") or not isinstance(plan.metadata, dict):
                 plan.metadata = {}
             plan.metadata["selector_candidate_audit"] = _ca
+            plan.metadata["candidate_table"] = _ca
 
         assert "selector_candidate_audit" in plan.metadata
+        assert "candidate_table" in plan.metadata
         assert plan.metadata["selector_candidate_audit"]["selected_contract"] == "A"
         assert len(plan.metadata["selector_candidate_audit"]["top_candidates"]) == 1
+        assert set(plan.metadata["selector_candidate_audit"].keys()) == set(plan.metadata["candidate_table"].keys())
 
     def test_preselected_path_falls_back_to_plan_metadata(self):
         """Half (b): mirror of the execution_core fallback when _candidate_audit
@@ -170,7 +204,7 @@ class TestPreselectedQueueAuditPersistence:
         if not _persist_ca and approved_plan is not None:
             _pmeta = getattr(approved_plan, "metadata", None) or {}
             if isinstance(_pmeta, dict):
-                _persist_ca = _pmeta.get("selector_candidate_audit")
+                _persist_ca = _pmeta.get("candidate_table") or _pmeta.get("selector_candidate_audit")
 
         assert _persist_ca is not None, "preselected path must fall back to plan.metadata"
         assert _persist_ca["selected_contract"] == "NFLX260619C00950000"
@@ -201,13 +235,16 @@ class TestPreselectedQueueAuditPersistence:
         if not _persist_ca and approved_plan is not None:
             _pmeta = getattr(approved_plan, "metadata", None) or {}
             if isinstance(_pmeta, dict):
-                _persist_ca = _pmeta.get("selector_candidate_audit")
+                _persist_ca = _pmeta.get("candidate_table") or _pmeta.get("selector_candidate_audit")
         if _persist_ca and local_order_id and hasattr(osm, "update_order_meta"):
-            osm.update_order_meta(local_order_id, {"selector_candidate_audit": _persist_ca})
+            osm.update_order_meta(local_order_id, {"selector_candidate_audit": _persist_ca, "candidate_table": _persist_ca})
 
         assert len(captured) == 1, "expected exactly one update_order_meta call"
         assert captured[0][0] == "LOID-123"
-        assert captured[0][1] == {"selector_candidate_audit": {"selected_contract": "MSFT"}}
+        assert captured[0][1] == {
+            "selector_candidate_audit": {"selected_contract": "MSFT"},
+            "candidate_table": {"selected_contract": "MSFT"},
+        }
 
     def test_fallback_is_none_when_both_sources_absent(self):
         """If neither breach-time selection nor preselected stash produced an
@@ -223,7 +260,7 @@ class TestPreselectedQueueAuditPersistence:
         if not _persist_ca and approved_plan is not None:
             _pmeta = getattr(approved_plan, "metadata", None) or {}
             if isinstance(_pmeta, dict):
-                _persist_ca = _pmeta.get("selector_candidate_audit")
+                _persist_ca = _pmeta.get("candidate_table") or _pmeta.get("selector_candidate_audit")
 
         assert _persist_ca is None
 
@@ -245,7 +282,7 @@ class TestPreselectedQueueAuditPersistence:
         if not _persist_ca and approved_plan is not None:
             _pmeta = getattr(approved_plan, "metadata", None) or {}
             if isinstance(_pmeta, dict):
-                _persist_ca = _pmeta.get("selector_candidate_audit")
+                _persist_ca = _pmeta.get("candidate_table") or _pmeta.get("selector_candidate_audit")
 
         assert _persist_ca["selected_contract"] == "FRESH_BREACH_TIME"
 
@@ -263,7 +300,7 @@ class TestPreselectedQueueAuditPersistence:
         if not _persist_ca and approved_plan is not None:
             _pmeta = getattr(approved_plan, "metadata", None) or {}
             if isinstance(_pmeta, dict):
-                _persist_ca = _pmeta.get("selector_candidate_audit")
+                _persist_ca = _pmeta.get("candidate_table") or _pmeta.get("selector_candidate_audit")
 
         # Defensive: corrupted metadata produces no audit, no crash.
         assert _persist_ca is None

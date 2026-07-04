@@ -3378,13 +3378,16 @@ class APExecutionCore:
                 if not _persist_ca and approved_plan is not None:
                     _pmeta = getattr(approved_plan, "metadata", None) or {}
                     if isinstance(_pmeta, dict):
-                        _persist_ca = _pmeta.get("selector_candidate_audit")
+                        _persist_ca = _pmeta.get("candidate_table") or _pmeta.get("selector_candidate_audit")
                 if _persist_ca and local_order_id and hasattr(
                     self.order_state_machine, "update_order_meta"
                 ):
                     self.order_state_machine.update_order_meta(
                         local_order_id,
-                        {"selector_candidate_audit": _persist_ca},
+                        {
+                            "selector_candidate_audit": _persist_ca,
+                            "candidate_table": _persist_ca,
+                        },
                     )
             except Exception as _ca_exc:
                 log.warning("[%s] candidate_audit persist failed: %s", ticker, _ca_exc)

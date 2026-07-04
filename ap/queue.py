@@ -1481,6 +1481,7 @@ def _dispatch(
                     if not hasattr(plan, "metadata") or not isinstance(plan.metadata, dict):
                         plan.metadata = {}
                     plan.metadata["selector_candidate_audit"] = _ca
+                    plan.metadata["candidate_table"] = _ca
             except Exception:
                 pass
         except Exception as e:
