@@ -58,7 +58,7 @@ def build_report(report_date, debug=False):
             return None
 
     signals  = fetch("ap_signals",   "created_at", "signal_id,ticker,side,decision_status", "ap_signals")
-    orders_r = fetch("orders",        "created_ts", "id,client_id,status,symbol,kind,limit_price,fill_price,qty,created_ts", "orders")
+    orders_r = fetch("orders",        "created_ts", "id,client_id,status,symbol,kind,limit_price,fill_price,qty,created_ts,meta", "orders")
     proof    = fetch("proof_trades",  "closed_at",  "ticker,side,option_pnl_pct,win,exit_reason,exit_bucket,client_email,seconds_to_fill,slippage_vs_mid,exit_pricing_tier", "proof_trades")
     try:
         rejs = sb_get("decision_events",
@@ -75,6 +75,37 @@ def build_report(report_date, debug=False):
     filled   = [o for o in entries if o.get("status") in ("FILLED","ACKNOWLEDGED")]
     canceled = [o for o in entries if o.get("status") == "CANCELED"]
     expired  = [o for o in entries if o.get("status") == "EXPIRED"]
+    terminal_orders = [
+        o for o in (orders_r or [])
+        if o.get("status") in ("FILLED", "CLOSED", "CANCELLED", "CANCELED", "EXPIRED")
+    ]
+    def _meta_dict(o):
+        m = o.get("meta") or {}
+        if isinstance(m, str):
+            try:
+                m = json.loads(m)
+            except Exception:
+                m = {}
+        return m if isinstance(m, dict) else {}
+    mfe_mae_covered = sum(
+        1 for o in terminal_orders
+        if (
+            "mfe_pct" in _meta_dict(o)
+            or "mae_pct" in _meta_dict(o)
+            or "mfe_mae_unavailable_reason" in _meta_dict(o)
+        )
+    )
+    mfe_mae_coverage_pct = (
+        round(mfe_mae_covered / max(len(terminal_orders), 1) * 100, 1)
+        if orders_r is not None else None
+    )
+    mfe_mae_warning = (
+        f"MFE/MAE coverage {mfe_mae_coverage_pct}% below 95% target"
+        if mfe_mae_coverage_pct is not None
+        and len(terminal_orders) > 0
+        and mfe_mae_coverage_pct < 95.0
+        else None
+    )
 
     winners  = [t for t in (proof or []) if t.get("win")]
     losers   = [t for t in (proof or []) if not t.get("win") and t.get("option_pnl_pct") is not None]
@@ -124,6 +155,10 @@ def build_report(report_date, debug=False):
             "manual_exits":   manual_exits,
             "exit_buckets":   buckets,
             "slow_fills_gt45s": len(slow_fills),
+            "mfe_mae_coverage_pct": mfe_mae_coverage_pct,
+            "mfe_mae_covered_count": mfe_mae_covered,
+            "mfe_mae_closed_count": len(terminal_orders),
+            "mfe_mae_coverage_warning": mfe_mae_warning,
         },
         "client_sync": {
             "clients_orders": c_orders,
@@ -137,7 +172,12 @@ def build_report(report_date, debug=False):
             "no_stale_expired": len(expired) == 0,
             "no_manual_exits":  manual_exits == 0,
             "client_sync_ok":   set(c_orders) == set(c_proof) or not (proof or []),
-            "clean_run":        data_valid and manual_exits == 0 and not slow_fills and not expired,
+            "mfe_mae_coverage_ok": (
+                mfe_mae_coverage_pct is None
+                or len(terminal_orders) == 0
+                or mfe_mae_coverage_pct >= 95.0
+            ),
+            "clean_run":        data_valid and manual_exits == 0 and not slow_fills and not expired and not mfe_mae_warning,
         },
         "trades": [
             {"ticker": t.get("ticker"), "side": t.get("side"),
@@ -186,6 +226,8 @@ def print_report(r, errs):
     print(f"  P&L          avg W: {p['avg_winner_pct']:+.1f}%  avg L: {p['avg_loser_pct']:+.1f}%")
     if p["manual_exits"]: print(f"  ⚠️  MANUAL EXITS: {p['manual_exits']} (should be 0)")
     if p["slow_fills_gt45s"]: print(f"  ⚠️  SLOW EXIT FILLS: {p['slow_fills_gt45s']} took >45s")
+    print(f"  MFE/MAE      coverage={p['mfe_mae_coverage_pct'] if p['mfe_mae_coverage_pct'] is not None else 'N/A'}% ({p['mfe_mae_covered_count']}/{p['mfe_mae_closed_count']})")
+    if p["mfe_mae_coverage_warning"]: print(f"  ⚠️  {p['mfe_mae_coverage_warning']}")
     print(f"  EXIT BUCKETS {json.dumps(p['exit_buckets'])}")
     print(f"  CLIENT SYNC  orders={cs['clients_orders']}  proof={cs['clients_proof']}  {'✅' if cs['sync_ok'] else '❌ OUT OF SYNC'}")
     print(f"  REJECTIONS   {r['rejections']['total']}  {r['rejections']['by_reason']}")
