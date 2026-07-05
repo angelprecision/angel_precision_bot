@@ -583,7 +583,15 @@ def _pro_contract_quality(opt: dict, ticker: str, dte: int) -> tuple[str, str]:
     if spread_pct > hard_spread:
         return "REJECT", f"spread_too_wide_{spread_pct*100:.1f}%_max_{hard_spread*100:.0f}%"
 
-    if bid_size or ask_size:
+    # P0 (monday-trade-flow-readiness) — one-sided-size trap fix.
+    # Tradier chain rows frequently report size on only ONE side (e.g.
+    # bid_size=12, ask_size=0). The previous gate `if bid_size or ask_size:`
+    # then rejected such rows as size_too_thin even when the reported side was
+    # deep and the quote was live/tight — a data-shape artifact, not thinness.
+    # The hard size gate now applies ONLY when BOTH sides report a size, so a
+    # genuinely thin two-sided book still rejects, while one-sided reporting
+    # falls through to the vol/OI liquidity gate below (which still protects).
+    if bid_size and ask_size:
         if bid_size < _PRO_MIN_BID_SIZE_HARD or ask_size < _PRO_MIN_BID_SIZE_HARD:
             return "REJECT", f"size_too_thin_bid{bid_size}_ask{ask_size}"
 

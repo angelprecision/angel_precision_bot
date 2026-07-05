@@ -22,7 +22,16 @@ def _trading_date(now: datetime | None = None) -> str:
 
 
 def _is_market_day(now: datetime | None = None) -> bool:
-    return _now_et(now).weekday() < 5
+    # P0 (monday-trade-flow-readiness): delegate to the canonical NYSE
+    # calendar (ap.flatline_alarm.is_trading_day, single source of truth per
+    # #282) so the handoff never runs a "trading day" pass on a full-closure
+    # holiday. Fail-safe to legacy weekday-only logic on import failure.
+    _dt = _now_et(now)
+    try:
+        from ap.flatline_alarm import is_trading_day as _nyse_is_trading_day
+        return _nyse_is_trading_day(_dt.date())
+    except Exception:
+        return _dt.weekday() < 5
 
 
 def _after_929_et(now: datetime | None = None) -> bool:
@@ -1099,6 +1108,43 @@ def run_morning_handoff_audit(
     ok = True
     error = None
 
+    # ── P0 (monday-trade-flow-readiness): pre-reseed WATCHING readiness pass ──
+    # Runs BEFORE fanout/reseed so stale/holiday/orphaned WATCHING rows are
+    # classified out of the pipe before anything is re-armed. Classification
+    # only — never resets to NEW, never re-triggers; live_no_replay_policy is
+    # untouched. Gated on AP_WATCHING_READINESS_PASS=1 (no-op when unset).
+    # dry_run mirrors the handoff's own dry_run so the audit endpoint shows a
+    # full preview with zero writes. A readiness failure is recorded in
+    # details but does NOT abort the handoff: a cleanup error must never
+    # block watcher reseed on a live trading morning.
+    # NOTE: readiness issues go into readiness_warnings (details-only), NOT
+    # into `warnings` — that list hard-fails the handoff below, and a cleanup
+    # error must never block watcher reseed on a live trading morning.
+    readiness_result: dict = {}
+    readiness_warnings: list[str] = []
+    try:
+        from ap.watching_readiness import run_watching_readiness_pass
+        readiness_result = run_watching_readiness_pass(
+            client_id,
+            execution_mode=mode,
+            dry_run=dry_run,
+            now=now,
+        )
+        if not readiness_result.get("ok", True):
+            readiness_warnings.append(
+                f"watching_readiness_failed:{readiness_result.get('error')}"
+            )
+            log.error(
+                "morning_handoff watching_readiness failed client=%s stage=%s err=%s",
+                client_id, stage, readiness_result.get("error"),
+            )
+    except Exception as _readiness_exc:  # noqa: BLE001
+        readiness_warnings.append(f"watching_readiness_exception:{_readiness_exc}")
+        log.error(
+            "morning_handoff watching_readiness exception client=%s stage=%s err=%s",
+            client_id, stage, _readiness_exc, exc_info=True,
+        )
+
     if not dry_run and warnings:
         ok = False
         error = ",".join(warnings)
@@ -1158,6 +1204,11 @@ def run_morning_handoff_audit(
         "warnings": warnings,
         "errors": list(recovery_result.get("errors") or []),
         "enqueue_result": enqueue_result,  # PR #183
+        # P0 (monday-trade-flow-readiness): full readiness pass result +
+        # non-fatal readiness warnings, persisted with the handoff lock row
+        # so the audit endpoint shows exactly what was archived/terminalized.
+        "watching_readiness": readiness_result,
+        "readiness_warnings": readiness_warnings,
     }
     _upsert_handoff_run_lock(
         client_id=client_id,

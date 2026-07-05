@@ -1077,6 +1077,56 @@ def _dispatch(
     payload["direction"] = _side
     # ── END PR #233 PRE-CHECKS ──────────────────────────────────────────────
 
+    # ── P0 (monday-trade-flow-readiness): entry ticker allowlist ────────────
+    # AP_ENTRY_TICKER_ALLOWLIST is an OPERATOR gate for acceptance-testing
+    # windows: when set (comma-separated, e.g. "SPY,QQQ,IWM"), any dispatched
+    # signal whose ticker is not in the list is REJECTED here — before Master
+    # Control, the selector, OSM, or the watcher — so nothing outside the
+    # allowlist can arm a watcher or reserve capital. Fully reversible by
+    # unsetting the env var (default: unset → gate inactive, behavior
+    # byte-for-byte unchanged). Index aliases normalize through the same map
+    # the selector uses (^GSPC→SPY etc.) so an allowlisted proxy is honored.
+    # Rejection is LOUD (job REJECTED + rejection ledger row) — never silent.
+    _allowlist_raw = os.getenv("AP_ENTRY_TICKER_ALLOWLIST", "").strip()
+    if _allowlist_raw:
+        _allowlist = {t.strip().upper() for t in _allowlist_raw.split(",") if t.strip()}
+        _gate_ticker = str(ticker or "").upper()
+        _INDEX_ALIAS = {"^GSPC": "SPY", "^NDX": "QQQ", "^RUT": "IWM"}
+        _gate_ticker_mapped = _INDEX_ALIAS.get(_gate_ticker, _gate_ticker)
+        if _allowlist and _gate_ticker_mapped not in _allowlist:
+            _clean_payload = dict(payload or {})
+            log.warning(
+                "[%s] QUEUE_TICKER_NOT_IN_ALLOWLIST signal_id=%s client_id=%s allowlist=%s",
+                ticker, signal_id, client_id, ",".join(sorted(_allowlist)),
+            )
+            _mark_job(
+                job_id,
+                "REJECTED",
+                result={
+                    "stage":       "entry_ticker_allowlist",
+                    "reason":      "TICKER_NOT_IN_ALLOWLIST",
+                    "reason_code": "TICKER_NOT_IN_ALLOWLIST",
+                    "allowlist":   sorted(_allowlist),
+                },
+                error="entry_ticker_allowlist:TICKER_NOT_IN_ALLOWLIST",
+            )
+            _log_rejection_to_db(
+                signal_id=signal_id,
+                client_id=client_id,
+                ticker=ticker,
+                side=_side,
+                score=_safe_float(_clean_payload.get("score") or 0),
+                stage="entry_ticker_allowlist",
+                reason_code="TICKER_NOT_IN_ALLOWLIST",
+                human_reason=(
+                    f"ticker {_gate_ticker_mapped} not in AP_ENTRY_TICKER_ALLOWLIST "
+                    f"({_allowlist_raw})"
+                ),
+                payload=_clean_payload,
+            )
+            return
+    # ── END entry ticker allowlist ───────────────────────────────────────────
+
     # Resolve canonical_signal_id — primary idempotency key for opportunity ledger.
     # PR79 build_canonical_signal_id prevents REEVAL suffix variants from
     # fragmenting opportunity rows.

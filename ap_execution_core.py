@@ -128,6 +128,62 @@ RETRYABLE_BREACH_SELECTOR_REASONS: frozenset = frozenset({
 })
 
 
+# ── P0 (monday-trade-flow-readiness, amended): acceptance ask-cap resolver ───
+# Small-account acceptance-window cap. FAIL-CLOSED contract:
+#   • DEFERRED_SMALL_ACCOUNT_FALLBACK unset/0  → (False, None, None): feature
+#     off, all cap checks are no-ops, behavior byte-for-byte unchanged.
+#   • Flag ON + MAX_CONTRACT_ASK_FOR_JASON_ACCEPTANCE valid (> 0)
+#     → (True, cap, None): enforce at BOTH check sites (selection copy AND
+#     final pre-submit limit) so a selector ask under cap with a refreshed
+#     submit limit over cap can never slip through.
+#   • Flag ON + cap env missing / unparsable / <= 0
+#     → (True, None, error): MISCONFIGURED. Callers must BLOCK the deferred
+#     materialization (terminalize), never proceed uncapped. An operator who
+#     turned the acceptance fallback on has declared a capped window; running
+#     uncapped inside it is the failure mode this contract forbids.
+# Hot-read per call (repo convention for operator flags).
+def _acceptance_ask_cap() -> "tuple[bool, float | None, str | None]":
+    enabled = os.getenv(
+        "DEFERRED_SMALL_ACCOUNT_FALLBACK", "0"
+    ).strip().lower() in ("1", "true", "yes")
+    if not enabled:
+        return False, None, None
+    raw = os.getenv("MAX_CONTRACT_ASK_FOR_JASON_ACCEPTANCE", "").strip()
+    if not raw:
+        return True, None, "acceptance_cap_missing"
+    try:
+        cap = float(raw)
+    except (TypeError, ValueError):
+        return True, None, f"acceptance_cap_unparsable:{raw!r}"
+    if cap <= 0:
+        return True, None, f"acceptance_cap_nonpositive:{cap}"
+    return True, cap, None
+
+
+# ── P0 (monday-trade-flow-readiness, amended): canonical materialization
+# outcome. Every triggered deferred row must resolve to EXACTLY ONE of three
+# operator-facing outcomes — the acceptance contract for restored trade flow:
+#   MATERIALIZED_AND_SUBMITTED     real OCC contract selected AND handed to
+#                                  the broker submit path
+#   RETRY_LATER_DATA_UNAVAILABLE   transient data-miss (zero quotes / empty
+#                                  chain near open); a bounded retry is
+#                                  scheduled inside the warmup/entry window
+#   TERMINAL_NO_TRADEABLE_CONTRACT everything else terminal: quality rejects,
+#                                  budget/cap blocks, retry exhaustion/cutoff,
+#                                  selector exceptions, submit failures
+# The fine-grained outcome (BREACH_SELECTOR_RETURNED_NONE, OI_TOO_LOW, ...)
+# is preserved as materialization_detail — canonicalization ADDS a stable
+# summary, it never replaces the honest detail. "No more DEFERRED:* + 0.01 +
+# EXPIRED with no broker_order_id and unclear reason."
+_MATERIALIZATION_ENTRY_PATH = "DEFERRED_BREACH_MATERIALIZATION"
+
+
+def _canonical_materialization_outcome(outcome: str) -> str:
+    if str(outcome or "").strip() == "BREACH_BROKER_SUBMITTED":
+        return "MATERIALIZED_AND_SUBMITTED"
+    return "TERMINAL_NO_TRADEABLE_CONTRACT"
+
+
 def _live_confirmation_required() -> bool:
     """
     P0 (PR #262): LIVE submits require an explicit entry-confirmation PASS.
@@ -317,6 +373,12 @@ def _build_deferred_retry_schedule_meta(
         "local_order_id": str(local_order_id or ""),
         "signal_id": str(signal_id or ""),
         "contract_selection_status": "CONTRACT_SELECTION_RETRY",
+        # P0 amended: canonical tri-outcome stamp — a scheduled retry is the
+        # RETRY_LATER_DATA_UNAVAILABLE state until the next attempt resolves
+        # it to MATERIALIZED_AND_SUBMITTED or TERMINAL_NO_TRADEABLE_CONTRACT.
+        "entry_path": _MATERIALIZATION_ENTRY_PATH,
+        "materialization_outcome": "RETRY_LATER_DATA_UNAVAILABLE",
+        "materialization_detail": str(reason_code or ""),
     }
 
 
@@ -347,6 +409,12 @@ def _build_deferred_retry_terminal_meta(
         "local_order_id": str(local_order_id or ""),
         "signal_id": str(signal_id or ""),
         "last_breach_failure_at": _now.isoformat(),
+        # P0 amended: canonical tri-outcome stamp for retry-exhaustion/cutoff/
+        # disabled terminals — the fine-grained reason stays in
+        # materialization_detail / deferred_retry_terminal_reason.
+        "entry_path": _MATERIALIZATION_ENTRY_PATH,
+        "materialization_outcome": "TERMINAL_NO_TRADEABLE_CONTRACT",
+        "materialization_detail": str(reason_code or ""),
     }
 
 
@@ -1738,6 +1806,41 @@ class APExecutionCore:
                     log.warning("DEFERRED_TRIGGER_OUTCOME_EMIT_FAILED outcome=%s", outcome)
                 except Exception:
                     pass
+            # ── P0 (monday-trade-flow-readiness, amended): persist the
+            # canonical tri-outcome onto the order row so the operator can
+            # answer "what happened to this deferred trigger?" from
+            # orders.meta alone — no log spelunking. Best-effort, never
+            # raises, exactly-once by construction (this emitter is the
+            # exactly-once terminal channel). Selected bid/ask/mid and the
+            # final submit limit arrive via `extra` from the call sites and
+            # are merged verbatim.
+            try:
+                if queue_local_order_id and self.order_state_machine is not None:
+                    _update_meta = getattr(
+                        self.order_state_machine, "update_order_meta", None
+                    )
+                    if callable(_update_meta):
+                        _canon_meta: dict = {
+                            "entry_path": _MATERIALIZATION_ENTRY_PATH,
+                            "materialization_outcome": _canonical_materialization_outcome(outcome),
+                            "materialization_detail": outcome,
+                            "materialization_reason": reason or "",
+                            "materialization_contract": contract or "",
+                            "materialization_broker_order_id": broker_order_id or "",
+                            "materialization_ts": datetime.now(timezone.utc).isoformat(),
+                        }
+                        if extra:
+                            for _mk, _mv in extra.items():
+                                _canon_meta.setdefault(f"materialization_{_mk}", _mv)
+                        _update_meta(queue_local_order_id, _canon_meta)
+            except Exception as _canon_exc:
+                try:
+                    log.debug(
+                        "materialization outcome meta persist failed (non-fatal): %s",
+                        _canon_exc,
+                    )
+                except Exception:
+                    pass
 
         # 3) Recover the already-approved queue/OSM plan.
         approved_plan = self._recover_plan_for_revalidation(watched)
@@ -1916,6 +2019,85 @@ class APExecutionCore:
                         _live_contract = str(getattr(approved_plan, "contract_symbol", "") or "").strip()
                     except Exception as _copy_exc:
                         log.warning("[%s] deferred breach selected contract copy failed: %s", ticker, _copy_exc)
+
+                # ── P0 (monday-trade-flow-readiness, amended): acceptance cap
+                # at SELECTION time. _acceptance_ask_cap() is FAIL-CLOSED:
+                # when DEFERRED_SMALL_ACCOUNT_FALLBACK=1 but the cap env is
+                # missing/unparsable/<=0, the materialization BLOCKS here as
+                # ACCEPTANCE_CAP_MISCONFIGURED — it never proceeds uncapped.
+                # When the cap is valid: selected ask must be <= cap and
+                # quantity clamps to exactly 1 (acceptance is flow-proof, not
+                # P&L). A second enforcement of the SAME cap runs against the
+                # final refreshed submit limit in the pre-submit invariant, so
+                # selection-time pass + refresh-time drift over cap still
+                # blocks before any broker POST. Feature off (flag unset)
+                # → this block is a no-op, behavior byte-for-byte unchanged.
+                _cap_enabled, _accept_cap, _cap_error = _acceptance_ask_cap()
+                if _cap_enabled and _sel_is_real:
+                    if _cap_error:
+                        _cap_reason = f"ACCEPTANCE_CAP_MISCONFIGURED:{_cap_error}"
+                        log.critical(
+                            "[%s] DEFERRED_ACCEPTANCE_CAP_MISCONFIGURED %s — "
+                            "fail-closed: blocking materialization, no broker POST",
+                            ticker, _cap_error,
+                        )
+                        _emit_deferred_outcome(
+                            "UNTRADEABLE_FOR_ACCOUNT_SIZE",
+                            reason=_cap_reason,
+                            contract=_sel_contract,
+                        )
+                        _terminalize_deferred_breach_failure(
+                            _cap_reason,
+                            extra_meta={
+                                "failure_stage": "acceptance_ask_cap",
+                                "acceptance_cap_error": _cap_error,
+                                "selected_contract": _sel_contract,
+                            },
+                        )
+                        return
+                    _sel_ask = float(getattr(_sel, "ask", 0) or 0)
+                    if _sel_ask <= 0 or _sel_ask > _accept_cap:
+                        _cap_reason = (
+                            f"acceptance_ask_cap:ask_{_sel_ask:.2f}_"
+                            f"cap_{_accept_cap:.2f}"
+                        )
+                        log.warning(
+                            "[%s] DEFERRED_ACCEPTANCE_CAP_BLOCK contract=%s "
+                            "ask=%.2f cap=%.2f — terminalizing, no retry",
+                            ticker, _sel_contract, _sel_ask, _accept_cap,
+                        )
+                        _emit_deferred_outcome(
+                            "UNTRADEABLE_FOR_ACCOUNT_SIZE",
+                            reason=_cap_reason,
+                            contract=_sel_contract,
+                        )
+                        _terminalize_deferred_breach_failure(
+                            _cap_reason,
+                            extra_meta={
+                                "failure_stage": "acceptance_ask_cap",
+                                "selected_contract": _sel_contract,
+                                "selected_ask": _sel_ask,
+                                "acceptance_cap": _accept_cap,
+                            },
+                        )
+                        return
+                    # Cap passed — acceptance mode trades exactly one
+                    # contract at the selected premium.
+                    try:
+                        approved_plan.contracts = 1
+                        _prem = float(getattr(_sel, "premium_per_contract", 0) or 0)
+                        if _prem > 0:
+                            approved_plan.max_position_usd = _prem
+                        log.info(
+                            "[%s] DEFERRED_ACCEPTANCE_CAP_PASS contract=%s "
+                            "ask=%.2f cap=%.2f qty=1",
+                            ticker, _sel_contract, _sel_ask, _accept_cap,
+                        )
+                    except Exception as _cap_exc:
+                        log.warning(
+                            "[%s] acceptance qty clamp failed (non-fatal): %s",
+                            ticker, _cap_exc,
+                        )
 
                 # ── P0 (hotfix/deferred-breach-selector-reasons, amended): ────
                 # Shared helper — builds the selector audit dict and extracts
@@ -3342,6 +3524,39 @@ class APExecutionCore:
                 _terminalize_breach_failure(_inv_err)
                 return
 
+            # ── P0 (monday-trade-flow-readiness, amended): acceptance cap on
+            # the FINAL submit limit. The selection-time cap check above can
+            # pass and the entry-pricing loop can then refresh the limit
+            # upward (ask-cross, drift within ENTRY_MAX_PRICE_DRIFT_PCT). The
+            # cap is a hard acceptance-window invariant, so it is re-enforced
+            # here against the exact limit that would go to the broker.
+            # Same FAIL-CLOSED contract as selection time: flag on + cap
+            # invalid → block; flag off → no-op.
+            _cap_enabled, _accept_cap, _cap_error = _acceptance_ask_cap()
+            if _cap_enabled:
+                if _cap_error:
+                    _inv_err = f"ACCEPTANCE_CAP_MISCONFIGURED:{_cap_error}"
+                    log.critical(
+                        "[%s] PRE_SUBMIT_INVARIANT_FAILED — %s | fail-closed; "
+                        "broker_order_id=null; blocking broker POST",
+                        ticker, _inv_err,
+                    )
+                    _terminalize_breach_failure(_inv_err)
+                    return
+                if _pre_limit > _accept_cap:
+                    _inv_err = (
+                        f"ACCEPTANCE_CAP_EXCEEDED_AT_SUBMIT:"
+                        f"limit_{_pre_limit:.2f}_cap_{_accept_cap:.2f}"
+                    )
+                    log.critical(
+                        "[%s] PRE_SUBMIT_INVARIANT_FAILED — %s | selection-time "
+                        "cap passed but refreshed submit limit exceeds cap; "
+                        "broker_order_id=null; blocking broker POST",
+                        ticker, _inv_err,
+                    )
+                    _terminalize_breach_failure(_inv_err)
+                    return
+
         submit_res = self.order_state_machine.submit_existing_entry(
             local_order_id=queue_local_order_id,
             broker=self.broker,
@@ -3410,10 +3625,24 @@ class APExecutionCore:
                 approved_contract,
                 submit_limit,
             )
+            # P0 amended (req: persist materialization audit): final broker
+            # limit + selected quote snapshot, merged into orders.meta as
+            # materialization_* fields by the emitter. `_sel` is bound ONLY on
+            # the deferred selection branch — resolve via locals() so the
+            # non-deferred success path (where _emit_deferred_outcome is a
+            # no-op anyway) can never NameError while building arguments.
+            _sel_snapshot = locals().get("_sel")
             _emit_deferred_outcome(
                 "BREACH_BROKER_SUBMITTED",
                 contract=str(approved_contract or ""),
                 broker_order_id=str(broker_order_id or ""),
+                extra={
+                    "final_submit_limit": float(submit_limit or 0),
+                    "selected_bid": float(getattr(_sel_snapshot, "bid", 0) or 0),
+                    "selected_ask": float(getattr(_sel_snapshot, "ask", 0) or 0),
+                    "selected_mid": float(getattr(_sel_snapshot, "mid", 0) or 0),
+                    "qty": int(approved_qty or 0),
+                },
             )
             return
 
