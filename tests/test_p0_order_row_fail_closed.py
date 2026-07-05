@@ -5,19 +5,19 @@ the persisted `orders` row was unreadable — the handoff proof would pass
 and broker submit would proceed WITHOUT having proven the DB row. For a
 system handling client money at scale, that is not acceptable.
 
-Amendment #5 changes the contract:
+Amendment #5+#6 changes the contract:
   osm.get_order() raises OR returns None after selector success
     → BLOCK_RETRY
-    → emit RETRY_LATER_DATA_UNAVAILABLE + MATERIALIZATION_ORDER_ROW_UNREADABLE
+    → emit TERMINAL_NO_TRADEABLE_CONTRACT + MATERIALIZATION_ORDER_ROW_UNREADABLE
     → terminalize, no broker POST
 
   readable row with DEFERRED:* or diverging contract
     → TERMINAL_NO_TRADEABLE_CONTRACT + MATERIALIZATION_COPYBACK_MISMATCH
     (unchanged from amendment #4 — classifier handles this)
 
-Two distinct failure modes, two distinct canonical outcomes.
-The distinction matters for the operator: "retry later, transient" vs
-"permanent mismatch, something is wrong with the pipeline".
+Two distinct failure modes, one terminal canonical outcome.
+The distinction matters for the operator through materialization_detail:
+"could not prove the row" vs "proved the row and it was wrong".
 
 Required test coverage (per spec):
   1. osm.get_order raises → BLOCK_RETRY, no broker POST.
@@ -92,6 +92,54 @@ def test_readable_row_returns_pass():
     assert (verdict, reason) == ("PASS", None)
 
 
+def test_handoff_row_reader_recovers_from_initial_none():
+    class _OSM:
+        def __init__(self):
+            self.calls = 0
+
+        def get_order(self, _local_order_id):
+            self.calls += 1
+            if self.calls == 1:
+                return None
+            return {"contract": _REAL_OCC, "local_order_id": "L1"}
+
+    osm = _OSM()
+    row, error, attempts = core._read_order_row_for_handoff_proof(
+        osm,
+        "L1",
+        attempts=3,
+        delay_s=0,
+    )
+
+    assert row == {"contract": _REAL_OCC, "local_order_id": "L1"}
+    assert error is None
+    assert attempts == 2
+    assert osm.calls == 2
+
+
+def test_handoff_row_reader_returns_none_after_bounded_misses():
+    class _OSM:
+        def __init__(self):
+            self.calls = 0
+
+        def get_order(self, _local_order_id):
+            self.calls += 1
+            return None
+
+    osm = _OSM()
+    row, error, attempts = core._read_order_row_for_handoff_proof(
+        osm,
+        "L1",
+        attempts=3,
+        delay_s=0,
+    )
+
+    assert row is None
+    assert error is None
+    assert attempts == 3
+    assert osm.calls == 3
+
+
 def test_proof_not_applicable_when_snapshot_not_captured():
     verdict, reason = core._classify_order_row_read(
         handoff_snapshot={"captured": False},
@@ -129,7 +177,7 @@ def test_none_snapshot_is_not_applicable():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Canonical outcome mapping: DEFERRED_ORDER_ROW_UNREADABLE → RETRY_LATER
+# Canonical outcome mapping: DEFERRED_ORDER_ROW_UNREADABLE → TERMINAL
 # ─────────────────────────────────────────────────────────────────────────────
 
 def test_unreadable_outcome_maps_to_terminal_option_b():
@@ -194,11 +242,12 @@ def _canon_meta_from_persist(outcome, reason, contract, broker_order_id, extra):
 
 def _unreadable_extra(read_reason, snap, pre_contract, pre_limit, pre_qty,
                        local_order_id="LOID-42", client_id="jason@example.com",
-                       execution_mode="LIVE"):
+                       execution_mode="LIVE", read_attempts=3):
     return {
         "failure_stage":                   "handoff_order_row_read",
         "materialization_detail_override": "MATERIALIZATION_ORDER_ROW_UNREADABLE",
         "order_row_read_error":            read_reason,
+        "order_row_read_attempts":         read_attempts,
         "selector_contract":               snap.get("selector_contract"),
         "selector_bid":                    snap.get("selector_bid"),
         "selector_ask":                    snap.get("selector_ask"),
@@ -237,6 +286,7 @@ def test_read_error_stamps_terminal_outcome_option_b():
     for field in (
         "materialization_selector_contract",
         "materialization_order_row_read_error",
+        "materialization_order_row_read_attempts",
         "materialization_pre_submit_contract",
         "materialization_pre_submit_limit",
         "materialization_local_order_id",
@@ -260,6 +310,7 @@ def test_row_not_found_stamps_terminal_outcome_option_b():
     assert meta["materialization_outcome"] == "TERMINAL_NO_TRADEABLE_CONTRACT"
     assert meta["materialization_detail"] == "MATERIALIZATION_ORDER_ROW_UNREADABLE"
     assert meta["materialization_order_row_read_error"] == "row_not_found"
+    assert meta["materialization_order_row_read_attempts"] == 3
     assert meta["materialization_broker_order_id"] == ""
 
 

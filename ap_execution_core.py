@@ -253,11 +253,11 @@ def _classify_materialization_handoff(
     if int(pre_submit_qty or 0) <= 0:
         return False, f"pre_submit_qty_not_materialized:qty={int(pre_submit_qty or 0)}"
 
-    # P0 amendment #4 (PR #294): third-view check against the persisted
-    # `orders` row. `order_row_contract=None` means the read was skipped or
-    # failed — degrade to "not-applicable-for-this-field" so a transient DB
-    # read hiccup cannot block every submit; the standing
-    # DEFERRED_CONTRACT_NOT_MATERIALIZED post-proof invariant still runs.
+    # P0 amendment #4+#5+#6 (PR #294): third-view check against the persisted
+    # `orders` row. When a deferred selector has produced a real OCC contract,
+    # the caller now proves the row is readable before reaching this classifier.
+    # `order_row_contract=None` only remains not-applicable for paths where the
+    # selector never captured a real contract; standing invariants still run.
     # Any non-None value is authoritative:
     #   - DEFERRED:* / empty → the OSM never persisted the materialized
     #     contract; block.
@@ -321,6 +321,41 @@ def _classify_order_row_read(
         return "BLOCK_RETRY", reason
 
     return "PASS", None
+
+
+def _read_order_row_for_handoff_proof(
+    order_state_machine: object,
+    local_order_id: str,
+    *,
+    attempts: int = 3,
+    delay_s: float = 0.05,
+) -> "tuple[object | None, str | None, int]":
+    """Read the persisted order row for the pre-submit handoff proof.
+
+    A readable row is required before broker POST. A transient None read can
+    happen during handoff timing or adapter hiccups, so give it a tiny bounded
+    re-read window. Exceptions are returned to the caller as audit detail; the
+    caller owns terminalization.
+    """
+    if order_state_machine is None:
+        return None, "osm_not_available", 0
+    get_order = getattr(order_state_machine, "get_order", None)
+    if not callable(get_order):
+        return None, "osm_get_order_not_callable", 0
+
+    max_attempts = max(1, int(attempts or 1))
+    last_error: str | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            row = get_order(local_order_id)
+        except Exception as exc:
+            last_error = str(exc)
+            return None, last_error, attempt
+        if row is not None:
+            return row, None, attempt
+        if attempt < max_attempts and delay_s > 0:
+            time.sleep(float(delay_s))
+    return None, last_error, max_attempts
 
 
 def _live_confirmation_required() -> bool:
@@ -1857,9 +1892,10 @@ class APExecutionCore:
             "NO_VALID_PLAYBOOK_DTE_CONTRACT",
             "UNTRADEABLE_FOR_ACCOUNT_SIZE",
             "DATA_MISSING_OI_VOLUME",
-            # P0 amendment #5 (PR #294 final hardening): transient failure
-            # to read the persisted `orders` row after selector success.
-            # Maps to RETRY_LATER_DATA_UNAVAILABLE (not a quality reject).
+            # P0 amendment #5+#6 (PR #294 final hardening): terminal failure
+            # to prove the persisted `orders` row after selector success.
+            # Maps to TERMINAL_NO_TRADEABLE_CONTRACT with
+            # MATERIALIZATION_ORDER_ROW_UNREADABLE detail.
             "DEFERRED_ORDER_ROW_UNREADABLE",
         })
         _deferred_outcome = {"emitted": False, "outcome": None, "is_deferred": False}
@@ -2125,14 +2161,12 @@ class APExecutionCore:
             "copied_plan_limit":      None,
             "copied_plan_qty":        None,
             "copied_plan_max_usd":    None,
-            # P0 amendment #4 (PR #294): third view — the persisted `orders`
-            # row's contract at pre-submit time. Populated inside the
-            # pre-submit block via a defensive osm.get_order() call. `None`
-            # means "read failed / not attempted" and the classifier
-            # gracefully skips the order-row check (fail-open on transient
-            # DB error is safer than blocking every submit on a read
-            # hiccup — the standing DEFERRED_CONTRACT invariant still runs
-            # after the proof). Any non-None value is authoritative and
+            # P0 amendment #4+#5+#6 (PR #294): third view — the persisted
+            # `orders` row's contract at pre-submit time. Populated inside the
+            # pre-submit block through the fail-closed handoff row reader. When
+            # selector success captured a real OCC contract, an unreadable row
+            # terminalizes before broker POST; `None` only remains for proof
+            # not-applicable paths. Any non-None value is authoritative and
             # participates in the mismatch decision.
             "order_row_contract":     None,
         }
@@ -3755,37 +3789,36 @@ class APExecutionCore:
                 or ""
             )
 
-            # ── P0 amendment #5 (PR #294 final hardening): fail-closed order-row
-            # read. Two distinct failure modes, two distinct outcomes:
+            # ── P0 amendment #5+#6 (PR #294 final hardening): fail-closed
+            # order-row read. Two distinct failure details, one terminal
+            # lifecycle:
             #
-            #   READ FAILURE  → RETRY_LATER_DATA_UNAVAILABLE  (transient; try again)
-            #   READABLE MISMATCH → TERMINAL_NO_TRADEABLE_CONTRACT (proved wrong)
+            #   READ FAILURE      → TERMINAL_NO_TRADEABLE_CONTRACT
+            #                         detail: MATERIALIZATION_ORDER_ROW_UNREADABLE
+            #   READABLE MISMATCH → TERMINAL_NO_TRADEABLE_CONTRACT
+            #                         detail: MATERIALIZATION_COPYBACK_MISMATCH
             #
-            # Stage A: read the persisted `orders` row. Track the raw row AND
-            # any read error separately so the pure classifier can distinguish
-            # "exception" from "row not found" in its audit field, even though
-            # both map to the same BLOCK_RETRY outcome. No logging of "non-fatal"
-            # here — order row unreadable after selector success IS fatal for
-            # this trigger; the log is at WARNING for the audit trail.
+            # Stage A: read the persisted `orders` row. Track the raw row, read
+            # error, and bounded read attempts separately so the pure classifier
+            # can distinguish "exception" from "row not found" in its audit
+            # field. No logging of "non-fatal" here — order row unreadable
+            # after selector success IS fatal for this trigger.
             _order_row_raw = None
             _order_row_read_error: "str | None" = None
+            _order_row_read_attempts = 0
             if _handoff_snapshot.get("captured") and queue_local_order_id:
-                try:
-                    if self.order_state_machine is not None:
-                        _get_order_fn = getattr(
-                            self.order_state_machine, "get_order", None
-                        )
-                        if callable(_get_order_fn):
-                            _order_row_raw = _get_order_fn(queue_local_order_id)
-                        else:
-                            _order_row_read_error = "osm_get_order_not_callable"
-                    else:
-                        _order_row_read_error = "osm_not_available"
-                except Exception as _row_exc:
-                    _order_row_read_error = str(_row_exc)
+                (
+                    _order_row_raw,
+                    _order_row_read_error,
+                    _order_row_read_attempts,
+                ) = _read_order_row_for_handoff_proof(
+                    self.order_state_machine,
+                    queue_local_order_id,
+                )
+                if _order_row_read_error:
                     log.warning(
                         "[%s] handoff order-row read FAILED local_order_id=%s: %s",
-                        ticker, queue_local_order_id, _row_exc,
+                        ticker, queue_local_order_id, _order_row_read_error,
                     )
 
             # Stage B: classify the read result using the pure helper.
@@ -3822,6 +3855,7 @@ class APExecutionCore:
                         "failure_stage":                   "handoff_order_row_read",
                         "materialization_detail_override": "MATERIALIZATION_ORDER_ROW_UNREADABLE",
                         "order_row_read_error":            _row_read_reason,
+                        "order_row_read_attempts":         _order_row_read_attempts,
                         "selector_contract":               _handoff_snapshot.get("selector_contract"),
                         "selector_bid":                    _handoff_snapshot.get("selector_bid"),
                         "selector_ask":                    _handoff_snapshot.get("selector_ask"),
@@ -3853,8 +3887,8 @@ class APExecutionCore:
                     )
                 except Exception as _extract_exc:
                     # Row was readable but contract extraction failed. This
-                    # is structurally the same as "row unreadable" — emit
-                    # the same RETRY outcome rather than falling through.
+                    # is structurally the same as "row unreadable" — emit the
+                    # same terminal detail rather than falling through.
                     _inv_err = "MATERIALIZATION_ORDER_ROW_UNREADABLE"
                     log.critical(
                         "[%s] PRE_SUBMIT_INVARIANT_FAILED — %s | "
@@ -3870,6 +3904,7 @@ class APExecutionCore:
                             "failure_stage":                   "handoff_order_row_extraction",
                             "materialization_detail_override": "MATERIALIZATION_ORDER_ROW_UNREADABLE",
                             "order_row_read_error":            str(_extract_exc),
+                            "order_row_read_attempts":         _order_row_read_attempts,
                             "selector_contract":               _handoff_snapshot.get("selector_contract"),
                             "local_order_id":                  str(queue_local_order_id or ""),
                             "client_id":                       _proof_client_id,
