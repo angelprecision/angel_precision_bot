@@ -56,9 +56,10 @@ _REAL_OCC = "SPY 250706 C00450000"
 def _snapshot(**overrides):
     """A captured snapshot representing a successful selector run.
 
-    Sensible defaults: real OCC contract, plausible quotes, qty=1, and the
-    copy-back propagated everything back into the plan. Individual tests
-    override only what they're stressing so the failure mode is unambiguous.
+    Sensible defaults: real OCC contract, plausible quotes, qty=1, copy-back
+    propagated back into the plan, AND the persisted `orders` row's
+    contract matches (`order_row_contract`). Individual tests override only
+    what they're stressing so the failure mode is unambiguous.
     """
     snap = {
         "captured":             True,
@@ -72,17 +73,21 @@ def _snapshot(**overrides):
         "copied_plan_limit":    1.86,
         "copied_plan_qty":      1,
         "copied_plan_max_usd":  186.0,
+        # P0 amendment #4 (PR #294): third view — the persisted `orders` row.
+        "order_row_contract":   _REAL_OCC,
     }
     snap.update(overrides)
     return snap
 
 
 def test_case_1_clean_handoff_returns_ok():
+    # Amendment #4: three-view alignment — selector, plan, order-row all match.
     ok, mismatch = core._classify_materialization_handoff(
         handoff_snapshot=_snapshot(),
         pre_submit_contract=_REAL_OCC,
         pre_submit_limit=1.87,
         pre_submit_qty=1,
+        order_row_contract=_REAL_OCC,
     )
     assert (ok, mismatch) == (True, None)
 
@@ -225,8 +230,87 @@ def test_none_snapshot_returns_not_applicable():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Canonical stamp on mismatch — mirrors the emitter persist block
+# Amendment #4: order_row_contract third-view checks
 # ─────────────────────────────────────────────────────────────────────────────
+# These cover the specific failure mode: selector succeeded AND the plan got
+# the real contract, but the persisted `orders` row was never updated. In
+# production that would look like "everything worked" until the OSM submit
+# path read a stale DB contract. The proof must catch it before broker POST.
+
+def test_case_3_order_row_still_deferred_while_plan_and_selector_real():
+    """Requirement scenario #3: selector + plan agree on real contract, but
+    order row still has DEFERRED — MUST block."""
+    ok, mismatch = core._classify_materialization_handoff(
+        handoff_snapshot=_snapshot(),
+        pre_submit_contract=_REAL_OCC,
+        pre_submit_limit=1.87,
+        pre_submit_qty=1,
+        order_row_contract="DEFERRED:SPY",
+    )
+    assert ok is False
+    assert mismatch == "order_row_contract_placeholder_or_missing"
+
+
+def test_case_3b_order_row_contract_empty():
+    ok, mismatch = core._classify_materialization_handoff(
+        handoff_snapshot=_snapshot(),
+        pre_submit_contract=_REAL_OCC,
+        pre_submit_limit=1.87,
+        pre_submit_qty=1,
+        order_row_contract="",
+    )
+    assert ok is False
+    assert mismatch == "order_row_contract_placeholder_or_missing"
+
+
+def test_order_row_contract_diverges_from_selector():
+    """Even when plan and pre-submit agree with selector, if the persisted
+    row disagrees (say, an earlier stale update leaked through), block."""
+    ok, mismatch = core._classify_materialization_handoff(
+        handoff_snapshot=_snapshot(),
+        pre_submit_contract=_REAL_OCC,
+        pre_submit_limit=1.87,
+        pre_submit_qty=1,
+        order_row_contract="SPY 250706 C00451000",   # +$1 strike drift
+    )
+    assert ok is False
+    assert mismatch.startswith("order_row_contract_diverges_from_selector:")
+    assert f"selector={_REAL_OCC}" in mismatch
+    assert "order_row=SPY 250706 C00451000" in mismatch
+
+
+def test_order_row_contract_none_degrades_gracefully_does_not_block():
+    """Amendment #4 fail-graceful: a failed DB read (None) must not weaken
+    the proof for OTHER dimensions but must not block on the order-row
+    dimension alone. Selector + plan + pre-submit all agree; order-row
+    unreadable → still OK. Standing DEFERRED_CONTRACT invariant runs after
+    and catches genuine placeholder leakage."""
+    ok, mismatch = core._classify_materialization_handoff(
+        handoff_snapshot=_snapshot(order_row_contract=None),
+        pre_submit_contract=_REAL_OCC,
+        pre_submit_limit=1.87,
+        pre_submit_qty=1,
+        order_row_contract=None,
+    )
+    assert (ok, mismatch) == (True, None)
+
+
+def test_order_row_check_does_not_precede_pre_submit_checks():
+    """When both pre-submit and order-row are broken, the pre-submit
+    mismatch reason wins — pre-submit is closer to the actual submit."""
+    ok, mismatch = core._classify_materialization_handoff(
+        handoff_snapshot=_snapshot(),
+        pre_submit_contract="DEFERRED:SPY",
+        pre_submit_limit=1.87,
+        pre_submit_qty=1,
+        order_row_contract="DEFERRED:SPY",
+    )
+    assert ok is False
+    # pre_submit check fires first — deterministic ordering.
+    assert mismatch == "pre_submit_contract_placeholder_or_missing"
+
+
+
 # The emitter is a closure inside _process_watcher_breach so we replicate its
 # persist logic byte-for-byte (same pattern as test_p0_submit_cap_canonical_stamp.py)
 # to verify the mismatch path produces the canonical fields the amendment
@@ -258,7 +342,7 @@ def _mismatch_extra(mismatch_reason, snapshot, pre_contract, pre_limit, pre_qty,
                      execution_mode="LIVE"):
     """Rebuilds the `extra` dict the production block passes to
     `_emit_deferred_outcome` on a mismatch. Kept in sync with the emitter
-    call site."""
+    call site — including the amendment #4 order_row_contract field."""
     return {
         "failure_stage":                   "materialization_handoff_proof",
         "materialization_detail_override": "MATERIALIZATION_COPYBACK_MISMATCH",
@@ -273,6 +357,7 @@ def _mismatch_extra(mismatch_reason, snapshot, pre_contract, pre_limit, pre_qty,
         "copied_plan_limit":               snapshot.get("copied_plan_limit"),
         "copied_plan_qty":                 snapshot.get("copied_plan_qty"),
         "copied_plan_max_usd":             snapshot.get("copied_plan_max_usd"),
+        "order_row_contract":              snapshot.get("order_row_contract"),
         "pre_submit_contract":             pre_contract,
         "pre_submit_limit":                pre_limit,
         "pre_submit_qty":                  pre_qty,
@@ -302,6 +387,7 @@ def test_mismatch_stamps_canonical_terminal_no_tradeable():
     for expected in (
         "materialization_selector_contract",
         "materialization_copied_plan_contract",
+        "materialization_order_row_contract",   # amendment #4
         "materialization_pre_submit_contract",
         "materialization_selector_bid",
         "materialization_selector_ask",
@@ -317,16 +403,21 @@ def test_mismatch_stamps_canonical_terminal_no_tradeable():
     assert meta["materialization_broker_order_id"] == ""    # never submitted
 
 
-@pytest.mark.parametrize("mismatch,pre_c,pre_l,pre_q", [
-    ("pre_submit_contract_placeholder_or_missing",         "DEFERRED:SPY",      1.87, 1),
-    ("pre_submit_contract_diverges_from_selector:...",     "SPY 250706 C00451000", 1.87, 1),
-    ("pre_submit_limit_not_materialized:limit=0.0100",     _REAL_OCC,          0.01, 1),
-    ("pre_submit_qty_not_materialized:qty=0",              _REAL_OCC,          1.87, 0),
+@pytest.mark.parametrize("mismatch,pre_c,pre_l,pre_q,order_c", [
+    ("pre_submit_contract_placeholder_or_missing",         "DEFERRED:SPY",         1.87, 1, _REAL_OCC),
+    ("pre_submit_contract_diverges_from_selector:...",     "SPY 250706 C00451000", 1.87, 1, _REAL_OCC),
+    ("pre_submit_limit_not_materialized:limit=0.0100",     _REAL_OCC,              0.01, 1, _REAL_OCC),
+    ("pre_submit_qty_not_materialized:qty=0",              _REAL_OCC,              1.87, 0, _REAL_OCC),
+    # Amendment #4: order-row mismatches produce the same canonical stamp
+    # so dashboards can filter every handoff break the same way.
+    ("order_row_contract_placeholder_or_missing",          _REAL_OCC,              1.87, 1, "DEFERRED:SPY"),
+    ("order_row_contract_diverges_from_selector:...",      _REAL_OCC,              1.87, 1, "SPY 250706 C00451000"),
 ])
-def test_all_four_mismatch_reasons_stamp_same_canonical_detail(
-    mismatch, pre_c, pre_l, pre_q,
+def test_all_mismatch_reasons_stamp_same_canonical_detail(
+    mismatch, pre_c, pre_l, pre_q, order_c,
 ):
-    extra = _mismatch_extra(mismatch, _snapshot(), pre_c, pre_l, pre_q)
+    snap = _snapshot(order_row_contract=order_c)
+    extra = _mismatch_extra(mismatch, snap, pre_c, pre_l, pre_q)
     meta = _canon_meta_from_persist(
         outcome="BREACH_SUBMISSION_SKIPPED",
         reason=f"materialization_copyback_mismatch:{mismatch}",
@@ -338,6 +429,9 @@ def test_all_four_mismatch_reasons_stamp_same_canonical_detail(
     assert meta["materialization_detail"] == "MATERIALIZATION_COPYBACK_MISMATCH"
     assert meta["materialization_mismatch_reason"] == mismatch
     assert meta["materialization_broker_order_id"] == ""
+    # Amendment #4: order_row_contract must always appear on any mismatch
+    # canonical stamp (its VALUE tells operators which view broke).
+    assert "materialization_order_row_contract" in meta
 
 
 def test_successful_materialization_stamps_submitted_with_handoff_fields():
@@ -354,6 +448,7 @@ def test_successful_materialization_stamps_submitted_with_handoff_fields():
         "handoff_ok":            True,
         "selector_contract":     snap["selector_contract"],
         "copied_plan_contract":  snap["copied_plan_contract"],
+        "order_row_contract":    snap["order_row_contract"],   # amendment #4
         "pre_submit_contract":   _REAL_OCC,
         "pre_submit_limit":      1.87,
         "pre_submit_qty":        1,
@@ -372,6 +467,7 @@ def test_successful_materialization_stamps_submitted_with_handoff_fields():
     # Successful terminal preserves handoff proof lineage for dashboards.
     assert meta["materialization_selector_contract"] == _REAL_OCC
     assert meta["materialization_pre_submit_contract"] == _REAL_OCC
+    assert meta["materialization_order_row_contract"] == _REAL_OCC   # amendment #4
     assert meta["materialization_handoff_ok"] is True
     assert meta["materialization_local_order_id"] == "LOID-42"
     assert meta["materialization_client_id"] == "jason@example.com"
