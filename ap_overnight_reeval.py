@@ -122,25 +122,43 @@ def _et_now() -> datetime:
 
 
 def _is_trading_day(dt: datetime) -> bool:
-    return dt.weekday() < 5  # Mon-Fri
+    # P0 (monday-trade-flow-readiness): delegate to the canonical NYSE
+    # calendar in ap.flatline_alarm (single source of truth per #282) instead
+    # of weekday-only logic. On 2026-07-03 (Independence Day observed) the
+    # weekday-only check let the overnight reeval run against dead holiday
+    # quotes. Fail-safe: if the calendar import ever breaks, fall back to the
+    # previous weekday-only behavior rather than blocking reeval entirely.
+    try:
+        from ap.flatline_alarm import is_trading_day as _nyse_is_trading_day
+        return _nyse_is_trading_day(dt.date())
+    except Exception:
+        return dt.weekday() < 5  # legacy fallback: Mon-Fri
 
 
 def _prior_trading_session_date(ref: Optional[datetime] = None) -> date:
     """Return the date of the prior *trading* session relative to ref (ET).
 
-    Walks back at least one day and skips weekends, so on a Monday morning the
-    prior trading session is the preceding Friday. This is the session a cached
-    prior-day high/low MUST match to be considered fresh.
-
-    NOTE: this does not model market holidays. A cached level whose stamped
-    session is a holiday-shifted day will simply fail the equality guard and be
-    treated as stale (fail-safe), which is the conservative behavior we want.
+    Walks back at least one day and skips weekends AND NYSE full-closure
+    holidays (via ap.flatline_alarm.is_trading_day, the canonical calendar),
+    so on a Monday morning after a Friday holiday the prior trading session is
+    the preceding Thursday. This is the session a cached prior-day high/low
+    MUST match to be considered fresh. Fail-safe: on calendar import failure,
+    weekend-only walk-back (previous behavior) — a holiday-stamped cache row
+    then simply fails the equality guard and is treated as stale.
     """
     d = (ref or _et_now()).date()
     d = d - timedelta(days=1)
-    while d.weekday() >= 5:  # Sat/Sun
-        d = d - timedelta(days=1)
-    return d
+    try:
+        from ap.flatline_alarm import is_trading_day as _nyse_is_trading_day
+        _guard = 0
+        while not _nyse_is_trading_day(d) and _guard < 14:
+            d = d - timedelta(days=1)
+            _guard += 1
+        return d
+    except Exception:
+        while d.weekday() >= 5:  # Sat/Sun
+            d = d - timedelta(days=1)
+        return d
 
 
 # ── PR4 (prior-day-level cache fallback) ─────────────────────────────────────

@@ -128,6 +128,236 @@ RETRYABLE_BREACH_SELECTOR_REASONS: frozenset = frozenset({
 })
 
 
+# ── P0 (monday-trade-flow-readiness, amended): acceptance ask-cap resolver ───
+# Small-account acceptance-window cap. FAIL-CLOSED contract:
+#   • DEFERRED_SMALL_ACCOUNT_FALLBACK unset/0  → (False, None, None): feature
+#     off, all cap checks are no-ops, behavior byte-for-byte unchanged.
+#   • Flag ON + MAX_CONTRACT_ASK_FOR_JASON_ACCEPTANCE valid (> 0)
+#     → (True, cap, None): enforce at BOTH check sites (selection copy AND
+#     final pre-submit limit) so a selector ask under cap with a refreshed
+#     submit limit over cap can never slip through.
+#   • Flag ON + cap env missing / unparsable / <= 0
+#     → (True, None, error): MISCONFIGURED. Callers must BLOCK the deferred
+#     materialization (terminalize), never proceed uncapped. An operator who
+#     turned the acceptance fallback on has declared a capped window; running
+#     uncapped inside it is the failure mode this contract forbids.
+# Hot-read per call (repo convention for operator flags).
+def _acceptance_ask_cap() -> "tuple[bool, float | None, str | None]":
+    enabled = os.getenv(
+        "DEFERRED_SMALL_ACCOUNT_FALLBACK", "0"
+    ).strip().lower() in ("1", "true", "yes")
+    if not enabled:
+        return False, None, None
+    raw = os.getenv("MAX_CONTRACT_ASK_FOR_JASON_ACCEPTANCE", "").strip()
+    if not raw:
+        return True, None, "acceptance_cap_missing"
+    try:
+        cap = float(raw)
+    except (TypeError, ValueError):
+        return True, None, f"acceptance_cap_unparsable:{raw!r}"
+    if cap <= 0:
+        return True, None, f"acceptance_cap_nonpositive:{cap}"
+    return True, cap, None
+
+
+# ── P0 (monday-trade-flow-readiness, amended): canonical materialization
+# outcome. Every triggered deferred row must resolve to EXACTLY ONE of three
+# operator-facing outcomes — the acceptance contract for restored trade flow:
+#   MATERIALIZED_AND_SUBMITTED     real OCC contract selected AND handed to
+#                                  the broker submit path
+#   RETRY_LATER_DATA_UNAVAILABLE   transient data-miss (zero quotes / empty
+#                                  chain near open); a bounded retry is
+#                                  scheduled inside the warmup/entry window
+#   TERMINAL_NO_TRADEABLE_CONTRACT everything else terminal: quality rejects,
+#                                  budget/cap blocks, retry exhaustion/cutoff,
+#                                  selector exceptions, submit failures
+# The fine-grained outcome (BREACH_SELECTOR_RETURNED_NONE, OI_TOO_LOW, ...)
+# is preserved as materialization_detail — canonicalization ADDS a stable
+# summary, it never replaces the honest detail. "No more DEFERRED:* + 0.01 +
+# EXPIRED with no broker_order_id and unclear reason."
+_MATERIALIZATION_ENTRY_PATH = "DEFERRED_BREACH_MATERIALIZATION"
+
+
+def _canonical_materialization_outcome(outcome: str) -> str:
+    _o = str(outcome or "").strip()
+    if _o == "BREACH_BROKER_SUBMITTED":
+        return "MATERIALIZED_AND_SUBMITTED"
+    # P0 amendment #6 (PR #294, Option B): DEFERRED_ORDER_ROW_UNREADABLE is
+    # now mapped to TERMINAL_NO_TRADEABLE_CONTRACT, not RETRY_LATER_DATA_UNAVAILABLE.
+    #
+    # Why Option B: The unreadable-row block calls _terminalize_breach_failure
+    # (cleanup_action="expire"). Amendment #5 labelled this RETRY_LATER but
+    # immediately expired the order — operator-facing outcome said "retry later",
+    # lifecycle said "expired". That is a lie and a production audit failure.
+    #
+    # The correct honesty test: at this pipeline stage (past breach, past
+    # selector success, inside the pre-submit invariant block), there is no safe
+    # bounded-retry path that can replay only the order-row read without
+    # re-running the full breach/selector cycle. The existing retry helpers
+    # (_build_deferred_retry_schedule_meta, _classify_deferred_breach_retry_decision)
+    # operate at breach-detection time, not here. Calling the outcome "retry later"
+    # when the lifecycle is "expire" would mislead on-call engineers.
+    #
+    # Option B: both outcome AND lifecycle are terminal. The detail field
+    # MATERIALIZATION_ORDER_ROW_UNREADABLE is specific enough that operators
+    # can investigate the infra failure (DB timeout, row not found) without
+    # the outcome implying a future attempt is scheduled.
+    if _o == "DEFERRED_ORDER_ROW_UNREADABLE":
+        return "TERMINAL_NO_TRADEABLE_CONTRACT"
+    return "TERMINAL_NO_TRADEABLE_CONTRACT"
+
+
+# ── P0 amendment #3 (PR #294): pure classifier for the deferred materialization
+# handoff proof. Given the three-stage snapshot the process_watcher_breach
+# path assembles, return one of:
+#   (True,  None)              — handoff clean, submit may proceed
+#   (False, "<mismatch_code>") — handoff broke; caller must terminalize
+#   (None,  None)              — proof not applicable (selector never
+#                                returned a real contract on this trigger);
+#                                caller falls through to the standing
+#                                DEFERRED_CONTRACT / LIMIT invariants
+#
+# Pulled out of the breach method so tests can exercise the exact
+# production truth table without instantiating the full execution core.
+# NO side effects, NO logging, NO writes — the caller owns emission,
+# terminalization, and orders.meta persistence.
+def _classify_materialization_handoff(
+    *,
+    handoff_snapshot: dict,
+    pre_submit_contract: str,
+    pre_submit_limit: float,
+    pre_submit_qty: int,
+    order_row_contract: "str | None" = None,
+) -> "tuple[bool | None, str | None]":
+    if not handoff_snapshot or not handoff_snapshot.get("captured"):
+        return None, None
+    selector_contract = str(handoff_snapshot.get("selector_contract") or "")
+    if not selector_contract:
+        return None, None
+    if selector_contract.upper().startswith("DEFERRED:"):
+        # Selector explicitly returned a placeholder — proof is not
+        # applicable; the standing DEFERRED_CONTRACT invariant catches it.
+        return None, None
+
+    pre_contract = str(pre_submit_contract or "")
+    pre_contract_upper = pre_contract.upper()
+    if (not pre_contract) or pre_contract_upper.startswith("DEFERRED:"):
+        return False, "pre_submit_contract_placeholder_or_missing"
+    if pre_contract != selector_contract:
+        return False, (
+            "pre_submit_contract_diverges_from_selector:"
+            f"selector={selector_contract}:pre_submit={pre_contract}"
+        )
+    if float(pre_submit_limit or 0) <= 0.01:
+        return False, f"pre_submit_limit_not_materialized:limit={float(pre_submit_limit or 0):.4f}"
+    if int(pre_submit_qty or 0) <= 0:
+        return False, f"pre_submit_qty_not_materialized:qty={int(pre_submit_qty or 0)}"
+
+    # P0 amendment #4+#5+#6 (PR #294): third-view check against the persisted
+    # `orders` row. When a deferred selector has produced a real OCC contract,
+    # the caller now proves the row is readable before reaching this classifier.
+    # `order_row_contract=None` only remains not-applicable for paths where the
+    # selector never captured a real contract; standing invariants still run.
+    # Any non-None value is authoritative:
+    #   - DEFERRED:* / empty → the OSM never persisted the materialized
+    #     contract; block.
+    #   - diverges from selector → the OSM row disagrees with the pipeline;
+    #     block. Signature is symmetric with the pre_submit_contract check
+    #     so dashboards can compare mismatch reasons directly.
+    if order_row_contract is not None:
+        order_row_str = str(order_row_contract or "")
+        order_row_upper = order_row_str.upper()
+        if (not order_row_str) or order_row_upper.startswith("DEFERRED:"):
+            return False, "order_row_contract_placeholder_or_missing"
+        if order_row_str != selector_contract:
+            return False, (
+                "order_row_contract_diverges_from_selector:"
+                f"selector={selector_contract}:order_row={order_row_str}"
+            )
+
+    return True, None
+
+
+# ── P0 amendment #5+#6 (PR #294): pure classifier for the order-row read
+# step of the handoff proof. Separate from _classify_materialization_handoff
+# so the two failure modes carry distinct audit detail codes even though
+# both now map to TERMINAL_NO_TRADEABLE_CONTRACT (amendment #6 Option B):
+#
+#   order-row UNREADABLE → TERMINAL_NO_TRADEABLE_CONTRACT
+#                          detail: MATERIALIZATION_ORDER_ROW_UNREADABLE
+#     (cannot prove the row; no safe retry path at this pipeline stage;
+#      lifecycle = expire; outcome = terminal — both consistent)
+#   order-row readable but WRONG → TERMINAL_NO_TRADEABLE_CONTRACT
+#                                   detail: MATERIALIZATION_COPYBACK_MISMATCH
+#     (proved the row and it disagrees; permanent pipeline mismatch)
+#
+# Returns one of:
+#   ("BLOCK_RETRY",  "<reason>") — row unreadable; caller MUST block and
+#                                  terminalize with DEFERRED_ORDER_ROW_UNREADABLE
+#   ("PASS",         None)       — row readable; extract contract for classifier
+#   (None,           None)       — proof not applicable; standing invariants handle
+#
+# NO side effects, NO logging, NO DB access. Pure truth table.
+def _classify_order_row_read(
+    *,
+    handoff_snapshot: dict,
+    order_row_raw: object,
+    read_error: "str | None" = None,
+) -> "tuple[str | None, str | None]":
+    if not handoff_snapshot or not handoff_snapshot.get("captured"):
+        return None, None
+    sel_contract = str(handoff_snapshot.get("selector_contract") or "")
+    if not sel_contract or sel_contract.upper().startswith("DEFERRED:"):
+        return None, None   # selector never returned a real contract
+
+    # Selector succeeded with a real OCC contract. The order row MUST be
+    # readable. A None row means either the row was not found (no row with
+    # that local_order_id exists) or the read raised an exception (caller
+    # tracks the distinction in read_error for the audit field — both map
+    # to the same BLOCK_RETRY outcome because in either case we cannot
+    # prove the persisted contract before broker POST).
+    if order_row_raw is None:
+        reason = f"read_error:{read_error}" if read_error else "row_not_found"
+        return "BLOCK_RETRY", reason
+
+    return "PASS", None
+
+
+def _read_order_row_for_handoff_proof(
+    order_state_machine: object,
+    local_order_id: str,
+    *,
+    attempts: int = 3,
+    delay_s: float = 0.05,
+) -> "tuple[object | None, str | None, int]":
+    """Read the persisted order row for the pre-submit handoff proof.
+
+    A readable row is required before broker POST. A transient None read can
+    happen during handoff timing or adapter hiccups, so give it a tiny bounded
+    re-read window. Exceptions are returned to the caller as audit detail; the
+    caller owns terminalization.
+    """
+    if order_state_machine is None:
+        return None, "osm_not_available", 0
+    get_order = getattr(order_state_machine, "get_order", None)
+    if not callable(get_order):
+        return None, "osm_get_order_not_callable", 0
+
+    max_attempts = max(1, int(attempts or 1))
+    last_error: str | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            row = get_order(local_order_id)
+        except Exception as exc:
+            last_error = str(exc)
+            return None, last_error, attempt
+        if row is not None:
+            return row, None, attempt
+        if attempt < max_attempts and delay_s > 0:
+            time.sleep(float(delay_s))
+    return None, last_error, max_attempts
+
+
 def _live_confirmation_required() -> bool:
     """
     P0 (PR #262): LIVE submits require an explicit entry-confirmation PASS.
@@ -317,6 +547,12 @@ def _build_deferred_retry_schedule_meta(
         "local_order_id": str(local_order_id or ""),
         "signal_id": str(signal_id or ""),
         "contract_selection_status": "CONTRACT_SELECTION_RETRY",
+        # P0 amended: canonical tri-outcome stamp — a scheduled retry is the
+        # RETRY_LATER_DATA_UNAVAILABLE state until the next attempt resolves
+        # it to MATERIALIZED_AND_SUBMITTED or TERMINAL_NO_TRADEABLE_CONTRACT.
+        "entry_path": _MATERIALIZATION_ENTRY_PATH,
+        "materialization_outcome": "RETRY_LATER_DATA_UNAVAILABLE",
+        "materialization_detail": str(reason_code or ""),
     }
 
 
@@ -347,6 +583,12 @@ def _build_deferred_retry_terminal_meta(
         "local_order_id": str(local_order_id or ""),
         "signal_id": str(signal_id or ""),
         "last_breach_failure_at": _now.isoformat(),
+        # P0 amended: canonical tri-outcome stamp for retry-exhaustion/cutoff/
+        # disabled terminals — the fine-grained reason stays in
+        # materialization_detail / deferred_retry_terminal_reason.
+        "entry_path": _MATERIALIZATION_ENTRY_PATH,
+        "materialization_outcome": "TERMINAL_NO_TRADEABLE_CONTRACT",
+        "materialization_detail": str(reason_code or ""),
     }
 
 
@@ -1650,6 +1892,11 @@ class APExecutionCore:
             "NO_VALID_PLAYBOOK_DTE_CONTRACT",
             "UNTRADEABLE_FOR_ACCOUNT_SIZE",
             "DATA_MISSING_OI_VOLUME",
+            # P0 amendment #5+#6 (PR #294 final hardening): terminal failure
+            # to prove the persisted `orders` row after selector success.
+            # Maps to TERMINAL_NO_TRADEABLE_CONTRACT with
+            # MATERIALIZATION_ORDER_ROW_UNREADABLE detail.
+            "DEFERRED_ORDER_ROW_UNREADABLE",
         })
         _deferred_outcome = {"emitted": False, "outcome": None, "is_deferred": False}
 
@@ -1736,6 +1983,58 @@ class APExecutionCore:
             except Exception:
                 try:
                     log.warning("DEFERRED_TRIGGER_OUTCOME_EMIT_FAILED outcome=%s", outcome)
+                except Exception:
+                    pass
+            # ── P0 (monday-trade-flow-readiness, amended): persist the
+            # canonical tri-outcome onto the order row so the operator can
+            # answer "what happened to this deferred trigger?" from
+            # orders.meta alone — no log spelunking. Best-effort, never
+            # raises, exactly-once by construction (this emitter is the
+            # exactly-once terminal channel). Selected bid/ask/mid and the
+            # final submit limit arrive via `extra` from the call sites and
+            # are merged verbatim.
+            try:
+                if queue_local_order_id and self.order_state_machine is not None:
+                    _update_meta = getattr(
+                        self.order_state_machine, "update_order_meta", None
+                    )
+                    if callable(_update_meta):
+                        # P0 amendment #2 (PR #294 review): submit-cap
+                        # terminals reuse the external UNTRADEABLE_FOR_ACCOUNT_SIZE
+                        # code (operator vocabulary continuity) but need to
+                        # preserve their fine-grained detail
+                        # (ACCEPTANCE_CAP_EXCEEDED_AT_SUBMIT vs
+                        # ACCEPTANCE_CAP_MISCONFIGURED). When the caller
+                        # supplies materialization_detail_override in extra,
+                        # it wins over the raw outcome string; otherwise the
+                        # raw outcome remains the detail. Never becomes the
+                        # OUTCOME — mapping to MATERIALIZED_AND_SUBMITTED /
+                        # TERMINAL_NO_TRADEABLE_CONTRACT still keys off
+                        # `outcome`, not the override.
+                        _detail = outcome
+                        if extra and "materialization_detail_override" in extra:
+                            _detail = str(extra.get("materialization_detail_override") or outcome)
+                        _canon_meta: dict = {
+                            "entry_path": _MATERIALIZATION_ENTRY_PATH,
+                            "materialization_outcome": _canonical_materialization_outcome(outcome),
+                            "materialization_detail": _detail,
+                            "materialization_reason": reason or "",
+                            "materialization_contract": contract or "",
+                            "materialization_broker_order_id": broker_order_id or "",
+                            "materialization_ts": datetime.now(timezone.utc).isoformat(),
+                        }
+                        if extra:
+                            for _mk, _mv in extra.items():
+                                if _mk == "materialization_detail_override":
+                                    continue  # already consumed above
+                                _canon_meta.setdefault(f"materialization_{_mk}", _mv)
+                        _update_meta(queue_local_order_id, _canon_meta)
+            except Exception as _canon_exc:
+                try:
+                    log.debug(
+                        "materialization outcome meta persist failed (non-fatal): %s",
+                        _canon_exc,
+                    )
                 except Exception:
                     pass
 
@@ -1838,6 +2137,39 @@ class APExecutionCore:
         # guard deferred logs with _deferred). Non-deferred entries never emit a
         # deferred terminal outcome.
         _deferred_outcome["is_deferred"] = bool(_deferred)
+
+        # ── P0 amendment #3 (PR #294): deferred materialization handoff proof ──
+        # A single snapshot dict that captures the three staged views of the
+        # deferred materialization pipeline:
+        #     stage 1: what the selector returned  (populated at copy-back)
+        #     stage 2: what got copied into the plan (populated at copy-back)
+        #     stage 3: what the pre-submit invariant sees (compared just
+        #              before broker POST)
+        # If stage 1 succeeded with a real OCC contract, stages 2 and 3 must
+        # agree. Any disagreement blocks the submit and terminalizes with
+        # MATERIALIZATION_COPYBACK_MISMATCH. Non-deferred entries never
+        # populate this snapshot; the handoff proof is a no-op for them.
+        _handoff_snapshot: dict = {
+            "captured":               False,
+            "selector_contract":      None,
+            "selector_bid":           None,
+            "selector_ask":           None,
+            "selector_mid":           None,
+            "selector_premium":       None,
+            "selector_qty":           None,
+            "copied_plan_contract":   None,
+            "copied_plan_limit":      None,
+            "copied_plan_qty":        None,
+            "copied_plan_max_usd":    None,
+            # P0 amendment #4+#5+#6 (PR #294): third view — the persisted
+            # `orders` row's contract at pre-submit time. Populated inside the
+            # pre-submit block through the fail-closed handoff row reader. When
+            # selector success captured a real OCC contract, an unreadable row
+            # terminalizes before broker POST; `None` only remains for proof
+            # not-applicable paths. Any non-None value is authoritative and
+            # participates in the mismatch decision.
+            "order_row_contract":     None,
+        }
         if _deferred:
             if self.contract_selector is None:
                 _reason = "contract_deferred_no_selector"
@@ -1914,8 +2246,126 @@ class APExecutionCore:
                             if _prem_per_contract > 0:
                                 approved_plan.max_position_usd = _sel_qty * _prem_per_contract
                         _live_contract = str(getattr(approved_plan, "contract_symbol", "") or "").strip()
+                        # P0 amendment #3 (PR #294): capture stages 1 & 2 of
+                        # the handoff snapshot the moment copy-back completes.
+                        # Stage 3 (pre-submit) is compared against these values
+                        # inside the pre-submit invariant block, below. Only
+                        # populated when the selector actually returned a real
+                        # OCC contract — the check requirement.
+                        try:
+                            _handoff_snapshot["captured"]             = True
+                            _handoff_snapshot["selector_contract"]    = _sel_contract or None
+                            _handoff_snapshot["selector_bid"]         = float(getattr(_sel, "bid", 0) or 0)
+                            _handoff_snapshot["selector_ask"]         = float(getattr(_sel, "ask", 0) or 0)
+                            _handoff_snapshot["selector_mid"]         = float(getattr(_sel, "mid", 0) or 0)
+                            _handoff_snapshot["selector_premium"]     = float(
+                                getattr(_sel, "execution_price_per_share", 0)
+                                or getattr(_sel, "ask", 0) or 0
+                            )
+                            _handoff_snapshot["selector_qty"]         = int(
+                                getattr(_sel, "affordable_contracts", 0) or 0
+                            )
+                            _handoff_snapshot["copied_plan_contract"] = _live_contract or None
+                            _handoff_snapshot["copied_plan_limit"]    = float(
+                                getattr(approved_plan, "limit_price", 0) or 0
+                            )
+                            _handoff_snapshot["copied_plan_qty"]      = int(
+                                getattr(approved_plan, "contracts", 0) or 0
+                            )
+                            _handoff_snapshot["copied_plan_max_usd"]  = float(
+                                getattr(approved_plan, "max_position_usd", 0) or 0
+                            )
+                        except Exception as _snap_exc:
+                            # Snapshot capture must never break the submit
+                            # path. On unexpected shape we log and fall
+                            # through; the pre-submit invariant + existing
+                            # DEFERRED:*/limit guards remain the definitive
+                            # safety net.
+                            log.warning(
+                                "[%s] handoff snapshot capture failed (non-fatal): %s",
+                                ticker, _snap_exc,
+                            )
                     except Exception as _copy_exc:
                         log.warning("[%s] deferred breach selected contract copy failed: %s", ticker, _copy_exc)
+
+                # ── P0 (monday-trade-flow-readiness, amended): acceptance cap
+                # at SELECTION time. _acceptance_ask_cap() is FAIL-CLOSED:
+                # when DEFERRED_SMALL_ACCOUNT_FALLBACK=1 but the cap env is
+                # missing/unparsable/<=0, the materialization BLOCKS here as
+                # ACCEPTANCE_CAP_MISCONFIGURED — it never proceeds uncapped.
+                # When the cap is valid: selected ask must be <= cap and
+                # quantity clamps to exactly 1 (acceptance is flow-proof, not
+                # P&L). A second enforcement of the SAME cap runs against the
+                # final refreshed submit limit in the pre-submit invariant, so
+                # selection-time pass + refresh-time drift over cap still
+                # blocks before any broker POST. Feature off (flag unset)
+                # → this block is a no-op, behavior byte-for-byte unchanged.
+                _cap_enabled, _accept_cap, _cap_error = _acceptance_ask_cap()
+                if _cap_enabled and _sel_is_real:
+                    if _cap_error:
+                        _cap_reason = f"ACCEPTANCE_CAP_MISCONFIGURED:{_cap_error}"
+                        log.critical(
+                            "[%s] DEFERRED_ACCEPTANCE_CAP_MISCONFIGURED %s — "
+                            "fail-closed: blocking materialization, no broker POST",
+                            ticker, _cap_error,
+                        )
+                        _emit_deferred_outcome(
+                            "UNTRADEABLE_FOR_ACCOUNT_SIZE",
+                            reason=_cap_reason,
+                            contract=_sel_contract,
+                        )
+                        _terminalize_deferred_breach_failure(
+                            _cap_reason,
+                            extra_meta={
+                                "failure_stage": "acceptance_ask_cap",
+                                "acceptance_cap_error": _cap_error,
+                                "selected_contract": _sel_contract,
+                            },
+                        )
+                        return
+                    _sel_ask = float(getattr(_sel, "ask", 0) or 0)
+                    if _sel_ask <= 0 or _sel_ask > _accept_cap:
+                        _cap_reason = (
+                            f"acceptance_ask_cap:ask_{_sel_ask:.2f}_"
+                            f"cap_{_accept_cap:.2f}"
+                        )
+                        log.warning(
+                            "[%s] DEFERRED_ACCEPTANCE_CAP_BLOCK contract=%s "
+                            "ask=%.2f cap=%.2f — terminalizing, no retry",
+                            ticker, _sel_contract, _sel_ask, _accept_cap,
+                        )
+                        _emit_deferred_outcome(
+                            "UNTRADEABLE_FOR_ACCOUNT_SIZE",
+                            reason=_cap_reason,
+                            contract=_sel_contract,
+                        )
+                        _terminalize_deferred_breach_failure(
+                            _cap_reason,
+                            extra_meta={
+                                "failure_stage": "acceptance_ask_cap",
+                                "selected_contract": _sel_contract,
+                                "selected_ask": _sel_ask,
+                                "acceptance_cap": _accept_cap,
+                            },
+                        )
+                        return
+                    # Cap passed — acceptance mode trades exactly one
+                    # contract at the selected premium.
+                    try:
+                        approved_plan.contracts = 1
+                        _prem = float(getattr(_sel, "premium_per_contract", 0) or 0)
+                        if _prem > 0:
+                            approved_plan.max_position_usd = _prem
+                        log.info(
+                            "[%s] DEFERRED_ACCEPTANCE_CAP_PASS contract=%s "
+                            "ask=%.2f cap=%.2f qty=1",
+                            ticker, _sel_contract, _sel_ask, _accept_cap,
+                        )
+                    except Exception as _cap_exc:
+                        log.warning(
+                            "[%s] acceptance qty clamp failed (non-fatal): %s",
+                            ticker, _cap_exc,
+                        )
 
                 # ── P0 (hotfix/deferred-breach-selector-reasons, amended): ────
                 # Shared helper — builds the selector audit dict and extracts
@@ -3323,6 +3773,236 @@ class APExecutionCore:
         if _deferred:
             _pre_contract = str(approved_contract or "")
             _pre_limit    = float(submit_limit or 0)
+            _pre_qty      = int(getattr(approved_plan, "contracts", 0) or 0)
+
+            # ── P0 amendment #6 (PR #294): identity vars hoisted here, BEFORE
+            # the order-row read block and before any branch that may call
+            # _emit_deferred_outcome() with these fields. Previously they were
+            # assigned after the BLOCK_RETRY early-return, causing an
+            # UnboundLocalError if osm.get_order() raised or returned None
+            # before reaching the assignment. Defensive getattr so an unusual
+            # runner shape can never NameError the proof.
+            _proof_client_id = str(getattr(self, "client_id", "") or "")
+            _proof_execution_mode = str(
+                getattr(self, "execution_mode", None)
+                or getattr(self, "mode", "")
+                or ""
+            )
+
+            # ── P0 amendment #5+#6 (PR #294 final hardening): fail-closed
+            # order-row read. Two distinct failure details, one terminal
+            # lifecycle:
+            #
+            #   READ FAILURE      → TERMINAL_NO_TRADEABLE_CONTRACT
+            #                         detail: MATERIALIZATION_ORDER_ROW_UNREADABLE
+            #   READABLE MISMATCH → TERMINAL_NO_TRADEABLE_CONTRACT
+            #                         detail: MATERIALIZATION_COPYBACK_MISMATCH
+            #
+            # Stage A: read the persisted `orders` row. Track the raw row, read
+            # error, and bounded read attempts separately so the pure classifier
+            # can distinguish "exception" from "row not found" in its audit
+            # field. No logging of "non-fatal" here — order row unreadable
+            # after selector success IS fatal for this trigger.
+            _order_row_raw = None
+            _order_row_read_error: "str | None" = None
+            _order_row_read_attempts = 0
+            if _handoff_snapshot.get("captured") and queue_local_order_id:
+                (
+                    _order_row_raw,
+                    _order_row_read_error,
+                    _order_row_read_attempts,
+                ) = _read_order_row_for_handoff_proof(
+                    self.order_state_machine,
+                    queue_local_order_id,
+                )
+                if _order_row_read_error:
+                    log.warning(
+                        "[%s] handoff order-row read FAILED local_order_id=%s: %s",
+                        ticker, queue_local_order_id, _order_row_read_error,
+                    )
+
+            # Stage B: classify the read result using the pure helper.
+            _row_read_verdict, _row_read_reason = _classify_order_row_read(
+                handoff_snapshot=_handoff_snapshot,
+                order_row_raw=_order_row_raw,
+                read_error=_order_row_read_error,
+            )
+
+            if _row_read_verdict == "BLOCK_RETRY":
+                # Cannot prove the persisted row before broker POST.
+                # Amendment #6 Option B: both outcome AND lifecycle are terminal.
+                # DEFERRED_ORDER_ROW_UNREADABLE → TERMINAL_NO_TRADEABLE_CONTRACT
+                # (see _canonical_materialization_outcome for the full rationale).
+                # This is the honest choice: there is no safe retry path at this
+                # pipeline stage that can replay only the order-row read without
+                # re-running the full breach/selector cycle. Expiring the order and
+                # stamping a clear terminal detail is better than claiming
+                # RETRY_LATER while immediately expiring the row.
+                _inv_err = "MATERIALIZATION_ORDER_ROW_UNREADABLE"
+                log.critical(
+                    "[%s] PRE_SUBMIT_INVARIANT_FAILED — %s | "
+                    "reason=%s local_order_id=%s | "
+                    "selector proved real OCC contract but persisted "
+                    "order row is unreadable before broker POST — "
+                    "broker_order_id=null; terminalizing (Option B: terminal)",
+                    ticker, _inv_err, _row_read_reason, queue_local_order_id,
+                )
+                _emit_deferred_outcome(
+                    "DEFERRED_ORDER_ROW_UNREADABLE",
+                    reason=f"order_row_unreadable:{_row_read_reason}",
+                    contract=str(_pre_contract or ""),
+                    extra={
+                        "failure_stage":                   "handoff_order_row_read",
+                        "materialization_detail_override": "MATERIALIZATION_ORDER_ROW_UNREADABLE",
+                        "order_row_read_error":            _row_read_reason,
+                        "order_row_read_attempts":         _order_row_read_attempts,
+                        "selector_contract":               _handoff_snapshot.get("selector_contract"),
+                        "selector_bid":                    _handoff_snapshot.get("selector_bid"),
+                        "selector_ask":                    _handoff_snapshot.get("selector_ask"),
+                        "selector_mid":                    _handoff_snapshot.get("selector_mid"),
+                        "copied_plan_contract":            _handoff_snapshot.get("copied_plan_contract"),
+                        "pre_submit_contract":             _pre_contract,
+                        "pre_submit_limit":                _pre_limit,
+                        "pre_submit_qty":                  _pre_qty,
+                        "local_order_id":                  str(queue_local_order_id or ""),
+                        "client_id":                       _proof_client_id,
+                        "execution_mode":                  _proof_execution_mode,
+                    },
+                )
+                _terminalize_breach_failure(_inv_err)
+                return
+
+            # Stage C: row is readable (PASS or proof not applicable). Extract
+            # order_row_contract into the snapshot for the handoff classifier
+            # and for the structured proof log.
+            if _row_read_verdict == "PASS" and _order_row_raw is not None:
+                try:
+                    _row_d = (
+                        dict(_order_row_raw)
+                        if not isinstance(_order_row_raw, dict)
+                        else _order_row_raw
+                    )
+                    _handoff_snapshot["order_row_contract"] = (
+                        str(_row_d.get("contract") or "") or None
+                    )
+                except Exception as _extract_exc:
+                    # Row was readable but contract extraction failed. This
+                    # is structurally the same as "row unreadable" — emit the
+                    # same terminal detail rather than falling through.
+                    _inv_err = "MATERIALIZATION_ORDER_ROW_UNREADABLE"
+                    log.critical(
+                        "[%s] PRE_SUBMIT_INVARIANT_FAILED — %s | "
+                        "contract extraction from order row failed: %s | "
+                        "broker_order_id=null; terminalizing",
+                        ticker, _inv_err, _extract_exc,
+                    )
+                    _emit_deferred_outcome(
+                        "DEFERRED_ORDER_ROW_UNREADABLE",
+                        reason=f"order_row_contract_extraction_failed:{_extract_exc}",
+                        contract=str(_pre_contract or ""),
+                        extra={
+                            "failure_stage":                   "handoff_order_row_extraction",
+                            "materialization_detail_override": "MATERIALIZATION_ORDER_ROW_UNREADABLE",
+                            "order_row_read_error":            str(_extract_exc),
+                            "order_row_read_attempts":         _order_row_read_attempts,
+                            "selector_contract":               _handoff_snapshot.get("selector_contract"),
+                            "local_order_id":                  str(queue_local_order_id or ""),
+                            "client_id":                       _proof_client_id,
+                            "execution_mode":                  _proof_execution_mode,
+                        },
+                    )
+                    _terminalize_breach_failure(_inv_err)
+                    return
+
+            # ── P0 amendment #3+#4+#5: deferred materialization handoff proof.
+            # Runs BEFORE the existing DEFERRED_CONTRACT/LIMIT invariants.
+            # All three views are now aligned (selector, copied_plan, order_row)
+            # or the earlier stages above have already terminalized this trigger.
+            # The classifier is only reached when the order row was readable (or
+            # proof is not applicable). A mismatch here means the data is
+            # coherent but the pipeline broke — permanent terminal, not retry.
+            _handoff_ok, _handoff_mismatch = _classify_materialization_handoff(
+                handoff_snapshot=_handoff_snapshot,
+                pre_submit_contract=_pre_contract,
+                pre_submit_limit=_pre_limit,
+                pre_submit_qty=_pre_qty,
+                order_row_contract=_handoff_snapshot.get("order_row_contract"),
+            )
+
+            # Structured proof log — one line per deferred trigger that
+            # reached selector success. Emitted BEFORE any block/return so it
+            # is present even when the block below terminalizes the row.
+            if _handoff_ok is not None:
+                log.info(
+                    "DEFERRED_MATERIALIZATION_HANDOFF_PROOF "
+                    "symbol=%s client_id=%s execution_mode=%s local_order_id=%s "
+                    "selector_contract=%s copied_plan_contract=%s "
+                    "order_row_contract=%s pre_submit_contract=%s "
+                    "selector_ask=%s pre_submit_limit=%.4f qty=%d "
+                    "handoff_ok=%s mismatch_reason=%s",
+                    ticker,
+                    _proof_client_id,
+                    _proof_execution_mode,
+                    str(queue_local_order_id or ""),
+                    _handoff_snapshot.get("selector_contract"),
+                    _handoff_snapshot.get("copied_plan_contract"),
+                    _handoff_snapshot.get("order_row_contract"),
+                    _pre_contract,
+                    _handoff_snapshot.get("selector_ask"),
+                    _pre_limit,
+                    _pre_qty,
+                    "true" if _handoff_ok else "false",
+                    _handoff_mismatch or "",
+                )
+
+            if _handoff_ok is False:
+                _inv_err = "MATERIALIZATION_COPYBACK_MISMATCH"
+                log.critical(
+                    "[%s] PRE_SUBMIT_INVARIANT_FAILED — %s | mismatch=%s | "
+                    "selector_contract=%s copied_plan_contract=%s "
+                    "order_row_contract=%s pre_submit_contract=%s "
+                    "pre_submit_limit=%.4f qty=%d | "
+                    "broker_order_id=null; blocking broker POST",
+                    ticker, _inv_err, _handoff_mismatch,
+                    _handoff_snapshot.get("selector_contract"),
+                    _handoff_snapshot.get("copied_plan_contract"),
+                    _handoff_snapshot.get("order_row_contract"),
+                    _pre_contract, _pre_limit, _pre_qty,
+                )
+                _emit_deferred_outcome(
+                    "BREACH_SUBMISSION_SKIPPED",
+                    reason=f"materialization_copyback_mismatch:{_handoff_mismatch}",
+                    contract=str(_pre_contract or ""),
+                    extra={
+                        "failure_stage":                   "materialization_handoff_proof",
+                        "materialization_detail_override": "MATERIALIZATION_COPYBACK_MISMATCH",
+                        "mismatch_reason":                 _handoff_mismatch,
+                        "selector_contract":               _handoff_snapshot.get("selector_contract"),
+                        "selector_bid":                    _handoff_snapshot.get("selector_bid"),
+                        "selector_ask":                    _handoff_snapshot.get("selector_ask"),
+                        "selector_mid":                    _handoff_snapshot.get("selector_mid"),
+                        "selector_premium":                _handoff_snapshot.get("selector_premium"),
+                        "selector_qty":                    _handoff_snapshot.get("selector_qty"),
+                        "copied_plan_contract":            _handoff_snapshot.get("copied_plan_contract"),
+                        "copied_plan_limit":               _handoff_snapshot.get("copied_plan_limit"),
+                        "copied_plan_qty":                 _handoff_snapshot.get("copied_plan_qty"),
+                        "copied_plan_max_usd":             _handoff_snapshot.get("copied_plan_max_usd"),
+                        # P0 amendment #4 (PR #294): third-view field.
+                        # Always present in the emit extra (even when None
+                        # — that itself is diagnostic: it means the DB read
+                        # failed and the pre-submit view drove the mismatch).
+                        "order_row_contract":              _handoff_snapshot.get("order_row_contract"),
+                        "pre_submit_contract":             _pre_contract,
+                        "pre_submit_limit":                _pre_limit,
+                        "pre_submit_qty":                  _pre_qty,
+                        "local_order_id":                  str(queue_local_order_id or ""),
+                        "client_id":                       _proof_client_id,
+                        "execution_mode":                  _proof_execution_mode,
+                    },
+                )
+                _terminalize_breach_failure(_inv_err)
+                return
+
             if (not _pre_contract) or _pre_contract.upper().startswith("DEFERRED:"):
                 _inv_err = "DEFERRED_CONTRACT_NOT_MATERIALIZED"
                 log.critical(
@@ -3341,6 +4021,88 @@ class APExecutionCore:
                 )
                 _terminalize_breach_failure(_inv_err)
                 return
+
+            # ── P0 (monday-trade-flow-readiness, amended): acceptance cap on
+            # the FINAL submit limit. The selection-time cap check above can
+            # pass and the entry-pricing loop can then refresh the limit
+            # upward (ask-cross, drift within ENTRY_MAX_PRICE_DRIFT_PCT). The
+            # cap is a hard acceptance-window invariant, so it is re-enforced
+            # here against the exact limit that would go to the broker.
+            # Same FAIL-CLOSED contract as selection time: flag on + cap
+            # invalid → block; flag off → no-op.
+            #
+            # P0 amendment #2 (PR #294 review): both terminal branches now
+            # emit through _emit_deferred_outcome BEFORE the OSM cleanup so
+            # the exactly-once terminal channel fires and orders.meta carries
+            # canonical entry_path / materialization_outcome /
+            # materialization_detail plus the full block-context audit (final
+            # submit limit, cap, contract, and the selected quote snapshot
+            # when available). The external reason code stays
+            # UNTRADEABLE_FOR_ACCOUNT_SIZE for operator vocabulary
+            # continuity; the fine-grained cause lives in
+            # materialization_detail. Broker POST remains blocked by the
+            # subsequent _terminalize_breach_failure that cleans up the
+            # order — the canonical stamp is written first so a cleanup
+            # exception cannot swallow the audit.
+            _cap_enabled, _accept_cap, _cap_error = _acceptance_ask_cap()
+            if _cap_enabled:
+                # Selected-contract snapshot is only bound on the deferred
+                # selection branch; resolve via locals() so the non-deferred
+                # path can never NameError while building the audit.
+                _sel_snapshot = locals().get("_sel")
+                _cap_audit_common = {
+                    "failure_stage": "acceptance_ask_cap_pre_submit",
+                    "final_submit_limit": float(_pre_limit or 0),
+                    "acceptance_cap": (
+                        float(_accept_cap) if _accept_cap is not None else None
+                    ),
+                    "selected_contract": str(_pre_contract or ""),
+                    "selected_bid": float(getattr(_sel_snapshot, "bid", 0) or 0),
+                    "selected_ask": float(getattr(_sel_snapshot, "ask", 0) or 0),
+                    "selected_mid": float(getattr(_sel_snapshot, "mid", 0) or 0),
+                    "qty": int(getattr(approved_plan, "contracts", 0) or 0),
+                }
+                if _cap_error:
+                    _inv_err = f"ACCEPTANCE_CAP_MISCONFIGURED:{_cap_error}"
+                    log.critical(
+                        "[%s] PRE_SUBMIT_INVARIANT_FAILED — %s | fail-closed; "
+                        "broker_order_id=null; blocking broker POST",
+                        ticker, _inv_err,
+                    )
+                    _emit_deferred_outcome(
+                        "UNTRADEABLE_FOR_ACCOUNT_SIZE",
+                        reason=_inv_err,
+                        contract=str(_pre_contract or ""),
+                        extra={
+                            **_cap_audit_common,
+                            "acceptance_cap_error": _cap_error,
+                            "materialization_detail_override": _inv_err,
+                        },
+                    )
+                    _terminalize_breach_failure(_inv_err)
+                    return
+                if _pre_limit > _accept_cap:
+                    _inv_err = (
+                        f"ACCEPTANCE_CAP_EXCEEDED_AT_SUBMIT:"
+                        f"limit_{_pre_limit:.2f}_cap_{_accept_cap:.2f}"
+                    )
+                    log.critical(
+                        "[%s] PRE_SUBMIT_INVARIANT_FAILED — %s | selection-time "
+                        "cap passed but refreshed submit limit exceeds cap; "
+                        "broker_order_id=null; blocking broker POST",
+                        ticker, _inv_err,
+                    )
+                    _emit_deferred_outcome(
+                        "UNTRADEABLE_FOR_ACCOUNT_SIZE",
+                        reason=_inv_err,
+                        contract=str(_pre_contract or ""),
+                        extra={
+                            **_cap_audit_common,
+                            "materialization_detail_override": "ACCEPTANCE_CAP_EXCEEDED_AT_SUBMIT",
+                        },
+                    )
+                    _terminalize_breach_failure(_inv_err)
+                    return
 
         submit_res = self.order_state_machine.submit_existing_entry(
             local_order_id=queue_local_order_id,
@@ -3410,10 +4172,39 @@ class APExecutionCore:
                 approved_contract,
                 submit_limit,
             )
+            # P0 amended (req: persist materialization audit): final broker
+            # limit + selected quote snapshot, merged into orders.meta as
+            # materialization_* fields by the emitter. `_sel` is bound ONLY on
+            # the deferred selection branch — resolve via locals() so the
+            # non-deferred success path (where _emit_deferred_outcome is a
+            # no-op anyway) can never NameError while building arguments.
+            _sel_snapshot = locals().get("_sel")
             _emit_deferred_outcome(
                 "BREACH_BROKER_SUBMITTED",
                 contract=str(approved_contract or ""),
                 broker_order_id=str(broker_order_id or ""),
+                extra={
+                    "final_submit_limit": float(submit_limit or 0),
+                    "selected_bid": float(getattr(_sel_snapshot, "bid", 0) or 0),
+                    "selected_ask": float(getattr(_sel_snapshot, "ask", 0) or 0),
+                    "selected_mid": float(getattr(_sel_snapshot, "mid", 0) or 0),
+                    "qty": int(approved_qty or 0),
+                    # P0 amendment #3+#4 (PR #294): handoff proof fields
+                    # persisted on the successful terminal too, so a
+                    # dashboard can prove every deferred trigger — whether
+                    # it materialized or terminalized — carries the
+                    # three-stage snapshot in orders.meta.
+                    "handoff_ok":            True,
+                    "selector_contract":     _handoff_snapshot.get("selector_contract"),
+                    "copied_plan_contract":  _handoff_snapshot.get("copied_plan_contract"),
+                    "order_row_contract":    _handoff_snapshot.get("order_row_contract"),
+                    "pre_submit_contract":   str(approved_contract or ""),
+                    "pre_submit_limit":      float(submit_limit or 0),
+                    "pre_submit_qty":        int(approved_qty or 0),
+                    "local_order_id":        str(queue_local_order_id or ""),
+                    "client_id":             str(getattr(self, "client_id", "") or ""),
+                    "execution_mode":        str(getattr(self, "execution_mode", None) or getattr(self, "mode", "") or ""),
+                },
             )
             return
 
