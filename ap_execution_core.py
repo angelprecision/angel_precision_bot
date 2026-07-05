@@ -1820,10 +1820,25 @@ class APExecutionCore:
                         self.order_state_machine, "update_order_meta", None
                     )
                     if callable(_update_meta):
+                        # P0 amendment #2 (PR #294 review): submit-cap
+                        # terminals reuse the external UNTRADEABLE_FOR_ACCOUNT_SIZE
+                        # code (operator vocabulary continuity) but need to
+                        # preserve their fine-grained detail
+                        # (ACCEPTANCE_CAP_EXCEEDED_AT_SUBMIT vs
+                        # ACCEPTANCE_CAP_MISCONFIGURED). When the caller
+                        # supplies materialization_detail_override in extra,
+                        # it wins over the raw outcome string; otherwise the
+                        # raw outcome remains the detail. Never becomes the
+                        # OUTCOME — mapping to MATERIALIZED_AND_SUBMITTED /
+                        # TERMINAL_NO_TRADEABLE_CONTRACT still keys off
+                        # `outcome`, not the override.
+                        _detail = outcome
+                        if extra and "materialization_detail_override" in extra:
+                            _detail = str(extra.get("materialization_detail_override") or outcome)
                         _canon_meta: dict = {
                             "entry_path": _MATERIALIZATION_ENTRY_PATH,
                             "materialization_outcome": _canonical_materialization_outcome(outcome),
-                            "materialization_detail": outcome,
+                            "materialization_detail": _detail,
                             "materialization_reason": reason or "",
                             "materialization_contract": contract or "",
                             "materialization_broker_order_id": broker_order_id or "",
@@ -1831,6 +1846,8 @@ class APExecutionCore:
                         }
                         if extra:
                             for _mk, _mv in extra.items():
+                                if _mk == "materialization_detail_override":
+                                    continue  # already consumed above
                                 _canon_meta.setdefault(f"materialization_{_mk}", _mv)
                         _update_meta(queue_local_order_id, _canon_meta)
             except Exception as _canon_exc:
@@ -3532,14 +3549,54 @@ class APExecutionCore:
             # here against the exact limit that would go to the broker.
             # Same FAIL-CLOSED contract as selection time: flag on + cap
             # invalid → block; flag off → no-op.
+            #
+            # P0 amendment #2 (PR #294 review): both terminal branches now
+            # emit through _emit_deferred_outcome BEFORE the OSM cleanup so
+            # the exactly-once terminal channel fires and orders.meta carries
+            # canonical entry_path / materialization_outcome /
+            # materialization_detail plus the full block-context audit (final
+            # submit limit, cap, contract, and the selected quote snapshot
+            # when available). The external reason code stays
+            # UNTRADEABLE_FOR_ACCOUNT_SIZE for operator vocabulary
+            # continuity; the fine-grained cause lives in
+            # materialization_detail. Broker POST remains blocked by the
+            # subsequent _terminalize_breach_failure that cleans up the
+            # order — the canonical stamp is written first so a cleanup
+            # exception cannot swallow the audit.
             _cap_enabled, _accept_cap, _cap_error = _acceptance_ask_cap()
             if _cap_enabled:
+                # Selected-contract snapshot is only bound on the deferred
+                # selection branch; resolve via locals() so the non-deferred
+                # path can never NameError while building the audit.
+                _sel_snapshot = locals().get("_sel")
+                _cap_audit_common = {
+                    "failure_stage": "acceptance_ask_cap_pre_submit",
+                    "final_submit_limit": float(_pre_limit or 0),
+                    "acceptance_cap": (
+                        float(_accept_cap) if _accept_cap is not None else None
+                    ),
+                    "selected_contract": str(_pre_contract or ""),
+                    "selected_bid": float(getattr(_sel_snapshot, "bid", 0) or 0),
+                    "selected_ask": float(getattr(_sel_snapshot, "ask", 0) or 0),
+                    "selected_mid": float(getattr(_sel_snapshot, "mid", 0) or 0),
+                    "qty": int(getattr(approved_plan, "contracts", 0) or 0),
+                }
                 if _cap_error:
                     _inv_err = f"ACCEPTANCE_CAP_MISCONFIGURED:{_cap_error}"
                     log.critical(
                         "[%s] PRE_SUBMIT_INVARIANT_FAILED — %s | fail-closed; "
                         "broker_order_id=null; blocking broker POST",
                         ticker, _inv_err,
+                    )
+                    _emit_deferred_outcome(
+                        "UNTRADEABLE_FOR_ACCOUNT_SIZE",
+                        reason=_inv_err,
+                        contract=str(_pre_contract or ""),
+                        extra={
+                            **_cap_audit_common,
+                            "acceptance_cap_error": _cap_error,
+                            "materialization_detail_override": _inv_err,
+                        },
                     )
                     _terminalize_breach_failure(_inv_err)
                     return
@@ -3553,6 +3610,15 @@ class APExecutionCore:
                         "cap passed but refreshed submit limit exceeds cap; "
                         "broker_order_id=null; blocking broker POST",
                         ticker, _inv_err,
+                    )
+                    _emit_deferred_outcome(
+                        "UNTRADEABLE_FOR_ACCOUNT_SIZE",
+                        reason=_inv_err,
+                        contract=str(_pre_contract or ""),
+                        extra={
+                            **_cap_audit_common,
+                            "materialization_detail_override": "ACCEPTANCE_CAP_EXCEEDED_AT_SUBMIT",
+                        },
                     )
                     _terminalize_breach_failure(_inv_err)
                     return

@@ -966,31 +966,62 @@ class APStartupRecovery:
 
         def _load_orphaned_pending_trigger_orders():
             with conn() as c:
+                # P0 amendment (PR #294): join the paired trade_queue row and
+                # exclude any pair whose queue row was moved out of WATCHING
+                # by the readiness pass (ARCHIVED / EXPIRED with a
+                # READINESS_* last_error). LEFT JOIN keeps historical orders
+                # without a queue row visible (legacy safety); the readiness
+                # exclusion only fires when a matching queue row exists AND
+                # its status/last_error prove a classification decision was
+                # made. Nothing is written; only the read set narrows.
                 c.execute(
                     """
-                    SELECT local_order_id,
-                           signal_id,
-                           plan_id,
-                           symbol,
-                           contract,
-                           direction,
-                           score,
-                           tier,
-                           trigger_price,
-                           stop_underlying,
-                           target_underlying,
-                           pattern,
-                           timeframe,
-                           meta
-                    FROM orders
-                    WHERE client_id = %s
-                      AND kind = 'ENTRY'
-                      AND status = 'PENDING_TRIGGER'
-                      AND created_ts >= %s
-                      AND broker_order_id IS NULL
-                      AND submitted_ts IS NULL
-                      AND filled_ts IS NULL
-                    ORDER BY created_ts ASC
+                    SELECT o.local_order_id,
+                           o.signal_id,
+                           o.plan_id,
+                           o.symbol,
+                           o.contract,
+                           o.direction,
+                           o.score,
+                           o.tier,
+                           o.trigger_price,
+                           o.stop_underlying,
+                           o.target_underlying,
+                           o.pattern,
+                           o.timeframe,
+                           o.meta,
+                           tq.status     AS _tq_status,
+                           tq.last_error AS _tq_last_error
+                    FROM orders o
+                    LEFT JOIN LATERAL (
+                             SELECT status, last_error
+                             FROM   trade_queue
+                             WHERE  trade_queue.client_id = o.client_id
+                               AND  trade_queue.signal_id = o.signal_id
+                             ORDER BY created_ts DESC
+                             LIMIT 1
+                    ) tq ON TRUE
+                    WHERE o.client_id = %s
+                      AND o.kind = 'ENTRY'
+                      AND o.status = 'PENDING_TRIGGER'
+                      AND o.created_ts >= %s
+                      AND o.broker_order_id IS NULL
+                      AND o.submitted_ts IS NULL
+                      AND o.filled_ts IS NULL
+                      AND (
+                            tq.status IS NULL           -- no paired queue row (legacy safety)
+                         OR tq.status = 'WATCHING'      -- fresh eligible pair
+                      )
+                      AND (
+                            tq.last_error IS NULL
+                         OR (
+                                tq.last_error NOT LIKE 'READINESS_ARCHIVED_STALE%%'
+                            AND tq.last_error NOT LIKE 'READINESS_ARCHIVED_NON_TRADING_DAY%%'
+                            AND tq.last_error NOT LIKE 'READINESS_ARCHIVED_NOT_IN_ALLOWLIST%%'
+                            AND tq.last_error NOT LIKE 'READINESS_ORPHANED_ORDER%%'
+                         )
+                      )
+                    ORDER BY o.created_ts ASC
                     """,
                     (self.client_id, cutoff_utc),
                 )
@@ -1018,6 +1049,44 @@ class APStartupRecovery:
             _mc_mode = "PAPER"
         _is_live = (_mc_mode == "LIVE")
 
+        # ── P0 amendment (PR #294): readiness-aware reseed gate ────────────
+        # A row's presence as a recent orphaned PENDING_TRIGGER is not by
+        # itself proof the operator wants it re-armed. When the pre-open
+        # WATCHING readiness pass has already ARCHIVED / EXPIRED the paired
+        # trade_queue row — because it is stale beyond the cutoff, was
+        # generated on a non-trading day (e.g. 2026-07-03 holiday batch), sits
+        # outside the entry allowlist, or its paired ENTRY order is already
+        # terminal — re-arming its watcher would nullify the classification
+        # decision and re-open the very dedup/pipe clog the readiness pass
+        # exists to close. The SELECT below therefore joins the paired
+        # trade_queue row and filters to (status='WATCHING' or paired queue
+        # row missing) so a rearm can only happen against a fresh, eligible,
+        # still-WATCHING row. Rows whose queue row was READINESS_* terminalized
+        # or moved out of WATCHING are excluded from the read set; that is the
+        # first defensive layer. The per-row skip below is the second layer:
+        # if a queue row transitions AFTER the SELECT but BEFORE the reseed
+        # loop reaches it (concurrent operator action, cron overlap), the
+        # per-row check catches it. Both layers preserve the LIVE
+        # no-replay invariant; neither writes anywhere; neither raises.
+        _READINESS_SKIP_LAST_ERRORS = (
+            "READINESS_ARCHIVED_STALE",
+            "READINESS_ARCHIVED_NON_TRADING_DAY",
+            "READINESS_ARCHIVED_NOT_IN_ALLOWLIST",
+            "READINESS_ORPHANED_ORDER",  # matches READINESS_ORPHANED_ORDER_EXPIRED, _CANCELLED, etc.
+        )
+
+        def _last_error_is_readiness_skip(last_error) -> bool:
+            # Diagnostic-only: never raise, even on corrupt row shapes. We
+            # str()-coerce inside a bare try/except so an odd payload (e.g.
+            # a shim object whose __str__ raises) falls through as "no
+            # readiness marker" and defers to the SELECT filter + downstream
+            # checks rather than aborting the whole reseed pass.
+            try:
+                _le = str(last_error) if last_error is not None else ""
+            except Exception:
+                return False
+            return any(_le.startswith(_p) for _p in _READINESS_SKIP_LAST_ERRORS)
+
         if _is_live:
             # Audit-required log; emitted before any DB write so it's
             # visible even if downstream paths fail.
@@ -1044,6 +1113,45 @@ class APStartupRecovery:
                 local_order_id = str(order.get("local_order_id") or "").strip()
                 if not local_order_id:
                     continue
+
+                # P0 amendment (PR #294): per-row readiness guard. The SELECT
+                # above already excludes readiness-terminalized pairs; this
+                # is the second defensive layer against a queue row that
+                # transitioned AFTER the SELECT but BEFORE this loop reached
+                # it (concurrent operator action, cron overlap, retry-loop
+                # timing). Diagnostic-only: `continue` past the row, do not
+                # raise, do not write. `_tq_status`/`_tq_last_error` come
+                # from the LEFT JOIN LATERAL; None on rows without a paired
+                # queue row (legacy safety — still eligible for reseed).
+                try:
+                    _tq_status = str(order.get("_tq_status") or "").upper()
+                    _tq_last_error = order.get("_tq_last_error")
+                    _readiness_skip_reason = None
+                    if _tq_status and _tq_status != "WATCHING":
+                        _readiness_skip_reason = f"queue_row_not_watching:{_tq_status}"
+                    elif _last_error_is_readiness_skip(_tq_last_error):
+                        _readiness_skip_reason = f"queue_readiness_terminal:{_tq_last_error}"
+                    if _readiness_skip_reason:
+                        log.info(
+                            "[%s] RECOVERY: readiness_reseed_skip local_order_id=%s "
+                            "signal_id=%s reason=%s | queue row was classified out "
+                            "of WATCHING by the pre-open readiness pass; watcher "
+                            "reseed suppressed (no order/queue/positions/proof "
+                            "mutation)",
+                            self.client_id, local_order_id,
+                            order.get("signal_id"), _readiness_skip_reason,
+                        )
+                        continue
+                except Exception as _gate_exc:
+                    # Guard must never raise. On unexpected shape, fall
+                    # through to the existing ownership/plan checks — the
+                    # SELECT filter is still the primary defence.
+                    log.warning(
+                        "[%s] RECOVERY: readiness_reseed_guard_error "
+                        "local_order_id=%s error=%s | falling through to "
+                        "downstream checks",
+                        self.client_id, local_order_id, _gate_exc,
+                    )
                 try:
                     if hasattr(self.entry_watcher, "has_order") and self.entry_watcher.has_order(local_order_id):
                         log.info(
