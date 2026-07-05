@@ -179,8 +179,18 @@ _MATERIALIZATION_ENTRY_PATH = "DEFERRED_BREACH_MATERIALIZATION"
 
 
 def _canonical_materialization_outcome(outcome: str) -> str:
-    if str(outcome or "").strip() == "BREACH_BROKER_SUBMITTED":
+    _o = str(outcome or "").strip()
+    if _o == "BREACH_BROKER_SUBMITTED":
         return "MATERIALIZED_AND_SUBMITTED"
+    # P0 amendment #5 (PR #294 final hardening): order-row-unreadable is a
+    # transient data-availability failure, not a permanent quality reject.
+    # The operator-facing outcome is RETRY_LATER_DATA_UNAVAILABLE so dashboards
+    # can distinguish "could not prove the row" (retryable) from "proved the
+    # row and it was wrong" (terminal mismatch). The internal outcome code
+    # DEFERRED_ORDER_ROW_UNREADABLE is never exposed externally — it maps
+    # cleanly here and is consumed by the emitter.
+    if _o == "DEFERRED_ORDER_ROW_UNREADABLE":
+        return "RETRY_LATER_DATA_UNAVAILABLE"
     return "TERMINAL_NO_TRADEABLE_CONTRACT"
 
 
@@ -253,6 +263,51 @@ def _classify_materialization_handoff(
             )
 
     return True, None
+
+
+# ── P0 amendment #5 (PR #294 final hardening): pure classifier for the
+# order-row read step of the handoff proof. Separate from
+# _classify_materialization_handoff so the two failure modes carry distinct
+# production semantics:
+#
+#   order-row UNREADABLE → RETRY_LATER_DATA_UNAVAILABLE
+#     (we cannot prove the row; transient/infra failure; do not submit)
+#   order-row readable but WRONG → TERMINAL_NO_TRADEABLE_CONTRACT
+#     (we proved the row and it is wrong; permanent mismatch; do not submit)
+#
+# Returns one of:
+#   ("BLOCK_RETRY",  "<reason>") — row unreadable; caller must emit
+#                                  RETRY_LATER_DATA_UNAVAILABLE + terminalize
+#   ("PASS",         None)       — row readable; caller extracts contract
+#                                  and passes to _classify_materialization_handoff
+#   (None,           None)       — proof not applicable (selector never ran
+#                                  to a real OCC contract on this trigger);
+#                                  no-op; standing invariants handle it
+#
+# NO side effects, NO logging, NO DB access. Pure truth table.
+def _classify_order_row_read(
+    *,
+    handoff_snapshot: dict,
+    order_row_raw: object,
+    read_error: "str | None" = None,
+) -> "tuple[str | None, str | None]":
+    if not handoff_snapshot or not handoff_snapshot.get("captured"):
+        return None, None
+    sel_contract = str(handoff_snapshot.get("selector_contract") or "")
+    if not sel_contract or sel_contract.upper().startswith("DEFERRED:"):
+        return None, None   # selector never returned a real contract
+
+    # Selector succeeded with a real OCC contract. The order row MUST be
+    # readable. A None row means either the row was not found (no row with
+    # that local_order_id exists) or the read raised an exception (caller
+    # tracks the distinction in read_error for the audit field — both map
+    # to the same BLOCK_RETRY outcome because in either case we cannot
+    # prove the persisted contract before broker POST).
+    if order_row_raw is None:
+        reason = f"read_error:{read_error}" if read_error else "row_not_found"
+        return "BLOCK_RETRY", reason
+
+    return "PASS", None
 
 
 def _live_confirmation_required() -> bool:
@@ -1789,6 +1844,10 @@ class APExecutionCore:
             "NO_VALID_PLAYBOOK_DTE_CONTRACT",
             "UNTRADEABLE_FOR_ACCOUNT_SIZE",
             "DATA_MISSING_OI_VOLUME",
+            # P0 amendment #5 (PR #294 final hardening): transient failure
+            # to read the persisted `orders` row after selector success.
+            # Maps to RETRY_LATER_DATA_UNAVAILABLE (not a quality reject).
+            "DEFERRED_ORDER_ROW_UNREADABLE",
         })
         _deferred_outcome = {"emitted": False, "outcome": None, "is_deferred": False}
 
@@ -3669,48 +3728,133 @@ class APExecutionCore:
             _pre_limit    = float(submit_limit or 0)
             _pre_qty      = int(getattr(approved_plan, "contracts", 0) or 0)
 
-            # ── P0 amendment #4 (PR #294): third-view read — the persisted
-            # `orders` row's contract as it stands at pre-submit time,
-            # BEFORE OSM.submit_existing_entry runs its own copy-back. If
-            # the OSM never persisted the materialized contract for any
-            # reason (plan.contract_symbol updated in memory but the
-            # UPDATE never fired, race with a stale in-memory reference,
-            # etc.), this catches it. Defensive: on any read failure we
-            # leave order_row_contract=None so the classifier degrades
-            # gracefully — a transient DB hiccup must not block every
-            # submit, and the standing DEFERRED_CONTRACT invariant runs
-            # after the proof either way.
-            try:
-                if queue_local_order_id and self.order_state_machine is not None:
-                    _get_order = getattr(self.order_state_machine, "get_order", None)
-                    if callable(_get_order):
-                        _row = _get_order(queue_local_order_id)
-                        if _row:
-                            _row_d = dict(_row) if not isinstance(_row, dict) else _row
-                            _handoff_snapshot["order_row_contract"] = (
-                                str(_row_d.get("contract") or "") or None
-                            )
-            except Exception as _row_read_exc:
-                log.warning(
-                    "[%s] handoff order-row read failed (non-fatal): %s",
-                    ticker, _row_read_exc,
-                )
+            # ── P0 amendment #5 (PR #294 final hardening): fail-closed order-row
+            # read. Two distinct failure modes, two distinct outcomes:
+            #
+            #   READ FAILURE  → RETRY_LATER_DATA_UNAVAILABLE  (transient; try again)
+            #   READABLE MISMATCH → TERMINAL_NO_TRADEABLE_CONTRACT (proved wrong)
+            #
+            # Stage A: read the persisted `orders` row. Track the raw row AND
+            # any read error separately so the pure classifier can distinguish
+            # "exception" from "row not found" in its audit field, even though
+            # both map to the same BLOCK_RETRY outcome. No logging of "non-fatal"
+            # here — order row unreadable after selector success IS fatal for
+            # this trigger; the log is at WARNING for the audit trail.
+            _order_row_raw = None
+            _order_row_read_error: "str | None" = None
+            if _handoff_snapshot.get("captured") and queue_local_order_id:
+                try:
+                    if self.order_state_machine is not None:
+                        _get_order_fn = getattr(
+                            self.order_state_machine, "get_order", None
+                        )
+                        if callable(_get_order_fn):
+                            _order_row_raw = _get_order_fn(queue_local_order_id)
+                        else:
+                            _order_row_read_error = "osm_get_order_not_callable"
+                    else:
+                        _order_row_read_error = "osm_not_available"
+                except Exception as _row_exc:
+                    _order_row_read_error = str(_row_exc)
+                    log.warning(
+                        "[%s] handoff order-row read FAILED local_order_id=%s: %s",
+                        ticker, queue_local_order_id, _row_exc,
+                    )
 
-            # ── P0 amendment #3+#4 (PR #294): deferred materialization
-            # handoff proof. Runs BEFORE the existing DEFERRED_CONTRACT/LIMIT
-            # invariants. If the selector actually succeeded (snapshot was
-            # captured with a real OCC contract), all three views MUST
-            # agree: same real OCC contract, limit > 0.01, qty > 0, AND
-            # the persisted `orders` row's contract matches when readable.
-            # If any of those fail, the handoff broke somewhere between
-            # copy-back and here — block the submit, terminalize with a
-            # MISMATCH detail, and stamp the full three-stage evidence
-            # into orders.meta. If the snapshot was NOT captured (selector
-            # never ran to success on this trigger), skip the proof and
-            # let the existing invariants below handle the classification.
-            # Classification lives in the pure module-level helper
-            # _classify_materialization_handoff so the truth table is
-            # test-covered directly and cannot drift between prod and tests.
+            # Stage B: classify the read result using the pure helper.
+            _row_read_verdict, _row_read_reason = _classify_order_row_read(
+                handoff_snapshot=_handoff_snapshot,
+                order_row_raw=_order_row_raw,
+                read_error=_order_row_read_error,
+            )
+
+            if _row_read_verdict == "BLOCK_RETRY":
+                # Cannot prove the persisted row before broker POST.
+                # Emit RETRY_LATER_DATA_UNAVAILABLE — the canonical outcome
+                # for a transient data-availability failure that may resolve
+                # on the next breach attempt. Broker POST blocked. OSM
+                # terminalize cleans up the order row.
+                _inv_err = "MATERIALIZATION_ORDER_ROW_UNREADABLE"
+                log.critical(
+                    "[%s] PRE_SUBMIT_INVARIANT_FAILED — %s | "
+                    "reason=%s local_order_id=%s | "
+                    "selector proved real OCC contract but persisted "
+                    "order row is unreadable before broker POST — "
+                    "broker_order_id=null; terminalizing; retry on next breach",
+                    ticker, _inv_err, _row_read_reason, queue_local_order_id,
+                )
+                _emit_deferred_outcome(
+                    "DEFERRED_ORDER_ROW_UNREADABLE",
+                    reason=f"order_row_unreadable:{_row_read_reason}",
+                    contract=str(_pre_contract or ""),
+                    extra={
+                        "failure_stage":                   "handoff_order_row_read",
+                        "materialization_detail_override": "MATERIALIZATION_ORDER_ROW_UNREADABLE",
+                        "order_row_read_error":            _row_read_reason,
+                        "selector_contract":               _handoff_snapshot.get("selector_contract"),
+                        "selector_bid":                    _handoff_snapshot.get("selector_bid"),
+                        "selector_ask":                    _handoff_snapshot.get("selector_ask"),
+                        "selector_mid":                    _handoff_snapshot.get("selector_mid"),
+                        "copied_plan_contract":            _handoff_snapshot.get("copied_plan_contract"),
+                        "pre_submit_contract":             _pre_contract,
+                        "pre_submit_limit":                _pre_limit,
+                        "pre_submit_qty":                  _pre_qty,
+                        "local_order_id":                  str(queue_local_order_id or ""),
+                        "client_id":                       _proof_client_id,
+                        "execution_mode":                  _proof_execution_mode,
+                    },
+                )
+                _terminalize_breach_failure(_inv_err)
+                return
+
+            # Stage C: row is readable (PASS or proof not applicable). Extract
+            # order_row_contract into the snapshot for the handoff classifier
+            # and for the structured proof log.
+            if _row_read_verdict == "PASS" and _order_row_raw is not None:
+                try:
+                    _row_d = (
+                        dict(_order_row_raw)
+                        if not isinstance(_order_row_raw, dict)
+                        else _order_row_raw
+                    )
+                    _handoff_snapshot["order_row_contract"] = (
+                        str(_row_d.get("contract") or "") or None
+                    )
+                except Exception as _extract_exc:
+                    # Row was readable but contract extraction failed. This
+                    # is structurally the same as "row unreadable" — emit
+                    # the same RETRY outcome rather than falling through.
+                    _inv_err = "MATERIALIZATION_ORDER_ROW_UNREADABLE"
+                    log.critical(
+                        "[%s] PRE_SUBMIT_INVARIANT_FAILED — %s | "
+                        "contract extraction from order row failed: %s | "
+                        "broker_order_id=null; terminalizing",
+                        ticker, _inv_err, _extract_exc,
+                    )
+                    _emit_deferred_outcome(
+                        "DEFERRED_ORDER_ROW_UNREADABLE",
+                        reason=f"order_row_contract_extraction_failed:{_extract_exc}",
+                        contract=str(_pre_contract or ""),
+                        extra={
+                            "failure_stage":                   "handoff_order_row_extraction",
+                            "materialization_detail_override": "MATERIALIZATION_ORDER_ROW_UNREADABLE",
+                            "order_row_read_error":            str(_extract_exc),
+                            "selector_contract":               _handoff_snapshot.get("selector_contract"),
+                            "local_order_id":                  str(queue_local_order_id or ""),
+                            "client_id":                       _proof_client_id,
+                            "execution_mode":                  _proof_execution_mode,
+                        },
+                    )
+                    _terminalize_breach_failure(_inv_err)
+                    return
+
+            # ── P0 amendment #3+#4+#5: deferred materialization handoff proof.
+            # Runs BEFORE the existing DEFERRED_CONTRACT/LIMIT invariants.
+            # All three views are now aligned (selector, copied_plan, order_row)
+            # or the earlier stages above have already terminalized this trigger.
+            # The classifier is only reached when the order row was readable (or
+            # proof is not applicable). A mismatch here means the data is
+            # coherent but the pipeline broke — permanent terminal, not retry.
             _handoff_ok, _handoff_mismatch = _classify_materialization_handoff(
                 handoff_snapshot=_handoff_snapshot,
                 pre_submit_contract=_pre_contract,
