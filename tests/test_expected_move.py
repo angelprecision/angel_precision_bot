@@ -188,15 +188,19 @@ def test_no_function_raises_on_malformed_inputs(fn, args):
     assert result.reason
 
 
-def test_expected_move_module_imported_by_nothing_else_in_this_pr():
-    offenders = []
-    for path in ROOT.rglob("*.py"):
-        if path.relative_to(ROOT).parts[0] == "tests":
-            continue
-        if path == ROOT / "ap" / "expected_move.py":
-            continue
-        text = path.read_text(encoding="utf-8")
-        if "ap.expected_move" in text or "from expected_move" in text:
-            offenders.append(str(path.relative_to(ROOT)))
+def test_canonical_expected_move_module_is_pure():
+    """Canonical module must import NO AP modules (pure math leaf)."""
+    text = (ROOT / "ap" / "expected_move.py").read_text(encoding="utf-8")
+    assert "from ap." not in text
+    assert "import ap_" not in text
+    assert "import ap." not in text
 
-    assert offenders == []
+
+def test_both_surfaces_present():
+    """Canonical module exposes BOTH the PR-F/PR-E and PR-G surfaces."""
+    import ap.expected_move as em
+    for name in ("ExpectedMoveResult", "AtmIvResult", "expected_move_1d",
+                 "expected_move_to", "atm_iv_from_chain", "feasibility_ratio",
+                 "expected_move_1d_pct", "expected_move_pct_over",
+                 "expected_option_daily_range_pct", "feasibility_ratio_pct"):
+        assert hasattr(em, name), f"canonical surface missing {name}"
