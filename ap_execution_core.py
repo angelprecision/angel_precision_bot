@@ -184,6 +184,53 @@ def _canonical_materialization_outcome(outcome: str) -> str:
     return "TERMINAL_NO_TRADEABLE_CONTRACT"
 
 
+# ── P0 amendment #3 (PR #294): pure classifier for the deferred materialization
+# handoff proof. Given the three-stage snapshot the process_watcher_breach
+# path assembles, return one of:
+#   (True,  None)              — handoff clean, submit may proceed
+#   (False, "<mismatch_code>") — handoff broke; caller must terminalize
+#   (None,  None)              — proof not applicable (selector never
+#                                returned a real contract on this trigger);
+#                                caller falls through to the standing
+#                                DEFERRED_CONTRACT / LIMIT invariants
+#
+# Pulled out of the breach method so tests can exercise the exact
+# production truth table without instantiating the full execution core.
+# NO side effects, NO logging, NO writes — the caller owns emission,
+# terminalization, and orders.meta persistence.
+def _classify_materialization_handoff(
+    *,
+    handoff_snapshot: dict,
+    pre_submit_contract: str,
+    pre_submit_limit: float,
+    pre_submit_qty: int,
+) -> "tuple[bool | None, str | None]":
+    if not handoff_snapshot or not handoff_snapshot.get("captured"):
+        return None, None
+    selector_contract = str(handoff_snapshot.get("selector_contract") or "")
+    if not selector_contract:
+        return None, None
+    if selector_contract.upper().startswith("DEFERRED:"):
+        # Selector explicitly returned a placeholder — proof is not
+        # applicable; the standing DEFERRED_CONTRACT invariant catches it.
+        return None, None
+
+    pre_contract = str(pre_submit_contract or "")
+    pre_contract_upper = pre_contract.upper()
+    if (not pre_contract) or pre_contract_upper.startswith("DEFERRED:"):
+        return False, "pre_submit_contract_placeholder_or_missing"
+    if pre_contract != selector_contract:
+        return False, (
+            "pre_submit_contract_diverges_from_selector:"
+            f"selector={selector_contract}:pre_submit={pre_contract}"
+        )
+    if float(pre_submit_limit or 0) <= 0.01:
+        return False, f"pre_submit_limit_not_materialized:limit={float(pre_submit_limit or 0):.4f}"
+    if int(pre_submit_qty or 0) <= 0:
+        return False, f"pre_submit_qty_not_materialized:qty={int(pre_submit_qty or 0)}"
+    return True, None
+
+
 def _live_confirmation_required() -> bool:
     """
     P0 (PR #262): LIVE submits require an explicit entry-confirmation PASS.
@@ -1958,6 +2005,31 @@ class APExecutionCore:
         # guard deferred logs with _deferred). Non-deferred entries never emit a
         # deferred terminal outcome.
         _deferred_outcome["is_deferred"] = bool(_deferred)
+
+        # ── P0 amendment #3 (PR #294): deferred materialization handoff proof ──
+        # A single snapshot dict that captures the three staged views of the
+        # deferred materialization pipeline:
+        #     stage 1: what the selector returned  (populated at copy-back)
+        #     stage 2: what got copied into the plan (populated at copy-back)
+        #     stage 3: what the pre-submit invariant sees (compared just
+        #              before broker POST)
+        # If stage 1 succeeded with a real OCC contract, stages 2 and 3 must
+        # agree. Any disagreement blocks the submit and terminalizes with
+        # MATERIALIZATION_COPYBACK_MISMATCH. Non-deferred entries never
+        # populate this snapshot; the handoff proof is a no-op for them.
+        _handoff_snapshot: dict = {
+            "captured":               False,
+            "selector_contract":      None,
+            "selector_bid":           None,
+            "selector_ask":           None,
+            "selector_mid":           None,
+            "selector_premium":       None,
+            "selector_qty":           None,
+            "copied_plan_contract":   None,
+            "copied_plan_limit":      None,
+            "copied_plan_qty":        None,
+            "copied_plan_max_usd":    None,
+        }
         if _deferred:
             if self.contract_selector is None:
                 _reason = "contract_deferred_no_selector"
@@ -2034,6 +2106,45 @@ class APExecutionCore:
                             if _prem_per_contract > 0:
                                 approved_plan.max_position_usd = _sel_qty * _prem_per_contract
                         _live_contract = str(getattr(approved_plan, "contract_symbol", "") or "").strip()
+                        # P0 amendment #3 (PR #294): capture stages 1 & 2 of
+                        # the handoff snapshot the moment copy-back completes.
+                        # Stage 3 (pre-submit) is compared against these values
+                        # inside the pre-submit invariant block, below. Only
+                        # populated when the selector actually returned a real
+                        # OCC contract — the check requirement.
+                        try:
+                            _handoff_snapshot["captured"]             = True
+                            _handoff_snapshot["selector_contract"]    = _sel_contract or None
+                            _handoff_snapshot["selector_bid"]         = float(getattr(_sel, "bid", 0) or 0)
+                            _handoff_snapshot["selector_ask"]         = float(getattr(_sel, "ask", 0) or 0)
+                            _handoff_snapshot["selector_mid"]         = float(getattr(_sel, "mid", 0) or 0)
+                            _handoff_snapshot["selector_premium"]     = float(
+                                getattr(_sel, "execution_price_per_share", 0)
+                                or getattr(_sel, "ask", 0) or 0
+                            )
+                            _handoff_snapshot["selector_qty"]         = int(
+                                getattr(_sel, "affordable_contracts", 0) or 0
+                            )
+                            _handoff_snapshot["copied_plan_contract"] = _live_contract or None
+                            _handoff_snapshot["copied_plan_limit"]    = float(
+                                getattr(approved_plan, "limit_price", 0) or 0
+                            )
+                            _handoff_snapshot["copied_plan_qty"]      = int(
+                                getattr(approved_plan, "contracts", 0) or 0
+                            )
+                            _handoff_snapshot["copied_plan_max_usd"]  = float(
+                                getattr(approved_plan, "max_position_usd", 0) or 0
+                            )
+                        except Exception as _snap_exc:
+                            # Snapshot capture must never break the submit
+                            # path. On unexpected shape we log and fall
+                            # through; the pre-submit invariant + existing
+                            # DEFERRED:*/limit guards remain the definitive
+                            # safety net.
+                            log.warning(
+                                "[%s] handoff snapshot capture failed (non-fatal): %s",
+                                ticker, _snap_exc,
+                            )
                     except Exception as _copy_exc:
                         log.warning("[%s] deferred breach selected contract copy failed: %s", ticker, _copy_exc)
 
@@ -3522,6 +3633,112 @@ class APExecutionCore:
         if _deferred:
             _pre_contract = str(approved_contract or "")
             _pre_limit    = float(submit_limit or 0)
+            _pre_qty      = int(getattr(approved_plan, "contracts", 0) or 0)
+
+            # ── P0 amendment #3 (PR #294): deferred materialization handoff
+            # proof. Runs BEFORE the existing DEFERRED_CONTRACT/LIMIT
+            # invariants. If the selector actually succeeded (snapshot was
+            # captured with a real OCC contract), the pre-submit view MUST
+            # match: same real OCC contract, limit > 0.01, qty > 0. If any
+            # of those fail, the handoff broke somewhere between copy-back
+            # and here — block the submit, terminalize with a MISMATCH
+            # detail, and stamp the full three-stage evidence into
+            # orders.meta. If the snapshot was NOT captured (selector never
+            # ran to success on this trigger), skip the proof and let the
+            # existing invariants below handle the classification — the
+            # proof augments those guards, it does not replace them.
+            # Classification lives in the pure module-level helper
+            # _classify_materialization_handoff so the truth table is
+            # test-covered directly and cannot drift between prod and tests.
+            _handoff_ok, _handoff_mismatch = _classify_materialization_handoff(
+                handoff_snapshot=_handoff_snapshot,
+                pre_submit_contract=_pre_contract,
+                pre_submit_limit=_pre_limit,
+                pre_submit_qty=_pre_qty,
+            )
+
+            # Structured proof log — one line per deferred trigger that
+            # reached selector success. Production dashboards can filter on
+            # DEFERRED_MATERIALIZATION_HANDOFF_PROOF to prove every deferred
+            # trigger either passes cleanly or terminalizes with the exact
+            # mismatch reason. Emitted BEFORE any block/return so it is
+            # present even if the block below terminalizes the row.
+            # Identity: self.client_id and self.execution_mode are the
+            # canonical per-runner identity accessors (client_id is set in
+            # __init__ from email; execution_mode is the alias of self.mode
+            # set alongside it). Using getattr defensively so an unusual
+            # runner shape can never NameError the proof log.
+            _proof_client_id = str(getattr(self, "client_id", "") or "")
+            _proof_execution_mode = str(getattr(self, "execution_mode", None) or getattr(self, "mode", "") or "")
+            if _handoff_ok is not None:
+                log.info(
+                    "DEFERRED_MATERIALIZATION_HANDOFF_PROOF "
+                    "symbol=%s client_id=%s execution_mode=%s local_order_id=%s "
+                    "selector_contract=%s copied_plan_contract=%s pre_submit_contract=%s "
+                    "selector_ask=%s pre_submit_limit=%.4f qty=%d "
+                    "handoff_ok=%s mismatch_reason=%s",
+                    ticker,
+                    _proof_client_id,
+                    _proof_execution_mode,
+                    str(queue_local_order_id or ""),
+                    _handoff_snapshot.get("selector_contract"),
+                    _handoff_snapshot.get("copied_plan_contract"),
+                    _pre_contract,
+                    _handoff_snapshot.get("selector_ask"),
+                    _pre_limit,
+                    _pre_qty,
+                    "true" if _handoff_ok else "false",
+                    _handoff_mismatch or "",
+                )
+
+            if _handoff_ok is False:
+                _inv_err = "MATERIALIZATION_COPYBACK_MISMATCH"
+                log.critical(
+                    "[%s] PRE_SUBMIT_INVARIANT_FAILED — %s | mismatch=%s | "
+                    "selector_contract=%s copied_plan_contract=%s "
+                    "pre_submit_contract=%s pre_submit_limit=%.4f qty=%d | "
+                    "broker_order_id=null; blocking broker POST",
+                    ticker, _inv_err, _handoff_mismatch,
+                    _handoff_snapshot.get("selector_contract"),
+                    _handoff_snapshot.get("copied_plan_contract"),
+                    _pre_contract, _pre_limit, _pre_qty,
+                )
+                # Canonical stamp via _emit_deferred_outcome. External
+                # terminal code stays UNTRADEABLE_FOR_ACCOUNT_SIZE-family?
+                # No — this failure is a materialization pipeline break, not
+                # a size/budget issue. Use BREACH_SUBMISSION_SKIPPED as the
+                # outcome (existing terminal vocabulary → maps to
+                # TERMINAL_NO_TRADEABLE_CONTRACT) with an explicit detail
+                # override so dashboards can filter precisely.
+                _emit_deferred_outcome(
+                    "BREACH_SUBMISSION_SKIPPED",
+                    reason=f"materialization_copyback_mismatch:{_handoff_mismatch}",
+                    contract=str(_pre_contract or ""),
+                    extra={
+                        "failure_stage":                   "materialization_handoff_proof",
+                        "materialization_detail_override": "MATERIALIZATION_COPYBACK_MISMATCH",
+                        "mismatch_reason":                 _handoff_mismatch,
+                        "selector_contract":               _handoff_snapshot.get("selector_contract"),
+                        "selector_bid":                    _handoff_snapshot.get("selector_bid"),
+                        "selector_ask":                    _handoff_snapshot.get("selector_ask"),
+                        "selector_mid":                    _handoff_snapshot.get("selector_mid"),
+                        "selector_premium":                _handoff_snapshot.get("selector_premium"),
+                        "selector_qty":                    _handoff_snapshot.get("selector_qty"),
+                        "copied_plan_contract":            _handoff_snapshot.get("copied_plan_contract"),
+                        "copied_plan_limit":               _handoff_snapshot.get("copied_plan_limit"),
+                        "copied_plan_qty":                 _handoff_snapshot.get("copied_plan_qty"),
+                        "copied_plan_max_usd":             _handoff_snapshot.get("copied_plan_max_usd"),
+                        "pre_submit_contract":             _pre_contract,
+                        "pre_submit_limit":                _pre_limit,
+                        "pre_submit_qty":                  _pre_qty,
+                        "local_order_id":                  str(queue_local_order_id or ""),
+                        "client_id":                       _proof_client_id,
+                        "execution_mode":                  _proof_execution_mode,
+                    },
+                )
+                _terminalize_breach_failure(_inv_err)
+                return
+
             if (not _pre_contract) or _pre_contract.upper().startswith("DEFERRED:"):
                 _inv_err = "DEFERRED_CONTRACT_NOT_MATERIALIZED"
                 log.critical(
@@ -3708,6 +3925,20 @@ class APExecutionCore:
                     "selected_ask": float(getattr(_sel_snapshot, "ask", 0) or 0),
                     "selected_mid": float(getattr(_sel_snapshot, "mid", 0) or 0),
                     "qty": int(approved_qty or 0),
+                    # P0 amendment #3 (PR #294): handoff proof fields
+                    # persisted on the successful terminal too, so a
+                    # dashboard can prove every deferred trigger — whether
+                    # it materialized or terminalized — carries the
+                    # three-stage snapshot in orders.meta.
+                    "handoff_ok":            True,
+                    "selector_contract":     _handoff_snapshot.get("selector_contract"),
+                    "copied_plan_contract":  _handoff_snapshot.get("copied_plan_contract"),
+                    "pre_submit_contract":   str(approved_contract or ""),
+                    "pre_submit_limit":      float(submit_limit or 0),
+                    "pre_submit_qty":        int(approved_qty or 0),
+                    "local_order_id":        str(queue_local_order_id or ""),
+                    "client_id":             str(getattr(self, "client_id", "") or ""),
+                    "execution_mode":        str(getattr(self, "execution_mode", None) or getattr(self, "mode", "") or ""),
                 },
             )
             return
