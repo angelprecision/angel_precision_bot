@@ -182,15 +182,28 @@ def _canonical_materialization_outcome(outcome: str) -> str:
     _o = str(outcome or "").strip()
     if _o == "BREACH_BROKER_SUBMITTED":
         return "MATERIALIZED_AND_SUBMITTED"
-    # P0 amendment #5 (PR #294 final hardening): order-row-unreadable is a
-    # transient data-availability failure, not a permanent quality reject.
-    # The operator-facing outcome is RETRY_LATER_DATA_UNAVAILABLE so dashboards
-    # can distinguish "could not prove the row" (retryable) from "proved the
-    # row and it was wrong" (terminal mismatch). The internal outcome code
-    # DEFERRED_ORDER_ROW_UNREADABLE is never exposed externally — it maps
-    # cleanly here and is consumed by the emitter.
+    # P0 amendment #6 (PR #294, Option B): DEFERRED_ORDER_ROW_UNREADABLE is
+    # now mapped to TERMINAL_NO_TRADEABLE_CONTRACT, not RETRY_LATER_DATA_UNAVAILABLE.
+    #
+    # Why Option B: The unreadable-row block calls _terminalize_breach_failure
+    # (cleanup_action="expire"). Amendment #5 labelled this RETRY_LATER but
+    # immediately expired the order — operator-facing outcome said "retry later",
+    # lifecycle said "expired". That is a lie and a production audit failure.
+    #
+    # The correct honesty test: at this pipeline stage (past breach, past
+    # selector success, inside the pre-submit invariant block), there is no safe
+    # bounded-retry path that can replay only the order-row read without
+    # re-running the full breach/selector cycle. The existing retry helpers
+    # (_build_deferred_retry_schedule_meta, _classify_deferred_breach_retry_decision)
+    # operate at breach-detection time, not here. Calling the outcome "retry later"
+    # when the lifecycle is "expire" would mislead on-call engineers.
+    #
+    # Option B: both outcome AND lifecycle are terminal. The detail field
+    # MATERIALIZATION_ORDER_ROW_UNREADABLE is specific enough that operators
+    # can investigate the infra failure (DB timeout, row not found) without
+    # the outcome implying a future attempt is scheduled.
     if _o == "DEFERRED_ORDER_ROW_UNREADABLE":
-        return "RETRY_LATER_DATA_UNAVAILABLE"
+        return "TERMINAL_NO_TRADEABLE_CONTRACT"
     return "TERMINAL_NO_TRADEABLE_CONTRACT"
 
 
@@ -265,24 +278,24 @@ def _classify_materialization_handoff(
     return True, None
 
 
-# ── P0 amendment #5 (PR #294 final hardening): pure classifier for the
-# order-row read step of the handoff proof. Separate from
-# _classify_materialization_handoff so the two failure modes carry distinct
-# production semantics:
+# ── P0 amendment #5+#6 (PR #294): pure classifier for the order-row read
+# step of the handoff proof. Separate from _classify_materialization_handoff
+# so the two failure modes carry distinct audit detail codes even though
+# both now map to TERMINAL_NO_TRADEABLE_CONTRACT (amendment #6 Option B):
 #
-#   order-row UNREADABLE → RETRY_LATER_DATA_UNAVAILABLE
-#     (we cannot prove the row; transient/infra failure; do not submit)
+#   order-row UNREADABLE → TERMINAL_NO_TRADEABLE_CONTRACT
+#                          detail: MATERIALIZATION_ORDER_ROW_UNREADABLE
+#     (cannot prove the row; no safe retry path at this pipeline stage;
+#      lifecycle = expire; outcome = terminal — both consistent)
 #   order-row readable but WRONG → TERMINAL_NO_TRADEABLE_CONTRACT
-#     (we proved the row and it is wrong; permanent mismatch; do not submit)
+#                                   detail: MATERIALIZATION_COPYBACK_MISMATCH
+#     (proved the row and it disagrees; permanent pipeline mismatch)
 #
 # Returns one of:
-#   ("BLOCK_RETRY",  "<reason>") — row unreadable; caller must emit
-#                                  RETRY_LATER_DATA_UNAVAILABLE + terminalize
-#   ("PASS",         None)       — row readable; caller extracts contract
-#                                  and passes to _classify_materialization_handoff
-#   (None,           None)       — proof not applicable (selector never ran
-#                                  to a real OCC contract on this trigger);
-#                                  no-op; standing invariants handle it
+#   ("BLOCK_RETRY",  "<reason>") — row unreadable; caller MUST block and
+#                                  terminalize with DEFERRED_ORDER_ROW_UNREADABLE
+#   ("PASS",         None)       — row readable; extract contract for classifier
+#   (None,           None)       — proof not applicable; standing invariants handle
 #
 # NO side effects, NO logging, NO DB access. Pure truth table.
 def _classify_order_row_read(
@@ -3728,6 +3741,20 @@ class APExecutionCore:
             _pre_limit    = float(submit_limit or 0)
             _pre_qty      = int(getattr(approved_plan, "contracts", 0) or 0)
 
+            # ── P0 amendment #6 (PR #294): identity vars hoisted here, BEFORE
+            # the order-row read block and before any branch that may call
+            # _emit_deferred_outcome() with these fields. Previously they were
+            # assigned after the BLOCK_RETRY early-return, causing an
+            # UnboundLocalError if osm.get_order() raised or returned None
+            # before reaching the assignment. Defensive getattr so an unusual
+            # runner shape can never NameError the proof.
+            _proof_client_id = str(getattr(self, "client_id", "") or "")
+            _proof_execution_mode = str(
+                getattr(self, "execution_mode", None)
+                or getattr(self, "mode", "")
+                or ""
+            )
+
             # ── P0 amendment #5 (PR #294 final hardening): fail-closed order-row
             # read. Two distinct failure modes, two distinct outcomes:
             #
@@ -3770,17 +3797,21 @@ class APExecutionCore:
 
             if _row_read_verdict == "BLOCK_RETRY":
                 # Cannot prove the persisted row before broker POST.
-                # Emit RETRY_LATER_DATA_UNAVAILABLE — the canonical outcome
-                # for a transient data-availability failure that may resolve
-                # on the next breach attempt. Broker POST blocked. OSM
-                # terminalize cleans up the order row.
+                # Amendment #6 Option B: both outcome AND lifecycle are terminal.
+                # DEFERRED_ORDER_ROW_UNREADABLE → TERMINAL_NO_TRADEABLE_CONTRACT
+                # (see _canonical_materialization_outcome for the full rationale).
+                # This is the honest choice: there is no safe retry path at this
+                # pipeline stage that can replay only the order-row read without
+                # re-running the full breach/selector cycle. Expiring the order and
+                # stamping a clear terminal detail is better than claiming
+                # RETRY_LATER while immediately expiring the row.
                 _inv_err = "MATERIALIZATION_ORDER_ROW_UNREADABLE"
                 log.critical(
                     "[%s] PRE_SUBMIT_INVARIANT_FAILED — %s | "
                     "reason=%s local_order_id=%s | "
                     "selector proved real OCC contract but persisted "
                     "order row is unreadable before broker POST — "
-                    "broker_order_id=null; terminalizing; retry on next breach",
+                    "broker_order_id=null; terminalizing (Option B: terminal)",
                     ticker, _inv_err, _row_read_reason, queue_local_order_id,
                 )
                 _emit_deferred_outcome(
@@ -3864,18 +3895,8 @@ class APExecutionCore:
             )
 
             # Structured proof log — one line per deferred trigger that
-            # reached selector success. Production dashboards can filter on
-            # DEFERRED_MATERIALIZATION_HANDOFF_PROOF to prove every deferred
-            # trigger either passes cleanly or terminalizes with the exact
-            # mismatch reason. Emitted BEFORE any block/return so it is
-            # present even if the block below terminalizes the row.
-            # Identity: self.client_id and self.execution_mode are the
-            # canonical per-runner identity accessors (client_id is set in
-            # __init__ from email; execution_mode is the alias of self.mode
-            # set alongside it). Using getattr defensively so an unusual
-            # runner shape can never NameError the proof log.
-            _proof_client_id = str(getattr(self, "client_id", "") or "")
-            _proof_execution_mode = str(getattr(self, "execution_mode", None) or getattr(self, "mode", "") or "")
+            # reached selector success. Emitted BEFORE any block/return so it
+            # is present even when the block below terminalizes the row.
             if _handoff_ok is not None:
                 log.info(
                     "DEFERRED_MATERIALIZATION_HANDOFF_PROOF "
