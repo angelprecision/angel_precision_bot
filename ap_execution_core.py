@@ -639,6 +639,94 @@ def _build_deferred_retry_stale_abort_meta(
     }
 
 
+# ── P0 (#301): Fix B — flat selector attempt audit helpers ────────────────────
+# Build and persist 16 flat last_deferred_selector_* fields to orders.meta on
+# every deferred attempt. Separated into a builder (for atomic merges) and a
+# standalone writer (for paths that need a dedicated write).
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _build_flat_selector_audit_fields(
+    *,
+    selector_audit: dict,
+    attempt_number: int,
+    execution_mode: str,
+    is_paper: bool = False,
+    broker_base_url: str = "",
+) -> dict:
+    """
+    Return the flat Fix B + Fix C audit field dict WITHOUT calling OSM.
+    Used when merging into an existing update_order_meta call atomically.
+    Fix C paper domain fields use domain-level classification ('live'/'sandbox'/'unknown'),
+    not the raw quote_source string.
+    Never raises — returns {} on any error.
+    """
+    import datetime as _dt
+    try:
+        _sa   = selector_audit or {}
+        _now  = _dt.datetime.now(_dt.timezone.utc).isoformat()
+        _patch: dict = {
+            "last_deferred_selector_attempt_at":              _now,
+            "last_deferred_selector_attempt_number":          int(attempt_number or 0),
+            "last_deferred_selector_reason_code":             str(_sa.get("reason_code") or "") or None,
+            "last_deferred_selector_stage":                   str(_sa.get("stage") or "") or None,
+            "last_deferred_selector_explanation":             str(_sa.get("explanation") or "") or None,
+            "last_deferred_selector_chain_rows":              int(_sa.get("chain_rows") or 0),
+            "last_deferred_selector_survivor_count":          int(_sa.get("survivor_count") or 0),
+            "last_deferred_selector_top_reject_buckets":      _sa.get("top_reject_buckets") or {},
+            "last_deferred_selector_best_rejected_candidate": _sa.get("best_rejected_candidate") or None,
+            "last_deferred_selector_quote_source":            str(_sa.get("quote_source") or "") or None,
+            "last_deferred_selector_tradier_base_url":        str(_sa.get("tradier_base_url") or broker_base_url or "") or None,
+            "last_deferred_selector_sandbox_mode":            bool(_sa.get("sandbox_mode", False)),
+            "last_deferred_selector_execution_mode":          str(_sa.get("execution_mode") or execution_mode or "") or None,
+            "last_dte_ladder_audit":                          _sa.get("last_dte_ladder_audit") or None,
+            "dte_ladder_enabled":                             bool(_sa.get("dte_ladder_enabled", False)),
+            "ladder_eligible_marker":                         bool(_sa.get("ladder_eligible_marker", False)),
+        }
+        if is_paper:
+            try:
+                from ap.deferred_breach_underlying_repair import build_paper_domain_fields
+                _paper_fields = build_paper_domain_fields(
+                    selector_audit=_sa,
+                    broker_base_url=broker_base_url,
+                )
+                _patch.update(_paper_fields)
+            except Exception as _pf_exc:
+                log.debug("paper domain fields non-critical: %s", _pf_exc)
+        return _patch
+    except Exception:
+        return {}
+
+
+def _persist_deferred_selector_attempt_audit(
+    osm,
+    local_order_id: str,
+    *,
+    selector_audit: dict,
+    attempt_number: int,
+    execution_mode: str,
+    is_paper: bool = False,
+    broker_base_url: str = "",
+) -> None:
+    """
+    Write flat Fix B + Fix C audit fields to orders.meta via a standalone
+    update_order_meta call. Use only when no existing call is available to
+    merge into. Best-effort — never raises.
+    """
+    try:
+        _patch = _build_flat_selector_audit_fields(
+            selector_audit=selector_audit,
+            attempt_number=attempt_number,
+            execution_mode=execution_mode,
+            is_paper=is_paper,
+            broker_base_url=broker_base_url,
+        )
+        _update = getattr(osm, "update_order_meta", None)
+        if callable(_update) and local_order_id:
+            _update(local_order_id, _patch)
+    except Exception as _exc:
+        log.debug("_persist_deferred_selector_attempt_audit non-critical: %s", _exc)
+
+
 # ── P0: Deferred materialization audit helper ─────────────────────────────────
 # Writes orders.meta.deferred_materialization on every breach-selector attempt
 # so every probed expiration, chain size, reject bucket, and account budget is
@@ -2660,6 +2748,21 @@ class APExecutionCore:
                         except Exception:
                             pass
                         try:
+                            # Fix B: build flat selector audit fields and merge atomically
+                            # into the existing retry meta write — single DB write, no regression.
+                            _fix_b_retry: dict = {}
+                            try:
+                                _fix_b_retry = _build_flat_selector_audit_fields(
+                                    selector_audit=_deferred_selector_audit or {},
+                                    attempt_number=_this_attempt_a,
+                                    execution_mode=str(getattr(approved_plan, "execution_mode", "") or ""),
+                                    is_paper=bool(getattr(self, "paper", False)),
+                                    broker_base_url=str(
+                                        getattr(getattr(self.broker, "cfg", None), "base_url", "") or ""
+                                    ),
+                                )
+                            except Exception:
+                                pass
                             _upd_retry_a = getattr(self.order_state_machine, "update_order_meta", None)
                             if callable(_upd_retry_a) and queue_local_order_id:
                                 _upd_retry_a(queue_local_order_id, {
@@ -2678,6 +2781,7 @@ class APExecutionCore:
                                         local_order_id=str(queue_local_order_id or ""),
                                         signal_id=str(getattr(approved_plan, "signal_id", "") or ""),
                                     ),
+                                    **_fix_b_retry,   # Fix B merged atomically
                                 })
                         except Exception as _retry_meta_exc_a:
                             log.debug("[%s] retry meta update non-critical: %s", ticker, _retry_meta_exc_a)
@@ -3020,6 +3124,21 @@ class APExecutionCore:
                             log.debug("[%s] PR182 meta update non-critical: %s", ticker, _ma_exc)
                     except Exception as _obs_a_exc:
                         log.debug("[%s] PR182 write-back non-critical: %s", ticker, _obs_a_exc)
+                    # Fix B: persist flat selector attempt audit on terminal failure (Path A)
+                    try:
+                        _persist_deferred_selector_attempt_audit(
+                            self.order_state_machine,
+                            str(queue_local_order_id or ""),
+                            selector_audit=_deferred_selector_audit or {},
+                            attempt_number=_this_attempt_a,
+                            execution_mode=str(getattr(approved_plan, "execution_mode", "") or ""),
+                            is_paper=bool(getattr(self, "paper", False)),
+                            broker_base_url=str(
+                                getattr(getattr(self.broker, "cfg", None), "base_url", "") or ""
+                            ),
+                        )
+                    except Exception as _b_term_exc:
+                        log.debug("[%s] Fix B terminal audit non-critical: %s", ticker, _b_term_exc)
                     # ── end PR #182 + P0 Path A ────────────────────────────────
                     # P0: Write durable materialization audit before terminalizing.
                     # Extracts chain/reject data from plan.metadata["selector_failure"]
@@ -3154,6 +3273,21 @@ class APExecutionCore:
                             log.debug("[%s] PR182 meta update non-critical: %s", ticker, _mb_exc)
                     except Exception as _obs_b_exc:
                         log.debug("[%s] PR182 write-back non-critical: %s", ticker, _obs_b_exc)
+                    # Fix B: persist flat selector attempt audit on Path B (DEFERRED unresolved)
+                    try:
+                        _persist_deferred_selector_attempt_audit(
+                            self.order_state_machine,
+                            str(queue_local_order_id or ""),
+                            selector_audit=_deferred_selector_audit or {},
+                            attempt_number=_prior_mat_attempt + 1,
+                            execution_mode=str(getattr(approved_plan, "execution_mode", "") or ""),
+                            is_paper=bool(getattr(self, "paper", False)),
+                            broker_base_url=str(
+                                getattr(getattr(self.broker, "cfg", None), "base_url", "") or ""
+                            ),
+                        )
+                    except Exception as _b_path_b_exc:
+                        log.debug("[%s] Fix B path-B audit non-critical: %s", ticker, _b_path_b_exc)
                     # ── end PR #182 Path B ─────────────────────────────────────
                     # P0: Write durable materialization audit before terminalizing (Path B).
                     try:
@@ -4488,6 +4622,206 @@ class APExecutionCore:
                     )
                     _terminalize_breach_failure(_inv_err)
                     return
+
+        # ── P0 (#301) Fix A: resolve_positive_underlying_for_breach ──────────────
+        # Mandatory before submit_existing_entry() for all breach orders.
+        # For deferred: missing underlying terminates with a durable audit.
+        # For non-deferred: best-effort patch only.
+        # Log markers (literal strings — grep-able in Render):
+        #   ZERO_UNDERLYING_REPAIRED / ZERO_UNDERLYING_NO_POSITIVE_SOURCE
+        # ─────────────────────────────────────────────────────────────────────
+        try:
+            from ap.deferred_breach_underlying_repair import (
+                resolve_positive_underlying_for_breach as _resolve_underlying,
+                build_underlying_patch as _build_underlying_patch,
+                build_no_source_meta as _build_no_source_meta,
+                check_paper_selector_data_domain as _check_paper_domain,
+                ZERO_UNDERLYING_TERMINAL_REASON as _ZU_TERMINAL,
+                PAPER_SELECTOR_DATA_DOMAIN_BLOCKED as _PAPER_DOMAIN_BLOCKED,
+            )
+            # Inline log markers — must remain as string literals for Render grep
+            _ZU_REPAIRED  = "ZERO_UNDERLYING_REPAIRED"
+            _ZU_NO_SOURCE = "ZERO_UNDERLYING_NO_POSITIVE_SOURCE"
+
+            _sel_for_udl       = _sel if _deferred else None              # type: ignore[name-defined]
+            # _deferred_selector_audit is only assigned on failure paths — safe access
+            _sel_audit_for_udl = (
+                locals().get("_deferred_selector_audit") or {}
+            ) if _deferred else {}
+            _order_row_meta_udl: dict = {}
+            try:
+                _orm_raw = getattr(self.order_state_machine, "_get_order", lambda x: {})(
+                    queue_local_order_id
+                ) or {}
+                _order_row_meta_udl = dict(_orm_raw.get("meta") or _orm_raw.get("metadata") or {})
+            except Exception:
+                pass
+
+            _udl_price, _udl_source, _udl_audit = _resolve_underlying(
+                approved_plan=approved_plan,
+                watched=watched,
+                sig=sig,
+                selector_audit=_sel_audit_for_udl,
+                selector_result=_sel_for_udl,
+                order_row_meta=_order_row_meta_udl,
+            )
+
+            _is_paper_udl  = bool(getattr(self, "paper", False))
+            _broker_url_udl = str(
+                getattr(getattr(self.broker, "cfg", None), "base_url", "") or
+                getattr(self.broker, "base_url", "") or ""
+            )
+
+            if _deferred:
+                # ── Fix C: paper data-domain enforcement (before underlying check) ──
+                if _is_paper_udl:
+                    _paper_block, _paper_block_reason = _check_paper_domain(
+                        is_paper=True,
+                        selector_audit=_sel_audit_for_udl,
+                        broker_base_url=_broker_url_udl,
+                    )
+                    if _paper_block and _paper_block_reason:
+                        log.critical(
+                            "%s order_id=%s symbol=%s execution_mode=%s "
+                            "failure_reason=%s",
+                            "PAPER_SELECTOR_DATA_DOMAIN_BLOCKED",
+                            str(queue_local_order_id or ""),
+                            ticker,
+                            str(_proof_execution_mode or ""),
+                            _paper_block_reason,
+                        )
+                        try:
+                            _upd_pb = getattr(self.order_state_machine, "update_order_meta", None)
+                            if callable(_upd_pb) and queue_local_order_id:
+                                _upd_pb(queue_local_order_id, {
+                                    "paper_domain_block_reason": _paper_block_reason,
+                                    "paper_domain_block_at": datetime.now(timezone.utc).isoformat(),
+                                })
+                        except Exception:
+                            pass
+                        _terminalize_breach_failure(_paper_block_reason)
+                        return
+
+                if _udl_price is None or _udl_price <= 0:
+                    # Fail closed — persist full candidate audit BEFORE terminalize
+                    log.critical(
+                        "%s order_id=%s client_id=%s execution_mode=%s symbol=%s "
+                        "failure_reason=%s broker_ready=blocked contract=%s limit=%.4f",
+                        _ZU_NO_SOURCE,
+                        str(queue_local_order_id or ""),
+                        str(_proof_client_id or ""),
+                        str(_proof_execution_mode or ""),
+                        ticker,
+                        _ZU_TERMINAL,
+                        str(approved_contract or ""),
+                        float(submit_limit or 0),
+                    )
+                    try:
+                        _no_src_meta = _build_no_source_meta(
+                            _udl_audit,
+                            order_id=str(queue_local_order_id or ""),
+                            ticker=ticker,
+                        )
+                        _upd_zu = getattr(self.order_state_machine, "update_order_meta", None)
+                        if callable(_upd_zu) and queue_local_order_id:
+                            _upd_zu(queue_local_order_id, _no_src_meta)
+                    except Exception as _zu_persist_exc:
+                        log.debug("[%s] zero_underlying no-source meta persist non-critical: %s",
+                                  ticker, _zu_persist_exc)
+                    _terminalize_breach_failure(_ZU_TERMINAL)
+                    return
+
+                # Underlying resolved — patch in-memory plan metadata
+                try:
+                    _existing_trigger = {}
+                    _ap_meta_udl = getattr(approved_plan, "metadata", None)
+                    if isinstance(_ap_meta_udl, dict):
+                        _existing_trigger = dict(_ap_meta_udl.get("trigger") or {})
+                    _udl_patch = _build_underlying_patch(
+                        _udl_price, _udl_source or "unknown", _udl_audit,
+                        order_id=str(queue_local_order_id or ""),
+                        ticker=ticker,
+                        existing_trigger=_existing_trigger,
+                    )
+                    # Patch flat keys + nested trigger into approved_plan.metadata
+                    if isinstance(_ap_meta_udl, dict):
+                        _ap_meta_udl["underlying_entry"]         = _udl_price
+                        _ap_meta_udl["underlying_price"]         = _udl_price
+                        _ap_meta_udl["current_underlying_price"] = _udl_price
+                        _ap_meta_udl["trigger_current_price"]    = _udl_price
+                        _ap_meta_udl["zero_underlying_repair"]   = _udl_patch["zero_underlying_repair"]
+                        # nested trigger — merge, never replace the whole dict
+                        if "trigger" not in _ap_meta_udl or not isinstance(_ap_meta_udl.get("trigger"), dict):
+                            _ap_meta_udl["trigger"] = {}
+                        _ap_meta_udl["trigger"]["current_price"] = _udl_price
+                    # Persist to orders.meta (best-effort)
+                    try:
+                        _upd_udl = getattr(self.order_state_machine, "update_order_meta", None)
+                        if callable(_upd_udl) and queue_local_order_id:
+                            _upd_udl(queue_local_order_id, _udl_patch)
+                    except Exception:
+                        pass
+                    log.info(
+                        "%s order_id=%s symbol=%s source=%s underlying=%.4f",
+                        _ZU_REPAIRED,
+                        str(queue_local_order_id or ""),
+                        ticker,
+                        str(_udl_source or ""),
+                        float(_udl_price),
+                    )
+                except Exception as _udl_patch_exc:
+                    log.warning("[%s] underlying patch non-critical: %s", ticker, _udl_patch_exc)
+            else:
+                # Non-deferred: best-effort patch — no terminalize on failure
+                if _udl_price and _udl_price > 0:
+                    try:
+                        _existing_trigger_nd: dict = {}
+                        _ap_meta_nd = getattr(approved_plan, "metadata", None)
+                        if isinstance(_ap_meta_nd, dict):
+                            _existing_trigger_nd = dict(_ap_meta_nd.get("trigger") or {})
+                        _udl_patch_nd = _build_underlying_patch(
+                            _udl_price, _udl_source or "unknown", _udl_audit,
+                            order_id=str(queue_local_order_id or ""),
+                            ticker=ticker,
+                            existing_trigger=_existing_trigger_nd,
+                        )
+                        if isinstance(_ap_meta_nd, dict):
+                            _ap_meta_nd.update({
+                                "underlying_entry":         _udl_price,
+                                "underlying_price":         _udl_price,
+                                "current_underlying_price": _udl_price,
+                                "trigger_current_price":    _udl_price,
+                            })
+                            if "trigger" not in _ap_meta_nd or not isinstance(_ap_meta_nd.get("trigger"), dict):
+                                _ap_meta_nd["trigger"] = {}
+                            _ap_meta_nd["trigger"]["current_price"] = _udl_price
+                    except Exception:
+                        pass
+
+        except ImportError as _udl_import_err:
+            log.warning("[%s] deferred_breach_underlying_repair import failed: %s",
+                        ticker, _udl_import_err)
+        except Exception as _udl_exc:
+            log.critical("[%s] UNEXPECTED_UNDERLYING_RESOLVE_ERROR order_id=%s error=%s",
+                         ticker, str(queue_local_order_id or ""), _udl_exc)
+            if _deferred:
+                _terminalize_breach_failure(f"underlying_resolve_error:{_udl_exc}")
+                return
+
+        # ── Fix B + Fix C: persist flat selector attempt audit at submit ──────
+        if _deferred:
+            try:
+                _persist_deferred_selector_attempt_audit(
+                    self.order_state_machine,
+                    str(queue_local_order_id or ""),
+                    selector_audit=(locals().get("_deferred_selector_audit") or {}) if _deferred else {},
+                    attempt_number=(locals().get("_prior_mat_attempt") or 0) + 1,
+                    execution_mode=str(_proof_execution_mode or ""),
+                    is_paper=bool(getattr(self, "paper", False)),
+                    broker_base_url=_broker_url_udl if "_broker_url_udl" in dir() else "",
+                )
+            except Exception as _b_submit_exc:
+                log.debug("[%s] Fix B submit audit non-critical: %s", ticker, _b_submit_exc)
 
         # P0 (PR #299): invariant OK marker — emitted only on deferred rows
         # that passed every pre-submit check. Operators filter on this to
