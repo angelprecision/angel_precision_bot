@@ -328,7 +328,69 @@ def test_chain_provider_errors_not_hidden_by_throttle(monkeypatch):
 # Test 9: throttle config parsing — bad env values fall back to defaults
 # ─────────────────────────────────────────────────────────────────────────────
 
-def test_bad_env_values_fall_back_to_defaults(monkeypatch):
+def test_after_market_data_call_does_not_rewind_future_reservation(monkeypatch):
+    """Concurrency correctness: after_market_data_call() must use max() so a
+    future slot reserved by a concurrent thread is never overwritten backward.
+
+    Failure scenario (the bug this fixes):
+      Thread A starts at t=0.00, reserves t=0.00.
+      Thread B starts at t=0.05, reserves future slot t=0.50 and sleeps 450ms.
+      Thread A finishes at t=0.10 — without max(), after_market_data_call()
+        writes _LAST_CALL_TS = 0.10, erasing B's 0.50 reservation.
+      Thread C arrives at t=0.15, sees 0.10, reserves 0.60.
+      B fires at 0.50, C fires at 0.60 — spacing is only 100ms, not 500ms.
+
+    With the fix (max), Thread A's after_market_data_call at t=0.10 writes
+    max(0.50, 0.10) = 0.50, preserving B's reservation. C then must wait
+    until t≥0.50+interval, maintaining the intended spacing guarantee.
+    """
+    _env(monkeypatch, enabled="1", min_ms="500", jitter_ms="0",
+         open_start="00:00", open_end="00:01")
+    import ap.tradier_market_data_throttle as _mod
+
+    # Step 1: reset shared state.
+    _mod._LAST_CALL_TS = 0.0
+
+    # Step 2: simulate a concurrent thread having reserved a future slot.
+    future_reservation = time.monotonic() + 0.5   # 500ms in the future
+    with _mod._LOCK:
+        _mod._LAST_CALL_TS = future_reservation
+
+    # Step 3: current thread finishes its request at "now" (< future_reservation).
+    _mod.after_market_data_call()
+
+    # Step 4: _LAST_CALL_TS must NOT have been moved backward to now.
+    with _mod._LOCK:
+        result = _mod._LAST_CALL_TS
+
+    assert result >= future_reservation, (
+        f"after_market_data_call moved _LAST_CALL_TS backward from "
+        f"{future_reservation:.4f} to {result:.4f}; "
+        f"this defeats the open-window spacing guarantee under concurrent breaches"
+    )
+
+
+def test_after_market_data_call_advances_past_reservation_when_request_slow(monkeypatch):
+    """If the actual request was slow enough that monotonic() > the reservation,
+    after_market_data_call should advance _LAST_CALL_TS to the actual finish
+    time (still uses max(), just the other branch)."""
+    _env(monkeypatch, enabled="1", min_ms="1", jitter_ms="0",
+         open_start="00:00", open_end="00:01")
+    import ap.tradier_market_data_throttle as _mod
+
+    past_reservation = time.monotonic() - 1.0   # 1 second in the past
+    with _mod._LOCK:
+        _mod._LAST_CALL_TS = past_reservation
+
+    _mod.after_market_data_call()
+
+    with _mod._LOCK:
+        result = _mod._LAST_CALL_TS
+
+    assert result >= past_reservation, "timestamp must not move backward"
+    assert result > past_reservation, "slow request must advance past old reservation"
+
+
     monkeypatch.setenv("TRADIER_MD_MIN_INTERVAL_MS", "not_a_number")
     monkeypatch.setenv("TRADIER_MD_JITTER_MS", "")
     monkeypatch.setenv("TRADIER_MD_OPEN_WINDOW_START_ET", "25:99")  # invalid

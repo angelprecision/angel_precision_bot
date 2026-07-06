@@ -43,7 +43,7 @@ TRADIER_MD_OPEN_MIN_INTERVAL_MS   integer         (default: 500 ms)
 TRADIER_MD_OPEN_WINDOW_START_ET   HH:MM           (default: 09:30)
 TRADIER_MD_OPEN_WINDOW_END_ET     HH:MM           (default: 09:40)
 TRADIER_MD_JITTER_MS              integer         (default: 75 ms)
-TRADIER_MD_MAX_CONCURRENT         integer ≥ 1     (default: 1)
+TRADIER_MD_MAX_CONCURRENT         reserved for future use — currently ignored
 
 When TRADIER_MD_THROTTLE_ENABLED is 0 (default), before_market_data_call()
 is a complete no-op: no sleep, no lock, no logging. Every other code path
@@ -67,8 +67,11 @@ log = get_logger("ap.tradier_md_throttle")
 _ET = ZoneInfo("America/New_York")
 
 # ── Process-wide shared state (module-level singletons) ───────────────────────
-# All state is protected by _LOCK. The semaphore governs concurrent callers;
-# last_call_ts is the wall-clock time of the most recent market-data call.
+# All state is protected by _LOCK. The guarantee this module provides is
+# call-START spacing: no two market-data GETs begin closer together than the
+# configured minimum interval. It does NOT limit how many in-flight requests
+# may be running concurrently (that would require a separate semaphore, reserved
+# for a future PR once spacing alone is proven in production).
 _LOCK = threading.Lock()
 _LAST_CALL_TS: float = 0.0
 
@@ -106,7 +109,11 @@ def _cfg() -> dict:
         "open_start":       _hhmm("TRADIER_MD_OPEN_WINDOW_START_ET", "09:30"),
         "open_end":         _hhmm("TRADIER_MD_OPEN_WINDOW_END_ET", "09:40"),
         "jitter_ms":        _ms("TRADIER_MD_JITTER_MS", 75),
-        "max_concurrent":   _int("TRADIER_MD_MAX_CONCURRENT", 1),
+        # TRADIER_MD_MAX_CONCURRENT is reserved for a future concurrent-limiting
+        # semaphore. In this PR it is parsed but NOT used — present only so
+        # operators who set it don't silently get wrong behavior from a future
+        # release.
+        "max_concurrent_reserved": _int("TRADIER_MD_MAX_CONCURRENT", 1),
     }
 
 
@@ -135,16 +142,20 @@ def before_market_data_call(
     When TRADIER_MD_THROTTLE_ENABLED=0 (default) this is a complete no-op.
 
     When enabled:
-      1. Acquires the process-wide concurrency semaphore (up to max_concurrent
-         callers may proceed simultaneously; excess callers wait).
-      2. Computes the interval since the last market-data call.
-      3. If elapsed < required_interval + random jitter, sleeps the deficit.
-      4. Updates _LAST_CALL_TS.
-      5. Emits one structured log line with wait_ms.
+      1. Computes the interval since the last market-data call start.
+      2. If elapsed < required_interval + random jitter, sleeps the deficit.
+      3. Optimistically reserves the next slot by advancing _LAST_CALL_TS,
+         so concurrent callers queue rather than pile up.
+      4. Emits one structured log line with wait_ms.
 
-    The semaphore is NOT released by this function — it is released by
-    after_market_data_call(). Callers MUST call after_market_data_call()
-    in a finally block after every before_market_data_call().
+    After the HTTP request completes (or fails), callers MUST call
+    after_market_data_call() in a finally block to update _LAST_CALL_TS
+    with max(reserved, actual_now), preserving any future reservation made
+    by a concurrently-waiting thread.
+
+    Note: this provides call-START spacing, not in-flight concurrency limiting.
+    A future PR may add a semaphore for the latter once spacing alone is
+    validated in production.
 
     Provider errors are NEVER suppressed. If Tradier returns 429 or empty
     data, the caller still receives the original response and the existing
@@ -177,13 +188,20 @@ def before_market_data_call(
 
 
 def after_market_data_call() -> None:
-    """
-    Update last-call timestamp after the HTTP request completes so the next
-    caller's elapsed-time calculation is accurate. Call in a finally block.
+    """Update last-call timestamp after the HTTP request completes.
+
+    Uses max() rather than unconditional assignment so a concurrent thread's
+    already-reserved future slot is never overwritten backward. Example:
+      Thread A starts at t=0.00, reserves slot t=0.00
+      Thread B starts at t=0.05, reserves future slot t=0.50
+      Thread A finishes at t=0.10 → after_market_data_call writes max(0.50, 0.10) = 0.50
+      Thread B's reservation is preserved; Thread C must wait until t≥0.50
+
+    Call in a finally block after every before_market_data_call().
     """
     global _LAST_CALL_TS
     cfg = _cfg()
     if not cfg["enabled"]:
         return
     with _LOCK:
-        _LAST_CALL_TS = time.monotonic()
+        _LAST_CALL_TS = max(_LAST_CALL_TS, time.monotonic())
