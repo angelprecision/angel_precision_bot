@@ -2191,6 +2191,21 @@ class APExecutionCore:
                     ticker,
                 )
                 return
+            # P0 (PR #299): structured start marker — one line per deferred breach
+            # attempt. Operators filter on this to confirm the materializer is
+            # actually running on the row before looking for SELECTED/FAILED.
+            log.info(
+                "DEFERRED_MATERIALIZATION_STARTED "
+                "order_id=%s client_id=%s execution_mode=%s symbol=%s "
+                "direction=%s contract_before=%s limit_before=%.4f",
+                str(queue_local_order_id or ""),
+                str(_breach_client_id or ""),
+                str(getattr(approved_plan, "execution_mode", "") or ""),
+                ticker,
+                str(getattr(approved_plan, "side", "") or ""),
+                str(_contract_sym_raw or ""),
+                float(getattr(approved_plan, "limit_price", 0) or 0),
+            )
             try:
                 log.info(
                     "[%s] Overnight deferred signal — selecting contract at breach "
@@ -2562,6 +2577,22 @@ class APExecutionCore:
                             ticker, _this_attempt_a, _MAX_RETRIES_A,
                             _obs_rc_a, _RETRY_DELAY_A, _RETRY_CUTOFF_A, _now_hhmm_a,
                         )
+                        # P0 (PR #299): canonical retry marker.
+                        log.warning(
+                            "DEFERRED_MATERIALIZATION_RETRY "
+                            "order_id=%s client_id=%s execution_mode=%s symbol=%s "
+                            "direction=%s failure_reason=%s retry_count=%d "
+                            "contract_before=%s limit_before=%.4f",
+                            str(queue_local_order_id or ""),
+                            str(_breach_client_id or ""),
+                            str(getattr(approved_plan, "execution_mode", "") or ""),
+                            ticker,
+                            str(getattr(approved_plan, "side", "") or ""),
+                            str(_obs_rc_a or ""),
+                            int(_this_attempt_a),
+                            str(_contract_sym_raw or ""),
+                            float(getattr(approved_plan, "limit_price", 0) or 0),
+                        )
                         # Update attempt count — do NOT expire/cancel the order
                         try:
                             _ap_meta_a = getattr(approved_plan, "metadata", None)
@@ -2811,6 +2842,38 @@ class APExecutionCore:
                         _cs_status_a,
                         _this_attempt_a,
                         _MAX_RETRIES_A,
+                    )
+                    # P0 (PR #299): canonical failure marker with candidate-scan counts
+                    # sourced from the selector audit. Operators filter on this to see
+                    # exactly how many contracts were scanned, how many failed each gate,
+                    # and what the best rejected candidate looked like.
+                    _sel_fail = _deferred_selector_audit or {}
+                    log.critical(
+                        "DEFERRED_MATERIALIZATION_FAILED "
+                        "order_id=%s client_id=%s execution_mode=%s symbol=%s "
+                        "direction=%s status=%s failure_reason=%s retry_count=%d "
+                        "contract_before=%s limit_before=%.4f "
+                        "chain_rows=%d rejected_by_oi=%d rejected_by_spread=%d "
+                        "rejected_by_volume=%d rejected_by_zero_bid_ask=%d "
+                        "best_candidate=%s best_candidate_rejection=%s",
+                        str(queue_local_order_id or ""),
+                        str(_breach_client_id or ""),
+                        str(getattr(approved_plan, "execution_mode", "") or ""),
+                        ticker,
+                        str(getattr(approved_plan, "side", "") or ""),
+                        _cs_status_a,
+                        str(_decision_a.get("terminal_reason") or _reason or ""),
+                        int(_this_attempt_a),
+                        str(_contract_sym_raw or ""),
+                        float(getattr(approved_plan, "limit_price", 0) or 0),
+                        int(_sel_fail.get("chain_rows") or 0),
+                        int((_sel_fail.get("top_reject_buckets") or {}).get("OI_TOO_LOW", 0)),
+                        int((_sel_fail.get("top_reject_buckets") or {}).get("SPREAD_TOO_WIDE", 0)),
+                        int((_sel_fail.get("top_reject_buckets") or {}).get("VOLUME_TOO_LOW", 0)),
+                        int((_sel_fail.get("top_reject_buckets") or {}).get("CHAIN_ROW_ZERO_BID_ASK", 0))
+                        + int((_sel_fail.get("top_reject_buckets") or {}).get("DIRECT_QUOTE_ZERO_BID_ASK", 0)),
+                        str((_sel_fail.get("best_rejected_candidate") or {}).get("symbol") or "none"),
+                        str((_sel_fail.get("best_rejected_candidate") or {}).get("rejection_reason") or ""),
                     )
                     log.critical(
                         "BREACH_TIME_CONTRACT_SELECTION_FAILED "
@@ -3108,6 +3171,20 @@ class APExecutionCore:
                     "[%s] DEFERRED_BREACH_CONTRACT_SELECTED — contract=%s limit=%.2f qty=%s",
                     ticker,
                     _live_contract,
+                    float(getattr(approved_plan, "limit_price", 0) or 0),
+                    int(getattr(approved_plan, "contracts", 0) or 0),
+                )
+                # P0 (PR #299): canonical structured selection marker.
+                log.info(
+                    "DEFERRED_MATERIALIZATION_SELECTED "
+                    "order_id=%s client_id=%s execution_mode=%s symbol=%s "
+                    "direction=%s contract_after=%s limit_after=%.4f qty=%d",
+                    str(queue_local_order_id or ""),
+                    str(_breach_client_id or ""),
+                    str(getattr(approved_plan, "execution_mode", "") or ""),
+                    ticker,
+                    str(getattr(approved_plan, "side", "") or ""),
+                    str(_live_contract or ""),
                     float(getattr(approved_plan, "limit_price", 0) or 0),
                     int(getattr(approved_plan, "contracts", 0) or 0),
                 )
@@ -4129,6 +4206,18 @@ class APExecutionCore:
                     "broker_order_id=null; blocking broker POST",
                     ticker, _inv_err, _pre_contract,
                 )
+                log.critical(
+                    "MATERIALIZATION_PRE_SUBMIT_INVARIANT_FAILED "
+                    "order_id=%s client_id=%s execution_mode=%s symbol=%s "
+                    "failure_reason=%s contract_before=%s limit_before=%.4f",
+                    str(queue_local_order_id or ""),
+                    str(_proof_client_id or ""),
+                    str(_proof_execution_mode or ""),
+                    ticker,
+                    _inv_err,
+                    str(_pre_contract or ""),
+                    float(_pre_limit),
+                )
                 _terminalize_breach_failure(_inv_err)
                 return
             if _pre_limit <= 0.01:
@@ -4137,6 +4226,18 @@ class APExecutionCore:
                     "[%s] PRE_SUBMIT_INVARIANT_FAILED — %s | limit_price=%r | "
                     "broker_order_id=null; blocking broker POST",
                     ticker, _inv_err, _pre_limit,
+                )
+                log.critical(
+                    "MATERIALIZATION_PRE_SUBMIT_INVARIANT_FAILED "
+                    "order_id=%s client_id=%s execution_mode=%s symbol=%s "
+                    "failure_reason=%s contract_before=%s limit_before=%.4f",
+                    str(queue_local_order_id or ""),
+                    str(_proof_client_id or ""),
+                    str(_proof_execution_mode or ""),
+                    ticker,
+                    _inv_err,
+                    str(_pre_contract or ""),
+                    float(_pre_limit),
                 )
                 _terminalize_breach_failure(_inv_err)
                 return
@@ -4223,6 +4324,22 @@ class APExecutionCore:
                     _terminalize_breach_failure(_inv_err)
                     return
 
+        # P0 (PR #299): invariant OK marker — emitted only on deferred rows
+        # that passed every pre-submit check. Operators filter on this to
+        # confirm the broker submit path was actually reached with a real contract.
+        if _deferred:
+            log.info(
+                "MATERIALIZATION_PRE_SUBMIT_INVARIANT_OK "
+                "order_id=%s client_id=%s execution_mode=%s symbol=%s "
+                "contract_after=%s limit_after=%.4f qty=%d",
+                str(queue_local_order_id or ""),
+                str(_proof_client_id or ""),
+                str(_proof_execution_mode or ""),
+                ticker,
+                str(approved_contract or ""),
+                float(submit_limit or 0),
+                int(approved_qty or 0),
+            )
         submit_res = self.order_state_machine.submit_existing_entry(
             local_order_id=queue_local_order_id,
             broker=self.broker,

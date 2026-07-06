@@ -204,6 +204,7 @@ def _attach_selector_failure(
     reject_buckets: "dict | None" = None,
     base_url: str = "",
     execution_mode: str = "unknown",
+    best_rejected_candidate: "dict | None" = None,
 ) -> None:
     """Attach plan.metadata["selector_failure"] when select() returns None.
 
@@ -258,6 +259,19 @@ def _attach_selector_failure(
             "sandbox_mode":       "sandbox" in _base.lower(),
             "execution_mode":     str(execution_mode or "unknown").lower(),
             "top_reject_buckets": _top,
+            # P0 (PR #299): named per-bucket counts extracted from top_reject_buckets
+            # so dashboards can query specific fields without parsing the dict.
+            "rejected_by_oi":          _top.get("OI_TOO_LOW", 0),
+            "rejected_by_spread":      _top.get("SPREAD_TOO_WIDE", 0),
+            "rejected_by_volume":      _top.get("VOLUME_TOO_LOW", 0),
+            "rejected_by_zero_bid_ask": (
+                _top.get("CHAIN_ROW_ZERO_BID_ASK", 0)
+                + _top.get("DIRECT_QUOTE_ZERO_BID_ASK", 0)
+            ),
+            # P0 (PR #299): best contract that failed quality gates — proves there
+            # was (or wasn't) a real near-ATM option available at breach time.
+            # Operators can answer "was there ANY liquid contract?" without logs.
+            "best_rejected_candidate": best_rejected_candidate or None,
         }
 
         if isinstance(plan, dict):
@@ -899,6 +913,7 @@ class APContractSelectionEngine:
         _sel_chain_rows:  int  = 0        # set after chain fetch
         _sel_survivors:   int  = 0        # set after quality filter
         _sel_rejections:  dict = {}        # set after quality filter
+        _best_rejected_candidate: dict | None = None  # PR #299: best contract that failed quality gates
         _sel_base_url:    str  = (         # for sandbox_mode / quote_source
             str(getattr(getattr(self, "data_broker", None), "base_url", "") or
                 getattr(getattr(self, "broker",      None), "base_url", "") or "")
@@ -1434,6 +1449,37 @@ class APContractSelectionEngine:
             else:
                 _rejections[result] = _rejections.get(result, 0) + 1
                 log.debug("[%s] filtered: %s -- %s", ticker, opt.get("symbol", "?"), result)
+                # P0 (PR #299): track the best rejected candidate — the one with
+                # the highest mid (i.e. most liquid/real) that still got rejected.
+                # Persisted in the selector_failure audit so operators can answer
+                # "was there ANY real contract near the money?" without scanning logs.
+                try:
+                    _opt_bid = _safe_float(opt.get("bid") or 0)
+                    _opt_ask = _safe_float(opt.get("ask") or 0)
+                    _opt_mid = (_opt_bid + _opt_ask) / 2.0 if _opt_bid and _opt_ask else 0.0
+                    _opt_oi  = int(opt.get("open_interest") or 0)
+                    _opt_vol = int(opt.get("volume") or 0)
+                    _opt_sprd = (
+                        round((_opt_ask - _opt_bid) / _opt_ask, 4)
+                        if _opt_ask > 0 else None
+                    )
+                    _cur_best_mid = _safe_float(
+                        (_best_rejected_candidate or {}).get("mid") or 0
+                    )
+                    if _opt_mid > _cur_best_mid:
+                        _best_rejected_candidate = {
+                            "symbol":        opt.get("symbol"),
+                            "bid":           _opt_bid,
+                            "ask":           _opt_ask,
+                            "mid":           _opt_mid,
+                            "ask_cost":      round(_opt_ask * 100, 2),
+                            "open_interest": _opt_oi,
+                            "volume":        _opt_vol,
+                            "spread_pct":    _opt_sprd,
+                            "rejection_reason": _normalize_reason_code(result),
+                        }
+                except Exception:
+                    pass
                 try:
                     self._emit_selector_event(
                         plan,
@@ -1529,6 +1575,7 @@ class APContractSelectionEngine:
                 reject_buckets=_sel_rejections,
                 base_url=_sel_base_url,
                 execution_mode=_sel_mode,
+                best_rejected_candidate=_best_rejected_candidate,
             )
             return None
 
@@ -1834,6 +1881,12 @@ class APContractSelectionEngine:
                     "near_atm_premium_estimate": _safe_float(selected.premium_per_contract),
                     "cheapest_quality_survivor_premium": _safe_float(selected.premium_per_contract),
                     "classification":         "UNTRADEABLE_FOR_ACCOUNT_SIZE",
+                    # P0 (PR #299): explicit cap-math fields so operators can prove
+                    # exactly why the contract failed the account-size check. Previously
+                    # this required mental math from the log line.
+                    "ask_cost":              round(_safe_float(selected.premium_per_contract) * 100, 2),
+                    "qty_attempted":         1,   # deferred breach always starts at qty=1 for materialization
+                    "projected_reserved_cost": round(_safe_float(selected.premium_per_contract) * 100, 2),
                 }
                 log.warning(
                     "[%s] UNTRADEABLE_FOR_ACCOUNT_SIZE -- quality contract %s @ "
@@ -1889,6 +1942,7 @@ class APContractSelectionEngine:
                     reject_buckets=_sel_rejections,
                     base_url=_sel_base_url,
                     execution_mode=_sel_mode,
+                    best_rejected_candidate=_best_rejected_candidate,
                 )
                 return None
 
@@ -1929,6 +1983,7 @@ class APContractSelectionEngine:
                 reject_buckets=_sel_rejections,
                 base_url=_sel_base_url,
                 execution_mode=_sel_mode,
+                best_rejected_candidate=_best_rejected_candidate,
             )
             return None
 
@@ -1976,6 +2031,7 @@ class APContractSelectionEngine:
                     reject_buckets=_sel_rejections,
                     base_url=_sel_base_url,
                     execution_mode=_sel_mode,
+                    best_rejected_candidate=_best_rejected_candidate,
                 )
                 return None
 
@@ -2013,6 +2069,7 @@ class APContractSelectionEngine:
                 reject_buckets=_sel_rejections,
                 base_url=_sel_base_url,
                 execution_mode=_sel_mode,
+                best_rejected_candidate=_best_rejected_candidate,
             )
             return None
 
