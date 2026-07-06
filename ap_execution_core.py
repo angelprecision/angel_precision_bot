@@ -3263,49 +3263,61 @@ class APExecutionCore:
                     float(getattr(approved_plan, "limit_price", 0) or 0),
                     int(getattr(approved_plan, "contracts", 0) or 0),
                 )
-                # P0 (PR #300): stamp SELECTED + broker_ready=True into orders.meta.
-                # This is the ONLY place broker_ready=True is set — enforces that
-                # only a real materialized contract can ever be broker-ready.
-                try:
-                    from ap.deferred_materializer import stamp_selected
-                    _sel_bid  = float(getattr(_sel, "bid", 0) or 0)
-                    _sel_ask  = float(getattr(_sel, "ask", 0) or 0)
-                    _sel_mid  = (_sel_bid + _sel_ask) / 2.0 if _sel_bid and _sel_ask else 0.0
-                    _sel_qty  = int(getattr(approved_plan, "contracts", 1) or 1)
-                    _sel_lim  = float(getattr(approved_plan, "limit_price", 0) or 0)
-                    _sel_cost = round(_sel_qty * _sel_lim * 100, 2)
-                    stamp_selected(
-                        self.order_state_machine,
+                # P0 (PR #300) — Amendment: stamp SELECTED + broker_ready=True into orders.meta.
+                # INVARIANT: broker_ready=True may ONLY be set after stamp_selected() returns True.
+                # A failed or non-True return is fatal — no broker POST may follow.
+                from ap.deferred_materializer import stamp_selected
+                _sel_bid  = float(getattr(_sel, "bid", 0) or 0)
+                _sel_ask  = float(getattr(_sel, "ask", 0) or 0)
+                _sel_mid  = (_sel_bid + _sel_ask) / 2.0 if _sel_bid and _sel_ask else 0.0
+                _sel_qty  = int(getattr(approved_plan, "contracts", 1) or 1)
+                _sel_lim  = float(getattr(approved_plan, "limit_price", 0) or 0)
+                _sel_cost = round(_sel_qty * _sel_lim * 100, 2)
+                _selected_persisted = stamp_selected(
+                    self.order_state_machine,
+                    str(queue_local_order_id or ""),
+                    client_id=str(_breach_client_id or ""),
+                    execution_mode=str(getattr(approved_plan, "execution_mode", "") or ""),
+                    symbol=ticker,
+                    direction=str(getattr(approved_plan, "side", "") or ""),
+                    contract=str(_live_contract or ""),
+                    bid=_sel_bid,
+                    ask=_sel_ask,
+                    mid=_sel_mid,
+                    limit_price=_sel_lim,
+                    qty=_sel_qty,
+                    reserved_cost=_sel_cost,
+                    dte=int(getattr(_sel, "dte", 0) or 0) or None,
+                    expiration=str(getattr(_sel, "expiration_date", "") or "") or None,
+                    delta=float(getattr(_sel, "delta", 0) or 0) or None,
+                    open_interest=int(getattr(_sel, "open_interest", 0) or 0) or None,
+                    volume=int(getattr(_sel, "volume", 0) or 0) or None,
+                    attempt=_prior_mat_attempt + 1,
+                )
+                if _selected_persisted is not True:
+                    _persist_err = "materialization_selected_meta_persist_failed"
+                    log.critical(
+                        "MATERIALIZATION_PRE_SUBMIT_INVARIANT_FAILED "
+                        "order_id=%s client_id=%s execution_mode=%s symbol=%s "
+                        "failure_reason=%s contract_after=%s limit_after=%.4f qty=%d "
+                        "materialization_status=selected_persist_failed broker_ready=false",
                         str(queue_local_order_id or ""),
-                        client_id=str(_breach_client_id or ""),
-                        execution_mode=str(getattr(approved_plan, "execution_mode", "") or ""),
-                        symbol=ticker,
-                        direction=str(getattr(approved_plan, "side", "") or ""),
-                        contract=str(_live_contract or ""),
-                        bid=_sel_bid,
-                        ask=_sel_ask,
-                        mid=_sel_mid,
-                        limit_price=_sel_lim,
-                        qty=_sel_qty,
-                        reserved_cost=_sel_cost,
-                        dte=int(getattr(_sel, "dte", 0) or 0) or None,
-                        expiration=str(getattr(_sel, "expiration_date", "") or "") or None,
-                        delta=float(getattr(_sel, "delta", 0) or 0) or None,
-                        open_interest=int(getattr(_sel, "open_interest", 0) or 0) or None,
-                        volume=int(getattr(_sel, "volume", 0) or 0) or None,
-                        attempt=_prior_mat_attempt + 1,
+                        str(_breach_client_id or ""),
+                        str(getattr(approved_plan, "execution_mode", "") or ""),
+                        ticker,
+                        _persist_err,
+                        str(_live_contract or ""),
+                        float(_sel_lim or 0),
+                        int(_sel_qty or 0),
                     )
-                    # Sync broker_ready into in-memory plan metadata so the
-                    # pre-submit broker_ready check below can read it.
-                    try:
-                        _ap_meta_sel = getattr(approved_plan, "metadata", None)
-                        if isinstance(_ap_meta_sel, dict):
-                            _ap_meta_sel["broker_ready"] = True
-                            _ap_meta_sel["materialization_status"] = "SELECTED"
-                    except Exception:
-                        pass
-                except Exception as _stamp_sel_exc:
-                    log.debug("[%s] stamp_selected non-critical: %s", ticker, _stamp_sel_exc)
+                    _terminalize_breach_failure(_persist_err)
+                    return
+                # stamp_selected returned True — durable SELECTED row confirmed.
+                # Safe to mirror into in-memory plan metadata for the pre-submit gate.
+                _ap_meta_sel = getattr(approved_plan, "metadata", None)
+                if isinstance(_ap_meta_sel, dict):
+                    _ap_meta_sel["broker_ready"] = True
+                    _ap_meta_sel["materialization_status"] = "SELECTED"
                 log.info(
                     "[%s] Breach-time contract selected: %s @ $%.2f x%s",
                     ticker, _live_contract,
