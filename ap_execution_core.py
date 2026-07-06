@@ -3474,6 +3474,19 @@ class APExecutionCore:
                 submit_limit,
             )
 
+            # ── Identity vars — resolved here, before the PR #295 copyback
+            # CAS block and before the PR #294 pre-submit proof block, so
+            # both can reference them without risk of UnboundLocalError.
+            # Defensive getattr: an unusual runner shape must never NameError
+            # either identity field — we fall back to empty string, which the
+            # CAS meta and proof log will carry rather than crashing.
+            _proof_client_id = str(getattr(self, "client_id", "") or "")
+            _proof_execution_mode = str(
+                getattr(self, "execution_mode", None)
+                or getattr(self, "mode", "")
+                or ""
+            )
+
             # ── P0 (PR #295): CAS-persist real OCC contract into the existing
             # PENDING_TRIGGER order row BEFORE the handoff proof reads it.
             #
@@ -3891,23 +3904,13 @@ class APExecutionCore:
             _pre_limit    = float(submit_limit or 0)
             _pre_qty      = int(getattr(approved_plan, "contracts", 0) or 0)
 
-            # ── P0 amendment #6 (PR #294): identity vars hoisted here, BEFORE
-            # the order-row read block and before any branch that may call
-            # _emit_deferred_outcome() with these fields. Previously they were
-            # assigned after the BLOCK_RETRY early-return, causing an
-            # UnboundLocalError if osm.get_order() raised or returned None
-            # before reaching the assignment. Defensive getattr so an unusual
-            # runner shape can never NameError the proof.
-            _proof_client_id = str(getattr(self, "client_id", "") or "")
-            _proof_execution_mode = str(
-                getattr(self, "execution_mode", None)
-                or getattr(self, "mode", "")
-                or ""
-            )
-
             # ── P0 amendment #5+#6 (PR #294 final hardening): fail-closed
-            # order-row read. Two distinct failure details, one terminal
-            # lifecycle:
+            # order-row read. Identity vars (_proof_client_id /
+            # _proof_execution_mode) are assigned above in the PR #295
+            # copyback block — do not re-assign here. Two distinct failure
+            # details, both map to TERMINAL_NO_TRADEABLE_CONTRACT:
+            #   READ FAILURE      → MATERIALIZATION_ORDER_ROW_UNREADABLE
+            #   READABLE MISMATCH → MATERIALIZATION_COPYBACK_MISMATCH
             #
             #   READ FAILURE      → TERMINAL_NO_TRADEABLE_CONTRACT
             #                         detail: MATERIALIZATION_ORDER_ROW_UNREADABLE
