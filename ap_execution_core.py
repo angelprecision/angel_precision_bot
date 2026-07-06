@@ -3474,6 +3474,122 @@ class APExecutionCore:
                 submit_limit,
             )
 
+            # ── P0 (PR #295): CAS-persist real OCC contract into the existing
+            # PENDING_TRIGGER order row BEFORE the handoff proof reads it.
+            #
+            # ROOT CAUSE this fixes:
+            #   record_deferred_hydration_result / submit_existing_entry._update_contract_pre_submit
+            #   both write the real contract into the orders row, but they are
+            #   called AFTER the #294 handoff proof reads the row. So a valid
+            #   selector success → plan copy-back arrives at the proof with
+            #   orders.contract still = "DEFERRED:<TICKER>" → proof blocks as
+            #   MATERIALIZATION_COPYBACK_MISMATCH → no broker POST ever fires.
+            #
+            # REQUIRED SEQUENCE after this patch:
+            #   selector real OCC → copy to approved_plan → refresh ask /
+            #   compute final submit_limit → CAS-persist → re-read for proof →
+            #   proof passes → submit_existing_entry() → broker POST
+            #
+            # This block ONLY runs on the deferred path (_deferred=True) and
+            # ONLY when the selector previously captured a real OCC contract
+            # (_handoff_snapshot["captured"]=True). Non-deferred paths are
+            # byte-for-byte unchanged.
+            _copyback_write_ok = False
+            if _handoff_snapshot.get("captured") and _handoff_snapshot.get("selector_contract"):
+                _cb_contract = str(_handoff_snapshot["selector_contract"])
+                _cb_limit    = float(submit_limit or 0)
+                _cb_qty      = int(getattr(approved_plan, "contracts", 0) or 0)
+                _cb_cost     = round(_cb_qty * _cb_limit * 100, 2) if _cb_qty and _cb_limit else 0.0
+                if _cb_contract and not _cb_contract.upper().startswith("DEFERRED:") and _cb_limit > 0.01 and _cb_qty > 0:
+                    try:
+                        _rec_fn = getattr(
+                            self.order_state_machine,
+                            "record_deferred_hydration_result",
+                            None,
+                        ) if self.order_state_machine is not None else None
+                        if callable(_rec_fn):
+                            _copyback_write_ok = bool(_rec_fn(
+                                queue_local_order_id,
+                                success=True,
+                                status="PENDING_TRIGGER",
+                                contract=_cb_contract,
+                                limit_price=_cb_limit,
+                                qty=_cb_qty,
+                                reserved_cost=_cb_cost,
+                                contract_selection_status="CONTRACT_SELECTED",
+                                hydration_meta={
+                                    "hydration_stage":             "deferred_breach_pre_submit_copyback",
+                                    "materialization_entry_path":  "DEFERRED_BREACH_MATERIALIZATION",
+                                    "selector_contract":           _cb_contract,
+                                    "copied_plan_contract":        str(getattr(approved_plan, "contract_symbol", "") or ""),
+                                    "pre_submit_contract":         str(approved_contract or ""),
+                                    "pre_submit_limit":            _cb_limit,
+                                    "pre_submit_qty":              _cb_qty,
+                                    "client_id":                   _proof_client_id,
+                                    "execution_mode":              _proof_execution_mode,
+                                    "local_order_id":              str(queue_local_order_id or ""),
+                                    "signal_id":                   str(signal_id or ""),
+                                },
+                            ))
+                        else:
+                            _copyback_write_ok = False
+                    except Exception as _cb_exc:
+                        log.warning(
+                            "[%s] DEFERRED_MATERIALIZATION_COPYBACK_PERSIST_FAILED "
+                            "local_order_id=%s err=%s — will block before submit",
+                            ticker, queue_local_order_id, _cb_exc,
+                        )
+                        _copyback_write_ok = False
+
+                    if _copyback_write_ok:
+                        log.info(
+                            "DEFERRED_MATERIALIZATION_COPYBACK_PERSISTED "
+                            "local_order_id=%s contract=%s limit=%.4f qty=%d",
+                            queue_local_order_id, _cb_contract, _cb_limit, _cb_qty,
+                        )
+                    else:
+                        # CAS missed: row was not in the expected PENDING_TRIGGER /
+                        # DEFERRED state. Treat as a stale/already-submitted row —
+                        # do not broker POST. Emit canonical terminal outcome so
+                        # orders.meta is not silent.
+                        _cb_fail_reason = "MATERIALIZATION_COPYBACK_WRITE_FAILED"
+                        log.critical(
+                            "[%s] PRE_SUBMIT_BLOCK — %s | "
+                            "local_order_id=%s contract=%s | "
+                            "CAS-persist of real OCC contract failed; "
+                            "order row may be stale or already submitted; "
+                            "broker_order_id=null; terminalizing",
+                            ticker, _cb_fail_reason, queue_local_order_id, _cb_contract,
+                        )
+                        _emit_deferred_outcome(
+                            "BREACH_SUBMISSION_SKIPPED",
+                            reason=f"materialization_copyback_write_failed:cas_miss_or_stale_order",
+                            contract=_cb_contract,
+                            extra={
+                                "failure_stage":                   "materialization_copyback_persist",
+                                "materialization_detail_override": "MATERIALIZATION_COPYBACK_WRITE_FAILED",
+                                "mismatch_reason":                 "copyback_persist_failed_before_handoff_proof",
+                                "selector_contract":               _cb_contract,
+                                "pre_submit_limit":                _cb_limit,
+                                "pre_submit_qty":                  _cb_qty,
+                                "local_order_id":                  str(queue_local_order_id or ""),
+                                "client_id":                       _proof_client_id,
+                                "execution_mode":                  _proof_execution_mode,
+                            },
+                        )
+                        _terminalize_breach_failure(_cb_fail_reason)
+                        return
+                else:
+                    # Selector snapshot exists but values are not copyback-ready
+                    # (placeholder contract, zero limit, zero qty). The existing
+                    # DEFERRED_CONTRACT / LIMIT invariants below will catch this.
+                    # Skip the CAS write — do not persist a bad state.
+                    log.warning(
+                        "[%s] DEFERRED_COPYBACK_SKIP — snapshot values not copyback-ready "
+                        "contract=%r limit=%.4f qty=%d; falling through to existing invariants",
+                        ticker, _cb_contract, _cb_limit, _cb_qty,
+                    )
+
         # ── P0 follow-up: Entry Confirmation Preflight ──────────────────────────
         # Runs AFTER live ask refresh (live quote available), BEFORE broker submit.
         # For plans with confirmation_required=True (set by PR74 Hybrid Gate),
