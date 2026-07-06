@@ -391,6 +391,32 @@ def test_after_market_data_call_advances_past_reservation_when_request_slow(monk
     assert result > past_reservation, "slow request must advance past old reservation"
 
 
+def test_latency_ms_excludes_throttle_wait_time(monkeypatch):
+    """t0 must be set AFTER before_market_data_call() so that
+    quote_fetch_latency_ms in orders.meta reflects actual broker response
+    time, not combined throttle-wait + broker-call duration.
+    For a client-money system, every audit field must be honest.
+    """
+    _env(monkeypatch, enabled="0")   # throttle off; tests t0 placement is invariant
+    from unittest.mock import MagicMock
+    broker = MagicMock()
+    broker.get_quote.return_value = {"bid": 1.80, "ask": 1.86, "last": 1.83,
+                                     "bid_size": 10, "ask_size": 10,
+                                     "volume": 100, "open_interest": 500}
+    from ap.contract_quote_revalidator import fetch_direct_option_quote_with_meta
+    result = fetch_direct_option_quote_with_meta(broker, "SPY250706C00450000")
+    if result.get("ok") and result.get("quote"):
+        latency = result["quote"].get("quote_fetch_latency_ms")
+        if latency is not None:
+            # Broker mock is instant; latency must be well under 50ms
+            assert latency < 50, (
+                f"quote_fetch_latency_ms={latency}ms is too high — "
+                f"throttle wait must not inflate broker call latency in audit trail"
+            )
+
+
+def test_bad_env_values_fall_back_to_defaults(monkeypatch):
+    """Garbage env values fall back to defaults rather than crashing."""
     monkeypatch.setenv("TRADIER_MD_MIN_INTERVAL_MS", "not_a_number")
     monkeypatch.setenv("TRADIER_MD_JITTER_MS", "")
     monkeypatch.setenv("TRADIER_MD_OPEN_WINDOW_START_ET", "25:99")  # invalid

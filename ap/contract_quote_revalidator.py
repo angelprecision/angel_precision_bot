@@ -308,12 +308,17 @@ def fetch_direct_option_quote_with_meta(
             "retryable": None,
         }
 
-    t0 = _now()
     # P0 (PR #296): throttle before direct OCC quote fetch. No-op when
     # TRADIER_MD_THROTTLE_ENABLED=0 (default). Provider errors are NOT
     # suppressed — if broker.get_quote() raises or returns empty/429/zero,
     # the existing reason taxonomy (DIRECT_QUOTE_RATE_LIMITED,
     # DIRECT_QUOTE_ZERO_BID_ASK, etc.) fires unchanged.
+    # t0 is set AFTER the throttle sleep so that latency_ms and
+    # quote_fetch_latency_ms in orders.meta reflect the actual broker call
+    # duration, not the combined throttle-wait + broker-call duration.
+    # The cache timestamp (fetched_at) uses the same t0, so the cache entry
+    # represents when the broker was actually reached, not when the call was
+    # queued.
     try:
         from ap.tradier_market_data_throttle import (
             before_market_data_call,
@@ -325,6 +330,7 @@ def fetch_direct_option_quote_with_meta(
         )
     except Exception:
         pass
+    t0 = _now()  # start timing AFTER throttle sleep
     try:
         raw = broker.get_quote(occ_symbol) or {}
     except Exception as e:
