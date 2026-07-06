@@ -309,6 +309,22 @@ def fetch_direct_option_quote_with_meta(
         }
 
     t0 = _now()
+    # P0 (PR #296): throttle before direct OCC quote fetch. No-op when
+    # TRADIER_MD_THROTTLE_ENABLED=0 (default). Provider errors are NOT
+    # suppressed — if broker.get_quote() raises or returns empty/429/zero,
+    # the existing reason taxonomy (DIRECT_QUOTE_RATE_LIMITED,
+    # DIRECT_QUOTE_ZERO_BID_ASK, etc.) fires unchanged.
+    try:
+        from ap.tradier_market_data_throttle import (
+            before_market_data_call,
+            after_market_data_call,
+        )
+        before_market_data_call(
+            "/v1/markets/quotes", occ_symbol,
+            context="direct_quote_revalidator",
+        )
+    except Exception:
+        pass
     try:
         raw = broker.get_quote(occ_symbol) or {}
     except Exception as e:
@@ -317,6 +333,11 @@ def fetch_direct_option_quote_with_meta(
             occ_symbol, e,
         )
         return _classify_direct_quote_exception(e)
+    finally:
+        try:
+            after_market_data_call()
+        except Exception:
+            pass
 
     latency_ms = int((_now() - t0) * 1000)
     quote = _normalize_quote(raw, t0, latency_ms)

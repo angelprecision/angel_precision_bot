@@ -2166,27 +2166,68 @@ class APContractSelectionEngine:
         # 1. Fetch underlying quote
         underlying_price = None
         try:
-            q_resp = _session.get(
-                f"{base_url}/v1/markets/quotes",
-                params={"symbols": ticker, "greeks": "false"},
-                headers=headers, timeout=8,
-            )
-            if q_resp.status_code == 200:
-                quotes = q_resp.json().get("quotes", {}).get("quote", {})
-                if isinstance(quotes, dict):
-                    underlying_price = float(quotes.get("last") or quotes.get("bid") or 0) or None
+            # P0 (PR #296): throttle before underlying quote GET to prevent
+            # market-open stampede from multiple concurrent deferred breaches.
+            # No-op when TRADIER_MD_THROTTLE_ENABLED=0 (default).
+            try:
+                from ap.tradier_market_data_throttle import (
+                    before_market_data_call,
+                    after_market_data_call,
+                )
+                before_market_data_call(
+                    "/v1/markets/quotes", ticker,
+                    context="selector_underlying_quote",
+                )
+            except Exception:
+                pass
+            try:
+                q_resp = _session.get(
+                    f"{base_url}/v1/markets/quotes",
+                    params={"symbols": ticker, "greeks": "false"},
+                    headers=headers, timeout=8,
+                )
+                if q_resp.status_code == 200:
+                    quotes = q_resp.json().get("quotes", {}).get("quote", {})
+                    if isinstance(quotes, dict):
+                        underlying_price = float(quotes.get("last") or quotes.get("bid") or 0) or None
+            finally:
+                try:
+                    after_market_data_call()
+                except Exception:
+                    pass
         except Exception:
             pass
 
         # 2. Get expirations
         try:
-            exp_resp = _session.get(
-                f"{base_url}/v1/markets/options/expirations",
-                params={"symbol": ticker, "includeAllRoots": "true"},
-                headers=headers, timeout=10,
-            )
-        except requests.exceptions.RequestException as _e:
-            raise ChainProviderError(f"Expirations fetch network error: {_e}") from _e
+            # P0 (PR #296): throttle before expirations GET.
+            try:
+                from ap.tradier_market_data_throttle import (
+                    before_market_data_call,
+                    after_market_data_call,
+                )
+                before_market_data_call(
+                    "/v1/markets/options/expirations", ticker,
+                    context="selector_expirations",
+                )
+            except Exception:
+                pass
+            try:
+                exp_resp = _session.get(
+                    f"{base_url}/v1/markets/options/expirations",
+                    params={"symbol": ticker, "includeAllRoots": "true"},
+                    headers=headers, timeout=10,
+                )
+            except requests.exceptions.RequestException as _e:
+                raise ChainProviderError(f"Expirations fetch network error: {_e}") from _e
+            finally:
+                try:
+                    after_market_data_call()
+                except Exception:
+                    pass
+        except (ChainProviderError, ChainAuthError, ChainEmptyExpirations,
+                NoExpirationInDTEWindow):
+            raise
         if exp_resp.status_code in (401, 403):
             raise ChainAuthError(
                 f"Expirations auth error {exp_resp.status_code} for {ticker}",
@@ -2218,13 +2259,33 @@ class APContractSelectionEngine:
 
         # 4. Get chain with greeks
         try:
-            chain_resp = _session.get(
-                f"{base_url}/v1/markets/options/chains",
-                params={"symbol": ticker, "expiration": target_exp, "greeks": "true"},
-                headers=headers, timeout=10,
-            )
-        except requests.exceptions.RequestException as _e:
-            raise ChainProviderError(f"Chain fetch network error (exp={target_exp}): {_e}") from _e
+            # P0 (PR #296): throttle before option chain GET.
+            try:
+                from ap.tradier_market_data_throttle import (
+                    before_market_data_call,
+                    after_market_data_call,
+                )
+                before_market_data_call(
+                    "/v1/markets/options/chains", ticker,
+                    context="selector_chain",
+                )
+            except Exception:
+                pass
+            try:
+                chain_resp = _session.get(
+                    f"{base_url}/v1/markets/options/chains",
+                    params={"symbol": ticker, "expiration": target_exp, "greeks": "true"},
+                    headers=headers, timeout=10,
+                )
+            except requests.exceptions.RequestException as _e:
+                raise ChainProviderError(f"Chain fetch network error (exp={target_exp}): {_e}") from _e
+            finally:
+                try:
+                    after_market_data_call()
+                except Exception:
+                    pass
+        except (ChainProviderError, ChainAuthError):
+            raise
         if chain_resp.status_code in (401, 403):
             raise ChainAuthError(
                 f"Chain fetch auth error {chain_resp.status_code} for {ticker}/{target_exp}",
@@ -2320,14 +2381,32 @@ class APContractSelectionEngine:
                  or getattr(self.data_broker, "token", "")) or ""
         headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
         try:
-            resp = _session.get(
-                f"{base_url}/v1/markets/options/expirations",
-                params={"symbol": ticker, "includeAllRoots": "true"},
-                headers=headers, timeout=10,
-            )
-            if resp.status_code != 200:
-                return []
-            return resp.json().get("expirations", {}).get("date", []) or []
+            # P0 (PR #296): throttle before expirations GET in DTE-ladder path.
+            try:
+                from ap.tradier_market_data_throttle import (
+                    before_market_data_call,
+                    after_market_data_call,
+                )
+                before_market_data_call(
+                    "/v1/markets/options/expirations", ticker,
+                    context="selector_expirations_list",
+                )
+            except Exception:
+                pass
+            try:
+                resp = _session.get(
+                    f"{base_url}/v1/markets/options/expirations",
+                    params={"symbol": ticker, "includeAllRoots": "true"},
+                    headers=headers, timeout=10,
+                )
+                if resp.status_code != 200:
+                    return []
+                return resp.json().get("expirations", {}).get("date", []) or []
+            finally:
+                try:
+                    after_market_data_call()
+                except Exception:
+                    pass
         except Exception:
             return []
 
