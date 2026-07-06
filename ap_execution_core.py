@@ -2206,6 +2206,46 @@ class APExecutionCore:
                 str(_contract_sym_raw or ""),
                 float(getattr(approved_plan, "limit_price", 0) or 0),
             )
+            # P0 (PR #300): stamp QUEUED then RUNNING into orders.meta so the
+            # materialization bucket is visible in Supabase from the moment
+            # price triggers. broker_ready stays False until stamp_selected()
+            # is called on the success path below.
+            _mat_client_id    = str(_breach_client_id or "")
+            _mat_exec_mode    = str(getattr(approved_plan, "execution_mode", "") or "")
+            _mat_direction    = str(getattr(approved_plan, "side", "") or "")
+            _mat_trigger_price = float(getattr(watched, "trigger_price", 0) or 0)
+            _prior_mat_attempt = 0
+            try:
+                _meta_for_attempt = getattr(approved_plan, "metadata", None) or {}
+                _prior_mat_attempt = int(_meta_for_attempt.get("materialization_attempts", 0) or 0)
+            except Exception:
+                _prior_mat_attempt = 0
+            try:
+                from ap.deferred_materializer import (
+                    stamp_trigger_queued, stamp_running, _cfg as _mat_cfg,
+                )
+                stamp_trigger_queued(
+                    self.order_state_machine,
+                    str(queue_local_order_id or ""),
+                    client_id=_mat_client_id,
+                    execution_mode=_mat_exec_mode,
+                    symbol=ticker,
+                    direction=_mat_direction,
+                    triggered_price=_mat_trigger_price,
+                    signal_id=str(getattr(approved_plan, "signal_id", "") or ""),
+                )
+                stamp_running(
+                    self.order_state_machine,
+                    str(queue_local_order_id or ""),
+                    client_id=_mat_client_id,
+                    execution_mode=_mat_exec_mode,
+                    symbol=ticker,
+                    attempt=_prior_mat_attempt + 1,
+                    lock_ttl_s=_mat_cfg().get("lock_ttl_s", 120),
+                )
+            except Exception as _mat_stamp_exc:
+                log.debug("[%s] materialization lifecycle stamp (non-critical): %s",
+                          ticker, _mat_stamp_exc)
             try:
                 log.info(
                     "[%s] Overnight deferred signal — selecting contract at breach "
@@ -2593,6 +2633,25 @@ class APExecutionCore:
                             str(_contract_sym_raw or ""),
                             float(getattr(approved_plan, "limit_price", 0) or 0),
                         )
+                        # P0 (PR #300): stamp RETRY_PENDING lifecycle state.
+                        try:
+                            from ap.deferred_materializer import stamp_retry_pending, _retry_delay_seconds, _cfg as _mat_cfg
+                            _mat_cfg_v = _mat_cfg()
+                            stamp_retry_pending(
+                                self.order_state_machine,
+                                str(queue_local_order_id or ""),
+                                client_id=str(_breach_client_id or ""),
+                                execution_mode=str(getattr(approved_plan, "execution_mode", "") or ""),
+                                symbol=ticker,
+                                direction=str(getattr(approved_plan, "side", "") or ""),
+                                reason_code=str(_obs_rc_a or ""),
+                                attempt=int(_this_attempt_a),
+                                max_attempts=int(_MAX_RETRIES_A),
+                                retry_delay_s=int(_RETRY_DELAY_A),
+                                selector_failure=_deferred_selector_audit or {},
+                            )
+                        except Exception as _rp_exc:
+                            log.debug("[%s] stamp_retry_pending non-critical: %s", ticker, _rp_exc)
                         # Update attempt count — do NOT expire/cancel the order
                         try:
                             _ap_meta_a = getattr(approved_plan, "metadata", None)
@@ -2880,6 +2939,22 @@ class APExecutionCore:
                         "client=%s ticker=%s reason=%s",
                         _breach_client_id, ticker, _reason,
                     )
+                    # P0 (PR #300): stamp FAILED_TERMINAL lifecycle state.
+                    try:
+                        from ap.deferred_materializer import stamp_failed_terminal
+                        stamp_failed_terminal(
+                            self.order_state_machine,
+                            str(queue_local_order_id or ""),
+                            client_id=str(_breach_client_id or ""),
+                            execution_mode=str(getattr(approved_plan, "execution_mode", "") or ""),
+                            symbol=ticker,
+                            direction=str(getattr(approved_plan, "side", "") or ""),
+                            reason_code=str(_decision_a.get("terminal_reason") or _reason or ""),
+                            attempt=int(_this_attempt_a),
+                            selector_failure=_deferred_selector_audit or {},
+                        )
+                    except Exception as _ft_exc:
+                        log.debug("[%s] stamp_failed_terminal non-critical: %s", ticker, _ft_exc)
                     _final_reason_a = str(_decision_a.get("terminal_reason") or _reason)
                     _emit_deferred_outcome(
                         (
@@ -3188,6 +3263,49 @@ class APExecutionCore:
                     float(getattr(approved_plan, "limit_price", 0) or 0),
                     int(getattr(approved_plan, "contracts", 0) or 0),
                 )
+                # P0 (PR #300): stamp SELECTED + broker_ready=True into orders.meta.
+                # This is the ONLY place broker_ready=True is set — enforces that
+                # only a real materialized contract can ever be broker-ready.
+                try:
+                    from ap.deferred_materializer import stamp_selected
+                    _sel_bid  = float(getattr(_sel, "bid", 0) or 0)
+                    _sel_ask  = float(getattr(_sel, "ask", 0) or 0)
+                    _sel_mid  = (_sel_bid + _sel_ask) / 2.0 if _sel_bid and _sel_ask else 0.0
+                    _sel_qty  = int(getattr(approved_plan, "contracts", 1) or 1)
+                    _sel_lim  = float(getattr(approved_plan, "limit_price", 0) or 0)
+                    _sel_cost = round(_sel_qty * _sel_lim * 100, 2)
+                    stamp_selected(
+                        self.order_state_machine,
+                        str(queue_local_order_id or ""),
+                        client_id=str(_breach_client_id or ""),
+                        execution_mode=str(getattr(approved_plan, "execution_mode", "") or ""),
+                        symbol=ticker,
+                        direction=str(getattr(approved_plan, "side", "") or ""),
+                        contract=str(_live_contract or ""),
+                        bid=_sel_bid,
+                        ask=_sel_ask,
+                        mid=_sel_mid,
+                        limit_price=_sel_lim,
+                        qty=_sel_qty,
+                        reserved_cost=_sel_cost,
+                        dte=int(getattr(_sel, "dte", 0) or 0) or None,
+                        expiration=str(getattr(_sel, "expiration_date", "") or "") or None,
+                        delta=float(getattr(_sel, "delta", 0) or 0) or None,
+                        open_interest=int(getattr(_sel, "open_interest", 0) or 0) or None,
+                        volume=int(getattr(_sel, "volume", 0) or 0) or None,
+                        attempt=_prior_mat_attempt + 1,
+                    )
+                    # Sync broker_ready into in-memory plan metadata so the
+                    # pre-submit broker_ready check below can read it.
+                    try:
+                        _ap_meta_sel = getattr(approved_plan, "metadata", None)
+                        if isinstance(_ap_meta_sel, dict):
+                            _ap_meta_sel["broker_ready"] = True
+                            _ap_meta_sel["materialization_status"] = "SELECTED"
+                    except Exception:
+                        pass
+                except Exception as _stamp_sel_exc:
+                    log.debug("[%s] stamp_selected non-critical: %s", ticker, _stamp_sel_exc)
                 log.info(
                     "[%s] Breach-time contract selected: %s @ $%.2f x%s",
                     ticker, _live_contract,
@@ -3980,6 +4098,41 @@ class APExecutionCore:
             _pre_contract = str(approved_contract or "")
             _pre_limit    = float(submit_limit or 0)
             _pre_qty      = int(getattr(approved_plan, "contracts", 0) or 0)
+
+            # ── P0 (PR #300): broker_ready gate — FIRST check.
+            # broker_ready=True is ONLY set by ap.deferred_materializer.stamp_selected()
+            # when a real OCC contract is materialized with limit>0.01 and qty>=1.
+            # If it's not True here, the materialization lifecycle did not complete
+            # successfully; block broker POST immediately with a clear reason.
+            # Read from plan.metadata (in-memory, synced by stamp_selected above).
+            try:
+                _plan_meta_for_ready = getattr(approved_plan, "metadata", None) or {}
+                _broker_ready = _plan_meta_for_ready.get("broker_ready")
+            except Exception:
+                _broker_ready = None
+            if _broker_ready is not True:
+                _br_inv_err = "materialization_incomplete_pre_submit:broker_ready_not_set"
+                log.critical(
+                    "[%s] MATERIALIZATION_PRE_SUBMIT_INVARIANT_FAILED — "
+                    "broker_ready=%r | deferred order not broker-ready; "
+                    "broker_order_id=null; blocking broker POST",
+                    ticker, _broker_ready,
+                )
+                log.critical(
+                    "MATERIALIZATION_PRE_SUBMIT_INVARIANT_FAILED "
+                    "order_id=%s client_id=%s execution_mode=%s symbol=%s "
+                    "failure_reason=%s contract_before=%s limit_before=%.4f "
+                    "materialization_status=not_selected broker_ready=false",
+                    str(queue_local_order_id or ""),
+                    str(_proof_client_id or ""),
+                    str(_proof_execution_mode or ""),
+                    ticker,
+                    _br_inv_err,
+                    str(_pre_contract or ""),
+                    float(_pre_limit),
+                )
+                _terminalize_breach_failure(_br_inv_err)
+                return
 
             # ── P0 amendment #5+#6 (PR #294 final hardening): fail-closed
             # order-row read. Identity vars (_proof_client_id /
