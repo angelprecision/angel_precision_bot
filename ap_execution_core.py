@@ -2466,6 +2466,26 @@ class APExecutionCore:
                             reason=_cap_reason,
                             contract=_sel_contract,
                         )
+                        # Write breach last error to trade_queue BEFORE terminalizing
+                        # so Supabase shows the cap reason without reading Render logs.
+                        try:
+                            from ap.queue import write_deferred_breach_last_error
+                            _cap_queue_id = (
+                                sig.get("queue_id")
+                                or sig.get("trade_queue_id")
+                                or (getattr(approved_plan, "metadata", None) or {}).get("queue_id")
+                            )
+                            write_deferred_breach_last_error(
+                                _cap_queue_id,
+                                reason_code=f"ACCEPTANCE_CAP_MISCONFIGURED:{_cap_error}",
+                                explanation=f"acceptance cap misconfigured: {_cap_error}",
+                                attempt=1,
+                                client_id=_breach_client_id,
+                                ticker=ticker,
+                            )
+                        except Exception as _cap_obs_exc:
+                            log.debug("[%s] cap misconfigured queue write non-critical: %s",
+                                      ticker, _cap_obs_exc)
                         _terminalize_deferred_breach_failure(
                             _cap_reason,
                             extra_meta={
@@ -2491,6 +2511,29 @@ class APExecutionCore:
                             reason=_cap_reason,
                             contract=_sel_contract,
                         )
+                        # Write breach last error to trade_queue BEFORE terminalizing
+                        # so Supabase shows the cap block reason without reading Render logs.
+                        try:
+                            from ap.queue import write_deferred_breach_last_error
+                            _cap_queue_id2 = (
+                                sig.get("queue_id")
+                                or sig.get("trade_queue_id")
+                                or (getattr(approved_plan, "metadata", None) or {}).get("queue_id")
+                            )
+                            write_deferred_breach_last_error(
+                                _cap_queue_id2,
+                                reason_code="ACCEPTANCE_ASK_CAP_EXCEEDED",
+                                explanation=(
+                                    f"acceptance ask cap exceeded: ask={_sel_ask:.2f} "
+                                    f"cap={_accept_cap:.2f} contract={_sel_contract}"
+                                ),
+                                attempt=1,
+                                client_id=_breach_client_id,
+                                ticker=ticker,
+                            )
+                        except Exception as _cap_obs_exc2:
+                            log.debug("[%s] cap exceeded queue write non-critical: %s",
+                                      ticker, _cap_obs_exc2)
                         _terminalize_deferred_breach_failure(
                             _cap_reason,
                             extra_meta={
