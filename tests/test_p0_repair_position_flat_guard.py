@@ -19,7 +19,16 @@ class FakeExitEngine:
         self.events.append(kwargs)
 
 
+def _reset_guard(monkeypatch):
+    monkeypatch.setattr(guard, "_INSTALLED", False)
+    sys.meta_path[:] = [finder for finder in sys.meta_path if not isinstance(finder, guard._Finder)]
+    if hasattr(FakeExitEngine, "_AP_FLAT_REPAIR_RUNTIME_GUARD"):
+        delattr(FakeExitEngine, "_AP_FLAT_REPAIR_RUNTIME_GUARD")
+
+
 def test_flat_repair_guard_returns_before_original_and_clears_memory(monkeypatch):
+    _reset_guard(monkeypatch)
+
     def original(self, pos, decision, *args, **kwargs):
         self.original_called = True
         return True
@@ -27,8 +36,6 @@ def test_flat_repair_guard_returns_before_original_and_clears_memory(monkeypatch
     FakeExitEngine._submit_exit_decision = original
     fake_module = types.SimpleNamespace(APExitEngine=FakeExitEngine)
     monkeypatch.setitem(sys.modules, "ap_exit_engine", fake_module)
-    if hasattr(FakeExitEngine, "_AP_FLAT_REPAIR_RUNTIME_GUARD"):
-        delattr(FakeExitEngine, "_AP_FLAT_REPAIR_RUNTIME_GUARD")
 
     guard.install_repair_position_flat_guard()
 
@@ -64,6 +71,8 @@ def test_flat_repair_guard_returns_before_original_and_clears_memory(monkeypatch
 
 
 def test_non_repair_position_calls_original(monkeypatch):
+    _reset_guard(monkeypatch)
+
     def original(self, pos, decision, *args, **kwargs):
         self.original_called = True
         return True
@@ -71,8 +80,6 @@ def test_non_repair_position_calls_original(monkeypatch):
     FakeExitEngine._submit_exit_decision = original
     fake_module = types.SimpleNamespace(APExitEngine=FakeExitEngine)
     monkeypatch.setitem(sys.modules, "ap_exit_engine", fake_module)
-    if hasattr(FakeExitEngine, "_AP_FLAT_REPAIR_RUNTIME_GUARD"):
-        delattr(FakeExitEngine, "_AP_FLAT_REPAIR_RUNTIME_GUARD")
 
     guard.install_repair_position_flat_guard()
 
@@ -81,3 +88,12 @@ def test_non_repair_position_calls_original(monkeypatch):
 
     assert engine._submit_exit_decision(pos, SimpleNamespace(action="CLOSE_ALL")) is True
     assert engine.original_called is True
+
+
+def test_install_registers_import_hook_when_exit_engine_not_loaded(monkeypatch):
+    _reset_guard(monkeypatch)
+    monkeypatch.delitem(sys.modules, "ap_exit_engine", raising=False)
+
+    guard.install_repair_position_flat_guard()
+
+    assert any(isinstance(finder, guard._Finder) for finder in sys.meta_path)
