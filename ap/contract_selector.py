@@ -296,18 +296,24 @@ def _attach_selector_failure(
         if chain_quote_validity:
             failure["selector_chain_quote_validity"] = chain_quote_validity
 
-        # P0 PR #302 Fix 2: direct quote recovery audit
+        # P0 PR #302 Fix 2: direct quote recovery audit — pass through all fields
+        # including quality_recheck_failed so operators can distinguish
+        # "zero bid/ask" from "real prices but spread/OI gate re-fired".
         if direct_quote_recovery_audit:
+            _dqra = direct_quote_recovery_audit
             failure.update({
-                "direct_quote_recovery_attempted": bool(
-                    direct_quote_recovery_audit.get("attempted", False)),
-                "direct_quote_recovery_selected":  bool(
-                    direct_quote_recovery_audit.get("selected", False)),
-                "direct_quote_recovery_contract":  direct_quote_recovery_audit.get("contract"),
-                "direct_quote_recovery_bid":       direct_quote_recovery_audit.get("bid"),
-                "direct_quote_recovery_ask":       direct_quote_recovery_audit.get("ask"),
-                "direct_quote_recovery_mid":       direct_quote_recovery_audit.get("mid"),
-                "direct_quote_recovery_failure":   direct_quote_recovery_audit.get("failure"),
+                "direct_quote_recovery_attempted":  bool(_dqra.get("attempted", False)),
+                "direct_quote_recovery_selected":   bool(_dqra.get("selected", False)),
+                "direct_quote_recovery_contract":   _dqra.get("contract"),
+                "direct_quote_recovery_bid":        _dqra.get("bid"),
+                "direct_quote_recovery_ask":        _dqra.get("ask"),
+                "direct_quote_recovery_mid":        _dqra.get("mid"),
+                "direct_quote_recovery_failure":    _dqra.get("failure"),
+                # Bug 2 fix: quality re-failure fields — set only when direct quote
+                # returned real prices but the re-run quality filter still rejected.
+                "quality_recheck_failed":           bool(_dqra.get("quality_recheck_failed", False)),
+                "direct_bid_at_recheck":            _dqra.get("direct_bid_at_recheck"),
+                "direct_ask_at_recheck":            _dqra.get("direct_ask_at_recheck"),
             })
 
         if isinstance(plan, dict):
@@ -422,13 +428,27 @@ def _classify_selector_failure(
     if _rc in _QUALITY_REJECT_CODES:
         return "contract_quality_reject", False, True
 
-    if _rc in ("CHAIN_ROW_ZERO_BID_ASK", "DIRECT_QUOTE_ZERO_BID_ASK",
-               "QUOTE_ZERO_BID_ASK", "CHAIN_PROVIDER_EMPTY_OPTIONS",
+    if _rc == "CHAIN_ROW_ZERO_BID_ASK":
+        # Use computed validity ratios to make an accurate classification.
+        # "Mostly zero rows" = no valid rows OR zero_quote_ratio > 0.5.
+        # If valid rows exist but were minority, zero quotes were not dominant
+        # and the valid contracts must have failed a quality gate.
+        if _both_gt == 0 or _zero_ratio > 0.5:
+            return "data_quality_zero_quotes", True, False
+        else:
+            # Valid quotes existed but contracts still failed — quality issue.
+            return "contract_quality_reject", False, True
+
+    if _rc == "DIRECT_QUOTE_ZERO_BID_ASK":
+        # Direct quote returning zero is always a data-source issue.
+        return "data_quality_zero_quotes", True, False
+
+    if _rc in ("QUOTE_ZERO_BID_ASK", "CHAIN_PROVIDER_EMPTY_OPTIONS",
                "CHAIN_PROVIDER_EMPTY_EXPIRATIONS", "NO_CHAIN_DATA",
                "CHAIN_PROVIDER_ERROR", "CHAIN_AUTH_ERROR"):
         return "data_quality_zero_quotes", True, False
 
-    # Mixed: some valid rows but quality gates failed
+    # Mixed: some valid rows exist but selector still failed — quality gate issue.
     if _both_gt > 0:
         return "contract_quality_reject", False, True
 
@@ -442,22 +462,30 @@ def _is_paper_sandbox_data_failure(reason_code: str) -> bool:
     return str(reason_code or "").upper() in _PAPER_SANDBOX_DATA_FAILURE_CODES
 
 
-def _detect_paper_selector_domain(sel_mode: str, sel_base_url: str) -> str:
+def _detect_paper_selector_domain(sel_base_url: str) -> str:
     """
-    Classify the effective data domain for the selector.
+    Classify the ACTUAL data domain from the selector's base URL.
     Returns: "live" | "sandbox" | "unknown"
-    Respects PAPER_SELECTOR_MARKET_DATA_DOMAIN env var for override.
+
+    IMPORTANT: This function classifies from the actual base_url of the data
+    broker — it does NOT override using PAPER_SELECTOR_MARKET_DATA_DOMAIN.
+    The env var has no routing power inside contract_selector.py (routing is
+    wired at client_runner.py level). Using the env var here would produce a
+    label that says "live" while the actual data comes from sandbox, which is
+    misleading and hides misconfiguration.
+
+    The env var _PAPER_SELECTOR_MARKET_DATA_DOMAIN is used separately:
+    - In the no-survivors path to decide if sandbox failures should be
+      reclassified as PAPER_SELECTOR_SANDBOX_DATA_UNUSABLE.
+    - To emit a misconfiguration warning when env requests live but URL is sandbox.
     """
     _url = str(sel_base_url or "").lower()
-    if _PAPER_SELECTOR_MARKET_DATA_DOMAIN == "live":
-        return "live"
-    if _PAPER_SELECTOR_MARKET_DATA_DOMAIN == "sandbox":
-        return "sandbox"
-    # auto: infer from base_url
     if "api.tradier.com" in _url:
         return "live"
     if "sandbox" in _url:
         return "sandbox"
+    if _url:
+        return "unknown"
     return "unknown"
 
 
@@ -693,9 +721,27 @@ _PAPER_SELECTOR_MARKET_DATA_DOMAIN = os.getenv(
 
 # P0 PR #302 — Fix 2: DIRECT_QUOTE_RECOVERY_TOP_N env alias.
 # Maps to existing CONTRACT_REVALIDATE_TOP_N; preference given to the new name.
-_DIRECT_QUOTE_RECOVERY_TOP_N = int(
-    os.getenv("DIRECT_QUOTE_RECOVERY_TOP_N",
-              os.getenv("CONTRACT_REVALIDATE_TOP_N", str(DEFAULT_REVALIDATE_TOP_N)))
+# Safe parse: never raises at module import on malformed env value.
+def _safe_int_env(primary: str, fallback: str, default: int) -> int:
+    """Parse int from env var safely. Logs warning on parse failure, never raises."""
+    import logging as _log_env
+    for _key in (primary, fallback):
+        _raw = (os.getenv(_key) or "").strip()
+        if _raw:
+            try:
+                return max(1, int(_raw))
+            except (ValueError, TypeError):
+                _log_env.getLogger("ap.contract_selector").warning(
+                    "SELECTOR_ENV_PARSE_ERROR key=%s value=%r expected_type=int "
+                    "— ignoring malformed value, using default=%d",
+                    _key, _raw, default,
+                )
+    return default
+
+_DIRECT_QUOTE_RECOVERY_TOP_N: int = _safe_int_env(
+    "DIRECT_QUOTE_RECOVERY_TOP_N",
+    "CONTRACT_REVALIDATE_TOP_N",
+    DEFAULT_REVALIDATE_TOP_N,
 )
 
 # Paper sandbox data failure reasons — these indicate data domain issues,
@@ -1477,10 +1523,22 @@ class APContractSelectionEngine:
         except Exception:
             pass
 
-        # P0 PR #302 Fix 1: detect effective paper selector data domain.
-        _is_paper_mode = str(_sel_mode or "").lower() in ("paper",)
-        _paper_sel_domain = _detect_paper_selector_domain(_sel_mode, _sel_base_url)
+        # P0 PR #302 Fix 1: detect effective paper selector data domain from actual URL.
+        # The domain reflects the REAL data source — not the env var preference.
+        _is_paper_mode    = str(_sel_mode or "").lower() in ("paper",)
+        _paper_sel_domain = _detect_paper_selector_domain(_sel_base_url)  # actual URL only
         _is_sandbox_data  = _paper_sel_domain == "sandbox"
+        # Detect misconfiguration: env requests live data but actual broker is sandbox.
+        if (_is_paper_mode and _is_sandbox_data
+                and _PAPER_SELECTOR_MARKET_DATA_DOMAIN == "live"):
+            log.warning(
+                "[%s] PAPER_SELECTOR_DOMAIN_MISCONFIGURED — "
+                "PAPER_SELECTOR_MARKET_DATA_DOMAIN=live but actual selector "
+                "data broker URL is sandbox (%s). Live market data is not "
+                "being used. Set TRADIER_MARKET_DATA_TOKEN and "
+                "TRADIER_MARKET_DATA_BASE_URL to route selector to live data.",
+                ticker, _sel_base_url,
+            )
 
         # P0 PR #302 Fix 2: track direct quote recovery at the select() level
         # (P0A per-row recovery is already in the quality filter loop).
@@ -1677,6 +1735,23 @@ class APContractSelectionEngine:
                         # spread too wide at direct prices) — reject with the
                         # real reason from the re-run, not the chain reason.
                         result = _result2
+                        # P0 PR #302 Fix 2: stamp quality re-failure audit so
+                        # operators can distinguish "zero bid/ask" from "real
+                        # bid/ask but spread/OI/volume gate re-fired".
+                        try:
+                            if not _direct_quote_recovery_audit.get("selected"):
+                                _dq_bid_rf = float(_rv["audit"].get("direct_bid") or 0)
+                                _dq_ask_rf = float(_rv["audit"].get("direct_ask") or 0)
+                                _direct_quote_recovery_audit.update({
+                                    "attempted":             True,
+                                    "selected":              False,
+                                    "failure":               str(_result2),
+                                    "quality_recheck_failed": True,
+                                    "direct_bid_at_recheck": _dq_bid_rf,
+                                    "direct_ask_at_recheck": _dq_ask_rf,
+                                })
+                        except Exception:
+                            pass
                 elif _rv_action == "REJECT_DIRECT_ZERO":
                     # P1: direct quote returned zero bid/ask — use truthful reason code
                     result = "DIRECT_QUOTE_ZERO_BID_ASK"

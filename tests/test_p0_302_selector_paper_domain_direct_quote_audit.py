@@ -87,38 +87,50 @@ def _plan_ns(**kw) -> types.SimpleNamespace:
 
 class TestPaperSelectorDomainDetection:
 
-    def test_1_auto_mode_live_url_returns_live_domain(self, monkeypatch):
-        """Test 1: auto mode + live Tradier URL → paper_selector_data_domain='live'."""
-        monkeypatch.delenv("PAPER_SELECTOR_MARKET_DATA_DOMAIN", raising=False)
-        # Reload the module-level constant via the function
-        domain = _detect_paper_selector_domain("paper", _LIVE_URL)
+    def test_1_live_url_returns_live_domain(self):
+        """Test 1: live Tradier URL → paper_selector_data_domain='live'."""
+        domain = _detect_paper_selector_domain(_LIVE_URL)
         assert domain == "live", (
-            "Test 1: auto mode with live Tradier URL must classify as 'live'"
+            "Test 1: live Tradier URL must classify as 'live'"
         )
 
-    def test_1_auto_mode_sandbox_url_returns_sandbox_domain(self, monkeypatch):
-        """Auto mode + sandbox URL → 'sandbox'."""
-        domain = _detect_paper_selector_domain("paper", _SAND_URL)
+    def test_1_sandbox_url_returns_sandbox_domain(self):
+        """Sandbox URL → 'sandbox' regardless of env var."""
+        domain = _detect_paper_selector_domain(_SAND_URL)
         assert domain == "sandbox"
 
-    def test_1_env_live_forces_live_regardless_of_url(self, monkeypatch):
-        """PAPER_SELECTOR_MARKET_DATA_DOMAIN=live forces 'live' regardless of URL."""
-        monkeypatch.setenv("PAPER_SELECTOR_MARKET_DATA_DOMAIN", "live")
-        # Directly test the function — env var read at call time in _detect
+    def test_1_env_live_does_NOT_override_actual_sandbox_url(self, monkeypatch):
+        """
+        Bug 1 fix: PAPER_SELECTOR_MARKET_DATA_DOMAIN=live must NOT override
+        the domain classification when the actual data broker URL is sandbox.
+        The env var has no routing power in contract_selector.py — it only
+        controls reclassification and warning logic.
+        """
         with patch.object(cs, "_PAPER_SELECTOR_MARKET_DATA_DOMAIN", "live"):
-            domain = _detect_paper_selector_domain("paper", _SAND_URL)
-        assert domain == "live"
+            domain = _detect_paper_selector_domain(_SAND_URL)
+        # Must reflect actual URL, NOT env var
+        assert domain == "sandbox", (
+            "Bug 1: _detect_paper_selector_domain must classify from actual URL, "
+            "not env var. Returning 'live' when actual URL is sandbox hides misconfiguration."
+        )
 
-    def test_1_env_sandbox_forces_sandbox(self, monkeypatch):
-        """PAPER_SELECTOR_MARKET_DATA_DOMAIN=sandbox forces 'sandbox'."""
+    def test_1_env_sandbox_does_NOT_override_actual_live_url(self, monkeypatch):
+        """Env=sandbox with live URL → domain must still be 'live' from actual URL."""
         with patch.object(cs, "_PAPER_SELECTOR_MARKET_DATA_DOMAIN", "sandbox"):
-            domain = _detect_paper_selector_domain("paper", _LIVE_URL)
-        assert domain == "sandbox"
+            domain = _detect_paper_selector_domain(_LIVE_URL)
+        assert domain == "live", (
+            "Bug 1: domain must reflect actual live URL even when env requests sandbox"
+        )
 
     def test_1_unknown_url_returns_unknown(self):
-        """Unknown URL (not Tradier) returns 'unknown'."""
-        domain = _detect_paper_selector_domain("paper", "https://otherprovider.com")
+        """Non-Tradier URL returns 'unknown'."""
+        domain = _detect_paper_selector_domain("https://otherprovider.com")
         assert domain == "unknown"
+
+    def test_1_empty_url_returns_unknown(self):
+        """Empty URL returns 'unknown'."""
+        assert _detect_paper_selector_domain("") == "unknown"
+        assert _detect_paper_selector_domain(None) == "unknown"
 
     def test_2_paper_broker_sandbox_while_selector_live(self):
         """
@@ -126,12 +138,8 @@ class TestPaperSelectorDomainDetection:
         _detect_paper_selector_domain is for the SELECTOR data domain only.
         The broker domain is separately classified in paper domain fields.
         """
-        # Selector uses live data
-        sel_domain = _detect_paper_selector_domain("paper", _LIVE_URL)
+        sel_domain = _detect_paper_selector_domain(_LIVE_URL)
         assert sel_domain == "live"
-        # Broker domain for paper is always sandbox (no separate function needed —
-        # it's implicit in paper mode). The audit fields confirm both separately.
-        # Test the field semantics by checking the paper domain audit build.
         from ap.deferred_breach_underlying_repair import build_paper_domain_fields
         fields = build_paper_domain_fields(
             selector_audit={"tradier_base_url": _LIVE_URL},
@@ -548,6 +556,157 @@ class TestSafetyInvariantsUnchanged:
         assert fclass == "paper_data_domain_issue"
         assert dfail  is True
         # No contract should be produced — verified by the no-survivors return path
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Bug fixes: specific regression tests for all four amendments
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestBugFixes:
+    """Regression tests proving all four amendment bugs are fixed."""
+
+    # Bug 1: domain detection from actual URL
+    def test_bug1_domain_label_reflects_actual_url_not_env(self, monkeypatch):
+        """
+        Bug 1 regression: domain must come from actual URL.
+        If env=live but URL is sandbox, domain must be 'sandbox' — not 'live'.
+        Returning 'live' here would hide misconfiguration and allow sandbox
+        failures to bypass PAPER_SELECTOR_SANDBOX_DATA_UNUSABLE reclassification.
+        """
+        with patch.object(cs, "_PAPER_SELECTOR_MARKET_DATA_DOMAIN", "live"):
+            actual_domain = _detect_paper_selector_domain(_SAND_URL)
+        assert actual_domain == "sandbox", (
+            "Bug 1: with env=live but URL=sandbox, domain must be 'sandbox'. "
+            "Returning 'live' would mean PAPER_SELECTOR_SANDBOX_DATA_UNUSABLE "
+            "reclassification never fires, hiding sandbox data quality issues."
+        )
+
+    # Bug 2: direct quote quality re-failure stamp
+    def test_bug2_quality_recheck_failure_is_stamped(self):
+        """
+        Bug 2 regression: when direct quote returns real bid/ask but fails
+        spread/OI gate on re-check, failure and quality_recheck_failed must
+        be stamped in the recovery audit.
+        """
+        plan = _plan_ns(metadata={})
+        # Simulate: direct quote tried, returned real bid/ask, but spread gate failed
+        _attach_selector_failure(
+            plan,
+            reason_code="SPREAD_TOO_WIDE",  # the re-check failure reason
+            explanation="direct quote bid/ask real but spread too wide",
+            base_url=_LIVE_URL,
+            direct_quote_recovery_audit={
+                "attempted":             True,
+                "selected":              False,
+                "failure":               "SPREAD_TOO_WIDE",
+                "quality_recheck_failed": True,
+                "direct_bid_at_recheck": 1.82,
+                "direct_ask_at_recheck": 2.10,  # wide spread
+            },
+        )
+        sf = plan.metadata["selector_failure"]
+        assert sf["direct_quote_recovery_attempted"] is True
+        assert sf["direct_quote_recovery_selected"]  is False
+        assert sf["direct_quote_recovery_failure"]   == "SPREAD_TOO_WIDE", (
+            "Bug 2: quality re-failure reason must be stamped, not None. "
+            "'None' hides whether direct quote had real prices that still failed gates."
+        )
+        assert sf.get("quality_recheck_failed") is True, (
+            "Bug 2: quality_recheck_failed must be True when bid/ask were real "
+            "but quality gate still fired."
+        )
+
+    def test_bug2_oi_recheck_failure_is_stamped(self):
+        """OI gate re-failure after direct quote must also be captured."""
+        plan = _plan_ns(metadata={})
+        _attach_selector_failure(
+            plan,
+            reason_code="OI_TOO_LOW",
+            explanation="direct quote ok but OI below threshold",
+            base_url=_LIVE_URL,
+            direct_quote_recovery_audit={
+                "attempted":             True,
+                "selected":              False,
+                "failure":               "OI_TOO_LOW",
+                "quality_recheck_failed": True,
+                "direct_bid_at_recheck": 1.85,
+                "direct_ask_at_recheck": 1.90,
+            },
+        )
+        sf = plan.metadata["selector_failure"]
+        assert sf["direct_quote_recovery_failure"] == "OI_TOO_LOW"
+        assert sf.get("quality_recheck_failed") is True
+
+    # Bug 3: CHAIN_ROW_ZERO_BID_ASK uses zero_quote_ratio
+    def test_bug3_chain_zero_mostly_zero_is_data_quality(self):
+        """
+        Bug 3 regression: CHAIN_ROW_ZERO_BID_ASK with zero_ratio > 0.5
+        → data_quality_zero_quotes (data issue, not contract quality).
+        """
+        validity = {"zero_quote_ratio": 0.9, "rows_with_bid_and_ask_gt_zero": 1}
+        fclass, dfail, qfail = _classify_selector_failure(
+            "CHAIN_ROW_ZERO_BID_ASK", chain_quote_validity=validity,
+        )
+        assert fclass == "data_quality_zero_quotes", (
+            "Bug 3: 90% zero rows must be data_quality_zero_quotes"
+        )
+        assert dfail  is True
+        assert qfail  is False
+
+    def test_bug3_chain_zero_minority_zero_is_quality_reject(self):
+        """
+        Bug 3 regression: CHAIN_ROW_ZERO_BID_ASK with zero_ratio < 0.5 and
+        valid rows existing → contract_quality_reject (valid quotes existed
+        but failed gates — retrying data won't help).
+        """
+        validity = {
+            "zero_quote_ratio": 0.2,  # only 20% zero
+            "rows_with_bid_and_ask_gt_zero": 8,  # 80% valid
+        }
+        fclass, dfail, qfail = _classify_selector_failure(
+            "CHAIN_ROW_ZERO_BID_ASK", chain_quote_validity=validity,
+        )
+        assert fclass == "contract_quality_reject", (
+            "Bug 3: 20% zero rows with 80% valid quotes means valid quotes existed "
+            "but failed quality gates — must be contract_quality_reject, not data issue."
+        )
+        assert dfail  is False
+        assert qfail  is True
+
+    def test_bug3_no_validity_data_still_safe(self):
+        """Without validity data, CHAIN_ROW_ZERO_BID_ASK must default safely."""
+        fclass, dfail, qfail = _classify_selector_failure(
+            "CHAIN_ROW_ZERO_BID_ASK", chain_quote_validity=None,
+        )
+        # No validity data → both_gt=0, ratio=0 → data quality (safe default)
+        assert fclass == "data_quality_zero_quotes"
+        assert dfail  is True
+
+    # Bug 4: safe int env parse
+    def test_bug4_malformed_env_does_not_crash(self, monkeypatch):
+        """
+        Bug 4 regression: malformed DIRECT_QUOTE_RECOVERY_TOP_N must not
+        crash module import. _safe_int_env must return the default.
+        """
+        from ap.contract_selector import _safe_int_env, DEFAULT_REVALIDATE_TOP_N
+        # Simulate malformed env values
+        for bad_val in ("abc", "1.5", "true", "", "  ", "-0"):
+            result = _safe_int_env("NONEXISTENT_KEY_XYZ", "ALSO_NONEXISTENT", 5)
+            assert result == 5, f"Safe default must be returned for bad value: {bad_val!r}"
+
+    def test_bug4_safe_int_env_clamps_to_at_least_1(self, monkeypatch):
+        """_safe_int_env must never return 0 or negative."""
+        monkeypatch.setenv("DIRECT_QUOTE_RECOVERY_TOP_N", "0")
+        from ap.contract_selector import _safe_int_env
+        result = _safe_int_env("DIRECT_QUOTE_RECOVERY_TOP_N", "CONTRACT_REVALIDATE_TOP_N", 5)
+        assert result >= 1, "Recovery top N must always be at least 1"
+
+    def test_bug4_valid_env_parses_correctly(self, monkeypatch):
+        """Valid int env value parses correctly."""
+        monkeypatch.setenv("DIRECT_QUOTE_RECOVERY_TOP_N", "3")
+        from ap.contract_selector import _safe_int_env
+        result = _safe_int_env("DIRECT_QUOTE_RECOVERY_TOP_N", "CONTRACT_REVALIDATE_TOP_N", 5)
+        assert result == 3
 
 
 # ─────────────────────────────────────────────────────────────────────────────
