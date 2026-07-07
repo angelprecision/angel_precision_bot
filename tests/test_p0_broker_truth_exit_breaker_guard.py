@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from ap.exit_circuit_breaker_broker_truth_guard import (
+    FLAT_REASON,
     _is_broker_truth_repair_context,
     apply_broker_truth_exit_breaker_bypass,
 )
@@ -54,7 +55,7 @@ def test_broker_truth_guard_does_not_bypass_normal_position():
     assert result["reason"] == "exit_circuit_breaker_tripped"
 
 
-def test_broker_truth_guard_does_not_bypass_zero_broker_qty():
+def test_broker_truth_repair_qty_zero_marks_flat_not_breaker_loop():
     result = apply_broker_truth_exit_breaker_bypass(
         _breaker_result(),
         {
@@ -67,7 +68,9 @@ def test_broker_truth_guard_does_not_bypass_zero_broker_qty():
         },
     )
     assert result["blocked"] is True
-    assert result["reason"] == "exit_circuit_breaker_tripped"
+    assert result["reason"] == FLAT_REASON
+    assert result["p0_broker_truth_position_flat"] is True
+    assert result["p0_broker_truth_open_qty"] == 0
 
 
 def test_broker_truth_repair_context_classifier():
