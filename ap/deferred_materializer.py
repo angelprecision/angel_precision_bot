@@ -18,7 +18,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 from ap.logger import get_logger
-from ap.live_submit_safety import normalize_execution_mode, require_live_identity
+from ap.live_submit_safety import SubmitSafetyDecision, normalize_execution_mode, require_live_identity
 
 log = get_logger("ap.deferred_materializer")
 
@@ -110,6 +110,16 @@ def _osm_update_meta(osm, local_order_id: str, patch: dict) -> bool:
     return False
 
 
+def _materialization_identity_decision(client_id: str, execution_mode: str) -> SubmitSafetyDecision:
+    """Return exact identity decision for deferred materialization evidence."""
+    mode = normalize_execution_mode(execution_mode)
+    if mode == "paper":
+        if str(client_id or "").strip():
+            return SubmitSafetyDecision(True)
+        return SubmitSafetyDecision(False, "PAPER_MATERIALIZATION_BLOCK_MISSING_CLIENT_ID")
+    return require_live_identity(client_id=client_id, execution_mode=execution_mode)
+
+
 def _safe_materialization_identity(client_id: str, execution_mode: str) -> bool:
     """Return True only when materializer identity is safe enough to continue.
 
@@ -117,22 +127,13 @@ def _safe_materialization_identity(client_id: str, execution_mode: str) -> bool:
     proceed only with explicit execution_mode=live and non-empty client_id.  Blank
     or unknown mode is blocked before broker_ready can become true.
     """
-    mode = normalize_execution_mode(execution_mode)
-    if mode == "paper":
-        if str(client_id or "").strip():
-            return True
-        log.critical(
-            "DEFERRED_MATERIALIZATION_IDENTITY_BLOCK order_client_missing execution_mode=paper"
-        )
-        return False
-    decision = require_live_identity(client_id=client_id, execution_mode=execution_mode)
+    decision = _materialization_identity_decision(client_id, execution_mode)
     if not decision.ok:
         log.critical(
             "DEFERRED_MATERIALIZATION_IDENTITY_BLOCK client_id=%s execution_mode=%s reason=%s",
             str(client_id or ""), str(execution_mode or ""), decision.reason,
         )
-        return False
-    return True
+    return decision.ok
 
 
 def stamp_trigger_queued(
@@ -236,11 +237,12 @@ def stamp_selected(
             _c, float(limit_price or 0), int(qty or 0),
         )
         return False
-    if not _safe_materialization_identity(client_id, execution_mode):
+    identity_decision = _materialization_identity_decision(client_id, execution_mode)
+    if not identity_decision.ok:
         _osm_update_meta(osm, local_order_id, {
             "materialization_status": FAILED_TERMINAL,
             "broker_ready": False,
-            "materialization_reason": "LIVE_SUBMIT_BLOCK_BLANK_OR_UNKNOWN_EXECUTION_MODE",
+            "materialization_reason": identity_decision.reason,
             "materialization_finished_at": _now_utc().isoformat(),
             "materialization_attempts": int(attempt),
             "materialization_client_id": str(client_id or ""),
@@ -248,8 +250,8 @@ def stamp_selected(
             "materialization_identity_ok": False,
         })
         log.critical(
-            "DEFERRED_MATERIALIZATION_SELECTED_BLOCKED order_id=%s client_id=%s execution_mode=%s symbol=%s contract=%s reason=unsafe_identity",
-            local_order_id, client_id, execution_mode, symbol, _c,
+            "DEFERRED_MATERIALIZATION_SELECTED_BLOCKED order_id=%s client_id=%s execution_mode=%s symbol=%s contract=%s reason=%s",
+            local_order_id, client_id, execution_mode, symbol, _c, identity_decision.reason,
         )
         return False
 
