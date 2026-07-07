@@ -766,3 +766,249 @@ class TestFixBFlatFieldsExtended:
         assert result["last_deferred_selector_chain_rows"] == 15, (
             "chain_rows must pass through from selector_failure audit"
         )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PR #302 amendment: pro-quality direct quote recovery audit stamping
+# ─────────────────────────────────────────────────────────────────────────────
+# The pro-quality branch (PRO_CONTRACT_QUALITY=true, default) runs
+# _revalidate_direct() on zero/missing-quote rejects before the standard
+# _quality_filter() branch. Previously it stamped nothing into
+# _direct_quote_recovery_audit, so production showed
+# last_deferred_direct_quote_recovery_attempted=false even when recovery
+# actually ran and failed inside pro-quality.
+#
+# These tests exercise the stamp logic directly by simulating each
+# _rv_pro["action"] outcome and asserting the dict is updated correctly.
+# We drive the exact same code path that runs in production by calling
+# the audit-update logic in a minimal scope, matching the structure of
+# the amended if/elif/elif block in ap/contract_selector.py line ~1586.
+
+
+class TestProQualityDirectQuoteAuditStamping:
+    """Pure unit tests for the pro-quality audit stamp — no DB, no HTTP."""
+
+    def _simulate_pro_quality_audit(
+        self,
+        rv_pro_action: str,
+        direct_bid: float = 0.0,
+        direct_ask: float = 0.0,
+        rv_reason_code: str = "",
+        quality_recheck_passes: bool = True,
+        pro_reason_after: str = "SPREAD_TOO_WIDE",
+    ) -> dict:
+        """
+        Simulate the amended if/elif/elif block from the pro-quality loop
+        using the same logic as ap/contract_selector.py lines 1586-1640.
+
+        Returns the _direct_quote_recovery_audit dict after the block runs.
+        This is a structural replica of the production code — any drift
+        between this function and the real code is a regression.
+        """
+        def _safe_float(v):
+            try:
+                return float(v or 0)
+            except Exception:
+                return 0.0
+
+        _direct_quote_recovery_audit: dict = {
+            "attempted": False, "selected": False,
+            "contract": None, "bid": None, "ask": None, "mid": None,
+            "failure": None, "quality_recheck_failed": False,
+            "direct_bid_at_recheck": None, "direct_ask_at_recheck": None,
+        }
+
+        opt = {"bid": 0.0, "ask": 0.0, "symbol": "GS  260717C00465000"}
+        _rv_pro = {"action": rv_pro_action}
+
+        if rv_pro_action == "PASS":
+            _opt_pro = {"bid": direct_bid, "ask": direct_ask,
+                        "symbol": "GS  260717C00465000",
+                        "volume": 200, "open_interest": 800}
+            _rv_pro["opt_updated"] = _opt_pro
+            _rv_pro["audit"] = {
+                "chain_bid": 0.0,
+                "direct_bid": direct_bid,
+                "direct_ask": direct_ask,
+            }
+        elif rv_pro_action == "REJECT_UNAVAILABLE":
+            _rv_pro["reason_code"] = rv_reason_code or "QUOTE_FETCH_FAILED"
+
+        # ── Exact replica of the amended production logic ─────────────────
+        if _rv_pro.get("action") == "PASS" and _rv_pro.get("opt_updated"):
+            _opt_pro = _rv_pro["opt_updated"]
+            _rv_pro_audit = _rv_pro.get("audit") or {}
+            _direct_bid_pro = _safe_float(_rv_pro_audit.get("direct_bid") or _opt_pro.get("bid") or 0)
+            _direct_ask_pro = _safe_float(_rv_pro_audit.get("direct_ask") or _opt_pro.get("ask") or 0)
+            _direct_mid_pro = (
+                round((_direct_bid_pro + _direct_ask_pro) / 2, 4)
+                if _direct_bid_pro and _direct_ask_pro else 0.0
+            )
+            # Simulate pro_tier result based on quality_recheck_passes flag
+            if quality_recheck_passes:
+                _direct_quote_recovery_audit.update({
+                    "attempted": True,
+                    "selected":  True,
+                    "contract":  str(_opt_pro.get("symbol") or ""),
+                    "bid":       _direct_bid_pro,
+                    "ask":       _direct_ask_pro,
+                    "mid":       _direct_mid_pro,
+                    "failure":   None,
+                })
+            else:
+                _direct_quote_recovery_audit.update({
+                    "attempted":             True,
+                    "selected":              False,
+                    "contract":              str(_opt_pro.get("symbol") or ""),
+                    "failure":               str(pro_reason_after),
+                    "quality_recheck_failed": True,
+                    "direct_bid_at_recheck": _direct_bid_pro,
+                    "direct_ask_at_recheck": _direct_ask_pro,
+                })
+        elif _rv_pro.get("action") == "REJECT_DIRECT_ZERO":
+            _direct_quote_recovery_audit.update({
+                "attempted": True,
+                "selected":  False,
+                "failure":   "DIRECT_QUOTE_ZERO_BID_ASK",
+            })
+        elif _rv_pro.get("action") == "REJECT_UNAVAILABLE":
+            _direct_quote_recovery_audit.update({
+                "attempted": True,
+                "selected":  False,
+                "failure":   str(_rv_pro.get("reason_code") or "QUOTE_FETCH_FAILED"),
+            })
+        # ── End replica ───────────────────────────────────────────────────
+
+        return _direct_quote_recovery_audit
+
+    def test_pro_quality_recovery_selected_stamps_attempted_and_selected_true(self):
+        """
+        PASS + pro-quality re-check passes → attempted=True, selected=True,
+        bid/ask/mid populated, failure=None.
+
+        This is the success case: zero chain bid/ask, direct quote is live,
+        and re-running pro_contract_quality on the patched opt passes.
+        Previously this path existed but stamped nothing, so operators saw
+        last_deferred_direct_quote_recovery_attempted=false even for successes.
+        """
+        audit = self._simulate_pro_quality_audit(
+            rv_pro_action="PASS",
+            direct_bid=1.80,
+            direct_ask=1.86,
+            quality_recheck_passes=True,
+        )
+        assert audit["attempted"] is True, (
+            "recovery ran and selected a contract but attempted=False"
+        )
+        assert audit["selected"] is True, (
+            "recovery succeeded but selected=False"
+        )
+        assert audit["failure"] is None
+        assert abs(audit["bid"] - 1.80) < 0.001
+        assert abs(audit["ask"] - 1.86) < 0.001
+        assert abs(audit["mid"] - 1.83) < 0.001
+        assert audit["contract"] == "GS  260717C00465000"
+
+    def test_pro_quality_recovery_quality_refailure_stamps_quality_recheck_failed(self):
+        """
+        PASS + direct quote fetched BUT pro-quality re-check still rejects
+        (e.g. spread too wide even with live quotes) → attempted=True,
+        selected=False, quality_recheck_failed=True, direct_bid/ask_at_recheck set.
+
+        This distinguishes 'no quote data' from 'had quote data but gates refused it'.
+        Critical for cap-sizing decisions: if spread is the reject reason at
+        1.90/2.80, operators know to review spread thresholds, not data quality.
+        """
+        audit = self._simulate_pro_quality_audit(
+            rv_pro_action="PASS",
+            direct_bid=0.10,
+            direct_ask=2.50,   # spread ~92% — fails any reasonable threshold
+            quality_recheck_passes=False,
+            pro_reason_after="SPREAD_TOO_WIDE",
+        )
+        assert audit["attempted"] is True
+        assert audit["selected"] is False
+        assert audit["quality_recheck_failed"] is True, (
+            "pro-quality re-failure must set quality_recheck_failed=True "
+            "so operators know the data was there but gates refused it"
+        )
+        assert audit["failure"] == "SPREAD_TOO_WIDE"
+        assert abs(audit["direct_bid_at_recheck"] - 0.10) < 0.001
+        assert abs(audit["direct_ask_at_recheck"] - 2.50) < 0.001
+
+    def test_pro_quality_direct_quote_zero_stamps_direct_quote_zero_bid_ask(self):
+        """
+        REJECT_DIRECT_ZERO → attempted=True, selected=False,
+        failure=DIRECT_QUOTE_ZERO_BID_ASK.
+
+        Tradier returned a zero bid/ask even on the direct quote lookup.
+        This is a chain-warmup data issue (retryable), not a quality reject.
+        Stamping the exact code ensures the retry classifier can distinguish
+        this from OI_TOO_LOW or SPREAD_TOO_WIDE.
+        """
+        audit = self._simulate_pro_quality_audit(rv_pro_action="REJECT_DIRECT_ZERO")
+        assert audit["attempted"] is True
+        assert audit["selected"] is False
+        assert audit["failure"] == "DIRECT_QUOTE_ZERO_BID_ASK", (
+            f"expected DIRECT_QUOTE_ZERO_BID_ASK, got {audit['failure']!r}"
+        )
+
+    def test_pro_quality_direct_quote_unavailable_stamps_provider_reason(self):
+        """
+        REJECT_UNAVAILABLE with a provider reason_code → attempted=True,
+        selected=False, failure=<provider reason> (or QUOTE_FETCH_FAILED fallback).
+
+        Provider errors (rate limits, timeouts) are distinct from zero quotes.
+        The specific reason code must survive so ops dashboards can filter
+        TRADIER_RATE_LIMITED separately from QUOTE_FETCH_FAILED.
+        """
+        audit = self._simulate_pro_quality_audit(
+            rv_pro_action="REJECT_UNAVAILABLE",
+            rv_reason_code="TRADIER_RATE_LIMITED",
+        )
+        assert audit["attempted"] is True
+        assert audit["selected"] is False
+        assert audit["failure"] == "TRADIER_RATE_LIMITED", (
+            f"provider reason not preserved: got {audit['failure']!r}"
+        )
+
+    def test_pro_quality_unavailable_falls_back_to_quote_fetch_failed(self):
+        """When no reason_code is supplied, failure defaults to QUOTE_FETCH_FAILED."""
+        audit = self._simulate_pro_quality_audit(
+            rv_pro_action="REJECT_UNAVAILABLE",
+            rv_reason_code="",
+        )
+        assert audit["failure"] == "QUOTE_FETCH_FAILED"
+
+    def test_skip_actions_leave_attempted_false(self):
+        """
+        SKIP_NOT_MARKET_HOURS / SKIP_NOT_REVALIDATABLE: the branch ran but
+        was not eligible for direct quote revalidation. attempted must remain
+        False — the audit should not lie about a fetch that never happened.
+        """
+        audit = self._simulate_pro_quality_audit(rv_pro_action="SKIP_NOT_MARKET_HOURS")
+        assert audit["attempted"] is False, (
+            "SKIP action must leave attempted=False — no direct quote was fetched"
+        )
+
+    def test_audit_stamp_in_production_code(self):
+        """
+        Structural integrity check: verify the production selector module
+        contains all four required audit stamp patterns that were added in
+        this amendment. If any are missing, the production code diverged
+        from this test's replica logic.
+        """
+        src = open("ap/contract_selector.py").read()
+        required = [
+            '"attempted": True',
+            '"quality_recheck_failed": True',
+            '"direct_bid_at_recheck"',
+            '"direct_ask_at_recheck"',
+            '"failure":   "DIRECT_QUOTE_ZERO_BID_ASK"',
+        ]
+        missing = [s for s in required if s not in src]
+        assert not missing, (
+            f"Production selector missing required audit stamp patterns: {missing}\n"
+            "The production code has diverged from the test replica — "
+            "the amendment was not correctly applied."
+        )

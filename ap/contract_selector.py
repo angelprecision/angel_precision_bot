@@ -1594,23 +1594,66 @@ class APContractSelectionEngine:
                         _opt_pro = _rv_pro["opt_updated"]
                         # Rerun pro_quality with patched bid/ask
                         pro_tier, pro_reason = _pro_contract_quality(_opt_pro, ticker, _dte)
+                        # Extract direct-quote values from the revalidation audit
+                        # for the audit stamp regardless of whether quality passed.
+                        _rv_pro_audit   = _rv_pro.get("audit") or {}
+                        _direct_bid_pro = _safe_float(_rv_pro_audit.get("direct_bid") or _opt_pro.get("bid") or 0)
+                        _direct_ask_pro = _safe_float(_rv_pro_audit.get("direct_ask") or _opt_pro.get("ask") or 0)
+                        _direct_mid_pro = (
+                            round((_direct_bid_pro + _direct_ask_pro) / 2, 4)
+                            if _direct_bid_pro and _direct_ask_pro else 0.0
+                        )
                         if pro_tier != "REJECT":
-                            # Pro quality passed on direct quote — use patched opt
+                            # Pro quality passed on direct quote — use patched opt.
                             opt = _opt_pro
                             log.info(
-                                "[%s] P0A pro_quality_recovered chain_reason=%s "                                "direct_bid=%.4f direct_ask=%.4f contract=%s",
+                                "[%s] P0A pro_quality_recovered chain_reason=%s "
+                                "direct_bid=%.4f direct_ask=%.4f contract=%s",
                                 ticker, _rv_pro["audit"].get("chain_bid", 0),
                                 _rv_pro["audit"].get("direct_bid", 0),
                                 _rv_pro["audit"].get("direct_ask", 0),
                                 opt.get("symbol", "?"),
                             )
-                        # else: direct quote fetched but still fails — fall through to reject
+                            # Stamp: recovery attempted AND selected
+                            _direct_quote_recovery_audit.update({
+                                "attempted": True,
+                                "selected":  True,
+                                "contract":  str(opt.get("symbol") or ""),
+                                "bid":       _direct_bid_pro,
+                                "ask":       _direct_ask_pro,
+                                "mid":       _direct_mid_pro,
+                                "failure":   None,
+                            })
+                        else:
+                            # Direct quote fetched but re-check still rejects.
+                            # Stamp: recovery attempted, quality re-failure.
+                            _direct_quote_recovery_audit.update({
+                                "attempted":             True,
+                                "selected":              False,
+                                "contract":              str(opt.get("symbol") or ""),
+                                "failure":               str(pro_reason),
+                                "quality_recheck_failed": True,
+                                "direct_bid_at_recheck": _direct_bid_pro,
+                                "direct_ask_at_recheck": _direct_ask_pro,
+                            })
                     elif _rv_pro.get("action") == "REJECT_DIRECT_ZERO":
                         # P1: name the specific failure — zero bid/ask on direct quote
                         pro_reason = "DIRECT_QUOTE_ZERO_BID_ASK"
+                        _direct_quote_recovery_audit.update({
+                            "attempted": True,
+                            "selected":  False,
+                            "failure":   "DIRECT_QUOTE_ZERO_BID_ASK",
+                        })
                     elif _rv_pro.get("action") == "REJECT_UNAVAILABLE":
                         pro_reason = _rv_pro.get("reason_code") or "QUOTE_FETCH_FAILED"
-                    # SKIP_NOT_MARKET_HOURS / SKIP_NOT_REVALIDATABLE: original reason stands.
+                        _direct_quote_recovery_audit.update({
+                            "attempted": True,
+                            "selected":  False,
+                            "failure":   str(_rv_pro.get("reason_code") or "QUOTE_FETCH_FAILED"),
+                        })
+                    # SKIP_NOT_MARKET_HOURS / SKIP_NOT_REVALIDATABLE: original reason
+                    # stands and audit is left unstamped — the branch did not run,
+                    # so attempted stays False by design.
                 # ── end P0A/FIX-2 ────────────────────────────────────────────
 
                 if pro_tier == "REJECT":
