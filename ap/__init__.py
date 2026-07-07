@@ -33,6 +33,12 @@ def install_exit_circuit_breaker_broker_truth_safety_guard() -> None:
     install_exit_circuit_breaker_broker_truth_guard()
 
 
+def install_repair_position_flat_safety_guard() -> None:
+    from .repair_position_flat_guard import install_repair_position_flat_guard
+
+    install_repair_position_flat_guard()
+
+
 def install_entry_safety_guards() -> None:
     installers = (
         install_entry_metadata_safety_guards,
@@ -40,6 +46,7 @@ def install_entry_safety_guards() -> None:
         install_deferred_materialization_persistence_guard,
         install_live_hard_hold_runtime_safety_guard,
         install_exit_circuit_breaker_broker_truth_safety_guard,
+        install_repair_position_flat_safety_guard,
     )
     for installer in installers:
         try:
