@@ -681,6 +681,15 @@ def _build_flat_selector_audit_fields(
             "last_dte_ladder_audit":                          _sa.get("last_dte_ladder_audit") or None,
             "dte_ladder_enabled":                             bool(_sa.get("dte_ladder_enabled", False)),
             "ladder_eligible_marker":                         bool(_sa.get("ladder_eligible_marker", False)),
+            # P0 PR #302 Fix 3+4: failure classification and chain validity flat fields
+            "last_deferred_selector_failure_class":          str(_sa.get("selector_failure_class") or "") or None,
+            "last_deferred_selector_nonzero_quote_rows":     int(_sa.get("nonzero_quote_rows") or 0),
+            "last_deferred_selector_zero_quote_ratio":       float(_sa.get("zero_quote_ratio") or 0.0),
+            "last_deferred_selector_data_failure":           bool(_sa.get("data_failure", False)),
+            "last_deferred_selector_quality_failure":        bool(_sa.get("quality_failure", False)),
+            # Fix 2: direct quote recovery audit
+            "last_deferred_direct_quote_recovery_attempted": bool(_sa.get("direct_quote_recovery_attempted", False)),
+            "last_deferred_direct_quote_recovery_selected":  bool(_sa.get("direct_quote_recovery_selected", False)),
         }
         if is_paper:
             try:
@@ -2457,6 +2466,26 @@ class APExecutionCore:
                             reason=_cap_reason,
                             contract=_sel_contract,
                         )
+                        # Write breach last error to trade_queue BEFORE terminalizing
+                        # so Supabase shows the cap reason without reading Render logs.
+                        try:
+                            from ap.queue import write_deferred_breach_last_error
+                            _cap_queue_id = (
+                                sig.get("queue_id")
+                                or sig.get("trade_queue_id")
+                                or (getattr(approved_plan, "metadata", None) or {}).get("queue_id")
+                            )
+                            write_deferred_breach_last_error(
+                                _cap_queue_id,
+                                reason_code=f"ACCEPTANCE_CAP_MISCONFIGURED:{_cap_error}",
+                                explanation=f"acceptance cap misconfigured: {_cap_error}",
+                                attempt=1,
+                                client_id=_breach_client_id,
+                                ticker=ticker,
+                            )
+                        except Exception as _cap_obs_exc:
+                            log.debug("[%s] cap misconfigured queue write non-critical: %s",
+                                      ticker, _cap_obs_exc)
                         _terminalize_deferred_breach_failure(
                             _cap_reason,
                             extra_meta={
@@ -2482,6 +2511,29 @@ class APExecutionCore:
                             reason=_cap_reason,
                             contract=_sel_contract,
                         )
+                        # Write breach last error to trade_queue BEFORE terminalizing
+                        # so Supabase shows the cap block reason without reading Render logs.
+                        try:
+                            from ap.queue import write_deferred_breach_last_error
+                            _cap_queue_id2 = (
+                                sig.get("queue_id")
+                                or sig.get("trade_queue_id")
+                                or (getattr(approved_plan, "metadata", None) or {}).get("queue_id")
+                            )
+                            write_deferred_breach_last_error(
+                                _cap_queue_id2,
+                                reason_code="ACCEPTANCE_ASK_CAP_EXCEEDED",
+                                explanation=(
+                                    f"acceptance ask cap exceeded: ask={_sel_ask:.2f} "
+                                    f"cap={_accept_cap:.2f} contract={_sel_contract}"
+                                ),
+                                attempt=1,
+                                client_id=_breach_client_id,
+                                ticker=ticker,
+                            )
+                        except Exception as _cap_obs_exc2:
+                            log.debug("[%s] cap exceeded queue write non-critical: %s",
+                                      ticker, _cap_obs_exc2)
                         _terminalize_deferred_breach_failure(
                             _cap_reason,
                             extra_meta={
@@ -2560,6 +2612,7 @@ class APExecutionCore:
                         else "breach_time_contract_selection_no_result"
                     )
                     import datetime as _dt
+                    _sf_dict = _sf if isinstance(_sf, dict) else {}
                     _audit: dict = {
                         "reason_code":         _rc,
                         "stage":               _st,
@@ -2571,9 +2624,35 @@ class APExecutionCore:
                         "contract_before":     _contract_sym_raw or None,
                         "selected_contract":   _sel_contract or None,
                         "timestamp":           _dt.datetime.now(_dt.timezone.utc).isoformat(),
-                        "raw_selector_reason": (
-                            _sf.get("raw_reason") if isinstance(_sf, dict) else None
+                        "raw_selector_reason": _sf_dict.get("raw_reason"),
+                        # P0 PR #302: pass through selector_failure fields that
+                        # were previously lost (not included in audit dict).
+                        "chain_rows":            int(_sf_dict.get("chain_rows") or 0),
+                        "survivor_count":        int(_sf_dict.get("survivor_count") or 0),
+                        "top_reject_buckets":    _sf_dict.get("top_reject_buckets") or {},
+                        "best_rejected_candidate": _sf_dict.get("best_rejected_candidate"),
+                        "quote_source":          _sf_dict.get("quote_source") or "unknown",
+                        "tradier_base_url":      _sf_dict.get("tradier_base_url") or "",
+                        "sandbox_mode":          bool(_sf_dict.get("sandbox_mode", False)),
+                        # Fix 3: failure classification
+                        "selector_failure_class": _sf_dict.get("selector_failure_class"),
+                        "data_failure":           bool(_sf_dict.get("data_failure", False)),
+                        "quality_failure":        bool(_sf_dict.get("quality_failure", False)),
+                        # Fix 4: chain quote validity
+                        "chain_quote_validity":   _sf_dict.get("selector_chain_quote_validity"),
+                        "nonzero_quote_rows":     int(
+                            (_sf_dict.get("selector_chain_quote_validity") or {})
+                            .get("rows_with_bid_and_ask_gt_zero") or 0
                         ),
+                        "zero_quote_ratio":       float(
+                            (_sf_dict.get("selector_chain_quote_validity") or {})
+                            .get("zero_quote_ratio") or 0.0
+                        ),
+                        # Fix 2: direct quote recovery
+                        "direct_quote_recovery_attempted": bool(
+                            _sf_dict.get("direct_quote_recovery_attempted", False)),
+                        "direct_quote_recovery_selected":  bool(
+                            _sf_dict.get("direct_quote_recovery_selected", False)),
                     }
                     # P0 (2026-07-02): config provability. Production ran for
                     # multiple sessions with the DTE ladder silently disabled
