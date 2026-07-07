@@ -29,6 +29,7 @@ import logging
 import os
 import threading
 import time
+import types
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Optional
@@ -2383,6 +2384,99 @@ class APEntryWatcher:
             signal_dict["entry_price"],
             signal_dict["side"],
         )
+        # ── P0 (PR #304) Bug C: arm-time already-through-trigger gate ──────
+        # Before add_signal(), during regular session, verify the underlying
+        # has not already crossed the trigger. If it has, a watcher armed now
+        # would fire on a move that already happened — the exact "late entry"
+        # failure the audit calls out.
+        #
+        # Runs even when:
+        #   - _is_overnight_signal is True (daily/overnight rows that got
+        #     late-handed off to a regular-session arm)
+        #   - recovery_rearm is True (morning handoff / restart recovery —
+        #     recovery mode may skip drift/staleness rejections, but MUST NOT
+        #     bypass this safety gate)
+        #
+        # Skipped when:
+        #   - pre_market or post_session (no live regular quote to trust)
+        #   - trigger is missing/invalid
+        #   - quote fetch fails (fail-safe: let existing paths handle it)
+        _regular_session_now = not pre_market and not post_session
+        if _regular_session_now and trigger and float(trigger or 0) > 0:
+            try:
+                _bug_c_quote = self._get_quote(ticker) or {}
+            except Exception:
+                _bug_c_quote = {}
+            _bug_c_bid = float(_bug_c_quote.get("bid") or 0)
+            _bug_c_ask = float(_bug_c_quote.get("ask") or 0)
+            if (_bug_c_bid > 0 or _bug_c_ask > 0) and self._is_already_through_trigger(
+                side, float(trigger), _bug_c_bid, _bug_c_ask,
+            ):
+                _bug_c_mid = (_bug_c_bid + _bug_c_ask) / 2.0 if (_bug_c_bid and _bug_c_ask) else max(_bug_c_bid, _bug_c_ask)
+                _bug_c_audit_payload = {
+                    "trigger_type": "arm_check",
+                    "reason_code":  "arm_already_through_trigger",
+                    "raw_reason": (
+                        f"side_{side}_ask_{_bug_c_ask:.4f}_bid_{_bug_c_bid:.4f}"
+                        f"_already_through_trigger_{float(trigger):.4f}"
+                        f"_at_arm_time recovery_rearm={_recovery_rearm}"
+                    ),
+                    "current_bid":  _bug_c_bid,
+                    "current_ask":  _bug_c_ask,
+                    "current_mid":  _bug_c_mid,
+                    "arm_condition": f"trigger_{float(trigger):.4f}",
+                    "extra": {
+                        "recovery_rearm": _recovery_rearm,
+                        "regular_session": True,
+                        "ticker": ticker,
+                        "side": side,
+                    },
+                }
+                try:
+                    # Persist audit directly — no watcher exists yet to route through.
+                    _bug_c_full_audit = {
+                        "reason_code":         "arm_already_through_trigger",
+                        "raw_reason":          _bug_c_audit_payload["raw_reason"],
+                        "trigger_type":        "arm_check",
+                        "current_bid":         _bug_c_bid,
+                        "current_ask":         _bug_c_ask,
+                        "current_mid":         _bug_c_mid,
+                        "arm_condition":       _bug_c_audit_payload["arm_condition"],
+                        "recovery_rearm":      _recovery_rearm,
+                        "regular_session":     True,
+                        "trigger_price":       float(trigger),
+                        "side":                side,
+                    }
+                    self._persist_watcher_audit(local_order_id, _bug_c_full_audit)
+                except Exception:
+                    pass
+                log.warning(
+                    "[%s] WATCHER_ARM_REJECTED_ALREADY_THROUGH_TRIGGER — "
+                    "%s ask=%.4f bid=%.4f already crossed trigger=%.4f at arm-time "
+                    "(recovery_rearm=%s). Refusing to arm; setup missed the move.",
+                    ticker, side, _bug_c_ask, _bug_c_bid, float(trigger), _recovery_rearm,
+                )
+                # In recovery rearm mode, do NOT cancel — caller (morning handoff)
+                # decides cleanup policy. In normal arm mode, terminalize via
+                # the existing on_invalidate path so the row transitions from
+                # PENDING_TRIGGER to EXPIRED/CANCELED.
+                if not _recovery_rearm and self.on_invalidate is not None:
+                    try:
+                        # Build a minimal watched-like object for the callback.
+                        _bug_c_shim = types.SimpleNamespace(
+                            signal=signal_dict,
+                            ticker=ticker,
+                            _pending_audit=_bug_c_full_audit,
+                            state=WatchState.INVALIDATED,
+                        )
+                        self.on_invalidate(_bug_c_shim)
+                    except Exception as _bc_exc:
+                        log.error(
+                            "[%s] arm_already_through_trigger cleanup callback failed: %s",
+                            ticker, _bc_exc,
+                        )
+                return False
+
         # PR-C / BUG-EW-4: when add_signal blocks (dedup, opposite-side
         # weaker score, etc.), the OSM entry order created earlier by the
         # queue/worker stays as a ghost CREATED row with no watcher
@@ -2757,15 +2851,59 @@ class APEntryWatcher:
                     )
                     to_remove.append(w)
                 else:
-                    w.overnight = False
-                    w.signal["queue_status"] = OvernightWatchState.VALID_AWAITING_BREACH
-                    log.info(
-                        "[%s] OVERNIGHT_DAILY_ARMED | side=%s | queue_status=%s | %s",
-                        w.ticker,
-                        w.side,
-                        OvernightWatchState.VALID_AWAITING_BREACH,
-                        getattr(result, "reason_text", "valid"),
-                    )
+                    # ── P0 (PR #304) Bug D fix ─────────────────────────────
+                    # Daily validator confirmed structural validity, but the
+                    # validator does NOT check whether price already crossed
+                    # the trigger premarket / before watcher armed. Fetch a
+                    # live quote and reject the arm if the setup is already
+                    # through trigger — never arm a watcher on a move that
+                    # already happened. This is the exact "trigger happened
+                    # before bot armed" scenario the audit flags as dangerous.
+                    _bug_d_quote = self._get_quote(w.ticker) or {}
+                    _bug_d_bid = float(_bug_d_quote.get("bid") or 0)
+                    _bug_d_ask = float(_bug_d_quote.get("ask") or 0)
+                    if self._is_already_through_trigger(
+                        w.side, w.entry_trigger, _bug_d_bid, _bug_d_ask,
+                    ):
+                        _bug_d_mid = (_bug_d_bid + _bug_d_ask) / 2.0 if (_bug_d_bid and _bug_d_ask) else max(_bug_d_bid, _bug_d_ask)
+                        _bug_d_audit = self._build_watcher_audit_payload(
+                            w,
+                            trigger_type="overnight_revalidation",
+                            current_bid=_bug_d_bid,
+                            current_ask=_bug_d_ask,
+                            current_mid=_bug_d_mid,
+                            arm_condition=f"trigger_{w.entry_trigger:.4f}",
+                            reason_code="overnight_daily_already_through_trigger",
+                            raw_reason=(
+                                f"side_{w.side}_ask_{_bug_d_ask:.4f}_bid_{_bug_d_bid:.4f}"
+                                f"_already_through_trigger_{w.entry_trigger:.4f}"
+                                f"_at_daily_valid_arm_time"
+                            ),
+                            extra={"is_daily": True, "validator_valid": True},
+                        )
+                        self._persist_watcher_audit(
+                            w.signal.get("local_order_id"), _bug_d_audit,
+                        )
+                        w.state = WatchState.EXPIRED
+                        w.signal["queue_status"] = OvernightWatchState.INVALIDATED
+                        w._release_dedup_key()
+                        log.warning(
+                            "[%s] OVERNIGHT_DAILY_ALREADY_THROUGH_TRIGGER — "
+                            "validator valid but %s already crossed trigger $%.4f "
+                            "(bid=%.4f ask=%.4f). Move done; refusing to arm.",
+                            w.ticker, w.side, w.entry_trigger, _bug_d_bid, _bug_d_ask,
+                        )
+                        to_remove.append(w)
+                    else:
+                        w.overnight = False
+                        w.signal["queue_status"] = OvernightWatchState.VALID_AWAITING_BREACH
+                        log.info(
+                            "[%s] OVERNIGHT_DAILY_ARMED | side=%s | queue_status=%s | %s",
+                            w.ticker,
+                            w.side,
+                            OvernightWatchState.VALID_AWAITING_BREACH,
+                            getattr(result, "reason_text", "valid"),
+                        )
                 continue
 
             # Generic/non-daily overnight revalidation from older stable watcher.
@@ -2987,7 +3125,16 @@ class APEntryWatcher:
                 elif new_state in (WatchState.EXPIRED, WatchState.INVALIDATED):
                     completed.append(("done", w))
 
-            done_ids = {id(w) for _, w in completed}
+            # ── P0 (PR #304) Bug B fix: DO NOT remove triggered watchers here.
+            # The old code removed EVERY completed watcher including triggers,
+            # so when on_trigger failed with attempts<3 and did `continue`
+            # claiming "will retry", the watcher had ALREADY been removed from
+            # _pending — the retry was a lie and the row zombied.
+            #
+            # Now: only remove EXPIRED/INVALIDATED watchers upfront (they have
+            # no callback that can fail). Triggered watchers stay in _pending
+            # and are removed below ONLY on on_trigger success or exhaustion.
+            done_ids = {id(w) for action, w in completed if action == "done"}
             self._pending = [w for w in self._pending if id(w) not in done_ids]
 
         for action, w in completed:
@@ -3025,9 +3172,32 @@ class APEntryWatcher:
                     # must not permanently kill a valid setup. On all 3 failures
                     # the signal is expired with a clear reason — not silently lost.
                     _trigger_attempts = getattr(w, "_trigger_attempts", 0)
+                    log.info(
+                        "WATCHER_TRIGGER_CALLBACK_ATTEMPT "
+                        "ticker=%s signal_id=%s attempt=%d/3 kept_in_pending=true",
+                        w.ticker, _sig_id or "?", _trigger_attempts + 1,
+                    )
                     try:
                         self.on_trigger(w)
                         w._trigger_attempts = 0   # reset on success
+                        # ── P0 (PR #304) Bug B: explicit removal on SUCCESS.
+                        # Since Bug B fix stopped removing triggered watchers
+                        # upfront (they used to zombie on retry), success now
+                        # needs an explicit removal so the watcher doesn't
+                        # re-fire on the next poll cycle. Uses id-based match
+                        # to avoid mutating _pending during callback iteration.
+                        with self._lock:
+                            _wid = id(w)
+                            self._pending = [_p for _p in self._pending if id(_p) != _wid]
+                        try:
+                            w._release_dedup_key()
+                        except Exception:
+                            pass
+                        log.info(
+                            "WATCHER_TRIGGER_CALLBACK_OK ticker=%s signal_id=%s "
+                            "removed_from_pending=true dedup_released=true",
+                            w.ticker, _sig_id or "?",
+                        )
                         # Diagnostic-only — proves the callback ran cleanly.
                         # Pair with BREACH_RISK_CHECK_BLOCKED / ENTRY_TRIGGER_BLOCKED_RETURN
                         # to determine whether a watcher trigger was consumed but blocked.
@@ -3085,29 +3255,78 @@ class APEntryWatcher:
                         except Exception:
                             pass
                         if _trigger_attempts < 3:
-                            # Do NOT release dedup key — keep watcher armed for next poll
+                            # ── P0 (PR #304) Bug B: HONEST retry.
+                            # Previously this claimed "will retry" but the
+                            # watcher had already been removed from _pending
+                            # by the done_ids filter above — no retry ever
+                            # happened. Now:
+                            #   • watcher stayed in _pending (Bug B fix above)
+                            #   • state must be reset to PENDING so
+                            #     _poll_active_signals() sees it as active
+                            #     and check() re-runs on the next poll
+                            #   • dedup key stays held
+                            # This is the ONLY code path in the loop where
+                            # a triggered watcher survives to the next tick.
+                            with self._lock:
+                                w.state = WatchState.PENDING
+                                # Preserve breach_count so momentum polls don't
+                                # have to restart from zero if the retry fires
+                                # right away; check() will re-verify breach on
+                                # the next tick anyway.
                             log.warning(
-                                "[%s] TRIGGER_RETRY — will retry on next poll cycle (attempt %d/3)",
-                                w.ticker, _trigger_attempts,
+                                "WATCHER_TRIGGER_CALLBACK_RETRY_SCHEDULED "
+                                "ticker=%s signal_id=%s attempt=%d/3 "
+                                "state_reset_to_pending=true dedup_held=true "
+                                "kept_in_pending=true",
+                                w.ticker, _sig_id or "?", _trigger_attempts,
                             )
                             continue  # stay in poll loop, retry on next tick
                         else:
-                            # 3 failures — expire cleanly with reason
+                            # ── P0 (PR #304) Bug B: EXHAUSTION.
+                            # 3 failures — expire cleanly with reason and
+                            # explicitly remove from _pending (was previously
+                            # removed upfront, now must be removed here).
                             log.error(
-                                "[%s] TRIGGER_EXHAUSTED — 3 on_trigger failures, expiring signal | "
+                                "WATCHER_TRIGGER_CALLBACK_EXHAUSTED_EXPIRED "
+                                "ticker=%s signal_id=%s attempts=3 "
                                 "last_error=%s",
-                                w.ticker, exc,
+                                w.ticker, _sig_id or "?", exc,
                             )
-                            w.state = WatchState.EXPIRED
+                            with self._lock:
+                                w.state = WatchState.EXPIRED
+                                _wid = id(w)
+                                self._pending = [_p for _p in self._pending if id(_p) != _wid]
                             w._release_dedup_key()
                             if _sig_id and _ticker:
                                 _ew_record(_sig_id, _ticker, "EXPIRED",
                                            "on_trigger_exhausted_3_attempts")
+                            # Stamp watcher_audit so _on_signal_invalidate
+                            # (if called via cleanup) classifies this as
+                            # a real underlying invalidation.
+                            try:
+                                w._pending_audit = self._build_watcher_audit_payload(
+                                    w,
+                                    trigger_type="trigger",
+                                    reason_code="on_trigger_exhausted_3_attempts",
+                                    raw_reason=f"on_trigger_failed_3_times_last_error={type(exc).__name__}",
+                                    extra={"exception_type": type(exc).__name__,
+                                           "exception_message": str(exc)[:200]},
+                                )
+                                self._persist_watcher_audit(
+                                    (getattr(w, "signal", {}) or {}).get("local_order_id"),
+                                    w._pending_audit,
+                                )
+                            except Exception:
+                                pass
                     finally:
                         if getattr(w, "_trigger_attempts", 0) == 0 or getattr(w, "_trigger_attempts", 0) >= 3:
                             w._release_dedup_key()
                 else:
                     log.error("[%s] TRIGGERED but no on_trigger callback is wired", w.ticker)
+                    # ── P0 (PR #304) Bug B: explicit removal since upfront removal was disabled.
+                    with self._lock:
+                        _wid = id(w)
+                        self._pending = [_p for _p in self._pending if id(_p) != _wid]
                     w._release_dedup_key()
             elif w.state == WatchState.EXPIRED:
                 # BUG TRAP: log every expiry with the reason it was in.
@@ -3134,6 +3353,59 @@ class APEntryWatcher:
                         self.on_invalidate(w)
                     except Exception as exc:
                         log.error("[%s] on_invalidate callback failed: %s", w.ticker, exc, exc_info=True)
+
+    # ── P0 (PR #304) Bugs C & D: arm-time already-through-trigger safety ────
+    @staticmethod
+    def _is_already_through_trigger(
+        side: str,
+        trigger: float,
+        bid: float,
+        ask: float,
+        mid: float = 0.0,
+        last: float = 0.0,
+    ) -> bool:
+        """
+        True when the underlying quote proves price has already crossed the
+        entry trigger — meaning any watcher armed now would fire on a move
+        that already happened.
+
+        Rule (matches WatchedSignal.check breach logic exactly):
+            CALL breached when ask >= trigger
+            PUT  breached when bid <= trigger
+
+        Falls back to mid/last only when bid/ask are missing entirely.
+        Zero quote data returns False (unknown — cannot claim already-through).
+        """
+        try:
+            trigger = float(trigger or 0)
+            bid = float(bid or 0)
+            ask = float(ask or 0)
+        except (TypeError, ValueError):
+            return False
+        if trigger <= 0:
+            return False
+
+        _side = str(side or "").strip().upper()
+        # Primary: bid/ask
+        if bid > 0 or ask > 0:
+            if _side == "CALL":
+                return ask > 0 and ask >= trigger
+            if _side == "PUT":
+                return bid > 0 and bid <= trigger
+            return False
+
+        # Fallback: mid / last (used only when bid/ask both missing)
+        try:
+            fallback = float(mid or 0) or float(last or 0)
+        except (TypeError, ValueError):
+            fallback = 0.0
+        if fallback <= 0:
+            return False
+        if _side == "CALL":
+            return fallback >= trigger
+        if _side == "PUT":
+            return fallback <= trigger
+        return False
 
     def _get_quote(self, ticker: str) -> dict:
         try:
