@@ -1,17 +1,16 @@
-"""P0 guard: broker-truth-open protective exits must not be trapped by the
-exit rejection circuit breaker.
+"""P0 guard: broker-truth repair exits must reduce risk truthfully.
 
-Incident shape: synthetic repair / broker-truth position still has open quantity,
-but repeated prior reject/error rows make evaluate_exit_submission_safety return
-exit_circuit_breaker_tripped. That is safe for normal repeated bad submits, but
-unsafe for a protective CLOSE_ALL when broker truth says qty > 0: the system keeps
-wanting to exit and the breaker keeps blocking risk reduction.
+Two incident shapes are handled here:
 
-This guard is intentionally narrow. It only bypasses the circuit breaker when the
-call already opted into broker-truth handling via
-allow_missing_position_with_broker_truth or a broker-repair-* position id, and
-broker_truth_open_qty is positive. It does not loosen normal exit circuit-breaker
-behavior.
+1. Broker truth says open qty > 0, but the rejection circuit breaker blocks the
+   protective exit.  In that case the circuit breaker is bypassed only for the
+   broker-truth repair context.
+2. Broker truth says open qty == 0 for a broker-repair/synthetic position.  In
+   that case the engine must stop repeatedly firing exits against a stale repair
+   row.  The safety result is rewritten to a terminal stale/flat reason so the
+   caller can clear or close in-memory state instead of looping forever.
+
+Normal positions are not loosened.
 """
 from __future__ import annotations
 
@@ -23,9 +22,10 @@ log = get_logger("ap.exit_circuit_breaker_broker_truth_guard")
 
 _PATCHED_ATTR = "_AP_BROKER_TRUTH_EXIT_BREAKER_GUARD_PATCHED"
 _ORIGINAL_ATTR = "_AP_BROKER_TRUTH_EXIT_BREAKER_GUARD_ORIGINAL"
+FLAT_REASON = "broker_truth_position_flat"
 
 
-def _positive_int(value: Any) -> int:
+def _nonnegative_int(value: Any) -> int:
     try:
         return max(0, int(float(value or 0)))
     except Exception:
@@ -43,18 +43,34 @@ def _is_broker_truth_repair_context(kwargs: dict[str, Any]) -> bool:
 def apply_broker_truth_exit_breaker_bypass(result: Any, kwargs: dict[str, Any]) -> Any:
     """Pure post-processor for evaluate_exit_submission_safety results.
 
-    Only changes a blocked exit_circuit_breaker_tripped result into allowed when
-    broker truth says the synthetic/broker-repair position still has open qty.
+    - repair context + broker qty > 0 + circuit breaker -> allow protective exit
+    - repair context + broker qty == 0 -> block as broker_truth_position_flat
     """
     if not isinstance(result, dict):
         return result
+    broker_qty = _nonnegative_int(kwargs.get("broker_truth_open_qty"))
+    if not _is_broker_truth_repair_context(kwargs):
+        return result
+
+    if broker_qty <= 0:
+        patched = dict(result)
+        patched["blocked"] = True
+        patched["reason"] = FLAT_REASON
+        patched["p0_broker_truth_position_flat"] = True
+        patched["p0_broker_truth_open_qty"] = broker_qty
+        log.critical(
+            "P0_BROKER_TRUTH_POSITION_FLAT position_id=%s client_id=%s execution_mode=%s contract=%s broker_truth_open_qty=%s original_reason=%s",
+            str(kwargs.get("position_id") or ""),
+            str(kwargs.get("client_id") or ""),
+            str(kwargs.get("execution_mode") or ""),
+            str(kwargs.get("contract") or ""),
+            broker_qty,
+            str(result.get("reason") or ""),
+        )
+        return patched
+
     reason = str(result.get("reason") or "")
-    broker_qty = _positive_int(kwargs.get("broker_truth_open_qty"))
-    if (
-        reason == "exit_circuit_breaker_tripped"
-        and broker_qty > 0
-        and _is_broker_truth_repair_context(kwargs)
-    ):
+    if reason == "exit_circuit_breaker_tripped":
         patched = dict(result)
         patched["blocked"] = False
         patched["reason"] = None
