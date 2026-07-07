@@ -205,6 +205,8 @@ def _attach_selector_failure(
     base_url: str = "",
     execution_mode: str = "unknown",
     best_rejected_candidate: "dict | None" = None,
+    chain_quote_validity: "dict | None" = None,           # P0 PR #302 Fix 4
+    direct_quote_recovery_audit: "dict | None" = None,   # P0 PR #302 Fix 2
 ) -> None:
     """Attach plan.metadata["selector_failure"] when select() returns None.
 
@@ -274,6 +276,40 @@ def _attach_selector_failure(
             "best_rejected_candidate": best_rejected_candidate or None,
         }
 
+        # P0 PR #302 Fix 3: failure classification
+        try:
+            _fclass, _dfail, _qfail = _classify_selector_failure(
+                _rc,
+                chain_quote_validity=chain_quote_validity,
+                sandbox_mode="sandbox" in _base.lower(),
+                execution_mode=str(execution_mode or "unknown"),
+            )
+            failure["selector_failure_class"]   = _fclass
+            failure["selector_reason_detail"]   = str(explanation or "")
+            failure["selector_terminal_reason"] = _rc
+            failure["data_failure"]             = _dfail
+            failure["quality_failure"]          = _qfail
+        except Exception:
+            pass
+
+        # P0 PR #302 Fix 4: chain quote validity summary
+        if chain_quote_validity:
+            failure["selector_chain_quote_validity"] = chain_quote_validity
+
+        # P0 PR #302 Fix 2: direct quote recovery audit
+        if direct_quote_recovery_audit:
+            failure.update({
+                "direct_quote_recovery_attempted": bool(
+                    direct_quote_recovery_audit.get("attempted", False)),
+                "direct_quote_recovery_selected":  bool(
+                    direct_quote_recovery_audit.get("selected", False)),
+                "direct_quote_recovery_contract":  direct_quote_recovery_audit.get("contract"),
+                "direct_quote_recovery_bid":       direct_quote_recovery_audit.get("bid"),
+                "direct_quote_recovery_ask":       direct_quote_recovery_audit.get("ask"),
+                "direct_quote_recovery_mid":       direct_quote_recovery_audit.get("mid"),
+                "direct_quote_recovery_failure":   direct_quote_recovery_audit.get("failure"),
+            })
+
         if isinstance(plan, dict):
             plan.setdefault("metadata", {})["selector_failure"] = failure
         else:
@@ -288,6 +324,141 @@ def _attach_selector_failure(
                 meta["selector_failure"] = failure
     except Exception:
         pass  # observability must never interrupt select()
+
+
+# ── P0 PR #302 — Fix 4: Chain quote validity summary ─────────────────────────
+
+def _build_chain_quote_validity(chain_rows: list) -> dict:
+    """
+    Build a validity summary of the option chain before quality filtering.
+    Distinguishes data-quality failures (zero quotes from Tradier) from
+    contract-quality failures (real quotes that don't pass thresholds).
+    Never raises — returns empty validity dict on any error.
+    """
+    try:
+        n = len(chain_rows)
+        if n == 0:
+            return {
+                "chain_rows": 0,
+                "rows_with_bid_gt_zero": 0,
+                "rows_with_ask_gt_zero": 0,
+                "rows_with_bid_and_ask_gt_zero": 0,
+                "rows_zero_bid_or_ask": 0,
+                "zero_quote_ratio": 1.0,
+                "nonzero_quote_ratio": 0.0,
+                "best_nonzero_quote_candidate": None,
+                "best_zero_quote_candidate": None,
+            }
+        _bid = lambda o: float(o.get("bid") or 0)
+        _ask = lambda o: float(o.get("ask") or 0)
+        bid_gt  = sum(1 for o in chain_rows if _bid(o) > 0)
+        ask_gt  = sum(1 for o in chain_rows if _ask(o) > 0)
+        both_gt = sum(1 for o in chain_rows if _bid(o) > 0 and _ask(o) > 0)
+        zero_ba = n - both_gt
+        nonzero_cands = [o for o in chain_rows if _bid(o) > 0 and _ask(o) > 0]
+        zero_cands    = [o for o in chain_rows if _bid(o) <= 0 or _ask(o) <= 0]
+        best_nonzero = None
+        if nonzero_cands:
+            _best = max(nonzero_cands, key=lambda o: (_bid(o) + _ask(o)) / 2)
+            best_nonzero = {
+                "symbol": _best.get("symbol"),
+                "bid":    round(_bid(_best), 4),
+                "ask":    round(_ask(_best), 4),
+                "mid":    round((_bid(_best) + _ask(_best)) / 2, 4),
+                "open_interest": int(_best.get("open_interest") or 0),
+                "delta": _best.get("greeks", {}).get("delta") if isinstance(_best.get("greeks"), dict) else None,
+            }
+        best_zero = None
+        if zero_cands:
+            _bzero = max(zero_cands, key=lambda o: int(o.get("open_interest") or 0))
+            best_zero = {
+                "symbol":        _bzero.get("symbol"),
+                "bid":           round(_bid(_bzero), 4),
+                "ask":           round(_ask(_bzero), 4),
+                "open_interest": int(_bzero.get("open_interest") or 0),
+            }
+        return {
+            "chain_rows":                     n,
+            "rows_with_bid_gt_zero":           bid_gt,
+            "rows_with_ask_gt_zero":           ask_gt,
+            "rows_with_bid_and_ask_gt_zero":   both_gt,
+            "rows_zero_bid_or_ask":            zero_ba,
+            "zero_quote_ratio":                round(zero_ba / n, 4),
+            "nonzero_quote_ratio":             round(both_gt / n, 4),
+            "best_nonzero_quote_candidate":    best_nonzero,
+            "best_zero_quote_candidate":       best_zero,
+        }
+    except Exception:
+        return {}
+
+
+# ── P0 PR #302 — Fix 3: Selector failure classification ──────────────────────
+
+def _classify_selector_failure(
+    reason_code: str,
+    chain_quote_validity: "dict | None" = None,
+    sandbox_mode: bool = False,
+    execution_mode: str = "unknown",
+) -> "tuple[str, bool, bool]":
+    """
+    Classify a selector failure into:
+      selector_failure_class: "data_quality_zero_quotes" |
+                              "contract_quality_reject"  |
+                              "paper_data_domain_issue"
+      data_failure:    True when the blocker is data quality (zero quotes,
+                       sandbox data, chain empty) not contract quality.
+      quality_failure: True when a real contract failed a threshold gate.
+
+    Used by operators to distinguish 'market data missing' from 'no good contracts'.
+    """
+    _rc  = str(reason_code or "").upper()
+    _qty = chain_quote_validity or {}
+    _zero_ratio = float(_qty.get("zero_quote_ratio") or 0.0)
+    _both_gt    = int(_qty.get("rows_with_bid_and_ask_gt_zero") or 0)
+
+    if _rc == "PAPER_SELECTOR_SANDBOX_DATA_UNUSABLE":
+        return "paper_data_domain_issue", True, False
+
+    if _rc in _QUALITY_REJECT_CODES:
+        return "contract_quality_reject", False, True
+
+    if _rc in ("CHAIN_ROW_ZERO_BID_ASK", "DIRECT_QUOTE_ZERO_BID_ASK",
+               "QUOTE_ZERO_BID_ASK", "CHAIN_PROVIDER_EMPTY_OPTIONS",
+               "CHAIN_PROVIDER_EMPTY_EXPIRATIONS", "NO_CHAIN_DATA",
+               "CHAIN_PROVIDER_ERROR", "CHAIN_AUTH_ERROR"):
+        return "data_quality_zero_quotes", True, False
+
+    # Mixed: some valid rows but quality gates failed
+    if _both_gt > 0:
+        return "contract_quality_reject", False, True
+
+    return "data_quality_zero_quotes", True, False
+
+
+# ── P0 PR #302 — Fix 1: paper domain utilities ────────────────────────────────
+
+def _is_paper_sandbox_data_failure(reason_code: str) -> bool:
+    """True when the reject reason indicates sandbox data quality, not contract quality."""
+    return str(reason_code or "").upper() in _PAPER_SANDBOX_DATA_FAILURE_CODES
+
+
+def _detect_paper_selector_domain(sel_mode: str, sel_base_url: str) -> str:
+    """
+    Classify the effective data domain for the selector.
+    Returns: "live" | "sandbox" | "unknown"
+    Respects PAPER_SELECTOR_MARKET_DATA_DOMAIN env var for override.
+    """
+    _url = str(sel_base_url or "").lower()
+    if _PAPER_SELECTOR_MARKET_DATA_DOMAIN == "live":
+        return "live"
+    if _PAPER_SELECTOR_MARKET_DATA_DOMAIN == "sandbox":
+        return "sandbox"
+    # auto: infer from base_url
+    if "api.tradier.com" in _url:
+        return "live"
+    if "sandbox" in _url:
+        return "sandbox"
+    return "unknown"
 
 
 def _safe_float(val, default: float = 0.0) -> float:
@@ -513,6 +684,37 @@ log = logging.getLogger("ap.contract_selector")
 # =============================================================================
 
 _PRO_QUALITY_ENABLED = os.getenv("PRO_CONTRACT_QUALITY", "true").lower() != "false"
+
+# P0 PR #302 — Fix 1: paper selector market-data domain config.
+# auto = detect from base_url; live = require live; sandbox = allow sandbox.
+_PAPER_SELECTOR_MARKET_DATA_DOMAIN = os.getenv(
+    "PAPER_SELECTOR_MARKET_DATA_DOMAIN", "auto"
+).strip().lower()
+
+# P0 PR #302 — Fix 2: DIRECT_QUOTE_RECOVERY_TOP_N env alias.
+# Maps to existing CONTRACT_REVALIDATE_TOP_N; preference given to the new name.
+_DIRECT_QUOTE_RECOVERY_TOP_N = int(
+    os.getenv("DIRECT_QUOTE_RECOVERY_TOP_N",
+              os.getenv("CONTRACT_REVALIDATE_TOP_N", str(DEFAULT_REVALIDATE_TOP_N)))
+)
+
+# Paper sandbox data failure reasons — these indicate data domain issues,
+# not true contract quality failures.
+_PAPER_SANDBOX_DATA_FAILURE_CODES = frozenset({
+    "CHAIN_ROW_ZERO_BID_ASK",
+    "DIRECT_QUOTE_ZERO_BID_ASK",
+    "CHAIN_PROVIDER_EMPTY_OPTIONS",
+    "CHAIN_PROVIDER_EMPTY_EXPIRATIONS",
+    "QUOTE_ZERO_BID_ASK",
+})
+
+# Failure classification mapping — determines data_failure vs quality_failure.
+_QUALITY_REJECT_CODES = frozenset({
+    "OI_TOO_LOW", "SPREAD_TOO_WIDE", "VOLUME_TOO_LOW",
+    "UNTRADEABLE_FOR_ACCOUNT_SIZE", "DEEP_OTM_REJECT", "OTM_TOO_FAR",
+    "PREMIUM_TOO_HIGH", "PREMIUM_TOO_LOW", "LIQUIDITY_BELOW_THRESHOLD",
+    "FINAL_SPREAD_TOO_WIDE", "FINAL_CONTRACT_UNAFFORDABLE",
+})
 
 # Safety defaults:
 # - Guard subsystem errors fail closed unless explicitly overridden.
@@ -1266,6 +1468,32 @@ class APContractSelectionEngine:
             )
             return None
 
+        # P0 PR #302 Fix 4: build chain quote validity BEFORE filtering so we can
+        # distinguish "all quotes were zero (data issue)" from "quotes were real
+        # but failed OI/spread gates (quality issue)". Never blocks. Best-effort.
+        _chain_quote_validity: dict = {}
+        try:
+            _chain_quote_validity = _build_chain_quote_validity(chain)
+        except Exception:
+            pass
+
+        # P0 PR #302 Fix 1: detect effective paper selector data domain.
+        _is_paper_mode = str(_sel_mode or "").lower() in ("paper",)
+        _paper_sel_domain = _detect_paper_selector_domain(_sel_mode, _sel_base_url)
+        _is_sandbox_data  = _paper_sel_domain == "sandbox"
+
+        # P0 PR #302 Fix 2: track direct quote recovery at the select() level
+        # (P0A per-row recovery is already in the quality filter loop).
+        _direct_quote_recovery_audit: dict = {
+            "attempted": False,
+            "selected":  False,
+            "contract":  None,
+            "bid":       None,
+            "ask":       None,
+            "mid":       None,
+            "failure":   None,
+        }
+
         # ── B. HARD QUALITY FILTER ────────────────────────────────────────────
         # No self-mutation: effective thresholds passed directly to _quality_filter.
         # This is thread-safe when worker_loop and entry_watcher breach both call
@@ -1276,7 +1504,7 @@ class APContractSelectionEngine:
         _pro_tiers:  dict = {"A": 0, "B": 0}
         # P2: per-selector-pass direct-quote budget so one stale chain cannot
         # trigger hundreds of Tradier quote fetches.
-        _p0a_budget: int = DEFAULT_REVALIDATE_TOP_N
+        _p0a_budget: int = _DIRECT_QUOTE_RECOVERY_TOP_N
 
         for opt in chain:
             if _PRO_QUALITY_ENABLED:
@@ -1410,6 +1638,21 @@ class APContractSelectionEngine:
                             _rv["audit"].get("direct_ask", 0),
                             opt.get("symbol", "?"),
                         )
+                        # P0 PR #302 Fix 2: stamp recovery audit at select() level
+                        try:
+                            _dq_bid = float(_rv["audit"].get("direct_bid") or 0)
+                            _dq_ask = float(_rv["audit"].get("direct_ask") or 0)
+                            _direct_quote_recovery_audit.update({
+                                "attempted": True,
+                                "selected":  True,
+                                "contract":  str(opt.get("symbol") or ""),
+                                "bid":       _dq_bid,
+                                "ask":       _dq_ask,
+                                "mid":       round((_dq_bid + _dq_ask) / 2, 4) if _dq_bid and _dq_ask else None,
+                                "failure":   None,
+                            })
+                        except Exception:
+                            pass
                         survivors.append(_opt_patched)
                         # Emit PASS event with audit fields
                         try:
@@ -1437,6 +1680,16 @@ class APContractSelectionEngine:
                 elif _rv_action == "REJECT_DIRECT_ZERO":
                     # P1: direct quote returned zero bid/ask — use truthful reason code
                     result = "DIRECT_QUOTE_ZERO_BID_ASK"
+                    # P0 PR #302 Fix 2: track failed recovery attempt
+                    try:
+                        if not _direct_quote_recovery_audit.get("selected"):
+                            _direct_quote_recovery_audit.update({
+                                "attempted": True,
+                                "selected":  False,
+                                "failure":   "DIRECT_QUOTE_ZERO_BID_ASK",
+                            })
+                    except Exception:
+                        pass
                 elif _rv_action == "REJECT_UNAVAILABLE":
                     # P1: quote source unavailable (network/auth failure)
                     result = _rv.get("reason_code") or "QUOTE_FETCH_FAILED"
@@ -1562,13 +1815,32 @@ class APContractSelectionEngine:
                     ),
                 },
             )
+            # P0 PR #302 Fix 1: paper + sandbox data + zero-quote failure →
+            # classify as PAPER_SELECTOR_SANDBOX_DATA_UNUSABLE so operators
+            # can distinguish data-domain issues from contract-quality issues.
+            _final_reason = _obs_reason
+            try:
+                if (_is_paper_mode and _is_sandbox_data
+                        and _is_paper_sandbox_data_failure(_obs_reason)):
+                    _final_reason = "PAPER_SELECTOR_SANDBOX_DATA_UNUSABLE"
+                    log.warning(
+                        "[%s] PAPER_SELECTOR_SANDBOX_DATA_UNUSABLE "
+                        "original_reason=%s base_url=%s — "
+                        "paper selector is using sandbox Tradier data which "
+                        "has 15-min delayed/zero quotes. "
+                        "Set TRADIER_MARKET_DATA_TOKEN to use live data.",
+                        ticker, _obs_reason, _sel_base_url,
+                    )
+            except Exception:
+                pass
             _attach_selector_failure(
                 plan,
-                reason_code=_obs_reason,
+                reason_code=_final_reason,
                 explanation=(
                     "No contracts passed quality gates"
                     f" | chain={_sel_chain_rows}"
                     f" | top_reason={_top_reject or 'none'}"
+                    + (f" | paper_domain={_paper_sel_domain}" if _is_paper_mode else "")
                 ),
                 chain_rows=_sel_chain_rows,
                 survivor_count=0,
@@ -1576,6 +1848,8 @@ class APContractSelectionEngine:
                 base_url=_sel_base_url,
                 execution_mode=_sel_mode,
                 best_rejected_candidate=_best_rejected_candidate,
+                chain_quote_validity=_chain_quote_validity or None,      # Fix 4
+                direct_quote_recovery_audit=_direct_quote_recovery_audit, # Fix 2
             )
             return None
 
