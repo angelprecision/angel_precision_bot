@@ -128,6 +128,7 @@ def _patch_watcher(mod: Any) -> None:
     if cls is None or getattr(cls, "_AP_LIVE_HARD_HOLD_GUARD", False):
         return
     original_watch = cls.watch
+    original_poll = getattr(cls, "_poll_active_signals", None)
 
     if watched_cls is not None and not getattr(watched_cls, "_AP_FIRST_BREACH_STAMP_GUARD", False):
         original_check = watched_cls.check
@@ -188,7 +189,46 @@ def _patch_watcher(mod: Any) -> None:
                 return False
         return original_watch(self, plan, local_order_id, *args, **kwargs)
 
+    def guarded_poll(self: Any, *args: Any, **kwargs: Any):
+        """Preserve watcher ownership for trigger retries without swallowing callback errors.
+
+        The underlying watcher removes triggered rows from _pending before calling
+        on_trigger. This wrapper does not swallow callback exceptions; it re-adds
+        the watcher before re-raising so the original retry logic can keep the row
+        owned until callback success or retry exhaustion.
+        """
+        if not callable(original_poll):
+            return None
+        cb = getattr(self, "on_trigger", None)
+        if not callable(cb) or getattr(cb, "_AP_RETRY_OWNERSHIP_GUARD", False):
+            return original_poll(self, *args, **kwargs)
+
+        def guarded_cb(watched: Any, *cb_args: Any, **cb_kwargs: Any):
+            try:
+                result = cb(watched, *cb_args, **cb_kwargs)
+                return result
+            except Exception:
+                try:
+                    attempts_before = int(getattr(watched, "_trigger_attempts", 0) or 0)
+                    max_attempts = int(os.getenv("WATCHER_TRIGGER_CALLBACK_MAX_ATTEMPTS", "3"))
+                    if attempts_before + 1 < max_attempts:
+                        with self._lock:
+                            if watched not in self._pending:
+                                self._pending.append(watched)
+                except Exception:
+                    pass
+                raise
+
+        guarded_cb._AP_RETRY_OWNERSHIP_GUARD = True
+        self.on_trigger = guarded_cb
+        try:
+            return original_poll(self, *args, **kwargs)
+        finally:
+            self.on_trigger = cb
+
     cls.watch = guarded_watch
+    if callable(original_poll):
+        cls._poll_active_signals = guarded_poll
     cls._AP_LIVE_HARD_HOLD_GUARD = True
     log.critical("P0_LIVE_HARD_HOLD_PATCHED target=ap_entry_watcher")
 
