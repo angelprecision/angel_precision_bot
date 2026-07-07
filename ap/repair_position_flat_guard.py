@@ -1,11 +1,18 @@
 from __future__ import annotations
 
+import importlib.abc
+import importlib.machinery
+import sys
+from typing import Any
+
 from ap.exit_broker_truth_flat import clear_flat_repair_position_memory
 
 _PATCHED = "_AP_FLAT_REPAIR_RUNTIME_GUARD"
+_INSTALLED = False
+_TARGET = "ap_exit_engine"
 
 
-def _is_flat_repair(pos) -> bool:
+def _is_flat_repair(pos: Any) -> bool:
     pid = str(getattr(pos, "position_id", "") or "")
     if not pid.startswith("broker-repair-"):
         return False
@@ -16,10 +23,8 @@ def _is_flat_repair(pos) -> bool:
     return bool(getattr(pos, "closed", False)) or qty <= 0
 
 
-def install_repair_position_flat_guard() -> None:
-    import ap_exit_engine
-
-    cls = getattr(ap_exit_engine, "APExitEngine", None)
+def _patch_exit_engine(module: Any) -> None:
+    cls = getattr(module, "APExitEngine", None)
     if cls is None or getattr(cls, _PATCHED, False):
         return
 
@@ -48,3 +53,41 @@ def install_repair_position_flat_guard() -> None:
 
     cls._submit_exit_decision = guarded
     setattr(cls, _PATCHED, True)
+
+
+class _Loader(importlib.abc.Loader):
+    def __init__(self, loader: Any):
+        self.loader = loader
+
+    def create_module(self, spec: Any):
+        create = getattr(self.loader, "create_module", None)
+        return create(spec) if callable(create) else None
+
+    def exec_module(self, module: Any) -> None:
+        self.loader.exec_module(module)
+        _patch_exit_engine(module)
+
+
+class _Finder(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname: str, path: Any = None, target: Any = None):
+        if fullname != _TARGET:
+            return None
+        spec = importlib.machinery.PathFinder.find_spec(fullname, path)
+        if spec and spec.loader:
+            spec.loader = _Loader(spec.loader)
+            return spec
+        return None
+
+
+def install_repair_position_flat_guard() -> None:
+    global _INSTALLED
+    if _INSTALLED:
+        return
+    _INSTALLED = True
+
+    module = sys.modules.get(_TARGET)
+    if module is not None:
+        _patch_exit_engine(module)
+
+    if not any(isinstance(finder, _Finder) for finder in sys.meta_path):
+        sys.meta_path.insert(0, _Finder())
