@@ -27,6 +27,12 @@ def install_live_hard_hold_runtime_safety_guard() -> None:
     install_live_hard_hold_runtime_guard()
 
 
+def install_live_submit_integration_safety_guard() -> None:
+    from .live_submit_integration_guard import install_live_submit_integration_guard
+
+    install_live_submit_integration_guard()
+
+
 def install_exit_circuit_breaker_broker_truth_safety_guard() -> None:
     from .exit_circuit_breaker_broker_truth_guard import install_exit_circuit_breaker_broker_truth_guard
 
@@ -45,6 +51,7 @@ def install_entry_safety_guards() -> None:
         install_underlying_confirmation_safety_guard,
         install_deferred_materialization_persistence_guard,
         install_live_hard_hold_runtime_safety_guard,
+        install_live_submit_integration_safety_guard,
         install_exit_circuit_breaker_broker_truth_safety_guard,
         install_repair_position_flat_safety_guard,
     )
