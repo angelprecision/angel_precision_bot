@@ -33,6 +33,31 @@ def test_stamp_selected_blocks_blank_execution_mode():
     assert osm.meta["broker_ready"] is False
     assert osm.meta["materialization_status"] == "FAILED_TERMINAL"
     assert osm.meta["materialization_identity_ok"] is False
+    assert osm.meta["materialization_reason"] == "LIVE_SUBMIT_BLOCK_BLANK_OR_UNKNOWN_EXECUTION_MODE"
+
+
+def test_stamp_selected_blocks_missing_client_with_exact_reason():
+    osm = FakeOSM()
+    ok = stamp_selected(
+        osm,
+        "order-missing-client",
+        client_id="",
+        execution_mode="live",
+        symbol="META",
+        direction="CALL",
+        contract="META260717C00100000",
+        bid=1.0,
+        ask=1.1,
+        mid=1.05,
+        limit_price=1.1,
+        qty=1,
+        reserved_cost=110,
+    )
+    assert ok is False
+    assert osm.meta["broker_ready"] is False
+    assert osm.meta["materialization_status"] == "FAILED_TERMINAL"
+    assert osm.meta["materialization_identity_ok"] is False
+    assert osm.meta["materialization_reason"] == "LIVE_SUBMIT_BLOCK_MISSING_CLIENT_ID"
 
 
 def test_stamp_selected_allows_explicit_live_identity():
