@@ -1,0 +1,89 @@
+diff --git a/ap_exit_engine.py b/ap_exit_engine.py
+--- a/ap_exit_engine.py
++++ b/ap_exit_engine.py
+@@
+         _exec_mode = str(
+             getattr(getattr(self, "master_control", None), "mode", "") or
+             getattr(pos, "execution_mode", "") or
+             ""
+         ).strip().lower()
+         try:
+             from ap.exit_safety import (
+                 alert_exit_submission_halted,
+                 evaluate_exit_submission_safety,
+             )
++            from ap.exit_broker_truth_flat import (
++                classify_broker_truth_flat,
++                clear_flat_repair_position_memory,
++            )
++
++            _broker_truth_qty = int(getattr(pos, "quantity_remaining", 0) or 0)
++            _allow_broker_truth = str(position_id or "").startswith("broker-repair-")
++            _flat_truth = classify_broker_truth_flat(
++                position_id=str(position_id or ""),
++                broker_truth_open_qty=_broker_truth_qty,
++                allow_missing_position_with_broker_truth=_allow_broker_truth,
++            )
++            if _flat_truth.flat:
++                with self._lock:
++                    clear_flat_repair_position_memory(pos)
++                    try:
++                        self._positions_by_id.pop(str(position_id or ""), None)
++                    except Exception:
++                        pass
++                self._emit_exit_event(
++                    pos,
++                    decision="CLOSED",
++                    reason_code="BROKER_TRUTH_POSITION_FLAT",
++                    explanation="Broker-truth repair position is flat; suppressing repeated exit submit.",
++                    stage="exit_reconciliation",
++                    extra_inputs={
++                        "position_id": str(position_id or ""),
++                        "execution_mode": _exec_mode,
++                        "broker_truth_open_qty": _flat_truth.broker_truth_open_qty,
++                    },
++                )
++                log.critical(
++                    "[%s] BROKER_TRUTH_POSITION_FLAT — closing stale repair memory before exit submit | position_id=%s contract=%s",
++                    ticker,
++                    position_id or "?",
++                    option_symbol,
++                )
++                return False
+ 
+             _exit_guard = evaluate_exit_submission_safety(
+                 position_id=str(position_id or ""),
+                 client_id=str(getattr(pos, "client_id", "") or self.client_id),
+                 execution_mode=_exec_mode,
+                 contract=str(option_symbol or ""),
+-                broker_truth_open_qty=int(getattr(pos, "quantity_remaining", 0) or 0),
+-                allow_missing_position_with_broker_truth=str(position_id or "").startswith("broker-repair-"),
++                broker_truth_open_qty=_broker_truth_qty,
++                allow_missing_position_with_broker_truth=_allow_broker_truth,
+             )
+             if _exit_guard.get("blocked"):
+                 _blocked_reason = str(_exit_guard.get("reason") or "exit_submission_blocked")
++                if _blocked_reason == "broker_truth_position_flat":
++                    with self._lock:
++                        clear_flat_repair_position_memory(pos)
++                        try:
++                            self._positions_by_id.pop(str(position_id or ""), None)
++                        except Exception:
++                            pass
++                    self._emit_exit_event(
++                        pos,
++                        decision="CLOSED",
++                        reason_code="BROKER_TRUTH_POSITION_FLAT",
++                        explanation="Broker-truth repair position is flat; suppressing repeated exit submit.",
++                        stage="exit_reconciliation",
++                        extra_inputs={
++                            "position_id": str(position_id or ""),
++                            "execution_mode": _exec_mode,
++                            "blocked_reason": _blocked_reason,
++                        },
++                    )
++                    return False
+                 if _blocked_reason != "exit_circuit_breaker_tripped":
+                     with self._lock:
+                         pos.exit_in_flight = False
+                         pos.pending_exit_reason = ""
