@@ -53,13 +53,98 @@ def _mode_from(core: Any, signal: dict, plan: Any = None) -> str:
     return ""
 
 
+def _stamp_first_breach(watched: Any, *, price: float, bid: float, ask: float) -> None:
+    if getattr(watched, "trigger_crossed_at", None):
+        return
+    ts = datetime.now(timezone.utc)
+    try:
+        setattr(watched, "trigger_crossed_at", ts)
+        setattr(watched, "first_breach_price", float(price or 0))
+        setattr(watched, "first_breach_bid", float(bid or 0))
+        setattr(watched, "first_breach_ask", float(ask or 0))
+    except Exception:
+        pass
+    try:
+        sig = getattr(watched, "signal", None)
+        if isinstance(sig, dict):
+            sig["trigger_crossed_at"] = ts.isoformat()
+            sig["first_breach_price"] = float(price or 0)
+            sig["first_breach_bid"] = float(bid or 0)
+            sig["first_breach_ask"] = float(ask or 0)
+    except Exception:
+        pass
+
+
+def _terminalize_live_submit_block(core: Any, watched: Any, *, reason: str, detail: str = "") -> None:
+    signal = getattr(watched, "signal", {}) or {}
+    if not isinstance(signal, dict):
+        signal = {}
+    local_order_id = str(signal.get("local_order_id") or getattr(watched, "local_order_id", "") or "").strip()
+    if not local_order_id:
+        return
+    meta = {
+        "live_submit_safety": {
+            "ok": False,
+            "reason": reason,
+            "detail": detail,
+            "blocked_at": datetime.now(timezone.utc).isoformat(),
+            "symbol": str(getattr(watched, "ticker", "") or signal.get("symbol") or signal.get("ticker") or ""),
+            "trigger_crossed_at": str(getattr(watched, "trigger_crossed_at", "") or signal.get("trigger_crossed_at") or ""),
+            "first_breach_price": getattr(watched, "first_breach_price", signal.get("first_breach_price")),
+        }
+    }
+    osm = (
+        getattr(core, "order_state_machine", None)
+        or getattr(core, "osm", None)
+        or getattr(core, "order_state", None)
+    )
+    if osm is not None:
+        try:
+            fn = getattr(osm, "update_order_meta", None)
+            if callable(fn):
+                fn(local_order_id, meta)
+        except Exception:
+            pass
+        for method_name in ("expire_pending_entry", "cancel_pending_entry"):
+            try:
+                fn = getattr(osm, method_name, None)
+                if callable(fn) and fn(local_order_id, reason=reason):
+                    return
+            except Exception:
+                pass
+        try:
+            status_cls = getattr(sys.modules.get("ap.order_state_machine"), "OrderStatus", None)
+            error_status = getattr(status_cls, "ERROR", "ERROR")
+            transition = getattr(osm, "transition", None)
+            if callable(transition):
+                transition(local_order_id, error_status, last_error=reason)
+        except Exception:
+            pass
+
+
 def _patch_watcher(mod: Any) -> None:
     cls = getattr(mod, "APEntryWatcher", None)
+    watched_cls = getattr(mod, "WatchedSignal", None)
     if cls is None or getattr(cls, "_AP_LIVE_HARD_HOLD_GUARD", False):
         return
     original_watch = cls.watch
-    original_setattr = cls.__setattr__
-    WatchState = getattr(mod, "WatchState", None)
+
+    if watched_cls is not None and not getattr(watched_cls, "_AP_FIRST_BREACH_STAMP_GUARD", False):
+        original_check = watched_cls.check
+
+        def guarded_check(self: Any, bid: float, ask: float):
+            side = str(getattr(self, "side", "") or "").upper()
+            trigger = _float(getattr(self, "entry_trigger", 0))
+            breach_count = int(getattr(self, "breach_count", 0) or 0)
+            if trigger > 0 and breach_count == 0:
+                if side == "CALL" and _float(ask) >= trigger:
+                    _stamp_first_breach(self, price=_float(ask), bid=_float(bid), ask=_float(ask))
+                elif side == "PUT" and _float(bid) <= trigger:
+                    _stamp_first_breach(self, price=_float(bid), bid=_float(bid), ask=_float(ask))
+            return original_check(self, bid, ask)
+
+        watched_cls.check = guarded_check
+        watched_cls._AP_FIRST_BREACH_STAMP_GUARD = True
 
     def guarded_watch(self: Any, plan: Any, local_order_id: str | None = None, *args: Any, **kwargs: Any):
         signal = getattr(plan, "signal", None) or getattr(plan, "signal_dict", None) or {}
@@ -76,64 +161,34 @@ def _patch_watcher(mod: Any) -> None:
                 bid = _float(q.get("bid"))
                 ask = _float(q.get("ask"))
                 last = _float(q.get("last") or q.get("last_price"))
-                mid = (bid + ask) / 2.0 if bid > 0 and ask > 0 else max(bid, ask, last)
-                already = (side == "CALL" and mid >= trigger) or (side == "PUT" and mid <= trigger)
-                if mid <= 0 or already:
-                    reason = "arm_quote_unavailable_live_blocked" if mid <= 0 else "arm_already_through_trigger"
+                fallback = (bid + ask) / 2.0 if bid > 0 and ask > 0 else max(bid, ask, last)
+                if side == "CALL":
+                    lane_price = ask if ask > 0 else fallback
+                    quote_missing = lane_price <= 0
+                    already = lane_price >= trigger
+                else:
+                    lane_price = bid if bid > 0 else fallback
+                    quote_missing = lane_price <= 0
+                    already = lane_price <= trigger if lane_price > 0 else False
+                if quote_missing or already:
+                    reason = "arm_quote_unavailable_live_blocked" if quote_missing else "arm_already_through_trigger"
                     try:
                         cancel = getattr(getattr(self, "order_state_machine", None), "cancel_pending_entry", None)
                         if callable(cancel) and local_order_id:
                             cancel(local_order_id, reason=f"watcher_block:{reason}")
                     except Exception:
                         pass
-                    log.critical("P0_LIVE_HARD_HOLD_WATCH_ARM_BLOCK symbol=%s side=%s reason=%s", ticker, side, reason)
+                    log.critical(
+                        "P0_LIVE_HARD_HOLD_WATCH_ARM_BLOCK symbol=%s side=%s reason=%s lane_price=%.4f trigger=%.4f bid=%.4f ask=%.4f",
+                        ticker, side, reason, lane_price, trigger, bid, ask,
+                    )
                     return False
             except Exception as exc:
                 log.critical("P0_LIVE_HARD_HOLD_WATCH_ARM_BLOCK symbol=%s reason=quote_exception error=%s", ticker, exc)
                 return False
         return original_watch(self, plan, local_order_id, *args, **kwargs)
 
-    def wrap_callback(self: Any, cb: Any):
-        if not callable(cb) or getattr(cb, "_AP_LIVE_HARD_HOLD_GUARD", False):
-            return cb
-        def wrapped(watched: Any, *args: Any, **kwargs: Any):
-            if not getattr(watched, "trigger_crossed_at", None):
-                ts = datetime.now(timezone.utc)
-                setattr(watched, "trigger_crossed_at", ts)
-                try:
-                    watched.signal["trigger_crossed_at"] = ts.isoformat()
-                except Exception:
-                    pass
-            try:
-                return cb(watched, *args, **kwargs)
-            except Exception as exc:
-                attempts = int(getattr(watched, "trigger_callback_attempts", 0) or 0) + 1
-                setattr(watched, "trigger_callback_attempts", attempts)
-                max_attempts = int(os.getenv("WATCHER_TRIGGER_CALLBACK_MAX_ATTEMPTS", "3"))
-                if attempts < max_attempts:
-                    if WatchState is not None:
-                        watched.state = WatchState.PENDING
-                    with self._lock:
-                        if watched not in self._pending:
-                            self._pending.append(watched)
-                    log.error("P0_LIVE_HARD_HOLD_TRIGGER_CALLBACK_RETRY symbol=%s attempt=%d", getattr(watched, "ticker", "?"), attempts)
-                    return None
-                if WatchState is not None:
-                    watched.state = WatchState.EXPIRED
-                if hasattr(watched, "_release_dedup_key"):
-                    watched._release_dedup_key()
-                log.critical("P0_LIVE_HARD_HOLD_TRIGGER_CALLBACK_EXPIRED symbol=%s attempts=%d error=%s", getattr(watched, "ticker", "?"), attempts, exc)
-                return None
-        wrapped._AP_LIVE_HARD_HOLD_GUARD = True
-        return wrapped
-
-    def guarded_setattr(self: Any, name: str, value: Any) -> None:
-        if name == "on_trigger":
-            value = wrap_callback(self, value)
-        original_setattr(self, name, value)
-
     cls.watch = guarded_watch
-    cls.__setattr__ = guarded_setattr
     cls._AP_LIVE_HARD_HOLD_GUARD = True
     log.critical("P0_LIVE_HARD_HOLD_PATCHED target=ap_entry_watcher")
 
@@ -158,12 +213,14 @@ def _patch_core(mod: Any) -> None:
             decision = require_live_identity(client_id=client_id, execution_mode=explicit_mode)
             if not decision.ok:
                 log.critical("P0_LIVE_HARD_HOLD_SUBMIT_BLOCK symbol=%s reason=%s", getattr(watched, "ticker", "?"), decision.reason)
+                _terminalize_live_submit_block(self, watched, reason=decision.reason, detail=decision.detail)
                 return None
             max_age = float(os.getenv("ENTRY_TRIGGER_MAX_AGE_SEC", "120"))
             crossed = getattr(watched, "trigger_crossed_at", None) or signal.get("trigger_crossed_at")
             decision = require_fresh_trigger(trigger_crossed_at=crossed, max_age_seconds=max_age)
             if not decision.ok:
                 log.critical("P0_LIVE_HARD_HOLD_SUBMIT_BLOCK symbol=%s reason=%s detail=%s", getattr(watched, "ticker", "?"), decision.reason, decision.detail)
+                _terminalize_live_submit_block(self, watched, reason=decision.reason, detail=decision.detail)
                 return None
         return original(self, watched, *args, **kwargs)
 
