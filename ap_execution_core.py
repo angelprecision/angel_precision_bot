@@ -1134,6 +1134,186 @@ class APExecutionCore:
             )
             return
 
+        def _normalize_materialization_failure_reason(reason_code: str | None) -> str:
+            code = str(reason_code or "").strip().upper()
+            if code == "ZERO_UNDERLYING_UNRECOVERABLE":
+                return code
+            if code in {
+                "CHAIN_AUTH_ERROR",
+                "CHAIN_PROVIDER_ERROR",
+                "CHAIN_FETCH_FAILED",
+                "NO_CHAIN_DATA",
+                "DIRECT_QUOTE_UNAVAILABLE",
+                "AUTH_401",
+                "AUTH_403",
+            }:
+                return "SELECTOR_DATA_SOURCE_BAD"
+            if code in {
+                "CHAIN_PROVIDER_EMPTY_EXPIRATIONS",
+                "NO_EXPIRATION_IN_DTE_WINDOW",
+            }:
+                return "CHAIN_EMPTY_EXPIRATIONS"
+            if code in {
+                "CHAIN_PROVIDER_EMPTY_OPTIONS",
+                "CHAIN_PARSE_EMPTY",
+                "CHAIN_EMPTY",
+            }:
+                return "CHAIN_EMPTY_OPTIONS"
+            if code == "CHAIN_ROW_ZERO_BID_ASK":
+                return "CHAIN_ROW_ZERO_BID_ASK"
+            if code == "DIRECT_QUOTE_ZERO_BID_ASK":
+                return "DIRECT_QUOTE_ZERO_BID_ASK"
+            if code == "NO_VALID_PLAYBOOK_DTE_CONTRACT":
+                return "DTE_LADDER_EXHAUSTED"
+            if code in {"SPREAD_TOO_WIDE", "QUALITY_REJECT_SPREAD"}:
+                return "QUALITY_REJECT_SPREAD"
+            if code in {
+                "OI_TOO_LOW",
+                "VOLUME_TOO_LOW",
+                "DATA_MISSING_OI_VOLUME",
+                "VOL0_OI0",
+                "QUALITY_REJECT_OI_VOLUME",
+            }:
+                return "QUALITY_REJECT_OI_VOLUME"
+            if code in {"DELTA_OUT_OF_RANGE", "QUALITY_REJECT_DELTA"}:
+                return "QUALITY_REJECT_DELTA"
+            if code in {
+                "NO_AFFORDABLE_CONTRACT",
+                "UNTRADEABLE_FOR_ACCOUNT_SIZE",
+                "AFFORDABILITY_REJECT",
+            }:
+                return "AFFORDABILITY_REJECT"
+            if code in {
+                "COPYBACK_INTEGRITY_FAILED",
+                "DEFERRED_UNRESOLVED_AT_BREACH",
+            }:
+                return "COPYBACK_INTEGRITY_FAILED"
+            if code == "SELECTOR_EXCEPTION":
+                return "SELECTOR_EXCEPTION"
+            return "SELECTOR_DATA_SOURCE_BAD"
+
+        def _resolve_breach_underlying_price() -> float:
+            candidates = [
+                getattr(approved_plan, "underlying_price", None),
+                getattr(approved_plan, "current_underlying_price", None),
+                getattr(approved_plan, "current_price", None),
+                getattr(approved_plan, "underlying_last", None),
+            ]
+            try:
+                _w_ask = getattr(watched, "last_quote_ask", None)
+                _w_bid = getattr(watched, "last_quote_bid", None)
+                if _w_ask and _w_bid and float(_w_ask) > 0 and float(_w_bid) > 0:
+                    candidates.append((float(_w_ask) + float(_w_bid)) / 2.0)
+                else:
+                    candidates.extend([_w_ask, _w_bid])
+            except Exception:
+                pass
+            candidates.extend([
+                getattr(watched, "trigger_price", None),
+                getattr(approved_plan, "trigger_price", None),
+            ])
+            for candidate in candidates:
+                try:
+                    value = float(candidate or 0)
+                except Exception:
+                    value = 0.0
+                if value > 0:
+                    return value
+            return 0.0
+
+        _copyback_expected = {
+            "client_id": str(sig.get("client_id") or _breach_client_id or "").strip(),
+            "execution_mode": str(
+                sig.get("execution_mode")
+                or getattr(self, "mode", "")
+                or ""
+            ).strip(),
+            "local_order_id": queue_local_order_id,
+            "signal_id": signal_id,
+        }
+
+        def _assert_deferred_materialization_integrity(
+            *,
+            contract_symbol: str,
+            limit_price: float,
+            qty: int,
+            underlying_price: float,
+        ) -> str | None:
+            if not contract_symbol or contract_symbol.upper().startswith("DEFERRED:"):
+                return "COPYBACK_INTEGRITY_FAILED"
+            if limit_price <= 0 or qty <= 0 or underlying_price <= 0:
+                return "COPYBACK_INTEGRITY_FAILED"
+            current_client_id = str(sig.get("client_id") or _breach_client_id or "").strip()
+            current_execution_mode = str(
+                sig.get("execution_mode")
+                or getattr(self, "mode", "")
+                or ""
+            ).strip()
+            if (
+                _copyback_expected["client_id"]
+                and current_client_id
+                and current_client_id != _copyback_expected["client_id"]
+            ):
+                return "COPYBACK_INTEGRITY_FAILED"
+            if (
+                _copyback_expected["execution_mode"]
+                and current_execution_mode
+                and current_execution_mode != _copyback_expected["execution_mode"]
+            ):
+                return "COPYBACK_INTEGRITY_FAILED"
+            if str(sig.get("local_order_id") or "").strip() != _copyback_expected["local_order_id"]:
+                return "COPYBACK_INTEGRITY_FAILED"
+            if str(sig.get("signal_id") or "").strip() != _copyback_expected["signal_id"]:
+                return "COPYBACK_INTEGRITY_FAILED"
+            return None
+
+        def _terminalize_deferred_materialization_failure(
+            reason_code: str,
+            *,
+            legacy_reason: str = "",
+            extra_meta: dict | None = None,
+        ) -> None:
+            exact_reason = _normalize_materialization_failure_reason(reason_code)
+            last_error = f"materialization:{exact_reason}"
+            meta_patch = {
+                "materialization_outcome": "TERMINAL_NO_SUBMIT",
+                "materialization_failure_reason": exact_reason,
+                "materialization_checked_at": datetime.now(timezone.utc).isoformat(),
+                "deferred_contract_finalized": True,
+                "deferred_breach_failure": True,
+                "deferred_breach_reason": legacy_reason or last_error,
+                "last_breach_failure_reason": legacy_reason or last_error,
+                "last_breach_failure_reason_code": str(reason_code or exact_reason),
+                "local_order_id": queue_local_order_id,
+            }
+            if extra_meta:
+                meta_patch.update(extra_meta)
+            if signal_id:
+                self.store.update_signal_fields(signal_id, {
+                    "decision_status": "blocked_at_breach",
+                    "context_notes": last_error,
+                })
+            if queue_local_order_id and self.order_state_machine is not None:
+                try:
+                    update_meta = getattr(self.order_state_machine, "update_order_meta", None)
+                    if callable(update_meta):
+                        update_meta(queue_local_order_id, meta_patch)
+                except Exception as _meta_exc:
+                    log.warning("[%s] materialization meta persist failed: %s", ticker, _meta_exc)
+                try:
+                    transition = getattr(self.order_state_machine, "transition", None)
+                    if callable(transition) and transition(
+                        queue_local_order_id,
+                        "ERROR",
+                        last_error=last_error,
+                    ):
+                        funnel.inc("order_failed")
+                        return
+                except Exception as _transition_exc:
+                    log.warning("[%s] materialization transition failed: %s", ticker, _transition_exc)
+            _terminalize_deferred_breach_failure(last_error, extra_meta=meta_patch)
+            return
+
         # ── PR3 (no-silent-deferred-trigger-exits): canonical terminal outcome ──
         # Every triggered deferred row MUST leave exactly one explicit TERMINAL
         # outcome so no trigger returns silently. Observability only — it records
@@ -1299,8 +1479,9 @@ class APExecutionCore:
                     "BREACH_SELECTOR_RETURNED_NONE",
                     reason=_reason,
                 )
-                _terminalize_deferred_breach_failure(
-                    _reason,
+                _terminalize_deferred_materialization_failure(
+                    "SELECTOR_EXCEPTION",
+                    legacy_reason=_reason,
                     extra_meta={"failure_stage": "deferred_contract_selection"},
                 )
                 log.critical(
@@ -1310,6 +1491,26 @@ class APExecutionCore:
                 )
                 return
             try:
+                _underlying_price = _resolve_breach_underlying_price()
+                if _underlying_price <= 0:
+                    _terminalize_deferred_materialization_failure(
+                        "ZERO_UNDERLYING_UNRECOVERABLE",
+                        legacy_reason="materialization_underlying_missing",
+                        extra_meta={
+                            "failure_stage": "deferred_contract_selection",
+                            "underlying_price": _underlying_price,
+                        },
+                    )
+                    log.critical(
+                        "[%s] PRODUCTION_ENTRY_BLOCK — zero underlying at deferred materialization seam",
+                        ticker,
+                    )
+                    return
+                try:
+                    approved_plan.underlying_price = _underlying_price
+                    approved_plan.current_underlying_price = _underlying_price
+                except Exception:
+                    pass
                 log.info(
                     "[%s] Overnight deferred signal — selecting contract at breach "
                     "with live quotes (trigger=%.4f side=%s)",
@@ -1346,10 +1547,15 @@ class APExecutionCore:
                 _live_contract = str(getattr(approved_plan, "contract_symbol", "") or "").strip()
                 _plan_is_placeholder = (not _live_contract) or _live_contract.upper().startswith("DEFERRED:")
                 _sel_is_real = bool(_sel_contract) and not _sel_contract.upper().startswith("DEFERRED:")
+                _materialization_meta = None
 
                 if _sel_is_real and _plan_is_placeholder:
                     try:
                         approved_plan.contract_symbol = _sel_contract
+                        try:
+                            approved_plan.contract = _sel_contract
+                        except Exception:
+                            pass
                         _sel_price = (
                             getattr(_sel, "execution_price_per_share", None)
                             or getattr(_sel, "ask", None)
@@ -1360,9 +1566,54 @@ class APExecutionCore:
                         _sel_qty = int(getattr(_sel, "affordable_contracts", 0) or 0)
                         if _sel_qty > 0:
                             approved_plan.contracts = _sel_qty
+                            try:
+                                approved_plan.qty = _sel_qty
+                            except Exception:
+                                pass
                             _prem_per_contract = float(getattr(_sel, "premium_per_contract", 0) or 0)
                             if _prem_per_contract > 0:
                                 approved_plan.max_position_usd = _sel_qty * _prem_per_contract
+                        _selector_data_source = (
+                            str(getattr(_sel, "pricing_basis", "") or "").strip()
+                            or "breach_time_selector"
+                        )
+                        _dte_bucket_used = None
+                        try:
+                            if hasattr(self.contract_selector, "get_last_dte_ladder_audit"):
+                                _ladder_audit = self.contract_selector.get_last_dte_ladder_audit() or {}
+                                if isinstance(_ladder_audit, dict):
+                                    _dte_bucket_used = _ladder_audit.get("selected_bucket")
+                        except Exception:
+                            _dte_bucket_used = None
+                        _materialization_meta = {
+                            "materialization_outcome": "MATERIALIZED_FOR_SUBMIT",
+                            "materialization_checked_at": datetime.now(timezone.utc).isoformat(),
+                            "deferred_contract_finalized": True,
+                            "materialized_contract": _sel_contract,
+                            "selected_expiration": getattr(_sel, "expiration", None),
+                            "selected_strike": getattr(_sel, "strike", None),
+                            "option_bid": getattr(_sel, "bid", None),
+                            "option_ask": getattr(_sel, "ask", None),
+                            "option_mid": getattr(_sel, "mid", None),
+                            "limit_price": float(getattr(approved_plan, "limit_price", 0) or 0),
+                            "qty": int(getattr(approved_plan, "contracts", 0) or 0),
+                            "underlying_price": _underlying_price,
+                            "selector_data_source": _selector_data_source,
+                            "dte_bucket_used": _dte_bucket_used,
+                        }
+                        _plan_meta = getattr(approved_plan, "metadata", None)
+                        if isinstance(_plan_meta, dict):
+                            _plan_meta.update(_materialization_meta)
+                        try:
+                            approved_plan.selected_expiration = getattr(_sel, "expiration", None)
+                            approved_plan.selected_strike = getattr(_sel, "strike", None)
+                            approved_plan.option_bid = getattr(_sel, "bid", None)
+                            approved_plan.option_ask = getattr(_sel, "ask", None)
+                            approved_plan.option_mid = getattr(_sel, "mid", None)
+                            approved_plan.selector_data_source = _selector_data_source
+                            approved_plan.dte_bucket_used = _dte_bucket_used
+                        except Exception:
+                            pass
                         _live_contract = str(getattr(approved_plan, "contract_symbol", "") or "").strip()
                     except Exception as _copy_exc:
                         log.warning("[%s] deferred breach selected contract copy failed: %s", ticker, _copy_exc)
@@ -1796,8 +2047,9 @@ class APExecutionCore:
                     except Exception as _obs_a_exc:
                         log.debug("[%s] PR182 write-back non-critical: %s", ticker, _obs_a_exc)
                     # ── end PR #182 + P0 Path A ────────────────────────────────
-                    _terminalize_deferred_breach_failure(
-                        _reason,
+                    _terminalize_deferred_materialization_failure(
+                        _obs_rc_a,
+                        legacy_reason=_reason,
                         extra_meta={
                             "failure_stage":           "deferred_contract_selection",
                             "selected_contract":       _sel_contract or None,
@@ -1897,8 +2149,9 @@ class APExecutionCore:
                     except Exception as _obs_b_exc:
                         log.debug("[%s] PR182 write-back non-critical: %s", ticker, _obs_b_exc)
                     # ── end PR #182 Path B ─────────────────────────────────────
-                    _terminalize_deferred_breach_failure(
-                        _reason,
+                    _terminalize_deferred_materialization_failure(
+                        "COPYBACK_INTEGRITY_FAILED",
+                        legacy_reason=_reason,
                         extra_meta={
                             "failure_stage":           "deferred_contract_selection",
                             "selected_contract":       _sel_contract or None,
@@ -1917,6 +2170,40 @@ class APExecutionCore:
                         ticker, _live_contract, _reason,
                     )
                     return
+                _copyback_reason = _assert_deferred_materialization_integrity(
+                    contract_symbol=_live_contract,
+                    limit_price=float(getattr(approved_plan, "limit_price", 0) or 0),
+                    qty=int(getattr(approved_plan, "contracts", 0) or 0),
+                    underlying_price=float(getattr(approved_plan, "underlying_price", 0) or 0),
+                )
+                if _copyback_reason:
+                    _terminalize_deferred_materialization_failure(
+                        _copyback_reason,
+                        legacy_reason=f"materialization_integrity_failed:{_live_contract or 'missing_contract'}",
+                        extra_meta={
+                            "failure_stage": "deferred_copy_back",
+                            "selected_contract": _sel_contract or None,
+                            "approved_contract": _live_contract or None,
+                        },
+                    )
+                    log.critical(
+                        "[%s] PRODUCTION_ENTRY_BLOCK — deferred materialization integrity failed "
+                        "contract=%s limit=%s qty=%s underlying=%s",
+                        ticker,
+                        _live_contract,
+                        getattr(approved_plan, "limit_price", None),
+                        getattr(approved_plan, "contracts", None),
+                        getattr(approved_plan, "underlying_price", None),
+                    )
+                    return
+                if _materialization_meta and queue_local_order_id and hasattr(self.order_state_machine, "update_order_meta"):
+                    try:
+                        self.order_state_machine.update_order_meta(
+                            queue_local_order_id,
+                            _materialization_meta,
+                        )
+                    except Exception as _mat_exc:
+                        log.warning("[%s] deferred materialization success meta persist failed: %s", ticker, _mat_exc)
                 _emit_deferred_progress(
                     "BREACH_CONTRACT_SELECTED",
                     contract=_live_contract,
@@ -1969,8 +2256,9 @@ class APExecutionCore:
                     reason=_reason,
                     extra={"exception_type": type(_cs_err).__name__},
                 )
-                _terminalize_deferred_breach_failure(
-                    _reason,
+                _terminalize_deferred_materialization_failure(
+                    "SELECTOR_EXCEPTION",
+                    legacy_reason=_reason,
                     extra_meta={"failure_stage": "deferred_contract_selection"},
                 )
                 log.critical(
