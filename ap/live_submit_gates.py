@@ -164,6 +164,61 @@ def _parse_iso(dt_str: Optional[str]) -> Optional[datetime]:
         return None
 
 
+def derive_submit_execution_mode(
+    *,
+    proof_execution_mode: Optional[str] = None,
+    approved_plan_execution_mode: Optional[str] = None,
+    self_execution_mode: Optional[str] = None,
+    self_mode: Optional[str] = None,
+    self_paper: Optional[bool] = None,
+    osm_execution_mode: Optional[str] = None,
+) -> str:
+    """Resolve the mode used by the final submit gates.
+
+    Blank/unknown values intentionally resolve to an empty string so the
+    identity gate fails closed with LIVE_SUBMIT_EXECUTION_MODE_UNKNOWN.
+    """
+    for candidate in (
+        proof_execution_mode,
+        approved_plan_execution_mode,
+        self_execution_mode,
+        self_mode,
+        "live" if self_paper is False else None,
+        osm_execution_mode,
+    ):
+        c = str(candidate or "").strip().lower()
+        if c in {"live", "paper"}:
+            return c
+    return ""
+
+
+def resolve_trigger_timestamps(
+    *,
+    order_meta: Optional[dict] = None,
+    approved_plan_watched_signal=None,
+    watched_signal=None,
+) -> tuple[Optional[str], Optional[str]]:
+    """Resolve trigger timestamps with durable order meta as the source of truth."""
+    meta = order_meta if isinstance(order_meta, dict) else {}
+    crossed_at = meta.get("trigger_crossed_at")
+    confirmed_at = meta.get("trigger_confirmed_at")
+
+    if not crossed_at:
+        w = approved_plan_watched_signal or watched_signal
+        if w is not None:
+            tc = getattr(w, "trigger_crossed_at", None)
+            tf = getattr(w, "triggered_at", None)
+            if tc is not None:
+                crossed_at = tc.isoformat() if hasattr(tc, "isoformat") else str(tc)
+            if tf is not None and not confirmed_at:
+                confirmed_at = tf.isoformat() if hasattr(tf, "isoformat") else str(tf)
+
+    return (
+        str(crossed_at) if crossed_at else None,
+        str(confirmed_at) if confirmed_at else None,
+    )
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # GATE 1 — IDENTITY
 # ─────────────────────────────────────────────────────────────────────────────
@@ -323,6 +378,7 @@ def check_market_validity_gate(
     current_bid: Optional[float],
     current_ask: Optional[float],
     quote_age_ms: Optional[float] = None,
+    quote_source: Optional[str] = None,
     execution_mode: str = "live",
     max_quote_age_ms: Optional[int] = None,
     min_remaining_opportunity_pct: Optional[float] = None,
@@ -376,6 +432,7 @@ def check_market_validity_gate(
         "current_ask":                ask,
         "current_mid":                mid,
         "quote_age_ms":               _to_float(quote_age_ms),
+        "quote_source":               str(quote_source or "").strip() or None,
         "max_quote_age_ms":           int(max_age_ms),
         "min_remaining_opportunity_pct": min_rem_pct,
     }
@@ -578,6 +635,7 @@ def run_all_live_submit_gates(
     current_bid: Optional[float] = None,
     current_ask: Optional[float] = None,
     quote_age_ms: Optional[float] = None,
+    quote_source: Optional[str] = None,
     # Trigger age
     trigger_crossed_at: Optional[str] = None,
     trigger_confirmed_at: Optional[str] = None,
@@ -613,6 +671,7 @@ def run_all_live_submit_gates(
         current_bid=current_bid,
         current_ask=current_ask,
         quote_age_ms=quote_age_ms,
+        quote_source=quote_source,
         execution_mode=str(execution_mode or "").strip().lower(),
     )
     combined_audit["market_validity_gate"] = mv_res.audit

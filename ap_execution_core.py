@@ -4935,6 +4935,8 @@ class APExecutionCore:
         # so sandbox flow can be exercised.
         try:
             from ap.live_submit_gates import (
+                derive_submit_execution_mode,
+                resolve_trigger_timestamps,
                 check_identity_gate,
                 check_market_validity_gate,
                 check_trigger_age_gate,
@@ -4942,28 +4944,34 @@ class APExecutionCore:
             )
 
             _gate_client_id = str(_proof_client_id or "")
+            _final_market_validity_audit = {
+                "gate": "market_validity",
+                "checked_at": __import__("datetime").datetime.now(
+                    __import__("datetime").timezone.utc
+                ).isoformat(),
+                "not_run": True,
+                "reason": "not_reached",
+                "execution_mode": None,
+                "symbol": ticker,
+            }
 
             # ── Amendment 1: execution_mode fallback chain ──────────────────
             # _proof_execution_mode is the primary source but may be blank.
             # Derive from 5 sources in priority order so LIVE never silently
             # submits with an unknown mode.
-            def _derive_exec_mode() -> str:
-                for candidate in (
-                    _proof_execution_mode,
-                    getattr(approved_plan, "execution_mode", None),
-                    getattr(self, "execution_mode", None),
-                    getattr(self, "mode", None),
-                    "paper" if getattr(self, "paper", True) else "live",
+            _gate_exec_mode = derive_submit_execution_mode(
+                proof_execution_mode=_proof_execution_mode,
+                approved_plan_execution_mode=getattr(approved_plan, "execution_mode", None),
+                self_execution_mode=getattr(self, "execution_mode", None),
+                self_mode=getattr(self, "mode", None),
+                self_paper=getattr(self, "paper", None),
+                osm_execution_mode=(
                     getattr(self.order_state_machine, "execution_mode", None)
-                    if self.order_state_machine else None,
-                ):
-                    c = str(candidate or "").strip().lower()
-                    if c in ("live", "paper"):
-                        return c
-                return ""   # unknown — identity gate will block with LIVE_SUBMIT_EXECUTION_MODE_UNKNOWN
-
-            _gate_exec_mode = _derive_exec_mode()
+                    if self.order_state_machine else None
+                ),
+            )
             _gate_is_live   = _gate_exec_mode == "live"
+            _final_market_validity_audit["execution_mode"] = _gate_exec_mode or None
 
             # ── Amendment 5: DEFERRED contract hard-stop ────────────────────
             # A DEFERRED:* contract must never reach broker POST. If we're
@@ -4988,6 +4996,11 @@ class APExecutionCore:
                             "failed_gate": "contract_check",
                             "reason_code": _deferred_reason,
                             "contract": _gate_contract,
+                        },
+                        "final_market_validity": {
+                            **_final_market_validity_audit,
+                            "reason": _deferred_reason,
+                            "contract": _gate_contract,
                         }},
                     )
                 except Exception:
@@ -5002,8 +5015,6 @@ class APExecutionCore:
             # then fall back to in-memory watched object (if in scope), then
             # to approved_plan._watched_signal. This eliminates the fragile
             # locals().get("watched") pattern.
-            _ta_crossed_at   = None
-            _ta_confirmed_at = None
             try:
                 # Tier 1: durable orders.meta (most reliable)
                 _meta_for_ts = {}
@@ -5020,25 +5031,14 @@ class APExecutionCore:
                                 _meta_for_ts = {}
                 except Exception:
                     _meta_for_ts = {}
-                if _meta_for_ts.get("trigger_crossed_at"):
-                    _ta_crossed_at = str(_meta_for_ts["trigger_crossed_at"])
-                if _meta_for_ts.get("trigger_confirmed_at"):
-                    _ta_confirmed_at = str(_meta_for_ts["trigger_confirmed_at"])
-                # Tier 2: in-memory WatchedSignal via approved_plan or watched
-                if not _ta_crossed_at:
-                    _w = (
-                        getattr(approved_plan, "_watched_signal", None)
-                        or getattr(watched, "trigger_crossed_at", None) and watched
-                    )
-                    if _w is not None and _w is not True:
-                        _tc = getattr(_w, "trigger_crossed_at", None)
-                        _tf = getattr(_w, "triggered_at", None)
-                        if _tc is not None:
-                            _ta_crossed_at = _tc.isoformat() if hasattr(_tc, "isoformat") else str(_tc)
-                        if _tf is not None and not _ta_confirmed_at:
-                            _ta_confirmed_at = _tf.isoformat() if hasattr(_tf, "isoformat") else str(_tf)
+                _ta_crossed_at, _ta_confirmed_at = resolve_trigger_timestamps(
+                    order_meta=_meta_for_ts,
+                    approved_plan_watched_signal=getattr(approved_plan, "_watched_signal", None),
+                    watched_signal=watched,
+                )
             except Exception as _ts_exc:
                 log.debug("[%s] trigger timestamp resolution: %s", ticker, _ts_exc)
+                _ta_crossed_at, _ta_confirmed_at = None, None
 
             # ── Gate 1: identity
             _id_res = check_identity_gate(
@@ -5058,7 +5058,11 @@ class APExecutionCore:
                 try:
                     self.order_state_machine.update_order_meta(
                         str(queue_local_order_id or ""),
-                        {"live_submit_gate": {"failed_gate": "identity", **_id_res.audit}},
+                        {"live_submit_gate": {"failed_gate": "identity", **_id_res.audit},
+                         "final_market_validity": {
+                             **_final_market_validity_audit,
+                             "reason": _id_res.reason_code,
+                         }},
                     )
                 except Exception:
                     pass
@@ -5071,6 +5075,7 @@ class APExecutionCore:
             _mv_bid = None
             _mv_ask = None
             _mv_quote_age_ms = None
+            _mv_quote_source = None
             try:
                 if hasattr(self.broker, "get_quote"):
                     _mv_q = self.broker.get_quote(ticker) or {}
@@ -5078,6 +5083,11 @@ class APExecutionCore:
                         _mv_bid = _mv_q.get("bid")
                         _mv_ask = _mv_q.get("ask")
                         _mv_quote_age_ms = _mv_q.get("quote_age_ms")
+                        _mv_quote_source = (
+                            _mv_q.get("source")
+                            or _mv_q.get("quote_source")
+                            or _mv_q.get("provider")
+                        )
             except Exception as _mv_exc:
                 log.warning(
                     "[%s] LIVE_SUBMIT_GATE market quote fetch failed: %s",
@@ -5097,8 +5107,10 @@ class APExecutionCore:
                 current_bid=_mv_bid,
                 current_ask=_mv_ask,
                 quote_age_ms=_mv_quote_age_ms,
+                quote_source=_mv_quote_source,
                 execution_mode=_gate_exec_mode,
             )
+            _final_market_validity_audit = _mv_res.audit
             if not _mv_res.passed:
                 log.critical(
                     "LIVE_SUBMIT_GATE_BLOCKED gate=market_validity reason=%s detail=%s "
@@ -5142,7 +5154,8 @@ class APExecutionCore:
                 try:
                     self.order_state_machine.update_order_meta(
                         str(queue_local_order_id or ""),
-                        {"live_submit_gate": {"failed_gate": "trigger_age", **_ta_res.audit}},
+                        {"live_submit_gate": {"failed_gate": "trigger_age", **_ta_res.audit},
+                         "final_market_validity": _final_market_validity_audit},
                     )
                 except Exception:
                     pass
@@ -5180,7 +5193,22 @@ class APExecutionCore:
                 "[%s] LIVE_SUBMIT_GATE_MODULE_ERROR — %s — LIVE will block, PAPER will proceed",
                 ticker, _gate_exc, exc_info=True,
             )
-            if str(_proof_execution_mode or "").strip().lower() == "live":
+            _module_error_exec_mode = str(locals().get("_gate_exec_mode") or "").strip().lower()
+            if not _module_error_exec_mode:
+                for _mode_candidate in (
+                    _proof_execution_mode,
+                    getattr(approved_plan, "execution_mode", None),
+                    getattr(self, "execution_mode", None),
+                    getattr(self, "mode", None),
+                    "live" if getattr(self, "paper", True) is False else None,
+                    getattr(self.order_state_machine, "execution_mode", None)
+                    if self.order_state_machine else None,
+                ):
+                    _candidate = str(_mode_candidate or "").strip().lower()
+                    if _candidate in ("live", "paper"):
+                        _module_error_exec_mode = _candidate
+                        break
+            if _module_error_exec_mode == "live":
                 try:
                     self.order_state_machine.update_order_meta(
                         str(queue_local_order_id or ""),
@@ -5188,6 +5216,13 @@ class APExecutionCore:
                             "all_passed": False,
                             "failed_gate": "module_error",
                             "error": str(_gate_exc)[:200],
+                        },
+                        "final_market_validity": {
+                            **(locals().get("_final_market_validity_audit") or {}),
+                            "gate": "market_validity",
+                            "not_run": True,
+                            "reason": "MODULE_ERROR",
+                            "execution_mode": _module_error_exec_mode,
                         }},
                     )
                 except Exception:
