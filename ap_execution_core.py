@@ -4942,8 +4942,103 @@ class APExecutionCore:
             )
 
             _gate_client_id = str(_proof_client_id or "")
-            _gate_exec_mode = str(_proof_execution_mode or "").strip().lower()
+
+            # ── Amendment 1: execution_mode fallback chain ──────────────────
+            # _proof_execution_mode is the primary source but may be blank.
+            # Derive from 5 sources in priority order so LIVE never silently
+            # submits with an unknown mode.
+            def _derive_exec_mode() -> str:
+                for candidate in (
+                    _proof_execution_mode,
+                    getattr(approved_plan, "execution_mode", None),
+                    getattr(self, "execution_mode", None),
+                    getattr(self, "mode", None),
+                    "paper" if getattr(self, "paper", True) else "live",
+                    getattr(self.order_state_machine, "execution_mode", None)
+                    if self.order_state_machine else None,
+                ):
+                    c = str(candidate or "").strip().lower()
+                    if c in ("live", "paper"):
+                        return c
+                return ""   # unknown — identity gate will block with LIVE_SUBMIT_EXECUTION_MODE_UNKNOWN
+
+            _gate_exec_mode = _derive_exec_mode()
             _gate_is_live   = _gate_exec_mode == "live"
+
+            # ── Amendment 5: DEFERRED contract hard-stop ────────────────────
+            # A DEFERRED:* contract must never reach broker POST. If we're
+            # still DEFERRED at the gate, block with a specific reason code
+            # that is distinct from the materialization invariant check that
+            # fires earlier. This is a belt-and-suspenders guard.
+            _gate_contract = str(approved_contract or "").strip()
+            if _gate_contract.upper().startswith("DEFERRED:") or not _gate_contract:
+                _deferred_reason = "LIVE_SUBMIT_CONTRACT_NOT_MATERIALIZED"
+                log.critical(
+                    "LIVE_SUBMIT_GATE_BLOCKED gate=contract_check reason=%s "
+                    "order_id=%s client_id=%s execution_mode=%s symbol=%s "
+                    "contract=%r — blocking broker POST on placeholder contract",
+                    _deferred_reason,
+                    str(queue_local_order_id or ""), _gate_client_id,
+                    _gate_exec_mode, ticker, _gate_contract,
+                )
+                try:
+                    self.order_state_machine.update_order_meta(
+                        str(queue_local_order_id or ""),
+                        {"live_submit_gate": {
+                            "failed_gate": "contract_check",
+                            "reason_code": _deferred_reason,
+                            "contract": _gate_contract,
+                        }},
+                    )
+                except Exception:
+                    pass
+                _terminalize_breach_failure(f"live_submit_gate:{_deferred_reason}")
+                return
+
+            # ── Amendment 2: read trigger timestamps from durable meta ───────
+            # WatchedSignal.check() stamps trigger_crossed_at on first breach
+            # AND the watcher persists it to orders.meta on callback success
+            # (see ap_entry_watcher.py Amendment 2). Read from meta first,
+            # then fall back to in-memory watched object (if in scope), then
+            # to approved_plan._watched_signal. This eliminates the fragile
+            # locals().get("watched") pattern.
+            _ta_crossed_at   = None
+            _ta_confirmed_at = None
+            try:
+                # Tier 1: durable orders.meta (most reliable)
+                _meta_for_ts = {}
+                try:
+                    _get_order = getattr(self.order_state_machine, "get_order", None)
+                    if callable(_get_order) and queue_local_order_id:
+                        _order_row = _get_order(str(queue_local_order_id)) or {}
+                        _meta_for_ts = _order_row.get("meta") or {}
+                        if isinstance(_meta_for_ts, str):
+                            import json as _json
+                            try:
+                                _meta_for_ts = _json.loads(_meta_for_ts)
+                            except Exception:
+                                _meta_for_ts = {}
+                except Exception:
+                    _meta_for_ts = {}
+                if _meta_for_ts.get("trigger_crossed_at"):
+                    _ta_crossed_at = str(_meta_for_ts["trigger_crossed_at"])
+                if _meta_for_ts.get("trigger_confirmed_at"):
+                    _ta_confirmed_at = str(_meta_for_ts["trigger_confirmed_at"])
+                # Tier 2: in-memory WatchedSignal via approved_plan or watched
+                if not _ta_crossed_at:
+                    _w = (
+                        getattr(approved_plan, "_watched_signal", None)
+                        or getattr(watched, "trigger_crossed_at", None) and watched
+                    )
+                    if _w is not None and _w is not True:
+                        _tc = getattr(_w, "trigger_crossed_at", None)
+                        _tf = getattr(_w, "triggered_at", None)
+                        if _tc is not None:
+                            _ta_crossed_at = _tc.isoformat() if hasattr(_tc, "isoformat") else str(_tc)
+                        if _tf is not None and not _ta_confirmed_at:
+                            _ta_confirmed_at = _tf.isoformat() if hasattr(_tf, "isoformat") else str(_tf)
+            except Exception as _ts_exc:
+                log.debug("[%s] trigger timestamp resolution: %s", ticker, _ts_exc)
 
             # ── Gate 1: identity
             _id_res = check_identity_gate(
@@ -5014,7 +5109,10 @@ class APExecutionCore:
                 try:
                     self.order_state_machine.update_order_meta(
                         str(queue_local_order_id or ""),
-                        {"live_submit_gate": {"failed_gate": "market_validity", **_mv_res.audit}},
+                        {
+                            "live_submit_gate": {"failed_gate": "market_validity", **_mv_res.audit},
+                            "final_market_validity": _mv_res.audit,
+                        },
                     )
                 except Exception:
                     pass
@@ -5027,22 +5125,7 @@ class APExecutionCore:
                     ticker, _mv_res.audit.get("current_mid"),
                 )
 
-            # ── Gate 3: trigger age
-            _ta_crossed_at = None
-            _ta_confirmed_at = None
-            try:
-                # WatchedSignal stamps trigger_crossed_at on first breach
-                # (see ap_entry_watcher.WatchedSignal.check).
-                _w = getattr(approved_plan, "_watched_signal", None) or locals().get("watched")
-                if _w is not None:
-                    _tc = getattr(_w, "trigger_crossed_at", None)
-                    _tcf = getattr(_w, "triggered_at", None)
-                    if _tc is not None:
-                        _ta_crossed_at = _tc.isoformat() if hasattr(_tc, "isoformat") else str(_tc)
-                    if _tcf is not None:
-                        _ta_confirmed_at = _tcf.isoformat() if hasattr(_tcf, "isoformat") else str(_tcf)
-            except Exception:
-                pass
+            # ── Gate 3: trigger age (uses durable timestamps from Amendment 2)
             _ta_res = check_trigger_age_gate(
                 trigger_crossed_at=_ta_crossed_at,
                 trigger_confirmed_at=_ta_confirmed_at,
@@ -5084,7 +5167,9 @@ class APExecutionCore:
                         "identity_gate": _id_res.audit,
                         "market_validity_gate": _mv_res.audit,
                         "trigger_age_gate": _ta_res.audit,
-                    }},
+                    },
+                    "final_market_validity": _mv_res.audit,
+                    },
                 )
             except Exception:
                 pass

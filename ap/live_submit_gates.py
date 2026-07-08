@@ -413,43 +413,45 @@ def check_market_validity_gate(
     st = _to_float(stop_price)
 
     # Rule: direction-specific geometry
+    # Amendment 3 (PR #305): use ASK (CALL) / BID (PUT) as primary trigger-
+    # lane check — matching WatchedSignal.check breach semantics exactly.
+    # Mid is only used as fallback when bid/ask missing, and for stop/target
+    # geometry (which is symmetric on both sides).
     if _side == "CALL":
-        # Trigger still valid — current price must be at or above trigger
-        if mid < tr:
+        _trigger_check = ask if ask and ask > 0 else mid
+        if _trigger_check is not None and _trigger_check < tr:
             return _fail(
                 GateOutcome.CALL_NO_LONGER_ABOVE_TRIGGER,
-                f"mid={mid:.4f} < trigger={tr:.4f} — breach reversed",
+                f"ask={ask:.4f} mid={(mid or 0.0):.4f} < trigger={tr:.4f} — breach reversed",
             )
-        # Stop not broken
-        if st is not None and st > 0 and mid <= st:
+        if st is not None and st > 0 and mid is not None and mid <= st:
             return _fail(
                 GateOutcome.CALL_STOP_ALREADY_BROKEN,
                 f"mid={mid:.4f} <= stop={st:.4f}",
             )
-        # Target not already reached
-        if tg is not None and tg > 0 and mid >= tg:
+        if tg is not None and tg > 0 and mid is not None and mid >= tg:
             return _fail(
                 GateOutcome.TARGET_ALREADY_INVALID,
                 f"CALL mid={mid:.4f} >= target={tg:.4f} — move complete",
             )
     elif _side == "PUT":
-        if mid > tr:
+        _trigger_check = bid if bid and bid > 0 else mid
+        if _trigger_check is not None and _trigger_check > tr:
             return _fail(
                 GateOutcome.PUT_NO_LONGER_BELOW_TRIGGER,
-                f"mid={mid:.4f} > trigger={tr:.4f} — breach reversed",
+                f"bid={bid:.4f} mid={(mid or 0.0):.4f} > trigger={tr:.4f} — breach reversed",
             )
-        if st is not None and st > 0 and mid >= st:
+        if st is not None and st > 0 and mid is not None and mid >= st:
             return _fail(
                 GateOutcome.PUT_STOP_ALREADY_BROKEN,
                 f"mid={mid:.4f} >= stop={st:.4f}",
             )
-        if tg is not None and tg > 0 and mid <= tg:
+        if tg is not None and tg > 0 and mid is not None and mid <= tg:
             return _fail(
                 GateOutcome.TARGET_ALREADY_INVALID,
                 f"PUT mid={mid:.4f} <= target={tg:.4f} — move complete",
             )
-    # Unknown side: pass (identity gate would have blocked this earlier;
-    # we don't add extra assertions here to keep the gate composable)
+    # Unknown side: pass (identity gate would have blocked this earlier)
 
     # Rule: remaining opportunity
     rem_pct = _remaining_opportunity_pct(_side, mid, tr, tg)

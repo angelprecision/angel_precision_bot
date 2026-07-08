@@ -3388,6 +3388,52 @@ class APEntryWatcher:
                             "removed_from_pending=true dedup_released=true",
                             w.ticker, _sig_id or "?",
                         )
+                        # ── Amendment 2 (PR #305): persist trigger timestamps ──
+                        # stamp trigger_crossed_at, first_breach_bid/ask into
+                        # orders.meta so the LIVE submit gate can verify trigger
+                        # age from durable storage rather than relying on the
+                        # in-memory WatchedSignal object (which may not be in
+                        # scope at the submit seam).
+                        try:
+                            _sig_for_ts = getattr(w, "signal", {}) or {}
+                            _local_oid_for_ts = _sig_for_ts.get("local_order_id")
+                            _tc_at = getattr(w, "trigger_crossed_at", None)
+                            _tc_bid = float(getattr(w, "first_breach_bid", 0) or 0)
+                            _tc_ask = float(getattr(w, "first_breach_ask", 0) or 0)
+                            _ta_at  = getattr(w, "triggered_at", None)
+                            if _local_oid_for_ts and self.order_state_machine is not None:
+                                _ts_patch = {}
+                                if _tc_at is not None:
+                                    _ts_patch["trigger_crossed_at"] = (
+                                        _tc_at.isoformat() if hasattr(_tc_at, "isoformat")
+                                        else str(_tc_at)
+                                    )
+                                if _tc_bid:
+                                    _ts_patch["first_breach_bid"] = _tc_bid
+                                if _tc_ask:
+                                    _ts_patch["first_breach_ask"] = _tc_ask
+                                if _ta_at is not None:
+                                    _ts_patch["trigger_confirmed_at"] = (
+                                        _ta_at.isoformat() if hasattr(_ta_at, "isoformat")
+                                        else str(_ta_at)
+                                    )
+                                if _ts_patch:
+                                    _update_meta = getattr(
+                                        self.order_state_machine, "update_order_meta", None
+                                    )
+                                    if callable(_update_meta):
+                                        _update_meta(_local_oid_for_ts, _ts_patch)
+                                        log.debug(
+                                            "WATCHER_TRIGGER_TIMESTAMPS_PERSISTED "
+                                            "local_order_id=%s trigger_crossed_at=%s",
+                                            _local_oid_for_ts,
+                                            _ts_patch.get("trigger_crossed_at"),
+                                        )
+                        except Exception as _ts_exc:
+                            log.debug(
+                                "[%s] trigger timestamp persist (non-critical): %s",
+                                w.ticker, _ts_exc,
+                            )
                         # Diagnostic-only — proves the callback ran cleanly.
                         # Pair with BREACH_RISK_CHECK_BLOCKED / ENTRY_TRIGGER_BLOCKED_RETURN
                         # to determine whether a watcher trigger was consumed but blocked.
