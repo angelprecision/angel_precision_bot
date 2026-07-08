@@ -378,6 +378,13 @@ class WatchedSignal:
         self.state = WatchState.PENDING
         self.created_at = datetime.now(timezone.utc)
         self.triggered_at: Optional[datetime] = None
+        # PR #305: FIRST breach moment (distinct from triggered_at which is
+        # when the confirmed poll fires after MOMENTUM_POLLS_REQUIRED breaches).
+        # Used by ap.live_submit_gates.check_trigger_age_gate to enforce
+        # ENTRY_TRIGGER_MAX_AGE_SEC (default 120s).
+        self.trigger_crossed_at: Optional[datetime] = None
+        self.first_breach_bid: float = 0.0
+        self.first_breach_ask: float = 0.0
         self.trigger_price: Optional[float] = None
         self.expire_at = self.created_at + timedelta(minutes=MAX_WATCH_MINUTES)
 
@@ -499,6 +506,16 @@ class WatchedSignal:
             if ask >= self.entry_trigger:
                 if self.breach_count == 0:
                     self.breach_price = ask
+                    # ── P0 (PR #305) trigger-age gate:
+                    # Stamp the first-breach moment so the LIVE pre-submit
+                    # trigger-age gate can enforce ENTRY_TRIGGER_MAX_AGE_SEC.
+                    # This is the "trigger crossed" moment, distinct from
+                    # triggered_at (which is when the confirmed poll fires
+                    # after MOMENTUM_POLLS_REQUIRED breaches).
+                    if getattr(self, "trigger_crossed_at", None) is None:
+                        self.trigger_crossed_at = now
+                        self.first_breach_bid = bid
+                        self.first_breach_ask = ask
                     log.debug(
                         "[%s] CALL breach candidate — ask=$%.2f >= trigger=$%.2f",
                         self.ticker,
@@ -576,6 +593,11 @@ class WatchedSignal:
             if bid <= self.entry_trigger:
                 if self.breach_count == 0:
                     self.breach_price = bid
+                    # ── P0 (PR #305) trigger-age gate — see CALL branch above.
+                    if getattr(self, "trigger_crossed_at", None) is None:
+                        self.trigger_crossed_at = now
+                        self.first_breach_bid = bid
+                        self.first_breach_ask = ask
                     log.debug(
                         "[%s] PUT breach candidate — bid=$%.2f <= trigger=$%.2f",
                         self.ticker,
