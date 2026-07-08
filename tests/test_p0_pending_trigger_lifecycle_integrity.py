@@ -433,6 +433,124 @@ class TestBugE_PendingTriggerClassifier:
         )
 
 
+class TestBugE_RecoveryRearmWiring:
+    """Behavioral proof that the shared classifier gates the actual
+    entry_watcher.watch(... recovery_rearm=True) path."""
+
+    def _plan(self):
+        return types.SimpleNamespace(
+            signal_id="sig-recovery",
+            ticker="SPY",
+            side="CALL",
+            score=80,
+            tier="A",
+            trigger_price=500.00,
+            stop_underlying=498.00,
+            target_underlying=505.00,
+            entry_option_price=0,
+            contract_symbol="DEFERRED:SPY",
+            plan_id="plan-recovery",
+            pattern="test",
+            prior_day_high=None,
+            prior_day_low=None,
+            timeframe="5m",
+            strategy_type="",
+            metadata={},
+        )
+
+    def _row(self, meta=None, status="PENDING_TRIGGER"):
+        return {
+            "status": status,
+            "broker_order_id": None,
+            "submitted_ts": None,
+            "meta": meta or {},
+        }
+
+    def _watcher(self, row):
+        import ap_entry_watcher as ew
+        osm = MagicMock()
+        osm.get_order.return_value = row
+        osm.cancel_pending_entry.return_value = True
+        osm.submit_existing_entry = MagicMock()
+        osm.record_deferred_hydration_result = MagicMock()
+        w = ew.APEntryWatcher(MagicMock(), order_state_machine=osm, mode="LIVE")
+        return ew, w, osm
+
+    def _patch_safe_context(self, w):
+        return patch.multiple(
+            w,
+            _is_regular_session_now=MagicMock(return_value=False),
+            _is_past_entry_cutoff_now=MagicMock(return_value=False),
+        )
+
+    def test_14_waiting_valid_orphan_rearmed_no_submit(self):
+        ew, w, osm = self._watcher(self._row())
+        with self._patch_safe_context(w), patch.object(w, "add_signal", return_value=True) as add_signal:
+            assert w.watch(self._plan(), "lo-valid", recovery_rearm=True) is True
+        add_signal.assert_called_once()
+        osm.cancel_pending_entry.assert_not_called()
+        osm.submit_existing_entry.assert_not_called()
+        osm.record_deferred_hydration_result.assert_not_called()
+
+    def test_15_waiting_retryable_rearmed_no_submit(self):
+        row = self._row({"materialization_status": "RETRY_PENDING"})
+        ew, w, osm = self._watcher(row)
+        with self._patch_safe_context(w), patch.object(w, "add_signal", return_value=True) as add_signal:
+            assert w.watch(self._plan(), "lo-retry", recovery_rearm=True) is True
+        add_signal.assert_called_once()
+        osm.cancel_pending_entry.assert_not_called()
+        osm.submit_existing_entry.assert_not_called()
+        osm.record_deferred_hydration_result.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "meta, expected",
+        [
+            ({"watcher_audit": {"reason_code": "trigger_ready"}}, "STUCK_TRIGGER_READY"),
+            ({"watcher_audit": {"reason_code": "stop_bid_below_call_stop"}}, "STUCK_INVALIDATED"),
+            ({"materialization_outcome": "TERMINAL_NO_TRADEABLE_CONTRACT"}, "STUCK_TERMINAL_MATERIALIZATION"),
+        ],
+    )
+    def test_16_stuck_classifications_terminalized(self, meta, expected):
+        ew, w, osm = self._watcher(self._row(meta))
+        with self._patch_safe_context(w), patch.object(w, "add_signal", return_value=True) as add_signal:
+            assert w.watch(self._plan(), f"lo-{expected}", recovery_rearm=True) is False
+        add_signal.assert_not_called()
+        osm.cancel_pending_entry.assert_called_once()
+        assert expected in str(osm.cancel_pending_entry.call_args)
+        osm.submit_existing_entry.assert_not_called()
+        osm.record_deferred_hydration_result.assert_not_called()
+
+    def test_17_unsafe_already_through_trigger_terminalized(self):
+        ew, w, osm = self._watcher(self._row())
+        with patch.object(w, "_is_regular_session_now", return_value=True), \
+             patch.object(w, "_is_past_entry_cutoff_now", return_value=False), \
+             patch.object(w, "_get_quote", return_value={"bid": 499.90, "ask": 500.01}), \
+             patch.object(w, "add_signal", return_value=True) as add_signal:
+            assert w.watch(self._plan(), "lo-through", recovery_rearm=True) is False
+        add_signal.assert_not_called()
+        osm.cancel_pending_entry.assert_called_once()
+        assert "UNSAFE_ALREADY_THROUGH_TRIGGER" in str(osm.cancel_pending_entry.call_args)
+        osm.submit_existing_entry.assert_not_called()
+        osm.record_deferred_hydration_result.assert_not_called()
+
+    def test_18_already_watcher_owned_waiting_valid_left_alone(self):
+        ew, w, osm = self._watcher(self._row())
+        sig = {
+            "signal_id": "sig-owned",
+            "ticker": "SPY",
+            "side": "CALL",
+            "entry_price": 500.00,
+            "local_order_id": "lo-owned",
+        }
+        w._pending.append(ew.WatchedSignal(sig, overnight=False))
+        with self._patch_safe_context(w), patch.object(w, "add_signal", return_value=True) as add_signal:
+            assert w.watch(self._plan(), "lo-owned", recovery_rearm=True) is True
+        add_signal.assert_not_called()
+        osm.cancel_pending_entry.assert_not_called()
+        osm.submit_existing_entry.assert_not_called()
+        osm.record_deferred_hydration_result.assert_not_called()
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Bug A LIVE fail-closed test
 # ─────────────────────────────────────────────────────────────────────────────
@@ -466,3 +584,35 @@ class TestBugA_LiveFailsClosed:
         assert "return  # do NOT return" not in real_branch, (
             "Bug A: real invalidation path must fall through to terminalization"
         )
+
+    def test_12b_live_detection_uses_paper_false_fallback(self):
+        import ap_execution_core as ec
+        import ap_entry_watcher as ew
+
+        core = ec.APExecutionCore.__new__(ec.APExecutionCore)
+        core.execution_mode = ""
+        core.mode = ""
+        core.paper = False
+        core.store = MagicMock()
+        core.broker = MagicMock()
+        core.client_id = "client@example.com"
+        core._cleanup_pending_entry_order = MagicMock()
+
+        watched = ew.WatchedSignal(
+            {
+                "signal_id": "sig-live-fallback",
+                "ticker": "SPY",
+                "side": "CALL",
+                "entry_price": 500.0,
+                "local_order_id": "lo-live-fallback",
+                "contract_symbol": "DEFERRED:SPY",
+            },
+            overnight=False,
+        )
+        watched.state = ew.WatchState.INVALIDATED
+        watched._pending_audit = {"reason_code": ""}
+
+        core._on_signal_invalidate(watched)
+
+        core._cleanup_pending_entry_order.assert_called_once()
+        assert watched.state != ew.WatchState.PENDING

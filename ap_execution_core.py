@@ -5655,7 +5655,14 @@ class APExecutionCore:
                 _inv_reason_code = ""
 
             _is_real_underlying_invalidation = self._is_real_underlying_invalidation(_inv_reason_code)
-            _watcher_is_live = str(getattr(self, "execution_mode", "") or "").strip().lower() == "live"
+            _watcher_mode = str(
+                getattr(self, "execution_mode", "")
+                or getattr(self, "mode", "")
+                or ""
+            ).strip().lower()
+            _watcher_is_live = _watcher_mode == "live" or (
+                not _watcher_mode and getattr(self, "paper", None) is False
+            )
             # LIVE fails closed: an unclassified reason on a LIVE deferred watcher
             # is treated as a real invalidation (terminalize) rather than kept alive.
             _unclassified_live = _watcher_is_live and not _inv_reason_code

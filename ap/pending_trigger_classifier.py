@@ -185,6 +185,9 @@ def classify_pending_trigger_row(
             return PendingTriggerClassification.STUCK_TRIGGER_READY
 
         # ── Priority 2: real invalidation reason ──
+        if watcher_reason == "orphan_no_watcher":
+            return PendingTriggerClassification.ORPHAN_NO_WATCHER
+
         if _reason_is_invalidation(watcher_reason):
             return PendingTriggerClassification.STUCK_INVALIDATED
 

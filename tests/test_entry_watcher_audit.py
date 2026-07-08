@@ -288,8 +288,8 @@ class TestBugEw4OsmCleanup:
             timeframe="5m",
             strategy_type="",
         )
-        # patch out the underlying-staleness check via outside-session detection
-        with patch.object(w, "_get_quote", return_value={"bid": 500.00, "ask": 500.02, "last": 500.01}):
+        # quote remains below trigger so the already-through-trigger guard does not fire
+        with patch.object(w, "_get_quote", return_value={"bid": 499.90, "ask": 499.98, "last": 499.94}):
             ok = w.watch(plan, local_order_id="lo-ok")
 
         assert ok is True

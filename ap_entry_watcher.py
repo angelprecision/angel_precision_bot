@@ -751,6 +751,95 @@ class APEntryWatcher:
         )
         return True
 
+    def _load_order_row_for_recovery_rearm(self, local_order_id: Optional[str]) -> dict:
+        """Best-effort OSM row load for recovery rearm classification."""
+        oid = str(local_order_id or "").strip()
+        if not oid:
+            return {}
+        osm = getattr(self, "order_state_machine", None)
+        if osm is None:
+            return {}
+        for name in ("get_order", "get", "get_order_by_local_id"):
+            fn = getattr(osm, name, None)
+            if not callable(fn):
+                continue
+            try:
+                row = fn(oid)
+                return row if isinstance(row, dict) else {}
+            except TypeError:
+                continue
+            except Exception as exc:
+                log.warning("[%s] recovery rearm order-row load failed via %s: %s", oid, name, exc)
+                return {}
+        for attr in ("orders", "_orders", "pending_orders", "_pending_orders", "local_orders", "_local_orders"):
+            obj = getattr(osm, attr, None)
+            try:
+                if isinstance(obj, dict):
+                    row = obj.get(oid) or {}
+                    return row if isinstance(row, dict) else {}
+            except Exception:
+                continue
+        return {}
+
+    def _is_past_entry_cutoff_now(self) -> bool:
+        try:
+            now_et = datetime.now(ET)
+            return (
+                now_et.hour > EOD_CUTOFF_HOUR
+                or (now_et.hour == EOD_CUTOFF_HOUR and now_et.minute >= EOD_CUTOFF_MIN)
+            )
+        except Exception:
+            return False
+
+    def _is_regular_session_now(self) -> bool:
+        try:
+            now_et = datetime.now(ET)
+            if now_et.hour < 9 or (now_et.hour == 9 and now_et.minute < 30):
+                return False
+            if (
+                now_et.hour > OVERNIGHT_THRESHOLD_HOUR
+                or (now_et.hour == OVERNIGHT_THRESHOLD_HOUR and now_et.minute >= OVERNIGHT_THRESHOLD_MIN)
+            ):
+                return False
+            return True
+        except Exception:
+            return False
+
+    def _terminalize_recovery_rearm_candidate(
+        self,
+        local_order_id: Optional[str],
+        *,
+        ticker: str,
+        classification: str,
+        watcher_owned: bool,
+        already_through: Optional[bool],
+    ) -> None:
+        """Durably block unsafe recovery candidates without broker submit."""
+        oid = str(local_order_id or "").strip()
+        audit = {
+            "reason_code": "recovery_rearm_blocked",
+            "classification": str(classification or ""),
+            "watcher_owned": bool(watcher_owned),
+            "live_quote_already_through_trigger": already_through,
+            "trigger_type": "recovery_rearm_classifier",
+        }
+        try:
+            self._persist_watcher_audit(oid, audit)
+        except Exception:
+            pass
+        osm = getattr(self, "order_state_machine", None)
+        cancel_fn = getattr(osm, "cancel_pending_entry", None) if osm is not None else None
+        if callable(cancel_fn) and oid:
+            try:
+                cancel_fn(oid, reason=f"pending_trigger_classifier:{classification}")
+                log.warning(
+                    "[%s] RECOVERY_REARM_BLOCKED classification=%s local_order_id=%s "
+                    "watcher_owned=%s already_through=%s terminalized=true",
+                    ticker, classification, oid, watcher_owned, already_through,
+                )
+            except Exception as exc:
+                log.error("[%s] recovery rearm terminalize failed for %s: %s", ticker, oid, exc)
+
     # ── Watcher Audit Helpers ────────────────────────────────────────────────
     # _build_watcher_audit_payload: pure dict construction — safe to call inside
     #   any lock or poll tick. No I/O.
@@ -2134,6 +2223,85 @@ class APEntryWatcher:
         # Stamp the recovery flag so add_signal() suppresses cancel_pending_entry.
         if _recovery_rearm:
             signal_dict["__recovery_rearm"] = True
+
+        if _recovery_rearm:
+            try:
+                from ap.pending_trigger_classifier import (
+                    PendingTriggerClassification,
+                    classify_pending_trigger_row,
+                    is_safe_to_recovery_rearm,
+                )
+                _recovery_row = self._load_order_row_for_recovery_rearm(local_order_id)
+                _watcher_owned = self.has_order(local_order_id)
+                _past_entry_cutoff = self._is_past_entry_cutoff_now()
+                _already_through = None
+                if self._is_regular_session_now() and trigger and float(trigger or 0) > 0:
+                    try:
+                        _recovery_quote = self._get_quote(ticker) or {}
+                    except Exception:
+                        _recovery_quote = {}
+                    _recovery_bid = float((_recovery_quote or {}).get("bid") or 0)
+                    _recovery_ask = float((_recovery_quote or {}).get("ask") or 0)
+                    if _recovery_bid > 0 or _recovery_ask > 0:
+                        _already_through = self._is_already_through_trigger(
+                            side, float(trigger), _recovery_bid, _recovery_ask,
+                        )
+
+                # Restart recovery needs to re-own clean rows whose watcher died
+                # with the process. Explicit ORPHAN_NO_WATCHER evidence in meta
+                # is still classified unsafe by the shared classifier.
+                _recovery_classification = classify_pending_trigger_row(
+                    _recovery_row,
+                    watcher_owned=True,
+                    is_past_eod=_past_entry_cutoff,
+                    live_quote_already_through_trigger=_already_through,
+                )
+                try:
+                    self._persist_watcher_audit(local_order_id, {
+                        "reason_code": "recovery_rearm_classified",
+                        "classification": _recovery_classification,
+                        "watcher_owned": _watcher_owned,
+                        "is_past_eod": _past_entry_cutoff,
+                        "live_quote_already_through_trigger": _already_through,
+                        "trigger_type": "recovery_rearm_classifier",
+                    })
+                except Exception:
+                    pass
+
+                if _watcher_owned and _recovery_classification in (
+                    PendingTriggerClassification.WAITING_VALID,
+                    PendingTriggerClassification.WAITING_RETRYABLE,
+                ):
+                    log.info(
+                        "[%s] RECOVERY_REARM_LEFT_ALONE classification=%s "
+                        "local_order_id=%s watcher_owned=true",
+                        ticker, _recovery_classification, local_order_id,
+                    )
+                    return True
+
+                if not is_safe_to_recovery_rearm(_recovery_classification):
+                    self._terminalize_recovery_rearm_candidate(
+                        local_order_id,
+                        ticker=ticker,
+                        classification=_recovery_classification,
+                        watcher_owned=_watcher_owned,
+                        already_through=_already_through,
+                    )
+                    return False
+            except Exception as _recovery_cls_exc:
+                log.error(
+                    "[%s] RECOVERY_REARM_CLASSIFIER_ERROR local_order_id=%s error=%s",
+                    ticker, local_order_id, _recovery_cls_exc,
+                    exc_info=True,
+                )
+                self._terminalize_recovery_rearm_candidate(
+                    local_order_id,
+                    ticker=ticker,
+                    classification="RECOVERY_REARM_CLASSIFIER_ERROR",
+                    watcher_owned=False,
+                    already_through=None,
+                )
+                return False
 
         # Queue-time staleness check is skipped for outside-session setups.
         # Those are revalidated at the regular-session open instead.
