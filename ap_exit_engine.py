@@ -5043,14 +5043,52 @@ class APExitEngine:
             from ap.exit_safety import (
                 alert_exit_submission_halted,
                 evaluate_exit_submission_safety,
+                resolve_exit_broker_truth,
             )
+            _broker_truth = resolve_exit_broker_truth(
+                broker=getattr(self, "broker", None),
+                client_id=str(getattr(pos, "client_id", "") or self.client_id),
+                contract=str(option_symbol or ""),
+            )
+            _broker_truth_qty = _broker_truth.get("broker_truth_open_qty")
+            _broker_truth_audit = dict((_broker_truth.get("audit") or {}))
+            _broker_truth_audit["requested_qty"] = int(decision.quantity or 0)
+            if (
+                _broker_truth.get("is_fresh_exact")
+                and _broker_truth_qty is not None
+                and int(_broker_truth_qty) > 0
+                and int(decision.quantity or 0) > int(_broker_truth_qty)
+            ):
+                with self._lock:
+                    pos.exit_in_flight = False
+                    pos.pending_exit_reason = ""
+                self._emit_exit_event(
+                    pos,
+                    decision="REJECT",
+                    reason_code="EXIT_BLOCKED_BROKER_QTY_INSUFFICIENT",
+                    explanation=(
+                        f"Blocked exit submit because requested_qty={int(decision.quantity or 0)} "
+                        f"exceeds exact broker long qty={int(_broker_truth_qty)}"
+                    ),
+                    stage="exit_submission",
+                    extra_inputs={"broker_truth": _broker_truth_audit},
+                )
+                log.warning(
+                    "[%s] EXIT_BLOCKED_BROKER_QTY_INSUFFICIENT | position_id=%s contract=%s requested_qty=%s broker_truth_open_qty=%s",
+                    ticker,
+                    position_id or "?",
+                    option_symbol,
+                    int(decision.quantity or 0),
+                    int(_broker_truth_qty),
+                )
+                return False
 
             _exit_guard = evaluate_exit_submission_safety(
                 position_id=str(position_id or ""),
                 client_id=str(getattr(pos, "client_id", "") or self.client_id),
                 execution_mode=_exec_mode,
                 contract=str(option_symbol or ""),
-                broker_truth_open_qty=int(getattr(pos, "quantity_remaining", 0) or 0),
+                broker_truth_open_qty=_broker_truth_qty,
                 allow_missing_position_with_broker_truth=str(position_id or "").startswith("broker-repair-"),
             )
             if _exit_guard.get("blocked"):

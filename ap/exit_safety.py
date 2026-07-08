@@ -58,6 +58,170 @@ def _safe_int(value: Any) -> Optional[int]:
         return None
 
 
+def _normalize_contract(value: Any) -> str:
+    return str(value or "").strip().upper().replace(" ", "")
+
+
+def _extract_broker_account_id(broker: Any) -> str:
+    return _normalize_text(
+        getattr(broker, "account_id", None)
+        or getattr(getattr(broker, "cfg", None), "account_id", None)
+        or getattr(broker, "_account_id", None)
+        or ""
+    )
+
+
+def _extract_position_account_id(raw: dict[str, Any]) -> str:
+    nested = raw.get("raw") if isinstance(raw.get("raw"), dict) else {}
+    for key in ("account_id", "account", "account_number"):
+        value = raw.get(key)
+        if value not in (None, ""):
+            return _normalize_text(value)
+        value = nested.get(key)
+        if value not in (None, ""):
+            return _normalize_text(value)
+    return ""
+
+
+def _extract_position_contract(raw: dict[str, Any]) -> str:
+    nested = raw.get("raw") if isinstance(raw.get("raw"), dict) else {}
+    for key in ("contract", "option_symbol", "symbol", "instrument"):
+        value = raw.get(key)
+        if value not in (None, ""):
+            return _normalize_contract(value)
+        value = nested.get(key)
+        if value not in (None, ""):
+            return _normalize_contract(value)
+    return ""
+
+
+def _extract_long_position_qty(raw: dict[str, Any]) -> int:
+    nested = raw.get("raw") if isinstance(raw.get("raw"), dict) else {}
+    qty = None
+    for key in ("quantity", "qty", "quantity_remaining", "remaining_quantity"):
+        qty = _safe_int(raw.get(key))
+        if qty is None:
+            qty = _safe_int(nested.get(key))
+        if qty is not None:
+            break
+    side_text = " ".join(
+        str(v or "")
+        for v in (
+            raw.get("side"),
+            raw.get("position_type"),
+            raw.get("direction"),
+            nested.get("side"),
+            nested.get("position_type"),
+            nested.get("direction"),
+        )
+    ).strip().lower()
+    if qty is None:
+        return 0
+    if qty < 0:
+        return 0
+    if "short" in side_text:
+        return 0
+    return int(qty)
+
+
+def resolve_exit_broker_truth(
+    *,
+    broker: Any,
+    client_id: str,
+    contract: str,
+) -> dict[str, Any]:
+    checked_at = now_utc_iso()
+    normalized_contract = _normalize_contract(contract)
+    account_id = _extract_broker_account_id(broker)
+    audit = {
+        "source": "broker.list_positions",
+        "checked_at": checked_at,
+        "client_id": str(client_id or "").strip().lower(),
+        "account": account_id,
+        "contract": str(contract or ""),
+        "normalized_contract": normalized_contract,
+        "exact_contract_match": False,
+    }
+
+    list_positions = getattr(broker, "list_positions", None)
+    if not callable(list_positions):
+        audit["snapshot_status"] = "broker_positions_unavailable"
+        audit["error"] = "broker_list_positions_missing"
+        return {
+            "broker_truth_open_qty": None,
+            "is_fresh_exact": False,
+            "audit": audit,
+        }
+
+    try:
+        rows = list_positions()
+    except Exception as exc:
+        audit["snapshot_status"] = "broker_positions_error"
+        audit["error"] = str(exc)
+        return {
+            "broker_truth_open_qty": None,
+            "is_fresh_exact": False,
+            "audit": audit,
+        }
+
+    if rows is None:
+        rows = []
+    if isinstance(rows, dict):
+        rows = [rows]
+    if not isinstance(rows, list):
+        audit["snapshot_status"] = "broker_positions_malformed"
+        audit["error"] = f"unexpected_payload:{type(rows).__name__}"
+        return {
+            "broker_truth_open_qty": None,
+            "is_fresh_exact": False,
+            "audit": audit,
+        }
+
+    matched_rows: list[dict[str, Any]] = []
+    broker_truth_open_qty = 0
+    for raw in rows:
+        if not isinstance(raw, dict):
+            continue
+        row_contract = _extract_position_contract(raw)
+        if not row_contract or row_contract != normalized_contract:
+            continue
+        row_account = _extract_position_account_id(raw)
+        if row_account and account_id and row_account != account_id:
+            continue
+        long_qty = _extract_long_position_qty(raw)
+        broker_truth_open_qty += max(int(long_qty), 0)
+        matched_rows.append(
+            {
+                "contract": row_contract,
+                "account": row_account or account_id,
+                "long_qty": int(long_qty),
+            }
+        )
+
+    if not matched_rows:
+        audit["snapshot_status"] = "contract_not_matched"
+        return {
+            "broker_truth_open_qty": None,
+            "is_fresh_exact": False,
+            "audit": audit,
+        }
+
+    audit.update(
+        {
+            "snapshot_status": "exact_match",
+            "exact_contract_match": True,
+            "matched_row_count": len(matched_rows),
+            "matched_rows": matched_rows,
+            "broker_truth_open_qty": broker_truth_open_qty,
+        }
+    )
+    return {
+        "broker_truth_open_qty": int(broker_truth_open_qty),
+        "is_fresh_exact": True,
+        "audit": audit,
+    }
+
+
 def _table_columns(table_name: str) -> set[str]:
     with _SCHEMA_CACHE_LOCK:
         cached = _SCHEMA_CACHE.get(table_name)
