@@ -5561,6 +5561,54 @@ class APExecutionCore:
         funnel.inc("watcher_expired")
         log.info(f"[{watched.ticker}] Signal expired -- no breach")
 
+    # ── P0 (PR #304): Real underlying invalidation classifier ────────────────
+    # Reason codes that mean "the underlying thesis is broken" and must NOT be
+    # ignored just because the option contract is still DEFERRED:*. Sourced
+    # directly from ap_entry_watcher.py invalidation sites (grep for
+    # reason_code= assignments in check() and _revalidate_overnight_at_open).
+    #
+    # If a reason code is not in this set AND we can positively classify it as
+    # benign, keep the DEFERRED watcher alive for breach-time selection. LIVE
+    # fails closed on unclassified reasons (see _on_signal_invalidate).
+    _REAL_UNDERLYING_INVALIDATION_REASONS: frozenset[str] = frozenset({
+        # Watcher intraday stop-touch (WatchedSignal.check)
+        "stop_bid_below_call_stop",
+        "stop_ask_above_put_stop",
+        # Watcher overnight structural / drift / breach
+        "overnight_daily_invalidated",
+        "overnight_premarket_breached",
+        "overnight_too_far_from_trigger",
+        "overnight_open_recheck_data_timeout",
+        "overnight_daily_validator_error",
+        "overnight_live_quote_unavailable",
+        "overnight_daily_already_through_trigger",   # PR #304 Bug D
+        # Arm-time invalidation (add_signal / _try_rearm)
+        "arm_drift",
+        "arm_below_stop",
+        "arm_already_through_trigger",                # PR #304 Bug C
+        # Catch-all watcher decision
+        "watcher_invalidated",
+        "on_trigger_exhausted_3_attempts",            # PR #304 Bug B exhaustion
+    })
+
+    def _is_real_underlying_invalidation(self, reason_code: str) -> bool:
+        """
+        True when the watcher's invalidation reason indicates a genuine
+        underlying/structure/arm-time break of the setup thesis.
+
+        Called from _on_signal_invalidate to decide whether a DEFERRED:*
+        contract may keep the watcher alive (benign reason) or must be
+        terminalized (real invalidation). Any prefix like 'stop_' is
+        treated as real underlying — future stop reason codes automatically
+        classify correctly.
+        """
+        rc = str(reason_code or "").strip().lower()
+        if not rc:
+            return False
+        if rc.startswith("stop_"):
+            return True
+        return rc in self._REAL_UNDERLYING_INVALIDATION_REASONS
+
     def _on_signal_invalidate(self, watched: WatchedSignal):
         signal_id = str(watched.signal.get("signal_id", ""))
         plan = watched.signal.get("plan") or {}
@@ -5571,45 +5619,91 @@ class APExecutionCore:
             or ""
         )
 
-        # ── P1 FIX (2026-05-21): DEFERRED contract guard ───────────────────
-        # If the contract starts with 'DEFERRED:', the contract was not yet
-        # selected at watcher-arm time. Watcher invalidation on a DEFERRED
-        # contract is NOT a true thesis invalidation — it means contract
-        # selection at breach time hasn't been attempted yet. Keep the
-        # watcher in PENDING_TRIGGER and let breach-time contract selection
-        # do its job. Only log the event; do NOT permanently cancel.
+        # ── P0 (PR #304): DEFERRED contract guard — REAL invalidation must win ──
+        # A 'DEFERRED:<SYMBOL>' contract means the OCC contract was not yet
+        # selected at watcher-arm time; selection is deferred to breach time.
+        # That defers *contract selection* only — it does NOT defer *thesis
+        # validity*. A genuine underlying invalidation (stop touched, overnight
+        # structural break, arm-time drift/through-trigger) invalidates the
+        # SETUP regardless of whether the option contract has been picked yet.
         #
-        # SAFETY (post-review): by the time _on_signal_invalidate is called,
-        # the watcher has ALREADY set self.state = WatchState.INVALIDATED.
-        # Returning early without restoring the state would zombie the
-        # watcher in INVALIDATED — it would never check() the price again
-        # and breach-time contract selection would never run. Restore the
-        # state to PENDING explicitly so the next poll re-enters check().
+        # THE BUG THIS FIXES (Bug A): the prior guard unconditionally restored
+        # state to PENDING and returned for ANY invalidation on a DEFERRED
+        # contract — including real stop breaks. That resurrected setups whose
+        # underlying thesis was already dead, keeping them in PENDING_TRIGGER
+        # until they eventually fired a live entry into a broken setup.
+        #
+        # CORRECT BEHAVIOR:
+        #   • Real underlying invalidation (stop_*, overnight_*, arm_*,
+        #     watcher_invalidated, through-trigger) → terminalize the setup
+        #     even when DEFERRED. The contract being unpicked is irrelevant;
+        #     the trade is off.
+        #   • Benign / non-underlying invalidation with NO recognized reason
+        #     code → keep the DEFERRED watcher alive in PENDING so breach-time
+        #     selection can still run (the original intent of this guard).
+        #   • LIVE + unclassified reason → FAIL CLOSED (terminalize). We never
+        #     keep a LIVE deferred watcher alive on an invalidation we cannot
+        #     positively classify as benign.
         is_deferred_contract = isinstance(contract, str) and contract.startswith("DEFERRED:")
         if is_deferred_contract:
+            _inv_reason_code = ""
             try:
-                from ap_entry_watcher import WatchState
-                _prior_state = getattr(watched, "state", None)
-                watched.state = WatchState.PENDING
-                # Reset breach counter so a stop touch doesn't immediately
-                # re-invalidate on the very next poll.
-                if hasattr(watched, "breach_count"):
-                    watched.breach_count = 0
-                log.info(
-                    "[%s] DEFERRED_CONTRACT_INVALIDATED ignored | signal_id=%s contract=%s "
-                    "— state restored %s -> PENDING; awaiting breach-time contract selection",
-                    watched.ticker, signal_id or "?", contract, _prior_state,
+                _pending_audit = getattr(watched, "_pending_audit", None)
+                if isinstance(_pending_audit, dict):
+                    _inv_reason_code = str(_pending_audit.get("reason_code") or "").strip()
+            except Exception:
+                _inv_reason_code = ""
+
+            _is_real_underlying_invalidation = self._is_real_underlying_invalidation(_inv_reason_code)
+            _watcher_mode = str(
+                getattr(self, "execution_mode", "")
+                or getattr(self, "mode", "")
+                or ""
+            ).strip().lower()
+            _watcher_is_live = _watcher_mode == "live" or (
+                not _watcher_mode and getattr(self, "paper", None) is False
+            )
+            # LIVE fails closed: an unclassified reason on a LIVE deferred watcher
+            # is treated as a real invalidation (terminalize) rather than kept alive.
+            _unclassified_live = _watcher_is_live and not _inv_reason_code
+
+            if _is_real_underlying_invalidation or _unclassified_live:
+                # Terminalize — the underlying thesis is invalid; deferral of
+                # contract selection does not save it. Fall through to the full
+                # forensic invalidation path below (do NOT return early).
+                log.warning(
+                    "[%s] DEFERRED_CONTRACT_REAL_INVALIDATION — signal_id=%s contract=%s "
+                    "reason_code=%s live=%s unclassified_live=%s — terminalizing setup; "
+                    "deferred contract selection does NOT override underlying invalidation",
+                    watched.ticker, signal_id or "?", contract,
+                    _inv_reason_code or "(none)", _watcher_is_live, _unclassified_live,
                 )
-            except Exception as _e:
-                # If we can't restore state, the safest thing is to still NOT cancel
-                # the order — log the failure so it can be investigated.
-                log.error(
-                    "[%s] DEFERRED_CONTRACT_INVALIDATED state-restore failed: %s — "
-                    "order NOT canceled, but watcher may be stuck in INVALIDATED",
-                    watched.ticker, _e,
-                )
-            funnel.inc("deferred_contract_invalidated")
-            return  # Do NOT cancel the order or write 'invalidated' to signal store.
+                funnel.inc("deferred_contract_real_invalidation_terminalized")
+                # do NOT return — continue to the full invalidation/cancel path
+            else:
+                # Benign, non-underlying invalidation on a (paper or reason-known-benign)
+                # deferred watcher: keep it alive so breach-time selection can run.
+                try:
+                    from ap_entry_watcher import WatchState
+                    _prior_state = getattr(watched, "state", None)
+                    watched.state = WatchState.PENDING
+                    if hasattr(watched, "breach_count"):
+                        watched.breach_count = 0
+                    log.info(
+                        "[%s] DEFERRED_CONTRACT_INVALIDATED ignored (benign) | signal_id=%s "
+                        "contract=%s reason_code=%s — state restored %s -> PENDING; "
+                        "awaiting breach-time contract selection",
+                        watched.ticker, signal_id or "?", contract,
+                        _inv_reason_code or "(none)", _prior_state,
+                    )
+                except Exception as _e:
+                    log.error(
+                        "[%s] DEFERRED_CONTRACT_INVALIDATED state-restore failed: %s — "
+                        "order NOT canceled, but watcher may be stuck in INVALIDATED",
+                        watched.ticker, _e,
+                    )
+                funnel.inc("deferred_contract_invalidated")
+                return  # Do NOT cancel the order or write 'invalidated' to signal store.
 
         # ── Full forensic context for legitimate invalidations ─────────────────
         # P1 FIX (2026-05-21): every watcher_invalidated must log:
