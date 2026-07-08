@@ -742,6 +742,33 @@ def test_broker_flat_exact_match_blocks_without_broker_post_and_marks_stale(monk
     assert any("UPDATE positions" in sql and "status = 'CLOSED'" in sql for sql, _ in fake_conn.queries)
 
 
+def test_broker_flat_exact_match_blocks_even_without_circuit_breaker_trip(monkeypatch, mock_broker):
+    fake_conn = _patch_db(
+        monkeypatch,
+        lambda sql, params: _open_position_row() if "FROM positions" in sql else {"rejection_count": 0},
+    )
+    mock_broker.list_positions.return_value = [
+        {"symbol": "SMCI260626P00032500", "quantity": 0, "account_id": "ACC123"},
+    ]
+    osm = _MockOSM()
+
+    result = osm.submit_exit(
+        broker=mock_broker,
+        position_id="pos-flat-no-breaker",
+        contract="SMCI260626P00032500",
+        symbol="SMCI",
+        direction="PUT",
+        qty=1,
+        limit_price=1.25,
+        execution_mode="live",
+    )
+
+    assert result["ok"] is False
+    assert result["reason"] == "SYNTHETIC_POSITION_STALE_BROKER_FLAT"
+    assert mock_broker.session.post.call_count == 0
+    assert any("UPDATE positions" in sql and "status = 'CLOSED'" in sql for sql, _ in fake_conn.queries)
+
+
 def test_broker_wrong_occ_contract_does_not_override_breaker(monkeypatch, mock_broker):
     monkeypatch.setenv("MAX_EXIT_REJECTIONS_BEFORE_HALT", "5")
     _patch_db(

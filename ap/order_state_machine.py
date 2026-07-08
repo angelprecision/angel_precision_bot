@@ -2477,6 +2477,65 @@ class APOrderStateMachine:
         if broker_truth_audit:
             broker_truth_audit["requested_qty"] = requested_qty
             self.update_order_meta(local_id, {"exit_safety": {"broker_truth": broker_truth_audit}})
+        if broker_truth.get("is_fresh_exact") and int(broker_truth_qty or 0) == 0:
+            blocked_reason = "SYNTHETIC_POSITION_STALE_BROKER_FLAT"
+            broker_truth_audit.update(
+                {
+                    "result": blocked_reason,
+                    "broker_truth_open_qty": 0,
+                    "manual_close_needed": True,
+                }
+            )
+            self.update_order_meta(local_id, {"exit_safety": {"broker_truth": broker_truth_audit}})
+            log.warning(
+                "[%s] %s position_id=%s contract=%s requested_qty=%s account=%s | broker flat on fresh exact snapshot",
+                self.client_id,
+                blocked_reason,
+                position_id,
+                contract,
+                requested_qty,
+                broker_truth_audit.get("account") or "",
+            )
+            try:
+                self.transition(local_id, OrderStatus.CANCELED, last_error=blocked_reason)
+            except Exception as exc:
+                log.debug("[%s] exit flat-truth block cancel transition failed for %s: %s", self.client_id, local_id, exc)
+            try:
+                with conn() as _stale_c:
+                    _stale_c.execute(
+                        """
+                        UPDATE positions
+                        SET status = 'CLOSED',
+                            meta = COALESCE(meta, '{}'::jsonb) || %s::jsonb
+                        WHERE id = %s
+                          AND client_id = %s
+                          AND status NOT IN ('CLOSED', 'EXPIRED')
+                        """,
+                        (
+                            __import__("json").dumps({
+                                "synthetic_position_stale_broker_flat": True,
+                                "stale_marked_at": __import__("datetime").datetime.now(
+                                    __import__("datetime").timezone.utc
+                                ).isoformat(),
+                                "broker_truth_open_qty": 0,
+                                "exit_circuit_breaker_broker_truth": broker_truth_audit,
+                                "reconciler_manual_close_needed": True,
+                            }),
+                            str(position_id),
+                            self.client_id,
+                        ),
+                    )
+            except Exception as exc:
+                log.warning("[%s] failed to mark flat broker-truth position %s stale: %s", self.client_id, position_id, exc)
+            return {
+                "ok": False,
+                "local_order_id": local_id,
+                "broker_order_id": None,
+                "status": OrderStatus.CANCELED,
+                "error": blocked_reason,
+                "skipped": True,
+                "reason": blocked_reason,
+            }
         if (
             broker_truth.get("is_fresh_exact")
             and broker_truth_qty is not None

@@ -5053,6 +5053,26 @@ class APExitEngine:
             _broker_truth_qty = _broker_truth.get("broker_truth_open_qty")
             _broker_truth_audit = dict((_broker_truth.get("audit") or {}))
             _broker_truth_audit["requested_qty"] = int(decision.quantity or 0)
+            if _broker_truth.get("is_fresh_exact") and int(_broker_truth_qty or 0) == 0:
+                with self._lock:
+                    pos.exit_in_flight = False
+                    pos.pending_exit_reason = ""
+                self._emit_exit_event(
+                    pos,
+                    decision="REJECT",
+                    reason_code="SYNTHETIC_POSITION_STALE_BROKER_FLAT",
+                    explanation="Blocked exit submit because fresh exact broker truth shows no open long position.",
+                    stage="exit_submission",
+                    extra_inputs={"broker_truth": _broker_truth_audit},
+                )
+                log.warning(
+                    "[%s] SYNTHETIC_POSITION_STALE_BROKER_FLAT | position_id=%s contract=%s requested_qty=%s",
+                    ticker,
+                    position_id or "?",
+                    option_symbol,
+                    int(decision.quantity or 0),
+                )
+                return False
             if (
                 _broker_truth.get("is_fresh_exact")
                 and _broker_truth_qty is not None
