@@ -2473,6 +2473,27 @@ class APOrderStateMachine:
             broker_truth_open_qty=int(qty or 0),
             allow_missing_position_with_broker_truth=str(position_id or "").startswith("broker-repair-"),
         )
+        # ── P0 (PR #307): log circuit breaker override before broker POST ───
+        # When broker truth confirms open qty > 0, _should_halt_exit_after_rejections
+        # returns blocked=False with reason=PROTECTIVE_EXIT_ALLOWED_BY_BROKER_TRUTH.
+        # The submit proceeds normally but we stamp the audit trail so operators
+        # can see the override happened and why.
+        _cb_override = (
+            isinstance(safety, dict)
+            and (safety.get("circuit_breaker") or {}).get("reason") == "PROTECTIVE_EXIT_ALLOWED_BY_BROKER_TRUTH"
+        )
+        if _cb_override:
+            _cb = safety.get("circuit_breaker") or {}
+            log.warning(
+                "[%s] PROTECTIVE_EXIT_ALLOWED_BY_BROKER_TRUTH "
+                "position_id=%s contract=%s "
+                "broker_truth_open_qty=%s rejection_count=%s threshold=%s — "
+                "proceeding to broker submit despite prior rejections",
+                self.client_id, position_id, contract,
+                _cb.get("broker_truth_open_qty"),
+                _cb.get("rejection_count"),
+                _cb.get("threshold"),
+            )
         if safety.get("blocked"):
             blocked_reason = str(safety.get("reason") or "exit_submission_blocked")
             log.warning(
@@ -2517,6 +2538,51 @@ class APOrderStateMachine:
                     )
                 except Exception as exc:
                     log.warning("[%s] exit circuit-breaker alert failed: %s", self.client_id, exc)
+
+            # ── P0 (PR #307): new reason codes from broker-truth override ────
+            # SYNTHETIC_POSITION_STALE_BROKER_FLAT: broker says qty=0 but the
+            # local position thinks it's still open. Stop repeated exit firing
+            # by marking the local position stale so the exit engine stops
+            # evaluating it on every tick.
+            if blocked_reason == "SYNTHETIC_POSITION_STALE_BROKER_FLAT":
+                log.warning(
+                    "[%s] SYNTHETIC_POSITION_STALE_BROKER_FLAT "
+                    "position_id=%s contract=%s — broker is flat; "
+                    "marking local position stale to stop repeated exit firing",
+                    self.client_id, position_id, contract,
+                )
+                try:
+                    with conn() as _stale_c:
+                        _stale_c.execute(
+                            """
+                            UPDATE positions
+                            SET status = 'CLOSED',
+                                meta = COALESCE(meta, '{}'::jsonb) || %s::jsonb
+                            WHERE id = %s
+                              AND client_id = %s
+                              AND status NOT IN ('CLOSED', 'EXPIRED')
+                            """,
+                            (
+                                __import__("json").dumps({
+                                    "synthetic_position_stale_broker_flat": True,
+                                    "stale_marked_at": __import__("datetime").datetime.now(
+                                        __import__("datetime").timezone.utc
+                                    ).isoformat(),
+                                    "broker_truth_open_qty": 0,
+                                }),
+                                str(position_id),
+                                self.client_id,
+                            ),
+                        )
+                    log.info(
+                        "[%s] position %s marked CLOSED (broker flat, stale synthetic)",
+                        self.client_id, position_id,
+                    )
+                except Exception as _stale_exc:
+                    log.warning(
+                        "[%s] failed to mark position %s stale: %s",
+                        self.client_id, position_id, _stale_exc,
+                    )
 
             return {
                 "ok": False,
