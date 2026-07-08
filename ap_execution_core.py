@@ -4918,6 +4918,198 @@ class APExecutionCore:
                 float(submit_limit or 0),
                 int(approved_qty or 0),
             )
+
+        # ── P0 (PR #305): LIVE submit safety gates ─────────────────────────
+        # Three brakes between materialization completion and the broker POST:
+        #   1. IDENTITY   — client_id + execution_mode must be non-empty,
+        #                   canonical, and self-consistent
+        #   2. MARKET     — fresh underlying quote must confirm the setup is
+        #                   still tradeable (not stale/reversed/target-hit)
+        #   3. AGE        — time from first breach to submit must not exceed
+        #                   ENTRY_TRIGGER_MAX_AGE_SEC
+        #
+        # Each gate is a pure classifier from ap.live_submit_gates. On FAIL
+        # in LIVE mode: block broker submit, terminalize the row with the
+        # canonical reason_code, stamp orders.meta.live_submit_gate with
+        # full audit evidence, and return. PAPER logs failures but proceeds
+        # so sandbox flow can be exercised.
+        try:
+            from ap.live_submit_gates import (
+                check_identity_gate,
+                check_market_validity_gate,
+                check_trigger_age_gate,
+                GateOutcome,
+            )
+
+            _gate_client_id = str(_proof_client_id or "")
+            _gate_exec_mode = str(_proof_execution_mode or "").strip().lower()
+            _gate_is_live   = _gate_exec_mode == "live"
+
+            # ── Gate 1: identity
+            _id_res = check_identity_gate(
+                client_id=_gate_client_id,
+                execution_mode=_gate_exec_mode,
+                osm_client_id=str(getattr(self.order_state_machine, "client_id", "") or ""),
+                osm_execution_mode=str(getattr(self.order_state_machine, "execution_mode", "") or ""),
+            )
+            if not _id_res.passed:
+                log.critical(
+                    "LIVE_SUBMIT_GATE_BLOCKED gate=identity reason=%s detail=%s "
+                    "order_id=%s client_id=%s execution_mode=%s symbol=%s",
+                    _id_res.reason_code, _id_res.detail,
+                    str(queue_local_order_id or ""), _gate_client_id,
+                    _gate_exec_mode, ticker,
+                )
+                try:
+                    self.order_state_machine.update_order_meta(
+                        str(queue_local_order_id or ""),
+                        {"live_submit_gate": {"failed_gate": "identity", **_id_res.audit}},
+                    )
+                except Exception:
+                    pass
+                _terminalize_breach_failure(f"live_submit_gate:{_id_res.reason_code}")
+                return
+
+            # ── Gate 2: market validity — LIVE only fails closed
+            # Fetch a fresh underlying quote from the broker. If the fetch
+            # itself fails, treat as CURRENT_PRICE_MISSING (fail closed LIVE).
+            _mv_bid = None
+            _mv_ask = None
+            _mv_quote_age_ms = None
+            try:
+                if hasattr(self.broker, "get_quote"):
+                    _mv_q = self.broker.get_quote(ticker) or {}
+                    if isinstance(_mv_q, dict):
+                        _mv_bid = _mv_q.get("bid")
+                        _mv_ask = _mv_q.get("ask")
+                        _mv_quote_age_ms = _mv_q.get("quote_age_ms")
+            except Exception as _mv_exc:
+                log.warning(
+                    "[%s] LIVE_SUBMIT_GATE market quote fetch failed: %s",
+                    ticker, _mv_exc,
+                )
+            _mv_res = check_market_validity_gate(
+                side=str(getattr(approved_plan, "side", "") or ""),
+                trigger_price=float(getattr(approved_plan, "trigger_price", 0) or 0),
+                stop_price=(
+                    float(getattr(approved_plan, "stop_underlying", 0) or 0)
+                    if getattr(approved_plan, "stop_underlying", None) else None
+                ),
+                target_price=(
+                    float(getattr(approved_plan, "target_underlying", 0) or 0)
+                    if getattr(approved_plan, "target_underlying", None) else None
+                ),
+                current_bid=_mv_bid,
+                current_ask=_mv_ask,
+                quote_age_ms=_mv_quote_age_ms,
+                execution_mode=_gate_exec_mode,
+            )
+            if not _mv_res.passed:
+                log.critical(
+                    "LIVE_SUBMIT_GATE_BLOCKED gate=market_validity reason=%s detail=%s "
+                    "order_id=%s client_id=%s symbol=%s",
+                    _mv_res.reason_code, _mv_res.detail,
+                    str(queue_local_order_id or ""), _gate_client_id, ticker,
+                )
+                try:
+                    self.order_state_machine.update_order_meta(
+                        str(queue_local_order_id or ""),
+                        {"live_submit_gate": {"failed_gate": "market_validity", **_mv_res.audit}},
+                    )
+                except Exception:
+                    pass
+                _terminalize_breach_failure(f"live_submit_gate:{_mv_res.reason_code}")
+                return
+            # Even on PASS in paper we log the mid so audit trails are complete
+            elif not _gate_is_live and _mv_res.audit.get("current_mid"):
+                log.info(
+                    "[%s] LIVE_SUBMIT_GATE_PASS gate=market_validity paper mid=%s",
+                    ticker, _mv_res.audit.get("current_mid"),
+                )
+
+            # ── Gate 3: trigger age
+            _ta_crossed_at = None
+            _ta_confirmed_at = None
+            try:
+                # WatchedSignal stamps trigger_crossed_at on first breach
+                # (see ap_entry_watcher.WatchedSignal.check).
+                _w = getattr(approved_plan, "_watched_signal", None) or locals().get("watched")
+                if _w is not None:
+                    _tc = getattr(_w, "trigger_crossed_at", None)
+                    _tcf = getattr(_w, "triggered_at", None)
+                    if _tc is not None:
+                        _ta_crossed_at = _tc.isoformat() if hasattr(_tc, "isoformat") else str(_tc)
+                    if _tcf is not None:
+                        _ta_confirmed_at = _tcf.isoformat() if hasattr(_tcf, "isoformat") else str(_tcf)
+            except Exception:
+                pass
+            _ta_res = check_trigger_age_gate(
+                trigger_crossed_at=_ta_crossed_at,
+                trigger_confirmed_at=_ta_confirmed_at,
+                execution_mode=_gate_exec_mode,
+            )
+            if not _ta_res.passed:
+                log.critical(
+                    "LIVE_SUBMIT_GATE_BLOCKED gate=trigger_age reason=%s detail=%s "
+                    "order_id=%s client_id=%s symbol=%s age_seconds=%s",
+                    _ta_res.reason_code, _ta_res.detail,
+                    str(queue_local_order_id or ""), _gate_client_id, ticker,
+                    _ta_res.audit.get("age_seconds"),
+                )
+                try:
+                    self.order_state_machine.update_order_meta(
+                        str(queue_local_order_id or ""),
+                        {"live_submit_gate": {"failed_gate": "trigger_age", **_ta_res.audit}},
+                    )
+                except Exception:
+                    pass
+                _terminalize_breach_failure(f"live_submit_gate:{_ta_res.reason_code}")
+                return
+
+            # All three passed — stamp combined audit as evidence.
+            log.info(
+                "LIVE_SUBMIT_GATES_PASSED "
+                "order_id=%s client_id=%s execution_mode=%s symbol=%s "
+                "market_mid=%s trigger_age_s=%s",
+                str(queue_local_order_id or ""), _gate_client_id,
+                _gate_exec_mode, ticker,
+                _mv_res.audit.get("current_mid"),
+                _ta_res.audit.get("age_seconds"),
+            )
+            try:
+                self.order_state_machine.update_order_meta(
+                    str(queue_local_order_id or ""),
+                    {"live_submit_gate": {
+                        "all_passed": True,
+                        "identity_gate": _id_res.audit,
+                        "market_validity_gate": _mv_res.audit,
+                        "trigger_age_gate": _ta_res.audit,
+                    }},
+                )
+            except Exception:
+                pass
+        except Exception as _gate_exc:
+            # If the entire gate module fails, LIVE fails closed. Never let
+            # a bug in the safety code allow an unchecked broker submit.
+            log.critical(
+                "[%s] LIVE_SUBMIT_GATE_MODULE_ERROR — %s — LIVE will block, PAPER will proceed",
+                ticker, _gate_exc, exc_info=True,
+            )
+            if str(_proof_execution_mode or "").strip().lower() == "live":
+                try:
+                    self.order_state_machine.update_order_meta(
+                        str(queue_local_order_id or ""),
+                        {"live_submit_gate": {
+                            "all_passed": False,
+                            "failed_gate": "module_error",
+                            "error": str(_gate_exc)[:200],
+                        }},
+                    )
+                except Exception:
+                    pass
+                _terminalize_breach_failure("live_submit_gate:MODULE_ERROR")
+                return
+
         submit_res = self.order_state_machine.submit_existing_entry(
             local_order_id=queue_local_order_id,
             broker=self.broker,
