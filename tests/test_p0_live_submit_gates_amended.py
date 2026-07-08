@@ -30,6 +30,8 @@ from ap.live_submit_gates import (
     check_identity_gate,
     check_market_validity_gate,
     check_trigger_age_gate,
+    derive_submit_execution_mode,
+    resolve_trigger_timestamps,
 )
 
 
@@ -79,11 +81,44 @@ class TestExecutionModeDerivation:
             r = check_identity_gate(client_id=_CLIENT_ID, execution_mode=mode)
             assert r.passed is True, f"mode={mode!r} should be accepted case-insensitively"
 
-    def test_execution_core_derives_mode_from_fallback_chain(self):
-        """Structural: _derive_exec_mode fallback chain is present in execution core."""
-        src = open("ap_execution_core.py").read()
-        assert "_derive_exec_mode" in src, "_derive_exec_mode helper missing"
-        assert "self.paper" in src or "self.mode" in src, "fallback chain must check self.paper/self.mode"
+    def test_blank_self_execution_mode_but_paper_false_derives_live(self):
+        mode = derive_submit_execution_mode(
+            proof_execution_mode="",
+            approved_plan_execution_mode="",
+            self_execution_mode="",
+            self_mode="",
+            self_paper=False,
+            osm_execution_mode="",
+        )
+        assert mode == "live"
+        r = check_identity_gate(client_id="", execution_mode=mode)
+        assert r.passed is False
+        assert r.reason_code == GateOutcome.LIVE_SUBMIT_CLIENT_ID_MISSING
+
+    def test_fallback_chain_uses_osm_when_available(self):
+        mode = derive_submit_execution_mode(
+            proof_execution_mode="",
+            approved_plan_execution_mode="",
+            self_execution_mode="",
+            self_mode="",
+            self_paper=None,
+            osm_execution_mode="live",
+        )
+        assert mode == "live"
+
+    def test_blank_unknown_mode_stays_unknown_for_fail_closed_gate(self):
+        mode = derive_submit_execution_mode(
+            proof_execution_mode="sandbox",
+            approved_plan_execution_mode="",
+            self_execution_mode="",
+            self_mode="",
+            self_paper=None,
+            osm_execution_mode="",
+        )
+        assert mode == ""
+        r = check_identity_gate(client_id=_CLIENT_ID, execution_mode=mode)
+        assert r.passed is False
+        assert r.reason_code == GateOutcome.LIVE_SUBMIT_EXECUTION_MODE_UNKNOWN
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -143,17 +178,33 @@ class TestTriggerTimestampPersistence:
         assert "first_breach_bid" in src
         assert "first_breach_ask" in src
 
-    def test_execution_core_reads_timestamps_from_meta_first(self):
-        """Execution core reads trigger_crossed_at from orders.meta
-        (Tier 1) before falling back to in-memory WatchedSignal."""
-        src = open("ap_execution_core.py").read()
-        assert "trigger_crossed_at" in src
-        # Tier 1 meta read must be present (get_order call for meta lookup)
-        assert "get_order" in src or "trigger_crossed_at" in src
-        # Verify the durable-meta-first pattern comment is there
-        assert "Tier 1" in src or "durable" in src.lower(), (
-            "Execution core must read trigger_crossed_at from durable meta first"
+    def test_timestamp_resolution_prefers_durable_order_meta(self):
+        """Durable order meta wins over any in-memory WatchedSignal value."""
+        import ap_entry_watcher as ew
+        older = _iso(45)
+        newer = datetime.now(timezone.utc)
+        w = ew.WatchedSignal(
+            {"signal_id": "S1", "ticker": "GS", "side": "CALL",
+             "entry_price": 100.0, "score": 65.0, "grade": "B"},
+            overnight=False,
         )
+        w.trigger_crossed_at = newer
+        crossed, _ = resolve_trigger_timestamps(
+            order_meta={"trigger_crossed_at": older},
+            watched_signal=w,
+        )
+        assert crossed == older
+
+    def test_timestamp_resolution_falls_back_to_watched_signal(self):
+        import ap_entry_watcher as ew
+        w = ew.WatchedSignal(
+            {"signal_id": "S1", "ticker": "GS", "side": "CALL",
+             "entry_price": 100.0, "score": 65.0, "grade": "B"},
+            overnight=False,
+        )
+        w.check(bid=99.5, ask=100.5)
+        crossed, _ = resolve_trigger_timestamps(order_meta={}, watched_signal=w)
+        assert crossed == w.trigger_crossed_at.isoformat()
 
     def test_paper_allows_missing_trigger_crossed_at(self):
         """Paper does not fail closed on missing timestamps."""
@@ -352,12 +403,14 @@ class TestTriggerLaneMarketValidity:
         r = check_market_validity_gate(
             side="CALL", trigger_price=100.0, stop_price=95.0, target_price=110.0,
             current_bid=101.0, current_ask=101.5, quote_age_ms=100,
+            quote_source="tradier",
             execution_mode="live",
         )
         assert "current_bid" in r.audit
         assert "current_ask" in r.audit
         assert "current_mid" in r.audit
         assert "quote_age_ms" in r.audit
+        assert r.audit["quote_source"] == "tradier"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -392,12 +445,13 @@ class TestFinalMarketValidityPersistence:
         r = check_market_validity_gate(
             side="CALL", trigger_price=100.0, stop_price=95.0, target_price=110.0,
             current_bid=101.0, current_ask=101.5, quote_age_ms=100,
+            quote_source="tradier",
             execution_mode="live",
         )
         for field in ("gate", "checked_at", "execution_mode", "side",
                       "trigger_price", "stop_price", "target_price",
                       "current_bid", "current_ask", "current_mid",
-                      "quote_age_ms", "max_quote_age_ms"):
+                      "quote_age_ms", "quote_source", "max_quote_age_ms"):
             assert field in r.audit, f"Missing required audit field: {field!r}"
 
 
