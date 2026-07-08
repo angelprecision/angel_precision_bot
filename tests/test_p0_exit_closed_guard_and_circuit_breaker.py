@@ -489,6 +489,11 @@ def test_exit_engine_callback_path_allows_broker_repair_position_with_broker_tru
     engine.on_scale = None
     engine.order_state_machine = None
     engine.osm = None
+    engine.broker = MagicMock()
+    engine.broker.account_id = "ACC123"
+    engine.broker.list_positions.return_value = [
+        {"symbol": "SMCI260626P00032500", "quantity": 3, "raw": {}},
+    ]
     engine._positions = []
     engine._positions_by_id = {}
     engine.hydrate_pending_exit_identity_from_db = lambda pos: False
@@ -590,6 +595,9 @@ def test_exit_engine_callback_path_does_not_allow_missing_non_repair_position(mo
     engine.on_scale = None
     engine.order_state_machine = None
     engine.osm = None
+    engine.broker = MagicMock()
+    engine.broker.account_id = "ACC123"
+    engine.broker.list_positions.return_value = []
     engine._positions = []
     engine._positions_by_id = {}
     engine.hydrate_pending_exit_identity_from_db = lambda pos: False
@@ -673,3 +681,243 @@ def test_exit_manager_open_positions_query_includes_execution_mode():
     assert idx != -1
     region = src[idx: idx + 500]
     assert "execution_mode" in region
+
+
+def test_requested_qty_one_but_broker_flat_blocks_without_broker_post(monkeypatch, mock_broker):
+    fake_conn = _patch_db(
+        monkeypatch,
+        lambda sql, params: _open_position_row()
+        if "SELECT status" in sql
+        else {"rejection_count": 5}
+        if "COUNT(*) AS rejection_count" in sql
+        else None,
+    )
+    monkeypatch.setenv("MAX_EXIT_REJECTIONS_BEFORE_HALT", "5")
+    mock_broker.list_positions.return_value = []
+    osm = _MockOSM()
+
+    result = osm.submit_exit(
+        broker=mock_broker,
+        position_id="pos-flat-1",
+        contract="SMCI260626P00032500",
+        symbol="SMCI",
+        direction="PUT",
+        qty=1,
+        limit_price=1.25,
+        execution_mode="live",
+    )
+
+    assert result["ok"] is False
+    assert result["reason"] == "synthetic_position_stale_broker_flat"
+    assert mock_broker.session.post.call_count == 0
+    assert any(
+        "UPDATE positions SET status=%s" in sql and "close_source=%s" in sql
+        for sql, _ in fake_conn.queries
+    )
+
+
+def test_broker_exact_occ_qty_one_allows_protective_close_despite_circuit_breaker(monkeypatch, mock_broker):
+    _patch_db(
+        monkeypatch,
+        lambda sql, params: _open_position_row(quantity_remaining=0)
+        if "SELECT status" in sql
+        else {"rejection_count": 5}
+        if "COUNT(*) AS rejection_count" in sql
+        else None,
+    )
+    monkeypatch.setenv("MAX_EXIT_REJECTIONS_BEFORE_HALT", "5")
+    mock_broker.list_positions.return_value = [
+        {"symbol": "SMCI260626P00032500", "quantity": 1, "raw": {}},
+    ]
+    mock_broker.session.post.return_value = _resp(
+        200,
+        json_body={"order": {"id": "BO-1", "status": "open"}},
+    )
+    osm = _MockOSM()
+
+    result = osm.submit_exit(
+        broker=mock_broker,
+        position_id="pos-open-override",
+        contract="SMCI260626P00032500",
+        symbol="SMCI",
+        direction="PUT",
+        qty=1,
+        limit_price=1.25,
+        execution_mode="live",
+    )
+
+    assert result["ok"] is True
+    assert mock_broker.session.post.call_count == 1
+
+
+def test_broker_wrong_occ_contract_does_not_override(monkeypatch, mock_broker):
+    _patch_db(
+        monkeypatch,
+        lambda sql, params: _open_position_row()
+        if "SELECT status" in sql
+        else {"rejection_count": 5}
+        if "COUNT(*) AS rejection_count" in sql
+        else None,
+    )
+    monkeypatch.setenv("MAX_EXIT_REJECTIONS_BEFORE_HALT", "5")
+    mock_broker.list_positions.return_value = [
+        {"symbol": "SMCI260703P00032500", "quantity": 1, "raw": {}},
+    ]
+    osm = _MockOSM()
+
+    result = osm.submit_exit(
+        broker=mock_broker,
+        position_id="pos-wrong-occ",
+        contract="SMCI260626P00032500",
+        symbol="SMCI",
+        direction="PUT",
+        qty=1,
+        limit_price=1.25,
+        execution_mode="live",
+    )
+
+    assert result["ok"] is False
+    assert result["reason"] == "synthetic_position_stale_broker_flat"
+    assert mock_broker.session.post.call_count == 0
+
+
+def test_broker_truth_unavailable_preserves_original_circuit_breaker(monkeypatch, mock_broker):
+    _patch_db(
+        monkeypatch,
+        lambda sql, params: _open_position_row()
+        if "SELECT status" in sql
+        else {"rejection_count": 5}
+        if "COUNT(*) AS rejection_count" in sql
+        else None,
+    )
+    monkeypatch.setenv("MAX_EXIT_REJECTIONS_BEFORE_HALT", "5")
+    mock_broker.list_positions.side_effect = RuntimeError("positions down")
+    osm = _MockOSM()
+
+    result = osm.submit_exit(
+        broker=mock_broker,
+        position_id="pos-no-truth",
+        contract="SMCI260626P00032500",
+        symbol="SMCI",
+        direction="PUT",
+        qty=1,
+        limit_price=1.25,
+        execution_mode="live",
+    )
+
+    assert result["ok"] is False
+    assert result["reason"] == "exit_circuit_breaker_tripped"
+    assert mock_broker.session.post.call_count == 0
+
+
+def test_broker_qty_less_than_requested_blocks_no_oversell(monkeypatch, mock_broker):
+    _patch_db(
+        monkeypatch,
+        lambda sql, params: _open_position_row(quantity_remaining=2)
+        if "SELECT status" in sql
+        else {"rejection_count": 0}
+        if "COUNT(*) AS rejection_count" in sql
+        else None,
+    )
+    mock_broker.list_positions.return_value = [
+        {"symbol": "SMCI260626P00032500", "quantity": 1, "raw": {}},
+    ]
+    osm = _MockOSM()
+
+    result = osm.submit_exit(
+        broker=mock_broker,
+        position_id="pos-insufficient",
+        contract="SMCI260626P00032500",
+        symbol="SMCI",
+        direction="PUT",
+        qty=2,
+        limit_price=1.25,
+        execution_mode="live",
+    )
+
+    assert result["ok"] is False
+    assert result["reason"] == "EXIT_BLOCKED_BROKER_QTY_INSUFFICIENT"
+    assert mock_broker.session.post.call_count == 0
+
+
+def test_stale_synthetic_close_only_when_fresh_exact_broker_truth_says_flat(monkeypatch, mock_broker):
+    fake_conn = _patch_db(
+        monkeypatch,
+        lambda sql, params: _open_position_row()
+        if "SELECT status" in sql
+        else {"rejection_count": 5}
+        if "COUNT(*) AS rejection_count" in sql
+        else None,
+    )
+    monkeypatch.setenv("MAX_EXIT_REJECTIONS_BEFORE_HALT", "5")
+    osm = _MockOSM()
+
+    mock_broker.list_positions.return_value = []
+    result_flat = osm.submit_exit(
+        broker=mock_broker,
+        position_id="pos-flat-close",
+        contract="SMCI260626P00032500",
+        symbol="SMCI",
+        direction="PUT",
+        qty=1,
+        limit_price=1.25,
+        execution_mode="live",
+    )
+
+    assert result_flat["reason"] == "synthetic_position_stale_broker_flat"
+    flat_updates = [sql for sql, _ in fake_conn.queries if "UPDATE positions SET status=%s" in sql]
+    assert flat_updates, "fresh exact broker-flat truth must synthetic-close the local row"
+
+    fake_conn_unavail = _patch_db(
+        monkeypatch,
+        lambda sql, params: _open_position_row()
+        if "SELECT status" in sql
+        else {"rejection_count": 5}
+        if "COUNT(*) AS rejection_count" in sql
+        else None,
+    )
+    mock_broker.list_positions.side_effect = RuntimeError("positions down")
+    result_unavail = osm.submit_exit(
+        broker=mock_broker,
+        position_id="pos-flat-unavail",
+        contract="SMCI260626P00032500",
+        symbol="SMCI",
+        direction="PUT",
+        qty=1,
+        limit_price=1.25,
+        execution_mode="live",
+    )
+
+    assert result_unavail["reason"] == "exit_circuit_breaker_tripped"
+    unavailable_updates = [sql for sql, _ in fake_conn_unavail.queries if "UPDATE positions SET status=%s" in sql]
+    assert not unavailable_updates, "unavailable broker truth must not synthetic-close the local row"
+
+
+def test_duplicate_exit_guard_still_blocks_after_broker_truth_override(monkeypatch, mock_broker):
+    class _ActiveExitOSM(_MockOSM):
+        def _get_active_exit_order(self, position_id):
+            return {
+                "local_order_id": "L-EXIT-DUPE",
+                "status": "SUBMITTED",
+                "broker_order_id": "BO-DUPE",
+            }
+
+    mock_broker.list_positions.return_value = [
+        {"symbol": "SMCI260626P00032500", "quantity": 1, "raw": {}},
+    ]
+    osm = _ActiveExitOSM()
+
+    result = osm.submit_exit(
+        broker=mock_broker,
+        position_id="pos-dupe",
+        contract="SMCI260626P00032500",
+        symbol="SMCI",
+        direction="PUT",
+        qty=1,
+        limit_price=1.25,
+        execution_mode="live",
+    )
+
+    assert result["ok"] is False
+    assert result["error"].startswith("active_exit_already_exists:")
+    assert mock_broker.session.post.call_count == 0

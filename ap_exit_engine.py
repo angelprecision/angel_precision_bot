@@ -5043,14 +5043,25 @@ class APExitEngine:
             from ap.exit_safety import (
                 alert_exit_submission_halted,
                 evaluate_exit_submission_safety,
+                mark_synthetic_position_stale_broker_flat,
+                resolve_broker_exit_truth,
             )
 
+            _broker_truth = resolve_broker_exit_truth(
+                broker=getattr(self, "broker", None),
+                client_id=str(getattr(pos, "client_id", "") or self.client_id),
+                execution_mode=_exec_mode,
+                contract=str(option_symbol or ""),
+                requested_exit_qty=int(getattr(decision, "quantity", 0) or 0),
+            )
             _exit_guard = evaluate_exit_submission_safety(
                 position_id=str(position_id or ""),
                 client_id=str(getattr(pos, "client_id", "") or self.client_id),
                 execution_mode=_exec_mode,
                 contract=str(option_symbol or ""),
-                broker_truth_open_qty=int(getattr(pos, "quantity_remaining", 0) or 0),
+                broker_truth_open_qty=_broker_truth.get("broker_truth_open_qty"),
+                requested_exit_qty=int(getattr(decision, "quantity", 0) or 0),
+                broker_truth_audit=_broker_truth,
                 allow_missing_position_with_broker_truth=str(position_id or "").startswith("broker-repair-"),
             )
             if _exit_guard.get("blocked"):
@@ -5068,6 +5079,26 @@ class APExitEngine:
                     option_symbol,
                     _blocked_reason,
                 )
+                if _blocked_reason == "synthetic_position_stale_broker_flat":
+                    mark_synthetic_position_stale_broker_flat(
+                        position_id=str(position_id or ""),
+                        client_id=str(getattr(pos, "client_id", "") or self.client_id),
+                        execution_mode=_exec_mode,
+                        broker_truth_audit=_broker_truth,
+                    )
+                    with self._lock:
+                        pos.closed = True
+                        pos.quantity_remaining = 0
+                    log.warning(
+                        "[%s] EXIT blocked by fresh broker-flat truth | position_id=%s contract=%s "
+                        "client_id=%s account=%s checked_at=%s — reconciler/manual-close-needed",
+                        ticker,
+                        position_id or "?",
+                        option_symbol,
+                        getattr(pos, "client_id", "") or self.client_id,
+                        _broker_truth.get("account") or "",
+                        _broker_truth.get("checked_at") or "",
+                    )
                 if _blocked_reason == "exit_circuit_breaker_tripped":
                     _breaker = (_exit_guard.get("circuit_breaker") or {}) if isinstance(_exit_guard, dict) else {}
                     try:

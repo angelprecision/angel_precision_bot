@@ -133,6 +133,146 @@ def _parse_max_exit_rejections_threshold() -> int:
     return threshold
 
 
+def resolve_broker_exit_truth(
+    *,
+    broker,
+    client_id: str,
+    execution_mode: Optional[str],
+    contract: str,
+    requested_exit_qty: Optional[int] = None,
+) -> dict:
+    checked_at = now_utc_iso()
+    account_id = str(
+        getattr(broker, "account_id", None)
+        or getattr(getattr(broker, "cfg", None), "account_id", None)
+        or ""
+    ).strip()
+    audit = {
+        "client_id": str(client_id or ""),
+        "execution_mode": str(execution_mode or ""),
+        "contract": str(contract or ""),
+        "requested_qty": _safe_int(requested_exit_qty),
+        "account": account_id,
+        "checked_at": checked_at,
+        "snapshot_available": False,
+        "snapshot_fresh": False,
+        "exact_contract_match": False,
+        "broker_truth_open_qty": None,
+        "position_count": None,
+        "reason": None,
+    }
+    list_positions = getattr(broker, "list_positions", None)
+    if not callable(list_positions):
+        audit["reason"] = "broker_positions_snapshot_unavailable"
+        return audit
+
+    try:
+        positions = list_positions() or []
+    except Exception as exc:
+        audit["reason"] = f"broker_positions_snapshot_error:{type(exc).__name__}"
+        return audit
+    if not isinstance(positions, (list, tuple)):
+        audit["reason"] = "broker_positions_snapshot_unavailable"
+        return audit
+
+    target = str(contract or "").strip().upper()
+    audit["snapshot_available"] = True
+    audit["snapshot_fresh"] = True
+    audit["position_count"] = len(positions)
+    audit["reason"] = "fresh_snapshot"
+
+    exact_rows = []
+    for row in positions:
+        if not isinstance(row, dict):
+            continue
+        symbol = str(row.get("symbol") or row.get("option_symbol") or "").strip().upper()
+        if symbol == target:
+            exact_rows.append(row)
+
+    if exact_rows:
+        qty = 0
+        for row in exact_rows:
+            row_qty = _safe_int(row.get("quantity"))
+            if row_qty and row_qty > 0:
+                qty += row_qty
+        audit["exact_contract_match"] = True
+        audit["broker_truth_open_qty"] = max(int(qty or 0), 0)
+        audit["matched_rows"] = len(exact_rows)
+        audit["reason"] = (
+            "fresh_exact_occ_long_qty"
+            if audit["broker_truth_open_qty"] > 0
+            else "fresh_exact_occ_not_long"
+        )
+        return audit
+
+    audit["broker_truth_open_qty"] = 0
+    audit["reason"] = "fresh_snapshot_exact_occ_flat"
+    return audit
+
+
+def mark_synthetic_position_stale_broker_flat(
+    *,
+    position_id: str,
+    client_id: str,
+    execution_mode: Optional[str],
+    broker_truth_audit: Optional[dict] = None,
+) -> bool:
+    position_columns = _table_columns("positions")
+    if "status" not in position_columns:
+        return False
+
+    normalized_mode = _normalize_mode(execution_mode)
+    metadata_col = "metadata" if "metadata" in position_columns else ("meta" if "meta" in position_columns else "")
+    audit_payload = {
+        "reason": "synthetic_position_stale_broker_flat",
+        "broker_truth": dict(broker_truth_audit or {}),
+        "manual_close_needed": True,
+        "reconciler_manual_close_needed": True,
+        "closed_at": now_utc_iso(),
+    }
+
+    def _fn():
+        with conn() as c:
+            updates = ["status=%s"]
+            params: list[Any] = ["CLOSED"]
+            if "quantity_remaining" in position_columns:
+                updates.append("quantity_remaining=%s")
+                params.append(0)
+            if "close_source" in position_columns:
+                updates.append("close_source=%s")
+                params.append("synthetic_position_stale_broker_flat")
+            if "exit_ts" in position_columns:
+                updates.append("exit_ts=%s")
+                params.append(now_utc_iso())
+            if metadata_col:
+                updates.append(f"{metadata_col} = COALESCE({metadata_col}, '{{}}'::jsonb) || %s::jsonb")
+                params.append(json.dumps({"exit_circuit_breaker_broker_truth": audit_payload}, default=str))
+            updates.append("updated_ts=NOW()")
+            sql = (
+                f"UPDATE positions SET {', '.join(updates)} "
+                "WHERE id=%s AND client_id=%s"
+            )
+            params.extend([position_id, client_id])
+            if normalized_mode and "execution_mode" in position_columns:
+                sql += " AND LOWER(COALESCE(execution_mode, '')) = %s"
+                params.append(normalized_mode)
+            cur = c.execute(sql, tuple(params))
+            return getattr(cur, "rowcount", getattr(c, "rowcount", 0))
+
+    try:
+        rowcount = run_with_retry(_fn)
+        return bool(rowcount)
+    except Exception as exc:
+        log.warning(
+            "synthetic broker-flat close persistence failed | client_id=%s execution_mode=%s position_id=%s err=%s",
+            client_id,
+            normalized_mode or "",
+            position_id,
+            exc,
+        )
+        return False
+
+
 def _persist_circuit_breaker_marker(
     db_conn,
     *,
@@ -235,6 +375,7 @@ def _exit_position_terminal_state(
     execution_mode=None,
     contract=None,
     broker_truth_open_qty=None,
+    broker_truth_audit: Optional[dict] = None,
     allow_missing_position_with_broker_truth: bool = False,
 ) -> dict:
     position_columns = _table_columns("positions")
@@ -250,6 +391,8 @@ def _exit_position_terminal_state(
         "WHERE id = %s AND client_id = %s"
     )
     normalized_mode = _normalize_mode(execution_mode)
+    broker_truth_qty = _safe_int(broker_truth_open_qty)
+    broker_truth_fresh = bool((broker_truth_audit or {}).get("snapshot_fresh"))
     if normalized_mode and "execution_mode" in position_columns:
         sql += " AND LOWER(COALESCE(execution_mode, '')) = %s"
         params.append(normalized_mode)
@@ -258,7 +401,6 @@ def _exit_position_terminal_state(
     db_conn.execute(sql, tuple(params))
     row = db_conn.fetchone()
     if not row:
-        broker_truth_qty = _safe_int(broker_truth_open_qty)
         synthetic_repair_id = str(position_id or "").startswith("broker-repair-")
         if broker_truth_qty is not None and broker_truth_qty > 0 and (
             allow_missing_position_with_broker_truth or synthetic_repair_id
@@ -304,6 +446,26 @@ def _exit_position_terminal_state(
     status_norm = _normalize_text(status)
     close_source_norm = _normalize_text(close_source)
     qty_remaining_int = _safe_int(quantity_remaining)
+
+    if broker_truth_qty is not None and broker_truth_qty > 0 and broker_truth_fresh:
+        return {
+            "blocked": False,
+            "reason": None,
+            "status": status,
+            "quantity_remaining": broker_truth_qty,
+            "close_source": close_source,
+            "entry_ts": entry_ts,
+            "broker_truth_override": True,
+            "local_block_reason": (
+                "position_already_closed"
+                if status_norm == "closed"
+                else "position_quantity_depleted"
+                if qty_remaining_int is not None and qty_remaining_int <= 0
+                else f"terminal_close_source:{close_source_norm}"
+                if close_source_norm in _TERMINAL_CLOSE_SOURCES
+                else None
+            ),
+        }
 
     if status_norm == "closed":
         return {
@@ -448,6 +610,8 @@ def evaluate_exit_submission_safety(
     execution_mode: Optional[str],
     contract: str,
     broker_truth_open_qty: Optional[int] = None,
+    requested_exit_qty: Optional[int] = None,
+    broker_truth_audit: Optional[dict] = None,
     allow_missing_position_with_broker_truth: bool = False,
 ) -> dict:
     def _fn():
@@ -459,6 +623,7 @@ def evaluate_exit_submission_safety(
                 execution_mode=execution_mode,
                 contract=contract,
                 broker_truth_open_qty=broker_truth_open_qty,
+                broker_truth_audit=broker_truth_audit,
                 allow_missing_position_with_broker_truth=allow_missing_position_with_broker_truth,
             )
             if position_state.get("blocked"):
@@ -467,6 +632,34 @@ def evaluate_exit_submission_safety(
                     "reason": position_state.get("reason"),
                     "position_state": position_state,
                     "circuit_breaker": None,
+                    "broker_truth": broker_truth_audit,
+                }
+
+            broker_truth_qty = _safe_int(broker_truth_open_qty)
+            requested_qty_int = _safe_int(requested_exit_qty)
+            broker_truth_fresh = bool((broker_truth_audit or {}).get("snapshot_fresh"))
+            if broker_truth_fresh and broker_truth_qty == 0:
+                return {
+                    "blocked": True,
+                    "reason": "synthetic_position_stale_broker_flat",
+                    "position_state": position_state,
+                    "circuit_breaker": None,
+                    "broker_truth": broker_truth_audit,
+                }
+
+            if (
+                broker_truth_fresh
+                and broker_truth_qty is not None
+                and broker_truth_qty > 0
+                and requested_qty_int is not None
+                and requested_qty_int > broker_truth_qty
+            ):
+                return {
+                    "blocked": True,
+                    "reason": "EXIT_BLOCKED_BROKER_QTY_INSUFFICIENT",
+                    "position_state": position_state,
+                    "circuit_breaker": None,
+                    "broker_truth": broker_truth_audit,
                 }
 
             circuit_breaker = _should_halt_exit_after_rejections(
@@ -477,11 +670,29 @@ def evaluate_exit_submission_safety(
                 contract=contract,
                 entry_ts=position_state.get("entry_ts"),
             )
+            if (
+                circuit_breaker.get("blocked")
+                and broker_truth_fresh
+                and broker_truth_qty is not None
+                and broker_truth_qty > 0
+            ):
+                return {
+                    "blocked": False,
+                    "reason": None,
+                    "position_state": position_state,
+                    "circuit_breaker": {
+                        **circuit_breaker,
+                        "blocked": False,
+                        "override_reason": "exit_circuit_breaker_broker_truth",
+                    },
+                    "broker_truth": broker_truth_audit,
+                }
             return {
                 "blocked": bool(circuit_breaker.get("blocked")),
                 "reason": circuit_breaker.get("reason"),
                 "position_state": position_state,
                 "circuit_breaker": circuit_breaker,
+                "broker_truth": broker_truth_audit,
             }
 
     try:
@@ -501,4 +712,5 @@ def evaluate_exit_submission_safety(
             "reason": None,
             "position_state": None,
             "circuit_breaker": None,
+            "broker_truth": broker_truth_audit,
         }

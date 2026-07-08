@@ -55,6 +55,8 @@ from ap.db import conn, run_with_retry
 from ap.exit_safety import (
     alert_exit_submission_halted,
     evaluate_exit_submission_safety,
+    mark_synthetic_position_stale_broker_flat,
+    resolve_broker_exit_truth,
 )
 try:
     from psycopg2 import errors as pg_errors
@@ -2465,14 +2467,33 @@ class APOrderStateMachine:
             limit_price=limit_price,
             execution_mode=execution_mode,
         )
+        broker_truth = resolve_broker_exit_truth(
+            broker=broker,
+            client_id=self.client_id,
+            execution_mode=execution_mode,
+            contract=str(contract or ""),
+            requested_exit_qty=int(qty or 0),
+        )
         safety = evaluate_exit_submission_safety(
             position_id=str(position_id),
             client_id=self.client_id,
             execution_mode=execution_mode,
             contract=str(contract or ""),
-            broker_truth_open_qty=int(qty or 0),
+            broker_truth_open_qty=broker_truth.get("broker_truth_open_qty"),
+            requested_exit_qty=int(qty or 0),
+            broker_truth_audit=broker_truth,
             allow_missing_position_with_broker_truth=str(position_id or "").startswith("broker-repair-"),
         )
+        if hasattr(self, "update_order_meta"):
+            try:
+                self.update_order_meta(local_id, {
+                    "exit_safety": {
+                        "broker_truth": broker_truth,
+                        "reason": str(safety.get("reason") or ""),
+                    },
+                })
+            except Exception as exc:
+                log.debug("[%s] exit_safety broker truth meta persist failed for %s: %s", self.client_id, local_id, exc)
         if safety.get("blocked"):
             blocked_reason = str(safety.get("reason") or "exit_submission_blocked")
             log.warning(
@@ -2502,6 +2523,24 @@ class APOrderStateMachine:
                         )
                 except Exception as exc:
                     log.debug("[%s] clear_exit_in_flight on terminal exit block failed: %s", self.client_id, exc)
+
+            if blocked_reason == "synthetic_position_stale_broker_flat":
+                mark_synthetic_position_stale_broker_flat(
+                    position_id=str(position_id),
+                    client_id=self.client_id,
+                    execution_mode=execution_mode,
+                    broker_truth_audit=broker_truth,
+                )
+                log.warning(
+                    "[%s] EXIT blocked by fresh broker-flat truth | position_id=%s contract=%s "
+                    "client_id=%s account=%s checked_at=%s — reconciler/manual-close-needed",
+                    self.client_id,
+                    position_id,
+                    contract,
+                    self.client_id,
+                    broker_truth.get("account") or "",
+                    broker_truth.get("checked_at") or "",
+                )
 
             breaker = (safety.get("circuit_breaker") or {}) if isinstance(safety, dict) else {}
             if blocked_reason == "exit_circuit_breaker_tripped":
