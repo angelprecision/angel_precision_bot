@@ -2264,6 +2264,43 @@ class APEntryWatcher:
                         _recovery_quote = {}
                     _recovery_bid = float((_recovery_quote or {}).get("bid") or 0)
                     _recovery_ask = float((_recovery_quote or {}).get("ask") or 0)
+
+                    # Amendment 3: LIVE + regular session + quote unavailable = fail closed.
+                    # A missing quote during regular session means we cannot verify the
+                    # underlying has not already blown through the trigger. Never rearm blind.
+                    _is_live_watcher_rr = str(getattr(self, "mode", "PAPER")).upper() == "LIVE"
+                    if _is_live_watcher_rr and _recovery_bid == 0 and _recovery_ask == 0:
+                        log.critical(
+                            "[%s] RECOVERY_REARM_QUOTE_UNAVAILABLE — LIVE mode, regular session, "
+                            "quote returned bid=0 ask=0. Blocking recovery_rearm for "
+                            "local_order_id=%s to prevent late entry without price verification.",
+                            ticker, local_order_id,
+                        )
+                        try:
+                            self._persist_watcher_audit(local_order_id, {
+                                "reason_code":     "RECOVERY_REARM_QUOTE_UNAVAILABLE",
+                                "trigger_type":    "recovery_rearm_classifier",
+                                "classification":  "RECOVERY_REARM_QUOTE_UNAVAILABLE",
+                                "watcher_owned":   _watcher_owned,
+                                "mode":            "LIVE",
+                                "regular_session": True,
+                                "quote_available": False,
+                            })
+                        except Exception as _rr_audit_exc:
+                            log.warning(
+                                "[%s] RECOVERY_REARM_QUOTE_UNAVAILABLE audit write failed "
+                                "local_order_id=%s error=%s",
+                                ticker, local_order_id, _rr_audit_exc,
+                            )
+                        self._terminalize_recovery_rearm_candidate(
+                            local_order_id,
+                            ticker=ticker,
+                            classification="RECOVERY_REARM_QUOTE_UNAVAILABLE",
+                            watcher_owned=_watcher_owned,
+                            already_through=None,
+                        )
+                        return False
+
                     if _recovery_bid > 0 or _recovery_ask > 0:
                         _already_through = self._is_already_through_trigger(
                             side, float(trigger), _recovery_bid, _recovery_ask,
@@ -2410,6 +2447,49 @@ class APEntryWatcher:
                 bid = float(quote.get("bid") or 0)
                 ask = float(quote.get("ask") or 0)
                 mid = (bid + ask) / 2 if bid > 0 and ask > 0 else max(bid, ask)
+                # Amendment 3b: LIVE + regular session + quote unavailable = block arm.
+                # If mid=0, we have no current price to verify the underlying has not
+                # already blown through the trigger. Never arm LIVE without verification.
+                _is_live_arm = str(getattr(self, "mode", "PAPER")).upper() == "LIVE"
+                _regular_session_arm = not post_session and not pre_market
+                if mid == 0 and _is_live_arm and _regular_session_arm:
+                    _watcher_arm_reason = "WATCHER_ARM_QUOTE_UNAVAILABLE"
+                    log.critical(
+                        "[%s] WATCHER_ARM_QUOTE_UNAVAILABLE — LIVE mode, regular session, "
+                        "quote returned bid=0 ask=0 mid=0 for trigger=$%.4f. "
+                        "Blocking arm to prevent entry without price verification.",
+                        ticker, float(trigger or 0),
+                    )
+                    _no_quote_audit = self._build_watcher_audit_payload(
+                        None,
+                        symbol=ticker,
+                        score=float(signal_dict.get("score") or 0),
+                        tier=str(signal_dict.get("grade") or ""),
+                        direction=side,
+                        timeframe=str(signal_dict.get("timeframe") or ""),
+                        pattern=str(signal_dict.get("pattern") or ""),
+                        signal_id=str(signal_dict.get("signal_id") or ""),
+                        plan_id=str(signal_dict.get("plan_id") or ""),
+                        trigger_type="arm_time",
+                        signal_entry_price=trigger,
+                        trigger_price=trigger,
+                        stop_price=stop,
+                        current_bid=0.0,
+                        current_ask=0.0,
+                        current_mid=0.0,
+                        reason_code=_watcher_arm_reason,
+                        raw_reason="live_regular_session_arm_quote_zero",
+                    )
+                    try:
+                        self._persist_watcher_audit(local_order_id, _no_quote_audit)
+                    except Exception as _arm_audit_exc:
+                        log.warning(
+                            "[%s] WATCHER_ARM_QUOTE_UNAVAILABLE audit write failed "
+                            "local_order_id=%s error=%s",
+                            ticker, local_order_id, _arm_audit_exc,
+                        )
+                    return False
+
                 if mid > 0:
                     pct_from_trigger = (mid - trigger) / trigger
                     # FUNNEL FIX (2026-05-20):
