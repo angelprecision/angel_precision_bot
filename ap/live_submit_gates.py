@@ -458,6 +458,16 @@ def check_market_validity_gate(
         return _fail(GateOutcome.CURRENT_PRICE_ZERO, f"bid={bid} ask={ask}")
 
     # Rule: quote freshness
+    if quote_age_ms is None and str(execution_mode or "").lower() == "live":
+        # LIVE: unknown age is not the same as fresh. If the adapter returned a
+        # valid bid/ask from a synchronous fetch, it should have stamped age=0.
+        # A None age here means the provider genuinely didn't report it — treat
+        # as stale to enforce verified freshness for LIVE money.
+        return _fail(
+            GateOutcome.CURRENT_PRICE_STALE,
+            "quote_age_ms=unknown — LIVE requires verified freshness "
+            "(synchronous fetch path stamps age=0)",
+        )
     if quote_age_ms is not None and float(quote_age_ms) > max_age_ms:
         return _fail(
             GateOutcome.CURRENT_PRICE_STALE,

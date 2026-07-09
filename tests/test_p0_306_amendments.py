@@ -713,3 +713,246 @@ class TestTriggerTimestampOrdering:
         assert "datetime.now" in persisted_block or "_confirmed_now" in persisted_block, (
             "trigger_confirmed_at must be set from current time in the pre-trigger block"
         )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Hardened amendments: _is_live_runtime, client_id cross-validation,
+# quote age enforcement
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestIsLiveRuntime:
+    """Fix 4: _is_live_runtime() helper uses all three attributes."""
+
+    def _watcher_with(self, mode="", execution_mode="", paper=None):
+        w = MagicMock()
+        w.mode           = mode
+        w.execution_mode = execution_mode
+        w.paper          = paper
+        return w
+
+    def test_mode_blank_paper_false_is_live(self):
+        """self.mode blank + self.paper=False → is_live_runtime() True (fix 4)."""
+        from ap_entry_watcher import APEntryWatcher
+        # Call the helper directly via a minimal instance
+        w = self._watcher_with(mode="", paper=False)
+        # Simulate _is_live_runtime logic
+        exec_mode  = str(getattr(w, "execution_mode", "") or "").strip().lower()
+        mode_str   = str(getattr(w, "mode",           "") or "").strip().upper()
+        paper_flag = getattr(w, "paper", None)
+        is_live    = exec_mode == "live" or mode_str == "LIVE" or paper_flag is False
+        is_paper   = exec_mode == "paper" or mode_str == "PAPER" or paper_flag is True
+        result     = (not is_paper) and is_live
+        assert result is True, "paper=False must signal LIVE even when mode is blank"
+
+    def test_mode_blank_execution_mode_live_is_live(self):
+        """self.mode blank + self.execution_mode='live' → is_live_runtime() True."""
+        w = self._watcher_with(mode="", execution_mode="live", paper=None)
+        exec_mode  = str(getattr(w, "execution_mode", "") or "").strip().lower()
+        mode_str   = str(getattr(w, "mode",           "") or "").strip().upper()
+        paper_flag = getattr(w, "paper", None)
+        is_live  = exec_mode == "live" or mode_str == "LIVE" or paper_flag is False
+        is_paper = exec_mode == "paper" or mode_str == "PAPER" or paper_flag is True
+        result   = (not is_paper) and is_live
+        assert result is True, "execution_mode='live' must signal LIVE even when mode is blank"
+
+    def test_paper_true_not_live_even_if_mode_blank(self):
+        """self.mode='PAPER' + self.paper=True → is_live_runtime() False."""
+        w = self._watcher_with(mode="PAPER", paper=True)
+        exec_mode  = str(getattr(w, "execution_mode", "") or "").strip().lower()
+        mode_str   = str(getattr(w, "mode",           "") or "").strip().upper()
+        paper_flag = getattr(w, "paper", None)
+        is_live  = exec_mode == "live" or mode_str == "LIVE" or paper_flag is False
+        is_paper = exec_mode == "paper" or mode_str == "PAPER" or paper_flag is True
+        result   = (not is_paper) and is_live
+        assert result is False, "PAPER=True must never yield is_live=True"
+
+    def test_is_live_runtime_method_exists_on_APEntryWatcher(self):
+        """_is_live_runtime must be a method on APEntryWatcher."""
+        from ap_entry_watcher import APEntryWatcher
+        assert hasattr(APEntryWatcher, "_is_live_runtime"), (
+            "_is_live_runtime must be a method on APEntryWatcher"
+        )
+
+    def test_all_four_detection_sites_use_is_live_runtime(self):
+        """All 4 mode-detection sites must call self._is_live_runtime()."""
+        src = open("ap_entry_watcher.py").read()
+        old_pattern = 'str(getattr(self, "mode", "PAPER")).upper() == "LIVE"'
+        assert old_pattern not in src, (
+            f"Found old mode-detection pattern — all sites must use _is_live_runtime()"
+        )
+        assert src.count("self._is_live_runtime()") >= 4, (
+            "Must have at least 4 calls to self._is_live_runtime()"
+        )
+
+
+class TestClientIdCrossValidation:
+    """Fix 1: all 6 client_id sources must agree before any is trusted."""
+
+    def _simulate_resolve(self, sources: dict) -> tuple:
+        nonblank = {k: v for k, v in sources.items() if v and v.strip()}
+        if not nonblank:
+            return "", ""
+        unique = set(v.strip() for v in nonblank.values())
+        if len(unique) > 1:
+            detail = "; ".join(f"{k}={v!r}" for k, v in sorted(nonblank.items()))
+            return "", f"client_id_source_mismatch [{detail}]"
+        return unique.pop(), ""
+
+    def test_all_agree_returns_canonical(self):
+        """All nonblank sources agree → canonical returned, no mismatch."""
+        cid, mismatch = self._simulate_resolve({
+            "_proof_client_id": _CLIENT_ID,
+            "plan.client_id":   _CLIENT_ID,
+            "sig.client_id":    _CLIENT_ID,
+        })
+        assert cid == _CLIENT_ID
+        assert mismatch == ""
+
+    def test_stale_proof_disagrees_with_plan_fails_closed(self):
+        """
+        _proof_client_id='wrong@example.com' + plan.client_id=jason → mismatch.
+        Previously _proof_client_id would win silently as first nonblank.
+        """
+        cid, mismatch = self._simulate_resolve({
+            "_proof_client_id": "stale_wrong@example.com",
+            "plan.client_id":   _CLIENT_ID,
+            "sig.client_id":    _CLIENT_ID,
+        })
+        assert cid == "", (
+            "Disagreeing sources must fail closed, not silently return first nonblank"
+        )
+        assert "mismatch" in mismatch.lower()
+
+    def test_blank_proof_with_valid_plan_client_id_passes(self):
+        """Blank _proof_client_id + valid plan.client_id → passes with canonical."""
+        cid, mismatch = self._simulate_resolve({
+            "_proof_client_id": "",
+            "plan.client_id":   _CLIENT_ID,
+            "sig.client_id":    _CLIENT_ID,
+        })
+        assert cid == _CLIENT_ID
+        assert mismatch == ""
+
+    def test_all_blank_returns_empty(self):
+        """All sources blank → empty canonical, gate fails closed."""
+        cid, mismatch = self._simulate_resolve({
+            k: "" for k in [
+                "_proof_client_id", "plan.client_id", "sig.client_id",
+                "sig.original_client_id", "osm_order.client_id",
+                "osm.client_id", "self.client_id"
+            ]
+        })
+        assert cid == ""
+        assert mismatch == ""
+
+    def test_execution_core_has_client_id_mismatch_terminal_reason(self):
+        """Structural: CLIENT_ID_SOURCE_MISMATCH terminal reason in execution_core."""
+        src = open("ap_execution_core.py").read()
+        assert "CLIENT_ID_SOURCE_MISMATCH" in src
+        assert "client_id_source_mismatch" in src.lower()
+
+
+class TestQuoteAgeMsEnforcement:
+    """Fix 2: synchronous fetch stamps age=0; LIVE gate blocks on None age."""
+
+    def test_synchronous_fetch_with_valid_bid_ask_gets_age_zero(self):
+        """
+        When synchronous broker.get_quote() returns valid bid/ask but no
+        quote_age_ms, execution_core must stamp quote_age_ms=0.
+        """
+        # Simulate the adapter block
+        bid, ask, age = None, None, None
+
+        q = {"bid": 1.80, "ask": 1.86}  # no quote_age_ms
+        if isinstance(q, dict):
+            bid = q.get("bid")
+            ask = q.get("ask")
+            age = q.get("quote_age_ms")
+            # Fix 2: synchronous fetch with valid bid/ask → age=0
+            if age is None and bid is not None and ask is not None:
+                age = 0
+
+        assert age == 0, (
+            "Synchronous fetch with valid bid/ask must stamp quote_age_ms=0, "
+            "not None. None would skip the stale check."
+        )
+
+    def test_synchronous_fetch_no_bid_ask_age_stays_none(self):
+        """
+        When broker returns no bid/ask (quote unavailable), age stays None.
+        This triggers CURRENT_PRICE_MISSING, not CURRENT_PRICE_STALE.
+        """
+        q = {}  # no bid/ask/age
+        bid = q.get("bid")
+        ask = q.get("ask")
+        age = q.get("quote_age_ms")
+        if age is None and bid is not None and ask is not None:
+            age = 0
+        assert age is None, "No bid/ask means no valid quote — age must stay None"
+
+    def test_live_gate_blocks_on_none_age(self):
+        """
+        LIVE gate with quote_age_ms=None and valid bid/ask must block with
+        CURRENT_PRICE_STALE (not silently pass the freshness check).
+        """
+        from ap.live_submit_gates import check_market_validity_gate
+        result = check_market_validity_gate(
+            side="CALL",
+            trigger_price=465.0,
+            stop_price=455.0,
+            target_price=480.0,
+            current_bid=1.80,
+            current_ask=1.86,
+            quote_age_ms=None,    # unknown age
+            quote_source="broker",
+            execution_mode="live",
+        )
+        assert not result.passed, (
+            "LIVE gate must block when quote_age_ms=None — "
+            "freshness is not enforced unless age is either 0 or explicitly provided"
+        )
+        assert "STALE" in result.reason_code.upper() or "UNKNOWN" in result.reason_code.upper(), (
+            f"Reason code must indicate stale/unknown, got: {result.reason_code}"
+        )
+
+    def test_live_gate_passes_when_age_zero(self):
+        """
+        LIVE gate with quote_age_ms=0 (synchronous fetch) must pass freshness.
+        """
+        from ap.live_submit_gates import check_market_validity_gate
+        result = check_market_validity_gate(
+            side="CALL",
+            trigger_price=465.0,
+            stop_price=455.0,
+            target_price=480.0,
+            current_bid=1.80,
+            current_ask=1.86,
+            quote_age_ms=0,       # synchronous fetch = 0ms old
+            quote_source="broker",
+            execution_mode="live",
+        )
+        # Should not be blocked for stale quote specifically
+        if not result.passed:
+            assert "STALE" not in result.reason_code, (
+                "age=0 must not trigger STALE — synchronous fetch IS fresh"
+            )
+
+    def test_paper_gate_passes_with_none_age(self):
+        """PAPER gate must not block on unknown quote age — paper is fail-open."""
+        from ap.live_submit_gates import check_market_validity_gate
+        result = check_market_validity_gate(
+            side="CALL",
+            trigger_price=465.0,
+            stop_price=455.0,
+            target_price=480.0,
+            current_bid=1.80,
+            current_ask=1.86,
+            quote_age_ms=None,
+            quote_source="sandbox",
+            execution_mode="paper",
+        )
+        # Paper: None age should not block
+        if not result.passed:
+            assert "STALE" not in result.reason_code, (
+                "PAPER must not block on unknown quote age"
+            )

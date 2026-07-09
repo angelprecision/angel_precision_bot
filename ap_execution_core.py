@@ -4943,29 +4943,71 @@ class APExecutionCore:
                 GateOutcome,
             )
 
-            # Amendment 4: client_id priority chain — _proof_client_id is primary but
-            # may be blank if proof vars were not populated. Walk all durable sources
-            # so a valid client_id in the order row does not get silently lost.
-            # Positive mismatch between any two non-blank sources is still caught
-            # by check_identity_gate() via watcher/osm cross-check args.
-            def _resolve_gate_client_id() -> str:
+            # Amendment 4 (hardened): collect all 6 client_id sources and verify
+            # they agree before accepting any as canonical. A stale/wrong
+            # _proof_client_id wins silently if we just return the first nonblank —
+            # that violates client_id attribution for LIVE money.
+            def _resolve_gate_client_id() -> tuple:
+                """
+                Returns (canonical_client_id, mismatch_reason).
+                canonical is the agreed value across all nonblank sources.
+                mismatch_reason is non-empty if any two sources disagree.
+                """
                 _sig_local = sig if isinstance(sig, dict) else {}
-                for _cid_src in (
-                    _proof_client_id,
-                    getattr(approved_plan, "client_id", None),
-                    _sig_local.get("client_id"),
-                    _sig_local.get("original_client_id"),
-                    (getattr(self.order_state_machine, "get_order", lambda x: {})(
-                        queue_local_order_id) or {}).get("client_id")
-                    if self.order_state_machine else None,
-                    getattr(self.order_state_machine, "client_id", None),
-                    getattr(self, "client_id", None),
-                ):
-                    _v = str(_cid_src or "").strip()
-                    if _v:
-                        return _v
-                return ""
-            _gate_client_id = _resolve_gate_client_id()
+                _cid_sources: dict = {
+                    "_proof_client_id":       str(_proof_client_id or "").strip(),
+                    "plan.client_id":         str(getattr(approved_plan, "client_id", "") or "").strip(),
+                    "sig.client_id":          str(_sig_local.get("client_id") or "").strip(),
+                    "sig.original_client_id": str(_sig_local.get("original_client_id") or "").strip(),
+                }
+                try:
+                    _osm_row = (
+                        getattr(self.order_state_machine, "get_order", lambda x: {})(
+                            queue_local_order_id
+                        ) or {}
+                    ) if self.order_state_machine else {}
+                    _cid_sources["osm_order.client_id"] = str(_osm_row.get("client_id") or "").strip()
+                except Exception:
+                    _cid_sources["osm_order.client_id"] = ""
+                _cid_sources["osm.client_id"]  = str(getattr(self.order_state_machine, "client_id", "") or "").strip()
+                _cid_sources["self.client_id"] = str(getattr(self, "client_id", "") or "").strip()
+
+                _nonblank = {k: v for k, v in _cid_sources.items() if v}
+                if not _nonblank:
+                    return "", ""  # all blank — gate will fail closed on missing client_id
+
+                _unique = set(_nonblank.values())
+                if len(_unique) > 1:
+                    # Positive disagreement between sources — fail closed regardless of which wins.
+                    _detail = "; ".join(f"{k}={v!r}" for k, v in sorted(_nonblank.items()))
+                    return "", f"client_id_source_mismatch [{_detail}]"
+
+                return _unique.pop(), ""
+
+            _gate_client_id, _gate_client_id_mismatch = _resolve_gate_client_id()
+            if _gate_client_id_mismatch:
+                log.critical(
+                    "LIVE_SUBMIT_GATE_BLOCKED gate=client_id_source_mismatch "
+                    "order_id=%s detail=%s",
+                    str(queue_local_order_id or ""), _gate_client_id_mismatch,
+                )
+                try:
+                    self.order_state_machine.update_order_meta(
+                        str(queue_local_order_id or ""),
+                        {"live_submit_gate": {
+                            "all_passed": False,
+                            "failed_gate": "client_id_source_mismatch",
+                            "detail": _gate_client_id_mismatch[:400],
+                        }},
+                    )
+                except Exception as _mism_meta_exc:
+                    log.warning(
+                        "[%s] LIVE_SUBMIT_GATE_AUDIT_WRITE_FAILED gate=client_id_source_mismatch "
+                        "order_id=%s error=%s — submit still blocked",
+                        ticker, str(queue_local_order_id or ""), _mism_meta_exc,
+                    )
+                _terminalize_breach_failure("live_submit_gate:CLIENT_ID_SOURCE_MISMATCH")
+                return
             _final_market_validity_audit = {
                 "gate": "market_validity",
                 "checked_at": __import__("datetime").datetime.now(
@@ -5132,13 +5174,20 @@ class APExecutionCore:
                 if isinstance(_mv_q, dict):
                     _mv_bid = _mv_q.get("bid")
                     _mv_ask = _mv_q.get("ask")
-                    _mv_quote_age_ms = _mv_q.get("quote_age_ms")  # None = age unknown
+                    _mv_quote_age_ms = _mv_q.get("quote_age_ms")
                     _mv_quote_source = (
                         _mv_q.get("source")
                         or _mv_q.get("quote_source")
                         or _mv_q.get("provider")
                         or "unknown"
                     )
+                    # Fix 2: synchronous fetch with valid bid/ask → treat as age=0.
+                    # We called the broker synchronously right now. If the adapter
+                    # does not return quote_age_ms, the quote is effectively 0ms old
+                    # (we just got it). Stamp 0 so the gate gets honest freshness
+                    # rather than treating None as "unknown = skip stale check".
+                    if _mv_quote_age_ms is None and _mv_bid is not None and _mv_ask is not None:
+                        _mv_quote_age_ms = 0  # synchronous fetch — age assumed 0ms
             except Exception as _mv_exc:
                 log.warning(
                     "[%s] LIVE_SUBMIT_GATE market quote fetch failed "

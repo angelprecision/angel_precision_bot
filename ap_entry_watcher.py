@@ -813,6 +813,34 @@ class APEntryWatcher:
         except Exception:
             return False
 
+    def _is_live_runtime(self) -> bool:
+        """
+        True when this watcher instance is running in LIVE mode.
+        Checks three independent attributes so the detection is robust even
+        when one is blank (common during restart / recovery paths):
+          1. self.execution_mode == "live"
+          2. self.mode == "LIVE"
+          3. self.paper is explicitly False
+        Only returns True if at least one confirms LIVE and none confirm PAPER.
+        """
+        _exec_mode = str(getattr(self, "execution_mode", "") or "").strip().lower()
+        _mode_str  = str(getattr(self, "mode",           "") or "").strip().upper()
+        _paper_flag = getattr(self, "paper", None)
+        is_live  = (
+            _exec_mode  == "live"
+            or _mode_str == "LIVE"
+            or _paper_flag is False
+        )
+        is_paper = (
+            _exec_mode  == "paper"
+            or _mode_str == "PAPER"
+            or _paper_flag is True
+        )
+        # If contradictory, trust the explicit paper flag first (safer default)
+        if is_paper:
+            return False
+        return is_live
+
     def _is_regular_session_now(self) -> bool:
         try:
             now_et = datetime.now(ET)
@@ -2268,7 +2296,7 @@ class APEntryWatcher:
                     # Amendment 3: LIVE + regular session + quote unavailable = fail closed.
                     # A missing quote during regular session means we cannot verify the
                     # underlying has not already blown through the trigger. Never rearm blind.
-                    _is_live_watcher_rr = str(getattr(self, "mode", "PAPER")).upper() == "LIVE"
+                    _is_live_watcher_rr = self._is_live_runtime()
                     if _is_live_watcher_rr and _recovery_bid == 0 and _recovery_ask == 0:
                         log.critical(
                             "[%s] RECOVERY_REARM_QUOTE_UNAVAILABLE — LIVE mode, regular session, "
@@ -2450,7 +2478,7 @@ class APEntryWatcher:
                 # Amendment 3b: LIVE + regular session + quote unavailable = block arm.
                 # If mid=0, we have no current price to verify the underlying has not
                 # already blown through the trigger. Never arm LIVE without verification.
-                _is_live_arm = str(getattr(self, "mode", "PAPER")).upper() == "LIVE"
+                _is_live_arm = self._is_live_runtime()
                 _regular_session_arm = not post_session and not pre_market
                 if mid == 0 and _is_live_arm and _regular_session_arm:
                     _watcher_arm_reason = "WATCHER_ARM_QUOTE_UNAVAILABLE"
@@ -3195,7 +3223,7 @@ class APEntryWatcher:
                 # LIVE: quote outage = invalidate. Never arm with stale/zero quotes.
                 #       Premium clients cannot have positions opened without verified price.
                 # PAPER: fail open (arm watcher) — sandbox is for learning, not money protection.
-                _is_live_watcher = str(getattr(self, "mode", "PAPER")).upper() == "LIVE"
+                _is_live_watcher = self._is_live_runtime()
                 if _is_live_watcher:
                     _ov_quot_audit = self._build_watcher_audit_payload(
                         w,
@@ -3496,7 +3524,7 @@ class APEntryWatcher:
                                         _ts_patch.get("trigger_confirmed_at"),
                                     )
                     except Exception as _pre_ts_exc:
-                        _is_live_ts = str(getattr(self, "mode", "PAPER")).upper() == "LIVE"
+                        _is_live_ts = self._is_live_runtime()
                         if _is_live_ts:
                             log.critical(
                                 "[%s] WATCHER_TRIGGER_TIMESTAMP_PERSIST_FAILED — "
