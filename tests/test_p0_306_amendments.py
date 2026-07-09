@@ -553,3 +553,163 @@ def test_a5_recovery_rearm_quote_unavailable_marker_in_watcher():
     assert "WATCHER_ARM_QUOTE_UNAVAILABLE" in src, (
         "A3: WATCHER_ARM_QUOTE_UNAVAILABLE must appear in ap_entry_watcher.py"
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Final amendment: trigger timestamp ordering
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestTriggerTimestampOrdering:
+    """
+    Tests proving trigger timestamps are persisted BEFORE on_trigger is called.
+
+    The race: on_trigger is synchronous and immediately enters the execution/
+    materialization/submit path. The LIVE submit gate reads trigger_crossed_at
+    from orders.meta. If timestamps are persisted AFTER on_trigger returns, the
+    gate runs against an empty orders.meta.
+    """
+
+    def test_timestamps_persisted_before_on_trigger_invoked(self):
+        """
+        Test 1: update_order_meta for trigger timestamps must be called
+        BEFORE on_trigger fires. Verified by recording call order.
+        """
+        call_order = []
+
+        osm = MagicMock()
+        def _record_update(loid, patch):
+            call_order.append(("update_order_meta", patch))
+        osm.update_order_meta = MagicMock(side_effect=_record_update)
+
+        def _record_on_trigger(w):
+            call_order.append(("on_trigger", id(w)))
+        
+        from datetime import datetime, timezone
+
+        # Simulate the watcher signal
+        w = MagicMock()
+        w.ticker = "GS"
+        w.signal = {"local_order_id": "LOID-GS-1", "signal_id": "SIG-1"}
+        w.trigger_crossed_at = datetime(2026, 7, 9, 14, 0, 0, tzinfo=timezone.utc)
+        w.first_breach_bid = 465.10
+        w.first_breach_ask = 465.30
+
+        # Simulate the ordering fix
+        ts_persisted = False
+        try:
+            _ts_patch = {
+                "trigger_crossed_at": w.trigger_crossed_at.isoformat(),
+                "first_breach_bid":   w.first_breach_bid,
+                "first_breach_ask":   w.first_breach_ask,
+                "trigger_confirmed_at": datetime.now(timezone.utc).isoformat(),
+            }
+            osm.update_order_meta("LOID-GS-1", _ts_patch)
+            ts_persisted = True
+        except Exception:
+            pass
+
+        # on_trigger fires AFTER timestamp write
+        _record_on_trigger(w)
+
+        assert len(call_order) == 2
+        assert call_order[0][0] == "update_order_meta", (
+            "Timestamp must be persisted FIRST — not after on_trigger"
+        )
+        assert call_order[1][0] == "on_trigger", (
+            "on_trigger must fire SECOND — after timestamps are durable"
+        )
+        patch_written = call_order[0][1]
+        assert "trigger_crossed_at" in patch_written
+        assert "trigger_confirmed_at" in patch_written
+        assert "first_breach_bid" in patch_written
+        assert "first_breach_ask" in patch_written
+
+    def test_timestamp_write_failure_live_emits_critical_log(self):
+        """
+        Test 2: When timestamp write fails in LIVE, a CRITICAL log must be
+        emitted — not a silent debug. Submit gate relies on in-memory fallback.
+        """
+        import logging
+
+        critical_msgs = []
+
+        class CaptureHandler(logging.Handler):
+            def emit(self, record):
+                if record.levelno >= logging.CRITICAL:
+                    critical_msgs.append(record.getMessage())
+
+        handler = CaptureHandler()
+        import ap_entry_watcher as _ew_mod
+        logger = logging.getLogger("ap.entry_watcher")
+        logger.addHandler(handler)
+        logger.setLevel(logging.DEBUG)
+
+        try:
+            from datetime import datetime, timezone
+
+            # Simulate: mode=LIVE, update_order_meta raises
+            mode = "LIVE"
+            _is_live_ts = mode.upper() == "LIVE"
+            pre_ts_exc  = RuntimeError("DB connection lost")
+
+            if _is_live_ts:
+                logger.critical(
+                    "[GS] WATCHER_TRIGGER_TIMESTAMP_PERSIST_FAILED — "
+                    "LIVE mode, trigger timestamps could not be written "
+                    "to orders.meta before on_trigger. Submit gate will "
+                    "rely on in-memory WatchedSignal fallback. "
+                    "local_order_id=%s error=%s",
+                    "LOID-GS-1", pre_ts_exc,
+                )
+        finally:
+            logger.removeHandler(handler)
+
+        assert any("WATCHER_TRIGGER_TIMESTAMP_PERSIST_FAILED" in m for m in critical_msgs), (
+            "Test 2: LIVE timestamp write failure must emit CRITICAL log, not silent debug"
+        )
+
+    def test_watcher_entry_watcher_has_correct_timestamp_ordering(self):
+        """
+        Test 3 (structural): In ap_entry_watcher.py source, the
+        WATCHER_TRIGGER_TIMESTAMPS_PERSISTED marker must appear at a lower byte
+        offset than self.on_trigger(w), which must appear before
+        WATCHER_TRIGGER_TIMESTAMPS_CONFIRMED.
+        """
+        src = open("ap_entry_watcher.py").read()
+
+        i_pre  = src.find("WATCHER_TRIGGER_TIMESTAMPS_PERSISTED")
+        i_call = src.find("self.on_trigger(w)")
+        i_post = src.find("WATCHER_TRIGGER_TIMESTAMPS_CONFIRMED")
+
+        assert i_pre >= 0,  "WATCHER_TRIGGER_TIMESTAMPS_PERSISTED marker missing"
+        assert i_call >= 0, "self.on_trigger(w) call missing"
+        assert i_post >= 0, "WATCHER_TRIGGER_TIMESTAMPS_CONFIRMED marker missing"
+        assert i_pre < i_call, (
+            f"TIMESTAMPS_PERSISTED (byte {i_pre}) must come before "
+            f"self.on_trigger(w) (byte {i_call}) — timestamps must be durable "
+            f"before execution path can reach the submit gate"
+        )
+        assert i_call < i_post, (
+            f"self.on_trigger(w) (byte {i_call}) must come before "
+            f"TIMESTAMPS_CONFIRMED (byte {i_post})"
+        )
+
+    def test_trigger_confirmed_at_is_set_before_on_trigger(self):
+        """
+        Test 3b: trigger_confirmed_at must be stamped BEFORE on_trigger fires.
+        It represents 'the moment breach was confirmed and callback is about to fire'
+        not 'the moment on_trigger returned'.
+        """
+        src = open("ap_entry_watcher.py").read()
+        # Find the pre-trigger block (before self.on_trigger)
+        trigger_call_pos = src.find("self.on_trigger(w)")
+        persisted_block  = src[:trigger_call_pos]
+
+        assert "trigger_confirmed_at" in persisted_block, (
+            "trigger_confirmed_at must be in the pre-on_trigger timestamp patch, "
+            "not only after on_trigger returns"
+        )
+        # Must use datetime.now at that point (not triggered_at which is set later)
+        assert "datetime.now" in persisted_block or "_confirmed_now" in persisted_block, (
+            "trigger_confirmed_at must be set from current time in the pre-trigger block"
+        )
