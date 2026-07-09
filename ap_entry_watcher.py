@@ -378,6 +378,13 @@ class WatchedSignal:
         self.state = WatchState.PENDING
         self.created_at = datetime.now(timezone.utc)
         self.triggered_at: Optional[datetime] = None
+        # PR #305: FIRST breach moment (distinct from triggered_at which is
+        # when the confirmed poll fires after MOMENTUM_POLLS_REQUIRED breaches).
+        # Used by ap.live_submit_gates.check_trigger_age_gate to enforce
+        # ENTRY_TRIGGER_MAX_AGE_SEC (default 120s).
+        self.trigger_crossed_at: Optional[datetime] = None
+        self.first_breach_bid: float = 0.0
+        self.first_breach_ask: float = 0.0
         self.trigger_price: Optional[float] = None
         self.expire_at = self.created_at + timedelta(minutes=MAX_WATCH_MINUTES)
 
@@ -499,6 +506,16 @@ class WatchedSignal:
             if ask >= self.entry_trigger:
                 if self.breach_count == 0:
                     self.breach_price = ask
+                    # ── P0 (PR #305) trigger-age gate:
+                    # Stamp the first-breach moment so the LIVE pre-submit
+                    # trigger-age gate can enforce ENTRY_TRIGGER_MAX_AGE_SEC.
+                    # This is the "trigger crossed" moment, distinct from
+                    # triggered_at (which is when the confirmed poll fires
+                    # after MOMENTUM_POLLS_REQUIRED breaches).
+                    if getattr(self, "trigger_crossed_at", None) is None:
+                        self.trigger_crossed_at = now
+                        self.first_breach_bid = bid
+                        self.first_breach_ask = ask
                     log.debug(
                         "[%s] CALL breach candidate — ask=$%.2f >= trigger=$%.2f",
                         self.ticker,
@@ -576,6 +593,11 @@ class WatchedSignal:
             if bid <= self.entry_trigger:
                 if self.breach_count == 0:
                     self.breach_price = bid
+                    # ── P0 (PR #305) trigger-age gate — see CALL branch above.
+                    if getattr(self, "trigger_crossed_at", None) is None:
+                        self.trigger_crossed_at = now
+                        self.first_breach_bid = bid
+                        self.first_breach_ask = ask
                     log.debug(
                         "[%s] PUT breach candidate — bid=$%.2f <= trigger=$%.2f",
                         self.ticker,
@@ -790,6 +812,34 @@ class APEntryWatcher:
             )
         except Exception:
             return False
+
+    def _is_live_runtime(self) -> bool:
+        """
+        True when this watcher instance is running in LIVE mode.
+        Checks three independent attributes so the detection is robust even
+        when one is blank (common during restart / recovery paths):
+          1. self.execution_mode == "live"
+          2. self.mode == "LIVE"
+          3. self.paper is explicitly False
+        Only returns True if at least one confirms LIVE and none confirm PAPER.
+        """
+        _exec_mode = str(getattr(self, "execution_mode", "") or "").strip().lower()
+        _mode_str  = str(getattr(self, "mode",           "") or "").strip().upper()
+        _paper_flag = getattr(self, "paper", None)
+        is_live  = (
+            _exec_mode  == "live"
+            or _mode_str == "LIVE"
+            or _paper_flag is False
+        )
+        is_paper = (
+            _exec_mode  == "paper"
+            or _mode_str == "PAPER"
+            or _paper_flag is True
+        )
+        # If contradictory, trust the explicit paper flag first (safer default)
+        if is_paper:
+            return False
+        return is_live
 
     def _is_regular_session_now(self) -> bool:
         try:
@@ -2242,6 +2292,43 @@ class APEntryWatcher:
                         _recovery_quote = {}
                     _recovery_bid = float((_recovery_quote or {}).get("bid") or 0)
                     _recovery_ask = float((_recovery_quote or {}).get("ask") or 0)
+
+                    # Amendment 3: LIVE + regular session + quote unavailable = fail closed.
+                    # A missing quote during regular session means we cannot verify the
+                    # underlying has not already blown through the trigger. Never rearm blind.
+                    _is_live_watcher_rr = self._is_live_runtime()
+                    if _is_live_watcher_rr and _recovery_bid == 0 and _recovery_ask == 0:
+                        log.critical(
+                            "[%s] RECOVERY_REARM_QUOTE_UNAVAILABLE — LIVE mode, regular session, "
+                            "quote returned bid=0 ask=0. Blocking recovery_rearm for "
+                            "local_order_id=%s to prevent late entry without price verification.",
+                            ticker, local_order_id,
+                        )
+                        try:
+                            self._persist_watcher_audit(local_order_id, {
+                                "reason_code":     "RECOVERY_REARM_QUOTE_UNAVAILABLE",
+                                "trigger_type":    "recovery_rearm_classifier",
+                                "classification":  "RECOVERY_REARM_QUOTE_UNAVAILABLE",
+                                "watcher_owned":   _watcher_owned,
+                                "mode":            "LIVE",
+                                "regular_session": True,
+                                "quote_available": False,
+                            })
+                        except Exception as _rr_audit_exc:
+                            log.warning(
+                                "[%s] RECOVERY_REARM_QUOTE_UNAVAILABLE audit write failed "
+                                "local_order_id=%s error=%s",
+                                ticker, local_order_id, _rr_audit_exc,
+                            )
+                        self._terminalize_recovery_rearm_candidate(
+                            local_order_id,
+                            ticker=ticker,
+                            classification="RECOVERY_REARM_QUOTE_UNAVAILABLE",
+                            watcher_owned=_watcher_owned,
+                            already_through=None,
+                        )
+                        return False
+
                     if _recovery_bid > 0 or _recovery_ask > 0:
                         _already_through = self._is_already_through_trigger(
                             side, float(trigger), _recovery_bid, _recovery_ask,
@@ -2388,6 +2475,49 @@ class APEntryWatcher:
                 bid = float(quote.get("bid") or 0)
                 ask = float(quote.get("ask") or 0)
                 mid = (bid + ask) / 2 if bid > 0 and ask > 0 else max(bid, ask)
+                # Amendment 3b: LIVE + regular session + quote unavailable = block arm.
+                # If mid=0, we have no current price to verify the underlying has not
+                # already blown through the trigger. Never arm LIVE without verification.
+                _is_live_arm = self._is_live_runtime()
+                _regular_session_arm = not post_session and not pre_market
+                if mid == 0 and _is_live_arm and _regular_session_arm:
+                    _watcher_arm_reason = "WATCHER_ARM_QUOTE_UNAVAILABLE"
+                    log.critical(
+                        "[%s] WATCHER_ARM_QUOTE_UNAVAILABLE — LIVE mode, regular session, "
+                        "quote returned bid=0 ask=0 mid=0 for trigger=$%.4f. "
+                        "Blocking arm to prevent entry without price verification.",
+                        ticker, float(trigger or 0),
+                    )
+                    _no_quote_audit = self._build_watcher_audit_payload(
+                        None,
+                        symbol=ticker,
+                        score=float(signal_dict.get("score") or 0),
+                        tier=str(signal_dict.get("grade") or ""),
+                        direction=side,
+                        timeframe=str(signal_dict.get("timeframe") or ""),
+                        pattern=str(signal_dict.get("pattern") or ""),
+                        signal_id=str(signal_dict.get("signal_id") or ""),
+                        plan_id=str(signal_dict.get("plan_id") or ""),
+                        trigger_type="arm_time",
+                        signal_entry_price=trigger,
+                        trigger_price=trigger,
+                        stop_price=stop,
+                        current_bid=0.0,
+                        current_ask=0.0,
+                        current_mid=0.0,
+                        reason_code=_watcher_arm_reason,
+                        raw_reason="live_regular_session_arm_quote_zero",
+                    )
+                    try:
+                        self._persist_watcher_audit(local_order_id, _no_quote_audit)
+                    except Exception as _arm_audit_exc:
+                        log.warning(
+                            "[%s] WATCHER_ARM_QUOTE_UNAVAILABLE audit write failed "
+                            "local_order_id=%s error=%s",
+                            ticker, local_order_id, _arm_audit_exc,
+                        )
+                    return False
+
                 if mid > 0:
                     pct_from_trigger = (mid - trigger) / trigger
                     # FUNNEL FIX (2026-05-20):
@@ -3093,7 +3223,7 @@ class APEntryWatcher:
                 # LIVE: quote outage = invalidate. Never arm with stale/zero quotes.
                 #       Premium clients cannot have positions opened without verified price.
                 # PAPER: fail open (arm watcher) — sandbox is for learning, not money protection.
-                _is_live_watcher = str(getattr(self, "mode", "PAPER")).upper() == "LIVE"
+                _is_live_watcher = self._is_live_runtime()
                 if _is_live_watcher:
                     _ov_quot_audit = self._build_watcher_audit_payload(
                         w,
@@ -3345,6 +3475,72 @@ class APEntryWatcher:
                         "ticker=%s signal_id=%s attempt=%d/3 kept_in_pending=true",
                         w.ticker, _sig_id or "?", _trigger_attempts + 1,
                     )
+                    # ── Final amendment (PR #306): persist trigger timestamps
+                    # BEFORE calling on_trigger.
+                    #
+                    # WHY: on_trigger is synchronous and immediately enters the
+                    # execution/materialization/submit path. The LIVE submit gate
+                    # reads trigger_crossed_at from orders.meta to compute trigger
+                    # age. If we persist AFTER on_trigger returns, the gate runs
+                    # against an empty orders.meta and either passes (stale-miss)
+                    # or relies on an in-memory fallback that may not be in scope.
+                    # Durable timestamp must exist BEFORE execution can reach the gate.
+                    _ts_pre_write_ok = False
+                    _ts_pre_local_oid = None
+                    try:
+                        _sig_for_ts   = getattr(w, "signal", {}) or {}
+                        _ts_pre_local_oid = _sig_for_ts.get("local_order_id")
+                        _tc_at  = getattr(w, "trigger_crossed_at", None)
+                        _tc_bid = float(getattr(w, "first_breach_bid", 0) or 0)
+                        _tc_ask = float(getattr(w, "first_breach_ask", 0) or 0)
+                        # trigger_confirmed_at = NOW (the moment breach is confirmed
+                        # and callback is about to fire, not after it returns).
+                        _confirmed_now = datetime.now(timezone.utc)
+                        if _ts_pre_local_oid and self.order_state_machine is not None:
+                            _ts_patch: dict = {}
+                            if _tc_at is not None:
+                                _ts_patch["trigger_crossed_at"] = (
+                                    _tc_at.isoformat() if hasattr(_tc_at, "isoformat")
+                                    else str(_tc_at)
+                                )
+                            if _tc_bid:
+                                _ts_patch["first_breach_bid"]  = _tc_bid
+                            if _tc_ask:
+                                _ts_patch["first_breach_ask"]  = _tc_ask
+                            _ts_patch["trigger_confirmed_at"] = _confirmed_now.isoformat()
+                            if _ts_patch:
+                                _upd_ts = getattr(
+                                    self.order_state_machine, "update_order_meta", None
+                                )
+                                if callable(_upd_ts):
+                                    _upd_ts(_ts_pre_local_oid, _ts_patch)
+                                    _ts_pre_write_ok = True
+                                    log.info(
+                                        "WATCHER_TRIGGER_TIMESTAMPS_PERSISTED "
+                                        "local_order_id=%s trigger_crossed_at=%s "
+                                        "trigger_confirmed_at=%s — before on_trigger",
+                                        _ts_pre_local_oid,
+                                        _ts_patch.get("trigger_crossed_at"),
+                                        _ts_patch.get("trigger_confirmed_at"),
+                                    )
+                    except Exception as _pre_ts_exc:
+                        _is_live_ts = self._is_live_runtime()
+                        if _is_live_ts:
+                            log.critical(
+                                "[%s] WATCHER_TRIGGER_TIMESTAMP_PERSIST_FAILED — "
+                                "LIVE mode, trigger timestamps could not be written "
+                                "to orders.meta before on_trigger. Submit gate will "
+                                "rely on in-memory WatchedSignal fallback. "
+                                "local_order_id=%s error=%s",
+                                w.ticker, _ts_pre_local_oid or "?", _pre_ts_exc,
+                            )
+                        else:
+                            log.debug(
+                                "[%s] trigger timestamp pre-persist non-critical: %s",
+                                w.ticker, _pre_ts_exc,
+                            )
+
+                    # ── Call the trigger callback — timestamps are now durable ──
                     try:
                         self.on_trigger(w)
                         w._trigger_attempts = 0   # reset on success
@@ -3363,8 +3559,15 @@ class APEntryWatcher:
                             pass
                         log.info(
                             "WATCHER_TRIGGER_CALLBACK_OK ticker=%s signal_id=%s "
-                            "removed_from_pending=true dedup_released=true",
-                            w.ticker, _sig_id or "?",
+                            "removed_from_pending=true dedup_released=true "
+                            "timestamps_pre_persisted=%s",
+                            w.ticker, _sig_id or "?", _ts_pre_write_ok,
+                        )
+                        # Post-success: log marker only — timestamps already durable.
+                        log.debug(
+                            "WATCHER_TRIGGER_TIMESTAMPS_CONFIRMED "
+                            "local_order_id=%s pre_write_ok=%s",
+                            _ts_pre_local_oid or "?", _ts_pre_write_ok,
                         )
                         # Diagnostic-only — proves the callback ran cleanly.
                         # Pair with BREACH_RISK_CHECK_BLOCKED / ENTRY_TRIGGER_BLOCKED_RETURN
