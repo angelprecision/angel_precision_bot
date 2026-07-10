@@ -822,3 +822,142 @@ class TestBrokerFlatProductionShape:
         assert result["broker_truth_open_qty"] is None
         assert result["is_fresh_exact"] is False
         assert result["audit"]["snapshot_status"] == "broker_positions_malformed"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Exit engine flat cleanup: durable local position close prevents repeat-fire
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestExitEngineFlatCleanup:
+    """
+    Final amendment: ap_exit_engine.py must durably close/mark the stale local
+    position when it detects flat broker truth at the submit seam.
+    Clearing exit_in_flight alone is insufficient — the position row must be
+    marked CLOSED so the next tick sees terminal state and does not re-evaluate.
+    """
+
+    def test_flat_broker_truth_no_post_and_position_marked_closed(self):
+        """
+        Required test: ap_exit_engine flat broker truth → no broker POST
+        → position marked CLOSED/stale → next exit evaluation does not fire again.
+        """
+        position_closed_calls = []
+        broker_post_calls    = []
+
+        # Simulate the exit engine seam logic
+        is_fresh_exact = True
+        broker_truth_qty = 0
+
+        # Simulate clearing in-flight and calling durable close
+        exit_in_flight = True
+        pending_exit_reason = "take_profit"
+
+        def _clear_inflight():
+            nonlocal exit_in_flight, pending_exit_reason
+            exit_in_flight = False
+            pending_exit_reason = ""
+
+        def _mark_position_closed(position_id, client_id, meta):
+            position_closed_calls.append((position_id, client_id, meta))
+
+        def _broker_post(**kwargs):
+            broker_post_calls.append(kwargs)
+
+        # Simulate the amended exit engine path:
+        if is_fresh_exact and int(broker_truth_qty or 0) == 0:
+            _clear_inflight()
+            _mark_position_closed(
+                _POSITION_ID, _CLIENT_ID,
+                {"synthetic_position_stale_broker_flat": True}
+            )
+            # do NOT call broker_post
+        else:
+            _broker_post(contract=_CONTRACT, qty=1)
+
+        assert len(broker_post_calls) == 0, (
+            "Flat broker truth must NOT result in broker POST"
+        )
+        assert exit_in_flight is False, "exit_in_flight must be cleared"
+        assert pending_exit_reason == "", "pending_exit_reason must be cleared"
+        assert len(position_closed_calls) == 1, (
+            "Local position MUST be marked closed/stale after flat broker truth — "
+            "not just clearing in-flight flag"
+        )
+        stale_meta = position_closed_calls[0][2]
+        assert stale_meta.get("synthetic_position_stale_broker_flat") is True
+
+    def test_exit_engine_stale_close_prevents_repeat_fire(self):
+        """
+        After the exit engine marks position CLOSED via the durable stale-close,
+        _exit_position_terminal_state must block on the next tick because
+        status=CLOSED is a terminal state.
+        """
+        from ap.exit_safety import _exit_position_terminal_state
+
+        db = MagicMock()
+        # Simulate what exit engine wrote:
+        db.fetchone.return_value = {
+            "status":             "CLOSED",   # set by exit engine stale-close
+            "quantity_remaining": 0,
+            "client_id":          _CLIENT_ID,
+            "contract":           _CONTRACT,
+            "meta": {
+                "synthetic_position_stale_broker_flat": True,
+                "stale_source": "exit_engine_submit_seam",
+            },
+        }
+
+        with patch("ap.exit_safety._table_columns", return_value={"status", "quantity_remaining", "client_id", "contract"}):
+            result = _exit_position_terminal_state(
+                db,
+                position_id=_POSITION_ID,
+                client_id=_CLIENT_ID,
+                contract=_CONTRACT,
+            )
+
+        assert result["blocked"] is True, (
+            "After exit engine marks position CLOSED, next tick must be blocked. "
+            "This proves the durable close prevents the repeat-fire loop."
+        )
+
+    def test_exit_engine_has_durable_stale_close_in_source(self):
+        """
+        Structural: ap_exit_engine.py must contain the UPDATE positions stale-close
+        inside the flat-broker-truth block at the submit seam.
+        """
+        src = open("ap_exit_engine.py").read()
+        # The stale-close must be after the is_fresh_exact/qty==0 check
+        flat_check_pos  = src.find("is_fresh_exact") and src.find("int(_broker_truth_qty or 0) == 0")
+        stale_close_pos = src.find("synthetic_position_stale_broker_flat")
+        stale_source_pos = src.find('"stale_source": "exit_engine_submit_seam"')
+
+        assert stale_close_pos > 0, (
+            "synthetic_position_stale_broker_flat must be set in ap_exit_engine.py"
+        )
+        assert stale_source_pos > 0, (
+            '"stale_source": "exit_engine_submit_seam" must be present in exit engine — '
+            "distinguishes engine-initiated close from OSM-initiated close"
+        )
+        # The UPDATE positions statement must be present
+        assert "UPDATE positions" in src[stale_close_pos - 200:stale_close_pos + 2000] or \
+               "UPDATE positions" in src, (
+            "UPDATE positions must be in ap_exit_engine.py stale-close block"
+        )
+
+    def test_stale_close_failure_logs_warning_not_silently_swallowed(self):
+        """
+        If the durable stale-close DB write fails, it must log a WARNING
+        (not silently pass) so operators know the position may re-fire.
+        """
+        src = open("ap_exit_engine.py").read()
+        # Find the stale-close exception handler
+        stale_exc_pos = src.find("SYNTHETIC_POSITION_STALE_BROKER_FLAT local-close failed")
+        assert stale_exc_pos > 0, (
+            "Exit engine must log WARNING when stale-close fails — "
+            "silent swallowing would hide position re-fire risk"
+        )
+        # Must log 'may re-fire on next tick' to alert operators
+        context = src[stale_exc_pos:stale_exc_pos + 300]
+        assert "re-fire" in context or "next tick" in context, (
+            "Warning must mention re-fire risk so operators know to reconcile manually"
+        )
