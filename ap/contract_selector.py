@@ -3141,29 +3141,16 @@ class APContractSelectionEngine:
                 audit["buckets_attempted"].append(bucket_rec)
 
             # All buckets exhausted. Priority for final reason preservation:
-            #   1. Retryable data-miss — upstream retry loop will re-probe after delay.
-            #   2. Quality reject — true contract-quality blocker; preserve the most
-            #      specific quality reason so dashboards show the real gate, not
-            #      the ladder-aggregation NO_VALID_PLAYBOOK_DTE_CONTRACT.
+            #   1. Quality reject from a usable chain — preserve the truthful
+            #      blocker rather than an earlier transient data miss.
+            #   2. Retryable data-miss — only when every probed expiration stayed
+            #      transient and no later usable-chain quality verdict occurred.
             #   3. NO_VALID_PLAYBOOK_DTE_CONTRACT — fallback when no specific reason
             #      was captured (empty chain, ladder never got any sub-failure).
             #
             # NOTE: _preserved_terminal is handled above via early return; it
             # should be None here.
             self._last_dte_ladder_audit = audit
-            if _preserved_retryable is not None:
-                self._last_failure = {
-                    "stage": str(_preserved_retryable.get("stage") or "dte_ladder"),
-                    "reason_code": str(_preserved_retryable.get("reason_code") or "UNKNOWN_REJECTION"),
-                    "explanation": str(_preserved_retryable.get("explanation") or ""),
-                }
-                _restore_selector_failure(plan, _preserved_retryable)
-                log.warning(
-                    "[%s] DTE_LADDER_RETRYABLE_REASON preserved reason=%s "
-                    "— not masking with NO_VALID_PLAYBOOK_DTE_CONTRACT",
-                    ticker, _preserved_retryable.get("reason_code"),
-                )
-                return None
             if _preserved_quality is not None:
                 self._last_failure = {
                     "stage": str(_preserved_quality.get("stage") or "dte_ladder"),
@@ -3175,6 +3162,19 @@ class APContractSelectionEngine:
                     "[%s] DTE_LADDER_QUALITY_REASON preserved reason=%s "
                     "— not masking with NO_VALID_PLAYBOOK_DTE_CONTRACT",
                     ticker, _preserved_quality.get("reason_code"),
+                )
+                return None
+            if _preserved_retryable is not None:
+                self._last_failure = {
+                    "stage": str(_preserved_retryable.get("stage") or "dte_ladder"),
+                    "reason_code": str(_preserved_retryable.get("reason_code") or "UNKNOWN_REJECTION"),
+                    "explanation": str(_preserved_retryable.get("explanation") or ""),
+                }
+                _restore_selector_failure(plan, _preserved_retryable)
+                log.warning(
+                    "[%s] DTE_LADDER_RETRYABLE_REASON preserved reason=%s "
+                    "— not masking with NO_VALID_PLAYBOOK_DTE_CONTRACT",
+                    ticker, _preserved_retryable.get("reason_code"),
                 )
                 return None
             self._last_failure = {

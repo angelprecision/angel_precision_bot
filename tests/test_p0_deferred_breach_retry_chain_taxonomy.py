@@ -318,6 +318,83 @@ def test_dte_ladder_preserves_quality_reason_when_chain_rows_exist(monkeypatch):
     )
 
 
+def test_dte_ladder_mixed_retryable_then_quality_finishes_as_quality(monkeypatch):
+    """If an early expiration is transient but a later usable chain fails
+    quality, the final ladder reason must be quality, not retryable."""
+    from datetime import date, timedelta
+    exp_a = date.today() + timedelta(days=1)
+    while exp_a.weekday() >= 5:
+        exp_a += timedelta(days=1)
+    exp_c = date.today() + timedelta(days=14)
+    while exp_c.weekday() >= 5:
+        exp_c += timedelta(days=1)
+
+    mod = _load_selector({"DEFERRED_DTE_LADDER": "1"})
+    APContractSelectionEngine = mod.APContractSelectionEngine
+    sel = object.__new__(APContractSelectionEngine)
+    sel.dte_ladder_enabled = True
+    sel.dte_bucket_a_max = 2
+    sel.dte_bucket_b_max = 7
+    sel.dte_ladder_probe_per_bucket = 2
+    sel._last_failure = None
+    sel._last_dte_ladder_audit = None
+    sel._fetch_expirations_list = MagicMock(return_value=[exp_a.isoformat(), exp_c.isoformat()])
+
+    def _fake_select(plan, *, expiration_override=None):
+        if expiration_override == exp_a.isoformat():
+            plan.metadata["selector_failure"] = {
+                "reason_code": "CHAIN_PROVIDER_EMPTY_OPTIONS",
+                "explanation": "provider warming up",
+            }
+        else:
+            plan.metadata["selector_failure"] = {
+                "reason_code": "SPREAD_TOO_WIDE",
+                "explanation": "usable nonzero chain failed spread gate",
+            }
+        return None
+
+    sel.select = _fake_select
+    result = sel._select_with_dte_ladder(SimpleNamespace(
+        ticker="AVGO", timeframe="1d",
+        metadata={"deferred_breach_selection": True},
+    ))
+    assert result is None
+    assert sel._last_failure["reason_code"] == "SPREAD_TOO_WIDE"
+
+
+def test_execution_core_does_not_retry_when_ladder_finishes_with_quality(monkeypatch):
+    """A mixed transient-plus-quality ladder run must terminalize, not schedule
+    a retry thread, because the final truthful blocker is quality."""
+    monkeypatch.setattr(ec_mod.APExecutionCore, "_breach_risk_check", lambda self, watched: True)
+    monkeypatch.setattr(
+        ec_mod.APExecutionCore,
+        "_recover_plan_for_revalidation",
+        lambda self, watched: _make_plan(reason_code="SPREAD_TOO_WIDE"),
+    )
+    monkeypatch.setattr("ap.queue.write_deferred_breach_last_error", lambda *args, **kwargs: None)
+    recorder = _ThreadRecorder()
+    monkeypatch.setattr(threading, "Thread", recorder.factory)
+
+    selector = _Selector("SPREAD_TOO_WIDE", stage="quality_summary", explanation="usable chain failed spread")
+    selector.get_last_dte_ladder_audit = lambda: {
+        "buckets_attempted": [
+            {"expirations_probed": [
+                {"failure": {"reason_code": "CHAIN_PROVIDER_EMPTY_OPTIONS"}},
+                {"failure": {"reason_code": "SPREAD_TOO_WIDE"}},
+            ]},
+        ]
+    }
+    core = _make_core(selector)
+    with monkeypatch.context() as m:
+        m.setenv("BREACH_SELECTOR_RETRY_ENABLED", "1")
+        m.setenv("MAX_BREACH_SELECTOR_RETRIES", "3")
+        core._on_entry_trigger(_make_watched())
+
+    assert recorder.starts == 0, "quality final verdict must not schedule retry"
+    core.order_state_machine.submit_existing_entry.assert_not_called()
+    core.order_state_machine.expire_pending_entry.assert_called_once()
+
+
 def test_chain_auth_error_remains_terminal(monkeypatch):
     mod = _load_selector({"DEFERRED_DTE_LADDER": "1"})
     APContractSelectionEngine = mod.APContractSelectionEngine
@@ -799,21 +876,21 @@ class TestJasonLiveRecoveryAmendments:
 
     # ── Fix C additional structural tests ───────────────────────────────────
 
-    def test_fix_c_ladder_priority_retryable_before_quality(self):
-        """Fix C: when ladder exhausts, retryable reason takes priority over
-        quality reason so the retry loop can fire."""
+    def test_fix_c_ladder_priority_quality_before_retryable(self):
+        """Fix C: when ladder exhausts after a later usable-chain quality
+        verdict, quality must take priority over any earlier transient miss."""
         src = open("ap/contract_selector.py").read()
         idx_ret = src.find("_preserved_retryable is not None")
         idx_qual = src.find("_preserved_quality is not None")
         # Both must exist
         assert idx_ret > 0, "Fix C: _preserved_retryable is not None check missing"
         assert idx_qual > 0, "Fix C: _preserved_quality is not None check missing"
-        # Retryable must come BEFORE quality in the final preservation block
-        # (after all buckets are exhausted)
-        assert idx_ret < idx_qual, (
-            "Fix C: in the final preservation block, _preserved_retryable "
-            "must be checked before _preserved_quality so data-miss failures "
-            "are retried before quality rejects terminalize."
+        # Quality must come BEFORE retryable in the final preservation block
+        # so a later usable-chain verdict is not masked by an earlier transient.
+        assert idx_qual < idx_ret, (
+            "Fix C: in the final preservation block, _preserved_quality "
+            "must be checked before _preserved_retryable so a truthful "
+            "quality rejection is not downgraded into a retry."
         )
 
     def test_fix_c_quality_rejects_do_not_stop_ladder_mid_probe(self):

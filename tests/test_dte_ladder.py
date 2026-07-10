@@ -574,6 +574,45 @@ class TestAmendmentGateOrdering:
             "CHAIN_PARSE_EMPTY",
         }
 
+    def test_ladder_prefers_later_quality_reason_over_earlier_retryable_miss(self):
+        """If an early expiration is transient but a later usable chain fails
+        quality, the truthful final verdict must be the quality rejection."""
+        mod = _load_selector({"DEFERRED_DTE_LADDER": "1"})
+        sel = object.__new__(mod.APContractSelectionEngine)
+        sel.dte_ladder_enabled = True
+        sel.dte_bucket_a_max = 2
+        sel.dte_bucket_b_max = 7
+        sel.dte_ladder_probe_per_bucket = 2
+        sel._last_failure = None
+        sel._last_dte_ladder_audit = None
+
+        today = date.today()
+        a_exp = _next_weekday(today, 1)
+        c_exp = _next_weekday(today, 14)
+        sel._fetch_expirations_list = MagicMock(return_value=[a_exp, c_exp])
+
+        def _fake_select(plan, *, expiration_override=None):
+            if expiration_override == a_exp:
+                plan.metadata["selector_failure"] = {
+                    "reason_code": "CHAIN_PROVIDER_EMPTY_OPTIONS",
+                    "explanation": "provider warming up",
+                }
+            else:
+                plan.metadata["selector_failure"] = {
+                    "reason_code": "SPREAD_TOO_WIDE",
+                    "explanation": "usable chain, no contract passed spread gate",
+                }
+            return None
+
+        sel.select = _fake_select
+
+        plan = _make_plan(timeframe="1d")
+        plan.metadata = {}
+        result = sel._select_with_dte_ladder(plan)
+        assert result is None
+        assert sel._last_failure["reason_code"] == "SPREAD_TOO_WIDE"
+        assert plan.metadata["selector_failure"]["reason_code"] == "SPREAD_TOO_WIDE"
+
 
 class TestDeferredPlanIntegration:
     def test_real_selector_ladder_preserves_recovered_plan_identity_on_copyback(self):
