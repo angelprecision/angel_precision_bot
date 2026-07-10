@@ -1122,6 +1122,52 @@ def _pricing_basis_for_mode(mode: str) -> tuple[bool, str]:
     is_live = mode == "LIVE"
     return is_live, "ASK_EXECUTION" if is_live else "MID_SIMULATION"
 
+def _selector_budget_constraints(plan) -> tuple[float, dict]:
+    """Return the most restrictive positive selector capital constraint.
+
+    Production sizing metadata carries multiple capital limits. The selector
+    must rank and size against the tightest real constraint, not the generic
+    theoretical risk budget.
+    """
+    raw_values = {
+        "selector_budget": _sizing_val(plan, "selector_budget", default=None),
+        "remaining_capacity": _sizing_val(plan, "remaining_capacity", default=None),
+        "max_position_usd": _sizing_val(plan, "max_position_usd", default=None),
+        "budget": _sizing_val(plan, "budget", default=None),
+    }
+    positive = {}
+    invalid = {}
+    for key, raw in raw_values.items():
+        if raw is None or raw == "":
+            continue
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            invalid[key] = raw
+            continue
+        if value > 0:
+            positive[key] = value
+
+    if not positive:
+        return 0.0, {
+            "raw": raw_values,
+            "positive": {},
+            "invalid": invalid,
+            "selected_source": None,
+            "selected_budget": 0.0,
+            "most_restrictive": True,
+        }
+
+    selected_source, selected_budget = min(positive.items(), key=lambda item: item[1])
+    return selected_budget, {
+        "raw": raw_values,
+        "positive": positive,
+        "invalid": invalid,
+        "selected_source": selected_source,
+        "selected_budget": selected_budget,
+        "most_restrictive": True,
+    }
+
 _PRO_TIER1_TICKERS = {
     "SPY", "QQQ", "IWM", "DIA",
     "AAPL", "MSFT", "NVDA", "AMD", "META", "GOOG", "GOOGL",
@@ -1531,6 +1577,7 @@ class APContractSelectionEngine:
         _bind_selector_request_diagnostics(plan, request_context)
 
         _selector_mode = _normalized_selector_mode(self.mode)
+        _plan_mode = _normalized_selector_mode(_safe_plan_attr(plan, "execution_mode", ""))
         _original_client_id = _safe_plan_attr(plan, "client_id", None)
         _original_execution_mode = _safe_plan_attr(plan, "execution_mode", None)
         _original_signal_id = _safe_plan_attr(plan, "signal_id", None)
@@ -1550,15 +1597,15 @@ class APContractSelectionEngine:
 
         ticker    = _safe_plan_attr(plan, "ticker")
         direction = str(_safe_plan_attr(plan, "side", "") or "").upper()
-        budget_raw = _sizing_val(plan, "budget", "max_position_usd", default=0)
-        budget = _safe_float(budget_raw, 0.0)
+        budget, _budget_constraints = _selector_budget_constraints(plan)
+        budget_raw = _budget_constraints.get("selected_budget")
         _sizing_ctx = _plan_sizing_ctx(plan)
         _top_level_budget = _safe_plan_attr(plan, "max_position_usd", None)
         _budget_conflict = (
-            isinstance(_sizing_ctx, dict)
-            and any(k in _sizing_ctx for k in ("budget", "max_position_usd"))
-            and _top_level_budget is not None
-            and _safe_float(_top_level_budget, 0.0) != budget
+            len({
+                round(float(value), 8)
+                for value in (_budget_constraints.get("positive") or {}).values()
+            }) > 1
         )
 
         try:
@@ -1583,15 +1630,30 @@ class APContractSelectionEngine:
             )
             return None
 
-        if _selector_mode not in {"LIVE", "PAPER"}:
-            _expl = f"Invalid selector execution mode: {self.mode!r}"
+        if _selector_mode not in {"LIVE", "PAPER"} or _plan_mode not in {"LIVE", "PAPER"}:
+            _expl = (
+                f"Invalid selector execution mode: selector={self.mode!r} "
+                f"plan={_original_execution_mode!r}"
+            )
+            _mode_diag = dict(
+                _selector_request_diagnostics(request_context),
+                selector_mode=_selector_mode,
+                plan_execution_mode=_plan_mode,
+                client_id=_original_client_id,
+                signal_id=_original_signal_id,
+            )
             self._emit_selector_event(
                 plan,
                 stage="selector_entry",
                 decision="REJECT",
                 reason_code="INVALID_EXECUTION_MODE",
                 explanation=_expl,
-                inputs={"mode": self.mode, "normalized_mode": _selector_mode},
+                inputs={
+                    "selector_mode": _selector_mode,
+                    "plan_execution_mode": _plan_mode,
+                    "client_id": _original_client_id,
+                    "signal_id": _original_signal_id,
+                },
             )
             _attach_selector_failure(
                 plan,
@@ -1599,12 +1661,47 @@ class APContractSelectionEngine:
                 explanation=_expl,
                 base_url=_sel_base_url,
                 execution_mode="unknown",
-                selection_diagnostics=_selector_request_diagnostics(request_context),
+                selection_diagnostics=_mode_diag,
+            )
+            return None
+
+        if _selector_mode != _plan_mode:
+            _expl = (
+                f"Selector execution mode {_selector_mode} does not match "
+                f"plan execution mode {_plan_mode}"
+            )
+            _mode_diag = dict(
+                _selector_request_diagnostics(request_context),
+                selector_mode=_selector_mode,
+                plan_execution_mode=_plan_mode,
+                client_id=_original_client_id,
+                signal_id=_original_signal_id,
+            )
+            self._emit_selector_event(
+                plan,
+                stage="selector_entry",
+                decision="REJECT",
+                reason_code="EXECUTION_MODE_MISMATCH",
+                explanation=_expl,
+                inputs={
+                    "selector_mode": _selector_mode,
+                    "plan_execution_mode": _plan_mode,
+                    "client_id": _original_client_id,
+                    "signal_id": _original_signal_id,
+                },
+            )
+            _attach_selector_failure(
+                plan,
+                reason_code="EXECUTION_MODE_MISMATCH",
+                explanation=_expl,
+                base_url=_sel_base_url,
+                execution_mode=_sel_mode,
+                selection_diagnostics=_mode_diag,
             )
             return None
 
         if budget <= 0:
-            _expl = f"Invalid selector position budget: {budget_raw!r}"
+            _expl = f"Invalid selector position budget: {_budget_constraints.get('raw')!r}"
             self._emit_selector_event(
                 plan,
                 stage="selector_entry",
@@ -1613,6 +1710,7 @@ class APContractSelectionEngine:
                 explanation=_expl,
                 inputs={
                     "budget": budget_raw,
+                    "budget_constraints": _budget_constraints,
                     "sizing_context": _sizing_ctx,
                     "top_level_max_position_usd": _top_level_budget,
                 },
@@ -2735,7 +2833,7 @@ class APContractSelectionEngine:
                 _equity = _safe_float(_sizing_val(plan, "account_equity", "equity", default=0)) or None
                 _max_pos_pct = _safe_float(_sizing_val(plan, "risk_pct", "max_position_pct", default=0)) or None
                 _max_afford_prem = _safe_float(_sizing_val(plan, "max_affordable_premium", default=0)) or None
-                _ctx_budget = _safe_float(_sizing_val(plan, "budget", "max_position_usd", default=0)) or _safe_float(budget)
+                _ctx_budget = _safe_float(budget)
                 _underlying = _safe_float(underlying_price) or None
                 _tradeability_diag = {
                     "equity":                 _equity,
@@ -2744,6 +2842,8 @@ class APContractSelectionEngine:
                     "max_affordable_premium": _max_afford_prem,
                     "underlying_price":       _underlying,
                     "budget":                 _ctx_budget,
+                    "budget_source":          _budget_constraints.get("selected_source"),
+                    "budget_constraints":     _budget_constraints,
                     "selected_dte":           _safe_float(getattr(selected, "dte", None)),
                     "near_atm_premium_estimate": _safe_float(selected.premium_per_contract),
                     "cheapest_quality_survivor_premium": _safe_float(selected.premium_per_contract),
@@ -2974,8 +3074,9 @@ class APContractSelectionEngine:
                     "affordable_contracts": selected.affordable_contracts,
                     "effective_budget": selected.effective_budget,
                     "budget_clipped": selected.budget_clipped,
-                    "budget_source": "metadata.sizing_context" if _sizing_ctx else "top_level",
+                    "budget_source": _budget_constraints.get("selected_source"),
                     "budget_conflict": _budget_conflict,
+                    "budget_constraints": _budget_constraints,
                     "sizing_context": dict(_sizing_ctx) if isinstance(_sizing_ctx, dict) else {},
                     "selection_diagnostics": _selection_diagnostics,
                     "premium_per_share": selected.premium_per_share,
@@ -3001,8 +3102,9 @@ class APContractSelectionEngine:
                         "affordable_contracts": selected.affordable_contracts,
                         "effective_budget": selected.effective_budget,
                         "budget_clipped": selected.budget_clipped,
-                        "budget_source": "metadata.sizing_context" if _sizing_ctx else "top_level",
+                        "budget_source": _budget_constraints.get("selected_source"),
                         "budget_conflict": _budget_conflict,
+                        "budget_constraints": _budget_constraints,
                         "sizing_context": dict(_sizing_ctx) if isinstance(_sizing_ctx, dict) else {},
                         "selection_diagnostics": _selection_diagnostics,
                         "premium_per_share": selected.premium_per_share,
