@@ -2145,6 +2145,28 @@ class APExecutionCore:
             _terminalize_breach_failure("approved_plan_missing_after_revalidation")
             return
 
+        # ── Intelligence PR 1: dispatch immediately after plan is confirmed ──────
+        # Fires before any post-plan terminal return (rejections, expiry, submit).
+        # _ensure_intelligence_dispatched is idempotent — retries do not re-dispatch.
+        # Disabled by default (INTELLIGENCE_EVIDENCE_ENABLED=0). Never raises.
+        try:
+            from ap.intelligence_evaluation import _ensure_intelligence_dispatched as _eid
+            _eid(
+                sig,
+                # Req 2: mode resolved inside _ensure_intelligence_dispatched
+                # from both sig and approved_plan with mismatch detection.
+                # Do NOT pass execution_mode from getattr(approved_plan, ...) alone.
+                execution_mode="",   # resolver reads plan directly
+                client_id=_breach_client_id,
+                local_order_id=str(queue_local_order_id or ""),
+                plan=approved_plan,  # Req 1: plan passed for canonical snapshot build
+                order_meta_writer=getattr(self.order_state_machine, "update_order_meta", None),
+                ticker=ticker,
+            )
+        except Exception as _eid_exc:
+            log.debug("[%s] intelligence early dispatch non-critical: %s", ticker, _eid_exc)
+        # ── End early intelligence dispatch ─────────────────────────────────────
+
         _hydration_bridge_applied = self._refresh_hydrated_prebreach_plan(
             approved_plan=approved_plan,
             sig=sig,
@@ -4930,6 +4952,9 @@ class APExecutionCore:
         #
         # Each gate is a pure classifier from ap.live_submit_gates. On FAIL
         # in LIVE mode: block broker submit, terminalize the row with the
+        # Intelligence already dispatched at plan-confirmation seam above.
+        # _ensure_intelligence_dispatched is idempotent — this is a no-op.
+
         # canonical reason_code, stamp orders.meta.live_submit_gate with
         # full audit evidence, and return. PAPER logs failures but proceeds
         # so sandbox flow can be exercised.
