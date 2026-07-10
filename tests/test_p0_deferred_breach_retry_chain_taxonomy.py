@@ -264,7 +264,7 @@ def test_dte_ladder_all_retryable_failures_remain_retryable(monkeypatch):
     _exp_c = (date.today() + timedelta(days=10)).isoformat()  # DTE=10 → bucket C (8+)
     sel._fetch_expirations_list = MagicMock(return_value=[_exp_a, _exp_c])
 
-    def _fake_select(plan, *, expiration_override=None):
+    def _fake_select(plan, *, expiration_override=None, request_context=None):
         plan.metadata["selector_failure"] = {
             "reason_code": "CHAIN_PROVIDER_EMPTY_OPTIONS" if expiration_override == _exp_a else "CHAIN_PARSE_EMPTY",
             "explanation": "provider warming up",
@@ -298,7 +298,7 @@ def test_dte_ladder_preserves_quality_reason_when_chain_rows_exist(monkeypatch):
     # tomorrow is 1 DTE → bucket A
     sel._fetch_expirations_list = MagicMock(return_value=[tomorrow])
 
-    def _fake_select(plan, *, expiration_override=None):
+    def _fake_select(plan, *, expiration_override=None, request_context=None):
         plan.metadata["selector_failure"] = {
             "reason_code": "OI_TOO_LOW",
             "explanation": "real rows but illiquid",
@@ -340,7 +340,7 @@ def test_dte_ladder_mixed_retryable_then_quality_finishes_as_quality(monkeypatch
     sel._last_dte_ladder_audit = None
     sel._fetch_expirations_list = MagicMock(return_value=[exp_a.isoformat(), exp_c.isoformat()])
 
-    def _fake_select(plan, *, expiration_override=None):
+    def _fake_select(plan, *, expiration_override=None, request_context=None):
         if expiration_override == exp_a.isoformat():
             plan.metadata["selector_failure"] = {
                 "reason_code": "CHAIN_PROVIDER_EMPTY_OPTIONS",
@@ -410,7 +410,7 @@ def test_chain_auth_error_remains_terminal(monkeypatch):
     _exp_c2 = (date.today() + timedelta(days=10)).isoformat()  # DTE=10 → bucket C
     sel._fetch_expirations_list = MagicMock(return_value=[_exp_a2, _exp_c2])
 
-    def _fake_select(plan, *, expiration_override=None):
+    def _fake_select(plan, *, expiration_override=None, request_context=None):
         plan.metadata["selector_failure"] = {
             "reason_code": "CHAIN_AUTH_ERROR",
             "explanation": "401",

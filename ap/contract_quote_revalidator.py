@@ -82,6 +82,8 @@ REASON_FINAL_CONTRACT_QUOTE_INVALID   = "FINAL_CONTRACT_QUOTE_INVALID"
 REASON_FINAL_SPREAD_TOO_WIDE          = "FINAL_SPREAD_TOO_WIDE"
 REASON_FINAL_CONTRACT_UNAFFORDABLE    = "FINAL_CONTRACT_UNAFFORDABLE"
 REASON_LIQUIDITY_BELOW_THRESHOLD      = "LIQUIDITY_BELOW_THRESHOLD"
+REASON_MARKET_DATA_THROTTLE_UNAVAILABLE = "MARKET_DATA_THROTTLE_UNAVAILABLE"
+REASON_SELECTOR_REQUEST_BUDGET_EXHAUSTED = "SELECTOR_REQUEST_BUDGET_EXHAUSTED"
 
 # Reasons that warrant direct quote revalidation.
 #
@@ -163,7 +165,97 @@ def _broker_cache_identity(broker) -> str:
 
 
 def _cache_key_for(broker, occ_symbol: str) -> str:
-    return f"{_broker_cache_identity(broker)}:{occ_symbol}"
+    return f"{_broker_cache_identity(broker)}:{_normalize_occ_symbol(occ_symbol)}"
+
+
+def _normalize_occ_symbol(occ_symbol: str) -> str:
+    """Canonicalize compact and root-padded OCC forms to one request key."""
+    return "".join(str(occ_symbol or "").upper().split())
+
+
+def _ctx_update_sink(request_context) -> None:
+    if request_context is None:
+        return
+    sink = getattr(request_context, "diagnostics_sink", None)
+    if not isinstance(sink, dict):
+        return
+    sink["provider_call_counts"] = dict(getattr(request_context, "provider_call_counts", {}) or {})
+    sink["elapsed_ms_by_stage"] = dict(getattr(request_context, "elapsed_ms_by_stage", {}) or {})
+    counts = sink["provider_call_counts"]
+    sink["direct_quote_calls"] = int(counts.get("direct_quote_calls", 0) or 0)
+    sink["budget_exhausted_stage"] = getattr(request_context, "budget_exhausted_stage", None)
+    sink["budget_exhausted_detail"] = getattr(request_context, "budget_exhausted_detail", None)
+
+
+def _direct_quote_budget_failure(request_context) -> Optional[dict]:
+    if request_context is None:
+        return None
+    started = float(getattr(request_context, "started_at_monotonic", 0.0) or 0.0)
+    elapsed_ms = max(0.0, (time.monotonic() - started) * 1000.0) if started else 0.0
+    elapsed_limit = int(getattr(request_context, "max_total_elapsed_ms", 15000) or 15000)
+    counts = getattr(request_context, "provider_call_counts", {}) or {}
+    used = int(counts.get("direct_quote_calls", 0) or 0)
+    call_limit = int(getattr(request_context, "max_direct_quote_calls", 5) or 5)
+    detail = None
+    if elapsed_ms >= elapsed_limit:
+        detail = f"elapsed_ms={elapsed_ms:.3f} limit_ms={elapsed_limit}"
+    elif used >= call_limit:
+        detail = f"direct_quote_calls={used} limit={call_limit}"
+    if detail is None:
+        return None
+    setattr(request_context, "budget_exhausted_stage", "direct_quote")
+    setattr(request_context, "budget_exhausted_detail", detail)
+    _ctx_update_sink(request_context)
+    return {
+        "ok": False,
+        "quote": None,
+        "reason_code": REASON_SELECTOR_REQUEST_BUDGET_EXHAUSTED,
+        "error": detail,
+        "endpoint": "/v1/markets/quotes",
+        "status_code": None,
+        "retryable": False,
+    }
+
+
+def _ctx_increment_call_count(request_context, key: str, count: int = 1) -> None:
+    if request_context is None:
+        return
+    counts = getattr(request_context, "provider_call_counts", None)
+    if isinstance(counts, dict):
+        counts[key] = int(counts.get(key, 0) or 0) + count
+        _ctx_update_sink(request_context)
+
+
+def _ctx_add_stage_ms(request_context, key: str, elapsed_ms: float) -> None:
+    if request_context is None:
+        return
+    buckets = getattr(request_context, "elapsed_ms_by_stage", None)
+    if isinstance(buckets, dict):
+        buckets[key] = float(buckets.get(key, 0.0) or 0.0) + float(elapsed_ms)
+        _ctx_update_sink(request_context)
+
+
+def _ctx_add_throttle_wait(request_context, wait_ms: float) -> None:
+    if request_context is None:
+        return
+    current = float(getattr(request_context, "throttle_wait_ms", 0.0) or 0.0)
+    setattr(request_context, "throttle_wait_ms", current + float(wait_ms or 0.0))
+    _ctx_update_sink(request_context)
+
+
+def _ctx_note_throttle_issue(request_context, *, endpoint: str, symbol: str, context: str, phase: str, error: Exception) -> None:
+    if request_context is None:
+        return
+    diags = getattr(request_context, "throttle_diagnostics", None)
+    if isinstance(diags, list):
+        diags.append({
+            "endpoint": str(endpoint),
+            "symbol": str(symbol),
+            "context": str(context),
+            "phase": str(phase),
+            "error": str(error),
+        })
+        _ctx_update_sink(request_context)
 
 
 def _exception_status_code(exc: Exception) -> Optional[int]:
@@ -270,6 +362,7 @@ def fetch_direct_option_quote_with_meta(
     occ_symbol: str,
     *,
     cache_ttl_s: Optional[float] = None,
+    request_context=None,
 ) -> dict:
     """
     Fetch a direct option quote and preserve structured broker failure metadata.
@@ -291,6 +384,7 @@ def fetch_direct_option_quote_with_meta(
     ttl = cache_ttl_s if cache_ttl_s is not None else _CACHE_TTL_S
     if not occ_symbol or broker is None:
         return _empty_quote_failure()
+    occ_symbol = _normalize_occ_symbol(occ_symbol)
 
     cache_key = _cache_key_for(broker, occ_symbol)
     cached = _QUOTE_CACHE.get(cache_key)
@@ -308,6 +402,40 @@ def fetch_direct_option_quote_with_meta(
             "retryable": None,
         }
 
+    budget_failure = _direct_quote_budget_failure(request_context)
+    if budget_failure is not None:
+        return budget_failure
+
+    def _throttle_failure(exc: Exception, phase: str) -> Optional[dict]:
+        mode = str(getattr(request_context, "execution_mode", "unknown") or "unknown").lower()
+        paper_unthrottled = (
+            mode == "paper"
+            and os.getenv(
+                "SELECTOR_PAPER_ALLOW_UNTHROTTLED_DIRECT_QUOTES", "0"
+            ).strip().lower() in ("1", "true", "yes")
+        )
+        diagnostics = getattr(request_context, "throttle_diagnostics", None)
+        if isinstance(diagnostics, list) and diagnostics:
+            diagnostics[-1]["paper_unthrottled_override"] = paper_unthrottled
+            diagnostics[-1]["provider_call_blocked"] = not paper_unthrottled
+            _ctx_update_sink(request_context)
+        if paper_unthrottled:
+            log.warning(
+                "direct quote proceeding unthrottled by explicit PAPER policy "
+                "contract=%s phase=%s",
+                occ_symbol, phase,
+            )
+            return None
+        return {
+            "ok": False,
+            "quote": None,
+            "reason_code": REASON_MARKET_DATA_THROTTLE_UNAVAILABLE,
+            "error": f"throttle {phase} failed: {exc}",
+            "endpoint": "/v1/markets/quotes",
+            "status_code": None,
+            "retryable": False,
+        }
+
     # P0 (PR #296): throttle before direct OCC quote fetch. No-op when
     # TRADIER_MD_THROTTLE_ENABLED=0 (default). Provider errors are NOT
     # suppressed — if broker.get_quote() raises or returns empty/429/zero,
@@ -316,18 +444,55 @@ def fetch_direct_option_quote_with_meta(
     # t0 is intentionally set AFTER the throttle returns so that
     # quote_fetch_latency_ms in orders.meta reflects the actual broker
     # round-trip, not the combined throttle-wait + broker-call duration.
+    throttle_token = None
     try:
         from ap.tradier_market_data_throttle import (
             before_market_data_call,
             after_market_data_call,
         )
-        before_market_data_call(
-            "/v1/markets/quotes", occ_symbol,
-            context="direct_quote_revalidator",
+    except Exception as exc:
+        log.error(
+            "fetch_direct_option_quote throttle import failed contract=%s err=%s",
+            occ_symbol, exc,
         )
-    except Exception:
-        pass
+        _ctx_note_throttle_issue(
+            request_context,
+            endpoint="/v1/markets/quotes",
+            symbol=occ_symbol,
+            context="direct_quote_revalidator",
+            phase="import",
+            error=exc,
+        )
+        failure = _throttle_failure(exc, "import")
+        if failure is not None:
+            return failure
+        after_market_data_call = None
+    else:
+        try:
+            throttle_token = before_market_data_call(
+                "/v1/markets/quotes", occ_symbol,
+                context="direct_quote_revalidator",
+            )
+            _ctx_add_throttle_wait(request_context, (throttle_token or {}).get("wait_ms", 0.0))
+        except Exception as exc:
+            log.error(
+                "fetch_direct_option_quote throttle acquire failed contract=%s err=%s",
+                occ_symbol, exc,
+            )
+            _ctx_note_throttle_issue(
+                request_context,
+                endpoint="/v1/markets/quotes",
+                symbol=occ_symbol,
+                context="direct_quote_revalidator",
+                phase="acquire",
+                error=exc,
+            )
+            failure = _throttle_failure(exc, "acquire")
+            if failure is not None:
+                return failure
+            throttle_token = None
     t0 = _now()  # start timing AFTER throttle sleep — latency reflects broker only
+    _ctx_increment_call_count(request_context, "direct_quote_calls")
     try:
         raw = broker.get_quote(occ_symbol) or {}
     except Exception as e:
@@ -337,12 +502,14 @@ def fetch_direct_option_quote_with_meta(
         )
         return _classify_direct_quote_exception(e)
     finally:
-        try:
-            after_market_data_call()
-        except Exception:
-            pass
+        if throttle_token is not None and after_market_data_call is not None:
+            try:
+                after_market_data_call()
+            except Exception:
+                pass
 
     latency_ms = int((_now() - t0) * 1000)
+    _ctx_add_stage_ms(request_context, "direct_quote", latency_ms)
     quote = _normalize_quote(raw, t0, latency_ms)
     _QUOTE_CACHE[cache_key] = (t0, quote)
 
@@ -431,6 +598,7 @@ def revalidate_with_direct_quote(
     chain_reject_reason: str,
     *,
     market_open_override: Optional[bool] = None,
+    request_context=None,
 ) -> dict:
     """
     Attempt to recover a contract that was about to be rejected from chain
@@ -511,7 +679,58 @@ def revalidate_with_direct_quote(
             "audit":             audit_base,
         }
 
-    quote_meta = fetch_direct_option_quote_with_meta(broker, occ)
+    occ_key = _normalize_occ_symbol(occ)
+    if request_context is not None:
+        revalidated_contracts = getattr(request_context, "revalidated_contracts", None)
+        if isinstance(revalidated_contracts, set):
+            if occ_key in revalidated_contracts:
+                return {
+                    "action":            "SKIP_ALREADY_REVALIDATED",
+                    "reason_code":       None,
+                    "direct_quote_used": False,
+                    "opt_updated":       None,
+                    "audit":             audit_base,
+                }
+        budget_failure = _direct_quote_budget_failure(request_context)
+        if budget_failure is not None:
+            audit = dict(audit_base)
+            audit["direct_quote_error"] = budget_failure["error"]
+            audit["direct_quote_endpoint"] = budget_failure["endpoint"]
+            audit["contract_quote_source"] = "none"
+            return {
+                "action":            "REJECT_UNAVAILABLE",
+                "reason_code":       REASON_SELECTOR_REQUEST_BUDGET_EXHAUSTED,
+                "direct_quote_used": False,
+                "opt_updated":       None,
+                "audit":             audit,
+            }
+        remaining = getattr(request_context, "direct_quote_attempts_remaining", None)
+        if remaining is not None:
+            remaining = int(remaining or 0)
+            if remaining <= 0:
+                setattr(request_context, "budget_exhausted_stage", "direct_quote")
+                setattr(
+                    request_context,
+                    "budget_exhausted_detail",
+                    "direct_quote_attempts_remaining=0",
+                )
+                _ctx_update_sink(request_context)
+                return {
+                    "action":            "REJECT_UNAVAILABLE",
+                    "reason_code":       REASON_SELECTOR_REQUEST_BUDGET_EXHAUSTED,
+                    "direct_quote_used": False,
+                    "opt_updated":       None,
+                    "audit":             audit_base,
+                }
+            setattr(request_context, "direct_quote_attempts_remaining", remaining - 1)
+        if isinstance(revalidated_contracts, set):
+            revalidated_contracts.add(occ_key)
+
+    quote_meta = fetch_direct_option_quote_with_meta(
+        broker,
+        occ_key,
+        request_context=request_context,
+    )
     if not quote_meta.get("ok"):
         audit = dict(audit_base)
         audit["direct_quote_error"] = quote_meta.get("error")

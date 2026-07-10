@@ -292,7 +292,7 @@ class TestLadderRouting:
         sel._fetch_expirations_list = MagicMock(return_value=[a_exp, c_exp])
 
         probed = []
-        def _fake_select(plan, *, expiration_override=None):
+        def _fake_select(plan, *, expiration_override=None, request_context=None):
             probed.append(expiration_override)
             if expiration_override == a_exp:
                 return MagicMock(contract_symbol="AMAT260101C00100000")
@@ -322,7 +322,7 @@ class TestLadderRouting:
         c_exp = _next_weekday(today, 14)
         sel._fetch_expirations_list = MagicMock(return_value=[a_exp, c_exp])
 
-        def _fake_select(plan, *, expiration_override=None):
+        def _fake_select(plan, *, expiration_override=None, request_context=None):
             if expiration_override == c_exp:
                 return MagicMock(contract_symbol="AMAT_C")
             return None
@@ -407,7 +407,11 @@ class TestLadderRouting:
         assert (result is selected) is expected_fallback
         assert sel.select.call_count == (1 if expected_fallback else 0)
         if expected_fallback:
-            sel.select.assert_called_once_with(plan, _dte_legacy_fallback=True)
+            sel.select.assert_called_once_with(
+                plan,
+                _dte_legacy_fallback=True,
+                request_context=None,
+            )
         audit = plan.metadata["dte_ladder_audit"]
         assert audit["expiration_fetch_attempts"] == 1
         assert audit["expiration_http_status"] == 429
@@ -484,7 +488,7 @@ class TestLadderRouting:
         plan.metadata = {"deferred_breach_selection": True}
         sel._fetch_expirations_list = MagicMock(return_value=[a_exp])
 
-        def _fake_select(sub_plan, *, expiration_override=None):
+        def _fake_select(sub_plan, *, expiration_override=None, request_context=None):
             sub_plan.metadata["selector_failure"] = {
                 "reason_code": "CHAIN_PROVIDER_EMPTY_OPTIONS",
                 "explanation": "no options for this expiration",
@@ -571,7 +575,7 @@ class TestAmendmentGateOrdering:
         a_exp = _next_weekday(today, 1)
         sel._fetch_expirations_list = MagicMock(return_value=[a_exp])
 
-        def _fake_select(plan, *, expiration_override=None):
+        def _fake_select(plan, *, expiration_override=None, request_context=None):
             # simulate the earnings gate firing inside the sub-call
             plan.metadata["selector_failure"] = {
                 "reason_code": "EARNINGS_LOCKOUT",
@@ -603,7 +607,7 @@ class TestAmendmentGateOrdering:
         a_exp = _next_weekday(today, 1)
         sel._fetch_expirations_list = MagicMock(return_value=[a_exp])
 
-        def _fake_select(plan, *, expiration_override=None):
+        def _fake_select(plan, *, expiration_override=None, request_context=None):
             plan.metadata["selector_failure"] = {
                 "reason_code": "OI_TOO_LOW",
                 "explanation": "illiquid",
@@ -634,7 +638,7 @@ class TestAmendmentGateOrdering:
         c_exp = _next_weekday(today, 14)
         sel._fetch_expirations_list = MagicMock(return_value=[a_exp, c_exp])
 
-        def _fake_select(plan, *, expiration_override=None):
+        def _fake_select(plan, *, expiration_override=None, request_context=None):
             plan.metadata["selector_failure"] = {
                 "reason_code": (
                     "CHAIN_PROVIDER_EMPTY_OPTIONS"
@@ -673,7 +677,7 @@ class TestAmendmentGateOrdering:
         c_exp = _next_weekday(today, 14)
         sel._fetch_expirations_list = MagicMock(return_value=[a_exp, c_exp])
 
-        def _fake_select(plan, *, expiration_override=None):
+        def _fake_select(plan, *, expiration_override=None, request_context=None):
             if expiration_override == a_exp:
                 plan.metadata["selector_failure"] = {
                     "reason_code": "CHAIN_PROVIDER_EMPTY_OPTIONS",
