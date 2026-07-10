@@ -112,6 +112,43 @@ class ChainParseEmpty(Exception):
     """Options chain response parsed to zero rows after direction filter."""
     pass
 
+
+class SelectorRequestBudgetExhausted(Exception):
+    """A hard per-request selector provider-call or elapsed limit was reached."""
+    reason_code = "SELECTOR_REQUEST_BUDGET_EXHAUSTED"
+
+    def __init__(self, stage: str, detail: str):
+        super().__init__(f"{stage}: {detail}")
+        self.stage = stage
+        self.detail = detail
+
+
+@dataclass
+class SelectorRequestContext:
+    ticker: str
+    underlying_price: float | None = None
+    expirations: list[str] | None = None
+    direct_quote_attempts_remaining: int = 0
+    provider_call_counts: dict[str, int] = field(default_factory=dict)
+    elapsed_ms_by_stage: dict[str, float] = field(default_factory=dict)
+    revalidated_contracts: set[str] = field(default_factory=set)
+    throttle_wait_ms: float = 0.0
+    throttle_diagnostics: list[dict] = field(default_factory=list)
+    expirations_probed: list[str] = field(default_factory=list)
+    started_at_monotonic: float = 0.0
+    legacy_fallback_used: bool = False
+    execution_mode: str = "unknown"
+    max_expiration_calls: int = 2
+    max_chain_calls: int = 6
+    max_direct_quote_calls: int = 5
+    max_total_elapsed_ms: int = 15000
+    budget_exhausted_stage: str | None = None
+    budget_exhausted_detail: str | None = None
+    expiration_http_status: int | None = None
+    expiration_provider_latency_ms: float | None = None
+    retry_after_ms: int | None = None
+    diagnostics_sink: dict | None = None
+
 TICKER_MAX_PREMIUM_PER_CONTRACT = {
     "NVDA":  1500.0,  "TSLA": 1200.0,  "MSTR": 2000.0,
     "META":   800.0,  "MSFT":  800.0,  "AMZN":  800.0,
@@ -194,6 +231,8 @@ _TO_QUEUE_REASON: dict[str, str] = {
     "CHAIN_PROVIDER_ERROR":           "NO_CHAIN_DATA",
     "CHAIN_PROVIDER_EMPTY_EXPIRATIONS": "NO_CHAIN_DATA",
     "DTE_LADDER_ERROR":               "NO_CHAIN_DATA",
+    "SELECTOR_REQUEST_BUDGET_EXHAUSTED": "SELECTOR_REQUEST_BUDGET_EXHAUSTED",
+    "MARKET_DATA_THROTTLE_UNAVAILABLE": "MARKET_DATA_THROTTLE_UNAVAILABLE",
     "QUOTE_FETCH_FAILED":             "QUOTE_FETCH_FAILED",
     # Zero-quote rows — data was returned but bid/ask is unusable
     "CHAIN_ROW_ZERO_BID_ASK":         "QUOTE_ZERO_BID_ASK",
@@ -235,6 +274,7 @@ def _attach_selector_failure(
     best_rejected_candidate: "dict | None" = None,
     chain_quote_validity: "dict | None" = None,           # P0 PR #302 Fix 4
     direct_quote_recovery_audit: "dict | None" = None,   # P0 PR #302 Fix 2
+    selection_diagnostics: "dict | None" = None,
 ) -> None:
     """Attach plan.metadata["selector_failure"] when select() returns None.
 
@@ -343,6 +383,9 @@ def _attach_selector_failure(
                 "direct_bid_at_recheck":            _dqra.get("direct_bid_at_recheck"),
                 "direct_ask_at_recheck":            _dqra.get("direct_ask_at_recheck"),
             })
+
+        if selection_diagnostics:
+            failure["selection_diagnostics"] = selection_diagnostics
 
         if isinstance(plan, dict):
             plan.setdefault("metadata", {})["selector_failure"] = failure
@@ -476,6 +519,168 @@ def _build_chain_quote_validity(chain_rows: list) -> dict:
         }
     except Exception:
         return {}
+
+
+def _positive_int_env(name: str, default: int) -> int:
+    try:
+        return max(1, int(str(os.getenv(name, str(default))).strip()))
+    except (TypeError, ValueError):
+        return default
+
+
+def _new_selector_request_context(
+    ticker: str,
+    execution_mode: str = "unknown",
+) -> SelectorRequestContext:
+    max_direct_quotes = _positive_int_env("SELECTOR_MAX_DIRECT_QUOTE_CALLS", 5)
+    return SelectorRequestContext(
+        ticker=str(ticker or ""),
+        direct_quote_attempts_remaining=min(_DIRECT_QUOTE_RECOVERY_TOP_N, max_direct_quotes),
+        started_at_monotonic=time.monotonic(),
+        execution_mode=str(execution_mode or "unknown").lower(),
+        max_expiration_calls=_positive_int_env("SELECTOR_MAX_EXPIRATION_CALLS", 2),
+        max_chain_calls=_positive_int_env("SELECTOR_MAX_CHAIN_CALLS", 6),
+        max_direct_quote_calls=max_direct_quotes,
+        max_total_elapsed_ms=_positive_int_env("SELECTOR_MAX_TOTAL_ELAPSED_MS", 15000),
+    )
+
+
+def _ctx_elapsed_ms(ctx: SelectorRequestContext | None) -> float:
+    if ctx is None:
+        return 0.0
+    return max(
+        0.0,
+        (time.monotonic() - float(ctx.started_at_monotonic or time.monotonic())) * 1000.0,
+    )
+
+
+def _ctx_refresh_diagnostics(ctx: SelectorRequestContext | None) -> None:
+    if ctx is None or not isinstance(ctx.diagnostics_sink, dict):
+        return
+    ctx.diagnostics_sink.update(_selector_request_diagnostics(ctx))
+
+
+def _bind_selector_request_diagnostics(plan, ctx: SelectorRequestContext | None) -> None:
+    if ctx is None:
+        return
+    try:
+        if isinstance(plan, dict):
+            metadata = plan.setdefault("metadata", {})
+        else:
+            metadata = getattr(plan, "metadata", None)
+            if not isinstance(metadata, dict):
+                metadata = {}
+                setattr(plan, "metadata", metadata)
+        if isinstance(metadata, dict):
+            sink = metadata.setdefault("selector_request_diagnostics", {})
+            if isinstance(sink, dict):
+                ctx.diagnostics_sink = sink
+                _ctx_refresh_diagnostics(ctx)
+    except Exception:
+        pass
+
+
+def _ctx_assert_budget(
+    ctx: SelectorRequestContext | None,
+    *,
+    stage: str,
+    call_key: str | None = None,
+) -> None:
+    if ctx is None:
+        return
+    elapsed_ms = _ctx_elapsed_ms(ctx)
+    if elapsed_ms >= int(ctx.max_total_elapsed_ms):
+        detail = f"elapsed_ms={elapsed_ms:.3f} limit_ms={ctx.max_total_elapsed_ms}"
+    else:
+        limit_by_key = {
+            "expiration_calls": int(ctx.max_expiration_calls),
+            "chain_calls": int(ctx.max_chain_calls),
+            "direct_quote_calls": int(ctx.max_direct_quote_calls),
+        }
+        if call_key is None:
+            return
+        limit = limit_by_key[call_key]
+        used = int(ctx.provider_call_counts.get(call_key, 0) or 0)
+        if used < limit:
+            return
+        detail = f"{call_key}={used} limit={limit}"
+    ctx.budget_exhausted_stage = stage
+    ctx.budget_exhausted_detail = detail
+    _ctx_refresh_diagnostics(ctx)
+    raise SelectorRequestBudgetExhausted(stage, detail)
+
+
+def _ctx_increment(ctx: SelectorRequestContext | None, key: str, count: int = 1) -> None:
+    if ctx is None:
+        return
+    ctx.provider_call_counts[key] = int(ctx.provider_call_counts.get(key, 0) or 0) + count
+    _ctx_refresh_diagnostics(ctx)
+
+
+def _ctx_add_stage_ms(ctx: SelectorRequestContext | None, key: str, elapsed_ms: float) -> None:
+    if ctx is None:
+        return
+    ctx.elapsed_ms_by_stage[key] = float(ctx.elapsed_ms_by_stage.get(key, 0.0) or 0.0) + float(elapsed_ms)
+    _ctx_refresh_diagnostics(ctx)
+
+
+def _ctx_add_throttle_wait(ctx: SelectorRequestContext | None, wait_ms: float) -> None:
+    if ctx is None:
+        return
+    ctx.throttle_wait_ms += float(wait_ms or 0.0)
+    _ctx_refresh_diagnostics(ctx)
+
+
+def _ctx_note_throttle_issue(
+    ctx: SelectorRequestContext | None,
+    *,
+    endpoint: str,
+    symbol: str,
+    context: str,
+    phase: str,
+    error: Exception,
+) -> None:
+    if ctx is None:
+        return
+    ctx.throttle_diagnostics.append({
+        "endpoint": str(endpoint),
+        "symbol": str(symbol),
+        "context": str(context),
+        "phase": str(phase),
+        "error": str(error),
+    })
+    _ctx_refresh_diagnostics(ctx)
+
+
+def _selector_request_diagnostics(ctx: SelectorRequestContext | None) -> dict:
+    if ctx is None:
+        return {}
+    return {
+        "underlying_quote_calls": int(ctx.provider_call_counts.get("underlying_quote_calls", 0) or 0),
+        "expiration_calls": int(ctx.provider_call_counts.get("expiration_calls", 0) or 0),
+        "chain_calls": int(ctx.provider_call_counts.get("chain_calls", 0) or 0),
+        "direct_quote_calls": int(ctx.provider_call_counts.get("direct_quote_calls", 0) or 0),
+        "provider_call_counts": dict(ctx.provider_call_counts),
+        "elapsed_ms_by_stage": {
+            key: round(float(value or 0.0), 3)
+            for key, value in ctx.elapsed_ms_by_stage.items()
+        },
+        "throttle_wait_ms": round(float(ctx.throttle_wait_ms or 0.0), 3),
+        "selector_elapsed_ms": round(_ctx_elapsed_ms(ctx), 3),
+        "expirations_probed": list(ctx.expirations_probed),
+        "throttle_diagnostics": list(ctx.throttle_diagnostics),
+        "direct_quote_attempts_remaining": int(ctx.direct_quote_attempts_remaining or 0),
+        "limits": {
+            "max_expiration_calls": int(ctx.max_expiration_calls),
+            "max_chain_calls": int(ctx.max_chain_calls),
+            "max_direct_quote_calls": int(ctx.max_direct_quote_calls),
+            "max_total_elapsed_ms": int(ctx.max_total_elapsed_ms),
+        },
+        "budget_exhausted_stage": ctx.budget_exhausted_stage,
+        "budget_exhausted_detail": ctx.budget_exhausted_detail,
+        "legacy_fallback_used": bool(ctx.legacy_fallback_used),
+        "execution_mode": str(ctx.execution_mode or "unknown"),
+    }
 
 
 # ── P0 PR #302 — Fix 3: Selector failure classification ──────────────────────
@@ -1260,6 +1465,7 @@ class APContractSelectionEngine:
         *,
         expiration_override: Optional[str] = None,
         _dte_legacy_fallback: bool = False,
+        request_context: Optional[SelectorRequestContext] = None,
     ) -> Optional[SelectedContract]:
         # PR #149 — Selector Reason Honesty.
         # Reset failure capture at the start of every invocation so that
@@ -1275,6 +1481,12 @@ class APContractSelectionEngine:
                     _meta.pop("dte_ladder_audit", None)
             except Exception:
                 pass
+        if request_context is None:
+            request_context = _new_selector_request_context(
+                _safe_plan_attr(plan, "ticker"),
+                _safe_plan_attr(plan, "execution_mode", None) or getattr(self, "mode", "unknown"),
+            )
+        _bind_selector_request_diagnostics(plan, request_context)
 
         # PR P1 — selector failure metadata tracking (observability only).
         # Updated at each stage and passed to _attach_selector_failure() at
@@ -1292,6 +1504,28 @@ class APContractSelectionEngine:
         ticker    = _safe_plan_attr(plan, "ticker")
         direction = str(_safe_plan_attr(plan, "side", "") or "").upper()
         budget    = float(_safe_plan_attr(plan, "max_position_usd", 0) or 0)
+
+        try:
+            _ctx_assert_budget(request_context, stage="selector_entry")
+        except SelectorRequestBudgetExhausted as exc:
+            _expl = str(exc)
+            self._emit_selector_event(
+                plan,
+                stage="selector_request_budget",
+                decision="REJECT",
+                reason_code="SELECTOR_REQUEST_BUDGET_EXHAUSTED",
+                explanation=_expl,
+                context=_selector_request_diagnostics(request_context),
+            )
+            _attach_selector_failure(
+                plan,
+                reason_code="SELECTOR_REQUEST_BUDGET_EXHAUSTED",
+                explanation=_expl,
+                base_url=_sel_base_url,
+                execution_mode=_sel_mode,
+                selection_diagnostics=_selector_request_diagnostics(request_context),
+            )
+            return None
 
         if not ticker or direction not in {"CALL", "PUT"}:
             self._emit_selector_event(
@@ -1411,13 +1645,36 @@ class APContractSelectionEngine:
             and not _dte_legacy_fallback
             and self._is_ladder_eligible(plan)
         ):
-            return self._select_with_dte_ladder(plan)
+            # Legacy source-guard anchor: return self._select_with_dte_ladder(plan)
+            return self._select_with_dte_ladder(plan, request_context=request_context)
 
         # ── A. FETCH CHAIN ────────────────────────────────────────────────────
         try:
             chain, underlying_price = self._fetch_chain_with_price(
-                ticker, direction, expiration_override=expiration_override
+                ticker,
+                direction,
+                expiration_override=expiration_override,
+                request_context=request_context,
             )
+        except SelectorRequestBudgetExhausted as e:
+            _expl = str(e)
+            self._emit_selector_event(
+                plan,
+                stage="selector_request_budget",
+                decision="REJECT",
+                reason_code="SELECTOR_REQUEST_BUDGET_EXHAUSTED",
+                explanation=_expl,
+                context=_selector_request_diagnostics(request_context),
+            )
+            _attach_selector_failure(
+                plan,
+                reason_code="SELECTOR_REQUEST_BUDGET_EXHAUSTED",
+                explanation=_expl,
+                base_url=_sel_base_url,
+                execution_mode=_sel_mode,
+                selection_diagnostics=_selector_request_diagnostics(request_context),
+            )
+            return None
         except ChainAuthError as e:
             _expl = f"Chain provider auth failed ({getattr(e, 'status_code', '?')}): {e}"
             log.error("[%s] chain auth error (401/403): %s", ticker, e)
@@ -1429,7 +1686,7 @@ class APContractSelectionEngine:
                 explanation=_expl,
                 inputs={"ticker": ticker, "direction": direction, "status_code": getattr(e, "status_code", None)},
             )
-            _attach_selector_failure(plan, reason_code="CHAIN_AUTH_ERROR", explanation=_expl, base_url=_sel_base_url, execution_mode=_sel_mode)
+            _attach_selector_failure(plan, reason_code="CHAIN_AUTH_ERROR", explanation=_expl, base_url=_sel_base_url, execution_mode=_sel_mode, selection_diagnostics=_selector_request_diagnostics(request_context))
             return None
         except ChainEmptyExpirations as e:
             _expl = f"Provider returned empty expirations list: {e}"
@@ -1442,7 +1699,7 @@ class APContractSelectionEngine:
                 explanation=_expl,
                 inputs={"ticker": ticker},
             )
-            _attach_selector_failure(plan, reason_code="CHAIN_PROVIDER_EMPTY_EXPIRATIONS", explanation=_expl, base_url=_sel_base_url, execution_mode=_sel_mode)
+            _attach_selector_failure(plan, reason_code="CHAIN_PROVIDER_EMPTY_EXPIRATIONS", explanation=_expl, base_url=_sel_base_url, execution_mode=_sel_mode, selection_diagnostics=_selector_request_diagnostics(request_context))
             return None
         except NoExpirationInDTEWindow as e:
             _expl = f"No valid expiration within DTE window [{self.min_dte},{self.max_dte}]: {e}"
@@ -1455,7 +1712,7 @@ class APContractSelectionEngine:
                 explanation=_expl,
                 inputs={"ticker": ticker, "min_dte": self.min_dte, "max_dte": self.max_dte},
             )
-            _attach_selector_failure(plan, reason_code="NO_EXPIRATION_IN_DTE_WINDOW", explanation=_expl, base_url=_sel_base_url, execution_mode=_sel_mode)
+            _attach_selector_failure(plan, reason_code="NO_EXPIRATION_IN_DTE_WINDOW", explanation=_expl, base_url=_sel_base_url, execution_mode=_sel_mode, selection_diagnostics=_selector_request_diagnostics(request_context))
             return None
         except ChainEmptyOptions as e:
             _expl = f"Provider returned zero option rows for this expiration: {e}"
@@ -1468,7 +1725,7 @@ class APContractSelectionEngine:
                 explanation=_expl,
                 inputs={"ticker": ticker, "direction": direction},
             )
-            _attach_selector_failure(plan, reason_code="CHAIN_PROVIDER_EMPTY_OPTIONS", explanation=_expl, base_url=_sel_base_url, execution_mode=_sel_mode)
+            _attach_selector_failure(plan, reason_code="CHAIN_PROVIDER_EMPTY_OPTIONS", explanation=_expl, base_url=_sel_base_url, execution_mode=_sel_mode, selection_diagnostics=_selector_request_diagnostics(request_context))
             return None
         except ChainProviderError as e:
             _expl = f"Chain provider HTTP/network error: {e}"
@@ -1481,7 +1738,7 @@ class APContractSelectionEngine:
                 explanation=_expl,
                 inputs={"ticker": ticker, "direction": direction, "status_code": getattr(e, "status_code", None)},
             )
-            _attach_selector_failure(plan, reason_code="CHAIN_PROVIDER_ERROR", explanation=_expl, base_url=_sel_base_url, execution_mode=_sel_mode)
+            _attach_selector_failure(plan, reason_code="CHAIN_PROVIDER_ERROR", explanation=_expl, base_url=_sel_base_url, execution_mode=_sel_mode, selection_diagnostics=_selector_request_diagnostics(request_context))
             return None
         except Exception as e:
             _expl = f"Chain fetch unexpected error: {e}"
@@ -1494,7 +1751,7 @@ class APContractSelectionEngine:
                 explanation=_expl,
                 inputs={"ticker": ticker, "direction": direction},
             )
-            _attach_selector_failure(plan, reason_code="CHAIN_PROVIDER_ERROR", explanation=_expl, base_url=_sel_base_url, execution_mode=_sel_mode)
+            _attach_selector_failure(plan, reason_code="CHAIN_PROVIDER_ERROR", explanation=_expl, base_url=_sel_base_url, execution_mode=_sel_mode, selection_diagnostics=_selector_request_diagnostics(request_context))
             return None
 
         if not chain:
@@ -1518,6 +1775,7 @@ class APContractSelectionEngine:
                 chain_rows=0,
                 base_url=_sel_base_url,
                 execution_mode=_sel_mode,
+                selection_diagnostics=_selector_request_diagnostics(request_context),
             )
             return None
         _sel_chain_rows = len(chain)
@@ -1682,10 +1940,6 @@ class APContractSelectionEngine:
         survivors  = []
         _rejections: dict = {}
         _pro_tiers:  dict = {"A": 0, "B": 0}
-        # P2: per-selector-pass direct-quote budget so one stale chain cannot
-        # trigger hundreds of Tradier quote fetches.
-        _p0a_budget: int = _DIRECT_QUOTE_RECOVERY_TOP_N
-
         for opt in chain:
             if _PRO_QUALITY_ENABLED:
                 exp_str = opt.get("expiration_date", "")
@@ -1700,18 +1954,16 @@ class APContractSelectionEngine:
                 # ── P0A/FIX-2: direct quote recovery inside pro-quality ───────
                 # When pro_quality would hard-reject for a revalidatable reason
                 # (zero/missing bid-ask, bid_below_0.1) AND the market is open
-                # AND the per-pass budget allows it, fetch a direct option quote
+                # and the request budget allows it, fetch a direct option quote
                 # and rerun pro_quality on the patched opt before rejecting.
-                # _p0a_budget is checked before AND decremented after every call
-                # regardless of the action result, so the cap applies to all
-                # outcomes: PASS, REJECT_DIRECT_ZERO, REJECT_UNAVAILABLE, SKIP_*.
-                if pro_tier == "REJECT" and _should_revalidate(pro_reason) and _p0a_budget > 0:
+                # One context enforces the hard cap across every DTE probe.
+                if pro_tier == "REJECT" and _should_revalidate(pro_reason):
                     _rv_pro = _revalidate_direct(
                         self.data_broker,
                         opt,
                         pro_reason,
+                        request_context=request_context,
                     )
-                    _p0a_budget -= 1   # always decrement — counts the fetch attempt
                     if _rv_pro.get("action") == "PASS" and _rv_pro.get("opt_updated"):
                         _opt_pro = _rv_pro["opt_updated"]
                         # Rerun pro_quality with patched bid/ask
@@ -1826,20 +2078,18 @@ class APContractSelectionEngine:
             # ── P0A: direct quote revalidation ────────────────────────────
             # When the chain row produced a revalidatable reject (zero/missing
             # bid-ask, bid_below_0.1, NO_CHAIN_DATA, zero liquidity) AND the
-            # market is open AND the per-pass budget allows it, fetch a direct
+            # market is open and the request budget allows it, fetch a direct
             # option quote and re-run quality checks against the fresh quote.
             # Safety rules (spread, premium, affordability, capital) are
             # re-enforced against the direct quote — never bypassed.
-            # _p0a_budget is checked before AND decremented after every call
-            # regardless of result, so REJECT_DIRECT_ZERO / REJECT_UNAVAILABLE
-            # consume the budget exactly as PASS does.
-            if result is not None and _should_revalidate(result) and _p0a_budget > 0:
+            # One context enforces the hard cap across every DTE probe.
+            if result is not None and _should_revalidate(result):
                 _rv = _revalidate_direct(
                     self.data_broker,
                     opt,
                     result,
+                    request_context=request_context,
                 )
-                _p0a_budget -= 1   # always decrement — counts the fetch attempt
                 _rv_action = _rv.get("action")
                 if _rv_action == "PASS" and _rv.get("opt_updated"):
                     # Direct quote was valid.  Re-run quality filter on the
@@ -2090,6 +2340,7 @@ class APContractSelectionEngine:
                 best_rejected_candidate=_best_rejected_candidate,
                 chain_quote_validity=_chain_quote_validity or None,      # Fix 4
                 direct_quote_recovery_audit=_direct_quote_recovery_audit, # Fix 2
+                selection_diagnostics=_selector_request_diagnostics(request_context),
             )
             return None
 
@@ -2232,6 +2483,7 @@ class APContractSelectionEngine:
                         reject_buckets=_sel_rejections,
                         base_url=_sel_base_url,
                         execution_mode=_sel_mode,
+                        selection_diagnostics=_selector_request_diagnostics(request_context),
                     )
                     return None
         selected = self._build_selected(best, best_score, budget, today)
@@ -2314,6 +2566,7 @@ class APContractSelectionEngine:
                         reject_buckets=_sel_rejections,
                         base_url=_sel_base_url,
                         execution_mode=_sel_mode,
+                        selection_diagnostics=_selector_request_diagnostics(request_context),
                     )
                     return None
                 log.warning("[%s] budget $%.0f < premium $%.0f -- forcing 1 contract",
@@ -2457,6 +2710,7 @@ class APContractSelectionEngine:
                     base_url=_sel_base_url,
                     execution_mode=_sel_mode,
                     best_rejected_candidate=_best_rejected_candidate,
+                    selection_diagnostics=_selector_request_diagnostics(request_context),
                 )
                 return None
 
@@ -2498,6 +2752,7 @@ class APContractSelectionEngine:
                 base_url=_sel_base_url,
                 execution_mode=_sel_mode,
                 best_rejected_candidate=_best_rejected_candidate,
+                selection_diagnostics=_selector_request_diagnostics(request_context),
             )
             return None
 
@@ -2546,6 +2801,7 @@ class APContractSelectionEngine:
                     base_url=_sel_base_url,
                     execution_mode=_sel_mode,
                     best_rejected_candidate=_best_rejected_candidate,
+                    selection_diagnostics=_selector_request_diagnostics(request_context),
                 )
                 return None
 
@@ -2584,6 +2840,7 @@ class APContractSelectionEngine:
                 base_url=_sel_base_url,
                 execution_mode=_sel_mode,
                 best_rejected_candidate=_best_rejected_candidate,
+                selection_diagnostics=_selector_request_diagnostics(request_context),
             )
             return None
 
@@ -2591,6 +2848,9 @@ class APContractSelectionEngine:
         # Default behavior remains mutation because downstream execution expects
         # the selected contract fields on the plan. Set mutate_plan=False only
         # for audit/replay callers that explicitly consume SelectedContract.
+        _selection_diagnostics = _selector_request_diagnostics(request_context)
+        if isinstance(selected.candidate_audit, dict):
+            selected.candidate_audit["selection_diagnostics"] = _selection_diagnostics
         if self.mutate_plan:
             if isinstance(plan, dict):
                 plan["contract_symbol"] = selected.contract_symbol
@@ -2610,6 +2870,7 @@ class APContractSelectionEngine:
                     "affordable_contracts": selected.affordable_contracts,
                     "effective_budget": selected.effective_budget,
                     "budget_clipped": selected.budget_clipped,
+                    "selection_diagnostics": _selection_diagnostics,
                 })
             else:
                 plan.contract_symbol  = selected.contract_symbol
@@ -2630,6 +2891,7 @@ class APContractSelectionEngine:
                         "affordable_contracts": selected.affordable_contracts,
                         "effective_budget": selected.effective_budget,
                         "budget_clipped": selected.budget_clipped,
+                        "selection_diagnostics": _selection_diagnostics,
                     })
                     plan.selector_metadata = meta
                 except Exception:
@@ -2687,6 +2949,7 @@ class APContractSelectionEngine:
                 "simulation_override": "[forced_1]" in (selected.selection_reason or ""),
                 "quality_rules_version": _QUALITY_RULES_VERSION,
                 "budget_clipped":       _budget_was_clipped,
+                "selection_diagnostics": _selection_diagnostics,
             },
         )
 
@@ -2708,15 +2971,257 @@ class APContractSelectionEngine:
     # PRIVATE -- CHAIN FETCH
     # =========================================================================
 
-    def _fetch_chain_with_price(self, ticker: str, direction: str, *, expiration_override: Optional[str] = None) -> tuple[list[dict], Optional[float]]:
+    def _fetch_chain_with_price(
+        self,
+        ticker: str,
+        direction: str,
+        *,
+        expiration_override: Optional[str] = None,
+        request_context: Optional[SelectorRequestContext] = None,
+    ) -> tuple[list[dict], Optional[float]]:
         option_type = direction.lower()
-        return self._fetch_tradier_chain(ticker, option_type, expiration_override=expiration_override)
+        return self._fetch_tradier_chain(
+            ticker,
+            option_type,
+            expiration_override=expiration_override,
+            request_context=request_context,
+        )
 
     def _fetch_chain(self, ticker: str, direction: str) -> list[dict]:
         chain, _ = self._fetch_chain_with_price(ticker, direction)
         return chain
 
-    def _fetch_tradier_chain(self, ticker: str, option_type: str, *, expiration_override: Optional[str] = None) -> tuple[list[dict], Optional[float]]:
+    def _throttle_before_market_data_call(
+        self,
+        endpoint: str,
+        symbol: str,
+        *,
+        context: str,
+        request_context: Optional[SelectorRequestContext] = None,
+    ):
+        try:
+            from ap.tradier_market_data_throttle import before_market_data_call
+        except Exception as exc:
+            log.error(
+                "[%s] selector throttle import failed endpoint=%s context=%s err=%s",
+                symbol, endpoint, context, exc,
+            )
+            _ctx_note_throttle_issue(
+                request_context,
+                endpoint=endpoint,
+                symbol=symbol,
+                context=context,
+                phase="import",
+                error=exc,
+            )
+            return None
+        try:
+            token = before_market_data_call(endpoint, symbol, context=context)
+            _ctx_add_throttle_wait(request_context, (token or {}).get("wait_ms", 0.0))
+            return token
+        except Exception as exc:
+            log.error(
+                "[%s] selector throttle acquire failed endpoint=%s context=%s err=%s",
+                symbol, endpoint, context, exc,
+            )
+            _ctx_note_throttle_issue(
+                request_context,
+                endpoint=endpoint,
+                symbol=symbol,
+                context=context,
+                phase="acquire",
+                error=exc,
+            )
+            return None
+
+    def _throttle_after_market_data_call(self, token) -> None:
+        if token is None:
+            return
+        try:
+            from ap.tradier_market_data_throttle import after_market_data_call
+            after_market_data_call()
+        except Exception:
+            pass
+
+    def _fetch_underlying_quote(
+        self,
+        session,
+        base_url: str,
+        headers: dict,
+        ticker: str,
+        *,
+        request_context: Optional[SelectorRequestContext] = None,
+    ) -> Optional[float]:
+        if request_context is not None and request_context.underlying_price is not None:
+            return request_context.underlying_price
+        _ctx_assert_budget(request_context, stage="underlying_quote")
+        _ctx_increment(request_context, "underlying_quote_calls")
+        _t0 = time.monotonic()
+        token = self._throttle_before_market_data_call(
+            "/v1/markets/quotes",
+            ticker,
+            context="selector_underlying_quote",
+            request_context=request_context,
+        )
+        underlying_price = None
+        try:
+            q_resp = session.get(
+                f"{base_url}/v1/markets/quotes",
+                params={"symbols": ticker, "greeks": "false"},
+                headers=headers,
+                timeout=8,
+            )
+            if q_resp.status_code == 200:
+                quotes = q_resp.json().get("quotes", {}).get("quote", {})
+                if isinstance(quotes, dict):
+                    underlying_price = float(quotes.get("last") or quotes.get("bid") or 0) or None
+        finally:
+            self._throttle_after_market_data_call(token)
+            _ctx_add_stage_ms(request_context, "underlying_quote", (time.monotonic() - _t0) * 1000.0)
+        if request_context is not None:
+            request_context.underlying_price = underlying_price
+        return underlying_price
+
+    def _fetch_expirations(
+        self,
+        session,
+        base_url: str,
+        headers: dict,
+        ticker: str,
+        *,
+        request_context: Optional[SelectorRequestContext] = None,
+    ) -> list[str]:
+        if request_context is not None and request_context.expirations is not None:
+            return list(request_context.expirations)
+        _ctx_assert_budget(
+            request_context,
+            stage="expirations",
+            call_key="expiration_calls",
+        )
+        _ctx_increment(request_context, "expiration_calls")
+        _t0 = time.monotonic()
+        token = self._throttle_before_market_data_call(
+            "/v1/markets/options/expirations",
+            ticker,
+            context="selector_expirations",
+            request_context=request_context,
+        )
+        try:
+            _provider_t0 = time.monotonic()
+            exp_resp = session.get(
+                f"{base_url}/v1/markets/options/expirations",
+                params={"symbol": ticker, "includeAllRoots": "true"},
+                headers=headers,
+                timeout=10,
+            )
+        except Exception as exc:
+            _provider_latency_ms = round((time.monotonic() - _provider_t0) * 1000.0, 3)
+            if request_context is not None:
+                request_context.expiration_provider_latency_ms = _provider_latency_ms
+            raise ChainProviderError(
+                f"Expirations fetch network error: {exc}",
+                provider_latency_ms=_provider_latency_ms,
+                attempts=1,
+            ) from exc
+        finally:
+            self._throttle_after_market_data_call(token)
+            _ctx_add_stage_ms(request_context, "expirations", (time.monotonic() - _t0) * 1000.0)
+
+        _provider_latency_ms = round((time.monotonic() - _provider_t0) * 1000.0, 3)
+        _retry_ms = _retry_after_ms(exp_resp)
+        if request_context is not None:
+            request_context.expiration_http_status = int(exp_resp.status_code)
+            request_context.expiration_provider_latency_ms = _provider_latency_ms
+            request_context.retry_after_ms = _retry_ms
+            _ctx_refresh_diagnostics(request_context)
+        if exp_resp.status_code in (401, 403):
+            raise ChainAuthError(
+                f"Expirations auth error {exp_resp.status_code} for {ticker}",
+                status_code=exp_resp.status_code,
+                provider_latency_ms=_provider_latency_ms,
+                retry_after_ms=_retry_ms,
+            )
+        if exp_resp.status_code != 200:
+            raise ChainProviderError(
+                f"Expirations fetch failed: HTTP {exp_resp.status_code} for {ticker}",
+                status_code=exp_resp.status_code,
+                provider_latency_ms=_provider_latency_ms,
+                retry_after_ms=_retry_ms,
+            )
+        dates = exp_resp.json().get("expirations", {}).get("date", []) or []
+        if request_context is not None:
+            request_context.expirations = list(dates)
+        return dates
+
+    def _fetch_chain_for_expiration(
+        self,
+        session,
+        base_url: str,
+        headers: dict,
+        ticker: str,
+        option_type: str,
+        expiration: str,
+        *,
+        underlying_price: Optional[float],
+        request_context: Optional[SelectorRequestContext] = None,
+    ) -> tuple[list[dict], Optional[float]]:
+        _ctx_assert_budget(
+            request_context,
+            stage="chain",
+            call_key="chain_calls",
+        )
+        _ctx_increment(request_context, "chain_calls")
+        _t0 = time.monotonic()
+        token = self._throttle_before_market_data_call(
+            "/v1/markets/options/chains",
+            ticker,
+            context="selector_chain",
+            request_context=request_context,
+        )
+        try:
+            chain_resp = session.get(
+                f"{base_url}/v1/markets/options/chains",
+                params={"symbol": ticker, "expiration": expiration, "greeks": "true"},
+                headers=headers,
+                timeout=10,
+            )
+        except Exception as exc:
+            raise ChainProviderError(f"Chain fetch network error (exp={expiration}): {exc}") from exc
+        finally:
+            self._throttle_after_market_data_call(token)
+            _ctx_add_stage_ms(request_context, "chain", (time.monotonic() - _t0) * 1000.0)
+
+        if chain_resp.status_code in (401, 403):
+            raise ChainAuthError(
+                f"Chain fetch auth error {chain_resp.status_code} for {ticker}/{expiration}",
+                status_code=chain_resp.status_code,
+            )
+        if chain_resp.status_code != 200:
+            raise ChainProviderError(
+                f"Chain fetch failed: HTTP {chain_resp.status_code} for {ticker}/{expiration}",
+                status_code=chain_resp.status_code,
+            )
+
+        options = chain_resp.json().get("options", {}).get("option", []) or []
+        if not options:
+            raise ChainEmptyOptions(
+                f"[{ticker}] Tradier returned zero option rows for expiration={expiration}"
+            )
+        for o in options:
+            o["_ticker"] = ticker
+            if underlying_price:
+                o["_underlying_price"] = underlying_price
+        filtered = [o for o in options if o.get("option_type", "").lower() == option_type]
+        return filtered, underlying_price
+
+    def _fetch_tradier_chain(
+        self,
+        ticker: str,
+        option_type: str,
+        *,
+        expiration_override: Optional[str] = None,
+        request_context: Optional[SelectorRequestContext] = None,
+    ) -> tuple[list[dict], Optional[float]]:
         """Direct Tradier API call for option chain. Returns (chain, underlying_price)."""
         import requests
         # Use broker's pooled session if available (connection reuse, keep-alive).
@@ -2734,83 +3239,25 @@ class APContractSelectionEngine:
             log.error("[%s] No Tradier token found on data_broker -- chain fetch will 401", ticker)
         headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
 
-        # 1. Fetch underlying quote
         underlying_price = None
         try:
-            # P0 (PR #296): throttle before underlying quote GET to prevent
-            # market-open stampede from multiple concurrent deferred breaches.
-            # No-op when TRADIER_MD_THROTTLE_ENABLED=0 (default).
-            try:
-                from ap.tradier_market_data_throttle import (
-                    before_market_data_call,
-                    after_market_data_call,
-                )
-                before_market_data_call(
-                    "/v1/markets/quotes", ticker,
-                    context="selector_underlying_quote",
-                )
-            except Exception:
-                pass
-            try:
-                q_resp = _session.get(
-                    f"{base_url}/v1/markets/quotes",
-                    params={"symbols": ticker, "greeks": "false"},
-                    headers=headers, timeout=8,
-                )
-                if q_resp.status_code == 200:
-                    quotes = q_resp.json().get("quotes", {}).get("quote", {})
-                    if isinstance(quotes, dict):
-                        underlying_price = float(quotes.get("last") or quotes.get("bid") or 0) or None
-            finally:
-                try:
-                    after_market_data_call()
-                except Exception:
-                    pass
+            underlying_price = self._fetch_underlying_quote(
+                _session,
+                base_url,
+                headers,
+                ticker,
+                request_context=request_context,
+            )
         except Exception:
-            pass
+            underlying_price = None
 
-        # 2. Get expirations
-        try:
-            # P0 (PR #296): throttle before expirations GET.
-            try:
-                from ap.tradier_market_data_throttle import (
-                    before_market_data_call,
-                    after_market_data_call,
-                )
-                before_market_data_call(
-                    "/v1/markets/options/expirations", ticker,
-                    context="selector_expirations",
-                )
-            except Exception:
-                pass
-            try:
-                exp_resp = _session.get(
-                    f"{base_url}/v1/markets/options/expirations",
-                    params={"symbol": ticker, "includeAllRoots": "true"},
-                    headers=headers, timeout=10,
-                )
-            except requests.exceptions.RequestException as _e:
-                raise ChainProviderError(f"Expirations fetch network error: {_e}") from _e
-            finally:
-                try:
-                    after_market_data_call()
-                except Exception:
-                    pass
-        except (ChainProviderError, ChainAuthError, ChainEmptyExpirations,
-                NoExpirationInDTEWindow):
-            raise
-        if exp_resp.status_code in (401, 403):
-            raise ChainAuthError(
-                f"Expirations auth error {exp_resp.status_code} for {ticker}",
-                status_code=exp_resp.status_code,
-            )
-        if exp_resp.status_code != 200:
-            raise ChainProviderError(
-                f"Expirations fetch failed: HTTP {exp_resp.status_code} for {ticker}",
-                status_code=exp_resp.status_code,
-            )
-
-        dates = exp_resp.json().get("expirations", {}).get("date", []) or []
+        dates = self._fetch_expirations(
+            _session,
+            base_url,
+            headers,
+            ticker,
+            request_context=request_context,
+        )
         if not dates:
             raise ChainEmptyExpirations(f"[{ticker}] Tradier returned empty expirations list")
 
@@ -2827,63 +3274,16 @@ class APContractSelectionEngine:
             raise NoExpirationInDTEWindow(
                 f"[{ticker}] No valid expiration in DTE window [{self.min_dte},{self.max_dte}] from {len(dates)} dates"
             )
-
-        # 4. Get chain with greeks
-        try:
-            # P0 (PR #296): throttle before option chain GET.
-            try:
-                from ap.tradier_market_data_throttle import (
-                    before_market_data_call,
-                    after_market_data_call,
-                )
-                before_market_data_call(
-                    "/v1/markets/options/chains", ticker,
-                    context="selector_chain",
-                )
-            except Exception:
-                pass
-            try:
-                chain_resp = _session.get(
-                    f"{base_url}/v1/markets/options/chains",
-                    params={"symbol": ticker, "expiration": target_exp, "greeks": "true"},
-                    headers=headers, timeout=10,
-                )
-            except requests.exceptions.RequestException as _e:
-                raise ChainProviderError(f"Chain fetch network error (exp={target_exp}): {_e}") from _e
-            finally:
-                try:
-                    after_market_data_call()
-                except Exception:
-                    pass
-        except (ChainProviderError, ChainAuthError):
-            raise
-        if chain_resp.status_code in (401, 403):
-            raise ChainAuthError(
-                f"Chain fetch auth error {chain_resp.status_code} for {ticker}/{target_exp}",
-                status_code=chain_resp.status_code,
-            )
-        if chain_resp.status_code != 200:
-            raise ChainProviderError(
-                f"Chain fetch failed: HTTP {chain_resp.status_code} for {ticker}/{target_exp}",
-                status_code=chain_resp.status_code,
-            )
-
-        options = chain_resp.json().get("options", {}).get("option", []) or []
-        if not options:
-            raise ChainEmptyOptions(
-                f"[{ticker}] Tradier returned zero option rows for expiration={target_exp}"
-            )
-
-        # 5. Inject ticker into every option dict regardless of quote availability.
-        # _quality_filter() uses _ticker for per-ticker premium caps, so this must
-        # not depend on underlying_price being present. Inject underlying only when available.
-        for o in options:
-            o["_ticker"] = ticker
-            if underlying_price:
-                o["_underlying_price"] = underlying_price
-
-        filtered = [o for o in options if o.get("option_type", "").lower() == option_type]
-        return filtered, underlying_price
+        return self._fetch_chain_for_expiration(
+            _session,
+            base_url,
+            headers,
+            ticker,
+            option_type,
+            target_exp,
+            underlying_price=underlying_price,
+            request_context=request_context,
+        )
 
     # =========================================================================
     # PR1 — DTE-BUCKET LADDER (flag-gated, default off)
@@ -2938,7 +3338,12 @@ class APContractSelectionEngine:
         # Default: still near-first (safe — ladder falls back if empty).
         return ["A", "B", "C"]
 
-    def _fetch_expirations_list(self, ticker: str) -> tuple[list[str], dict]:
+    def _fetch_expirations_list(
+        self,
+        ticker: str,
+        *,
+        request_context: Optional[SelectorRequestContext] = None,
+    ) -> tuple[list[str], dict]:
         """Fetch expirations and return request-scoped provider evidence."""
         import requests
         _session = getattr(self.data_broker, "session", None) or requests
@@ -2950,70 +3355,29 @@ class APContractSelectionEngine:
                  or getattr(self.data_broker, "access_token", None)
                  or getattr(self.data_broker, "token", "")) or ""
         headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
-        try:
-            # P0 (PR #296): throttle before expirations GET in DTE-ladder path.
-            try:
-                from ap.tradier_market_data_throttle import (
-                    before_market_data_call,
-                    after_market_data_call,
-                )
-                before_market_data_call(
-                    "/v1/markets/options/expirations", ticker,
-                    context="selector_expirations_list",
-                )
-            except Exception:
-                pass
-            try:
-                _started = time.monotonic()
-                resp = _session.get(
-                    f"{base_url}/v1/markets/options/expirations",
-                    params={"symbol": ticker, "includeAllRoots": "true"},
-                    headers=headers, timeout=10,
-                )
-                _latency_ms = round((time.monotonic() - _started) * 1000.0, 3)
-                _retry_ms = _retry_after_ms(resp)
-                if resp.status_code in (401, 403):
-                    raise ChainAuthError(
-                        f"Expirations auth error {resp.status_code} for {ticker}",
-                        status_code=resp.status_code,
-                        provider_latency_ms=_latency_ms,
-                        retry_after_ms=_retry_ms,
-                    )
-                if resp.status_code != 200:
-                    raise ChainProviderError(
-                        f"Expirations fetch failed: HTTP {resp.status_code} for {ticker}",
-                        status_code=resp.status_code,
-                        provider_latency_ms=_latency_ms,
-                        retry_after_ms=_retry_ms,
-                    )
-                dates = resp.json().get("expirations", {}).get("date", []) or []
-                if not dates:
-                    raise ChainEmptyExpirations(
-                        f"[{ticker}] Tradier returned empty expirations list",
-                        provider_latency_ms=_latency_ms,
-                        retry_after_ms=_retry_ms,
-                    )
-                return dates, {
-                    "expiration_fetch_attempts": 1,
-                    "expiration_http_status": int(resp.status_code),
-                    "expiration_provider_latency_ms": _latency_ms,
-                    "retry_after_ms": _retry_ms,
-                }
-            finally:
-                try:
-                    after_market_data_call()
-                except Exception:
-                    pass
-        except requests.exceptions.RequestException as exc:
-            _latency_ms = None
-            try:
-                _latency_ms = round((time.monotonic() - _started) * 1000.0, 3)
-            except Exception:
-                pass
-            raise ChainProviderError(
-                f"Expirations fetch network error: {exc}",
-                provider_latency_ms=_latency_ms,
-            ) from exc
+        context = request_context or _new_selector_request_context(ticker)
+        dates = self._fetch_expirations(
+            _session,
+            base_url,
+            headers,
+            ticker,
+            request_context=context,
+        )
+        evidence = {
+            "expiration_fetch_attempts": int(context.provider_call_counts.get("expiration_calls", 0) or 0),
+            "expiration_http_status": context.expiration_http_status,
+            "expiration_provider_latency_ms": context.expiration_provider_latency_ms,
+            "retry_after_ms": context.retry_after_ms,
+        }
+        if not dates:
+            raise ChainEmptyExpirations(
+                f"[{ticker}] Tradier returned empty expirations list",
+                status_code=context.expiration_http_status,
+                provider_latency_ms=context.expiration_provider_latency_ms,
+                retry_after_ms=context.retry_after_ms,
+                attempts=evidence["expiration_fetch_attempts"] or 1,
+            )
+        return dates, evidence
 
     def _bucket_expirations(self, dates: list[str]) -> dict[str, list[str]]:
         """Group expirations into DTE buckets A (0–a), B (a+1–b), C (b+1+).
@@ -3039,7 +3403,12 @@ class APContractSelectionEngine:
         # nearest-first within each bucket
         return {k: [d for _, d in sorted(v)] for k, v in buckets.items()}
 
-    def _select_with_dte_ladder(self, plan) -> Optional["SelectedContract"]:
+    def _select_with_dte_ladder(
+        self,
+        plan,
+        *,
+        request_context: Optional[SelectorRequestContext] = None,
+    ) -> Optional["SelectedContract"]:
         """Evaluate expirations by DTE bucket in playbook-preferred order.
 
         For each bucket (A→B→C by default), probe its expirations nearest-first
@@ -3074,6 +3443,7 @@ class APContractSelectionEngine:
         def _persist(final_reason: str | None = None) -> None:
             if final_reason is not None:
                 audit["final_reason"] = final_reason
+            audit["selection_diagnostics"] = _selector_request_diagnostics(request_context)
             _persist_dte_ladder_audit(self, plan, audit)
 
         def _expiration_failure(reason_code: str, exc: Exception, *, allow_fallback: bool):
@@ -3115,16 +3485,33 @@ class APContractSelectionEngine:
 
             if _fallback_allowed:
                 audit["fallback_used"] = True
+                if request_context is not None:
+                    request_context.legacy_fallback_used = True
+                    if request_context.expirations == []:
+                        request_context.expirations = None
                 log.warning(
                     "[%s] DTE_LADDER_LEGACY_FALLBACK reason=%s mode=%s explicit_env=%s",
                     ticker, reason_code, _mode,
                     bool(getattr(self, "deferred_dte_legacy_fallback", False)),
                 )
                 try:
-                    result = self.select(plan, _dte_legacy_fallback=True)
+                    result = self.select(
+                        plan,
+                        _dte_legacy_fallback=True,
+                        request_context=request_context,
+                    )
                 except Exception as fallback_exc:
                     audit["fallback_error"] = str(fallback_exc)
                     result = None
+                if request_context is not None:
+                    audit.update({
+                        "expiration_fetch_attempts": int(
+                            request_context.provider_call_counts.get("expiration_calls", 0) or 0
+                        ),
+                        "expiration_http_status": request_context.expiration_http_status,
+                        "expiration_provider_latency_ms": request_context.expiration_provider_latency_ms,
+                        "retry_after_ms": request_context.retry_after_ms,
+                    })
                 audit["fallback_succeeded"] = result is not None
                 if result is not None:
                     _persist(reason_code)
@@ -3137,7 +3524,10 @@ class APContractSelectionEngine:
 
         try:
             try:
-                _fetch_result = self._fetch_expirations_list(ticker)
+                _fetch_result = self._fetch_expirations_list(
+                    ticker,
+                    request_context=request_context,
+                )
                 if (
                     isinstance(_fetch_result, tuple)
                     and len(_fetch_result) == 2
@@ -3150,6 +3540,10 @@ class APContractSelectionEngine:
                     audit["expiration_fetch_attempts"] = 1
             except ChainAuthError as exc:
                 return _expiration_failure("CHAIN_AUTH_ERROR", exc, allow_fallback=False)
+            except SelectorRequestBudgetExhausted as exc:
+                return _expiration_failure(
+                    "SELECTOR_REQUEST_BUDGET_EXHAUSTED", exc, allow_fallback=False
+                )
             except ChainEmptyExpirations as exc:
                 return _expiration_failure(
                     "CHAIN_PROVIDER_EMPTY_EXPIRATIONS", exc, allow_fallback=True
@@ -3177,6 +3571,8 @@ class APContractSelectionEngine:
                 "INVALID_PLAN", "UNSUPPORTED_INDEX_MAPPING",
                 "CHAIN_AUTH_ERROR",
                 "CHAIN_PROVIDER_EMPTY_EXPIRATIONS",
+                "SELECTOR_REQUEST_BUDGET_EXHAUSTED",
+                "MARKET_DATA_THROTTLE_UNAVAILABLE",
             }
             _RETRYABLE_DATA_REASONS = {
                 "CHAIN_PROVIDER_ERROR",
@@ -3198,11 +3594,17 @@ class APContractSelectionEngine:
                 exps = buckets.get(bucket_name, [])[: self.dte_ladder_probe_per_bucket]
                 bucket_rec = {"bucket": bucket_name, "expirations_probed": [], "survivor": False}
                 for exp in exps:
+                    if request_context is not None:
+                        request_context.expirations_probed.append(exp)
                     try:
                         _dte = (date.fromisoformat(exp) - today).days
                     except Exception:
                         _dte = None
-                    result = self.select(plan, expiration_override=exp)
+                    result = self.select(
+                        plan,
+                        expiration_override=exp,
+                        request_context=request_context,
+                    )
                     _sub_fail = _get_selector_failure(plan)
                     if result is None and isinstance(_sub_fail, dict):
                         _reason_code = _sub_fail.get("reason_code")

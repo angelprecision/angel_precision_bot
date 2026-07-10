@@ -135,7 +135,7 @@ def before_market_data_call(
     endpoint: str,
     symbol: str,
     context: str = "",
-) -> None:
+) -> Optional[dict]:
     """
     Call this IMMEDIATELY before any Tradier market-data GET request.
 
@@ -166,7 +166,7 @@ def before_market_data_call(
 
     cfg = _cfg()
     if not cfg["enabled"]:
-        return  # ← complete no-op; behavior unchanged for disabled state
+        return None  # ← complete no-op; behavior unchanged for disabled state
 
     required_ms   = cfg["open_ms"] if _in_open_window(cfg) else cfg["min_ms"]
     jitter_ms     = random.randint(0, max(0, cfg["jitter_ms"]))
@@ -185,6 +185,13 @@ def before_market_data_call(
             endpoint, symbol, wait_ms, required_ms, jitter_ms, context,
         )
         time.sleep(wait_ms / 1000.0)
+    return {
+        "acquired": True,
+        "endpoint": str(endpoint),
+        "symbol": str(symbol),
+        "context": str(context),
+        "wait_ms": float(wait_ms),
+    }
 
 
 def after_market_data_call() -> None:
