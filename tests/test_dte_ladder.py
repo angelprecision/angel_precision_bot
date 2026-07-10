@@ -19,6 +19,7 @@ import os
 import importlib.util
 from datetime import date, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -88,6 +89,7 @@ class TestSourceGuards:
 
 def _load_selector(env_overrides: dict | None = None):
     stubs = {
+        "ap.db": MagicMock(),
         "ap.brokers": MagicMock(),
         "ap.brokers.tradier": MagicMock(),
         "ap.observability": MagicMock(
@@ -95,6 +97,7 @@ def _load_selector(env_overrides: dict | None = None):
             get_git_commit=MagicMock(return_value="test"),
             make_config_hash=MagicMock(return_value="test"),
         ),
+        "ap.trace": MagicMock(trace_gate=MagicMock()),
         "yfinance": MagicMock(),
         "requests": MagicMock(),
     }
@@ -126,6 +129,42 @@ def _make_plan(ticker="AMAT", side="CALL", timeframe="1d", budget=198.72):
     p.max_position_usd = budget
     p.signal_id = "sig-test"
     return p
+
+
+class _FakeResponse:
+    def __init__(self, status_code: int, payload: dict):
+        self.status_code = status_code
+        self._payload = payload
+
+    def json(self):
+        return self._payload
+
+
+class _FakeSession:
+    def __init__(self, responses: dict[tuple[str, tuple[tuple[str, str], ...]], _FakeResponse]):
+        self._responses = responses
+
+    def get(self, url, params=None, headers=None, timeout=None):
+        key = (url, tuple(sorted((params or {}).items())))
+        try:
+            return self._responses[key]
+        except KeyError as exc:
+            raise AssertionError(f"unexpected GET {url} params={params}") from exc
+
+
+def _make_option(symbol: str, expiration: str, *, bid: float, ask: float, strike: float, delta: float,
+                 volume: int = 250, open_interest: int = 1200) -> dict:
+    return {
+        "symbol": symbol,
+        "option_type": "call",
+        "expiration_date": expiration,
+        "strike": strike,
+        "bid": bid,
+        "ask": ask,
+        "volume": volume,
+        "open_interest": open_interest,
+        "greeks": {"delta": delta},
+    }
 
 
 class TestBucketing:
@@ -319,34 +358,98 @@ class TestLadderRouting:
         sel._fetch_expirations_list = MagicMock(return_value=[a_exp])
         sel.select = MagicMock(return_value=None)
 
-        result = sel._select_with_dte_ladder(_make_plan(timeframe="1d"))
+        plan = _make_plan(timeframe="1d")
+        plan.metadata = {}
+        result = sel._select_with_dte_ladder(plan)
         assert result is None
         assert sel._last_failure is not None
         assert sel._last_failure["reason_code"] == "NO_VALID_PLAYBOOK_DTE_CONTRACT"
 
-    def test_ladder_falls_back_to_legacy_on_no_expirations(self):
-        """If the expirations list can't be fetched, fall back to legacy
-        single-shot (override="") rather than failing."""
+    def test_ladder_fails_closed_on_empty_expirations(self):
+        """Empty expirations must fail closed with the exact provider reason."""
         mod = _load_selector({"DEFERRED_DTE_LADDER": "1"})
         sel = object.__new__(mod.APContractSelectionEngine)
         sel.dte_ladder_enabled = True
         sel.dte_bucket_a_max = 2
         sel.dte_bucket_b_max = 7
         sel.dte_ladder_probe_per_bucket = 2
+        sel.mode = "live"
         sel._last_failure = None
         sel._last_dte_ladder_audit = None
-        sel._fetch_expirations_list = MagicMock(return_value=[])
+        plan = _make_plan()
+        plan.metadata = {"deferred_breach_selection": True}
+        sel._fetch_expirations_list = MagicMock(side_effect=mod.ChainEmptyExpirations("empty list"))
 
-        legacy_called = {"override": "unset"}
-        def _fake_select(plan, *, expiration_override=None):
-            legacy_called["override"] = expiration_override
-            return MagicMock(contract_symbol="LEGACY")
+        result = sel._select_with_dte_ladder(plan)
+        assert result is None
+        assert sel._last_failure["reason_code"] == "CHAIN_PROVIDER_EMPTY_EXPIRATIONS"
+        assert plan.metadata["selector_failure"]["reason_code"] == "CHAIN_PROVIDER_EMPTY_EXPIRATIONS"
+
+    def test_ladder_uses_plan_scoped_failure_not_shared_last_failure(self):
+        """Ladder control flow must preserve the sub-call plan failure snapshot,
+        not whatever another request last wrote to self._last_failure."""
+        mod = _load_selector({"DEFERRED_DTE_LADDER": "1"})
+        sel = object.__new__(mod.APContractSelectionEngine)
+        sel.dte_ladder_enabled = True
+        sel.dte_bucket_a_max = 2
+        sel.dte_bucket_b_max = 7
+        sel.dte_ladder_probe_per_bucket = 2
+        sel.mode = "live"
+        sel._last_failure = {"reason_code": "ALIEN_FAILURE", "stage": "other", "explanation": "other request"}
+        sel._last_dte_ladder_audit = None
+        today = date.today()
+        a_exp = _next_weekday(today, 1)
+        plan = _make_plan(timeframe="1d")
+        plan.metadata = {"deferred_breach_selection": True}
+        sel._fetch_expirations_list = MagicMock(return_value=[a_exp])
+
+        def _fake_select(sub_plan, *, expiration_override=None):
+            sub_plan.metadata["selector_failure"] = {
+                "reason_code": "CHAIN_PROVIDER_EMPTY_OPTIONS",
+                "explanation": "no options for this expiration",
+            }
+            sel._last_failure = {"reason_code": "ALIEN_FAILURE", "stage": "other", "explanation": "other request"}
+            return None
+
         sel.select = _fake_select
+        result = sel._select_with_dte_ladder(plan)
+        assert result is None
+        assert sel._last_failure["reason_code"] == "CHAIN_PROVIDER_EMPTY_OPTIONS"
+        assert plan.metadata["selector_failure"]["reason_code"] == "CHAIN_PROVIDER_EMPTY_OPTIONS"
 
-        result = sel._select_with_dte_ladder(_make_plan())
+    def test_top_level_select_resets_stale_ladder_audit(self):
+        mod = _load_selector({"DEFERRED_DTE_LADDER": "0"})
+        sel = mod.APContractSelectionEngine(
+            broker=SimpleNamespace(),
+            data_broker=SimpleNamespace(
+                session=_FakeSession({
+                    ("https://api.tradier.com/v1/markets/quotes", (("greeks", "false"), ("symbols", "AMAT"))):
+                        _FakeResponse(200, {"quotes": {"quote": {"last": 145.0}}}),
+                    ("https://api.tradier.com/v1/markets/options/expirations", (("includeAllRoots", "true"), ("symbol", "AMAT"))):
+                        _FakeResponse(200, {"expirations": {"date": [_next_weekday(date.today(), 1)]}}),
+                    ("https://api.tradier.com/v1/markets/options/chains", (("expiration", _next_weekday(date.today(), 1)), ("greeks", "true"), ("symbol", "AMAT"))):
+                        _FakeResponse(200, {"options": {"option": [
+                            _make_option("AMAT_A", _next_weekday(date.today(), 1), bid=2.0, ask=2.1, strike=145.0, delta=0.42),
+                        ]}}),
+                }),
+                cfg=SimpleNamespace(base_url="https://api.tradier.com", access_token="token"),
+                base_url="https://api.tradier.com",
+            ),
+            mode="live",
+        )
+        sel._last_dte_ladder_audit = {"ticker": "STALE"}
+        plan = SimpleNamespace(
+            ticker="AMAT",
+            side="CALL",
+            timeframe="1d",
+            max_position_usd=500.0,
+            signal_id="sig-reset",
+            metadata={},
+        )
+
+        result = sel.select(plan)
         assert result is not None
-        # legacy fallback passes empty-string override (=> _pick_expiration path)
-        assert legacy_called["override"] == ""
+        assert sel.get_last_dte_ladder_audit() is None
 
 
 class TestAmendmentGateOrdering:
@@ -388,15 +491,16 @@ class TestAmendmentGateOrdering:
 
         def _fake_select(plan, *, expiration_override=None):
             # simulate the earnings gate firing inside the sub-call
-            sel._last_failure = {
-                "stage": "earnings_gate",
+            plan.metadata["selector_failure"] = {
                 "reason_code": "EARNINGS_LOCKOUT",
                 "explanation": "Blocked by EarningsGuard",
             }
             return None
         sel.select = _fake_select
 
-        result = sel._select_with_dte_ladder(_make_plan(timeframe="1d"))
+        plan = _make_plan(timeframe="1d")
+        plan.metadata = {}
+        result = sel._select_with_dte_ladder(plan)
         assert result is None
         # the true reason must survive
         assert sel._last_failure["reason_code"] == "EARNINGS_LOCKOUT"
@@ -418,15 +522,16 @@ class TestAmendmentGateOrdering:
         sel._fetch_expirations_list = MagicMock(return_value=[a_exp])
 
         def _fake_select(plan, *, expiration_override=None):
-            sel._last_failure = {
-                "stage": "quality_summary",
+            plan.metadata["selector_failure"] = {
                 "reason_code": "OI_TOO_LOW",
                 "explanation": "illiquid",
             }
             return None
         sel.select = _fake_select
 
-        result = sel._select_with_dte_ladder(_make_plan(timeframe="1d"))
+        plan = _make_plan(timeframe="1d")
+        plan.metadata = {}
+        result = sel._select_with_dte_ladder(plan)
         assert result is None
         assert sel._last_failure["reason_code"] == "OI_TOO_LOW"
 
@@ -448,8 +553,7 @@ class TestAmendmentGateOrdering:
         sel._fetch_expirations_list = MagicMock(return_value=[a_exp, c_exp])
 
         def _fake_select(plan, *, expiration_override=None):
-            sel._last_failure = {
-                "stage": "chain_fetch",
+            plan.metadata["selector_failure"] = {
                 "reason_code": (
                     "CHAIN_PROVIDER_EMPTY_OPTIONS"
                     if expiration_override == a_exp else
@@ -461,9 +565,86 @@ class TestAmendmentGateOrdering:
 
         sel.select = _fake_select
 
-        result = sel._select_with_dte_ladder(_make_plan(timeframe="1d"))
+        plan = _make_plan(timeframe="1d")
+        plan.metadata = {}
+        result = sel._select_with_dte_ladder(plan)
         assert result is None
         assert sel._last_failure["reason_code"] in {
             "CHAIN_PROVIDER_EMPTY_OPTIONS",
             "CHAIN_PARSE_EMPTY",
         }
+
+
+class TestDeferredPlanIntegration:
+    def test_real_selector_ladder_preserves_recovered_plan_identity_on_copyback(self):
+        mod = _load_selector({"DEFERRED_DTE_LADDER": "1"})
+        today = date.today()
+        near_exp = _next_weekday(today, 1)
+        far_exp = _next_weekday(today, 14)
+        responses = {
+            ("https://api.tradier.com/v1/markets/options/expirations", (("includeAllRoots", "true"), ("symbol", "AMAT"))):
+                _FakeResponse(200, {"expirations": {"date": [near_exp, far_exp]}}),
+            ("https://api.tradier.com/v1/markets/quotes", (("greeks", "false"), ("symbols", "AMAT"))):
+                _FakeResponse(200, {"quotes": {"quote": {"last": 145.0}}}),
+            ("https://api.tradier.com/v1/markets/options/chains", (("expiration", near_exp), ("greeks", "true"), ("symbol", "AMAT"))):
+                _FakeResponse(200, {"options": {"option": [
+                    _make_option("AMAT_NEAR_EXPENSIVE", near_exp, bid=8.7, ask=9.1, strike=145.0, delta=0.41),
+                ]}}),
+            ("https://api.tradier.com/v1/markets/options/chains", (("expiration", far_exp), ("greeks", "true"), ("symbol", "AMAT"))):
+                _FakeResponse(200, {"options": {"option": [
+                    _make_option("AMAT_FAR_WINNER", far_exp, bid=2.0, ask=2.2, strike=145.0, delta=0.40),
+                    _make_option("AMAT_FAR_LOSER", far_exp, bid=1.5, ask=2.9, strike=150.0, delta=0.19),
+                ]}}),
+        }
+        sel = mod.APContractSelectionEngine(
+            broker=SimpleNamespace(),
+            data_broker=SimpleNamespace(
+                session=_FakeSession(responses),
+                cfg=SimpleNamespace(base_url="https://api.tradier.com", access_token="token"),
+                base_url="https://api.tradier.com",
+            ),
+            mode="live",
+        )
+        plan = SimpleNamespace(
+            client_id="jason@example.com",
+            execution_mode="live",
+            signal_id="sig-live-314",
+            ticker="AMAT",
+            side="CALL",
+            timeframe="1d",
+            trigger_price=145.0,
+            target_underlying=147.0,
+            max_position_usd=500.0,
+            contract_symbol="DEFERRED:AMAT",
+            limit_price=0.01,
+            contracts=1,
+            metadata={
+                "deferred_breach_selection": True,
+                "selection_context": "deferred_breach",
+                "recovered_plan": True,
+            },
+        )
+
+        contract_before = plan.contract_symbol
+        result = sel.select(plan)
+
+        assert result is not None
+        assert result.contract_symbol == "AMAT_FAR_WINNER"
+        assert result.expiration == far_exp
+        assert result.affordable_contracts == 2
+        assert result.premium_per_contract == pytest.approx(220.0)
+        assert plan.client_id == "jason@example.com"
+        assert plan.execution_mode == "live"
+        assert plan.signal_id == "sig-live-314"
+
+        if result.contract_symbol and contract_before.upper().startswith("DEFERRED:"):
+            plan.contract_symbol = result.contract_symbol
+            plan.limit_price = result.execution_price_per_share or result.ask or result.mid
+            plan.contracts = int(result.affordable_contracts or 0)
+            plan.max_position_usd = float(plan.contracts) * float(result.premium_per_contract)
+
+        assert plan.contract_symbol == result.contract_symbol
+        assert plan.limit_price == result.execution_price_per_share
+        assert plan.contracts == result.affordable_contracts
+        assert plan.max_position_usd == result.affordable_contracts * result.premium_per_contract
+        assert sel.get_last_dte_ladder_audit()["selected_expiration"] == far_exp

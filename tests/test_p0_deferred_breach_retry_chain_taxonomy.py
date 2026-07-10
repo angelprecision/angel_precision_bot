@@ -265,8 +265,7 @@ def test_dte_ladder_all_retryable_failures_remain_retryable(monkeypatch):
     sel._fetch_expirations_list = MagicMock(return_value=[_exp_a, _exp_c])
 
     def _fake_select(plan, *, expiration_override=None):
-        sel._last_failure = {
-            "stage": "chain_fetch",
+        plan.metadata["selector_failure"] = {
             "reason_code": "CHAIN_PROVIDER_EMPTY_OPTIONS" if expiration_override == _exp_a else "CHAIN_PARSE_EMPTY",
             "explanation": "provider warming up",
         }
@@ -300,8 +299,7 @@ def test_dte_ladder_preserves_quality_reason_when_chain_rows_exist(monkeypatch):
     sel._fetch_expirations_list = MagicMock(return_value=[tomorrow])
 
     def _fake_select(plan, *, expiration_override=None):
-        sel._last_failure = {
-            "stage": "quality_summary",
+        plan.metadata["selector_failure"] = {
             "reason_code": "OI_TOO_LOW",
             "explanation": "real rows but illiquid",
         }
@@ -336,8 +334,7 @@ def test_chain_auth_error_remains_terminal(monkeypatch):
     sel._fetch_expirations_list = MagicMock(return_value=[_exp_a2, _exp_c2])
 
     def _fake_select(plan, *, expiration_override=None):
-        sel._last_failure = {
-            "stage": "chain_fetch",
+        plan.metadata["selector_failure"] = {
             "reason_code": "CHAIN_AUTH_ERROR",
             "explanation": "401",
         }
