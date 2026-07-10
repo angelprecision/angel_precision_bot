@@ -12,6 +12,7 @@ os.environ.setdefault("DATABASE_URL", "postgresql://test:test@localhost/test")
 sys.path.insert(0, str(REPO_ROOT))
 
 from ap import exit_safety as exit_safety_mod  # noqa: E402
+from ap import order_state_machine as osm_mod  # noqa: E402
 from ap.order_state_machine import APOrderStateMachine  # noqa: E402
 
 
@@ -51,6 +52,7 @@ class _FakeConnContext:
 
 class _MockOSM:
     submit_exit = APOrderStateMachine.submit_exit
+    update_order_meta = APOrderStateMachine.update_order_meta
 
     def __init__(self):
         self.client_id = "jason@example.com"
@@ -120,6 +122,8 @@ def _patch_db(monkeypatch, resolver):
     fake_conn = _FakeConn(resolver)
     monkeypatch.setattr(exit_safety_mod, "conn", lambda: _FakeConnContext(fake_conn))
     monkeypatch.setattr(exit_safety_mod, "run_with_retry", lambda fn, *a, **k: fn())
+    monkeypatch.setattr(osm_mod, "conn", lambda: _FakeConnContext(fake_conn))
+    monkeypatch.setattr(osm_mod, "run_with_retry", lambda fn, *a, **k: fn())
     return fake_conn
 
 
@@ -489,6 +493,10 @@ def test_exit_engine_callback_path_allows_broker_repair_position_with_broker_tru
     engine.on_scale = None
     engine.order_state_machine = None
     engine.osm = None
+    engine.broker = MagicMock()
+    engine.broker.list_positions.return_value = [
+        {"symbol": "SMCI260626P00032500", "quantity": 3},
+    ]
     engine._positions = []
     engine._positions_by_id = {}
     engine.hydrate_pending_exit_identity_from_db = lambda pos: False
@@ -673,3 +681,287 @@ def test_exit_manager_open_positions_query_includes_execution_mode():
     assert idx != -1
     region = src[idx: idx + 500]
     assert "execution_mode" in region
+
+
+def test_broker_truth_exact_occ_allows_protective_close(monkeypatch, mock_broker):
+    monkeypatch.setenv("MAX_EXIT_REJECTIONS_BEFORE_HALT", "5")
+    fake_conn = _patch_db(
+        monkeypatch,
+        lambda sql, params: _open_position_row() if "FROM positions" in sql else {"rejection_count": 5},
+    )
+    mock_broker.list_positions.return_value = [
+        {"symbol": "SMCI260626P00032500", "quantity": 1, "account_id": "ACC123"},
+    ]
+    mock_broker.session.post.return_value = _resp(
+        200,
+        json_body={"order": {"id": "BO-PROTECT", "status": "open"}},
+    )
+    osm = _MockOSM()
+
+    result = osm.submit_exit(
+        broker=mock_broker,
+        position_id="pos-protect",
+        contract="SMCI260626P00032500",
+        symbol="SMCI",
+        direction="PUT",
+        qty=1,
+        limit_price=1.25,
+        execution_mode="live",
+    )
+
+    assert result["ok"] is True
+    assert mock_broker.session.post.call_count == 1
+    assert any("UPDATE orders " in sql and "SET meta = COALESCE(meta, '{}'::jsonb)" in sql for sql, _ in fake_conn.queries)
+
+
+def test_broker_flat_exact_match_blocks_without_broker_post_and_marks_stale(monkeypatch, mock_broker):
+    monkeypatch.setenv("MAX_EXIT_REJECTIONS_BEFORE_HALT", "5")
+    fake_conn = _patch_db(
+        monkeypatch,
+        lambda sql, params: _open_position_row() if "FROM positions" in sql else {"rejection_count": 5},
+    )
+    mock_broker.list_positions.return_value = [
+        {"symbol": "SMCI260626P00032500", "quantity": 0, "account_id": "ACC123"},
+    ]
+    osm = _MockOSM()
+
+    result = osm.submit_exit(
+        broker=mock_broker,
+        position_id="pos-flat",
+        contract="SMCI260626P00032500",
+        symbol="SMCI",
+        direction="PUT",
+        qty=1,
+        limit_price=1.25,
+        execution_mode="live",
+    )
+
+    assert result["ok"] is False
+    assert result["reason"] == "SYNTHETIC_POSITION_STALE_BROKER_FLAT"
+    assert mock_broker.session.post.call_count == 0
+    assert any("UPDATE positions" in sql and "status = 'CLOSED'" in sql for sql, _ in fake_conn.queries)
+
+
+def test_broker_flat_exact_match_blocks_even_without_circuit_breaker_trip(monkeypatch, mock_broker):
+    fake_conn = _patch_db(
+        monkeypatch,
+        lambda sql, params: _open_position_row() if "FROM positions" in sql else {"rejection_count": 0},
+    )
+    mock_broker.list_positions.return_value = [
+        {"symbol": "SMCI260626P00032500", "quantity": 0, "account_id": "ACC123"},
+    ]
+    osm = _MockOSM()
+
+    result = osm.submit_exit(
+        broker=mock_broker,
+        position_id="pos-flat-no-breaker",
+        contract="SMCI260626P00032500",
+        symbol="SMCI",
+        direction="PUT",
+        qty=1,
+        limit_price=1.25,
+        execution_mode="live",
+    )
+
+    assert result["ok"] is False
+    assert result["reason"] == "SYNTHETIC_POSITION_STALE_BROKER_FLAT"
+    assert mock_broker.session.post.call_count == 0
+    assert any("UPDATE positions" in sql and "status = 'CLOSED'" in sql for sql, _ in fake_conn.queries)
+
+
+def test_broker_wrong_occ_contract_does_not_override_breaker(monkeypatch, mock_broker):
+    """
+    Production-shape fix: broker returns a DIFFERENT OCC contract (260703 vs 260626).
+    The requested contract (260626) is absent from the snapshot — that means the broker
+    confirms qty=0 for 260626 (it closed/expired). Must fire SYNTHETIC_POSITION_STALE_BROKER_FLAT,
+    not fall through as "no broker truth."
+    OLD expected "exit_circuit_breaker_tripped" — that was the VZ/META bug.
+    """
+    monkeypatch.setenv("MAX_EXIT_REJECTIONS_BEFORE_HALT", "5")
+    fake_conn = _patch_db(
+        monkeypatch,
+        lambda sql, params: _open_position_row() if "FROM positions" in sql else {"rejection_count": 5},
+    )
+    mock_broker.list_positions.return_value = [
+        {"symbol": "SMCI260703P00032500", "quantity": 1, "account_id": "ACC123"},
+    ]
+    osm = _MockOSM()
+
+    result = osm.submit_exit(
+        broker=mock_broker,
+        position_id="pos-wrong-occ",
+        contract="SMCI260626P00032500",
+        symbol="SMCI",
+        direction="PUT",
+        qty=1,
+        limit_price=1.25,
+        execution_mode="live",
+    )
+
+    assert result["ok"] is False
+    assert result["reason"] == "SYNTHETIC_POSITION_STALE_BROKER_FLAT", (
+        "Broker has a DIFFERENT option (260703) but NOT 260626. "
+        "260626 absent from snapshot = broker confirms 260626 is flat. "
+        "Must block as stale, not fall through to circuit_breaker_tripped."
+    )
+    assert mock_broker.session.post.call_count == 0
+
+
+def test_broker_other_account_does_not_override_breaker(monkeypatch, mock_broker):
+    """
+    Production-shape fix: broker returns the contract but for a different account
+    (OTHER-ACC vs ACC123). After account-filtering, no match for ACC123.
+    Absent-for-this-account = broker confirms ACC123 is flat on this contract.
+    Must fire SYNTHETIC_POSITION_STALE_BROKER_FLAT, not "no broker truth."
+    OLD expected "exit_circuit_breaker_tripped" — that was the bug.
+    """
+    monkeypatch.setenv("MAX_EXIT_REJECTIONS_BEFORE_HALT", "5")
+    fake_conn = _patch_db(
+        monkeypatch,
+        lambda sql, params: _open_position_row() if "FROM positions" in sql else {"rejection_count": 5},
+    )
+    mock_broker.list_positions.return_value = [
+        {"symbol": "SMCI260626P00032500", "quantity": 1, "account_id": "OTHER-ACC"},
+    ]
+    osm = _MockOSM()
+
+    result = osm.submit_exit(
+        broker=mock_broker,
+        position_id="pos-other-account",
+        contract="SMCI260626P00032500",
+        symbol="SMCI",
+        direction="PUT",
+        qty=1,
+        limit_price=1.25,
+        execution_mode="live",
+    )
+
+    assert result["ok"] is False
+    assert result["reason"] == "SYNTHETIC_POSITION_STALE_BROKER_FLAT", (
+        "Contract is in OTHER-ACC, not ACC123. For ACC123, contract is absent = flat. "
+        "Must block as stale, not circuit_breaker_tripped."
+    )
+    assert mock_broker.session.post.call_count == 0
+
+
+def test_broker_truth_unavailable_preserves_original_breaker(monkeypatch, mock_broker):
+    monkeypatch.setenv("MAX_EXIT_REJECTIONS_BEFORE_HALT", "5")
+    _patch_db(
+        monkeypatch,
+        lambda sql, params: _open_position_row() if "FROM positions" in sql else {"rejection_count": 5},
+    )
+    mock_broker.list_positions.side_effect = RuntimeError("positions down")
+    osm = _MockOSM()
+
+    result = osm.submit_exit(
+        broker=mock_broker,
+        position_id="pos-unavailable",
+        contract="SMCI260626P00032500",
+        symbol="SMCI",
+        direction="PUT",
+        qty=1,
+        limit_price=1.25,
+        execution_mode="live",
+    )
+
+    assert result["ok"] is False
+    assert result["reason"] == "exit_circuit_breaker_tripped"
+    assert mock_broker.session.post.call_count == 0
+
+
+def test_requested_qty_greater_than_broker_truth_blocks_no_oversell(monkeypatch, mock_broker):
+    _patch_db(
+        monkeypatch,
+        lambda sql, params: _open_position_row(quantity_remaining=2) if "FROM positions" in sql else {"rejection_count": 0},
+    )
+    mock_broker.list_positions.return_value = [
+        {"symbol": "SMCI260626P00032500", "quantity": 1, "account_id": "ACC123"},
+    ]
+    osm = _MockOSM()
+
+    result = osm.submit_exit(
+        broker=mock_broker,
+        position_id="pos-insufficient",
+        contract="SMCI260626P00032500",
+        symbol="SMCI",
+        direction="PUT",
+        qty=2,
+        limit_price=1.25,
+        execution_mode="live",
+    )
+
+    assert result["ok"] is False
+    assert result["reason"] == "EXIT_BLOCKED_BROKER_QTY_INSUFFICIENT"
+    assert mock_broker.session.post.call_count == 0
+
+
+def test_empty_positions_marks_stale_position_closed(monkeypatch, mock_broker):
+    """
+    Production-shape fix (formerly 'test_contract_not_matched_does_not_mark_position_closed').
+    Empty positions list = broker confirms ALL positions flat = this contract is flat.
+    OSM must fire SYNTHETIC_POSITION_STALE_BROKER_FLAT and mark position CLOSED.
+    OLD expected circuit_breaker_tripped + NO position close. That was the VZ/META bug.
+    NEW (correct) behavior: stale position gets marked CLOSED to stop repeat-fire loop.
+    """
+    monkeypatch.setenv("MAX_EXIT_REJECTIONS_BEFORE_HALT", "5")
+    fake_conn = _patch_db(
+        monkeypatch,
+        lambda sql, params: _open_position_row() if "FROM positions" in sql else {"rejection_count": 5},
+    )
+    mock_broker.list_positions.return_value = []
+    osm = _MockOSM()
+
+    result = osm.submit_exit(
+        broker=mock_broker,
+        position_id="pos-no-match",
+        contract="SMCI260626P00032500",
+        symbol="SMCI",
+        direction="PUT",
+        qty=1,
+        limit_price=1.25,
+        execution_mode="live",
+    )
+
+    assert result["ok"] is False
+    assert result["reason"] == "SYNTHETIC_POSITION_STALE_BROKER_FLAT", (
+        "Empty broker positions list MUST block with SYNTHETIC_POSITION_STALE_BROKER_FLAT. "
+        "It must NOT fall through as 'no broker truth' and trigger circuit_breaker_tripped. "
+        "That fallthrough was the VZ/META production shape bug."
+    )
+    assert mock_broker.session.post.call_count == 0
+    # Position row must be marked CLOSED to prevent repeat-fire loop
+    assert any(
+        "UPDATE positions" in sql and "'CLOSED'" in sql
+        for sql, _ in fake_conn.queries
+    ), "Empty broker snapshot must mark position CLOSED to stop the repeat-fire loop"
+
+
+def test_duplicate_exit_guard_still_blocks_before_override(monkeypatch, mock_broker):
+    monkeypatch.setenv("MAX_EXIT_REJECTIONS_BEFORE_HALT", "5")
+    _patch_db(
+        monkeypatch,
+        lambda sql, params: _open_position_row() if "FROM positions" in sql else {"rejection_count": 5},
+    )
+    mock_broker.list_positions.return_value = [
+        {"symbol": "SMCI260626P00032500", "quantity": 1, "account_id": "ACC123"},
+    ]
+
+    class _ExistingExitOSM(_MockOSM):
+        def _get_active_exit_order(self, position_id):
+            return {"local_order_id": "L-EXISTING", "status": "SUBMITTED", "broker_order_id": "BO-EXISTING"}
+
+    osm = _ExistingExitOSM()
+    result = osm.submit_exit(
+        broker=mock_broker,
+        position_id="pos-duplicate",
+        contract="SMCI260626P00032500",
+        symbol="SMCI",
+        direction="PUT",
+        qty=1,
+        limit_price=1.25,
+        execution_mode="live",
+    )
+
+    assert result["ok"] is False
+    assert result["error"].startswith("active_exit_already_exists")
+    assert mock_broker.session.post.call_count == 0

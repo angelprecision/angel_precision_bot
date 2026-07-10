@@ -58,6 +58,183 @@ def _safe_int(value: Any) -> Optional[int]:
         return None
 
 
+def _normalize_contract(value: Any) -> str:
+    return str(value or "").strip().upper().replace(" ", "")
+
+
+def _extract_broker_account_id(broker: Any) -> str:
+    return _normalize_text(
+        getattr(broker, "account_id", None)
+        or getattr(getattr(broker, "cfg", None), "account_id", None)
+        or getattr(broker, "_account_id", None)
+        or ""
+    )
+
+
+def _extract_position_account_id(raw: dict[str, Any]) -> str:
+    nested = raw.get("raw") if isinstance(raw.get("raw"), dict) else {}
+    for key in ("account_id", "account", "account_number"):
+        value = raw.get(key)
+        if value not in (None, ""):
+            return _normalize_text(value)
+        value = nested.get(key)
+        if value not in (None, ""):
+            return _normalize_text(value)
+    return ""
+
+
+def _extract_position_contract(raw: dict[str, Any]) -> str:
+    nested = raw.get("raw") if isinstance(raw.get("raw"), dict) else {}
+    for key in ("contract", "option_symbol", "symbol", "instrument"):
+        value = raw.get(key)
+        if value not in (None, ""):
+            return _normalize_contract(value)
+        value = nested.get(key)
+        if value not in (None, ""):
+            return _normalize_contract(value)
+    return ""
+
+
+def _extract_long_position_qty(raw: dict[str, Any]) -> int:
+    nested = raw.get("raw") if isinstance(raw.get("raw"), dict) else {}
+    qty = None
+    for key in ("quantity", "qty", "quantity_remaining", "remaining_quantity"):
+        qty = _safe_int(raw.get(key))
+        if qty is None:
+            qty = _safe_int(nested.get(key))
+        if qty is not None:
+            break
+    side_text = " ".join(
+        str(v or "")
+        for v in (
+            raw.get("side"),
+            raw.get("position_type"),
+            raw.get("direction"),
+            nested.get("side"),
+            nested.get("position_type"),
+            nested.get("direction"),
+        )
+    ).strip().lower()
+    if qty is None:
+        return 0
+    if qty < 0:
+        return 0
+    if "short" in side_text:
+        return 0
+    return int(qty)
+
+
+def resolve_exit_broker_truth(
+    *,
+    broker: Any,
+    client_id: str,
+    contract: str,
+) -> dict[str, Any]:
+    checked_at = now_utc_iso()
+    normalized_contract = _normalize_contract(contract)
+    account_id = _extract_broker_account_id(broker)
+    audit = {
+        "source": "broker.list_positions",
+        "checked_at": checked_at,
+        "client_id": str(client_id or "").strip().lower(),
+        "account": account_id,
+        "contract": str(contract or ""),
+        "normalized_contract": normalized_contract,
+        "exact_contract_match": False,
+    }
+
+    list_positions = getattr(broker, "list_positions", None)
+    if not callable(list_positions):
+        audit["snapshot_status"] = "broker_positions_unavailable"
+        audit["error"] = "broker_list_positions_missing"
+        return {
+            "broker_truth_open_qty": None,
+            "is_fresh_exact": False,
+            "audit": audit,
+        }
+
+    try:
+        rows = list_positions()
+    except Exception as exc:
+        audit["snapshot_status"] = "broker_positions_error"
+        audit["error"] = str(exc)
+        return {
+            "broker_truth_open_qty": None,
+            "is_fresh_exact": False,
+            "audit": audit,
+        }
+
+    if rows is None:
+        rows = []
+    if isinstance(rows, dict):
+        rows = [rows]
+    if not isinstance(rows, list):
+        audit["snapshot_status"] = "broker_positions_malformed"
+        audit["error"] = f"unexpected_payload:{type(rows).__name__}"
+        return {
+            "broker_truth_open_qty": None,
+            "is_fresh_exact": False,
+            "audit": audit,
+        }
+
+    matched_rows: list[dict[str, Any]] = []
+    broker_truth_open_qty = 0
+    for raw in rows:
+        if not isinstance(raw, dict):
+            continue
+        row_contract = _extract_position_contract(raw)
+        if not row_contract or row_contract != normalized_contract:
+            continue
+        row_account = _extract_position_account_id(raw)
+        if row_account and account_id and row_account != account_id:
+            continue
+        long_qty = _extract_long_position_qty(raw)
+        broker_truth_open_qty += max(int(long_qty), 0)
+        matched_rows.append(
+            {
+                "contract": row_contract,
+                "account": row_account or account_id,
+                "long_qty": int(long_qty),
+            }
+        )
+
+    if not matched_rows:
+        # Production-shape fix: list_positions() succeeded and returned a valid list
+        # but this OCC contract is absent. In real broker shape, a flat/closed option
+        # simply disappears from the positions snapshot — it does NOT appear as a row
+        # with qty=0. "Contract absent from fresh snapshot" = "broker confirms qty=0".
+        #
+        # This is the VZ/META production failure class: a stale synthetic local
+        # position that the broker had already closed was flowing through as
+        # "no broker truth" because the missing row was treated as unknown.
+        # Treat absent-from-snapshot as exact flat only when list_positions() itself
+        # succeeded and returned a parseable list (including empty list).
+        # list_positions() error / malformed payload / missing method → None (no change).
+        audit["snapshot_status"]      = "contract_absent_open_qty_zero"
+        audit["exact_contract_match"] = False
+        audit["broker_position_count"] = len(rows)
+        return {
+            "broker_truth_open_qty": 0,
+            "is_fresh_exact": True,
+            "audit": audit,
+        }
+
+    audit.update(
+        {
+            "snapshot_status": "exact_match",
+            "exact_contract_match": True,
+            "matched_row_count": len(matched_rows),
+            "matched_rows": matched_rows,
+            "broker_truth_open_qty": broker_truth_open_qty,
+        }
+    )
+    return {
+        "broker_truth_open_qty": int(broker_truth_open_qty),
+        "is_fresh_exact": True,
+        "audit": audit,
+    }
+
+
 def _table_columns(table_name: str) -> set[str]:
     with _SCHEMA_CACHE_LOCK:
         cached = _SCHEMA_CACHE.get(table_name)
@@ -353,6 +530,7 @@ def _should_halt_exit_after_rejections(
     execution_mode=None,
     contract,
     entry_ts=None,
+    broker_truth_open_qty: Optional[int] = None,
 ) -> dict:
     threshold = _parse_max_exit_rejections_threshold()
     if threshold <= 0:
@@ -422,7 +600,91 @@ def _should_halt_exit_after_rejections(
     rejection_count = int(row.get("rejection_count") or 0)
     blocked = rejection_count >= threshold
 
-    if blocked and position_id:
+    if not blocked:
+        return {
+            "blocked": False,
+            "reason": None,
+            "rejection_count": rejection_count,
+            "threshold": threshold,
+        }
+
+    # ── P0 (PR #307): broker-truth circuit breaker override ─────────────────
+    # The circuit breaker fires on repeated exit rejections to prevent
+    # dangerous flapping. But it must not trap a LIVE open broker position
+    # with no way to close it.
+    #
+    # Case A — broker truth confirms open qty > 0:
+    #   Allow one controlled protective close regardless of rejection count.
+    #   The circuit breaker is designed to stop repeated blind exits, not to
+    #   prevent closing a confirmed real position. Stamp
+    #   PROTECTIVE_EXIT_ALLOWED_BY_BROKER_TRUTH so the caller knows this was
+    #   an override. The duplicate-in-flight guard in the exit engine still
+    #   prevents concurrent double-submits.
+    #
+    # Case B — broker truth confirms flat (qty == 0) while circuit breaker
+    #   keeps firing:
+    #   The local/synthetic position believes it is open but the broker says
+    #   it is flat. Stop repeated firing by returning a specific reason code
+    #   SYNTHETIC_POSITION_STALE_BROKER_FLAT. The OSM caller must then mark
+    #   the synthetic position stale so the exit engine stops evaluating it.
+    #   Do NOT submit an exit order — there is nothing to close.
+    _broker_qty = None
+    try:
+        _broker_qty = int(broker_truth_open_qty) if broker_truth_open_qty is not None else None
+    except (TypeError, ValueError):
+        _broker_qty = None
+
+    if _broker_qty is not None:
+        if _broker_qty > 0:
+            # Case A: real broker exposure — allow the protective close
+            log.warning(
+                "exit_circuit_breaker OVERRIDE: broker_truth_open_qty=%d > 0 "
+                "for position_id=%s client_id=%s contract=%s — "
+                "allowing protective close despite %d rejections (threshold=%d). "
+                "Duplicate-in-flight guard still active.",
+                _broker_qty, position_id, client_id, contract,
+                rejection_count, threshold,
+            )
+            return {
+                "blocked": False,
+                "reason": "PROTECTIVE_EXIT_ALLOWED_BY_BROKER_TRUTH",
+                "rejection_count": rejection_count,
+                "threshold": threshold,
+                "broker_truth_open_qty": _broker_qty,
+                "circuit_breaker_overridden": True,
+            }
+        else:
+            # Case B: broker is flat — stop repeated exit firing
+            log.warning(
+                "exit_circuit_breaker STALE_POSITION: broker_truth_open_qty=0 "
+                "for position_id=%s client_id=%s contract=%s — "
+                "synthetic position is stale; broker is flat. "
+                "Blocking with SYNTHETIC_POSITION_STALE_BROKER_FLAT "
+                "to stop repeated exit firing.",
+                position_id, client_id, contract,
+            )
+            # Persist the circuit breaker marker so the entry brake (#306)
+            # and the health dashboard can see this position is stuck.
+            try:
+                _persist_circuit_breaker_marker(
+                    db_conn,
+                    position_id=str(position_id),
+                    client_id=str(client_id),
+                    rejection_count=rejection_count,
+                )
+            except Exception as _cb_exc:
+                log.debug("circuit breaker marker persistence failed: %s", _cb_exc)
+            return {
+                "blocked": True,
+                "reason": "SYNTHETIC_POSITION_STALE_BROKER_FLAT",
+                "rejection_count": rejection_count,
+                "threshold": threshold,
+                "broker_truth_open_qty": 0,
+                "synthetic_stale": True,
+            }
+
+    # No broker truth supplied — original behavior: persist marker and block.
+    if position_id:
         try:
             _persist_circuit_breaker_marker(
                 db_conn,
@@ -476,6 +738,7 @@ def evaluate_exit_submission_safety(
                 execution_mode=execution_mode,
                 contract=contract,
                 entry_ts=position_state.get("entry_ts"),
+                broker_truth_open_qty=broker_truth_open_qty,
             )
             return {
                 "blocked": bool(circuit_breaker.get("blocked")),
