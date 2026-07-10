@@ -3804,6 +3804,11 @@ class APMasterControl:
                 new_cost=real_cost,
                 projected=projected_total_exposure,
                 limit=max_capital,
+                per_trade_budget=per_trade_budget,
+                total_capital_cap=total_capital_cap,
+                current_deployed=snap["capital_deployed"],
+                pending_reserved=pending_cap,
+                remaining_capacity=total_capital_cap - projected_total_exposure,
                 pct_used=pct_used,
                 sector=sector,
                 sector_deployed=sector_deployed,
@@ -4162,6 +4167,11 @@ class APMasterControl:
         new_cost: float,
         projected: float,
         limit: float,
+        per_trade_budget: Optional[float] = None,
+        total_capital_cap: Optional[float] = None,
+        current_deployed: Optional[float] = None,
+        pending_reserved: Optional[float] = None,
+        remaining_capacity: Optional[float] = None,
         pct_used: float,
         sector: str,
         sector_deployed: float,
@@ -4173,18 +4183,39 @@ class APMasterControl:
         blocked: bool,
         block_reason: str,
     ):
+        decision = "BLOCKED" if blocked else "APPROVED"
+        per_trade_budget_value = float(limit if per_trade_budget is None else per_trade_budget)
+        total_capital_cap_value = float(limit if total_capital_cap is None else total_capital_cap)
+        current_deployed_value = float(deployed if current_deployed is None else current_deployed)
+        pending_reserved_value = float(pending if pending_reserved is None else pending_reserved)
+        remaining_capacity_value = float(
+            (total_capital_cap_value - projected)
+            if remaining_capacity is None
+            else remaining_capacity
+        )
         record = {
             "event": "capital_utilization",
+            "schema_version": 2,
+            "legacy_aliases_preserved": True,
+            "client_id": client_id,
             "execution_mode": execution_mode,
             "ticker": ticker,
             "signal_id": signal_id,
-            "deployed": round(deployed, 2),
-            "pending": round(pending, 2),
+            "selected_trade_cost": round(new_cost, 2),
+            "per_trade_budget": round(per_trade_budget_value, 2),
+            "current_deployed": round(current_deployed_value, 2),
+            "pending_reserved": round(pending_reserved_value, 2),
+            "projected_portfolio_exposure": round(projected, 2),
+            "total_capital_cap": round(total_capital_cap_value, 2),
+            "remaining_capacity": round(remaining_capacity_value, 2),
+            # Backward-compatibility aliases for existing dashboards and queries.
+            "deployed": round(current_deployed_value, 2),
+            "pending": round(pending_reserved_value, 2),
             "new_cost": round(new_cost, 2),
             "projected": round(projected, 2),
-            "limit": round(limit, 2),
+            "limit": round(total_capital_cap_value, 2),
+            "headroom": round(remaining_capacity_value, 2),
             "pct_used": round(pct_used, 1),
-            "headroom": round(limit - projected, 2),
             "sector": sector,
             "sector_deployed": round(sector_deployed, 2),
             "sector_projected": round(sector_projected, 2),
@@ -4193,22 +4224,30 @@ class APMasterControl:
             "ticker_projected": round(ticker_projected, 2),
             "ticker_limit": round(ticker_limit, 2),
             "blocked": blocked,
+            "decision": decision,
             "block_reason": block_reason,
             "account_equity": round(self.account_equity, 2),
         }
         log.info(
-            "[%s] CAPITAL_UTIL | mode=%s | %s | deployed=$%.0f pending=$%.0f new=$%.0f projected=$%.0f/%.0f (%.1f%%) headroom=$%.0f | %s",
+            "CAPITAL_GATE client_id=%s symbol=%s execution_mode=%s "
+            "selected_trade_cost=$%.2f per_trade_budget=$%.2f "
+            "current_deployed=$%.2f pending_reserved=$%.2f "
+            "projected_portfolio_exposure=$%.2f total_capital_cap=$%.2f "
+            "remaining_capacity=$%.2f pct_used=%.1f%% "
+            "decision=%s block_reason=%s",
             client_id,
-            execution_mode,
             ticker,
-            deployed,
-            pending,
+            execution_mode,
             new_cost,
+            per_trade_budget_value,
+            current_deployed_value,
+            pending_reserved_value,
             projected,
-            limit,
+            total_capital_cap_value,
+            remaining_capacity_value,
             pct_used,
-            limit - projected,
-            f"BLOCKED: {block_reason}" if blocked else "APPROVED",
+            decision,
+            block_reason or "none",
         )
         try:
             from ap.db import conn, run_with_retry
@@ -4225,7 +4264,7 @@ class APMasterControl:
 
             run_with_retry(_insert)
         except Exception as e:
-            log.debug("Capital utilization log failed (non-critical): %s", e)
+            log.warning("Capital utilization audit write failed (non-critical): %s", e)
             self._alert_degraded(
                 "CAPITAL_UTILIZATION_LOG_FAILED",
                 severity="WARNING",
