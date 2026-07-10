@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import math
 import logging
+import contextvars
 from ap.trace import trace_gate
 import os
 import time
@@ -940,11 +941,12 @@ def _build_candidate_audit(scored, underlying_price, selected_symbol, selected_r
 def _safe_plan_attr(plan, attr: str, default=None):
     """Get attribute from plan whether it is an object or dict."""
     try:
-        return getattr(plan, attr, default)
+        if isinstance(plan, dict):
+            return plan.get(attr, default)
     except Exception:
-        pass
+        return default
     try:
-        return plan.get(attr, default) if isinstance(plan, dict) else default
+        return getattr(plan, attr, default)
     except Exception:
         return default
 
@@ -952,7 +954,10 @@ def _safe_plan_attr(plan, attr: str, default=None):
 def _persist_dte_ladder_audit(selector, plan, audit: dict) -> None:
     """Persist request evidence both on the selector and the request plan."""
     snapshot = dict(audit)
-    selector._last_dte_ladder_audit = snapshot
+    if hasattr(selector, "_set_last_dte_ladder_audit"):
+        selector._set_last_dte_ladder_audit(snapshot)
+    else:
+        selector._last_dte_ladder_audit = snapshot
     try:
         if isinstance(plan, dict):
             metadata = plan.setdefault("metadata", {})
@@ -1083,6 +1088,7 @@ _RAW_SELECTOR_FAIL_OPEN_GUARD_ERRORS = os.getenv("SELECTOR_FAIL_OPEN_GUARD_ERROR
 _SELECTOR_FAIL_OPEN_GUARD_ERRORS = (_RAW_SELECTOR_FAIL_OPEN_GUARD_ERRORS == "I_UNDERSTAND_THIS_IS_UNSAFE")
 _QUALITY_RULES_VERSION = os.getenv("CONTRACT_QUALITY_RULES_VERSION", "contract_selector_v1")
 _UNKNOWN_SELECTOR_REASONS_SEEN: set[str] = set()
+_REQUEST_STATE_UNSET = object()
 
 if _SELECTOR_FAIL_OPEN_GUARD_ERRORS:
     log.critical(
@@ -1098,6 +1104,9 @@ def _max_trade_usd() -> float:
     except Exception:
         return 1800.0
 
+def _normalized_selector_mode(mode: str) -> str:
+    return str(mode or "").strip().upper()
+
 def _effective_budget(raw_budget: float) -> tuple[float, float, bool]:
     cap = _max_trade_usd()
     try:
@@ -1109,8 +1118,106 @@ def _effective_budget(raw_budget: float) -> tuple[float, float, bool]:
 
 def _pricing_basis_for_mode(mode: str) -> tuple[bool, str]:
     """Return (is_live, pricing_basis) for selector capital math."""
-    is_live = str(mode or "paper").upper() == "LIVE"
+    mode = _normalized_selector_mode(mode)
+    is_live = mode == "LIVE"
     return is_live, "ASK_EXECUTION" if is_live else "MID_SIMULATION"
+
+def _selector_budget_constraints(plan) -> tuple[float, dict]:
+    """Return the effective selector capital constraint and its diagnostics.
+
+    Production sizing metadata carries multiple capital limits. The selector
+    must rank and size against the tightest real constraint, not the generic
+    theoretical risk budget.
+    """
+    authoritative_keys = (
+        "selector_budget",
+        "remaining_capacity",
+        "max_position_usd",
+    )
+    generic_keys = ("budget",)
+    raw_values = {
+        "selector_budget": _sizing_val(plan, "selector_budget", default=None),
+        "remaining_capacity": _sizing_val(plan, "remaining_capacity", default=None),
+        "max_position_usd": _sizing_val(plan, "max_position_usd", default=None),
+        "budget": _sizing_val(plan, "budget", default=None),
+    }
+    positive = {}
+    zero = {}
+    invalid = {}
+    for key, raw in raw_values.items():
+        if raw is None or raw == "":
+            continue
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            invalid[key] = raw
+            continue
+        if value < 0:
+            invalid[key] = raw
+        elif value == 0:
+            zero[key] = value
+        else:
+            positive[key] = value
+
+    invalid_authoritative = {
+        key: invalid[key] for key in authoritative_keys if key in invalid
+    }
+    if invalid_authoritative:
+        return 0.0, {
+            "raw": raw_values,
+            "positive": positive,
+            "zero": zero,
+            "invalid": invalid,
+            "selected_source": None,
+            "selected_budget": 0.0,
+            "most_restrictive": True,
+            "reason_code": "INVALID_POSITION_BUDGET",
+        }
+
+    zero_authoritative = {
+        key: zero[key] for key in authoritative_keys if key in zero
+    }
+    if zero_authoritative:
+        selected_source = min(authoritative_keys, key=lambda key: 0 if key in zero_authoritative else 1)
+        return 0.0, {
+            "raw": raw_values,
+            "positive": positive,
+            "zero": zero,
+            "invalid": invalid,
+            "selected_source": selected_source,
+            "selected_budget": 0.0,
+            "most_restrictive": True,
+            "reason_code": "CAPITAL_NO_REMAINING",
+        }
+
+    candidate_positive = {
+        key: value
+        for key, value in positive.items()
+        if key in authoritative_keys or key in generic_keys
+    }
+    if not candidate_positive:
+        return 0.0, {
+            "raw": raw_values,
+            "positive": positive,
+            "zero": zero,
+            "invalid": invalid,
+            "selected_source": None,
+            "selected_budget": 0.0,
+            "most_restrictive": True,
+            "reason_code": "INVALID_POSITION_BUDGET" if invalid else "CAPITAL_NO_REMAINING",
+        }
+
+    selected_source, selected_budget = min(candidate_positive.items(), key=lambda item: item[1])
+    return selected_budget, {
+        "raw": raw_values,
+        "positive": candidate_positive,
+        "zero": zero,
+        "invalid": invalid,
+        "selected_source": selected_source,
+        "selected_budget": selected_budget,
+        "most_restrictive": True,
+        "reason_code": None,
+    }
 
 _PRO_TIER1_TICKERS = {
     "SPY", "QQQ", "IWM", "DIA",
@@ -1282,7 +1389,7 @@ class APContractSelectionEngine:
     ):
         self.broker         = broker
         self.data_broker    = data_broker if data_broker is not None else broker
-        self.mode           = mode
+        self.mode           = _normalized_selector_mode(mode)
         self.target_delta   = target_delta
         self.delta_band     = delta_band
         self.max_spread_pct = float(os.getenv("MAX_SPREAD_PCT", str(max_spread_pct)))
@@ -1313,6 +1420,10 @@ class APContractSelectionEngine:
         self.dte_ladder_probe_per_bucket = int(os.getenv("DTE_LADDER_PROBE_PER_BUCKET", "2"))
         # Records the last ladder run for diagnostics (observability only).
         self._last_dte_ladder_audit: Optional[dict] = None
+        self._last_dte_ladder_audit_ctx = contextvars.ContextVar(
+            f"selector_last_dte_ladder_audit_{id(self)}",
+            default=_REQUEST_STATE_UNSET,
+        )
 
         # PR #149 — Selector Reason Honesty.
         # Records the most recent REJECT event emitted during a single select()
@@ -1322,11 +1433,15 @@ class APContractSelectionEngine:
         # Reset to None at the top of every select() invocation.
         # Never affects selection — observability only.
         self._last_failure: Optional[dict] = None
+        self._last_failure_ctx = contextvars.ContextVar(
+            f"selector_last_failure_{id(self)}",
+            default=_REQUEST_STATE_UNSET,
+        )
 
         self.strategy_version = os.getenv("AP_STRATEGY_VERSION", "ap_live_beta")
         self.git_commit       = get_git_commit()
         self.config_hash = make_config_hash({
-            "mode":                   mode,
+            "mode":                   self.mode,
             "target_delta":           self.target_delta,
             "delta_band":             self.delta_band,
             "max_spread_pct":         self.max_spread_pct,
@@ -1351,7 +1466,7 @@ class APContractSelectionEngine:
             "pro_t2_size_min":        _PRO_T2_SIZE_MIN,
             "min_contract_delta":     float(os.getenv("MIN_CONTRACT_DELTA", "0.10")),
             "max_otm_pct":            float(os.getenv("MAX_OTM_PCT", "0.12")),
-            "max_trade_usd":          float(os.getenv("MAX_TRADE_USD", "500")),
+            "max_trade_usd":          _max_trade_usd(),
             "max_ideal_premium":      float(os.getenv("MAX_IDEAL_PREMIUM", "3.50")),
             "ticker_premium_caps":    TICKER_MAX_PREMIUM_PER_CONTRACT,
         })
@@ -1360,13 +1475,29 @@ class APContractSelectionEngine:
             "APContractSelectionEngine | mode=%s delta=%.2f±%.2f "
             "max_spread=%d%% dte=[%d,%d] premium=[$%.0f,$%.0f] "
             "earnings_guard=%s iv_filter=%s",
-            mode, target_delta, delta_band,
+            self.mode, target_delta, delta_band,
             int(max_spread_pct * 100), min_dte, max_dte,
             min_premium, max_premium,
             type(earnings_guard).__name__ if earnings_guard is not None else "None",
             type(iv_filter).__name__ if iv_filter is not None else "None",
         )
 
+
+    def _set_last_failure(self, failure: Optional[dict]) -> None:
+        snapshot = dict(failure) if isinstance(failure, dict) else None
+        self._last_failure = snapshot
+        try:
+            self._last_failure_ctx.set(snapshot)
+        except Exception:
+            pass
+
+    def _set_last_dte_ladder_audit(self, audit: Optional[dict]) -> None:
+        snapshot = dict(audit) if isinstance(audit, dict) else None
+        self._last_dte_ladder_audit = snapshot
+        try:
+            self._last_dte_ladder_audit_ctx.set(snapshot)
+        except Exception:
+            pass
 
     def _emit_selector_event(
         self,
@@ -1389,11 +1520,11 @@ class APContractSelectionEngine:
         # affect emit behavior — wrapped defensively. Observability only.
         try:
             if str(decision).upper() == "REJECT":
-                self._last_failure = {
+                self._set_last_failure({
                     "stage":       str(stage or ""),
                     "reason_code": str(reason_code or "") or "UNKNOWN_REJECTION",
                     "explanation": str(explanation or ""),
-                }
+                })
         except Exception:
             pass
         try:
@@ -1407,10 +1538,10 @@ class APContractSelectionEngine:
                 decision=decision,
                 reason_code=reason_code,
                 explanation=explanation,
-                symbol=getattr(plan, "ticker", None) or (plan.get("ticker") if isinstance(plan, dict) else None),
+                symbol=_safe_plan_attr(plan, "ticker", None),
                 contract=contract,
-                setup_type=getattr(plan, "pattern", None),
-                timeframe=getattr(plan, "timeframe", None),
+                setup_type=_safe_plan_attr(plan, "pattern", None),
+                timeframe=_safe_plan_attr(plan, "timeframe", None),
                 strategy_version=self.strategy_version,
                 config_hash=self.config_hash,
                 git_commit=self.git_commit,
@@ -1440,9 +1571,13 @@ class APContractSelectionEngine:
         Observability only. Never affects selection. Never raises.
         """
         try:
-            if isinstance(self._last_failure, dict):
+            ctx = getattr(self, "_last_failure_ctx", None)
+            current = ctx.get() if ctx is not None else _REQUEST_STATE_UNSET
+            if current is _REQUEST_STATE_UNSET:
+                current = getattr(self, "_last_failure", None)
+            if isinstance(current, dict):
                 # Defensive copy so callers can't mutate selector state.
-                return dict(self._last_failure)
+                return dict(current)
         except Exception:
             pass
         return None
@@ -1452,8 +1587,12 @@ class APContractSelectionEngine:
         survivors per bucket, selected bucket/DTE/expiration), or None if the
         ladder was not used. Observability only. Never raises."""
         try:
-            if isinstance(self._last_dte_ladder_audit, dict):
-                return dict(self._last_dte_ladder_audit)
+            ctx = getattr(self, "_last_dte_ladder_audit_ctx", None)
+            current = ctx.get() if ctx is not None else _REQUEST_STATE_UNSET
+            if current is _REQUEST_STATE_UNSET:
+                current = getattr(self, "_last_dte_ladder_audit", None)
+            if isinstance(current, dict):
+                return dict(current)
         except Exception:
             pass
         return None
@@ -1471,10 +1610,10 @@ class APContractSelectionEngine:
         # Reset failure capture at the start of every invocation so that
         # get_last_failure() reflects ONLY this call's most recent REJECT,
         # never a stale value from a prior select(). Observability only.
-        self._last_failure = None
+        self._set_last_failure(None)
         _clear_selector_failure(plan)
         if expiration_override is None and not _dte_legacy_fallback:
-            self._last_dte_ladder_audit = None
+            self._set_last_dte_ladder_audit(None)
             try:
                 _meta = plan.get("metadata") if isinstance(plan, dict) else getattr(plan, "metadata", None)
                 if isinstance(_meta, dict):
@@ -1484,9 +1623,15 @@ class APContractSelectionEngine:
         if request_context is None:
             request_context = _new_selector_request_context(
                 _safe_plan_attr(plan, "ticker"),
-                _safe_plan_attr(plan, "execution_mode", None) or getattr(self, "mode", "unknown"),
+                self.mode,
             )
         _bind_selector_request_diagnostics(plan, request_context)
+
+        _selector_mode = _normalized_selector_mode(self.mode)
+        _plan_mode = _normalized_selector_mode(_safe_plan_attr(plan, "execution_mode", ""))
+        _original_client_id = _safe_plan_attr(plan, "client_id", None)
+        _original_execution_mode = _safe_plan_attr(plan, "execution_mode", None)
+        _original_signal_id = _safe_plan_attr(plan, "signal_id", None)
 
         # PR P1 — selector failure metadata tracking (observability only).
         # Updated at each stage and passed to _attach_selector_failure() at
@@ -1499,11 +1644,20 @@ class APContractSelectionEngine:
             str(getattr(getattr(self, "data_broker", None), "base_url", "") or
                 getattr(getattr(self, "broker",      None), "base_url", "") or "")
         )
-        _sel_mode: str = str(getattr(self, "mode", "unknown") or "unknown").lower()
+        _sel_mode: str = _selector_mode.lower() if _selector_mode in {"LIVE", "PAPER"} else "unknown"
 
         ticker    = _safe_plan_attr(plan, "ticker")
         direction = str(_safe_plan_attr(plan, "side", "") or "").upper()
-        budget    = float(_safe_plan_attr(plan, "max_position_usd", 0) or 0)
+        budget, _budget_constraints = _selector_budget_constraints(plan)
+        budget_raw = _budget_constraints.get("selected_budget")
+        _sizing_ctx = _plan_sizing_ctx(plan)
+        _top_level_budget = _safe_plan_attr(plan, "max_position_usd", None)
+        _budget_conflict = (
+            len({
+                round(float(value), 8)
+                for value in (_budget_constraints.get("positive") or {}).values()
+            }) > 1
+        )
 
         try:
             _ctx_assert_budget(request_context, stage="selector_entry")
@@ -1520,6 +1674,105 @@ class APContractSelectionEngine:
             _attach_selector_failure(
                 plan,
                 reason_code="SELECTOR_REQUEST_BUDGET_EXHAUSTED",
+                explanation=_expl,
+                base_url=_sel_base_url,
+                execution_mode=_sel_mode,
+                selection_diagnostics=_selector_request_diagnostics(request_context),
+            )
+            return None
+
+        if _selector_mode not in {"LIVE", "PAPER"} or _plan_mode not in {"LIVE", "PAPER"}:
+            _expl = (
+                f"Invalid selector execution mode: selector={self.mode!r} "
+                f"plan={_original_execution_mode!r}"
+            )
+            _mode_diag = dict(
+                _selector_request_diagnostics(request_context),
+                selector_mode=_selector_mode,
+                plan_execution_mode=_plan_mode,
+                client_id=_original_client_id,
+                signal_id=_original_signal_id,
+            )
+            self._emit_selector_event(
+                plan,
+                stage="selector_entry",
+                decision="REJECT",
+                reason_code="INVALID_EXECUTION_MODE",
+                explanation=_expl,
+                inputs={
+                    "selector_mode": _selector_mode,
+                    "plan_execution_mode": _plan_mode,
+                    "client_id": _original_client_id,
+                    "signal_id": _original_signal_id,
+                },
+            )
+            _attach_selector_failure(
+                plan,
+                reason_code="INVALID_EXECUTION_MODE",
+                explanation=_expl,
+                base_url=_sel_base_url,
+                execution_mode="unknown",
+                selection_diagnostics=_mode_diag,
+            )
+            return None
+
+        if _selector_mode != _plan_mode:
+            _expl = (
+                f"Selector execution mode {_selector_mode} does not match "
+                f"plan execution mode {_plan_mode}"
+            )
+            _mode_diag = dict(
+                _selector_request_diagnostics(request_context),
+                selector_mode=_selector_mode,
+                plan_execution_mode=_plan_mode,
+                client_id=_original_client_id,
+                signal_id=_original_signal_id,
+            )
+            self._emit_selector_event(
+                plan,
+                stage="selector_entry",
+                decision="REJECT",
+                reason_code="EXECUTION_MODE_MISMATCH",
+                explanation=_expl,
+                inputs={
+                    "selector_mode": _selector_mode,
+                    "plan_execution_mode": _plan_mode,
+                    "client_id": _original_client_id,
+                    "signal_id": _original_signal_id,
+                },
+            )
+            _attach_selector_failure(
+                plan,
+                reason_code="EXECUTION_MODE_MISMATCH",
+                explanation=_expl,
+                base_url=_sel_base_url,
+                execution_mode=_sel_mode,
+                selection_diagnostics=_mode_diag,
+            )
+            return None
+
+        if budget <= 0:
+            _budget_reason = _budget_constraints.get("reason_code") or "INVALID_POSITION_BUDGET"
+            if _budget_reason == "CAPITAL_NO_REMAINING":
+                _expl = f"No selector capital remaining: {_budget_constraints.get('raw')!r}"
+            else:
+                _expl = f"Invalid selector position budget: {_budget_constraints.get('raw')!r}"
+            self._emit_selector_event(
+                plan,
+                stage="selector_entry",
+                decision="REJECT",
+                reason_code=_budget_reason,
+                explanation=_expl,
+                inputs={
+                    "budget": budget_raw,
+                    "budget_constraints": _budget_constraints,
+                    "sizing_context": _sizing_ctx,
+                    "top_level_max_position_usd": _top_level_budget,
+                },
+            )
+            _attach_selector_failure(
+                plan,
+                reason_code=_budget_reason,
                 explanation=_expl,
                 base_url=_sel_base_url,
                 execution_mode=_sel_mode,
@@ -1569,15 +1822,15 @@ class APContractSelectionEngine:
                 )
                 return None
 
-        pt1 = getattr(plan, "target_underlying", None)
-        wick_targets = getattr(plan, "wick_targets", None) or []
+        pt1 = _safe_plan_attr(plan, "target_underlying", None)
+        wick_targets = _safe_plan_attr(plan, "wick_targets", None) or []
         _expected_move_pct = 0.0
         _wick_confidence   = 0.5
         if wick_targets:
             _expected_move_pct = float(wick_targets[0].get("distance_pct", 0) or 0)
             _wick_confidence   = float(wick_targets[0].get("confidence", 0.5) or 0.5)
         elif pt1 and pt1 > 0:
-            entry_approx = getattr(plan, "trigger_price", pt1) or pt1
+            entry_approx = _safe_plan_attr(plan, "trigger_price", pt1) or pt1
             _expected_move_pct = abs(pt1 - entry_approx) / entry_approx * 100 if entry_approx else 0
 
         _plan_tier = _safe_plan_attr(plan, "tier", "B") or "B"
@@ -1781,7 +2034,7 @@ class APContractSelectionEngine:
         _sel_chain_rows = len(chain)
 
         if not underlying_price:
-            underlying_price = getattr(plan, "trigger_price", None)
+            underlying_price = _safe_plan_attr(plan, "trigger_price", None)
 
         # ── GATE 2: IV RANK FILTER ────────────────────────────────────────────
         if self.iv_filter is not None:
@@ -1793,7 +2046,7 @@ class APContractSelectionEngine:
                 if iv_result.get("blocked"):
                     log.warning("[%s] BLOCKED by IVRankFilter -- %s",
                                 ticker, iv_result.get("reason", "IV rank too high"))
-                    _sig_id = getattr(plan, "signal_id", "") or ""
+                    _sig_id = _safe_plan_attr(plan, "signal_id", "") or ""
                     trace_gate(str(_sig_id), ticker, "IV_GATE", "REJECT",
                                reason="iv_extreme", iv_rank=iv_result.get("iv_rank"))
                     self._emit_selector_event(
@@ -1808,10 +2061,10 @@ class APContractSelectionEngine:
 
                 if iv_result.get("requires_momentum"):
                     iv_zone      = iv_result.get("iv_zone", "soft")
-                    signal_score = float(plan.score if hasattr(plan, "score") else 0)
+                    signal_score = float(_safe_plan_attr(plan, "score", 0) or 0)
                     min_score    = float(iv_result.get("momentum_min_score", 65.0))
                     mom_ok       = signal_score >= min_score
-                    _sig_id      = getattr(plan, "signal_id", "") or ""
+                    _sig_id      = _safe_plan_attr(plan, "signal_id", "") or ""
                     if not mom_ok:
                         log.warning("[%s] IVGate reject | iv_zone=%s score=%.1f need>=%.0f",
                                     ticker, iv_zone, signal_score, min_score)
@@ -2357,7 +2610,7 @@ class APContractSelectionEngine:
                 opt, budget,
                 expected_move_pct=_expected_move_pct,
                 underlying_price=underlying_price or 0.0,
-                tier=getattr(plan, "tier", "B") or "B",
+                tier=_safe_plan_attr(plan, "tier", "B") or "B",
             )
             scored.append((s, opt))
 
@@ -2393,7 +2646,7 @@ class APContractSelectionEngine:
         _MIN_ACCEPTABLE_PREMIUM = float(os.getenv("MIN_ACCEPTABLE_PREMIUM_PER_CONTRACT", "50"))
         _MAX_UPGRADE_PREMIUM    = float(os.getenv("MAX_IDEAL_PREMIUM_PER_CONTRACT", "350"))
 
-        is_live_upgrade, _ = _pricing_basis_for_mode(getattr(self, "mode", "paper"))
+        is_live_upgrade, _ = _pricing_basis_for_mode(_selector_mode)
 
         def _exec_premium(opt: dict) -> float:
             b = _safe_float(opt.get("bid"))
@@ -2533,7 +2786,7 @@ class APContractSelectionEngine:
 
         # ── E. AFFORDABILITY GATE ────────────────────────────────────────────
         if selected.affordable_contracts < 1:
-            if self.mode.upper() != "LIVE":
+            if _selector_mode != "LIVE":
                 if selected.premium_per_contract > self.max_premium:
                     log.warning("[%s] premium $%.0f > max $%.0f -- skipping (too expensive for paper)",
                                 ticker, selected.premium_per_contract, self.max_premium)
@@ -2635,7 +2888,7 @@ class APContractSelectionEngine:
                 _equity = _safe_float(_sizing_val(plan, "account_equity", "equity", default=0)) or None
                 _max_pos_pct = _safe_float(_sizing_val(plan, "risk_pct", "max_position_pct", default=0)) or None
                 _max_afford_prem = _safe_float(_sizing_val(plan, "max_affordable_premium", default=0)) or None
-                _ctx_budget = _safe_float(_sizing_val(plan, "budget", "max_position_usd", default=0)) or _safe_float(budget)
+                _ctx_budget = _safe_float(budget)
                 _underlying = _safe_float(underlying_price) or None
                 _tradeability_diag = {
                     "equity":                 _equity,
@@ -2644,6 +2897,8 @@ class APContractSelectionEngine:
                     "max_affordable_premium": _max_afford_prem,
                     "underlying_price":       _underlying,
                     "budget":                 _ctx_budget,
+                    "budget_source":          _budget_constraints.get("selected_source"),
+                    "budget_constraints":     _budget_constraints,
                     "selected_dte":           _safe_float(getattr(selected, "dte", None)),
                     "near_atm_premium_estimate": _safe_float(selected.premium_per_contract),
                     "cheapest_quality_survivor_premium": _safe_float(selected.premium_per_contract),
@@ -2651,9 +2906,12 @@ class APContractSelectionEngine:
                     # P0 (PR #299): explicit cap-math fields so operators can prove
                     # exactly why the contract failed the account-size check. Previously
                     # this required mental math from the log line.
-                    "ask_cost":              round(_safe_float(selected.premium_per_contract) * 100, 2),
+                    "premium_per_share":     _safe_float(selected.premium_per_share),
+                    "premium_per_contract_usd": _safe_float(selected.premium_per_contract),
+                    "ask_cost":              round(_safe_float(selected.premium_per_contract), 2),
                     "qty_attempted":         1,   # deferred breach always starts at qty=1 for materialization
-                    "projected_reserved_cost": round(_safe_float(selected.premium_per_contract) * 100, 2),
+                    "projected_reserved_cost": round(_safe_float(selected.premium_per_contract), 2),
+                    "projected_reserved_cost_usd": round(_safe_float(selected.premium_per_contract), 2),
                 }
                 log.warning(
                     "[%s] UNTRADEABLE_FOR_ACCOUNT_SIZE -- quality contract %s @ "
@@ -2690,16 +2948,17 @@ class APContractSelectionEngine:
                     thresholds={"min_contracts": 1},
                     context=_candidate_context,
                 )
+                # Decision remains fail-closed for LIVE account-size rejects: return None below.
                 # Record as the authoritative last-failure reason for the queue
                 # and the deferred-breach audit (consumed by PR3's taxonomy). Both
                 # the structured diag AND the flattened explanation are included so
                 # the numbers survive whichever downstream copies them.
-                self._last_failure = {
+                self._set_last_failure({
                     "stage": "affordability_gate",
                     "reason_code": "UNTRADEABLE_FOR_ACCOUNT_SIZE",
                     "explanation": _explanation,
                     "tradeability_diag": _tradeability_diag,
-                }
+                })
                 _attach_selector_failure(
                     plan,
                     reason_code="UNTRADEABLE_FOR_ACCOUNT_SIZE",
@@ -2870,7 +3129,14 @@ class APContractSelectionEngine:
                     "affordable_contracts": selected.affordable_contracts,
                     "effective_budget": selected.effective_budget,
                     "budget_clipped": selected.budget_clipped,
+                    "budget_source": _budget_constraints.get("selected_source"),
+                    "budget_conflict": _budget_conflict,
+                    "budget_constraints": _budget_constraints,
+                    "sizing_context": dict(_sizing_ctx) if isinstance(_sizing_ctx, dict) else {},
                     "selection_diagnostics": _selection_diagnostics,
+                    "premium_per_share": selected.premium_per_share,
+                    "premium_per_contract_usd": selected.premium_per_contract,
+                    "projected_reserved_cost_usd": selected.premium_per_contract * selected.affordable_contracts,
                 })
             else:
                 plan.contract_symbol  = selected.contract_symbol
@@ -2891,11 +3157,24 @@ class APContractSelectionEngine:
                         "affordable_contracts": selected.affordable_contracts,
                         "effective_budget": selected.effective_budget,
                         "budget_clipped": selected.budget_clipped,
+                        "budget_source": _budget_constraints.get("selected_source"),
+                        "budget_conflict": _budget_conflict,
+                        "budget_constraints": _budget_constraints,
+                        "sizing_context": dict(_sizing_ctx) if isinstance(_sizing_ctx, dict) else {},
                         "selection_diagnostics": _selection_diagnostics,
+                        "premium_per_share": selected.premium_per_share,
+                        "premium_per_contract_usd": selected.premium_per_contract,
+                        "projected_reserved_cost_usd": selected.premium_per_contract * selected.affordable_contracts,
                     })
                     plan.selector_metadata = meta
                 except Exception:
                     pass
+            if (
+                _safe_plan_attr(plan, "client_id", None) != _original_client_id
+                or _safe_plan_attr(plan, "execution_mode", None) != _original_execution_mode
+                or _safe_plan_attr(plan, "signal_id", None) != _original_signal_id
+            ):
+                raise AssertionError("Selector mutation changed execution identity")
         else:
             log.info(
                 "[%s] Selector mutate_plan=False — returning SelectedContract without mutating plan | %s",
@@ -3472,7 +3751,7 @@ class APContractSelectionEngine:
                 "explanation": str(exc),
             }
             audit["failure"] = dict(_failure)
-            self._last_failure = dict(_failure)
+            self._set_last_failure(_failure)
             _failure_meta = {
                 "reason_code": reason_code,
                 "queue_reason_code": _to_queue_reason(reason_code),
@@ -3516,7 +3795,7 @@ class APContractSelectionEngine:
                 if result is not None:
                     _persist(reason_code)
                     return result
-                self._last_failure = dict(_failure)
+                self._set_last_failure(_failure)
                 _restore_selector_failure(plan, _failure_meta)
 
             _persist(reason_code)
@@ -3618,11 +3897,11 @@ class APContractSelectionEngine:
                             })
                             audit["buckets_attempted"].append(bucket_rec)
                             # Short-circuit everything.
-                            self._last_failure = {
+                            self._set_last_failure({
                                 "stage": str(_preserved_terminal.get("stage") or "dte_ladder"),
                                 "reason_code": str(_preserved_terminal.get("reason_code") or "UNKNOWN_REJECTION"),
                                 "explanation": str(_preserved_terminal.get("explanation") or ""),
-                            }
+                            })
                             _persist(str(_preserved_terminal.get("reason_code") or "UNKNOWN_REJECTION"))
                             _restore_selector_failure(plan, _preserved_terminal)
                             log.warning(
@@ -3670,11 +3949,11 @@ class APContractSelectionEngine:
             # NOTE: _preserved_terminal is handled above via early return; it
             # should be None here.
             if _preserved_quality is not None:
-                self._last_failure = {
+                self._set_last_failure({
                     "stage": str(_preserved_quality.get("stage") or "dte_ladder"),
                     "reason_code": str(_preserved_quality.get("reason_code") or "UNKNOWN_REJECTION"),
                     "explanation": str(_preserved_quality.get("explanation") or ""),
-                }
+                })
                 _restore_selector_failure(plan, _preserved_quality)
                 _persist(str(_preserved_quality.get("reason_code") or "UNKNOWN_REJECTION"))
                 log.warning(
@@ -3684,11 +3963,11 @@ class APContractSelectionEngine:
                 )
                 return None
             if _preserved_retryable is not None:
-                self._last_failure = {
+                self._set_last_failure({
                     "stage": str(_preserved_retryable.get("stage") or "dte_ladder"),
                     "reason_code": str(_preserved_retryable.get("reason_code") or "UNKNOWN_REJECTION"),
                     "explanation": str(_preserved_retryable.get("explanation") or ""),
-                }
+                })
                 _restore_selector_failure(plan, _preserved_retryable)
                 _persist(str(_preserved_retryable.get("reason_code") or "UNKNOWN_REJECTION"))
                 log.warning(
@@ -3697,14 +3976,14 @@ class APContractSelectionEngine:
                     ticker, _preserved_retryable.get("reason_code"),
                 )
                 return None
-            self._last_failure = {
+            self._set_last_failure({
                 "stage": "dte_ladder",
                 "reason_code": "NO_VALID_PLAYBOOK_DTE_CONTRACT",
                 "explanation": (
                     "No quality survivor in any evaluated DTE bucket "
                     f"(order={order}, buckets={ {k: len(v) for k, v in buckets.items()} })"
                 ),
-            }
+            })
             log.warning(
                 "[%s] DTE_LADDER_NO_SURVIVOR order=%s buckets=%s",
                 ticker, order, {k: len(v) for k, v in buckets.items()},
@@ -3718,11 +3997,11 @@ class APContractSelectionEngine:
                 "reason_code": "DTE_LADDER_ERROR",
                 "explanation": str(exc),
             }
-            self._last_failure = {
+            self._set_last_failure({
                 "stage": "dte_ladder",
                 "reason_code": "DTE_LADDER_ERROR",
                 "explanation": str(exc),
-            }
+            })
             _restore_selector_failure(
                 plan,
                 {
@@ -3784,7 +4063,7 @@ class APContractSelectionEngine:
         """Dead code — never called in production. Guard prevents accidental wiring in LIVE.
         If this is ever needed, create a dedicated paper-only code path instead.
         """
-        assert self.mode.upper() != "LIVE", (
+        assert _normalized_selector_mode(self.mode) != "LIVE", (
             "_synthetic_contract must never be called in LIVE mode — "
             f"{ticker}_SIM is not a real option symbol and would be submitted to the broker"
         )
@@ -3906,7 +4185,7 @@ class APContractSelectionEngine:
         # must use the same capital basis as _build_selected(): ask in LIVE, mid
         # in paper/research. This prevents a contract from ranking highly only
         # because it fits at mid while failing live affordability at ask.
-        is_live, _pricing_basis = _pricing_basis_for_mode(getattr(self, "mode", "paper"))
+        is_live, _pricing_basis = _pricing_basis_for_mode(self.mode)
         execution_price = ask if is_live else mid
         execution_premium = execution_price * 100
 
@@ -4010,7 +4289,7 @@ class APContractSelectionEngine:
             # ENTRY_ATTEMPT0_PRICING env var ('ASK' default | 'BLEND' legacy)
             # lets ops fall back to the old blend if needed without a redeploy.
             # ─────────────────────────────────────────────────────────────
-            is_live, pricing_basis = _pricing_basis_for_mode(getattr(self, "mode", "paper"))
+            is_live, pricing_basis = _pricing_basis_for_mode(self.mode)
             scoring_price_per_share = mid   # ranking always on mid (unchanged)
 
             _attempt0_mode = os.getenv("ENTRY_ATTEMPT0_PRICING", "ASK").strip().upper()

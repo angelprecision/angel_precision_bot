@@ -46,7 +46,7 @@ class TestDiagnostics:
         """Spec-required diagnostics for each rejected ticker."""
         idx = _SRC.find("_tradeability_diag = {")
         assert idx != -1
-        block = _SRC[idx: idx + 700]
+        block = _SRC[idx: idx + 1100]
         for field in (
             "equity",
             "max_position_pct",
@@ -121,7 +121,9 @@ class TestSizingContextReading:
         block = _SRC[idx - 700: idx]
         assert "_sizing_val(plan" in block
         assert '"account_equity", "equity"' in block
-        assert '"budget", "max_position_usd"' in block
+        assert "_selector_budget_constraints(plan)" in _SRC
+        assert '"selector_budget"' in _SRC
+        assert '"remaining_capacity"' in _SRC
 
     def test_diag_flattened_into_explanation(self):
         """The key numbers must be embedded in the explanation string so they
