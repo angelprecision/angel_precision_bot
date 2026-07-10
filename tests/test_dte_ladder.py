@@ -528,6 +528,7 @@ class TestLadderRouting:
             side="CALL",
             timeframe="1d",
             max_position_usd=500.0,
+            execution_mode="LIVE",
             signal_id="sig-reset",
             metadata={"dte_ladder_audit": {"ticker": "STALE"}},
         )

@@ -128,16 +128,67 @@ def test_paper_uses_paper_simulation_basis():
     assert result.execution_price_per_share == pytest.approx(2.49)
 
 
-def test_sizing_context_budget_wins_over_top_level_conflict():
+def test_selector_budget_beats_generic_budget():
     selector = FakeSelector(mode="LIVE")
-    plan = _plan_dict(metadata={"sizing_context": {"budget": 500.0}}, max_position_usd=999.0)
+    plan = _plan_dict(
+        metadata={"sizing_context": {"budget": 500.0, "selector_budget": 260.0}},
+        max_position_usd=999.0,
+    )
     result = selector.select(plan)
     assert result is not None
-    assert result.affordable_contracts == 2
+    assert result.affordable_contracts == 1
     assert plan["selector_metadata"]["budget_conflict"] is True
-    assert plan["selector_metadata"]["effective_budget"] == pytest.approx(500.0)
+    assert plan["selector_metadata"]["budget_source"] == "selector_budget"
+    assert plan["selector_metadata"]["effective_budget"] == pytest.approx(260.0)
     assert plan["selector_metadata"]["premium_per_contract_usd"] == pytest.approx(250.0)
-    assert plan["selector_metadata"]["projected_reserved_cost_usd"] == pytest.approx(500.0)
+    assert plan["selector_metadata"]["projected_reserved_cost_usd"] == pytest.approx(250.0)
+
+
+def test_remaining_capacity_beats_generic_budget():
+    selector = FakeSelector(mode="LIVE")
+    plan = _plan_dict(
+        metadata={"sizing_context": {"budget": 500.0, "remaining_capacity": 220.0}},
+        max_position_usd=999.0,
+    )
+    result = selector.select(plan)
+    assert result is None
+    assert selector.get_last_failure()["reason_code"] == "UNTRADEABLE_FOR_ACCOUNT_SIZE"
+    assert isinstance(plan["metadata"]["selector_failure"]["selection_diagnostics"], dict)
+    assert selector.get_last_failure()["tradeability_diag"]["budget"] == pytest.approx(220.0)
+
+
+def test_minimum_positive_budget_constraint_wins():
+    selector = FakeSelector(mode="LIVE")
+    plan = _plan_dict(
+        metadata={
+            "sizing_context": {
+                "budget": 500.0,
+                "selector_budget": 400.0,
+                "remaining_capacity": 250.0,
+            }
+        },
+        max_position_usd=999.0,
+    )
+    result = selector.select(plan)
+    assert result is not None
+    assert result.affordable_contracts == 1
+    assert plan["selector_metadata"]["budget_source"] == "remaining_capacity"
+    assert plan["selector_metadata"]["effective_budget"] == pytest.approx(250.0)
+
+
+def test_remaining_budget_ranking_selects_cheaper_valid_contract():
+    expensive = _option(bid=4.48, ask=4.50, symbol="SPY260717C00501000")
+    cheap = _option(bid=2.48, ask=2.50, symbol="SPY260717C00500000")
+    selector = FakeSelector(mode="LIVE", chain=[expensive, cheap])
+    plan = _plan_dict(
+        metadata={"sizing_context": {"budget": 500.0, "selector_budget": 260.0}},
+        max_position_usd=999.0,
+    )
+    result = selector.select(plan)
+    assert result is not None
+    assert result.contract_symbol == "SPY260717C00500000"
+    assert result.premium_per_contract == pytest.approx(250.0)
+    assert result.affordable_contracts == 1
 
 
 def test_dict_and_object_plans_select_equivalently():
@@ -154,6 +205,41 @@ def test_dict_plan_score_passes_iv_momentum_gate():
     result = selector.select(_plan_dict(score=80.0))
     assert result is not None
     assert selector.get_last_failure() is None
+
+
+def test_selector_live_plan_paper_rejects_before_market_data():
+    selector = FakeSelector(mode="LIVE")
+    result = selector.select(_plan_dict(execution_mode="PAPER"))
+    assert result is None
+    assert selector.fetch_calls == 0
+    assert selector.get_last_failure()["reason_code"] == "EXECUTION_MODE_MISMATCH"
+
+
+def test_selector_paper_plan_live_rejects_before_market_data():
+    selector = FakeSelector(mode="PAPER")
+    result = selector.select(_plan_dict(execution_mode="LIVE"))
+    assert result is None
+    assert selector.fetch_calls == 0
+    assert selector.get_last_failure()["reason_code"] == "EXECUTION_MODE_MISMATCH"
+
+
+def test_invalid_plan_execution_mode_rejects_before_market_data():
+    selector = FakeSelector(mode="LIVE")
+    for bad_mode in ("", "unknown"):
+        selector.fetch_calls = 0
+        result = selector.select(_plan_dict(execution_mode=bad_mode))
+        assert result is None
+        assert selector.fetch_calls == 0
+        assert selector.get_last_failure()["reason_code"] == "INVALID_EXECUTION_MODE"
+
+
+def test_execution_mode_case_normalization_preserves_plan_identity():
+    selector = FakeSelector(mode=" live ")
+    plan = _plan_dict(execution_mode=" Live ")
+    result = selector.select(plan)
+    assert result is not None
+    assert result.pricing_basis == "ASK_EXECUTION"
+    assert plan["execution_mode"] == " Live "
 
 
 def test_cost_diagnostics_do_not_double_multiply_contract_cost():
@@ -190,7 +276,9 @@ def test_two_contexts_on_one_selector_do_not_cross_contaminate_getters():
 
 def test_malformed_budget_rejects_before_chain_fetch():
     selector = FakeSelector(mode="LIVE")
-    result = selector.select(_plan_dict(metadata={"sizing_context": {"budget": "bad"}}))
+    result = selector.select(
+        _plan_dict(metadata={"sizing_context": {"budget": "bad"}}, max_position_usd=None)
+    )
     assert result is None
     assert selector.fetch_calls == 0
     assert selector.get_last_failure()["reason_code"] == "INVALID_POSITION_BUDGET"
