@@ -2601,10 +2601,14 @@ class APOrderStateMachine:
             self.update_order_meta(local_id, {"exit_safety": {"broker_truth": broker_truth_audit}})
             log.warning(
                 "[%s] PROTECTIVE_EXIT_ALLOWED_BY_BROKER_TRUTH "
-                "position_id=%s contract=%s "
+                "local_order_id=%s position_id=%s contract=%s execution_mode=%s "
                 "broker_truth_open_qty=%s rejection_count=%s threshold=%s — "
                 "proceeding to broker submit despite prior rejections",
-                self.client_id, position_id, contract,
+                self.client_id,
+                local_id,       # local_order_id preserved in audit
+                position_id,
+                contract,
+                str(execution_mode or "").strip().lower(),
                 _cb.get("broker_truth_open_qty"),
                 _cb.get("rejection_count"),
                 _cb.get("threshold"),
