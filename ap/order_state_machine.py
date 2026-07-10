@@ -2476,7 +2476,12 @@ class APOrderStateMachine:
         broker_truth_audit = dict((broker_truth.get("audit") or {}))
         if broker_truth_audit:
             broker_truth_audit["requested_qty"] = requested_qty
-            self.update_order_meta(local_id, {"exit_safety": {"broker_truth": broker_truth_audit}})
+            _upd_bt = getattr(self, "update_order_meta", None)
+            if callable(_upd_bt):
+                try:
+                    _upd_bt(local_id, {"exit_safety": {"broker_truth": broker_truth_audit}})
+                except Exception as _upd_bt_exc:
+                    log.debug("submit_exit broker_truth audit write failed: %s", _upd_bt_exc)
         if broker_truth.get("is_fresh_exact") and int(broker_truth_qty or 0) == 0:
             blocked_reason = "SYNTHETIC_POSITION_STALE_BROKER_FLAT"
             broker_truth_audit.update(
@@ -2486,7 +2491,12 @@ class APOrderStateMachine:
                     "manual_close_needed": True,
                 }
             )
-            self.update_order_meta(local_id, {"exit_safety": {"broker_truth": broker_truth_audit}})
+            _upd_bt = getattr(self, "update_order_meta", None)
+            if callable(_upd_bt):
+                try:
+                    _upd_bt(local_id, {"exit_safety": {"broker_truth": broker_truth_audit}})
+                except Exception as _upd_bt_exc:
+                    log.debug("submit_exit broker_truth audit write failed: %s", _upd_bt_exc)
             log.warning(
                 "[%s] %s position_id=%s contract=%s requested_qty=%s account=%s | broker flat on fresh exact snapshot",
                 self.client_id,
@@ -2549,7 +2559,12 @@ class APOrderStateMachine:
                     "broker_truth_open_qty": int(broker_truth_qty),
                 }
             )
-            self.update_order_meta(local_id, {"exit_safety": {"broker_truth": broker_truth_audit}})
+            _upd_bt = getattr(self, "update_order_meta", None)
+            if callable(_upd_bt):
+                try:
+                    _upd_bt(local_id, {"exit_safety": {"broker_truth": broker_truth_audit}})
+                except Exception as _upd_bt_exc:
+                    log.debug("submit_exit broker_truth audit write failed: %s", _upd_bt_exc)
             log.warning(
                 "[%s] %s position_id=%s contract=%s requested_qty=%s broker_truth_open_qty=%s account=%s",
                 self.client_id,
@@ -2598,7 +2613,12 @@ class APOrderStateMachine:
                     "broker_truth_open_qty": _cb.get("broker_truth_open_qty"),
                 }
             )
-            self.update_order_meta(local_id, {"exit_safety": {"broker_truth": broker_truth_audit}})
+            _upd_bt = getattr(self, "update_order_meta", None)
+            if callable(_upd_bt):
+                try:
+                    _upd_bt(local_id, {"exit_safety": {"broker_truth": broker_truth_audit}})
+                except Exception as _upd_bt_exc:
+                    log.debug("submit_exit broker_truth audit write failed: %s", _upd_bt_exc)
             log.warning(
                 "[%s] PROTECTIVE_EXIT_ALLOWED_BY_BROKER_TRUTH "
                 "local_order_id=%s position_id=%s contract=%s execution_mode=%s "
@@ -2671,7 +2691,12 @@ class APOrderStateMachine:
                         "manual_close_needed": True,
                     }
                 )
-                self.update_order_meta(local_id, {"exit_safety": {"broker_truth": broker_truth_audit}})
+                _upd_bt = getattr(self, "update_order_meta", None)
+            if callable(_upd_bt):
+                try:
+                    _upd_bt(local_id, {"exit_safety": {"broker_truth": broker_truth_audit}})
+                except Exception as _upd_bt_exc:
+                    log.debug("submit_exit broker_truth audit write failed: %s", _upd_bt_exc)
                 log.warning(
                     "[%s] SYNTHETIC_POSITION_STALE_BROKER_FLAT "
                     "position_id=%s contract=%s — broker is flat; "
