@@ -33,22 +33,12 @@ _SRC  = (_REPO / "ap" / "contract_selector.py").read_text()
 # ---------------------------------------------------------------------------
 
 class TestSourceGuards:
-    def test_flag_defaults_on(self):
-        # PR #219 amendment (Jason LIVE recovery 2026-07-01): the default
-        # flipped from "0" (off) to "1" (on). The ladder is still narrowly
-        # gated by _is_ladder_eligible(plan) so non-deferred callers see no
-        # behavior change. The env var is preserved as an emergency kill
-        # switch: DEFERRED_DTE_LADDER=0 disables without a code deploy.
-        assert 'os.getenv("DEFERRED_DTE_LADDER", "1")' in _SRC, (
-            "DEFERRED_DTE_LADDER default must be '1' — the PR #219 "
-            "Jason LIVE recovery amendment enables the ladder by default."
-        )
-        # And the pre-amendment default must NOT be present anywhere in the
-        # module, so a silent revert of the amendment surfaces in CI.
-        assert 'os.getenv("DEFERRED_DTE_LADDER", "0")' not in _SRC, (
-            "Old default '0' for DEFERRED_DTE_LADDER still in source — the "
-            "PR #219 amendment may have been reverted."
-        )
+    def test_flag_defaults_off_for_post_close_rollout(self):
+        assert 'os.getenv("DEFERRED_DTE_LADDER", "0")' in _SRC
+        assert 'os.getenv("DEFERRED_DTE_LADDER", "1")' not in _SRC
+
+    def test_live_legacy_fallback_defaults_off(self):
+        assert '"DEFERRED_DTE_LEGACY_FALLBACK", "0"' in _SRC
 
     def test_ladder_method_present(self):
         assert "def _select_with_dte_ladder(" in _SRC
@@ -132,9 +122,10 @@ def _make_plan(ticker="AMAT", side="CALL", timeframe="1d", budget=198.72):
 
 
 class _FakeResponse:
-    def __init__(self, status_code: int, payload: dict):
+    def __init__(self, status_code: int, payload: dict, headers: dict | None = None):
         self.status_code = status_code
         self._payload = payload
+        self.headers = headers or {}
 
     def json(self):
         return self._payload
@@ -385,6 +376,96 @@ class TestLadderRouting:
         assert sel._last_failure["reason_code"] == "CHAIN_PROVIDER_EMPTY_EXPIRATIONS"
         assert plan.metadata["selector_failure"]["reason_code"] == "CHAIN_PROVIDER_EMPTY_EXPIRATIONS"
 
+    @pytest.mark.parametrize("mode,explicit_flag,expected_fallback", [
+        ("paper", False, True),
+        ("live", False, False),
+        ("live", True, True),
+    ])
+    def test_provider_failure_has_one_explicit_bounded_fallback(
+        self, mode, explicit_flag, expected_fallback
+    ):
+        mod = _load_selector({"DEFERRED_DTE_LADDER": "1"})
+        sel = object.__new__(mod.APContractSelectionEngine)
+        sel.mode = mode
+        sel.deferred_dte_legacy_fallback = explicit_flag
+        sel._last_failure = None
+        sel._last_dte_ladder_audit = None
+        sel._fetch_expirations_list = MagicMock(side_effect=mod.ChainProviderError(
+            "rate limited",
+            status_code=429,
+            provider_latency_ms=87.5,
+            retry_after_ms=2000,
+        ))
+        selected = MagicMock(contract_symbol="AMAT_LEGACY")
+        sel.select = MagicMock(return_value=selected)
+        plan = _make_plan()
+        plan.execution_mode = mode
+        plan.metadata = {"deferred_breach_selection": True}
+
+        result = sel._select_with_dte_ladder(plan)
+
+        assert (result is selected) is expected_fallback
+        assert sel.select.call_count == (1 if expected_fallback else 0)
+        if expected_fallback:
+            sel.select.assert_called_once_with(plan, _dte_legacy_fallback=True)
+        audit = plan.metadata["dte_ladder_audit"]
+        assert audit["expiration_fetch_attempts"] == 1
+        assert audit["expiration_http_status"] == 429
+        assert audit["expiration_provider_latency_ms"] == 87.5
+        assert audit["retry_after_ms"] == 2000
+        assert audit["final_reason"] == "CHAIN_PROVIDER_ERROR"
+        assert audit["fallback_considered"] is True
+        assert audit["fallback_allowed"] is expected_fallback
+        assert audit["fallback_used"] is expected_fallback
+
+    def test_auth_failure_never_falls_back_even_in_paper(self):
+        mod = _load_selector({"DEFERRED_DTE_LADDER": "1"})
+        sel = object.__new__(mod.APContractSelectionEngine)
+        sel.mode = "paper"
+        sel.deferred_dte_legacy_fallback = True
+        sel._last_failure = None
+        sel._last_dte_ladder_audit = None
+        sel._fetch_expirations_list = MagicMock(side_effect=mod.ChainAuthError(
+            "unauthorized", status_code=401, provider_latency_ms=12.0
+        ))
+        sel.select = MagicMock()
+        plan = _make_plan()
+        plan.execution_mode = "paper"
+        plan.metadata = {"deferred_breach_selection": True}
+
+        assert sel._select_with_dte_ladder(plan) is None
+        sel.select.assert_not_called()
+        audit = plan.metadata["dte_ladder_audit"]
+        assert audit["final_reason"] == "CHAIN_AUTH_ERROR"
+        assert audit["fallback_considered"] is False
+        assert audit["fallback_used"] is False
+
+    def test_real_expiration_fetch_captures_http_latency_and_retry_after(self):
+        mod = _load_selector({"DEFERRED_DTE_LADDER": "1"})
+        url = "https://api.tradier.com/v1/markets/options/expirations"
+        session = _FakeSession({
+            (url, (("includeAllRoots", "true"), ("symbol", "AMAT"))):
+                _FakeResponse(429, {}, headers={"Retry-After": "3"}),
+        })
+        sel = mod.APContractSelectionEngine(
+            broker=SimpleNamespace(),
+            data_broker=SimpleNamespace(
+                session=session,
+                cfg=SimpleNamespace(base_url="https://api.tradier.com", access_token="token"),
+            ),
+            mode="paper",
+        )
+
+        with pytest.raises(mod.ChainProviderError) as exc_info:
+            sel._fetch_expirations_list("AMAT")
+
+        exc = exc_info.value
+        assert exc.status_code == 429
+        assert exc.provider_latency_ms is not None
+        assert exc.provider_latency_ms >= 0
+        assert exc.retry_after_ms == 3000
+        assert exc.attempts == 1
+
     def test_ladder_uses_plan_scoped_failure_not_shared_last_failure(self):
         """Ladder control flow must preserve the sub-call plan failure snapshot,
         not whatever another request last wrote to self._last_failure."""
@@ -444,12 +525,13 @@ class TestLadderRouting:
             timeframe="1d",
             max_position_usd=500.0,
             signal_id="sig-reset",
-            metadata={},
+            metadata={"dte_ladder_audit": {"ticker": "STALE"}},
         )
 
         result = sel.select(plan)
         assert result is not None
         assert sel.get_last_dte_ladder_audit() is None
+        assert "dte_ladder_audit" not in plan.metadata
 
 
 class TestAmendmentGateOrdering:
@@ -644,6 +726,7 @@ class TestDeferredPlanIntegration:
             ),
             mode="live",
         )
+        sel.dte_ladder_enabled = True
         plan = SimpleNamespace(
             client_id="jason@example.com",
             execution_mode="live",

@@ -43,6 +43,7 @@ import math
 import logging
 from ap.trace import trace_gate
 import os
+import time
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from typing import Optional
@@ -58,9 +59,20 @@ from ap.contract_quote_revalidator import (
 # ── P0: exact chain-fetch taxonomy exceptions ────────────────────────────────
 class ChainProviderError(Exception):
     """HTTP or network error from the options chain provider."""
-    def __init__(self, msg: str, *, status_code: int | None = None):
+    def __init__(
+        self,
+        msg: str,
+        *,
+        status_code: int | None = None,
+        provider_latency_ms: float | None = None,
+        retry_after_ms: int | None = None,
+        attempts: int = 1,
+    ):
         super().__init__(msg)
         self.status_code = status_code
+        self.provider_latency_ms = provider_latency_ms
+        self.retry_after_ms = retry_after_ms
+        self.attempts = attempts
 
 
 class ChainAuthError(ChainProviderError):
@@ -70,7 +82,20 @@ class ChainAuthError(ChainProviderError):
 
 class ChainEmptyExpirations(Exception):
     """Expirations endpoint returned an empty list for this ticker."""
-    pass
+    def __init__(
+        self,
+        msg: str,
+        *,
+        status_code: int | None = 200,
+        provider_latency_ms: float | None = None,
+        retry_after_ms: int | None = None,
+        attempts: int = 1,
+    ):
+        super().__init__(msg)
+        self.status_code = status_code
+        self.provider_latency_ms = provider_latency_ms
+        self.retry_after_ms = retry_after_ms
+        self.attempts = attempts
 
 
 class NoExpirationInDTEWindow(Exception):
@@ -719,6 +744,35 @@ def _safe_plan_attr(plan, attr: str, default=None):
         return default
 
 
+def _persist_dte_ladder_audit(selector, plan, audit: dict) -> None:
+    """Persist request evidence both on the selector and the request plan."""
+    snapshot = dict(audit)
+    selector._last_dte_ladder_audit = snapshot
+    try:
+        if isinstance(plan, dict):
+            metadata = plan.setdefault("metadata", {})
+        else:
+            metadata = getattr(plan, "metadata", None)
+            if not isinstance(metadata, dict):
+                metadata = {}
+                setattr(plan, "metadata", metadata)
+        if isinstance(metadata, dict):
+            metadata["dte_ladder_audit"] = snapshot
+    except Exception:
+        pass
+
+
+def _retry_after_ms(response) -> int | None:
+    """Return numeric Retry-After seconds as milliseconds when supplied."""
+    try:
+        raw = (getattr(response, "headers", None) or {}).get("Retry-After")
+        if raw is None or str(raw).strip() == "":
+            return None
+        return max(0, int(float(str(raw).strip()) * 1000))
+    except (TypeError, ValueError, AttributeError):
+        return None
+
+
 def _plan_sizing_ctx(plan) -> dict:
     """Return plan.metadata['sizing_context'] (object or dict plan), or {}.
 
@@ -1038,18 +1092,15 @@ class APContractSelectionEngine:
         self.iv_filter      = iv_filter
         self.mutate_plan    = bool(mutate_plan)
 
-        # ── PR1 (deferred-dte-ladder): DTE-bucket selection policy ────────────
-        # AMENDMENT (PR #219, Jason LIVE recovery): default is now "1" (ON).
-        # The ladder is already narrowly gated by _is_ladder_eligible(plan) —
-        # only fires when plan.metadata["deferred_breach_selection"] is True,
-        # a marker set exclusively by ap_execution_core's breach-time path.
-        # Non-deferred select() calls are byte-for-byte unchanged. Flipping
-        # the default from "0" to "1" enables the ladder for the exact path
-        # that needed it (54 Jason LIVE overnight setups today expired without
-        # a single broker submit because they all tried only one expiration).
-        # The env var is preserved as an emergency kill switch: set
-        # DEFERRED_DTE_LADDER=0 on Render to disable without a code deploy.
-        self.dte_ladder_enabled = os.getenv("DEFERRED_DTE_LADDER", "1").strip() in ("1", "true", "yes")
+        # The ladder is opt-in for the post-close rollout. Set
+        # DEFERRED_DTE_LADDER=1 to enable and DEFERRED_DTE_LADDER=0 as the kill
+        # switch. Normal selectors remain outside this deferred-only path.
+        self.dte_ladder_enabled = os.getenv("DEFERRED_DTE_LADDER", "0").strip().lower() in ("1", "true", "yes")
+        # A failed authoritative expiration fetch may invoke the legacy selector
+        # once in PAPER. LIVE requires this explicit break-glass override.
+        self.deferred_dte_legacy_fallback = os.getenv(
+            "DEFERRED_DTE_LEGACY_FALLBACK", "0"
+        ).strip().lower() in ("1", "true", "yes")
         # Bucket boundaries (inclusive upper, DTE). A=near, B=adjacent, C=fallback.
         self.dte_bucket_a_max = int(os.getenv("DTE_BUCKET_A_MAX", "2"))   # 0–2 DTE
         self.dte_bucket_b_max = int(os.getenv("DTE_BUCKET_B_MAX", "7"))   # 3–7 DTE
@@ -1203,15 +1254,27 @@ class APContractSelectionEngine:
         return None
 
 
-    def select(self, plan, *, expiration_override: Optional[str] = None) -> Optional[SelectedContract]:
+    def select(
+        self,
+        plan,
+        *,
+        expiration_override: Optional[str] = None,
+        _dte_legacy_fallback: bool = False,
+    ) -> Optional[SelectedContract]:
         # PR #149 — Selector Reason Honesty.
         # Reset failure capture at the start of every invocation so that
         # get_last_failure() reflects ONLY this call's most recent REJECT,
         # never a stale value from a prior select(). Observability only.
         self._last_failure = None
         _clear_selector_failure(plan)
-        if expiration_override is None:
+        if expiration_override is None and not _dte_legacy_fallback:
             self._last_dte_ladder_audit = None
+            try:
+                _meta = plan.get("metadata") if isinstance(plan, dict) else getattr(plan, "metadata", None)
+                if isinstance(_meta, dict):
+                    _meta.pop("dte_ladder_audit", None)
+            except Exception:
+                pass
 
         # PR P1 — selector failure metadata tracking (observability only).
         # Updated at each stage and passed to _attach_selector_failure() at
@@ -1345,6 +1408,7 @@ class APContractSelectionEngine:
         if (
             self.dte_ladder_enabled
             and expiration_override is None
+            and not _dte_legacy_fallback
             and self._is_ladder_eligible(plan)
         ):
             return self._select_with_dte_ladder(plan)
@@ -2874,8 +2938,8 @@ class APContractSelectionEngine:
         # Default: still near-first (safe — ladder falls back if empty).
         return ["A", "B", "C"]
 
-    def _fetch_expirations_list(self, ticker: str) -> list[str]:
-        """Fetch the raw expirations list for the ticker (live data broker)."""
+    def _fetch_expirations_list(self, ticker: str) -> tuple[list[str], dict]:
+        """Fetch expirations and return request-scoped provider evidence."""
         import requests
         _session = getattr(self.data_broker, "session", None) or requests
         cfg      = getattr(self.data_broker, "cfg", None)
@@ -2900,32 +2964,56 @@ class APContractSelectionEngine:
             except Exception:
                 pass
             try:
+                _started = time.monotonic()
                 resp = _session.get(
                     f"{base_url}/v1/markets/options/expirations",
                     params={"symbol": ticker, "includeAllRoots": "true"},
                     headers=headers, timeout=10,
                 )
+                _latency_ms = round((time.monotonic() - _started) * 1000.0, 3)
+                _retry_ms = _retry_after_ms(resp)
                 if resp.status_code in (401, 403):
                     raise ChainAuthError(
                         f"Expirations auth error {resp.status_code} for {ticker}",
                         status_code=resp.status_code,
+                        provider_latency_ms=_latency_ms,
+                        retry_after_ms=_retry_ms,
                     )
                 if resp.status_code != 200:
                     raise ChainProviderError(
                         f"Expirations fetch failed: HTTP {resp.status_code} for {ticker}",
                         status_code=resp.status_code,
+                        provider_latency_ms=_latency_ms,
+                        retry_after_ms=_retry_ms,
                     )
                 dates = resp.json().get("expirations", {}).get("date", []) or []
                 if not dates:
-                    raise ChainEmptyExpirations(f"[{ticker}] Tradier returned empty expirations list")
-                return dates
+                    raise ChainEmptyExpirations(
+                        f"[{ticker}] Tradier returned empty expirations list",
+                        provider_latency_ms=_latency_ms,
+                        retry_after_ms=_retry_ms,
+                    )
+                return dates, {
+                    "expiration_fetch_attempts": 1,
+                    "expiration_http_status": int(resp.status_code),
+                    "expiration_provider_latency_ms": _latency_ms,
+                    "retry_after_ms": _retry_ms,
+                }
             finally:
                 try:
                     after_market_data_call()
                 except Exception:
                     pass
         except requests.exceptions.RequestException as exc:
-            raise ChainProviderError(f"Expirations fetch network error: {exc}") from exc
+            _latency_ms = None
+            try:
+                _latency_ms = round((time.monotonic() - _started) * 1000.0, 3)
+            except Exception:
+                pass
+            raise ChainProviderError(
+                f"Expirations fetch network error: {exc}",
+                provider_latency_ms=_latency_ms,
+            ) from exc
 
     def _bucket_expirations(self, dates: list[str]) -> dict[str, list[str]]:
         """Group expirations into DTE buckets A (0–a), B (a+1–b), C (b+1+).
@@ -2972,73 +3060,102 @@ class APContractSelectionEngine:
             "selected_bucket": None,
             "selected_dte": None,
             "selected_expiration": None,
+            "expiration_fetch_attempts": 0,
+            "expiration_http_status": None,
+            "expiration_provider_latency_ms": None,
+            "retry_after_ms": None,
+            "final_reason": None,
+            "fallback_considered": False,
+            "fallback_allowed": False,
+            "fallback_used": False,
+            "fallback_succeeded": False,
         }
+
+        def _persist(final_reason: str | None = None) -> None:
+            if final_reason is not None:
+                audit["final_reason"] = final_reason
+            _persist_dte_ladder_audit(self, plan, audit)
+
+        def _expiration_failure(reason_code: str, exc: Exception, *, allow_fallback: bool):
+            audit.update({
+                "expiration_fetch_attempts": int(getattr(exc, "attempts", 1) or 1),
+                "expiration_http_status": getattr(exc, "status_code", None),
+                "expiration_provider_latency_ms": getattr(exc, "provider_latency_ms", None),
+                "retry_after_ms": getattr(exc, "retry_after_ms", None),
+                "final_reason": reason_code,
+                "fallback_considered": bool(allow_fallback),
+            })
+            _mode = str(
+                _safe_plan_attr(plan, "execution_mode", None)
+                or getattr(self, "mode", "unknown")
+                or "unknown"
+            ).strip().upper()
+            _fallback_allowed = bool(
+                allow_fallback
+                and (_mode == "PAPER" or getattr(self, "deferred_dte_legacy_fallback", False))
+            )
+            audit["fallback_allowed"] = _fallback_allowed
+            audit["fallback_policy"] = "paper" if _mode == "PAPER" else "explicit_env"
+            _failure = {
+                "stage": "dte_ladder_expirations",
+                "reason_code": reason_code,
+                "explanation": str(exc),
+            }
+            audit["failure"] = dict(_failure)
+            self._last_failure = dict(_failure)
+            _failure_meta = {
+                "reason_code": reason_code,
+                "queue_reason_code": _to_queue_reason(reason_code),
+                "explanation": str(exc),
+                "chain_rows": 0,
+                "survivor_count": 0,
+                "execution_mode": _mode.lower(),
+            }
+            _restore_selector_failure(plan, _failure_meta)
+
+            if _fallback_allowed:
+                audit["fallback_used"] = True
+                log.warning(
+                    "[%s] DTE_LADDER_LEGACY_FALLBACK reason=%s mode=%s explicit_env=%s",
+                    ticker, reason_code, _mode,
+                    bool(getattr(self, "deferred_dte_legacy_fallback", False)),
+                )
+                try:
+                    result = self.select(plan, _dte_legacy_fallback=True)
+                except Exception as fallback_exc:
+                    audit["fallback_error"] = str(fallback_exc)
+                    result = None
+                audit["fallback_succeeded"] = result is not None
+                if result is not None:
+                    _persist(reason_code)
+                    return result
+                self._last_failure = dict(_failure)
+                _restore_selector_failure(plan, _failure_meta)
+
+            _persist(reason_code)
+            return None
+
         try:
             try:
-                dates = self._fetch_expirations_list(ticker)
+                _fetch_result = self._fetch_expirations_list(ticker)
+                if (
+                    isinstance(_fetch_result, tuple)
+                    and len(_fetch_result) == 2
+                    and isinstance(_fetch_result[1], dict)
+                ):
+                    dates, _fetch_evidence = _fetch_result
+                    audit.update(_fetch_evidence)
+                else:
+                    dates = _fetch_result
+                    audit["expiration_fetch_attempts"] = 1
             except ChainAuthError as exc:
-                _failure = {
-                    "stage": "dte_ladder_expirations",
-                    "reason_code": "CHAIN_AUTH_ERROR",
-                    "explanation": str(exc),
-                }
-                audit["failure"] = dict(_failure)
-                self._last_failure = dict(_failure)
-                self._last_dte_ladder_audit = audit
-                _restore_selector_failure(
-                    plan,
-                    {
-                        "reason_code": "CHAIN_AUTH_ERROR",
-                        "queue_reason_code": _to_queue_reason("CHAIN_AUTH_ERROR"),
-                        "explanation": str(exc),
-                        "chain_rows": 0,
-                        "survivor_count": 0,
-                        "execution_mode": str(getattr(self, "mode", "unknown") or "unknown").lower(),
-                    },
-                )
-                return None
+                return _expiration_failure("CHAIN_AUTH_ERROR", exc, allow_fallback=False)
             except ChainEmptyExpirations as exc:
-                _failure = {
-                    "stage": "dte_ladder_expirations",
-                    "reason_code": "CHAIN_PROVIDER_EMPTY_EXPIRATIONS",
-                    "explanation": str(exc),
-                }
-                audit["failure"] = dict(_failure)
-                self._last_failure = dict(_failure)
-                self._last_dte_ladder_audit = audit
-                _restore_selector_failure(
-                    plan,
-                    {
-                        "reason_code": "CHAIN_PROVIDER_EMPTY_EXPIRATIONS",
-                        "queue_reason_code": _to_queue_reason("CHAIN_PROVIDER_EMPTY_EXPIRATIONS"),
-                        "explanation": str(exc),
-                        "chain_rows": 0,
-                        "survivor_count": 0,
-                        "execution_mode": str(getattr(self, "mode", "unknown") or "unknown").lower(),
-                    },
+                return _expiration_failure(
+                    "CHAIN_PROVIDER_EMPTY_EXPIRATIONS", exc, allow_fallback=True
                 )
-                return None
             except ChainProviderError as exc:
-                _failure = {
-                    "stage": "dte_ladder_expirations",
-                    "reason_code": "CHAIN_PROVIDER_ERROR",
-                    "explanation": str(exc),
-                }
-                audit["failure"] = dict(_failure)
-                self._last_failure = dict(_failure)
-                self._last_dte_ladder_audit = audit
-                _restore_selector_failure(
-                    plan,
-                    {
-                        "reason_code": "CHAIN_PROVIDER_ERROR",
-                        "queue_reason_code": _to_queue_reason("CHAIN_PROVIDER_ERROR"),
-                        "explanation": str(exc),
-                        "chain_rows": 0,
-                        "survivor_count": 0,
-                        "execution_mode": str(getattr(self, "mode", "unknown") or "unknown").lower(),
-                    },
-                )
-                return None
+                return _expiration_failure("CHAIN_PROVIDER_ERROR", exc, allow_fallback=True)
 
             buckets = self._bucket_expirations(dates)
             order = self._preferred_bucket_order(plan)
@@ -3104,7 +3221,7 @@ class APContractSelectionEngine:
                                 "reason_code": str(_preserved_terminal.get("reason_code") or "UNKNOWN_REJECTION"),
                                 "explanation": str(_preserved_terminal.get("explanation") or ""),
                             }
-                            self._last_dte_ladder_audit = audit
+                            _persist(str(_preserved_terminal.get("reason_code") or "UNKNOWN_REJECTION"))
                             _restore_selector_failure(plan, _preserved_terminal)
                             log.warning(
                                 "[%s] DTE_LADDER_TERMINAL_NON_DTE preserved reason=%s "
@@ -3132,7 +3249,7 @@ class APContractSelectionEngine:
                         audit["selected_bucket"] = bucket_name
                         audit["selected_dte"] = _dte
                         audit["selected_expiration"] = exp
-                        self._last_dte_ladder_audit = audit
+                        _persist("SELECTED")
                         log.info(
                             "[%s] DTE_LADDER_SELECTED bucket=%s dte=%s exp=%s",
                             ticker, bucket_name, _dte, exp,
@@ -3150,7 +3267,6 @@ class APContractSelectionEngine:
             #
             # NOTE: _preserved_terminal is handled above via early return; it
             # should be None here.
-            self._last_dte_ladder_audit = audit
             if _preserved_quality is not None:
                 self._last_failure = {
                     "stage": str(_preserved_quality.get("stage") or "dte_ladder"),
@@ -3158,6 +3274,7 @@ class APContractSelectionEngine:
                     "explanation": str(_preserved_quality.get("explanation") or ""),
                 }
                 _restore_selector_failure(plan, _preserved_quality)
+                _persist(str(_preserved_quality.get("reason_code") or "UNKNOWN_REJECTION"))
                 log.warning(
                     "[%s] DTE_LADDER_QUALITY_REASON preserved reason=%s "
                     "— not masking with NO_VALID_PLAYBOOK_DTE_CONTRACT",
@@ -3171,6 +3288,7 @@ class APContractSelectionEngine:
                     "explanation": str(_preserved_retryable.get("explanation") or ""),
                 }
                 _restore_selector_failure(plan, _preserved_retryable)
+                _persist(str(_preserved_retryable.get("reason_code") or "UNKNOWN_REJECTION"))
                 log.warning(
                     "[%s] DTE_LADDER_RETRYABLE_REASON preserved reason=%s "
                     "— not masking with NO_VALID_PLAYBOOK_DTE_CONTRACT",
@@ -3189,6 +3307,7 @@ class APContractSelectionEngine:
                 "[%s] DTE_LADDER_NO_SURVIVOR order=%s buckets=%s",
                 ticker, order, {k: len(v) for k, v in buckets.items()},
             )
+            _persist("NO_VALID_PLAYBOOK_DTE_CONTRACT")
             return None
         except Exception as exc:
             log.warning("[%s] DTE_LADDER_ERROR fail-closed: %s", ticker, exc)
@@ -3197,7 +3316,6 @@ class APContractSelectionEngine:
                 "reason_code": "DTE_LADDER_ERROR",
                 "explanation": str(exc),
             }
-            self._last_dte_ladder_audit = audit
             self._last_failure = {
                 "stage": "dte_ladder",
                 "reason_code": "DTE_LADDER_ERROR",
@@ -3214,6 +3332,7 @@ class APContractSelectionEngine:
                     "execution_mode": str(getattr(self, "mode", "unknown") or "unknown").lower(),
                 },
             )
+            _persist("DTE_LADDER_ERROR")
             return None
 
     def _pick_expiration(self, dates: list[str]) -> Optional[str]:

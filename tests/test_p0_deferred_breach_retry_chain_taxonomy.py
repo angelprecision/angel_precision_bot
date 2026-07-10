@@ -468,7 +468,7 @@ def test_duplicate_retry_thread_is_suppressed(monkeypatch):
 #
 # These lock the four amendments applied after the initial retry+taxonomy work
 # on this PR was reviewed against Jason's actual production failure pattern:
-#   1. DEFERRED_DTE_LADDER default = "1"
+#   1. DEFERRED_DTE_LADDER default = "0" for post-close opt-in rollout
 #   2. BREACH_SELECTOR_RETRY_ENABLED default = "1"
 #   3. RETRYABLE_BREACH_SELECTOR_REASONS extended with the codes that killed
 #      17 of 54 Jason LIVE overnight setups today
@@ -482,16 +482,13 @@ def test_duplicate_retry_thread_is_suppressed(monkeypatch):
 class TestJasonLiveRecoveryAmendments:
     """Parity locks for the PR #219 amendment (see commit body)."""
 
-    def test_amendment_1_dte_ladder_default_is_on(self, monkeypatch):
-        """DEFERRED_DTE_LADDER unset => ladder is enabled by default."""
+    def test_amendment_1_dte_ladder_default_is_off(self, monkeypatch):
+        """DEFERRED_DTE_LADDER unset => active LIVE behavior is unchanged."""
         monkeypatch.delenv("DEFERRED_DTE_LADDER", raising=False)
         mod = _load_selector()
         sel = object.__new__(mod.APContractSelectionEngine)
         mod.APContractSelectionEngine.__init__(sel, broker=SimpleNamespace(), data_broker=SimpleNamespace())
-        assert sel.dte_ladder_enabled is True, (
-            "DEFERRED_DTE_LADDER must default to '1' — 54 Jason LIVE setups "
-            "expired today because only one expiration was probed."
-        )
+        assert sel.dte_ladder_enabled is False
 
     def test_amendment_1_kill_switch_still_works(self, monkeypatch):
         """DEFERRED_DTE_LADDER=0 must still disable the ladder as an emergency
