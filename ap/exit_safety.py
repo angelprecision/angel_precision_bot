@@ -199,10 +199,23 @@ def resolve_exit_broker_truth(
         )
 
     if not matched_rows:
-        audit["snapshot_status"] = "contract_not_matched"
+        # Production-shape fix: list_positions() succeeded and returned a valid list
+        # but this OCC contract is absent. In real broker shape, a flat/closed option
+        # simply disappears from the positions snapshot — it does NOT appear as a row
+        # with qty=0. "Contract absent from fresh snapshot" = "broker confirms qty=0".
+        #
+        # This is the VZ/META production failure class: a stale synthetic local
+        # position that the broker had already closed was flowing through as
+        # "no broker truth" because the missing row was treated as unknown.
+        # Treat absent-from-snapshot as exact flat only when list_positions() itself
+        # succeeded and returned a parseable list (including empty list).
+        # list_positions() error / malformed payload / missing method → None (no change).
+        audit["snapshot_status"]      = "contract_absent_open_qty_zero"
+        audit["exact_contract_match"] = False
+        audit["broker_position_count"] = len(rows)
         return {
-            "broker_truth_open_qty": None,
-            "is_fresh_exact": False,
+            "broker_truth_open_qty": 0,
+            "is_fresh_exact": True,
             "audit": audit,
         }
 

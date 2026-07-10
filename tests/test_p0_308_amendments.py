@@ -564,3 +564,261 @@ class TestR8ScopeFence:
         assert "ap/exit_safety.py" in changed, "exit_safety.py must be changed"
         assert "ap/order_state_machine.py" in changed, "order_state_machine.py must be changed"
         assert "ap_exit_engine.py" in changed, "ap_exit_engine.py must be changed"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Production-shape broker-flat fix: absent contract = qty=0 in fresh snapshot
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestBrokerFlatProductionShape:
+    """
+    Critical production-shape fix: when list_positions() succeeds and the
+    requested OCC contract is absent from the snapshot, that MUST mean
+    broker_truth_open_qty=0 / is_fresh_exact=True.
+
+    In production Tradier shape, a flat/closed option simply disappears from
+    list_positions. It does NOT return as a row with qty=0. Treating
+    "absent = unknown" caused the VZ/META incident class where a stale local
+    synthetic position flowed through as "no broker truth" and potentially
+    broker POST'd an exit on a position the broker had already closed.
+    """
+
+    def _run_broker_truth(self, list_positions_return=None, list_positions_error=None):
+        """Call resolve_exit_broker_truth with controlled broker.list_positions behavior."""
+        from ap.exit_safety import resolve_exit_broker_truth
+
+        broker = MagicMock()
+        if list_positions_error:
+            broker.list_positions = MagicMock(side_effect=list_positions_error)
+        elif list_positions_return is not None:
+            broker.list_positions = MagicMock(return_value=list_positions_return)
+        else:
+            del broker.list_positions  # simulate missing method
+
+        # Mock account extraction
+        broker.account_id = "VA_TEST"
+
+        with patch("ap.exit_safety._extract_broker_account_id", return_value="VA_TEST"):
+            return resolve_exit_broker_truth(
+                broker=broker,
+                client_id=_CLIENT_ID,
+                contract=_CONTRACT,
+            )
+
+    def test_1_empty_positions_list_means_broker_flat(self):
+        """
+        Test 1: broker.list_positions() returns [] (all positions closed)
+        → broker_truth_open_qty=0, is_fresh_exact=True.
+        """
+        result = self._run_broker_truth(list_positions_return=[])
+
+        assert result["broker_truth_open_qty"] == 0, (
+            "Test 1: Empty positions list MUST return broker_truth_open_qty=0. "
+            "An empty list means the broker has NO open positions — flat is confirmed."
+        )
+        assert result["is_fresh_exact"] is True, (
+            "Test 1: is_fresh_exact must be True — list_positions() succeeded and "
+            "the absence of the contract IS the exact answer."
+        )
+        assert result["audit"]["snapshot_status"] == "contract_absent_open_qty_zero"
+        assert result["audit"]["broker_position_count"] == 0
+
+    def test_2_other_contracts_but_not_requested_means_flat(self):
+        """
+        Test 2: broker.list_positions() returns other contracts (not the requested OCC)
+        → broker_truth_open_qty=0, is_fresh_exact=True.
+
+        Production shape: broker has other open positions but THIS contract is closed.
+        The option disappeared from the snapshot = flat.
+        """
+        other_contract_row = {
+            "symbol":       "SPY   260717C00600000",
+            "option_type":  "Call",
+            "quantity":     2.0,
+            "side":         "long",
+            "account_number": "VA_TEST",
+        }
+        result = self._run_broker_truth(list_positions_return=[other_contract_row])
+
+        assert result["broker_truth_open_qty"] == 0, (
+            "Test 2: Other contracts present but requested OCC absent → flat on requested contract."
+        )
+        assert result["is_fresh_exact"] is True
+        assert result["audit"]["snapshot_status"] == "contract_absent_open_qty_zero"
+        assert result["audit"]["broker_position_count"] == 1
+
+    def test_3_absent_contract_osm_submit_exit_triggers_synthetic_stale(self):
+        """
+        Test 3: After fix, absent-contract now returns is_fresh_exact=True, qty=0.
+        OSM submit_exit must then block with SYNTHETIC_POSITION_STALE_BROKER_FLAT
+        (not proceed to broker POST as before the fix).
+        """
+        from ap.exit_safety import resolve_exit_broker_truth
+
+        broker = MagicMock()
+        broker.list_positions = MagicMock(return_value=[])  # contract absent
+        broker.account_id = "VA_TEST"
+
+        with patch("ap.exit_safety._extract_broker_account_id", return_value="VA_TEST"):
+            result = resolve_exit_broker_truth(
+                broker=broker,
+                client_id=_CLIENT_ID,
+                contract=_CONTRACT,
+            )
+
+        # Verify the OSM path would trigger SYNTHETIC_POSITION_STALE_BROKER_FLAT
+        assert result["is_fresh_exact"] is True
+        assert result["broker_truth_open_qty"] == 0
+        # This is the exact condition OSM checks:
+        # if broker_truth.get("is_fresh_exact") and int(broker_truth_qty or 0) == 0:
+        is_fresh_and_flat = (
+            result.get("is_fresh_exact") is True
+            and int(result.get("broker_truth_open_qty") or 0) == 0
+        )
+        assert is_fresh_and_flat, (
+            "Test 3: OSM submit_exit checks 'is_fresh_exact AND qty==0'. "
+            "After fix, absent contract satisfies this condition → "
+            "SYNTHETIC_POSITION_STALE_BROKER_FLAT fires, no broker POST."
+        )
+
+    def test_4_absent_contract_exit_engine_seam_no_broker_post(self):
+        """
+        Test 4: At the exit engine submit seam, absent-contract broker truth
+        now triggers the SYNTHETIC_POSITION_STALE_BROKER_FLAT early return.
+
+        The exit engine checks:
+            if _broker_truth.get("is_fresh_exact") and int(_broker_truth_qty or 0) == 0:
+                return False  (no broker POST)
+        """
+        from ap.exit_safety import resolve_exit_broker_truth
+
+        broker = MagicMock()
+        broker.list_positions = MagicMock(return_value=[
+            # OTHER contracts — but not _CONTRACT
+            {
+                "symbol": "AMD   260717C00450000",
+                "quantity": 1.0,
+                "side": "long",
+                "account_number": "VA_TEST",
+            }
+        ])
+        broker.account_id = "VA_TEST"
+
+        with patch("ap.exit_safety._extract_broker_account_id", return_value="VA_TEST"):
+            bt = resolve_exit_broker_truth(
+                broker=broker,
+                client_id=_CLIENT_ID,
+                contract=_CONTRACT,
+            )
+
+        # Verify the exit engine seam condition is met
+        fresh_and_flat = (
+            bt.get("is_fresh_exact") is True
+            and int(bt.get("broker_truth_open_qty") or 0) == 0
+        )
+        assert fresh_and_flat, (
+            "Test 4: Exit engine early-return condition 'is_fresh_exact AND qty==0' "
+            "must now be satisfied for absent-contract — prevents broker POST "
+            "on a position the broker already closed."
+        )
+
+    def test_5_list_positions_error_preserves_original_behavior(self):
+        """
+        Test 5: list_positions() raises → broker_truth_open_qty=None, is_fresh_exact=False.
+        Errors must not be treated as flat — only SUCCESSFUL snapshots with absent
+        contract are treated as confirmed flat.
+        """
+        result = self._run_broker_truth(
+            list_positions_error=Exception("Tradier 503 Service Unavailable")
+        )
+
+        assert result["broker_truth_open_qty"] is None, (
+            "Test 5: list_positions() error must NOT set qty=0. "
+            "Error = unknown, not confirmed flat."
+        )
+        assert result["is_fresh_exact"] is False, (
+            "Test 5: is_fresh_exact must be False on list_positions() error."
+        )
+        assert result["audit"]["snapshot_status"] == "broker_positions_error"
+
+    def test_5b_list_positions_missing_preserves_original_behavior(self):
+        """broker method missing → broker_truth_open_qty=None (unchanged)."""
+        from ap.exit_safety import resolve_exit_broker_truth
+
+        broker = MagicMock(spec=[])  # no list_positions method
+        result = resolve_exit_broker_truth(
+            broker=broker,
+            client_id=_CLIENT_ID,
+            contract=_CONTRACT,
+        )
+
+        assert result["broker_truth_open_qty"] is None
+        assert result["is_fresh_exact"] is False
+        assert result["audit"]["snapshot_status"] == "broker_positions_unavailable"
+
+    def test_existing_exact_match_still_returns_real_qty(self):
+        """
+        Regression: when the contract IS in the snapshot with real qty,
+        the existing exact-match path must still return the correct qty.
+        """
+        real_position_row = {
+            "symbol":         _CONTRACT.replace(" ", ""),
+            "option_type":    "Call",
+            "quantity":       2.0,
+            "side":           "long",
+            "account_number": "VA_TEST",
+        }
+
+        from ap.exit_safety import resolve_exit_broker_truth, _normalize_contract
+
+        broker = MagicMock()
+        broker.list_positions = MagicMock(return_value=[real_position_row])
+        broker.account_id = "VA_TEST"
+
+        with patch("ap.exit_safety._extract_broker_account_id", return_value="VA_TEST"), \
+             patch("ap.exit_safety._extract_position_contract",
+                   return_value=_normalize_contract(_CONTRACT)), \
+             patch("ap.exit_safety._extract_position_account_id", return_value="VA_TEST"), \
+             patch("ap.exit_safety._extract_long_position_qty", return_value=2):
+            result = resolve_exit_broker_truth(
+                broker=broker,
+                client_id=_CLIENT_ID,
+                contract=_CONTRACT,
+            )
+
+        assert result["broker_truth_open_qty"] == 2
+        assert result["is_fresh_exact"] is True
+        assert result["audit"]["snapshot_status"] == "exact_match"
+        assert result["audit"]["exact_contract_match"] is True
+
+    def test_audit_fields_present_on_absent_contract(self):
+        """Audit dict must include all required fields when contract is absent."""
+        result = self._run_broker_truth(list_positions_return=[])
+        audit = result["audit"]
+
+        assert "snapshot_status" in audit
+        assert "exact_contract_match" in audit
+        assert "broker_position_count" in audit
+        assert audit["exact_contract_match"] is False, (
+            "exact_contract_match must be False for absent contract (not an exact row match)"
+        )
+        assert audit["snapshot_status"] == "contract_absent_open_qty_zero"
+        assert audit["broker_position_count"] == 0
+
+    def test_malformed_payload_still_returns_none(self):
+        """Malformed list_positions payload → broker_truth_open_qty=None (unchanged)."""
+        from ap.exit_safety import resolve_exit_broker_truth
+
+        broker = MagicMock()
+        broker.list_positions = MagicMock(return_value="NOT_A_LIST")
+        broker.account_id = "VA_TEST"
+
+        result = resolve_exit_broker_truth(
+            broker=broker,
+            client_id=_CLIENT_ID,
+            contract=_CONTRACT,
+        )
+
+        assert result["broker_truth_open_qty"] is None
+        assert result["is_fresh_exact"] is False
+        assert result["audit"]["snapshot_status"] == "broker_positions_malformed"

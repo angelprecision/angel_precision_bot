@@ -770,8 +770,15 @@ def test_broker_flat_exact_match_blocks_even_without_circuit_breaker_trip(monkey
 
 
 def test_broker_wrong_occ_contract_does_not_override_breaker(monkeypatch, mock_broker):
+    """
+    Production-shape fix: broker returns a DIFFERENT OCC contract (260703 vs 260626).
+    The requested contract (260626) is absent from the snapshot — that means the broker
+    confirms qty=0 for 260626 (it closed/expired). Must fire SYNTHETIC_POSITION_STALE_BROKER_FLAT,
+    not fall through as "no broker truth."
+    OLD expected "exit_circuit_breaker_tripped" — that was the VZ/META bug.
+    """
     monkeypatch.setenv("MAX_EXIT_REJECTIONS_BEFORE_HALT", "5")
-    _patch_db(
+    fake_conn = _patch_db(
         monkeypatch,
         lambda sql, params: _open_position_row() if "FROM positions" in sql else {"rejection_count": 5},
     )
@@ -792,13 +799,24 @@ def test_broker_wrong_occ_contract_does_not_override_breaker(monkeypatch, mock_b
     )
 
     assert result["ok"] is False
-    assert result["reason"] == "exit_circuit_breaker_tripped"
+    assert result["reason"] == "SYNTHETIC_POSITION_STALE_BROKER_FLAT", (
+        "Broker has a DIFFERENT option (260703) but NOT 260626. "
+        "260626 absent from snapshot = broker confirms 260626 is flat. "
+        "Must block as stale, not fall through to circuit_breaker_tripped."
+    )
     assert mock_broker.session.post.call_count == 0
 
 
 def test_broker_other_account_does_not_override_breaker(monkeypatch, mock_broker):
+    """
+    Production-shape fix: broker returns the contract but for a different account
+    (OTHER-ACC vs ACC123). After account-filtering, no match for ACC123.
+    Absent-for-this-account = broker confirms ACC123 is flat on this contract.
+    Must fire SYNTHETIC_POSITION_STALE_BROKER_FLAT, not "no broker truth."
+    OLD expected "exit_circuit_breaker_tripped" — that was the bug.
+    """
     monkeypatch.setenv("MAX_EXIT_REJECTIONS_BEFORE_HALT", "5")
-    _patch_db(
+    fake_conn = _patch_db(
         monkeypatch,
         lambda sql, params: _open_position_row() if "FROM positions" in sql else {"rejection_count": 5},
     )
@@ -819,7 +837,10 @@ def test_broker_other_account_does_not_override_breaker(monkeypatch, mock_broker
     )
 
     assert result["ok"] is False
-    assert result["reason"] == "exit_circuit_breaker_tripped"
+    assert result["reason"] == "SYNTHETIC_POSITION_STALE_BROKER_FLAT", (
+        "Contract is in OTHER-ACC, not ACC123. For ACC123, contract is absent = flat. "
+        "Must block as stale, not circuit_breaker_tripped."
+    )
     assert mock_broker.session.post.call_count == 0
 
 
@@ -874,7 +895,14 @@ def test_requested_qty_greater_than_broker_truth_blocks_no_oversell(monkeypatch,
     assert mock_broker.session.post.call_count == 0
 
 
-def test_contract_not_matched_does_not_mark_position_closed(monkeypatch, mock_broker):
+def test_empty_positions_marks_stale_position_closed(monkeypatch, mock_broker):
+    """
+    Production-shape fix (formerly 'test_contract_not_matched_does_not_mark_position_closed').
+    Empty positions list = broker confirms ALL positions flat = this contract is flat.
+    OSM must fire SYNTHETIC_POSITION_STALE_BROKER_FLAT and mark position CLOSED.
+    OLD expected circuit_breaker_tripped + NO position close. That was the VZ/META bug.
+    NEW (correct) behavior: stale position gets marked CLOSED to stop repeat-fire loop.
+    """
     monkeypatch.setenv("MAX_EXIT_REJECTIONS_BEFORE_HALT", "5")
     fake_conn = _patch_db(
         monkeypatch,
@@ -895,8 +923,17 @@ def test_contract_not_matched_does_not_mark_position_closed(monkeypatch, mock_br
     )
 
     assert result["ok"] is False
-    assert result["reason"] == "exit_circuit_breaker_tripped"
-    assert not any("UPDATE positions" in sql and "status = 'CLOSED'" in sql for sql, _ in fake_conn.queries)
+    assert result["reason"] == "SYNTHETIC_POSITION_STALE_BROKER_FLAT", (
+        "Empty broker positions list MUST block with SYNTHETIC_POSITION_STALE_BROKER_FLAT. "
+        "It must NOT fall through as 'no broker truth' and trigger circuit_breaker_tripped. "
+        "That fallthrough was the VZ/META production shape bug."
+    )
+    assert mock_broker.session.post.call_count == 0
+    # Position row must be marked CLOSED to prevent repeat-fire loop
+    assert any(
+        "UPDATE positions" in sql and "'CLOSED'" in sql
+        for sql, _ in fake_conn.queries
+    ), "Empty broker snapshot must mark position CLOSED to stop the repeat-fire loop"
 
 
 def test_duplicate_exit_guard_still_blocks_before_override(monkeypatch, mock_broker):
