@@ -2615,7 +2615,6 @@ class APContractSelectionEngine:
             scored.append((s, opt))
 
         scored.sort(key=lambda x: x[0], reverse=True)
-        best_score, best = scored[0]
 
         # ── CANDIDATE AUDIT — log why every contract won or lost ──────────────
         # This is how you answer "why did we pick $0.11 instead of $0.50?"
@@ -2638,470 +2637,384 @@ class APContractSelectionEngine:
         except Exception:
             pass
 
-        # ── CHEAP CONTRACT UPGRADE PASS ───────────────────────────────────────
-        # If selected contract is below MIN_ACCEPTABLE_PREMIUM, look for a
-        # better-priced contract in the $50–$350 range.
-        # Cheap contracts ($0.10–$0.49) are fragile: 1 cent move = -10% loss,
-        # fills are hard, and exits fail repeatedly (as seen with NVDA $0.11).
         _MIN_ACCEPTABLE_PREMIUM = float(os.getenv("MIN_ACCEPTABLE_PREMIUM_PER_CONTRACT", "50"))
         _MAX_UPGRADE_PREMIUM    = float(os.getenv("MAX_IDEAL_PREMIUM_PER_CONTRACT", "350"))
+        _MIN_DELTA              = float(os.getenv("MIN_CONTRACT_DELTA", "0.10"))
+        _MAX_OTM_PCT            = float(os.getenv("MAX_OTM_PCT", "0.12"))
+        _final_prem_cap         = _get_max_premium(ticker)
+        _effective_budget_used, _max_trade_cap, _budget_was_clipped = _effective_budget(budget)
+        _candidate_table_top_n = int(os.getenv("SELECTOR_CANDIDATE_TABLE_TOP_N", "15"))
+        _final_candidate_rejections: list[dict] = []
 
-        is_live_upgrade, _ = _pricing_basis_for_mode(_selector_mode)
+        def _candidate_audit_payload(selected_symbol, selected_reason):
+            try:
+                payload = _build_candidate_audit(
+                    scored,
+                    underlying_price or 0.0,
+                    selected_symbol=selected_symbol,
+                    selected_reason=selected_reason,
+                    rejections=_rejections,
+                    top_n=_candidate_table_top_n,
+                )
+                if isinstance(payload, dict):
+                    payload["final_candidate_rejections"] = list(_final_candidate_rejections)
+                return payload
+            except Exception:
+                return None
 
-        def _exec_premium(opt: dict) -> float:
-            b = _safe_float(opt.get("bid"))
-            a = _safe_float(opt.get("ask"))
-            ep = a if is_live_upgrade else (b + a) / 2
-            return ep * 100
+        def _record_final_rejection(
+            rank_idx: int,
+            opt: dict,
+            score: float,
+            selected_candidate: Optional[SelectedContract],
+            *,
+            stage: str,
+            reason_code: str,
+            explanation: str,
+            inputs: Optional[dict] = None,
+            thresholds: Optional[dict] = None,
+            context: Optional[dict] = None,
+            tradeability_diag: Optional[dict] = None,
+        ) -> None:
+            candidate_row = _build_candidate_row(
+                opt,
+                rank_score=score,
+                rejected_at_step=stage,
+                rejection_reason=reason_code,
+                selected=False,
+            )
+            candidate_row["rank"] = rank_idx + 1
+            candidate_row["contract"] = candidate_row["symbol"]
+            candidate_row["reason_code"] = reason_code
+            candidate_row["explanation"] = explanation
+            if selected_candidate is not None:
+                candidate_row["premium_per_contract_usd"] = _safe_float(selected_candidate.premium_per_contract)
+                candidate_row["affordable_contracts"] = int(selected_candidate.affordable_contracts or 0)
+                candidate_row["pricing_basis"] = selected_candidate.pricing_basis
+            if tradeability_diag:
+                candidate_row["tradeability_diag"] = dict(tradeability_diag)
+            _final_candidate_rejections.append(candidate_row)
+            self._emit_selector_event(
+                plan,
+                stage=stage,
+                decision="REJECT",
+                reason_code=reason_code,
+                explanation=explanation,
+                contract=opt.get("symbol"),
+                inputs=inputs,
+                thresholds=thresholds,
+                context=context,
+            )
+            failure = {
+                "stage": stage,
+                "reason_code": reason_code,
+                "explanation": explanation,
+            }
+            if tradeability_diag:
+                failure["tradeability_diag"] = dict(tradeability_diag)
+            self._set_last_failure(failure)
 
-        best_exec_prem = _exec_premium(best)
+        selected = None
+        for _rank_idx, (candidate_score, candidate_opt) in enumerate(scored):
+            candidate = self._build_selected(candidate_opt, candidate_score, budget, today)
+            if candidate is None:
+                _record_final_rejection(
+                    _rank_idx,
+                    candidate_opt,
+                    candidate_score,
+                    None,
+                    stage="contract_build",
+                    reason_code="NO_AFFORDABLE_CONTRACT",
+                    explanation=f"Unable to build selected contract for {candidate_opt.get('symbol', '?')}",
+                )
+                continue
 
-        if best_exec_prem < _MIN_ACCEPTABLE_PREMIUM:
-            upgrade_pool = []
-            for _s, _c in scored[1:]:  # already sorted best-first
-                _prem = _exec_premium(_c)
-                if _MIN_ACCEPTABLE_PREMIUM <= _prem <= _MAX_UPGRADE_PREMIUM:
-                    _delta_val, _ = _extract_abs_delta(_c)
-                    if _delta_val is not None:  # require real Greeks on upgrade
-                        upgrade_pool.append((_s, _c, _prem))
+            _candidate_context = {
+                "candidate_rank": _rank_idx + 1,
+                "candidate_table": _candidate_audit_payload(candidate.contract_symbol, candidate.selection_reason),
+            }
 
-            if upgrade_pool:
-                upgrade_pool.sort(key=lambda x: x[0], reverse=True)
-                old_sym   = best.get("symbol")
-                old_prem  = best_exec_prem
-                best_score, best, new_prem = upgrade_pool[0]
+            if _budget_was_clipped and _rank_idx == 0:
                 log.warning(
-                    "[%s] CONTRACT_UPGRADE | %s ($%.0f) → %s ($%.0f) | reason=cheap_contract_upgrade",
-                    ticker, old_sym, old_prem, best.get("symbol"), new_prem,
+                    "[%s] Budget clipped by selector | upstream_budget=$%.0f max_trade_usd=$%.0f effective_budget=$%.0f",
+                    ticker, budget, _max_trade_cap, _effective_budget_used,
                 )
                 self._emit_selector_event(
-                    plan, stage="contract_upgrade", decision="ALLOW",
-                    reason_code="CHEAP_CONTRACT_UPGRADED",
+                    plan,
+                    stage="budget_gate",
+                    decision="ALLOW",
+                    reason_code="BUDGET_CLIPPED_BY_SELECTOR",
                     explanation=(
-                        f"Selected {old_sym} premium ${old_prem:.0f} below minimum "
-                        f"${_MIN_ACCEPTABLE_PREMIUM:.0f}; upgraded to "
-                        f"{best.get('symbol')} premium ${new_prem:.0f}"
+                        f"Upstream budget ${budget:.0f} clipped to MAX_TRADE_USD "
+                        f"${_max_trade_cap:.0f}; effective selector budget=${_effective_budget_used:.0f}"
                     ),
-                    contract=best.get("symbol"),
-                    inputs={"old_contract": old_sym, "old_premium": round(old_prem, 2),
-                            "new_contract": best.get("symbol"), "new_premium": round(new_prem, 2)},
-                    thresholds={"min_acceptable_premium": _MIN_ACCEPTABLE_PREMIUM,
-                                "max_upgrade_premium": _MAX_UPGRADE_PREMIUM},
-                )
-            else:
-                _allow_cheap = os.getenv("ALLOW_CHEAP_CONTRACT_IF_ONLY_CHOICE", "false").lower() == "true"
-                log.warning(
-                    "[%s] CHEAP_CONTRACT_%s | %s premium=$%.0f below min=$%.0f — no upgrade found",
-                    ticker,
-                    "ALLOWED" if _allow_cheap else "BLOCKED",
-                    best.get("symbol"), best_exec_prem, _MIN_ACCEPTABLE_PREMIUM,
-                )
-                self._emit_selector_event(
-                    plan, stage="cheap_contract_gate",
-                    decision="ALLOW" if _allow_cheap else "REJECT",
-                    reason_code="CHEAP_CONTRACT_NO_UPGRADE" if not _allow_cheap else "CHEAP_CONTRACT_ONLY_CHOICE",
-                    explanation=(
-                        f"{best.get('symbol')} premium ${best_exec_prem:.0f} below "
-                        f"${_MIN_ACCEPTABLE_PREMIUM:.0f} and no upgrade available. "
-                        f"{'Allowed by ALLOW_CHEAP_CONTRACT_IF_ONLY_CHOICE.' if _allow_cheap else 'Blocked.'}"
-                    ),
-                    contract=best.get("symbol"),
-                    inputs={"selected_contract": best.get("symbol"),
-                            "selected_premium": round(best_exec_prem, 2)},
-                    thresholds={"min_acceptable_premium": _MIN_ACCEPTABLE_PREMIUM,
-                                "allow_cheap_if_only_choice": _allow_cheap},
-                    context={
-                        "candidate_table": _build_candidate_audit(
-                            scored,
-                            underlying_price or 0.0,
-                            selected_symbol=best.get("symbol"),
-                            selected_reason="cheap_contract_no_upgrade",
-                            rejections=_rejections,
-                            top_n=int(os.getenv("SELECTOR_CANDIDATE_TABLE_TOP_N", "15")),
-                        ),
+                    contract=candidate.contract_symbol,
+                    inputs={
+                        "upstream_budget": _safe_float(budget),
+                        "effective_budget": _safe_float(_effective_budget_used),
+                        "max_trade_usd": _safe_float(_max_trade_cap),
+                        "premium_per_contract": _safe_float(candidate.premium_per_contract),
                     },
+                    thresholds={"max_trade_usd": _max_trade_cap},
+                    context={"budget_clipped": True},
                 )
+
+            if candidate.premium_per_contract < _MIN_ACCEPTABLE_PREMIUM:
+                _allow_cheap = os.getenv("ALLOW_CHEAP_CONTRACT_IF_ONLY_CHOICE", "false").lower() == "true"
                 if not _allow_cheap:
-                    _attach_selector_failure(
-                        plan,
-                        reason_code="NO_AFFORDABLE_CONTRACT",
+                    _record_final_rejection(
+                        _rank_idx,
+                        candidate_opt,
+                        candidate_score,
+                        candidate,
+                        stage="cheap_contract_gate",
+                        reason_code="CHEAP_CONTRACT_NO_UPGRADE",
                         explanation=(
-                            f"{best.get('symbol','?')} premium ${best_exec_prem:.0f}"
-                            f" below min ${_MIN_ACCEPTABLE_PREMIUM:.0f}"
-                            f" and no upgrade found | chain={_sel_chain_rows}"
-                            f" survivors={_sel_survivors}"
+                            f"{candidate.contract_symbol} premium ${candidate.premium_per_contract:.0f} below "
+                            f"${_MIN_ACCEPTABLE_PREMIUM:.0f}; evaluating next ranked candidate."
                         ),
-                        chain_rows=_sel_chain_rows,
-                        survivor_count=_sel_survivors,
-                        reject_buckets=_sel_rejections,
-                        base_url=_sel_base_url,
-                        execution_mode=_sel_mode,
-                        selection_diagnostics=_selector_request_diagnostics(request_context),
+                        inputs={
+                            "selected_contract": candidate.contract_symbol,
+                            "selected_premium": round(candidate.premium_per_contract, 2),
+                        },
+                        thresholds={
+                            "min_acceptable_premium": _MIN_ACCEPTABLE_PREMIUM,
+                            "max_upgrade_premium": _MAX_UPGRADE_PREMIUM,
+                            "allow_cheap_if_only_choice": _allow_cheap,
+                        },
+                        context=_candidate_context,
                     )
-                    return None
-        selected = self._build_selected(best, best_score, budget, today)
+                    continue
+
+            if candidate.affordable_contracts < 1:
+                if _selector_mode != "LIVE":
+                    if candidate.premium_per_contract > self.max_premium:
+                        _record_final_rejection(
+                            _rank_idx,
+                            candidate_opt,
+                            candidate_score,
+                            candidate,
+                            stage="affordability_gate",
+                            reason_code="PAPER_PREMIUM_CAP",
+                            explanation=(
+                                f"Paper premium cap: ${candidate.premium_per_contract:.0f} "
+                                f"> max ${self.max_premium:.0f} — valid contract but too expensive for paper."
+                            ),
+                            inputs={
+                                "premium_per_contract": _safe_float(candidate.premium_per_contract),
+                                "max_premium": _safe_float(self.max_premium),
+                            },
+                            thresholds={"max_premium": self.max_premium},
+                            context=dict({"mode": self.mode}, **_candidate_context),
+                        )
+                        continue
+                    log.warning("[%s] budget $%.0f < premium $%.0f -- forcing 1 contract",
+                                ticker, budget, candidate.premium_per_contract)
+                    self._emit_selector_event(
+                        plan,
+                        stage="affordability_gate",
+                        decision="ALLOW",
+                        reason_code="FORCED_1_FOR_PAPER",
+                        explanation=(
+                            f"Paper override: budget ${budget:.0f} < premium "
+                            f"${candidate.premium_per_contract:.0f} — forcing 1 contract. "
+                            "NOT valid for live trading."
+                        ),
+                        contract=candidate.contract_symbol,
+                        inputs={
+                            "budget": _safe_float(budget),
+                            "premium_per_contract": _safe_float(candidate.premium_per_contract),
+                        },
+                        context={"mode": self.mode, "simulation_override": True},
+                    )
+                    candidate = SelectedContract(
+                        contract_symbol=candidate.contract_symbol,
+                        expiration=candidate.expiration,
+                        strike=candidate.strike,
+                        option_type=candidate.option_type,
+                        bid=candidate.bid,
+                        ask=candidate.ask,
+                        mid=candidate.mid,
+                        spread_pct=candidate.spread_pct,
+                        delta=candidate.delta,
+                        open_interest=candidate.open_interest,
+                        volume=candidate.volume,
+                        premium_per_share=candidate.premium_per_share,
+                        premium_per_contract=candidate.premium_per_contract,
+                        affordable_contracts=1,
+                        scoring_price_per_share=candidate.scoring_price_per_share,
+                        execution_price_per_share=candidate.execution_price_per_share,
+                        effective_budget=candidate.effective_budget,
+                        budget_clipped=candidate.budget_clipped,
+                        pricing_basis=candidate.pricing_basis,
+                        selection_reason=candidate.selection_reason + " [forced_1]",
+                        selection_score=candidate.selection_score,
+                        dte=candidate.dte,
+                        candidate_audit=candidate.candidate_audit,
+                    )
+                else:
+                    _equity = _safe_float(_sizing_val(plan, "account_equity", "equity", default=0)) or None
+                    _max_pos_pct = _safe_float(_sizing_val(plan, "risk_pct", "max_position_pct", default=0)) or None
+                    _max_afford_prem = _safe_float(_sizing_val(plan, "max_affordable_premium", default=0)) or None
+                    _ctx_budget = _safe_float(budget)
+                    _underlying = _safe_float(underlying_price) or None
+                    _tradeability_diag = {
+                        "equity": _equity,
+                        "max_position_pct": _max_pos_pct,
+                        "max_trade_usd": _safe_float(_max_trade_usd()),
+                        "max_affordable_premium": _max_afford_prem,
+                        "underlying_price": _underlying,
+                        "budget": _ctx_budget,
+                        "budget_source": _budget_constraints.get("selected_source"),
+                        "budget_constraints": _budget_constraints,
+                        "selected_dte": _safe_float(getattr(candidate, "dte", None)),
+                        "near_atm_premium_estimate": _safe_float(candidate.premium_per_contract),
+                        "cheapest_quality_survivor_premium": _safe_float(candidate.premium_per_contract),
+                        "classification": "UNTRADEABLE_FOR_ACCOUNT_SIZE",
+                        "premium_per_share": _safe_float(candidate.premium_per_share),
+                        "premium_per_contract_usd": _safe_float(candidate.premium_per_contract),
+                        "ask_cost": round(_safe_float(candidate.premium_per_contract), 2),
+                        "qty_attempted": 1,
+                        "projected_reserved_cost": round(_safe_float(candidate.premium_per_contract), 2),
+                        "projected_reserved_cost_usd": round(_safe_float(candidate.premium_per_contract), 2),
+                    }
+                    _diag_summary = (
+                        f"equity=${_equity or 0:.0f} budget=${_ctx_budget or 0:.0f} "
+                        f"premium=${candidate.premium_per_contract:.0f} "
+                        f"underlying=${_underlying or 0:.2f} dte={getattr(candidate,'dte',None)}"
+                    )
+                    _explanation = (
+                        f"Quality contract {candidate.contract_symbol} @ "
+                        f"${candidate.premium_per_contract:.0f}/contract exceeds budget "
+                        f"${_ctx_budget or 0:.0f} — structurally untradeable for this account "
+                        f"size [{_diag_summary}]. No ticker blacklist; eligible again if a "
+                        f"cheaper quality contract appears or the account grows."
+                    )
+                    self._set_last_failure({
+                        "stage": "affordability_gate",
+                        "reason_code": "UNTRADEABLE_FOR_ACCOUNT_SIZE",
+                        "explanation": _explanation,
+                        "tradeability_diag": _tradeability_diag,
+                    })
+                    # return None after ranked fallback if no later candidate passes.
+                    _record_final_rejection(
+                        _rank_idx,
+                        candidate_opt,
+                        candidate_score,
+                        candidate,
+                        stage="affordability_gate",
+                        reason_code="UNTRADEABLE_FOR_ACCOUNT_SIZE",  # return None if no later candidate passes.
+                        explanation=_explanation,
+                        inputs=_tradeability_diag,
+                        thresholds={"min_contracts": 1},
+                        context=_candidate_context,
+                        tradeability_diag=_tradeability_diag,
+                    )
+                    continue
+
+            if candidate.delta is not None and candidate.delta < _MIN_DELTA:
+                _record_final_rejection(
+                    _rank_idx,
+                    candidate_opt,
+                    candidate_score,
+                    candidate,
+                    stage="deep_otm_gate",
+                    reason_code="DELTA_OUT_OF_RANGE",
+                    explanation=f"Deep OTM gate: delta={candidate.delta:.2f} < min={_MIN_DELTA:.2f}",
+                    inputs={"delta": candidate.delta, "strike": candidate.strike},
+                    thresholds={"min_delta": _MIN_DELTA},
+                    context=_candidate_context,
+                )
+                continue
+
+            if underlying_price and underlying_price > 0 and candidate.strike > 0:
+                _otm_pct = abs(candidate.strike - underlying_price) / underlying_price
+                if _otm_pct > _MAX_OTM_PCT:
+                    _record_final_rejection(
+                        _rank_idx,
+                        candidate_opt,
+                        candidate_score,
+                        candidate,
+                        stage="deep_otm_gate",
+                        reason_code="DELTA_OUT_OF_RANGE",
+                        explanation=(
+                            f"Deep OTM gate: strike={candidate.strike:.2f} "
+                            f"underlying={underlying_price:.2f} "
+                            f"OTM={_otm_pct*100:.1f}% > max={_MAX_OTM_PCT*100:.0f}%"
+                        ),
+                        inputs={
+                            "strike": _safe_float(candidate.strike),
+                            "underlying_price": _safe_float(underlying_price),
+                            "otm_pct": round(_otm_pct, 4),
+                            "delta": _safe_float(candidate.delta),
+                        },
+                        thresholds={"max_otm_pct": _MAX_OTM_PCT},
+                        context=_candidate_context,
+                    )
+                    continue
+
+            if candidate.premium_per_contract > _final_prem_cap:
+                _record_final_rejection(
+                    _rank_idx,
+                    candidate_opt,
+                    candidate_score,
+                    candidate,
+                    stage="premium_gate",
+                    reason_code="PREMIUM_CAP_EXCEEDED",
+                    explanation=(
+                        f"Final premium gate: ${candidate.premium_per_contract:.0f} "
+                        f"> ${_final_prem_cap:.0f} per-ticker cap for {ticker}"
+                    ),
+                    inputs={
+                        "premium_per_contract": _safe_float(candidate.premium_per_contract),
+                        "ticker_cap": _safe_float(_final_prem_cap),
+                    },
+                    thresholds={"ticker_premium_cap": _final_prem_cap},
+                    context=_candidate_context,
+                )
+                continue
+
+            selected = candidate
+            break
+
         if selected is None:
+            _final_failure = _final_candidate_rejections[0] if _final_candidate_rejections else None
+            _final_reason_code = (_final_failure or {}).get("reason_code", "NO_AFFORDABLE_CONTRACT")
+            _final_explanation = (_final_failure or {}).get(
+                "explanation",
+                f"No ranked candidates survived final gates | chain={_sel_chain_rows} survivors={_sel_survivors}",
+            )
+            _failure_diagnostics = dict(_selector_request_diagnostics(request_context))
+            _failure_diagnostics["final_candidate_rejections"] = list(_final_candidate_rejections)
+            _failure_diagnostics["pricing_basis"] = _pricing_basis_for_mode(_selector_mode)[1]
+            _failure_diagnostics["sizing_context"] = dict(_sizing_ctx) if isinstance(_sizing_ctx, dict) else {}
+            _failure_candidate_audit = _candidate_audit_payload(None, _final_reason_code)
+            if _failure_candidate_audit is not None:
+                _failure_diagnostics["candidate_table"] = _failure_candidate_audit
+            _attach_selector_failure(
+                plan,
+                reason_code=_final_reason_code,
+                explanation=_final_explanation,
+                chain_rows=_sel_chain_rows,
+                survivor_count=_sel_survivors,
+                reject_buckets=_sel_rejections,
+                base_url=_sel_base_url,
+                execution_mode=_sel_mode,
+                best_rejected_candidate=_final_failure or _best_rejected_candidate,
+                chain_quote_validity=_chain_quote_validity or None,
+                direct_quote_recovery_audit=_direct_quote_recovery_audit,
+                selection_diagnostics=_failure_diagnostics,
+            )
             return None
 
-        # Persist compact candidate-table evidence from the final sorted
-        # survivor list + rejection counts. This is observational only.
         try:
-            selected.candidate_audit = _build_candidate_audit(
-                scored,
-                underlying_price or 0.0,
-                selected_symbol=selected.contract_symbol,
-                selected_reason=selected.selection_reason,
-                rejections=_rejections,
-                top_n=int(os.getenv("SELECTOR_CANDIDATE_TABLE_TOP_N", "15")),
+            selected.candidate_audit = _candidate_audit_payload(
+                selected.contract_symbol,
+                selected.selection_reason,
             )
         except Exception:
             selected.candidate_audit = None
         _candidate_context = {"candidate_table": selected.candidate_audit} if selected.candidate_audit else None
-
-        _effective_budget_used, _max_trade_cap, _budget_was_clipped = _effective_budget(budget)
-        if _budget_was_clipped:
-            log.warning(
-                "[%s] Budget clipped by selector | upstream_budget=$%.0f max_trade_usd=$%.0f effective_budget=$%.0f",
-                ticker, budget, _max_trade_cap, _effective_budget_used,
-            )
-            self._emit_selector_event(
-                plan,
-                stage="budget_gate",
-                decision="ALLOW",
-                reason_code="BUDGET_CLIPPED_BY_SELECTOR",
-                explanation=(
-                    f"Upstream budget ${budget:.0f} clipped to MAX_TRADE_USD "
-                    f"${_max_trade_cap:.0f}; effective selector budget=${_effective_budget_used:.0f}"
-                ),
-                contract=selected.contract_symbol,
-                inputs={
-                    "upstream_budget": _safe_float(budget),
-                    "effective_budget": _safe_float(_effective_budget_used),
-                    "max_trade_usd": _safe_float(_max_trade_cap),
-                    "premium_per_contract": _safe_float(selected.premium_per_contract),
-                },
-                thresholds={"max_trade_usd": _max_trade_cap},
-                context={"budget_clipped": True},
-            )
-
-        # ── E. AFFORDABILITY GATE ────────────────────────────────────────────
-        if selected.affordable_contracts < 1:
-            if _selector_mode != "LIVE":
-                if selected.premium_per_contract > self.max_premium:
-                    log.warning("[%s] premium $%.0f > max $%.0f -- skipping (too expensive for paper)",
-                                ticker, selected.premium_per_contract, self.max_premium)
-                    self._emit_selector_event(
-                        plan,
-                stage="affordability_gate",
-                        decision="REJECT",
-                        reason_code="PAPER_PREMIUM_CAP",
-                        explanation=(
-                            f"Paper premium cap: ${selected.premium_per_contract:.0f} "
-                            f"> max ${self.max_premium:.0f} — valid contract but too expensive for paper."
-                        ),
-                        contract=selected.contract_symbol,
-                        inputs={
-                            "premium_per_contract": _safe_float(selected.premium_per_contract),
-                            "max_premium":          _safe_float(self.max_premium),
-                        },
-                        thresholds={"max_premium": self.max_premium},
-                        context=dict({"mode": self.mode}, **(_candidate_context or {})),
-                    )
-                    _attach_selector_failure(
-                        plan,
-                        reason_code="PREMIUM_CAP_EXCEEDED",
-                        explanation=(
-                            f"Paper premium cap: ${selected.premium_per_contract:.0f}"
-                            f" > max ${self.max_premium:.0f}"
-                        ),
-                        chain_rows=_sel_chain_rows,
-                        survivor_count=_sel_survivors,
-                        reject_buckets=_sel_rejections,
-                        base_url=_sel_base_url,
-                        execution_mode=_sel_mode,
-                        selection_diagnostics=_selector_request_diagnostics(request_context),
-                    )
-                    return None
-                log.warning("[%s] budget $%.0f < premium $%.0f -- forcing 1 contract",
-                            ticker, budget, selected.premium_per_contract)
-                self._emit_selector_event(
-                    plan,
-                stage="affordability_gate",
-                    decision="ALLOW",
-                    reason_code="FORCED_1_FOR_PAPER",
-                    explanation=(
-                        f"Paper override: budget ${budget:.0f} < premium "
-                        f"${selected.premium_per_contract:.0f} — forcing 1 contract. "
-                        "NOT valid for live trading."
-                    ),
-                    contract=selected.contract_symbol,
-                    inputs={
-                        "budget":               _safe_float(budget),
-                        "premium_per_contract": _safe_float(selected.premium_per_contract),
-                    },
-                    context={"mode": self.mode, "simulation_override": True},
-                )
-                selected = SelectedContract(
-                    contract_symbol      = selected.contract_symbol,
-                    expiration           = selected.expiration,
-                    strike               = selected.strike,
-                    option_type          = selected.option_type,
-                    bid                  = selected.bid,
-                    ask                  = selected.ask,
-                    mid                  = selected.mid,
-                    spread_pct           = selected.spread_pct,
-                    delta                = selected.delta,
-                    open_interest        = selected.open_interest,
-                    volume               = selected.volume,
-                    premium_per_share    = selected.premium_per_share,
-                    premium_per_contract = selected.premium_per_contract,
-                    affordable_contracts = 1,
-                    scoring_price_per_share   = selected.scoring_price_per_share,
-                    execution_price_per_share = selected.execution_price_per_share,
-                    effective_budget          = selected.effective_budget,
-                    budget_clipped            = selected.budget_clipped,
-                    pricing_basis             = selected.pricing_basis,
-                    selection_reason     = selected.selection_reason + " [forced_1]",
-                    selection_score      = selected.selection_score,
-                    dte                  = selected.dte,
-                    candidate_audit      = selected.candidate_audit,
-                )
-            else:
-                # ── PR2: account-size tradeability classification ─────────────
-                # A QUALITY contract was found (it passed every liquidity / spread
-                # / OI / delta gate) but it exceeds the per-trade budget. This is
-                # not a data or liquidity failure — it is structurally untradeable
-                # for THIS account size. Classify it precisely so the operator can
-                # tell "account too small for this name right now" apart from
-                # "bad data / no liquidity / wrong DTE". Breach-time authoritative:
-                # this runs only after the chain (and, under PR1, the DTE ladder)
-                # has been fully evaluated, so the quality contract is real.
-                #
-                # NOTE: this does NOT loosen any gate and does NOT change the
-                # decision — the live reject still returns None. It only upgrades
-                # the REASON from generic NO_AFFORDABLE_CONTRACT to the specific
-                # UNTRADEABLE_FOR_ACCOUNT_SIZE, with full budget diagnostics.
-                # Read sizing diagnostics from plan.metadata['sizing_context']
-                # first (their canonical production location); fall back to
-                # top-level attrs only if absent. Reading top-level alone returned
-                # None in production, defeating the diagnostics.
-                _equity = _safe_float(_sizing_val(plan, "account_equity", "equity", default=0)) or None
-                _max_pos_pct = _safe_float(_sizing_val(plan, "risk_pct", "max_position_pct", default=0)) or None
-                _max_afford_prem = _safe_float(_sizing_val(plan, "max_affordable_premium", default=0)) or None
-                _ctx_budget = _safe_float(budget)
-                _underlying = _safe_float(underlying_price) or None
-                _tradeability_diag = {
-                    "equity":                 _equity,
-                    "max_position_pct":       _max_pos_pct,
-                    "max_trade_usd":          _safe_float(_max_trade_usd()),
-                    "max_affordable_premium": _max_afford_prem,
-                    "underlying_price":       _underlying,
-                    "budget":                 _ctx_budget,
-                    "budget_source":          _budget_constraints.get("selected_source"),
-                    "budget_constraints":     _budget_constraints,
-                    "selected_dte":           _safe_float(getattr(selected, "dte", None)),
-                    "near_atm_premium_estimate": _safe_float(selected.premium_per_contract),
-                    "cheapest_quality_survivor_premium": _safe_float(selected.premium_per_contract),
-                    "classification":         "UNTRADEABLE_FOR_ACCOUNT_SIZE",
-                    # P0 (PR #299): explicit cap-math fields so operators can prove
-                    # exactly why the contract failed the account-size check. Previously
-                    # this required mental math from the log line.
-                    "premium_per_share":     _safe_float(selected.premium_per_share),
-                    "premium_per_contract_usd": _safe_float(selected.premium_per_contract),
-                    "ask_cost":              round(_safe_float(selected.premium_per_contract), 2),
-                    "qty_attempted":         1,   # deferred breach always starts at qty=1 for materialization
-                    "projected_reserved_cost": round(_safe_float(selected.premium_per_contract), 2),
-                    "projected_reserved_cost_usd": round(_safe_float(selected.premium_per_contract), 2),
-                }
-                log.warning(
-                    "[%s] UNTRADEABLE_FOR_ACCOUNT_SIZE -- quality contract %s @ "
-                    "$%.0f/contract exceeds budget $%.0f (equity=%s pct=%s) — "
-                    "not a data/liquidity failure",
-                    ticker, selected.contract_symbol,
-                    selected.premium_per_contract, _ctx_budget, _equity, _max_pos_pct,
-                )
-                # Flatten the key diagnostics INTO the explanation string so they
-                # survive downstream: ap/queue.py _derive_last_error and the
-                # deferred-breach audit persist reason_code/stage/explanation but
-                # may drop the structured tradeability_diag dict. Embedding the
-                # numbers in explanation guarantees they reach the order row.
-                _diag_summary = (
-                    f"equity=${_equity or 0:.0f} budget=${_ctx_budget or 0:.0f} "
-                    f"premium=${selected.premium_per_contract:.0f} "
-                    f"underlying=${_underlying or 0:.2f} dte={getattr(selected,'dte',None)}"
-                )
-                _explanation = (
-                    f"Quality contract {selected.contract_symbol} @ "
-                    f"${selected.premium_per_contract:.0f}/contract exceeds budget "
-                    f"${_ctx_budget or 0:.0f} — structurally untradeable for this account "
-                    f"size [{_diag_summary}]. No ticker blacklist; eligible again if a "
-                    f"cheaper quality contract appears or the account grows."
-                )
-                self._emit_selector_event(
-                    plan,
-                    stage="affordability_gate",
-                    decision="REJECT",
-                    reason_code="UNTRADEABLE_FOR_ACCOUNT_SIZE",
-                    explanation=_explanation,
-                    contract=selected.contract_symbol,
-                    inputs=_tradeability_diag,
-                    thresholds={"min_contracts": 1},
-                    context=_candidate_context,
-                )
-                # Decision remains fail-closed for LIVE account-size rejects: return None below.
-                # Record as the authoritative last-failure reason for the queue
-                # and the deferred-breach audit (consumed by PR3's taxonomy). Both
-                # the structured diag AND the flattened explanation are included so
-                # the numbers survive whichever downstream copies them.
-                self._set_last_failure({
-                    "stage": "affordability_gate",
-                    "reason_code": "UNTRADEABLE_FOR_ACCOUNT_SIZE",
-                    "explanation": _explanation,
-                    "tradeability_diag": _tradeability_diag,
-                })
-                _attach_selector_failure(
-                    plan,
-                    reason_code="UNTRADEABLE_FOR_ACCOUNT_SIZE",
-                    explanation=_explanation,
-                    chain_rows=_sel_chain_rows,
-                    survivor_count=_sel_survivors,
-                    reject_buckets=_sel_rejections,
-                    base_url=_sel_base_url,
-                    execution_mode=_sel_mode,
-                    best_rejected_candidate=_best_rejected_candidate,
-                    selection_diagnostics=_selector_request_diagnostics(request_context),
-                )
-                return None
-
-        if selected is None:
-            return None
-
-        # ── DEEP OTM GATE ────────────────────────────────────────────────────
-        # Reject contracts where delta is too low (too far OTM).
-        # A delta below 0.10 means the option barely moves with the stock.
-        # META $610 put when stock at $672 = 9% OTM, delta ~0.05 = lottery ticket.
-        # Better to skip the trade than buy a contract that can't win.
-        _MIN_DELTA = float(os.getenv("MIN_CONTRACT_DELTA", "0.10"))
-        if selected.delta is not None and selected.delta < _MIN_DELTA:
-            log.warning(
-                "[%s] DEEP OTM GATE: delta=%.2f < min=%.2f — contract too far OTM, skipping",
-                ticker, selected.delta, _MIN_DELTA,
-            )
-            self._emit_selector_event(
-                plan,
-                stage="deep_otm_gate",
-                decision="REJECT",
-                reason_code="DELTA_OUT_OF_RANGE",
-                explanation=f"Deep OTM gate: delta={selected.delta:.2f} < min={_MIN_DELTA:.2f}",
-                contract=selected.contract_symbol,
-                inputs={"delta": selected.delta, "strike": selected.strike},
-                thresholds={"min_delta": _MIN_DELTA},
-                context=_candidate_context,
-            )
-            _attach_selector_failure(
-                plan,
-                reason_code="DELTA_OUT_OF_RANGE",
-                explanation=(
-                    f"Deep OTM: delta={selected.delta:.2f} < min={_MIN_DELTA:.2f}"
-                    f" | {selected.contract_symbol}"
-                ),
-                chain_rows=_sel_chain_rows,
-                survivor_count=_sel_survivors,
-                reject_buckets=_sel_rejections,
-                base_url=_sel_base_url,
-                execution_mode=_sel_mode,
-                best_rejected_candidate=_best_rejected_candidate,
-                selection_diagnostics=_selector_request_diagnostics(request_context),
-            )
-            return None
-
-        # Also check moneyness if underlying price available
-        # Block if strike is more than 12% away from current price
-        _MAX_OTM_PCT = float(os.getenv("MAX_OTM_PCT", "0.12"))
-        if underlying_price and underlying_price > 0 and selected.strike > 0:
-            _otm_pct = abs(selected.strike - underlying_price) / underlying_price
-            if _otm_pct > _MAX_OTM_PCT:
-                log.warning(
-                    "[%s] DEEP OTM GATE: strike=%.2f underlying=%.2f OTM=%.1f%% > max=%.0f%% — skipping",
-                    ticker, selected.strike, underlying_price,
-                    _otm_pct * 100, _MAX_OTM_PCT * 100,
-                )
-                self._emit_selector_event(
-                    plan,
-                    stage="deep_otm_gate",
-                    decision="REJECT",
-                    reason_code="DELTA_OUT_OF_RANGE",
-                    explanation=(
-                        f"Deep OTM gate: strike={selected.strike:.2f} "
-                        f"underlying={underlying_price:.2f} "
-                        f"OTM={_otm_pct*100:.1f}% > max={_MAX_OTM_PCT*100:.0f}%"
-                    ),
-                    contract=selected.contract_symbol,
-                    inputs={
-                        "strike":           _safe_float(selected.strike),
-                        "underlying_price": _safe_float(underlying_price),
-                        "otm_pct":          round(_otm_pct, 4),
-                        "delta":            _safe_float(selected.delta),
-                    },
-                    thresholds={"max_otm_pct": _MAX_OTM_PCT},
-                    context=_candidate_context,
-                )
-                _attach_selector_failure(
-                    plan,
-                    reason_code="DELTA_OUT_OF_RANGE",
-                    explanation=(
-                        f"Deep OTM moneyness: strike={selected.strike:.2f}"
-                        f" underlying={underlying_price:.2f}"
-                        f" OTM={_otm_pct*100:.1f}% > max={_MAX_OTM_PCT*100:.0f}%"
-                    ),
-                    chain_rows=_sel_chain_rows,
-                    survivor_count=_sel_survivors,
-                    reject_buckets=_sel_rejections,
-                    base_url=_sel_base_url,
-                    execution_mode=_sel_mode,
-                    best_rejected_candidate=_best_rejected_candidate,
-                    selection_diagnostics=_selector_request_diagnostics(request_context),
-                )
-                return None
-
-        # ── FINAL PREMIUM GATE (per-ticker cap) ──────────────────────────────
-        _final_prem_cap = _get_max_premium(ticker)
-        if selected.premium_per_contract > _final_prem_cap:
-            log.warning("[%s] FINAL PREMIUM GATE: $%.0f > $%.0f per-ticker cap — blocking",
-                        ticker, selected.premium_per_contract, _final_prem_cap)
-            self._emit_selector_event(
-                plan,
-                stage="premium_gate",
-                decision="REJECT",
-                reason_code="PREMIUM_CAP_EXCEEDED",
-                explanation=(
-                    f"Final premium gate: ${selected.premium_per_contract:.0f} "
-                    f"> ${_final_prem_cap:.0f} per-ticker cap for {ticker}"
-                ),
-                contract=selected.contract_symbol,
-                inputs={
-                    "premium_per_contract": _safe_float(selected.premium_per_contract),
-                    "ticker_cap":           _safe_float(_final_prem_cap),
-                },
-                thresholds={"ticker_premium_cap": _final_prem_cap},
-                context=_candidate_context,
-            )
-            _attach_selector_failure(
-                plan,
-                reason_code="PREMIUM_CAP_EXCEEDED",
-                explanation=(
-                    f"Final premium gate: ${selected.premium_per_contract:.0f}"
-                    f" > ${_final_prem_cap:.0f} per-ticker cap for {ticker}"
-                ),
-                chain_rows=_sel_chain_rows,
-                survivor_count=_sel_survivors,
-                reject_buckets=_sel_rejections,
-                base_url=_sel_base_url,
-                execution_mode=_sel_mode,
-                best_rejected_candidate=_best_rejected_candidate,
-                selection_diagnostics=_selector_request_diagnostics(request_context),
-            )
-            return None
 
         # ── F. UPDATE PLAN IN-PLACE ───────────────────────────────────────────
         # Default behavior remains mutation because downstream execution expects

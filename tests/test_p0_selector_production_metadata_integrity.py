@@ -92,6 +92,13 @@ def _plan_object(**overrides):
     return SimpleNamespace(**_plan_dict(**overrides))
 
 
+def _force_rank(monkeypatch, scores):
+    def fake_rank(self, opt, budget, **kwargs):
+        return scores[opt["symbol"]]
+
+    monkeypatch.setattr(APContractSelectionEngine, "_rank_score", fake_rank)
+
+
 def test_blank_mode_rejects_before_market_data():
     selector = FakeSelector(mode="")
     result = selector.select(_plan_dict())
@@ -345,3 +352,102 @@ def test_malformed_budget_rejects_before_chain_fetch():
     assert result is None
     assert selector.fetch_calls == 0
     assert selector.get_last_failure()["reason_code"] == "INVALID_POSITION_BUDGET"
+
+
+def test_rank_one_unaffordable_falls_back_to_rank_two(monkeypatch):
+    expensive = _option(bid=4.48, ask=4.50, symbol="SPY260717C00501000")
+    affordable = _option(bid=2.48, ask=2.50, symbol="SPY260717C00500000")
+    _force_rank(monkeypatch, {expensive["symbol"]: 100.0, affordable["symbol"]: 90.0})
+    selector = FakeSelector(mode="LIVE", chain=[expensive, affordable])
+    plan = _plan_dict(metadata={"sizing_context": {"selector_budget": 260.0, "budget": 500.0}})
+    result = selector.select(plan)
+    assert result is not None
+    assert result.contract_symbol == affordable["symbol"]
+    assert selector.fetch_calls == 1
+    assert plan["selector_metadata"]["premium_per_contract_usd"] == pytest.approx(250.0)
+
+
+def test_cheap_contract_rejection_falls_back_to_next_candidate(monkeypatch):
+    cheap = _option(bid=0.48, ask=0.49, symbol="SPY260717C00495000")
+    valid = _option(bid=2.48, ask=2.50, symbol="SPY260717C00500000")
+    _force_rank(monkeypatch, {cheap["symbol"]: 100.0, valid["symbol"]: 90.0})
+    selector = FakeSelector(mode="LIVE", chain=[cheap, valid])
+    result = selector.select(_plan_dict())
+    assert result is not None
+    assert result.contract_symbol == valid["symbol"]
+    assert result.candidate_audit["final_candidate_rejections"][0]["reason_code"] == "CHEAP_CONTRACT_NO_UPGRADE"
+
+
+def test_rank_one_final_delta_fail_falls_back(monkeypatch):
+    low_delta = _option(symbol="SPY260717C00499000")
+    low_delta["greeks"] = {"delta": "0.06"}
+    valid = _option(symbol="SPY260717C00500000")
+    _force_rank(monkeypatch, {low_delta["symbol"]: 100.0, valid["symbol"]: 90.0})
+    selector = FakeSelector(mode="LIVE", chain=[low_delta, valid])
+    selector.target_delta = 0.2
+    selector.delta_band = 0.2
+    result = selector.select(_plan_dict())
+    assert result is not None
+    assert result.contract_symbol == valid["symbol"]
+    assert result.candidate_audit["final_candidate_rejections"][0]["reason_code"] == "DELTA_OUT_OF_RANGE"
+
+
+def test_rank_one_final_moneyness_fail_falls_back(monkeypatch):
+    far_otm = _option(symbol="SPY260717C00580000")
+    far_otm["strike"] = 580.0
+    valid = _option(symbol="SPY260717C00500000")
+    _force_rank(monkeypatch, {far_otm["symbol"]: 100.0, valid["symbol"]: 90.0})
+    selector = FakeSelector(mode="LIVE", chain=[far_otm, valid])
+    result = selector.select(_plan_dict())
+    assert result is not None
+    assert result.contract_symbol == valid["symbol"]
+    assert result.candidate_audit["final_candidate_rejections"][0]["contract"] == far_otm["symbol"]
+
+
+def test_rank_one_final_premium_cap_fail_falls_back(monkeypatch):
+    over_cap = _option(bid=4.48, ask=4.50, symbol="SPY260717C00501000")
+    valid = _option(bid=3.48, ask=3.50, symbol="SPY260717C00500000")
+    _force_rank(monkeypatch, {over_cap["symbol"]: 100.0, valid["symbol"]: 90.0})
+    selector = FakeSelector(mode="LIVE", chain=[over_cap, valid])
+    result = selector.select(_plan_dict(metadata={"sizing_context": {"budget": 800.0}}))
+    assert result is not None
+    assert result.contract_symbol == valid["symbol"]
+    assert result.candidate_audit["final_candidate_rejections"][0]["reason_code"] == "PREMIUM_CAP_EXCEEDED"
+
+
+def test_all_candidates_unaffordable_return_truthful_reason_and_no_preselection_mutation(monkeypatch):
+    first = _option(bid=4.48, ask=4.50, symbol="SPY260717C00501000")
+    second = _option(bid=3.48, ask=3.50, symbol="SPY260717C00500000")
+    _force_rank(monkeypatch, {first["symbol"]: 100.0, second["symbol"]: 90.0})
+    selector = FakeSelector(mode="LIVE", chain=[first, second])
+    plan = _plan_dict(metadata={"sizing_context": {"selector_budget": 200.0, "budget": 500.0}})
+    result = selector.select(plan)
+    assert result is None
+    assert selector.fetch_calls == 1
+    assert selector.get_last_failure()["reason_code"] == "UNTRADEABLE_FOR_ACCOUNT_SIZE"
+    assert plan.get("contract_symbol") is None
+    audit = plan["metadata"]["selector_failure"]["selection_diagnostics"]["final_candidate_rejections"]
+    assert [row["reason_code"] for row in audit] == [
+        "UNTRADEABLE_FOR_ACCOUNT_SIZE",
+        "UNTRADEABLE_FOR_ACCOUNT_SIZE",
+    ]
+
+
+def test_failure_audit_stays_deterministic_for_mixed_final_rejections(monkeypatch):
+    low_delta = _option(symbol="SPY260717C00499000")
+    low_delta["greeks"] = {"delta": "0.06"}
+    over_cap = _option(bid=4.48, ask=4.50, symbol="SPY260717C00501000")
+    _force_rank(monkeypatch, {low_delta["symbol"]: 100.0, over_cap["symbol"]: 90.0})
+    selector = FakeSelector(mode="LIVE", chain=[low_delta, over_cap])
+    selector.target_delta = 0.2
+    selector.delta_band = 0.2
+    plan = _plan_dict(metadata={"sizing_context": {"budget": 800.0}})
+    result = selector.select(plan)
+    assert result is None
+    failure = plan["metadata"]["selector_failure"]
+    assert failure["reason_code"] == "DELTA_OUT_OF_RANGE"
+    rejections = failure["selection_diagnostics"]["final_candidate_rejections"]
+    assert [row["reason_code"] for row in rejections] == [
+        "DELTA_OUT_OF_RANGE",
+        "PREMIUM_CAP_EXCEEDED",
+    ]
