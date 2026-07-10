@@ -191,6 +191,66 @@ def test_remaining_budget_ranking_selects_cheaper_valid_contract():
     assert result.affordable_contracts == 1
 
 
+def test_selector_budget_zero_blocks_before_market_data():
+    selector = FakeSelector(mode="LIVE")
+    plan = _plan_dict(
+        metadata={"sizing_context": {"budget": 500.0, "selector_budget": 0.0}},
+        max_position_usd=None,
+    )
+    result = selector.select(plan)
+    assert result is None
+    assert selector.fetch_calls == 0
+    assert selector.get_last_failure()["reason_code"] == "CAPITAL_NO_REMAINING"
+
+
+def test_remaining_capacity_zero_blocks_before_market_data():
+    selector = FakeSelector(mode="LIVE")
+    plan = _plan_dict(
+        metadata={"sizing_context": {"budget": 500.0, "remaining_capacity": 0.0}},
+        max_position_usd=500.0,
+    )
+    result = selector.select(plan)
+    assert result is None
+    assert selector.fetch_calls == 0
+    assert selector.get_last_failure()["reason_code"] == "CAPITAL_NO_REMAINING"
+
+
+def test_zero_authoritative_budget_beats_positive_constraints():
+    selector = FakeSelector(mode="LIVE")
+    plan = _plan_dict(
+        metadata={"sizing_context": {"selector_budget": 260.0, "remaining_capacity": 0.0}},
+        max_position_usd=500.0,
+    )
+    result = selector.select(plan)
+    assert result is None
+    assert selector.fetch_calls == 0
+    assert selector.get_last_failure()["reason_code"] == "CAPITAL_NO_REMAINING"
+
+
+def test_generic_budget_is_only_fallback_when_authoritative_constraints_missing():
+    selector = FakeSelector(mode="LIVE")
+    plan = _plan_dict(
+        metadata={"sizing_context": {"budget": 500.0}},
+        max_position_usd=None,
+    )
+    result = selector.select(plan)
+    assert result is not None
+    assert result.affordable_contracts == 2
+    assert plan["selector_metadata"]["budget_source"] == "budget"
+
+
+def test_negative_selector_budget_rejects_without_falling_back():
+    selector = FakeSelector(mode="LIVE")
+    plan = _plan_dict(
+        metadata={"sizing_context": {"budget": 500.0, "selector_budget": -10.0}},
+        max_position_usd=None,
+    )
+    result = selector.select(plan)
+    assert result is None
+    assert selector.fetch_calls == 0
+    assert selector.get_last_failure()["reason_code"] == "INVALID_POSITION_BUDGET"
+
+
 def test_dict_and_object_plans_select_equivalently():
     dict_result = FakeSelector(mode="LIVE").select(_plan_dict())
     obj_result = FakeSelector(mode="LIVE").select(_plan_object())
@@ -277,7 +337,10 @@ def test_two_contexts_on_one_selector_do_not_cross_contaminate_getters():
 def test_malformed_budget_rejects_before_chain_fetch():
     selector = FakeSelector(mode="LIVE")
     result = selector.select(
-        _plan_dict(metadata={"sizing_context": {"budget": "bad"}}, max_position_usd=None)
+        _plan_dict(
+            metadata={"sizing_context": {"budget": 500.0, "selector_budget": "bad"}},
+            max_position_usd=None,
+        )
     )
     assert result is None
     assert selector.fetch_calls == 0

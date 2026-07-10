@@ -1123,12 +1123,18 @@ def _pricing_basis_for_mode(mode: str) -> tuple[bool, str]:
     return is_live, "ASK_EXECUTION" if is_live else "MID_SIMULATION"
 
 def _selector_budget_constraints(plan) -> tuple[float, dict]:
-    """Return the most restrictive positive selector capital constraint.
+    """Return the effective selector capital constraint and its diagnostics.
 
     Production sizing metadata carries multiple capital limits. The selector
     must rank and size against the tightest real constraint, not the generic
     theoretical risk budget.
     """
+    authoritative_keys = (
+        "selector_budget",
+        "remaining_capacity",
+        "max_position_usd",
+    )
+    generic_keys = ("budget",)
     raw_values = {
         "selector_budget": _sizing_val(plan, "selector_budget", default=None),
         "remaining_capacity": _sizing_val(plan, "remaining_capacity", default=None),
@@ -1136,6 +1142,7 @@ def _selector_budget_constraints(plan) -> tuple[float, dict]:
         "budget": _sizing_val(plan, "budget", default=None),
     }
     positive = {}
+    zero = {}
     invalid = {}
     for key, raw in raw_values.items():
         if raw is None or raw == "":
@@ -1145,27 +1152,71 @@ def _selector_budget_constraints(plan) -> tuple[float, dict]:
         except (TypeError, ValueError):
             invalid[key] = raw
             continue
-        if value > 0:
+        if value < 0:
+            invalid[key] = raw
+        elif value == 0:
+            zero[key] = value
+        else:
             positive[key] = value
 
-    if not positive:
+    invalid_authoritative = {
+        key: invalid[key] for key in authoritative_keys if key in invalid
+    }
+    if invalid_authoritative:
         return 0.0, {
             "raw": raw_values,
-            "positive": {},
+            "positive": positive,
+            "zero": zero,
             "invalid": invalid,
             "selected_source": None,
             "selected_budget": 0.0,
             "most_restrictive": True,
+            "reason_code": "INVALID_POSITION_BUDGET",
         }
 
-    selected_source, selected_budget = min(positive.items(), key=lambda item: item[1])
+    zero_authoritative = {
+        key: zero[key] for key in authoritative_keys if key in zero
+    }
+    if zero_authoritative:
+        selected_source = min(authoritative_keys, key=lambda key: 0 if key in zero_authoritative else 1)
+        return 0.0, {
+            "raw": raw_values,
+            "positive": positive,
+            "zero": zero,
+            "invalid": invalid,
+            "selected_source": selected_source,
+            "selected_budget": 0.0,
+            "most_restrictive": True,
+            "reason_code": "CAPITAL_NO_REMAINING",
+        }
+
+    candidate_positive = {
+        key: value
+        for key, value in positive.items()
+        if key in authoritative_keys or key in generic_keys
+    }
+    if not candidate_positive:
+        return 0.0, {
+            "raw": raw_values,
+            "positive": positive,
+            "zero": zero,
+            "invalid": invalid,
+            "selected_source": None,
+            "selected_budget": 0.0,
+            "most_restrictive": True,
+            "reason_code": "INVALID_POSITION_BUDGET" if invalid else "CAPITAL_NO_REMAINING",
+        }
+
+    selected_source, selected_budget = min(candidate_positive.items(), key=lambda item: item[1])
     return selected_budget, {
         "raw": raw_values,
-        "positive": positive,
+        "positive": candidate_positive,
+        "zero": zero,
         "invalid": invalid,
         "selected_source": selected_source,
         "selected_budget": selected_budget,
         "most_restrictive": True,
+        "reason_code": None,
     }
 
 _PRO_TIER1_TICKERS = {
@@ -1701,12 +1752,16 @@ class APContractSelectionEngine:
             return None
 
         if budget <= 0:
-            _expl = f"Invalid selector position budget: {_budget_constraints.get('raw')!r}"
+            _budget_reason = _budget_constraints.get("reason_code") or "INVALID_POSITION_BUDGET"
+            if _budget_reason == "CAPITAL_NO_REMAINING":
+                _expl = f"No selector capital remaining: {_budget_constraints.get('raw')!r}"
+            else:
+                _expl = f"Invalid selector position budget: {_budget_constraints.get('raw')!r}"
             self._emit_selector_event(
                 plan,
                 stage="selector_entry",
                 decision="REJECT",
-                reason_code="INVALID_POSITION_BUDGET",
+                reason_code=_budget_reason,
                 explanation=_expl,
                 inputs={
                     "budget": budget_raw,
@@ -1717,7 +1772,7 @@ class APContractSelectionEngine:
             )
             _attach_selector_failure(
                 plan,
-                reason_code="INVALID_POSITION_BUDGET",
+                reason_code=_budget_reason,
                 explanation=_expl,
                 base_url=_sel_base_url,
                 execution_mode=_sel_mode,
