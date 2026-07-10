@@ -259,12 +259,15 @@ def test_dte_ladder_all_retryable_failures_remain_retryable(monkeypatch):
     sel.dte_ladder_probe_per_bucket = 3
     sel._last_failure = None
     sel._last_dte_ladder_audit = None
-    sel._fetch_expirations_list = MagicMock(return_value=["2026-07-01", "2026-07-08"])
+    from datetime import date, timedelta
+    _exp_a = (date.today() + timedelta(days=1)).isoformat()   # DTE=1 → bucket A (0-2)
+    _exp_c = (date.today() + timedelta(days=10)).isoformat()  # DTE=10 → bucket C (8+)
+    sel._fetch_expirations_list = MagicMock(return_value=[_exp_a, _exp_c])
 
     def _fake_select(plan, *, expiration_override=None):
         sel._last_failure = {
             "stage": "chain_fetch",
-            "reason_code": "CHAIN_PROVIDER_EMPTY_OPTIONS" if expiration_override == "2026-07-01" else "CHAIN_PARSE_EMPTY",
+            "reason_code": "CHAIN_PROVIDER_EMPTY_OPTIONS" if expiration_override == _exp_a else "CHAIN_PARSE_EMPTY",
             "explanation": "provider warming up",
         }
         return None
@@ -327,7 +330,10 @@ def test_chain_auth_error_remains_terminal(monkeypatch):
     sel.dte_ladder_probe_per_bucket = 2
     sel._last_failure = None
     sel._last_dte_ladder_audit = None
-    sel._fetch_expirations_list = MagicMock(return_value=["2026-07-01", "2026-07-08"])
+    from datetime import date, timedelta
+    _exp_a2 = (date.today() + timedelta(days=1)).isoformat()   # DTE=1 → bucket A
+    _exp_c2 = (date.today() + timedelta(days=10)).isoformat()  # DTE=10 → bucket C
+    sel._fetch_expirations_list = MagicMock(return_value=[_exp_a2, _exp_c2])
 
     def _fake_select(plan, *, expiration_override=None):
         sel._last_failure = {
