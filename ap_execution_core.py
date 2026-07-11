@@ -2106,6 +2106,13 @@ class APExecutionCore:
             timeframe=str(meta.get("timeframe") or "1d"), tier=str(meta.get("tier") or "B"),
             score=float(meta.get("score") or 0), trigger_type="breach",
         )
+        if not isinstance(getattr(recovered_plan, "metadata", None), dict):
+            recovered_plan.metadata = {}
+        recovered_plan.metadata.update({
+            "recovery_submit_owner": _claim_owner,
+            "recovery_submit_generation": _generation,
+            "recovery_submit_fenced": True,
+        })
         signal = {
             "signal_id": recovered_plan.signal_id, "local_order_id": local_order_id,
             "client_id": recovered_plan.client_id, "execution_mode": mode,
@@ -2116,6 +2123,8 @@ class APExecutionCore:
             "contract_symbol": contract, "contracts": qty,
             "limit_price": limit_price, "reserved_cost": reserved_cost,
             "contract_deferred": False, "_approved_plan": recovered_plan,
+            "recovery_submit_owner": _claim_owner,
+            "recovery_submit_generation": _generation,
         }
         crossed = datetime.fromisoformat(str(trigger_crossed_at))
         if crossed.tzinfo is None:

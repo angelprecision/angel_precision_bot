@@ -3,6 +3,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import ap_execution_core
+from ap.order_state_machine import APOrderStateMachine
 
 
 def _row(crash=False):
@@ -49,6 +50,8 @@ def test_broker_ready_claims_then_enters_canonical_callback_once():
     watched = core._on_entry_trigger.call_args.args[0]
     assert watched.signal["_approved_plan"].contract_symbol == _row()["contract"]
     assert watched.signal["contract_deferred"] is False
+    assert watched.signal["recovery_submit_owner"].startswith("recovery_submit:oid-1:")
+    assert watched.signal["_approved_plan"].metadata["recovery_submit_generation"] == 3
     core.order_state_machine.submit_existing_entry.assert_not_called()
 
 
@@ -109,3 +112,84 @@ def test_query_failure_is_retryable_and_never_posts():
     assert result["disposition"] == "RECONCILE_PENDING"
     assert result["reason_code"] == "RECONCILE_BROKER_QUERY_FAILED:TimeoutError"
     core.broker.place_order.assert_not_called()
+
+
+def _submit_osm(intent_results):
+    osm = object.__new__(APOrderStateMachine)
+    osm.client_id = "jason@example.com"
+    osm.execution_mode = "live"
+    row = _row()
+    osm._get_order = MagicMock(return_value=row)
+    osm.persist_deferred_submit_intent = MagicMock(side_effect=intent_results)
+    osm.update_order_meta = MagicMock(return_value=True)
+    osm.transition = MagicMock(return_value=True)
+    osm._submit_order_with_retry = MagicMock(return_value=(
+        {"id": "TR-1"}, None, "TR-1", "ACK",
+    ))
+    osm._lookup_order_by_tag = MagicMock(return_value=None)
+    osm._flag_split_brain_order = MagicMock()
+    return osm
+
+
+def _recovery_plan(owner):
+    row = _row()
+    return SimpleNamespace(
+        contract_symbol=row["contract"], contracts=row["qty"],
+        signal_id=row["signal_id"], client_id=row["client_id"],
+        execution_mode=row["execution_mode"], ticker=row["symbol"],
+        side="CALL", direction="CALL", timeframe="1d", score=90.0,
+        trigger_price=600.0, underlying_entry=599.5,
+        target_underlying=605.0, stop_underlying=595.0,
+        metadata={
+            "recovery_submit_fenced": True,
+            "recovery_submit_owner": owner,
+            "recovery_submit_generation": 3,
+        },
+    )
+
+
+def test_lease_expiry_race_real_submit_path_allows_exactly_one_post():
+    """A lost worker's intent CAS fails; the replacement alone reaches POST."""
+    osm = _submit_osm([False, True])
+    broker = MagicMock(base_url="https://api.tradier.com")
+
+    stale = osm.submit_existing_entry(
+        local_order_id="oid-1", broker=broker,
+        plan=_recovery_plan("worker-A"), limit_price=2.10,
+    )
+    winner = osm.submit_existing_entry(
+        local_order_id="oid-1", broker=broker,
+        plan=_recovery_plan("worker-B"), limit_price=2.10,
+    )
+
+    assert stale["error"] == "RECOVERY_SUBMIT_INTENT_FENCE_LOST"
+    assert winner["ok"] is True
+    assert osm._submit_order_with_retry.call_count == 1
+    assert osm.persist_deferred_submit_intent.call_args_list[0].kwargs["owner"] == "worker-A"
+    assert osm.persist_deferred_submit_intent.call_args_list[1].kwargs["owner"] == "worker-B"
+
+
+def test_any_recovery_intent_cas_failure_blocks_broker_bytes():
+    """Owner/generation/lease/intent/DB CAS misses share one fail-closed result."""
+    for owner in ("wrong-owner", "expired-lease", "wrong-generation", "db-failure"):
+        osm = _submit_osm([False])
+        result = osm.submit_existing_entry(
+            local_order_id="oid-1", broker=MagicMock(),
+            plan=_recovery_plan(owner), limit_price=2.10,
+        )
+        assert result["error"] == "RECOVERY_SUBMIT_INTENT_FENCE_LOST"
+        osm._submit_order_with_retry.assert_not_called()
+
+
+def test_submit_intent_cas_declares_all_irreversible_boundary_predicates():
+    import inspect
+    source = inspect.getsource(APOrderStateMachine.persist_deferred_submit_intent)
+    for proof in (
+        "local_order_id = %s", "client_id = %s", "execution_mode,'')) = %s",
+        "status,'')) = 'PENDING_TRIGGER'", "broker_order_id IS NULL",
+        "submitted_ts IS NULL", "lifecycle_state','') = 'BROKER_READY'",
+        "broker_ready')::boolean", "materialization_generation')::int",
+        "recovery_submit_owner','') = %s", "recovery_submit_lease_until",
+        "submit_intent_at','') = ''",
+    ):
+        assert proof in source

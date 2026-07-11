@@ -1660,6 +1660,78 @@ class APOrderStateMachine:
             )
             return False
 
+    def persist_deferred_submit_intent(
+        self,
+        local_order_id: str,
+        *,
+        owner: str,
+        generation: int,
+        execution_mode: str,
+        payload_hash: str,
+        broker_submit_key: str,
+    ) -> bool:
+        """Atomically transfer an unexpired recovery claim to broker submit.
+
+        This is the irreversible boundary fence. A stale recovery worker may
+        not create submit intent after its lease expires or ownership changes.
+        Once this CAS succeeds, ``submit_intent_at`` prevents any replacement
+        worker from claiming the row while broker truth is ambiguous.
+        """
+        import json as _json_local
+        owner = str(owner or "").strip()
+        mode = str(execution_mode or "").strip().lower()
+        submit_key = str(broker_submit_key or "").strip()[:32]
+        payload_hash = str(payload_hash or "").strip()
+        try:
+            generation = int(generation)
+        except (TypeError, ValueError):
+            return False
+        if not owner or mode not in {"live", "paper"} or not submit_key or not payload_hash:
+            return False
+        now = now_utc_iso()
+        patch = _json_local.dumps({
+            "lifecycle_state": "SUBMITTING",
+            "submit_started_at": now,
+            "submit_intent_at": now,
+            "broker_submit_key": submit_key,
+            "broker_submit_payload_hash": payload_hash,
+            "current_owner": f"broker_submit:{submit_key}",
+        })
+
+        def _persist():
+            with conn() as c:
+                cur = c.execute(
+                    """
+                    UPDATE orders
+                    SET meta = COALESCE(meta, '{}'::jsonb) || %s::jsonb,
+                        updated_ts = NOW()
+                    WHERE local_order_id = %s
+                      AND client_id = %s
+                      AND LOWER(COALESCE(execution_mode,'')) = %s
+                      AND kind = 'ENTRY'
+                      AND UPPER(COALESCE(status,'')) = 'PENDING_TRIGGER'
+                      AND (broker_order_id IS NULL OR broker_order_id = '')
+                      AND submitted_ts IS NULL
+                      AND COALESCE(meta->>'lifecycle_state','') = 'BROKER_READY'
+                      AND COALESCE((meta->>'broker_ready')::boolean, false) = true
+                      AND COALESCE((meta->>'materialization_generation')::int, 0) = %s
+                      AND COALESCE(meta->>'recovery_submit_owner','') = %s
+                      AND NULLIF(meta->>'recovery_submit_lease_until','')::timestamptz >= NOW()
+                      AND COALESCE(meta->>'submit_intent_at','') = ''
+                    """,
+                    (patch, local_order_id, self.client_id, mode, generation, owner),
+                )
+                return int(getattr(cur, "rowcount", getattr(c, "rowcount", 0)) or 0)
+
+        try:
+            return bool(run_with_retry(_persist) > 0)
+        except Exception as exc:
+            log.warning(
+                "[%s] persist_deferred_submit_intent failed order=%s: %s",
+                self.client_id, local_order_id, exc,
+            )
+            return False
+
     def claim_deferred_materialization(
         self,
         local_order_id: str,
@@ -2634,20 +2706,39 @@ class APOrderStateMachine:
             )
         except Exception:
             _breach_to_submit_ms = None
-        if not self.update_order_meta(local_order_id, {
-            "lifecycle_state": "SUBMITTING" if _is_materialized_deferred else "SUBMITTING",
-            "submit_started_at": now_utc_iso(),
-            "submit_intent_at": now_utc_iso(),
-            "broker_submit_key": str(local_order_id)[:32],
-            "current_owner": f"broker_submit:{str(local_order_id)[:32]}",
-            "broker_submit_payload_hash": _payload_hash,
-        }):
+        _plan_meta = getattr(plan, "metadata", None) if plan is not None else None
+        _plan_meta = _plan_meta if isinstance(_plan_meta, dict) else {}
+        _recovery_owner = str(_plan_meta.get("recovery_submit_owner") or "").strip()
+        _recovery_generation = _plan_meta.get("recovery_submit_generation")
+        _is_recovery_submit = bool(_plan_meta.get("recovery_submit_fenced") or _recovery_owner)
+        if _is_recovery_submit:
+            _intent_ok = self.persist_deferred_submit_intent(
+                local_order_id,
+                owner=_recovery_owner,
+                generation=_recovery_generation,
+                execution_mode=str(current.get("execution_mode") or ""),
+                payload_hash=_payload_hash,
+                broker_submit_key=str(local_order_id)[:32],
+            )
+            _intent_error = "RECOVERY_SUBMIT_INTENT_FENCE_LOST"
+        else:
+            # Preserve the established non-recovery submission path.
+            _intent_ok = self.update_order_meta(local_order_id, {
+                "lifecycle_state": "SUBMITTING",
+                "submit_started_at": now_utc_iso(),
+                "submit_intent_at": now_utc_iso(),
+                "broker_submit_key": str(local_order_id)[:32],
+                "current_owner": f"broker_submit:{str(local_order_id)[:32]}",
+                "broker_submit_payload_hash": _payload_hash,
+            })
+            _intent_error = "MATERIALIZATION_STATE_WRITE_FAILED:submit_intent"
+        if not _intent_ok:
             return {
                 "ok": False,
                 "local_order_id": local_order_id,
                 "broker_order_id": latest.get("broker_order_id"),
                 "status": OrderStatus.ERROR,
-                "error": "MATERIALIZATION_STATE_WRITE_FAILED:submit_intent",
+                "error": _intent_error,
             }
         if _had_prior_submit_intent:
             _existing_oid = self._lookup_order_by_tag(
