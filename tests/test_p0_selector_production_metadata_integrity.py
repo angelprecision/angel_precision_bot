@@ -451,3 +451,307 @@ def test_failure_audit_stays_deterministic_for_mixed_final_rejections(monkeypatc
         "DELTA_OUT_OF_RANGE",
         "PREMIUM_CAP_EXCEEDED",
     ]
+
+
+# =============================================================================
+# Amendment 1 — clear authoritative last_failure after successful fallback
+# =============================================================================
+# For each gate type that can cause rank-1 rejection: verify that when a
+# later candidate passes, get_last_failure() is None, plan.metadata has no
+# selector_failure, and the rank-1 rejection survives in candidate_audit.
+
+def test_rank_one_unaffordable_fallback_clears_last_failure(monkeypatch):
+    """Rank-1 unaffordable, rank-2 selected → get_last_failure() is None."""
+    expensive = _option(bid=4.48, ask=4.50, symbol="SPY260717C00501000")
+    affordable = _option(bid=2.48, ask=2.50, symbol="SPY260717C00500000")
+    _force_rank(monkeypatch, {expensive["symbol"]: 100.0, affordable["symbol"]: 90.0})
+    selector = FakeSelector(mode="LIVE", chain=[expensive, affordable])
+    plan = _plan_dict(metadata={"sizing_context": {"selector_budget": 260.0, "budget": 500.0}})
+
+    result = selector.select(plan)
+
+    assert result is not None, "rank-2 should be selected"
+    assert result.contract_symbol == affordable["symbol"]
+    # Amendment 1: authoritative failure cleared after fallback selection
+    assert selector.get_last_failure() is None, (
+        "get_last_failure() must be None after a valid fallback candidate is selected"
+    )
+    # plan.metadata must not carry a selector_failure from the candidate loop
+    assert plan["metadata"].get("selector_failure") is None, (
+        "plan.metadata.selector_failure must be absent after successful fallback"
+    )
+    # Rank-1 rejection is preserved in the winner's candidate_audit
+    rejections = result.candidate_audit["final_candidate_rejections"]
+    assert len(rejections) >= 1
+    assert rejections[0]["reason_code"] == "UNTRADEABLE_FOR_ACCOUNT_SIZE"
+
+
+def test_cheap_contract_fallback_clears_last_failure(monkeypatch):
+    """Rank-1 cheap (flag=false), rank-2 selected → get_last_failure() is None."""
+    cheap = _option(bid=0.48, ask=0.49, symbol="SPY260717C00495000")
+    valid = _option(bid=2.48, ask=2.50, symbol="SPY260717C00500000")
+    _force_rank(monkeypatch, {cheap["symbol"]: 100.0, valid["symbol"]: 90.0})
+    selector = FakeSelector(mode="LIVE", chain=[cheap, valid])
+
+    result = selector.select(_plan_dict())
+
+    assert result is not None
+    assert result.contract_symbol == valid["symbol"]
+    assert selector.get_last_failure() is None, (
+        "get_last_failure() must be None after cheap-fallback succeeds"
+    )
+    assert _plan_dict()["metadata"].get("selector_failure") is None
+    rejections = result.candidate_audit["final_candidate_rejections"]
+    assert rejections[0]["reason_code"] == "CHEAP_CONTRACT_NO_UPGRADE"
+
+
+def test_delta_fallback_clears_last_failure(monkeypatch):
+    """Rank-1 deep-OTM delta fail, rank-2 selected → get_last_failure() is None."""
+    low_delta = _option(symbol="SPY260717C00499000")
+    low_delta["greeks"] = {"delta": "0.06"}
+    valid = _option(symbol="SPY260717C00500000")
+    _force_rank(monkeypatch, {low_delta["symbol"]: 100.0, valid["symbol"]: 90.0})
+    selector = FakeSelector(mode="LIVE", chain=[low_delta, valid])
+    selector.target_delta = 0.2
+    selector.delta_band = 0.2
+    plan = _plan_dict()
+
+    result = selector.select(plan)
+
+    assert result is not None
+    assert result.contract_symbol == valid["symbol"]
+    assert selector.get_last_failure() is None, (
+        "get_last_failure() must be None after delta-fallback succeeds"
+    )
+    assert plan["metadata"].get("selector_failure") is None
+    rejections = result.candidate_audit["final_candidate_rejections"]
+    assert rejections[0]["reason_code"] == "DELTA_OUT_OF_RANGE"
+
+
+def test_moneyness_fallback_clears_last_failure(monkeypatch):
+    """Rank-1 far-OTM moneyness fail, rank-2 selected → get_last_failure() is None."""
+    far_otm = _option(symbol="SPY260717C00580000")
+    far_otm["strike"] = 580.0
+    valid = _option(symbol="SPY260717C00500000")
+    _force_rank(monkeypatch, {far_otm["symbol"]: 100.0, valid["symbol"]: 90.0})
+    selector = FakeSelector(mode="LIVE", chain=[far_otm, valid])
+    plan = _plan_dict()
+
+    result = selector.select(plan)
+
+    assert result is not None
+    assert result.contract_symbol == valid["symbol"]
+    assert selector.get_last_failure() is None, (
+        "get_last_failure() must be None after moneyness-fallback succeeds"
+    )
+    assert plan["metadata"].get("selector_failure") is None
+    rejections = result.candidate_audit["final_candidate_rejections"]
+    assert rejections[0]["contract"] == far_otm["symbol"]
+
+
+def test_premium_cap_fallback_clears_last_failure(monkeypatch):
+    """Rank-1 over per-ticker premium cap, rank-2 selected → get_last_failure() is None."""
+    over_cap = _option(bid=4.48, ask=4.50, symbol="SPY260717C00501000")
+    valid = _option(bid=3.48, ask=3.50, symbol="SPY260717C00500000")
+    _force_rank(monkeypatch, {over_cap["symbol"]: 100.0, valid["symbol"]: 90.0})
+    selector = FakeSelector(mode="LIVE", chain=[over_cap, valid])
+    plan = _plan_dict(metadata={"sizing_context": {"budget": 800.0}})
+
+    result = selector.select(plan)
+
+    assert result is not None
+    assert result.contract_symbol == valid["symbol"]
+    assert selector.get_last_failure() is None, (
+        "get_last_failure() must be None after premium-cap-fallback succeeds"
+    )
+    assert plan["metadata"].get("selector_failure") is None
+    rejections = result.candidate_audit["final_candidate_rejections"]
+    assert rejections[0]["reason_code"] == "PREMIUM_CAP_EXCEEDED"
+
+
+# =============================================================================
+# Amendment 2 — true "cheap contract only choice" semantics
+# =============================================================================
+
+def test_cheap_rank1_normal_rank2_flag_true_rank2_wins(monkeypatch, monkeypatch_env=None):
+    """
+    A: rank-1 cheap, rank-2 normal premium, ALLOW_CHEAP=true → rank-2 wins.
+    The cheap candidate must NOT be selected when a normal-premium candidate
+    passes all gates.
+    """
+    cheap = _option(bid=0.48, ask=0.49, symbol="SPY260717C00495000")
+    valid = _option(bid=2.48, ask=2.50, symbol="SPY260717C00500000")
+    _force_rank(monkeypatch, {cheap["symbol"]: 100.0, valid["symbol"]: 90.0})
+    selector = FakeSelector(mode="LIVE", chain=[cheap, valid])
+    plan = _plan_dict()
+
+    import os
+    original = os.environ.get("ALLOW_CHEAP_CONTRACT_IF_ONLY_CHOICE")
+    os.environ["ALLOW_CHEAP_CONTRACT_IF_ONLY_CHOICE"] = "true"
+    try:
+        result = selector.select(plan)
+    finally:
+        if original is None:
+            os.environ.pop("ALLOW_CHEAP_CONTRACT_IF_ONLY_CHOICE", None)
+        else:
+            os.environ["ALLOW_CHEAP_CONTRACT_IF_ONLY_CHOICE"] = original
+
+    assert result is not None, "rank-2 should be selected"
+    assert result.contract_symbol == valid["symbol"], (
+        "rank-2 normal-premium candidate must win over rank-1 cheap candidate"
+    )
+    assert result.selection_reason != "cheap_contract_only_choice", (
+        "selection_reason must NOT be cheap_contract_only_choice when normal candidate exists"
+    )
+    assert selector.get_last_failure() is None
+
+
+def test_cheap_rank1_all_later_fail_flag_true_cheap_selected(monkeypatch):
+    """
+    B: rank-1 cheap and otherwise valid, every later candidate fails,
+    flag=true → cheap rank-1 may be selected with selection_reason=cheap_contract_only_choice.
+    """
+    cheap = _option(bid=0.48, ask=0.49, symbol="SPY260717C00495000")
+    # rank-2 fails: way too far OTM (moneyness gate)
+    far_otm = _option(symbol="SPY260717C00580000")
+    far_otm["strike"] = 580.0
+    _force_rank(monkeypatch, {cheap["symbol"]: 100.0, far_otm["symbol"]: 90.0})
+    selector = FakeSelector(mode="LIVE", chain=[cheap, far_otm])
+    plan = _plan_dict()
+
+    import os
+    original = os.environ.get("ALLOW_CHEAP_CONTRACT_IF_ONLY_CHOICE")
+    os.environ["ALLOW_CHEAP_CONTRACT_IF_ONLY_CHOICE"] = "true"
+    try:
+        result = selector.select(plan)
+    finally:
+        if original is None:
+            os.environ.pop("ALLOW_CHEAP_CONTRACT_IF_ONLY_CHOICE", None)
+        else:
+            os.environ["ALLOW_CHEAP_CONTRACT_IF_ONLY_CHOICE"] = original
+
+    assert result is not None, (
+        "cheap candidate should be selected when it is the only valid choice"
+    )
+    assert result.contract_symbol == cheap["symbol"]
+    assert result.selection_reason == "cheap_contract_only_choice", (
+        "selection_reason must be cheap_contract_only_choice"
+    )
+    assert selector.get_last_failure() is None
+    assert plan["metadata"].get("selector_failure") is None
+
+
+def test_cheap_rank1_all_later_fail_flag_false_no_selection(monkeypatch):
+    """
+    C: same setup as B but ALLOW_CHEAP_CONTRACT_IF_ONLY_CHOICE=false →
+    no selection; cheap candidate is rejected outright.
+    """
+    cheap = _option(bid=0.48, ask=0.49, symbol="SPY260717C00495000")
+    far_otm = _option(symbol="SPY260717C00580000")
+    far_otm["strike"] = 580.0
+    _force_rank(monkeypatch, {cheap["symbol"]: 100.0, far_otm["symbol"]: 90.0})
+    selector = FakeSelector(mode="LIVE", chain=[cheap, far_otm])
+    plan = _plan_dict()
+
+    import os
+    original = os.environ.get("ALLOW_CHEAP_CONTRACT_IF_ONLY_CHOICE")
+    os.environ["ALLOW_CHEAP_CONTRACT_IF_ONLY_CHOICE"] = "false"
+    try:
+        result = selector.select(plan)
+    finally:
+        if original is None:
+            os.environ.pop("ALLOW_CHEAP_CONTRACT_IF_ONLY_CHOICE", None)
+        else:
+            os.environ["ALLOW_CHEAP_CONTRACT_IF_ONLY_CHOICE"] = original
+
+    assert result is None, (
+        "no selection expected when ALLOW_CHEAP_CONTRACT_IF_ONLY_CHOICE=false"
+    )
+    # Cheap candidate must appear in rejections with CHEAP_CONTRACT_NO_UPGRADE
+    failure = plan["metadata"]["selector_failure"]
+    rejections = failure["selection_diagnostics"]["final_candidate_rejections"]
+    assert any(r["reason_code"] == "CHEAP_CONTRACT_NO_UPGRADE" for r in rejections)
+
+
+# =============================================================================
+# Amendment 3 — final failure is authoritative and deterministic
+# =============================================================================
+
+def test_final_rejection_counts_present_in_failure_diagnostics(monkeypatch):
+    """All-fail scenario must include final_rejection_counts in selection_diagnostics."""
+    first = _option(bid=4.48, ask=4.50, symbol="SPY260717C00501000")
+    second = _option(bid=3.48, ask=3.50, symbol="SPY260717C00500000")
+    _force_rank(monkeypatch, {first["symbol"]: 100.0, second["symbol"]: 90.0})
+    selector = FakeSelector(mode="LIVE", chain=[first, second])
+    plan = _plan_dict(metadata={"sizing_context": {"selector_budget": 200.0, "budget": 500.0}})
+
+    result = selector.select(plan)
+
+    assert result is None
+    diag = plan["metadata"]["selector_failure"]["selection_diagnostics"]
+    assert "final_rejection_counts" in diag, (
+        "final_rejection_counts must be present in selection_diagnostics"
+    )
+    counts = diag["final_rejection_counts"]
+    assert isinstance(counts, dict)
+    assert counts.get("UNTRADEABLE_FOR_ACCOUNT_SIZE", 0) == 2
+
+
+def test_final_reason_uses_precedence_not_last_evaluated(monkeypatch):
+    """
+    Deterministic precedence: DELTA_OUT_OF_RANGE (rank-1) vs PREMIUM_CAP_EXCEEDED
+    (rank-2), each appearing once — DELTA_OUT_OF_RANGE wins by fixed precedence,
+    not by which candidate was evaluated last.
+    """
+    low_delta = _option(symbol="SPY260717C00499000")
+    low_delta["greeks"] = {"delta": "0.06"}
+    over_cap = _option(bid=4.48, ask=4.50, symbol="SPY260717C00501000")
+    _force_rank(monkeypatch, {low_delta["symbol"]: 100.0, over_cap["symbol"]: 90.0})
+    selector = FakeSelector(mode="LIVE", chain=[low_delta, over_cap])
+    selector.target_delta = 0.2
+    selector.delta_band = 0.2
+    plan = _plan_dict(metadata={"sizing_context": {"budget": 800.0}})
+
+    result = selector.select(plan)
+
+    assert result is None
+    failure = plan["metadata"]["selector_failure"]
+    # DELTA_OUT_OF_RANGE must win over PREMIUM_CAP_EXCEEDED by fixed precedence
+    assert failure["reason_code"] == "DELTA_OUT_OF_RANGE"
+    diag = failure["selection_diagnostics"]
+    counts = diag["final_rejection_counts"]
+    assert counts == {"DELTA_OUT_OF_RANGE": 1, "PREMIUM_CAP_EXCEEDED": 1}
+
+
+def test_final_reason_uses_most_common_when_counts_differ(monkeypatch):
+    """
+    Most-common-count policy: if one reason appears more than any other it wins
+    regardless of its position in the precedence list.
+    Two UNTRADEABLE + one DELTA_OUT_OF_RANGE → UNTRADEABLE wins by count.
+    """
+    unaffordable_a = _option(bid=4.48, ask=4.50, symbol="SPY260717C00501000")
+    unaffordable_b = _option(bid=4.0, ask=4.2, symbol="SPY260717C00502000")
+    low_delta = _option(symbol="SPY260717C00499000")
+    low_delta["greeks"] = {"delta": "0.06"}
+    _force_rank(monkeypatch, {
+        unaffordable_a["symbol"]: 100.0,
+        unaffordable_b["symbol"]: 95.0,
+        low_delta["symbol"]: 90.0,
+    })
+    selector = FakeSelector(mode="LIVE", chain=[unaffordable_a, unaffordable_b, low_delta])
+    selector.target_delta = 0.2
+    selector.delta_band = 0.2
+    # selector_budget=350: unaffordable_a ($450) and unaffordable_b ($420) each
+    # floor(350 / cost) = 0  → UNTRADEABLE_FOR_ACCOUNT_SIZE (×2).
+    # low_delta ($250) is affordable at 1 contract but fails the delta gate → DELTA_OUT_OF_RANGE (×1).
+    # Count policy: UNTRADEABLE (2) > DELTA (1) → UNTRADEABLE wins.
+    plan = _plan_dict(metadata={"sizing_context": {"selector_budget": 350.0, "budget": 500.0}})
+
+    result = selector.select(plan)
+
+    assert result is None
+    failure = plan["metadata"]["selector_failure"]
+    assert failure["reason_code"] == "UNTRADEABLE_FOR_ACCOUNT_SIZE"
+    counts = failure["selection_diagnostics"]["final_rejection_counts"]
+    assert counts.get("UNTRADEABLE_FOR_ACCOUNT_SIZE", 0) == 2
+    assert counts.get("DELTA_OUT_OF_RANGE", 0) == 1

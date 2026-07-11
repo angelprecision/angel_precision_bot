@@ -45,7 +45,7 @@ import contextvars
 from ap.trace import trace_gate
 import os
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace as _dc_replace
 from datetime import date, timedelta
 from typing import Optional
 
@@ -2645,6 +2645,12 @@ class APContractSelectionEngine:
         _effective_budget_used, _max_trade_cap, _budget_was_clipped = _effective_budget(budget)
         _candidate_table_top_n = int(os.getenv("SELECTOR_CANDIDATE_TABLE_TOP_N", "15"))
         _final_candidate_rejections: list[dict] = []
+        # Amendment 2: deferred cheap-contract fallback.
+        # When ALLOW_CHEAP_CONTRACT_IF_ONLY_CHOICE=true a cheap candidate that
+        # otherwise passes all gates is retained here rather than selected
+        # immediately.  We continue evaluating every later ranked candidate and
+        # only use _cheap_fallback when no normal-premium candidate passes.
+        _cheap_fallback: Optional[SelectedContract] = None
 
         def _candidate_audit_payload(selected_symbol, selected_reason):
             try:
@@ -2759,6 +2765,10 @@ class APContractSelectionEngine:
                     context={"budget_clipped": True},
                 )
 
+            # Amendment 2: _defer_as_cheap is reset every iteration.
+            # Set to True when ALLOW_CHEAP_CONTRACT_IF_ONLY_CHOICE=true and the
+            # candidate is cheap so the bottom of the loop defers instead of selects.
+            _defer_as_cheap = False
             if candidate.premium_per_contract < _MIN_ACCEPTABLE_PREMIUM:
                 _allow_cheap = os.getenv("ALLOW_CHEAP_CONTRACT_IF_ONLY_CHOICE", "false").lower() == "true"
                 if not _allow_cheap:
@@ -2785,6 +2795,10 @@ class APContractSelectionEngine:
                         context=_candidate_context,
                     )
                     continue
+                # Flag is true: fall through all remaining gates — if this candidate
+                # passes everything, defer it as a fallback rather than selecting it.
+                # We keep evaluating later candidates for a normal-premium winner.
+                _defer_as_cheap = True
 
             if candidate.affordable_contracts < 1:
                 if _selector_mode != "LIVE":
@@ -2974,18 +2988,105 @@ class APContractSelectionEngine:
                 )
                 continue
 
+            # Amendment 2: candidate passed all gates.
+            # If it is cheap and the flag is set, store as deferred fallback and
+            # keep evaluating — a normal-premium candidate later in the ranking wins.
+            if _defer_as_cheap:
+                if _cheap_fallback is None:
+                    _cheap_fallback = candidate
+                    log.debug(
+                        "[%s] cheap_contract_fallback stored rank=%d %s @ $%.0f — "
+                        "continuing evaluation for normal-premium candidate",
+                        ticker, _rank_idx + 1,
+                        candidate.contract_symbol, candidate.premium_per_contract,
+                    )
+                continue
+
             selected = candidate
             break
 
+        # Amendment 1: a valid candidate passed all final gates.
+        # Higher-ranked rejections are preserved in _final_candidate_rejections
+        # (embedded in candidate_audit["final_candidate_rejections"]) but must
+        # NOT be the authoritative last_failure for this invocation.
+        if selected is not None:
+            self._set_last_failure(None)
+            _clear_selector_failure(plan)  # belt-and-suspenders: remove any stale rejection
+
+        # Amendment 2: no normal-premium candidate found — activate cheap fallback.
+        if selected is None and _cheap_fallback is not None:
+            selected = _dc_replace(
+                _cheap_fallback,
+                selection_reason="cheap_contract_only_choice",
+            )
+            log.info(
+                "[%s] cheap_contract_only_choice: %s @ $%.0f — "
+                "%d later candidate(s) evaluated and rejected",
+                ticker, selected.contract_symbol,
+                selected.premium_per_contract,
+                len(_final_candidate_rejections),
+            )
+            self._set_last_failure(None)
+            _clear_selector_failure(plan)
+
         if selected is None:
-            _final_failure = _final_candidate_rejections[0] if _final_candidate_rejections else None
-            _final_reason_code = (_final_failure or {}).get("reason_code", "NO_AFFORDABLE_CONTRACT")
+            # Amendment 3: authoritative and deterministic final failure reason.
+            #
+            # Policy: choose the reason_code with the highest occurrence count
+            # across all final-gate rejections; ties broken by _FINAL_REASON_PRECEDENCE
+            # (most structurally severe first).  This prevents the last evaluated
+            # candidate from accidentally determining the operator-visible failure.
+            #
+            # _FINAL_REASON_PRECEDENCE (fixed, documented):
+            #   CAPITAL_NO_REMAINING        — no capital at all
+            #   INVALID_POSITION_BUDGET     — budget value is corrupt / negative
+            #   UNTRADEABLE_FOR_ACCOUNT_SIZE — every contract exceeds account size
+            #   DELTA_OUT_OF_RANGE          — chain has no quality-delta contracts
+            #   CHEAP_CONTRACT_NO_UPGRADE   — only sub-minimum-premium contracts exist
+            #   PREMIUM_CAP_EXCEEDED        — per-ticker cap blocks all candidates
+            #   PAPER_PREMIUM_CAP           — paper-mode cap blocks all candidates
+            #   CONTRACT_BUILD_FAILED       — internal build error
+            #   NO_AFFORDABLE_CONTRACT      — generic fallback
+            _FINAL_REASON_PRECEDENCE = [
+                "CAPITAL_NO_REMAINING",
+                "INVALID_POSITION_BUDGET",
+                "UNTRADEABLE_FOR_ACCOUNT_SIZE",
+                "DELTA_OUT_OF_RANGE",
+                "CHEAP_CONTRACT_NO_UPGRADE",
+                "PREMIUM_CAP_EXCEEDED",
+                "PAPER_PREMIUM_CAP",
+                "CONTRACT_BUILD_FAILED",
+                "NO_AFFORDABLE_CONTRACT",
+            ]
+            _reason_counts: dict[str, int] = {}
+            for _rej in _final_candidate_rejections:
+                _rc = str(_rej.get("reason_code") or "UNKNOWN")
+                _reason_counts[_rc] = _reason_counts.get(_rc, 0) + 1
+
+            if _reason_counts:
+                _max_count = max(_reason_counts.values())
+                _tied = [r for r, c in _reason_counts.items() if c == _max_count]
+                _final_reason_code = next(
+                    (p for p in _FINAL_REASON_PRECEDENCE if p in _tied),
+                    _tied[0],
+                )
+            else:
+                _final_reason_code = "NO_AFFORDABLE_CONTRACT"
+
+            _final_failure = next(
+                (r for r in _final_candidate_rejections
+                 if r.get("reason_code") == _final_reason_code),
+                _final_candidate_rejections[0] if _final_candidate_rejections else None,
+            )
             _final_explanation = (_final_failure or {}).get(
                 "explanation",
                 f"No ranked candidates survived final gates | chain={_sel_chain_rows} survivors={_sel_survivors}",
             )
             _failure_diagnostics = dict(_selector_request_diagnostics(request_context))
             _failure_diagnostics["final_candidate_rejections"] = list(_final_candidate_rejections)
+            # Amendment 3: per-reason counts so operators can see the distribution
+            # of failure modes without scanning every row in final_candidate_rejections.
+            _failure_diagnostics["final_rejection_counts"] = dict(_reason_counts)
             _failure_diagnostics["pricing_basis"] = _pricing_basis_for_mode(_selector_mode)[1]
             _failure_diagnostics["sizing_context"] = dict(_sizing_ctx) if isinstance(_sizing_ctx, dict) else {}
             _failure_candidate_audit = _candidate_audit_payload(None, _final_reason_code)
