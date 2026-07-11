@@ -270,6 +270,7 @@ class APStartupRecovery:
         master_control,   # APMasterControl
         exit_engine=None, # APExitEngine (optional — needed for exit re-attachment)
         entry_watcher=None,  # APEntryWatcher (optional — needed for watcher reseed)
+        execution_core=None, # APExecutionCore (optional — required for §2 safe BROKER_READY recovery)
     ):
         self.client_id     = str(client_id or "").strip().lower()
         self.broker        = broker
@@ -278,6 +279,7 @@ class APStartupRecovery:
         self.mc            = master_control
         self.exit_engine   = exit_engine
         self.entry_watcher = entry_watcher
+        self.execution_core = execution_core
 
     # ──────────────────────────────────────────────────────────────────────────
     # Entry point
@@ -1115,28 +1117,83 @@ class APStartupRecovery:
                 continue
 
             if lifecycle in {"BROKER_READY", "SUBMITTING"} and meta.get("broker_ready") is True:
-                submit = getattr(self.osm, "submit_existing_entry", None)
-                if callable(submit):
-                    submit_result = submit(
-                        local_order_id=local_order_id,
-                        broker=self.broker,
-                        plan=plan,
-                        limit_price=float(order.get("limit_price") or 0),
+                # ── AMENDMENT §2: NEVER fall through to submit_existing_entry ──
+                # The direct submit path bypasses kill switch, exposure
+                # revalidation, fresh quote, spread, drift, entry confirmation
+                # and account-size cap.  All BROKER_READY / SUBMITTING recovery
+                # submits MUST route through the dedicated execution-core
+                # scaffold.  While the scaffold's canonical gates are still
+                # being wired in, it never calls the broker — it returns a
+                # RETRY_WAIT disposition that keeps the row durably owned by
+                # the recovery scheduler until either the gates land or a
+                # truthful boundary is reached (trigger age, retry exhaustion,
+                # identity mismatch, invalid status).
+                resume_fn = None
+                if self.execution_core is not None:
+                    resume_fn = getattr(
+                        self.execution_core, "resume_deferred_broker_ready_order", None
                     )
-                    if submit_result.get("ok"):
-                        recovered += 1
-                    else:
-                        terminalize = getattr(self.osm, "terminalize_deferred_breach", None)
-                        if callable(terminalize):
-                            terminalize(
-                                local_order_id,
-                                reason_code=str(
-                                    submit_result.get("error")
-                                    or "RECOVERY_BROKER_READY_SUBMIT_FAILED"
-                                ),
-                                terminal_status="ERROR",
-                                diagnostics={"recovery_classification": "broker_ready_submit"},
-                            )
+                if not callable(resume_fn):
+                    # No dedicated recovery path available — retain the row
+                    # WITHOUT terminalizing (engineering incomplete is not a
+                    # truthful boundary) and WITHOUT calling the direct
+                    # submit path (that's exactly what §2 forbids).  The
+                    # next recovery pass will re-attempt.
+                    log.critical(
+                        "[%s] RECOVERY_BLOCKED "
+                        "resume_deferred_broker_ready_order_unavailable "
+                        "local_order_id=%s — row retained without action "
+                        "(never falling back to submit_existing_entry per §2)",
+                        self.client_id, local_order_id,
+                    )
+                    continue
+
+                try:
+                    outcome = resume_fn(local_order_id=local_order_id, plan=plan) or {}
+                except Exception as exc:
+                    log.error(
+                        "[%s] resume_deferred_broker_ready_order raised "
+                        "local_order_id=%s exc=%s",
+                        self.client_id, local_order_id, exc,
+                    )
+                    continue
+
+                disposition = str(outcome.get("disposition") or "").strip().upper()
+                reason_code = str(outcome.get("reason_code") or "RECOVERY_UNKNOWN")
+
+                if disposition == "TERMINAL_DURABLE":
+                    terminalize = getattr(self.osm, "terminalize_deferred_breach", None)
+                    if callable(terminalize):
+                        terminalize(
+                            local_order_id,
+                            reason_code=reason_code,
+                            terminal_status=str(outcome.get("terminal_status") or "EXPIRED"),
+                            diagnostics={
+                                "recovery_classification": "broker_ready_boundary",
+                                "recovery_attempt": outcome.get("attempt"),
+                                "recovery_max_attempts": outcome.get("max_attempts"),
+                                "recovery_owner": outcome.get("owner"),
+                            },
+                        )
+                elif disposition == "RETRY_WAIT":
+                    # Persist attempt tracking WITHOUT clearing broker_ready
+                    # or any selector/contract/quantity/limit field.  The row
+                    # remains resumable — the durable BROKER_READY state is
+                    # preserved.  See ap_execution_core.resume_deferred_broker_ready_order
+                    # for the full field-preservation rationale.
+                    update_meta = getattr(self.osm, "update_order_meta", None)
+                    if callable(update_meta):
+                        update_meta(local_order_id, {
+                            "recovery_last_attempt_at": now.isoformat(),
+                            "recovery_attempt_count": outcome.get("attempt"),
+                            "recovery_next_retry_at": outcome.get("next_retry_at"),
+                            "recovery_reason_code": reason_code,
+                            "recovery_owner": outcome.get("owner"),
+                            "recovery_generation": outcome.get("generation"),
+                            "recovery_max_attempts": outcome.get("max_attempts"),
+                        })
+                # KEEP_WATCHER (e.g. RECOVERY_OSM_UNAVAILABLE, row read
+                # error, already-submitted) → row untouched.
                 continue
 
             should_resume = False

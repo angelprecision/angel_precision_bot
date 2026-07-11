@@ -1752,6 +1752,7 @@ class ClientRunner(threading.Thread):
                 master_control=self.master_control,
                 exit_engine=getattr(core, "exit_eng", None),
                 entry_watcher=watcher,
+                execution_core=core,  # §2: required for safe BROKER_READY recovery
             )
             outcome = recovery.recover_deferred_lifecycles()
             if outcome.get("errors"):
@@ -3155,6 +3156,7 @@ class ClientRunner(threading.Thread):
                 master_control=self.master_control,
                 exit_engine=exit_eng,
                 entry_watcher=getattr(getattr(self, "core", None), "entry_watcher", None),
+                execution_core=getattr(self, "core", None),  # §2: required for safe BROKER_READY recovery
             )
             return recovery.run(include_watcher_reseed=False)
 

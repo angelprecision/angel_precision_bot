@@ -405,7 +405,7 @@ def _recovery_order(lifecycle, *, lease_until=None, next_retry_at=None, contract
     }
 
 
-def _run_recovery_rows(monkeypatch, rows):
+def _run_recovery_rows(monkeypatch, rows, *, execution_core=None):
     import ap.db as ap_db
 
     monkeypatch.setattr(ap_db, "conn", lambda: _RecoveryConn(rows))
@@ -417,6 +417,8 @@ def _run_recovery_rows(monkeypatch, rows):
     osm = types.SimpleNamespace(
         submit_existing_entry=MagicMock(return_value={"ok": True}),
         terminalize_deferred_breach=MagicMock(return_value=True),
+        update_order_meta=MagicMock(return_value=True),
+        client_id="client@example.com",
     )
     recovery = APStartupRecovery(
         client_id="client@example.com",
@@ -425,10 +427,67 @@ def _run_recovery_rows(monkeypatch, rows):
         pm=None,
         master_control=types.SimpleNamespace(mode="PAPER"),
         entry_watcher=watcher,
+        execution_core=execution_core,
     )
     result = {"deferred_lifecycles_recovered": 0}
     recovery._recover_deferred_breach_lifecycles(result)
     return watcher, osm, result
+
+
+def test_restart_broker_ready_routes_through_scaffold_and_never_submits(monkeypatch):
+    """Amendment §2: recovery of a BROKER_READY row MUST route through
+    execution_core.resume_deferred_broker_ready_order.  It MUST NOT call
+    osm.submit_existing_entry directly.  While the scaffold's canonical
+    gates are unwired the row remains BROKER_READY under the recovery
+    scheduler (RETRY_WAIT ownership recorded via meta patch)."""
+    row = _recovery_order("BROKER_READY", contract="SPY260717C00600000")
+    ec = types.SimpleNamespace(
+        resume_deferred_broker_ready_order=MagicMock(return_value={
+            "disposition": "RETRY_WAIT",
+            "reason_code": "RECOVERY_SUBMIT_GATES_NOT_YET_WIRED",
+            "next_retry_at": "2026-07-10T20:00:00+00:00",
+            "attempt": 1,
+            "max_attempts": 20,
+            "owner": "recovery_scheduler:client@example.com",
+            "generation": 1,
+            "local_order_id": "oid-BROKER_READY",
+        }),
+    )
+    watcher, osm, _ = _run_recovery_rows(monkeypatch, [row], execution_core=ec)
+
+    # Hard invariant: direct submit path never touched
+    osm.submit_existing_entry.assert_not_called()
+    # Row not destroyed by scaffold RETRY_WAIT
+    osm.terminalize_deferred_breach.assert_not_called()
+    # Scaffold was consulted
+    ec.resume_deferred_broker_ready_order.assert_called_once()
+    call_kwargs = ec.resume_deferred_broker_ready_order.call_args.kwargs
+    assert call_kwargs["local_order_id"] == "oid-BROKER_READY"
+    # Ownership persisted via non-destructive meta patch
+    osm.update_order_meta.assert_called_once()
+    patch = osm.update_order_meta.call_args.args[1]
+    assert patch["recovery_reason_code"] == "RECOVERY_SUBMIT_GATES_NOT_YET_WIRED"
+    assert patch["recovery_attempt_count"] == 1
+    assert patch["recovery_owner"] == "recovery_scheduler:client@example.com"
+    # Preservation: no key in the patch mutates broker_ready / contract / qty / limit
+    for forbidden in {"broker_ready", "contract", "qty", "limit_price",
+                      "selected_contract", "selected_limit", "selected_qty",
+                      "client_id", "execution_mode"}:
+        assert forbidden not in patch, (
+            f"§2 preservation invariant broken: meta patch mutated {forbidden!r}"
+        )
+
+
+def test_restart_broker_ready_without_execution_core_retains_row(monkeypatch):
+    """Without execution_core wired, the recovery must NOT fall through
+    to submit_existing_entry (that's the exact path §2 forbids).  Row
+    must be retained without terminalization; a future recovery pass
+    with execution_core wired will handle it."""
+    row = _recovery_order("BROKER_READY", contract="SPY260717C00600000")
+    watcher, osm, _ = _run_recovery_rows(monkeypatch, [row], execution_core=None)
+    osm.submit_existing_entry.assert_not_called()
+    osm.terminalize_deferred_breach.assert_not_called()
+    osm.update_order_meta.assert_not_called()
 
 
 def test_restart_due_retry_row_rearms_same_generation(monkeypatch):
@@ -453,9 +512,7 @@ def test_restart_stale_materializing_row_rearms(monkeypatch):
     assert result["deferred_lifecycles_recovered"] == 1
 
 
-def test_restart_broker_ready_resumes_submit_once(monkeypatch):
-    row = _recovery_order("BROKER_READY", contract="SPY260717C00600000")
-    watcher, osm, result = _run_recovery_rows(monkeypatch, [row])
-    osm.submit_existing_entry.assert_called_once()
-    watcher.watch.assert_not_called()
-    assert result["deferred_lifecycles_recovered"] == 1
+# NOTE: test_restart_broker_ready_resumes_submit_once was removed under
+# amendment §2 — it asserted the exact direct-submit behaviour that §2
+# forbids.  Replaced by test_restart_broker_ready_routes_through_scaffold_and_never_submits
+# and test_restart_broker_ready_without_execution_core_retains_row above.

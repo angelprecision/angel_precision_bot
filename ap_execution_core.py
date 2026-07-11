@@ -1872,6 +1872,205 @@ class APExecutionCore:
 
     # ── CALLBACK: Breach Confirmed -> Execute ─────────────────────────────────
 
+    def resume_deferred_broker_ready_order(
+        self,
+        *,
+        local_order_id: str,
+        plan=None,
+    ) -> dict:
+        """AMENDMENT §2 fail-closed scaffold for BROKER_READY recovery.
+
+        The canonical entry-time gate stack (kill switch, exposure
+        revalidation, fresh option quote, spread policy, drift policy,
+        entry confirmation, account-size cap, submit-intent CAS, broker
+        POST) lives inside ``_on_entry_trigger`` and its ~2000 lines of
+        supporting infrastructure.  Reproducing that surface here would
+        risk drift and duplicate submissions.
+
+        Until each canonical gate is refactored into a callable that
+        this method can invoke, the scaffold **never calls the broker**.
+        Instead it inspects the durable row and returns a disposition
+        that keeps ownership durable:
+
+          * TERMINAL_DURABLE  — only on a truthful boundary:
+                * client identity mismatch
+                * wrong kind
+                * invalid status (not PENDING_TRIGGER/CREATED)
+                * missing trigger evidence
+                * malformed trigger timestamp
+                * trigger older than DEFERRED_RECOVERY_MAX_TRIGGER_AGE_SECONDS
+                * recovery attempt count exhausted
+          * KEEP_WATCHER      — inspection could not complete (OSM
+                                unavailable, row read raised, row is
+                                already-submitted-family) — retain
+                                current owner without change.
+          * RETRY_WAIT        — engineering incomplete; row remains
+                                BROKER_READY, only recovery-tracking
+                                fields are added to meta by the caller.
+
+        The method never mutates the row directly.  The caller
+        (``ap_recovery.APStartupRecovery._recover_deferred_breach_lifecycles``)
+        applies the disposition via existing OSM helpers, preserving
+        broker_ready, contract, qty, limit, selector evidence, submit
+        intent fields, client_id, execution_mode and diagnostics.
+
+        Args:
+            local_order_id: the durable row identifier.
+            plan: optional prebuilt plan snapshot (ignored by scaffold,
+                  reserved for the fully-gated future implementation).
+
+        Returns:
+            dict with keys: disposition, reason_code, terminal_status
+            (when TERMINAL_DURABLE), next_retry_at (when RETRY_WAIT),
+            attempt, max_attempts, owner, generation, local_order_id.
+        """
+        _now = datetime.now(timezone.utc)
+        # Owner label used in returned metadata so downstream code can
+        # attribute the recovery pass without additional lookups.
+        _owner_label = f"recovery_scheduler:{self.client_id or self.email or ''}"
+        _base = {
+            "local_order_id": local_order_id,
+            "owner": _owner_label,
+            "attempt": None,
+            "max_attempts": None,
+            "generation": None,
+            "next_retry_at": None,
+        }
+
+        def _keep(reason: str) -> dict:
+            return {**_base, "disposition": "KEEP_WATCHER", "reason_code": reason}
+
+        def _term(reason: str, status: str = "EXPIRED", **extra) -> dict:
+            return {
+                **_base, **extra,
+                "disposition": "TERMINAL_DURABLE",
+                "reason_code": reason,
+                "terminal_status": status,
+            }
+
+        # ── OSM reachability ────────────────────────────────────────
+        osm = getattr(self, "order_state_machine", None) or getattr(self, "osm", None)
+        if osm is None:
+            return _keep("RECOVERY_OSM_UNAVAILABLE")
+
+        # ── Row read ────────────────────────────────────────────────
+        try:
+            row = osm.get_order(local_order_id)
+        except Exception as exc:
+            log.error(
+                "[%s] resume_deferred_broker_ready_order row_read_failed "
+                "local_order_id=%s exc=%s",
+                self.client_id, local_order_id, exc,
+            )
+            return _keep(f"RECOVERY_ROW_READ_ERROR:{type(exc).__name__}")
+        if not isinstance(row, dict):
+            return _keep("RECOVERY_ROW_MISSING")
+
+        # ── Identity: client_id ─────────────────────────────────────
+        row_client_id = str(row.get("client_id") or "").strip().lower()
+        expected_client_id = str(self.client_id or self.email or "").strip().lower()
+        if row_client_id and expected_client_id and row_client_id != expected_client_id:
+            return _term("RECOVERY_CLIENT_ID_MISMATCH", status="ERROR")
+
+        # ── Identity: kind ──────────────────────────────────────────
+        kind = str(row.get("kind") or "").upper()
+        if kind != "ENTRY":
+            return _term(f"RECOVERY_WRONG_KIND:{kind}", status="ERROR")
+
+        # ── Durable state: status ───────────────────────────────────
+        status = str(row.get("status") or "").upper()
+        if status not in {"PENDING_TRIGGER", "CREATED"}:
+            # Any other status (SUBMITTED family, terminal family) means
+            # this row is not eligible for recovery submit — reconciler
+            # or order monitor owns it.
+            return _keep(f"RECOVERY_STATUS_NOT_ELIGIBLE:{status}")
+
+        # ── Durable state: already submitted (belt-and-suspenders) ──
+        broker_order_id = str(row.get("broker_order_id") or "").strip()
+        submitted_ts = row.get("submitted_ts")
+        if broker_order_id or submitted_ts:
+            return _keep("RECOVERY_ALREADY_SUBMITTED")
+
+        # ── Meta hydration ──────────────────────────────────────────
+        meta = row.get("meta") or {}
+        if isinstance(meta, str):
+            try:
+                meta = json.loads(meta)
+            except Exception:
+                meta = {}
+        meta = meta or {}
+
+        # ── Trigger evidence & age ──────────────────────────────────
+        # Config with safe defaults.  The chosen defaults intentionally
+        # bias to short windows — restart windows are usually well
+        # under a minute, and a stale trigger should never become a
+        # live submit.
+        try:
+            _max_trigger_age = int(os.getenv(
+                "DEFERRED_RECOVERY_MAX_TRIGGER_AGE_SECONDS", "300"
+            ))
+        except (TypeError, ValueError):
+            _max_trigger_age = 300
+        try:
+            _max_attempts = int(os.getenv(
+                "DEFERRED_RECOVERY_MAX_ATTEMPTS", "20"
+            ))
+        except (TypeError, ValueError):
+            _max_attempts = 20
+        try:
+            _retry_delay_seconds = int(os.getenv(
+                "DEFERRED_RECOVERY_RETRY_DELAY_SECONDS", "30"
+            ))
+        except (TypeError, ValueError):
+            _retry_delay_seconds = 30
+
+        trigger_crossed_at = (
+            meta.get("trigger_crossed_at")
+            or meta.get("trigger_confirmed_at")
+        )
+        if not trigger_crossed_at:
+            return _term("RECOVERY_MISSING_TRIGGER_EVIDENCE", status="EXPIRED")
+        try:
+            _crossed = datetime.fromisoformat(str(trigger_crossed_at))
+            if _crossed.tzinfo is None:
+                _crossed = _crossed.replace(tzinfo=timezone.utc)
+            _trigger_age = (_now - _crossed).total_seconds()
+        except Exception:
+            return _term("RECOVERY_INVALID_TRIGGER_TIMESTAMP", status="EXPIRED")
+        if _trigger_age > _max_trigger_age:
+            return _term("RECOVERY_TRIGGER_TOO_OLD", status="EXPIRED")
+
+        # ── Retry exhaustion ────────────────────────────────────────
+        try:
+            _prior_attempts = int(meta.get("recovery_attempt_count") or 0)
+        except (TypeError, ValueError):
+            _prior_attempts = 0
+        _attempt = _prior_attempts + 1
+        if _attempt > _max_attempts:
+            return _term(
+                "RECOVERY_RETRY_EXHAUSTED", status="EXPIRED",
+                attempt=_attempt, max_attempts=_max_attempts,
+            )
+
+        # ── Fail-closed: engineering incomplete ─────────────────────
+        try:
+            _generation = int(meta.get("materialization_generation") or 1)
+        except (TypeError, ValueError):
+            _generation = 1
+        _next_retry_at = (
+            _now + timedelta(seconds=_retry_delay_seconds)
+        ).isoformat()
+
+        return {
+            **_base,
+            "disposition": "RETRY_WAIT",
+            "reason_code": "RECOVERY_SUBMIT_GATES_NOT_YET_WIRED",
+            "next_retry_at": _next_retry_at,
+            "attempt": _attempt,
+            "max_attempts": _max_attempts,
+            "generation": _generation,
+        }
+
     def _on_entry_trigger(self, watched: WatchedSignal):
         """Called by watcher when price holds above/below trigger for 2 polls.
 
