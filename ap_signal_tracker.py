@@ -16,8 +16,6 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 from zoneinfo import ZoneInfo
 
-import yfinance as yf
-
 from ap_signal_store import APSignalStore
 
 log = logging.getLogger("ap.signal_tracker")
@@ -286,6 +284,12 @@ class APSignalTracker:
         """One yfinance call for all tickers. Falls back per-ticker on failure."""
         if not tickers:
             return {}
+
+        # Lazy import: yfinance is a heavy optional dep only needed at runtime.
+        # Kept out of module scope so unit/CI environments can import this module
+        # without installing yfinance (matches convention in ap/market_intelligence.py,
+        # ap/weekly_report.py, ap/alpha_tracker.py, ap_intelligence/tools/ap_data_tools.py).
+        import yfinance as yf  # type: ignore
 
         prices: dict[str, float] = {}
         ticker_list = list(tickers)
