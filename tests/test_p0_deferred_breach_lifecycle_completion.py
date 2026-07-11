@@ -258,9 +258,30 @@ def test_handoff_blocks_durable_quantity_mismatch():
 
 
 def test_watcher_retains_retry_ownership_from_callback_result():
-    watcher = APEntryWatcher(None, order_state_machine=MagicMock(), mode="LIVE")
-    watched = types.SimpleNamespace(signal={"contract_symbol": "DEFERRED:SPY"})
+    """Amendment §4: a RETRY_WAIT claim must be *verified* against the
+    durable order row, not trusted verbatim.  With a matching row the
+    watcher returns the same RETRY_WAIT disposition and next_retry_at
+    it did before §4."""
     due = (datetime.now(timezone.utc) + timedelta(seconds=20)).isoformat()
+    osm = MagicMock()
+    osm.get_order.return_value = {
+        "status": "PENDING_TRIGGER",
+        "broker_order_id": None,
+        "submitted_ts": None,
+        "meta": {
+            "lifecycle_state": "RETRY_WAIT",
+            "materialization_status": "RETRY_PENDING",
+            "next_retry_at": due,
+            "retry_attempt": 1,
+            "retry_max_attempts": 3,
+            "broker_ready": False,
+        },
+    }
+    watcher = APEntryWatcher(None, order_state_machine=osm, mode="LIVE")
+    watched = types.SimpleNamespace(signal={
+        "local_order_id": "oid-retry",
+        "contract_symbol": "DEFERRED:SPY",
+    })
     assert watcher._resolve_trigger_callback_disposition(
         watched, {"disposition": "RETRY_WAIT", "next_retry_at": due}
     ) == ("RETRY_WAIT", due)

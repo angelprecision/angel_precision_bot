@@ -706,19 +706,49 @@ class APEntryWatcher:
         return bool((signal or {}).get("contract_deferred")) or contract.startswith("DEFERRED:")
 
     def _resolve_trigger_callback_disposition(self, watched, result) -> tuple[str, str | None]:
-        """Prove the durable owner/state before a triggered watcher is removed."""
+        """Prove the durable owner/state before a triggered watcher is removed.
+
+        AMENDMENT §4 (durable verification of callback dispositions)
+        -----------------------------------------------------------
+        A trigger callback returns a *claimed* outcome — it is a request,
+        not proof.  A callback's own DB write may have silently failed
+        while it still returned ``disposition=SUBMITTED``.  Removing the
+        watcher on that word alone leaves the row PENDING_TRIGGER with
+        no owner.
+
+        For deferred signals we therefore ALWAYS re-read the order row
+        and verify the claim against the durable state before allowing
+        watcher removal.  An unverified or unknowable claim collapses to
+        ``KEEP_WATCHER`` so the invariant "no ownerless row" holds.
+
+        For non-deferred signals the existing behaviour is preserved
+        (the callback dict is trusted verbatim) — those paths already
+        have their own durable-write guarantees and rewiring them here
+        would risk duplicate submissions.
+        """
+        signal = getattr(watched, "signal", {}) or {}
+        is_deferred = self._is_deferred_signal(signal)
+
+        # ── Extract the CLAIM (may be absent / malformed) ────────────
+        claimed_disposition: str | None = None
+        claimed_next_retry: str | None = None
         if isinstance(result, dict):
-            disposition = str(result.get("disposition") or "").strip().upper()
-            if disposition in {
+            _raw = str(result.get("disposition") or "").strip().upper()
+            if _raw in {
                 "RETRY_WAIT", "KEEP_WATCHER", "TERMINAL_DURABLE",
                 "SUBMITTED", "OWNERSHIP_TRANSFERRED",
+                "RECONCILE_BROKER_INTENT",
             }:
-                return disposition, result.get("next_retry_at")
+                claimed_disposition = _raw
+                claimed_next_retry = result.get("next_retry_at")
 
-        signal = getattr(watched, "signal", {}) or {}
-        if not self._is_deferred_signal(signal):
+        # ── Non-deferred: preserve prior behaviour (trust the claim) ──
+        if not is_deferred:
+            if claimed_disposition:
+                return claimed_disposition, claimed_next_retry
             return "OWNERSHIP_TRANSFERRED", None
 
+        # ── Deferred: always re-read the row ─────────────────────────
         local_order_id = str(signal.get("local_order_id") or "").strip()
         get_order = getattr(self.order_state_machine, "get_order", None)
         if not local_order_id or not callable(get_order):
@@ -729,25 +759,150 @@ class APEntryWatcher:
             return "UNKNOWN", None
         if not isinstance(row, dict):
             return "UNKNOWN", None
+
         status = str(row.get("status") or "").upper()
-        if status in {"SUBMITTED", "ACKNOWLEDGED", "PARTIAL_FILL", "FILLED"}:
-            return "SUBMITTED", None
-        if status in {"REJECTED", "EXPIRED", "CANCELED", "ERROR"}:
-            return "TERMINAL_DURABLE", None
+        broker_order_id = str(row.get("broker_order_id") or "").strip()
+        submitted_ts = row.get("submitted_ts")
         meta = row.get("meta") or {}
         if isinstance(meta, str):
             try:
                 meta = json.loads(meta)
             except Exception:
                 meta = {}
-        lifecycle = str((meta or {}).get("lifecycle_state") or "").upper()
-        if lifecycle == "RETRY_WAIT":
-            return "RETRY_WAIT", (
-                (meta or {}).get("next_retry_at")
-                or (meta or {}).get("materialization_next_retry_at")
+        meta = meta or {}
+        lifecycle = str(meta.get("lifecycle_state") or "").upper()
+        mstatus = str(meta.get("materialization_status") or "").upper()
+
+        def _submitted_family() -> bool:
+            return status in {"SUBMITTED", "ACKNOWLEDGED", "PARTIAL_FILL", "FILLED"}
+
+        def _terminal_family() -> bool:
+            return status in {"REJECTED", "EXPIRED", "CANCELED", "ERROR"}
+
+        def _terminal_reason_present() -> bool:
+            return bool(
+                meta.get("reason_code")
+                or meta.get("final_reason")
+                or meta.get("materialization_reason")
             )
+
+        def _verify_submitted() -> tuple[str, str | None]:
+            """Return the verified disposition for a SUBMITTED claim."""
+            if not _submitted_family():
+                return "KEEP_WATCHER", None
+            if broker_order_id:
+                return "SUBMITTED", None
+            # No broker id yet.  If a durable submit-intent exists the
+            # order is in the crash-window and belongs to reconciliation.
+            # Per amendment §6 (still to land) the reconciler will own
+            # the row; until then we keep the watcher so the row is
+            # never ownerless.  RECONCILE_BROKER_INTENT is emitted for
+            # diagnostic clarity and is treated as "retain" by the
+            # consumer.
+            if meta.get("submit_intent_at"):
+                return "RECONCILE_BROKER_INTENT", None
+            # Status says submitted but no broker id and no submit intent
+            # — inconsistent durable state.  Retain the watcher.
+            return "KEEP_WATCHER", None
+
+        def _verify_terminal() -> tuple[str, str | None]:
+            if _terminal_family() and _terminal_reason_present():
+                return "TERMINAL_DURABLE", None
+            return "KEEP_WATCHER", None
+
+        def _verify_retry() -> tuple[str, str | None]:
+            if status not in {"PENDING_TRIGGER", "CREATED"}:
+                return "KEEP_WATCHER", None
+            if lifecycle != "RETRY_WAIT" or mstatus != "RETRY_PENDING":
+                return "KEEP_WATCHER", None
+            next_retry_at = (
+                meta.get("next_retry_at")
+                or meta.get("materialization_next_retry_at")
+            )
+            if not next_retry_at:
+                return "KEEP_WATCHER", None
+            if meta.get("retry_attempt") is None:
+                return "KEEP_WATCHER", None
+            if meta.get("retry_max_attempts") is None:
+                return "KEEP_WATCHER", None
+            if meta.get("broker_ready") is True:
+                return "KEEP_WATCHER", None
+            if broker_order_id:
+                return "KEEP_WATCHER", None
+            if submitted_ts is not None:
+                return "KEEP_WATCHER", None
+            return "RETRY_WAIT", str(next_retry_at)
+
+        def _verify_ownership_transferred() -> tuple[str, str | None]:
+            current_owner = str(
+                meta.get("current_owner")
+                or meta.get("materialization_owner")
+                or ""
+            ).strip()
+            owner_token = str(
+                meta.get("owner_token")
+                or meta.get("materialization_owner_token")
+                or ""
+            ).strip()
+            owner_generation = (
+                meta.get("owner_generation")
+                if meta.get("owner_generation") is not None
+                else meta.get("materialization_generation")
+            )
+            owner_lease_until = (
+                meta.get("owner_lease_until")
+                or meta.get("materialization_lease_until")
+            )
+            if not (current_owner and owner_token
+                    and owner_generation is not None and owner_lease_until):
+                return "KEEP_WATCHER", None
+            try:
+                lease = datetime.fromisoformat(str(owner_lease_until))
+                if lease.tzinfo is None:
+                    lease = lease.replace(tzinfo=timezone.utc)
+            except Exception:
+                return "KEEP_WATCHER", None
+            if lease <= datetime.now(timezone.utc):
+                return "KEEP_WATCHER", None
+            return "OWNERSHIP_TRANSFERRED", None
+
+        # ── Route the claim through its verifier ──────────────────────
+        if claimed_disposition == "SUBMITTED":
+            return _verify_submitted()
+        if claimed_disposition == "TERMINAL_DURABLE":
+            return _verify_terminal()
+        if claimed_disposition == "RETRY_WAIT":
+            return _verify_retry()
+        if claimed_disposition == "OWNERSHIP_TRANSFERRED":
+            return _verify_ownership_transferred()
+        if claimed_disposition == "KEEP_WATCHER":
+            return "KEEP_WATCHER", claimed_next_retry
+        if claimed_disposition == "RECONCILE_BROKER_INTENT":
+            # Trust the claim only if row actually shows a durable intent.
+            if meta.get("submit_intent_at"):
+                return "RECONCILE_BROKER_INTENT", None
+            return "KEEP_WATCHER", None
+
+        # ── No claim (None/malformed) — infer from durable row ────────
+        # Prior behaviour, preserved as fallback.  Every branch below
+        # ends in either a verified terminal state, an in-flight
+        # KEEP_WATCHER, or UNKNOWN (which the consumer converts into
+        # watcher retention via RuntimeError).
+        submitted, _ = _verify_submitted()
+        if submitted in {"SUBMITTED", "RECONCILE_BROKER_INTENT"}:
+            return submitted, None
+        terminal, _ = _verify_terminal()
+        if terminal == "TERMINAL_DURABLE":
+            return terminal, None
+        if lifecycle == "RETRY_WAIT":
+            next_retry = (
+                meta.get("next_retry_at")
+                or meta.get("materialization_next_retry_at")
+            )
+            if next_retry:
+                return "RETRY_WAIT", str(next_retry)
         if lifecycle == "MATERIALIZING":
-            return "KEEP_WATCHER", (meta or {}).get("materialization_lease_until")
+            return "KEEP_WATCHER", meta.get("materialization_lease_until")
         return "UNKNOWN", None
 
     def _dedup_key_for_signal(self, signal: dict) -> str:
@@ -3667,7 +3822,7 @@ class APEntryWatcher:
                         _callback_disposition, _callback_next_retry = (
                             self._resolve_trigger_callback_disposition(w, _callback_result)
                         )
-                        if _callback_disposition in {"RETRY_WAIT", "KEEP_WATCHER"}:
+                        if _callback_disposition in {"RETRY_WAIT", "KEEP_WATCHER", "RECONCILE_BROKER_INTENT"}:
                             with self._lock:
                                 w.state = WatchState.PENDING
                                 if _callback_next_retry:
