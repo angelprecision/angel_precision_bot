@@ -2071,6 +2071,120 @@ class APExecutionCore:
             "generation": _generation,
         }
 
+    def reconcile_deferred_broker_intent(
+        self,
+        *,
+        local_order_id: str,
+    ) -> dict:
+        """AMENDMENT §6 fail-closed broker-ambiguity reconciler (crash window).
+
+        The submit path persists ``submit_intent_at`` and the Tradier
+        idempotency tag (``broker_submit_key`` = local_order_id) BEFORE
+        any broker bytes leave the process.  If the process crashes after
+        the broker accepted the order but before ``broker_order_id`` was
+        committed to the row, the durable row shows:
+
+            submit_intent_at present, broker_order_id absent
+
+        while a LIVE order may exist at the broker.  This is the
+        double-submit hazard: naively "resuming" such a row (the §2 path)
+        could place a second live order for Jason.
+
+        The correct resolution is to query the broker by the durable tag
+        (``_lookup_order_by_tag``) and ADOPT any existing order rather
+        than resubmit.  That query issues live broker I/O against a real
+        account; until it is explicitly wired and reviewed, this reconciler
+        is fail-closed:
+
+          * ALREADY_RECONCILED — broker_order_id already present; the
+            order monitor owns the row.  (Defensive; the recovery load
+            filter normally excludes these.)
+          * NOT_IN_CRASH_WINDOW — no submit_intent_at; the row never
+            reached the broker-submit boundary and is safe for the normal
+            resume path.
+          * RECONCILE_PENDING — crash window detected.  NEVER resubmit,
+            NEVER terminalize (the order may be live at the broker).  The
+            row is kept durably owned by the reconciler until the broker
+            query gate is wired.  reason_code
+            RECONCILE_BROKER_QUERY_NOT_YET_WIRED.
+          * KEEP_WATCHER — inspection could not complete (OSM unavailable,
+            row read raised, row missing).
+
+        The method never mutates the row and never calls the broker.
+        """
+        _owner_label = f"broker_reconciler:{self.client_id or self.email or ''}"
+        _base = {
+            "local_order_id": local_order_id,
+            "owner": _owner_label,
+            "submit_intent_at": None,
+            "broker_submit_key": None,
+        }
+
+        def _keep(reason: str) -> dict:
+            return {**_base, "disposition": "KEEP_WATCHER", "reason_code": reason}
+
+        osm = getattr(self, "order_state_machine", None) or getattr(self, "osm", None)
+        if osm is None:
+            return _keep("RECONCILE_OSM_UNAVAILABLE")
+        try:
+            row = osm.get_order(local_order_id)
+        except Exception as exc:
+            log.error(
+                "[%s] reconcile_deferred_broker_intent row_read_failed "
+                "local_order_id=%s exc=%s",
+                self.client_id, local_order_id, exc,
+            )
+            return _keep(f"RECONCILE_ROW_READ_ERROR:{type(exc).__name__}")
+        if not isinstance(row, dict):
+            return _keep("RECONCILE_ROW_MISSING")
+
+        # Identity: client_id (never touch another client's row)
+        row_client_id = str(row.get("client_id") or "").strip().lower()
+        expected_client_id = str(self.client_id or self.email or "").strip().lower()
+        if row_client_id and expected_client_id and row_client_id != expected_client_id:
+            return _keep("RECONCILE_CLIENT_ID_MISMATCH")
+
+        broker_order_id = str(row.get("broker_order_id") or "").strip()
+        meta = row.get("meta") or {}
+        if isinstance(meta, str):
+            try:
+                meta = json.loads(meta)
+            except Exception:
+                meta = {}
+        meta = meta or {}
+        submit_intent_at = meta.get("submit_intent_at")
+        broker_submit_key = meta.get("broker_submit_key")
+        _base["submit_intent_at"] = submit_intent_at
+        _base["broker_submit_key"] = broker_submit_key
+
+        # ── Already has a broker order → adopted, not our concern ────
+        if broker_order_id:
+            return {
+                **_base,
+                "disposition": "ALREADY_RECONCILED",
+                "reason_code": "RECONCILE_BROKER_ORDER_PRESENT",
+                "broker_order_id": broker_order_id,
+            }
+
+        # ── No submit intent → not a crash-window row ────────────────
+        if not submit_intent_at:
+            return {
+                **_base,
+                "disposition": "NOT_IN_CRASH_WINDOW",
+                "reason_code": "RECONCILE_NO_SUBMIT_INTENT",
+            }
+
+        # ── Crash window: submit intent present, no broker order ─────
+        # A live order may exist at the broker under broker_submit_key.
+        # FAIL CLOSED: never resubmit, never terminalize. The broker-query
+        # adoption path (_lookup_order_by_tag) issues live broker I/O and
+        # is deferred to a reviewed follow-up. Keep the row owned.
+        return {
+            **_base,
+            "disposition": "RECONCILE_PENDING",
+            "reason_code": "RECONCILE_BROKER_QUERY_NOT_YET_WIRED",
+        }
+
     def _on_entry_trigger(self, watched: WatchedSignal):
         """Called by watcher when price holds above/below trigger for 2 polls.
 

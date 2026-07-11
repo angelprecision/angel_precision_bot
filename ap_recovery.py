@@ -1198,6 +1198,72 @@ class APStartupRecovery:
                 )
                 continue
 
+            # ── AMENDMENT §6: broker-ambiguity crash window ────────────────
+            # If a durable submit intent was persisted (submit_intent_at) but
+            # no broker_order_id landed on the row, the process may have
+            # crashed AFTER the broker accepted the order but BEFORE the id
+            # was committed. A live order may exist at the broker under the
+            # durable tag. Such a row MUST NOT be resumed toward resubmission
+            # (the §2 path) — that risks a double-submit on a live account.
+            # Route it to the fail-closed reconciler, which never resubmits
+            # and never terminalizes until the broker-query adoption gate is
+            # wired. On RECONCILE_PENDING we retain durable ownership so the
+            # row is never lost while it waits for reconciliation.
+            if meta.get("submit_intent_at") and not str(order.get("broker_order_id") or "").strip():
+                reconcile_fn = None
+                if self.execution_core is not None:
+                    reconcile_fn = getattr(
+                        self.execution_core, "reconcile_deferred_broker_intent", None
+                    )
+                if not callable(reconcile_fn):
+                    # No reconciler available — retain ownership WITHOUT
+                    # resubmitting or terminalizing (a live order may exist).
+                    log.critical(
+                        "[%s] RECOVERY_CRASH_WINDOW reconciler_unavailable "
+                        "local_order_id=%s — row retained, NOT resumed "
+                        "(possible live broker order)",
+                        self.client_id, local_order_id,
+                    )
+                    _retain_recovery_ownership(
+                        local_order_id, reason="crash_window_reconciler_unavailable",
+                    )
+                    continue
+                try:
+                    rec = reconcile_fn(local_order_id=local_order_id) or {}
+                except Exception as exc:
+                    log.error(
+                        "[%s] reconcile_deferred_broker_intent raised "
+                        "local_order_id=%s exc=%s",
+                        self.client_id, local_order_id, exc,
+                    )
+                    _retain_recovery_ownership(
+                        local_order_id, reason="crash_window_reconcile_raised",
+                    )
+                    continue
+                rec_disposition = str(rec.get("disposition") or "").strip().upper()
+                if rec_disposition == "ALREADY_RECONCILED":
+                    # A broker order id is already present — the order monitor
+                    # owns it. Nothing to resume; leave the row untouched.
+                    continue
+                if rec_disposition == "RECONCILE_PENDING":
+                    # Crash window unresolved. NEVER resubmit / terminalize.
+                    _retain_recovery_ownership(
+                        local_order_id,
+                        reason=str(rec.get("reason_code") or "crash_window_reconcile_pending"),
+                    )
+                    continue
+                if rec_disposition == "NOT_IN_CRASH_WINDOW":
+                    # Reconciler proved the row never reached the broker
+                    # boundary — fall through to the normal resume path below.
+                    pass
+                else:
+                    # KEEP_WATCHER / unknown → retain ownership, do not resume.
+                    _retain_recovery_ownership(
+                        local_order_id,
+                        reason=str(rec.get("reason_code") or "crash_window_keep"),
+                    )
+                    continue
+
             if lifecycle in {"BROKER_READY", "SUBMITTING"} and meta.get("broker_ready") is True:
                 # ── AMENDMENT §2: NEVER fall through to submit_existing_entry ──
                 # The direct submit path bypasses kill switch, exposure
