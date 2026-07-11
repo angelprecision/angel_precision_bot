@@ -1606,7 +1606,8 @@ class APOrderStateMachine:
         local_order_id: str,
         *,
         owner: str,
-        generation: int,
+        generation: int | None = None,
+        new_generation: int | None = None,
         lease_until: str,
         trigger_crossed_at: str,
         trigger_price: float,
@@ -1616,20 +1617,50 @@ class APOrderStateMachine:
     ) -> bool:
         """Atomically fence one deferred-breach materialization worker.
 
-        The order row remains ``PENDING_TRIGGER`` until broker submission, but
-        the durable lifecycle in ``orders.meta`` moves to ``MATERIALIZING``.
-        A different owner cannot claim the same generation while its lease is
-        live.  Every later copyback uses the same owner/generation CAS.
+        AMENDMENT §3 (strictly monotonic generation fencing)
+        ---------------------------------------------------
+        Every new ownership claim MUST atomically advance the persisted
+        generation by exactly one.  The SQL predicate requires the
+        persisted ``materialization_generation`` to equal
+        ``new_generation - 1``; the patch writes ``new_generation``.
+        This closes the stale-worker window where a worker at
+        ``generation=N`` could previously claim a row where the
+        persisted value was already ``N`` or lower (the old ``<= %s``
+        predicate).
+
+        The ``generation`` keyword is preserved as a legacy alias for
+        ``new_generation`` — callers that already computed the correct
+        "next" value keep working; the SQL contract silently rejects
+        any caller whose expected-previous did not match the durable
+        row.
+
+        The order row remains ``PENDING_TRIGGER`` until broker
+        submission, but the durable lifecycle in ``orders.meta`` moves
+        to ``MATERIALIZING``.  A different owner cannot claim the same
+        generation while its lease is live; once the lease expires the
+        next claim advances the generation, and any downstream write
+        from the prior owner fails because ``persist_deferred_broker_ready``,
+        ``schedule_deferred_materialization_retry`` and
+        ``terminalize_deferred_breach`` all require exact owner +
+        generation match.
         """
         import json as _json_local
 
         _owner = str(owner or "").strip()
         _signal_id = str(signal_id or "").strip()
         _mode = str(execution_mode or "").strip().lower()
+
+        # ── §3: resolve the target new generation ────────────────────
+        # new_generation takes precedence when both are supplied.
+        _candidate = new_generation if new_generation is not None else generation
         try:
-            _generation = max(1, int(generation or 1))
+            _new_generation = int(_candidate) if _candidate is not None else 1
         except (TypeError, ValueError):
             return False
+        if _new_generation < 1:
+            return False
+        _expected_previous_generation = _new_generation - 1  # strictly monotonic
+
         if not _owner or not _signal_id or _mode not in ("live", "paper"):
             return False
 
@@ -1641,7 +1672,7 @@ class APOrderStateMachine:
             "materialization_owner": _owner,
             "watcher_token": _owner,
             "current_owner": _owner,
-            "materialization_generation": _generation,
+            "materialization_generation": _new_generation,
             "materialization_claimed_at": _now,
             "materialization_lease_until": str(lease_until or ""),
             "materialization_started_at": _now,
@@ -1681,14 +1712,11 @@ class APOrderStateMachine:
                             COALESCE(meta->>'lifecycle_state','') IN ('', 'RETRY_WAIT')
                          OR COALESCE(meta->>'materialization_lease_until','') < %s
                       )
-                      AND (
-                            COALESCE(meta->>'materialization_generation','') = ''
-                         OR COALESCE((meta->>'materialization_generation')::int, 0) <= %s
-                      )
+                      AND COALESCE((meta->>'materialization_generation')::int, 0) = %s
                     """,
                     (
                         _patch_json, local_order_id, self.client_id,
-                        _signal_id, _mode, _now, _generation,
+                        _signal_id, _mode, _now, _expected_previous_generation,
                     ),
                 )
                 return int(getattr(cur, "rowcount", getattr(c, "rowcount", 0)) or 0)

@@ -2670,15 +2670,28 @@ class APExecutionCore:
                 _prior_mat_attempt = int(_meta_for_attempt.get("materialization_attempts", 0) or 0)
             except Exception:
                 _prior_mat_attempt = 0
+            # ── AMENDMENT §3: strictly monotonic generation ──────────
+            # Read the *current* persisted generation directly from the
+            # durable row.  The plan's metadata carries a stale
+            # snapshot; using it would cause a reclaim after lease
+            # expiry to compute the wrong new_generation and the CAS
+            # would fail.  Fresh read is authoritative.
+            _persisted_generation = 0
             try:
-                _mat_generation = max(1, int(
-                    (getattr(approved_plan, "metadata", None) or {}).get(
-                        "materialization_generation",
-                        sig.get("trigger_generation", 1),
-                    ) or 1
-                ))
-            except (TypeError, ValueError):
-                _mat_generation = 1
+                _durable_row = self.order_state_machine.get_order(queue_local_order_id)
+                if isinstance(_durable_row, dict):
+                    _dur_meta = _durable_row.get("meta") or {}
+                    if isinstance(_dur_meta, str):
+                        try:
+                            _dur_meta = json.loads(_dur_meta)
+                        except Exception:
+                            _dur_meta = {}
+                    _persisted_generation = int(
+                        (_dur_meta or {}).get("materialization_generation") or 0
+                    )
+            except Exception:
+                _persisted_generation = 0
+            _mat_generation = _persisted_generation + 1
             _deferred_claim_context.update({
                 "owner": _mat_owner,
                 "generation": _mat_generation,
