@@ -189,7 +189,7 @@ _REASON_CODE_MAP: dict[str, str] = {
     "dte_out_of_range":      "DTE_OUT_OF_RANGE",
     "delta_out_of_range":    "DELTA_OUT_OF_RANGE",
     "premium_too_high":      "PREMIUM_CAP_EXCEEDED",
-    "moneyness_out_of_range": "DELTA_OUT_OF_RANGE",   # canonical: OTM moneyness = delta out of range
+    "moneyness_out_of_range": "MONEYNESS_OUT_OF_RANGE",  # own code: delta may be valid, only strike distance failed
     "premium_too_low":        "NO_AFFORDABLE_CONTRACT",
     "low_oi":                 "OI_TOO_LOW",
     "low_volume":             "VOLUME_TOO_LOW",
@@ -244,6 +244,7 @@ _TO_QUEUE_REASON: dict[str, str] = {
     "OI_TOO_LOW":                     "OI_TOO_LOW",
     "VOLUME_TOO_LOW":                 "VOLUME_TOO_LOW",
     "DELTA_OUT_OF_RANGE":             "DELTA_OUT_OF_RANGE",
+    "MONEYNESS_OUT_OF_RANGE":         "MONEYNESS_OUT_OF_RANGE",
     "DTE_OUT_OF_RANGE":               "DTE_OUT_OF_RANGE",
     "NO_AFFORDABLE_CONTRACT":         "NO_AFFORDABLE_CONTRACT",
     "UNTRADEABLE_FOR_ACCOUNT_SIZE":   "NO_AFFORDABLE_CONTRACT",
@@ -2730,8 +2731,8 @@ class APContractSelectionEngine:
                     candidate_score,
                     None,
                     stage="contract_build",
-                    reason_code="NO_AFFORDABLE_CONTRACT",
-                    explanation=f"Unable to build selected contract for {candidate_opt.get('symbol', '?')}",
+                    reason_code="CONTRACT_BUILD_FAILED",
+                    explanation=f"_build_selected() returned None for {candidate_opt.get('symbol', '?')} — internal build error",
                 )
                 continue
 
@@ -2949,10 +2950,10 @@ class APContractSelectionEngine:
                         candidate_opt,
                         candidate_score,
                         candidate,
-                        stage="deep_otm_gate",
-                        reason_code="DELTA_OUT_OF_RANGE",
+                        stage="moneyness_gate",
+                        reason_code="MONEYNESS_OUT_OF_RANGE",
                         explanation=(
-                            f"Deep OTM gate: strike={candidate.strike:.2f} "
+                            f"Moneyness gate: strike={candidate.strike:.2f} "
                             f"underlying={underlying_price:.2f} "
                             f"OTM={_otm_pct*100:.1f}% > max={_MAX_OTM_PCT*100:.0f}%"
                         ),
@@ -3041,17 +3042,19 @@ class APContractSelectionEngine:
             #   CAPITAL_NO_REMAINING        — no capital at all
             #   INVALID_POSITION_BUDGET     — budget value is corrupt / negative
             #   UNTRADEABLE_FOR_ACCOUNT_SIZE — every contract exceeds account size
-            #   DELTA_OUT_OF_RANGE          — chain has no quality-delta contracts
+            #   DELTA_OUT_OF_RANGE          — chain has no quality-delta contracts (delta < min)
+            #   MONEYNESS_OUT_OF_RANGE      — chain strikes are too far from price (OTM > max)
             #   CHEAP_CONTRACT_NO_UPGRADE   — only sub-minimum-premium contracts exist
             #   PREMIUM_CAP_EXCEEDED        — per-ticker cap blocks all candidates
             #   PAPER_PREMIUM_CAP           — paper-mode cap blocks all candidates
-            #   CONTRACT_BUILD_FAILED       — internal build error
+            #   CONTRACT_BUILD_FAILED       — internal _build_selected() error
             #   NO_AFFORDABLE_CONTRACT      — generic fallback
             _FINAL_REASON_PRECEDENCE = [
                 "CAPITAL_NO_REMAINING",
                 "INVALID_POSITION_BUDGET",
                 "UNTRADEABLE_FOR_ACCOUNT_SIZE",
                 "DELTA_OUT_OF_RANGE",
+                "MONEYNESS_OUT_OF_RANGE",
                 "CHEAP_CONTRACT_NO_UPGRADE",
                 "PREMIUM_CAP_EXCEEDED",
                 "PAPER_PREMIUM_CAP",
@@ -3082,6 +3085,21 @@ class APContractSelectionEngine:
                 "explanation",
                 f"No ranked candidates survived final gates | chain={_sel_chain_rows} survivors={_sel_survivors}",
             )
+            # Blocking defect fix: _record_final_rejection() left _last_failure pointing
+            # at the last candidate's rejection.  Stamp the deterministic authoritative
+            # reason so get_last_failure() always reflects the policy decision, not
+            # whichever candidate happened to be evaluated last.
+            # tradeability_diag is forwarded from the winning failure row when present
+            # (UNTRADEABLE_FOR_ACCOUNT_SIZE carries per-contract cost evidence that
+            # callers rely on for diagnostics).
+            _authoritative_lf: dict = {
+                "stage":       (_final_failure or {}).get("stage", "final_gate"),
+                "reason_code": _final_reason_code,
+                "explanation": _final_explanation,
+            }
+            if _final_failure and "tradeability_diag" in _final_failure:
+                _authoritative_lf["tradeability_diag"] = _final_failure["tradeability_diag"]
+            self._set_last_failure(_authoritative_lf)
             _failure_diagnostics = dict(_selector_request_diagnostics(request_context))
             _failure_diagnostics["final_candidate_rejections"] = list(_final_candidate_rejections)
             # Amendment 3: per-reason counts so operators can see the distribution

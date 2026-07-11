@@ -401,7 +401,7 @@ def test_rank_one_final_moneyness_fail_falls_back(monkeypatch):
     result = selector.select(_plan_dict())
     assert result is not None
     assert result.contract_symbol == valid["symbol"]
-    assert result.candidate_audit["final_candidate_rejections"][0]["contract"] == far_otm["symbol"]
+    assert result.candidate_audit["final_candidate_rejections"][0]["reason_code"] == "MONEYNESS_OUT_OF_RANGE"
 
 
 def test_rank_one_final_premium_cap_fail_falls_back(monkeypatch):
@@ -492,15 +492,17 @@ def test_cheap_contract_fallback_clears_last_failure(monkeypatch):
     valid = _option(bid=2.48, ask=2.50, symbol="SPY260717C00500000")
     _force_rank(monkeypatch, {cheap["symbol"]: 100.0, valid["symbol"]: 90.0})
     selector = FakeSelector(mode="LIVE", chain=[cheap, valid])
+    plan = _plan_dict()
 
-    result = selector.select(_plan_dict())
+    result = selector.select(plan)
 
     assert result is not None
     assert result.contract_symbol == valid["symbol"]
     assert selector.get_last_failure() is None, (
         "get_last_failure() must be None after cheap-fallback succeeds"
     )
-    assert _plan_dict()["metadata"].get("selector_failure") is None
+    # Must check the plan that was passed to select(), not a fresh _plan_dict()
+    assert plan["metadata"].get("selector_failure") is None
     rejections = result.candidate_audit["final_candidate_rejections"]
     assert rejections[0]["reason_code"] == "CHEAP_CONTRACT_NO_UPGRADE"
 
@@ -546,7 +548,7 @@ def test_moneyness_fallback_clears_last_failure(monkeypatch):
     )
     assert plan["metadata"].get("selector_failure") is None
     rejections = result.candidate_audit["final_candidate_rejections"]
-    assert rejections[0]["contract"] == far_otm["symbol"]
+    assert rejections[0]["reason_code"] == "MONEYNESS_OUT_OF_RANGE"
 
 
 def test_premium_cap_fallback_clears_last_failure(monkeypatch):
@@ -755,3 +757,192 @@ def test_final_reason_uses_most_common_when_counts_differ(monkeypatch):
     counts = failure["selection_diagnostics"]["final_rejection_counts"]
     assert counts.get("UNTRADEABLE_FOR_ACCOUNT_SIZE", 0) == 2
     assert counts.get("DELTA_OUT_OF_RANGE", 0) == 1
+
+
+# =============================================================================
+# Issue 1 — MONEYNESS_OUT_OF_RANGE is distinct from DELTA_OUT_OF_RANGE
+# =============================================================================
+
+def test_valid_delta_excessive_strike_distance_gives_moneyness_code(monkeypatch):
+    """
+    A candidate with valid delta (≥ MIN_CONTRACT_DELTA) but a strike that is
+    too far from the current price must produce MONEYNESS_OUT_OF_RANGE, not
+    DELTA_OUT_OF_RANGE.  The contract was not out-of-range on delta — only
+    the strike distance was wrong.
+    """
+    # Strike = 580, underlying = 500 → OTM ≈ 16% > MAX_OTM_PCT default 12%
+    far_strike = _option(symbol="SPY260717C00580000")
+    far_strike["strike"] = 580.0
+    far_strike["greeks"] = {"delta": "0.35"}  # valid delta
+    valid = _option(symbol="SPY260717C00500000")
+    _force_rank(monkeypatch, {far_strike["symbol"]: 100.0, valid["symbol"]: 90.0})
+    selector = FakeSelector(mode="LIVE", chain=[far_strike, valid])
+
+    result = selector.select(_plan_dict())
+
+    assert result is not None
+    assert result.contract_symbol == valid["symbol"]
+    rejections = result.candidate_audit["final_candidate_rejections"]
+    assert rejections[0]["reason_code"] == "MONEYNESS_OUT_OF_RANGE", (
+        f"Expected MONEYNESS_OUT_OF_RANGE, got {rejections[0]['reason_code']!r} — "
+        "delta was valid; only the strike distance was excessive"
+    )
+
+
+def test_low_delta_valid_strike_distance_gives_delta_code(monkeypatch):
+    """
+    A candidate with delta below MIN_CONTRACT_DELTA but a strike close to the
+    current price must produce DELTA_OUT_OF_RANGE, not MONEYNESS_OUT_OF_RANGE.
+    """
+    low_delta = _option(symbol="SPY260717C00499000")
+    low_delta["greeks"] = {"delta": "0.06"}   # below MIN_CONTRACT_DELTA=0.10
+    low_delta["strike"] = 499.0               # only 0.2% OTM — well within range
+    valid = _option(symbol="SPY260717C00500000")
+    _force_rank(monkeypatch, {low_delta["symbol"]: 100.0, valid["symbol"]: 90.0})
+    selector = FakeSelector(mode="LIVE", chain=[low_delta, valid])
+    selector.target_delta = 0.2
+    selector.delta_band = 0.2
+
+    result = selector.select(_plan_dict())
+
+    assert result is not None
+    assert result.contract_symbol == valid["symbol"]
+    rejections = result.candidate_audit["final_candidate_rejections"]
+    assert rejections[0]["reason_code"] == "DELTA_OUT_OF_RANGE", (
+        f"Expected DELTA_OUT_OF_RANGE, got {rejections[0]['reason_code']!r} — "
+        "the strike was close enough; only delta was below minimum"
+    )
+
+
+def test_mixed_delta_and_moneyness_failures_preserve_separate_counts(monkeypatch):
+    """
+    A candidate set with one DELTA failure and one MONEYNESS failure must record
+    them in separate final_rejection_counts buckets, and the deterministic final
+    reason must choose between them correctly (DELTA_OUT_OF_RANGE beats
+    MONEYNESS_OUT_OF_RANGE by precedence when both appear once).
+    """
+    low_delta = _option(symbol="SPY260717C00499000")
+    low_delta["greeks"] = {"delta": "0.06"}
+    low_delta["strike"] = 499.0
+
+    far_strike = _option(symbol="SPY260717C00580000")
+    far_strike["strike"] = 580.0
+    far_strike["greeks"] = {"delta": "0.35"}  # valid delta, bad distance
+
+    _force_rank(monkeypatch, {low_delta["symbol"]: 100.0, far_strike["symbol"]: 90.0})
+    selector = FakeSelector(mode="LIVE", chain=[low_delta, far_strike])
+    selector.target_delta = 0.2
+    selector.delta_band = 0.2
+    plan = _plan_dict()
+
+    result = selector.select(plan)
+
+    assert result is None
+    failure = plan["metadata"]["selector_failure"]
+    counts = failure["selection_diagnostics"]["final_rejection_counts"]
+
+    assert counts.get("DELTA_OUT_OF_RANGE", 0) == 1
+    assert counts.get("MONEYNESS_OUT_OF_RANGE", 0) == 1
+    # DELTA_OUT_OF_RANGE beats MONEYNESS_OUT_OF_RANGE by fixed precedence when tied
+    assert failure["reason_code"] == "DELTA_OUT_OF_RANGE"
+    # get_last_failure() must agree with the deterministic plan failure
+    lf = selector.get_last_failure()
+    assert lf is not None
+    assert lf["reason_code"] == "DELTA_OUT_OF_RANGE"
+
+
+# =============================================================================
+# Issue 2 — CONTRACT_BUILD_FAILED for _build_selected() returning None
+# =============================================================================
+
+def test_build_selected_failure_records_contract_build_failed(monkeypatch):
+    """
+    When _build_selected() returns None (e.g. internal error), the rejection
+    row must carry CONTRACT_BUILD_FAILED — not NO_AFFORDABLE_CONTRACT.
+    NO_AFFORDABLE_CONTRACT is reserved for genuine affordability results.
+    No plan mutation must occur (contract_symbol must remain absent).
+    """
+    broken = _option(symbol="SPY260717C00500000")
+    _force_rank(monkeypatch, {broken["symbol"]: 100.0})
+    monkeypatch.setattr(
+        APContractSelectionEngine,
+        "_build_selected",
+        lambda self, opt, score, budget, today: None,
+    )
+    selector = FakeSelector(mode="LIVE", chain=[broken])
+    plan = _plan_dict()
+
+    result = selector.select(plan)
+
+    assert result is None
+    # No plan mutation when build fails
+    assert plan.get("contract_symbol") is None
+    failure = plan["metadata"]["selector_failure"]
+    assert failure["reason_code"] == "CONTRACT_BUILD_FAILED"
+    counts = failure["selection_diagnostics"]["final_rejection_counts"]
+    assert counts.get("CONTRACT_BUILD_FAILED", 0) == 1
+    assert counts.get("NO_AFFORDABLE_CONTRACT", 0) == 0, (
+        "NO_AFFORDABLE_CONTRACT must not appear when the real cause is a build error"
+    )
+
+
+# =============================================================================
+# Blocking defect — all-fail path leaves get_last_failure() on last candidate
+# =============================================================================
+
+def test_all_fail_get_last_failure_matches_deterministic_plan_reason(monkeypatch):
+    """
+    When every candidate fails, get_last_failure() must return the same
+    deterministic reason that is stamped into plan.metadata.selector_failure.
+    Previously _set_last_failure() was left pointing at the last candidate's
+    rejection, making get_last_failure() disagree with selector_failure.
+    """
+    low_delta = _option(symbol="SPY260717C00499000")
+    low_delta["greeks"] = {"delta": "0.06"}
+    over_cap = _option(bid=4.48, ask=4.50, symbol="SPY260717C00501000")
+    _force_rank(monkeypatch, {low_delta["symbol"]: 100.0, over_cap["symbol"]: 90.0})
+    selector = FakeSelector(mode="LIVE", chain=[low_delta, over_cap])
+    selector.target_delta = 0.2
+    selector.delta_band = 0.2
+    plan = _plan_dict(metadata={"sizing_context": {"budget": 800.0}})
+
+    result = selector.select(plan)
+
+    assert result is None
+    plan_reason = plan["metadata"]["selector_failure"]["reason_code"]
+    lf = selector.get_last_failure()
+    assert lf is not None, "get_last_failure() must not be None on all-fail path"
+    assert lf["reason_code"] == plan_reason, (
+        f"get_last_failure() reason_code={lf['reason_code']!r} "
+        f"disagrees with plan selector_failure reason_code={plan_reason!r}"
+    )
+
+
+def test_all_fail_last_failure_not_last_candidate_but_authoritative(monkeypatch):
+    """
+    get_last_failure() on all-fail must reflect the authoritative precedence
+    winner, NOT whichever candidate happened to be evaluated last.
+
+    rank-1: DELTA_OUT_OF_RANGE  (evaluated first)
+    rank-2: PREMIUM_CAP_EXCEEDED (evaluated last → previously left in _last_failure)
+
+    Correct result: DELTA_OUT_OF_RANGE wins by precedence (both count=1).
+    get_last_failure() must agree.
+    """
+    low_delta = _option(symbol="SPY260717C00499000")
+    low_delta["greeks"] = {"delta": "0.06"}
+    over_cap = _option(bid=4.48, ask=4.50, symbol="SPY260717C00501000")
+    _force_rank(monkeypatch, {low_delta["symbol"]: 100.0, over_cap["symbol"]: 90.0})
+    selector = FakeSelector(mode="LIVE", chain=[low_delta, over_cap])
+    selector.target_delta = 0.2
+    selector.delta_band = 0.2
+    plan = _plan_dict(metadata={"sizing_context": {"budget": 800.0}})
+
+    selector.select(plan)
+
+    lf = selector.get_last_failure()
+    assert lf is not None
+    assert lf["reason_code"] == "DELTA_OUT_OF_RANGE", (
+        f"Expected DELTA_OUT_OF_RANGE (precedence winner), "
+        f"got {lf['reason_code']!r} — last-evaluated bias must not win"
+    )
