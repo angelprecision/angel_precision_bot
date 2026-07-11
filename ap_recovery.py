@@ -929,9 +929,8 @@ class APStartupRecovery:
             execution_mode=str(
                 order.get("execution_mode")
                 or meta.get("execution_mode")
-                or self._execution_mode()
                 or ""
-            ).lower(),
+            ).strip().lower(),
             contracts=int(order.get("qty") or meta.get("selected_qty") or 0),
             limit_price=float(
                 order.get("limit_price") or meta.get("selected_limit") or 0
@@ -944,8 +943,44 @@ class APStartupRecovery:
         )
 
     def _recover_deferred_breach_lifecycles(self, result: dict) -> None:
-        """Resume fenced deferred rows before normal startup entry processing."""
+        """Resume fenced deferred rows before normal startup entry processing.
+
+        AMENDMENT 1 (execution_mode scoping + identity proof)
+        -----------------------------------------------------
+        Every load and every mutation in this pass is scoped to the exact
+        runner mode. A paper runner MUST NOT observe or mutate LIVE rows,
+        and a LIVE runner MUST NOT observe or mutate paper rows, even for
+        the same client_id. The runner mode is resolved once at the top;
+        the SQL query filters by `LOWER(TRIM(COALESCE(execution_mode,'')))`;
+        each row is re-verified in Python (defence in depth); the plan
+        built from the row is re-verified before any watcher rearm or
+        submit path. The plan builder no longer infers a missing row mode
+        from the runner (see `_build_recovery_plan_from_order`), so a row
+        with a blank/malformed persisted mode fails identity closed here.
+        """
         from ap.db import conn, run_with_retry
+
+        # ── Runner mode resolve (once) ─────────────────────────────────
+        recovery_mode = self._execution_mode()  # "PAPER" | "LIVE" | None
+        if recovery_mode is None:
+            log.error(
+                "[%s] RECOVERY_BLOCKED unknown_execution_mode — deferred lifecycle recovery skipped",
+                self.client_id,
+            )
+            result.setdefault("errors", []).append("recovery_unknown_execution_mode")
+            return
+        recovery_mode_sql = recovery_mode.lower()  # SQL predicate is case-insensitive lower
+
+        # ── OSM identity proof (once) ──────────────────────────────────
+        osm_client_id = str(getattr(self.osm, "client_id", "") or "").strip().lower()
+        if osm_client_id and osm_client_id != self.client_id:
+            log.critical(
+                "[%s] RECOVERY_BLOCKED osm_client_id_mismatch osm=%r recovery=%r — "
+                "deferred lifecycle recovery skipped",
+                self.client_id, osm_client_id, self.client_id,
+            )
+            result.setdefault("errors", []).append("recovery_osm_client_id_mismatch")
+            return
 
         def _load():
             with conn() as c:
@@ -959,13 +994,14 @@ class APStartupRecovery:
                            , created_ts
                     FROM orders
                     WHERE client_id = %s
+                      AND LOWER(TRIM(COALESCE(execution_mode, ''))) = %s
                       AND kind = 'ENTRY'
                       AND UPPER(COALESCE(status,'')) = 'PENDING_TRIGGER'
                       AND (broker_order_id IS NULL OR broker_order_id = '')
                       AND submitted_ts IS NULL
                     ORDER BY created_ts ASC
                     """,
-                    (self.client_id,),
+                    (self.client_id, recovery_mode_sql),
                 )
                 return c.fetchall()
 
@@ -977,6 +1013,43 @@ class APStartupRecovery:
             local_order_id = str(order.get("local_order_id") or "").strip()
             if not local_order_id:
                 continue
+
+            # ── Per-row identity proof (defence in depth vs. SQL filter) ──
+            # The SQL predicate above SHOULD prevent any cross-mode or
+            # cross-client row from loading. These checks are belt-and-
+            # suspenders against DB whitespace, mocked/tested paths, or
+            # any future refactor that widens the SELECT. On mismatch we
+            # SKIP (never terminalize) because a mode/client mismatch
+            # likely means the row belongs to a DIFFERENT runner and
+            # terminalizing would destroy someone else's live row.
+            row_client_id = str(order.get("client_id") or "").strip().lower()
+            if row_client_id and row_client_id != self.client_id:
+                log.error(
+                    "[%s] RECOVERY_SKIP client_id_mismatch local_order_id=%s row=%r",
+                    self.client_id, local_order_id, row_client_id,
+                )
+                continue
+            row_mode = _normalize_execution_mode(order.get("execution_mode"))
+            if row_mode is None:
+                # Blank/malformed persisted mode. Per amendment §1, this is
+                # RECOVERY_INVALID_EXECUTION_MODE. SQL should already have
+                # filtered it out; if we're here it's a defensive catch.
+                # We QUARANTINE (skip + log) rather than terminalize, because
+                # we cannot prove the row is ours without a valid mode field.
+                log.error(
+                    "[%s] RECOVERY_SKIP RECOVERY_INVALID_EXECUTION_MODE "
+                    "local_order_id=%s raw_mode=%r",
+                    self.client_id, local_order_id, order.get("execution_mode"),
+                )
+                continue
+            if row_mode != recovery_mode:
+                log.error(
+                    "[%s] RECOVERY_SKIP execution_mode_mismatch local_order_id=%s "
+                    "row_mode=%s recovery_mode=%s",
+                    self.client_id, local_order_id, row_mode, recovery_mode,
+                )
+                continue
+
             meta = self._coerce_order_meta(order.get("meta"))
             lifecycle = str(meta.get("lifecycle_state") or "").upper()
             materialization_status = str(meta.get("materialization_status") or "").upper()
@@ -1017,6 +1090,28 @@ class APStartupRecovery:
 
             plan = self._build_recovery_plan_from_order(order)
             if plan is None:
+                continue
+
+            # ── Plan-level identity proof ────────────────────────────
+            # After building the plan, verify the plan carries the exact
+            # client_id and execution_mode we expect. The plan builder no
+            # longer infers execution_mode from the runner (Amendment 1),
+            # so a persisted row with a blank mode surfaces here as an
+            # empty plan.execution_mode string and is skipped.
+            plan_client_id = str(getattr(plan, "client_id", "") or "").strip().lower()
+            if plan_client_id and plan_client_id != self.client_id:
+                log.error(
+                    "[%s] RECOVERY_SKIP plan_client_id_mismatch local_order_id=%s plan=%r",
+                    self.client_id, local_order_id, plan_client_id,
+                )
+                continue
+            plan_mode_raw = str(getattr(plan, "execution_mode", "") or "").strip().upper()
+            if plan_mode_raw != recovery_mode:
+                log.error(
+                    "[%s] RECOVERY_SKIP plan_execution_mode_mismatch local_order_id=%s "
+                    "plan_mode=%r recovery_mode=%s",
+                    self.client_id, local_order_id, plan_mode_raw, recovery_mode,
+                )
                 continue
 
             if lifecycle in {"BROKER_READY", "SUBMITTING"} and meta.get("broker_ready") is True:
