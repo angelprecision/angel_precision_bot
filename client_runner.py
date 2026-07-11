@@ -1731,6 +1731,45 @@ class ClientRunner(threading.Thread):
         except Exception as _exc:
             logger.debug("[%s] exit_autonomous_recovery error (non-fatal): %s", self.email, _exc)
 
+    def _run_deferred_breach_lifecycle_recovery(self):
+        """Continuously recover due/stale deferred-breach ownership rows."""
+        _now = time.time()
+        _last = getattr(self, "_last_deferred_breach_recovery_ts", 0.0)
+        if _now - _last < 20.0:
+            return
+        self._last_deferred_breach_recovery_ts = _now
+        broker = getattr(self, "broker", None)
+        core = getattr(self, "core", None)
+        watcher = getattr(core, "entry_watcher", None) if core is not None else None
+        if broker is None or watcher is None or self.order_state_machine is None:
+            return
+        try:
+            recovery = APStartupRecovery(
+                client_id=self.email,
+                broker=broker,
+                osm=self.order_state_machine,
+                pm=self.position_manager,
+                master_control=self.master_control,
+                exit_engine=getattr(core, "exit_eng", None),
+                entry_watcher=watcher,
+            )
+            outcome = recovery.recover_deferred_lifecycles()
+            if outcome.get("errors"):
+                logger.error(
+                    "[%s] deferred breach lifecycle recovery errors=%s",
+                    self.email, outcome.get("errors"),
+                )
+            elif outcome.get("deferred_lifecycles_recovered"):
+                logger.info(
+                    "[%s] deferred breach lifecycles recovered=%s",
+                    self.email, outcome.get("deferred_lifecycles_recovered"),
+                )
+        except Exception as exc:
+            logger.error(
+                "[%s] deferred breach lifecycle recovery failed: %s",
+                self.email, exc, exc_info=True,
+            )
+
     def _detect_manual_closes(self):
         """
         Detect positions that were manually closed at the broker but still show OPEN in DB.
@@ -1869,6 +1908,7 @@ class ClientRunner(threading.Thread):
                 self._check_split_brain_recovery()   # BUG-5 FIX: poll for reconciler resolution
                 self._run_overnight_reeval_if_due()  # Arm WATCHING signals at 9:00-9:45 AM ET
                 self._run_exit_autonomous_recovery() # Resolve CLOSING-forever positions every 60s
+                self._run_deferred_breach_lifecycle_recovery()
                 self._detect_manual_closes()         # Detect broker-closed positions not in DB
                 self._set_entry_permission()
 

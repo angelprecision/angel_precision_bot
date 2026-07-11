@@ -36,6 +36,7 @@ jobs:
             tests/test_p0_regression_suite.py \
             tests/test_p0_entry_metadata_guard.py \
             tests/test_p0_trade_flow_contracts.py \
+            tests/test_p0_deferred_breach_lifecycle_completion.py \
             -v --tb=short --color=yes
 
       - name: Summary

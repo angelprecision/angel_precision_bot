@@ -32,9 +32,10 @@ dashboard queries that filter on the existing PENDING_TRIGGER status):
 
 HARD INVARIANT
 ──────────────
-meta.broker_ready=true is ONLY set by this module's `stamp_selected()` helper.
-Execution core checks it at pre-submit: if false, broker POST is blocked
-regardless of what the contract field contains.
+Legacy callers set meta.broker_ready through this module's `stamp_selected()`
+helper. The production breach path now uses the OSM atomic copyback CAS so the
+contract, price, quantity, reserved cost, and broker_ready flag commit together.
+Execution core checks readiness at pre-submit: if false, broker POST is blocked.
 
 DESIGN NOTES
 ────────────
@@ -80,6 +81,10 @@ RETRYABLE_MATERIALIZATION_REASONS: frozenset[str] = frozenset({
     "DIRECT_QUOTE_ZERO_BID_ASK",
     "QUOTE_FETCH_FAILED",
     "CHAIN_EMPTY",
+    "SELECTOR_REQUEST_BUDGET_EXHAUSTED",
+    "MARKET_DATA_THROTTLE_UNAVAILABLE",
+    "PROVIDER_RATE_LIMITED",
+    "PROVIDER_TIMEOUT",
 })
 
 # ── Config helpers (hot-read from env; no restart needed for tuning) ──────────

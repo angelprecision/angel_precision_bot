@@ -42,6 +42,8 @@
 # =============================================================================
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import os
 import re
@@ -1599,6 +1601,362 @@ class APOrderStateMachine:
             )
             return False
 
+    def claim_deferred_materialization(
+        self,
+        local_order_id: str,
+        *,
+        owner: str,
+        generation: int,
+        lease_until: str,
+        trigger_crossed_at: str,
+        trigger_price: float,
+        observed_underlying_price: float,
+        signal_id: str,
+        execution_mode: str,
+    ) -> bool:
+        """Atomically fence one deferred-breach materialization worker.
+
+        The order row remains ``PENDING_TRIGGER`` until broker submission, but
+        the durable lifecycle in ``orders.meta`` moves to ``MATERIALIZING``.
+        A different owner cannot claim the same generation while its lease is
+        live.  Every later copyback uses the same owner/generation CAS.
+        """
+        import json as _json_local
+
+        _owner = str(owner or "").strip()
+        _signal_id = str(signal_id or "").strip()
+        _mode = str(execution_mode or "").strip().lower()
+        try:
+            _generation = max(1, int(generation or 1))
+        except (TypeError, ValueError):
+            return False
+        if not _owner or not _signal_id or _mode not in ("live", "paper"):
+            return False
+
+        _now = now_utc_iso()
+        _patch = {
+            "lifecycle_state": "MATERIALIZING",
+            "materialization_status": "RUNNING",
+            "materialization_in_flight": True,
+            "materialization_owner": _owner,
+            "watcher_token": _owner,
+            "current_owner": _owner,
+            "materialization_generation": _generation,
+            "materialization_claimed_at": _now,
+            "materialization_lease_until": str(lease_until or ""),
+            "materialization_started_at": _now,
+            "selector_started_at": _now,
+            "trigger_crossed_at": str(trigger_crossed_at or _now),
+            "breach_received_at": _now,
+            "trigger_price": float(trigger_price or 0),
+            "observed_underlying_price": float(observed_underlying_price or 0),
+            "signal_id": _signal_id,
+            "local_order_id": str(local_order_id or ""),
+            "client_id": self.client_id,
+            "execution_mode": _mode,
+            "broker_ready": False,
+        }
+        try:
+            _patch_json = _json_local.dumps(_patch, default=str)
+        except Exception:
+            return False
+
+        def _claim():
+            with conn() as c:
+                cur = c.execute(
+                    """
+                    UPDATE orders
+                    SET meta = COALESCE(meta, '{}'::jsonb) || %s::jsonb,
+                        updated_ts = NOW()
+                    WHERE local_order_id = %s
+                      AND client_id = %s
+                      AND kind = 'ENTRY'
+                      AND UPPER(COALESCE(status,'')) = 'PENDING_TRIGGER'
+                      AND (broker_order_id IS NULL OR broker_order_id = '')
+                      AND submitted_ts IS NULL
+                      AND signal_id = %s
+                      AND LOWER(COALESCE(execution_mode,'')) = %s
+                      AND COALESCE((meta->>'broker_ready')::boolean, false) = false
+                      AND (
+                            COALESCE(meta->>'lifecycle_state','') IN ('', 'RETRY_WAIT')
+                         OR COALESCE(meta->>'materialization_lease_until','') < %s
+                      )
+                      AND (
+                            COALESCE(meta->>'materialization_generation','') = ''
+                         OR COALESCE((meta->>'materialization_generation')::int, 0) <= %s
+                      )
+                    """,
+                    (
+                        _patch_json, local_order_id, self.client_id,
+                        _signal_id, _mode, _now, _generation,
+                    ),
+                )
+                return int(getattr(cur, "rowcount", getattr(c, "rowcount", 0)) or 0)
+
+        try:
+            return bool(run_with_retry(_claim) > 0)
+        except Exception as exc:
+            log.warning(
+                "[%s] claim_deferred_materialization failed order=%s: %s",
+                self.client_id, local_order_id, exc,
+            )
+            return False
+
+    def persist_deferred_broker_ready(
+        self,
+        local_order_id: str,
+        *,
+        owner: str,
+        generation: int,
+        signal_id: str,
+        execution_mode: str,
+        contract: str,
+        limit_price: float,
+        qty: int,
+        reserved_cost: float,
+        selector_meta: dict,
+    ) -> bool:
+        """Atomically copy the complete materialized payload into durable state."""
+        import json as _json_local
+
+        _contract = str(contract or "").strip()
+        _owner = str(owner or "").strip()
+        _signal_id = str(signal_id or "").strip()
+        _mode = str(execution_mode or "").strip().lower()
+        try:
+            _generation = max(1, int(generation or 1))
+            _limit = round(float(limit_price or 0), 2)
+            _qty = int(qty or 0)
+            _reserved = round(float(reserved_cost or 0), 2)
+        except (TypeError, ValueError):
+            return False
+        if (
+            not _owner or not _signal_id or _mode not in ("live", "paper")
+            or not _contract or _contract.upper().startswith("DEFERRED:")
+            or _limit <= 0.01 or _qty <= 0 or _reserved <= 0
+        ):
+            return False
+
+        _now = now_utc_iso()
+        _meta = dict(selector_meta or {})
+        _meta.update({
+            "lifecycle_state": "BROKER_READY",
+            "materialization_status": "SELECTED",
+            "materialization_in_flight": False,
+            "materialization_owner": _owner,
+            "current_owner": _owner,
+            "materialization_generation": _generation,
+            "materialization_completed_at": _now,
+            "selector_completed_at": _now,
+            "copyback_completed_at": _now,
+            "broker_ready": True,
+            "selected_contract": _contract,
+            "selected_limit": _limit,
+            "selected_qty": _qty,
+            "selected_reserved_cost": _reserved,
+            "selector_failure": None,
+            "signal_id": _signal_id,
+            "local_order_id": str(local_order_id or ""),
+            "client_id": self.client_id,
+            "execution_mode": _mode,
+        })
+        try:
+            _meta_json = _json_local.dumps(_meta, default=str)
+        except Exception:
+            return False
+
+        def _persist():
+            with conn() as c:
+                cur = c.execute(
+                    """
+                    UPDATE orders
+                    SET contract = %s,
+                        limit_price = %s,
+                        qty = %s,
+                        reserved_cost = %s,
+                        contract_selection_status = 'CONTRACT_SELECTED',
+                        meta = COALESCE(meta, '{}'::jsonb) || %s::jsonb,
+                        updated_ts = NOW()
+                    WHERE local_order_id = %s
+                      AND client_id = %s
+                      AND kind = 'ENTRY'
+                      AND UPPER(COALESCE(status,'')) = 'PENDING_TRIGGER'
+                      AND (broker_order_id IS NULL OR broker_order_id = '')
+                      AND submitted_ts IS NULL
+                      AND signal_id = %s
+                      AND LOWER(COALESCE(execution_mode,'')) = %s
+                      AND COALESCE(meta->>'materialization_owner','') = %s
+                      AND COALESCE((meta->>'materialization_generation')::int, 0) = %s
+                      AND COALESCE(meta->>'lifecycle_state','') = 'MATERIALIZING'
+                    """,
+                    (
+                        _contract, _limit, _qty, _reserved, _meta_json,
+                        local_order_id, self.client_id, _signal_id, _mode,
+                        _owner, _generation,
+                    ),
+                )
+                return int(getattr(cur, "rowcount", getattr(c, "rowcount", 0)) or 0)
+
+        try:
+            return bool(run_with_retry(_persist) > 0)
+        except Exception as exc:
+            log.warning(
+                "[%s] persist_deferred_broker_ready failed order=%s: %s",
+                self.client_id, local_order_id, exc,
+            )
+            return False
+
+    def schedule_deferred_materialization_retry(
+        self,
+        local_order_id: str,
+        *,
+        owner: str,
+        generation: int,
+        reason_code: str,
+        attempt: int,
+        max_attempts: int,
+        next_retry_at: str,
+        selector_failure: dict,
+    ) -> bool:
+        """Durably transfer a fenced materializer claim to retry ownership."""
+        import json as _json_local
+
+        _owner = str(owner or "").strip()
+        _reason = str(reason_code or "").strip()
+        try:
+            _generation = max(1, int(generation or 1))
+            _attempt = max(1, int(attempt or 1))
+            _max_attempts = max(_attempt, int(max_attempts or _attempt))
+        except (TypeError, ValueError):
+            return False
+        if not _owner or not _reason or not str(next_retry_at or "").strip():
+            return False
+
+        _now = now_utc_iso()
+        _patch = {
+            "lifecycle_state": "RETRY_WAIT",
+            "materialization_status": "RETRY_PENDING",
+            "materialization_in_flight": False,
+            "materialization_owner": "",
+            "materialization_lease_until": "",
+            "materialization_generation": _generation,
+            "retry_reason": _reason,
+            "retry_attempt": _attempt,
+            "breach_attempt_count": _attempt,
+            "retry_max_attempts": _max_attempts,
+            "next_retry_at": str(next_retry_at),
+            "materialization_next_retry_at": str(next_retry_at),
+            "retry_owner": _owner,
+            "current_owner": _owner,
+            "retry_scheduled_at": _now,
+            "selector_completed_at": _now,
+            "materialization_selector_failure": selector_failure or {},
+            "broker_ready": False,
+        }
+        try:
+            _patch_json = _json_local.dumps(_patch, default=str)
+        except Exception:
+            return False
+
+        def _schedule():
+            with conn() as c:
+                cur = c.execute(
+                    """
+                    UPDATE orders
+                    SET meta = COALESCE(meta, '{}'::jsonb) || %s::jsonb,
+                        updated_ts = NOW()
+                    WHERE local_order_id = %s
+                      AND client_id = %s
+                      AND kind = 'ENTRY'
+                      AND UPPER(COALESCE(status,'')) = 'PENDING_TRIGGER'
+                      AND (broker_order_id IS NULL OR broker_order_id = '')
+                      AND submitted_ts IS NULL
+                      AND COALESCE(meta->>'materialization_owner','') = %s
+                      AND COALESCE((meta->>'materialization_generation')::int, 0) = %s
+                      AND COALESCE(meta->>'lifecycle_state','') = 'MATERIALIZING'
+                    """,
+                    (_patch_json, local_order_id, self.client_id, _owner, _generation),
+                )
+                return int(getattr(cur, "rowcount", getattr(c, "rowcount", 0)) or 0)
+
+        try:
+            return bool(run_with_retry(_schedule) > 0)
+        except Exception as exc:
+            log.warning(
+                "[%s] schedule_deferred_materialization_retry failed order=%s: %s",
+                self.client_id, local_order_id, exc,
+            )
+            return False
+
+    def terminalize_deferred_breach(
+        self,
+        local_order_id: str,
+        *,
+        reason_code: str,
+        terminal_status: str = "EXPIRED",
+        owner: str = "",
+        generation: int | None = None,
+        diagnostics: dict | None = None,
+    ) -> bool:
+        """Atomically persist the exact terminal reason and release ownership."""
+        import json as _json_local
+
+        _reason = str(reason_code or "").strip()
+        _status = str(terminal_status or "EXPIRED").strip().upper()
+        if not _reason or _status not in {"REJECTED", "EXPIRED", "CANCELED", "ERROR"}:
+            return False
+        _now = now_utc_iso()
+        _patch = dict(diagnostics or {})
+        _patch.update({
+            "lifecycle_state": _status,
+            "materialization_status": "FAILED_TERMINAL",
+            "materialization_in_flight": False,
+            "materialization_owner": "",
+            "current_owner": "",
+            "materialization_lease_until": "",
+            "broker_ready": False,
+            "reason_code": _reason,
+            "materialization_reason": _reason,
+            "final_reason": _reason,
+            "materialization_finished_at": _now,
+            "selector_completed_at": _now,
+        })
+        try:
+            _patch_json = _json_local.dumps(_patch, default=str)
+        except Exception:
+            return False
+
+        _where_owner = ""
+        _params: list = [_status, _reason, _patch_json, local_order_id, self.client_id]
+        if owner and generation is not None:
+            _where_owner = (
+                " AND COALESCE(meta->>'materialization_owner','') = %s"
+                " AND COALESCE((meta->>'materialization_generation')::int, 0) = %s"
+            )
+            _params.extend([str(owner), int(generation)])
+
+        def _terminalize():
+            with conn() as c:
+                cur = c.execute(
+                    "UPDATE orders SET status=%s, last_error=%s, "
+                    "meta=COALESCE(meta, '{}'::jsonb) || %s::jsonb, updated_ts=NOW() "
+                    "WHERE local_order_id=%s AND client_id=%s AND kind='ENTRY' "
+                    "AND UPPER(COALESCE(status,'')) IN ('CREATED','PENDING_TRIGGER') "
+                    "AND (broker_order_id IS NULL OR broker_order_id='') "
+                    "AND submitted_ts IS NULL" + _where_owner,
+                    tuple(_params),
+                )
+                return int(getattr(cur, "rowcount", getattr(c, "rowcount", 0)) or 0)
+
+        try:
+            return bool(run_with_retry(_terminalize) > 0)
+        except Exception as exc:
+            log.warning(
+                "[%s] terminalize_deferred_breach failed order=%s: %s",
+                self.client_id, local_order_id, exc,
+            )
+            return False
+
     def record_deferred_hydration_result(
         self,
         local_order_id: str,
@@ -1959,57 +2317,79 @@ class APOrderStateMachine:
                     "broker_order_id": current.get("broker_order_id"),
                     "status": status, "error": error_msg}
 
-        lp       = float(limit_price or current.get("limit_price") or getattr(plan, "limit_price", 0) or 0)
-        # ── CONTRACT RESOLUTION — prefer live plan over stale DB row ──────────
-        # DB order row may contain DEFERRED:TICKER (set during overnight premarket
-        # when no chain was available). At breach time, execution_core runs live
-        # contract selection and updates plan.contract_symbol with the real OCC symbol.
-        # We MUST use the plan's live contract, not the stale placeholder.
+        # Durable state is authoritative.  A caller may pass an in-memory plan
+        # only as an agreement proof; it may never repair or override the row at
+        # submit time.  Deferred copyback must have committed atomically before
+        # this method is called.
+        lp             = float(current.get("limit_price") or 0)
         _db_contract   = str(current.get("contract") or "").strip()
         _plan_contract = str(getattr(plan, "contract_symbol", "") or "").strip()
         _ticker        = current.get("symbol") or getattr(plan, "ticker", "")
-
+        contract       = _db_contract
         _db_is_deferred = (
             not _db_contract
             or _db_contract.upper().startswith("DEFERRED:")
             or _db_contract.upper() == str(_ticker).upper()
         )
 
-        if _db_is_deferred and _plan_contract and not _plan_contract.upper().startswith("DEFERRED:"):
-            # Use live plan contract — breach-time selection resolved it
-            contract = _plan_contract
-            log.info(
-                "[%s] CONTRACT_RESOLVED: DB had placeholder %r → using plan %r",
-                _ticker, _db_contract, contract,
-            )
-            # Update the order row so DB is consistent before broker POST
+        _raw_meta = current.get("meta") or {}
+        if isinstance(_raw_meta, str):
             try:
-                def _update_contract_pre_submit():
-                    with conn() as c:
-                        _upd_qty = int(getattr(plan, "contracts", 0) or current.get("qty") or 0)
-                        _upd_lp  = round(lp, 2)
-                        # P0: also update reserved_cost = qty * limit_price * 100 so
-                        # the capital gate sees the real breach-time cost, not the
-                        # placeholder 0.01 * 100 written at PENDING_TRIGGER arm time.
-                        _upd_rc  = round(_upd_qty * _upd_lp * 100, 2) if _upd_qty > 0 and _upd_lp > 0 else None
-                        c.execute(
-                            "UPDATE orders SET contract=%s, limit_price=%s, qty=%s, "
-                            "reserved_cost=%s, updated_ts=NOW() "
-                            "WHERE local_order_id=%s AND client_id=%s",
-                            (
-                                contract,
-                                _upd_lp,
-                                _upd_qty,
-                                _upd_rc,
-                                local_order_id,
-                                self.client_id,
-                            ),
-                        )
-                run_with_retry(_update_contract_pre_submit)
-            except Exception as _upd_exc:
-                log.warning("[%s] Failed to update order contract pre-submit: %s", _ticker, _upd_exc)
-        else:
-            contract = _db_contract or _plan_contract or _ticker
+                _raw_meta = json.loads(_raw_meta)
+            except Exception:
+                _raw_meta = {}
+        if not isinstance(_raw_meta, dict):
+            _raw_meta = {}
+
+        _is_materialized_deferred = bool(
+            _raw_meta.get("contract_deferred")
+            or _raw_meta.get("materialization_generation")
+            or _raw_meta.get("materialization_entry_path") == "DEFERRED_BREACH_MATERIALIZATION"
+        )
+        if not _is_materialized_deferred:
+            # Preserve the established non-deferred refresh path: its caller may
+            # supply a fresh ask, which is fail-closed synced below before POST.
+            lp = float(limit_price or current.get("limit_price") or 0)
+        if _is_materialized_deferred and (
+            _raw_meta.get("broker_ready") is not True
+            or str(_raw_meta.get("lifecycle_state") or "") != "BROKER_READY"
+        ):
+            error_msg = "MATERIALIZATION_DURABLE_STATE_MISMATCH:broker_ready"
+            log.critical("[%s] %s order=%s", _ticker, error_msg, local_order_id)
+            return {"ok": False, "local_order_id": local_order_id,
+                    "broker_order_id": current.get("broker_order_id"),
+                    "status": OrderStatus.ERROR, "error": error_msg}
+
+        _plan_qty = int(getattr(plan, "contracts", 0) or 0) if plan is not None else 0
+        _db_qty = int(current.get("qty") or 0)
+        _requested_limit = float(limit_price or 0)
+        _identity_mismatches = []
+        if plan is not None:
+            if _plan_contract and _plan_contract != _db_contract:
+                _identity_mismatches.append("contract")
+            if _plan_qty and _plan_qty != _db_qty:
+                _identity_mismatches.append("quantity")
+            _plan_signal_id = str(getattr(plan, "signal_id", "") or "")
+            if _plan_signal_id and _plan_signal_id != str(current.get("signal_id") or ""):
+                _identity_mismatches.append("signal_id")
+            _plan_client_id = str(getattr(plan, "client_id", "") or "").lower()
+            if _plan_client_id and _plan_client_id != str(current.get("client_id") or "").lower():
+                _identity_mismatches.append("client_id")
+            _plan_mode = str(getattr(plan, "execution_mode", "") or "").lower()
+            if _plan_mode and _plan_mode != str(current.get("execution_mode") or "").lower():
+                _identity_mismatches.append("execution_mode")
+        if (
+            _is_materialized_deferred
+            and _requested_limit
+            and abs(_requested_limit - lp) > 0.001
+        ):
+            _identity_mismatches.append("execution_price")
+        if _identity_mismatches:
+            error_msg = "MATERIALIZATION_DURABLE_STATE_MISMATCH:" + ",".join(_identity_mismatches)
+            log.critical("[%s] %s order=%s", _ticker, error_msg, local_order_id)
+            return {"ok": False, "local_order_id": local_order_id,
+                    "broker_order_id": current.get("broker_order_id"),
+                    "status": OrderStatus.ERROR, "error": error_msg}
 
         # HARD BLOCK — never submit a DEFERRED placeholder to Tradier
         if not contract or contract.upper().startswith("DEFERRED:") or contract.upper() == str(_ticker).upper():
@@ -2025,7 +2405,7 @@ class APOrderStateMachine:
                     "status": OrderStatus.ERROR, "error": error_msg}
 
         ticker   = _ticker
-        qty      = int(current.get("qty") or getattr(plan, "contracts", 0) or 0)
+        qty      = _db_qty
 
         if lp <= 0:
             error_msg = "invalid_existing_entry_limit_price"
@@ -2113,6 +2493,21 @@ class APOrderStateMachine:
                     "broker_order_id": latest.get("broker_order_id"),
                     "status": latest_status,
                     "error": f"submit_existing_entry_invalid_status:{latest_status}"}
+        if (
+            str(latest.get("contract") or "") != contract
+            or int(latest.get("qty") or 0) != qty
+            or abs(float(latest.get("limit_price") or 0) - lp) > 0.001
+            or str(latest.get("signal_id") or "") != str(current.get("signal_id") or "")
+            or str(latest.get("execution_mode") or "").lower()
+               != str(current.get("execution_mode") or "").lower()
+        ):
+            return {
+                "ok": False,
+                "local_order_id": local_order_id,
+                "broker_order_id": latest.get("broker_order_id"),
+                "status": OrderStatus.ERROR,
+                "error": "MATERIALIZATION_DURABLE_STATE_MISMATCH:stale_read",
+            }
 
         base_url   = (getattr(broker, "base_url", None)
                       or getattr(getattr(broker, "cfg", None), "base_url", None)
@@ -2131,6 +2526,66 @@ class APOrderStateMachine:
             "type": "limit", "price": round(lp, 2), "duration": "day",
             "tag": str(local_order_id)[:32],
         }
+        # Persist the exact durable submit intent before any broker bytes leave
+        # the process.  The Tradier tag is the stable idempotency/reconciliation
+        # key for the crash window after POST but before broker_order_id commit.
+        _had_prior_submit_intent = bool(_raw_meta.get("submit_intent_at"))
+        _payload_hash = hashlib.sha256(
+            json.dumps(_order_data, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        _breach_to_submit_ms = None
+        try:
+            _breach_at = datetime.fromisoformat(str(
+                _raw_meta.get("trigger_crossed_at")
+                or _raw_meta.get("trigger_confirmed_at")
+            ))
+            if _breach_at.tzinfo is None:
+                _breach_at = _breach_at.replace(tzinfo=timezone.utc)
+            _breach_to_submit_ms = max(
+                0, int((datetime.now(timezone.utc) - _breach_at).total_seconds() * 1000)
+            )
+        except Exception:
+            _breach_to_submit_ms = None
+        if not self.update_order_meta(local_order_id, {
+            "lifecycle_state": "SUBMITTING" if _is_materialized_deferred else "SUBMITTING",
+            "submit_started_at": now_utc_iso(),
+            "submit_intent_at": now_utc_iso(),
+            "broker_submit_key": str(local_order_id)[:32],
+            "current_owner": f"broker_submit:{str(local_order_id)[:32]}",
+            "broker_submit_payload_hash": _payload_hash,
+        }):
+            return {
+                "ok": False,
+                "local_order_id": local_order_id,
+                "broker_order_id": latest.get("broker_order_id"),
+                "status": OrderStatus.ERROR,
+                "error": "MATERIALIZATION_STATE_WRITE_FAILED:submit_intent",
+            }
+        if _had_prior_submit_intent:
+            _existing_oid = self._lookup_order_by_tag(
+                broker, base_url, account_id, str(local_order_id),
+            )
+            if _existing_oid:
+                ok = self.transition(
+                    local_order_id, OrderStatus.SUBMITTED,
+                    broker_order_id=_existing_oid, submitted_ts=now_utc_iso(),
+                )
+                if ok:
+                    self.update_order_meta(local_order_id, {
+                        "lifecycle_state": "SUBMITTED",
+                        "submit_completed_at": now_utc_iso(),
+                        "broker_order_id": str(_existing_oid),
+                        "current_owner": "broker",
+                        "total_breach_to_submit_ms": _breach_to_submit_ms,
+                    })
+                    return {
+                        "ok": True,
+                        "local_order_id": local_order_id,
+                        "broker_order_id": _existing_oid,
+                        "status": OrderStatus.SUBMITTED,
+                        "error": None,
+                        "reconciled_by_tag": True,
+                    }
         order, error_msg, broker_order_id, broker_status = self._submit_order_with_retry(
             broker=broker, base_url=base_url, account_id=account_id,
             order_data=_order_data, local_id=local_order_id, op_label="existing_entry",
@@ -2140,6 +2595,13 @@ class APOrderStateMachine:
                 ok = self.transition(local_order_id, OrderStatus.SUBMITTED,
                                      broker_order_id=broker_order_id, submitted_ts=now_utc_iso())
                 if ok:
+                    self.update_order_meta(local_order_id, {
+                        "lifecycle_state": "SUBMITTED",
+                        "submit_completed_at": now_utc_iso(),
+                        "broker_order_id": str(broker_order_id),
+                        "current_owner": "broker",
+                        "total_breach_to_submit_ms": _breach_to_submit_ms,
+                    })
                     return {"ok": True, "local_order_id": local_order_id,
                             "broker_order_id": broker_order_id,
                             "status": OrderStatus.SUBMITTED, "error": None}
@@ -2157,6 +2619,15 @@ class APOrderStateMachine:
         # structured audit trail captures WHY Tradier rejected the order.
         self.transition(local_order_id, OrderStatus.ERROR,
                         last_error=error_msg or "unknown_error")
+        self.update_order_meta(local_order_id, {
+            "lifecycle_state": "ERROR",
+            "materialization_in_flight": False,
+            "broker_ready": False,
+            "reason_code": error_msg or "BROKER_REJECTED_ENTRY",
+            "final_reason": error_msg or "BROKER_REJECTED_ENTRY",
+            "current_owner": "",
+            "submit_completed_at": now_utc_iso(),
+        })
         self._emit_transition_event(
             local_order_id=local_order_id,
             old_status=latest_status,

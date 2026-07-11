@@ -293,6 +293,7 @@ class APStartupRecovery:
             "buying_power_reserved": 0.0,
             "dedup_seeded":        0,
             "watchers_requeued":   0,
+            "deferred_lifecycles_recovered": 0,
             "errors":              [],
         }
 
@@ -302,6 +303,12 @@ class APStartupRecovery:
             log.error("[%s] RECOVERY_BLOCKED unknown execution_mode", self.client_id)
             result["errors"].append("recovery_unknown_execution_mode")
             return result
+
+        try:
+            self._recover_deferred_breach_lifecycles(result)
+        except Exception as e:
+            log.error("[%s] Deferred breach lifecycle recovery error: %s", self.client_id, e)
+            result["errors"].append(f"deferred_lifecycle: {e}")
 
         try:
             self._recover_positions(result)
@@ -353,6 +360,22 @@ class APStartupRecovery:
             result["buying_power_reserved"],
             len(result["errors"]),
         )
+        return result
+
+    def recover_deferred_lifecycles(self) -> dict:
+        """Lightweight runtime pass for durable deferred-breach ownership."""
+        result = {
+            "client_id": self.client_id,
+            "deferred_lifecycles_recovered": 0,
+            "errors": [],
+        }
+        if self._execution_mode() is None:
+            result["errors"].append("recovery_unknown_execution_mode")
+            return result
+        try:
+            self._recover_deferred_breach_lifecycles(result)
+        except Exception as exc:
+            result["errors"].append(f"deferred_lifecycle:{exc}")
         return result
 
     def _execution_mode(self) -> str | None:
@@ -902,7 +925,170 @@ class APStartupRecovery:
             prior_day_low=meta.get("prior_day_low"),
             strategy_type=str(meta.get("strategy_type") or ""),
             metadata=metadata,
+            client_id=str(order.get("client_id") or self.client_id),
+            execution_mode=str(
+                order.get("execution_mode")
+                or meta.get("execution_mode")
+                or self._execution_mode()
+                or ""
+            ).lower(),
+            contracts=int(order.get("qty") or meta.get("selected_qty") or 0),
+            limit_price=float(
+                order.get("limit_price") or meta.get("selected_limit") or 0
+            ),
+            max_position_usd=float(
+                order.get("reserved_cost")
+                or meta.get("selected_reserved_cost")
+                or 0
+            ),
         )
+
+    def _recover_deferred_breach_lifecycles(self, result: dict) -> None:
+        """Resume fenced deferred rows before normal startup entry processing."""
+        from ap.db import conn, run_with_retry
+
+        def _load():
+            with conn() as c:
+                c.execute(
+                    """
+                    SELECT local_order_id, client_id, signal_id, plan_id,
+                           symbol, contract, direction, score, tier,
+                           trigger_price, stop_underlying, target_underlying,
+                           pattern, timeframe, execution_mode, qty, limit_price,
+                           reserved_cost, status, broker_order_id, submitted_ts, meta
+                           , created_ts
+                    FROM orders
+                    WHERE client_id = %s
+                      AND kind = 'ENTRY'
+                      AND UPPER(COALESCE(status,'')) = 'PENDING_TRIGGER'
+                      AND (broker_order_id IS NULL OR broker_order_id = '')
+                      AND submitted_ts IS NULL
+                    ORDER BY created_ts ASC
+                    """,
+                    (self.client_id,),
+                )
+                return c.fetchall()
+
+        rows = run_with_retry(_load) or []
+        now = datetime.now(timezone.utc)
+        recovered = 0
+        for raw in rows:
+            order = dict(raw or {})
+            local_order_id = str(order.get("local_order_id") or "").strip()
+            if not local_order_id:
+                continue
+            meta = self._coerce_order_meta(order.get("meta"))
+            lifecycle = str(meta.get("lifecycle_state") or "").upper()
+            materialization_status = str(meta.get("materialization_status") or "").upper()
+
+            created_raw = order.get("created_ts")
+            try:
+                created_at = (
+                    created_raw
+                    if isinstance(created_raw, datetime)
+                    else datetime.fromisoformat(str(created_raw))
+                )
+                if created_at.tzinfo is None:
+                    created_at = created_at.replace(tzinfo=timezone.utc)
+                stale_pending = (now - created_at).total_seconds() > 72 * 3600
+            except Exception:
+                stale_pending = False
+            if stale_pending:
+                terminalize = getattr(self.osm, "terminalize_deferred_breach", None)
+                if callable(terminalize):
+                    terminalize(
+                        local_order_id,
+                        reason_code="RECOVERY_STALE_PENDING_TRIGGER",
+                        terminal_status="EXPIRED",
+                        diagnostics={"recovery_classification": "stale_over_72h"},
+                    )
+                continue
+
+            if lifecycle in {"REJECTED", "EXPIRED", "CANCELED", "ERROR"}:
+                terminalize = getattr(self.osm, "terminalize_deferred_breach", None)
+                if callable(terminalize):
+                    terminalize(
+                        local_order_id,
+                        reason_code=str(meta.get("reason_code") or meta.get("final_reason") or "RECOVERY_TERMINAL_STATE"),
+                        terminal_status=lifecycle,
+                        diagnostics={"recovery_classification": "terminal_meta_pending_row"},
+                    )
+                continue
+
+            plan = self._build_recovery_plan_from_order(order)
+            if plan is None:
+                continue
+
+            if lifecycle in {"BROKER_READY", "SUBMITTING"} and meta.get("broker_ready") is True:
+                submit = getattr(self.osm, "submit_existing_entry", None)
+                if callable(submit):
+                    submit_result = submit(
+                        local_order_id=local_order_id,
+                        broker=self.broker,
+                        plan=plan,
+                        limit_price=float(order.get("limit_price") or 0),
+                    )
+                    if submit_result.get("ok"):
+                        recovered += 1
+                    else:
+                        terminalize = getattr(self.osm, "terminalize_deferred_breach", None)
+                        if callable(terminalize):
+                            terminalize(
+                                local_order_id,
+                                reason_code=str(
+                                    submit_result.get("error")
+                                    or "RECOVERY_BROKER_READY_SUBMIT_FAILED"
+                                ),
+                                terminal_status="ERROR",
+                                diagnostics={"recovery_classification": "broker_ready_submit"},
+                            )
+                continue
+
+            should_resume = False
+            materialization_resume = False
+            if lifecycle == "RETRY_WAIT" or materialization_status == "RETRY_PENDING":
+                # Rearm immediately; the watcher consumes next_retry_at and
+                # remains dormant until due.  Startup recovery is not the only
+                # scheduler tick, so a future-due row still has a real owner.
+                should_resume = True
+                materialization_resume = True
+            elif lifecycle == "MATERIALIZING" or materialization_status == "RUNNING":
+                lease_raw = meta.get("materialization_lease_until")
+                try:
+                    lease = datetime.fromisoformat(str(lease_raw))
+                    if lease.tzinfo is None:
+                        lease = lease.replace(tzinfo=timezone.utc)
+                    should_resume = lease <= now
+                except Exception:
+                    should_resume = True
+                materialization_resume = should_resume
+            elif lifecycle == "" and materialization_status == "QUEUED":
+                should_resume = True
+                materialization_resume = True
+            elif lifecycle == "" and materialization_status in {"", "WAITING_FOR_TRIGGER"}:
+                # Ordinary orphan: the watch() recovery classifier either
+                # rearms it, or terminalizes if the live quote proves the move
+                # already happened/staleness makes rearm unsafe.
+                should_resume = True
+
+            if should_resume and self.entry_watcher is not None:
+                if hasattr(self.entry_watcher, "has_order") and self.entry_watcher.has_order(local_order_id):
+                    continue
+                plan.metadata["materialization_generation"] = int(
+                    meta.get("materialization_generation") or 1
+                )
+                plan.metadata["contract_deferred"] = True
+                armed = bool(self.entry_watcher.watch(
+                    plan,
+                    local_order_id,
+                    recovery_rearm=True,
+                    no_cancel_on_reject=True,
+                    materialization_resume=materialization_resume,
+                ))
+                if armed:
+                    recovered += 1
+
+        result["deferred_lifecycles_recovered"] = recovered
 
     def _reseed_watchers(self, result: dict):
         """

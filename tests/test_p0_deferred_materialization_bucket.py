@@ -4,7 +4,7 @@ tests/test_p0_deferred_materialization_bucket.py
 PR #300 — deferred materialization bucket + broker-ready lifecycle tests.
 
 CORE INVARIANTS BEING PROVED:
-  • broker_ready=True is ONLY set by stamp_selected() with a real OCC contract
+  • legacy stamp_selected() and the production atomic CAS require a real OCC contract
   • DEFERRED:*/0.01 rows can never have broker_ready=True
   • Triggered deferred rows get QUEUED/RUNNING meta stamps before selector runs
   • Successful materialization stamps SELECTED + broker_ready=True
@@ -92,17 +92,18 @@ class TestStampTriggerQueued:
         assert patch["broker_ready"] is False
         assert patch["materialization_attempts"] == 0
 
-    def test_preserves_client_id_in_log(self, caplog):
+    def test_preserves_client_id_in_log(self, monkeypatch):
         """M. Jason live identity must appear in every structured log."""
         import logging
         osm = _osm()
-        with caplog.at_level(logging.INFO, logger="ap.deferred_materializer"):
-            dm.stamp_trigger_queued(
-                osm, "LOID-GS-1",
-                client_id=_CLIENT_ID, execution_mode=_EXEC_MODE,
-                symbol="GS", direction="CALL", triggered_price=461.50,
-            )
-        log_text = "\n".join(caplog.messages)
+        logged = MagicMock()
+        monkeypatch.setattr(dm.log, "info", logged)
+        dm.stamp_trigger_queued(
+            osm, "LOID-GS-1",
+            client_id=_CLIENT_ID, execution_mode=_EXEC_MODE,
+            symbol="GS", direction="CALL", triggered_price=461.50,
+        )
+        log_text = str(logged.call_args_list)
         assert _CLIENT_ID in log_text
         assert "DEFERRED_TRIGGER_MOVED_TO_MATERIALIZATION_BUCKET" in log_text
 
@@ -210,19 +211,20 @@ class TestStampSelected:
         assert patch["selected_open_interest"] == 850
         assert patch["selected_volume"] == 210
 
-    def test_emits_ready_to_submit_created_log(self, caplog):
+    def test_emits_ready_to_submit_created_log(self, monkeypatch):
         import logging
         osm = _osm()
-        with caplog.at_level(logging.INFO, logger="ap.deferred_materializer"):
-            dm.stamp_selected(
-                osm, "LOID-1",
-                client_id=_CLIENT_ID, execution_mode=_EXEC_MODE,
-                symbol="GS", direction="CALL",
-                contract=_REAL_OCC,
-                bid=1.80, ask=1.86, mid=1.83,
-                limit_price=1.87, qty=1, reserved_cost=187.0,
-            )
-        log_text = "\n".join(caplog.messages)
+        logged = MagicMock()
+        monkeypatch.setattr(dm.log, "info", logged)
+        dm.stamp_selected(
+            osm, "LOID-1",
+            client_id=_CLIENT_ID, execution_mode=_EXEC_MODE,
+            symbol="GS", direction="CALL",
+            contract=_REAL_OCC,
+            bid=1.80, ask=1.86, mid=1.83,
+            limit_price=1.87, qty=1, reserved_cost=187.0,
+        )
+        log_text = str(logged.call_args_list)
         assert "READY_TO_SUBMIT_CREATED" in log_text
         assert "DEFERRED_MATERIALIZATION_SELECTED" in log_text
 
@@ -272,18 +274,19 @@ class TestStampRetryPending:
         patch = osm._calls[-1]["patch"]
         assert patch["materialization_selector_failure"]["chain_rows"] == 5
 
-    def test_emits_deferred_materialization_retry_log(self, caplog):
+    def test_emits_deferred_materialization_retry_log(self, monkeypatch):
         import logging
         osm = _osm()
-        with caplog.at_level(logging.WARNING, logger="ap.deferred_materializer"):
-            dm.stamp_retry_pending(
-                osm, "LOID-1",
-                client_id=_CLIENT_ID, execution_mode=_EXEC_MODE,
-                symbol="GS", direction="CALL",
-                reason_code="CHAIN_ROW_ZERO_BID_ASK",
-                attempt=1, max_attempts=3, retry_delay_s=20,
-            )
-        log_text = "\n".join(caplog.messages)
+        logged = MagicMock()
+        monkeypatch.setattr(dm.log, "warning", logged)
+        dm.stamp_retry_pending(
+            osm, "LOID-1",
+            client_id=_CLIENT_ID, execution_mode=_EXEC_MODE,
+            symbol="GS", direction="CALL",
+            reason_code="CHAIN_ROW_ZERO_BID_ASK",
+            attempt=1, max_attempts=3, retry_delay_s=20,
+        )
+        log_text = str(logged.call_args_list)
         assert "DEFERRED_MATERIALIZATION_RETRY" in log_text
         assert "RETRY_PENDING" in log_text
 
@@ -331,17 +334,18 @@ class TestStampFailedTerminal:
         assert sf["rejected_by_oi"] == 15
         assert sf["best_rejected_candidate"]["rejection_reason"] == "OI_TOO_LOW"
 
-    def test_emits_deferred_materialization_failed_log(self, caplog):
+    def test_emits_deferred_materialization_failed_log(self, monkeypatch):
         import logging
         osm = _osm()
-        with caplog.at_level(logging.CRITICAL, logger="ap.deferred_materializer"):
-            dm.stamp_failed_terminal(
-                osm, "LOID-1",
-                client_id=_CLIENT_ID, execution_mode=_EXEC_MODE,
-                symbol="GS", direction="CALL",
-                reason_code="OI_TOO_LOW", attempt=1,
-            )
-        log_text = "\n".join(caplog.messages)
+        logged = MagicMock()
+        monkeypatch.setattr(dm.log, "critical", logged)
+        dm.stamp_failed_terminal(
+            osm, "LOID-1",
+            client_id=_CLIENT_ID, execution_mode=_EXEC_MODE,
+            symbol="GS", direction="CALL",
+            reason_code="OI_TOO_LOW", attempt=1,
+        )
+        log_text = str(logged.call_args_list)
         assert "DEFERRED_MATERIALIZATION_FAILED" in log_text
         assert "broker_ready=false" in log_text
 
@@ -485,33 +489,35 @@ class TestIdempotency:
 class TestIdentityPreservation:
     """I + M + N. client_id and execution_mode preserved through all transitions."""
 
-    def test_stamp_selected_carries_execution_mode(self, caplog):
+    def test_stamp_selected_carries_execution_mode(self, monkeypatch):
         import logging
         osm = _osm()
-        with caplog.at_level(logging.INFO, logger="ap.deferred_materializer"):
-            dm.stamp_selected(
-                osm, "LOID-1",
-                client_id=_CLIENT_ID, execution_mode=_EXEC_MODE,
-                symbol="GS", direction="CALL",
-                contract=_REAL_OCC,
-                bid=1.80, ask=1.86, mid=1.83,
-                limit_price=1.87, qty=1, reserved_cost=187.0,
-            )
-        log_text = "\n".join(caplog.messages)
+        logged = MagicMock()
+        monkeypatch.setattr(dm.log, "info", logged)
+        dm.stamp_selected(
+            osm, "LOID-1",
+            client_id=_CLIENT_ID, execution_mode=_EXEC_MODE,
+            symbol="GS", direction="CALL",
+            contract=_REAL_OCC,
+            bid=1.80, ask=1.86, mid=1.83,
+            limit_price=1.87, qty=1, reserved_cost=187.0,
+        )
+        log_text = str(logged.call_args_list)
         assert _CLIENT_ID in log_text
         assert _EXEC_MODE in log_text
 
-    def test_stamp_failed_terminal_carries_client_id(self, caplog):
+    def test_stamp_failed_terminal_carries_client_id(self, monkeypatch):
         import logging
         osm = _osm()
-        with caplog.at_level(logging.CRITICAL, logger="ap.deferred_materializer"):
-            dm.stamp_failed_terminal(
-                osm, "LOID-1",
-                client_id=_CLIENT_ID, execution_mode=_EXEC_MODE,
-                symbol="GS", direction="CALL",
-                reason_code="OI_TOO_LOW", attempt=1,
-            )
-        log_text = "\n".join(caplog.messages)
+        logged = MagicMock()
+        monkeypatch.setattr(dm.log, "critical", logged)
+        dm.stamp_failed_terminal(
+            osm, "LOID-1",
+            client_id=_CLIENT_ID, execution_mode=_EXEC_MODE,
+            symbol="GS", direction="CALL",
+            reason_code="OI_TOO_LOW", attempt=1,
+        )
+        log_text = str(logged.call_args_list)
         assert _CLIENT_ID in log_text
 
     def test_paper_client_stamp_does_not_use_live_client_id(self):
@@ -610,8 +616,8 @@ class TestStructuredLogMarkers:
 
     def test_stamp_selected_called_in_execution_core(self):
         src = open("ap_execution_core.py").read()
-        assert "stamp_selected" in src
-        assert "from ap.deferred_materializer import stamp_selected" in src
+        assert "persist_deferred_broker_ready" in src
+        assert "broker_ready" in src
 
     def test_stamp_failed_terminal_called_in_execution_core(self):
         src = open("ap_execution_core.py").read()
@@ -619,7 +625,7 @@ class TestStructuredLogMarkers:
 
     def test_stamp_retry_pending_called_in_execution_core(self):
         src = open("ap_execution_core.py").read()
-        assert "stamp_retry_pending" in src
+        assert "schedule_deferred_materialization_retry" in src
 
 
 # ─────────────────────────────────────────────────────────────────────────────

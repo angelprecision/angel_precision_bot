@@ -686,6 +686,7 @@ class APEntryWatcher:
         self._lock = threading.Lock()
         self._running = False
         self._thread: Optional[threading.Thread] = None
+        self.owner_token = f"watcher:{uuid.uuid4()}"
 
         self.on_trigger: Optional[Callable] = None
         self.on_expire: Optional[Callable] = None
@@ -698,6 +699,56 @@ class APEntryWatcher:
         # Real watcher-level duplicate barrier. Cleanup alone is not enough;
         # the key must be initialized and enforced before a signal is armed.
         self._dedup_set: set[str] = set()
+
+    @staticmethod
+    def _is_deferred_signal(signal: dict) -> bool:
+        contract = str((signal or {}).get("contract_symbol") or "").strip().upper()
+        return bool((signal or {}).get("contract_deferred")) or contract.startswith("DEFERRED:")
+
+    def _resolve_trigger_callback_disposition(self, watched, result) -> tuple[str, str | None]:
+        """Prove the durable owner/state before a triggered watcher is removed."""
+        if isinstance(result, dict):
+            disposition = str(result.get("disposition") or "").strip().upper()
+            if disposition in {
+                "RETRY_WAIT", "KEEP_WATCHER", "TERMINAL_DURABLE",
+                "SUBMITTED", "OWNERSHIP_TRANSFERRED",
+            }:
+                return disposition, result.get("next_retry_at")
+
+        signal = getattr(watched, "signal", {}) or {}
+        if not self._is_deferred_signal(signal):
+            return "OWNERSHIP_TRANSFERRED", None
+
+        local_order_id = str(signal.get("local_order_id") or "").strip()
+        get_order = getattr(self.order_state_machine, "get_order", None)
+        if not local_order_id or not callable(get_order):
+            return "UNKNOWN", None
+        try:
+            row = get_order(local_order_id)
+        except Exception:
+            return "UNKNOWN", None
+        if not isinstance(row, dict):
+            return "UNKNOWN", None
+        status = str(row.get("status") or "").upper()
+        if status in {"SUBMITTED", "ACKNOWLEDGED", "PARTIAL_FILL", "FILLED"}:
+            return "SUBMITTED", None
+        if status in {"REJECTED", "EXPIRED", "CANCELED", "ERROR"}:
+            return "TERMINAL_DURABLE", None
+        meta = row.get("meta") or {}
+        if isinstance(meta, str):
+            try:
+                meta = json.loads(meta)
+            except Exception:
+                meta = {}
+        lifecycle = str((meta or {}).get("lifecycle_state") or "").upper()
+        if lifecycle == "RETRY_WAIT":
+            return "RETRY_WAIT", (
+                (meta or {}).get("next_retry_at")
+                or (meta or {}).get("materialization_next_retry_at")
+            )
+        if lifecycle == "MATERIALIZING":
+            return "KEEP_WATCHER", (meta or {}).get("materialization_lease_until")
+        return "UNKNOWN", None
 
     def _dedup_key_for_signal(self, signal: dict) -> str:
         return str(signal.get("signal_id") or "").strip()
@@ -1711,6 +1762,7 @@ class APEntryWatcher:
 
         watched = WatchedSignal(signal, overnight=overnight)
         watched._watcher_ref = self
+        watched.deferred_retry_not_before = signal.get("deferred_retry_not_before")
 
         local_order_id = watched.signal.get("local_order_id")
         if not self._validate_local_order_id(local_order_id):
@@ -2207,6 +2259,7 @@ class APEntryWatcher:
         *,
         recovery_rearm: bool = False,
         no_cancel_on_reject: bool = False,
+        materialization_resume: bool = False,
     ) -> bool:
         """Plan-aware entrypoint called by queue/execution orchestration.
 
@@ -2228,6 +2281,7 @@ class APEntryWatcher:
         # Propagate recovery mode flag into signal_dict so add_signal()
         # can suppress its own cancel_pending_entry calls.
         _recovery_rearm    = bool(recovery_rearm)
+        _materialization_resume = bool(materialization_resume)
         _no_cancel_on_reject = bool(no_cancel_on_reject or recovery_rearm)
 
         signal_dict = {
@@ -2241,6 +2295,26 @@ class APEntryWatcher:
             "target_price": getattr(plan, "target_underlying", None),
             "plan_id": getattr(plan, "plan_id", ""),
             "local_order_id": local_order_id,
+            "client_id": str(
+                getattr(plan, "client_id", "")
+                or (getattr(plan, "metadata", None) or {}).get("client_id")
+                or ""
+            ),
+            "execution_mode": str(
+                getattr(plan, "execution_mode", "")
+                or (getattr(plan, "metadata", None) or {}).get("execution_mode")
+                or self.mode
+            ).lower(),
+            "watcher_token": self.owner_token,
+            "trigger_generation": int(
+                (getattr(plan, "metadata", None) or {}).get(
+                    "materialization_generation", 1
+                ) or 1
+            ),
+            "deferred_retry_not_before": (
+                (getattr(plan, "metadata", None) or {}).get("next_retry_at")
+                or (getattr(plan, "metadata", None) or {}).get("materialization_next_retry_at")
+            ),
             # PR #182: carry trade_queue.id through to breach time so
             # write_deferred_breach_last_error() can find the queue row.
             # Populated by queue.py _dispatch() onto plan.metadata before watch() is called.
@@ -2252,6 +2326,10 @@ class APEntryWatcher:
             "prior_day_low": getattr(plan, "prior_day_low", None),
             "timeframe": getattr(plan, "timeframe", "1d"),
             "strategy_type": getattr(plan, "strategy_type", ""),
+            "contract_deferred": bool(
+                (getattr(plan, "metadata", None) or {}).get("contract_deferred")
+                or str(getattr(plan, "contract_symbol", "") or "").upper().startswith("DEFERRED:")
+            ),
             "trigger": {
                 "entry": getattr(plan, "trigger_price", None),
                 "stop": getattr(plan, "stop_underlying", None),
@@ -2273,8 +2351,10 @@ class APEntryWatcher:
         # Stamp the recovery flag so add_signal() suppresses cancel_pending_entry.
         if _recovery_rearm:
             signal_dict["__recovery_rearm"] = True
+        if _materialization_resume:
+            signal_dict["__materialization_resume"] = True
 
-        if _recovery_rearm:
+        if _recovery_rearm and not _materialization_resume:
             try:
                 from ap.pending_trigger_classifier import (
                     PendingTriggerClassification,
@@ -2700,7 +2780,12 @@ class APEntryWatcher:
         #   - trigger is missing/invalid
         #   - quote fetch fails (fail-safe: let existing paths handle it)
         _regular_session_now = not pre_market and not post_session
-        if _regular_session_now and trigger and float(trigger or 0) > 0:
+        if (
+            _regular_session_now
+            and trigger
+            and float(trigger or 0) > 0
+            and not _materialization_resume
+        ):
             try:
                 _bug_c_quote = self._get_quote(ticker) or {}
             except Exception:
@@ -3391,6 +3476,20 @@ class APEntryWatcher:
         completed = []
         with self._lock:
             for w in active:
+                _retry_not_before = getattr(w, "deferred_retry_not_before", None)
+                if _retry_not_before is not None:
+                    try:
+                        if isinstance(_retry_not_before, str):
+                            _retry_not_before = datetime.fromisoformat(_retry_not_before)
+                        if _retry_not_before.tzinfo is None:
+                            _retry_not_before = _retry_not_before.replace(tzinfo=timezone.utc)
+                        if datetime.now(timezone.utc) < _retry_not_before:
+                            continue
+                        w.deferred_retry_not_before = None
+                    except Exception:
+                        # Invalid retry timestamps never create an indefinite wait;
+                        # clear and let the normal breach check re-prove the trigger.
+                        w.deferred_retry_not_before = None
                 quote = quotes.get(w.ticker)
                 if not quote:
                     continue
@@ -3513,8 +3612,11 @@ class APEntryWatcher:
                                     self.order_state_machine, "update_order_meta", None
                                 )
                                 if callable(_upd_ts):
-                                    _upd_ts(_ts_pre_local_oid, _ts_patch)
-                                    _ts_pre_write_ok = True
+                                    _ts_pre_write_ok = bool(
+                                        _upd_ts(_ts_pre_local_oid, _ts_patch)
+                                    )
+                                    if not _ts_pre_write_ok:
+                                        raise RuntimeError("trigger_timestamp_meta_write_returned_false")
                                     log.info(
                                         "WATCHER_TRIGGER_TIMESTAMPS_PERSISTED "
                                         "local_order_id=%s trigger_crossed_at=%s "
@@ -3540,9 +3642,67 @@ class APEntryWatcher:
                                 w.ticker, _pre_ts_exc,
                             )
 
+                    if (
+                        self._is_live_runtime()
+                        and self._is_deferred_signal(getattr(w, "signal", {}) or {})
+                        and not _ts_pre_write_ok
+                    ):
+                        # Database truth is unavailable.  Keep the watcher as the
+                        # active owner and never enter selector/broker work.
+                        with self._lock:
+                            w.state = WatchState.PENDING
+                            w.deferred_retry_not_before = (
+                                datetime.now(timezone.utc) + timedelta(seconds=5)
+                            )
+                        log.critical(
+                            "WATCHER_TRIGGER_PERSISTENCE_RETRY "
+                            "ticker=%s local_order_id=%s kept_in_pending=true",
+                            w.ticker, _ts_pre_local_oid or "?",
+                        )
+                        continue
+
                     # ── Call the trigger callback — timestamps are now durable ──
                     try:
-                        self.on_trigger(w)
+                        _callback_result = self.on_trigger(w)
+                        _callback_disposition, _callback_next_retry = (
+                            self._resolve_trigger_callback_disposition(w, _callback_result)
+                        )
+                        if _callback_disposition in {"RETRY_WAIT", "KEEP_WATCHER"}:
+                            with self._lock:
+                                w.state = WatchState.PENDING
+                                if _callback_next_retry:
+                                    try:
+                                        w.deferred_retry_not_before = datetime.fromisoformat(
+                                            str(_callback_next_retry)
+                                        )
+                                    except Exception:
+                                        w.deferred_retry_not_before = (
+                                            datetime.now(timezone.utc) + timedelta(seconds=5)
+                                        )
+                                else:
+                                    _retry_after = 5
+                                    if isinstance(_callback_result, dict):
+                                        try:
+                                            _retry_after = max(
+                                                1, int(_callback_result.get("retry_after_seconds") or 5)
+                                            )
+                                        except Exception:
+                                            _retry_after = 5
+                                    w.deferred_retry_not_before = (
+                                        datetime.now(timezone.utc)
+                                        + timedelta(seconds=_retry_after)
+                                    )
+                            log.warning(
+                                "WATCHER_TRIGGER_OWNERSHIP_RETAINED "
+                                "ticker=%s signal_id=%s disposition=%s next_retry_at=%s",
+                                w.ticker, _sig_id or "?", _callback_disposition,
+                                getattr(w, "deferred_retry_not_before", None),
+                            )
+                            continue
+                        if _callback_disposition == "UNKNOWN":
+                            raise RuntimeError(
+                                "deferred_trigger_callback_returned_without_durable_outcome"
+                            )
                         w._trigger_attempts = 0   # reset on success
                         # ── P0 (PR #304) Bug B: explicit removal on SUCCESS.
                         # Since Bug B fix stopped removing triggered watchers
@@ -3663,6 +3823,40 @@ class APEntryWatcher:
                                 "last_error=%s",
                                 w.ticker, _sig_id or "?", exc,
                             )
+                            _terminalized = False
+                            _terminalize = getattr(
+                                self.order_state_machine,
+                                "terminalize_deferred_breach",
+                                None,
+                            )
+                            if callable(_terminalize):
+                                try:
+                                    _terminalized = bool(_terminalize(
+                                        str((getattr(w, "signal", {}) or {}).get("local_order_id") or ""),
+                                        reason_code="on_trigger_exhausted_3_attempts",
+                                        terminal_status="ERROR",
+                                        diagnostics={
+                                            "exception_class": type(exc).__name__,
+                                            "safe_error_text": str(exc)[:200],
+                                            "failure_stage": "trigger_callback",
+                                            "diagnostic_id": str(uuid.uuid4()),
+                                        },
+                                    ))
+                                except Exception:
+                                    _terminalized = False
+                            if not _terminalized:
+                                with self._lock:
+                                    w.state = WatchState.PENDING
+                                    w.deferred_retry_not_before = (
+                                        datetime.now(timezone.utc) + timedelta(seconds=5)
+                                    )
+                                w._trigger_attempts = 0
+                                log.critical(
+                                    "WATCHER_TRIGGER_CALLBACK_EXHAUSTED_TERMINAL_WRITE_FAILED "
+                                    "ticker=%s signal_id=%s kept_in_pending=true",
+                                    w.ticker, _sig_id or "?",
+                                )
+                                continue
                             with self._lock:
                                 w.state = WatchState.EXPIRED
                                 _wid = id(w)
