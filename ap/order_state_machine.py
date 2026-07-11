@@ -50,7 +50,7 @@ import re
 import threading
 import time as _time_module
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from ap.db import conn, run_with_retry
@@ -1601,6 +1601,65 @@ class APOrderStateMachine:
             )
             return False
 
+    def claim_deferred_broker_ready_submit(
+        self,
+        local_order_id: str,
+        *,
+        owner: str,
+        generation: int,
+    ) -> bool:
+        """Fence recovery submit so only one worker can enter canonical gates."""
+        import json as _json_local
+        owner = str(owner or "").strip()
+        if not owner:
+            return False
+        try:
+            generation = int(generation)
+        except (TypeError, ValueError):
+            return False
+        now = datetime.now(timezone.utc)
+        patch = _json_local.dumps({
+            "current_owner": owner,
+            "recovery_submit_owner": owner,
+            "recovery_submit_claimed_at": now.isoformat(),
+            "recovery_submit_lease_until": (now + timedelta(seconds=60)).isoformat(),
+        })
+
+        def _claim():
+            with conn() as c:
+                cur = c.execute(
+                    """
+                    UPDATE orders
+                    SET meta = COALESCE(meta, '{}'::jsonb) || %s::jsonb,
+                        updated_ts = NOW()
+                    WHERE local_order_id = %s
+                      AND client_id = %s
+                      AND kind = 'ENTRY'
+                      AND UPPER(COALESCE(status,'')) = 'PENDING_TRIGGER'
+                      AND (broker_order_id IS NULL OR broker_order_id = '')
+                      AND submitted_ts IS NULL
+                      AND COALESCE((meta->>'broker_ready')::boolean, false) = true
+                      AND COALESCE(meta->>'lifecycle_state','') = 'BROKER_READY'
+                      AND COALESCE((meta->>'materialization_generation')::int, 0) = %s
+                      AND COALESCE(meta->>'submit_intent_at','') = ''
+                      AND (
+                            COALESCE(meta->>'recovery_submit_owner','') = ''
+                         OR COALESCE(meta->>'recovery_submit_lease_until','') < %s
+                      )
+                    """,
+                    (patch, local_order_id, self.client_id, generation, now.isoformat()),
+                )
+                return int(getattr(cur, "rowcount", getattr(c, "rowcount", 0)) or 0)
+
+        try:
+            return bool(run_with_retry(_claim) > 0)
+        except Exception as exc:
+            log.warning(
+                "[%s] claim_deferred_broker_ready_submit failed order=%s: %s",
+                self.client_id, local_order_id, exc,
+            )
+            return False
+
     def claim_deferred_materialization(
         self,
         local_order_id: str,
@@ -1657,6 +1716,7 @@ class APOrderStateMachine:
             _new_generation = int(_candidate) if _candidate is not None else 1
         except (TypeError, ValueError):
             return False
+
         if _new_generation < 1:
             return False
         _expected_previous_generation = _new_generation - 1  # strictly monotonic

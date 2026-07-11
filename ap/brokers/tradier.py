@@ -409,6 +409,24 @@ class TradierBroker(BrokerAdapter):
         except Exception as e:
             return {"status": "ERROR", "reason": str(e)}
 
+    def list_orders(self) -> List[Dict[str, Any]]:
+        """Return account orders for exact-tag crash-window reconciliation.
+
+        Unlike ``get_order`` this deliberately propagates transport/auth errors:
+        callers must distinguish an authoritative empty result from an unavailable
+        broker query before deciding that a new POST is safe.
+        """
+        j = self._get(f"/v1/accounts/{self.cfg.account_id}/orders")
+        node = j.get("orders") if isinstance(j, dict) else None
+        orders = node.get("order") if isinstance(node, dict) else node
+        if orders is None:
+            return []
+        if isinstance(orders, dict):
+            return [orders]
+        if isinstance(orders, list):
+            return [order for order in orders if isinstance(order, dict)]
+        raise ValueError("TRADIER_ORDERS_PAYLOAD_MALFORMED")
+
     def close_position(self, position_id: str) -> BrokerOrderResponse:
         # Not used in current architecture
         return BrokerOrderResponse(

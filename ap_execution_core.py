@@ -34,6 +34,7 @@ from ap_tier_engine          import APShadowTracker
 from ap_proof_logger         import APProofLogger, funnel
 from ap_signal_store         import APSignalStore
 from ap_signal_tracker       import APSignalTracker
+from ap.utils                import now_utc_iso
 
 # Intelligence outcome feedback — optional, fails silently if bridge not deployed
 try:
@@ -1878,7 +1879,7 @@ class APExecutionCore:
         local_order_id: str,
         plan=None,
     ) -> dict:
-        """AMENDMENT §2 fail-closed scaffold for BROKER_READY recovery.
+        """Resume BROKER_READY through the canonical breach callback.
 
         The canonical entry-time gate stack (kill switch, exposure
         revalidation, fresh option quote, spread policy, drift policy,
@@ -1887,10 +1888,9 @@ class APExecutionCore:
         supporting infrastructure.  Reproducing that surface here would
         risk drift and duplicate submissions.
 
-        Until each canonical gate is refactored into a callable that
-        this method can invoke, the scaffold **never calls the broker**.
-        Instead it inspects the durable row and returns a disposition
-        that keeps ownership durable:
+        The durable row is fenced before the normal callback is invoked, so
+        recovery shares the production policy stack without a second copy.
+        It returns an explicit disposition that keeps ownership durable:
 
           * TERMINAL_DURABLE  — only on a truthful boundary:
                 * client identity mismatch
@@ -1904,9 +1904,7 @@ class APExecutionCore:
                                 unavailable, row read raised, row is
                                 already-submitted-family) — retain
                                 current owner without change.
-          * RETRY_WAIT        — engineering incomplete; row remains
-                                BROKER_READY, only recovery-tracking
-                                fields are added to meta by the caller.
+          * RETRY_WAIT / RECONCILE_PENDING — transient or ambiguous outcome.
 
         The method never mutates the row directly.  The caller
         (``ap_recovery.APStartupRecovery._recover_deferred_breach_lifecycles``)
@@ -2052,23 +2050,111 @@ class APExecutionCore:
                 attempt=_attempt, max_attempts=_max_attempts,
             )
 
-        # ── Fail-closed: engineering incomplete ─────────────────────
         try:
             _generation = int(meta.get("materialization_generation") or 1)
         except (TypeError, ValueError):
             _generation = 1
-        _next_retry_at = (
-            _now + timedelta(seconds=_retry_delay_seconds)
-        ).isoformat()
+        _base.update(attempt=_attempt, max_attempts=_max_attempts, generation=_generation)
 
+        # The recovery path deliberately enters the same callback used by a
+        # live watcher.  That keeps kill switches, exposure, quote/spread/drift,
+        # confirmation, final-cap, durable identity and submit_existing_entry
+        # policy in one place instead of maintaining a recovery clone.
+        claim = getattr(osm, "claim_deferred_broker_ready_submit", None)
+        if not callable(claim):
+            return {
+                **_base, "disposition": "RETRY_WAIT",
+                "reason_code": "RECOVERY_SUBMIT_CLAIM_UNAVAILABLE",
+                "next_retry_at": (_now + timedelta(seconds=_retry_delay_seconds)).isoformat(),
+            }
+        _claim_owner = f"recovery_submit:{local_order_id}:{uuid.uuid4().hex[:12]}"
+        if not claim(local_order_id, owner=_claim_owner, generation=_generation):
+            # A peer, submit intent, status transition, or generation change won
+            # the CAS. Re-read on the next scheduler pass; never POST here.
+            return {
+                **_base, "disposition": "RECONCILE_PENDING",
+                "reason_code": "RECOVERY_SUBMIT_CLAIM_NOT_ACQUIRED",
+                "owner": _claim_owner,
+                "next_retry_at": (_now + timedelta(seconds=_retry_delay_seconds)).isoformat(),
+            }
+
+        mode = str(row.get("execution_mode") or meta.get("execution_mode") or "").lower()
+        if mode not in {"live", "paper"} or mode != str(self.execution_mode or "").lower():
+            return _term("RECOVERY_EXECUTION_MODE_MISMATCH", status="ERROR")
+        contract = str(row.get("contract") or "").strip()
+        qty = int(row.get("qty") or 0)
+        limit_price = float(row.get("limit_price") or 0)
+        reserved_cost = float(row.get("reserved_cost") or 0)
+        if not self._is_real_occ_contract(contract, str(row.get("symbol") or "")):
+            return _term("RECOVERY_INVALID_OCC_CONTRACT", status="ERROR")
+        if qty <= 0 or limit_price <= 0 or reserved_cost <= 0:
+            return _term("RECOVERY_INVALID_DURABLE_PRICING", status="ERROR")
+
+        recovered_plan = plan or SimpleNamespace(
+            plan_id=str(row.get("plan_id") or local_order_id),
+            signal_id=str(row.get("signal_id") or meta.get("signal_id") or ""),
+            client_id=str(row.get("client_id") or ""), execution_mode=mode,
+            ticker=str(row.get("symbol") or ""),
+            side=str(row.get("direction") or meta.get("side") or "CALL").upper(),
+            direction=str(row.get("direction") or meta.get("side") or "CALL").upper(),
+            contracts=qty, limit_price=limit_price, max_position_usd=reserved_cost,
+            contract_symbol=contract,
+            trigger_price=float(meta.get("trigger_price") or row.get("trigger_price") or 0),
+            stop_underlying=meta.get("stop_underlying") or meta.get("stop_price"),
+            target_underlying=meta.get("target_underlying") or meta.get("target_price"),
+            metadata=dict(meta), pattern=str(meta.get("pattern") or ""),
+            timeframe=str(meta.get("timeframe") or "1d"), tier=str(meta.get("tier") or "B"),
+            score=float(meta.get("score") or 0), trigger_type="breach",
+        )
+        signal = {
+            "signal_id": recovered_plan.signal_id, "local_order_id": local_order_id,
+            "client_id": recovered_plan.client_id, "execution_mode": mode,
+            "ticker": recovered_plan.ticker, "side": recovered_plan.side,
+            "entry_price": recovered_plan.trigger_price,
+            "stop_price": recovered_plan.stop_underlying,
+            "target_price": recovered_plan.target_underlying,
+            "contract_symbol": contract, "contracts": qty,
+            "limit_price": limit_price, "reserved_cost": reserved_cost,
+            "contract_deferred": False, "_approved_plan": recovered_plan,
+        }
+        crossed = datetime.fromisoformat(str(trigger_crossed_at))
+        if crossed.tzinfo is None:
+            crossed = crossed.replace(tzinfo=timezone.utc)
+        watched = SimpleNamespace(
+            signal=signal, ticker=recovered_plan.ticker, side=recovered_plan.side,
+            trigger_price=recovered_plan.trigger_price,
+            entry_trigger=recovered_plan.trigger_price,
+            stop_level=recovered_plan.stop_underlying,
+            target_price=recovered_plan.target_underlying,
+            trigger_crossed_at=crossed, triggered_at=crossed,
+            breach_price=float(meta.get("observed_underlying_price") or recovered_plan.trigger_price or 0),
+        )
+        try:
+            self._on_entry_trigger(watched)
+        except Exception as exc:
+            log.exception("[%s] recovered canonical entry callback failed", recovered_plan.ticker)
+            return {
+                **_base, "disposition": "RETRY_WAIT",
+                "reason_code": f"RECOVERY_CANONICAL_GATES_EXCEPTION:{type(exc).__name__}",
+                "next_retry_at": (_now + timedelta(seconds=_retry_delay_seconds)).isoformat(),
+            }
+
+        after = osm.get_order(local_order_id) or {}
+        after_status = str(after.get("status") or "").upper()
+        after_meta = after.get("meta") or {}
+        if isinstance(after_meta, str):
+            try: after_meta = json.loads(after_meta)
+            except Exception: after_meta = {}
+        if after.get("broker_order_id") and after_status in {"SUBMITTED", "ACK", "ACKNOWLEDGED", "PARTIAL", "PARTIAL_FILL", "FILLED"}:
+            return {**_base, "disposition": "SUBMITTED", "reason_code": "RECOVERY_CANONICAL_SUBMIT_ACCEPTED", "broker_order_id": after.get("broker_order_id")}
+        if after_meta.get("submit_intent_at"):
+            return {**_base, "disposition": "RECONCILE_PENDING", "reason_code": "RECOVERY_SUBMIT_INTENT_REQUIRES_RECONCILIATION"}
+        if after_status in {"REJECTED", "EXPIRED", "CANCELED", "ERROR"}:
+            return {**_base, "disposition": "TERMINAL_DURABLE", "reason_code": str(after.get("last_error") or "RECOVERY_CANONICAL_GATE_REJECTED"), "terminal_status": after_status}
         return {
-            **_base,
-            "disposition": "RETRY_WAIT",
-            "reason_code": "RECOVERY_SUBMIT_GATES_NOT_YET_WIRED",
-            "next_retry_at": _next_retry_at,
-            "attempt": _attempt,
-            "max_attempts": _max_attempts,
-            "generation": _generation,
+            **_base, "disposition": "RETRY_WAIT",
+            "reason_code": "RECOVERY_CANONICAL_GATES_NO_DURABLE_OUTCOME",
+            "next_retry_at": (_now + timedelta(seconds=_retry_delay_seconds)).isoformat(),
         }
 
     def reconcile_deferred_broker_intent(
@@ -2076,7 +2162,7 @@ class APExecutionCore:
         *,
         local_order_id: str,
     ) -> dict:
-        """AMENDMENT §6 fail-closed broker-ambiguity reconciler (crash window).
+        """Reconcile a submit-intent crash window against broker truth.
 
         The submit path persists ``submit_intent_at`` and the Tradier
         idempotency tag (``broker_submit_key`` = local_order_id) BEFORE
@@ -2090,11 +2176,9 @@ class APExecutionCore:
         double-submit hazard: naively "resuming" such a row (the §2 path)
         could place a second live order for Jason.
 
-        The correct resolution is to query the broker by the durable tag
-        (``_lookup_order_by_tag``) and ADOPT any existing order rather
-        than resubmit.  That query issues live broker I/O against a real
-        account; until it is explicitly wired and reviewed, this reconciler
-        is fail-closed:
+        The broker account order list is queried by the durable tag and the
+        result is strongly checked against contract, side and quantity before
+        an existing order is adopted. Ambiguity remains fail-closed.
 
           * ALREADY_RECONCILED — broker_order_id already present; the
             order monitor owns the row.  (Defensive; the recovery load
@@ -2102,15 +2186,12 @@ class APExecutionCore:
           * NOT_IN_CRASH_WINDOW — no submit_intent_at; the row never
             reached the broker-submit boundary and is safe for the normal
             resume path.
-          * RECONCILE_PENDING — crash window detected.  NEVER resubmit,
-            NEVER terminalize (the order may be live at the broker).  The
-            row is kept durably owned by the reconciler until the broker
-            query gate is wired.  reason_code
-            RECONCILE_BROKER_QUERY_NOT_YET_WIRED.
+          * RECONCILE_PENDING — broker truth is unavailable or ambiguous.
           * KEEP_WATCHER — inspection could not complete (OSM unavailable,
             row read raised, row missing).
 
-        The method never mutates the row and never calls the broker.
+        This method never POSTs. It only reads broker truth and adopts an exact
+        match through the existing order state machine.
         """
         _owner_label = f"broker_reconciler:{self.client_id or self.email or ''}"
         _base = {
@@ -2143,6 +2224,10 @@ class APExecutionCore:
         expected_client_id = str(self.client_id or self.email or "").strip().lower()
         if row_client_id and expected_client_id and row_client_id != expected_client_id:
             return _keep("RECONCILE_CLIENT_ID_MISMATCH")
+        row_mode = str(row.get("execution_mode") or "").strip().lower()
+        expected_mode = str(getattr(self, "execution_mode", None) or getattr(self, "mode", None) or "").strip().lower()
+        if row_mode and expected_mode and row_mode != expected_mode:
+            return _keep("RECONCILE_EXECUTION_MODE_MISMATCH")
 
         broker_order_id = str(row.get("broker_order_id") or "").strip()
         meta = row.get("meta") or {}
@@ -2174,16 +2259,76 @@ class APExecutionCore:
                 "reason_code": "RECONCILE_NO_SUBMIT_INTENT",
             }
 
-        # ── Crash window: submit intent present, no broker order ─────
-        # A live order may exist at the broker under broker_submit_key.
-        # FAIL CLOSED: never resubmit, never terminalize. The broker-query
-        # adoption path (_lookup_order_by_tag) issues live broker I/O and
-        # is deferred to a reviewed follow-up. Keep the row owned.
-        return {
-            **_base,
-            "disposition": "RECONCILE_PENDING",
-            "reason_code": "RECONCILE_BROKER_QUERY_NOT_YET_WIRED",
+        broker = getattr(self, "broker", None)
+        list_orders = getattr(broker, "list_orders", None)
+        if not callable(list_orders):
+            return {**_base, "disposition": "RECONCILE_PENDING", "reason_code": "RECONCILE_BROKER_QUERY_UNAVAILABLE"}
+        try:
+            broker_orders = list_orders()
+        except Exception as exc:
+            return {**_base, "disposition": "RECONCILE_PENDING", "reason_code": f"RECONCILE_BROKER_QUERY_FAILED:{type(exc).__name__}"}
+
+        tag = str(broker_submit_key or local_order_id)[:32]
+        exact_tag = [o for o in broker_orders if isinstance(o, dict) and str(o.get("tag") or "") == tag]
+        expected_contract = str(row.get("contract") or "")
+        expected_qty = int(row.get("qty") or 0)
+        strong = [
+            o for o in exact_tag
+            if str(o.get("option_symbol") or o.get("contract") or o.get("symbol") or "") == expected_contract
+            and str(o.get("side") or "").lower() == "buy_to_open"
+            and int(float(o.get("quantity") or 0)) == expected_qty
+        ]
+        if len(exact_tag) > 1 or len(strong) > 1:
+            return {**_base, "disposition": "RECONCILE_PENDING", "reason_code": "RECONCILE_MULTIPLE_MATCHES", "match_count": len(exact_tag)}
+        if exact_tag and not strong:
+            return {**_base, "disposition": "RECONCILE_PENDING", "reason_code": "RECONCILE_TAG_IDENTITY_MISMATCH"}
+        if not strong:
+            # An empty authoritative response is still held through the
+            # ambiguity window. The next recovery pass can re-enter Part A.
+            try:
+                intent_dt = datetime.fromisoformat(str(submit_intent_at))
+                if intent_dt.tzinfo is None: intent_dt = intent_dt.replace(tzinfo=timezone.utc)
+                elapsed = (datetime.now(timezone.utc) - intent_dt).total_seconds()
+            except Exception:
+                elapsed = 0
+            window = int(os.getenv("DEFERRED_BROKER_AMBIGUITY_SECONDS", "30"))
+            if elapsed < window:
+                return {**_base, "disposition": "RECONCILE_PENDING", "reason_code": "RECONCILE_AMBIGUITY_WINDOW_ACTIVE"}
+            osm.update_order_meta(local_order_id, {
+                "submit_intent_at": None, "broker_submit_key": None,
+                "recovery_submit_owner": "", "current_owner": _owner_label,
+                "reconcile_authoritative_no_match_at": now_utc_iso(),
+            })
+            return {**_base, "disposition": "NOT_IN_CRASH_WINDOW", "reason_code": "RECONCILE_AUTHORITATIVE_NO_MATCH"}
+
+        remote = strong[0]
+        remote_id = str(remote.get("id") or remote.get("order_id") or "")
+        remote_status = str(remote.get("status") or "").lower().replace("-", "_")
+        if not remote_id:
+            return {**_base, "disposition": "RECONCILE_PENDING", "reason_code": "RECONCILE_MATCH_MISSING_ORDER_ID"}
+        status_map = {
+            "filled": "FILLED", "partially_filled": "PARTIAL_FILL",
+            "partial_filled": "PARTIAL_FILL", "rejected": "REJECTED",
+            "canceled": "CANCELED", "cancelled": "CANCELED", "expired": "EXPIRED",
         }
+        local_status = status_map.get(remote_status, "SUBMITTED")
+        # Establish the accepted boundary first so the existing state machine
+        # owns all subsequent fill/terminal transitions.
+        if not osm.transition(local_order_id, "SUBMITTED", broker_order_id=remote_id, submitted_ts=now_utc_iso()):
+            return {**_base, "disposition": "RECONCILE_PENDING", "reason_code": "RECONCILE_ADOPTION_TRANSITION_FAILED"}
+        if local_status != "SUBMITTED":
+            osm.transition(
+                local_order_id, local_status, broker_order_id=remote_id,
+                filled_qty=remote.get("exec_quantity") or remote.get("filled_quantity"),
+                fill_price=remote.get("avg_fill_price"),
+                last_error=(str(remote.get("reason") or remote.get("message") or "") or None),
+            )
+        osm.update_order_meta(local_order_id, {
+            "reconciled_at": now_utc_iso(), "recovery_classification": "BROKER_ORDER_ADOPTED",
+            "broker_reconcile_status": remote_status, "broker_reconcile_response": remote,
+            "current_owner": "ORDER_MONITOR", "lifecycle_state": local_status,
+        })
+        return {**_base, "disposition": "ALREADY_RECONCILED", "reason_code": "BROKER_ORDER_ADOPTED", "broker_order_id": remote_id, "status": local_status}
 
     def _on_entry_trigger(self, watched: WatchedSignal):
         """Called by watcher when price holds above/below trigger for 2 polls.

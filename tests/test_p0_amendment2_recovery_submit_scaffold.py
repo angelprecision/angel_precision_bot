@@ -42,7 +42,11 @@ def _make_core(client_id="jason@example.com", email="jason@example.com"):
     core = types.SimpleNamespace()
     core.client_id = client_id
     core.email = email
+    core.execution_mode = "live"
     core.order_state_machine = MagicMock()
+    core.order_state_machine.claim_deferred_broker_ready_submit.return_value = False
+    core._is_real_occ_contract = ap_execution_core.APExecutionCore._is_real_occ_contract
+    core._on_entry_trigger = MagicMock()
     # Bind the unbound method to our stub instance
     core.resume_deferred_broker_ready_order = (
         ap_execution_core.APExecutionCore.resume_deferred_broker_ready_order.__get__(
@@ -64,6 +68,10 @@ def _row(**overrides):
     base = {
         "local_order_id": "oid-1",
         "client_id": "jason@example.com",
+        "execution_mode": "live",
+        "signal_id": "sig-1",
+        "symbol": "SPY",
+        "direction": "CALL",
         "kind": "ENTRY",
         "status": "PENDING_TRIGGER",
         "broker_order_id": None,
@@ -107,8 +115,7 @@ def test_scaffold_never_calls_broker():
         )
 
 
-def test_scaffold_never_calls_submit_existing_entry():
-    """The scaffold must never touch osm.submit_existing_entry."""
+def test_losing_recovery_claim_never_calls_submit_existing_entry():
     core = _make_core()
     core.order_state_machine.get_order.return_value = _row()
     core.resume_deferred_broker_ready_order(local_order_id="oid-1")
@@ -120,31 +127,31 @@ def test_scaffold_never_calls_submit_existing_entry():
 # ═══════════════════════════════════════════════════════════════════════
 
 
-def test_healthy_broker_ready_returns_retry_wait_gates_not_yet_wired():
+def test_healthy_broker_ready_without_claim_returns_reconcile_pending():
     core = _make_core()
     core.order_state_machine.get_order.return_value = _row()
     result = core.resume_deferred_broker_ready_order(local_order_id="oid-1")
 
-    assert result["disposition"] == "RETRY_WAIT"
-    assert result["reason_code"] == "RECOVERY_SUBMIT_GATES_NOT_YET_WIRED"
+    assert result["disposition"] == "RECONCILE_PENDING"
+    assert result["reason_code"] == "RECOVERY_SUBMIT_CLAIM_NOT_ACQUIRED"
     assert result["local_order_id"] == "oid-1"
     assert result["attempt"] == 1
     assert result["max_attempts"] == 20  # default
     assert result["generation"] == 3
-    assert result["owner"] == "recovery_scheduler:jason@example.com"
+    assert result["owner"].startswith("recovery_submit:oid-1:")
     # next_retry_at must be a bounded future time
     _next = datetime.fromisoformat(result["next_retry_at"])
     _delta = (_next - datetime.now(timezone.utc)).total_seconds()
     assert 0 < _delta <= 60, f"next_retry_at must be bounded, got {_delta}s"
 
 
-def test_retry_attempt_increments_from_prior_meta():
+def test_retry_attempt_increments_before_claim_attempt():
     core = _make_core()
     row = _row()
     row["meta"]["recovery_attempt_count"] = 5
     core.order_state_machine.get_order.return_value = row
     result = core.resume_deferred_broker_ready_order(local_order_id="oid-1")
-    assert result["disposition"] == "RETRY_WAIT"
+    assert result["disposition"] == "RECONCILE_PENDING"
     assert result["attempt"] == 6
 
 
@@ -299,11 +306,11 @@ def test_already_submitted_by_submitted_ts_returns_keep_watcher():
 # ═══════════════════════════════════════════════════════════════════════
 
 
-def test_owner_label_identifies_recovery_scheduler():
+def test_owner_label_identifies_exact_recovery_submit_claim():
     core = _make_core(client_id="jason@example.com")
     core.order_state_machine.get_order.return_value = _row()
     result = core.resume_deferred_broker_ready_order(local_order_id="oid-1")
-    assert result["owner"] == "recovery_scheduler:jason@example.com"
+    assert result["owner"].startswith("recovery_submit:oid-1:")
 
 
 def test_scaffold_does_not_mutate_the_row():

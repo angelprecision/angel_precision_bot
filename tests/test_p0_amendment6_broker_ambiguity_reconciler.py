@@ -38,6 +38,8 @@ def _make_core(client_id="jason@example.com"):
     core.client_id = client_id
     core.email = client_id
     core.order_state_machine = MagicMock()
+    core.broker = MagicMock()
+    core.broker.list_orders.side_effect = TimeoutError("broker unavailable")
     core.reconcile_deferred_broker_intent = (
         ap_execution_core.APExecutionCore.reconcile_deferred_broker_intent.__get__(
             core, type(core)
@@ -69,12 +71,12 @@ def _row(**overrides):
 # ═══════════════════════════════════════════════════════════════════════
 
 
-def test_crash_window_returns_reconcile_pending():
+def test_crash_window_query_failure_returns_reconcile_pending():
     core = _make_core()
     core.order_state_machine.get_order.return_value = _row()
     result = core.reconcile_deferred_broker_intent(local_order_id="oid-1")
     assert result["disposition"] == "RECONCILE_PENDING"
-    assert result["reason_code"] == "RECONCILE_BROKER_QUERY_NOT_YET_WIRED"
+    assert result["reason_code"] == "RECONCILE_BROKER_QUERY_FAILED:TimeoutError"
     assert result["broker_submit_key"] == "oid-1"
 
 
@@ -101,13 +103,14 @@ def test_no_submit_intent_returns_not_in_crash_window():
 # ═══════════════════════════════════════════════════════════════════════
 
 
-def test_reconciler_never_calls_broker():
+def test_reconciler_queries_broker_but_never_posts():
     core = _make_core()
     broker = MagicMock()
     core.broker = broker
     core.order_state_machine.get_order.return_value = _row()
     core.reconcile_deferred_broker_intent(local_order_id="oid-1")
-    for m in ("place_order", "buy_option", "get_order", "list_orders", "post"):
+    assert broker.list_orders.called
+    for m in ("place_order", "buy_option", "post"):
         assert not getattr(broker, m).called, f"reconciler touched broker.{m}"
 
 
