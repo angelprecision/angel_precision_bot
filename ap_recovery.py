@@ -1010,6 +1010,92 @@ class APStartupRecovery:
         rows = run_with_retry(_load) or []
         now = datetime.now(timezone.utc)
         recovered = 0
+
+        # ── AMENDMENT §7: verified terminalization ─────────────────────
+        # terminalize_deferred_breach returns True only when Postgres
+        # confirmed rowcount > 0. A False return means the row was NOT
+        # terminalized (CAS miss, not-found, or write error) and is still
+        # live as PENDING_TRIGGER. Ignoring that return value lets a failed
+        # terminalize masquerade as success, silently dropping the row.
+        # Every terminalize in this pass now routes through this helper so
+        # a failed durable write is surfaced (critical log + errors entry)
+        # rather than swallowed.
+        def _terminalize_verified(loid, *, reason_code, terminal_status, diagnostics):
+            terminalize = getattr(self.osm, "terminalize_deferred_breach", None)
+            if not callable(terminalize):
+                log.critical(
+                    "[%s] RECOVERY_TERMINALIZE_UNAVAILABLE local_order_id=%s "
+                    "reason=%s — row NOT terminalized",
+                    self.client_id, loid, reason_code,
+                )
+                result.setdefault("errors", []).append("recovery_terminalize_unavailable")
+                return False
+            try:
+                ok = bool(terminalize(
+                    loid,
+                    reason_code=reason_code,
+                    terminal_status=terminal_status,
+                    diagnostics=diagnostics,
+                ))
+            except Exception as exc:
+                log.critical(
+                    "[%s] RECOVERY_TERMINALIZE_RAISED local_order_id=%s reason=%s exc=%s",
+                    self.client_id, loid, reason_code, exc,
+                )
+                result.setdefault("errors", []).append("recovery_terminalize_raised")
+                return False
+            if not ok:
+                log.critical(
+                    "[%s] RECOVERY_TERMINALIZE_FAILED local_order_id=%s reason=%s "
+                    "— durable write returned no rows; row still PENDING_TRIGGER",
+                    self.client_id, loid, reason_code,
+                )
+                result.setdefault("errors", []).append("recovery_terminalize_failed")
+            return ok
+
+        # ── AMENDMENT §5: durable ownership on failed/impossible rearm ──
+        # A resumable row must never be left ownerless. When a rearm cannot
+        # happen (no entry_watcher wired) or the rearm returns False, we do
+        # NOT silently drop the row. We record a durable recovery-ownership
+        # marker via a non-destructive meta patch so the row is diagnosably
+        # owned by the recovery scheduler and a future recovery pass will
+        # resume it. Only recovery_* keys are written — contract, qty,
+        # limit, selector evidence, tp/sl, direction and every trade-policy
+        # field are preserved untouched.
+        def _retain_recovery_ownership(loid, *, reason):
+            update_meta = getattr(self.osm, "update_order_meta", None)
+            if not callable(update_meta):
+                log.critical(
+                    "[%s] RECOVERY_RETENTION_UNAVAILABLE local_order_id=%s reason=%s "
+                    "— cannot record durable ownership",
+                    self.client_id, loid, reason,
+                )
+                result.setdefault("errors", []).append("recovery_retention_unavailable")
+                return False
+            try:
+                ok = bool(update_meta(loid, {
+                    "recovery_ownership": "recovery_scheduler",
+                    "recovery_owner": f"recovery_scheduler:{self.client_id}",
+                    "recovery_retained_at": now.isoformat(),
+                    "recovery_retention_reason": reason,
+                    "recovery_retention_mode": recovery_mode,
+                }))
+            except Exception as exc:
+                log.critical(
+                    "[%s] RECOVERY_RETENTION_RAISED local_order_id=%s reason=%s exc=%s",
+                    self.client_id, loid, reason, exc,
+                )
+                result.setdefault("errors", []).append("recovery_retention_raised")
+                return False
+            if not ok:
+                log.critical(
+                    "[%s] RECOVERY_RETENTION_WRITE_FAILED local_order_id=%s reason=%s "
+                    "— durable ownership marker not persisted",
+                    self.client_id, loid, reason,
+                )
+                result.setdefault("errors", []).append("recovery_retention_write_failed")
+            return ok
+
         for raw in rows:
             order = dict(raw or {})
             local_order_id = str(order.get("local_order_id") or "").strip()
@@ -1069,25 +1155,21 @@ class APStartupRecovery:
             except Exception:
                 stale_pending = False
             if stale_pending:
-                terminalize = getattr(self.osm, "terminalize_deferred_breach", None)
-                if callable(terminalize):
-                    terminalize(
-                        local_order_id,
-                        reason_code="RECOVERY_STALE_PENDING_TRIGGER",
-                        terminal_status="EXPIRED",
-                        diagnostics={"recovery_classification": "stale_over_72h"},
-                    )
+                _terminalize_verified(
+                    local_order_id,
+                    reason_code="RECOVERY_STALE_PENDING_TRIGGER",
+                    terminal_status="EXPIRED",
+                    diagnostics={"recovery_classification": "stale_over_72h"},
+                )
                 continue
 
             if lifecycle in {"REJECTED", "EXPIRED", "CANCELED", "ERROR"}:
-                terminalize = getattr(self.osm, "terminalize_deferred_breach", None)
-                if callable(terminalize):
-                    terminalize(
-                        local_order_id,
-                        reason_code=str(meta.get("reason_code") or meta.get("final_reason") or "RECOVERY_TERMINAL_STATE"),
-                        terminal_status=lifecycle,
-                        diagnostics={"recovery_classification": "terminal_meta_pending_row"},
-                    )
+                _terminalize_verified(
+                    local_order_id,
+                    reason_code=str(meta.get("reason_code") or meta.get("final_reason") or "RECOVERY_TERMINAL_STATE"),
+                    terminal_status=lifecycle,
+                    diagnostics={"recovery_classification": "terminal_meta_pending_row"},
+                )
                 continue
 
             plan = self._build_recovery_plan_from_order(order)
@@ -1162,18 +1244,24 @@ class APStartupRecovery:
                 reason_code = str(outcome.get("reason_code") or "RECOVERY_UNKNOWN")
 
                 if disposition == "TERMINAL_DURABLE":
-                    terminalize = getattr(self.osm, "terminalize_deferred_breach", None)
-                    if callable(terminalize):
-                        terminalize(
-                            local_order_id,
-                            reason_code=reason_code,
-                            terminal_status=str(outcome.get("terminal_status") or "EXPIRED"),
-                            diagnostics={
-                                "recovery_classification": "broker_ready_boundary",
-                                "recovery_attempt": outcome.get("attempt"),
-                                "recovery_max_attempts": outcome.get("max_attempts"),
-                                "recovery_owner": outcome.get("owner"),
-                            },
+                    # §7: verified — a failed terminalize is surfaced, not
+                    # swallowed. On failure the row remains PENDING_TRIGGER
+                    # and is retained with durable ownership (§5) so it is
+                    # never left ownerless by a silent terminalize miss.
+                    _term_ok = _terminalize_verified(
+                        local_order_id,
+                        reason_code=reason_code,
+                        terminal_status=str(outcome.get("terminal_status") or "EXPIRED"),
+                        diagnostics={
+                            "recovery_classification": "broker_ready_boundary",
+                            "recovery_attempt": outcome.get("attempt"),
+                            "recovery_max_attempts": outcome.get("max_attempts"),
+                            "recovery_owner": outcome.get("owner"),
+                        },
+                    )
+                    if not _term_ok:
+                        _retain_recovery_ownership(
+                            local_order_id, reason="broker_ready_terminalize_failed",
                         )
                 elif disposition == "RETRY_WAIT":
                     # Persist attempt tracking WITHOUT clearing broker_ready
@@ -1181,17 +1269,36 @@ class APStartupRecovery:
                     # remains resumable — the durable BROKER_READY state is
                     # preserved.  See ap_execution_core.resume_deferred_broker_ready_order
                     # for the full field-preservation rationale.
+                    # §7: verify the durable write; §5: on failure the row is
+                    # still owned (broker_ready meta intact) but we record the
+                    # write failure so a silently-lost attempt is diagnosable.
                     update_meta = getattr(self.osm, "update_order_meta", None)
+                    _meta_ok = False
                     if callable(update_meta):
-                        update_meta(local_order_id, {
-                            "recovery_last_attempt_at": now.isoformat(),
-                            "recovery_attempt_count": outcome.get("attempt"),
-                            "recovery_next_retry_at": outcome.get("next_retry_at"),
-                            "recovery_reason_code": reason_code,
-                            "recovery_owner": outcome.get("owner"),
-                            "recovery_generation": outcome.get("generation"),
-                            "recovery_max_attempts": outcome.get("max_attempts"),
-                        })
+                        try:
+                            _meta_ok = bool(update_meta(local_order_id, {
+                                "recovery_last_attempt_at": now.isoformat(),
+                                "recovery_attempt_count": outcome.get("attempt"),
+                                "recovery_next_retry_at": outcome.get("next_retry_at"),
+                                "recovery_reason_code": reason_code,
+                                "recovery_owner": outcome.get("owner"),
+                                "recovery_generation": outcome.get("generation"),
+                                "recovery_max_attempts": outcome.get("max_attempts"),
+                            }))
+                        except Exception as exc:
+                            log.critical(
+                                "[%s] RECOVERY_RETRY_META_RAISED local_order_id=%s exc=%s",
+                                self.client_id, local_order_id, exc,
+                            )
+                            result.setdefault("errors", []).append("recovery_retry_meta_raised")
+                    if not _meta_ok:
+                        log.critical(
+                            "[%s] RECOVERY_RETRY_META_WRITE_FAILED local_order_id=%s "
+                            "— retry-tracking marker not persisted; row still "
+                            "durably BROKER_READY and owned",
+                            self.client_id, local_order_id,
+                        )
+                        result.setdefault("errors", []).append("recovery_retry_meta_write_failed")
                 # KEEP_WATCHER (e.g. RECOVERY_OSM_UNAVAILABLE, row read
                 # error, already-submitted) → row untouched.
                 continue
@@ -1223,8 +1330,18 @@ class APStartupRecovery:
                 # already happened/staleness makes rearm unsafe.
                 should_resume = True
 
-            if should_resume and self.entry_watcher is not None:
+            if should_resume:
+                # ── AMENDMENT §5: a resumable row must never be ownerless ──
+                if self.entry_watcher is None:
+                    # No watcher wired — cannot rearm this pass. Record
+                    # durable ownership so the row is diagnosably owned by
+                    # the recovery scheduler and a future pass resumes it.
+                    _retain_recovery_ownership(
+                        local_order_id, reason="entry_watcher_unavailable",
+                    )
+                    continue
                 if hasattr(self.entry_watcher, "has_order") and self.entry_watcher.has_order(local_order_id):
+                    # Already owned by a live watcher — nothing to do.
                     continue
                 plan.metadata["materialization_generation"] = int(
                     meta.get("materialization_generation") or 1
@@ -1239,6 +1356,13 @@ class APStartupRecovery:
                 ))
                 if armed:
                     recovered += 1
+                else:
+                    # Rearm returned False — the watcher did NOT take
+                    # ownership. Do not silently drop the row; record durable
+                    # recovery ownership so it is resumed on a later pass.
+                    _retain_recovery_ownership(
+                        local_order_id, reason="watcher_rearm_returned_false",
+                    )
 
         result["deferred_lifecycles_recovered"] = recovered
 
