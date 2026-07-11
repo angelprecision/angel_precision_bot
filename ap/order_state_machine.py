@@ -935,6 +935,10 @@ class APOrderStateMachine:
     @staticmethod
     def _pending_entry_has_submit_or_recovery_owner(order: dict) -> bool:
         """Protect generic pending cleanup from broker-ambiguous ownership."""
+        # Resolve the stdlib clock locally. Some long-running/test processes
+        # replace module collaborators; ownership safety must not inherit a
+        # stale or mocked module-level clock.
+        from datetime import datetime as _real_datetime, timezone as _real_timezone
         if order.get("broker_order_id") or order.get("submitted_ts"):
             return True
         meta = order.get("meta") or {}
@@ -954,10 +958,10 @@ class APOrderStateMachine:
         recovery_owner = str(meta.get("recovery_submit_owner") or "").strip()
         if recovery_owner:
             try:
-                lease = datetime.fromisoformat(str(meta.get("recovery_submit_lease_until") or ""))
+                lease = _real_datetime.fromisoformat(str(meta.get("recovery_submit_lease_until") or ""))
                 if lease.tzinfo is None:
-                    lease = lease.replace(tzinfo=timezone.utc)
-                if lease >= datetime.now(timezone.utc):
+                    lease = lease.replace(tzinfo=_real_timezone.utc)
+                if lease >= _real_datetime.now(_real_timezone.utc):
                     return True
             except Exception:
                 # Malformed ownership evidence is not safe to clear generically.

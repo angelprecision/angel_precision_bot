@@ -121,8 +121,6 @@ def test_fence_lost_branch_precedes_generic_cancel_cleanup():
 def test_real_claim_and_intent_cas_reject_stale_owner(monkeypatch):
     """Execute the real OSM CAS methods against one transactional fake row."""
     import json
-    import ap.order_state_machine as osm_module
-
     state = _pending_row({
         "lifecycle_state": "BROKER_READY", "broker_ready": True,
         "materialization_generation": 3, "submit_intent_at": None,
@@ -184,8 +182,12 @@ def test_real_claim_and_intent_cas_reject_stale_owner(monkeypatch):
         def __enter__(self): return Conn()
         def __exit__(self, *_args): return False
 
-    monkeypatch.setattr(osm_module, "conn", lambda: ConnContext())
-    monkeypatch.setattr(osm_module, "run_with_retry", lambda fn: fn())
+    # The full P0 suite reloads ap.order_state_machine in import tests. Patch
+    # the globals used by the already-collected class methods, not whichever
+    # module object happens to be current in sys.modules.
+    method_globals = APOrderStateMachine.claim_deferred_broker_ready_submit.__globals__
+    monkeypatch.setitem(method_globals, "conn", lambda: ConnContext())
+    monkeypatch.setitem(method_globals, "run_with_retry", lambda fn: fn())
     osm = object.__new__(APOrderStateMachine)
     osm.client_id = "jason@example.com"
 
