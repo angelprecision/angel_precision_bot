@@ -897,6 +897,12 @@ class APOrderStateMachine:
             log.warning("[%s] expire_pending_entry blocked -- status=%s order=%s",
                         self.client_id, status, local_order_id)
             return False
+        if self._pending_entry_has_submit_or_recovery_owner(current):
+            log.warning(
+                "[%s] expire_pending_entry refused -- broker/recovery ownership active | %s",
+                self.client_id, local_order_id,
+            )
+            return False
         return self.transition(local_order_id, OrderStatus.EXPIRED, last_error=reason)
 
     def cancel_pending_entry(self, local_order_id: str, *, reason: str = "watcher_invalidated") -> bool:
@@ -918,7 +924,45 @@ class APOrderStateMachine:
             log.warning("[%s] cancel_pending_entry blocked -- status=%s order=%s",
                         self.client_id, status, local_order_id)
             return False
+        if self._pending_entry_has_submit_or_recovery_owner(current):
+            log.warning(
+                "[%s] cancel_pending_entry refused -- broker/recovery ownership active | %s",
+                self.client_id, local_order_id,
+            )
+            return False
         return self.transition(local_order_id, OrderStatus.CANCELED, last_error=reason)
+
+    @staticmethod
+    def _pending_entry_has_submit_or_recovery_owner(order: dict) -> bool:
+        """Protect generic pending cleanup from broker-ambiguous ownership."""
+        if order.get("broker_order_id") or order.get("submitted_ts"):
+            return True
+        meta = order.get("meta") or {}
+        if isinstance(meta, str):
+            try:
+                meta = json.loads(meta)
+            except Exception:
+                meta = {}
+        if not isinstance(meta, dict):
+            meta = {}
+        if str(meta.get("lifecycle_state") or "").upper() == "SUBMITTING":
+            return True
+        if meta.get("submit_intent_at") or meta.get("broker_submit_key"):
+            return True
+        if str(meta.get("current_owner") or "").startswith("broker_submit:"):
+            return True
+        recovery_owner = str(meta.get("recovery_submit_owner") or "").strip()
+        if recovery_owner:
+            try:
+                lease = datetime.fromisoformat(str(meta.get("recovery_submit_lease_until") or ""))
+                if lease.tzinfo is None:
+                    lease = lease.replace(tzinfo=timezone.utc)
+                if lease >= datetime.now(timezone.utc):
+                    return True
+            except Exception:
+                # Malformed ownership evidence is not safe to clear generically.
+                return True
+        return False
 
     # ------------------------------------------------------------------
     # State transition authority
@@ -1686,6 +1730,7 @@ class APOrderStateMachine:
             generation = int(generation)
         except (TypeError, ValueError):
             return False
+
         if not owner or mode not in {"live", "paper"} or not submit_key or not payload_hash:
             return False
         now = now_utc_iso()
@@ -1728,6 +1773,78 @@ class APOrderStateMachine:
         except Exception as exc:
             log.warning(
                 "[%s] persist_deferred_submit_intent failed order=%s: %s",
+                self.client_id, local_order_id, exc,
+            )
+            return False
+
+    def terminalize_recovered_entry(
+        self,
+        local_order_id: str,
+        *,
+        owner: str,
+        generation: int,
+        execution_mode: str,
+        terminal_status: str,
+        reason: str,
+    ) -> bool:
+        """Terminalize only while the exact recovered callback still owns it."""
+        import json as _json_local
+        owner = str(owner or "").strip()
+        mode = str(execution_mode or "").strip().lower()
+        terminal = str(terminal_status or "").strip().upper()
+        if terminal not in {"EXPIRED", "CANCELED", "ERROR", "REJECTED"}:
+            return False
+        try:
+            generation = int(generation)
+        except (TypeError, ValueError):
+            return False
+        if not owner or mode not in {"live", "paper"}:
+            return False
+        now = now_utc_iso()
+        meta_patch = _json_local.dumps({
+            "lifecycle_state": terminal,
+            "reason_code": str(reason or "RECOVERED_ENTRY_TERMINAL"),
+            "final_reason": str(reason or "RECOVERED_ENTRY_TERMINAL"),
+            "materialization_in_flight": False,
+            "broker_ready": False,
+            "current_owner": "TERMINAL",
+            "recovery_terminalized_at": now,
+        })
+
+        def _terminalize():
+            with conn() as c:
+                cur = c.execute(
+                    """
+                    UPDATE orders
+                    SET status = %s,
+                        last_error = %s,
+                        meta = COALESCE(meta, '{}'::jsonb) || %s::jsonb,
+                        updated_ts = NOW()
+                    WHERE local_order_id = %s
+                      AND client_id = %s
+                      AND LOWER(COALESCE(execution_mode,'')) = %s
+                      AND kind = 'ENTRY'
+                      AND UPPER(COALESCE(status,'')) IN ('CREATED','PENDING_TRIGGER')
+                      AND (broker_order_id IS NULL OR broker_order_id = '')
+                      AND submitted_ts IS NULL
+                      AND COALESCE((meta->>'materialization_generation')::int, 0) = %s
+                      AND COALESCE(meta->>'recovery_submit_owner','') = %s
+                      AND NULLIF(meta->>'recovery_submit_lease_until','')::timestamptz >= NOW()
+                      AND COALESCE(meta->>'lifecycle_state','') = 'BROKER_READY'
+                      AND COALESCE(meta->>'submit_intent_at','') = ''
+                    """,
+                    (
+                        terminal, str(reason or "RECOVERED_ENTRY_TERMINAL"), meta_patch,
+                        local_order_id, self.client_id, mode, generation, owner,
+                    ),
+                )
+                return int(getattr(cur, "rowcount", getattr(c, "rowcount", 0)) or 0)
+
+        try:
+            return bool(run_with_retry(_terminalize) > 0)
+        except Exception as exc:
+            log.warning(
+                "[%s] terminalize_recovered_entry failed order=%s: %s",
                 self.client_id, local_order_id, exc,
             )
             return False

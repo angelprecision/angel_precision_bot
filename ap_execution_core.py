@@ -24,7 +24,7 @@ import logging
 import threading
 from datetime import datetime, timezone, timedelta
 from typing import Optional
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 from zoneinfo import ZoneInfo
 
 from ap_entry_watcher        import APEntryWatcher, WatchedSignal
@@ -2355,6 +2355,62 @@ class APExecutionCore:
         ticker = watched.ticker
         signal_id = str(sig.get("signal_id", "") or "")
 
+        # Recovery ownership must exist before the first policy gate.  Store one
+        # immutable context on the callback payload so every cleanup path uses
+        # the same exact owner/generation/mode/local-order identity.
+        _initial_plan = sig.get("_approved_plan")
+        _initial_meta = getattr(_initial_plan, "metadata", None) or {}
+        if not isinstance(_initial_meta, dict):
+            _initial_meta = {}
+        _is_recovered = bool(
+            sig.get("recovery_submit_fenced")
+            or _initial_meta.get("recovery_submit_fenced")
+        )
+        _recovery_owner = str(
+            sig.get("recovery_submit_owner")
+            or _initial_meta.get("recovery_submit_owner")
+            or ""
+        ).strip()
+        _recovery_generation_raw = (
+            sig.get("recovery_submit_generation")
+            if sig.get("recovery_submit_generation") is not None
+            else _initial_meta.get("recovery_submit_generation")
+        )
+        try:
+            _recovery_generation = int(_recovery_generation_raw)
+        except (TypeError, ValueError):
+            _recovery_generation = None
+        _callback_mode = str(
+            sig.get("execution_mode")
+            or getattr(_initial_plan, "execution_mode", None)
+            or getattr(self, "execution_mode", None)
+            or ""
+        ).strip().lower()
+        _callback_local_order_id = str(sig.get("local_order_id") or "").strip()
+        _ownership_context = MappingProxyType({
+            "is_recovered": _is_recovered,
+            "owner": _recovery_owner,
+            "generation": _recovery_generation,
+            "execution_mode": _callback_mode,
+            "local_order_id": _callback_local_order_id,
+        })
+        sig["_callback_ownership_context"] = _ownership_context
+        if _is_recovered and (
+            not _recovery_owner
+            or _recovery_generation is None
+            or _callback_mode not in {"live", "paper"}
+            or not _callback_local_order_id
+        ):
+            log.critical(
+                "[%s] RECOVERY_CALLBACK_OWNERSHIP_INVALID order=%s owner=%r generation=%r mode=%r",
+                ticker, _callback_local_order_id, _recovery_owner,
+                _recovery_generation, _callback_mode,
+            )
+            return {
+                "disposition": "KEEP_WATCHER",
+                "reason_code": "RECOVERY_CALLBACK_OWNERSHIP_INVALID",
+            }
+
         # P0 hotfix — resolve client identity from the signal dict first, then
         # fall back to self.client_id (set in __init__), then self.email.
         # This ensures breach-time logs never throw AttributeError and that
@@ -2411,7 +2467,10 @@ class APExecutionCore:
                 reason="breach_risk_check_false",
             )
             return {
-                "disposition": "TERMINAL_DURABLE" if _risk_terminalized else "KEEP_WATCHER",
+                "disposition": (
+                    "TERMINAL_DURABLE" if _risk_terminalized
+                    else str(sig.get("_recovery_cleanup_disposition") or "KEEP_WATCHER")
+                ),
                 "reason_code": "breach_risk_check_false",
                 "retry_after_seconds": 5,
             }
@@ -2461,6 +2520,22 @@ class APExecutionCore:
             context_notes: str | None = None,
             funnel_key: str = "order_failed",
         ) -> None:
+            if _ownership_context.get("is_recovered"):
+                # Recovery terminal truth belongs to the exact callback owner.
+                # Never write generic diagnostics or signal state before its
+                # owner/generation/lease CAS succeeds.
+                _recovered_ok = self._cleanup_pending_entry_order(
+                    watched, action=cleanup_action, reason=reason,
+                )
+                if _recovered_ok:
+                    if funnel_key:
+                        funnel.inc(funnel_key)
+                    if signal_id:
+                        self.store.update_signal_fields(signal_id, {
+                            "decision_status": decision_status,
+                            "context_notes": context_notes or reason,
+                        })
+                return
             if funnel_key:
                 funnel.inc(funnel_key)
             if signal_id:
@@ -2513,6 +2588,14 @@ class APExecutionCore:
             }
             if extra_meta:
                 meta_patch.update(extra_meta)
+            if _ownership_context.get("is_recovered"):
+                _terminalize_breach_failure(
+                    reason,
+                    cleanup_action="expire",
+                    meta_patch=meta_patch,
+                    context_notes=reason,
+                )
+                return
             _atomic_terminalize = getattr(
                 self.order_state_machine, "terminalize_deferred_breach", None,
             )
@@ -5984,6 +6067,19 @@ class APExecutionCore:
             )
             return
 
+        if submit_res.get("error") == "RECOVERY_SUBMIT_INTENT_FENCE_LOST":
+            # Ownership loss is not an order failure.  A winner may already own
+            # the row or have durable submit intent; never cancel/expire it.
+            disposition = self._classify_recovered_ownership_loss(queue_local_order_id)
+            log.warning(
+                "[%s] RECOVERY_SUBMIT_FENCE_LOST order=%s disposition=%s",
+                ticker, queue_local_order_id, disposition,
+            )
+            return {
+                "disposition": disposition,
+                "reason_code": "RECOVERY_SUBMIT_INTENT_FENCE_LOST",
+            }
+
         log.error(
             "[%s] Entry submit failed via OSM | local=%s error=%s",
             ticker,
@@ -6480,6 +6576,31 @@ class APExecutionCore:
         if not local_order_id or self.order_state_machine is None:
             return False
 
+        ownership = sig.get("_callback_ownership_context") or {}
+        if ownership.get("is_recovered"):
+            terminalize = getattr(self.order_state_machine, "terminalize_recovered_entry", None)
+            if not callable(terminalize):
+                sig["_recovery_cleanup_disposition"] = "KEEP_WATCHER"
+                return False
+            terminal_status = "EXPIRED" if action == "expire" else "CANCELED"
+            try:
+                ok = bool(terminalize(
+                    local_order_id,
+                    owner=str(ownership.get("owner") or ""),
+                    generation=ownership.get("generation"),
+                    execution_mode=str(ownership.get("execution_mode") or ""),
+                    terminal_status=terminal_status,
+                    reason=reason,
+                ))
+            except Exception as exc:
+                log.error("[%s] recovered terminal CAS raised: %s", watched.ticker, exc)
+                ok = False
+            if not ok:
+                sig["_recovery_cleanup_disposition"] = self._classify_recovered_ownership_loss(
+                    local_order_id
+                )
+            return ok
+
         try:
             if action == "expire" and hasattr(self.order_state_machine, "expire_pending_entry"):
                 ok = self.order_state_machine.expire_pending_entry(local_order_id, reason=reason)
@@ -6515,6 +6636,34 @@ class APExecutionCore:
                 watched.ticker, local_order_id, action, reason, exc, exc_info=True,
             )
         return False
+
+    def _classify_recovered_ownership_loss(self, local_order_id: str) -> str:
+        """Classify a lost recovery CAS without mutating lifecycle state."""
+        osm = getattr(self, "order_state_machine", None)
+        if osm is None or not hasattr(osm, "get_order"):
+            return "KEEP_WATCHER"
+        try:
+            row = osm.get_order(local_order_id) or {}
+        except Exception:
+            return "KEEP_WATCHER"
+        status = str(row.get("status") or "").upper()
+        if status in {"SUBMITTED", "ACK", "ACKNOWLEDGED", "PARTIAL", "PARTIAL_FILL", "FILLED"}:
+            return "SUBMITTED"
+        if status in {"REJECTED", "EXPIRED", "CANCELED", "ERROR"}:
+            return "TERMINAL_DURABLE"
+        meta = row.get("meta") or {}
+        if isinstance(meta, str):
+            try:
+                meta = json.loads(meta)
+            except Exception:
+                meta = {}
+        if not isinstance(meta, dict):
+            meta = {}
+        if str(meta.get("lifecycle_state") or "").upper() == "SUBMITTING" or meta.get("submit_intent_at"):
+            return "RECONCILE_PENDING"
+        if str(meta.get("recovery_submit_owner") or "").strip():
+            return "OWNERSHIP_TRANSFERRED"
+        return "KEEP_WATCHER"
 
     def _on_signal_expire(self, watched: WatchedSignal):
         signal_id = str(watched.signal.get("signal_id", ""))
