@@ -247,47 +247,61 @@ def test_B_cas_miss_means_persist_returns_false(db_spy):
 # ═══════════════════════════════════════════════════════════════════════
 
 
-def test_C_recovery_retains_ownership_within_deadline(monkeypatch):
-    """Process crashes after PRE_SUBMIT_PROOF_RETRY persistence.
-    Recovery finds the row within deadline → retain durable ownership,
-    NOT terminalized; broker_order_id remains null."""
-    osm = _osm_mock()
-    result = _run_recovery(
-        monkeypatch,
-        [_proof_retry_row(deadline_offset_seconds=+120)],  # 2 min in future
-        osm=osm,
+class _ProofConsumerOSM:
+    def __init__(self, row):
+        self.client_id = row["client_id"]
+        self.row = row
+        self.claims = 0
+        self.terminalize_deferred_breach = MagicMock(return_value=True)
+
+    def claim_pre_submit_proof_retry(self, local_order_id, **kwargs):
+        if self.row["meta"]["lifecycle_state"] != "PRE_SUBMIT_PROOF_RETRY":
+            return False
+        self.claims += 1
+        self.row["meta"].update({
+            "lifecycle_state": "BROKER_READY",
+            "materialization_generation": kwargs["new_generation"],
+            "materialization_owner": kwargs["owner"],
+            "proof_retry_attempt": kwargs["attempt"],
+        })
+        return True
+
+    def get_order(self, local_order_id):
+        return self.row
+
+
+def test_C_due_proof_retry_claims_and_enters_canonical_recovery(monkeypatch):
+    row = _proof_retry_row(deadline_offset_seconds=120)
+    row["meta"].update({
+        "selected_contract": row["contract"],
+        "selected_qty": row["qty"],
+        "selected_limit": row["limit_price"],
+    })
+    osm = _ProofConsumerOSM(row)
+    core = types.SimpleNamespace(
+        client_id=row["client_id"], execution_mode="paper",
+        resume_deferred_broker_ready_order=MagicMock(return_value={
+            "disposition": "SUBMITTED", "reason_code": "RECOVERY_CANONICAL_SUBMIT_ACCEPTED",
+        }),
     )
-    # Row is retained — not terminalized
-    osm.terminalize_deferred_breach.assert_not_called()
-    # Durable ownership marker written
-    osm.update_order_meta.assert_called_once()
-    _, patch = osm.update_order_meta.call_args.args
-    assert patch["recovery_retention_reason"] == "pre_submit_proof_retry_pending"
-
-
-def test_C_recovery_does_not_broker_post_proof_retry(monkeypatch):
-    """PRE_SUBMIT_PROOF_RETRY recovery NEVER reaches submit_existing_entry."""
-    osm = _osm_mock()
-    _run_recovery(
-        monkeypatch,
-        [_proof_retry_row(deadline_offset_seconds=+120)],
-        osm=osm,
+    result = _run_recovery(monkeypatch, [row], osm=osm, execution_core=core)
+    assert osm.claims == 1
+    core.resume_deferred_broker_ready_order.assert_called_once_with(
+        local_order_id=row["local_order_id"], plan=None,
     )
-    osm.submit_existing_entry.assert_not_called()
+    assert row["meta"]["materialization_generation"] == 4
+    assert result["deferred_lifecycles_recovered"] == 1
 
 
-def test_C_client_id_preserved_in_retention_marker(monkeypatch):
-    """F: client_id must not change during recovery handling."""
-    osm = _osm_mock()
-    _run_recovery(
-        monkeypatch,
-        [_proof_retry_row(deadline_offset_seconds=+120)],
-        osm=osm,
-    )
-    _, patch = osm.update_order_meta.call_args.args
-    # recovery_owner carries client_id
-    assert "client@example.com" in patch["recovery_owner"]
-    assert patch["recovery_retention_mode"] == "PAPER"
+def test_C_future_proof_retry_is_not_claimed(monkeypatch):
+    row = _proof_retry_row(deadline_offset_seconds=120)
+    row["meta"]["proof_retry_next_at"] = (
+        datetime.now(timezone.utc) + timedelta(seconds=30)
+    ).isoformat()
+    osm = _ProofConsumerOSM(row)
+    core = types.SimpleNamespace(client_id=row["client_id"], execution_mode="paper")
+    _run_recovery(monkeypatch, [row], osm=osm, execution_core=core)
+    assert osm.claims == 0
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -321,6 +335,24 @@ def test_D_two_workers_race_exactly_one_wins(db_spy):
     assert ok_second is False
 
 
+def test_D_due_consumer_claim_is_generation_fenced(db_spy):
+    sink, state = db_spy
+    osm = APOrderStateMachine("client@example.com")
+    state["rowcount"] = 1
+    assert osm.claim_pre_submit_proof_retry(
+        "oid-1", owner="proof-worker", expected_generation=3,
+        new_generation=4, attempt=2,
+        claimed_at=datetime.now(timezone.utc).isoformat(),
+    ) is True
+    sql, params = sink[-1]
+    patch = json.loads(params[0])
+    assert patch["lifecycle_state"] == "BROKER_READY"
+    assert patch["materialization_generation"] == 4
+    assert patch["proof_retry_attempt"] == 2
+    assert "proof_retry_next_at','')::timestamptz <= NOW()" in sql
+    assert params[-2:] == (3, 2)
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # Test E: Deadline expired → terminalize with exact read failure reason
 # ═══════════════════════════════════════════════════════════════════════
@@ -340,7 +372,7 @@ def test_E_expired_deadline_terminalizes_with_exact_reason(monkeypatch):
     # Terminal status is EXPIRED
     assert call_kwargs["terminal_status"] == "EXPIRED"
     # Reason encodes the original read error
-    assert "deadline_expired" in call_kwargs["reason_code"] or "read_error" in call_kwargs["reason_code"].lower() or "UNREADABLE" in call_kwargs["reason_code"]
+    assert call_kwargs["reason_code"] == "PROOF_RETRY_DEADLINE_EXCEEDED"
     # Diagnostics carry selected contract
     assert call_kwargs["diagnostics"]["selected_contract"] == "SPY260717C00600000"
     # Zero broker POST
@@ -371,19 +403,13 @@ def test_E_missing_deadline_fails_closed(monkeypatch):
 # ═══════════════════════════════════════════════════════════════════════
 
 
-def test_F_execution_mode_unchanged_in_retention(monkeypatch):
-    """The execution_mode from the persisted row must survive unchanged
-    through recovery.  Paper rows stay paper; live rows stay live."""
-    osm = _osm_mock()
-    row = _proof_retry_row(deadline_offset_seconds=+120)
-    row["execution_mode"] = "paper"
-    row["meta"]["execution_mode"] = "paper"
-    _run_recovery(monkeypatch, [row], osm=osm)
-    # retention patch records mode
-    _, patch = osm.update_order_meta.call_args.args
-    assert patch["recovery_retention_mode"] == "PAPER"
-    # No terminalization
-    osm.terminalize_deferred_breach.assert_not_called()
+def test_F_execution_mode_mismatch_terminalizes(monkeypatch):
+    row = _proof_retry_row(deadline_offset_seconds=120)
+    osm = _ProofConsumerOSM(row)
+    core = types.SimpleNamespace(client_id=row["client_id"], execution_mode="live")
+    _run_recovery(monkeypatch, [row], osm=osm, execution_core=core)
+    osm.terminalize_deferred_breach.assert_called_once()
+    assert osm.claims == 0
 
 
 # ═══════════════════════════════════════════════════════════════════════

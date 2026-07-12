@@ -27,6 +27,85 @@ import pytest
 from ap.live_submit_gates import check_trigger_age_gate, GateOutcome
 
 
+def test_production_final_gate_persists_and_passes_fresh_confirmation(monkeypatch):
+    """The actual execution callback supplies the exact durable confirmation."""
+    import sys
+    import types
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    import ap_execution_core as core_mod
+    import ap.live_submit_gates as gates_mod
+
+    now = datetime.now(timezone.utc)
+    crossed = (now - timedelta(seconds=150)).isoformat()
+    row = {
+        "local_order_id": "oid-live-confirm", "client_id": "client@example.com",
+        "execution_mode": "live", "kind": "ENTRY", "status": "PENDING_TRIGGER",
+        "contract": "SPY260717C00600000", "qty": 1, "limit_price": 1.25,
+        "reserved_cost": 125.0, "broker_order_id": None, "submitted_ts": None,
+        "meta": {"trigger_crossed_at": crossed},
+    }
+    plan = SimpleNamespace(
+        contract_symbol=row["contract"], execution_price_per_share=1.25,
+        ask=1.25, mid=1.20, affordable_contracts=1, premium_per_contract=125.0,
+        contracts=1, limit_price=1.25, side="CALL", direction="CALL",
+        execution_mode="live", client_id=row["client_id"], signal_id="sig-live-confirm",
+        trigger_price=600.0, stop_underlying=595.0, target_underlying=610.0,
+        metadata={"queue_id": 11},
+    )
+    watched = SimpleNamespace(
+        signal={"ticker": "SPY", "side": "CALL", "entry_price": 600.0,
+                "stop_price": 595.0, "target_price": 610.0,
+                "signal_id": plan.signal_id, "local_order_id": row["local_order_id"],
+                "client_id": row["client_id"], "execution_mode": "live"},
+        trigger_price=600.0, ticker="SPY", trigger_crossed_at=datetime.fromisoformat(crossed),
+    )
+    core = core_mod.APExecutionCore.__new__(core_mod.APExecutionCore)
+    core.paper = False
+    core.mode = core.execution_mode = "LIVE"
+    core.client_id = core.client_email = row["client_id"]
+    core.broker = SimpleNamespace(
+        cfg=SimpleNamespace(base_url="https://api.tradier.com"),
+        get_quote=lambda _ticker: {"bid": 601.0, "ask": 601.2, "quote_age_ms": 25, "source": "test"},
+    )
+    core.store = MagicMock()
+    core.contract_selector = MagicMock()
+    core._breach_risk_check = MagicMock(return_value=True)
+    core._recover_plan_for_revalidation = MagicMock(return_value=plan)
+    core._refresh_hydrated_prebreach_plan = MagicMock(return_value=False)
+    core._cleanup_pending_entry_order = types.MethodType(core_mod.APExecutionCore._cleanup_pending_entry_order, core)
+    osm = MagicMock(client_id=row["client_id"], execution_mode="live")
+    osm.get_order.side_effect = lambda _oid: row
+    def _update(_oid, patch):
+        row["meta"].update(patch)
+        return True
+    osm.update_order_meta.side_effect = _update
+    osm.submit_existing_entry.return_value = {"ok": True, "broker_order_id": "TR-1"}
+    core.order_state_machine = osm
+
+    fake_execution = types.ModuleType("ap.execution")
+    fake_execution._refresh_ask_at_submit = lambda *_a, **_k: (1.25, 5, True, "", {
+        "submit_bid": 1.20, "submit_ask": 1.25, "submit_last": 1.23,
+        "submit_mid": 1.225, "spread_pct": 0.04,
+    })
+    monkeypatch.setitem(sys.modules, "ap.execution", fake_execution)
+    monkeypatch.setenv("LIVE_CONFIRMATION_REQUIRED", "0")
+    monkeypatch.setenv("ENTRY_CUTOFF_ET_HHMM", "2359")
+    captured = {}
+    real_gate = gates_mod.check_trigger_age_gate
+    def _capture_gate(**kwargs):
+        captured.update(kwargs)
+        return real_gate(**kwargs)
+    monkeypatch.setattr(gates_mod, "check_trigger_age_gate", _capture_gate)
+
+    core_mod.APExecutionCore._on_entry_trigger(core, watched)
+
+    assert captured["trigger_crossed_at"] == crossed
+    assert captured["last_confirmed_trigger_at"] == row["meta"]["last_confirmed_trigger_at"]
+    assert datetime.fromisoformat(captured["last_confirmed_trigger_at"]) > datetime.fromisoformat(crossed)
+    osm.submit_existing_entry.assert_called_once()
+
+
 def _now():
     return datetime.now(timezone.utc)
 

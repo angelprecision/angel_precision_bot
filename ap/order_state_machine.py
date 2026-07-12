@@ -2228,6 +2228,7 @@ class APOrderStateMachine:
             "proof_retry_max_attempts":     _max,
             "proof_retry_next_at":          str(next_retry_at),
             "proof_retry_deadline":         str(retry_deadline),
+            "absolute_entry_deadline":      str(retry_deadline),
             "proof_retry_last_read_error":  str(read_error or ""),
             "proof_retry_owner":            _owner,
             "proof_retry_scheduled_at":     _now,
@@ -2336,6 +2337,65 @@ class APOrderStateMachine:
         except Exception as exc:
             log.warning(
                 "[%s] terminalize_deferred_breach failed order=%s: %s",
+                self.client_id, local_order_id, exc,
+            )
+            return False
+
+    def claim_pre_submit_proof_retry(
+        self,
+        local_order_id: str,
+        *,
+        owner: str,
+        expected_generation: int,
+        new_generation: int,
+        attempt: int,
+        claimed_at: str,
+    ) -> bool:
+        """Fence one due PRE_SUBMIT_PROOF_RETRY worker and restore BROKER_READY."""
+        import json as _json_local
+
+        if not owner or expected_generation < 1 or new_generation <= expected_generation:
+            return False
+        patch = _json_local.dumps({
+            "lifecycle_state": "BROKER_READY",
+            "materialization_status": "SELECTED",
+            "broker_ready": True,
+            "materialization_in_flight": False,
+            "materialization_owner": owner,
+            "current_owner": owner,
+            "materialization_generation": new_generation,
+            "proof_retry_attempt": attempt,
+            "proof_retry_claimed_at": claimed_at,
+            "proof_retry_owner": owner,
+        })
+
+        def _claim():
+            with conn() as c:
+                cur = c.execute(
+                    """
+                    UPDATE orders
+                    SET meta = COALESCE(meta, '{}'::jsonb) || %s::jsonb,
+                        updated_ts = NOW()
+                    WHERE local_order_id = %s
+                      AND client_id = %s
+                      AND kind = 'ENTRY'
+                      AND UPPER(COALESCE(status,'')) = 'PENDING_TRIGGER'
+                      AND (broker_order_id IS NULL OR broker_order_id = '')
+                      AND submitted_ts IS NULL
+                      AND COALESCE(meta->>'lifecycle_state','') = 'PRE_SUBMIT_PROOF_RETRY'
+                      AND COALESCE((meta->>'materialization_generation')::int, 0) = %s
+                      AND COALESCE((meta->>'proof_retry_attempt')::int, 0) < %s
+                      AND NULLIF(meta->>'proof_retry_next_at','')::timestamptz <= NOW()
+                    """,
+                    (patch, local_order_id, self.client_id, expected_generation, attempt),
+                )
+                return int(getattr(cur, "rowcount", getattr(c, "rowcount", 0)) or 0)
+
+        try:
+            return bool(run_with_retry(_claim) > 0)
+        except Exception as exc:
+            log.warning(
+                "[%s] claim_pre_submit_proof_retry failed order=%s: %s",
                 self.client_id, local_order_id, exc,
             )
             return False

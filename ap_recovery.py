@@ -255,6 +255,141 @@ def _position_reserved_cost(pos: dict) -> float:
     return 0.0
 
 
+def resume_pre_submit_proof_retry(order_row: dict, osm, execution_core) -> dict:
+    """Consume one due PRE_SUBMIT_PROOF_RETRY row without watcher ownership.
+
+    The first CAS advances the durable materialization generation and restores
+    BROKER_READY.  The canonical execution-core recovery callback then performs
+    the persisted-row handoff proof, fresh market validation, final LIVE gates,
+    submit-intent CAS, and broker submit.
+    """
+    row = dict(order_row or {})
+    meta = row.get("meta") or {}
+    if isinstance(meta, str):
+        try:
+            meta = json.loads(meta)
+        except Exception:
+            meta = {}
+    now = datetime.now(timezone.utc)
+    local_order_id = str(row.get("local_order_id") or "").strip()
+    client_id = str(row.get("client_id") or "").strip().lower()
+    mode = _normalize_execution_mode(row.get("execution_mode"))
+    if not local_order_id or not client_id or mode is None:
+        return {"disposition": "TERMINAL_DURABLE", "reason_code": "PROOF_RETRY_INVALID_IDENTITY", "terminal_status": "ERROR"}
+    def _parse_ts(value):
+        try:
+            parsed = datetime.fromisoformat(str(value))
+            return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed
+        except Exception:
+            return None
+
+    due_at = _parse_ts(meta.get("proof_retry_next_at"))
+    deadline = _parse_ts(meta.get("proof_retry_deadline") or meta.get("absolute_entry_deadline"))
+    attempt = _safe_int(meta.get("proof_retry_attempt"), 0) + 1
+    max_attempts = _safe_int(meta.get("proof_retry_max_attempts"), 3)
+    if due_at is None or due_at > now:
+        return {"disposition": "NOT_DUE", "reason_code": "PROOF_RETRY_NOT_DUE"}
+    if deadline is None or now >= deadline:
+        return {"disposition": "TERMINAL_DURABLE", "reason_code": "PROOF_RETRY_DEADLINE_EXCEEDED", "terminal_status": "EXPIRED"}
+    if attempt > max_attempts:
+        return {"disposition": "TERMINAL_DURABLE", "reason_code": "PROOF_RETRY_MAX_ATTEMPTS", "terminal_status": "EXPIRED"}
+    if osm is None or execution_core is None:
+        return {"disposition": "RETRY_WAIT", "reason_code": "PROOF_RETRY_CONSUMER_UNAVAILABLE"}
+    if client_id != str(getattr(osm, "client_id", "") or "").strip().lower():
+        return {"disposition": "TERMINAL_DURABLE", "reason_code": "PROOF_RETRY_CLIENT_ID_MISMATCH", "terminal_status": "ERROR"}
+    core_mode = _normalize_execution_mode(
+        getattr(execution_core, "execution_mode", None) or getattr(execution_core, "mode", None)
+    )
+    if core_mode != mode:
+        return {"disposition": "TERMINAL_DURABLE", "reason_code": "PROOF_RETRY_EXECUTION_MODE_MISMATCH", "terminal_status": "ERROR"}
+
+    generation = _safe_int(meta.get("materialization_generation"), 0)
+    owner = f"proof_retry:{client_id}:{local_order_id}:{generation + 1}"
+    claim = getattr(osm, "claim_pre_submit_proof_retry", None)
+    if not callable(claim) or not claim(
+        local_order_id,
+        owner=owner,
+        expected_generation=generation,
+        new_generation=generation + 1,
+        attempt=attempt,
+        claimed_at=now.isoformat(),
+    ):
+        return {"disposition": "CLAIM_LOST", "reason_code": "PROOF_RETRY_CLAIM_NOT_ACQUIRED"}
+
+    try:
+        persisted = osm.get_order(local_order_id)
+    except Exception as exc:
+        persisted = None
+        read_error = f"read_error:{type(exc).__name__}"
+    else:
+        read_error = "row_missing" if not isinstance(persisted, dict) else ""
+    if not isinstance(persisted, dict):
+        delay = max(1, int(os.getenv("PRE_SUBMIT_PROOF_RETRY_DELAY_SECONDS", "5")))
+        reschedule = getattr(osm, "persist_pre_submit_proof_retry", None)
+        ok = bool(callable(reschedule) and reschedule(
+            local_order_id,
+            owner=owner,
+            generation=generation + 1,
+            retry_attempt=attempt,
+            max_attempts=max_attempts,
+            next_retry_at=(now + timedelta(seconds=delay)).isoformat(),
+            retry_deadline=deadline.isoformat(),
+            read_error=read_error,
+            selected_at=str(meta.get("selected_at") or now.isoformat()),
+            selected_quote_at=str(meta.get("selected_quote_at") or now.isoformat()),
+        ))
+        return {
+            "disposition": "RETRY_WAIT" if ok else "TERMINAL_DURABLE",
+            "reason_code": read_error if ok else "PROOF_RETRY_RESCHEDULE_FAILED",
+            "terminal_status": "ERROR",
+        }
+
+    # Run the same persisted-row proof primitives used by the breach callback.
+    from ap_execution_core import _classify_materialization_handoff, _classify_order_row_read
+    proof_snapshot = {
+        "captured": True,
+        "selector_contract": str(meta.get("selected_contract") or ""),
+        "selector_qty": _safe_int(meta.get("selected_qty"), 0),
+        "copied_plan_contract": str(persisted.get("contract") or ""),
+        "copied_plan_limit": _safe_float(persisted.get("limit_price"), 0.0),
+        "copied_plan_qty": _safe_int(persisted.get("qty"), 0),
+    }
+    verdict, proof_reason = _classify_order_row_read(
+        handoff_snapshot=proof_snapshot,
+        order_row_raw=persisted,
+        read_error=None,
+    )
+    if verdict != "PASS":
+        return {
+            "disposition": "TERMINAL_DURABLE",
+            "reason_code": f"PROOF_RETRY_HANDOFF_FAILED:{proof_reason}",
+            "terminal_status": "ERROR",
+        }
+    aligned, mismatch = _classify_materialization_handoff(
+        handoff_snapshot=proof_snapshot,
+        pre_submit_contract=proof_snapshot["copied_plan_contract"],
+        pre_submit_limit=proof_snapshot["copied_plan_limit"],
+        pre_submit_qty=proof_snapshot["copied_plan_qty"],
+        order_row_contract=str(persisted.get("contract") or ""),
+        order_row_limit=_safe_float(persisted.get("limit_price"), 0.0),
+        order_row_qty=_safe_int(persisted.get("qty"), 0),
+    )
+    if not aligned:
+        return {
+            "disposition": "TERMINAL_DURABLE",
+            "reason_code": f"PROOF_RETRY_HANDOFF_MISMATCH:{mismatch}",
+            "terminal_status": "ERROR",
+        }
+
+    outcome = execution_core.resume_deferred_broker_ready_order(
+        local_order_id=local_order_id,
+        plan=None,
+    ) or {}
+    outcome.setdefault("proof_retry_attempt", attempt)
+    outcome.setdefault("proof_retry_owner", owner)
+    return outcome
+
+
 class APStartupRecovery:
     """
     Runs once on ClientRunner startup to restore in-memory state from DB.
@@ -1369,47 +1504,29 @@ class APStartupRecovery:
                 # error, already-submitted) → row untouched.
                 continue
 
-            # ── AMENDMENT: PR #323 Seam 1 — PRE_SUBMIT_PROOF_RETRY recovery ──
-            # A row in PRE_SUBMIT_PROOF_RETRY has a real OCC contract already
-            # persisted in the row columns; only the order-row read proof failed
-            # transiently.  On recovery startup, if the deadline has not passed
-            # we retain durable ownership (the watcher will re-attempt the proof
-            # on the next materialization pass).  If the deadline has expired we
-            # terminalize with exact reason.  We do NOT rearm the watcher here —
-            # the watcher's normal materialization path already handles the proof
-            # read.  Retaining ownership is sufficient for the next watcher pass.
+            # PRE_SUBMIT_PROOF_RETRY has an explicit scheduler consumer. Both
+            # startup recovery and the runtime 20-second pass enter this branch;
+            # no in-memory watcher is required for completion.
             if lifecycle == "PRE_SUBMIT_PROOF_RETRY":
-                _proof_deadline_raw = meta.get("proof_retry_deadline")
-                _deadline_expired = False
-                if _proof_deadline_raw:
-                    try:
-                        _proof_deadline_ts = datetime.fromisoformat(str(_proof_deadline_raw))
-                        if _proof_deadline_ts.tzinfo is None:
-                            _proof_deadline_ts = _proof_deadline_ts.replace(tzinfo=timezone.utc)
-                        _deadline_expired = now >= _proof_deadline_ts
-                    except Exception:
-                        _deadline_expired = True  # unparseable deadline → fail closed
-                else:
-                    _deadline_expired = True  # no deadline recorded → fail closed
-
-                if _deadline_expired:
+                outcome = resume_pre_submit_proof_retry(order, self.osm, self.execution_core)
+                disposition = str(outcome.get("disposition") or "").upper()
+                reason_code = str(outcome.get("reason_code") or "PROOF_RETRY_UNKNOWN")
+                if disposition == "SUBMITTED":
+                    recovered += 1
+                elif disposition == "TERMINAL_DURABLE":
                     _terminalize_verified(
                         local_order_id,
-                        reason_code=str(
-                            meta.get("proof_retry_last_read_error")
-                            or "MATERIALIZATION_ORDER_ROW_UNREADABLE_DEADLINE_EXPIRED"
-                        ),
-                        terminal_status="EXPIRED",
+                        reason_code=reason_code,
+                        terminal_status=str(outcome.get("terminal_status") or "EXPIRED"),
                         diagnostics={
-                            "recovery_classification": "pre_submit_proof_retry_deadline_expired",
-                            "proof_retry_deadline":    _proof_deadline_raw,
-                            "selected_contract":       str(order.get("contract") or ""),
+                            "recovery_classification": "pre_submit_proof_retry_terminal",
+                            "proof_retry_attempt": outcome.get("proof_retry_attempt"),
+                            "selected_contract": str(order.get("contract") or ""),
                         },
                     )
-                else:
-                    # Deadline still valid — retain ownership, watcher will resume
-                    _retain_recovery_ownership(
-                        local_order_id, reason="pre_submit_proof_retry_pending",
+                elif disposition not in {"NOT_DUE", "CLAIM_LOST", "RETRY_WAIT", "RECONCILE_PENDING"}:
+                    result.setdefault("errors", []).append(
+                        f"proof_retry_unknown_disposition:{disposition or 'blank'}"
                     )
                 continue
 

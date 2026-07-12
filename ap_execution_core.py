@@ -2921,6 +2921,15 @@ class APExecutionCore:
         # select the contract before the limit_price and contract_symbol checks.
         _sig_meta   = getattr(approved_plan, "metadata", {}) or {}
         _sig_dict   = sig or {}
+        _proof_client_id = str(
+            getattr(approved_plan, "client_id", None) or _breach_client_id or ""
+        )
+        _proof_execution_mode = str(
+            getattr(approved_plan, "execution_mode", None)
+            or sig.get("execution_mode")
+            or getattr(self, "execution_mode", None)
+            or ""
+        )
         _candidate_audit = None  # Item 3 — set if breach-time selection runs
         _contract_sym_raw = str(getattr(approved_plan, "contract_symbol", "") or "").strip()
         _deferred   = (
@@ -5117,6 +5126,11 @@ class APExecutionCore:
                             "failure_stage":         "handoff_order_row_read",
                             "proof_retry_scheduled": True,
                             "proof_retry_deadline":  _proof_deadline,
+                            "absolute_entry_deadline": _proof_deadline,
+                            "original_trigger_crossed_at": str(
+                                _handoff_snapshot.get("trigger_crossed_at")
+                                or getattr(watched, "trigger_crossed_at", "")
+                            ),
                             "order_row_read_error":  _row_read_reason,
                             "pre_submit_contract":   _pre_contract,
                             "pre_submit_limit":      _pre_limit,
@@ -5909,13 +5923,20 @@ class APExecutionCore:
                         or _mv_q.get("provider")
                         or "unknown"
                     )
-                    # Fix 2: synchronous fetch with valid bid/ask → treat as age=0.
-                    # We called the broker synchronously right now. If the adapter
-                    # does not return quote_age_ms, the quote is effectively 0ms old
-                    # (we just got it). Stamp 0 so the gate gets honest freshness
-                    # rather than treating None as "unknown = skip stale check".
-                    if _mv_quote_age_ms is None and _mv_bid is not None and _mv_ask is not None:
-                        _mv_quote_age_ms = 0  # synchronous fetch — age assumed 0ms
+                    if _mv_quote_age_ms is None:
+                        _quote_ts_raw = (
+                            _mv_q.get("quote_timestamp")
+                            or _mv_q.get("timestamp")
+                            or _mv_q.get("as_of")
+                        )
+                        if _quote_ts_raw:
+                            _quote_ts = datetime.fromisoformat(str(_quote_ts_raw).replace("Z", "+00:00"))
+                            if _quote_ts.tzinfo is None:
+                                _quote_ts = _quote_ts.replace(tzinfo=timezone.utc)
+                            _mv_quote_age_ms = max(
+                                0.0,
+                                (datetime.now(timezone.utc) - _quote_ts).total_seconds() * 1000.0,
+                            )
             except Exception as _mv_exc:
                 log.warning(
                     "[%s] LIVE_SUBMIT_GATE market quote fetch failed "
@@ -5970,10 +5991,65 @@ class APExecutionCore:
                     ticker, _mv_res.audit.get("current_mid"),
                 )
 
-            # ── Gate 3: trigger age (uses durable timestamps from Amendment 2)
+            # A market-valid quote is the only event allowed to advance the
+            # trigger confirmation anchor. Persist it, then reread the exact
+            # durable value used by the age gate. The original breach timestamp
+            # is never rewritten.
+            _confirm_now = datetime.now(timezone.utc)
+            _absolute_deadline_raw = _meta_for_ts.get("absolute_entry_deadline")
+            if _absolute_deadline_raw:
+                try:
+                    _absolute_deadline = datetime.fromisoformat(
+                        str(_absolute_deadline_raw).replace("Z", "+00:00")
+                    )
+                    if _absolute_deadline.tzinfo is None:
+                        _absolute_deadline = _absolute_deadline.replace(tzinfo=timezone.utc)
+                except Exception:
+                    _absolute_deadline = None
+                if _absolute_deadline is None or _confirm_now >= _absolute_deadline:
+                    _terminalize_breach_failure("live_submit_gate:ABSOLUTE_ENTRY_DEADLINE_EXCEEDED")
+                    return
+
+            from zoneinfo import ZoneInfo as _ZoneInfo
+            _entry_cutoff_hhmm = int(
+                _meta_for_ts.get("entry_cutoff_et")
+                or os.getenv("ENTRY_CUTOFF_ET_HHMM", "1530")
+            )
+            _confirm_et = _confirm_now.astimezone(_ZoneInfo("America/New_York"))
+            if _gate_is_live and (_confirm_et.hour * 100 + _confirm_et.minute) >= _entry_cutoff_hhmm:
+                _terminalize_breach_failure("live_submit_gate:ENTRY_CUTOFF_EXCEEDED")
+                return
+
+            _last_confirmed_candidate = _confirm_now.isoformat()
+            if not self.order_state_machine.update_order_meta(
+                str(queue_local_order_id or ""),
+                {
+                    "last_confirmed_trigger_at": _last_confirmed_candidate,
+                    "original_trigger_crossed_at": (
+                        _meta_for_ts.get("original_trigger_crossed_at")
+                        or _ta_crossed_at
+                    ),
+                    "last_trigger_confirmation_quote": _mv_res.audit,
+                },
+            ):
+                _terminalize_breach_failure("live_submit_gate:TRIGGER_CONFIRMATION_PERSIST_FAILED")
+                return
+            _confirmed_row = self.order_state_machine.get_order(
+                str(queue_local_order_id or "")
+            ) or {}
+            _confirmed_meta = _confirmed_row.get("meta") or {}
+            if isinstance(_confirmed_meta, str):
+                _confirmed_meta = json.loads(_confirmed_meta)
+            _last_confirmed_durable = _confirmed_meta.get("last_confirmed_trigger_at")
+            if _last_confirmed_durable != _last_confirmed_candidate:
+                _terminalize_breach_failure("live_submit_gate:TRIGGER_CONFIRMATION_REREAD_MISMATCH")
+                return
+
+            # ── Gate 3: trigger age (uses the exact durable confirmation)
             _ta_res = check_trigger_age_gate(
                 trigger_crossed_at=_ta_crossed_at,
                 trigger_confirmed_at=_ta_confirmed_at,
+                last_confirmed_trigger_at=_last_confirmed_durable,
                 execution_mode=_gate_exec_mode,
             )
             if not _ta_res.passed:

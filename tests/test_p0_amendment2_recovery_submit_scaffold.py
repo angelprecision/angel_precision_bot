@@ -86,6 +86,9 @@ def _row(**overrides):
             "trigger_crossed_at": _past_iso(20),   # 20s ago — well within window
             "trigger_confirmed_at": _past_iso(19),
             "materialization_generation": 3,
+            "selected_contract": "SPY260717C00600000",
+            "selected_limit": 2.10,
+            "selected_qty": 1,
         },
     }
     base.update(overrides)

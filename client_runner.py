@@ -1741,7 +1741,7 @@ class ClientRunner(threading.Thread):
         broker = getattr(self, "broker", None)
         core = getattr(self, "core", None)
         watcher = getattr(core, "entry_watcher", None) if core is not None else None
-        if broker is None or watcher is None or self.order_state_machine is None:
+        if broker is None or core is None or self.order_state_machine is None:
             return
         try:
             recovery = APStartupRecovery(

@@ -13,6 +13,9 @@ def _row(crash=False):
         "trigger_crossed_at": (datetime.now(timezone.utc) - timedelta(seconds=5)).isoformat(),
         "trigger_price": 600.0, "observed_underlying_price": 600.1,
         "materialization_generation": 3,
+        "selected_contract": "SPY260717C00600000",
+        "selected_limit": 2.10,
+        "selected_qty": 1,
     }
     if crash:
         meta.update(lifecycle_state="SUBMITTING", submit_intent_at=datetime.now(timezone.utc).isoformat(), broker_submit_key="oid-1")
