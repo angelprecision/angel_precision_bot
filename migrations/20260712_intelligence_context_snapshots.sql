@@ -56,6 +56,8 @@ CREATE TABLE IF NOT EXISTS ap_intelligence_jobs (
   local_order_id TEXT,
   phase TEXT NOT NULL,
   context_revision INTEGER NOT NULL DEFAULT 1,
+  profile_version TEXT NOT NULL,
+  input_hash TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT 'PENDING',
   attempt_count INTEGER NOT NULL DEFAULT 0,
   max_attempts INTEGER NOT NULL DEFAULT 3,
@@ -65,6 +67,7 @@ CREATE TABLE IF NOT EXISTS ap_intelligence_jobs (
   claim_expires_at TIMESTAMPTZ,
   last_error_code TEXT,
   last_error_detail TEXT,
+  snapshot_id UUID REFERENCES ap_intelligence_snapshots(id),
   payload JSONB NOT NULL DEFAULT '{}'::jsonb,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -79,11 +82,25 @@ ON ap_intelligence_jobs (
   canonical_signal_id,
   COALESCE(NULLIF(BTRIM(local_order_id), ''), '__none__'),
   phase,
-  context_revision
+  context_revision,
+  profile_version
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_ap_intel_jobs_same_input
+ON ap_intelligence_jobs (
+  client_id,
+  lower(execution_mode),
+  canonical_signal_id,
+  COALESCE(NULLIF(BTRIM(local_order_id), ''), '__none__'),
+  phase,
+  profile_version,
+  input_hash
 );
 
 CREATE INDEX IF NOT EXISTS idx_ap_intel_jobs_due_claim
-ON ap_intelligence_jobs (status, next_attempt_at, claim_expires_at);
+ON ap_intelligence_jobs (
+  client_id, lower(execution_mode), status, next_attempt_at, claim_expires_at
+);
 
 CREATE INDEX IF NOT EXISTS idx_ap_intel_jobs_identity_lookup
 ON ap_intelligence_jobs (

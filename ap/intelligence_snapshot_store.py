@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import threading
 import time
 import uuid
 from datetime import datetime, timezone
@@ -15,6 +16,7 @@ DEFAULT_PROFILE_VERSION = "intelligence_context_v1_observe_only"
 
 _MEMORY_JOBS: dict[str, dict[str, Any]] = {}
 _MEMORY_SNAPSHOTS: dict[str, dict[str, Any]] = {}
+_MEMORY_LOCK = threading.Lock()
 
 
 def _now_iso() -> str:
@@ -91,26 +93,42 @@ def enqueue_intelligence_job(
     local_order_id: str = "",
     phase: str,
     context_revision: int = 1,
+    profile_version: str = DEFAULT_PROFILE_VERSION,
+    input_hash: str,
     max_attempts: int = 3,
     payload: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     try:
         phase = normalize_phase(phase)
         execution_mode = normalize_execution_mode(execution_mode)
-        key = identity_key(
-            client_id=client_id,
-            execution_mode=execution_mode,
-            canonical_signal_id=canonical_signal_id,
-            local_order_id=local_order_id,
-            phase=phase,
-            context_revision=context_revision,
-        )
         if _memory_enabled():
-            existing = _MEMORY_JOBS.get(key)
-            if existing:
-                return _result(True, inserted=False, duplicate=True, job_id=existing["id"])
-            job_id = str(uuid.uuid4())
-            _MEMORY_JOBS[key] = {
+            with _MEMORY_LOCK:
+                same_identity = [
+                    job for job in _MEMORY_JOBS.values()
+                    if job["client_id"] == client_id
+                    and job["execution_mode"] == execution_mode
+                    and job["canonical_signal_id"] == canonical_signal_id
+                    and job["local_order_id"] == normalized_local_order_id(local_order_id)
+                    and job["phase"] == phase
+                    and job["profile_version"] == profile_version
+                ]
+                for existing in same_identity:
+                    if existing["input_hash"] == input_hash:
+                        return _result(True, inserted=False, duplicate=True,
+                                       duplicate_same_input=True, job_id=existing["id"],
+                                       context_revision=existing["context_revision"])
+                next_revision = max(
+                    [int(job["context_revision"]) for job in same_identity]
+                    or [int(context_revision or 1) - 1]
+                ) + 1
+                key = identity_key(
+                    client_id=client_id, execution_mode=execution_mode,
+                    canonical_signal_id=canonical_signal_id, local_order_id=local_order_id,
+                    phase=phase, context_revision=next_revision,
+                    profile_version=profile_version,
+                )
+                job_id = str(uuid.uuid4())
+                _MEMORY_JOBS[key] = {
                 "id": job_id,
                 "client_id": client_id,
                 "execution_mode": execution_mode,
@@ -118,15 +136,18 @@ def enqueue_intelligence_job(
                 "signal_id": signal_id,
                 "local_order_id": normalized_local_order_id(local_order_id),
                 "phase": phase,
-                "context_revision": int(context_revision or 1),
+                "context_revision": next_revision,
+                "profile_version": profile_version,
+                "input_hash": input_hash,
                 "status": "PENDING",
                 "attempt_count": 0,
                 "max_attempts": int(max_attempts or 3),
                 "payload": copy.deepcopy(payload or {}),
                 "created_at": _now_iso(),
                 "updated_at": _now_iso(),
-            }
-            return _result(True, inserted=True, duplicate=False, job_id=job_id)
+                }
+                return _result(True, inserted=True, duplicate=False, job_id=job_id,
+                               context_revision=next_revision)
 
         payload_json = json.dumps(payload or {}, default=str)
 
@@ -134,12 +155,52 @@ def enqueue_intelligence_job(
             with _db_conn()() as c:
                 c.execute(
                     """
+                    SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))
+                    """,
+                    ("|".join((client_id, execution_mode.lower(), canonical_signal_id,
+                               normalized_local_order_id(local_order_id) or "__none__",
+                               phase, profile_version)),),
+                )
+                c.execute(
+                    """
+                    SELECT id, context_revision FROM ap_intelligence_jobs
+                    WHERE client_id=%s AND lower(execution_mode)=lower(%s)
+                      AND canonical_signal_id=%s
+                      AND COALESCE(NULLIF(BTRIM(local_order_id), ''), '__none__')=%s
+                      AND phase=%s AND profile_version=%s AND input_hash=%s
+                    LIMIT 1
+                    """,
+                    (client_id, execution_mode, canonical_signal_id,
+                     normalized_local_order_id(local_order_id) or "__none__",
+                     phase, profile_version, input_hash),
+                )
+                existing = c.fetchone()
+                if existing:
+                    return _result(True, inserted=False, duplicate=True,
+                                   duplicate_same_input=True, job_id=str(existing["id"]),
+                                   context_revision=int(existing["context_revision"]))
+                c.execute(
+                    """
+                    SELECT COALESCE(MAX(context_revision), %s - 1) + 1 AS next_revision
+                    FROM ap_intelligence_jobs
+                    WHERE client_id=%s AND lower(execution_mode)=lower(%s)
+                      AND canonical_signal_id=%s
+                      AND COALESCE(NULLIF(BTRIM(local_order_id), ''), '__none__')=%s
+                      AND phase=%s AND profile_version=%s
+                    """,
+                    (int(context_revision or 1), client_id, execution_mode,
+                     canonical_signal_id, normalized_local_order_id(local_order_id) or "__none__",
+                     phase, profile_version),
+                )
+                next_revision = int(c.fetchone()["next_revision"])
+                c.execute(
+                    """
                     INSERT INTO ap_intelligence_jobs (
                       client_id, execution_mode, canonical_signal_id, signal_id,
-                      local_order_id, phase, context_revision, max_attempts, payload
+                      local_order_id, phase, context_revision, profile_version,
+                      input_hash, max_attempts, payload
                     )
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)
-                    ON CONFLICT DO NOTHING
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)
                     RETURNING id
                     """,
                     (
@@ -149,37 +210,16 @@ def enqueue_intelligence_job(
                         signal_id,
                         normalized_local_order_id(local_order_id),
                         phase,
-                        int(context_revision or 1),
+                        next_revision,
+                        profile_version,
+                        input_hash,
                         int(max_attempts or 3),
                         payload_json,
                     ),
                 )
                 inserted = c.fetchone()
-                if inserted:
-                    return _result(True, inserted=True, duplicate=False, job_id=str(inserted["id"]))
-                c.execute(
-                    """
-                    SELECT id FROM ap_intelligence_jobs
-                    WHERE client_id=%s
-                      AND lower(execution_mode)=lower(%s)
-                      AND canonical_signal_id=%s
-                      AND COALESCE(NULLIF(BTRIM(local_order_id), ''), '__none__')=%s
-                      AND phase=%s
-                      AND context_revision=%s
-                    ORDER BY created_at DESC
-                    LIMIT 1
-                    """,
-                    (
-                        client_id,
-                        execution_mode,
-                        canonical_signal_id,
-                        normalized_local_order_id(local_order_id) or "__none__",
-                        phase,
-                        int(context_revision or 1),
-                    ),
-                )
-                existing = c.fetchone() or {}
-                return _result(True, inserted=False, duplicate=True, job_id=str(existing.get("id") or ""))
+                return _result(True, inserted=True, duplicate=False,
+                               job_id=str(inserted["id"]), context_revision=next_revision)
 
         return _run_with_retry(_fn)
     except Exception as exc:
@@ -189,6 +229,8 @@ def enqueue_intelligence_job(
 def claim_due_intelligence_jobs(
     *,
     claim_owner: str,
+    client_id: str,
+    execution_mode: str,
     limit: int = 5,
     lease_seconds: int = 120,
 ) -> dict[str, Any]:
@@ -196,18 +238,22 @@ def claim_due_intelligence_jobs(
         if _memory_enabled():
             now = time.time()
             claimed = []
-            for job in _MEMORY_JOBS.values():
-                if len(claimed) >= limit:
-                    break
-                expired = float(job.get("_claim_expires_epoch") or 0) <= now
-                if job.get("status") in {"PENDING", "RETRY_PENDING"} or (
-                    job.get("status") == "RUNNING" and expired
-                ):
-                    job["status"] = "RUNNING"
-                    job["claim_owner"] = claim_owner
-                    job["_claim_expires_epoch"] = now + lease_seconds
-                    job["attempt_count"] = int(job.get("attempt_count") or 0) + 1
-                    claimed.append(copy.deepcopy(job))
+            execution_mode = normalize_execution_mode(execution_mode)
+            with _MEMORY_LOCK:
+                for job in _MEMORY_JOBS.values():
+                    if len(claimed) >= limit:
+                        break
+                    expired = float(job.get("_claim_expires_epoch") or 0) <= now
+                    if job.get("client_id") != client_id or job.get("execution_mode") != execution_mode:
+                        continue
+                    if job.get("status") in {"PENDING", "RETRY_PENDING"} or (
+                        job.get("status") == "RUNNING" and expired
+                    ):
+                        job["status"] = "RUNNING"
+                        job["claim_owner"] = claim_owner
+                        job["_claim_expires_epoch"] = now + lease_seconds
+                        job["attempt_count"] = int(job.get("attempt_count") or 0) + 1
+                        claimed.append(copy.deepcopy(job))
             return _result(True, jobs=claimed)
 
         def _fn():
@@ -217,15 +263,13 @@ def claim_due_intelligence_jobs(
                     WITH due AS (
                       SELECT id
                       FROM ap_intelligence_jobs
-                      WHERE (
-                        status IN ('PENDING', 'RETRY_PENDING')
-                        AND next_attempt_at <= now()
-                      )
-                      OR (
-                        status='RUNNING'
-                        AND claim_expires_at IS NOT NULL
-                        AND claim_expires_at <= now()
-                      )
+                      WHERE client_id=%s AND lower(execution_mode)=lower(%s)
+                        AND (
+                          (status IN ('PENDING', 'RETRY_PENDING') AND next_attempt_at <= now())
+                          OR
+                          (status='RUNNING' AND claim_expires_at IS NOT NULL
+                           AND claim_expires_at <= now())
+                        )
                       ORDER BY next_attempt_at ASC, created_at ASC
                       LIMIT %s
                       FOR UPDATE SKIP LOCKED
@@ -241,7 +285,8 @@ def claim_due_intelligence_jobs(
                     WHERE j.id=due.id
                     RETURNING j.*
                     """,
-                    (int(limit or 5), claim_owner, int(lease_seconds or 120)),
+                    (client_id, normalize_execution_mode(execution_mode), int(limit or 5),
+                     claim_owner, int(lease_seconds or 120)),
                 )
                 return _result(True, jobs=c.fetchall())
 
@@ -297,7 +342,10 @@ def _update_job_terminality(
     try:
         if _memory_enabled():
             for job in _MEMORY_JOBS.values():
-                if str(job["id"]) == str(job_id) and job.get("claim_owner") == claim_owner:
+                if (str(job["id"]) == str(job_id)
+                        and job.get("claim_owner") == claim_owner
+                        and job.get("status") == "RUNNING"
+                        and float(job.get("_claim_expires_epoch") or 0) > time.time()):
                     job["status"] = status
                     job["last_error_code"] = error_code
                     job["last_error_detail"] = error_detail[:500]
@@ -316,6 +364,7 @@ def _update_job_terminality(
                         claim_expires_at=NULL,
                         updated_at=now()
                     WHERE id=%s AND claim_owner=%s AND status='RUNNING'
+                      AND claim_expires_at > now()
                     """,
                     (
                         status,
@@ -465,36 +514,128 @@ def complete_job_with_snapshot(
     claim_owner: str,
     snapshot_kwargs: dict[str, Any],
 ) -> dict[str, Any]:
-    snapshot = write_snapshot(**snapshot_kwargs)
-    if not snapshot.get("ok"):
-        return _result(False, completed=False, snapshot=snapshot, error=snapshot.get("error"))
     job_id = str(job.get("id") or "")
+    failure_stage = {"value": "ownership"}
     try:
         if _memory_enabled():
-            for stored in _MEMORY_JOBS.values():
-                if str(stored["id"]) == job_id and stored.get("claim_owner") == claim_owner:
+            with _MEMORY_LOCK:
+                stored = next(
+                    (item for item in _MEMORY_JOBS.values() if str(item["id"]) == job_id),
+                    None,
+                )
+                if (stored and stored.get("claim_owner") == claim_owner
+                        and stored.get("status") == "RUNNING"
+                        and float(stored.get("_claim_expires_epoch") or 0) > time.time()):
+                    snapshot = write_snapshot(**snapshot_kwargs)
+                    if not snapshot.get("ok"):
+                        return _result(False, completed=False, error_code="SNAPSHOT_PERSIST_FAILED",
+                                       snapshot=snapshot, error=snapshot.get("error"))
                     stored["status"] = "COMPLETED"
                     stored["snapshot_id"] = snapshot.get("snapshot_id")
                     return _result(True, completed=True, snapshot=snapshot)
-            return _result(False, completed=False, snapshot=snapshot, error="job_not_owned")
+                return _result(False, completed=False, error_code="JOB_CLAIM_OWNERSHIP_LOST",
+                               error="job_not_owned_or_lease_expired")
 
         def _fn():
             with _db_conn()() as c:
                 c.execute(
                     """
-                    UPDATE ap_intelligence_jobs
-                    SET status='COMPLETED',
-                        claim_expires_at=NULL,
-                        updated_at=now()
+                    SELECT id FROM ap_intelligence_jobs
                     WHERE id=%s AND claim_owner=%s AND status='RUNNING'
+                      AND claim_expires_at > now()
+                    FOR UPDATE
                     """,
                     (job_id, claim_owner),
                 )
-                return _result(c.rowcount == 1, completed=c.rowcount == 1, snapshot=snapshot)
+                if not c.fetchone():
+                    return _result(False, completed=False,
+                                   error_code="JOB_CLAIM_OWNERSHIP_LOST",
+                                   error="job_not_owned_or_lease_expired")
+                failure_stage["value"] = "snapshot"
+                payload_json = json.dumps(snapshot_kwargs.get("payload") or {}, default=str)
+                c.execute(
+                    """
+                    INSERT INTO ap_intelligence_snapshots (
+                      client_id, execution_mode, canonical_signal_id, signal_id,
+                      local_order_id, phase, context_revision, profile_version,
+                      parent_snapshot_id, input_hash, config_hash, git_commit,
+                      data_as_of, status, payload
+                    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)
+                    ON CONFLICT DO NOTHING
+                    RETURNING id
+                    """,
+                    (
+                        snapshot_kwargs["client_id"],
+                        normalize_execution_mode(snapshot_kwargs["execution_mode"]),
+                        snapshot_kwargs["canonical_signal_id"],
+                        snapshot_kwargs.get("signal_id", ""),
+                        normalized_local_order_id(snapshot_kwargs.get("local_order_id")),
+                        normalize_phase(snapshot_kwargs["phase"]),
+                        int(snapshot_kwargs.get("context_revision") or 1),
+                        snapshot_kwargs.get("profile_version") or DEFAULT_PROFILE_VERSION,
+                        snapshot_kwargs.get("parent_snapshot_id"),
+                        snapshot_kwargs["input_hash"],
+                        snapshot_kwargs.get("config_hash", ""),
+                        snapshot_kwargs.get("git_commit", ""),
+                        snapshot_kwargs.get("data_as_of"),
+                        str(snapshot_kwargs["status"]).upper(),
+                        payload_json,
+                    ),
+                )
+                inserted = c.fetchone()
+                if inserted:
+                    snapshot_id = str(inserted["id"])
+                    snapshot = _result(True, inserted=True, duplicate=False, snapshot_id=snapshot_id)
+                else:
+                    c.execute(
+                        """
+                        SELECT id FROM ap_intelligence_snapshots
+                        WHERE client_id=%s AND lower(execution_mode)=lower(%s)
+                          AND canonical_signal_id=%s
+                          AND COALESCE(NULLIF(BTRIM(local_order_id), ''), '__none__')=%s
+                          AND phase=%s AND context_revision=%s AND profile_version=%s
+                        LIMIT 1
+                        """,
+                        (snapshot_kwargs["client_id"], snapshot_kwargs["execution_mode"],
+                         snapshot_kwargs["canonical_signal_id"],
+                         normalized_local_order_id(snapshot_kwargs.get("local_order_id")) or "__none__",
+                         normalize_phase(snapshot_kwargs["phase"]),
+                         int(snapshot_kwargs.get("context_revision") or 1),
+                         snapshot_kwargs.get("profile_version") or DEFAULT_PROFILE_VERSION),
+                    )
+                    existing = c.fetchone()
+                    if not existing:
+                        return _result(False, completed=False,
+                                       error_code="SNAPSHOT_PERSIST_FAILED",
+                                       error="snapshot_insert_or_lookup_failed")
+                    snapshot_id = str(existing["id"])
+                    snapshot = _result(True, inserted=False, duplicate=True, snapshot_id=snapshot_id)
+                failure_stage["value"] = "completion"
+                c.execute(
+                    """
+                    UPDATE ap_intelligence_jobs
+                    SET status='COMPLETED',
+                        snapshot_id=%s,
+                        claim_expires_at=NULL,
+                        updated_at=now()
+                    WHERE id=%s AND claim_owner=%s AND status='RUNNING'
+                      AND claim_expires_at > now()
+                    """,
+                    (snapshot_id, job_id, claim_owner),
+                )
+                if c.rowcount != 1:
+                    raise RuntimeError("JOB_CLAIM_OWNERSHIP_LOST")
+                return _result(True, completed=True, snapshot=snapshot)
 
         return _run_with_retry(_fn)
     except Exception as exc:
-        return _result(False, completed=False, snapshot=snapshot, error=str(exc)[:500])
+        if "JOB_CLAIM_OWNERSHIP_LOST" in str(exc) or failure_stage["value"] == "ownership":
+            code = "JOB_CLAIM_OWNERSHIP_LOST"
+        elif failure_stage["value"] == "snapshot":
+            code = "SNAPSHOT_PERSIST_FAILED"
+        else:
+            code = "JOB_COMPLETION_UPDATE_FAILED"
+        return _result(False, completed=False, error_code=code, error=str(exc)[:500])
 
 
 def get_latest_snapshot(

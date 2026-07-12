@@ -167,6 +167,19 @@ def build_snapshot_kwargs(job: dict[str, Any]) -> dict[str, Any]:
     execution_mode = normalize_execution_mode(job.get("execution_mode") or payload.get("execution_mode"))
     local_order_id = str(job.get("local_order_id") or payload.get("local_order_id") or "")
     parent_snapshot_id = payload.get("parent_snapshot_id")
+    parent_link_status = payload.get("parent_link_status")
+    if phase == "PREOPEN" and not parent_snapshot_id:
+        parent = get_latest_snapshot(
+            client_id=client_id,
+            execution_mode=execution_mode,
+            canonical_signal_id=canonical_signal_id,
+            phase="PRETRIGGER",
+        )
+        if parent.get("ok"):
+            parent_snapshot_id = ((parent.get("snapshot") or {}).get("id") or None)
+            parent_link_status = "LINKED" if parent_snapshot_id else "PRETRIGGER_NOT_AVAILABLE"
+        else:
+            parent_link_status = "PRETRIGGER_LOOKUP_FAILED"
     context_payload = build_intelligence_context_payload(
         dict(signal or {}),
         phase=phase,
@@ -176,6 +189,8 @@ def build_snapshot_kwargs(job: dict[str, Any]) -> dict[str, Any]:
         local_order_id=local_order_id,
         parent_snapshot_id=parent_snapshot_id,
     )
+    if phase == "PREOPEN":
+        context_payload["parent_link_status"] = parent_link_status or "PRETRIGGER_NOT_AVAILABLE"
     return {
         "client_id": client_id,
         "execution_mode": execution_mode,
@@ -184,9 +199,9 @@ def build_snapshot_kwargs(job: dict[str, Any]) -> dict[str, Any]:
         "local_order_id": local_order_id,
         "phase": phase,
         "context_revision": int(job.get("context_revision") or CONTEXT_REVISION),
-        "profile_version": DEFAULT_PROFILE_VERSION,
+        "profile_version": str(job.get("profile_version") or DEFAULT_PROFILE_VERSION),
         "parent_snapshot_id": parent_snapshot_id,
-        "input_hash": context_payload["input_hash"],
+        "input_hash": str(job.get("input_hash") or context_payload["input_hash"]),
         "config_hash": context_payload["config_hash"],
         "git_commit": context_payload["git_commit"],
         "data_as_of": context_payload.get("data_as_of"),
@@ -213,6 +228,7 @@ def enqueue_pretrigger_context(
         "observe_only": True,
         "affected_eligibility": False,
     }
+    input_hash = _stable_hash(payload)
     return enqueue_intelligence_job(
         client_id=str(client_id or ""),
         execution_mode=normalize_execution_mode(execution_mode),
@@ -221,6 +237,8 @@ def enqueue_pretrigger_context(
         local_order_id="",
         phase="PRETRIGGER",
         context_revision=CONTEXT_REVISION,
+        profile_version=DEFAULT_PROFILE_VERSION,
+        input_hash=input_hash,
         payload=payload,
     )
 
@@ -243,6 +261,11 @@ def enqueue_preopen_context(
     )
     parent_snapshot = parent.get("snapshot") if parent.get("ok") else None
     parent_snapshot_id = (parent_snapshot or {}).get("id")
+    parent_link_status = (
+        "LINKED" if parent_snapshot_id
+        else "PRETRIGGER_NOT_AVAILABLE" if parent.get("ok")
+        else "PRETRIGGER_LOOKUP_FAILED"
+    )
     payload = {
         "phase": "PREOPEN",
         "signal": sig,
@@ -251,9 +274,12 @@ def enqueue_preopen_context(
         "canonical_signal_id": canonical_signal_id,
         "local_order_id": str(local_order_id or ""),
         "parent_snapshot_id": str(parent_snapshot_id) if parent_snapshot_id else None,
+        "parent_link_status": parent_link_status,
         "observe_only": True,
         "affected_eligibility": False,
     }
+    input_hash = _stable_hash({key: value for key, value in payload.items()
+                               if key not in {"parent_snapshot_id", "parent_link_status"}})
     return enqueue_intelligence_job(
         client_id=str(client_id or ""),
         execution_mode=normalize_execution_mode(execution_mode),
@@ -262,5 +288,7 @@ def enqueue_preopen_context(
         local_order_id=str(local_order_id or ""),
         phase="PREOPEN",
         context_revision=CONTEXT_REVISION,
+        profile_version=DEFAULT_PROFILE_VERSION,
+        input_hash=input_hash,
         payload=payload,
     )

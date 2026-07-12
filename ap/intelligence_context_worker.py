@@ -22,6 +22,8 @@ _THREADS: dict[str, threading.Thread] = {}
 
 def process_due_intelligence_jobs_once(
     *,
+    client_id: str,
+    execution_mode: str,
     claim_owner: Optional[str] = None,
     limit: int = 5,
     lease_seconds: int = 120,
@@ -29,6 +31,8 @@ def process_due_intelligence_jobs_once(
     owner = claim_owner or f"intelligence-context-worker:{uuid.uuid4().hex[:8]}"
     claimed = claim_due_intelligence_jobs(
         claim_owner=owner,
+        client_id=client_id,
+        execution_mode=execution_mode,
         limit=limit,
         lease_seconds=lease_seconds,
     )
@@ -38,6 +42,7 @@ def process_due_intelligence_jobs_once(
     retried = 0
     terminal = 0
     errors = 0
+    transition_failures = 0
     for job in claimed.get("jobs") or []:
         try:
             snapshot_kwargs = build_snapshot_kwargs(job)
@@ -48,44 +53,70 @@ def process_due_intelligence_jobs_once(
             errors += 1
             attempts = int(job.get("attempt_count") or 0)
             max_attempts = int(job.get("max_attempts") or 3)
+            error_code = str(result.get("error_code") or "SNAPSHOT_PERSIST_FAILED")
+            if error_code == "JOB_CLAIM_OWNERSHIP_LOST":
+                transition_failures += 1
+                log.critical("intelligence completion ownership lost job_id=%s owner=%s",
+                             job.get("id"), owner)
+                continue
             if attempts >= max_attempts:
-                mark_job_terminal(
+                transition = mark_job_terminal(
                     str(job.get("id")),
                     claim_owner=owner,
-                    error_code="snapshot_persist_failed",
+                    error_code=error_code,
                     error_detail=str(result.get("error") or result)[:500],
                 )
-                terminal += 1
+                if transition.get("ok") and transition.get("updated"):
+                    terminal += 1
+                else:
+                    transition_failures += 1
+                    log.critical("intelligence terminal transition failed job_id=%s owner=%s result=%s",
+                                 job.get("id"), owner, transition)
             else:
-                mark_job_retry(
+                transition = mark_job_retry(
                     str(job.get("id")),
                     claim_owner=owner,
-                    error_code="snapshot_persist_failed",
+                    error_code=error_code,
                     error_detail=str(result.get("error") or result)[:500],
                     retry_delay_seconds=30,
                 )
-                retried += 1
+                if transition.get("ok") and transition.get("updated"):
+                    retried += 1
+                else:
+                    transition_failures += 1
+                    log.critical("intelligence retry transition failed job_id=%s owner=%s result=%s",
+                                 job.get("id"), owner, transition)
         except Exception as exc:
             errors += 1
             attempts = int(job.get("attempt_count") or 0)
             max_attempts = int(job.get("max_attempts") or 3)
             if attempts >= max_attempts:
-                mark_job_terminal(
+                transition = mark_job_terminal(
                     str(job.get("id")),
                     claim_owner=owner,
                     error_code=type(exc).__name__,
                     error_detail=str(exc)[:500],
                 )
-                terminal += 1
+                if transition.get("ok") and transition.get("updated"):
+                    terminal += 1
+                else:
+                    transition_failures += 1
+                    log.critical("intelligence terminal transition failed job_id=%s owner=%s result=%s",
+                                 job.get("id"), owner, transition)
             else:
-                mark_job_retry(
+                transition = mark_job_retry(
                     str(job.get("id")),
                     claim_owner=owner,
                     error_code=type(exc).__name__,
                     error_detail=str(exc)[:500],
                     retry_delay_seconds=30,
                 )
-                retried += 1
+                if transition.get("ok") and transition.get("updated"):
+                    retried += 1
+                else:
+                    transition_failures += 1
+                    log.critical("intelligence retry transition failed job_id=%s owner=%s result=%s",
+                                 job.get("id"), owner, transition)
     return {
         "ok": True,
         "claimed": len(claimed.get("jobs") or []),
@@ -93,18 +124,21 @@ def process_due_intelligence_jobs_once(
         "retried": retried,
         "terminal": terminal,
         "errors": errors,
+        "transition_failures": transition_failures,
     }
 
 
 def start_intelligence_context_worker(
     *,
     client_id: str,
+    execution_mode: str,
     stop_event: threading.Event,
     interval_seconds: Optional[float] = None,
 ) -> Optional[threading.Thread]:
     if os.getenv("INTELLIGENCE_CONTEXT_WORKER_ENABLED", "0").strip().lower() not in {"1", "true", "yes", "on"}:
         return None
-    name = f"intelligence-context-{client_id}"
+    mode = str(execution_mode or "").strip().upper()
+    name = f"intelligence-context-{client_id}-{mode.lower()}"
     existing = _THREADS.get(name)
     if existing and existing.is_alive():
         return existing
@@ -113,7 +147,11 @@ def start_intelligence_context_worker(
     def _loop() -> None:
         owner = f"{name}:{uuid.uuid4().hex[:8]}"
         while not stop_event.is_set():
-            result = process_due_intelligence_jobs_once(claim_owner=owner)
+            result = process_due_intelligence_jobs_once(
+                claim_owner=owner,
+                client_id=client_id,
+                execution_mode=execution_mode,
+            )
             if result.get("errors"):
                 log.warning("[%s] intelligence context worker errors: %s", client_id, result)
             stop_event.wait(interval)

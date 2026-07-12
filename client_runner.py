@@ -3437,6 +3437,7 @@ class ClientRunner(threading.Thread):
 
             self.intelligence_context_thread = start_intelligence_context_worker(
                 client_id=self.email,
+                execution_mode=self.mode,
                 stop_event=self.stopped,
             )
         except Exception as _intel_worker_exc:

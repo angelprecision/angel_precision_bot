@@ -1148,9 +1148,9 @@ def _dispatch(
     # non-blocking. This is intentionally before synchronous Master Control
     # intelligence so slow evidence can materialize ahead of any trigger breach.
     try:
-        from ap.intelligence_context_materializer import enqueue_pretrigger_context
+        from ap.intelligence_context_handoff import enqueue_pretrigger_context_best_effort
 
-        _intel_enqueue = enqueue_pretrigger_context(
+        _intel_enqueue = enqueue_pretrigger_context_best_effort(
             payload,
             client_id=client_id,
             execution_mode=_execution_mode,
