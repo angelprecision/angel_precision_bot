@@ -25,6 +25,7 @@ CLIENT_ID = "jason@example.com"
 LOCAL_ORDER_ID = "oid-pr323-e2e-1"
 SIGNAL_ID = "sig-pr323-e2e-1"
 REAL_OCC = "SPY260717C00600000"
+TEST_ENTRY_CUTOFF_ET = "2359"
 
 
 def _now() -> datetime:
@@ -66,7 +67,7 @@ def _row() -> dict:
             "broker_ready": False,
             "execution_mode": "live",
             "queue_id": 323,
-            "entry_cutoff_et": "1530",
+            "entry_cutoff_et": TEST_ENTRY_CUTOFF_ET,
         },
     }
 
@@ -437,7 +438,7 @@ def _broker_ready_row() -> dict:
         "trigger_crossed_at": _iso(_now() - timedelta(seconds=10)),
         "trigger_price": 600.0,
         "observed_underlying_price": 600.20,
-        "entry_cutoff_et": "1530",
+        "entry_cutoff_et": TEST_ENTRY_CUTOFF_ET,
     }
     return row
 
