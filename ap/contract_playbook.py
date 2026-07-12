@@ -4,6 +4,10 @@ import os
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import Optional
+from zoneinfo import ZoneInfo
+
+
+ET = ZoneInfo("America/New_York")
 
 
 def _env_flag(name: str, default: str = "0") -> bool:
@@ -95,6 +99,8 @@ def _cutoff_hour_minute() -> tuple[int, int]:
 def _before_index_cutoff(now_et: datetime | None) -> bool:
     if now_et is None:
         return True
+    if now_et.tzinfo is not None:
+        now_et = now_et.astimezone(ET)
     hour, minute = _cutoff_hour_minute()
     return (now_et.hour, now_et.minute) < (hour, minute)
 
@@ -159,13 +165,15 @@ def resolve_contract_playbook(
         short_max = max(0, _index_short_max_dte())
         diagnostics["cutoff_allows_0dte"] = before_cutoff
         diagnostics["cutoff_time_et"] = "%02d:%02d" % _cutoff_hour_minute()
+        permitted_windowed: list[tuple[int, str]] = []
         for dte, exp in windowed:
             if dte == 0 and (not allow_0dte or not before_cutoff):
                 continue
+            permitted_windowed.append((dte, exp))
             if dte <= short_max:
                 preferred.append(exp)
                 preferred_dtes.append(dte)
-        for dte, exp in windowed:
+        for dte, exp in permitted_windowed:
             if exp not in preferred:
                 preferred.append(exp)
                 preferred_dtes.append(dte)

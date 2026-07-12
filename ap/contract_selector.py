@@ -46,8 +46,9 @@ from ap.trace import trace_gate
 import os
 import time
 from dataclasses import dataclass, field, replace as _dc_replace
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from typing import Optional
+from zoneinfo import ZoneInfo
 from ap.contract_playbook import (
     ContractPlaybookSpec,
     build_playbook_candidate_context,
@@ -3805,6 +3806,7 @@ class APContractSelectionEngine:
             ticker,
             request_context=request_context,
         )
+        now_et = self._playbook_now_et()
         spec = resolve_contract_playbook(
             ticker=ticker,
             side=_safe_plan_attr(plan, "side", ""),
@@ -3819,6 +3821,7 @@ class APContractSelectionEngine:
             min_dte=int(self.min_dte),
             max_dte=int(self.max_dte),
             metadata=_safe_plan_attr(plan, "metadata", None) or {},
+            now_et=now_et,
         )
         ordered = resolve_playbook_expiration_order(
             spec,
@@ -3857,7 +3860,11 @@ class APContractSelectionEngine:
             "diagnostics": dict(spec.diagnostics),
         }
         audit.update(evidence)
+        audit["resolved_now_et"] = now_et.isoformat()
         return ordered, audit
+
+    def _playbook_now_et(self) -> datetime:
+        return datetime.now(ZoneInfo("America/New_York"))
 
     def _bucket_expirations(self, dates: list[str]) -> dict[str, list[str]]:
         """Group expirations into DTE buckets A (0–a), B (a+1–b), C (b+1+).
