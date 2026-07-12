@@ -7,6 +7,18 @@ from types import SimpleNamespace
 import pytest
 
 from ap.entry_metadata_guard import (
+    ENTRY_GEOMETRY_CALL_INVALID,
+    ENTRY_GEOMETRY_CHANGED_AFTER_ARM,
+    ENTRY_GEOMETRY_CONFLICT,
+    ENTRY_GEOMETRY_MISSING,
+    ENTRY_GEOMETRY_NONNUMERIC,
+    ENTRY_GEOMETRY_PUT_INVALID,
+    ENTRY_GEOMETRY_STOP_EQUALS_TARGET,
+    ENTRY_GEOMETRY_STOP_EQUALS_TRIGGER,
+    ENTRY_GEOMETRY_TARGET_EQUALS_TRIGGER,
+    ENTRY_PATTERN_SIDE_CONFLICT,
+    LIVE_FAILED_DIRECTION_PATTERN_BLOCKED,
+    LIVE_TIMEFRAME_NOT_ALLOWED,
     MISSING_SIGNAL_ID,
     MISSING_TIMEFRAME,
     UNKNOWN_EXECUTION_MODE,
@@ -16,6 +28,7 @@ from ap.entry_metadata_guard import (
     _allow_deferred_overnight_watcher_create,
     _mark_deferred_watcher_data_pending,
     validate_entry_metadata,
+    validate_entry_strategy_truth,
 )
 
 
@@ -100,6 +113,125 @@ def test_fully_shaped_signal_passes_unchanged():
     assert result.ok
     assert result.reason is None
     assert signal == before
+
+
+def test_strategy_truth_valid_call_passes():
+    result = validate_entry_strategy_truth(plan=_shaped_signal())
+    assert result.ok
+    assert result.details["trigger"] == 77.62
+    assert result.details["stop"] == 75.10
+    assert result.details["target"] == 81.50
+
+
+def test_strategy_truth_valid_put_passes():
+    result = validate_entry_strategy_truth(plan=_shaped_signal(
+        side="PUT",
+        direction="PUT",
+        pattern="1-2_2D",
+        entry_trigger=77.62,
+        stop_price=80.10,
+        target_price=74.50,
+    ))
+    assert result.ok
+
+
+@pytest.mark.parametrize(
+    ("overrides", "reason"),
+    [
+        ({"target_price": 76.50}, ENTRY_GEOMETRY_CALL_INVALID),
+        ({"stop_price": 78.10}, ENTRY_GEOMETRY_CALL_INVALID),
+        ({"stop_price": 77.62}, ENTRY_GEOMETRY_STOP_EQUALS_TRIGGER),
+        ({"target_price": 77.62}, ENTRY_GEOMETRY_TARGET_EQUALS_TRIGGER),
+        ({"stop_price": 81.50}, ENTRY_GEOMETRY_STOP_EQUALS_TARGET),
+        ({"target_price": None, "trigger": {"entry": 77.62, "stop": 75.10}}, ENTRY_GEOMETRY_MISSING),
+        ({"target_price": "not-a-number"}, ENTRY_GEOMETRY_NONNUMERIC),
+    ],
+)
+def test_strategy_truth_call_geometry_blocks(overrides, reason):
+    result = validate_entry_strategy_truth(plan=_shaped_signal(**overrides))
+    assert not result.ok
+    assert result.reason == reason
+
+
+@pytest.mark.parametrize(
+    ("overrides", "reason"),
+    [
+        ({"target_price": 78.20}, ENTRY_GEOMETRY_PUT_INVALID),
+        ({"stop_price": 76.40}, ENTRY_GEOMETRY_PUT_INVALID),
+    ],
+)
+def test_strategy_truth_put_geometry_blocks(overrides, reason):
+    signal = _shaped_signal(
+        side="PUT",
+        direction="PUT",
+        pattern="1-2_2D",
+        stop_price=80.10,
+        target_price=74.50,
+    )
+    signal.update(overrides)
+    result = validate_entry_strategy_truth(plan=signal)
+    assert not result.ok
+    assert result.reason == reason
+
+
+def test_strategy_truth_rejects_conflicting_authoritative_geometry():
+    order = _shaped_signal(target_price=81.50)
+    plan = SimpleNamespace(**_shaped_signal(target_price=82.00))
+    result = validate_entry_strategy_truth(order=order, plan=plan)
+    assert not result.ok
+    assert result.reason == ENTRY_GEOMETRY_CONFLICT
+    assert result.details["field"] == "target"
+
+
+def test_strategy_truth_pattern_side_conflicts_block():
+    result = validate_entry_strategy_truth(plan=_shaped_signal(
+        side="PUT",
+        direction="PUT",
+        pattern="1-2_2U",
+        stop_price=80.10,
+        target_price=74.50,
+    ))
+    assert not result.ok
+    assert result.reason == ENTRY_PATTERN_SIDE_CONFLICT
+
+    result = validate_entry_strategy_truth(plan=_shaped_signal(
+        side="CALL",
+        direction="CALL",
+        pattern="1-2_2D",
+    ))
+    assert not result.ok
+    assert result.reason == ENTRY_PATTERN_SIDE_CONFLICT
+
+
+def test_strategy_truth_ambiguous_pattern_not_rejected_by_parser():
+    result = validate_entry_strategy_truth(plan=_shaped_signal(pattern="3-2-2"))
+    assert result.ok
+
+
+def test_failed_direction_blocks_in_live_and_paper_follows_policy(monkeypatch):
+    live = validate_entry_strategy_truth(plan=_shaped_signal(pattern="FAILED_DIR_2U_30min+60min"))
+    assert not live.ok
+    assert live.reason == LIVE_FAILED_DIRECTION_PATTERN_BLOCKED
+
+    paper_signal = _shaped_signal(execution_mode="paper", pattern="FAILED_DIR_2U_30min+60min")
+    paper = validate_entry_strategy_truth(plan=paper_signal)
+    assert paper.ok
+
+    monkeypatch.setenv("PAPER_BLOCK_FAILED_DIRECTION_PATTERNS", "1")
+    paper_blocked = validate_entry_strategy_truth(plan=paper_signal)
+    assert not paper_blocked.ok
+    assert paper_blocked.reason == LIVE_FAILED_DIRECTION_PATTERN_BLOCKED
+
+
+def test_live_timeframe_policy_blocks_intraday_and_allows_daily_weekly(monkeypatch):
+    monkeypatch.delenv("LIVE_ALLOWED_ENTRY_TIMEFRAMES", raising=False)
+    assert validate_entry_strategy_truth(plan=_shaped_signal(timeframe="1d")).ok
+    assert validate_entry_strategy_truth(plan=_shaped_signal(timeframe="overnight")).ok
+    assert validate_entry_strategy_truth(plan=_shaped_signal(timeframe="weekly")).ok
+
+    blocked = validate_entry_strategy_truth(plan=_shaped_signal(timeframe="15m"))
+    assert not blocked.ok
+    assert blocked.reason == LIVE_TIMEFRAME_NOT_ALLOWED
 
 
 def test_nested_daily_trigger_stop_target_shape_passes_unchanged():
@@ -390,3 +522,112 @@ def test_submit_existing_entry_blocks_before_broker_submit_or_order_mutation(mon
     assert result["metadata_blocked"] is True
     assert result["error"] == ZERO_SCORE
     assert result["status"] == OrderStatus.PENDING_TRIGGER
+
+
+def _valid_submit_order(**overrides):
+    row = {
+        "local_order_id": "local-geometry",
+        "client_id": "jasoncosby1@gmail.com",
+        "kind": "ENTRY",
+        "status": "PENDING_TRIGGER",
+        "signal_id": "sig-wfc-call-1d",
+        "canonical_signal_id": "WFC:CALL:1d:2026-06-26",
+        "symbol": "WFC",
+        "contract": "WFC260717C00080000",
+        "direction": "CALL",
+        "execution_mode": "live",
+        "score": 80,
+        "trigger_price": 77.62,
+        "stop_underlying": 75.10,
+        "target_underlying": 81.50,
+        "pattern": "1-2_2U",
+        "timeframe": "1d",
+        "limit_price": 1.25,
+        "qty": 1,
+        "meta": json.dumps({
+            "underlying_entry": 77.88,
+        }),
+    }
+    row.update(overrides)
+    return row
+
+
+def test_submit_existing_entry_blocks_invalid_geometry_before_submit_intent_or_broker(monkeypatch):
+    _install_or_skip()
+    from ap.order_state_machine import APOrderStateMachine, OrderStatus
+
+    osm = APOrderStateMachine("jasoncosby1@gmail.com")
+    order_row = _valid_submit_order(target_underlying=76.50)
+    terminalized = {}
+
+    monkeypatch.setattr(osm, "_get_order", lambda local_order_id: order_row)
+    monkeypatch.setattr(osm, "terminalize_deferred_breach", lambda local_order_id, **kwargs: terminalized.setdefault("kwargs", kwargs) or True)
+
+    def _should_not_submit(*args, **kwargs):
+        raise AssertionError("broker submit must not be called for invalid geometry")
+
+    def _should_not_write_submit_intent(*args, **kwargs):
+        raise AssertionError("submit intent must not be written for invalid geometry")
+
+    monkeypatch.setattr(osm, "_submit_order_with_retry", _should_not_submit)
+    monkeypatch.setattr(osm, "update_order_meta", _should_not_write_submit_intent)
+    monkeypatch.setattr(osm, "persist_materialized_submit_intent", _should_not_write_submit_intent)
+    monkeypatch.setattr(osm, "persist_deferred_submit_intent", _should_not_write_submit_intent)
+
+    result = osm.submit_existing_entry(
+        local_order_id="local-geometry",
+        broker=object(),
+        plan=None,
+        limit_price=1.25,
+    )
+
+    assert result["ok"] is False
+    assert result["strategy_truth_blocked"] is True
+    assert result["error"] == ENTRY_GEOMETRY_CALL_INVALID
+    assert result["terminalized"] is True
+    assert terminalized["kwargs"]["reason_code"] == ENTRY_GEOMETRY_CALL_INVALID
+    assert terminalized["kwargs"]["terminal_status"] == OrderStatus.ERROR
+
+
+def test_direct_submit_boundary_detects_geometry_changed_after_arm(monkeypatch):
+    _install_or_skip()
+    from ap.order_state_machine import APOrderStateMachine
+
+    osm = APOrderStateMachine("jasoncosby1@gmail.com")
+    order_row = _valid_submit_order(target_underlying=76.50)
+    armed_plan = SimpleNamespace(
+        contract_symbol="WFC260717C00080000",
+        contracts=1,
+        signal_id="sig-wfc-call-1d",
+        client_id="jasoncosby1@gmail.com",
+        execution_mode="live",
+        ticker="WFC",
+        side="CALL",
+        trigger_price=77.62,
+        stop_underlying=75.10,
+        target_underlying=81.50,
+        pattern="1-2_2U",
+        timeframe="1d",
+        metadata={"underlying_entry": 77.88},
+    )
+
+    monkeypatch.setattr(osm, "_get_order", lambda local_order_id: order_row)
+    monkeypatch.setattr(osm, "terminalize_deferred_breach", lambda *args, **kwargs: True)
+
+    def _should_not_submit(*args, **kwargs):
+        raise AssertionError("broker submit must not be called after geometry corruption")
+
+    monkeypatch.setattr(osm, "_submit_order_with_retry", _should_not_submit)
+
+    original = getattr(APOrderStateMachine, "_entry_metadata_guard_original_submit_existing", None)
+    submit = original.__get__(osm, APOrderStateMachine) if original else osm.submit_existing_entry
+    result = submit(
+        local_order_id="local-geometry",
+        broker=object(),
+        plan=armed_plan,
+        limit_price=1.25,
+    )
+
+    assert result["ok"] is False
+    assert result["strategy_truth_blocked"] is True
+    assert result["error"] == ENTRY_GEOMETRY_CHANGED_AFTER_ARM

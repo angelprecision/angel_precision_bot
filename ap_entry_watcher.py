@@ -2503,6 +2503,77 @@ class APEntryWatcher:
         ticker = str(signal_dict.get("ticker", "")).upper()
         stop = signal_dict.get("stop_price")
 
+        try:
+            from ap.entry_metadata_guard import validate_entry_strategy_truth
+            _strategy_result = validate_entry_strategy_truth(
+                plan=plan,
+                caller_meta=getattr(plan, "metadata", None),
+                client_id=signal_dict.get("client_id"),
+                execution_mode=signal_dict.get("execution_mode"),
+            )
+        except Exception as _strategy_exc:
+            log.critical(
+                "[%s] ENTRY_STRATEGY_TRUTH_VALIDATOR_ERROR before watcher arm | "
+                "local_order_id=%s error=%s",
+                ticker, local_order_id, _strategy_exc,
+            )
+            _strategy_result = types.SimpleNamespace(
+                ok=False,
+                reason=f"ENTRY_STRATEGY_TRUTH_VALIDATOR_ERROR:{_strategy_exc}",
+                details={"ticker": ticker, "local_order_id": local_order_id},
+            )
+        if not _strategy_result.ok:
+            _strategy_reason = str(_strategy_result.reason or "ENTRY_STRATEGY_TRUTH_INVALID")
+            _strategy_audit = self._build_watcher_audit_payload(
+                None,
+                symbol=ticker,
+                score=float(signal_dict.get("score") or 0),
+                tier=str(signal_dict.get("grade") or ""),
+                direction=side,
+                timeframe=str(signal_dict.get("timeframe") or ""),
+                pattern=str(signal_dict.get("pattern") or ""),
+                signal_id=str(signal_dict.get("signal_id") or ""),
+                plan_id=str(signal_dict.get("plan_id") or ""),
+                trigger_type="strategy_truth",
+                signal_entry_price=trigger,
+                trigger_price=trigger,
+                stop_price=stop,
+                reason_code=_strategy_reason,
+                raw_reason=_strategy_reason,
+            )
+            _strategy_audit["entry_strategy_truth"] = dict(_strategy_result.details or {})
+            try:
+                self._persist_watcher_audit(local_order_id, _strategy_audit)
+            except Exception as _strategy_audit_exc:
+                log.warning(
+                    "[%s] ENTRY_STRATEGY_TRUTH audit write failed local_order_id=%s error=%s",
+                    ticker, local_order_id, _strategy_audit_exc,
+                )
+            if local_order_id and self.order_state_machine is not None:
+                update_meta = getattr(self.order_state_machine, "update_order_meta", None)
+                if callable(update_meta):
+                    try:
+                        update_meta(local_order_id, {
+                            "entry_strategy_truth": {
+                                "ok": False,
+                                "reason_code": _strategy_reason,
+                                **(dict(_strategy_result.details or {})),
+                            },
+                            "metadata_validation_status": "BLOCKED",
+                            "metadata_validation_reason": _strategy_reason,
+                        })
+                    except Exception:
+                        pass
+                cancel_fn = getattr(self.order_state_machine, "cancel_pending_entry", None)
+                if callable(cancel_fn):
+                    cancel_fn(local_order_id, reason=_strategy_reason)
+            log.warning(
+                "[%s] ENTRY_STRATEGY_TRUTH_BLOCKED before watcher arm | "
+                "local_order_id=%s reason=%s details=%s",
+                ticker, local_order_id, _strategy_reason, _strategy_result.details,
+            )
+            return False
+
         # Stamp the recovery flag so add_signal() suppresses cancel_pending_entry.
         if _recovery_rearm:
             signal_dict["__recovery_rearm"] = True
