@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import sys
 import types
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
@@ -544,10 +545,10 @@ def test_real_watcher_to_recovery_to_single_post_call_graph(monkeypatch):
             },
         )
 
-    with patch(
-        "ap.execution._refresh_ask_at_submit",
-        new=_refresh_ask_at_submit,
-    ), patch(
+    fake_execution = types.ModuleType("ap.execution")
+    fake_execution._refresh_ask_at_submit = _refresh_ask_at_submit
+
+    with patch.dict(sys.modules, {"ap.execution": fake_execution}), patch(
         "ap_entry_confirmation.check_entry_confirmation",
         return_value=_FakeConfirmResult(),
     ), patch("ap.db.conn", lambda: _NoopConn()), patch(
