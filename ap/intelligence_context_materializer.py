@@ -79,6 +79,8 @@ def build_intelligence_context_payload(
     canonical_signal_id: str = "",
     local_order_id: str = "",
     parent_snapshot_id: Optional[str] = None,
+    context_revision: int = CONTEXT_REVISION,
+    profile_version: str = DEFAULT_PROFILE_VERSION,
 ) -> dict[str, Any]:
     phase = str(phase or "").upper()
     sig = dict(signal or {})
@@ -107,9 +109,9 @@ def build_intelligence_context_payload(
         status = "UNAVAILABLE"
 
     payload = {
-        "profile_version": DEFAULT_PROFILE_VERSION,
+        "profile_version": str(profile_version or DEFAULT_PROFILE_VERSION),
         "phase": phase,
-        "context_revision": CONTEXT_REVISION,
+        "context_revision": int(context_revision or CONTEXT_REVISION),
         "client_id": str(client_id or ""),
         "execution_mode": normalize_execution_mode(execution_mode),
         "canonical_signal_id": canonical_signal_id,
@@ -188,6 +190,8 @@ def build_snapshot_kwargs(job: dict[str, Any]) -> dict[str, Any]:
         canonical_signal_id=canonical_signal_id,
         local_order_id=local_order_id,
         parent_snapshot_id=parent_snapshot_id,
+        context_revision=int(job.get("context_revision") or CONTEXT_REVISION),
+        profile_version=str(job.get("profile_version") or DEFAULT_PROFILE_VERSION),
     )
     if phase == "PREOPEN":
         context_payload["parent_link_status"] = parent_link_status or "PRETRIGGER_NOT_AVAILABLE"

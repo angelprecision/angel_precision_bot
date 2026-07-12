@@ -13,6 +13,9 @@ from ap.intelligence_context_materializer import (  # noqa: E402
 )
 from ap.intelligence_context_worker import process_due_intelligence_jobs_once  # noqa: E402
 from ap.intelligence_context_handoff import submit_intelligence_enqueue  # noqa: E402
+from ap.intelligence_context_handoff import (  # noqa: E402
+    enqueue_pretrigger_context_best_effort,
+)
 from ap.intelligence_snapshot_store import (  # noqa: E402
     _MEMORY_JOBS,
     _reset_memory_store_for_tests,
@@ -270,6 +273,25 @@ def test_identical_input_is_idempotent_but_changed_input_gets_next_revision():
     assert changed["context_revision"] == 2
 
 
+def test_changed_input_snapshot_payload_matches_allocated_revision():
+    enqueue_pretrigger_context(
+        _signal(), client_id="client@example.com", execution_mode="PAPER",
+        canonical_signal_id="canon-123",
+    )
+    enqueue_pretrigger_context(
+        {**_signal(), "sector": "XLK"}, client_id="client@example.com",
+        execution_mode="PAPER", canonical_signal_id="canon-123",
+    )
+    _process(limit=2)
+    latest = get_latest_snapshot(
+        client_id="client@example.com", execution_mode="PAPER",
+        canonical_signal_id="canon-123", phase="PRETRIGGER",
+    )["snapshot"]
+    assert latest["context_revision"] == 2
+    assert latest["payload"]["context_revision"] == 2
+    assert latest["profile_version"] == latest["payload"]["profile_version"]
+
+
 def test_concurrent_changed_input_allocates_one_next_revision():
     enqueue_pretrigger_context(
         _signal(), client_id="client@example.com", execution_mode="PAPER",
@@ -365,3 +387,103 @@ def test_failed_retry_transition_is_not_counted_as_retried(monkeypatch):
     result = _process()
     assert result["retried"] == 0
     assert result["transition_failures"] == 1
+
+
+def test_disabled_feature_does_not_submit_enqueue(monkeypatch):
+    monkeypatch.setenv("INTELLIGENCE_CONTEXT_WORKER_ENABLED", "0")
+
+    def should_not_submit(*_args, **_kwargs):
+        raise AssertionError("disabled intelligence attempted executor submission")
+
+    monkeypatch.setattr("ap.intelligence_context_handoff._EXECUTOR.submit", should_not_submit)
+    result = enqueue_pretrigger_context_best_effort(
+        _signal(), client_id="client@example.com", execution_mode="PAPER",
+        canonical_signal_id="canon-123",
+    )
+    assert result == {"ok": True, "accepted": False, "disabled": True}
+
+
+def test_async_handoff_freezes_nested_signal_state(monkeypatch):
+    monkeypatch.setenv("INTELLIGENCE_CONTEXT_WORKER_ENABLED", "1")
+    captured = {}
+
+    def capture_submission(_enqueue, *args, **_kwargs):
+        captured["signal"] = args[0]
+        return {"ok": True, "accepted": True}
+
+    monkeypatch.setattr(
+        "ap.intelligence_context_handoff.submit_intelligence_enqueue", capture_submission
+    )
+    signal = _signal()
+    enqueue_pretrigger_context_best_effort(
+        signal, client_id="client@example.com", execution_mode="PAPER",
+        canonical_signal_id="canon-123",
+    )
+    signal["candles_1h"][0]["c"] = 999
+    assert captured["signal"]["candles_1h"][0]["c"] == 500
+
+
+def test_snapshot_completion_uses_one_transaction_shaped_connection(monkeypatch):
+    monkeypatch.delenv("INTELLIGENCE_CONTEXT_STORE_BACKEND", raising=False)
+    events = []
+
+    class FakeConnection:
+        rowcount = 0
+        next_row = None
+        update_rowcount = 1
+
+        def __enter__(self):
+            events.append("begin")
+            return self
+
+        def __exit__(self, exc_type, _exc, _tb):
+            events.append("rollback" if exc_type else "commit")
+            return False
+
+        def execute(self, sql, _params=None):
+            normalized = " ".join(sql.split())
+            events.append(normalized)
+            if normalized.startswith("SELECT id FROM ap_intelligence_jobs"):
+                self.next_row = {"id": "job-1"}
+            elif normalized.startswith("INSERT INTO ap_intelligence_snapshots"):
+                self.next_row = {"id": "snapshot-1"}
+            elif normalized.startswith("UPDATE ap_intelligence_jobs"):
+                self.rowcount = self.update_rowcount
+
+        def fetchone(self):
+            row, self.next_row = self.next_row, None
+            return row
+
+    fake = FakeConnection()
+    monkeypatch.setattr("ap.intelligence_snapshot_store._db_conn", lambda: lambda: fake)
+    monkeypatch.setattr("ap.intelligence_snapshot_store._run_with_retry", lambda fn: fn())
+    result = complete_job_with_snapshot(
+        {"id": "job-1"}, claim_owner="owner",
+        snapshot_kwargs={
+            "client_id": "client@example.com", "execution_mode": "PAPER",
+            "canonical_signal_id": "canon-123", "phase": "PRETRIGGER",
+            "context_revision": 1, "profile_version": "profile-1",
+            "input_hash": "hash-1", "status": "COMPLETE", "payload": {},
+        },
+    )
+    assert result["ok"] and result["completed"]
+    assert events.count("begin") == 1
+    assert events[-1] == "commit"
+    assert events.index(next(e for e in events if e.startswith("INSERT INTO"))) < events.index(
+        next(e for e in events if e.startswith("UPDATE ap_intelligence_jobs"))
+    )
+
+    events.clear()
+    fake.update_rowcount = 0
+    failed = complete_job_with_snapshot(
+        {"id": "job-1"}, claim_owner="owner",
+        snapshot_kwargs={
+            "client_id": "client@example.com", "execution_mode": "PAPER",
+            "canonical_signal_id": "canon-123", "phase": "PRETRIGGER",
+            "context_revision": 1, "profile_version": "profile-1",
+            "input_hash": "hash-1", "status": "COMPLETE", "payload": {},
+        },
+    )
+    assert failed["ok"] is False
+    assert failed["error_code"] == "JOB_CLAIM_OWNERSHIP_LOST"
+    assert events[-1] == "rollback"

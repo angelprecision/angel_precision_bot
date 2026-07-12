@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import copy
 import logging
+import os
 import threading
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any, Callable
@@ -9,6 +11,12 @@ log = logging.getLogger("ap.intelligence_context_handoff")
 
 _EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="intelligence-handoff")
 _CAPACITY = threading.BoundedSemaphore(128)
+
+
+def intelligence_context_enabled() -> bool:
+    return os.getenv("INTELLIGENCE_CONTEXT_WORKER_ENABLED", "0").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
 
 
 def _log_result(future: Future, *, phase: str, signal_id: str) -> None:
@@ -50,11 +58,13 @@ def submit_intelligence_enqueue(
 
 
 def enqueue_pretrigger_context_best_effort(signal: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
+    if not intelligence_context_enabled():
+        return {"ok": True, "accepted": False, "disabled": True}
     from ap.intelligence_context_materializer import enqueue_pretrigger_context
 
     return submit_intelligence_enqueue(
         enqueue_pretrigger_context,
-        dict(signal or {}),
+        copy.deepcopy(signal or {}),
         phase="PRETRIGGER",
         signal_id=str((signal or {}).get("signal_id") or ""),
         **kwargs,
@@ -62,11 +72,13 @@ def enqueue_pretrigger_context_best_effort(signal: dict[str, Any], **kwargs: Any
 
 
 def enqueue_preopen_context_best_effort(signal: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
+    if not intelligence_context_enabled():
+        return {"ok": True, "accepted": False, "disabled": True}
     from ap.intelligence_context_materializer import enqueue_preopen_context
 
     return submit_intelligence_enqueue(
         enqueue_preopen_context,
-        dict(signal or {}),
+        copy.deepcopy(signal or {}),
         phase="PREOPEN",
         signal_id=str((signal or {}).get("signal_id") or ""),
         **kwargs,
