@@ -1865,7 +1865,6 @@ class APEntryWatcher:
                 if getattr(w, "rearm_mode", False) and w.state == WatchState.PENDING:
                     w.rearm_mode = False
                     w.state = WatchState.EXPIRED
-                    w._release_dedup_key()
                     expired_signals.append(w)
 
         for w in expired_signals:
@@ -1893,18 +1892,10 @@ class APEntryWatcher:
                 w.ticker, WATCHER_REARM_WINDOW_SEC, w.side,
                 f"{w.stop_level:.4f}" if w.stop_level else "none",
             )
-            if self.on_expire:
-                try:
-                    self.on_expire(w)
-                except Exception as _exc:
-                    log.error(
-                        "[%s] on_expire failed during rearm expiry: %s", w.ticker, _exc, exc_info=True
-                    )
-
-        if expired_signals:
-            with self._lock:
-                _exp_ids = {id(w) for w in expired_signals}
-                self._pending = [w for w in self._pending if id(w) not in _exp_ids]
+            self._dispatch_completion(
+                w, self.on_expire or (lambda _w: None),
+                pre_computed_audit=_exp_audit,
+            )
 
         # ── Process reclaims — flip inside lock, audit+log outside ────────
         rearmed_signals: list = []
@@ -1916,7 +1907,6 @@ class APEntryWatcher:
                     if w.rearm_count >= WATCHER_REARM_MAX_ATTEMPTS:
                         w.rearm_mode = False
                         w.state = WatchState.EXPIRED
-                        w._release_dedup_key()
                         _max_attempt_expired.append(w)   # separate list — cleanup runs below
                         log.info(
                             "[%s] REARM_MAX_ATTEMPTS reached (%d) — expiring on reclaim",
@@ -1953,23 +1943,14 @@ class APEntryWatcher:
             if _sig_id and w.ticker:
                 _ew_record(_sig_id, w.ticker, "EXPIRED", "rearm_max_attempts_expired")
             log.info(
-                "[%s] REARM_MAX_ATTEMPTS_EXPIRED | side=%s stop=%s | removing from pending",
+                "[%s] REARM_MAX_ATTEMPTS_EXPIRED | side=%s stop=%s | dispatching expiry",
                 w.ticker, w.side,
                 f"{w.stop_level:.4f}" if w.stop_level else "none",
             )
-            if self.on_expire:
-                try:
-                    self.on_expire(w)
-                except Exception as _exc:
-                    log.error(
-                        "[%s] on_expire failed on max-attempts expiry: %s",
-                        w.ticker, _exc, exc_info=True,
-                    )
-
-        if _max_attempt_expired:
-            with self._lock:
-                _max_ids = {id(w) for w in _max_attempt_expired}
-                self._pending = [w for w in self._pending if id(w) not in _max_ids]
+            self._dispatch_completion(
+                w, self.on_expire or (lambda _w: None),
+                pre_computed_audit=_max_audit,
+            )
 
         for w, bid, ask, mid, reclaim_threshold in rearmed_signals:
             _reclaim_dir = "above" if w.side == "CALL" else "below"
@@ -3911,7 +3892,6 @@ class APEntryWatcher:
                         # at open. Block duplicate triggers for the same ticker within
                         # the open protection window (first 5 minutes).
                         w.state = WatchState.EXPIRED
-                        w._release_dedup_key()
                         completed.append(("done", w))
                         log.info(
                             "[%s] OPEN_PROTECTION_BLOCK — ticker already triggered at open",
@@ -4368,6 +4348,7 @@ class APEntryWatcher:
         # Persist pending audit before callback so cleanup can read the row.
         if pre_computed_audit:
             try:
+                w._pending_audit = pre_computed_audit
                 _sig_for_audit = getattr(w, "signal", {}) or {}
                 self._persist_watcher_audit(
                     _sig_for_audit.get("local_order_id"), pre_computed_audit

@@ -1179,6 +1179,68 @@ class TestProductionPathRegressions:
         assert watched._ownership_quarantine is True
         assert watched in w._pending
 
+    def test_rearm_window_expire_callback_raises_quarantines_without_dedup_release(self):
+        """Real rearm timeout path must dispatch/verify before releasing ownership."""
+        osm = _MockOSM()
+        w, watched, sig = _arm_watcher(mode="paper", osm=osm)
+        watched.rearm_mode = True
+        watched.rearm_expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+
+        def _on_exp(ws: WatchedSignal) -> WatcherCompletionResult:
+            raise RuntimeError("rearm_expire_db_timeout")
+
+        w.on_expire = _on_exp
+        with patch.object(w, "_fetch_quotes", return_value={"SPY": {"bid": 450.0, "ask": 451.0}}):
+            w._check_rearm_signals()
+
+        assert watched._ownership_quarantine is True
+        assert watched in w._pending
+        assert sig["signal_id"] in w._dedup_set
+        assert osm._row_status[sig["local_order_id"]] == "PENDING_TRIGGER"
+
+    def test_rearm_max_attempt_expire_callback_raises_quarantines_without_dedup_release(self):
+        """Real max-attempt rearm expiry must not remove ownership on callback failure."""
+        from ap_entry_watcher import WATCHER_REARM_MAX_ATTEMPTS
+
+        osm = _MockOSM()
+        w, watched, sig = _arm_watcher(mode="paper", osm=osm)
+        watched.rearm_mode = True
+        watched.rearm_count = WATCHER_REARM_MAX_ATTEMPTS
+        watched.rearm_expires_at = datetime.now(timezone.utc) + timedelta(minutes=5)
+
+        def _on_exp(ws: WatchedSignal) -> WatcherCompletionResult:
+            raise RuntimeError("rearm_max_attempt_db_timeout")
+
+        w.on_expire = _on_exp
+        with patch.object(w, "_fetch_quotes", return_value={"SPY": {"bid": 460.0, "ask": 460.0}}):
+            w._check_rearm_signals()
+
+        assert watched._ownership_quarantine is True
+        assert watched in w._pending
+        assert sig["signal_id"] in w._dedup_set
+        assert osm._row_status[sig["local_order_id"]] == "PENDING_TRIGGER"
+
+    def test_open_protection_expire_callback_raises_keeps_dedup_during_quarantine(self):
+        """Open-protection expiry must not release dedup before verified cleanup."""
+        osm = _MockOSM()
+        w, watched, sig = _arm_watcher(mode="paper", osm=osm)
+        watched.entry_trigger = 450.0
+        watched.stop_level = 440.0
+        watched.breach_count = watched.MOMENTUM_POLLS_REQUIRED - 1
+        w._open_trigger_tickers.add("SPY")
+
+        def _on_exp(ws: WatchedSignal) -> WatcherCompletionResult:
+            raise RuntimeError("open_protection_expire_db_timeout")
+
+        w.on_expire = _on_exp
+        with patch.object(w, "_fetch_quotes", return_value={"SPY": {"bid": 451.0, "ask": 451.0}}):
+            w._poll_active_signals(open_protect_active=True)
+
+        assert watched._ownership_quarantine is True
+        assert watched in w._pending
+        assert sig["signal_id"] in w._dedup_set
+        assert osm._row_status[sig["local_order_id"]] == "PENDING_TRIGGER"
+
     # ── OSM reread failures ───────────────────────────────────────────────
 
     def test_osm_reread_raises_rejects_terminalized(self):
