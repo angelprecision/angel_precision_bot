@@ -2110,6 +2110,7 @@ class APExecutionCore:
         if not isinstance(getattr(recovered_plan, "metadata", None), dict):
             recovered_plan.metadata = {}
         recovered_plan.metadata.update({
+            "contract_deferred": False,
             "recovery_submit_owner": _claim_owner,
             "recovery_submit_generation": _generation,
             "recovery_submit_fenced": True,

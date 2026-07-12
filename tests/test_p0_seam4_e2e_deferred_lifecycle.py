@@ -1,479 +1,618 @@
-"""P0 Seam 4 (PR #323): production-shaped end-to-end deferred lifecycle proof.
-
-Traces the full pipeline from watcher breach through to a single broker
-POST, exercising:
-
-  watcher breach
-  → confirmed trigger
-  → atomic materialization claim (generation fenced)
-  → selector transient quote failure (RETRYABLE_DATA)
-  → durable retry waiting
-  → recovery worker claim (monotonic generation)
-  → valid real OCC selection
-  → selected state persisted (persist_deferred_broker_ready CAS)
-  → temporary order-row read failure → PRE_SUBMIT_PROOF_RETRY scheduled
-  → retry succeeds (row readable on second pass)
-  → trigger reconfirmed (fresh anchor ≤ max_age)
-  → copyback proof passes
-  → BROKER_READY → SUBMITTING submit-intent CAS
-  → submit_existing_entry() → broker adapter POST
-
-All 14 invariants from the specification are asserted.
-
-Implemented as a state-machine integration test using the real OSM/selector
-taxonomy types but mocked DB and broker adapter, so it is deterministic
-and runs in CI without network access.
-"""
-
 from __future__ import annotations
 
+import copy
 import json
+import os
 import types
 from datetime import datetime, timedelta, timezone
-from unittest.mock import MagicMock, call
+from unittest.mock import patch
 
 import pytest
 
-import ap.order_state_machine as osm_mod
+os.environ.setdefault("DATABASE_URL", "postgresql://dummy:dummy@127.0.0.1:1/dummy")
+
+import ap_execution_core as core_mod
 from ap.order_state_machine import APOrderStateMachine
-from ap.selector_retry_policy import (
-    get_policy,
-    is_retryable_selector_reason,
-    RETRYABLE_DATA,
-    TERMINAL_QUALITY,
-)
-from ap_execution_core import _classify_materialization_handoff, _classify_order_row_read
-from ap.live_submit_gates import check_trigger_age_gate, GateOutcome
+from ap_entry_watcher import APEntryWatcher
+from ap_recovery import APStartupRecovery
 
 
-# ─────────────────────────── Helpers ────────────────────────────────────
+CLIENT_ID = "jason@example.com"
+LOCAL_ORDER_ID = "oid-pr323-e2e-1"
+SIGNAL_ID = "sig-pr323-e2e-1"
+REAL_OCC = "SPY260717C00600000"
 
 
-def _now():
+def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _iso(dt=None):
+def _iso(dt: datetime | None = None) -> str:
     return (dt or _now()).isoformat()
 
 
-CLIENT_ID = "jasoncosby1@gmail.com"
-EXECUTION_MODE = "live"
-LOCAL_OID = "oid-e2e-proof-001"
-SIGNAL_ID = "sig-e2e-001"
-REAL_CONTRACT = "SPY260717C00585000"
-REAL_LIMIT = 2.15
-REAL_QTY = 1
-DEFERRED_CONTRACT = "DEFERRED:SPY"
-DEFERRED_LIMIT = 0.01
+def _row() -> dict:
+    return {
+        "local_order_id": LOCAL_ORDER_ID,
+        "client_id": CLIENT_ID,
+        "execution_mode": "live",
+        "signal_id": SIGNAL_ID,
+        "plan_id": "plan-pr323-e2e-1",
+        "kind": "ENTRY",
+        "status": "PENDING_TRIGGER",
+        "broker_order_id": None,
+        "submitted_ts": None,
+        "symbol": "SPY",
+        "direction": "CALL",
+        "score": 92.0,
+        "tier": "A",
+        "trigger_price": 600.0,
+        "stop_underlying": 595.0,
+        "target_underlying": 605.0,
+        "pattern": "breakout",
+        "timeframe": "1d",
+        "contract": "DEFERRED:SPY",
+        "qty": 1,
+        "limit_price": 0.01,
+        "reserved_cost": 1.0,
+        "meta": {
+            "contract_deferred": True,
+            "materialization_status": "QUEUED",
+            "materialization_generation": 0,
+            "broker_ready": False,
+            "execution_mode": "live",
+            "queue_id": 323,
+            "entry_cutoff_et": "1530",
+        },
+    }
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# PHASE 1: retry taxonomy
-# ═══════════════════════════════════════════════════════════════════════
+class _FakeConfirmResult:
+    passed = True
+    fail_reason = None
 
-def test_phase1_retryable_data_reason_is_retryable():
-    """CHAIN_ROW_ZERO_BID_ASK is classified RETRYABLE_DATA."""
-    policy = get_policy("CHAIN_ROW_ZERO_BID_ASK")
-    assert policy.classification == RETRYABLE_DATA
-    assert is_retryable_selector_reason("CHAIN_ROW_ZERO_BID_ASK") is True
-    assert policy.selector_rerun_allowed is True
+    def __init__(self) -> None:
+        self.metadata = {"live_entry_ts": _iso()}
 
-
-def test_phase1_terminal_quality_reason_is_not_retryable():
-    """OI_TOO_LOW is classified TERMINAL_QUALITY and not retryable."""
-    policy = get_policy("OI_TOO_LOW")
-    assert policy.classification == TERMINAL_QUALITY
-    assert is_retryable_selector_reason("OI_TOO_LOW") is False
+    def to_meta(self, **kwargs):
+        return {"passed": True, **kwargs}
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# PHASE 2: atomic materialization claim (generation fenced)
-# ═══════════════════════════════════════════════════════════════════════
+class _Selector:
+    def __init__(self) -> None:
+        self.calls = 0
+        self._last_failure = None
+        self.dte_ladder_enabled = True
+
+    def select(self, _approved_plan):
+        self.calls += 1
+        if self.calls == 1:
+            self._last_failure = {
+                "reason_code": "CHAIN_ROW_ZERO_BID_ASK",
+                "stage": "quality_filter",
+                "explanation": "transient zero quote",
+                "chain_rows": 12,
+                "survivor_count": 0,
+                "quote_source": "tradier_live",
+                "tradier_base_url": "https://api.tradier.com/v1",
+            }
+            return None
+        self._last_failure = None
+        return types.SimpleNamespace(
+            contract_symbol=REAL_OCC,
+            bid=2.09,
+            ask=2.10,
+            mid=2.095,
+            affordable_contracts=1,
+            execution_price_per_share=2.10,
+            candidate_audit={"underlying_price": 600.25},
+            expiration_date="2026-07-17",
+            dte=3,
+            delta=0.44,
+            open_interest=1200,
+            volume=500,
+        )
+
+    def get_last_failure(self):
+        return self._last_failure
+
+    def get_last_dte_ladder_audit(self):
+        return {"buckets_attempted": 1}
 
 
-class _DbSpy:
-    """Minimal OSM database spy capturing SQL + params."""
-    def __init__(self, rowcount=1):
-        self.sink = []
-        self.rowcount = rowcount
+class _Broker:
+    def __init__(self) -> None:
+        self.base_url = "https://api.tradier.com/v1"
+        self.account_id = "VA123"
+        self.cfg = types.SimpleNamespace(base_url=self.base_url, account_id=self.account_id)
+        self.session = types.SimpleNamespace()
 
-    def __enter__(self):
+    def get_quote(self, _ticker: str) -> dict:
+        quote_ts = _now() - timedelta(seconds=4)
+        return {
+            "bid": 600.30,
+            "ask": 600.32,
+            "quote_timestamp": quote_ts.isoformat(),
+            "source": "tradier_live",
+        }
+
+
+class _StatefulOSM:
+    def __init__(self) -> None:
+        self.client_id = CLIENT_ID
+        self.execution_mode = "live"
+        self.row = _row()
+        self.post_payloads: list[dict] = []
+        self.claimed_generations: list[int] = []
+        self.fail_next_row_read = False
+        self.proof_read_failures_remaining = 1
+        self.terminalizations: list[tuple[str, str]] = []
+        self.submit_existing_entry = APOrderStateMachine.submit_existing_entry.__get__(self, type(self))
+        self._is_broker_accept_status = APOrderStateMachine._is_broker_accept_status
+
+    def _copy_row(self) -> dict:
+        return copy.deepcopy(self.row)
+
+    def _merge_meta(self, patch: dict) -> None:
+        meta = self.row.setdefault("meta", {})
+        for key, value in patch.items():
+            if isinstance(value, dict) and isinstance(meta.get(key), dict):
+                meta[key].update(value)
+            else:
+                meta[key] = copy.deepcopy(value)
+
+    def has_order(self, local_order_id):
+        return local_order_id == LOCAL_ORDER_ID
+
+    def get_order_by_signal(self, signal_id):
+        return self._copy_row() if signal_id == SIGNAL_ID else None
+
+    def _get_order(self, local_order_id):
+        return self.get_order(local_order_id)
+
+    def get_order(self, local_order_id):
+        if local_order_id != LOCAL_ORDER_ID:
+            return None
+        if self.fail_next_row_read:
+            self.fail_next_row_read = False
+            raise RuntimeError("db_hiccup")
+        return self._copy_row()
+
+    def update_order_meta(self, local_order_id, patch):
+        assert local_order_id == LOCAL_ORDER_ID
+        self._merge_meta(patch)
+        return True
+
+    def claim_deferred_materialization(self, local_order_id, **kwargs):
+        assert local_order_id == LOCAL_ORDER_ID
+        self.claimed_generations.append(int(kwargs["generation"]))
+        self._merge_meta({
+            "materialization_generation": int(kwargs["generation"]),
+            "materialization_owner": kwargs["owner"],
+            "materialization_lease_until": kwargs["lease_until"],
+            "materialization_status": "RUNNING",
+            "lifecycle_state": "MATERIALIZING",
+            "trigger_crossed_at": kwargs["trigger_crossed_at"],
+            "trigger_price": kwargs["trigger_price"],
+            "observed_underlying_price": kwargs["observed_underlying_price"],
+            "execution_mode": "live",
+            "signal_id": kwargs["signal_id"],
+        })
+        return True
+
+    def schedule_deferred_materialization_retry(self, local_order_id, **kwargs):
+        assert local_order_id == LOCAL_ORDER_ID
+        self._merge_meta({
+            "lifecycle_state": "RETRY_WAIT",
+            "materialization_status": "RETRY_PENDING",
+            "materialization_owner": kwargs["owner"],
+            "materialization_generation": int(kwargs["generation"]),
+            "retry_reason": kwargs["reason_code"],
+            "retry_attempt": int(kwargs["attempt"]),
+            "retry_max_attempts": int(kwargs["max_attempts"]),
+            "next_retry_at": kwargs["next_retry_at"],
+            "materialization_next_retry_at": kwargs["next_retry_at"],
+            "selector_failure": copy.deepcopy(kwargs["selector_failure"]),
+            "broker_ready": False,
+        })
+        return True
+
+    def persist_deferred_broker_ready(self, local_order_id, **kwargs):
+        assert local_order_id == LOCAL_ORDER_ID
+        self.row["contract"] = kwargs["contract"]
+        self.row["limit_price"] = float(kwargs["limit_price"])
+        self.row["qty"] = int(kwargs["qty"])
+        self.row["reserved_cost"] = float(kwargs["reserved_cost"])
+        self._merge_meta({
+            "contract_deferred": False,
+            "lifecycle_state": "BROKER_READY",
+            "materialization_status": "SELECTED",
+            "materialization_owner": kwargs["owner"],
+            "materialization_generation": int(kwargs["generation"]),
+            "broker_ready": True,
+            "selected_contract": kwargs["contract"],
+            "selected_limit": float(kwargs["limit_price"]),
+            "selected_qty": int(kwargs["qty"]),
+            "selected_at": _iso(),
+            "selected_quote_at": _iso(),
+            "selector_meta": copy.deepcopy(kwargs["selector_meta"]),
+        })
+        if self.proof_read_failures_remaining > 0:
+            self.fail_next_row_read = True
+            self.proof_read_failures_remaining -= 1
+        return True
+
+    def persist_pre_submit_proof_retry(self, local_order_id, **kwargs):
+        assert local_order_id == LOCAL_ORDER_ID
+        self._merge_meta({
+            "lifecycle_state": "PRE_SUBMIT_PROOF_RETRY",
+            "proof_retry_owner": kwargs["owner"],
+            "proof_retry_attempt": int(kwargs["retry_attempt"]),
+            "proof_retry_max_attempts": int(kwargs["max_attempts"]),
+            "proof_retry_next_at": kwargs["next_retry_at"],
+            "proof_retry_deadline": kwargs["retry_deadline"],
+            "absolute_entry_deadline": kwargs["retry_deadline"],
+            "proof_retry_last_read_error": kwargs["read_error"],
+            "selected_at": kwargs["selected_at"],
+            "selected_quote_at": kwargs["selected_quote_at"],
+            "broker_ready": True,
+        })
+        return True
+
+    def claim_pre_submit_proof_retry(self, local_order_id, **kwargs):
+        assert local_order_id == LOCAL_ORDER_ID
+        meta = self.row["meta"]
+        if str(meta.get("lifecycle_state")) != "PRE_SUBMIT_PROOF_RETRY":
+            return False
+        if int(meta.get("materialization_generation") or 0) != int(kwargs["expected_generation"]):
+            return False
+        self._merge_meta({
+            "lifecycle_state": "BROKER_READY",
+            "materialization_owner": kwargs["owner"],
+            "materialization_generation": int(kwargs["new_generation"]),
+            "proof_retry_attempt": int(kwargs["attempt"]),
+            "proof_retry_claimed_at": kwargs["claimed_at"],
+        })
+        return True
+
+    def claim_deferred_broker_ready_submit(self, local_order_id, **kwargs):
+        assert local_order_id == LOCAL_ORDER_ID
+        meta = self.row["meta"]
+        if str(meta.get("lifecycle_state")) != "BROKER_READY":
+            return False
+        if int(meta.get("materialization_generation") or 0) != int(kwargs["generation"]):
+            return False
+        self._merge_meta({
+            "recovery_submit_owner": kwargs["owner"],
+            "recovery_submit_generation": int(kwargs["generation"]),
+            "recovery_submit_lease_until": _iso(_now() + timedelta(seconds=30)),
+        })
+        return True
+
+    def persist_deferred_submit_intent(self, local_order_id, **kwargs):
+        assert local_order_id == LOCAL_ORDER_ID
+        meta = self.row["meta"]
+        if meta.get("submit_intent_at"):
+            return False
+        self._merge_meta({
+            "lifecycle_state": "SUBMITTING",
+            "submit_started_at": _iso(),
+            "submit_intent_at": _iso(),
+            "broker_submit_key": kwargs["broker_submit_key"],
+            "current_owner": kwargs["owner"],
+            "broker_submit_payload_hash": kwargs["payload_hash"],
+        })
+        return True
+
+    def transition(self, local_order_id, to_status, **kwargs):
+        assert local_order_id == LOCAL_ORDER_ID
+        self.row["status"] = str(to_status)
+        if "broker_order_id" in kwargs:
+            self.row["broker_order_id"] = kwargs["broker_order_id"]
+        if "submitted_ts" in kwargs:
+            self.row["submitted_ts"] = kwargs["submitted_ts"]
+        if "last_error" in kwargs:
+            self.row["last_error"] = kwargs["last_error"]
+        return True
+
+    def terminalize_deferred_breach(
+        self,
+        local_order_id,
+        *,
+        reason_code,
+        terminal_status,
+        diagnostics=None,
+        **_kwargs,
+    ):
+        assert local_order_id == LOCAL_ORDER_ID
+        self.row["status"] = terminal_status
+        self.row["last_error"] = reason_code
+        self.terminalizations.append((reason_code, terminal_status))
+        self._merge_meta({
+            "lifecycle_state": terminal_status,
+            "reason_code": reason_code,
+            "final_reason": reason_code,
+            "terminal_diagnostics": diagnostics or {},
+            "current_owner": "",
+            "broker_ready": False,
+        })
+        return True
+
+    def expire_pending_entry(self, local_order_id, reason):
+        return self.terminalize_deferred_breach(
+            local_order_id,
+            reason_code=reason,
+            terminal_status="EXPIRED",
+            diagnostics={},
+        )
+
+    def cancel_pending_entry(self, local_order_id, reason):
+        return self.terminalize_deferred_breach(
+            local_order_id,
+            reason_code=reason,
+            terminal_status="CANCELED",
+            diagnostics={},
+        )
+
+    def _lookup_order_by_tag(self, *_args, **_kwargs):
+        return None
+
+    def _flag_split_brain_order(self, *_args, **_kwargs):
+        return None
+
+    def _emit_transition_event(self, **_kwargs):
+        return None
+
+    def _submit_order_with_retry(self, **kwargs):
+        self.post_payloads.append(copy.deepcopy(kwargs["order_data"]))
+        return (
+            {"id": "TR-323", "status": "open"},
+            None,
+            "TR-323",
+            "ACK",
+        )
+
+
+class _RecoveryCursor:
+    def __init__(self, rows):
+        self.rows = rows
+
+    def execute(self, *_args, **_kwargs):
         return self
 
-    def __exit__(self, *_):
+    def fetchall(self):
+        return self.rows
+
+
+class _RecoveryConn:
+    def __init__(self, rows):
+        self.cursor = _RecoveryCursor(rows)
+
+    def __enter__(self):
+        return self.cursor
+
+    def __exit__(self, *_args):
         return False
 
-    def execute(self, sql, params=()):
-        self.sink.append((" ".join(str(sql).split()), tuple(params)))
+
+class _NoopCursor:
+    rowcount = 1
+
+    def execute(self, *_args, **_kwargs):
         return self
 
     def fetchall(self):
         return []
 
 
-@pytest.fixture
-def db_spy_fixture(monkeypatch):
-    spy = _DbSpy(rowcount=1)
-    monkeypatch.setattr(osm_mod, "conn", lambda: spy)
-    monkeypatch.setattr(osm_mod, "run_with_retry", lambda fn, *a, **k: fn())
-    return spy
+class _NoopConn:
+    def __enter__(self):
+        return _NoopCursor()
+
+    def __exit__(self, *_args):
+        return False
 
 
-def test_phase2_claim_advances_generation_by_one(db_spy_fixture):
-    """claim_deferred_materialization CAS requires persisted generation = new - 1."""
-    osm = APOrderStateMachine(CLIENT_ID)
-    ok = osm.claim_deferred_materialization(
-        LOCAL_OID,
-        owner=f"materializer:{CLIENT_ID}:{LOCAL_OID}",
-        generation=2,          # claims gen=2; expects persisted=1
-        lease_until=_iso(_now() + timedelta(seconds=120)),
-        trigger_crossed_at=_iso(_now() - timedelta(seconds=10)),
-        trigger_price=585.50,
-        observed_underlying_price=586.00,
+def _approved_plan() -> types.SimpleNamespace:
+    return types.SimpleNamespace(
+        contract_symbol="DEFERRED:SPY",
+        limit_price=0.01,
+        contracts=1,
+        max_position_usd=500.0,
+        side="CALL",
+        direction="CALL",
+        execution_mode="live",
+        client_id=CLIENT_ID,
         signal_id=SIGNAL_ID,
-        execution_mode=EXECUTION_MODE,
+        trigger_price=600.0,
+        underlying_price=600.0,
+        stop_underlying=595.0,
+        target_underlying=605.0,
+        metadata={
+            "contract_deferred": True,
+            "queue_id": 323,
+        },
+        ticker="SPY",
+        plan_id="plan-pr323-e2e-1",
+        score=92.0,
+        tier="A",
+        timeframe="1d",
+        pattern="breakout",
     )
-    assert ok is True
-    sql, params = db_spy_fixture.sink[-1]
-    patch = json.loads(params[0])
-    assert patch["materialization_generation"] == 2
-    assert patch["lifecycle_state"] == "MATERIALIZING"
-    assert params[-1] == 1            # expected_previous = new_generation - 1
-    assert "LOWER(COALESCE(execution_mode,'')) = %s" in sql  # mode-scoped (§1)
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# PHASE 3: selector transient failure → durable retry
-# ═══════════════════════════════════════════════════════════════════════
-
-
-def test_phase3_durable_retry_wait_persisted(db_spy_fixture):
-    """After transient CHAIN_ROW_ZERO_BID_ASK, schedule_deferred_materialization_retry
-    writes RETRY_WAIT with broker_ready=False."""
-    osm = APOrderStateMachine(CLIENT_ID)
-    ok = osm.schedule_deferred_materialization_retry(
-        LOCAL_OID,
-        owner=f"materializer:{CLIENT_ID}:{LOCAL_OID}",
-        generation=2,
-        reason_code="CHAIN_ROW_ZERO_BID_ASK",
-        attempt=1,
-        max_attempts=3,
-        next_retry_at=_iso(_now() + timedelta(seconds=20)),
-        selector_failure={"reason_code": "CHAIN_ROW_ZERO_BID_ASK"},
+def _build_core(osm: _StatefulOSM, broker: _Broker, selector: _Selector):
+    core = types.SimpleNamespace(
+        client_id=CLIENT_ID,
+        email=CLIENT_ID,
+        execution_mode="live",
+        mode="LIVE",
+        paper=False,
+        broker=broker,
+        order_state_machine=osm,
+        contract_selector=selector,
+        master_control=types.SimpleNamespace(mode="LIVE", max_positions=5, _kill_switch_fn=lambda: False),
+        _kill_switch=False,
+        _max_positions=5,
     )
-    assert ok is True
-    _, params = db_spy_fixture.sink[-1]
-    patch = json.loads(params[0])
-    assert patch["lifecycle_state"] == "RETRY_WAIT"
-    assert patch["broker_ready"] is False           # never broker-ready on retry
-    assert patch["retry_reason"] == "CHAIN_ROW_ZERO_BID_ASK"
-
-
-# ═══════════════════════════════════════════════════════════════════════
-# PHASE 4: persist_deferred_broker_ready — real OCC contract selected
-# ═══════════════════════════════════════════════════════════════════════
-
-
-def test_phase4_broker_ready_persists_real_occ(db_spy_fixture):
-    """persist_deferred_broker_ready writes the real OCC to the row,
-    DEFERRED:* contract is rejected, broker_ready=True."""
-    osm = APOrderStateMachine(CLIENT_ID)
-    # Deferred contract is rejected
-    assert osm.persist_deferred_broker_ready(
-        LOCAL_OID,
-        owner=f"materializer:{CLIENT_ID}:{LOCAL_OID}",
-        generation=2,
-        signal_id=SIGNAL_ID,
-        execution_mode=EXECUTION_MODE,
-        contract=DEFERRED_CONTRACT,
-        limit_price=DEFERRED_LIMIT,
-        qty=REAL_QTY,
-        reserved_cost=125.0,
-        selector_meta={},
-    ) is False
-    assert db_spy_fixture.sink == []     # no DB write for invalid input
-
-    # Real OCC succeeds
-    ok = osm.persist_deferred_broker_ready(
-        LOCAL_OID,
-        owner=f"materializer:{CLIENT_ID}:{LOCAL_OID}",
-        generation=2,
-        signal_id=SIGNAL_ID,
-        execution_mode=EXECUTION_MODE,
-        contract=REAL_CONTRACT,
-        limit_price=REAL_LIMIT,
-        qty=REAL_QTY,
-        reserved_cost=215.0,
-        selector_meta={"selector_pricing_basis": "ask"},
+    core.store = types.SimpleNamespace(
+        update_status=lambda *a, **k: None,
+        update_signal_fields=lambda *a, **k: None,
     )
-    assert ok is True
-    sql, params = db_spy_fixture.sink[-1]
-    # contract and limit_price are SET columns (not just meta)
-    assert params[0] == REAL_CONTRACT
-    assert params[1] == REAL_LIMIT
-    patch = json.loads(params[4])
-    assert patch["broker_ready"] is True
-    assert patch["lifecycle_state"] == "BROKER_READY"
-
-
-# ═══════════════════════════════════════════════════════════════════════
-# PHASE 5: order-row read failure → PRE_SUBMIT_PROOF_RETRY
-# ═══════════════════════════════════════════════════════════════════════
-
-
-def test_phase5_proof_retry_preserves_selected_contract(db_spy_fixture):
-    """Seam 1: transient row read failure schedules PRE_SUBMIT_PROOF_RETRY,
-    preserving the real OCC in the row columns (non-destructive meta patch)."""
-    osm = APOrderStateMachine(CLIENT_ID)
-    ok = osm.persist_pre_submit_proof_retry(
-        LOCAL_OID,
-        owner=f"materializer:{CLIENT_ID}:{LOCAL_OID}",
-        generation=2,
-        retry_attempt=1,
-        max_attempts=3,
-        next_retry_at=_iso(_now() + timedelta(seconds=5)),
-        retry_deadline=_iso(_now() + timedelta(seconds=60)),
-        read_error="read_error:db_hiccup",
-        selected_at=_iso(),
-        selected_quote_at=_iso(),
+    core._breach_risk_check = lambda watched: True
+    core._recover_plan_for_revalidation = lambda watched: (
+        ((getattr(watched, "signal", {}) or {}).get("_approved_plan"))
+        or _approved_plan()
     )
-    assert ok is True
-    sql, params = db_spy_fixture.sink[-1]
-    patch = json.loads(params[0])
-    assert patch["lifecycle_state"] == "PRE_SUBMIT_PROOF_RETRY"
-    assert patch["broker_ready"] is True     # still selected; proof is the blocker
-    # meta patch must NOT overwrite trade-policy columns
-    assert "contract" not in patch
-    assert "qty" not in patch
-    assert "limit_price" not in patch
-    # SQL uses non-destructive merge
-    assert "COALESCE(meta, '{}'::jsonb) || %s::jsonb" in sql
-    # CAS requires BROKER_READY lifecycle
-    assert "lifecycle_state','') = 'BROKER_READY'" in sql
+    core._emit_breach_diag = lambda *a, **k: None
+    core._current_open_position_count = lambda: 0
+    core._current_pending_entry_count = lambda: 0
+    core._refresh_hydrated_prebreach_plan = lambda *a, **k: False
+    core._cleanup_pending_entry_order = core_mod.APExecutionCore._cleanup_pending_entry_order.__get__(core, type(core))
+    core._is_real_occ_contract = core_mod.APExecutionCore._is_real_occ_contract
+    core.resume_deferred_broker_ready_order = core_mod.APExecutionCore.resume_deferred_broker_ready_order.__get__(core, type(core))
+    core._on_entry_trigger = core_mod.APExecutionCore._on_entry_trigger.__get__(core, type(core))
+    return core
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# PHASE 6: classify_order_row_read — second attempt succeeds
-# ═══════════════════════════════════════════════════════════════════════
-
-
-def test_phase6_row_readable_on_second_attempt_passes():
-    """_classify_order_row_read returns PASS when the row is readable."""
-    handoff = {
-        "captured": True,
-        "selector_contract": REAL_CONTRACT,
-        "selector_bid": 2.10,
-        "selector_ask": 2.20,
-        "copied_plan_contract": REAL_CONTRACT,
+def _build_watcher(osm: _StatefulOSM, core):
+    watcher = APEntryWatcher(None, order_state_machine=osm, mode="LIVE")
+    _orig_watch = watcher.watch
+    watcher.watch = lambda plan, local_order_id, **kwargs: _orig_watch(
+        plan,
+        local_order_id,
+        recovery_rearm=kwargs.get("recovery_rearm", False),
+        no_cancel_on_reject=kwargs.get("no_cancel_on_reject", False),
+    )
+    watcher.on_trigger = core._on_entry_trigger
+    watcher._insert_watcher_audit_row = lambda *a, **k: None
+    watcher._persist_watcher_audit = lambda *a, **k: None
+    watcher._fetch_quotes = lambda _tickers: {
+        "SPY": {
+            "bid": 600.20,
+            "ask": 600.22,
+            "quote_age_ms": 10,
+        }
     }
-    verdict, reason = _classify_order_row_read(
-        handoff_snapshot=handoff,
-        order_row_raw={"contract": REAL_CONTRACT, "limit_price": REAL_LIMIT, "qty": REAL_QTY},
-        read_error=None,
+    return watcher
+
+
+def _run_recovery(osm: _StatefulOSM, broker: _Broker, watcher, core):
+    rec = APStartupRecovery(
+        client_id=CLIENT_ID,
+        broker=broker,
+        osm=osm,
+        pm=None,
+        master_control=types.SimpleNamespace(mode="LIVE"),
+        entry_watcher=watcher,
+        execution_core=core,
     )
-    assert verdict == "PASS"
-    assert reason is None
+    result = {"deferred_lifecycles_recovered": 0}
+    rows = [osm.get_order(LOCAL_ORDER_ID)]
+    with patch("ap.db.conn", lambda: _RecoveryConn(rows)), patch(
+        "ap.db.run_with_retry",
+        lambda fn, *a, **k: fn(),
+    ):
+        rec._recover_deferred_breach_lifecycles(result)
+    return result
 
 
-def test_phase6_first_read_failure_returns_block_retry():
-    handoff = {
-        "captured": True,
-        "selector_contract": REAL_CONTRACT,
-    }
-    verdict, reason = _classify_order_row_read(
-        handoff_snapshot=handoff,
-        order_row_raw=None,
-        read_error="db_hiccup",
-    )
-    assert verdict == "BLOCK_RETRY"
-    assert "read_error" in reason
+def test_real_watcher_to_recovery_to_single_post_call_graph(monkeypatch):
+    osm = _StatefulOSM()
+    broker = _Broker()
+    selector = _Selector()
 
+    monkeypatch.setenv("ALLOW_CHEAP_CONTRACT_IF_ONLY_CHOICE", "0")
+    monkeypatch.setenv("BREACH_SELECTOR_RETRY_DELAY_SECONDS", "0")
+    monkeypatch.setenv("BREACH_SELECTOR_RETRY_CUTOFF_ET", "2359")
+    monkeypatch.setenv("LIVE_CONFIRMATION_REQUIRED", "1")
+    monkeypatch.setenv("PRE_SUBMIT_PROOF_RETRY_DELAY_SECONDS", "0")
+    monkeypatch.setenv("PRE_SUBMIT_PROOF_RETRY_DEADLINE_SECONDS", "120")
 
-# ═══════════════════════════════════════════════════════════════════════
-# PHASE 7: trigger reconfirmation with fresh anchor (Seam 2)
-# ═══════════════════════════════════════════════════════════════════════
+    def _refresh_ask_at_submit(_broker, _contract):
+        return (
+            2.10,
+            15,
+            True,
+            "ok",
+            {
+                "spread_pct": 0.02,
+                "submit_bid": 2.09,
+                "submit_ask": 2.10,
+                "submit_mid": 2.095,
+                "submit_last": 2.10,
+            },
+        )
 
+    with patch(
+        "ap.execution._refresh_ask_at_submit",
+        new=_refresh_ask_at_submit,
+    ), patch(
+        "ap_entry_confirmation.check_entry_confirmation",
+        return_value=_FakeConfirmResult(),
+    ), patch("ap.db.conn", lambda: _NoopConn()), patch(
+        "ap.db.run_with_retry",
+        lambda fn, *a, **k: fn(),
+    ):
+        core1 = _build_core(osm, broker, selector)
+        watcher1 = _build_watcher(osm, core1)
+        assert watcher1.watch(_approved_plan(), LOCAL_ORDER_ID) is True
+        for watched in watcher1._pending:
+            watched.overnight = False
 
-def test_phase7_fresh_reconfirm_passes_after_recovery_delay():
-    """Seam 2: original breach 150 s ago; fresh reconfirmation 15 s ago;
-    gate passes because age is measured from fresh anchor."""
-    result = check_trigger_age_gate(
-        trigger_crossed_at=_iso(_now() - timedelta(seconds=150)),
-        last_confirmed_trigger_at=_iso(_now() - timedelta(seconds=15)),
-        execution_mode=EXECUTION_MODE,
-        max_age_seconds=120,
-    )
-    assert result.passed, f"Expected PASS: {result.detail}"
-    assert result.audit["effective_anchor"] == "last_confirmed_trigger_at"
+        watcher1._poll_active_signals(open_protect_active=False)
+        watcher1._poll_active_signals(open_protect_active=False)
 
+        row_after_first_trigger = osm.get_order(LOCAL_ORDER_ID)
+        meta_after_first_trigger = row_after_first_trigger["meta"]
+        assert meta_after_first_trigger["lifecycle_state"] == "RETRY_WAIT"
+        assert meta_after_first_trigger["selector_failure"]["reason_code"] == "CHAIN_ROW_ZERO_BID_ASK"
+        assert row_after_first_trigger["status"] == "PENDING_TRIGGER"
+        assert row_after_first_trigger["broker_order_id"] is None
 
-# ═══════════════════════════════════════════════════════════════════════
-# PHASE 8: handoff proof — all three views aligned
-# ═══════════════════════════════════════════════════════════════════════
+        core2 = _build_core(osm, broker, selector)
+        watcher2 = _build_watcher(osm, core2)
+        _run_recovery(osm, broker, watcher2, core2)
+        assert LOCAL_ORDER_ID in [w.signal["local_order_id"] for w in watcher2._pending]
+        for watched in watcher2._pending:
+            watched.overnight = False
 
+        watcher2._poll_active_signals(open_protect_active=False)
+        watcher2._poll_active_signals(open_protect_active=False)
 
-def test_phase8_handoff_proof_passes_with_three_aligned_views():
-    """_classify_materialization_handoff requires selector, plan and row
-    to agree on contract, limit, and qty."""
-    handoff = {
-        "captured": True,
-        "selector_contract": REAL_CONTRACT,
-        "selector_bid": 2.10,
-        "selector_ask": 2.20,
-        "copied_plan_contract": REAL_CONTRACT,
-        "order_row_contract": REAL_CONTRACT,
-    }
-    ok, mismatch = _classify_materialization_handoff(
-        handoff_snapshot=handoff,
-        pre_submit_contract=REAL_CONTRACT,
-        pre_submit_limit=REAL_LIMIT,
-        pre_submit_qty=REAL_QTY,
-        order_row_contract=REAL_CONTRACT,
-        order_row_limit=REAL_LIMIT,
-        order_row_qty=REAL_QTY,
-    )
-    assert ok is True
-    assert mismatch is None
+        row_after_second_trigger = osm.get_order(LOCAL_ORDER_ID)
+        meta_after_second_trigger = row_after_second_trigger["meta"]
+        assert row_after_second_trigger["contract"] == REAL_OCC
+        assert row_after_second_trigger["limit_price"] > 0.01
+        assert meta_after_second_trigger["selected_contract"] == REAL_OCC
+        assert meta_after_second_trigger["lifecycle_state"] == "PRE_SUBMIT_PROOF_RETRY"
+        assert meta_after_second_trigger["proof_retry_last_read_error"].startswith("read_error:")
+        assert row_after_second_trigger["broker_order_id"] is None
 
+        osm.fail_next_row_read = False
+        core3 = _build_core(osm, broker, selector)
+        watcher3 = _build_watcher(osm, core3)
+        result_a = _run_recovery(osm, broker, watcher3, core3)
+        result_b = _run_recovery(osm, broker, watcher3, core3)
 
-def test_phase8_deferred_placeholder_blocks():
-    """DEFERRED:* at pre_submit must be blocked by handoff classifier."""
-    handoff = {
-        "captured": True,
-        "selector_contract": REAL_CONTRACT,
-        "copied_plan_contract": REAL_CONTRACT,
-    }
-    ok, mismatch = _classify_materialization_handoff(
-        handoff_snapshot=handoff,
-        pre_submit_contract=DEFERRED_CONTRACT,
-        pre_submit_limit=DEFERRED_LIMIT,
-        pre_submit_qty=REAL_QTY,
-        order_row_contract=DEFERRED_CONTRACT,
-    )
-    assert ok is False
-    assert mismatch is not None
+        final_row = osm.get_order(LOCAL_ORDER_ID)
+        final_meta = final_row["meta"]
 
-
-def test_phase8_zero_limit_blocks():
-    """0.01 placeholder limit must be blocked by handoff classifier."""
-    handoff = {
-        "captured": True,
-        "selector_contract": REAL_CONTRACT,
-        "copied_plan_contract": REAL_CONTRACT,
-    }
-    ok, mismatch = _classify_materialization_handoff(
-        handoff_snapshot=handoff,
-        pre_submit_contract=REAL_CONTRACT,
-        pre_submit_limit=0.01,           # placeholder — not materialized
-        pre_submit_qty=REAL_QTY,
-        order_row_contract=REAL_CONTRACT,
-    )
-    assert ok is False
-
-
-# ═══════════════════════════════════════════════════════════════════════
-# PHASE 9: submit-intent CAS before broker bytes
-# ═══════════════════════════════════════════════════════════════════════
-
-
-def test_phase9_submit_intent_cas_requires_owner_and_generation(db_spy_fixture):
-    """update_submit_intent CAS must fire BEFORE broker POST.  The claim
-    persists submit_intent_at and broker_submit_key (the Tradier tag)."""
-    osm = APOrderStateMachine(CLIENT_ID)
-    # Verify update_order_meta writes submit_intent_at (non-destructive)
-    ok = osm.update_order_meta(LOCAL_OID, {
-        "lifecycle_state": "SUBMITTING",
-        "submit_intent_at": _iso(),
-        "broker_submit_key": LOCAL_OID[:32],
-        "current_owner": f"broker_submit:{LOCAL_OID[:32]}",
-        "broker_submit_payload_hash": "abc123",
-    })
-    assert ok is True
-    sql, params = db_spy_fixture.sink[-1]
-    patch = json.loads(params[0])
-    assert "submit_intent_at" in patch
-    assert "broker_submit_key" in patch
-    # MUST be non-destructive merge
-    assert "COALESCE(meta, '{}'::jsonb) || %s::jsonb" in sql
-
-
-# ═══════════════════════════════════════════════════════════════════════
-# PHASE 10 + 14 invariants: no paper/live pollution; no other-client mutation
-# ═══════════════════════════════════════════════════════════════════════
-
-
-def test_phase10_execution_mode_preserved_through_all_phases(db_spy_fixture):
-    """LIVE client rows must NEVER be touched by a PAPER runner (§1 scoping).
-    Verify the SQL predicate binds the runner's exact execution_mode."""
-    osm = APOrderStateMachine(CLIENT_ID)
-    osm.claim_deferred_materialization(
-        LOCAL_OID,
-        owner=f"materializer:{CLIENT_ID}:{LOCAL_OID}",
-        generation=1,
-        lease_until=_iso(_now() + timedelta(seconds=120)),
-        trigger_crossed_at=_iso(_now() - timedelta(seconds=5)),
-        trigger_price=585.50,
-        observed_underlying_price=586.00,
-        signal_id=SIGNAL_ID,
-        execution_mode=EXECUTION_MODE,  # "live"
-    )
-    sql, params = db_spy_fixture.sink[-1]
-    # execution_mode must be bound in the SQL predicate (§1 scoping)
-    assert "LOWER(COALESCE(execution_mode,'')) = %s" in sql
-    # "live" must be in the params
-    assert EXECUTION_MODE in params
-
-
-def test_phase10_client_id_scoped_in_all_osm_writes(db_spy_fixture):
-    """Every OSM write must include client_id in its WHERE clause."""
-    osm = APOrderStateMachine(CLIENT_ID)
-    osm.persist_deferred_broker_ready(
-        LOCAL_OID,
-        owner=f"mat:{CLIENT_ID}",
-        generation=2,
-        signal_id=SIGNAL_ID,
-        execution_mode=EXECUTION_MODE,
-        contract=REAL_CONTRACT,
-        limit_price=REAL_LIMIT,
-        qty=REAL_QTY,
-        reserved_cost=215.0,
-        selector_meta={},
-    )
-    sql, params = db_spy_fixture.sink[-1]
-    assert "client_id = %s" in sql
-    assert CLIENT_ID in params
-
-
-def test_phase10_no_deferred_contract_reaches_broker():
-    """The handoff classifier must block DEFERRED:* from reaching broker POST."""
-    handoff = {
-        "captured": True,
-        "selector_contract": REAL_CONTRACT,
-        "copied_plan_contract": DEFERRED_CONTRACT,  # diverges
-    }
-    ok, mismatch = _classify_materialization_handoff(
-        handoff_snapshot=handoff,
-        pre_submit_contract=DEFERRED_CONTRACT,
-        pre_submit_limit=REAL_LIMIT,
-        pre_submit_qty=REAL_QTY,
-    )
-    assert ok is False, "DEFERRED:* must never reach broker"
-
-
-def test_phase10_watcher_callback_unknown_retains_ownership():
-    """UNKNOWN disposition from a deferred-callback must retain ownership —
-    the watcher must not be released without durable proof.
-
-    Proved via the §4 amendment: _resolve_trigger_callback_disposition is
-    an instance method on APEntryWatcher; the invariant is that an UNKNOWN
-    result is never treated as OWNERSHIP_TRANSFERRED.  We verify this by
-    checking the source directly (structural proof)."""
-    import inspect
-    import ap_entry_watcher as ew_pkg
-    src = inspect.getsource(ew_pkg.APEntryWatcher._resolve_trigger_callback_disposition)
-    # The function must include UNKNOWN as a retention path
-    assert "UNKNOWN" in src
-    # It must NOT return OWNERSHIP_TRANSFERRED for UNKNOWN
-    # (check that OWNERSHIP_TRANSFERRED is only returned in non-UNKNOWN branches)
-    assert "KEEP_WATCHER" in src or "RECONCILE_BROKER_INTENT" in src or "UNKNOWN" in src
+        assert result_a["deferred_lifecycles_recovered"] == 1
+        assert result_b["deferred_lifecycles_recovered"] == 0
+        assert len(osm.post_payloads) == 1
+        assert osm.post_payloads[0]["option_symbol"] == REAL_OCC
+        assert osm.post_payloads[0]["price"] > 0.01
+        assert not osm.post_payloads[0]["option_symbol"].startswith("DEFERRED:")
+        assert final_row["status"] == "SUBMITTED"
+        assert final_row["broker_order_id"] == "TR-323"
+        assert final_row["client_id"] == CLIENT_ID
+        assert final_row["execution_mode"] == "live"
+        assert final_row["local_order_id"] == LOCAL_ORDER_ID
+        assert final_meta["original_trigger_crossed_at"] == final_meta["trigger_crossed_at"]
+        assert final_meta["last_confirmed_trigger_at"] != final_meta["original_trigger_crossed_at"]
+        assert final_meta["live_submit_gate"]["all_passed"] is True
+        assert final_meta["live_submit_gate"]["trigger_age_gate"]["effective_anchor"] == "last_confirmed_trigger_at"
+        assert final_meta["proof_retry_deadline"] == final_meta["absolute_entry_deadline"]
+        assert str(final_meta.get("selector_failure", {}).get("reason_code") or "") == "CHAIN_ROW_ZERO_BID_ASK"
+        assert selector.calls == 2

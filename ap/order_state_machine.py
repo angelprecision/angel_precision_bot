@@ -2013,6 +2013,7 @@ class APOrderStateMachine:
         _now = now_utc_iso()
         _meta = dict(selector_meta or {})
         _meta.update({
+            "contract_deferred": False,
             "lifecycle_state": "BROKER_READY",
             "materialization_status": "SELECTED",
             "materialization_in_flight": False,
