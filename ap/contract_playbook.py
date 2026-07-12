@@ -155,7 +155,7 @@ def _before_index_cutoff(now_et: datetime | None) -> bool:
 def _same_calendar_week(today: date, expiration: date) -> bool:
     today_iso = today.isocalendar()
     exp_iso = expiration.isocalendar()
-    return today.year == expiration.year and today_iso.week == exp_iso.week
+    return today_iso.year == exp_iso.year and today_iso.week == exp_iso.week
 
 
 def _order_by_dte_sequence(

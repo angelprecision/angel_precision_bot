@@ -16,6 +16,7 @@ from ap.contract_playbook import (
     TIMEFRAME_INTRADAY_SHORT,
     TIMEFRAME_UNKNOWN,
     TIMEFRAME_WEEKLY,
+    _same_calendar_week,
     build_playbook_candidate_context,
     normalize_playbook_timeframe,
     playbook_contract_selection_enabled,
@@ -284,6 +285,44 @@ def test_daily_equity_prefers_same_week_wednesday_then_friday():
     )
     ordered = resolve_playbook_expiration_order(spec, available, today=today, min_dte=0, max_dte=21)
     assert ordered[:2] == available[:2]
+
+
+def test_same_calendar_week_true_across_2025_to_2026_boundary():
+    assert _same_calendar_week(date(2025, 12, 29), date(2026, 1, 2)) is True
+
+
+def test_same_calendar_week_true_across_2026_to_2027_boundary():
+    assert _same_calendar_week(date(2026, 12, 31), date(2027, 1, 1)) is True
+
+
+def test_same_calendar_week_false_for_following_iso_week():
+    assert _same_calendar_week(date(2026, 1, 2), date(2026, 1, 9)) is False
+
+
+def test_daily_equity_new_year_same_week_friday_stays_ahead_of_fallback():
+    today = date(2025, 12, 29)  # Monday, ISO week 1 of 2026
+    same_week_friday = date(2026, 1, 2).isoformat()
+    fallback_friday = date(2026, 1, 9).isoformat()
+    available = [same_week_friday, fallback_friday]
+    spec = resolve_contract_playbook(
+        ticker="AAPL",
+        side="CALL",
+        timeframe="1d",
+        pattern="3-1-2",
+        underlying_price=100.0,
+        trigger_price=99.5,
+        target_underlying=105.0,
+        wick_targets=[],
+        available_expirations=available,
+        today=today,
+        min_dte=0,
+        max_dte=21,
+        metadata={},
+        now_et=datetime(2025, 12, 29, 10, 0, tzinfo=ET),
+    )
+    ordered = resolve_playbook_expiration_order(spec, available, today=today, min_dte=0, max_dte=21)
+    assert ordered[0] == same_week_friday
+    assert ordered[1] == fallback_friday
 
 
 def test_weekly_equity_receives_wider_window_than_daily():
