@@ -2577,7 +2577,11 @@ class APExecutionCore:
                         generation=_claim_generation,
                         diagnostics=meta_patch or {},
                     ):
-                        return
+                        return {
+                            "disposition": "TERMINAL_DURABLE",
+                            "reason_code": str(reason or "UNKNOWN_BREACH_FAILURE"),
+                            "terminal_status": ("CANCELED" if cleanup_action == "cancel" else "EXPIRED"),
+                        }
                 except Exception as _atomic_terminal_exc:
                     log.critical(
                         "[%s] breach atomic terminal write failed order=%s error=%s",
@@ -2590,10 +2594,22 @@ class APExecutionCore:
                         update_meta(queue_local_order_id, meta_patch)
                 except Exception as _meta_exc:
                     log.warning("[%s] breach failure meta persist failed: %s", ticker, _meta_exc)
-            self._cleanup_pending_entry_order(watched, action=cleanup_action, reason=reason)
-            return
+            _cleanup_ok = self._cleanup_pending_entry_order(
+                watched, action=cleanup_action, reason=reason,
+            )
+            if not _cleanup_ok:
+                return {
+                    "disposition": "KEEP_WATCHER",
+                    "reason_code": "BREACH_TERMINAL_WRITE_FAILED",
+                    "retry_after_seconds": 5,
+                }
+            return {
+                "disposition": "TERMINAL_DURABLE",
+                "reason_code": str(reason or "UNKNOWN_BREACH_FAILURE"),
+                "terminal_status": ("CANCELED" if cleanup_action == "cancel" else "EXPIRED"),
+            }
 
-        def _terminalize_deferred_breach_failure(reason: str, *, extra_meta: dict | None = None) -> None:
+        def _terminalize_deferred_breach_failure(reason: str, *, extra_meta: dict | None = None) -> dict:
             """Best-effort cleanup for deferred breach failures.
 
             Acceptance contract:
@@ -2608,13 +2624,12 @@ class APExecutionCore:
             if extra_meta:
                 meta_patch.update(extra_meta)
             if _ownership_context.get("is_recovered"):
-                _terminalize_breach_failure(
+                return _terminalize_breach_failure(
                     reason,
                     cleanup_action="expire",
                     meta_patch=meta_patch,
                     context_notes=reason,
                 )
-                return
             _atomic_terminalize = getattr(
                 self.order_state_machine, "terminalize_deferred_breach", None,
             )
@@ -2634,19 +2649,22 @@ class APExecutionCore:
                                 "context_notes": reason,
                             })
                         funnel.inc("order_failed")
-                        return
+                        return {
+                            "disposition": "TERMINAL_DURABLE",
+                            "reason_code": str(reason or "UNKNOWN_DEFERRED_BREACH_FAILURE"),
+                            "terminal_status": "EXPIRED",
+                        }
                 except Exception as _atomic_terminal_exc:
                     log.critical(
                         "[%s] deferred terminal CAS failed order=%s error=%s",
                         ticker, queue_local_order_id, _atomic_terminal_exc,
                     )
-            _terminalize_breach_failure(
+            return _terminalize_breach_failure(
                 reason,
                 cleanup_action="expire",
                 meta_patch=meta_patch,
                 context_notes=reason,
             )
-            return
 
         # ── PR3 (no-silent-deferred-trigger-exits): canonical terminal outcome ──
         # Every triggered deferred row MUST leave exactly one explicit TERMINAL
@@ -3006,7 +3024,7 @@ class APExecutionCore:
                     "BREACH_SELECTOR_RETURNED_NONE",
                     reason=_reason,
                 )
-                _terminalize_deferred_breach_failure(
+                return _terminalize_deferred_breach_failure(
                     _reason,
                     extra_meta={"failure_stage": "deferred_contract_selection"},
                 )
@@ -3290,7 +3308,7 @@ class APExecutionCore:
                         except Exception as _cap_obs_exc:
                             log.debug("[%s] cap misconfigured queue write non-critical: %s",
                                       ticker, _cap_obs_exc)
-                        _terminalize_deferred_breach_failure(
+                        return _terminalize_deferred_breach_failure(
                             _cap_reason,
                             extra_meta={
                                 "failure_stage": "acceptance_ask_cap",
@@ -3298,7 +3316,6 @@ class APExecutionCore:
                                 "selected_contract": _sel_contract,
                             },
                         )
-                        return
                     _sel_ask = float(getattr(_sel, "ask", 0) or 0)
                     if _sel_ask <= 0 or _sel_ask > _accept_cap:
                         _cap_reason = (
@@ -3338,7 +3355,7 @@ class APExecutionCore:
                         except Exception as _cap_obs_exc2:
                             log.debug("[%s] cap exceeded queue write non-critical: %s",
                                       ticker, _cap_obs_exc2)
-                        _terminalize_deferred_breach_failure(
+                        return _terminalize_deferred_breach_failure(
                             _cap_reason,
                             extra_meta={
                                 "failure_stage": "acceptance_ask_cap",
@@ -3347,7 +3364,6 @@ class APExecutionCore:
                                 "acceptance_cap": _accept_cap,
                             },
                         )
-                        return
                     # Cap passed — acceptance mode trades exactly one
                     # contract at the selected premium.
                     try:
@@ -3887,7 +3903,7 @@ class APExecutionCore:
                         )
                     except Exception:
                         pass  # audit write is non-critical
-                    _terminalize_deferred_breach_failure(
+                    return _terminalize_deferred_breach_failure(
                         _final_reason_a,
                         extra_meta={
                             "failure_stage":           "deferred_contract_selection",
@@ -4033,7 +4049,7 @@ class APExecutionCore:
                         )
                     except Exception:
                         pass  # audit write is non-critical
-                    _terminalize_deferred_breach_failure(
+                    return _terminalize_deferred_breach_failure(
                         _reason,
                         extra_meta={
                             "failure_stage":           "deferred_contract_selection",
@@ -4185,7 +4201,7 @@ class APExecutionCore:
                     reason=_reason,
                     extra={"exception_type": type(_cs_err).__name__},
                 )
-                _terminalize_deferred_breach_failure(
+                return _terminalize_deferred_breach_failure(
                     _reason,
                     extra_meta={"failure_stage": "deferred_contract_selection"},
                 )
@@ -4218,6 +4234,23 @@ class APExecutionCore:
                 )
             except Exception:
                 _selector_failure_meta = {}
+            if not isinstance(_selector_failure_meta, dict) or not _selector_failure_meta:
+                try:
+                    _selected_meta = getattr(locals().get("_sel"), "metadata", None) or {}
+                    if isinstance(_selected_meta, dict):
+                        _selector_failure_meta = _selected_meta.get("selector_failure") or {}
+                except Exception:
+                    _selector_failure_meta = {}
+            if not isinstance(_selector_failure_meta, dict) or not _selector_failure_meta:
+                try:
+                    _last_failure = getattr(self.contract_selector, "get_last_failure", lambda: None)()
+                    if isinstance(_last_failure, dict):
+                        _selector_failure_meta = _last_failure
+                except Exception:
+                    _selector_failure_meta = {}
+            _deferred_selector_audit = (
+                dict(_selector_failure_meta) if isinstance(_selector_failure_meta, dict) else {}
+            )
             _limit_reason = str(
                 _selector_failure_meta.get("reason_code") or "INVALID_EXECUTABLE_LIMIT"
             ).strip() or "INVALID_EXECUTABLE_LIMIT"
@@ -4229,7 +4262,7 @@ class APExecutionCore:
                 _plan_limit,
                 _limit_reason,
             )
-            _terminalize_deferred_breach_failure(
+            return _terminalize_deferred_breach_failure(
                 _limit_reason,
                 extra_meta={
                     "failure_stage": "deferred_contract_selection",
@@ -4239,7 +4272,6 @@ class APExecutionCore:
                     "selector_failure": _selector_failure_meta,
                 },
             )
-            return
 
         # Optional hard guards: require contract + nonzero qty from the approved plan.
         approved_contract = str(getattr(approved_plan, "contract_symbol", "") or "").strip()

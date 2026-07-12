@@ -1186,3 +1186,267 @@ def test_live_watcher_and_recovery_worker_race_to_single_broker_post(monkeypatch
         "RECOVERY_ALREADY_SUBMITTED",
         "RECOVERY_STATUS_NOT_ELIGIBLE:SUBMITTED",
     }
+
+
+def test_penny_selector_result_terminalizes_without_broker_post(monkeypatch):
+    class _PennySelector:
+        dte_ladder_enabled = True
+
+        def select(self, *_args, **_kwargs):
+            return types.SimpleNamespace(
+                contract_symbol=REAL_OCC,
+                bid=0.01,
+                ask=0.01,
+                mid=0.01,
+                execution_price_per_share=0.01,
+                premium_per_contract=1.0,
+                affordable_contracts=1,
+                metadata={
+                    "selector_failure": {
+                        "reason_code": "CHEAP_CONTRACT_ONLY_CHOICE",
+                        "stage": "cheap_contract_gate",
+                        "explanation": "cheap only choice",
+                    }
+                },
+            )
+
+        def get_last_failure(self):
+            return {
+                "reason_code": "CHEAP_CONTRACT_ONLY_CHOICE",
+                "stage": "cheap_contract_gate",
+                "explanation": "cheap only choice",
+                "selector_failure_class": "quality",
+                "quality_failure": True,
+            }
+
+        def get_last_dte_ladder_audit(self):
+            return {"buckets_attempted": 1}
+
+    broker = _Broker()
+    osm = _StatefulOSM()
+    core = _build_core(osm, broker, _PennySelector())
+    watcher = _build_watcher(osm, core)
+
+    fake_execution = types.ModuleType("ap.execution")
+    fake_execution._refresh_ask_at_submit = lambda *_args, **_kwargs: (
+        2.09,
+        15,
+        True,
+        "ok",
+        {
+            "spread_pct": 0.02,
+            "submit_bid": 2.08,
+            "submit_ask": 2.09,
+            "submit_mid": 2.085,
+            "submit_last": 2.09,
+        },
+    )
+
+    with patch.dict(sys.modules, {"ap.execution": fake_execution}), patch(
+        "ap_entry_confirmation.check_entry_confirmation",
+        return_value=_FakeConfirmResult(),
+    ), patch("ap.db.conn", lambda: _NoopConn()), patch(
+        "ap.db.run_with_retry",
+        lambda fn, *a, **k: fn(),
+    ):
+        assert watcher.watch(_approved_plan(), LOCAL_ORDER_ID) is True
+        result = watcher.on_trigger(watcher._pending[0])
+
+    row = osm.get_order(LOCAL_ORDER_ID)
+    meta = row["meta"]
+
+    assert result["disposition"] == "TERMINAL_DURABLE"
+    assert result["reason_code"] == "CHEAP_CONTRACT_ONLY_CHOICE"
+    assert len(osm.post_payloads) == 0
+    assert row["status"] == "EXPIRED"
+    assert row["broker_order_id"] is None
+    assert row["contract"] == "DEFERRED:SPY"
+    assert row["limit_price"] == pytest.approx(0.01)
+    assert meta["broker_ready"] is False
+    assert str(meta.get("submit_intent_at") or "") == ""
+    assert meta["terminal_diagnostics"]["selector_failure"]["reason_code"] == "CHEAP_CONTRACT_ONLY_CHOICE"
+    assert meta["terminal_diagnostics"]["deferred_selector_audit"]["reason_code"] == "CHEAP_CONTRACT_ONLY_CHOICE"
+    assert meta["terminal_diagnostics"]["selected_limit_price"] == pytest.approx(0.01)
+    assert str(meta.get("lifecycle_state") or "") == "EXPIRED"
+
+
+def test_cheap_gate_none_terminalizes_with_exact_reason_and_no_generic_overwrite(monkeypatch):
+    class _NoneCheapSelector:
+        dte_ladder_enabled = True
+
+        def select(self, *_args, **_kwargs):
+            return None
+
+        def get_last_failure(self):
+            return {
+                "reason_code": "CHEAP_CONTRACT_NO_UPGRADE",
+                "stage": "cheap_contract_gate",
+                "explanation": "all candidates below premium floor",
+                "selector_failure_class": "quality",
+                "quality_failure": True,
+                "data_failure": False,
+                "chain_rows": 4,
+                "survivor_count": 0,
+            }
+
+        def get_last_dte_ladder_audit(self):
+            return {"buckets_attempted": 1}
+
+    broker = _Broker()
+    osm = _StatefulOSM()
+    core = _build_core(osm, broker, _NoneCheapSelector())
+    watcher = _build_watcher(osm, core)
+
+    fake_execution = types.ModuleType("ap.execution")
+    fake_execution._refresh_ask_at_submit = lambda *_args, **_kwargs: (
+        2.09,
+        15,
+        True,
+        "ok",
+        {
+            "spread_pct": 0.02,
+            "submit_bid": 2.08,
+            "submit_ask": 2.09,
+            "submit_mid": 2.085,
+            "submit_last": 2.09,
+        },
+    )
+
+    with patch.dict(sys.modules, {"ap.execution": fake_execution}), patch(
+        "ap_entry_confirmation.check_entry_confirmation",
+        return_value=_FakeConfirmResult(),
+    ), patch("ap.db.conn", lambda: _NoopConn()), patch(
+        "ap.db.run_with_retry",
+        lambda fn, *a, **k: fn(),
+    ):
+        assert watcher.watch(_approved_plan(), LOCAL_ORDER_ID) is True
+        result = watcher.on_trigger(watcher._pending[0])
+
+    row = osm.get_order(LOCAL_ORDER_ID)
+    meta = row["meta"]
+
+    assert result["disposition"] == "TERMINAL_DURABLE"
+    assert row["status"] == "EXPIRED"
+    assert row["last_error"] == "breach_time_contract_selection:CHEAP_CONTRACT_NO_UPGRADE"
+    assert len(osm.post_payloads) == 0
+    assert meta["broker_ready"] is False
+    assert meta["last_breach_failure_reason_code"] == "CHEAP_CONTRACT_NO_UPGRADE"
+    assert meta["terminal_diagnostics"]["deferred_selector_audit"]["reason_code"] == "CHEAP_CONTRACT_NO_UPGRADE"
+    assert "NO_CONTRACT_FOUND" not in row["last_error"]
+    assert str(meta.get("lifecycle_state") or "") == "EXPIRED"
+
+
+def test_cheap_gate_terminal_write_failure_keeps_watcher_owned(monkeypatch):
+    class _FailTerminalOSM(_StatefulOSM):
+        def terminalize_deferred_breach(self, *_args, **_kwargs):
+            return False
+
+        def expire_pending_entry(self, *_args, **_kwargs):
+            return False
+
+        def cancel_pending_entry(self, *_args, **_kwargs):
+            return False
+
+    class _NoneCheapSelector:
+        dte_ladder_enabled = True
+
+        def select(self, *_args, **_kwargs):
+            return None
+
+        def get_last_failure(self):
+            return {
+                "reason_code": "CHEAP_CONTRACT_NO_UPGRADE",
+                "stage": "cheap_contract_gate",
+                "explanation": "all candidates below premium floor",
+                "selector_failure_class": "quality",
+                "quality_failure": True,
+            }
+
+        def get_last_dte_ladder_audit(self):
+            return {"buckets_attempted": 1}
+
+    broker = _Broker()
+    osm = _FailTerminalOSM()
+    core = _build_core(osm, broker, _NoneCheapSelector())
+    watcher = _build_watcher(osm, core)
+
+    fake_execution = types.ModuleType("ap.execution")
+    fake_execution._refresh_ask_at_submit = lambda *_args, **_kwargs: (
+        2.09,
+        15,
+        True,
+        "ok",
+        {
+            "spread_pct": 0.02,
+            "submit_bid": 2.08,
+            "submit_ask": 2.09,
+            "submit_mid": 2.085,
+            "submit_last": 2.09,
+        },
+    )
+
+    with patch.dict(sys.modules, {"ap.execution": fake_execution}), patch(
+        "ap_entry_confirmation.check_entry_confirmation",
+        return_value=_FakeConfirmResult(),
+    ), patch("ap.db.conn", lambda: _NoopConn()), patch(
+        "ap.db.run_with_retry",
+        lambda fn, *a, **k: fn(),
+    ):
+        assert watcher.watch(_approved_plan(), LOCAL_ORDER_ID) is True
+        watched = watcher._pending[0]
+        result = watcher.on_trigger(watched)
+        disposition, _ = watcher._resolve_trigger_callback_disposition(watched, result)
+
+    row = osm.get_order(LOCAL_ORDER_ID)
+    meta = row["meta"]
+
+    assert result["disposition"] == "KEEP_WATCHER"
+    assert result["reason_code"] == "BREACH_TERMINAL_WRITE_FAILED"
+    assert disposition == "KEEP_WATCHER"
+    assert len(osm.post_payloads) == 0
+    assert row["status"] == "PENDING_TRIGGER"
+    assert str(meta.get("lifecycle_state") or "") == "MATERIALIZING"
+    assert str(meta.get("materialization_owner") or "").startswith("watcher:")
+    assert meta["broker_ready"] is False
+
+
+def test_stale_deferred_penny_broker_ready_recovery_cannot_submit(monkeypatch):
+    broker = _Broker()
+    osm = _StatefulOSM()
+    osm.row["status"] = "PENDING_TRIGGER"
+    osm.row["contract"] = "DEFERRED:SPY"
+    osm.row["limit_price"] = 0.01
+    osm.row["reserved_cost"] = 1.0
+    osm.row["meta"].update({
+        "contract_deferred": True,
+        "broker_ready": True,
+        "lifecycle_state": "BROKER_READY",
+        "selected_contract": "DEFERRED:SPY",
+        "selected_limit": 0.01,
+        "selected_qty": 1,
+        "trigger_crossed_at": _iso(_now() - timedelta(seconds=10)),
+        "trigger_price": 600.0,
+        "observed_underlying_price": 600.20,
+    })
+
+    core = _build_core(osm, broker, _Selector())
+
+    monkeypatch.setenv("DEFERRED_RECOVERY_MAX_TRIGGER_AGE_SECONDS", "300")
+    monkeypatch.setenv("DEFERRED_RECOVERY_MAX_ATTEMPTS", "20")
+    monkeypatch.setenv("DEFERRED_RECOVERY_RETRY_DELAY_SECONDS", "30")
+
+    outcome = core.resume_deferred_broker_ready_order(
+        local_order_id=LOCAL_ORDER_ID,
+        plan=_live_broker_ready_plan(),
+    )
+
+    row = osm.get_order(LOCAL_ORDER_ID)
+    meta = row["meta"]
+
+    assert outcome["disposition"] == "TERMINAL_DURABLE"
+    assert outcome["reason_code"] == "RECOVERY_INVALID_OCC_CONTRACT"
+    assert len(osm.post_payloads) == 0
+    assert str(meta.get("submit_intent_at") or "") == ""
+    assert row["broker_order_id"] is None
+    assert row["contract"] == "DEFERRED:SPY"
+    assert row["limit_price"] == pytest.approx(0.01)

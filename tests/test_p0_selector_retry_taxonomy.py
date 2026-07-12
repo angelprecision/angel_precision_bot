@@ -14,6 +14,8 @@ Proves that:
 
 from __future__ import annotations
 
+import pytest
+
 import ap.selector_retry_policy as policy_mod
 from ap.selector_retry_policy import (
     get_policy,
@@ -29,6 +31,11 @@ from ap.selector_retry_policy import (
     UNKNOWN_FAIL_CLOSED,
     _POLICY_TABLE,
     _FALLBACK_UNKNOWN,
+)
+from tests.test_p0_selector_production_metadata_integrity import (
+    FakeSelector,
+    _option,
+    _plan_dict,
 )
 
 VALID_CLASSIFICATIONS = {
@@ -310,3 +317,35 @@ def test_known_terminal_codes_absent_from_retryable_frozenset():
     assert not contaminating, (
         f"Terminal codes found in RETRYABLE frozenset: {contaminating}"
     )
+
+
+def test_allow_cheap_only_choice_live_missing_and_malformed_env_fail_closed(monkeypatch):
+    cheap = _option(bid=0.48, ask=0.49, symbol="SPY260717C00495000")
+
+    monkeypatch.delenv("ALLOW_CHEAP_CONTRACT_IF_ONLY_CHOICE", raising=False)
+    selector_missing = FakeSelector(mode="LIVE", chain=[cheap])
+    result_missing = selector_missing.select(_plan_dict())
+    assert result_missing is None
+    assert selector_missing.get_last_failure()["reason_code"] == "CHEAP_CONTRACT_NO_UPGRADE"
+
+    monkeypatch.setenv("ALLOW_CHEAP_CONTRACT_IF_ONLY_CHOICE", "garbage")
+    selector_bad = FakeSelector(mode="LIVE", chain=[cheap])
+    result_bad = selector_bad.select(_plan_dict())
+    assert result_bad is None
+    assert selector_bad.get_last_failure()["reason_code"] == "CHEAP_CONTRACT_NO_UPGRADE"
+
+
+def test_allow_cheap_only_choice_live_true_comes_from_real_env_path(monkeypatch):
+    cheap = _option(bid=0.48, ask=0.49, symbol="SPY260717C00495000")
+
+    monkeypatch.setenv("ALLOW_CHEAP_CONTRACT_IF_ONLY_CHOICE", "true")
+    selector = FakeSelector(mode="LIVE", chain=[cheap])
+    plan = _plan_dict(metadata={"allow_cheap_contract_if_only_choice": False})
+
+    result = selector.select(plan)
+
+    assert result is not None
+    assert result.contract_symbol == cheap["symbol"]
+    assert result.execution_price_per_share == pytest.approx(0.49)
+    assert result.selection_reason == "cheap_contract_only_choice"
+    assert selector.get_last_failure() is None
