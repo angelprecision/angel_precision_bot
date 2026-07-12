@@ -145,6 +145,7 @@ def resolve_contract_playbook(
     instrument_class = classify_instrument_class(ticker)
     side_norm = str(side or "").upper()
     windowed = _within_window(available_expirations, today, min_dte, max_dte)
+    permitted_windowed = list(windowed)
     diagnostics: dict = {
         "ticker": str(ticker or "").upper(),
         "pattern": pattern,
@@ -165,7 +166,7 @@ def resolve_contract_playbook(
         short_max = max(0, _index_short_max_dte())
         diagnostics["cutoff_allows_0dte"] = before_cutoff
         diagnostics["cutoff_time_et"] = "%02d:%02d" % _cutoff_hour_minute()
-        permitted_windowed: list[tuple[int, str]] = []
+        permitted_windowed = []
         for dte, exp in windowed:
             if dte == 0 and (not allow_0dte or not before_cutoff):
                 continue
@@ -209,6 +210,7 @@ def resolve_contract_playbook(
         band_high = reference or None
 
     diagnostics["resolved_preferred_expirations"] = list(preferred)
+    diagnostics["resolved_permitted_expirations"] = [exp for _, exp in permitted_windowed]
     diagnostics["resolved_preferred_dtes"] = list(preferred_dtes)
     diagnostics["wick_target_count"] = len(wick_targets or [])
 
@@ -217,7 +219,7 @@ def resolve_contract_playbook(
         timeframe=str(timeframe or ""),
         side=side_norm,
         preferred_expirations=list(preferred),
-        permitted_expirations=[exp for _, exp in windowed],
+        permitted_expirations=[exp for _, exp in permitted_windowed],
         preferred_dte_order=list(preferred_dtes),
         strike_policy="ATM_OR_ONE_STEP_OTM_TOWARD_TARGET",
         preferred_strikes=[],
@@ -240,13 +242,13 @@ def resolve_playbook_expiration_order(
     min_dte: int,
     max_dte: int,
 ) -> list[str]:
-    windowed = {exp for _, exp in _within_window(available_expirations, today, min_dte, max_dte)}
+    permitted = set(spec.permitted_expirations)
     ordered: list[str] = []
     for exp in spec.preferred_expirations:
-        if exp in windowed and exp not in ordered:
+        if exp in permitted and exp not in ordered:
             ordered.append(exp)
     for exp in available_expirations:
-        if exp in windowed and exp not in ordered:
+        if exp in permitted and exp not in ordered:
             ordered.append(exp)
     return ordered
 

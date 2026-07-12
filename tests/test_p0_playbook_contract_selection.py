@@ -98,6 +98,7 @@ def test_liquid_index_prefers_short_expirations_in_window():
     )
     ordered = resolve_playbook_expiration_order(spec, available, today=date.today(), min_dte=0, max_dte=7)
     assert ordered[:3] == available[:3]
+    assert available[0] in ordered
 
 
 def test_liquid_index_skips_0dte_at_cutoff():
@@ -121,6 +122,8 @@ def test_liquid_index_skips_0dte_at_cutoff():
     ordered = resolve_playbook_expiration_order(spec, available, today=date.today(), min_dte=0, max_dte=7)
     assert ordered[0] == available[1]
     assert available[0] not in spec.preferred_expirations
+    assert available[0] not in spec.permitted_expirations
+    assert available[0] not in ordered
 
 
 def test_liquid_index_skips_0dte_after_cutoff():
@@ -143,6 +146,8 @@ def test_liquid_index_skips_0dte_after_cutoff():
     )
     ordered = resolve_playbook_expiration_order(spec, available, today=date.today(), min_dte=0, max_dte=7)
     assert ordered[0] == available[1]
+    assert available[0] not in spec.permitted_expirations
+    assert available[0] not in ordered
 
 
 def test_timezone_aware_utc_input_converts_to_et_cutoff():
@@ -164,6 +169,7 @@ def test_timezone_aware_utc_input_converts_to_et_cutoff():
         now_et=datetime.combine(date.today(), datetime.min.time(), tzinfo=timezone.utc).replace(hour=17, minute=30),
     )
     assert available[0] not in spec.preferred_expirations
+    assert available[0] not in spec.permitted_expirations
 
 
 def test_dst_date_cutoff_remains_eastern_local():
@@ -186,6 +192,7 @@ def test_dst_date_cutoff_remains_eastern_local():
         now_et=datetime(2026, 7, 1, 13, 30, tzinfo=ET),
     )
     assert available[0] not in spec.preferred_expirations
+    assert available[0] not in spec.permitted_expirations
 
 
 def test_daily_equity_prefers_same_week_over_farther_dte():
@@ -286,4 +293,60 @@ def test_selector_passes_transaction_now_et_to_resolver():
     })()
     ordered, audit = engine._resolve_playbook_probe_order(plan, "SPY", request_context=None)
     assert ordered[0] == _today_plus(1)
+    assert _today_plus(0) not in ordered
     assert audit["resolved_now_et"].endswith("-04:00")
+
+
+def test_ladder_never_probes_0dte_after_cutoff_when_later_expirations_fail():
+    mod = _load_selector_module()
+    engine = object.__new__(mod.APContractSelectionEngine)
+    engine.dte_ladder_enabled = True
+    engine.playbook_contract_selection_enabled = True
+    engine.dte_ladder_probe_per_bucket = 2
+    engine.min_dte = 0
+    engine.max_dte = 7
+    engine.mode = "live"
+    engine.data_broker = MagicMock()
+    engine._last_failure = None
+    engine._last_dte_ladder_audit = None
+    engine._playbook_now_et = MagicMock(return_value=datetime(2026, 7, 12, 14, 0, tzinfo=ET))
+    engine._fetch_underlying_quote = MagicMock(return_value=500.0)
+    today = date.today()
+    exp_0 = today.isoformat()
+    exp_1 = (today + timedelta(days=1)).isoformat()
+    exp_3 = (today + timedelta(days=3)).isoformat()
+    engine._fetch_expirations_list = MagicMock(return_value=([exp_0, exp_1, exp_3], {}))
+    probed: list[str] = []
+
+    def _fake_select(plan, *, expiration_override=None, request_context=None, _dte_legacy_fallback=False):
+        if expiration_override is not None:
+            probed.append(expiration_override)
+            if isinstance(plan, dict):
+                meta = plan.setdefault("metadata", {})
+            else:
+                meta = getattr(plan, "metadata", None)
+                if not isinstance(meta, dict):
+                    meta = {}
+                    setattr(plan, "metadata", meta)
+            meta["selector_failure"] = {
+                "reason_code": "SPREAD_TOO_WIDE",
+                "explanation": f"failed {expiration_override}",
+            }
+        return None
+
+    engine.select = _fake_select
+    plan = type("Plan", (), {
+        "ticker": "SPY",
+        "side": "CALL",
+        "timeframe": "1d",
+        "pattern": "2-1-2",
+        "trigger_price": 499.5,
+        "target_underlying": 505.0,
+        "wick_targets": [],
+        "metadata": {"deferred_breach_selection": True},
+        "execution_mode": "live",
+    })()
+    result = engine._select_with_dte_ladder(plan)
+    assert result is None
+    assert probed == [exp_1, exp_3]
+    assert exp_0 not in probed
