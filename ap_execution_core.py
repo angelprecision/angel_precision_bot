@@ -7008,22 +7008,25 @@ class APExecutionCore:
     })
 
     def _is_real_underlying_invalidation(self, reason_code: str) -> bool:
-        """
-        True when the watcher's invalidation reason indicates a genuine
-        underlying/structure/arm-time break of the setup thesis.
+        """PR #324 §4: delegate to canonical classify_watcher_reason().
 
-        Called from _on_signal_invalidate to decide whether a DEFERRED:*
-        contract may keep the watcher alive (benign reason) or must be
-        terminalized (real invalidation). Any prefix like 'stop_' is
-        treated as real underlying — future stop reason codes automatically
-        classify correctly.
+        True for TERMINAL or ALREADY_BREACHED classifications — these mean
+        the underlying thesis is broken and a DEFERRED contract cannot be
+        kept alive.  RETRYABLE/REARMABLE are NOT real underlying invalidation.
         """
-        rc = str(reason_code or "").strip().lower()
-        if not rc:
-            return False
-        if rc.startswith("stop_"):
-            return True
-        return rc in self._REAL_UNDERLYING_INVALIDATION_REASONS
+        try:
+            from ap.pending_trigger_classifier import (
+                classify_watcher_reason, WatcherInvalidationClass,
+            )
+            cls = classify_watcher_reason(reason_code)
+            return cls in (
+                WatcherInvalidationClass.TERMINAL,
+                WatcherInvalidationClass.ALREADY_BREACHED,
+            )
+        except Exception:
+            # Fallback: stop_* prefix is always terminal
+            rc = str(reason_code or "").strip().lower()
+            return rc.startswith("stop_") or rc in self._REAL_UNDERLYING_INVALIDATION_REASONS
 
     def _on_signal_invalidate(self, watched: WatchedSignal):
         signal_id = str(watched.signal.get("signal_id", ""))
@@ -7079,9 +7082,51 @@ class APExecutionCore:
             _watcher_is_live = _watcher_mode == "live" or (
                 not _watcher_mode and getattr(self, "paper", None) is False
             )
-            # LIVE fails closed: an unclassified reason on a LIVE deferred watcher
-            # is treated as a real invalidation (terminalize) rather than kept alive.
-            _unclassified_live = _watcher_is_live and not _inv_reason_code
+            # PR #324 §5 — LIVE unknown reason check uses classify_watcher_reason, not empty-string.
+            # NO_WATCHER_OWNER from classifier means the reason is unknown or invariant-violating.
+            _inv_class = ""
+            try:
+                from ap.pending_trigger_classifier import (
+                    classify_watcher_reason as _cwrfn,
+                    WatcherInvalidationClass as _WIC,
+                )
+                _inv_class = _cwrfn(_inv_reason_code) if _inv_reason_code else _WIC.NO_WATCHER_OWNER
+            except Exception:
+                _inv_class = "INVALIDATED_NO_WATCHER_OWNER"
+
+            # Unknown LIVE reason (NO_WATCHER_OWNER) → FAILED quarantine, no terminalize.
+            _is_unknown_live_reason = (
+                _watcher_is_live
+                and _inv_class == "INVALIDATED_NO_WATCHER_OWNER"
+                and not _is_real_underlying_invalidation
+            )
+            if _is_unknown_live_reason and _inv_reason_code:
+                # PR #324 §5: unknown LIVE reason must NOT auto-terminalize.
+                # Retain watcher + quarantine.
+                log.critical(
+                    "[%s] DEFERRED_CONTRACT_UNKNOWN_LIVE_REASON — signal_id=%s "
+                    "reason_code=%s class=%s — FAILED quarantine (watcher retained, "
+                    "dedup held, exact reason preserved, no cancel).",
+                    watched.ticker, signal_id or "?",
+                    _inv_reason_code, _inv_class,
+                )
+                funnel.inc("deferred_contract_unknown_live_reason_quarantine")
+                try:
+                    from ap.pending_trigger_classifier import (
+                        WatcherCompletionResult as _UWCR, WatcherCompletionOutcome as _UWCO,
+                    )
+                    return _UWCR(
+                        outcome=_UWCO.FAILED,
+                        reason_code=f"unknown_live_reason:{_inv_reason_code}",
+                        local_order_id=str(
+                            (getattr(watched, "signal", {}) or {}).get("local_order_id") or ""
+                        ),
+                        detail=f"class={_inv_class}",
+                    )
+                except Exception:
+                    return None
+
+            _unclassified_live = False  # handled above
 
             if _is_real_underlying_invalidation or _unclassified_live:
                 # Terminalize — the underlying thesis is invalid; deferral of
@@ -7137,17 +7182,70 @@ class APExecutionCore:
                         watched.ticker, _e,
                     )
                 funnel.inc("deferred_contract_invalidated")
+                # PR #324 §6 — RETRY_OWNED must persist durable bounded retry metadata.
+                _def_oid = str((getattr(watched, "signal", {}) or {}).get("local_order_id") or "")
+                _def_now = datetime.now(timezone.utc)
+                try:
+                    _def_retry_delay = max(5, int(os.getenv(
+                        "WATCHER_DEFERRED_RETRY_DELAY_SECONDS", "30"
+                    )))
+                except (TypeError, ValueError):
+                    _def_retry_delay = 30
+                try:
+                    _def_retry_deadline_secs = max(60, int(os.getenv(
+                        "WATCHER_DEFERRED_RETRY_DEADLINE_SECONDS", "300"
+                    )))
+                except (TypeError, ValueError):
+                    _def_retry_deadline_secs = 300
+
+                _def_next_at = (_def_now + timedelta(seconds=_def_retry_delay)).isoformat()
+                _def_deadline = (_def_now + timedelta(seconds=_def_retry_deadline_secs)).isoformat()
+                _def_owner = f"deferred_retry:{_def_oid}"
+
+                # Persist metadata — failure → FAILED quarantine.
+                _def_meta_ok = False
+                _def_meta_exc = None
+                _def_osm = getattr(self, "order_state_machine", None)
+                if _def_osm is not None and _def_oid:
+                    _def_upd = getattr(_def_osm, "update_order_meta", None)
+                    if callable(_def_upd):
+                        try:
+                            _def_meta_ok = bool(_def_upd(_def_oid, {
+                                "watcher_invalidation_class":  "INVALIDATED_RETRYABLE",
+                                "watcher_invalidation_reason": _inv_reason_code or "deferred_contract_benign_invalidation",
+                                "watcher_retry_owner":         _def_owner,
+                                "watcher_retry_attempt":       1,
+                                "watcher_retry_next_at":       _def_next_at,
+                                "watcher_retry_deadline":      _def_deadline,
+                            }))
+                        except Exception as _dme:
+                            _def_meta_exc = _dme
+                            _def_meta_ok = False
+
                 try:
                     from ap.pending_trigger_classifier import (
                         WatcherCompletionResult as _WCR,
                         WatcherCompletionOutcome as _WCO,
                     )
+                    if not _def_meta_ok:
+                        log.critical(
+                            "[%s] deferred RETRY_OWNED metadata write failed (exc=%s) — "
+                            "cannot claim RETRY_OWNED without durable metadata; "
+                            "returning FAILED for quarantine.",
+                            watched.ticker, _def_meta_exc,
+                        )
+                        return _WCR(
+                            outcome=_WCO.FAILED,
+                            reason_code="deferred_retry_metadata_persistence_failed",
+                            local_order_id=_def_oid or None,
+                            detail=str(_def_meta_exc)[:200] if _def_meta_exc else "write_returned_false",
+                        )
                     return _WCR(
                         outcome=_WCO.RETRY_OWNED,
                         reason_code=_inv_reason_code or "deferred_contract_benign_invalidation",
-                        local_order_id=str(
-                            (getattr(watched, "signal", {}) or {}).get("local_order_id") or ""
-                        ),
+                        local_order_id=_def_oid or None,
+                        retry_next_at=_def_next_at,
+                        retry_deadline=_def_deadline,
                     )
                 except Exception:
                     return None  # fallback — poll loop normalizes None → FAILED

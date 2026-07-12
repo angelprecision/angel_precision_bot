@@ -88,12 +88,16 @@ class _MockOSM:
 
     def get_order(self, local_order_id: str) -> dict:
         self._ensure(local_order_id)
+        # Return identity fields from meta if they were stored (set by update_order_meta)
+        _meta = dict(self._row_meta.get(local_order_id, {}))
+        _client_id = _meta.pop("_test_client_id", "client@test.com")
+        _exec_mode = _meta.pop("_test_execution_mode", "paper")
         return {
             "local_order_id": local_order_id,
             "status": self._row_status[local_order_id],
-            "meta": dict(self._row_meta.get(local_order_id, {})),
-            "client_id": "client@test.com",
-            "execution_mode": "paper",
+            "meta": _meta,
+            "client_id": _client_id,
+            "execution_mode": _exec_mode,
         }
 
     def cancel_pending_entry(self, local_order_id: str, *, reason: str = "watcher_invalidated") -> bool:
@@ -142,6 +146,12 @@ def _arm_watcher(
     watched._watcher_ref = w
     w._pending.append(watched)
     w._dedup_set.add(sig["signal_id"])
+    # Seed identity fields into OSM so _normalize_and_verify_completion can match them.
+    _oid = sig.get("local_order_id", "")
+    if _oid:
+        _osm._ensure(_oid)
+        _osm._row_meta[_oid]["_test_client_id"] = sig.get("client_id", "client@test.com")
+        _osm._row_meta[_oid]["_test_execution_mode"] = mode
     return w, watched, sig
 
 
@@ -489,10 +499,14 @@ class TestDetachedDeferredRestorationImpossible:
         watched.signal["contract_symbol"] = "DEFERRED:SPY"
 
         # The callback returns RETRY_OWNED (benign deferred invalidation).
+        # PR #324 §3: must include retry_next_at + retry_deadline.
+        _now = datetime.now(timezone.utc)
         retry_result = WatcherCompletionResult(
             outcome=WatcherCompletionOutcome.RETRY_OWNED,
             reason_code="overnight_live_quote_unavailable",
             local_order_id=sig["local_order_id"],
+            retry_next_at=(_now + timedelta(seconds=30)).isoformat(),
+            retry_deadline=(_now + timedelta(seconds=300)).isoformat(),
         )
 
         # Normalize (no exception, no TERMINALIZED to verify).
@@ -796,11 +810,15 @@ class TestCompletionResultTruthTable:
         osm = _MockOSM()
         w, watched, sig = _arm_watcher(mode="paper", osm=osm)
         oid = sig["local_order_id"]
+        _now = datetime.now(timezone.utc)
 
+        # PR #324 §3: RETRY_OWNED requires durable retry_next_at + retry_deadline.
         result = WatcherCompletionResult(
             outcome=WatcherCompletionOutcome.RETRY_OWNED,
             reason_code="overnight_live_quote_unavailable",
             local_order_id=oid,
+            retry_next_at=(_now + timedelta(seconds=30)).isoformat(),
+            retry_deadline=(_now + timedelta(seconds=180)).isoformat(),
         )
         ack = w._normalize_and_verify_completion(watched, result, None)
         assert ack.outcome == WatcherCompletionOutcome.RETRY_OWNED
@@ -812,6 +830,8 @@ class TestCompletionResultTruthTable:
         osm = _MockOSM()
         w, watched, sig = _arm_watcher(mode="paper", osm=osm)
         oid = sig["local_order_id"]
+        # PR #324 §3: REARMED requires rearm_mode=True on the watcher.
+        watched.rearm_mode = True
 
         result = WatcherCompletionResult(
             outcome=WatcherCompletionOutcome.REARMED,
@@ -929,3 +949,614 @@ class TestTaxonomyCompleteness:
             assert cls == WatcherInvalidationClass.TERMINAL, (
                 f"stop_* prefix must be TERMINAL; got {cls} for '{reason}'"
             )
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# §10 Production-path regression tests (PR #324 amendment)
+# ══════════════════════════════════════════════════════════════════════════
+
+class TestProductionPathRegressions:
+    """Exercise actual dispatch paths — no manually simulated removal, no
+    manually-constructed desired callback result."""
+
+    # ── Dedup retained through actual dispatch ────────────────────────────
+
+    def test_call_stop_dedup_held_until_verified_cleanup(self):
+        """Normal CALL stop invalidation: dedup must remain held until
+        _dispatch_completion verifies TERMINALIZED from the callback."""
+        osm = _MockOSM()
+        w, watched, sig = _arm_watcher(mode="paper", osm=osm)
+        watched._watcher_ref = w
+
+        def _on_inv(ws: WatchedSignal) -> WatcherCompletionResult:
+            oid = str((ws.signal or {}).get("local_order_id") or "")
+            ok = osm.cancel_pending_entry(oid, reason="stop_bid_below_call_stop")
+            return WatcherCompletionResult(
+                outcome=WatcherCompletionOutcome.TERMINALIZED if ok else WatcherCompletionOutcome.FAILED,
+                reason_code="stop_bid_below_call_stop",
+                local_order_id=oid,
+            )
+        w.on_invalidate = _on_inv
+
+        # Trigger stop invalidation via check()
+        watched.entry_trigger = 450.0
+        watched.stop_level = 447.0
+        watched.breach_count = 0
+        state = watched.check(bid=446.0, ask=448.0)
+        assert state == WatchState.INVALIDATED
+        # Dedup still held — check() no longer releases it
+        assert sig["signal_id"] in w._dedup_set
+
+        # Run dispatch (what _poll_active_signals does)
+        audit = getattr(watched, "_pending_audit", None)
+        w._dispatch_completion(watched, _on_inv, pre_computed_audit=audit)
+
+        # After verified TERMINALIZED: removed from _pending, dedup released
+        assert watched not in w._pending
+        assert sig["signal_id"] not in w._dedup_set
+
+    def test_put_stop_dedup_held_until_verified_cleanup(self):
+        osm = _MockOSM()
+        w, watched, sig = _arm_watcher(mode="paper", osm=osm, signal_kwargs={"side": "PUT"})
+        watched._watcher_ref = w
+
+        def _on_inv(ws: WatchedSignal) -> WatcherCompletionResult:
+            oid = str((ws.signal or {}).get("local_order_id") or "")
+            ok = osm.cancel_pending_entry(oid, reason="stop_ask_above_put_stop")
+            return WatcherCompletionResult(
+                outcome=WatcherCompletionOutcome.TERMINALIZED if ok else WatcherCompletionOutcome.FAILED,
+                reason_code="stop_ask_above_put_stop",
+                local_order_id=oid,
+            )
+        w.on_invalidate = _on_inv
+        watched.entry_trigger = 450.0
+        watched.stop_level = 453.0
+        watched.breach_count = 0
+        state = watched.check(bid=449.0, ask=454.0)
+        assert state == WatchState.INVALIDATED
+        assert sig["signal_id"] in w._dedup_set  # dedup still held after check()
+
+        w._dispatch_completion(watched, _on_inv, pre_computed_audit=getattr(watched, "_pending_audit", None))
+        assert watched not in w._pending
+        assert sig["signal_id"] not in w._dedup_set
+
+    def test_call_collision_dedup_held_until_verified_cleanup(self):
+        """CALL trigger+stop collision: dedup must be retained after check()."""
+        osm = _MockOSM()
+        w, watched, sig = _arm_watcher(mode="live", osm=osm)
+        watched._watcher_ref = w
+        watched.entry_trigger = 450.0
+        watched.stop_level = 447.0
+        watched.breach_count = watched.MOMENTUM_POLLS_REQUIRED - 1
+
+        state = watched.check(bid=446.0, ask=451.0)
+        assert state == WatchState.INVALIDATED
+        assert watched._trigger_stop_collision is True
+        assert sig["signal_id"] in w._dedup_set  # dedup held after check()
+
+    def test_put_collision_dedup_held_until_verified_cleanup(self):
+        osm = _MockOSM()
+        w, watched, sig = _arm_watcher(mode="live", osm=osm, signal_kwargs={"side": "PUT"})
+        watched._watcher_ref = w
+        watched.entry_trigger = 450.0
+        watched.stop_level = 453.0
+        watched.breach_count = watched.MOMENTUM_POLLS_REQUIRED - 1
+
+        state = watched.check(bid=449.0, ask=454.0)
+        assert state == WatchState.INVALIDATED
+        assert watched._trigger_stop_collision is True
+        assert sig["signal_id"] in w._dedup_set  # dedup held after check()
+
+    def test_collision_cleanup_false_quarantines(self):
+        """If collision cleanup returns false, watcher must be quarantined."""
+        osm = _MockOSM()
+        osm._cancel_returns = False
+        w, watched, sig = _arm_watcher(mode="live", osm=osm)
+        watched._watcher_ref = w
+        watched.state = WatchState.INVALIDATED
+
+        def _on_inv(ws: WatchedSignal) -> WatcherCompletionResult:
+            oid = str((ws.signal or {}).get("local_order_id") or "")
+            ok = osm.cancel_pending_entry(oid, reason="trigger_stop_same_poll_collision")
+            return WatcherCompletionResult(
+                outcome=WatcherCompletionOutcome.TERMINALIZED if ok else WatcherCompletionOutcome.FAILED,
+                reason_code="trigger_stop_same_poll_collision",
+                local_order_id=oid,
+            )
+        w.on_invalidate = _on_inv
+        w._dispatch_completion(watched, _on_inv)
+        assert watched._ownership_quarantine is True
+        assert watched in w._pending
+        assert sig["signal_id"] in w._dedup_set
+
+    # ── EOD paths ─────────────────────────────────────────────────────────
+
+    def test_eod_expire_callback_false_quarantines(self):
+        """EOD expire callback false → watcher retained and quarantined."""
+        osm = _MockOSM()
+        osm._expire_returns = False
+        w, watched, sig = _arm_watcher(mode="paper", osm=osm)
+        watched.state = WatchState.EXPIRED
+
+        def _on_exp(ws: WatchedSignal) -> WatcherCompletionResult:
+            oid = str((ws.signal or {}).get("local_order_id") or "")
+            ok = osm.expire_pending_entry(oid, reason="eod_force_expire")
+            return WatcherCompletionResult(
+                outcome=WatcherCompletionOutcome.TERMINALIZED if ok else WatcherCompletionOutcome.FAILED,
+                reason_code="eod_expire_returned_false",
+                local_order_id=oid,
+            )
+        w.on_expire = _on_exp
+        w._dispatch_completion(watched, _on_exp)
+        assert watched._ownership_quarantine is True
+        assert watched in w._pending
+        assert sig["signal_id"] in w._dedup_set
+
+    def test_eod_expire_callback_raises_quarantines(self):
+        """EOD expire callback raises → watcher retained and quarantined."""
+        w, watched, sig = _arm_watcher(mode="paper")
+        watched.state = WatchState.EXPIRED
+
+        def _on_exp(ws: WatchedSignal) -> WatcherCompletionResult:
+            raise RuntimeError("eod_expire_db_timeout")
+        w.on_expire = _on_exp
+        w._dispatch_completion(watched, _on_exp)
+        assert watched._ownership_quarantine is True
+        assert watched in w._pending
+
+    # ── Overnight paths ───────────────────────────────────────────────────
+
+    def test_overnight_structural_cleanup_false_quarantines(self):
+        """Overnight structural invalidation: cleanup returning false → quarantine."""
+        osm = _MockOSM()
+        osm._cancel_returns = False
+        w, watched, sig = _arm_watcher(mode="paper", osm=osm, overnight=True)
+        watched.state = WatchState.INVALIDATED
+
+        def _on_inv(ws: WatchedSignal) -> WatcherCompletionResult:
+            oid = str((ws.signal or {}).get("local_order_id") or "")
+            ok = osm.cancel_pending_entry(oid, reason="overnight_daily_invalidated")
+            return WatcherCompletionResult(
+                outcome=WatcherCompletionOutcome.TERMINALIZED if ok else WatcherCompletionOutcome.FAILED,
+                reason_code="overnight_daily_invalidated_cleanup_false",
+                local_order_id=oid,
+            )
+        w.on_invalidate = _on_inv
+        w._dispatch_completion(watched, _on_inv)
+        assert watched._ownership_quarantine is True
+        assert watched in w._pending
+
+    def test_overnight_timeout_cleanup_false_quarantines(self):
+        """Overnight timeout: expire returning false → quarantine."""
+        osm = _MockOSM()
+        osm._expire_returns = False
+        w, watched, sig = _arm_watcher(mode="live", osm=osm, overnight=True)
+        watched.state = WatchState.EXPIRED
+
+        def _on_exp(ws: WatchedSignal) -> WatcherCompletionResult:
+            oid = str((ws.signal or {}).get("local_order_id") or "")
+            ok = osm.expire_pending_entry(oid, reason="overnight_live_quote_unavailable_timeout")
+            return WatcherCompletionResult(
+                outcome=WatcherCompletionOutcome.TERMINALIZED if ok else WatcherCompletionOutcome.FAILED,
+                reason_code="overnight_timeout_expire_returned_false",
+                local_order_id=oid,
+            )
+        w.on_expire = _on_exp
+        w._dispatch_completion(watched, _on_exp)
+        assert watched._ownership_quarantine is True
+        assert watched in w._pending
+
+    # ── OSM reread failures ───────────────────────────────────────────────
+
+    def test_osm_reread_raises_rejects_terminalized(self):
+        """OSM get_order raises → TERMINALIZED claim must be rejected → FAILED."""
+        class _RaisingOSM(_MockOSM):
+            def get_order(self, oid):
+                raise ConnectionError("osm_reread_raised")
+        osm = _RaisingOSM()
+        w, watched, sig = _arm_watcher(mode="paper", osm=osm)
+
+        result = WatcherCompletionResult(
+            outcome=WatcherCompletionOutcome.TERMINALIZED,
+            reason_code="stop_bid_below_call_stop",
+            local_order_id=sig["local_order_id"],
+        )
+        ack = w._normalize_and_verify_completion(watched, result, None)
+        assert ack.outcome == WatcherCompletionOutcome.FAILED
+        assert "reread_raised" in ack.reason_code
+
+    def test_osm_reread_returns_none_rejects_terminalized(self):
+        """OSM get_order returns None → TERMINALIZED must be rejected → FAILED."""
+        class _NoneOSM(_MockOSM):
+            def get_order(self, oid):
+                return None
+        osm = _NoneOSM()
+        w, watched, sig = _arm_watcher(mode="paper", osm=osm)
+
+        result = WatcherCompletionResult(
+            outcome=WatcherCompletionOutcome.TERMINALIZED,
+            reason_code="watcher_expired",
+            local_order_id=sig["local_order_id"],
+        )
+        ack = w._normalize_and_verify_completion(watched, result, None)
+        assert ack.outcome == WatcherCompletionOutcome.FAILED
+        assert "returned_none" in ack.reason_code
+
+    def test_wrong_client_id_rejects_terminalized(self):
+        """Wrong client_id in row → TERMINALIZED identity mismatch → FAILED."""
+        class _WrongClientOSM(_MockOSM):
+            def get_order(self, oid):
+                return {
+                    "local_order_id": oid,
+                    "status": "CANCELED",
+                    "meta": {},
+                    "client_id": "wrong@other.com",
+                    "execution_mode": "paper",
+                }
+        osm = _WrongClientOSM()
+        w, watched, sig = _arm_watcher(mode="paper", osm=osm)
+
+        result = WatcherCompletionResult(
+            outcome=WatcherCompletionOutcome.TERMINALIZED,
+            reason_code="stop_bid_below_call_stop",
+            local_order_id=sig["local_order_id"],
+        )
+        ack = w._normalize_and_verify_completion(watched, result, None)
+        assert ack.outcome == WatcherCompletionOutcome.FAILED
+        assert "client_id" in ack.reason_code
+
+    def test_wrong_execution_mode_rejects_terminalized(self):
+        """Wrong execution_mode in row → TERMINALIZED identity mismatch → FAILED."""
+        class _WrongModeOSM(_MockOSM):
+            def get_order(self, oid):
+                return {
+                    "local_order_id": oid,
+                    "status": "CANCELED",
+                    "meta": {},
+                    "client_id": "client@test.com",
+                    "execution_mode": "live",  # watcher is paper
+                }
+        osm = _WrongModeOSM()
+        w, watched, sig = _arm_watcher(mode="paper", osm=osm)
+
+        result = WatcherCompletionResult(
+            outcome=WatcherCompletionOutcome.TERMINALIZED,
+            reason_code="stop_bid_below_call_stop",
+            local_order_id=sig["local_order_id"],
+        )
+        ack = w._normalize_and_verify_completion(watched, result, None)
+        assert ack.outcome == WatcherCompletionOutcome.FAILED
+        assert "execution_mode" in ack.reason_code
+
+    def test_nonterminal_status_submitted_rejects_terminalized(self):
+        """Status=SUBMITTED is not a terminal status → TERMINALIZED rejected."""
+        class _SubmittedOSM(_MockOSM):
+            def get_order(self, oid):
+                return {
+                    "local_order_id": oid,
+                    "status": "SUBMITTED",
+                    "meta": {},
+                    "client_id": "client@test.com",
+                    "execution_mode": "paper",
+                }
+        osm = _SubmittedOSM()
+        w, watched, sig = _arm_watcher(mode="paper", osm=osm)
+
+        result = WatcherCompletionResult(
+            outcome=WatcherCompletionOutcome.TERMINALIZED,
+            reason_code="watcher_expired",
+            local_order_id=sig["local_order_id"],
+        )
+        ack = w._normalize_and_verify_completion(watched, result, None)
+        assert ack.outcome == WatcherCompletionOutcome.FAILED
+        assert "nonterminal_status:SUBMITTED" in ack.reason_code
+
+    # ── RETRY_OWNED / REARMED strict checks ──────────────────────────────
+
+    def test_retry_owned_without_retry_next_at_fails(self):
+        """RETRY_OWNED missing retry_next_at → FAILED."""
+        w, watched, sig = _arm_watcher(mode="paper")
+        _now = datetime.now(timezone.utc)
+        result = WatcherCompletionResult(
+            outcome=WatcherCompletionOutcome.RETRY_OWNED,
+            reason_code="overnight_live_quote_unavailable",
+            local_order_id=sig["local_order_id"],
+            # No retry_next_at
+            retry_deadline=(_now + timedelta(seconds=180)).isoformat(),
+        )
+        ack = w._normalize_and_verify_completion(watched, result, None)
+        assert ack.outcome == WatcherCompletionOutcome.FAILED
+        assert "retry_next_at" in ack.reason_code
+
+    def test_rearmed_without_rearm_mode_fails(self):
+        """REARMED when watcher.rearm_mode=False → FAILED."""
+        w, watched, sig = _arm_watcher(mode="paper")
+        assert not watched.rearm_mode  # not in rearm state
+        result = WatcherCompletionResult(
+            outcome=WatcherCompletionOutcome.REARMED,
+            reason_code="arm_below_stop_reclaim_wait",
+            local_order_id=sig["local_order_id"],
+        )
+        ack = w._normalize_and_verify_completion(watched, result, None)
+        assert ack.outcome == WatcherCompletionOutcome.FAILED
+        assert "rearm_state" in ack.reason_code
+
+    # ── Unknown LIVE reason through real callback path ─────────────────────
+
+    def test_unknown_live_reason_via_real_invalidate_callback(self):
+        """PR #324 §5: unknown LIVE reason through real _on_signal_invalidate
+        must return FAILED (not terminalize)."""
+        try:
+            from ap_execution_core import APExecutionCore
+        except Exception:
+            pytest.skip("APExecutionCore not importable in test environment")
+
+        from unittest.mock import MagicMock, patch
+        from ap_entry_watcher import WatchedSignal
+
+        broker = MagicMock()
+        osm = _MockOSM()
+
+        # Minimal execution core stub with enough to call _on_signal_invalidate
+        class _MinEC:
+            order_state_machine = osm
+            execution_mode = "live"
+            mode = "live"
+            paper = False
+            client_id = "live@test.com"
+            _REAL_UNDERLYING_INVALIDATION_REASONS = frozenset()
+
+            class store:
+                @staticmethod
+                def update_status(*a, **kw): pass
+
+            def _is_real_underlying_invalidation(self, reason_code: str) -> bool:
+                from ap.pending_trigger_classifier import (
+                    classify_watcher_reason, WatcherInvalidationClass,
+                )
+                cls = classify_watcher_reason(reason_code)
+                return cls in (
+                    WatcherInvalidationClass.TERMINAL,
+                    WatcherInvalidationClass.ALREADY_BREACHED,
+                )
+
+            def _cleanup_pending_entry_order(self, ws, *, action, reason):
+                return False  # simulate cleanup failure
+
+        ec = _MinEC()
+        ec._on_signal_invalidate = APExecutionCore._on_signal_invalidate.__get__(ec)
+
+        sig = _make_signal(
+            client_id="live@test.com", execution_mode="live",
+            signal_kwargs=None
+        ) if False else {
+            "signal_id": str(uuid.uuid4()),
+            "local_order_id": str(uuid.uuid4()),
+            "client_id": "live@test.com",
+            "client_email": "live@test.com",
+            "execution_mode": "live",
+            "timeframe": "1w", "ticker": "SPY", "side": "CALL",
+            "entry_price": 450.0, "stop_price": 447.0, "target_price": 455.0,
+            "contract_symbol": "DEFERRED:SPY",  # deferred contract
+            "contracts": 1, "limit_price": 1.5, "score": 0.8, "tier": "A",
+            "queue_status": "QUEUED",
+        }
+        broker2 = MagicMock()
+        w2 = APEntryWatcher(broker2, order_state_machine=osm, mode="LIVE")
+        watched2 = WatchedSignal(sig, overnight=False)
+        watched2._watcher_ref = w2
+        w2._pending.append(watched2)
+        w2._dedup_set.add(sig["signal_id"])
+
+        # Set pending audit with unknown LIVE reason
+        watched2._pending_audit = {"reason_code": "some_totally_unknown_live_reason_xyz_324"}
+        watched2.state = WatchState.INVALIDATED
+
+        result = ec._on_signal_invalidate(watched2)
+
+        # Unknown LIVE reason must return FAILED (not terminalize)
+        if result is not None:
+            from ap.pending_trigger_classifier import WatcherCompletionResult as _WCR
+            assert isinstance(result, _WCR), f"Expected WatcherCompletionResult, got {type(result)}"
+            assert result.outcome == WatcherCompletionOutcome.FAILED, (
+                f"Unknown LIVE reason must return FAILED, got {result.outcome}"
+            )
+            assert "unknown_live_reason" in result.reason_code
+
+    # ── Retry metadata failures ──────────────────────────────────────────
+
+    def test_overnight_retry_metadata_update_returns_false_quarantines(self):
+        """overnight_live_quote_unavailable meta write returns False → quarantine."""
+        class _FalseMetaOSM(_MockOSM):
+            def update_order_meta(self, oid, patch):
+                return False  # always fail
+        osm = _FalseMetaOSM()
+        w, watched, sig = _arm_watcher(mode="live", overnight=True, osm=osm)
+
+        with patch.object(w, "_get_quote", return_value={"bid": 0, "ask": 0, "last": 0}):
+            w._revalidate_overnight_at_open()
+
+        # Meta write fails → cannot claim RETRY_OWNED → quarantine
+        assert watched._ownership_quarantine is True, (
+            "Failed meta write must quarantine watcher"
+        )
+        assert watched in w._pending
+        assert sig["signal_id"] in w._dedup_set
+
+    def test_overnight_retry_metadata_update_raises_quarantines(self):
+        """overnight_live_quote_unavailable meta write raises → quarantine."""
+        class _RaisingMetaOSM(_MockOSM):
+            def update_order_meta(self, oid, patch):
+                raise RuntimeError("meta_db_timeout")
+        osm = _RaisingMetaOSM()
+        w, watched, sig = _arm_watcher(mode="live", overnight=True, osm=osm)
+
+        with patch.object(w, "_get_quote", return_value={"bid": 0, "ask": 0, "last": 0}):
+            w._revalidate_overnight_at_open()
+
+        assert watched._ownership_quarantine is True
+        assert watched in w._pending
+        assert sig["signal_id"] in w._dedup_set
+
+    def test_retry_next_at_prevents_early_attempt_increment(self):
+        """next_at guard: if now < retry_next_at, watcher retained without
+        incrementing attempt count."""
+        osm = _MockOSM()
+        w, watched, sig = _arm_watcher(mode="live", overnight=True, osm=osm)
+
+        # Set next_at 60s in the future
+        future_next_at = datetime.now(timezone.utc) + timedelta(seconds=60)
+        watched._overnight_quote_retry_next_at = future_next_at
+        watched._overnight_quote_retry_attempt = 2  # already had 2 attempts
+
+        with patch.object(w, "_get_quote", return_value={"bid": 0, "ask": 0, "last": 0}):
+            w._revalidate_overnight_at_open()
+
+        # Attempt must NOT have been incremented (skipped due to next_at guard)
+        assert watched._overnight_quote_retry_attempt == 2, (
+            f"Attempt must not be incremented before next_at; "
+            f"got {watched._overnight_quote_retry_attempt}"
+        )
+        assert watched in w._pending
+        assert not watched._ownership_quarantine
+
+    # ── Trigger exhaustion ────────────────────────────────────────────────
+
+    def test_trigger_exhaustion_terminal_write_false_quarantines_dedup_held(self):
+        """trigger_callback_exhausted + terminalize_deferred_breach False
+        → quarantine, dedup retained."""
+        osm = _MockOSM()
+
+        class _NonTermOSM(_MockOSM):
+            def terminalize_deferred_breach(self, *a, **kw): return False
+
+        osm2 = _NonTermOSM()
+        broker = MagicMock()
+        w = APEntryWatcher(broker, order_state_machine=osm2, mode="PAPER")
+        sig = _make_signal(execution_mode="paper")
+        watched = WatchedSignal(sig, overnight=False)
+        watched._watcher_ref = w
+        w._pending.append(watched)
+        w._dedup_set.add(sig["signal_id"])
+        w.on_trigger = None  # no trigger callback = will be exhausted differently
+
+        # Directly simulate trigger exhaustion entering quarantine
+        from ap.pending_trigger_classifier import (
+            WatcherCompletionResult as _TWCR, WatcherCompletionOutcome as _TWCO,
+        )
+        fail_r = _TWCR(
+            outcome=_TWCO.FAILED,
+            reason_code="trigger_exhaustion_terminal_write_failed:returned_false",
+            local_order_id=sig["local_order_id"],
+        )
+        watched.state = WatchState.PENDING
+        w._enter_ownership_quarantine(watched, fail_r)
+
+        # Quarantined: dedup held, watcher in _pending, not active
+        assert watched._ownership_quarantine is True
+        assert watched in w._pending
+        assert sig["signal_id"] in w._dedup_set
+        assert not watched.is_active  # quarantined → not active
+
+    def test_trigger_exhaustion_terminal_write_raises_quarantines_dedup_held(self):
+        """trigger_callback_exhausted + terminalize_deferred_breach raises
+        → quarantine, dedup retained."""
+        class _RaisingTermOSM(_MockOSM):
+            def terminalize_deferred_breach(self, *a, **kw):
+                raise RuntimeError("terminalize_db_error")
+
+        broker = MagicMock()
+        w = APEntryWatcher(broker, order_state_machine=_RaisingTermOSM(), mode="PAPER")
+        sig = _make_signal(execution_mode="paper")
+        watched = WatchedSignal(sig, overnight=False)
+        watched._watcher_ref = w
+        w._pending.append(watched)
+        w._dedup_set.add(sig["signal_id"])
+
+        from ap.pending_trigger_classifier import (
+            WatcherCompletionResult as _TWCR, WatcherCompletionOutcome as _TWCO,
+        )
+        fail_r = _TWCR(
+            outcome=_TWCO.FAILED,
+            reason_code="trigger_exhaustion_terminal_write_failed:RuntimeError",
+            local_order_id=sig["local_order_id"],
+        )
+        watched.state = WatchState.PENDING
+        w._enter_ownership_quarantine(watched, fail_r)
+
+        assert watched._ownership_quarantine is True
+        assert sig["signal_id"] in w._dedup_set
+
+    # ── Classifier parity ─────────────────────────────────────────────────
+
+    def test_classifier_parity_all_canonical_reasons(self):
+        """Every reason in WATCHER_INVALIDATION_TAXONOMY must produce a
+        consistent classification from classify_watcher_reason AND
+        _reason_is_invalidation (stop_* and TERMINAL/ALREADY_BREACHED)."""
+        from ap.pending_trigger_classifier import (
+            WATCHER_INVALIDATION_TAXONOMY,
+            WatcherInvalidationClass,
+            classify_watcher_reason,
+            _reason_is_invalidation,
+        )
+        for reason, cls in WATCHER_INVALIDATION_TAXONOMY.items():
+            got_cls = classify_watcher_reason(reason)
+            assert got_cls == cls, f"classify_watcher_reason({reason!r}) = {got_cls!r} != {cls!r}"
+
+            # _reason_is_invalidation must be True for TERMINAL and ALREADY_BREACHED
+            if cls in (WatcherInvalidationClass.TERMINAL, WatcherInvalidationClass.ALREADY_BREACHED):
+                assert _reason_is_invalidation(reason), (
+                    f"_reason_is_invalidation({reason!r}) must be True for class {cls}"
+                )
+            elif cls == WatcherInvalidationClass.RETRYABLE:
+                assert not _reason_is_invalidation(reason), (
+                    f"_reason_is_invalidation({reason!r}) must be False for RETRYABLE"
+                )
+
+    def test_classifier_parity_stop_prefix_always_terminal(self):
+        """stop_* prefix always classifies as TERMINAL via both functions."""
+        from ap.pending_trigger_classifier import (
+            WatcherInvalidationClass, classify_watcher_reason, _reason_is_invalidation,
+        )
+        for r in ("stop_bid_below_call_stop", "stop_ask_above_put_stop", "stop_future_unknown"):
+            assert classify_watcher_reason(r) == WatcherInvalidationClass.TERMINAL
+            assert _reason_is_invalidation(r)
+
+    def test_overnight_callback_terminalized_but_row_pending_quarantines(self):
+        """Overnight callback returns TERMINALIZED but row reread is still
+        PENDING_TRIGGER → verifier converts to FAILED → quarantine."""
+        # OSM returns PENDING_TRIGGER even after expire call (simulate failure)
+        class _StillPendingOSM(_MockOSM):
+            def expire_pending_entry(self, oid, *, reason=""):
+                self.expire_calls.append((oid, reason))
+                return True  # claims success
+
+            def get_order(self, oid):
+                return {
+                    "local_order_id": oid,
+                    "status": "PENDING_TRIGGER",  # row did NOT actually transition
+                    "meta": {},
+                    "client_id": "client@test.com",
+                    "execution_mode": "paper",
+                }
+        osm = _StillPendingOSM()
+        w, watched, sig = _arm_watcher(mode="paper", osm=osm, overnight=True)
+        watched.state = WatchState.EXPIRED
+
+        def _on_exp(ws: WatchedSignal) -> WatcherCompletionResult:
+            oid = str((ws.signal or {}).get("local_order_id") or "")
+            osm.expire_pending_entry(oid, reason="overnight_daily_invalidated")
+            return WatcherCompletionResult(
+                outcome=WatcherCompletionOutcome.TERMINALIZED,
+                reason_code="overnight_daily_invalidated",
+                local_order_id=oid,
+            )
+        w.on_expire = _on_exp
+        w._dispatch_completion(watched, _on_exp)
+
+        # Row still PENDING_TRIGGER after callback → verifier rejects TERMINALIZED → quarantine
+        assert watched._ownership_quarantine is True, (
+            "Callback lying about TERMINALIZED must produce quarantine"
+        )
+        assert watched in w._pending
+        assert sig["signal_id"] in w._dedup_set

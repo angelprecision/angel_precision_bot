@@ -178,24 +178,26 @@ class PendingTriggerClassification:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Terminal reason sets — must stay in sync with
-# ap_execution_core._REAL_UNDERLYING_INVALIDATION_REASONS (Bug A classifier)
+# Terminal reason sets — derived from WATCHER_INVALIDATION_TAXONOMY (PR #324 §4).
+# These must NOT be maintained separately; use classify_watcher_reason() instead.
+# Kept for backward-compat with existing callers of _reason_is_invalidation().
 # ─────────────────────────────────────────────────────────────────────────────
 
-_INVALIDATION_REASON_CODES: frozenset[str] = frozenset({
-    "overnight_daily_invalidated",
-    "overnight_premarket_breached",
-    "overnight_too_far_from_trigger",
-    "overnight_open_recheck_data_timeout",
-    "overnight_daily_validator_error",
-    "overnight_live_quote_unavailable",
-    "overnight_daily_already_through_trigger",
-    "arm_drift",
-    "arm_below_stop",
-    "arm_already_through_trigger",
-    "watcher_invalidated",
-    "on_trigger_exhausted_3_attempts",
-})
+# Derived at module-load time from the canonical taxonomy.
+# INVALIDATED_TERMINAL reasons → treated as "real invalidation" by legacy classifier.
+# INVALIDATED_ALREADY_BREACHED reasons are also treated as real (setup is over).
+# INVALIDATED_NO_WATCHER_OWNER ("watcher_invalidated" alone) is NOT terminal by itself
+# but is kept here for backward compat with existing callers.
+def _build_invalidation_reason_codes() -> frozenset:
+    _codes = set()
+    for reason, cls in WATCHER_INVALIDATION_TAXONOMY.items():
+        if cls in (WatcherInvalidationClass.TERMINAL, WatcherInvalidationClass.ALREADY_BREACHED):
+            _codes.add(reason)
+    # Keep backward-compat entries that callers depend on
+    _codes.update({"watcher_invalidated", "on_trigger_exhausted_3_attempts"})
+    return frozenset(_codes)
+
+_INVALIDATION_REASON_CODES: frozenset = _build_invalidation_reason_codes()
 
 _TERMINAL_MATERIALIZATION_OUTCOMES: frozenset[str] = frozenset({
     "TERMINAL_NO_TRADEABLE_CONTRACT",
@@ -206,13 +208,16 @@ _TERMINAL_MATERIALIZATION_OUTCOMES: frozenset[str] = frozenset({
 
 
 def _reason_is_invalidation(reason_code: str) -> bool:
-    """Match the classifier in ap_execution_core: stop_* prefix + known set."""
-    rc = str(reason_code or "").strip().lower()
-    if not rc:
-        return False
-    if rc.startswith("stop_"):
-        return True
-    return rc in _INVALIDATION_REASON_CODES
+    """PR #324 §4: delegate to classify_watcher_reason for canonical classification.
+
+    stop_* prefix and TERMINAL/ALREADY_BREACHED classes are treated as
+    "real invalidation" by the pending-trigger classifier.
+    """
+    cls = classify_watcher_reason(reason_code)
+    return cls in (
+        WatcherInvalidationClass.TERMINAL,
+        WatcherInvalidationClass.ALREADY_BREACHED,
+    )
 
 
 def _extract(row: dict, path: str, default=None):
@@ -314,8 +319,13 @@ def classify_pending_trigger_row(
         if watcher_owned is False:
             return PendingTriggerClassification.ORPHAN_NO_WATCHER
 
-        # ── Priority 7: active retry state → retryable ──
+        # ── Priority 7: INVALIDATED_RETRYABLE or INVALIDATED_REARMABLE with active retry → retryable ──
+        # PR #324 §4: a retryable reason must never be STUCK_INVALIDATED.
         if retry_status in ("RETRY_PENDING", "RUNNING") or retry_next_at:
+            return PendingTriggerClassification.WAITING_RETRYABLE
+        # If watcher_invalidation_class says RETRYABLE/REARMABLE, row is still waiting.
+        _inv_class = str(meta.get("watcher_invalidation_class") or "").strip()
+        if _inv_class in ("INVALIDATED_RETRYABLE", "INVALIDATED_REARMABLE"):
             return PendingTriggerClassification.WAITING_RETRYABLE
 
         # Default: watcher owns it, no terminal evidence — safe waiting state
